@@ -114,6 +114,13 @@ url = "2.5"
 # IP address handling
 ipnetwork = "0.20"
 
+# Regex for route matching
+regex = "1.11"
+
+# TLS for backend connections (re-encrypt mode)
+hyper-rustls = { version = "0.27", features = ["http1", "http2", "native-tokio", "tls12"] }
+tokio-rustls = "0.26"
+
 # Windows service (optional)
 windows-service-rs = { version = "0.7", package = "windows-service", optional = true }
 

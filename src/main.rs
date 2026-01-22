@@ -27,7 +27,7 @@ mod webtransport_server;
 
 use admin::AdminServer;
 use config::ConfigManager;
-use http_listener::run_http_listener;
+use http_listener::{run_http_listener, run_http_redirect_server};
 use proxy::BackendPool;
 use tls::TlsProvider;
 use webtransport_server::WebTransportServer;
@@ -169,56 +169,111 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Start both HTTP (TCP) and WebTransport (UDP) listeners on the same port
-    // This enables standalone operation - no nginx dependency
-    let bind_addr: std::net::SocketAddr = format!(
-        "{}:{}",
-        config.server.bind_address,
-        config.server.udp_port
-    ).parse()?;
-
+    // Start HTTP/HTTPS/WebTransport listeners on all configured ports
+    // This enables standalone operation - replaces nginx entirely
     let cert_path = config.tls.cert_path.to_string_lossy().to_string();
     let key_path = config.tls.key_path.to_string_lossy().to_string();
 
-    // Start HTTP/1.1 & HTTP/2 listener (TCP) - serves Alt-Svc headers for upgrade
-    let http_addr = bind_addr;
-    let http_cert = cert_path.clone();
-    let http_key = key_path.clone();
-    let http_config = config.clone();
-
-    let http_handle = tokio::spawn(async move {
-        info!("🌐 Starting HTTP listener on {} (TCP)", http_addr);
-        if let Err(e) = run_http_listener(http_addr, &http_cert, &http_key, http_config).await {
-            error!("HTTP listener error: {}", e);
-        }
-    });
-
-    // Start WebTransport server (UDP) - handles QUIC/HTTP3/WebTransport
-    let webtransport_server = WebTransportServer::new(
-        bind_addr,
-        &cert_path,
-        &key_path,
-        config.clone(),
-        backend_pool.clone(),
-    ).await
-    .map_err(|e| anyhow::anyhow!("Failed to create WebTransport server: {}", e))?;
-
-    let wt_addr = webtransport_server.local_addr();
-
-    let quic_handle = tokio::spawn(async move {
-        if let Err(e) = webtransport_server.run().await {
-            error!("WebTransport server error: {}", e);
-        }
-    });
+    // Collect all ports to listen on
+    let mut all_ports = vec![config.server.udp_port];
+    all_ports.extend(&config.server.additional_ports);
 
     info!("═══════════════════════════════════════════════════════════════");
-    info!("  🚀 STANDALONE PROXY - No nginx dependency!");
+    info!("  🚀 STANDALONE PROXY - Replaces nginx entirely!");
     info!("═══════════════════════════════════════════════════════════════");
-    info!("  HTTPS (TCP):     {} - serves Alt-Svc headers", bind_addr);
-    info!("  WebTransport:    {} - QUIC/HTTP3/WebTransport", wt_addr);
-    info!("  Alt-Svc:         h3=\":{}\"; ma=86400", config.server.udp_port);
+    info!("  Ports: {:?}", all_ports);
+    info!("  Backends:");
+    for (name, backend) in &config.backends {
+        info!("    - {} → {}", name, backend.address);
+    }
     info!("═══════════════════════════════════════════════════════════════");
-    info!("  Clients connect to HTTPS, receive Alt-Svc, upgrade to HTTP/3");
+
+    // Start HTTP redirect server (port 80 → HTTPS)
+    if config.http_redirect.enabled {
+        let redirect_port = config.http_redirect.port;
+        let https_port = config.server.udp_port;
+
+        tokio::spawn(async move {
+            if let Err(e) = run_http_redirect_server(redirect_port, https_port).await {
+                error!("HTTP redirect server error: {}", e);
+            }
+        });
+    }
+
+    // Start HTTPS reverse proxy listeners (TCP) on all ports
+    for port in all_ports.clone() {
+        let bind_addr: std::net::SocketAddr = format!(
+            "{}:{}",
+            config.server.bind_address,
+            port
+        ).parse()?;
+
+        let http_cert = cert_path.clone();
+        let http_key = key_path.clone();
+        let http_config = config.clone();
+
+        tokio::spawn(async move {
+            info!("🌐 Starting HTTPS reverse proxy on {} (TCP)", bind_addr);
+            if let Err(e) = run_http_listener(bind_addr, &http_cert, &http_key, http_config).await {
+                error!("HTTP listener error on port {}: {}", bind_addr.port(), e);
+            }
+        });
+    }
+
+    // Start WebTransport servers (UDP) on all ports
+    for port in all_ports.clone() {
+        let bind_addr: std::net::SocketAddr = format!(
+            "{}:{}",
+            config.server.bind_address,
+            port
+        ).parse()?;
+
+        let wt_cert = cert_path.clone();
+        let wt_key = key_path.clone();
+        let wt_config = config.clone();
+        let wt_backend_pool = backend_pool.clone();
+
+        tokio::spawn(async move {
+            match WebTransportServer::new(
+                bind_addr,
+                &wt_cert,
+                &wt_key,
+                wt_config,
+                wt_backend_pool,
+            ).await {
+                Ok(server) => {
+                    let addr = server.local_addr();
+                    info!("📡 WebTransport server started on {} (UDP)", addr);
+                    if let Err(e) = server.run().await {
+                        error!("WebTransport server error on {}: {}", addr, e);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to create WebTransport server on {}: {}", bind_addr, e);
+                }
+            }
+        });
+    }
+
+    // Build Alt-Svc header value for logging
+    let alt_svc_parts: Vec<String> = all_ports.iter()
+        .map(|p| format!("h3=\":{}\"; ma=86400", p))
+        .collect();
+
+    info!("═══════════════════════════════════════════════════════════════");
+    info!("  📡 All listeners started:");
+    if config.http_redirect.enabled {
+        info!("  HTTP Redirect:   0.0.0.0:{} → HTTPS", config.http_redirect.port);
+    }
+    for port in &all_ports {
+        info!("  HTTPS (TCP):     0.0.0.0:{}", port);
+        info!("  WebTransport:    0.0.0.0:{} (UDP)", port);
+    }
+    info!("  Alt-Svc:         {}", alt_svc_parts.join(", "));
+    info!("═══════════════════════════════════════════════════════════════");
+    info!("  Routing:");
+    info!("    api.pqcrypta.com → 127.0.0.1:3003 (Rust API)");
+    info!("    pqcrypta.com     → 127.0.0.1:8080 (Apache)");
     info!("═══════════════════════════════════════════════════════════════");
 
     // Print startup summary
@@ -241,11 +296,11 @@ async fn main() -> anyhow::Result<()> {
     // Stop config watching
     config_manager.stop_watching();
 
-    // Send shutdown signal to QUIC listener
+    // Send shutdown signal
     let _ = shutdown_tx.send(()).await;
 
-    // Wait for QUIC listener to finish
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), quic_handle).await;
+    // Give spawned tasks time to complete
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     info!("PQCrypta Proxy shutdown complete");
     Ok(())
