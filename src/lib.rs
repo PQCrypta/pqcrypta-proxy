@@ -13,11 +13,13 @@ pub mod handlers;
 pub mod proxy;
 pub mod quic_listener;
 pub mod tls;
+pub mod webtransport_server;
 
 // Re-export commonly used types
 pub use config::{ConfigManager, ProxyConfig};
 pub use proxy::BackendPool;
 pub use tls::TlsProvider;
+pub use webtransport_server::WebTransportServer;
 
 /// Library version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

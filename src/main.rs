@@ -22,12 +22,14 @@ mod handlers;
 mod proxy;
 mod quic_listener;
 mod tls;
+mod webtransport_server;
 
 use admin::AdminServer;
 use config::ConfigManager;
 use proxy::BackendPool;
 use quic_listener::QuicListener;
 use tls::TlsProvider;
+use webtransport_server::WebTransportServer;
 
 /// PQCrypta Proxy - QUIC/HTTP3/WebTransport Proxy with PQC TLS
 #[derive(Parser, Debug)]
@@ -128,11 +130,8 @@ async fn main() -> anyhow::Result<()> {
     info!("Backend pool initialized with {} backends", config.backends.len());
 
     // Create shutdown channels
-    let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
-    let (admin_shutdown_tx, _admin_shutdown_rx) = mpsc::channel::<()>(1);
-
-    // Create reload channel for QUIC listener
-    let (quic_reload_tx, quic_reload_rx) = mpsc::channel(16);
+    let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+    let (_admin_shutdown_tx, _admin_shutdown_rx) = mpsc::channel::<()>(1);
 
     // Start configuration file watching
     if args.watch_config {
@@ -140,13 +139,11 @@ async fn main() -> anyhow::Result<()> {
         info!("Configuration file watching enabled");
     }
 
-    // Spawn config reload handler
-    let config_manager_clone = config_manager.clone();
-    let quic_reload_tx_clone = quic_reload_tx.clone();
+    // Spawn config reload handler (for future hot-reload support)
     tokio::spawn(async move {
-        while let Some(event) = reload_rx.recv().await {
-            // Forward reload events to QUIC listener
-            let _ = quic_reload_tx_clone.send(event).await;
+        while let Some(_event) = reload_rx.recv().await {
+            // Config reload events are logged but not yet forwarded to WebTransport server
+            info!("Configuration reload event received");
         }
     });
 
@@ -165,21 +162,33 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Start QUIC listener
-    let quic_listener = QuicListener::new(
-        config.clone(),
-        tls_provider.clone(),
-        shutdown_rx,
-        quic_reload_rx,
-    )
-    .await?;
+    // Start WebTransport server (using wtransport for proper protocol support)
+    let bind_addr: std::net::SocketAddr = format!(
+        "{}:{}",
+        config.server.bind_address,
+        config.server.udp_port
+    ).parse()?;
 
-    let quic_addr = quic_listener.local_addr()?;
-    info!("🚀 QUIC/HTTP3/WebTransport server listening on {}", quic_addr);
+    let cert_path = config.tls.cert_path.to_string_lossy().to_string();
+    let key_path = config.tls.key_path.to_string_lossy().to_string();
+
+    let webtransport_server = WebTransportServer::new(
+        bind_addr,
+        &cert_path,
+        &key_path,
+        config.clone(),
+        backend_pool.clone(),
+    ).await
+    .map_err(|e| anyhow::anyhow!("Failed to create WebTransport server: {}", e))?;
+
+    let wt_addr = webtransport_server.local_addr();
+    info!("🚀 WebTransport server listening on {} (wtransport)", wt_addr);
+    info!("   ALPN: h3 (automatically configured)");
+    info!("   Protocol: WebTransport over HTTP/3");
 
     let quic_handle = tokio::spawn(async move {
-        if let Err(e) = quic_listener.run().await {
-            error!("QUIC listener error: {}", e);
+        if let Err(e) = webtransport_server.run().await {
+            error!("WebTransport server error: {}", e);
         }
     });
 
