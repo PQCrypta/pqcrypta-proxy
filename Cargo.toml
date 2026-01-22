@@ -35,6 +35,9 @@ quinn-proto = "0.11"
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 
+# WebTransport (proper protocol support)
+wtransport = "0.6"
+
 # HTTP client/server for backend proxying
 hyper = { version = "1.5", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full", "tokio"] }
