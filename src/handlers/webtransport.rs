@@ -17,7 +17,7 @@ pub struct WebTransportHandler {
     /// Proxy configuration
     config: Arc<ProxyConfig>,
     /// Backend connection pool
-    backend_pool: Arc<BackendPool>,
+    pub backend_pool: Arc<BackendPool>,
     /// Remote client address
     remote_addr: SocketAddr,
 }
