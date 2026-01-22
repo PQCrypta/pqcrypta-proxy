@@ -55,6 +55,9 @@ pub struct ProxyConfig {
     /// Route mappings
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
+    /// TLS passthrough routes (SNI-based routing without termination)
+    #[serde(default)]
+    pub passthrough_routes: Vec<PassthroughRoute>,
     /// Admin API configuration
     pub admin: AdminConfig,
     /// Logging configuration
@@ -63,6 +66,12 @@ pub struct ProxyConfig {
     pub rate_limiting: RateLimitConfig,
     /// Security settings
     pub security: SecurityConfig,
+    /// Security headers configuration
+    #[serde(default)]
+    pub headers: HeadersConfig,
+    /// HTTP redirect configuration
+    #[serde(default)]
+    pub http_redirect: HttpRedirectConfig,
 }
 
 impl Default for ProxyConfig {
@@ -73,10 +82,13 @@ impl Default for ProxyConfig {
             pqc: PqcConfig::default(),
             backends: HashMap::new(),
             routes: Vec::new(),
+            passthrough_routes: Vec::new(),
             admin: AdminConfig::default(),
             logging: LoggingConfig::default(),
             rate_limiting: RateLimitConfig::default(),
             security: SecurityConfig::default(),
+            headers: HeadersConfig::default(),
+            http_redirect: HttpRedirectConfig::default(),
         }
     }
 }
@@ -87,8 +99,11 @@ impl Default for ProxyConfig {
 pub struct ServerConfig {
     /// Bind address for QUIC listener (default: 0.0.0.0)
     pub bind_address: String,
-    /// UDP port for QUIC/HTTP3/WebTransport (default: 4433)
+    /// Primary UDP port for QUIC/HTTP3/WebTransport (default: 443)
     pub udp_port: u16,
+    /// Additional ports for WebTransport (e.g., [4433, 4434])
+    #[serde(default)]
+    pub additional_ports: Vec<u16>,
     /// Maximum concurrent connections
     pub max_connections: u32,
     /// Maximum concurrent streams per connection
@@ -107,12 +122,13 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind_address: "0.0.0.0".to_string(),
-            udp_port: 4433,
+            udp_port: 443,
+            additional_ports: vec![4433, 4434],
             max_connections: 10000,
             max_streams_per_connection: 1000,
             keepalive_interval_secs: 15,
             max_idle_timeout_secs: 120,
-            enable_ipv6: false,
+            enable_ipv6: true,
             worker_threads: 0,
         }
     }
@@ -203,14 +219,23 @@ pub struct BackendConfig {
     pub backend_type: BackendType,
     /// Backend address (e.g., "127.0.0.1:8080" or "unix:/run/php-fpm.sock")
     pub address: String,
-    /// Enable TLS to backend (re-encrypt)
+    /// TLS mode for backend connection
+    #[serde(default)]
+    pub tls_mode: TlsMode,
+    /// Enable TLS to backend (re-encrypt) - legacy option, use tls_mode instead
     #[serde(default)]
     pub tls: bool,
-    /// TLS certificate for backend verification
+    /// TLS certificate for backend verification (CA cert)
     pub tls_cert: Option<PathBuf>,
+    /// TLS client certificate for mTLS
+    pub tls_client_cert: Option<PathBuf>,
+    /// TLS client key for mTLS
+    pub tls_client_key: Option<PathBuf>,
     /// Skip TLS verification (dangerous, for testing only)
     #[serde(default)]
     pub tls_skip_verify: bool,
+    /// SNI hostname for backend TLS (defaults to backend address hostname)
+    pub tls_sni: Option<String>,
     /// Connection timeout in milliseconds
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
@@ -222,6 +247,36 @@ pub struct BackendConfig {
     /// Health check interval in seconds
     #[serde(default = "default_health_interval")]
     pub health_check_interval_secs: u64,
+}
+
+/// TLS mode for backend connections
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TlsMode {
+    /// Terminate TLS at proxy, connect to backend via plain HTTP (default)
+    #[default]
+    Terminate,
+    /// Terminate TLS at proxy, re-encrypt connection to backend via HTTPS
+    Reencrypt,
+    /// Pass through TLS without termination (SNI-based routing)
+    Passthrough,
+}
+
+/// TLS passthrough route configuration (SNI-based routing)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PassthroughRoute {
+    /// Route name for logging
+    pub name: Option<String>,
+    /// SNI hostname pattern to match (supports wildcards: *.example.com)
+    pub sni: String,
+    /// Backend address to forward to (host:port)
+    pub backend: String,
+    /// Enable PROXY protocol v2 when connecting to backend
+    #[serde(default)]
+    pub proxy_protocol: bool,
+    /// Connection timeout in milliseconds
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
 }
 
 fn default_timeout_ms() -> u64 {
@@ -263,10 +318,13 @@ pub struct RouteConfig {
     pub path_prefix: Option<String>,
     /// Exact path match
     pub path_exact: Option<String>,
+    /// Path regex pattern
+    pub path_regex: Option<String>,
     /// Enable WebTransport for this route
     #[serde(default)]
     pub webtransport: bool,
-    /// Backend name to route to
+    /// Backend name to route to (not required if redirect is set)
+    #[serde(default)]
     pub backend: String,
     /// Transform WebTransport stream to HTTP method
     pub stream_to_method: Option<String>,
@@ -284,6 +342,28 @@ pub struct RouteConfig {
     /// Priority (lower = higher priority)
     #[serde(default = "default_priority")]
     pub priority: i32,
+    /// CORS configuration for this route
+    #[serde(default)]
+    pub cors: Option<CorsConfig>,
+    /// Redirect URL (for SEO redirects)
+    pub redirect: Option<String>,
+    /// Permanent redirect (301) vs temporary (302)
+    #[serde(default)]
+    pub redirect_permanent: bool,
+    /// Override headers for this route
+    #[serde(default)]
+    pub headers_override: HashMap<String, String>,
+    /// Allow HTTP/1.1 for this route (for search bots)
+    #[serde(default)]
+    pub allow_http11: bool,
+    /// Skip bot blocking for this route
+    #[serde(default)]
+    pub skip_bot_blocking: bool,
+    /// Stripe.js compatibility (removes COEP/COOP headers)
+    #[serde(default)]
+    pub stripe_compatibility: bool,
+    /// Timeout override in milliseconds
+    pub timeout_override_ms: Option<u64>,
 }
 
 fn default_priority() -> i32 {
@@ -413,6 +493,99 @@ impl Default for SecurityConfig {
             allowed_ips: Vec::new(),
         }
     }
+}
+
+/// Security headers configuration (replaces nginx security headers)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HeadersConfig {
+    /// HSTS header
+    pub hsts: String,
+    /// X-Frame-Options header
+    pub x_frame_options: String,
+    /// X-Content-Type-Options header
+    pub x_content_type_options: String,
+    /// Referrer-Policy header
+    pub referrer_policy: String,
+    /// Permissions-Policy header
+    pub permissions_policy: String,
+    /// Cross-Origin-Opener-Policy header
+    pub cross_origin_opener_policy: String,
+    /// Cross-Origin-Embedder-Policy header
+    pub cross_origin_embedder_policy: String,
+    /// Cross-Origin-Resource-Policy header
+    pub cross_origin_resource_policy: String,
+    /// X-Permitted-Cross-Domain-Policies header
+    pub x_permitted_cross_domain_policies: String,
+    /// X-Download-Options header
+    pub x_download_options: String,
+    /// X-DNS-Prefetch-Control header
+    pub x_dns_prefetch_control: String,
+    /// X-Quantum-Resistant branding header
+    pub x_quantum_resistant: String,
+    /// X-Security-Level branding header
+    pub x_security_level: String,
+}
+
+impl Default for HeadersConfig {
+    fn default() -> Self {
+        Self {
+            hsts: "max-age=63072000; includeSubDomains; preload".to_string(),
+            x_frame_options: "DENY".to_string(),
+            x_content_type_options: "nosniff".to_string(),
+            referrer_policy: "strict-origin-when-cross-origin".to_string(),
+            permissions_policy: "camera=(), microphone=(), geolocation=(), interest-cohort=(), fullscreen=(self), payment=()".to_string(),
+            cross_origin_opener_policy: "same-origin".to_string(),
+            cross_origin_embedder_policy: "require-corp".to_string(),
+            cross_origin_resource_policy: "same-origin".to_string(),
+            x_permitted_cross_domain_policies: "none".to_string(),
+            x_download_options: "noopen".to_string(),
+            x_dns_prefetch_control: "off".to_string(),
+            x_quantum_resistant: "ML-KEM-1024, ML-DSA-87, X25519MLKEM768".to_string(),
+            x_security_level: "Post-Quantum Ready".to_string(),
+        }
+    }
+}
+
+/// HTTP redirect configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HttpRedirectConfig {
+    /// Enable HTTP redirect server
+    pub enabled: bool,
+    /// HTTP port to listen on
+    pub port: u16,
+    /// Redirect all HTTP to HTTPS
+    pub redirect_to_https: bool,
+}
+
+impl Default for HttpRedirectConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: 80,
+            redirect_to_https: true,
+        }
+    }
+}
+
+/// CORS configuration for routes
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CorsConfig {
+    /// Allowed origin (e.g., "https://pqcrypta.com")
+    pub allow_origin: Option<String>,
+    /// Allowed methods
+    #[serde(default)]
+    pub allow_methods: Vec<String>,
+    /// Allowed headers
+    #[serde(default)]
+    pub allow_headers: Vec<String>,
+    /// Allow credentials
+    #[serde(default)]
+    pub allow_credentials: bool,
+    /// Max age for preflight cache
+    #[serde(default)]
+    pub max_age: u64,
 }
 
 impl ConfigManager {
@@ -551,9 +724,14 @@ impl ProxyConfig {
             warn!("TLS private key not found: {:?}", self.tls.key_path);
         }
 
-        // Validate routes reference existing backends
+        // Validate routes reference existing backends (unless they're redirect routes)
         for route in &self.routes {
-            if !self.backends.contains_key(&route.backend) {
+            // Skip backend validation for redirect routes
+            if route.redirect.is_some() {
+                continue;
+            }
+
+            if route.backend.is_empty() || !self.backends.contains_key(&route.backend) {
                 return Err(anyhow::anyhow!(
                     "Route {:?} references unknown backend: {}",
                     route.name,
@@ -600,13 +778,25 @@ impl ProxyConfig {
             }
         }
 
-        // Check path
+        // Check path - exact match takes priority
         if let Some(ref exact) = route.path_exact {
             if path != exact {
                 return false;
             }
+            return true;
         }
 
+        // Check path regex
+        if let Some(ref regex_str) = route.path_regex {
+            if let Ok(re) = regex::Regex::new(regex_str) {
+                if !re.is_match(path) {
+                    return false;
+                }
+                return true;
+            }
+        }
+
+        // Check path prefix
         if let Some(ref prefix) = route.path_prefix {
             if !path.starts_with(prefix) {
                 return false;

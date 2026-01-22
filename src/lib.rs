@@ -18,7 +18,7 @@ pub mod webtransport_server;
 
 // Re-export commonly used types
 pub use config::{ConfigManager, ProxyConfig};
-pub use http_listener::run_http_listener;
+pub use http_listener::{run_http_listener, run_http_redirect_server, run_tls_passthrough_server};
 pub use proxy::BackendPool;
 pub use tls::TlsProvider;
 pub use webtransport_server::WebTransportServer;
