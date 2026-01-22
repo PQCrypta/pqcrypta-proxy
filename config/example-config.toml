@@ -1,0 +1,297 @@
+# PQCrypta Proxy Configuration
+# =============================
+# All values are configurable - no hardcoded ports, paths, or addresses.
+# CLI arguments and environment variables can override these settings.
+
+# =============================
+# Server Configuration
+# =============================
+[server]
+# Bind address for QUIC/UDP listener
+bind_address = "0.0.0.0"
+
+# UDP port for QUIC/HTTP3/WebTransport (default: 4433)
+udp_port = 4433
+
+# Maximum concurrent connections
+max_connections = 10000
+
+# Maximum concurrent streams per connection
+max_streams_per_connection = 1000
+
+# Keep-alive interval in seconds
+keepalive_interval_secs = 15
+
+# Maximum idle timeout in seconds
+max_idle_timeout_secs = 120
+
+# Enable IPv6 dual-stack binding
+enable_ipv6 = false
+
+# Worker threads (0 = auto-detect based on CPU cores)
+worker_threads = 0
+
+# =============================
+# TLS Configuration
+# =============================
+[tls]
+# Path to TLS certificate chain (PEM format)
+cert_path = "/etc/letsencrypt/live/pqcrypta.com/fullchain.pem"
+
+# Path to TLS private key (PEM format)
+key_path = "/etc/letsencrypt/live/pqcrypta.com/privkey.pem"
+
+# Optional: CA certificate for client verification (mTLS)
+# ca_cert_path = "/etc/pqcrypta/ca.pem"
+
+# Require client certificates (mTLS mode)
+require_client_cert = false
+
+# ALPN protocols to advertise
+alpn_protocols = ["h3", "webtransport"]
+
+# Minimum TLS version (only "1.3" supported for QUIC)
+min_version = "1.3"
+
+# Enable OCSP stapling
+ocsp_stapling = true
+
+# Certificate reload interval in seconds (0 = disabled)
+cert_reload_interval_secs = 3600
+
+# =============================
+# Post-Quantum Cryptography
+# =============================
+[pqc]
+# Enable PQC hybrid key exchange
+enabled = true
+
+# PQC provider: "openssl3.5" (requires OpenSSL 3.5+ with OQS provider)
+provider = "openssl3.5"
+
+# Path to OpenSSL 3.5 binary (for PQC support)
+openssl_path = "/usr/local/openssl-3.5/bin/openssl"
+
+# OpenSSL library path
+openssl_lib_path = "/usr/local/openssl-3.5/lib64"
+
+# Preferred KEM algorithm for key exchange
+# Options: kyber768, kyber1024, mlkem768, mlkem1024, x25519_kyber768
+preferred_kem = "x25519_kyber768"
+
+# Fallback to classical TLS if PQC is unavailable
+fallback_to_classical = true
+
+# =============================
+# Admin API Configuration
+# =============================
+[admin]
+# Enable admin HTTP API
+enabled = true
+
+# Admin API bind address (use 127.0.0.1 for local-only access)
+bind_address = "127.0.0.1"
+
+# Admin API port
+port = 8081
+
+# Require mTLS for admin API
+require_mtls = false
+
+# Optional: Bearer token for admin API authentication
+# auth_token = "your-secret-token-here"
+
+# Allowed IP addresses for admin API access
+allowed_ips = ["127.0.0.1", "::1"]
+
+# =============================
+# Logging Configuration
+# =============================
+[logging]
+# Log level: trace, debug, info, warn, error
+level = "info"
+
+# Log format: "json" or "text"
+format = "json"
+
+# Log file path (empty = stdout)
+# file = "/var/log/pqcrypta-proxy/proxy.log"
+
+# Enable access logs
+access_log = true
+
+# Access log file path
+# access_log_file = "/var/log/pqcrypta-proxy/access.log"
+
+# =============================
+# Rate Limiting
+# =============================
+[rate_limiting]
+# Enable rate limiting
+enabled = true
+
+# Requests per second per IP
+requests_per_second = 100
+
+# Burst size for rate limiter
+burst_size = 50
+
+# Enable connection rate limiting
+connection_rate_limit = true
+
+# New connections per second per IP
+connections_per_second = 10
+
+# =============================
+# Security Settings
+# =============================
+[security]
+# Maximum request body size in bytes (10MB default)
+max_request_size = 10485760
+
+# Maximum header size in bytes (64KB default)
+max_header_size = 65536
+
+# Connection timeout in seconds
+connection_timeout_secs = 30
+
+# Enable DoS protection
+dos_protection = true
+
+# Blocked IP addresses
+blocked_ips = []
+
+# Allowed IP addresses (whitelist mode - empty = allow all)
+allowed_ips = []
+
+# =============================
+# Backend Definitions
+# =============================
+
+# PHP-FPM backend via Unix socket
+[backends.php]
+name = "php"
+type = "unix"
+address = "unix:/run/php-fpm.sock"
+timeout_ms = 30000
+max_connections = 100
+health_check = "/health"
+health_check_interval_secs = 30
+
+# HTTP/1.1 backend
+[backends.api]
+name = "api"
+type = "http1"
+address = "127.0.0.1:3003"
+tls = false
+timeout_ms = 30000
+max_connections = 100
+health_check = "/health"
+health_check_interval_secs = 30
+
+# HTTP/2 backend with TLS (re-encrypt)
+[backends.secure-api]
+name = "secure-api"
+type = "http2"
+address = "api.internal.example.com:443"
+tls = true
+tls_skip_verify = false
+timeout_ms = 30000
+max_connections = 50
+health_check = "/health"
+health_check_interval_secs = 30
+
+# HTTP/3 backend (QUIC to QUIC)
+[backends.quic-backend]
+name = "quic-backend"
+type = "http3"
+address = "backend.example.com:4433"
+tls = true
+timeout_ms = 30000
+max_connections = 50
+
+# Raw TCP backend
+[backends.tcp-service]
+name = "tcp-service"
+type = "tcp"
+address = "127.0.0.1:9000"
+timeout_ms = 10000
+max_connections = 100
+
+# =============================
+# Route Configuration
+# =============================
+
+# WebTransport route to PHP backend
+[[routes]]
+name = "webtransport-encrypt"
+host = "api.pqcrypta.com"
+path_prefix = "/encrypt"
+webtransport = true
+backend = "php"
+stream_to_method = "POST"
+forward_client_identity = true
+client_identity_header = "X-Client-IP"
+priority = 10
+
+[routes.add_headers]
+X-Forwarded-Proto = "https"
+X-WebTransport = "true"
+
+# WebTransport route for streaming
+[[routes]]
+name = "webtransport-stream"
+host = "api.pqcrypta.com"
+path_prefix = "/stream"
+webtransport = true
+backend = "api"
+stream_to_method = "POST"
+forward_client_identity = true
+priority = 10
+
+# HTTP/3 API route
+[[routes]]
+name = "api-route"
+host = "api.pqcrypta.com"
+path_prefix = "/api"
+webtransport = false
+backend = "api"
+forward_client_identity = true
+priority = 20
+
+# Wildcard catch-all route
+[[routes]]
+name = "default"
+path_prefix = "/"
+backend = "api"
+priority = 100
+
+# =============================
+# Example: mTLS for Admin Access
+# =============================
+# To enable mTLS for the admin API:
+# 1. Set require_mtls = true in [admin]
+# 2. Configure ca_cert_path in [tls] with client CA
+# 3. Clients must present valid certificates signed by the CA
+
+# =============================
+# Example: Edge TLS Termination
+# =============================
+# This configuration terminates TLS at the proxy and forwards
+# to plaintext backends. The X-Client-IP header preserves client identity.
+
+# =============================
+# Example: Re-encrypt to Backend
+# =============================
+# For backends requiring TLS:
+# - Set tls = true in backend config
+# - Optionally set tls_cert for custom CA verification
+# - Set tls_skip_verify = true only for testing (DANGEROUS)
+
+# =============================
+# Example: PHP-FPM WebTransport
+# =============================
+# Map WebTransport streams to HTTP/1.1 POST requests to PHP-FPM:
+# 1. Configure Unix socket backend pointing to PHP-FPM sock
+# 2. Create WebTransport route with stream_to_method = "POST"
+# 3. PHP script receives POST body with WebTransport stream data
