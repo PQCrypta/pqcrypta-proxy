@@ -23,6 +23,105 @@ ocsp_stapling = true
 cert_reload_interval_secs = 3600
 ```
 
+### TLS Modes
+
+PQCrypta Proxy supports three TLS modes for backend connections:
+
+#### 1. TLS Terminate (Default)
+- TLS is terminated at the proxy
+- Backend connections use plain HTTP
+- Most common mode for internal backends
+
+```toml
+[backends.apache]
+name = "apache"
+type = "http1"
+address = "127.0.0.1:8080"
+tls_mode = "terminate"
+```
+
+#### 2. TLS Re-encrypt
+- TLS is terminated at the proxy
+- New TLS connection established to backend
+- Use for backends requiring end-to-end encryption
+
+```toml
+[backends.internal-api]
+name = "internal-api"
+type = "http1"
+address = "internal.example.com:443"
+tls_mode = "reencrypt"
+tls_cert = "/path/to/ca.pem"           # Custom CA for verification
+tls_client_cert = "/path/to/client.pem" # mTLS client certificate
+tls_client_key = "/path/to/client.key"  # mTLS client key
+tls_skip_verify = false                 # NEVER set true in production
+tls_sni = "internal.example.com"        # Custom SNI hostname
+```
+
+**Security considerations for re-encrypt mode:**
+- Always verify backend certificates (`tls_skip_verify = false`)
+- Use mTLS for mutual authentication when possible
+- Ensure CA certificates are up to date
+- Monitor certificate expiration
+
+#### 3. TLS Passthrough (SNI Routing)
+- No TLS termination at proxy
+- Traffic routed based on SNI hostname
+- Backend handles all TLS
+
+```toml
+[[passthrough_routes]]
+name = "external-service"
+sni = "external.example.com"    # Supports wildcards: *.example.com
+backend = "10.0.0.5:443"
+proxy_protocol = false          # Enable for client IP preservation
+timeout_ms = 30000
+```
+
+**Security considerations for passthrough mode:**
+- Proxy cannot inspect traffic (no WAF, rate limiting)
+- Backend must handle all security
+- Use for services requiring end-to-end encryption
+- Consider PROXY protocol for client IP preservation
+
+### Security Headers
+
+PQCrypta Proxy automatically injects security headers to all responses:
+
+```toml
+[headers]
+# HSTS - 2 year max-age for preload list eligibility
+hsts = "max-age=63072000; includeSubDomains; preload"
+
+# Prevent clickjacking
+x_frame_options = "DENY"
+
+# Prevent MIME-type sniffing
+x_content_type_options = "nosniff"
+
+# Control referrer information
+referrer_policy = "strict-origin-when-cross-origin"
+
+# Disable browser features
+permissions_policy = "camera=(), microphone=(), geolocation=(), interest-cohort=()"
+
+# Cross-origin isolation
+cross_origin_opener_policy = "same-origin"
+cross_origin_embedder_policy = "require-corp"
+cross_origin_resource_policy = "same-origin"
+
+# Additional security
+x_permitted_cross_domain_policies = "none"
+x_download_options = "noopen"
+x_dns_prefetch_control = "off"
+
+# Custom branding (hides backend identity)
+x_quantum_resistant = "ML-KEM-1024, ML-DSA-87, X25519MLKEM768"
+x_security_level = "Post-Quantum Ready"
+```
+
+**Note:** The proxy automatically replaces backend `Server` headers with `PQ Crypta HTTP3/QUIC/WebTransport Proxy v0.1.0` to hide backend identity.
+
 ### Post-Quantum Cryptography
 
 - [ ] **Install OpenSSL 3.5+** with OQS provider
@@ -88,7 +187,9 @@ dos_protection = true
 
 ```bash
 # Linux firewall rules
-iptables -A INPUT -p udp --dport 4433 -j ACCEPT   # QUIC
+iptables -A INPUT -p tcp --dport 80 -j ACCEPT    # HTTP redirect
+iptables -A INPUT -p tcp --dport 443 -j ACCEPT   # HTTPS (TCP)
+iptables -A INPUT -p udp --dport 443 -j ACCEPT   # QUIC (UDP)
 iptables -A INPUT -p tcp --dport 8081 -s 127.0.0.1 -j ACCEPT  # Admin (localhost only)
 ```
 
@@ -113,6 +214,7 @@ iptables -A INPUT -p tcp --dport 8081 -s 127.0.0.1 -j ACCEPT  # Admin (localhost
 level = "info"
 format = "json"
 access_log = true
+access_log_file = "/var/log/pqcrypta-proxy/access.log"
 ```
 
 ### Secrets Management
@@ -129,7 +231,7 @@ access_log = true
 
 1. Validate configuration:
    ```bash
-   pqcrypta-proxy --config /etc/pqcrypta/config.toml --validate
+   pqcrypta-proxy --config /etc/pqcrypta/proxy-config.toml --validate
    ```
 
 2. Start service:
@@ -140,6 +242,12 @@ access_log = true
 3. Verify health:
    ```bash
    curl http://127.0.0.1:8081/health
+   ```
+
+4. Verify server header:
+   ```bash
+   curl -I https://your-domain.com/ | grep -i server
+   # Expected: server: PQ Crypta HTTP3/QUIC/WebTransport Proxy v0.1.0
    ```
 
 ### Configuration Reload
@@ -193,30 +301,38 @@ curl http://127.0.0.1:8081/tls
 
 2. **Verify configuration**:
    ```bash
-   pqcrypta-proxy --config /etc/pqcrypta/config.toml --validate
+   pqcrypta-proxy --config /etc/pqcrypta/proxy-config.toml --validate
    ```
 
 3. **Check port binding**:
    ```bash
-   ss -ulnp | grep 4433   # QUIC UDP port
+   ss -ulnp | grep 443    # QUIC UDP port
+   ss -tlnp | grep 443    # HTTPS TCP port
+   ss -tlnp | grep 80     # HTTP redirect port
    ss -tlnp | grep 8081   # Admin TCP port
    ```
 
-4. **Test QUIC connectivity**:
+4. **Test HTTP/3 connectivity**:
    ```bash
    # Using curl with HTTP/3 support
-   curl --http3 https://your-domain:4433/health
+   curl --http3 https://your-domain:443/
    ```
 
 5. **Verify TLS certificate**:
    ```bash
-   openssl s_client -connect your-domain:4433 -alpn h3
+   openssl s_client -connect your-domain:443 -alpn h3
+   ```
+
+6. **Check Alt-Svc header**:
+   ```bash
+   curl -I https://your-domain.com/ | grep alt-svc
+   # Expected: alt-svc: h3=":443"; ma=86400, h3=":4433"; ma=86400
    ```
 
 ### Backup & Recovery
 
 **What to backup:**
-- Configuration file (`/etc/pqcrypta/config.toml`)
+- Configuration file (`/etc/pqcrypta/proxy-config.toml`)
 - TLS certificates (or Let's Encrypt account)
 - Prometheus metrics history (if using persistent storage)
 
@@ -247,6 +363,7 @@ chmod +x /etc/letsencrypt/renewal-hooks/post/pqcrypta-reload.sh
    - List all virtual hosts and routes
    - Document backend configurations
    - Note TLS settings and certificates
+   - Document security headers
 
 2. **Create equivalent PQCrypta config**:
    ```toml
@@ -255,6 +372,7 @@ chmod +x /etc/letsencrypt/renewal-hooks/post/pqcrypta-reload.sh
    name = "api"
    type = "http1"
    address = "127.0.0.1:8080"
+   tls_mode = "terminate"
 
    # Map nginx location to routes
    [[routes]]
@@ -262,22 +380,34 @@ chmod +x /etc/letsencrypt/renewal-hooks/post/pqcrypta-reload.sh
    host = "api.example.com"
    path_prefix = "/api"
    backend = "api"
+
+   [routes.cors]
+   allow_origin = "https://example.com"
+   allow_methods = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
    ```
 
 3. **Test in parallel**:
    - Run PQCrypta Proxy on different port
    - Use curl/wrk to test routes
    - Compare responses with existing proxy
+   - Verify security headers
 
-4. **Gradual traffic migration**:
-   - Start with internal/staging traffic
-   - Monitor metrics and logs
-   - Gradually increase traffic percentage
+4. **Switch over**:
+   ```bash
+   # Stop nginx
+   sudo systemctl stop nginx
+   sudo systemctl disable nginx
 
-5. **Full cutover**:
-   - Update DNS/load balancer
-   - Monitor for issues
-   - Keep old proxy ready for rollback
+   # Start PQCrypta Proxy
+   sudo systemctl start pqcrypta-proxy
+   sudo systemctl enable pqcrypta-proxy
+   ```
+
+5. **Monitor for issues**:
+   - Check logs for errors
+   - Monitor metrics
+   - Verify all routes work
+   - Keep nginx ready for rollback
 
 ### From Node.js WebTransport
 
@@ -287,7 +417,7 @@ chmod +x /etc/letsencrypt/renewal-hooks/post/pqcrypta-reload.sh
    const transport = new WebTransport('https://api.example.com:3003/stream');
 
    // New: Connect via PQCrypta Proxy
-   const transport = new WebTransport('https://api.example.com:4433/stream');
+   const transport = new WebTransport('https://api.example.com:443/stream');
    ```
 
 2. **Configure backend routing**:
@@ -305,7 +435,7 @@ chmod +x /etc/letsencrypt/renewal-hooks/post/pqcrypta-reload.sh
    ```
 
 3. **Update firewall rules**:
-   - Allow UDP 4433 (QUIC)
+   - Allow TCP/UDP 443 (HTTPS/QUIC)
    - Remove external access to Node.js port
 
 ### Rollback Procedure
@@ -313,8 +443,10 @@ chmod +x /etc/letsencrypt/renewal-hooks/post/pqcrypta-reload.sh
 If issues occur after migration:
 
 1. **Immediate rollback**:
-   - Update DNS/load balancer to point to old proxy
-   - Keep PQCrypta Proxy running for debugging
+   ```bash
+   sudo systemctl stop pqcrypta-proxy
+   sudo systemctl start nginx
+   ```
 
 2. **Gradual rollback**:
    - Reduce traffic percentage to PQCrypta Proxy

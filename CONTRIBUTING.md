@@ -154,12 +154,24 @@ async fn test_admin_health_endpoint() {
 
 ```
 src/
-├── main.rs           # Entry point and CLI
-├── config.rs         # Configuration parsing and validation
-├── tls.rs            # TLS provider with PQC support
-├── quic_listener.rs  # QUIC/HTTP3/WebTransport listener
-├── proxy.rs          # Backend connection pool
-├── admin.rs          # Admin API server
+├── main.rs              # Entry point and CLI
+├── lib.rs               # Library exports
+├── config.rs            # Configuration parsing and validation
+│                        # - TlsMode enum (terminate, reencrypt, passthrough)
+│                        # - PassthroughRoute for SNI routing
+│                        # - HeadersConfig for security headers
+│                        # - CorsConfig for CORS handling
+├── http_listener.rs     # HTTP/1.1/2 reverse proxy
+│                        # - TLS termination and re-encryption
+│                        # - TLS passthrough (SNI routing)
+│                        # - Security headers middleware
+│                        # - CORS handling
+│                        # - HTTP→HTTPS redirect server
+├── tls.rs               # TLS provider with PQC support
+├── quic_listener.rs     # QUIC/HTTP3 listener
+├── webtransport_server.rs # WebTransport session handling
+├── proxy.rs             # Backend connection pool
+├── admin.rs             # Admin API server
 └── handlers/
     ├── mod.rs
     └── webtransport.rs  # WebTransport handlers

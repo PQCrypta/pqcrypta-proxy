@@ -1,16 +1,41 @@
 # PQCrypta Proxy
 
-**Production-ready QUIC/HTTP/3/WebTransport proxy with hybrid Post-Quantum Cryptography (PQC) TLS support.**
+**Production-ready HTTP/3/QUIC/WebTransport reverse proxy with hybrid Post-Quantum Cryptography (PQC) TLS support. A complete nginx replacement.**
 
 [![Build Status](https://github.com/PQCrypta/pqcrypta-proxy/workflows/CI/badge.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 
+## Highlights
+
+- **Full nginx Replacement**: Domain-based routing, security headers, CORS, redirects
+- **Three TLS Modes**: Terminate, Re-encrypt, and Passthrough (SNI-based)
+- **Modern Protocols**: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebTransport
+- **Post-Quantum Ready**: Hybrid PQC key exchange via OpenSSL 3.5 + OQS provider
+- **Zero Downtime**: Hot reload configuration and TLS certificates
+
 ## Features
 
-- **QUIC/HTTP/3 Protocol**: Full HTTP/3 support with QUIC transport
+### Reverse Proxy
+- **Domain-based Routing**: Route `api.example.com` → port 3003, `example.com` → port 8080
+- **TLS Termination**: Decrypt at proxy, plain HTTP to backend (default)
+- **TLS Re-encryption**: Decrypt at proxy, re-encrypt HTTPS to backend with mTLS support
+- **TLS Passthrough**: SNI-based routing without decryption
+- **HTTP→HTTPS Redirect**: Automatic port 80 to 443 redirect server
+
+### Security
+- **Security Headers**: HSTS, X-Frame-Options, CSP, COEP, COOP, CORP, and more
+- **CORS Handling**: Full CORS support with preflight OPTIONS handling
+- **Server Branding**: Hide backend identity (Apache/nginx → "PQ Crypta Proxy")
+- **Rate Limiting**: Per-IP request and connection rate limiting
+- **DoS Protection**: Connection limits, timeouts, blocked IPs
+
+### Protocols
+- **QUIC/HTTP/3**: Full HTTP/3 support with QUIC transport
 - **WebTransport**: Native WebTransport session handling for bidirectional streaming
-- **Hybrid PQC TLS**: Post-quantum key exchange via OpenSSL 3.5 + OQS provider (Kyber/ML-KEM)
-- **Multi-Backend Routing**: Route to HTTP/1.1, HTTP/2, HTTP/3, Unix sockets, or raw TCP
+- **Alt-Svc Advertisement**: Automatic HTTP/3 upgrade headers
+- **X-Forwarded Headers**: X-Real-IP, X-Forwarded-For, X-Forwarded-Proto
+
+### Operations
 - **Hot Reload**: Configuration and TLS certificate reload without restart
 - **Admin API**: Health checks, Prometheus metrics, config reload, graceful shutdown
 - **Cross-Platform**: Linux, macOS, and Windows support
@@ -33,8 +58,11 @@ cd pqcrypta-proxy
 # Build release binary
 cargo build --release
 
-# Run with default config
-./target/release/pqcrypta-proxy --config config/example-config.toml
+# Validate configuration
+./target/release/pqcrypta-proxy --config /etc/pqcrypta/proxy-config.toml --validate
+
+# Run
+./target/release/pqcrypta-proxy --config /etc/pqcrypta/proxy-config.toml
 ```
 
 ### Docker
@@ -44,7 +72,7 @@ cargo build --release
 docker build -t pqcrypta-proxy .
 
 # Run container
-docker run -p 4433:4433/udp -p 8081:8081 \
+docker run -p 80:80 -p 443:443/tcp -p 443:443/udp \
   -v /etc/letsencrypt:/etc/letsencrypt:ro \
   -v ./config:/etc/pqcrypta:ro \
   pqcrypta-proxy
@@ -52,34 +80,144 @@ docker run -p 4433:4433/udp -p 8081:8081 \
 
 ## Configuration
 
-All configuration is externalized via TOML file. No hardcoded values.
+### Minimal Configuration
 
 ```toml
-# /etc/pqcrypta/config.toml
+# /etc/pqcrypta/proxy-config.toml
 
 [server]
 bind_address = "0.0.0.0"
-udp_port = 4433
+udp_port = 443
+additional_ports = [4433, 4434]
 
 [tls]
 cert_path = "/etc/letsencrypt/live/example.com/fullchain.pem"
 key_path = "/etc/letsencrypt/live/example.com/privkey.pem"
 
-[pqc]
+[http_redirect]
 enabled = true
-provider = "openssl3.5"
-preferred_kem = "x25519_kyber768"
+port = 80
 
-[backends.php]
-name = "php"
-type = "unix"
-address = "unix:/run/php-fpm.sock"
+# Backend: Apache on port 8080
+[backends.apache]
+name = "apache"
+type = "http1"
+address = "127.0.0.1:8080"
+tls_mode = "terminate"
 
+# Backend: Rust API on port 3003
+[backends.api]
+name = "api"
+type = "http1"
+address = "127.0.0.1:3003"
+tls_mode = "terminate"
+
+# Route: api.example.com → API backend
 [[routes]]
-name = "webtransport-to-php"
-webtransport = true
-backend = "php"
-stream_to_method = "POST"
+name = "api-route"
+host = "api.example.com"
+path_prefix = "/"
+backend = "api"
+forward_client_identity = true
+priority = 100
+
+# Route: example.com → Apache backend
+[[routes]]
+name = "main-site"
+host = "example.com"
+path_prefix = "/"
+backend = "apache"
+forward_client_identity = true
+priority = 100
+```
+
+### TLS Modes
+
+#### 1. TLS Terminate (Default)
+Decrypt TLS at proxy, plain HTTP to backend.
+
+```toml
+[backends.apache]
+name = "apache"
+type = "http1"
+address = "127.0.0.1:8080"
+tls_mode = "terminate"  # Default - can be omitted
+```
+
+#### 2. TLS Re-encrypt
+Decrypt at proxy, re-encrypt to backend via HTTPS.
+
+```toml
+[backends.internal-api]
+name = "internal-api"
+type = "http1"
+address = "internal.example.com:443"
+tls_mode = "reencrypt"
+tls_cert = "/path/to/ca.pem"           # Optional: custom CA
+tls_client_cert = "/path/to/client.pem" # Optional: mTLS client cert
+tls_client_key = "/path/to/client.key"  # Optional: mTLS client key
+tls_skip_verify = false                 # DANGEROUS if true
+tls_sni = "internal.example.com"        # Optional: custom SNI
+```
+
+#### 3. TLS Passthrough (SNI Routing)
+Route based on SNI without decryption.
+
+```toml
+[[passthrough_routes]]
+name = "external-service"
+sni = "external.example.com"    # Supports wildcards: *.example.com
+backend = "10.0.0.5:443"
+proxy_protocol = false          # Optional: PROXY protocol v2
+timeout_ms = 30000
+```
+
+### Security Headers
+
+```toml
+[headers]
+hsts = "max-age=63072000; includeSubDomains; preload"
+x_frame_options = "DENY"
+x_content_type_options = "nosniff"
+referrer_policy = "strict-origin-when-cross-origin"
+permissions_policy = "camera=(), microphone=(), geolocation=()"
+cross_origin_opener_policy = "same-origin"
+cross_origin_embedder_policy = "require-corp"
+cross_origin_resource_policy = "same-origin"
+
+# Custom branding headers
+x_quantum_resistant = "ML-KEM-1024, ML-DSA-87, X25519MLKEM768"
+x_security_level = "Post-Quantum Ready"
+```
+
+### CORS Configuration
+
+```toml
+[[routes]]
+name = "api-cors"
+host = "api.example.com"
+path_prefix = "/"
+backend = "api"
+
+[routes.cors]
+allow_origin = "https://example.com"
+allow_methods = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+allow_headers = ["Content-Type", "Authorization", "X-API-Key"]
+allow_credentials = true
+max_age = 86400
+```
+
+### SEO Redirects
+
+```toml
+# Redirect underscore URLs to hyphenated (SEO best practice)
+[[routes]]
+name = "seo-redirect"
+host = "example.com"
+path_prefix = "/old_path"
+redirect = "/new-path"
+redirect_permanent = true
+priority = 1
 ```
 
 See [config/example-config.toml](config/example-config.toml) for full documentation.
@@ -107,35 +245,48 @@ Environment variables: `PQCRYPTA_CONFIG`, `PQCRYPTA_UDP_PORT`, `PQCRYPTA_ADMIN_P
 ## Architecture
 
 ```
-                    ┌─────────────────────────────────────────┐
-                    │           PQCrypta Proxy                │
-                    │                                         │
-  Client ──────────►│  QUIC Listener (UDP 4433)              │
-  (Browser/App)     │    │                                    │
-                    │    ├─► HTTP/3 Handler                   │
-                    │    │     └─► WebTransport Sessions      │
-                    │    │                                    │
-                    │    └─► Raw QUIC Streams                 │
-                    │                                         │
-                    │  ┌────────────────────────────────────┐ │
-                    │  │         Route Engine               │ │
-                    │  │  - Host matching                   │ │
-                    │  │  - Path matching                   │ │
-                    │  │  - WebTransport routing            │ │
-                    │  └────────────────────────────────────┘ │
-                    │                                         │
-                    │  ┌────────────────────────────────────┐ │
-                    │  │         Backend Pool               │ │
-                    │  │  - HTTP/1.1                        │──────►  Backend A
-                    │  │  - HTTP/2                          │──────►  Backend B
-                    │  │  - HTTP/3 (QUIC)                   │──────►  Backend C
-                    │  │  - Unix Socket (PHP-FPM)           │──────►  PHP-FPM
-                    │  │  - Raw TCP                         │──────►  TCP Service
-                    │  └────────────────────────────────────┘ │
-                    │                                         │
-                    │  Admin API (HTTP 8081)                  │
-                    │    /health, /metrics, /reload           │
-                    └─────────────────────────────────────────┘
+                    ┌──────────────────────────────────────────────────────────┐
+                    │              PQ Crypta HTTP3/QUIC/WebTransport Proxy     │
+                    │                                                          │
+  Client ──────────►│  Port 80  ─► HTTP Redirect Server ─► HTTPS (301/308)    │
+  (Browser/App)     │                                                          │
+                    │  Port 443 ─► TLS Termination ─► Reverse Proxy            │
+                    │     │           │                                        │
+                    │     │           ├─► HTTP/1.1, HTTP/2 (TCP)              │
+                    │     │           ├─► HTTP/3 (QUIC/UDP)                   │
+                    │     │           └─► WebTransport Sessions               │
+                    │     │                                                    │
+                    │     └─► TLS Passthrough ─► SNI Routing (no decrypt)     │
+                    │                                                          │
+                    │  ┌─────────────────────────────────────────────────────┐ │
+                    │  │              Security Headers Middleware            │ │
+                    │  │  HSTS, X-Frame-Options, COEP, COOP, CORP, etc.     │ │
+                    │  └─────────────────────────────────────────────────────┘ │
+                    │                                                          │
+                    │  ┌─────────────────────────────────────────────────────┐ │
+                    │  │                    Route Engine                      │ │
+                    │  │  - Domain matching (api.example.com vs example.com) │ │
+                    │  │  - Path matching (prefix, exact, regex)             │ │
+                    │  │  - CORS handling                                     │ │
+                    │  │  - Redirect rules                                    │ │
+                    │  └─────────────────────────────────────────────────────┘ │
+                    │                                                          │
+                    │  ┌─────────────────────────────────────────────────────┐ │
+                    │  │                   Backend Pool                       │ │
+                    │  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  │ │
+                    │  │  │ TLS         │  │ TLS         │  │ TLS         │  │ │
+                    │  │  │ Terminate   │  │ Re-encrypt  │  │ Passthrough │  │ │
+                    │  │  │ (HTTP)      │  │ (HTTPS)     │  │ (SNI)       │  │ │
+                    │  │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  │ │
+                    │  └─────────┼────────────────┼────────────────┼─────────┘ │
+                    │            │                │                │           │
+                    │            ▼                ▼                ▼           │
+                    │      Backend A        Backend B        Backend C         │
+                    │   (Apache :8080)   (API :3003)    (External :443)       │
+                    │                                                          │
+                    │  Admin API (HTTP 8081)                                   │
+                    │    /health, /metrics, /reload, /shutdown                 │
+                    └──────────────────────────────────────────────────────────┘
 ```
 
 ## Post-Quantum Cryptography
@@ -220,6 +371,22 @@ sudo systemctl start pqcrypta-proxy
 journalctl -u pqcrypta-proxy -f
 ```
 
+### Replacing nginx
+
+```bash
+# Stop and disable nginx
+sudo systemctl stop nginx
+sudo systemctl disable nginx
+
+# Start pqcrypta-proxy on ports 80 and 443
+sudo systemctl enable pqcrypta-proxy
+sudo systemctl start pqcrypta-proxy
+
+# Verify
+curl -I https://your-domain.com/
+# Should show: server: PQ Crypta HTTP3/QUIC/WebTransport Proxy v0.1.0
+```
+
 ### macOS (launchd)
 
 ```bash
@@ -266,14 +433,17 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 cargo bench
 
 # Test QUIC throughput
-cargo run --release --bin quic-bench -- --target localhost:4433
+cargo run --release --bin quic-bench -- --target localhost:443
 ```
 
 ## Security
 
 ### Checklist
 
-- [ ] Use TLS 1.3 only (configured by default)
+- [x] TLS 1.3 only (enforced by QUIC)
+- [x] Full security headers (HSTS, COEP, COOP, CORP, etc.)
+- [x] Server identity hidden (custom branding)
+- [x] X-Forwarded-For header support
 - [ ] Enable PQC hybrid key exchange for quantum resistance
 - [ ] Restrict admin API to localhost or mTLS
 - [ ] Configure rate limiting
