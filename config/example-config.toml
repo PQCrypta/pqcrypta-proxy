@@ -496,7 +496,7 @@ priority = 1000
 # -----------------
 # The proxy automatically injects security headers from [headers] section.
 # The Server header is always replaced with:
-#   "PQ Crypta HTTP3/QUIC/WebTransport Proxy v0.1.0"
+#   "PQCProxy v0.1.0"
 # This hides backend identity (Apache, nginx, etc.).
 
 # CORS Handling:

@@ -120,7 +120,7 @@ x_quantum_resistant = "ML-KEM-1024, ML-DSA-87, X25519MLKEM768"
 x_security_level = "Post-Quantum Ready"
 ```
 
-**Note:** The proxy automatically replaces backend `Server` headers with `PQ Crypta HTTP3/QUIC/WebTransport Proxy v0.1.0` to hide backend identity.
+**Note:** The proxy automatically replaces backend `Server` headers with `PQCProxy v0.1.0` to hide backend identity.
 
 ### Post-Quantum Cryptography
 
@@ -247,7 +247,7 @@ access_log_file = "/var/log/pqcrypta-proxy/access.log"
 4. Verify server header:
    ```bash
    curl -I https://your-domain.com/ | grep -i server
-   # Expected: server: PQ Crypta HTTP3/QUIC/WebTransport Proxy v0.1.0
+   # Expected: server: PQCProxy v0.1.0
    ```
 
 ### Configuration Reload

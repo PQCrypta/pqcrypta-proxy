@@ -246,7 +246,7 @@ Environment variables: `PQCRYPTA_CONFIG`, `PQCRYPTA_UDP_PORT`, `PQCRYPTA_ADMIN_P
 
 ```
                     ┌──────────────────────────────────────────────────────────┐
-                    │              PQ Crypta HTTP3/QUIC/WebTransport Proxy     │
+                    │                         PQCProxy v0.1.0                   │
                     │                                                          │
   Client ──────────►│  Port 80  ─► HTTP Redirect Server ─► HTTPS (301/308)    │
   (Browser/App)     │                                                          │
@@ -384,7 +384,7 @@ sudo systemctl start pqcrypta-proxy
 
 # Verify
 curl -I https://your-domain.com/
-# Should show: server: PQ Crypta HTTP3/QUIC/WebTransport Proxy v0.1.0
+# Should show: server: PQCProxy v0.1.0
 ```
 
 ### macOS (launchd)
