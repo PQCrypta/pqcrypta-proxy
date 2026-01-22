@@ -1,5 +1,8 @@
 # PQCrypta Proxy Configuration
 # =============================
+# Production-ready HTTP/3/QUIC/WebTransport reverse proxy with hybrid PQC TLS.
+# A complete nginx replacement with modern protocol support.
+#
 # All values are configurable - no hardcoded ports, paths, or addresses.
 # CLI arguments and environment variables can override these settings.
 
@@ -10,8 +13,11 @@
 # Bind address for QUIC/UDP listener
 bind_address = "0.0.0.0"
 
-# UDP port for QUIC/HTTP3/WebTransport (default: 4433)
-udp_port = 4433
+# Primary UDP port for QUIC/HTTP3/WebTransport (default: 443)
+udp_port = 443
+
+# Additional ports to listen on (all support QUIC/HTTP3/WebTransport)
+additional_ports = [4433, 4434]
 
 # Maximum concurrent connections
 max_connections = 10000
@@ -58,6 +64,51 @@ ocsp_stapling = true
 
 # Certificate reload interval in seconds (0 = disabled)
 cert_reload_interval_secs = 3600
+
+# =============================
+# HTTP→HTTPS Redirect Server
+# =============================
+[http_redirect]
+# Enable HTTP redirect server on port 80
+enabled = true
+
+# HTTP port (redirects to HTTPS on primary port)
+port = 80
+
+# =============================
+# Security Headers
+# =============================
+# These headers are automatically injected into all responses.
+# The Server header is always replaced with PQ Crypta branding.
+[headers]
+# HTTP Strict Transport Security (2 years, preload-ready)
+hsts = "max-age=63072000; includeSubDomains; preload"
+
+# Prevent clickjacking
+x_frame_options = "DENY"
+
+# Prevent MIME-type sniffing
+x_content_type_options = "nosniff"
+
+# Control referrer information
+referrer_policy = "strict-origin-when-cross-origin"
+
+# Disable browser features (FLoC, camera, microphone, geolocation)
+permissions_policy = "camera=(), microphone=(), geolocation=(), interest-cohort=()"
+
+# Cross-origin isolation headers
+cross_origin_opener_policy = "same-origin"
+cross_origin_embedder_policy = "require-corp"
+cross_origin_resource_policy = "same-origin"
+
+# Additional security headers
+x_permitted_cross_domain_policies = "none"
+x_download_options = "noopen"
+x_dns_prefetch_control = "off"
+
+# Custom branding headers (advertise PQC capabilities)
+x_quantum_resistant = "ML-KEM-1024, ML-DSA-87, X25519MLKEM768"
+x_security_level = "Post-Quantum Ready"
 
 # =============================
 # Post-Quantum Cryptography
@@ -167,6 +218,52 @@ allowed_ips = []
 # =============================
 # Backend Definitions
 # =============================
+# Backends support three TLS modes:
+#   - terminate (default): TLS terminates at proxy, plain HTTP to backend
+#   - reencrypt: TLS terminates at proxy, new HTTPS connection to backend
+#   - passthrough: No TLS termination, SNI-based routing (see [[passthrough_routes]])
+
+# Apache/PHP backend (TLS Terminate - default)
+[backends.apache]
+name = "apache"
+type = "http1"
+address = "127.0.0.1:8080"
+tls_mode = "terminate"  # Default - can be omitted
+timeout_ms = 30000
+max_connections = 100
+health_check = "/health"
+health_check_interval_secs = 30
+
+# Rust API backend (TLS Terminate)
+[backends.api]
+name = "api"
+type = "http1"
+address = "127.0.0.1:3003"
+tls_mode = "terminate"
+timeout_ms = 30000
+max_connections = 100
+health_check = "/health"
+health_check_interval_secs = 30
+
+# Internal HTTPS API (TLS Re-encrypt with mTLS)
+[backends.internal-api]
+name = "internal-api"
+type = "http1"
+address = "internal.example.com:443"
+tls_mode = "reencrypt"
+# Custom CA for backend certificate verification
+tls_cert = "/etc/pqcrypta/internal-ca.pem"
+# mTLS client certificate (optional)
+tls_client_cert = "/etc/pqcrypta/client.pem"
+tls_client_key = "/etc/pqcrypta/client.key"
+# DANGEROUS: Only set true for testing
+tls_skip_verify = false
+# Custom SNI hostname (optional)
+tls_sni = "internal.example.com"
+timeout_ms = 30000
+max_connections = 50
+health_check = "/health"
+health_check_interval_secs = 30
 
 # PHP-FPM backend via Unix socket
 [backends.php]
@@ -178,23 +275,12 @@ max_connections = 100
 health_check = "/health"
 health_check_interval_secs = 30
 
-# HTTP/1.1 backend
-[backends.api]
-name = "api"
-type = "http1"
-address = "127.0.0.1:3003"
-tls = false
-timeout_ms = 30000
-max_connections = 100
-health_check = "/health"
-health_check_interval_secs = 30
-
-# HTTP/2 backend with TLS (re-encrypt)
-[backends.secure-api]
-name = "secure-api"
+# HTTP/2 backend with TLS
+[backends.http2-backend]
+name = "http2-backend"
 type = "http2"
 address = "api.internal.example.com:443"
-tls = true
+tls_mode = "reencrypt"
 tls_skip_verify = false
 timeout_ms = 30000
 max_connections = 50
@@ -206,7 +292,7 @@ health_check_interval_secs = 30
 name = "quic-backend"
 type = "http3"
 address = "backend.example.com:4433"
-tls = true
+tls_mode = "reencrypt"
 timeout_ms = 30000
 max_connections = 50
 
@@ -219,23 +305,119 @@ timeout_ms = 10000
 max_connections = 100
 
 # =============================
+# TLS Passthrough Routes (SNI Routing)
+# =============================
+# These routes bypass TLS termination entirely.
+# Traffic is routed based on SNI (Server Name Indication) without decryption.
+# Use for services that must handle their own TLS or require end-to-end encryption.
+
+# External service with SNI routing
+[[passthrough_routes]]
+name = "external-mail"
+sni = "mail.example.com"
+backend = "10.0.0.10:443"
+proxy_protocol = false  # Enable for client IP preservation
+timeout_ms = 30000
+
+# Wildcard SNI routing (matches *.internal.example.com)
+[[passthrough_routes]]
+name = "internal-wildcard"
+sni = "*.internal.example.com"
+backend = "10.0.0.20:443"
+proxy_protocol = true
+timeout_ms = 30000
+
+# Legacy service requiring passthrough
+[[passthrough_routes]]
+name = "legacy-service"
+sni = "legacy.example.com"
+backend = "192.168.1.100:443"
+timeout_ms = 60000
+
+# =============================
 # Route Configuration
 # =============================
+# Routes are matched by priority (lower = higher priority).
+# Routes support: domain matching, path matching, CORS, redirects, headers override.
 
-# WebTransport route to PHP backend
+# API subdomain route with CORS
+[[routes]]
+name = "api-route"
+host = "api.example.com"
+path_prefix = "/"
+backend = "api"
+forward_client_identity = true
+client_identity_header = "X-Client-IP"
+priority = 100
+
+[routes.cors]
+allow_origin = "https://example.com"
+allow_methods = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+allow_headers = ["Content-Type", "Authorization", "X-API-Key", "X-Request-ID"]
+allow_credentials = true
+max_age = 86400
+
+[routes.add_headers]
+X-Forwarded-Proto = "https"
+X-API-Version = "v1"
+
+# Main site route (Apache backend)
+[[routes]]
+name = "main-site"
+host = "example.com"
+path_prefix = "/"
+backend = "apache"
+forward_client_identity = true
+priority = 100
+
+# www redirect to non-www
+[[routes]]
+name = "www-redirect"
+host = "www.example.com"
+path_prefix = "/"
+redirect = "https://example.com"
+redirect_permanent = true
+priority = 1
+
+# Internal API route (TLS re-encrypt)
+[[routes]]
+name = "internal-api-route"
+host = "example.com"
+path_prefix = "/internal-api"
+backend = "internal-api"
+forward_client_identity = true
+priority = 50
+
+# SEO redirect: underscore to hyphen
+[[routes]]
+name = "seo-old-path"
+host = "example.com"
+path_prefix = "/old_path"
+redirect = "/new-path"
+redirect_permanent = true
+priority = 1
+
+# SEO redirect: legacy URL
+[[routes]]
+name = "seo-legacy"
+host = "example.com"
+path_prefix = "/legacy_page"
+redirect = "/modern-page"
+redirect_permanent = true
+priority = 1
+
+# WebTransport route for real-time encryption
 [[routes]]
 name = "webtransport-encrypt"
 host = "api.example.com"
 path_prefix = "/encrypt"
 webtransport = true
-backend = "php"
+backend = "api"
 stream_to_method = "POST"
 forward_client_identity = true
-client_identity_header = "X-Client-IP"
 priority = 10
 
 [routes.add_headers]
-X-Forwarded-Proto = "https"
 X-WebTransport = "true"
 
 # WebTransport route for streaming
@@ -249,12 +431,33 @@ stream_to_method = "POST"
 forward_client_identity = true
 priority = 10
 
-# HTTP/3 API route
+# Route with custom headers override
 [[routes]]
-name = "api-route"
+name = "custom-headers"
+host = "example.com"
+path_prefix = "/embed"
+backend = "apache"
+priority = 50
+
+# Override global security headers for this route
+[routes.headers_override]
+x_frame_options = "SAMEORIGIN"  # Allow embedding from same origin
+cross_origin_embedder_policy = "unsafe-none"  # Disable for legacy content
+
+# PHP-FPM route
+[[routes]]
+name = "php-route"
+host = "example.com"
+path_prefix = "/app"
+backend = "php"
+forward_client_identity = true
+priority = 80
+
+# Regex path matching (requires path_regex instead of path_prefix)
+[[routes]]
+name = "api-versioned"
 host = "api.example.com"
-path_prefix = "/api"
-webtransport = false
+path_regex = "^/v[0-9]+/.*"
 backend = "api"
 forward_client_identity = true
 priority = 20
@@ -263,35 +466,61 @@ priority = 20
 [[routes]]
 name = "default"
 path_prefix = "/"
-backend = "api"
-priority = 100
+backend = "apache"
+priority = 1000
 
 # =============================
-# Example: mTLS for Admin Access
+# Configuration Notes
 # =============================
-# To enable mTLS for the admin API:
-# 1. Set require_mtls = true in [admin]
-# 2. Configure ca_cert_path in [tls] with client CA
-# 3. Clients must present valid certificates signed by the CA
 
-# =============================
-# Example: Edge TLS Termination
-# =============================
-# This configuration terminates TLS at the proxy and forwards
-# to plaintext backends. The X-Client-IP header preserves client identity.
+# TLS Modes Explained:
+# --------------------
+# 1. TERMINATE (default): TLS terminates at proxy
+#    - Client ←(HTTPS)→ Proxy ←(HTTP)→ Backend
+#    - Most common mode for internal backends
+#    - Proxy can inspect/modify traffic
+#
+# 2. REENCRYPT: TLS terminates and re-establishes
+#    - Client ←(HTTPS)→ Proxy ←(HTTPS)→ Backend
+#    - Use for backends requiring end-to-end encryption
+#    - Supports mTLS for mutual authentication
+#    - Proxy can still inspect traffic
+#
+# 3. PASSTHROUGH: No TLS termination (SNI routing)
+#    - Client ←(HTTPS)→ Proxy ←(HTTPS)→ Backend (same TLS session)
+#    - Use for services handling their own TLS
+#    - Proxy cannot inspect traffic
+#    - Configured via [[passthrough_routes]], not backends
 
-# =============================
-# Example: Re-encrypt to Backend
-# =============================
-# For backends requiring TLS:
-# - Set tls = true in backend config
-# - Optionally set tls_cert for custom CA verification
-# - Set tls_skip_verify = true only for testing (DANGEROUS)
+# Security Headers:
+# -----------------
+# The proxy automatically injects security headers from [headers] section.
+# The Server header is always replaced with:
+#   "PQ Crypta HTTP3/QUIC/WebTransport Proxy v0.1.0"
+# This hides backend identity (Apache, nginx, etc.).
 
-# =============================
-# Example: PHP-FPM WebTransport
-# =============================
-# Map WebTransport streams to HTTP/1.1 POST requests to PHP-FPM:
-# 1. Configure Unix socket backend pointing to PHP-FPM sock
-# 2. Create WebTransport route with stream_to_method = "POST"
-# 3. PHP script receives POST body with WebTransport stream data
+# CORS Handling:
+# --------------
+# When [routes.cors] is configured:
+# - OPTIONS preflight requests are handled automatically
+# - CORS headers are added to all responses
+# - Credentials and custom headers supported
+
+# HTTP Redirect:
+# --------------
+# When [http_redirect] is enabled:
+# - Port 80 redirects all requests to HTTPS
+# - Uses 301 (permanent) redirect
+# - Preserves path and query string
+
+# Alt-Svc Advertisement:
+# ----------------------
+# All responses include Alt-Svc header advertising HTTP/3:
+#   Alt-Svc: h3=":443"; ma=86400, h3=":4433"; ma=86400, h3=":4434"; ma=86400
+
+# Hot Reload:
+# -----------
+# Configuration can be reloaded without restart:
+#   curl -X POST http://127.0.0.1:8081/reload
+# TLS certificates can be reloaded separately:
+#   curl -X POST http://127.0.0.1:8081/reload -d '{"tls_only":true}'
