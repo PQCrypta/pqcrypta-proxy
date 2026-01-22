@@ -36,10 +36,10 @@ worker_threads = 0
 # =============================
 [tls]
 # Path to TLS certificate chain (PEM format)
-cert_path = "/etc/letsencrypt/live/pqcrypta.com/fullchain.pem"
+cert_path = "/etc/letsencrypt/live/example.com/fullchain.pem"
 
 # Path to TLS private key (PEM format)
-key_path = "/etc/letsencrypt/live/pqcrypta.com/privkey.pem"
+key_path = "/etc/letsencrypt/live/example.com/privkey.pem"
 
 # Optional: CA certificate for client verification (mTLS)
 # ca_cert_path = "/etc/pqcrypta/ca.pem"
@@ -225,7 +225,7 @@ max_connections = 100
 # WebTransport route to PHP backend
 [[routes]]
 name = "webtransport-encrypt"
-host = "api.pqcrypta.com"
+host = "api.example.com"
 path_prefix = "/encrypt"
 webtransport = true
 backend = "php"
@@ -241,7 +241,7 @@ X-WebTransport = "true"
 # WebTransport route for streaming
 [[routes]]
 name = "webtransport-stream"
-host = "api.pqcrypta.com"
+host = "api.example.com"
 path_prefix = "/stream"
 webtransport = true
 backend = "api"
@@ -252,7 +252,7 @@ priority = 10
 # HTTP/3 API route
 [[routes]]
 name = "api-route"
-host = "api.pqcrypta.com"
+host = "api.example.com"
 path_prefix = "/api"
 webtransport = false
 backend = "api"
