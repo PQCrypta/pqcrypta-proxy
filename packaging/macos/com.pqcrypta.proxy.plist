@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Service identifier -->
+    <key>Label</key>
+    <string>com.pqcrypta.proxy</string>
+
+    <!-- Human-readable description -->
+    <key>ProgramDescription</key>
+    <string>PQCrypta Proxy - QUIC/HTTP3/WebTransport Proxy with PQC TLS</string>
+
+    <!-- Program and arguments -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/pqcrypta-proxy</string>
+        <string>--config</string>
+        <string>/usr/local/etc/pqcrypta/config.toml</string>
+    </array>
+
+    <!-- Environment variables -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PQCRYPTA_LOG_LEVEL</key>
+        <string>info</string>
+        <key>PQCRYPTA_JSON_LOGS</key>
+        <string>true</string>
+    </dict>
+
+    <!-- Working directory -->
+    <key>WorkingDirectory</key>
+    <string>/usr/local/var/pqcrypta-proxy</string>
+
+    <!-- Start at boot -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Keep running -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>NetworkState</key>
+        <true/>
+    </dict>
+
+    <!-- Restart on failure (after 5 seconds) -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <!-- Logging -->
+    <key>StandardOutPath</key>
+    <string>/usr/local/var/log/pqcrypta-proxy/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/pqcrypta-proxy/stderr.log</string>
+
+    <!-- Resource limits -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65535</integer>
+        <key>NumberOfProcesses</key>
+        <integer>4096</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65535</integer>
+        <key>NumberOfProcesses</key>
+        <integer>4096</integer>
+    </dict>
+
+    <!-- Nice value (scheduling priority) -->
+    <key>Nice</key>
+    <integer>-5</integer>
+
+    <!-- Process type hint for Activity Monitor -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <!-- Prevent starting if upgrade is in progress -->
+    <key>LaunchOnlyOnce</key>
+    <false/>
+</dict>
+</plist>

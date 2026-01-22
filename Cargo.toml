@@ -1,0 +1,150 @@
+[package]
+name = "pqcrypta-proxy"
+version = "0.1.0"
+edition = "2021"
+authors = ["PQCrypta Team <team@pqcrypta.com>"]
+description = "Production-ready QUIC/HTTP/3/WebTransport proxy with hybrid PQC TLS support"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/PQCrypta/pqcrypta-proxy"
+readme = "README.md"
+keywords = ["quic", "http3", "webtransport", "pqc", "proxy", "post-quantum"]
+categories = ["network-programming", "cryptography", "web-programming"]
+
+[features]
+default = ["pqc", "metrics", "admin-api"]
+# Enable PQC hybrid key exchange (requires OpenSSL 3.5 + OQS provider)
+pqc = ["openssl"]
+# Prometheus metrics endpoint
+metrics = ["prometheus"]
+# Admin HTTP API for health, reload, shutdown
+admin-api = ["axum", "tower-http"]
+# ACME certificate automation
+acme = []
+# Windows service support
+windows-service = ["windows-service-rs"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.43", features = ["full", "tracing", "signal"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+
+# QUIC and HTTP/3 - matching existing ent/api versions
+quinn = "0.11"
+quinn-proto = "0.11"
+h3 = "0.0.6"
+h3-quinn = "0.0.7"
+
+# HTTP client/server for backend proxying
+hyper = { version = "1.5", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full", "tokio"] }
+http = "1.2"
+http-body-util = "0.1"
+bytes = "1.9"
+
+# TLS - matching existing versions
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2.2"
+rustls-native-certs = "0.8"
+rcgen = "0.13"
+webpki-roots = "0.26"
+
+# OpenSSL for PQC support (optional feature)
+openssl = { version = "0.10", optional = true, default-features = false }
+openssl-sys = { version = "0.9", optional = true, default-features = false }
+
+# Configuration
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# Admin API (optional feature)
+axum = { version = "0.7", features = ["macros"], optional = true }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "limit"], optional = true }
+
+# Metrics (optional feature)
+prometheus = { version = "0.13", optional = true }
+
+# Unix socket support for PHP-FPM backends
+hyperlocal = "0.9"
+
+# Utilities
+anyhow = "1.0"
+thiserror = "2.0"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+hex = "0.4"
+rand = "0.8"
+parking_lot = "0.12"
+dashmap = "6.1"
+arc-swap = "1.7"
+
+# Hot reload - file watching
+notify = "7.0"
+
+# Signal handling
+signal-hook = "0.3"
+signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
+
+# Rate limiting
+governor = "0.7"
+
+# CLI argument parsing
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Futures utilities
+futures = "0.3"
+futures-util = "0.3"
+pin-project-lite = "0.2"
+
+# URL parsing
+url = "2.5"
+
+# IP address handling
+ipnetwork = "0.20"
+
+# Windows service (optional)
+windows-service-rs = { version = "0.7", package = "windows-service", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal", "user"] }
+
+[dev-dependencies]
+tempfile = "3.14"
+criterion = { version = "0.5", features = ["async_tokio"] }
+tokio-test = "0.4"
+assert_matches = "1.5"
+reqwest = { version = "0.12", features = ["json"] }
+
+[[bin]]
+name = "pqcrypta-proxy"
+path = "src/main.rs"
+
+[[bench]]
+name = "quic_throughput"
+harness = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
+
+[profile.bench]
+debug = true
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"

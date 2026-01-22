@@ -1,0 +1,296 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  release:
+    types: [created]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # =============================================================================
+  # Code Quality Checks
+  # =============================================================================
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # =============================================================================
+  # Build and Test Matrix
+  # =============================================================================
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      # Install OpenSSL on Windows
+      - name: Install OpenSSL (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          choco install openssl -y
+          echo "OPENSSL_DIR=C:\Program Files\OpenSSL-Win64" >> $env:GITHUB_ENV
+
+      # Install OpenSSL on macOS
+      - name: Install OpenSSL (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install openssl@3
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> $GITHUB_ENV
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pqcrypta-proxy-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/pqcrypta-proxy${{ matrix.os == 'windows-latest' && '.exe' || '' }}
+
+  # =============================================================================
+  # Unit Tests
+  # =============================================================================
+  test:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}-test
+
+      - name: Install OpenSSL (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install openssl@3
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> $GITHUB_ENV
+
+      - name: Run unit tests
+        run: cargo test --all-features -- --nocapture
+
+  # =============================================================================
+  # Integration Tests
+  # =============================================================================
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [build]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Generate self-signed certificates for testing
+      - name: Generate test certificates
+        run: |
+          mkdir -p test-certs
+          openssl req -x509 -newkey rsa:4096 -keyout test-certs/key.pem -out test-certs/cert.pem \
+            -days 1 -nodes -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+
+      # Create test config
+      - name: Create test configuration
+        run: |
+          cat > test-config.toml << 'EOF'
+          [server]
+          bind_address = "127.0.0.1"
+          udp_port = 4433
+          max_connections = 100
+
+          [tls]
+          cert_path = "test-certs/cert.pem"
+          key_path = "test-certs/key.pem"
+
+          [pqc]
+          enabled = false
+
+          [admin]
+          enabled = true
+          bind_address = "127.0.0.1"
+          port = 8081
+
+          [backends.echo]
+          name = "echo"
+          type = "http1"
+          address = "127.0.0.1:9999"
+          timeout_ms = 5000
+          max_connections = 10
+
+          [[routes]]
+          name = "default"
+          path_prefix = "/"
+          backend = "echo"
+          EOF
+
+      # Run integration tests
+      - name: Run integration tests
+        run: cargo test --test integration -- --nocapture
+        env:
+          TEST_CONFIG: test-config.toml
+
+      # Start proxy and run health check
+      - name: Health check test
+        run: |
+          # Build the binary
+          cargo build --release
+
+          # Start proxy in background
+          ./target/release/pqcrypta-proxy --config test-config.toml &
+          PROXY_PID=$!
+
+          # Wait for startup
+          sleep 3
+
+          # Test admin health endpoint
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8081/health)
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "Health check passed"
+          else
+            echo "Health check failed with code: $HTTP_CODE"
+            kill $PROXY_PID 2>/dev/null || true
+            exit 1
+          fi
+
+          # Cleanup
+          kill $PROXY_PID 2>/dev/null || true
+
+  # =============================================================================
+  # Security Audit
+  # =============================================================================
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # =============================================================================
+  # Docker Build
+  # =============================================================================
+  docker:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    needs: [test]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false
+          tags: pqcrypta-proxy:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # =============================================================================
+  # Release Builds
+  # =============================================================================
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: [build, test, integration, security]
+    if: github.event_name == 'release'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release archives
+        run: |
+          cd artifacts
+          for dir in */; do
+            target=$(basename "$dir")
+            tar -czvf "../${target}.tar.gz" -C "$dir" .
+          done
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v1
+        with:
+          files: "*.tar.gz"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # =============================================================================
+  # Documentation
+  # =============================================================================
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Generate docs
+        run: cargo doc --no-deps --all-features
+      - name: Upload docs
+        uses: actions/upload-artifact@v4
+        with:
+          name: documentation
+          path: target/doc

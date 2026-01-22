@@ -1,0 +1,71 @@
+[Unit]
+Description=PQCrypta Proxy - QUIC/HTTP3/WebTransport Proxy with PQC TLS
+Documentation=https://github.com/PQCrypta/pqcrypta-proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=pqcrypta
+Group=pqcrypta
+
+# Configuration
+Environment=PQCRYPTA_CONFIG=/etc/pqcrypta/config.toml
+Environment=PQCRYPTA_LOG_LEVEL=info
+Environment=PQCRYPTA_JSON_LOGS=true
+
+# Binary path
+ExecStart=/usr/local/bin/pqcrypta-proxy --config ${PQCRYPTA_CONFIG}
+
+# Reload configuration
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Graceful shutdown (30 second timeout)
+TimeoutStopSec=30
+KillSignal=SIGTERM
+KillMode=mixed
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=SIGTERM
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+
+# Allow reading certificates
+ReadOnlyPaths=/etc/letsencrypt
+ReadOnlyPaths=/etc/pqcrypta
+
+# Allow writing logs
+ReadWritePaths=/var/log/pqcrypta-proxy
+
+# Network capabilities
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Resource limits
+LimitNOFILE=65535
+LimitNPROC=4096
+
+# Working directory
+WorkingDirectory=/var/lib/pqcrypta-proxy
+
+# Standard output/error
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pqcrypta-proxy
+
+[Install]
+WantedBy=multi-user.target
