@@ -19,6 +19,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 mod admin;
 mod config;
 mod handlers;
+mod http_listener;
 mod proxy;
 mod quic_listener;
 mod tls;
@@ -26,8 +27,8 @@ mod webtransport_server;
 
 use admin::AdminServer;
 use config::ConfigManager;
+use http_listener::run_http_listener;
 use proxy::BackendPool;
-use quic_listener::QuicListener;
 use tls::TlsProvider;
 use webtransport_server::WebTransportServer;
 
@@ -71,6 +72,12 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Install rustls CryptoProvider before any TLS operations
+    // This is required when both ring and aws-lc-rs features are available
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     let args = Args::parse();
 
     // Initialize logging
@@ -162,7 +169,8 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Start WebTransport server (using wtransport for proper protocol support)
+    // Start both HTTP (TCP) and WebTransport (UDP) listeners on the same port
+    // This enables standalone operation - no nginx dependency
     let bind_addr: std::net::SocketAddr = format!(
         "{}:{}",
         config.server.bind_address,
@@ -172,6 +180,20 @@ async fn main() -> anyhow::Result<()> {
     let cert_path = config.tls.cert_path.to_string_lossy().to_string();
     let key_path = config.tls.key_path.to_string_lossy().to_string();
 
+    // Start HTTP/1.1 & HTTP/2 listener (TCP) - serves Alt-Svc headers for upgrade
+    let http_addr = bind_addr;
+    let http_cert = cert_path.clone();
+    let http_key = key_path.clone();
+    let http_config = config.clone();
+
+    let http_handle = tokio::spawn(async move {
+        info!("🌐 Starting HTTP listener on {} (TCP)", http_addr);
+        if let Err(e) = run_http_listener(http_addr, &http_cert, &http_key, http_config).await {
+            error!("HTTP listener error: {}", e);
+        }
+    });
+
+    // Start WebTransport server (UDP) - handles QUIC/HTTP3/WebTransport
     let webtransport_server = WebTransportServer::new(
         bind_addr,
         &cert_path,
@@ -182,15 +204,22 @@ async fn main() -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("Failed to create WebTransport server: {}", e))?;
 
     let wt_addr = webtransport_server.local_addr();
-    info!("🚀 WebTransport server listening on {} (wtransport)", wt_addr);
-    info!("   ALPN: h3 (automatically configured)");
-    info!("   Protocol: WebTransport over HTTP/3");
 
     let quic_handle = tokio::spawn(async move {
         if let Err(e) = webtransport_server.run().await {
             error!("WebTransport server error: {}", e);
         }
     });
+
+    info!("═══════════════════════════════════════════════════════════════");
+    info!("  🚀 STANDALONE PROXY - No nginx dependency!");
+    info!("═══════════════════════════════════════════════════════════════");
+    info!("  HTTPS (TCP):     {} - serves Alt-Svc headers", bind_addr);
+    info!("  WebTransport:    {} - QUIC/HTTP3/WebTransport", wt_addr);
+    info!("  Alt-Svc:         h3=\":{}\"; ma=86400", config.server.udp_port);
+    info!("═══════════════════════════════════════════════════════════════");
+    info!("  Clients connect to HTTPS, receive Alt-Svc, upgrade to HTTP/3");
+    info!("═══════════════════════════════════════════════════════════════");
 
     // Print startup summary
     print_startup_summary(&config, tls_provider.is_pqc_enabled());

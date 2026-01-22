@@ -10,6 +10,7 @@
 pub mod admin;
 pub mod config;
 pub mod handlers;
+pub mod http_listener;
 pub mod proxy;
 pub mod quic_listener;
 pub mod tls;
@@ -17,6 +18,7 @@ pub mod webtransport_server;
 
 // Re-export commonly used types
 pub use config::{ConfigManager, ProxyConfig};
+pub use http_listener::run_http_listener;
 pub use proxy::BackendPool;
 pub use tls::TlsProvider;
 pub use webtransport_server::WebTransportServer;

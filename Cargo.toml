@@ -17,7 +17,7 @@ pqc = ["openssl"]
 # Prometheus metrics endpoint
 metrics = ["prometheus"]
 # Admin HTTP API for health, reload, shutdown
-admin-api = ["axum", "tower-http"]
+admin-api = ["tower-http"]
 # ACME certificate automation
 acme = []
 # Windows service support
@@ -66,8 +66,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 
-# Admin API (optional feature)
-axum = { version = "0.7", features = ["macros"], optional = true }
+# Admin API and HTTP listener
+axum = { version = "0.7", features = ["macros"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "limit"], optional = true }
 
