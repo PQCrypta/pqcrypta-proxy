@@ -294,34 +294,6 @@ require_client_cert = true
 require_mtls = true
 ```
 
-## Integration with Existing PQ Crypta
-
-To migrate existing PQ Crypta WebTransport code to use this proxy:
-
-1. **Update DNS/Load Balancer**: Point WebTransport traffic to the proxy on port 4433
-
-2. **Configure Backend**: Add your existing API as a backend:
-   ```toml
-   [backends.pqcrypta-api]
-   type = "http1"
-   address = "127.0.0.1:3003"
-   ```
-
-3. **Add WebTransport Route**:
-   ```toml
-   [[routes]]
-   webtransport = true
-   backend = "pqcrypta-api"
-   stream_to_method = "POST"
-   ```
-
-4. **Forward Client Identity**:
-   ```toml
-   [[routes]]
-   forward_client_identity = true
-   client_identity_header = "X-Client-IP"
-   ```
-
 ## License
 
 Licensed under either of:
