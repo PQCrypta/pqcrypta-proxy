@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use dashmap::DashMap;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -104,8 +104,8 @@ impl BackendPool {
             .uri(&uri);
 
         // Add headers
-        for (key, value) in headers {
-            request_builder = request_builder.header(&key, &value);
+        for (key, value) in &headers {
+            request_builder = request_builder.header(key, value);
         }
 
         // Add content-type if not specified
@@ -318,12 +318,16 @@ impl BackendPool {
 
         // Read response body
         let mut response_body = Vec::new();
-        while let Some(chunk) = stream
+        while let Some(mut chunk) = stream
             .recv_data()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to receive data: {}", e))?
         {
-            response_body.extend_from_slice(&chunk);
+            while chunk.has_remaining() {
+                let bytes = chunk.chunk();
+                response_body.extend_from_slice(bytes);
+                chunk.advance(bytes.len());
+            }
         }
 
         debug!("Received {} bytes from HTTP/3 backend", response_body.len());

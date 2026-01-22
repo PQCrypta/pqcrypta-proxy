@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use h3::quic::BidiStream;
 use h3_quinn::Connection as H3Connection;
 use quinn::{Endpoint, ServerConfig as QuinnServerConfig, TransportConfig};
@@ -68,9 +68,6 @@ impl QuicListener {
         let mut server_config =
             QuinnServerConfig::with_crypto(tls_provider.get_quic_server_config());
         server_config.transport = Arc::new(transport_config);
-
-        // Limit concurrent connections
-        server_config.concurrent_connections(config.server.max_connections);
 
         // Create endpoint
         let endpoint = Endpoint::server(server_config, addr)?;
@@ -223,7 +220,16 @@ impl QuicListener {
     ) -> anyhow::Result<()> {
         loop {
             match h3.accept().await {
-                Ok(Some((request, stream))) => {
+                Ok(Some(resolver)) => {
+                    // Resolve the request
+                    let (request, stream) = match resolver.resolve_request().await {
+                        Ok(result) => result,
+                        Err(e) => {
+                            error!("Failed to resolve request: {}", e);
+                            continue;
+                        }
+                    };
+
                     let method = request.method().clone();
                     let uri = request.uri().clone();
                     let path = uri.path().to_string();
@@ -338,8 +344,13 @@ impl QuicListener {
 
         // Read request body
         let mut body = Vec::new();
-        while let Some(chunk) = stream.recv_data().await? {
-            body.extend_from_slice(&chunk);
+        while let Some(mut chunk) = stream.recv_data().await? {
+            // Convert impl Buf to bytes
+            while chunk.has_remaining() {
+                let bytes = chunk.chunk();
+                body.extend_from_slice(bytes);
+                chunk.advance(bytes.len());
+            }
             if body.len() > config.security.max_request_size {
                 let response = http::Response::builder()
                     .status(http::StatusCode::PAYLOAD_TOO_LARGE)
@@ -477,12 +488,5 @@ impl QuicListener {
     /// Get local address
     pub fn local_addr(&self) -> anyhow::Result<SocketAddr> {
         Ok(self.endpoint.local_addr()?)
-    }
-}
-
-impl WebTransportHandler {
-    /// Get backend pool reference
-    pub fn backend_pool(&self) -> &Arc<BackendPool> {
-        &self.backend_pool
     }
 }
