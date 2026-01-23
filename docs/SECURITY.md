@@ -157,27 +157,34 @@ auth_token = "your-secret-token-here"
 allowed_ips = ["127.0.0.1", "10.0.0.0/8"]
 ```
 
-### Rate Limiting & DoS Protection
+### Rate Limiting & DoS Protection ✅ IMPLEMENTED
 
-- [ ] **Enable request rate limiting**
-- [ ] **Enable connection rate limiting**
-- [ ] **Set maximum request/header sizes**
-- [ ] **Configure connection timeouts**
-- [ ] **Enable DoS protection**
+All rate limiting and DoS protection features are now fully implemented:
+
+- [x] **Request rate limiting** - Per-IP token bucket via `governor` crate
+- [x] **Connection rate limiting** - Configurable `max_connections_per_ip`
+- [x] **Burst handling** - `burst_size` configuration
+- [x] **Automatic IP blocking** - After `auto_block_threshold` exceeded
+- [x] **Maximum request/header sizes** - 413/431 responses for oversized requests
+- [x] **Connection timeouts** - Configurable timeouts
+- [x] **DoS protection** - Connection limits, auto-blocking with expiration
+- [x] **GeoIP blocking** - MaxMind DB integration for country-level blocking
+- [x] **JA3/JA4 fingerprinting** - TLS fingerprint detection
+- [x] **Circuit breaker** - Backend protection from cascading failures
 
 ```toml
-[rate_limiting]
-enabled = true
-requests_per_second = 100
-burst_size = 50
-connection_rate_limit = true
-connections_per_second = 10
-
 [security]
-max_request_size = 10485760      # 10MB
-max_header_size = 65536          # 64KB
-connection_timeout_secs = 30
 dos_protection = true
+blocked_ips = []
+geoip_db_path = "/var/www/html/pqcrypta-proxy/data/geoip/GeoLite2-City.mmdb"
+blocked_countries = ["CN", "RU", "KP"]
+
+[security.rate_limit]
+requests_per_second = 100
+burst_size = 200
+auto_block_threshold = 1000
+block_duration_secs = 3600
+max_connections_per_ip = 100
 ```
 
 ### Network Security

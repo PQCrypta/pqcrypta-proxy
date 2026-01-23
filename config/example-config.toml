@@ -86,7 +86,7 @@ port = 80
 # Security Headers
 # =============================
 # These headers are automatically injected into all responses.
-# The Server header is always replaced with PQ Crypta branding.
+# The Server header is always replaced with "PQCProxy v0.1.0".
 [headers]
 # HTTP Strict Transport Security (2 years, preload-ready)
 hsts = "max-age=63072000; includeSubDomains; preload"
@@ -502,9 +502,8 @@ priority = 1000
 # Security Headers:
 # -----------------
 # The proxy automatically injects security headers from [headers] section.
-# The Server header is always replaced with:
-#   "PQCProxy v0.1.0"
-# This hides backend identity (Apache, nginx, etc.).
+# The Server header is always replaced with "PQCProxy v0.1.0" to hide
+# backend identity (Apache, nginx, etc.).
 
 # CORS Handling:
 # --------------

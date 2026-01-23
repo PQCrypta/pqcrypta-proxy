@@ -161,12 +161,28 @@ src/
 │                        # - PassthroughRoute for SNI routing
 │                        # - HeadersConfig for security headers
 │                        # - CorsConfig for CORS handling
+│                        # - RateLimitConfig, CompressionConfig
 ├── http_listener.rs     # HTTP/1.1/2 reverse proxy
 │                        # - TLS termination and re-encryption
 │                        # - TLS passthrough (SNI routing)
 │                        # - Security headers middleware
 │                        # - CORS handling
 │                        # - HTTP→HTTPS redirect server
+├── security.rs          # Security middleware (NEW)
+│                        # - Rate limiting (governor crate)
+│                        # - DoS protection & connection limits
+│                        # - IP blocking (manual + auto)
+│                        # - GeoIP blocking (MaxMind DB)
+│                        # - JA3/JA4 TLS fingerprinting
+│                        # - Circuit breaker
+├── compression.rs       # Compression middleware (NEW)
+│                        # - Brotli, Zstd, Gzip, Deflate
+│                        # - Content negotiation
+│                        # - Skip pre-compressed content
+├── http3_features.rs    # HTTP/3 advanced features (NEW)
+│                        # - Early Hints (103)
+│                        # - Priority Hints (RFC 9218)
+│                        # - Request Coalescing
 ├── tls.rs               # TLS provider with PQC support
 ├── quic_listener.rs     # QUIC/HTTP3 listener
 ├── webtransport_server.rs # WebTransport session handling

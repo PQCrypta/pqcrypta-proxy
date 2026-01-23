@@ -206,7 +206,9 @@ impl Default for PqcConfig {
             provider: "openssl3.5".to_string(),
             openssl_path: Some(PathBuf::from("/usr/local/openssl-3.5/bin/openssl")),
             openssl_lib_path: Some(PathBuf::from("/usr/local/openssl-3.5/lib64")),
-            preferred_kem: "kyber768".to_string(),
+            // X25519MLKEM768 is the IETF standard hybrid (classical + PQC)
+            // Provides NIST Level 3 security with classical fallback
+            preferred_kem: "X25519MLKEM768".to_string(),
             fallback_to_classical: true,
         }
     }
@@ -483,6 +485,16 @@ pub struct SecurityConfig {
     pub blocked_ips: Vec<String>,
     /// Allowed IP addresses (whitelist mode)
     pub allowed_ips: Vec<String>,
+    /// GeoIP database path (for country blocking)
+    pub geoip_db_path: Option<PathBuf>,
+    /// Blocked country codes (ISO 3166-1 alpha-2, e.g., "CN", "RU")
+    pub blocked_countries: Vec<String>,
+    /// Maximum connections per IP
+    pub max_connections_per_ip: u32,
+    /// Auto-block threshold (errors before auto-block)
+    pub auto_block_threshold: u32,
+    /// Auto-block duration in seconds
+    pub auto_block_duration_secs: u64,
 }
 
 impl Default for SecurityConfig {
@@ -494,6 +506,11 @@ impl Default for SecurityConfig {
             dos_protection: true,
             blocked_ips: Vec::new(),
             allowed_ips: Vec::new(),
+            geoip_db_path: Some(PathBuf::from("/var/www/html/pqcrypta-proxy/data/geoip/GeoLite2-City.mmdb")),
+            blocked_countries: Vec::new(), // e.g., vec!["CN", "RU", "KP", "IR"]
+            max_connections_per_ip: 100,
+            auto_block_threshold: 10, // 10 violations before auto-block
+            auto_block_duration_secs: 300, // 5 minute auto-block
         }
     }
 }
