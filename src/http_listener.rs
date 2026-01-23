@@ -8,8 +8,7 @@
 //! - Alt-Svc advertisement for HTTP/3 and WebTransport
 //! - Security headers injection
 //! - CORS handling
-//! - Standalone operation (full nginx replacement)
-//! - **PQC hybrid key exchange** via OpenSSL 3.5+ with ML-KEM support
+//! - **PQC hybrid key exchange** via rustls-post-quantum with ML-KEM support
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -303,8 +302,25 @@ pub async fn run_http_listener_pqc(
     // This provider includes X25519MLKEM768 hybrid key exchange
     let crypto_provider = std::sync::Arc::new(rustls_post_quantum::provider());
 
+    // Determine TLS protocol versions from config
+    let min_version = config.tls.min_version.as_str();
+    let protocol_versions: Vec<&'static rustls::SupportedProtocolVersion> = match min_version {
+        "1.3" => vec![&rustls::version::TLS13],
+        "1.2" => vec![&rustls::version::TLS12, &rustls::version::TLS13],
+        _ => {
+            warn!("Unknown min_version '{}' in config, defaulting to TLS 1.3 only", min_version);
+            vec![&rustls::version::TLS13]
+        }
+    };
+
+    let tls_version_info = if protocol_versions.len() == 1 {
+        "TLS 1.3 ONLY - TLS 1.2 disabled to prevent downgrade attacks"
+    } else {
+        "TLS 1.2+ (TLS 1.3 preferred)"
+    };
+
     let mut rustls_config = rustls::ServerConfig::builder_with_provider(crypto_provider)
-        .with_safe_default_protocol_versions()
+        .with_protocol_versions(&protocol_versions)
         .map_err(|e| format!("Failed to set protocol versions: {}", e))?
         .with_no_client_auth()
         .with_single_cert(cert_chain, private_key)
@@ -317,6 +333,7 @@ pub async fn run_http_listener_pqc(
     let tls_config = RustlsConfig::from_config(std::sync::Arc::new(rustls_config));
 
     info!("✅ PQC TLS configured via rustls-post-quantum");
+    info!("🔒 {} (config: min_version = \"{}\")", tls_version_info, min_version);
     info!("🔒 Post-Quantum HTTPS reverse proxy ready on port {} (TCP)", port);
     info!("🛡️  PQC KEM: X25519MLKEM768 (hybrid classical + post-quantum)");
     info!("🛡️  Hybrid Mode: true");

@@ -254,7 +254,6 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Start HTTP/HTTPS/WebTransport listeners on all configured ports
-    // This enables standalone operation - replaces nginx entirely
     let cert_path = config.tls.cert_path.to_string_lossy().to_string();
     let key_path = config.tls.key_path.to_string_lossy().to_string();
 
@@ -263,7 +262,7 @@ async fn main() -> anyhow::Result<()> {
     all_ports.extend(&config.server.additional_ports);
 
     info!("═══════════════════════════════════════════════════════════════");
-    info!("  🚀 STANDALONE PROXY - Replaces nginx entirely!");
+    info!("  🚀 PQCrypta Proxy - Post-Quantum Ready");
     info!("═══════════════════════════════════════════════════════════════");
     info!("  Ports: {:?}", all_ports);
     info!("  Backends:");

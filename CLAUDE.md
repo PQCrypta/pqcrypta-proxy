@@ -4,7 +4,7 @@ This file provides guidance to Claude Code when working with the PQCrypta Proxy 
 
 ## Project Overview
 
-PQCrypta Proxy is a high-performance reverse proxy with QUIC/HTTP/3, WebTransport, and Post-Quantum Cryptography TLS support. It serves as a complete nginx replacement.
+PQCrypta Proxy is a high-performance reverse proxy with QUIC/HTTP/3, WebTransport, and Post-Quantum Cryptography TLS support.
 
 ## ✅ All Features Implemented
 

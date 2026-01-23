@@ -1,13 +1,13 @@
 # PQCrypta Proxy
 
-**Production-ready HTTP/3/QUIC/WebTransport reverse proxy with hybrid Post-Quantum Cryptography (PQC) TLS support. A complete nginx replacement.**
+**Production-ready HTTP/3/QUIC/WebTransport reverse proxy with hybrid Post-Quantum Cryptography (PQC) TLS support.**
 
 [![Build Status](https://github.com/PQCrypta/pqcrypta-proxy/workflows/CI/badge.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 
 ## Highlights
 
-- **Full nginx Replacement**: Domain-based routing, security headers, CORS, redirects
+- **Full-Featured Proxy**: Domain-based routing, security headers, CORS, redirects
 - **Three TLS Modes**: Terminate, Re-encrypt, and Passthrough (SNI-based)
 - **Modern Protocols**: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebTransport
 - **Post-Quantum Ready**: Hybrid PQC key exchange via OpenSSL 3.5 + OQS provider
@@ -369,22 +369,6 @@ sudo systemctl start pqcrypta-proxy
 
 # View logs
 journalctl -u pqcrypta-proxy -f
-```
-
-### Replacing nginx
-
-```bash
-# Stop and disable nginx
-sudo systemctl stop nginx
-sudo systemctl disable nginx
-
-# Start pqcrypta-proxy on ports 80 and 443
-sudo systemctl enable pqcrypta-proxy
-sudo systemctl start pqcrypta-proxy
-
-# Verify
-curl -I https://your-domain.com/
-# Should show: server: PQCProxy v0.1.0
 ```
 
 ### macOS (launchd)
