@@ -18,11 +18,10 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 use rand::Rng;
 use tokio::sync::Semaphore;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::config::{
-    AffinityMode, BackendPoolConfig, LoadBalancerConfig, PoolServerConfig,
-    SessionAffinityConfig, TlsMode,
+    AffinityMode, BackendPoolConfig, LoadBalancerConfig, PoolServerConfig, TlsMode,
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -326,7 +325,7 @@ struct WeightedRoundRobinState {
 
 impl BackendPool {
     /// Create pool from configuration
-    pub fn from_config(config: &BackendPoolConfig, lb_config: &LoadBalancerConfig) -> Self {
+    pub fn from_config(config: &BackendPoolConfig, _lb_config: &LoadBalancerConfig) -> Self {
         let algorithm = Self::create_algorithm(&config.algorithm);
 
         let servers: Vec<Arc<BackendServer>> = config

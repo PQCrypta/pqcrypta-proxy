@@ -181,10 +181,10 @@ access_log = true
 # access_log_file = "/var/log/pqcrypta-proxy/access.log"
 
 # =============================
-# Rate Limiting
+# Rate Limiting (Basic)
 # =============================
 [rate_limiting]
-# Enable rate limiting
+# Enable basic rate limiting
 enabled = true
 
 # Requests per second per IP
@@ -198,6 +198,96 @@ connection_rate_limit = true
 
 # New connections per second per IP
 connections_per_second = 10
+
+# =============================
+# Advanced Multi-Dimensional Rate Limiting
+# =============================
+# Cutting-edge rate limiting inspired by Cloudflare, Envoy, HAProxy, and Traefik.
+# Features: composite keys, JA3 fingerprinting, X-Forwarded-For trust, adaptive ML.
+
+[advanced_rate_limiting]
+# Enable advanced rate limiting (overrides basic when enabled)
+enabled = true
+
+# IPv6 subnet grouping (64 = /64 subnets treated as single client)
+ipv6_subnet_bits = 64
+
+# Trusted proxies for X-Forwarded-For parsing (CIDR or IP)
+trusted_proxies = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.1"]
+
+# Key resolution strategy
+[advanced_rate_limiting.key_strategy]
+# Priority order for key resolution (first found wins)
+# Options: source_ip, real_ip, api_key, jwt_subject, ja3_fingerprint, ja4_fingerprint
+order = ["api_key", "jwt_subject", "ja3_fingerprint", "real_ip", "source_ip"]
+
+# Fallback key if none found
+fallback = "source_ip"
+
+# Enable composite keys (combine multiple keys)
+use_composite = false
+
+# Header names for key extraction
+[advanced_rate_limiting.headers]
+api_key = "X-API-Key"
+user_id = "X-User-ID"
+tenant_id = "X-Tenant-ID"
+real_ip = "X-Real-IP"
+
+# Global limits (DDoS protection layer)
+[advanced_rate_limiting.global_limits]
+requests_per_second = 100000
+burst_size = 50000
+
+[advanced_rate_limiting.global_limits.per_ip]
+requests_per_second = 1000
+burst_size = 500
+requests_per_minute = 30000
+requests_per_hour = 500000
+
+[advanced_rate_limiting.global_limits.per_fingerprint]
+requests_per_second = 100
+burst_size = 50
+requests_per_minute = 3000
+requests_per_hour = 50000
+
+# JA3/JA4 fingerprint-based limiting (NAT-friendly)
+[advanced_rate_limiting.fingerprint_limiting]
+enabled = true
+prefer_over_ip = false  # Use fingerprint as primary key for NAT scenarios
+blocked_fingerprints = []  # Block known malicious fingerprints
+
+# Unknown fingerprint limits (more restrictive)
+[advanced_rate_limiting.fingerprint_limiting.unknown_limits]
+requests_per_second = 50
+burst_size = 25
+requests_per_minute = 1500
+requests_per_hour = 25000
+
+# Adaptive rate limiting (ML-inspired anomaly detection)
+[advanced_rate_limiting.adaptive]
+enabled = false  # Disabled by default, enable for production
+baseline_window_secs = 3600  # 1 hour baseline learning
+sensitivity = 0.7
+auto_adjust = false
+min_samples = 1000
+std_dev_multiplier = 3.0  # Requests > mean + 3*std_dev = anomaly
+
+# Example composite key configuration
+# [[advanced_rate_limiting.composite_keys]]
+# name = "ip_plus_path"
+# keys = ["source_ip", "path"]
+# routes = []  # Empty = all routes
+# [advanced_rate_limiting.composite_keys.limits]
+# requests_per_second = 50
+# burst_size = 25
+
+# Example per-route rate limits
+# [advanced_rate_limiting.route_limits.api_heavy]
+# pattern = "/api/heavy"
+# [advanced_rate_limiting.route_limits.api_heavy.limits]
+# requests_per_second = 10
+# burst_size = 5
 
 # =============================
 # Security Settings
