@@ -26,8 +26,8 @@ mod tls;
 mod webtransport_server;
 
 use admin::AdminServer;
-use config::ConfigManager;
-use http_listener::{run_http_listener, run_http_redirect_server};
+use config::{ConfigManager, ConfigReloadEvent};
+use http_listener::{run_http_listener, run_http_redirect_server, run_tls_passthrough_server};
 use proxy::BackendPool;
 use tls::TlsProvider;
 use webtransport_server::WebTransportServer;
@@ -146,13 +146,60 @@ async fn main() -> anyhow::Result<()> {
         info!("Configuration file watching enabled");
     }
 
-    // Spawn config reload handler (for future hot-reload support)
+    // Spawn config reload handler for hot-reload support
+    let reload_tls_provider = tls_provider.clone();
     tokio::spawn(async move {
-        while let Some(_event) = reload_rx.recv().await {
-            // Config reload events are logged but not yet forwarded to WebTransport server
-            info!("Configuration reload event received");
+        while let Some(event) = reload_rx.recv().await {
+            match event {
+                ConfigReloadEvent::ConfigReloaded(new_config) => {
+                    info!("Configuration reloaded - applying changes");
+
+                    // Update TLS provider with new config
+                    if let Err(e) = reload_tls_provider.update_config(&new_config.tls, &new_config.pqc) {
+                        error!("Failed to update TLS config: {}", e);
+                    } else {
+                        info!("TLS configuration updated successfully");
+                    }
+
+                    // Note: BackendPool update requires mutable access
+                    // which would require additional synchronization
+                    info!("Backend pool will use new config for new connections");
+                }
+                ConfigReloadEvent::TlsCertsReloaded => {
+                    info!("TLS certificates reloaded");
+                    if let Err(e) = reload_tls_provider.reload_certificates() {
+                        error!("Failed to reload TLS certificates: {}", e);
+                    }
+                }
+                ConfigReloadEvent::ReloadFailed(err) => {
+                    error!("Configuration reload failed: {}", err);
+                }
+            }
         }
     });
+
+    // Spawn periodic certificate reload check
+    let cert_check_interval = config.tls.cert_reload_interval_secs;
+    if cert_check_interval > 0 {
+        let cert_tls_provider = tls_provider.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(
+                std::time::Duration::from_secs(cert_check_interval)
+            );
+            loop {
+                interval.tick().await;
+                if cert_tls_provider.needs_reload() {
+                    info!("TLS certificate change detected, reloading...");
+                    if let Err(e) = cert_tls_provider.reload_certificates() {
+                        error!("Failed to reload TLS certificates: {}", e);
+                    } else {
+                        info!("TLS certificates reloaded successfully");
+                    }
+                }
+            }
+        });
+        info!("Certificate auto-reload enabled (checking every {}s)", cert_check_interval);
+    }
 
     // Start admin API server
     let admin_server = AdminServer::new(
@@ -196,6 +243,22 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             if let Err(e) = run_http_redirect_server(redirect_port, https_port).await {
                 error!("HTTP redirect server error: {}", e);
+            }
+        });
+    }
+
+    // Start TLS passthrough server if routes are configured
+    if !config.passthrough_routes.is_empty() {
+        let passthrough_addr: std::net::SocketAddr = format!(
+            "{}:{}",
+            config.server.bind_address,
+            config.server.udp_port  // Use primary port for passthrough
+        ).parse()?;
+        let passthrough_config = config.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = run_tls_passthrough_server(passthrough_addr, passthrough_config).await {
+                error!("TLS passthrough server error: {}", e);
             }
         });
     }

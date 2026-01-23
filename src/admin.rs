@@ -302,6 +302,8 @@ async fn reload_handler(
         match state.tls_provider.reload_certificates() {
             Ok(()) => {
                 info!("TLS certificates reloaded via admin API");
+                // Notify other components
+                state.config_manager.notify_tls_reload().await;
                 Json(ReloadResponse {
                     success: true,
                     message: "TLS certificates reloaded successfully".to_string(),

@@ -126,8 +126,7 @@ pub async fn run_http_listener(
 }
 
 /// Run TLS passthrough server (SNI-based routing without termination)
-/// Note: Scaffolded for future use - can be enabled via configuration.
-#[allow(dead_code)]
+/// Enabled when passthrough_routes are configured in proxy-config.toml
 pub async fn run_tls_passthrough_server(
     addr: SocketAddr,
     config: Arc<ProxyConfig>,
@@ -157,7 +156,6 @@ pub async fn run_tls_passthrough_server(
 }
 
 /// Handle a TLS passthrough connection by peeking at SNI
-#[allow(dead_code)]
 async fn handle_passthrough_connection(
     client_stream: TcpStream,
     client_addr: SocketAddr,
@@ -233,7 +231,6 @@ async fn handle_passthrough_connection(
 }
 
 /// Extract SNI from TLS ClientHello
-#[allow(dead_code)]
 fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {
     // TLS record header: type (1) + version (2) + length (2)
     if data.len() < 5 {
