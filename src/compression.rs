@@ -133,7 +133,7 @@ pub fn parse_accept_encoding(accept_encoding: Option<&HeaderValue>) -> Compressi
             "gzip" => return CompressionEncoding::Gzip,
             "deflate" => return CompressionEncoding::Deflate,
             "*" => return CompressionEncoding::Brotli, // Use best by default
-            _ => continue,
+            _ => {}
         }
     }
 
@@ -141,7 +141,10 @@ pub fn parse_accept_encoding(accept_encoding: Option<&HeaderValue>) -> Compressi
 }
 
 /// Check if content type should be compressed
-pub fn should_compress_content_type(content_type: Option<&HeaderValue>, config: &CompressionConfig) -> bool {
+pub fn should_compress_content_type(
+    content_type: Option<&HeaderValue>,
+    config: &CompressionConfig,
+) -> bool {
     let Some(value) = content_type else {
         return false;
     };
@@ -173,7 +176,11 @@ pub fn is_already_compressed(headers: &HeaderMap) -> bool {
 }
 
 /// Compress data using the specified encoding
-pub fn compress_bytes(data: &[u8], encoding: CompressionEncoding, config: &CompressionConfig) -> Option<Vec<u8>> {
+pub fn compress_bytes(
+    data: &[u8],
+    encoding: CompressionEncoding,
+    config: &CompressionConfig,
+) -> Option<Vec<u8>> {
     match encoding {
         CompressionEncoding::Brotli => {
             let mut encoder = brotli::CompressorWriter::new(
@@ -185,9 +192,7 @@ pub fn compress_bytes(data: &[u8], encoding: CompressionEncoding, config: &Compr
             encoder.write_all(data).ok()?;
             Some(encoder.into_inner())
         }
-        CompressionEncoding::Zstd => {
-            zstd::encode_all(data, config.zstd_level).ok()
-        }
+        CompressionEncoding::Zstd => zstd::encode_all(data, config.zstd_level).ok(),
         CompressionEncoding::Gzip => {
             use std::io::Write;
             let mut encoder = flate2::write::GzEncoder::new(
@@ -325,7 +330,11 @@ pub async fn compression_middleware(
 
     // Only use compressed version if it's smaller
     if compressed.len() >= body_bytes.len() {
-        trace!("Compressed size ({}) >= original ({}), skipping", compressed.len(), body_bytes.len());
+        trace!(
+            "Compressed size ({}) >= original ({}), skipping",
+            compressed.len(),
+            body_bytes.len()
+        );
         return Response::from_parts(parts, Body::from(body_bytes));
     }
 
@@ -363,7 +372,9 @@ pub async fn compression_middleware(
             }
         }
     } else {
-        parts.headers.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+        parts
+            .headers
+            .insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
     }
 
     Response::from_parts(parts, Body::from(compressed))
@@ -377,15 +388,24 @@ mod tests {
     fn test_parse_accept_encoding() {
         // Test with quality values
         let header = HeaderValue::from_static("gzip;q=0.8, br;q=1.0, deflate;q=0.6");
-        assert_eq!(parse_accept_encoding(Some(&header)), CompressionEncoding::Brotli);
+        assert_eq!(
+            parse_accept_encoding(Some(&header)),
+            CompressionEncoding::Brotli
+        );
 
         // Test simple list
         let header = HeaderValue::from_static("gzip, deflate");
-        assert_eq!(parse_accept_encoding(Some(&header)), CompressionEncoding::Gzip);
+        assert_eq!(
+            parse_accept_encoding(Some(&header)),
+            CompressionEncoding::Gzip
+        );
 
         // Test zstd
         let header = HeaderValue::from_static("zstd, gzip, br");
-        assert_eq!(parse_accept_encoding(Some(&header)), CompressionEncoding::Zstd);
+        assert_eq!(
+            parse_accept_encoding(Some(&header)),
+            CompressionEncoding::Zstd
+        );
 
         // Test no compression
         assert_eq!(parse_accept_encoding(None), CompressionEncoding::Identity);
@@ -413,7 +433,8 @@ mod tests {
     #[test]
     fn test_compress_bytes() {
         let config = CompressionConfig::default();
-        let data = b"Hello, World! This is a test string that should compress well when repeated. ".repeat(100);
+        let data = b"Hello, World! This is a test string that should compress well when repeated. "
+            .repeat(100);
 
         // Test Brotli
         let compressed = compress_bytes(&data, CompressionEncoding::Brotli, &config).unwrap();

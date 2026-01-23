@@ -120,7 +120,11 @@ impl TlsProvider {
     }
 
     /// Update configuration (for hot-reload)
-    pub fn update_config(&self, tls_config: &TlsConfig, pqc_config: &PqcConfig) -> anyhow::Result<()> {
+    pub fn update_config(
+        &self,
+        tls_config: &TlsConfig,
+        pqc_config: &PqcConfig,
+    ) -> anyhow::Result<()> {
         // Update stored configs
         *self.tls_config.write() = tls_config.clone();
         *self.pqc_config.write() = pqc_config.clone();
@@ -162,13 +166,15 @@ impl TlsProvider {
         {
             use std::process::Command;
 
-            let openssl_path = pqc_config.openssl_path
+            let openssl_path = pqc_config
+                .openssl_path
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|| "openssl".to_string());
 
             // Set library path for OpenSSL 3.5
-            let lib_path = pqc_config.openssl_lib_path
+            let lib_path = pqc_config
+                .openssl_lib_path
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
@@ -182,7 +188,10 @@ impl TlsProvider {
             match version_output {
                 Ok(output) => {
                     let version_str = String::from_utf8_lossy(&output.stdout);
-                    if version_str.contains("3.5") || version_str.contains("3.4") || version_str.contains("3.3") {
+                    if version_str.contains("3.5")
+                        || version_str.contains("3.4")
+                        || version_str.contains("3.3")
+                    {
                         info!("OpenSSL version detected: {}", version_str.trim());
 
                         // Check for OQS provider
@@ -195,7 +204,9 @@ impl TlsProvider {
                             Ok(output) => {
                                 let providers = String::from_utf8_lossy(&output.stdout);
                                 if providers.contains("oqs") || providers.contains("OQS") {
-                                    info!("OQS provider detected - PQC hybrid key exchange available");
+                                    info!(
+                                        "OQS provider detected - PQC hybrid key exchange available"
+                                    );
                                     return true;
                                 }
 
@@ -207,7 +218,10 @@ impl TlsProvider {
 
                                 if let Ok(output) = kem_output {
                                     let kems = String::from_utf8_lossy(&output.stdout);
-                                    if kems.contains("kyber") || kems.contains("Kyber") || kems.contains("ML-KEM") {
+                                    if kems.contains("kyber")
+                                        || kems.contains("Kyber")
+                                        || kems.contains("ML-KEM")
+                                    {
                                         info!("Kyber/ML-KEM KEM detected - PQC available natively");
                                         return true;
                                     }
@@ -222,7 +236,10 @@ impl TlsProvider {
                             }
                         }
                     } else {
-                        warn!("OpenSSL version {} does not support PQC", version_str.trim());
+                        warn!(
+                            "OpenSSL version {} does not support PQC",
+                            version_str.trim()
+                        );
                         false
                     }
                 }
@@ -313,7 +330,8 @@ impl TlsProvider {
         };
 
         // Configure ALPN protocols
-        config.alpn_protocols = tls_config.alpn_protocols
+        config.alpn_protocols = tls_config
+            .alpn_protocols
             .iter()
             .map(|p| p.as_bytes().to_vec())
             .collect();
@@ -397,7 +415,8 @@ impl TlsProvider {
         if let Some(ca_path) = path {
             let certs = Self::load_certificates(ca_path)?;
             for cert in certs {
-                root_store.add(cert)
+                root_store
+                    .add(cert)
                     .map_err(|e| anyhow::anyhow!("Failed to add CA certificate: {}", e))?;
             }
             info!("Loaded {} client CA certificates", root_store.len());
@@ -424,9 +443,8 @@ impl TlsProvider {
             pqc_enabled: *self.pqc_available.read(),
             pqc_provider: self.pqc_config.read().provider.clone(),
             alpn_protocols: tls_config.alpn_protocols.clone(),
-            last_reloaded: last_modified.map(|t| {
-                chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()
-            }),
+            last_reloaded: last_modified
+                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()),
         }
     }
 }
@@ -520,13 +538,22 @@ mod tests {
     #[test]
     fn test_pqc_kem_names() {
         assert_eq!(pqc_kex::PqcKem::Kyber768.openssl_name(), "kyber768");
-        assert_eq!(pqc_kex::PqcKem::X25519Kyber768.openssl_name(), "x25519_kyber768");
+        assert_eq!(
+            pqc_kex::PqcKem::X25519Kyber768.openssl_name(),
+            "x25519_kyber768"
+        );
     }
 
     #[test]
     fn test_pqc_kem_parsing() {
-        assert_eq!(pqc_kex::PqcKem::from_str("kyber768"), Some(pqc_kex::PqcKem::Kyber768));
-        assert_eq!(pqc_kex::PqcKem::from_str("ML-KEM-1024"), Some(pqc_kex::PqcKem::MlKem1024));
+        assert_eq!(
+            pqc_kex::PqcKem::from_str("kyber768"),
+            Some(pqc_kex::PqcKem::Kyber768)
+        );
+        assert_eq!(
+            pqc_kex::PqcKem::from_str("ML-KEM-1024"),
+            Some(pqc_kex::PqcKem::MlKem1024)
+        );
         assert_eq!(pqc_kex::PqcKem::from_str("unknown"), None);
     }
 }

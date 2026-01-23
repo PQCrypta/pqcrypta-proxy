@@ -6,15 +6,15 @@
 //! - Proper session handling
 //! - Bidirectional/unidirectional streams and datagrams
 
+use serde_json::json;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use wtransport::{Endpoint, ServerConfig, Identity, Connection};
+use tracing::{debug, error, info};
 use wtransport::config::QuicTransportConfig;
-use tracing::{info, error, debug};
-use serde_json::json;
+use wtransport::{Connection, Endpoint, Identity, ServerConfig};
 
 use crate::config::ProxyConfig;
 use crate::proxy::BackendPool;
@@ -46,7 +46,8 @@ impl WebTransportServer {
         info!("🔧 ALPN Protocol: h3 (HTTP/3) - automatically configured");
 
         // Load TLS identity from PEM files
-        let identity = Identity::load_pemfiles(cert_path, key_path).await
+        let identity = Identity::load_pemfiles(cert_path, key_path)
+            .await
             .map_err(|e| {
                 error!("❌ TLS certificate load failed: {}", e);
                 error!("   Certificate: {}", cert_path);
@@ -78,7 +79,9 @@ impl WebTransportServer {
         transport_config.datagram_receive_buffer_size(Some(65536));
         transport_config.datagram_send_buffer_size(65536);
 
-        info!("🔧 Custom transport config: receive_window=16MB, stream_window=8MB, send_window=16MB");
+        info!(
+            "🔧 Custom transport config: receive_window=16MB, stream_window=8MB, send_window=16MB"
+        );
 
         // Create server configuration with WebTransport support
         // The wtransport crate automatically:
@@ -99,11 +102,10 @@ impl WebTransportServer {
         info!("🔧 Max idle timeout: 120 seconds");
 
         // Create WebTransport endpoint
-        let server = Endpoint::server(config_builder)
-            .map_err(|e| {
-                error!("❌ WebTransport endpoint creation failed: {}", e);
-                e
-            })?;
+        let server = Endpoint::server(config_builder).map_err(|e| {
+            error!("❌ WebTransport endpoint creation failed: {}", e);
+            e
+        })?;
 
         info!("✅ WebTransport server endpoint created");
         info!("🌟 WebTransport server ready - ALPN h3 configured automatically");
@@ -141,11 +143,9 @@ impl WebTransportServer {
             let config_clone = config.clone();
             let backend_clone = backend_pool.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_incoming_session(
-                    incoming_session,
-                    config_clone,
-                    backend_clone
-                ).await {
+                if let Err(e) =
+                    handle_incoming_session(incoming_session, config_clone, backend_clone).await
+                {
                     error!("❌ Session handler error: {}", e);
                 }
             });
@@ -190,7 +190,10 @@ async fn handle_connection(
     config: Arc<ProxyConfig>,
     backend_pool: Arc<BackendPool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    info!("🔄 Handling WebTransport connection from {} (path: {})", remote_addr, path);
+    info!(
+        "🔄 Handling WebTransport connection from {} (path: {})",
+        remote_addr, path
+    );
 
     let connection = Arc::new(connection);
 
@@ -274,7 +277,11 @@ async fn handle_uni_stream(
     let mut buffer = Vec::new();
     recv_stream.read_to_end(&mut buffer).await?;
 
-    debug!("📥 Unidirectional data from {} ({} bytes)", remote_addr, buffer.len());
+    debug!(
+        "📥 Unidirectional data from {} ({} bytes)",
+        remote_addr,
+        buffer.len()
+    );
 
     // Process and proxy the request
     match proxy_request(&buffer, &path, remote_addr, &config, &backend_pool).await {
@@ -303,12 +310,20 @@ async fn handle_bi_stream(
     let mut buffer = Vec::new();
     recv_stream.read_to_end(&mut buffer).await?;
 
-    debug!("📥 Bidirectional request from {} ({} bytes)", remote_addr, buffer.len());
+    debug!(
+        "📥 Bidirectional request from {} ({} bytes)",
+        remote_addr,
+        buffer.len()
+    );
 
     // Process and proxy the request
     match proxy_request(&buffer, &path, remote_addr, &config, &backend_pool).await {
         Ok(response) => {
-            debug!("📤 Sending response to {} ({} bytes)", remote_addr, response.len());
+            debug!(
+                "📤 Sending response to {} ({} bytes)",
+                remote_addr,
+                response.len()
+            );
             send_stream.write_all(&response).await?;
             send_stream.finish().await?;
             info!("✅ Bidirectional stream completed: {}", remote_addr);
@@ -341,11 +356,19 @@ async fn handle_datagram(
     config: Arc<ProxyConfig>,
     backend_pool: Arc<BackendPool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    debug!("📦 Processing datagram from {} ({} bytes)", remote_addr, datagram.len());
+    debug!(
+        "📦 Processing datagram from {} ({} bytes)",
+        remote_addr,
+        datagram.len()
+    );
 
     match proxy_request(&datagram, &path, remote_addr, &config, &backend_pool).await {
         Ok(response) => {
-            debug!("📤 Sending datagram response to {} ({} bytes)", remote_addr, response.len());
+            debug!(
+                "📤 Sending datagram response to {} ({} bytes)",
+                remote_addr,
+                response.len()
+            );
             connection.send_datagram(&response)?;
             debug!("✅ Datagram response sent to {}", remote_addr);
         }
@@ -402,7 +425,8 @@ async fn proxy_request(
                 };
 
                 // Forward to backend
-                return forward_to_backend(data, backend_path, remote_addr, config, backend_pool).await;
+                return forward_to_backend(data, backend_path, remote_addr, config, backend_pool)
+                    .await;
             }
         }
     }
@@ -422,26 +446,33 @@ async fn forward_to_backend(
     // Find the appropriate backend for this path
     let backend_name = find_backend_for_path(path, config);
 
-    let backend = config.backends.get(&backend_name)
-        .ok_or_else(|| format!("No backend configured for path: {} (tried: {})", path, backend_name))?;
+    let backend = config.backends.get(&backend_name).ok_or_else(|| {
+        format!(
+            "No backend configured for path: {} (tried: {})",
+            path, backend_name
+        )
+    })?;
 
-    debug!("🔄 Forwarding WebTransport request to backend '{}': {}{}", backend_name, backend.address, path);
+    debug!(
+        "🔄 Forwarding WebTransport request to backend '{}': {}{}",
+        backend_name, backend.address, path
+    );
 
     // Create headers for the request
     let mut headers = HashMap::new();
     headers.insert("Content-Type".to_string(), "application/json".to_string());
     headers.insert("X-Forwarded-For".to_string(), remote_addr.ip().to_string());
-    headers.insert("X-WebTransport-Proxy".to_string(), "pqcrypta-proxy".to_string());
+    headers.insert(
+        "X-WebTransport-Proxy".to_string(),
+        "pqcrypta-proxy".to_string(),
+    );
     headers.insert("X-Real-IP".to_string(), remote_addr.ip().to_string());
 
     // Use the BackendPool's proxy_http method
-    let response = backend_pool.proxy_http(
-        backend,
-        "POST",
-        path,
-        headers,
-        data,
-    ).await.map_err(|e| format!("Backend proxy error: {}", e))?;
+    let response = backend_pool
+        .proxy_http(backend, "POST", path, headers, data)
+        .await
+        .map_err(|e| format!("Backend proxy error: {}", e))?;
 
     info!("✅ Backend response received ({} bytes)", response.len());
 
@@ -473,7 +504,9 @@ fn find_backend_for_path(path: &str, config: &ProxyConfig) -> String {
     }
 
     // Fallback: use the first backend (usually "main" or "api")
-    config.backends.keys()
+    config
+        .backends
+        .keys()
         .next()
         .cloned()
         .unwrap_or_else(|| "main".to_string())

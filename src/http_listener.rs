@@ -15,19 +15,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    Router,
     body::Body,
     extract::{ConnectInfo, Host, State},
     http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
     middleware::{self, Next},
-    response::{IntoResponse, Response, Redirect},
+    response::{IntoResponse, Redirect, Response},
     routing::any,
+    Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
-#[cfg(feature = "pqc")]
-use axum_server::tls_openssl::OpenSSLConfig;
-use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
@@ -36,10 +34,10 @@ use tracing::{debug, error, info, warn};
 #[cfg(feature = "pqc")]
 use crate::pqc_tls::PqcTlsProvider;
 
-use crate::compression::{CompressionState, compression_middleware};
-use crate::config::{ProxyConfig, CorsConfig, TlsMode, BackendConfig};
-use crate::http3_features::{Http3FeaturesState, http3_features_middleware};
-use crate::security::{SecurityState, security_middleware};
+use crate::compression::{compression_middleware, CompressionState};
+use crate::config::{BackendConfig, CorsConfig, ProxyConfig, TlsMode};
+use crate::http3_features::{http3_features_middleware, Http3FeaturesState};
+use crate::security::{security_middleware, SecurityState};
 
 /// HTTP listener state
 #[derive(Clone)]
@@ -51,6 +49,7 @@ pub struct HttpListenerState {
 }
 
 /// Create and run the HTTP listener with TLS termination
+#[allow(clippy::similar_names)]
 pub async fn run_http_listener(
     addr: SocketAddr,
     cert_path: &str,
@@ -59,7 +58,10 @@ pub async fn run_http_listener(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let port = addr.port();
 
-    info!("🌐 Starting HTTP/1.1 & HTTP/2 reverse proxy on {} (TCP)", addr);
+    info!(
+        "🌐 Starting HTTP/1.1 & HTTP/2 reverse proxy on {} (TCP)",
+        addr
+    );
     info!("📢 Will advertise Alt-Svc: h3=\":{}\"; ma=86400", port);
 
     // Create HTTP client for plain backend connections (terminate mode)
@@ -163,22 +165,25 @@ pub async fn run_http_listener(
 /// Create and run the HTTP listener with PQC-enabled OpenSSL TLS
 /// Uses OpenSSL 3.5+ with ML-KEM hybrid key exchange for quantum-resistant connections
 #[cfg(feature = "pqc")]
+#[allow(clippy::similar_names)]
 pub async fn run_http_listener_pqc(
     addr: SocketAddr,
     cert_path: &str,
     key_path: &str,
     config: Arc<ProxyConfig>,
-    pqc_provider: Arc<PqcTlsProvider>,
+    _pqc_provider: Arc<PqcTlsProvider>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use std::path::Path;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls_pemfile::{certs, ec_private_keys, pkcs8_private_keys, rsa_private_keys};
     use std::fs::File;
     use std::io::BufReader;
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys, ec_private_keys};
 
     let port = addr.port();
 
-    info!("🔐 Starting PQC-enabled HTTP/1.1 & HTTP/2 reverse proxy on {} (TCP)", addr);
+    info!(
+        "🔐 Starting PQC-enabled HTTP/1.1 & HTTP/2 reverse proxy on {} (TCP)",
+        addr
+    );
     info!("📢 Will advertise Alt-Svc: h3=\":{}\"; ma=86400", port);
 
     // Create HTTP client for plain backend connections (terminate mode)
@@ -255,8 +260,8 @@ pub async fn run_http_listener_pqc(
     // Load certificates
     let cert_file = File::open(cert_path)?;
     let mut cert_reader = BufReader::new(cert_file);
-    let cert_chain: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
-        .collect::<Result<Vec<_>, _>>()?;
+    let cert_chain: Vec<CertificateDer<'static>> =
+        certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
 
     if cert_chain.is_empty() {
         return Err("No certificates found in certificate file".into());
@@ -268,8 +273,7 @@ pub async fn run_http_listener_pqc(
     let mut key_reader = BufReader::new(key_file);
 
     // Try PKCS#8 format first
-    let pkcs8_keys: Vec<_> = pkcs8_private_keys(&mut key_reader)
-        .collect::<Result<Vec<_>, _>>()?;
+    let pkcs8_keys: Vec<_> = pkcs8_private_keys(&mut key_reader).collect::<Result<Vec<_>, _>>()?;
 
     let private_key: PrivateKeyDer<'static> = if !pkcs8_keys.is_empty() {
         PrivateKeyDer::Pkcs8(pkcs8_keys.into_iter().next().unwrap())
@@ -277,8 +281,7 @@ pub async fn run_http_listener_pqc(
         // Try RSA format
         let key_file = File::open(key_path)?;
         let mut key_reader = BufReader::new(key_file);
-        let rsa_keys: Vec<_> = rsa_private_keys(&mut key_reader)
-            .collect::<Result<Vec<_>, _>>()?;
+        let rsa_keys: Vec<_> = rsa_private_keys(&mut key_reader).collect::<Result<Vec<_>, _>>()?;
 
         if !rsa_keys.is_empty() {
             PrivateKeyDer::Pkcs1(rsa_keys.into_iter().next().unwrap())
@@ -286,8 +289,8 @@ pub async fn run_http_listener_pqc(
             // Try EC format
             let key_file = File::open(key_path)?;
             let mut key_reader = BufReader::new(key_file);
-            let ec_keys: Vec<_> = ec_private_keys(&mut key_reader)
-                .collect::<Result<Vec<_>, _>>()?;
+            let ec_keys: Vec<_> =
+                ec_private_keys(&mut key_reader).collect::<Result<Vec<_>, _>>()?;
 
             if !ec_keys.is_empty() {
                 PrivateKeyDer::Sec1(ec_keys.into_iter().next().unwrap())
@@ -308,7 +311,10 @@ pub async fn run_http_listener_pqc(
         "1.3" => vec![&rustls::version::TLS13],
         "1.2" => vec![&rustls::version::TLS12, &rustls::version::TLS13],
         _ => {
-            warn!("Unknown min_version '{}' in config, defaulting to TLS 1.3 only", min_version);
+            warn!(
+                "Unknown min_version '{}' in config, defaulting to TLS 1.3 only",
+                min_version
+            );
             vec![&rustls::version::TLS13]
         }
     };
@@ -333,8 +339,14 @@ pub async fn run_http_listener_pqc(
     let tls_config = RustlsConfig::from_config(std::sync::Arc::new(rustls_config));
 
     info!("✅ PQC TLS configured via rustls-post-quantum");
-    info!("🔒 {} (config: min_version = \"{}\")", tls_version_info, min_version);
-    info!("🔒 Post-Quantum HTTPS reverse proxy ready on port {} (TCP)", port);
+    info!(
+        "🔒 {} (config: min_version = \"{}\")",
+        tls_version_info, min_version
+    );
+    info!(
+        "🔒 Post-Quantum HTTPS reverse proxy ready on port {} (TCP)",
+        port
+    );
     info!("🛡️  PQC KEM: X25519MLKEM768 (hybrid classical + post-quantum)");
     info!("🛡️  Hybrid Mode: true");
     info!("📊 Security Level: NIST Level 3 (192-bit equivalent)");
@@ -360,7 +372,10 @@ pub async fn run_tls_passthrough_server(
         return Ok(());
     }
 
-    info!("🔀 Starting TLS passthrough server on {} (SNI routing)", addr);
+    info!(
+        "🔀 Starting TLS passthrough server on {} (SNI routing)",
+        addr
+    );
     for route in &config.passthrough_routes {
         info!("   {} → {}", route.sni, route.backend);
     }
@@ -411,12 +426,18 @@ async fn handle_passthrough_connection(
     });
 
     if route.is_none() {
-        warn!("No passthrough route for SNI '{}' from {}", sni, client_addr);
+        warn!(
+            "No passthrough route for SNI '{}' from {}",
+            sni, client_addr
+        );
         return Err(format!("No route for SNI: {}", sni).into());
     }
 
     let route = route.unwrap();
-    info!("Passthrough: {} → {} (SNI: {})", client_addr, route.backend, sni);
+    info!(
+        "Passthrough: {} → {} (SNI: {})",
+        client_addr, route.backend, sni
+    );
 
     // Connect to backend
     let backend_stream = tokio::time::timeout(
@@ -437,13 +458,11 @@ async fn handle_passthrough_connection(
     let (mut client_read, mut client_write) = client_stream.into_split();
     let (mut backend_read, mut backend_write) = backend_stream.into_split();
 
-    let client_to_backend = tokio::spawn(async move {
-        tokio::io::copy(&mut client_read, &mut backend_write).await
-    });
+    let client_to_backend =
+        tokio::spawn(async move { tokio::io::copy(&mut client_read, &mut backend_write).await });
 
-    let backend_to_client = tokio::spawn(async move {
-        tokio::io::copy(&mut backend_read, &mut client_write).await
-    });
+    let backend_to_client =
+        tokio::spawn(async move { tokio::io::copy(&mut backend_read, &mut client_write).await });
 
     // Wait for either direction to complete
     tokio::select! {
@@ -499,7 +518,8 @@ fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {
     if offset + 2 > client_hello.len() {
         return None;
     }
-    let cipher_suites_len = u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]) as usize;
+    let cipher_suites_len =
+        u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]) as usize;
     offset += 2 + cipher_suites_len;
 
     // Compression methods length
@@ -513,7 +533,8 @@ fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {
     if offset + 2 > client_hello.len() {
         return None;
     }
-    let extensions_len = u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]) as usize;
+    let extensions_len =
+        u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]) as usize;
     offset += 2;
 
     let extensions_end = offset + extensions_len;
@@ -524,7 +545,8 @@ fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {
     // Parse extensions to find SNI (type 0x0000)
     while offset + 4 <= extensions_end {
         let ext_type = u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]);
-        let ext_len = u16::from_be_bytes([client_hello[offset + 2], client_hello[offset + 3]]) as usize;
+        let ext_len =
+            u16::from_be_bytes([client_hello[offset + 2], client_hello[offset + 3]]) as usize;
         offset += 4;
 
         if ext_type == 0x0000 {
@@ -545,12 +567,16 @@ fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {
             // Parse SNI entries
             while sni_offset + 3 <= sni_data.len() {
                 let name_type = sni_data[sni_offset];
-                let name_len = u16::from_be_bytes([sni_data[sni_offset + 1], sni_data[sni_offset + 2]]) as usize;
+                let name_len =
+                    u16::from_be_bytes([sni_data[sni_offset + 1], sni_data[sni_offset + 2]])
+                        as usize;
                 sni_offset += 3;
 
                 if name_type == 0x00 && sni_offset + name_len <= sni_data.len() {
                     // Host name
-                    if let Ok(hostname) = std::str::from_utf8(&sni_data[sni_offset..sni_offset + name_len]) {
+                    if let Ok(hostname) =
+                        std::str::from_utf8(&sni_data[sni_offset..sni_offset + name_len])
+                    {
                         return Some(hostname.to_string());
                     }
                 }
@@ -675,7 +701,10 @@ async fn proxy_handler(
     let path = uri.path();
     let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
 
-    debug!("Incoming request: {} {} {} from {}", method, host, path, client_addr);
+    debug!(
+        "Incoming request: {} {} {} from {}",
+        method, host, path, client_addr
+    );
 
     // Find matching route
     let route = state.config.find_route(Some(&host), path, false);
@@ -693,9 +722,8 @@ async fn proxy_handler(
 
             if route.redirect_permanent {
                 return Redirect::permanent(&new_path).into_response();
-            } else {
-                return Redirect::temporary(&new_path).into_response();
             }
+            return Redirect::temporary(&new_path).into_response();
         }
 
         // Handle OPTIONS preflight for CORS
@@ -722,25 +750,32 @@ async fn proxy_handler(
 
         // Build backend URL based on TLS mode
         let (backend_url, use_https) = match tls_mode {
-            TlsMode::Terminate => {
-                (format!("http://{}{}{}", backend.address, path, query), false)
-            }
-            TlsMode::Reencrypt => {
-                (format!("https://{}{}{}", backend.address, path, query), true)
-            }
+            TlsMode::Terminate => (
+                format!("http://{}{}{}", backend.address, path, query),
+                false,
+            ),
+            TlsMode::Reencrypt => (
+                format!("https://{}{}{}", backend.address, path, query),
+                true,
+            ),
             TlsMode::Passthrough => {
                 // Passthrough mode shouldn't reach here - it's handled at TCP level
                 error!("Passthrough mode backend reached HTTP handler - this is a config error");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Invalid backend configuration").into_response();
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Invalid backend configuration",
+                )
+                    .into_response();
             }
         };
 
-        debug!("Proxying to backend: {} (TLS mode: {:?})", backend_url, tls_mode);
+        debug!(
+            "Proxying to backend: {} (TLS mode: {:?})",
+            backend_url, tls_mode
+        );
 
         // Build proxy request
-        let mut proxy_req = Request::builder()
-            .method(method.clone())
-            .uri(&backend_url);
+        let mut proxy_req = Request::builder().method(method.clone()).uri(&backend_url);
 
         // Copy headers with modifications
         if let Some(h) = proxy_req.headers_mut() {
@@ -748,8 +783,19 @@ async fn proxy_handler(
             for (name, value) in headers.iter() {
                 // Skip hop-by-hop headers
                 let name_str = name.as_str().to_lowercase();
-                if !["host", "connection", "transfer-encoding", "upgrade", "keep-alive",
-                     "proxy-authenticate", "proxy-authorization", "te", "trailer"].contains(&name_str.as_str()) {
+                if ![
+                    "host",
+                    "connection",
+                    "transfer-encoding",
+                    "upgrade",
+                    "keep-alive",
+                    "proxy-authenticate",
+                    "proxy-authorization",
+                    "te",
+                    "trailer",
+                ]
+                .contains(&name_str.as_str())
+                {
                     h.insert(name.clone(), value.clone());
                 }
             }
@@ -773,7 +819,7 @@ async fn proxy_handler(
             for (key, value) in &route.add_headers {
                 if let (Ok(name), Ok(val)) = (
                     header::HeaderName::from_bytes(key.as_bytes()),
-                    HeaderValue::from_str(value)
+                    HeaderValue::from_str(value),
                 ) {
                     h.insert(name, val);
                 }
@@ -784,7 +830,7 @@ async fn proxy_handler(
                 if let Some(ref header_name) = route.client_identity_header {
                     if let (Ok(name), Ok(val)) = (
                         header::HeaderName::from_bytes(header_name.as_bytes()),
-                        HeaderValue::from_str(&client_addr.ip().to_string())
+                        HeaderValue::from_str(&client_addr.ip().to_string()),
                     ) {
                         h.insert(name, val);
                     }
@@ -806,7 +852,8 @@ async fn proxy_handler(
             Ok(req) => req,
             Err(e) => {
                 error!("Failed to build proxy request: {}", e);
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to build request").into_response();
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to build request")
+                    .into_response();
             }
         };
 
@@ -830,7 +877,7 @@ async fn proxy_handler(
                 for (key, value) in &route.headers_override {
                     if let (Ok(name), Ok(val)) = (
                         header::HeaderName::from_bytes(key.as_bytes()),
-                        HeaderValue::from_str(value)
+                        HeaderValue::from_str(value),
                     ) {
                         parts.headers.insert(name, val);
                     }
@@ -846,10 +893,9 @@ async fn proxy_handler(
                 parts.headers.remove("upgrade");
 
                 // Replace Server header with our own branding (hide backend identity)
-                parts.headers.insert(
-                    header::SERVER,
-                    HeaderValue::from_static("PQCProxy v0.1.0"),
-                );
+                parts
+                    .headers
+                    .insert(header::SERVER, HeaderValue::from_static("PQCProxy v0.1.0"));
 
                 // Convert Incoming body to axum Body
                 let body = Body::new(incoming_body);
@@ -952,15 +998,15 @@ fn add_cors_headers(headers: &mut HeaderMap, cors: &CorsConfig) {
 /// Check if user agent is a mobile device
 fn is_mobile_user_agent(ua: &str) -> bool {
     let ua_lower = ua.to_lowercase();
-    ua_lower.contains("mobile") ||
-    ua_lower.contains("android") ||
-    ua_lower.contains("webos") ||
-    ua_lower.contains("iphone") ||
-    ua_lower.contains("ipad") ||
-    ua_lower.contains("ipod") ||
-    ua_lower.contains("blackberry") ||
-    ua_lower.contains("iemobile") ||
-    ua_lower.contains("opera mini")
+    ua_lower.contains("mobile")
+        || ua_lower.contains("android")
+        || ua_lower.contains("webos")
+        || ua_lower.contains("iphone")
+        || ua_lower.contains("ipad")
+        || ua_lower.contains("ipod")
+        || ua_lower.contains("blackberry")
+        || ua_lower.contains("iemobile")
+        || ua_lower.contains("opera mini")
 }
 
 /// Run HTTP redirect server (port 80 → HTTPS)
@@ -970,20 +1016,19 @@ pub async fn run_http_redirect_server(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let https_port_clone = https_port;
 
-    let app = Router::new()
-        .fallback(move |Host(host): Host, uri: Uri| async move {
-            let path = uri.path();
-            let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
+    let app = Router::new().fallback(move |Host(host): Host, uri: Uri| async move {
+        let path = uri.path();
+        let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
 
-            // Build HTTPS URL
-            let https_url = if https_port_clone == 443 {
-                format!("https://{}{}{}", host, path, query)
-            } else {
-                format!("https://{}:{}{}{}", host, https_port_clone, path, query)
-            };
+        // Build HTTPS URL
+        let https_url = if https_port_clone == 443 {
+            format!("https://{}{}{}", host, path, query)
+        } else {
+            format!("https://{}:{}{}{}", host, https_port_clone, path, query)
+        };
 
-            Redirect::permanent(&https_url)
-        });
+        Redirect::permanent(&https_url)
+    });
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("🔀 Starting HTTP→HTTPS redirect server on {}", addr);
@@ -999,8 +1044,8 @@ pub async fn run_http_redirect_server(
 pub fn create_backend_tls_connector(
     backend: &BackendConfig,
 ) -> Result<TlsConnector, Box<dyn std::error::Error + Send + Sync>> {
-    use rustls::ClientConfig;
     use rustls::pki_types::CertificateDer;
+    use rustls::ClientConfig;
     use std::fs::File;
     use std::io::BufReader;
 
@@ -1038,8 +1083,7 @@ pub fn create_backend_tls_connector(
 
         let key_file = File::open(key_path)?;
         let mut key_reader = BufReader::new(key_file);
-        let key = rustls_pemfile::private_key(&mut key_reader)?
-            .ok_or("No private key found")?;
+        let key = rustls_pemfile::private_key(&mut key_reader)?.ok_or("No private key found")?;
 
         config = ClientConfig::builder()
             .with_root_certificates(rustls::RootCertStore::empty())
@@ -1048,7 +1092,10 @@ pub fn create_backend_tls_connector(
 
     // Optionally skip verification (dangerous!)
     if backend.tls_skip_verify {
-        warn!("⚠️ TLS verification disabled for backend {} - THIS IS DANGEROUS!", backend.name);
+        warn!(
+            "⚠️ TLS verification disabled for backend {} - THIS IS DANGEROUS!",
+            backend.name
+        );
         config
             .dangerous()
             .set_certificate_verifier(Arc::new(NoVerifier));

@@ -1,4 +1,59 @@
-//! PQCrypta Proxy - QUIC/HTTP3/WebTransport Proxy with Hybrid PQC TLS
+// Crate-level lint configuration
+#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::cognitive_complexity)]
+#![allow(clippy::needless_continue)]
+#![allow(clippy::option_if_let_else)]
+#![allow(clippy::use_self)]
+#![allow(clippy::match_same_arms)]
+#![allow(clippy::derivable_impls)]
+#![allow(clippy::too_many_lines)]
+#![allow(clippy::single_match_else)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::manual_let_else)]
+#![allow(clippy::option_map_or_none)]
+#![allow(clippy::map_unwrap_or)]
+#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::missing_const_for_fn)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::struct_excessive_bools)]
+#![allow(clippy::unnecessary_debug_formatting)]
+#![allow(clippy::unused_self)]
+#![allow(clippy::format_push_string)]
+#![allow(clippy::significant_drop_tightening)]
+#![allow(clippy::manual_strip)]
+#![allow(clippy::bool_comparison)]
+#![allow(clippy::needless_borrow)]
+#![allow(clippy::explicit_iter_loop)]
+#![allow(clippy::redundant_closure_for_method_calls)]
+#![allow(clippy::should_implement_trait)]
+#![allow(clippy::single_char_pattern)]
+#![allow(clippy::similar_names)]
+#![allow(clippy::nonminimal_bool)]
+#![allow(clippy::op_ref)]
+#![allow(clippy::assigning_clones)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::wildcard_imports)]
+#![allow(clippy::items_after_statements)]
+#![allow(clippy::ptr_as_ptr)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::unnecessary_wraps)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::cast_lossless)]
+#![allow(clippy::struct_field_names)]
+#![allow(clippy::branches_sharing_code)]
+#![allow(clippy::ref_option_ref)]
+#![allow(clippy::unused_async)]
+#![allow(clippy::if_not_else)]
+#![allow(clippy::ignored_unit_patterns)]
+#![allow(clippy::ref_option)]
+#![allow(dead_code)]
+#![allow(clippy::trivially_copy_pass_by_ref)]
+
+//! `PQCrypta` Proxy - QUIC/HTTP3/WebTransport Proxy with Hybrid PQC TLS
 //!
 //! A production-ready proxy that:
 //! - Listens for QUIC connections with HTTP/3 and WebTransport support
@@ -31,9 +86,9 @@ mod webtransport_server;
 
 use admin::AdminServer;
 use config::{ConfigManager, ConfigReloadEvent};
-use http_listener::{run_http_listener, run_http_redirect_server, run_tls_passthrough_server};
 #[cfg(feature = "pqc")]
 use http_listener::run_http_listener_pqc;
+use http_listener::{run_http_listener, run_http_redirect_server, run_tls_passthrough_server};
 use pqc_tls::PqcTlsProvider;
 use proxy::BackendPool;
 use tls::TlsProvider;
@@ -45,7 +100,12 @@ use webtransport_server::WebTransportServer;
 #[command(version, about, long_about = None)]
 struct Args {
     /// Configuration file path
-    #[arg(short, long, default_value = "/etc/pqcrypta/config.toml", env = "PQCRYPTA_CONFIG")]
+    #[arg(
+        short,
+        long,
+        default_value = "/etc/pqcrypta/config.toml",
+        env = "PQCRYPTA_CONFIG"
+    )]
     config: PathBuf,
 
     /// Override UDP port for QUIC listener
@@ -136,9 +196,20 @@ async fn main() -> anyhow::Result<()> {
         info!("  🔐 POST-QUANTUM CRYPTOGRAPHY ENABLED");
         info!("═══════════════════════════════════════════════════════════════");
         info!("  OpenSSL:       {}", pqc_status.openssl_version);
-        info!("  Hybrid Mode:   {}", if pqc_status.hybrid_mode { "Yes (Classical + PQC)" } else { "No (Pure PQC)" });
+        info!(
+            "  Hybrid Mode:   {}",
+            if pqc_status.hybrid_mode {
+                "Yes (Classical + PQC)"
+            } else {
+                "No (Pure PQC)"
+            }
+        );
         if let Some(kem) = &pqc_status.configured_kem {
-            info!("  Preferred KEM: {} (NIST Level {})", kem.openssl_name(), kem.security_level());
+            info!(
+                "  Preferred KEM: {} (NIST Level {})",
+                kem.openssl_name(),
+                kem.security_level()
+            );
         }
         info!("  Available KEMs: {}", pqc_status.available_kems.len());
         info!("  Groups:        {}", pqc_provider.groups_string());
@@ -161,7 +232,10 @@ async fn main() -> anyhow::Result<()> {
     let tls_provider = Arc::new(TlsProvider::new(&config.tls, &config.pqc)?);
 
     if tls_provider.is_pqc_enabled() {
-        info!("✅ PQC hybrid key exchange enabled (provider: {})", config.pqc.provider);
+        info!(
+            "✅ PQC hybrid key exchange enabled (provider: {})",
+            config.pqc.provider
+        );
         info!("   Preferred KEM: {}", config.pqc.preferred_kem);
     } else if config.pqc.enabled && !pqc_status.available {
         // Already warned above
@@ -171,7 +245,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Create backend pool
     let backend_pool = Arc::new(BackendPool::new(config.clone()));
-    info!("Backend pool initialized with {} backends", config.backends.len());
+    info!(
+        "Backend pool initialized with {} backends",
+        config.backends.len()
+    );
 
     // Create shutdown channels
     let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
@@ -192,7 +269,9 @@ async fn main() -> anyhow::Result<()> {
                     info!("Configuration reloaded - applying changes");
 
                     // Update TLS provider with new config
-                    if let Err(e) = reload_tls_provider.update_config(&new_config.tls, &new_config.pqc) {
+                    if let Err(e) =
+                        reload_tls_provider.update_config(&new_config.tls, &new_config.pqc)
+                    {
                         error!("Failed to update TLS config: {}", e);
                     } else {
                         info!("TLS configuration updated successfully");
@@ -220,9 +299,8 @@ async fn main() -> anyhow::Result<()> {
     if cert_check_interval > 0 {
         let cert_tls_provider = tls_provider.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(
-                std::time::Duration::from_secs(cert_check_interval)
-            );
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(cert_check_interval));
             loop {
                 interval.tick().await;
                 if cert_tls_provider.needs_reload() {
@@ -235,7 +313,10 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         });
-        info!("Certificate auto-reload enabled (checking every {}s)", cert_check_interval);
+        info!(
+            "Certificate auto-reload enabled (checking every {}s)",
+            cert_check_interval
+        );
     }
 
     // Start admin API server
@@ -288,8 +369,9 @@ async fn main() -> anyhow::Result<()> {
         let passthrough_addr: std::net::SocketAddr = format!(
             "{}:{}",
             config.server.bind_address,
-            config.server.udp_port  // Use primary port for passthrough
-        ).parse()?;
+            config.server.udp_port // Use primary port for passthrough
+        )
+        .parse()?;
         let passthrough_config = config.clone();
 
         tokio::spawn(async move {
@@ -304,11 +386,8 @@ async fn main() -> anyhow::Result<()> {
     let use_pqc_listener = pqc_status.available && config.pqc.enabled;
 
     for port in all_ports.clone() {
-        let bind_addr: std::net::SocketAddr = format!(
-            "{}:{}",
-            config.server.bind_address,
-            port
-        ).parse()?;
+        let bind_addr: std::net::SocketAddr =
+            format!("{}:{}", config.server.bind_address, port).parse()?;
 
         let http_cert = cert_path.clone();
         let http_key = key_path.clone();
@@ -318,21 +397,32 @@ async fn main() -> anyhow::Result<()> {
         if use_pqc_listener {
             let http_pqc_provider = pqc_provider.clone();
             tokio::spawn(async move {
-                info!("🔐 Starting PQC HTTPS reverse proxy on {} (TCP with ML-KEM)", bind_addr);
+                info!(
+                    "🔐 Starting PQC HTTPS reverse proxy on {} (TCP with ML-KEM)",
+                    bind_addr
+                );
                 if let Err(e) = run_http_listener_pqc(
                     bind_addr,
                     &http_cert,
                     &http_key,
                     http_config,
                     http_pqc_provider,
-                ).await {
-                    error!("PQC HTTP listener error on port {}: {}", bind_addr.port(), e);
+                )
+                .await
+                {
+                    error!(
+                        "PQC HTTP listener error on port {}: {}",
+                        bind_addr.port(),
+                        e
+                    );
                 }
             });
         } else {
             tokio::spawn(async move {
                 info!("🌐 Starting HTTPS reverse proxy on {} (TCP)", bind_addr);
-                if let Err(e) = run_http_listener(bind_addr, &http_cert, &http_key, http_config).await {
+                if let Err(e) =
+                    run_http_listener(bind_addr, &http_cert, &http_key, http_config).await
+                {
                     error!("HTTP listener error on port {}: {}", bind_addr.port(), e);
                 }
             });
@@ -349,11 +439,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Start WebTransport servers (UDP) on all ports
     for port in all_ports.clone() {
-        let bind_addr: std::net::SocketAddr = format!(
-            "{}:{}",
-            config.server.bind_address,
-            port
-        ).parse()?;
+        let bind_addr: std::net::SocketAddr =
+            format!("{}:{}", config.server.bind_address, port).parse()?;
 
         let wt_cert = cert_path.clone();
         let wt_key = key_path.clone();
@@ -361,13 +448,9 @@ async fn main() -> anyhow::Result<()> {
         let wt_backend_pool = backend_pool.clone();
 
         tokio::spawn(async move {
-            match WebTransportServer::new(
-                bind_addr,
-                &wt_cert,
-                &wt_key,
-                wt_config,
-                wt_backend_pool,
-            ).await {
+            match WebTransportServer::new(bind_addr, &wt_cert, &wt_key, wt_config, wt_backend_pool)
+                .await
+            {
                 Ok(server) => {
                     let addr = server.local_addr();
                     info!("📡 WebTransport server started on {} (UDP)", addr);
@@ -376,25 +459,35 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 Err(e) => {
-                    error!("Failed to create WebTransport server on {}: {}", bind_addr, e);
+                    error!(
+                        "Failed to create WebTransport server on {}: {}",
+                        bind_addr, e
+                    );
                 }
             }
         });
     }
 
     // Build Alt-Svc header value for logging
-    let alt_svc_parts: Vec<String> = all_ports.iter()
+    let alt_svc_parts: Vec<String> = all_ports
+        .iter()
         .map(|p| format!("h3=\":{}\"; ma=86400", p))
         .collect();
 
     info!("═══════════════════════════════════════════════════════════════");
     info!("  📡 All listeners started:");
     if config.http_redirect.enabled {
-        info!("  HTTP Redirect:   0.0.0.0:{} → HTTPS", config.http_redirect.port);
+        info!(
+            "  HTTP Redirect:   0.0.0.0:{} → HTTPS",
+            config.http_redirect.port
+        );
     }
     for port in &all_ports {
         if use_pqc_listener {
-            info!("  HTTPS (PQC):     0.0.0.0:{} (ML-KEM hybrid key exchange)", port);
+            info!(
+                "  HTTPS (PQC):     0.0.0.0:{} (ML-KEM hybrid key exchange)",
+                port
+            );
         } else {
             info!("  HTTPS (TCP):     0.0.0.0:{}", port);
         }
@@ -444,8 +537,7 @@ async fn main() -> anyhow::Result<()> {
 
 /// Initialize logging
 fn init_logging(level: &str, json: bool) -> anyhow::Result<()> {
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
 
     if json {
         tracing_subscriber::registry()
@@ -500,9 +592,18 @@ fn print_startup_summary(config: &config::ProxyConfig, pqc_enabled: bool) {
     info!("═══════════════════════════════════════════════════════════════");
     info!("  PQCrypta Proxy v{}", env!("CARGO_PKG_VERSION"));
     info!("═══════════════════════════════════════════════════════════════");
-    info!("  QUIC/HTTP3:    {}:{}", config.server.bind_address, config.server.udp_port);
-    info!("  Admin API:     {}:{}", config.admin.bind_address, config.admin.port);
-    info!("  PQC Enabled:   {}", if pqc_enabled { "✅ Yes" } else { "❌ No" });
+    info!(
+        "  QUIC/HTTP3:    {}:{}",
+        config.server.bind_address, config.server.udp_port
+    );
+    info!(
+        "  Admin API:     {}:{}",
+        config.admin.bind_address, config.admin.port
+    );
+    info!(
+        "  PQC Enabled:   {}",
+        if pqc_enabled { "✅ Yes" } else { "❌ No" }
+    );
     info!("  ALPN:          {:?}", config.tls.alpn_protocols);
     info!("  Backends:      {} configured", config.backends.len());
     info!("  Routes:        {} configured", config.routes.len());
@@ -511,7 +612,10 @@ fn print_startup_summary(config: &config::ProxyConfig, pqc_enabled: bool) {
     if !config.backends.is_empty() {
         info!("  Backends:");
         for (name, backend) in &config.backends {
-            info!("    - {} ({:?}): {}", name, backend.backend_type, backend.address);
+            info!(
+                "    - {} ({:?}): {}",
+                name, backend.backend_type, backend.address
+            );
         }
     }
 
@@ -520,9 +624,20 @@ fn print_startup_summary(config: &config::ProxyConfig, pqc_enabled: bool) {
         for route in &config.routes {
             let name = route.name.as_deref().unwrap_or("unnamed");
             let host = route.host.as_deref().unwrap_or("*");
-            let path = route.path_prefix.as_deref().or(route.path_exact.as_deref()).unwrap_or("*");
-            let wt = if route.webtransport { " [WebTransport]" } else { "" };
-            info!("    - {}: {} {} -> {}{}", name, host, path, route.backend, wt);
+            let path = route
+                .path_prefix
+                .as_deref()
+                .or(route.path_exact.as_deref())
+                .unwrap_or("*");
+            let wt = if route.webtransport {
+                " [WebTransport]"
+            } else {
+                ""
+            };
+            info!(
+                "    - {}: {} {} -> {}{}",
+                name, host, path, route.backend, wt
+            );
         }
     }
 
