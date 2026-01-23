@@ -36,7 +36,7 @@ h3 = "0.0.8"
 h3-quinn = "0.0.10"
 
 # WebTransport (proper protocol support)
-wtransport = { path = "../public/ent/vendor/wtransport-fixed/wtransport", features = ["quinn"] }
+wtransport = { path = "vendor/wtransport", features = ["quinn"] }
 
 # HTTP client/server for backend proxying
 hyper = { version = "1.5", features = ["full"] }
