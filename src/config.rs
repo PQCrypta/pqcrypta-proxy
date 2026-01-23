@@ -161,6 +161,9 @@ pub struct TlsConfig {
     pub ocsp_stapling: bool,
     /// Certificate reload interval in seconds (0 = disabled)
     pub cert_reload_interval_secs: u64,
+    /// Enable 0-RTT (early data) - SECURITY WARNING: vulnerable to replay attacks
+    /// Default: false (disabled for security)
+    pub enable_0rtt: bool,
 }
 
 impl Default for TlsConfig {
@@ -174,6 +177,7 @@ impl Default for TlsConfig {
             min_version: "1.3".to_string(),
             ocsp_stapling: true,
             cert_reload_interval_secs: 3600,
+            enable_0rtt: false, // Disabled by default for security (replay attack risk)
         }
     }
 }

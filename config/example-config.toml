@@ -65,6 +65,13 @@ ocsp_stapling = true
 # Certificate reload interval in seconds (0 = disabled)
 cert_reload_interval_secs = 3600
 
+# Enable 0-RTT (early data) for faster reconnections
+# SECURITY WARNING: 0-RTT is vulnerable to replay attacks!
+# Only enable if your application can handle replay protection,
+# or if the performance benefit outweighs the security risk.
+# Default: false (disabled for security)
+enable_0rtt = false
+
 # =============================
 # HTTP→HTTPS Redirect Server
 # =============================

@@ -21,6 +21,8 @@ key_path = "/etc/letsencrypt/live/example.com/privkey.pem"
 min_version = "1.3"
 ocsp_stapling = true
 cert_reload_interval_secs = 3600
+# SECURITY: Disable 0-RTT to prevent replay attacks (default: false)
+enable_0rtt = false
 ```
 
 ### TLS Modes
