@@ -103,7 +103,6 @@ impl TlsProvider {
     }
 
     /// Check if certificates need reloading
-    #[allow(dead_code)]
     pub fn needs_reload(&self) -> bool {
         let tls_config = self.tls_config.read();
         let current_modified = std::fs::metadata(&tls_config.cert_path)
@@ -120,7 +119,6 @@ impl TlsProvider {
     }
 
     /// Update configuration (for hot-reload)
-    #[allow(dead_code)]
     pub fn update_config(&self, tls_config: &TlsConfig, pqc_config: &PqcConfig) -> anyhow::Result<()> {
         // Update stored configs
         *self.tls_config.write() = tls_config.clone();

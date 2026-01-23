@@ -29,11 +29,10 @@ pub struct ConfigManager {
 
 /// Events emitted on configuration changes
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum ConfigReloadEvent {
     /// Full configuration reload
     ConfigReloaded(Arc<ProxyConfig>),
-    /// TLS certificates reloaded (scaffolded for hot-reload)
+    /// TLS certificates reloaded (triggered via admin API)
     TlsCertsReloaded,
     /// Reload failed with error
     ReloadFailed(String),
@@ -629,6 +628,11 @@ impl ConfigManager {
     /// Get current configuration
     pub fn get(&self) -> Arc<ProxyConfig> {
         self.config.load_full()
+    }
+
+    /// Notify listeners that TLS certificates were reloaded
+    pub async fn notify_tls_reload(&self) {
+        let _ = self.reload_tx.send(ConfigReloadEvent::TlsCertsReloaded).await;
     }
 
     /// Manually reload configuration
