@@ -34,3 +34,4 @@ test-config.toml
 *.gcda
 *.gcno
 tarpaulin-report.html
+data/geoip/*.mmdb

@@ -172,7 +172,10 @@ pub async fn run_http_listener_pqc(
     pqc_provider: Arc<PqcTlsProvider>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::path::Path;
-    use crate::pqc_tls::openssl_pqc::create_pqc_acceptor;
+    use std::fs::File;
+    use std::io::BufReader;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys, ec_private_keys};
 
     let port = addr.port();
 
@@ -250,29 +253,79 @@ pub async fn run_http_listener_pqc(
         return Err(format!("Key file not found: {}", key_path).into());
     }
 
-    // Create OpenSSL acceptor with PQC support
-    let ssl_acceptor = create_pqc_acceptor(
-        Path::new(cert_path),
-        Path::new(key_path),
-        &pqc_provider,
-    ).map_err(|e| {
-        error!("❌ PQC TLS configuration error: {}", e);
-        e
-    })?;
+    // Load certificates
+    let cert_file = File::open(cert_path)?;
+    let mut cert_reader = BufReader::new(cert_file);
+    let cert_chain: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()?;
 
-    // Create OpenSSL config from acceptor
-    let openssl_config = OpenSSLConfig::from_acceptor(Arc::new(ssl_acceptor));
+    if cert_chain.is_empty() {
+        return Err("No certificates found in certificate file".into());
+    }
+    info!("📜 Loaded {} certificates", cert_chain.len());
 
-    let pqc_status = pqc_provider.status();
-    info!("✅ PQC TLS configured for HTTP listener");
+    // Load private key - try multiple formats
+    let key_file = File::open(key_path)?;
+    let mut key_reader = BufReader::new(key_file);
+
+    // Try PKCS#8 format first
+    let pkcs8_keys: Vec<_> = pkcs8_private_keys(&mut key_reader)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let private_key: PrivateKeyDer<'static> = if !pkcs8_keys.is_empty() {
+        PrivateKeyDer::Pkcs8(pkcs8_keys.into_iter().next().unwrap())
+    } else {
+        // Try RSA format
+        let key_file = File::open(key_path)?;
+        let mut key_reader = BufReader::new(key_file);
+        let rsa_keys: Vec<_> = rsa_private_keys(&mut key_reader)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if !rsa_keys.is_empty() {
+            PrivateKeyDer::Pkcs1(rsa_keys.into_iter().next().unwrap())
+        } else {
+            // Try EC format
+            let key_file = File::open(key_path)?;
+            let mut key_reader = BufReader::new(key_file);
+            let ec_keys: Vec<_> = ec_private_keys(&mut key_reader)
+                .collect::<Result<Vec<_>, _>>()?;
+
+            if !ec_keys.is_empty() {
+                PrivateKeyDer::Sec1(ec_keys.into_iter().next().unwrap())
+            } else {
+                return Err("No valid private key found".into());
+            }
+        }
+    };
+    info!("🔑 Private key loaded successfully");
+
+    // Create rustls config with PQC support via rustls-post-quantum
+    // This provider includes X25519MLKEM768 hybrid key exchange
+    let crypto_provider = std::sync::Arc::new(rustls_post_quantum::provider());
+
+    let mut rustls_config = rustls::ServerConfig::builder_with_provider(crypto_provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("Failed to set protocol versions: {}", e))?
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, private_key)
+        .map_err(|e| format!("Failed to create TLS config: {}", e))?;
+
+    // Configure ALPN for HTTP/1.1 and HTTP/2
+    rustls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    // Create axum-server rustls config
+    let tls_config = RustlsConfig::from_config(std::sync::Arc::new(rustls_config));
+
+    info!("✅ PQC TLS configured via rustls-post-quantum");
     info!("🔒 Post-Quantum HTTPS reverse proxy ready on port {} (TCP)", port);
-    info!("🛡️  PQC KEM: {}", pqc_status.configured_kem.map(|k| k.openssl_name()).unwrap_or("X25519MLKEM768"));
-    info!("🛡️  Hybrid Mode: {}", pqc_status.hybrid_mode);
+    info!("🛡️  PQC KEM: X25519MLKEM768 (hybrid classical + post-quantum)");
+    info!("🛡️  Hybrid Mode: true");
+    info!("📊 Security Level: NIST Level 3 (192-bit equivalent)");
     info!("🔄 Routing: api.pqcrypta.com → 127.0.0.1:3003");
     info!("🔄 Routing: pqcrypta.com → 127.0.0.1:8080");
 
-    // Run HTTPS server with OpenSSL (PQC-enabled)
-    axum_server::bind_openssl(addr, openssl_config)
+    // Run HTTPS server with rustls (PQC-enabled via aws-lc-rs)
+    axum_server::bind_rustls(addr, tls_config)
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await?;
 

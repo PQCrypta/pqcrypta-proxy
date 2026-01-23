@@ -47,12 +47,16 @@ http = "1.2"
 http-body-util = "0.1"
 bytes = "1.9"
 
-# TLS - matching existing versions
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# TLS with PQC support via aws-lc-rs (has ML-KEM)
+# prefer-post-quantum feature enables X25519MLKEM768 as preferred key exchange
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "prefer-post-quantum"] }
 rustls-pemfile = "2.2"
 rustls-native-certs = "0.8"
 rcgen = "0.13"
 webpki-roots = "0.26"
+
+# Post-quantum support for rustls (X25519MLKEM768 hybrid via aws-lc-rs)
+rustls-post-quantum = "0.2"
 
 # OpenSSL for PQC support (optional feature)
 openssl = { version = "0.10", optional = true, default-features = false }
