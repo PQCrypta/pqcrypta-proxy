@@ -4,7 +4,7 @@
 
 [![Build Status](https://github.com/PQCrypta/pqcrypta-proxy/workflows/CI/badge.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-33%20passing-brightgreen.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
+[![Tests](https://img.shields.io/badge/tests-38%20passing-brightgreen.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
 
 ## Highlights
 
@@ -14,11 +14,13 @@
 - **Post-Quantum Ready**: Hybrid PQC key exchange (X25519MLKEM768) via rustls-post-quantum
 - **Zero Downtime**: Hot reload configuration and TLS certificates
 - **Advanced Security**: JA3/JA4 fingerprinting, circuit breaker, GeoIP blocking
+- **Enterprise Load Balancing**: 6 algorithms, session affinity, health-aware routing
 
 ## All Features Implemented
 
 | Feature | Status | Description |
 |---------|--------|-------------|
+| **Load Balancing** | ✅ | 6 algorithms with session affinity and health-aware routing |
 | Circuit Breaker | ✅ | Backend health monitoring with auto-recovery |
 | Rate Limiting | ✅ | Per-IP + global limits with auto-blocking |
 | DoS Protection | ✅ | Connection limits, request validation |
@@ -50,6 +52,21 @@
 - **Security Headers**: HSTS, X-Frame-Options, CSP, COEP, COOP, CORP, and more
 - **CORS Handling**: Full CORS support with preflight OPTIONS handling
 - **Server Branding**: Hide backend identity (Apache/nginx → "PQCProxy v0.1.0")
+
+### Load Balancing
+- **6 Load Balancing Algorithms**:
+  - `least_connections` (default): Routes to server with fewest active connections
+  - `round_robin`: Simple rotation through servers
+  - `weighted_round_robin`: nginx-style smooth weighted distribution
+  - `random`: Random server selection
+  - `ip_hash`: Consistent hashing by client IP for sticky sessions
+  - `least_response_time`: Routes to fastest responding server (EMA tracking)
+- **Backend Pools**: Group multiple servers per route for high availability
+- **Session Affinity**: Cookie-based, IP hash, or custom header sticky sessions
+- **Health-Aware Routing**: Automatically bypasses unhealthy backends
+- **Slow Start**: Gradually increases traffic to recovering servers
+- **Connection Draining**: Graceful server removal without dropping connections
+- **Priority Failover**: Primary servers first, then failover to lower priority
 
 ### HTTP/3 Advanced Features
 - **Early Hints (103)**: Preload CSS/JS resources via Link headers
@@ -177,6 +194,84 @@ max_connections_per_ip = 100
 failure_threshold = 5
 success_threshold = 2
 timeout_secs = 30
+```
+
+### Load Balancer Configuration
+
+```toml
+# Global load balancer settings
+[load_balancer]
+enabled = true
+default_algorithm = "least_connections"  # Options: least_connections, round_robin, weighted_round_robin, random, ip_hash, least_response_time
+
+# Session affinity (sticky sessions) settings
+[load_balancer.session_affinity]
+cookie_name = "PQCPROXY_BACKEND"
+cookie_ttl_secs = 3600
+cookie_secure = true
+cookie_httponly = true
+cookie_samesite = "lax"  # Options: strict, lax, none
+
+# Request queue when all backends busy
+[load_balancer.queue]
+enabled = true
+max_size = 1000
+timeout_ms = 5000
+
+# Slow start for recovering servers
+[load_balancer.slow_start]
+enabled = true
+duration_secs = 30
+initial_weight_percent = 10
+
+# Connection draining for graceful removal
+[load_balancer.connection_draining]
+enabled = true
+timeout_secs = 30
+
+# Backend pool with multiple servers
+[backend_pools.api]
+name = "api"
+algorithm = "least_connections"
+health_aware = true
+affinity = "cookie"  # Options: none, cookie, ip_hash, header
+health_check_path = "/health"
+health_check_interval_secs = 10
+
+# Primary server
+[[backend_pools.api.servers]]
+address = "127.0.0.1:3003"
+weight = 100
+priority = 1
+max_connections = 100
+timeout_ms = 30000
+tls_mode = "terminate"
+
+# Secondary server
+[[backend_pools.api.servers]]
+address = "127.0.0.1:3004"
+weight = 100
+priority = 1
+max_connections = 100
+
+# Failover server (only used when primary/secondary unavailable)
+[[backend_pools.api.servers]]
+address = "10.0.0.5:3003"
+weight = 50
+priority = 2  # Lower priority = failover only
+max_connections = 50
+```
+
+**Route to Pool**: Routes can reference either single backends or backend pools:
+
+```toml
+# Route using a backend pool
+[[routes]]
+name = "api-route"
+host = "api.example.com"
+path_prefix = "/"
+backend = "api"  # References backend_pools.api
+priority = 100
 ```
 
 ### TLS Modes
@@ -312,7 +407,15 @@ Environment variables: `PQCRYPTA_CONFIG`, `PQCRYPTA_UDP_PORT`, `PQCRYPTA_ADMIN_P
                     │  └─────────────────────────────────────────────────────┘ │
                     │                                                          │
                     │  ┌─────────────────────────────────────────────────────┐ │
-                    │  │                   Backend Pool                       │ │
+                    │  │                   Load Balancer                      │ │
+                    │  │  Algorithms: least_conn | round_robin | weighted    │ │
+                    │  │              random | ip_hash | least_response_time │ │
+                    │  │  Features: Session affinity, Health-aware routing   │ │
+                    │  │           Slow start, Connection draining           │ │
+                    │  └─────────────────────────────────────────────────────┘ │
+                    │                                                          │
+                    │  ┌─────────────────────────────────────────────────────┐ │
+                    │  │                   Backend Pools                      │ │
                     │  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  │ │
                     │  │  │ TLS         │  │ TLS         │  │ TLS         │  │ │
                     │  │  │ Terminate   │  │ Re-encrypt  │  │ Passthrough │  │ │
@@ -321,8 +424,10 @@ Environment variables: `PQCRYPTA_CONFIG`, `PQCRYPTA_UDP_PORT`, `PQCRYPTA_ADMIN_P
                     │  └─────────┼────────────────┼────────────────┼─────────┘ │
                     │            │                │                │           │
                     │            ▼                ▼                ▼           │
-                    │      Backend A        Backend B        Backend C         │
-                    │   (Apache :8080)   (API :3003)    (External :443)       │
+                    │      Pool: Apache     Pool: API       Pool: External    │
+                    │   ┌────┬────┬────┐ ┌────┬────┬────┐  ┌────┬────┐       │
+                    │   │ S1 │ S2 │ S3 │ │ S1 │ S2 │ S3 │  │ S1 │ S2 │       │
+                    │   └────┴────┴────┘ └────┴────┴────┘  └────┴────┘       │
                     │                                                          │
                     │  Admin API (HTTP 8081)                                   │
                     │    /health, /metrics, /reload, /shutdown                 │
@@ -336,7 +441,8 @@ src/
 ├── main.rs              # Entry point
 ├── lib.rs               # Library exports
 ├── config.rs            # Configuration parsing
-├── proxy.rs             # Backend pool & load balancing
+├── load_balancer.rs     # Load balancing algorithms, pools, session affinity
+├── proxy.rs             # Backend pool & request routing
 ├── http_listener.rs     # HTTP/1.1 + HTTP/2 listener with PQC TLS
 ├── quic_listener.rs     # QUIC/HTTP/3 listener
 ├── security.rs          # Rate limiting, DoS, GeoIP, circuit breaker
