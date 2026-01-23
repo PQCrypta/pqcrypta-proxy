@@ -6,14 +6,15 @@ This file provides guidance to Claude Code when working with the PQCrypta Proxy 
 
 PQCrypta Proxy is a high-performance reverse proxy with QUIC/HTTP/3, WebTransport, and Post-Quantum Cryptography TLS support.
 
-**Version**: v1.0.0 (2026-01-23)
+**Version**: v1.1.0 (2026-01-23)
 **Status**: All features complete and integrated
-**Tests**: 33 passing
+**Tests**: 38 passing
 
 ## All Features Fully Integrated
 
 | Feature | Status | Module | Integration |
 |---------|--------|--------|-------------|
+| **Load Balancing** | ✅ COMPLETE | `load_balancer.rs` | 6 algorithms, session affinity, health-aware |
 | Circuit Breaker | ✅ COMPLETE | `security.rs` | Integrated in `http_listener.rs` proxy_handler |
 | Rate Limiting | ✅ COMPLETE | `security.rs` | Integrated via security_middleware |
 | DoS Protection | ✅ COMPLETE | `security.rs` | Integrated via security_middleware |
@@ -35,7 +36,7 @@ PQCrypta Proxy is a high-performance reverse proxy with QUIC/HTTP/3, WebTranspor
 # Build release binary
 cargo build --release
 
-# Run tests (33 tests)
+# Run tests (38 tests)
 cargo test
 
 # Run with config
@@ -84,13 +85,14 @@ sudo journalctl -u pqcrypta-proxy -f
 │   ├── main.rs             # Entry point
 │   ├── lib.rs              # Library exports
 │   ├── config.rs           # Configuration parsing
-│   ├── proxy.rs            # Backend pool & load balancing
+│   ├── load_balancer.rs    # Load balancing algorithms, pools, session affinity (NEW)
+│   ├── proxy.rs            # Backend pool & request routing
 │   ├── http_listener.rs    # HTTP/1.1 + HTTP/2 listener with PQC TLS
 │   ├── quic_listener.rs    # QUIC/HTTP/3 listener
 │   ├── handlers.rs         # Request handlers
 │   ├── security.rs         # Rate limiting, DoS, GeoIP, circuit breaker
-│   ├── fingerprint.rs      # JA3/JA4 TLS fingerprint extraction (NEW)
-│   ├── tls_acceptor.rs     # Custom TLS acceptor with fingerprint capture (NEW)
+│   ├── fingerprint.rs      # JA3/JA4 TLS fingerprint extraction
+│   ├── tls_acceptor.rs     # Custom TLS acceptor with fingerprint capture
 │   ├── compression.rs      # Brotli/Zstd/Gzip compression
 │   ├── http3_features.rs   # Early Hints, Priority, Coalescing
 │   ├── admin.rs            # Admin API endpoints
@@ -376,12 +378,54 @@ curl -sI https://api.pqcrypta.com/health | grep -E "^(server|alt-svc|priority):"
 for i in {1..5}; do curl -s -o /dev/null -w "%{http_code}\n" https://api.pqcrypta.com/health; done
 ```
 
+### 11. Load Balancing (`load_balancer.rs`)
+
+**New module with:**
+- **6 Load Balancing Algorithms:**
+  - `least_connections` (default) - Routes to server with fewest active connections
+  - `round_robin` - Simple rotation through servers
+  - `weighted_round_robin` - nginx-style smooth weighted distribution
+  - `random` - Random server selection
+  - `ip_hash` - Consistent hashing by client IP for sticky sessions
+  - `least_response_time` - Routes to fastest responding server (EMA tracking)
+- **Backend Pools** - Group multiple servers per route for high availability
+- **Session Affinity** - Cookie-based, IP hash, or custom header sticky sessions
+- **Health-Aware Routing** - Automatically bypasses unhealthy backends
+- **Slow Start** - Gradually increases traffic to recovering servers
+- **Connection Draining** - Graceful server removal without dropping connections
+- **Priority Failover** - Primary servers (priority 1) first, then failover
+
+**Integration Points:**
+- `load_balancer.rs:LoadBalancer` - Main load balancer manager
+- `load_balancer.rs:BackendPool` - Pool of servers with algorithm
+- `load_balancer.rs:BackendServer` - Individual server with health tracking
+- `http_listener.rs:proxy_handler()` - Selects backend via load balancer, records response times
+- `config.rs:LoadBalancerConfig` - TOML configuration structs
+
+**Configuration:**
+```toml
+[load_balancer]
+enabled = true
+default_algorithm = "least_connections"
+
+[backend_pools.api]
+algorithm = "least_connections"
+health_aware = true
+affinity = "cookie"
+
+[[backend_pools.api.servers]]
+address = "127.0.0.1:3003"
+weight = 100
+priority = 1
+```
+
 ## Recent Changes (2026-01-23)
 
-1. **Circuit Breaker Integration** - Now checks backend health before forwarding, records results after
-2. **JA3/JA4 Fingerprinting Module** - New `fingerprint.rs` with full extraction and classification
-3. **TLS Acceptor Module** - New `tls_acceptor.rs` for ClientHello capture
-4. **Background Cleanup** - Auto-spawned task for expired entry cleanup
-5. **FingerprintExtractor in HttpListenerState** - Added to state for request processing
-6. **Tests Fixed** - Updated to use `#[tokio::test]` for async tests
-7. **All 33 tests passing**
+1. **Load Balancing Module** - New `load_balancer.rs` with 6 algorithms, session affinity, health-aware routing
+2. **Circuit Breaker Integration** - Now checks backend health before forwarding, records results after
+3. **JA3/JA4 Fingerprinting Module** - New `fingerprint.rs` with full extraction and classification
+4. **TLS Acceptor Module** - New `tls_acceptor.rs` for ClientHello capture
+5. **Background Cleanup** - Auto-spawned task for expired entry cleanup
+6. **FingerprintExtractor in HttpListenerState** - Added to state for request processing
+7. **Tests Fixed** - Updated to use `#[tokio::test]` for async tests
+8. **All 38 tests passing** (5 new load balancer tests)
