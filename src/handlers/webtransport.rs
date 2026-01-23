@@ -113,7 +113,9 @@ impl WebTransportHandler {
         };
 
         // Read request data from stream
-        let request_data = recv.read_to_end(self.config.security.max_request_size).await?;
+        let request_data = recv
+            .read_to_end(self.config.security.max_request_size)
+            .await?;
         debug!(
             "Received {} bytes from client {}",
             request_data.len(),
@@ -168,7 +170,9 @@ impl WebTransportHandler {
         };
 
         // Read request data
-        let request_data = recv.read_to_end(self.config.security.max_request_size).await?;
+        let request_data = recv
+            .read_to_end(self.config.security.max_request_size)
+            .await?;
 
         // Proxy to backend (fire-and-forget for unidirectional)
         let _ = self
@@ -252,10 +256,7 @@ impl WebTransportHandler {
         }
 
         // Determine HTTP method for stream-to-HTTP conversion
-        let method = route
-            .stream_to_method
-            .as_deref()
-            .unwrap_or("POST");
+        let method = route.stream_to_method.as_deref().unwrap_or("POST");
 
         match backend.backend_type {
             BackendType::Http1 | BackendType::Http2 => {

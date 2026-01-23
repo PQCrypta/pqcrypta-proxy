@@ -14,17 +14,17 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, Request, Response, StatusCode};
 use axum::middleware::Next;
-use axum::response::IntoResponse;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use tokio::sync::broadcast;
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 // ============================================================================
 // Early Hints (103 Status Code)
 // ============================================================================
 
 /// Early Hints configuration
+#[allow(dead_code)] // Infrastructure for future HTTP/3 Early Hints feature
 #[derive(Debug, Clone)]
 pub struct EarlyHintsConfig {
     /// Enable Early Hints
@@ -69,6 +69,7 @@ impl Default for EarlyHintsConfig {
 }
 
 /// Preload rule for a path pattern
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PreloadRule {
     /// Path pattern (prefix match)
@@ -78,6 +79,7 @@ pub struct PreloadRule {
 }
 
 /// Link hint types for Early Hints
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum LinkHint {
     /// Preload a resource
@@ -92,13 +94,9 @@ pub enum LinkHint {
         crossorigin: Option<String>,
     },
     /// DNS prefetch
-    DnsPrefetch {
-        href: String,
-    },
+    DnsPrefetch { href: String },
     /// Prerender a page (speculative)
-    Prerender {
-        href: String,
-    },
+    Prerender { href: String },
     /// Module preload
     ModulePreload {
         href: String,
@@ -110,7 +108,11 @@ impl LinkHint {
     /// Convert to Link header value
     pub fn to_link_header(&self) -> String {
         match self {
-            LinkHint::Preload { href, as_type, crossorigin } => {
+            LinkHint::Preload {
+                href,
+                as_type,
+                crossorigin,
+            } => {
                 let mut link = format!("<{}>; rel=preload; as={}", href, as_type);
                 if let Some(co) = crossorigin {
                     link.push_str(&format!("; crossorigin={}", co));
@@ -142,6 +144,7 @@ impl LinkHint {
 }
 
 /// State for Early Hints
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct EarlyHintsState {
     pub config: Arc<RwLock<EarlyHintsConfig>>,
@@ -158,6 +161,7 @@ impl Default for EarlyHintsState {
     }
 }
 
+#[allow(dead_code)]
 impl EarlyHintsState {
     /// Get Link headers for a path
     pub fn get_hints_for_path(&self, path: &str) -> Vec<String> {
@@ -193,6 +197,7 @@ impl EarlyHintsState {
 }
 
 /// Build a 103 Early Hints response
+#[allow(dead_code)]
 pub fn build_early_hints_response(hints: &[String]) -> Response<Body> {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::EARLY_HINTS;
@@ -234,60 +239,93 @@ impl Default for PriorityConfig {
         let mut type_priorities = HashMap::new();
 
         // HTML documents - highest priority
-        type_priorities.insert("text/html".to_string(), ResourcePriority {
-            urgency: 0,
-            incremental: false,
-        });
+        type_priorities.insert(
+            "text/html".to_string(),
+            ResourcePriority {
+                urgency: 0,
+                incremental: false,
+            },
+        );
 
         // CSS - high priority (render blocking)
-        type_priorities.insert("text/css".to_string(), ResourcePriority {
-            urgency: 1,
-            incremental: false,
-        });
+        type_priorities.insert(
+            "text/css".to_string(),
+            ResourcePriority {
+                urgency: 1,
+                incremental: false,
+            },
+        );
 
         // JavaScript - medium-high priority
-        type_priorities.insert("application/javascript".to_string(), ResourcePriority {
-            urgency: 2,
-            incremental: false,
-        });
-        type_priorities.insert("text/javascript".to_string(), ResourcePriority {
-            urgency: 2,
-            incremental: false,
-        });
+        type_priorities.insert(
+            "application/javascript".to_string(),
+            ResourcePriority {
+                urgency: 2,
+                incremental: false,
+            },
+        );
+        type_priorities.insert(
+            "text/javascript".to_string(),
+            ResourcePriority {
+                urgency: 2,
+                incremental: false,
+            },
+        );
 
         // Fonts - medium priority
-        type_priorities.insert("font/woff2".to_string(), ResourcePriority {
-            urgency: 3,
-            incremental: false,
-        });
-        type_priorities.insert("font/woff".to_string(), ResourcePriority {
-            urgency: 3,
-            incremental: false,
-        });
+        type_priorities.insert(
+            "font/woff2".to_string(),
+            ResourcePriority {
+                urgency: 3,
+                incremental: false,
+            },
+        );
+        type_priorities.insert(
+            "font/woff".to_string(),
+            ResourcePriority {
+                urgency: 3,
+                incremental: false,
+            },
+        );
 
         // Images - lower priority, incremental
-        type_priorities.insert("image/webp".to_string(), ResourcePriority {
-            urgency: 5,
-            incremental: true,
-        });
-        type_priorities.insert("image/avif".to_string(), ResourcePriority {
-            urgency: 5,
-            incremental: true,
-        });
-        type_priorities.insert("image/png".to_string(), ResourcePriority {
-            urgency: 5,
-            incremental: true,
-        });
-        type_priorities.insert("image/jpeg".to_string(), ResourcePriority {
-            urgency: 5,
-            incremental: true,
-        });
+        type_priorities.insert(
+            "image/webp".to_string(),
+            ResourcePriority {
+                urgency: 5,
+                incremental: true,
+            },
+        );
+        type_priorities.insert(
+            "image/avif".to_string(),
+            ResourcePriority {
+                urgency: 5,
+                incremental: true,
+            },
+        );
+        type_priorities.insert(
+            "image/png".to_string(),
+            ResourcePriority {
+                urgency: 5,
+                incremental: true,
+            },
+        );
+        type_priorities.insert(
+            "image/jpeg".to_string(),
+            ResourcePriority {
+                urgency: 5,
+                incremental: true,
+            },
+        );
 
         // JSON API responses - high priority
-        type_priorities.insert("application/json".to_string(), ResourcePriority {
-            urgency: 2,
-            incremental: false,
-        });
+        type_priorities.insert(
+            "application/json".to_string(),
+            ResourcePriority {
+                urgency: 2,
+                incremental: false,
+            },
+        );
 
         Self {
             enabled: true,
@@ -368,7 +406,10 @@ impl PriorityState {
             }
         }
 
-        Some(ResourcePriority { urgency, incremental })
+        Some(ResourcePriority {
+            urgency,
+            incremental,
+        })
     }
 }
 
@@ -506,7 +547,11 @@ impl CoalescingState {
         }
 
         // Check method
-        if !config.coalesce_methods.iter().any(|m| m.eq_ignore_ascii_case(method)) {
+        if !config
+            .coalesce_methods
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case(method))
+        {
             return false;
         }
 
@@ -528,8 +573,10 @@ impl CoalescingState {
 
             if req.subscriber_count < config.max_subscribers {
                 req.subscriber_count += 1;
-                debug!("Coalescing request: {} {} (subscribers: {})",
-                    key.method, key.uri, req.subscriber_count);
+                debug!(
+                    "Coalescing request: {} {} (subscribers: {})",
+                    key.method, key.uri, req.subscriber_count
+                );
                 return Some(req.sender.subscribe());
             }
         }
@@ -556,8 +603,10 @@ impl CoalescingState {
             let req = request.read();
             let _ = req.sender.send(response.clone());
 
-            debug!("Completed coalesced request: {} {} (served {} subscribers)",
-                key.method, key.uri, req.subscriber_count);
+            debug!(
+                "Completed coalesced request: {} {} (served {} subscribers)",
+                key.method, key.uri, req.subscriber_count
+            );
         }
 
         // Optionally cache for a very short time
@@ -571,15 +620,13 @@ impl CoalescingState {
     fn cleanup_cache(&self) {
         let max_age = Duration::from_millis(50); // Very short cache
 
-        self.response_cache.retain(|_, response| {
-            response.created_at.elapsed() < max_age
-        });
+        self.response_cache
+            .retain(|_, response| response.created_at.elapsed() < max_age);
 
         // Also clean up stale in-flight requests
         let max_inflight = Duration::from_secs(30);
-        self.in_flight.retain(|_, request| {
-            request.read().started_at.elapsed() < max_inflight
-        });
+        self.in_flight
+            .retain(|_, request| request.read().started_at.elapsed() < max_inflight);
     }
 }
 
@@ -650,8 +697,10 @@ pub async fn http3_features_middleware(
             // Wait for the response
             match tokio::time::timeout(
                 Duration::from_millis(coalescing_config.max_wait_ms),
-                receiver.recv()
-            ).await {
+                receiver.recv(),
+            )
+            .await
+            {
                 Ok(Ok(coalesced)) => {
                     // Build response from coalesced data
                     let mut response = Response::new(Body::from((*coalesced.body).clone()));
@@ -659,10 +708,9 @@ pub async fn http3_features_middleware(
                     *response.headers_mut() = coalesced.headers;
 
                     // Add header indicating this was coalesced
-                    response.headers_mut().insert(
-                        "x-coalesced",
-                        HeaderValue::from_static("true"),
-                    );
+                    response
+                        .headers_mut()
+                        .insert("x-coalesced", HeaderValue::from_static("true"));
 
                     return response;
                 }
@@ -680,7 +728,8 @@ pub async fn http3_features_middleware(
     // Add Priority header based on content type
     let priority_config = state.priority.config.read();
     if priority_config.enabled {
-        let content_type = response.headers()
+        let content_type = response
+            .headers()
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok());
 
@@ -740,7 +789,10 @@ mod tests {
             as_type: "style".to_string(),
             crossorigin: None,
         };
-        assert_eq!(preload.to_link_header(), "</css/main.css>; rel=preload; as=style");
+        assert_eq!(
+            preload.to_link_header(),
+            "</css/main.css>; rel=preload; as=style"
+        );
 
         let preconnect = LinkHint::Preconnect {
             href: "https://fonts.googleapis.com".to_string(),

@@ -54,12 +54,10 @@ impl QuicListener {
 
         // Create transport configuration
         let mut transport_config = TransportConfig::default();
-        transport_config.max_concurrent_bidi_streams(
-            config.server.max_streams_per_connection.into(),
-        );
-        transport_config.max_concurrent_uni_streams(
-            config.server.max_streams_per_connection.into(),
-        );
+        transport_config
+            .max_concurrent_bidi_streams(config.server.max_streams_per_connection.into());
+        transport_config
+            .max_concurrent_uni_streams(config.server.max_streams_per_connection.into());
         transport_config.keep_alive_interval(Some(Duration::from_secs(
             config.server.keepalive_interval_secs,
         )));
@@ -78,10 +76,7 @@ impl QuicListener {
         let endpoint = Endpoint::server(server_config, addr)?;
 
         info!("QUIC endpoint created on {}", addr);
-        info!(
-            "ALPN protocols: {:?}",
-            config.tls.alpn_protocols
-        );
+        info!("ALPN protocols: {:?}", config.tls.alpn_protocols);
         info!("PQC enabled: {}", tls_provider.is_pqc_enabled());
 
         // Create backend pool
@@ -204,10 +199,7 @@ impl QuicListener {
             }
             Err(e) => {
                 // Fall back to raw QUIC streams (WebTransport without HTTP/3)
-                warn!(
-                    "HTTP/3 handshake failed, handling raw QUIC streams: {}",
-                    e
-                );
+                warn!("HTTP/3 handshake failed, handling raw QUIC streams: {}", e);
                 Self::handle_raw_quic(connection, remote_addr, config, backend_pool).await?;
             }
         }
@@ -254,15 +246,24 @@ impl QuicListener {
                             .map(|v| v == "webtransport")
                             .unwrap_or(false)
                     {
-                        info!("WebTransport CONNECT request for {} from {} (host: {:?})", path, remote_addr, host);
+                        info!(
+                            "WebTransport CONNECT request for {} from {} (host: {:?})",
+                            path, remote_addr, host
+                        );
 
                         // Handle WebTransport session
-                        let handler =
-                            WebTransportHandler::new(config.clone(), backend_pool.clone(), remote_addr);
+                        let handler = WebTransportHandler::new(
+                            config.clone(),
+                            backend_pool.clone(),
+                            remote_addr,
+                        );
 
                         // Accept WebTransport session and handle streams/datagrams
                         tokio::spawn(async move {
-                            debug!("WebTransport session started for {} on path {}", remote_addr, path);
+                            debug!(
+                                "WebTransport session started for {} on path {}",
+                                remote_addr, path
+                            );
                             // Use the handler to process the WebTransport session
                             // The actual stream handling is done by the dedicated WebTransport server
                             // This QuicListener handles the HTTP/3 layer
@@ -316,10 +317,7 @@ impl QuicListener {
         S: h3::quic::BidiStream<Bytes>,
     {
         let path = request.uri().path();
-        let host = request
-            .headers()
-            .get("host")
-            .and_then(|v| v.to_str().ok());
+        let host = request.headers().get("host").and_then(|v| v.to_str().ok());
 
         // Find route
         let route = config.find_route(host, path, false);

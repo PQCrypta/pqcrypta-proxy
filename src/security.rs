@@ -33,7 +33,8 @@ use crate::config::{ProxyConfig, RateLimitConfig, SecurityConfig};
 #[derive(Clone)]
 pub struct SecurityState {
     /// Per-IP rate limiters
-    pub ip_rate_limiters: Arc<DashMap<IpAddr, Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>>>,
+    pub ip_rate_limiters:
+        Arc<DashMap<IpAddr, Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>>>,
     /// Per-IP connection counters
     pub ip_connections: Arc<DashMap<IpAddr, u32>>,
     /// Blocked IPs with expiration time
@@ -177,8 +178,10 @@ impl SecurityState {
         let rate_per_second = config.rate_limiting.requests_per_second;
         let burst = config.rate_limiting.burst_size;
 
-        let quota = Quota::per_second(NonZeroU32::new(rate_per_second).unwrap_or(NonZeroU32::new(100).unwrap()))
-            .allow_burst(NonZeroU32::new(burst).unwrap_or(NonZeroU32::new(50).unwrap()));
+        let quota = Quota::per_second(
+            NonZeroU32::new(rate_per_second).unwrap_or(NonZeroU32::new(100).unwrap()),
+        )
+        .allow_burst(NonZeroU32::new(burst).unwrap_or(NonZeroU32::new(50).unwrap()));
 
         let global_rate_limiter = Arc::new(RateLimiter::direct(quota));
 
@@ -186,29 +189,35 @@ impl SecurityState {
         let blocked_ips = Arc::new(DashMap::new());
         for ip_str in &config.security.blocked_ips {
             if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                blocked_ips.insert(ip, BlockedIpInfo {
-                    blocked_at: Instant::now(),
-                    expires_at: None, // Permanent for manual blocks
-                    reason: BlockReason::Manual,
-                    block_count: 1,
-                });
+                blocked_ips.insert(
+                    ip,
+                    BlockedIpInfo {
+                        blocked_at: Instant::now(),
+                        expires_at: None, // Permanent for manual blocks
+                        reason: BlockReason::Manual,
+                        block_count: 1,
+                    },
+                );
             }
         }
 
         // Load GeoIP database if configured
         #[cfg(feature = "geoip")]
-        let geoip_db = config.security.geoip_db_path.as_ref().and_then(|path| {
-            match GeoIpDb::new(path) {
-                Ok(db) => {
-                    info!("✅ GeoIP database loaded from {:?}", path);
-                    Some(Arc::new(db))
-                }
-                Err(e) => {
-                    warn!("⚠️ Failed to load GeoIP database from {:?}: {}", path, e);
-                    None
-                }
-            }
-        });
+        let geoip_db =
+            config
+                .security
+                .geoip_db_path
+                .as_ref()
+                .and_then(|path| match GeoIpDb::new(path) {
+                    Ok(db) => {
+                        info!("✅ GeoIP database loaded from {:?}", path);
+                        Some(Arc::new(db))
+                    }
+                    Err(e) => {
+                        warn!("⚠️ Failed to load GeoIP database from {:?}: {}", path, e);
+                        None
+                    }
+                });
 
         Self {
             ip_rate_limiters: Arc::new(DashMap::new()),
@@ -245,15 +254,20 @@ impl SecurityState {
     }
 
     /// Get or create rate limiter for an IP
-    pub fn get_ip_rate_limiter(&self, ip: IpAddr) -> Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>> {
+    pub fn get_ip_rate_limiter(
+        &self,
+        ip: IpAddr,
+    ) -> Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>> {
         self.ip_rate_limiters
             .entry(ip)
             .or_insert_with(|| {
                 let config = self.rate_config.read();
                 let quota = Quota::per_second(
-                    NonZeroU32::new(config.requests_per_second).unwrap_or(NonZeroU32::new(100).unwrap())
-                ).allow_burst(
-                    NonZeroU32::new(config.burst_size).unwrap_or(NonZeroU32::new(50).unwrap())
+                    NonZeroU32::new(config.requests_per_second)
+                        .unwrap_or(NonZeroU32::new(100).unwrap()),
+                )
+                .allow_burst(
+                    NonZeroU32::new(config.burst_size).unwrap_or(NonZeroU32::new(50).unwrap()),
                 );
                 Arc::new(RateLimiter::direct(quota))
             })
@@ -281,7 +295,8 @@ impl SecurityState {
     pub fn block_ip(&self, ip: IpAddr, reason: BlockReason, duration: Option<Duration>) {
         let expires_at = duration.map(|d| Instant::now() + d);
 
-        let block_count = self.blocked_ips
+        let block_count = self
+            .blocked_ips
             .get(&ip)
             .map(|info| info.block_count + 1)
             .unwrap_or(1);
@@ -289,17 +304,22 @@ impl SecurityState {
         warn!(
             "Blocked IP {} for {:?} (reason: {:?}, block count: {})",
             ip,
-            duration.map(|d| format!("{:?}", d)).unwrap_or_else(|| "permanent".to_string()),
+            duration
+                .map(|d| format!("{:?}", d))
+                .unwrap_or_else(|| "permanent".to_string()),
             reason,
             block_count
         );
 
-        self.blocked_ips.insert(ip, BlockedIpInfo {
-            blocked_at: Instant::now(),
-            expires_at,
-            reason,
-            block_count,
-        });
+        self.blocked_ips.insert(
+            ip,
+            BlockedIpInfo {
+                blocked_at: Instant::now(),
+                expires_at,
+                reason,
+                block_count,
+            },
+        );
     }
 
     /// Increment connection count for IP
@@ -324,7 +344,11 @@ impl SecurityState {
 
         // Reset window if needed (1 minute windows)
         let window_duration = Duration::from_secs(60);
-        if counter.window_start.map(|s| s.elapsed() > window_duration).unwrap_or(true) {
+        if counter
+            .window_start
+            .map(|s| s.elapsed() > window_duration)
+            .unwrap_or(true)
+        {
             counter.total_requests = 0;
             counter.error_4xx = 0;
             counter.error_5xx = 0;
@@ -349,7 +373,11 @@ impl SecurityState {
                 // Auto-block if too suspicious
                 if counter.suspicious_patterns >= 3 {
                     drop(counter);
-                    self.block_ip(ip, BlockReason::TooManyErrors, Some(Duration::from_secs(300)));
+                    self.block_ip(
+                        ip,
+                        BlockReason::TooManyErrors,
+                        Some(Duration::from_secs(300)),
+                    );
                 }
             }
         }
@@ -357,7 +385,10 @@ impl SecurityState {
 
     /// Record circuit breaker result
     pub fn record_backend_result(&self, backend: &str, success: bool) {
-        let mut state = self.circuit_breakers.entry(backend.to_string()).or_default();
+        let mut state = self
+            .circuit_breakers
+            .entry(backend.to_string())
+            .or_default();
 
         if success {
             state.success_count += 1;
@@ -379,7 +410,10 @@ impl SecurityState {
                     if state.failure_count >= 5 {
                         state.state = CircuitState::Open;
                         state.last_state_change = Instant::now();
-                        warn!("Circuit breaker for {} opened (failures: {})", backend, state.failure_count);
+                        warn!(
+                            "Circuit breaker for {} opened (failures: {})",
+                            backend, state.failure_count
+                        );
                     }
                 }
                 CircuitState::HalfOpen => {
@@ -397,7 +431,10 @@ impl SecurityState {
 
     /// Check if circuit breaker allows request to backend
     pub fn circuit_allows(&self, backend: &str) -> bool {
-        let mut state = self.circuit_breakers.entry(backend.to_string()).or_default();
+        let mut state = self
+            .circuit_breakers
+            .entry(backend.to_string())
+            .or_default();
 
         match state.state {
             CircuitState::Closed => true,
@@ -428,13 +465,15 @@ impl SecurityState {
     /// Cleanup expired entries (call periodically)
     pub fn cleanup(&self) {
         // Remove expired blocks
-        self.blocked_ips.retain(|_, info| {
-            info.expires_at.map(|e| Instant::now() < e).unwrap_or(true)
-        });
+        self.blocked_ips
+            .retain(|_, info| info.expires_at.map(|e| Instant::now() < e).unwrap_or(true));
 
         // Remove old request counters (older than 5 minutes)
         self.request_counts.retain(|_, counter| {
-            counter.window_start.map(|s| s.elapsed() < Duration::from_secs(300)).unwrap_or(false)
+            counter
+                .window_start
+                .map(|s| s.elapsed() < Duration::from_secs(300))
+                .unwrap_or(false)
         });
 
         // Remove stale rate limiters (not used in 10 minutes)
@@ -456,7 +495,10 @@ pub async fn security_middleware(
 
     // 1. Check if IP is blocked
     if let Some(block_info) = security.is_blocked(&ip) {
-        warn!("Blocked request from {} (reason: {:?})", ip, block_info.reason);
+        warn!(
+            "Blocked request from {} (reason: {:?})",
+            ip, block_info.reason
+        );
         return blocked_response(&block_info);
     }
 
@@ -474,7 +516,11 @@ pub async fn security_middleware(
 
         if connections > max_connections {
             security.decrement_connections(ip);
-            security.block_ip(ip, BlockReason::ConnectionLimitExceeded, Some(Duration::from_secs(60)));
+            security.block_ip(
+                ip,
+                BlockReason::ConnectionLimitExceeded,
+                Some(Duration::from_secs(60)),
+            );
             warn!("Connection limit exceeded for {}: {}", ip, connections);
             return too_many_connections_response();
         }
@@ -515,7 +561,8 @@ pub async fn security_middleware(
     }
 
     // 6. Header size validation
-    let header_size: usize = headers.iter()
+    let header_size: usize = headers
+        .iter()
         .map(|(k, v)| k.as_str().len() + v.len())
         .sum();
 
@@ -541,14 +588,12 @@ pub async fn security_middleware(
 
 /// Generate blocked IP response
 fn blocked_response(info: &BlockedIpInfo) -> Response {
-    let retry_after = info.expires_at
+    let retry_after = info
+        .expires_at
         .map(|e| e.duration_since(Instant::now()).as_secs())
         .unwrap_or(3600);
 
-    let mut response = (
-        StatusCode::FORBIDDEN,
-        "Access denied - IP blocked"
-    ).into_response();
+    let mut response = (StatusCode::FORBIDDEN, "Access denied - IP blocked").into_response();
 
     response.headers_mut().insert(
         "Retry-After",
@@ -562,31 +607,27 @@ fn blocked_response(info: &BlockedIpInfo) -> Response {
 fn geo_blocked_response() -> Response {
     (
         StatusCode::FORBIDDEN,
-        "Access denied - Your region is not allowed"
-    ).into_response()
+        "Access denied - Your region is not allowed",
+    )
+        .into_response()
 }
 
 /// Generate rate limit exceeded response
 fn rate_limit_response(config: &RateLimitConfig) -> Response {
-    let mut response = (
-        StatusCode::TOO_MANY_REQUESTS,
-        "Rate limit exceeded"
-    ).into_response();
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
 
     // Add standard rate limit headers
-    response.headers_mut().insert(
-        "Retry-After",
-        HeaderValue::from_static("1"),
-    );
+    response
+        .headers_mut()
+        .insert("Retry-After", HeaderValue::from_static("1"));
     response.headers_mut().insert(
         "X-RateLimit-Limit",
         HeaderValue::from_str(&config.requests_per_second.to_string())
             .unwrap_or(HeaderValue::from_static("100")),
     );
-    response.headers_mut().insert(
-        "X-RateLimit-Remaining",
-        HeaderValue::from_static("0"),
-    );
+    response
+        .headers_mut()
+        .insert("X-RateLimit-Remaining", HeaderValue::from_static("0"));
 
     response
 }
@@ -595,16 +636,18 @@ fn rate_limit_response(config: &RateLimitConfig) -> Response {
 fn too_many_connections_response() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        "Too many connections from your IP"
-    ).into_response()
+        "Too many connections from your IP",
+    )
+        .into_response()
 }
 
 /// Generate payload too large response
 fn payload_too_large_response(max_size: usize) -> Response {
     let mut response = (
         StatusCode::PAYLOAD_TOO_LARGE,
-        format!("Request body exceeds maximum size of {} bytes", max_size)
-    ).into_response();
+        format!("Request body exceeds maximum size of {} bytes", max_size),
+    )
+        .into_response();
 
     response.headers_mut().insert(
         "X-Max-Request-Size",
@@ -619,8 +662,9 @@ fn payload_too_large_response(max_size: usize) -> Response {
 fn headers_too_large_response(max_size: usize) -> Response {
     (
         StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
-        format!("Headers exceed maximum size of {} bytes", max_size)
-    ).into_response()
+        format!("Headers exceed maximum size of {} bytes", max_size),
+    )
+        .into_response()
 }
 
 /// JA3 fingerprint calculation from TLS ClientHello
@@ -713,10 +757,12 @@ pub fn calculate_ja3(client_hello: &[u8]) -> Option<String> {
 
             // Parse supported_groups (extension 10)
             if ext_type == 10 && ext_len >= 2 && offset + ext_len <= handshake.len() {
-                let groups_len = u16::from_be_bytes([handshake[offset], handshake[offset + 1]]) as usize;
+                let groups_len =
+                    u16::from_be_bytes([handshake[offset], handshake[offset + 1]]) as usize;
                 for i in (2..2 + groups_len).step_by(2) {
                     if offset + i + 2 <= handshake.len() {
-                        let group = u16::from_be_bytes([handshake[offset + i], handshake[offset + i + 1]]);
+                        let group =
+                            u16::from_be_bytes([handshake[offset + i], handshake[offset + i + 1]]);
                         if group & 0x0f0f != 0x0a0a {
                             elliptic_curves.push(group);
                         }
@@ -742,10 +788,26 @@ pub fn calculate_ja3(client_hello: &[u8]) -> Option<String> {
     let ja3_string = format!(
         "{},{},{},{},{}",
         tls_version,
-        ciphers.iter().map(|c| c.to_string()).collect::<Vec<_>>().join("-"),
-        extensions.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("-"),
-        elliptic_curves.iter().map(|c| c.to_string()).collect::<Vec<_>>().join("-"),
-        ec_point_formats.iter().map(|f| f.to_string()).collect::<Vec<_>>().join("-"),
+        ciphers
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join("-"),
+        extensions
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("-"),
+        elliptic_curves
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join("-"),
+        ec_point_formats
+            .iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+            .join("-"),
     );
 
     // Calculate MD5 hash
@@ -854,10 +916,13 @@ mod geoip {
 
             Some(GeoLocation {
                 country_code: city.country.as_ref().and_then(|c| c.iso_code.clone()),
-                country_name: city.country.as_ref()
+                country_name: city
+                    .country
+                    .as_ref()
                     .and_then(|c| c.names.as_ref())
                     .and_then(|n| n.get("en").cloned()),
-                city: city.city
+                city: city
+                    .city
                     .and_then(|c| c.names)
                     .and_then(|n| n.get("en").cloned()),
                 continent: city.continent.and_then(|c| c.code),
@@ -868,7 +933,9 @@ mod geoip {
         pub fn is_country_blocked(&self, ip: IpAddr, blocked_countries: &[String]) -> bool {
             if let Some(location) = self.lookup(ip) {
                 if let Some(country_code) = location.country_code {
-                    return blocked_countries.iter().any(|c| c.eq_ignore_ascii_case(&country_code));
+                    return blocked_countries
+                        .iter()
+                        .any(|c| c.eq_ignore_ascii_case(&country_code));
                 }
             }
             false
@@ -891,7 +958,11 @@ mod tests {
         let ip: IpAddr = "192.168.1.1".parse().unwrap();
 
         // Block for 1 second
-        security.block_ip(ip, BlockReason::RateLimitExceeded, Some(Duration::from_millis(100)));
+        security.block_ip(
+            ip,
+            BlockReason::RateLimitExceeded,
+            Some(Duration::from_millis(100)),
+        );
 
         // Should be blocked
         assert!(security.is_blocked(&ip).is_some());

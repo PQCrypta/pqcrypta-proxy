@@ -99,9 +99,7 @@ impl BackendPool {
 
         // Build request
         let method = method.parse::<Method>()?;
-        let mut request_builder = Request::builder()
-            .method(method)
-            .uri(&uri);
+        let mut request_builder = Request::builder().method(method).uri(&uri);
 
         // Add headers
         for (key, value) in &headers {
@@ -206,7 +204,9 @@ impl BackendPool {
 
         #[cfg(not(unix))]
         {
-            Err(anyhow::anyhow!("Unix sockets not supported on this platform"))
+            Err(anyhow::anyhow!(
+                "Unix sockets not supported on this platform"
+            ))
         }
     }
 
@@ -245,7 +245,10 @@ impl BackendPool {
 
         // Skip verification if configured (dangerous)
         if backend.tls_skip_verify {
-            warn!("TLS verification disabled for backend {} - INSECURE", backend.name);
+            warn!(
+                "TLS verification disabled for backend {} - INSECURE",
+                backend.name
+            );
         }
 
         let client_config = quinn::ClientConfig::new(Arc::new(
@@ -274,9 +277,9 @@ impl BackendPool {
             .map_err(|e| anyhow::anyhow!("Failed to create HTTP/3 client: {}", e))?;
 
         // Spawn driver
-        tokio::spawn(async move {
-            futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await
-        });
+        tokio::spawn(
+            async move { futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await },
+        );
 
         // Build request
         let mut request_builder = http::Request::builder()
@@ -347,7 +350,11 @@ impl BackendPool {
         // Acquire connection permit
         let _permit = self.acquire_permit(&backend.name).await?;
 
-        debug!("Proxying {} bytes to TCP backend: {}", data.len(), backend.address);
+        debug!(
+            "Proxying {} bytes to TCP backend: {}",
+            data.len(),
+            backend.address
+        );
 
         // Connect to backend
         let mut stream = TcpStream::connect(&backend.address)
@@ -381,7 +388,10 @@ impl BackendPool {
     }
 
     /// Acquire a connection permit for rate limiting
-    async fn acquire_permit(&self, backend_name: &str) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
+    async fn acquire_permit(
+        &self,
+        backend_name: &str,
+    ) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
         let limiter = self
             .limiters
             .get(backend_name)
@@ -460,7 +470,10 @@ impl BackendPool {
                     #[cfg(unix)]
                     {
                         use tokio::net::UnixStream;
-                        let socket_path = backend.address.strip_prefix("unix:").unwrap_or(&backend.address);
+                        let socket_path = backend
+                            .address
+                            .strip_prefix("unix:")
+                            .unwrap_or(&backend.address);
                         UnixStream::connect(socket_path).await.is_ok()
                     }
                     #[cfg(not(unix))]

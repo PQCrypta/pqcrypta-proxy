@@ -1,6 +1,7 @@
 //! Post-Quantum Cryptography TLS Provider
 //!
 //! Implements hybrid PQC key exchange using OpenSSL 3.5+ with native ML-KEM support.
+#![allow(unsafe_code)] // Required for OpenSSL FFI bindings
 //! Supports:
 //! - X25519MLKEM768 (IETF hybrid - recommended)
 //! - SecP256r1MLKEM768
@@ -60,8 +61,11 @@ impl PqcKemAlgorithm {
     pub fn security_level(&self) -> u8 {
         match self {
             Self::MlKem512 => 1,
-            Self::X25519MlKem768 | Self::SecP256r1MlKem768 | Self::MlKem768 |
-            Self::Kyber768 | Self::X25519Kyber768 => 3,
+            Self::X25519MlKem768
+            | Self::SecP256r1MlKem768
+            | Self::MlKem768
+            | Self::Kyber768
+            | Self::X25519Kyber768 => 3,
             Self::SecP384r1MlKem1024 | Self::X448MlKem1024 | Self::MlKem1024 => 5,
         }
     }
@@ -70,8 +74,11 @@ impl PqcKemAlgorithm {
     pub fn is_hybrid(&self) -> bool {
         matches!(
             self,
-            Self::X25519MlKem768 | Self::SecP256r1MlKem768 |
-            Self::SecP384r1MlKem1024 | Self::X448MlKem1024 | Self::X25519Kyber768
+            Self::X25519MlKem768
+                | Self::SecP256r1MlKem768
+                | Self::SecP384r1MlKem1024
+                | Self::X448MlKem1024
+                | Self::X25519Kyber768
         )
     }
 
@@ -94,10 +101,10 @@ impl PqcKemAlgorithm {
     /// Get all available hybrid algorithms (recommended order)
     pub fn recommended_hybrids() -> Vec<Self> {
         vec![
-            Self::X25519MlKem768,      // IETF standard, best compatibility
-            Self::SecP256r1MlKem768,   // NIST curve variant
-            Self::SecP384r1MlKem1024,  // Higher security
-            Self::X448MlKem1024,       // Maximum security
+            Self::X25519MlKem768,     // IETF standard, best compatibility
+            Self::SecP256r1MlKem768,  // NIST curve variant
+            Self::SecP384r1MlKem1024, // Higher security
+            Self::X448MlKem1024,      // Maximum security
         ]
     }
 }
@@ -182,8 +189,11 @@ impl PqcTlsProvider {
                 info!("  Available KEMs: {}", status.available_kems.len());
                 info!("  Configured groups: {}", groups);
                 if let Some(kem) = preferred {
-                    info!("  Preferred KEM: {} (Security Level {})",
-                          kem.openssl_name(), kem.security_level());
+                    info!(
+                        "  Preferred KEM: {} (Security Level {})",
+                        kem.openssl_name(),
+                        kem.security_level()
+                    );
                 }
             }
             Err(e) => {
@@ -205,12 +215,14 @@ impl PqcTlsProvider {
         let config = self.config.read();
 
         // Get paths from config
-        let openssl_bin = config.openssl_path
+        let openssl_bin = config
+            .openssl_path
             .as_ref()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| "openssl".to_string());
 
-        let openssl_lib = config.openssl_lib_path
+        let openssl_lib = config
+            .openssl_lib_path
             .as_ref()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
@@ -258,8 +270,10 @@ impl PqcTlsProvider {
             .lines()
             .filter(|line| {
                 let lower = line.to_lowercase();
-                lower.contains("mlkem") || lower.contains("kyber") ||
-                lower.contains("x25519") || lower.contains("x448")
+                lower.contains("mlkem")
+                    || lower.contains("kyber")
+                    || lower.contains("x25519")
+                    || lower.contains("x448")
             })
             .map(|s| s.trim().to_string())
             .collect();
@@ -327,12 +341,14 @@ impl PqcTlsProvider {
     /// Get environment variables for OpenSSL
     pub fn openssl_env(&self) -> Vec<(String, String)> {
         let config = self.config.read();
-        let lib_path = config.openssl_lib_path
+        let lib_path = config
+            .openssl_lib_path
             .as_ref()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        let conf_path = config.openssl_path
+        let conf_path = config
+            .openssl_path
             .as_ref()
             .and_then(|p| p.parent())
             .and_then(|p| p.parent())
@@ -360,12 +376,14 @@ impl PqcTlsProvider {
         }
 
         let config = self.config.read();
-        let openssl_bin = config.openssl_path
+        let openssl_bin = config
+            .openssl_path
             .as_ref()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| "openssl".to_string());
 
-        let openssl_lib = config.openssl_lib_path
+        let openssl_lib = config
+            .openssl_lib_path
             .as_ref()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
@@ -377,8 +395,10 @@ impl PqcTlsProvider {
         let key_output = Command::new(&openssl_bin)
             .args([
                 "genpkey",
-                "-algorithm", "ML-DSA-87",
-                "-out", key_path.to_str().unwrap(),
+                "-algorithm",
+                "ML-DSA-87",
+                "-out",
+                key_path.to_str().unwrap(),
             ])
             .env("LD_LIBRARY_PATH", &openssl_lib)
             .output()
@@ -395,11 +415,16 @@ impl PqcTlsProvider {
         let cert_output = Command::new(&openssl_bin)
             .args([
                 "req",
-                "-new", "-x509",
-                "-key", key_path.to_str().unwrap(),
-                "-out", cert_path.to_str().unwrap(),
-                "-days", "365",
-                "-subj", "/CN=PQCrypta Test/O=PQCrypta/C=US",
+                "-new",
+                "-x509",
+                "-key",
+                key_path.to_str().unwrap(),
+                "-out",
+                cert_path.to_str().unwrap(),
+                "-days",
+                "365",
+                "-subj",
+                "/CN=PQCrypta Test/O=PQCrypta/C=US",
             ])
             .env("LD_LIBRARY_PATH", &openssl_lib)
             .output()
@@ -421,7 +446,7 @@ impl PqcTlsProvider {
 #[cfg(feature = "pqc")]
 pub mod openssl_pqc {
     use super::*;
-    use openssl::ssl::{SslAcceptor, SslMethod, SslFiletype, SslVersion};
+    use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVersion};
     use openssl_sys;
 
     /// Create SSL acceptor with PQC hybrid key exchange
@@ -441,23 +466,30 @@ pub mod openssl_pqc {
             .map_err(|e| format!("Failed to create SSL acceptor: {}", e))?;
 
         // Set minimum TLS version to 1.3 (required for ML-KEM)
-        builder.set_min_proto_version(Some(SslVersion::TLS1_3))
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
             .map_err(|e| format!("Failed to set TLS version: {}", e))?;
 
         // Load certificate
-        builder.set_certificate_file(cert_path, SslFiletype::PEM)
+        builder
+            .set_certificate_file(cert_path, SslFiletype::PEM)
             .map_err(|e| format!("Failed to load certificate: {}", e))?;
 
         // Load private key
-        builder.set_private_key_file(key_path, SslFiletype::PEM)
+        builder
+            .set_private_key_file(key_path, SslFiletype::PEM)
             .map_err(|e| format!("Failed to load private key: {}", e))?;
 
         // Configure PQC groups if available
         if pqc_provider.is_available() {
             // First try classical groups to verify the API works
             let classical_groups = "X25519:P-256:P-384";
-            info!("Testing groups API with classical groups first: {}", classical_groups);
-            builder.set_groups_list(classical_groups)
+            info!(
+                "Testing groups API with classical groups first: {}",
+                classical_groups
+            );
+            builder
+                .set_groups_list(classical_groups)
                 .map_err(|e| format!("Failed to set classical groups: {}", e))?;
             info!("Classical groups set successfully");
 
@@ -471,17 +503,19 @@ pub mod openssl_pqc {
             // Clear any previous errors
             unsafe { openssl_sys::ERR_clear_error() };
 
-            let groups_cstr = CString::new(pqc_groups.clone())
-                .map_err(|_| "Invalid groups string")?;
+            let groups_cstr =
+                CString::new(pqc_groups.clone()).map_err(|_| "Invalid groups string")?;
 
             // Get the SSL_CTX and try to set PQC groups
             let ssl_ctx = builder.as_ptr() as *mut openssl_sys::SSL_CTX;
-            let result = unsafe {
-                openssl_sys::SSL_CTX_set1_groups_list(ssl_ctx, groups_cstr.as_ptr())
-            };
+            let result =
+                unsafe { openssl_sys::SSL_CTX_set1_groups_list(ssl_ctx, groups_cstr.as_ptr()) };
 
             if result == 1 {
-                info!("✅ PQC groups configured successfully via FFI: {}", pqc_groups);
+                info!(
+                    "✅ PQC groups configured successfully via FFI: {}",
+                    pqc_groups
+                );
             } else {
                 // Get all errors from the error queue
                 let mut error_messages = Vec::new();
@@ -504,12 +538,22 @@ pub mod openssl_pqc {
                 }
 
                 if error_messages.is_empty() {
-                    error!("Failed to set PQC groups '{}': No specific error returned", pqc_groups);
+                    error!(
+                        "Failed to set PQC groups '{}': No specific error returned",
+                        pqc_groups
+                    );
                 } else {
-                    error!("Failed to set PQC groups '{}': {}", pqc_groups, error_messages.join("; "));
+                    error!(
+                        "Failed to set PQC groups '{}': {}",
+                        pqc_groups,
+                        error_messages.join("; ")
+                    );
                 }
 
-                warn!("PQC groups not available, using classical groups: {}", classical_groups);
+                warn!(
+                    "PQC groups not available, using classical groups: {}",
+                    classical_groups
+                );
             }
         }
 
@@ -536,7 +580,8 @@ pub mod openssl_pqc {
 
     /// Get PQC handshake info from SSL connection
     pub fn get_pqc_info(ssl: &openssl::ssl::SslRef) -> PqcHandshakeInfo {
-        let cipher = ssl.current_cipher()
+        let cipher = ssl
+            .current_cipher()
             .map(|c| c.name().to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
@@ -587,7 +632,10 @@ mod tests {
 
     #[test]
     fn test_kem_algorithm_names() {
-        assert_eq!(PqcKemAlgorithm::X25519MlKem768.openssl_name(), "X25519MLKEM768");
+        assert_eq!(
+            PqcKemAlgorithm::X25519MlKem768.openssl_name(),
+            "X25519MLKEM768"
+        );
         assert_eq!(PqcKemAlgorithm::MlKem1024.openssl_name(), "ML-KEM-1024");
     }
 

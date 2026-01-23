@@ -110,7 +110,7 @@ impl AdminServer {
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
         .await
-        .map_err(|e| anyhow::anyhow!("Admin server error: {}", e))
+        .map_err(|e| anyhow::anyhow!("Admin server error: {e}"))
     }
 }
 
@@ -197,7 +197,7 @@ async fn health_handler(State(state): State<Arc<AdminState>>) -> Json<HealthResp
 /// Prometheus metrics endpoint
 #[cfg(feature = "metrics")]
 async fn metrics_handler(State(state): State<Arc<AdminState>>) -> String {
-    
+    use std::fmt::Write;
 
     let config = state.config_manager.get();
     let uptime = state.start_time.elapsed().as_secs();
@@ -207,65 +207,34 @@ async fn metrics_handler(State(state): State<Arc<AdminState>>) -> String {
     // Build Prometheus metrics
     let mut output = String::new();
 
-    output.push_str(&format!(
-        "# HELP pqcrypta_proxy_uptime_seconds Proxy uptime in seconds\n"
-    ));
-    output.push_str(&format!(
-        "# TYPE pqcrypta_proxy_uptime_seconds gauge\n"
-    ));
-    output.push_str(&format!(
-        "pqcrypta_proxy_uptime_seconds {}\n",
-        uptime
-    ));
+    output.push_str("# HELP pqcrypta_proxy_uptime_seconds Proxy uptime in seconds\n");
+    output.push_str("# TYPE pqcrypta_proxy_uptime_seconds gauge\n");
+    let _ = writeln!(output, "pqcrypta_proxy_uptime_seconds {uptime}");
 
-    output.push_str(&format!(
-        "# HELP pqcrypta_proxy_connections_total Total connections handled\n"
-    ));
-    output.push_str(&format!(
-        "# TYPE pqcrypta_proxy_connections_total counter\n"
-    ));
-    output.push_str(&format!(
-        "pqcrypta_proxy_connections_total {}\n",
-        connections
-    ));
+    output.push_str("# HELP pqcrypta_proxy_connections_total Total connections handled\n");
+    output.push_str("# TYPE pqcrypta_proxy_connections_total counter\n");
+    let _ = writeln!(output, "pqcrypta_proxy_connections_total {connections}");
 
-    output.push_str(&format!(
-        "# HELP pqcrypta_proxy_requests_total Total requests handled\n"
-    ));
-    output.push_str(&format!(
-        "# TYPE pqcrypta_proxy_requests_total counter\n"
-    ));
-    output.push_str(&format!(
-        "pqcrypta_proxy_requests_total {}\n",
-        requests
-    ));
+    output.push_str("# HELP pqcrypta_proxy_requests_total Total requests handled\n");
+    output.push_str("# TYPE pqcrypta_proxy_requests_total counter\n");
+    let _ = writeln!(output, "pqcrypta_proxy_requests_total {requests}");
 
-    output.push_str(&format!(
-        "# HELP pqcrypta_proxy_pqc_enabled PQC hybrid key exchange enabled\n"
-    ));
-    output.push_str(&format!(
-        "# TYPE pqcrypta_proxy_pqc_enabled gauge\n"
-    ));
-    output.push_str(&format!(
-        "pqcrypta_proxy_pqc_enabled {}\n",
-        if state.tls_provider.is_pqc_enabled() { 1 } else { 0 }
-    ));
+    output.push_str("# HELP pqcrypta_proxy_pqc_enabled PQC hybrid key exchange enabled\n");
+    output.push_str("# TYPE pqcrypta_proxy_pqc_enabled gauge\n");
+    let pqc_enabled = i32::from(state.tls_provider.is_pqc_enabled());
+    let _ = writeln!(output, "pqcrypta_proxy_pqc_enabled {pqc_enabled}");
 
     // Backend metrics
-    output.push_str(&format!(
-        "# HELP pqcrypta_proxy_backend_up Backend availability\n"
-    ));
-    output.push_str(&format!(
-        "# TYPE pqcrypta_proxy_backend_up gauge\n"
-    ));
+    output.push_str("# HELP pqcrypta_proxy_backend_up Backend availability\n");
+    output.push_str("# TYPE pqcrypta_proxy_backend_up gauge\n");
 
     for (name, backend) in &config.backends {
         let healthy = state.backend_pool.check_health(backend).await;
-        output.push_str(&format!(
-            "pqcrypta_proxy_backend_up{{name=\"{}\"}} {}\n",
-            name,
-            if healthy { 1 } else { 0 }
-        ));
+        let health_val = i32::from(healthy);
+        let _ = writeln!(
+            output,
+            "pqcrypta_proxy_backend_up{{name=\"{name}\"}} {health_val}"
+        );
     }
 
     output
