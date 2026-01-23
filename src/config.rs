@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -30,10 +29,11 @@ pub struct ConfigManager {
 
 /// Events emitted on configuration changes
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum ConfigReloadEvent {
     /// Full configuration reload
     ConfigReloaded(Arc<ProxyConfig>),
-    /// TLS certificates reloaded
+    /// TLS certificates reloaded (scaffolded for hot-reload)
     TlsCertsReloaded,
     /// Reload failed with error
     ReloadFailed(String),

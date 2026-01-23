@@ -10,7 +10,6 @@
 //! - CORS handling
 //! - Standalone operation (full nginx replacement)
 
-use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,12 +24,9 @@ use axum::{
     routing::any,
 };
 use axum_server::tls_rustls::RustlsConfig;
-use http_body_util::BodyExt;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
-use rustls::pki_types::ServerName;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
@@ -130,6 +126,8 @@ pub async fn run_http_listener(
 }
 
 /// Run TLS passthrough server (SNI-based routing without termination)
+/// Note: Scaffolded for future use - can be enabled via configuration.
+#[allow(dead_code)]
 pub async fn run_tls_passthrough_server(
     addr: SocketAddr,
     config: Arc<ProxyConfig>,
@@ -159,8 +157,9 @@ pub async fn run_tls_passthrough_server(
 }
 
 /// Handle a TLS passthrough connection by peeking at SNI
+#[allow(dead_code)]
 async fn handle_passthrough_connection(
-    mut client_stream: TcpStream,
+    client_stream: TcpStream,
     client_addr: SocketAddr,
     config: Arc<ProxyConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -234,6 +233,7 @@ async fn handle_passthrough_connection(
 }
 
 /// Extract SNI from TLS ClientHello
+#[allow(dead_code)]
 fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {
     // TLS record header: type (1) + version (2) + length (2)
     if data.len() < 5 {
@@ -774,11 +774,12 @@ pub async fn run_http_redirect_server(
 }
 
 /// Create TLS connector for re-encrypt mode with optional client cert
+#[allow(dead_code)]
 pub fn create_backend_tls_connector(
     backend: &BackendConfig,
 ) -> Result<TlsConnector, Box<dyn std::error::Error + Send + Sync>> {
     use rustls::ClientConfig;
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls::pki_types::CertificateDer;
     use std::fs::File;
     use std::io::BufReader;
 
@@ -836,6 +837,7 @@ pub fn create_backend_tls_connector(
 }
 
 /// Dangerous: No-verification TLS verifier (for testing only)
+#[allow(dead_code)]
 #[derive(Debug)]
 struct NoVerifier;
 

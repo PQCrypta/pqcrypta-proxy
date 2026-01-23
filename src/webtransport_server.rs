@@ -10,10 +10,10 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use wtransport::{Endpoint, ServerConfig, Identity, Connection};
 use wtransport::config::QuicTransportConfig;
-use tracing::{info, error, warn, debug};
+use tracing::{info, error, debug};
 use serde_json::json;
 
 use crate::config::ProxyConfig;

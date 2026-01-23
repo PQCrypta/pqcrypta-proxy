@@ -17,7 +17,7 @@ use parking_lot::RwLock;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::ServerConfig as RustlsServerConfig;
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn};
 
 use crate::config::{PqcConfig, TlsConfig};
 
@@ -103,6 +103,7 @@ impl TlsProvider {
     }
 
     /// Check if certificates need reloading
+    #[allow(dead_code)]
     pub fn needs_reload(&self) -> bool {
         let tls_config = self.tls_config.read();
         let current_modified = std::fs::metadata(&tls_config.cert_path)
@@ -119,6 +120,7 @@ impl TlsProvider {
     }
 
     /// Update configuration (for hot-reload)
+    #[allow(dead_code)]
     pub fn update_config(&self, tls_config: &TlsConfig, pqc_config: &PqcConfig) -> anyhow::Result<()> {
         // Update stored configs
         *self.tls_config.write() = tls_config.clone();
@@ -409,9 +411,8 @@ pub struct CertificateInfo {
 ///
 /// This module provides abstraction for PQC key exchange when OpenSSL 3.5 + OQS is available.
 /// The actual PQC handshake is performed by OpenSSL; this provides monitoring and fallback.
+#[allow(dead_code)]
 pub mod pqc_kex {
-    use super::*;
-
     /// PQC KEX algorithm identifiers
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum PqcKem {

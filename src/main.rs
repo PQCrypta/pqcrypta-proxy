@@ -299,6 +299,11 @@ async fn main() -> anyhow::Result<()> {
     // Send shutdown signal
     let _ = shutdown_tx.send(()).await;
 
+    // Wait for admin server to stop
+    if let Err(e) = admin_handle.await {
+        warn!("Admin server task error during shutdown: {}", e);
+    }
+
     // Give spawned tasks time to complete
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 

@@ -13,14 +13,13 @@ use std::time::Duration;
 use bytes::{Buf, Bytes};
 use dashmap::DashMap;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
-use hyper::{Method, Request, StatusCode};
+use hyper::{Method, Request};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, warn};
 
 use crate::config::{BackendConfig, BackendType, ProxyConfig};
 
@@ -62,6 +61,7 @@ impl BackendPool {
     }
 
     /// Update configuration (for hot-reload)
+    #[allow(dead_code)]
     pub fn update_config(&mut self, config: Arc<ProxyConfig>) {
         // Update limiters for new/changed backends
         for (name, backend) in &config.backends {
@@ -315,6 +315,14 @@ impl BackendPool {
             .recv_response()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to receive response: {}", e))?;
+
+        // Log response status
+        let status = response.status();
+        debug!("HTTP/3 backend response status: {}", status);
+
+        if !status.is_success() {
+            warn!("HTTP/3 backend returned non-success status: {}", status);
+        }
 
         // Read response body
         let mut response_body = Vec::new();
