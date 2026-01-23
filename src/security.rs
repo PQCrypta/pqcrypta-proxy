@@ -219,7 +219,7 @@ impl SecurityState {
                     }
                 });
 
-        Self {
+        let state = Self {
             ip_rate_limiters: Arc::new(DashMap::new()),
             ip_connections: Arc::new(DashMap::new()),
             blocked_ips,
@@ -231,7 +231,25 @@ impl SecurityState {
             global_rate_limiter,
             #[cfg(feature = "geoip")]
             geoip_db,
-        }
+        };
+
+        // Spawn background cleanup task
+        state.spawn_cleanup_task();
+
+        state
+    }
+
+    /// Spawn a background task that periodically cleans up expired entries
+    fn spawn_cleanup_task(&self) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                state.cleanup();
+                debug!("Security state cleanup completed");
+            }
+        });
     }
 
     /// Check if an IP is from a blocked country
@@ -950,14 +968,14 @@ pub use geoip::*;
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_blocked_ip_expiration() {
+    #[tokio::test]
+    async fn test_blocked_ip_expiration() {
         let config = ProxyConfig::default();
         let security = SecurityState::new(&config);
 
         let ip: IpAddr = "192.168.1.1".parse().unwrap();
 
-        // Block for 1 second
+        // Block for 100ms
         security.block_ip(
             ip,
             BlockReason::RateLimitExceeded,
@@ -968,14 +986,14 @@ mod tests {
         assert!(security.is_blocked(&ip).is_some());
 
         // Wait for expiration
-        std::thread::sleep(Duration::from_millis(150));
+        tokio::time::sleep(Duration::from_millis(150)).await;
 
         // Should no longer be blocked
         assert!(security.is_blocked(&ip).is_none());
     }
 
-    #[test]
-    fn test_circuit_breaker() {
+    #[tokio::test]
+    async fn test_circuit_breaker() {
         let config = ProxyConfig::default();
         let security = SecurityState::new(&config);
 

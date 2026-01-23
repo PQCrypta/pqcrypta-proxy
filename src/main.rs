@@ -50,7 +50,6 @@
 #![allow(clippy::if_not_else)]
 #![allow(clippy::ignored_unit_patterns)]
 #![allow(clippy::ref_option)]
-#![allow(dead_code)]
 #![allow(clippy::trivially_copy_pass_by_ref)]
 
 //! `PQCrypta` Proxy - QUIC/HTTP3/WebTransport Proxy with Hybrid PQC TLS
@@ -74,6 +73,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 mod admin;
 mod compression;
 mod config;
+mod fingerprint;
 mod handlers;
 mod http3_features;
 mod http_listener;
@@ -82,6 +82,7 @@ mod proxy;
 mod quic_listener;
 mod security;
 mod tls;
+mod tls_acceptor;
 mod webtransport_server;
 
 use admin::AdminServer;

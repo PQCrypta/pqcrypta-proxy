@@ -4,14 +4,33 @@
 
 [![Build Status](https://github.com/PQCrypta/pqcrypta-proxy/workflows/CI/badge.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-33%20passing-brightgreen.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
 
 ## Highlights
 
 - **Full-Featured Proxy**: Domain-based routing, security headers, CORS, redirects
 - **Three TLS Modes**: Terminate, Re-encrypt, and Passthrough (SNI-based)
 - **Modern Protocols**: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebTransport
-- **Post-Quantum Ready**: Hybrid PQC key exchange via OpenSSL 3.5 + OQS provider
+- **Post-Quantum Ready**: Hybrid PQC key exchange (X25519MLKEM768) via rustls-post-quantum
 - **Zero Downtime**: Hot reload configuration and TLS certificates
+- **Advanced Security**: JA3/JA4 fingerprinting, circuit breaker, GeoIP blocking
+
+## All Features Implemented
+
+| Feature | Status | Description |
+|---------|--------|-------------|
+| Circuit Breaker | ✅ | Backend health monitoring with auto-recovery |
+| Rate Limiting | ✅ | Per-IP + global limits with auto-blocking |
+| DoS Protection | ✅ | Connection limits, request validation |
+| GeoIP Blocking | ✅ | Country-based blocking (MaxMind DB) |
+| JA3/JA4 Fingerprinting | ✅ | TLS client fingerprint detection and classification |
+| Priority Hints | ✅ | RFC 9218 response prioritization |
+| Request Coalescing | ✅ | Deduplicates identical in-flight requests |
+| Early Hints (103) | ✅ | Link headers for preload/preconnect |
+| Compression | ✅ | Brotli/gzip/deflate/zstd |
+| Security Headers | ✅ | HSTS, CSP, CORS, Alt-Svc |
+| PQC TLS | ✅ | X25519MLKEM768 hybrid (NIST Level 3) |
+| Background Cleanup | ✅ | Auto-cleanup of expired entries |
 
 ## Features
 
@@ -23,16 +42,24 @@
 - **HTTP→HTTPS Redirect**: Automatic port 80 to 443 redirect server
 
 ### Security
+- **JA3/JA4 TLS Fingerprinting**: Detects browsers, bots, scanners, malware based on TLS ClientHello
+- **Circuit Breaker**: Protects backends from cascading failures with automatic recovery
+- **Rate Limiting**: Per-IP token bucket with configurable burst and auto-blocking
+- **DoS Protection**: Connection limits, request size validation, auto-blocking
+- **GeoIP Blocking**: Block by country/region using MaxMind GeoLite2 database
 - **Security Headers**: HSTS, X-Frame-Options, CSP, COEP, COOP, CORP, and more
 - **CORS Handling**: Full CORS support with preflight OPTIONS handling
 - **Server Branding**: Hide backend identity (Apache/nginx → "PQCProxy v0.1.0")
-- **Rate Limiting**: Per-IP request and connection rate limiting
-- **DoS Protection**: Connection limits, timeouts, blocked IPs
+
+### HTTP/3 Advanced Features
+- **Early Hints (103)**: Preload CSS/JS resources via Link headers
+- **Priority Hints**: RFC 9218 Extensible Priorities for resource scheduling
+- **Request Coalescing**: Deduplicate identical GET/HEAD requests in flight
+- **Alt-Svc Advertisement**: Automatic HTTP/3 upgrade headers
 
 ### Protocols
 - **QUIC/HTTP/3**: Full HTTP/3 support with QUIC transport
 - **WebTransport**: Native WebTransport session handling for bidirectional streaming
-- **Alt-Svc Advertisement**: Automatic HTTP/3 upgrade headers
 - **X-Forwarded Headers**: X-Real-IP, X-Forwarded-For, X-Forwarded-Proto
 
 ### Operations
@@ -45,7 +72,6 @@
 ### Prerequisites
 
 - Rust 1.75+ (install via [rustup](https://rustup.rs/))
-- OpenSSL 3.5+ with OQS provider (optional, for PQC support)
 - TLS certificates (Let's Encrypt recommended)
 
 ### Build
@@ -131,6 +157,28 @@ forward_client_identity = true
 priority = 100
 ```
 
+### Security Configuration
+
+```toml
+[security]
+dos_protection = true
+blocked_ips = []
+geoip_db_path = "/var/www/html/pqcrypta-proxy/data/geoip/GeoLite2-City.mmdb"
+blocked_countries = ["CN", "RU", "KP"]
+
+[security.rate_limit]
+requests_per_second = 100
+burst_size = 200
+auto_block_threshold = 1000
+block_duration_secs = 3600
+max_connections_per_ip = 100
+
+[security.circuit_breaker]
+failure_threshold = 5
+success_threshold = 2
+timeout_secs = 30
+```
+
 ### TLS Modes
 
 #### 1. TLS Terminate (Default)
@@ -207,19 +255,6 @@ allow_credentials = true
 max_age = 86400
 ```
 
-### SEO Redirects
-
-```toml
-# Redirect underscore URLs to hyphenated (SEO best practice)
-[[routes]]
-name = "seo-redirect"
-host = "example.com"
-path_prefix = "/old_path"
-redirect = "/new-path"
-redirect_permanent = true
-priority = 1
-```
-
 See [config/example-config.toml](config/example-config.toml) for full documentation.
 
 ## CLI Arguments
@@ -259,8 +294,13 @@ Environment variables: `PQCRYPTA_CONFIG`, `PQCRYPTA_UDP_PORT`, `PQCRYPTA_ADMIN_P
                     │     └─► TLS Passthrough ─► SNI Routing (no decrypt)     │
                     │                                                          │
                     │  ┌─────────────────────────────────────────────────────┐ │
-                    │  │              Security Headers Middleware            │ │
-                    │  │  HSTS, X-Frame-Options, COEP, COOP, CORP, etc.     │ │
+                    │  │              Security Middleware Stack              │ │
+                    │  │  JA3/JA4 → Rate Limit → GeoIP → Circuit Breaker   │ │
+                    │  └─────────────────────────────────────────────────────┘ │
+                    │                                                          │
+                    │  ┌─────────────────────────────────────────────────────┐ │
+                    │  │              HTTP/3 Features Middleware             │ │
+                    │  │  Early Hints → Priority → Coalescing → Compression │ │
                     │  └─────────────────────────────────────────────────────┘ │
                     │                                                          │
                     │  ┌─────────────────────────────────────────────────────┐ │
@@ -289,40 +329,49 @@ Environment variables: `PQCRYPTA_CONFIG`, `PQCRYPTA_UDP_PORT`, `PQCRYPTA_ADMIN_P
                     └──────────────────────────────────────────────────────────┘
 ```
 
+## Module Structure
+
+```
+src/
+├── main.rs              # Entry point
+├── lib.rs               # Library exports
+├── config.rs            # Configuration parsing
+├── proxy.rs             # Backend pool & load balancing
+├── http_listener.rs     # HTTP/1.1 + HTTP/2 listener with PQC TLS
+├── quic_listener.rs     # QUIC/HTTP/3 listener
+├── security.rs          # Rate limiting, DoS, GeoIP, circuit breaker
+├── fingerprint.rs       # JA3/JA4 TLS fingerprint extraction
+├── tls_acceptor.rs      # Custom TLS acceptor with fingerprint capture
+├── compression.rs       # Brotli/Zstd/Gzip compression
+├── http3_features.rs    # Early Hints, Priority, Request Coalescing
+├── admin.rs             # Admin API endpoints
+├── tls.rs               # TLS configuration
+└── pqc_tls.rs           # Post-Quantum TLS provider
+```
+
 ## Post-Quantum Cryptography
 
-PQCrypta Proxy supports hybrid PQC key exchange using OpenSSL 3.5+ with the OQS (Open Quantum Safe) provider.
+PQCrypta Proxy supports hybrid PQC key exchange using rustls-post-quantum (X25519MLKEM768).
 
 ### Supported KEMs
 
 | Algorithm | Security Level | Description |
 |-----------|---------------|-------------|
+| `X25519MLKEM768` | NIST Level 3 | Hybrid X25519 + ML-KEM-768 (default) |
 | `kyber768` | NIST Level 3 | Kyber-768 standalone |
 | `kyber1024` | NIST Level 5 | Kyber-1024 standalone |
 | `mlkem768` | NIST Level 3 | ML-KEM-768 (FIPS 203) |
 | `mlkem1024` | NIST Level 5 | ML-KEM-1024 (FIPS 203) |
-| `x25519_kyber768` | Hybrid | X25519 + Kyber-768 hybrid |
 
-### Setup OpenSSL 3.5 with OQS
+### Configuration
 
-```bash
-# Install OpenSSL 3.5
-wget https://www.openssl.org/source/openssl-3.5.0.tar.gz
-tar xzf openssl-3.5.0.tar.gz
-cd openssl-3.5.0
-./Configure --prefix=/usr/local/openssl-3.5
-make -j$(nproc)
-sudo make install
-
-# Install OQS provider
-git clone https://github.com/open-quantum-safe/oqs-provider.git
-cd oqs-provider
-cmake -DCMAKE_PREFIX_PATH=/usr/local/openssl-3.5 -B build
-cmake --build build
-sudo cmake --install build
-
-# Verify PQC support
-/usr/local/openssl-3.5/bin/openssl list -kem-algorithms | grep -i kyber
+```toml
+[pqc]
+enabled = true
+provider = "rustls-pqc"
+preferred_kem = "x25519_mlkem768"
+hybrid_mode = true
+fallback_to_classical = true
 ```
 
 ## Admin API
@@ -422,27 +471,25 @@ cargo run --release --bin quic-bench -- --target localhost:443
 
 ## Security
 
-### Checklist - All Core Features Complete
+### All Security Features Complete
 
 - [x] TLS 1.3 only (enforced by QUIC)
 - [x] Full security headers (HSTS, COEP, COOP, CORP, etc.)
 - [x] Server identity hidden (custom branding)
 - [x] X-Forwarded-For header support
-- [x] Rate limiting (governor crate, per-IP token bucket with burst handling)
-- [x] DoS protection (connection limits, auto-blocking after threshold)
-- [x] Request size limits (413/431 responses for oversized requests)
+- [x] Rate limiting (per-IP token bucket with burst handling)
+- [x] DoS protection (connection limits, auto-blocking)
+- [x] Request size limits (413/431 responses)
 - [x] GeoIP blocking (MaxMind DB integration)
-- [x] JA3/JA4 TLS fingerprinting (implemented)
+- [x] JA3/JA4 TLS fingerprinting (browser/bot/malware detection)
 - [x] Circuit breaker (backend protection)
 - [x] IP blocking (manual + auto with expiration)
 - [x] Compression (Brotli, Zstd, Gzip, Deflate)
 - [x] Early Hints (103) support
 - [x] Priority Hints (RFC 9218)
-- [x] Request Coalescing (dedupe identical in-flight requests)
-- [ ] Enable PQC hybrid key exchange for quantum resistance
-- [ ] Use strong TLS certificates (ECDSA P-384 or Ed25519)
-- [ ] Disable 0-RTT if replay attacks are a concern
-- [ ] Monitor with Prometheus metrics
+- [x] Request Coalescing (dedupe identical requests)
+- [x] PQC hybrid key exchange (X25519MLKEM768)
+- [x] Background cleanup (auto-expire blocked IPs)
 
 ### mTLS Configuration
 

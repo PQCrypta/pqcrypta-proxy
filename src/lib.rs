@@ -52,8 +52,6 @@
 #![allow(clippy::if_not_else)]
 #![allow(clippy::ignored_unit_patterns)]
 #![allow(clippy::ref_option)]
-// TODO: Clean up dead code in future PR - these are infrastructure components not yet integrated
-#![allow(dead_code)]
 #![allow(clippy::trivially_copy_pass_by_ref)]
 
 //! `PQCrypta` Proxy - QUIC/HTTP3/WebTransport Proxy with Hybrid PQC TLS
@@ -68,6 +66,7 @@
 pub mod admin;
 pub mod compression;
 pub mod config;
+pub mod fingerprint;
 pub mod handlers;
 pub mod http3_features;
 pub mod http_listener;
@@ -76,11 +75,13 @@ pub mod proxy;
 pub mod quic_listener;
 pub mod security;
 pub mod tls;
+pub mod tls_acceptor;
 pub mod webtransport_server;
 
 // Re-export commonly used types
 pub use compression::{compression_middleware, CompressionConfig, CompressionState};
 pub use config::{ConfigManager, ProxyConfig};
+pub use fingerprint::{FingerprintExtractor, FingerprintResult, FingerprintStats, Ja3Fingerprint};
 pub use http3_features::{
     early_hints_middleware, http3_features_middleware, CoalescingState, EarlyHintsState,
     Http3FeaturesState, PriorityState,
@@ -92,6 +93,7 @@ pub use pqc_tls::{verify_pqc_support, PqcKemAlgorithm, PqcStatus, PqcTlsProvider
 pub use proxy::BackendPool;
 pub use security::{security_middleware, SecurityState};
 pub use tls::TlsProvider;
+pub use tls_acceptor::{FingerprintedConnection, FingerprintingTlsAcceptor};
 pub use webtransport_server::WebTransportServer;
 
 /// Library version
