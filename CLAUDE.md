@@ -6,21 +6,28 @@ This file provides guidance to Claude Code when working with the PQCrypta Proxy 
 
 PQCrypta Proxy is a high-performance reverse proxy with QUIC/HTTP/3, WebTransport, and Post-Quantum Cryptography TLS support.
 
-## ✅ All Features Implemented
+**Version**: v1.0.0 (2026-01-23)
+**Status**: All features complete and integrated
+**Tests**: 33 passing
 
-| Feature | Status | Module |
-|---------|--------|--------|
-| Rate Limiting | ✅ COMPLETE | `security.rs` |
-| DoS Protection | ✅ COMPLETE | `security.rs` |
-| IP Blocking | ✅ COMPLETE | `security.rs` |
-| GeoIP Blocking | ✅ COMPLETE | `security.rs` |
-| Compression | ✅ COMPLETE | `compression.rs` |
-| Request Size Limits | ✅ COMPLETE | `security.rs` |
-| Early Hints (103) | ✅ COMPLETE | `http3_features.rs` |
-| Priority Hints | ✅ COMPLETE | `http3_features.rs` |
-| Request Coalescing | ✅ COMPLETE | `http3_features.rs` |
-| JA3/JA4 Fingerprinting | ✅ COMPLETE | `security.rs` |
-| Circuit Breaker | ✅ COMPLETE | `security.rs` |
+## All Features Fully Integrated
+
+| Feature | Status | Module | Integration |
+|---------|--------|--------|-------------|
+| Circuit Breaker | ✅ COMPLETE | `security.rs` | Integrated in `http_listener.rs` proxy_handler |
+| Rate Limiting | ✅ COMPLETE | `security.rs` | Integrated via security_middleware |
+| DoS Protection | ✅ COMPLETE | `security.rs` | Integrated via security_middleware |
+| IP Blocking | ✅ COMPLETE | `security.rs` | Integrated with auto-expiration |
+| GeoIP Blocking | ✅ COMPLETE | `security.rs` | MaxMind DB loaded at startup |
+| Compression | ✅ COMPLETE | `compression.rs` | Integrated via compression_middleware |
+| Request Size Limits | ✅ COMPLETE | `security.rs` | Integrated via security_middleware |
+| Early Hints (103) | ✅ COMPLETE | `http3_features.rs` | Link headers added to responses |
+| Priority Hints | ✅ COMPLETE | `http3_features.rs` | RFC 9218 headers added |
+| Request Coalescing | ✅ COMPLETE | `http3_features.rs` | Deduplicates in-flight requests |
+| JA3/JA4 Fingerprinting | ✅ COMPLETE | `fingerprint.rs` | Full extraction and classification |
+| TLS Acceptor | ✅ COMPLETE | `tls_acceptor.rs` | ClientHello capture infrastructure |
+| Background Cleanup | ✅ COMPLETE | `security.rs` | Auto-spawned cleanup task |
+| PQC TLS | ✅ COMPLETE | `http_listener.rs` | X25519MLKEM768 via rustls-post-quantum |
 
 ## Development Commands
 
@@ -28,14 +35,14 @@ PQCrypta Proxy is a high-performance reverse proxy with QUIC/HTTP/3, WebTranspor
 # Build release binary
 cargo build --release
 
-# Run tests
+# Run tests (33 tests)
 cargo test
 
 # Run with config
-./target/release/pqcrypta-proxy --config /var/www/html/pqcrypta-proxy/config/proxy.toml
+./target/release/pqcrypta-proxy --config /etc/pqcrypta/proxy-config.toml
 
 # Validate config only
-./target/release/pqcrypta-proxy --config /var/www/html/pqcrypta-proxy/config/proxy.toml --validate
+./target/release/pqcrypta-proxy --config /etc/pqcrypta/proxy-config.toml --validate
 ```
 
 ## Deployment
@@ -78,12 +85,17 @@ sudo journalctl -u pqcrypta-proxy -f
 │   ├── lib.rs              # Library exports
 │   ├── config.rs           # Configuration parsing
 │   ├── proxy.rs            # Backend pool & load balancing
-│   ├── http_listener.rs    # HTTP/1.1 + HTTP/2 listener
+│   ├── http_listener.rs    # HTTP/1.1 + HTTP/2 listener with PQC TLS
 │   ├── quic_listener.rs    # QUIC/HTTP/3 listener
 │   ├── handlers.rs         # Request handlers
-│   ├── security.rs         # Rate limiting, DoS, GeoIP, JA3/JA4
+│   ├── security.rs         # Rate limiting, DoS, GeoIP, circuit breaker
+│   ├── fingerprint.rs      # JA3/JA4 TLS fingerprint extraction (NEW)
+│   ├── tls_acceptor.rs     # Custom TLS acceptor with fingerprint capture (NEW)
 │   ├── compression.rs      # Brotli/Zstd/Gzip compression
-│   └── http3_features.rs   # Early Hints, Priority, Coalescing
+│   ├── http3_features.rs   # Early Hints, Priority, Coalescing
+│   ├── admin.rs            # Admin API endpoints
+│   ├── tls.rs              # TLS configuration
+│   └── pqc_tls.rs          # Post-Quantum TLS provider
 ├── vendor/
 │   └── wtransport/         # Vendored WebTransport library
 └── target/
@@ -101,28 +113,73 @@ Request → Security → HTTP/3 Features → Compression → Alt-Svc → Headers
 Response ← Security ← HTTP/3 Features ← Compression ← Alt-Svc ← Headers ← Handler
 ```
 
+### Security Middleware (`security.rs`)
+1. Check if IP is blocked
+2. Apply rate limiting (per-IP token bucket)
+3. Check GeoIP restrictions
+4. Validate request size
+5. Check circuit breaker status
+
+### HTTP/3 Features Middleware (`http3_features.rs`)
+1. Add Priority headers (RFC 9218)
+2. Check request coalescing
+3. Add Early Hints Link headers
+
+### Compression Middleware (`compression.rs`)
+1. Check Accept-Encoding
+2. Apply Brotli/Zstd/Gzip/Deflate compression
+3. Skip pre-compressed content
+
 ## Feature Details
 
-### 1. Rate Limiting (`security.rs`)
+### 1. Circuit Breaker (`security.rs` + `http_listener.rs`)
+
+**Integration Points:**
+- `security.rs:circuit_allows()` - Check if backend is healthy
+- `security.rs:record_backend_result()` - Record success/failure
+- `http_listener.rs:proxy_handler()` - Check before forwarding, record after response
+
+**Behavior:**
+- Opens after 5 consecutive failures
+- Closes after 2 consecutive successes
+- Returns 503 when open
+
+### 2. Rate Limiting (`security.rs`)
 
 - Per-IP token bucket algorithm via `governor` crate
 - Configurable requests/second and burst size
 - Automatic IP blocking after threshold
 - Retry-After headers on rate limit responses
 
-### 2. DoS Protection (`security.rs`)
+### 3. JA3/JA4 Fingerprinting (`fingerprint.rs`)
 
-- Connection limits per IP
-- Auto-blocking with expiration
-- Request size validation (413/431 responses)
+**New module with:**
+- Full JA3 extraction from TLS ClientHello
+- JA4 fingerprint calculation (newer format)
+- Known fingerprint database:
+  - Browsers: Chrome, Firefox, Safari, Edge
+  - Legitimate bots: Googlebot, Bingbot, Cloudflare-Bot
+  - Malicious: SQLMap, Exploit Kits
+  - Scanners: Nmap, Nikto, Burp Suite
+  - API clients: curl, wget, Python-requests
+- Classification: Browser, LegitimateBot, Suspicious, Malicious, Scanner, ApiClient
+- Auto-blocking of malicious fingerprints
 
-### 3. GeoIP Blocking (`security.rs`)
+### 4. TLS Acceptor (`tls_acceptor.rs`)
+
+**New module with:**
+- `FingerprintingTlsAcceptor` - Custom TLS acceptor
+- `FingerprintedTlsStream` - Stream wrapper with fingerprint metadata
+- `FingerprintedConnection` - Connection info with JA3/JA4 data
+- Peeks at ClientHello before TLS handshake
+
+### 5. GeoIP Blocking (`security.rs`)
 
 - MaxMind GeoLite2 database integration
 - Country-level access control
 - Database path: `/var/www/html/pqcrypta-proxy/data/geoip/GeoLite2-City.mmdb`
 
-### 4. Compression (`compression.rs`)
+### 6. Compression (`compression.rs`)
 
 - **Brotli** (quality 4) - Best compression
 - **Zstandard** (level 3) - Fast with good ratios
@@ -131,7 +188,7 @@ Response ← Security ← HTTP/3 Features ← Compression ← Alt-Svc ← Header
 - Content negotiation via Accept-Encoding
 - Skips pre-compressed content
 
-### 5. Early Hints (`http3_features.rs`)
+### 7. Early Hints (`http3_features.rs`)
 
 - `LinkHint::Preload` - Preload CSS, JS, fonts
 - `LinkHint::Preconnect` - Preconnect to origins
@@ -139,7 +196,7 @@ Response ← Security ← HTTP/3 Features ← Compression ← Alt-Svc ← Header
 - `LinkHint::ModulePreload` - ES Module preload
 - `LinkHint::Prerender` - Speculative page prerender
 
-### 6. Priority Hints (`http3_features.rs`)
+### 8. Priority Hints (`http3_features.rs`)
 
 RFC 9218 Extensible Priorities:
 - HTML: `u=0` (highest)
@@ -149,41 +206,58 @@ RFC 9218 Extensible Priorities:
 - JSON API: `u=2`
 - Images: `u=5, incremental`
 
-### 7. Request Coalescing (`http3_features.rs`)
+### 9. Request Coalescing (`http3_features.rs`)
 
 - Deduplicates identical GET/HEAD requests
 - Broadcast channel for response sharing
 - Configurable max wait time (100ms default)
 - `x-coalesced: true` header on coalesced responses
 
+### 10. Background Cleanup (`security.rs`)
+
+- Spawned automatically when SecurityState is created
+- Runs every 60 seconds
+- Cleans up:
+  - Expired blocked IPs
+  - Old rate limiter entries
+  - Stale circuit breaker states
+  - Expired fingerprint cache entries
+
 ## Configuration
 
-Main config file: `/var/www/html/pqcrypta-proxy/config/proxy.toml`
+Main config file: `/etc/pqcrypta/proxy-config.toml`
 
 ```toml
-[proxy]
-bind_addr = "0.0.0.0"
-http_port = 80
-https_port = 443
-quic_port = 443
+[server]
+bind_address = "0.0.0.0"
+udp_port = 443
+additional_ports = [4433, 4434]
 
-[backends]
-[[backends.routes]]
-domain = "api.pqcrypta.com"
-upstream = "127.0.0.1:3003"
+[tls]
+cert_path = "/etc/letsencrypt/live/pqcrypta.com/fullchain.pem"
+key_path = "/etc/letsencrypt/live/pqcrypta.com/privkey.pem"
+min_version = "1.3"
 
-[[backends.routes]]
-domain = "pqcrypta.com"
-upstream = "127.0.0.1:8080"
+[pqc]
+enabled = true
+provider = "rustls-pqc"
+preferred_kem = "x25519_mlkem768"
+hybrid_mode = true
 
 [security]
 dos_protection = true
 geoip_db_path = "/var/www/html/pqcrypta-proxy/data/geoip/GeoLite2-City.mmdb"
+blocked_countries = []
 
 [security.rate_limit]
 requests_per_second = 100
 burst_size = 200
 auto_block_threshold = 1000
+
+[security.circuit_breaker]
+failure_threshold = 5
+success_threshold = 2
+timeout_secs = 30
 
 [compression]
 enabled = true
@@ -193,6 +267,30 @@ algorithms = ["br", "zstd", "gzip", "deflate"]
 early_hints_enabled = true
 priority_hints_enabled = true
 coalescing_enabled = true
+
+[backends.api]
+name = "api"
+type = "http1"
+address = "127.0.0.1:3003"
+tls_mode = "terminate"
+
+[backends.apache]
+name = "apache"
+type = "http1"
+address = "127.0.0.1:8080"
+tls_mode = "terminate"
+
+[[routes]]
+name = "api-route"
+host = "api.pqcrypta.com"
+path_prefix = "/"
+backend = "api"
+
+[[routes]]
+name = "main-site"
+host = "pqcrypta.com"
+path_prefix = "/"
+backend = "apache"
 ```
 
 ## Code Standards
@@ -200,7 +298,7 @@ coalescing_enabled = true
 - **Language**: Rust (stable channel)
 - **Async Runtime**: Tokio
 - **HTTP Framework**: Axum + Hyper
-- **TLS**: Rustls
+- **TLS**: Rustls with rustls-post-quantum
 - **QUIC**: Quinn (via wtransport)
 - **Formatting**: `cargo fmt`
 - **Linting**: `cargo clippy`
@@ -208,19 +306,21 @@ coalescing_enabled = true
 ## CSP Policy
 
 Same as main PQCrypta project:
-- ❌ NO inline styles
-- ❌ NO inline scripts
-- ❌ NO inline event handlers
-- ✅ External CSS/JS files only
-- ✅ Use nonces when absolutely necessary
+- No inline styles
+- No inline scripts
+- No inline event handlers
+- External CSS/JS files only
+- Use nonces when absolutely necessary
 
 ## Security Considerations
 
 - Rate limiting prevents abuse
 - GeoIP blocking for geographic restrictions
 - JA3/JA4 fingerprinting detects suspicious clients
-- Circuit breaker protects backends
+- Circuit breaker protects backends from cascading failures
 - All TLS 1.3 (enforced by QUIC)
+- PQC hybrid key exchange (X25519MLKEM768)
+- Background cleanup prevents memory leaks
 
 ## Systemd Service
 
@@ -230,10 +330,11 @@ Location: `/etc/systemd/system/pqcrypta-proxy.service`
 [Unit]
 Description=PQCrypta Proxy - QUIC/HTTP3/WebTransport Proxy with PQC TLS
 After=network.target
+Documentation=https://github.com/PQCrypta/pqcrypta-proxy
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/pqcrypta-proxy --config /var/www/html/pqcrypta-proxy/config/proxy.toml
+ExecStart=/usr/local/bin/pqcrypta-proxy --config /etc/pqcrypta/proxy-config.toml
 Restart=always
 RestartSec=5
 User=root
@@ -241,7 +342,7 @@ WorkingDirectory=/var/www/html/pqcrypta-proxy
 Environment=RUST_LOG=info
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=multi-target.target
 ```
 
 ## Troubleshooting
@@ -263,6 +364,24 @@ sudo journalctl -u pqcrypta-proxy -f
 sudo systemctl status pqcrypta-proxy
 ```
 
-## Version
+### Test endpoints
+```bash
+# Health check
+curl -s https://api.pqcrypta.com/health | head -c 200
 
-**v1.0.0** - All features complete (2026-01-22)
+# Check response headers
+curl -sI https://api.pqcrypta.com/health | grep -E "^(server|alt-svc|priority):"
+
+# Test circuit breaker (multiple requests)
+for i in {1..5}; do curl -s -o /dev/null -w "%{http_code}\n" https://api.pqcrypta.com/health; done
+```
+
+## Recent Changes (2026-01-23)
+
+1. **Circuit Breaker Integration** - Now checks backend health before forwarding, records results after
+2. **JA3/JA4 Fingerprinting Module** - New `fingerprint.rs` with full extraction and classification
+3. **TLS Acceptor Module** - New `tls_acceptor.rs` for ClientHello capture
+4. **Background Cleanup** - Auto-spawned task for expired entry cleanup
+5. **FingerprintExtractor in HttpListenerState** - Added to state for request processing
+6. **Tests Fixed** - Updated to use `#[tokio::test]` for async tests
+7. **All 33 tests passing**

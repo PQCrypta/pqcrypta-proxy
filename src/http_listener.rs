@@ -36,6 +36,7 @@ use crate::pqc_tls::PqcTlsProvider;
 
 use crate::compression::{compression_middleware, CompressionState};
 use crate::config::{BackendConfig, CorsConfig, ProxyConfig, TlsMode};
+use crate::fingerprint::FingerprintExtractor;
 use crate::http3_features::{http3_features_middleware, Http3FeaturesState};
 use crate::security::{security_middleware, SecurityState};
 
@@ -46,6 +47,8 @@ pub struct HttpListenerState {
     pub port: u16,
     pub http_client: Client<HttpConnector, Body>,
     pub https_client: Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>,
+    pub security: SecurityState,
+    pub fingerprint: Arc<FingerprintExtractor>,
 }
 
 /// Create and run the HTTP listener with TLS termination
@@ -84,15 +87,20 @@ pub async fn run_http_listener(
         .pool_idle_timeout(Duration::from_secs(90))
         .build(https_connector);
 
+    // Initialize security state from config (must be created before state)
+    let security_state = SecurityState::new(&config);
+
+    // Initialize fingerprint extractor for JA3/JA4 tracking
+    let fingerprint_extractor = Arc::new(FingerprintExtractor::new());
+
     let state = HttpListenerState {
         config: config.clone(),
         port,
         http_client,
         https_client,
+        security: security_state.clone(),
+        fingerprint: fingerprint_extractor,
     };
-
-    // Initialize security state from config
-    let security_state = SecurityState::new(&config);
 
     // Initialize compression state
     let compression_state = CompressionState::default();
@@ -206,15 +214,20 @@ pub async fn run_http_listener_pqc(
         .pool_idle_timeout(Duration::from_secs(90))
         .build(https_connector);
 
+    // Initialize security state from config (must be created before state)
+    let security_state = SecurityState::new(&config);
+
+    // Initialize fingerprint extractor for JA3/JA4 tracking
+    let fingerprint_extractor = Arc::new(FingerprintExtractor::new());
+
     let state = HttpListenerState {
         config: config.clone(),
         port,
         http_client,
         https_client,
+        security: security_state.clone(),
+        fingerprint: fingerprint_extractor,
     };
-
-    // Initialize security state from config
-    let security_state = SecurityState::new(&config);
 
     // Initialize compression state
     let compression_state = CompressionState::default();
@@ -741,6 +754,19 @@ async fn proxy_handler(
         }
         let backend = backend.unwrap();
 
+        // Check circuit breaker - if backend is unhealthy, reject early
+        if !state.security.circuit_allows(&route.backend) {
+            warn!(
+                "Circuit breaker open for backend '{}', rejecting request",
+                route.backend
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service temporarily unavailable",
+            )
+                .into_response();
+        }
+
         // Determine TLS mode (use tls_mode, or legacy tls bool)
         let tls_mode = if backend.tls {
             TlsMode::Reencrypt
@@ -866,6 +892,9 @@ async fn proxy_handler(
 
         match result {
             Ok(backend_response) => {
+                // Record success for circuit breaker
+                state.security.record_backend_result(&route.backend, true);
+
                 let (mut parts, incoming_body) = backend_response.into_parts();
 
                 // Add CORS headers if configured
@@ -902,6 +931,9 @@ async fn proxy_handler(
                 Response::from_parts(parts, body)
             }
             Err(e) => {
+                // Record failure for circuit breaker
+                state.security.record_backend_result(&route.backend, false);
+
                 error!("Backend request failed: {}", e);
                 (StatusCode::BAD_GATEWAY, format!("Backend error: {}", e)).into_response()
             }

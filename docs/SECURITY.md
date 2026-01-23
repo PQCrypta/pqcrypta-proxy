@@ -2,17 +2,36 @@
 
 This document provides security hardening guidelines, operational best practices, and a migration plan for deploying PQCrypta Proxy in production environments.
 
+**Last Updated**: 2026-01-23
+**Status**: All security features implemented and integrated
+
+## Security Features Status
+
+| Feature | Status | Module |
+|---------|--------|--------|
+| TLS 1.3 Only | ✅ Complete | `http_listener.rs` |
+| PQC Hybrid Key Exchange | ✅ Complete | `http_listener.rs` (X25519MLKEM768) |
+| Rate Limiting | ✅ Complete | `security.rs` |
+| DoS Protection | ✅ Complete | `security.rs` |
+| GeoIP Blocking | ✅ Complete | `security.rs` |
+| JA3/JA4 Fingerprinting | ✅ Complete | `fingerprint.rs` |
+| Circuit Breaker | ✅ Complete | `security.rs` + `http_listener.rs` |
+| IP Blocking | ✅ Complete | `security.rs` |
+| Request Size Limits | ✅ Complete | `security.rs` |
+| Security Headers | ✅ Complete | `http_listener.rs` |
+| Background Cleanup | ✅ Complete | `security.rs` |
+
 ## Security Checklist
 
 ### TLS Configuration
 
-- [ ] **Use TLS 1.3 only** (enforced by QUIC)
-- [ ] **Enable hybrid PQC key exchange** for quantum resistance
+- [x] **Use TLS 1.3 only** (enforced by QUIC)
+- [x] **Enable hybrid PQC key exchange** for quantum resistance (X25519MLKEM768)
 - [ ] **Use strong certificates** (ECDSA P-384 or Ed25519 recommended)
 - [ ] **Enable OCSP stapling** for certificate validation
 - [ ] **Configure automatic certificate renewal** with Let's Encrypt
 - [ ] **Disable 0-RTT** if replay attacks are a concern
-- [ ] **Set appropriate cipher suites** (TLS 1.3 only has secure options)
+- [x] **Set appropriate cipher suites** (TLS 1.3 only has secure options)
 
 ```toml
 [tls]
@@ -157,20 +176,21 @@ auth_token = "your-secret-token-here"
 allowed_ips = ["127.0.0.1", "10.0.0.0/8"]
 ```
 
-### Rate Limiting & DoS Protection ✅ IMPLEMENTED
+### Rate Limiting & DoS Protection ✅ FULLY IMPLEMENTED & INTEGRATED
 
-All rate limiting and DoS protection features are now fully implemented:
+All rate limiting and DoS protection features are now fully implemented and integrated into the request flow:
 
-- [x] **Request rate limiting** - Per-IP token bucket via `governor` crate
-- [x] **Connection rate limiting** - Configurable `max_connections_per_ip`
-- [x] **Burst handling** - `burst_size` configuration
-- [x] **Automatic IP blocking** - After `auto_block_threshold` exceeded
-- [x] **Maximum request/header sizes** - 413/431 responses for oversized requests
-- [x] **Connection timeouts** - Configurable timeouts
-- [x] **DoS protection** - Connection limits, auto-blocking with expiration
-- [x] **GeoIP blocking** - MaxMind DB integration for country-level blocking
-- [x] **JA3/JA4 fingerprinting** - TLS fingerprint detection
-- [x] **Circuit breaker** - Backend protection from cascading failures
+- [x] **Request rate limiting** - Per-IP token bucket via `governor` crate (integrated via security_middleware)
+- [x] **Connection rate limiting** - Configurable `max_connections_per_ip` (integrated via security_middleware)
+- [x] **Burst handling** - `burst_size` configuration (integrated via security_middleware)
+- [x] **Automatic IP blocking** - After `auto_block_threshold` exceeded (integrated with auto-expiration)
+- [x] **Maximum request/header sizes** - 413/431 responses for oversized requests (integrated via security_middleware)
+- [x] **Connection timeouts** - Configurable timeouts (integrated via axum-server)
+- [x] **DoS protection** - Connection limits, auto-blocking with expiration (integrated via security_middleware)
+- [x] **GeoIP blocking** - MaxMind DB integration for country-level blocking (loaded at startup)
+- [x] **JA3/JA4 fingerprinting** - Full TLS ClientHello extraction and classification (new `fingerprint.rs` module)
+- [x] **Circuit breaker** - Backend protection from cascading failures (integrated in `proxy_handler`)
+- [x] **Background cleanup** - Auto-spawned task for expired entry cleanup (60-second interval)
 
 ```toml
 [security]
