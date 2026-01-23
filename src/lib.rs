@@ -70,6 +70,7 @@ pub mod fingerprint;
 pub mod handlers;
 pub mod http3_features;
 pub mod http_listener;
+pub mod load_balancer;
 pub mod pqc_tls;
 pub mod proxy;
 pub mod quic_listener;
@@ -81,6 +82,10 @@ pub mod webtransport_server;
 // Re-export commonly used types
 pub use compression::{compression_middleware, CompressionConfig, CompressionState};
 pub use config::{ConfigManager, ProxyConfig};
+pub use load_balancer::{
+    BackendPool as LbBackendPool, BackendServer, LoadBalancer, PoolStats, SelectionContext,
+    SessionCookieConfig, extract_session_cookie,
+};
 pub use fingerprint::{FingerprintExtractor, FingerprintResult, FingerprintStats, Ja3Fingerprint};
 pub use http3_features::{
     early_hints_middleware, http3_features_middleware, CoalescingState, EarlyHintsState,

@@ -77,6 +77,7 @@ mod fingerprint;
 mod handlers;
 mod http3_features;
 mod http_listener;
+mod load_balancer;
 mod pqc_tls;
 mod proxy;
 mod quic_listener;
