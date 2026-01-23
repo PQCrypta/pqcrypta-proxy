@@ -222,7 +222,136 @@ blocked_ips = []
 allowed_ips = []
 
 # =============================
-# Backend Definitions
+# Load Balancer Configuration
+# =============================
+# Configure load balancing for backend pools with multiple servers.
+# Supports: least_connections (default), round_robin, weighted_round_robin,
+#           random, ip_hash, least_response_time
+
+[load_balancer]
+# Enable load balancing (automatically enabled when backend_pools defined)
+enabled = true
+
+# Default algorithm for all pools (can be overridden per-pool)
+# Options: least_connections, round_robin, weighted_round_robin, random, ip_hash, least_response_time
+default_algorithm = "least_connections"
+
+# Session affinity (sticky sessions) configuration
+[load_balancer.session_affinity]
+# Enable session affinity globally
+enabled = false
+# Cookie name for session tracking
+cookie_name = "PQCPROXY_BACKEND"
+# Cookie TTL in seconds (0 = session cookie)
+cookie_ttl_secs = 3600
+# Use secure cookies (HTTPS only)
+cookie_secure = true
+# Use HttpOnly cookies (prevent XSS access)
+cookie_httponly = true
+# SameSite attribute: strict, lax, none
+cookie_samesite = "lax"
+
+# Request queue for when all backends are saturated
+[load_balancer.queue]
+enabled = true
+max_size = 1000
+timeout_ms = 5000
+
+# Slow start for recovering backends (gradual traffic increase)
+[load_balancer.slow_start]
+enabled = true
+duration_secs = 30
+initial_weight_percent = 10
+
+# Connection draining for graceful backend removal
+[load_balancer.connection_draining]
+enabled = true
+timeout_secs = 30
+
+# =============================
+# Backend Pools (Load Balanced)
+# =============================
+# Backend pools define multiple servers for load balancing.
+# Routes can reference pools by name just like single backends.
+# Pools take priority over single backends with the same name.
+
+# Example: API pool with 3 servers using least_connections
+[backend_pools.api-pool]
+name = "api-pool"
+algorithm = "least_connections"  # Override default algorithm
+health_aware = true              # Skip unhealthy backends
+affinity = "none"                # Options: none, cookie, ip_hash, header
+health_check_path = "/health"
+health_check_interval_secs = 10
+
+[[backend_pools.api-pool.servers]]
+address = "127.0.0.1:3003"
+weight = 100          # For weighted algorithms
+priority = 1          # Lower = higher priority for failover
+max_connections = 100
+timeout_ms = 30000
+tls_mode = "terminate"
+
+[[backend_pools.api-pool.servers]]
+address = "127.0.0.1:3004"
+weight = 100
+priority = 1
+max_connections = 100
+timeout_ms = 30000
+tls_mode = "terminate"
+
+[[backend_pools.api-pool.servers]]
+address = "10.0.0.5:3003"
+weight = 50           # Half the traffic (weighted algorithms)
+priority = 2          # Failover only (used when priority 1 servers down)
+max_connections = 50
+timeout_ms = 30000
+tls_mode = "terminate"
+
+# Example: Apache pool with IP hash for session stickiness
+[backend_pools.apache-pool]
+name = "apache-pool"
+algorithm = "ip_hash"   # Consistent hashing by client IP
+health_aware = true
+affinity = "ip_hash"    # Built-in IP-based stickiness
+health_check_path = "/health"
+health_check_interval_secs = 10
+
+[[backend_pools.apache-pool.servers]]
+address = "127.0.0.1:8080"
+weight = 100
+priority = 1
+max_connections = 200
+
+[[backend_pools.apache-pool.servers]]
+address = "127.0.0.1:8081"
+weight = 100
+priority = 1
+max_connections = 200
+
+# Example: Session pool with cookie-based sticky sessions
+[backend_pools.session-pool]
+name = "session-pool"
+algorithm = "round_robin"
+health_aware = true
+affinity = "cookie"     # Cookie-based sticky sessions
+health_check_path = "/health"
+health_check_interval_secs = 10
+
+[[backend_pools.session-pool.servers]]
+address = "192.168.1.10:8000"
+weight = 100
+priority = 1
+max_connections = 100
+
+[[backend_pools.session-pool.servers]]
+address = "192.168.1.11:8000"
+weight = 100
+priority = 1
+max_connections = 100
+
+# =============================
+# Backend Definitions (Single)
 # =============================
 # Backends support three TLS modes:
 #   - terminate (default): TLS terminates at proxy, plain HTTP to backend

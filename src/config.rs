@@ -48,9 +48,12 @@ pub struct ProxyConfig {
     pub tls: TlsConfig,
     /// Post-quantum cryptography settings
     pub pqc: PqcConfig,
-    /// Backend definitions
+    /// Backend definitions (single backend per name)
     #[serde(default)]
     pub backends: HashMap<String, BackendConfig>,
+    /// Backend pools (multiple servers with load balancing)
+    #[serde(default)]
+    pub backend_pools: HashMap<String, BackendPoolConfig>,
     /// Route mappings
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
@@ -71,6 +74,9 @@ pub struct ProxyConfig {
     /// HTTP redirect configuration
     #[serde(default)]
     pub http_redirect: HttpRedirectConfig,
+    /// Load balancer configuration
+    #[serde(default)]
+    pub load_balancer: LoadBalancerConfig,
 }
 
 impl Default for ProxyConfig {
@@ -80,6 +86,7 @@ impl Default for ProxyConfig {
             tls: TlsConfig::default(),
             pqc: PqcConfig::default(),
             backends: HashMap::new(),
+            backend_pools: HashMap::new(),
             routes: Vec::new(),
             passthrough_routes: Vec::new(),
             admin: AdminConfig::default(),
@@ -88,6 +95,7 @@ impl Default for ProxyConfig {
             security: SecurityConfig::default(),
             headers: HeadersConfig::default(),
             http_redirect: HttpRedirectConfig::default(),
+            load_balancer: LoadBalancerConfig::default(),
         }
     }
 }
@@ -591,6 +599,239 @@ impl Default for HttpRedirectConfig {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════
+// Load Balancer Configuration
+// ═══════════════════════════════════════════════════════════════
+
+/// Load balancer global configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoadBalancerConfig {
+    /// Enable load balancing
+    pub enabled: bool,
+    /// Default algorithm: least_connections, round_robin, weighted_round_robin, random, ip_hash, least_response_time
+    pub default_algorithm: String,
+    /// Session affinity configuration
+    pub session_affinity: SessionAffinityConfig,
+    /// Request queue configuration
+    pub queue: QueueConfig,
+    /// Slow start configuration for recovering backends
+    pub slow_start: SlowStartLbConfig,
+    /// Connection draining configuration
+    pub connection_draining: ConnectionDrainingConfig,
+}
+
+impl Default for LoadBalancerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            default_algorithm: "least_connections".to_string(),
+            session_affinity: SessionAffinityConfig::default(),
+            queue: QueueConfig::default(),
+            slow_start: SlowStartLbConfig::default(),
+            connection_draining: ConnectionDrainingConfig::default(),
+        }
+    }
+}
+
+/// Session affinity (sticky sessions) configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionAffinityConfig {
+    /// Enable session affinity globally
+    pub enabled: bool,
+    /// Cookie name for session tracking
+    pub cookie_name: String,
+    /// Cookie TTL in seconds (0 = session cookie)
+    pub cookie_ttl_secs: u64,
+    /// Use secure cookies (HTTPS only)
+    pub cookie_secure: bool,
+    /// Use HttpOnly cookies
+    pub cookie_httponly: bool,
+    /// SameSite attribute: strict, lax, none
+    pub cookie_samesite: String,
+}
+
+impl Default for SessionAffinityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cookie_name: "PQCPROXY_BACKEND".to_string(),
+            cookie_ttl_secs: 3600,
+            cookie_secure: true,
+            cookie_httponly: true,
+            cookie_samesite: "lax".to_string(),
+        }
+    }
+}
+
+/// Request queue configuration for saturated backends
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QueueConfig {
+    /// Enable request queuing
+    pub enabled: bool,
+    /// Maximum queue size per pool
+    pub max_size: usize,
+    /// Queue timeout in milliseconds
+    pub timeout_ms: u64,
+}
+
+impl Default for QueueConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_size: 1000,
+            timeout_ms: 5000,
+        }
+    }
+}
+
+/// Slow start configuration for recovering backends
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SlowStartLbConfig {
+    /// Enable slow start
+    pub enabled: bool,
+    /// Duration in seconds for gradual traffic increase
+    pub duration_secs: u64,
+    /// Initial weight percentage (1-100)
+    pub initial_weight_percent: u32,
+}
+
+impl Default for SlowStartLbConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            duration_secs: 30,
+            initial_weight_percent: 10,
+        }
+    }
+}
+
+/// Connection draining configuration for graceful backend removal
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConnectionDrainingConfig {
+    /// Enable connection draining
+    pub enabled: bool,
+    /// Maximum time to wait for connections to drain (seconds)
+    pub timeout_secs: u64,
+}
+
+impl Default for ConnectionDrainingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout_secs: 30,
+        }
+    }
+}
+
+/// Backend pool configuration (multiple servers with load balancing)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackendPoolConfig {
+    /// Pool name (used in routes as backend = "name")
+    pub name: String,
+    /// Load balancing algorithm (overrides global default)
+    #[serde(default = "default_lb_algorithm")]
+    pub algorithm: String,
+    /// Enable health-aware routing (skip unhealthy backends)
+    #[serde(default = "default_true")]
+    pub health_aware: bool,
+    /// Session affinity mode
+    #[serde(default)]
+    pub affinity: AffinityMode,
+    /// Header name for header-based affinity
+    pub affinity_header: Option<String>,
+    /// Pool-specific queue max size (overrides global)
+    pub queue_max_size: Option<usize>,
+    /// Pool-specific queue timeout (overrides global)
+    pub queue_timeout_ms: Option<u64>,
+    /// Health check endpoint path
+    pub health_check_path: Option<String>,
+    /// Health check interval in seconds
+    #[serde(default = "default_pool_health_interval")]
+    pub health_check_interval_secs: u64,
+    /// Servers in this pool
+    #[serde(default)]
+    pub servers: Vec<PoolServerConfig>,
+}
+
+fn default_lb_algorithm() -> String {
+    "least_connections".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_pool_health_interval() -> u64 {
+    10
+}
+
+/// Individual server within a backend pool
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolServerConfig {
+    /// Server address (host:port)
+    pub address: String,
+    /// Weight for weighted algorithms (1-1000)
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+    /// Priority for failover (lower = higher priority)
+    #[serde(default = "default_server_priority")]
+    pub priority: u32,
+    /// Maximum connections to this server
+    #[serde(default = "default_max_connections")]
+    pub max_connections: u32,
+    /// Request timeout in milliseconds
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// TLS mode for this server
+    #[serde(default)]
+    pub tls_mode: TlsMode,
+    /// TLS certificate for backend verification
+    pub tls_cert: Option<PathBuf>,
+    /// Skip TLS verification (dangerous)
+    #[serde(default)]
+    pub tls_skip_verify: bool,
+    /// Custom SNI hostname
+    pub tls_sni: Option<String>,
+}
+
+fn default_weight() -> u32 {
+    100
+}
+
+fn default_server_priority() -> u32 {
+    1
+}
+
+/// Session affinity mode for sticky sessions
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AffinityMode {
+    /// No session affinity
+    #[default]
+    None,
+    /// Cookie-based sticky sessions
+    Cookie,
+    /// IP hash sticky sessions
+    IpHash,
+    /// Header-based sticky sessions
+    Header,
+}
+
+impl AffinityMode {
+    /// Get header name for header-based affinity
+    pub fn header_name(&self) -> Option<&'static str> {
+        match self {
+            Self::Header => Some("X-Session-ID"),
+            _ => None,
+        }
+    }
+}
+
 /// CORS configuration for routes
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CorsConfig {
@@ -765,19 +1006,42 @@ impl ProxyConfig {
             warn!("TLS private key not found: {:?}", self.tls.key_path);
         }
 
-        // Validate routes reference existing backends (unless they're redirect routes)
+        // Validate routes reference existing backends or backend_pools (unless they're redirect routes)
         for route in &self.routes {
             // Skip backend validation for redirect routes
             if route.redirect.is_some() {
                 continue;
             }
 
-            if route.backend.is_empty() || !self.backends.contains_key(&route.backend) {
+            // Check if backend exists in either backends or backend_pools
+            let backend_exists = self.backends.contains_key(&route.backend)
+                || self.backend_pools.contains_key(&route.backend);
+
+            if route.backend.is_empty() || !backend_exists {
                 return Err(anyhow::anyhow!(
-                    "Route {:?} references unknown backend: {}",
+                    "Route {:?} references unknown backend or pool: {}",
                     route.name,
                     route.backend
                 ));
+            }
+        }
+
+        // Validate backend pool server addresses
+        for (name, pool) in &self.backend_pools {
+            if pool.servers.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "Backend pool '{}' has no servers configured",
+                    name
+                ));
+            }
+            for server in &pool.servers {
+                if server.address.parse::<std::net::SocketAddr>().is_err() {
+                    return Err(anyhow::anyhow!(
+                        "Invalid server address '{}' in pool '{}'",
+                        server.address,
+                        name
+                    ));
+                }
             }
         }
 

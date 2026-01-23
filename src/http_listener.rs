@@ -39,6 +39,7 @@ use crate::config::{BackendConfig, CorsConfig, ProxyConfig, TlsMode};
 use crate::fingerprint::FingerprintExtractor;
 use crate::http3_features::{http3_features_middleware, Http3FeaturesState};
 use crate::security::{security_middleware, SecurityState};
+use crate::load_balancer::{extract_session_cookie, LoadBalancer, SelectionContext};
 
 /// HTTP listener state
 #[derive(Clone)]
@@ -49,6 +50,7 @@ pub struct HttpListenerState {
     pub https_client: Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>,
     pub security: SecurityState,
     pub fingerprint: Arc<FingerprintExtractor>,
+    pub load_balancer: Arc<LoadBalancer>,
 }
 
 /// Create and run the HTTP listener with TLS termination
@@ -93,6 +95,21 @@ pub async fn run_http_listener(
     // Initialize fingerprint extractor for JA3/JA4 tracking
     let fingerprint_extractor = Arc::new(FingerprintExtractor::new());
 
+    // Initialize load balancer from config
+    let lb_config = Arc::new(config.load_balancer.clone());
+    let load_balancer = Arc::new(LoadBalancer::new(lb_config));
+
+    // Add backend pools from configuration
+    for (name, pool_config) in &config.backend_pools {
+        load_balancer.add_pool(pool_config);
+        info!(
+            "⚖️  Added backend pool '{}' with {} servers ({})",
+            name,
+            pool_config.servers.len(),
+            pool_config.algorithm
+        );
+    }
+
     let state = HttpListenerState {
         config: config.clone(),
         port,
@@ -100,6 +117,7 @@ pub async fn run_http_listener(
         https_client,
         security: security_state.clone(),
         fingerprint: fingerprint_extractor,
+        load_balancer,
     };
 
     // Initialize compression state
@@ -220,6 +238,21 @@ pub async fn run_http_listener_pqc(
     // Initialize fingerprint extractor for JA3/JA4 tracking
     let fingerprint_extractor = Arc::new(FingerprintExtractor::new());
 
+    // Initialize load balancer from config
+    let lb_config = Arc::new(config.load_balancer.clone());
+    let load_balancer = Arc::new(LoadBalancer::new(lb_config));
+
+    // Add backend pools from configuration
+    for (name, pool_config) in &config.backend_pools {
+        load_balancer.add_pool(pool_config);
+        info!(
+            "⚖️  Added backend pool '{}' with {} servers ({})",
+            name,
+            pool_config.servers.len(),
+            pool_config.algorithm
+        );
+    }
+
     let state = HttpListenerState {
         config: config.clone(),
         port,
@@ -227,6 +260,7 @@ pub async fn run_http_listener_pqc(
         https_client,
         security: security_state.clone(),
         fingerprint: fingerprint_extractor,
+        load_balancer,
     };
 
     // Initialize compression state
@@ -746,42 +780,86 @@ async fn proxy_handler(
             }
         }
 
-        // Get backend configuration
-        let backend = state.config.get_backend(&route.backend);
-        if backend.is_none() {
-            error!("Backend not found: {}", route.backend);
-            return (StatusCode::BAD_GATEWAY, "Backend not configured").into_response();
-        }
-        let backend = backend.unwrap();
+        // Track request timing for load balancer
+        let request_start = std::time::Instant::now();
 
-        // Check circuit breaker - if backend is unhealthy, reject early
-        if !state.security.circuit_allows(&route.backend) {
-            warn!(
-                "Circuit breaker open for backend '{}', rejecting request",
-                route.backend
-            );
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Service temporarily unavailable",
-            )
-                .into_response();
-        }
+        // Check if backend is a pool first, then fall back to single backend
+        let (backend_address, tls_mode, pool_server, pool_name) =
+            if let Some(pool) = state.load_balancer.get_pool(&route.backend) {
+                // Extract session cookie for sticky sessions
+                let session_cookie = headers
+                    .get("cookie")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|cookies| {
+                        extract_session_cookie(Some(cookies), &state.load_balancer.cookie_config)
+                    });
 
-        // Determine TLS mode (use tls_mode, or legacy tls bool)
-        let tls_mode = if backend.tls {
-            TlsMode::Reencrypt
-        } else {
-            backend.tls_mode.clone()
-        };
+                // Build selection context
+                let ctx = SelectionContext {
+                    client_ip: client_addr.ip(),
+                    session_cookie,
+                    affinity_header: pool.affinity_header.as_ref().and_then(|h| {
+                        headers.get(h).and_then(|v| v.to_str().ok().map(String::from))
+                    }),
+                    path: path.to_string(),
+                    host: host.clone(),
+                };
+
+                // Select backend from pool
+                match pool.select(&ctx) {
+                    Some(server) => {
+                        let address = server.address.to_string();
+                        let tls = server.tls_mode.clone();
+                        (address, tls, Some(server), Some(route.backend.clone()))
+                    }
+                    None => {
+                        warn!(
+                            "No healthy backends in pool '{}' for request {}",
+                            route.backend, path
+                        );
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "No healthy backends available",
+                        )
+                            .into_response();
+                    }
+                }
+            } else if let Some(backend) = state.config.get_backend(&route.backend) {
+                // Fall back to single backend (backward compatibility)
+                // Check circuit breaker - if backend is unhealthy, reject early
+                if !state.security.circuit_allows(&route.backend) {
+                    warn!(
+                        "Circuit breaker open for backend '{}', rejecting request",
+                        route.backend
+                    );
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Service temporarily unavailable",
+                    )
+                        .into_response();
+                }
+
+                // Determine TLS mode (use tls_mode, or legacy tls bool)
+                let tls_mode = if backend.tls {
+                    TlsMode::Reencrypt
+                } else {
+                    backend.tls_mode.clone()
+                };
+
+                (backend.address.clone(), tls_mode, None, None)
+            } else {
+                error!("Backend or pool not found: {}", route.backend);
+                return (StatusCode::BAD_GATEWAY, "Backend not configured").into_response();
+            };
 
         // Build backend URL based on TLS mode
         let (backend_url, use_https) = match tls_mode {
             TlsMode::Terminate => (
-                format!("http://{}{}{}", backend.address, path, query),
+                format!("http://{}{}{}", backend_address, path, query),
                 false,
             ),
             TlsMode::Reencrypt => (
-                format!("https://{}{}{}", backend.address, path, query),
+                format!("https://{}{}{}", backend_address, path, query),
                 true,
             ),
             TlsMode::Passthrough => {
@@ -892,14 +970,39 @@ async fn proxy_handler(
 
         match result {
             Ok(backend_response) => {
-                // Record success for circuit breaker
+                let response_time = request_start.elapsed();
+
+                // Record success for circuit breaker (single backend)
                 state.security.record_backend_result(&route.backend, true);
+
+                // Record success for load balancer pool
+                if let (Some(server), Some(ref pn)) = (&pool_server, &pool_name) {
+                    state.load_balancer.record_completion(
+                        pn,
+                        server.as_ref(),
+                        response_time,
+                        true,
+                    );
+                    server.release_connection();
+                }
 
                 let (mut parts, incoming_body) = backend_response.into_parts();
 
                 // Add CORS headers if configured
                 if let Some(ref cors) = route.cors {
                     add_cors_headers(&mut parts.headers, cors);
+                }
+
+                // Add sticky session cookie if using pool with cookie affinity
+                if let Some(server) = &pool_server {
+                    if let Some(pool) = state.load_balancer.get_pool(&route.backend) {
+                        if pool.affinity == crate::config::AffinityMode::Cookie {
+                            let cookie = state.load_balancer.cookie_config.generate_cookie(&server.id);
+                            if let Ok(val) = HeaderValue::from_str(&cookie) {
+                                parts.headers.insert(header::SET_COOKIE, val);
+                            }
+                        }
+                    }
                 }
 
                 // Add route-specific header overrides
@@ -931,8 +1034,21 @@ async fn proxy_handler(
                 Response::from_parts(parts, body)
             }
             Err(e) => {
+                let response_time = request_start.elapsed();
+
                 // Record failure for circuit breaker
                 state.security.record_backend_result(&route.backend, false);
+
+                // Record failure for load balancer pool
+                if let (Some(server), Some(ref pn)) = (&pool_server, &pool_name) {
+                    state.load_balancer.record_completion(
+                        pn,
+                        server.as_ref(),
+                        response_time,
+                        false,
+                    );
+                    server.release_connection();
+                }
 
                 error!("Backend request failed: {}", e);
                 (StatusCode::BAD_GATEWAY, format!("Backend error: {}", e)).into_response()
