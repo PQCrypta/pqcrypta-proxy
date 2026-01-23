@@ -2,13 +2,18 @@
 //!
 //! Accepts QUIC connections, negotiates HTTP/3, and handles WebTransport sessions.
 //! Routes streams and datagrams to configured backends.
+//!
+//! Note: This is an alternative to WebTransportServer using h3/quinn directly.
+//! Currently scaffolded for future use - the wtransport-based WebTransportServer
+//! is the primary implementation.
+
+#![allow(dead_code)]
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
-use h3::quic::BidiStream;
 use h3_quinn::Connection as H3Connection;
 use quinn::{Endpoint, ServerConfig as QuinnServerConfig, TransportConfig};
 use tokio::sync::mpsc;
@@ -249,17 +254,21 @@ impl QuicListener {
                             .map(|v| v == "webtransport")
                             .unwrap_or(false)
                     {
-                        info!("WebTransport CONNECT request for {} from {}", path, remote_addr);
+                        info!("WebTransport CONNECT request for {} from {} (host: {:?})", path, remote_addr, host);
 
                         // Handle WebTransport session
                         let handler =
                             WebTransportHandler::new(config.clone(), backend_pool.clone(), remote_addr);
 
-                        // Accept WebTransport session
-                        // This is a simplified handling - full implementation needs webtransport crate
+                        // Accept WebTransport session and handle streams/datagrams
                         tokio::spawn(async move {
-                            // Handle WebTransport streams and datagrams
-                            debug!("WebTransport session started for {}", remote_addr);
+                            debug!("WebTransport session started for {} on path {}", remote_addr, path);
+                            // Use the handler to process the WebTransport session
+                            // The actual stream handling is done by the dedicated WebTransport server
+                            // This QuicListener handles the HTTP/3 layer
+                            if let Err(e) = handler.handle_session().await {
+                                error!("WebTransport session error for {}: {}", remote_addr, e);
+                            }
                         });
                     } else {
                         // Regular HTTP/3 request

@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
-use crate::config::{AdminConfig, ConfigManager, ProxyConfig};
+use crate::config::{AdminConfig, ConfigManager};
 use crate::proxy::BackendPool;
 use crate::tls::{CertificateInfo, TlsProvider};
 
@@ -197,7 +197,7 @@ async fn health_handler(State(state): State<Arc<AdminState>>) -> Json<HealthResp
 /// Prometheus metrics endpoint
 #[cfg(feature = "metrics")]
 async fn metrics_handler(State(state): State<Arc<AdminState>>) -> String {
-    use prometheus::{Encoder, TextEncoder};
+    
 
     let config = state.config_manager.get();
     let uptime = state.start_time.elapsed().as_secs();
