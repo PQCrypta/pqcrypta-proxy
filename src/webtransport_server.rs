@@ -9,8 +9,10 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wtransport::{Endpoint, ServerConfig, Identity, Connection};
+use wtransport::config::QuicTransportConfig;
 use tracing::{info, error, warn, debug};
 use serde_json::json;
 
@@ -54,6 +56,30 @@ impl WebTransportServer {
 
         info!("✅ TLS identity loaded successfully");
 
+        // Create custom transport configuration to prevent ExcessiveLoad errors
+        // Increase buffer sizes for better handling of burst traffic
+        use quinn::VarInt;
+        let mut transport_config = QuicTransportConfig::default();
+
+        // Increase receive window (connection-level) - 16MB
+        transport_config.receive_window(VarInt::from_u32(16 * 1024 * 1024));
+
+        // Increase stream receive window (per-stream) - 8MB
+        transport_config.stream_receive_window(VarInt::from_u32(8 * 1024 * 1024));
+
+        // Increase send window - 16MB
+        transport_config.send_window(16 * 1024 * 1024);
+
+        // Increase concurrent streams
+        transport_config.max_concurrent_bidi_streams(VarInt::from_u32(1000));
+        transport_config.max_concurrent_uni_streams(VarInt::from_u32(1000));
+
+        // Datagram settings
+        transport_config.datagram_receive_buffer_size(Some(65536));
+        transport_config.datagram_send_buffer_size(65536);
+
+        info!("🔧 Custom transport config: receive_window=16MB, stream_window=8MB, send_window=16MB");
+
         // Create server configuration with WebTransport support
         // The wtransport crate automatically:
         // - Configures ALPN with "h3" protocol
@@ -61,9 +87,9 @@ impl WebTransportServer {
         // - Handles QUIC connection establishment
         let config_builder = ServerConfig::builder()
             .with_bind_address(addr)
-            .with_identity(identity)
-            .keep_alive_interval(Some(std::time::Duration::from_secs(15)))
-            .max_idle_timeout(Some(std::time::Duration::from_secs(120)))
+            .with_custom_transport(identity, transport_config)
+            .keep_alive_interval(Some(Duration::from_secs(15)))
+            .max_idle_timeout(Some(Duration::from_secs(120)))
             .map_err(|e| format!("Invalid idle timeout: {}", e))?
             .build();
 
