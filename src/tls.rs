@@ -282,6 +282,17 @@ impl TlsProvider {
 
         info!("ALPN protocols: {:?}", tls_config.alpn_protocols);
 
+        // Configure 0-RTT (early data)
+        if tls_config.enable_0rtt {
+            // Enable 0-RTT with 16KB max early data
+            config.max_early_data_size = 16384;
+            warn!("0-RTT enabled - vulnerable to replay attacks. Use only if replay protection is handled at application layer.");
+        } else {
+            // Disable 0-RTT for security
+            config.max_early_data_size = 0;
+            info!("0-RTT disabled (secure default)");
+        }
+
         // Log PQC status
         if pqc_config.enabled && pqc_available {
             info!("PQC hybrid key exchange enabled (provider: {})", pqc_config.provider);
