@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use crate::rate_limiter::AdvancedRateLimitConfig;
+
 /// Global configuration container with hot-reload support
 pub struct ConfigManager {
     /// Current active configuration (atomic swap for hot-reload)
@@ -64,8 +66,11 @@ pub struct ProxyConfig {
     pub admin: AdminConfig,
     /// Logging configuration
     pub logging: LoggingConfig,
-    /// Rate limiting configuration
+    /// Rate limiting configuration (basic)
     pub rate_limiting: RateLimitConfig,
+    /// Advanced multi-dimensional rate limiting
+    #[serde(default)]
+    pub advanced_rate_limiting: AdvancedRateLimitConfig,
     /// Security settings
     pub security: SecurityConfig,
     /// Security headers configuration
@@ -92,6 +97,7 @@ impl Default for ProxyConfig {
             admin: AdminConfig::default(),
             logging: LoggingConfig::default(),
             rate_limiting: RateLimitConfig::default(),
+            advanced_rate_limiting: AdvancedRateLimitConfig::default(),
             security: SecurityConfig::default(),
             headers: HeadersConfig::default(),
             http_redirect: HttpRedirectConfig::default(),

@@ -38,8 +38,11 @@ use crate::compression::{compression_middleware, CompressionState};
 use crate::config::{BackendConfig, CorsConfig, ProxyConfig, TlsMode};
 use crate::fingerprint::FingerprintExtractor;
 use crate::http3_features::{http3_features_middleware, Http3FeaturesState};
-use crate::security::{security_middleware, SecurityState};
 use crate::load_balancer::{extract_session_cookie, LoadBalancer, SelectionContext};
+use crate::rate_limiter::{
+    build_context_from_request, AdvancedRateLimiter, LimitReason, RateLimitResult,
+};
+use crate::security::{security_middleware, SecurityState};
 
 /// HTTP listener state
 #[derive(Clone)]
@@ -51,6 +54,7 @@ pub struct HttpListenerState {
     pub security: SecurityState,
     pub fingerprint: Arc<FingerprintExtractor>,
     pub load_balancer: Arc<LoadBalancer>,
+    pub rate_limiter: Arc<AdvancedRateLimiter>,
 }
 
 /// Create and run the HTTP listener with TLS termination
@@ -110,6 +114,15 @@ pub async fn run_http_listener(
         );
     }
 
+    // Initialize advanced multi-dimensional rate limiter
+    let rate_limiter = Arc::new(AdvancedRateLimiter::new(
+        config.advanced_rate_limiting.clone(),
+    ));
+    info!(
+        "🚦 Advanced rate limiter enabled (key strategy: {:?})",
+        config.advanced_rate_limiting.key_strategy.order.first()
+    );
+
     let state = HttpListenerState {
         config: config.clone(),
         port,
@@ -118,6 +131,7 @@ pub async fn run_http_listener(
         security: security_state.clone(),
         fingerprint: fingerprint_extractor,
         load_balancer,
+        rate_limiter: rate_limiter.clone(),
     };
 
     // Initialize compression state
@@ -127,7 +141,7 @@ pub async fn run_http_listener(
     let http3_features_state = Http3FeaturesState::new();
 
     // Build router with full middleware stack
-    // Order (outside to inside): security -> http3 -> compression -> headers -> handler
+    // Order (outside to inside): advanced_rate_limit -> security -> http3 -> compression -> headers -> handler
     let app = Router::new()
         .fallback(any(proxy_handler))
         // Response headers (innermost - runs last on response)
@@ -150,10 +164,15 @@ pub async fn run_http_listener(
             http3_features_state,
             http3_features_middleware,
         ))
-        // Security middleware (outermost - runs first)
+        // Security middleware (basic IP checks, circuit breaker)
         .layer(middleware::from_fn_with_state(
             security_state,
             security_middleware,
+        ))
+        // Advanced rate limiting (outermost - runs first, multi-dimensional)
+        .layer(middleware::from_fn_with_state(
+            rate_limiter,
+            advanced_rate_limit_middleware,
         ))
         .with_state(state);
 
@@ -253,6 +272,15 @@ pub async fn run_http_listener_pqc(
         );
     }
 
+    // Initialize advanced multi-dimensional rate limiter
+    let rate_limiter = Arc::new(AdvancedRateLimiter::new(
+        config.advanced_rate_limiting.clone(),
+    ));
+    info!(
+        "🚦 Advanced rate limiter enabled (key strategy: {:?})",
+        config.advanced_rate_limiting.key_strategy.order.first()
+    );
+
     let state = HttpListenerState {
         config: config.clone(),
         port,
@@ -261,6 +289,7 @@ pub async fn run_http_listener_pqc(
         security: security_state.clone(),
         fingerprint: fingerprint_extractor,
         load_balancer,
+        rate_limiter: rate_limiter.clone(),
     };
 
     // Initialize compression state
@@ -270,6 +299,7 @@ pub async fn run_http_listener_pqc(
     let http3_features_state = Http3FeaturesState::new();
 
     // Build router with full middleware stack
+    // Order (outside to inside): advanced_rate_limit -> security -> http3 -> compression -> headers -> handler
     let app = Router::new()
         .fallback(any(proxy_handler))
         .layer(middleware::from_fn_with_state(
@@ -291,6 +321,11 @@ pub async fn run_http_listener_pqc(
         .layer(middleware::from_fn_with_state(
             security_state,
             security_middleware,
+        ))
+        // Advanced rate limiting (outermost - runs first, multi-dimensional)
+        .layer(middleware::from_fn_with_state(
+            rate_limiter,
+            advanced_rate_limit_middleware,
         ))
         .with_state(state);
 
@@ -733,6 +768,120 @@ async fn security_headers_middleware(
     }
 
     response
+}
+
+/// Advanced multi-dimensional rate limiting middleware
+///
+/// Features:
+/// - Multi-key rate limiting (IP, API key, JA3 fingerprint, JWT, headers)
+/// - Layered limits (global → route → client)
+/// - Composite keys (IP + path, fingerprint + method)
+/// - X-Forwarded-For trust for clients behind proxies
+/// - IPv6 /64 subnet grouping
+/// - Adaptive baseline learning with anomaly detection
+async fn advanced_rate_limit_middleware(
+    State(rate_limiter): State<Arc<AdvancedRateLimiter>>,
+    ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let method = request.method().as_str().to_string();
+    let path = request.uri().path().to_string();
+
+    // Extract JA3/JA4 fingerprints from headers (set by TLS acceptor)
+    let ja3_hash = headers
+        .get("x-ja3-hash")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let ja4_hash = headers
+        .get("x-ja4-hash")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
+    // Build rate limit context
+    let ctx = build_context_from_request(
+        client_addr.ip(),
+        &headers,
+        &path,
+        &method,
+        ja3_hash,
+        ja4_hash,
+        None, // Route name resolved later
+    );
+
+    // Check rate limit
+    match rate_limiter.check(&ctx) {
+        RateLimitResult::Allowed { remaining, limit } => {
+            // Add rate limit headers to response
+            let mut response = next.run(request).await;
+            let resp_headers = response.headers_mut();
+
+            if let Ok(v) = HeaderValue::from_str(&limit.to_string()) {
+                resp_headers.insert("x-ratelimit-limit", v);
+            }
+            if let Ok(v) = HeaderValue::from_str(&remaining.to_string()) {
+                resp_headers.insert("x-ratelimit-remaining", v);
+            }
+
+            response
+        }
+        RateLimitResult::Limited {
+            reason,
+            retry_after_ms,
+            limit,
+            remaining: _,
+        } => {
+            debug!(
+                "Rate limited {} {} from {} (reason: {:?})",
+                method, path, client_addr.ip(), reason
+            );
+
+            let mut response = (
+                StatusCode::TOO_MANY_REQUESTS,
+                match reason {
+                    LimitReason::PerSecond => "Rate limit exceeded (per second)",
+                    LimitReason::PerMinute => "Rate limit exceeded (per minute)",
+                    LimitReason::PerHour => "Rate limit exceeded (per hour)",
+                    LimitReason::Global => "Global rate limit exceeded",
+                    LimitReason::AnomalyDetected => "Anomalous traffic pattern detected",
+                    LimitReason::RouteLimit => "Route rate limit exceeded",
+                },
+            )
+                .into_response();
+
+            let headers = response.headers_mut();
+
+            // Standard rate limit headers
+            if let Ok(v) = HeaderValue::from_str(&(retry_after_ms / 1000).to_string()) {
+                headers.insert("retry-after", v);
+            }
+            if let Ok(v) = HeaderValue::from_str(&limit.to_string()) {
+                headers.insert("x-ratelimit-limit", v);
+            }
+            headers.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
+
+            // Reset time (approximate)
+            let reset_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                + (retry_after_ms / 1000);
+            if let Ok(v) = HeaderValue::from_str(&reset_time.to_string()) {
+                headers.insert("x-ratelimit-reset", v);
+            }
+
+            response
+        }
+        RateLimitResult::Blocked { reason } => {
+            warn!(
+                "Blocked request {} {} from {} (reason: {})",
+                method, path, client_addr.ip(), reason
+            );
+
+            (StatusCode::FORBIDDEN, "Access denied").into_response()
+        }
+    }
 }
 
 /// Main proxy handler - routes requests to appropriate backends

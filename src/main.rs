@@ -72,6 +72,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 
 mod admin;
 mod compression;
+mod rate_limiter; // Must be before config (config imports from it)
 mod config;
 mod fingerprint;
 mod handlers;

@@ -65,6 +65,7 @@
 
 pub mod admin;
 pub mod compression;
+pub mod rate_limiter; // Must be before config (config imports from it)
 pub mod config;
 pub mod fingerprint;
 pub mod handlers;
@@ -96,6 +97,10 @@ pub use http_listener::run_http_listener_pqc;
 pub use http_listener::{run_http_listener, run_http_redirect_server, run_tls_passthrough_server};
 pub use pqc_tls::{verify_pqc_support, PqcKemAlgorithm, PqcStatus, PqcTlsProvider};
 pub use proxy::BackendPool;
+pub use rate_limiter::{
+    AdvancedRateLimitConfig, AdvancedRateLimiter, RateLimitContext, RateLimitKey,
+    RateLimitKeyType, RateLimitResult, RateLimiterSnapshot, build_context_from_request,
+};
 pub use security::{security_middleware, SecurityState};
 pub use tls::TlsProvider;
 pub use tls_acceptor::{FingerprintedConnection, FingerprintingTlsAcceptor};
