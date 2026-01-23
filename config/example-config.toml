@@ -1,7 +1,6 @@
 # PQCrypta Proxy Configuration
 # =============================
 # Production-ready HTTP/3/QUIC/WebTransport reverse proxy with hybrid PQC TLS.
-# A complete nginx replacement with modern protocol support.
 #
 # All values are configurable - no hardcoded ports, paths, or addresses.
 # CLI arguments and environment variables can override these settings.

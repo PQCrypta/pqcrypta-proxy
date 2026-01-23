@@ -515,7 +515,7 @@ impl Default for SecurityConfig {
     }
 }
 
-/// Security headers configuration (replaces nginx security headers)
+/// Security headers configuration (similar to nginx/Apache security headers)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HeadersConfig {
