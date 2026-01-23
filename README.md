@@ -4,7 +4,7 @@
 
 [![Build Status](https://github.com/PQCrypta/pqcrypta-proxy/workflows/CI/badge.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-38%20passing-brightgreen.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
+[![Tests](https://img.shields.io/badge/tests-46%20passing-brightgreen.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
 
 ## Highlights
 
@@ -15,6 +15,7 @@
 - **Zero Downtime**: Hot reload configuration and TLS certificates
 - **Advanced Security**: JA3/JA4 fingerprinting, circuit breaker, GeoIP blocking
 - **Enterprise Load Balancing**: 6 algorithms, session affinity, health-aware routing
+- **Multi-Dimensional Rate Limiting**: Composite keys, JA3/JA4-based, adaptive ML anomaly detection
 
 ## All Features Implemented
 
@@ -22,7 +23,7 @@
 |---------|--------|-------------|
 | **Load Balancing** | ✅ | 6 algorithms with session affinity and health-aware routing |
 | Circuit Breaker | ✅ | Backend health monitoring with auto-recovery |
-| Rate Limiting | ✅ | Per-IP + global limits with auto-blocking |
+| **Advanced Rate Limiting** | ✅ | Multi-dimensional: IP, JA3/JA4, JWT, headers, composite keys |
 | DoS Protection | ✅ | Connection limits, request validation |
 | GeoIP Blocking | ✅ | Country-based blocking (MaxMind DB) |
 | JA3/JA4 Fingerprinting | ✅ | TLS client fingerprint detection and classification |
@@ -46,7 +47,9 @@
 ### Security
 - **JA3/JA4 TLS Fingerprinting**: Detects browsers, bots, scanners, malware based on TLS ClientHello
 - **Circuit Breaker**: Protects backends from cascading failures with automatic recovery
-- **Rate Limiting**: Per-IP token bucket with configurable burst and auto-blocking
+- **Advanced Rate Limiting**: Multi-dimensional limiting (IP, JA3/JA4, JWT, headers, composite keys)
+- **NAT-Friendly**: JA3/JA4 fingerprints identify clients behind shared corporate IPs
+- **Adaptive Baseline**: ML-inspired anomaly detection learns normal traffic patterns
 - **DoS Protection**: Connection limits, request size validation, auto-blocking
 - **GeoIP Blocking**: Block by country/region using MaxMind GeoLite2 database
 - **Security Headers**: HSTS, X-Frame-Options, CSP, COEP, COOP, CORP, and more
@@ -195,6 +198,82 @@ failure_threshold = 5
 success_threshold = 2
 timeout_secs = 30
 ```
+
+### Advanced Rate Limiting Configuration
+
+The advanced rate limiter provides multi-dimensional rate limiting inspired by Cloudflare, Envoy, HAProxy, and ML research. It solves the corporate NAT problem where many users share one gateway IP.
+
+```toml
+[advanced_rate_limiting]
+enabled = true
+
+# Key resolution strategy
+# Options: source_ip, xff_trusted, ja3_fingerprint, jwt_subject, composite
+key_strategy = "composite"
+
+# X-Forwarded-For trust configuration
+xff_trust_depth = 1                 # How many proxies to trust
+trusted_proxies = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+
+# IPv6 subnet grouping (prevents per-host evasion)
+ipv6_prefix_length = 64
+
+# Global rate limits (DDoS protection layer)
+[advanced_rate_limiting.global_limits]
+requests_per_second = 10000
+burst_size = 2000
+
+# Per-IP limits (NAT-aware via composite keys)
+[advanced_rate_limiting.global_limits.per_ip]
+requests_per_second = 100
+burst_size = 200
+requests_per_minute = 1000
+requests_per_hour = 10000
+
+# Per-JA3 fingerprint limits (NAT-friendly client identification)
+[advanced_rate_limiting.global_limits.per_ja3]
+requests_per_second = 500
+burst_size = 100
+
+# Per-JWT subject limits (user-level limiting)
+[advanced_rate_limiting.global_limits.per_jwt_subject]
+requests_per_second = 50
+burst_size = 100
+
+# Composite key limits (IP + JA3 + Path)
+[advanced_rate_limiting.global_limits.composite]
+requests_per_second = 200
+burst_size = 50
+
+# Adaptive baseline learning (ML-inspired anomaly detection)
+[advanced_rate_limiting.adaptive]
+enabled = true
+learning_window_secs = 3600         # 1 hour learning window
+anomaly_threshold = 3.0             # Standard deviations from mean
+block_anomalies = false             # Only log, don't block during learning
+min_samples = 100                   # Minimum samples before blocking
+
+# Route-specific overrides
+[[advanced_rate_limiting.route_overrides]]
+route_name = "api-route"
+per_ip_rps = 200                    # Higher limits for API route
+per_ip_burst = 400
+per_ja3_rps = 1000
+
+[[advanced_rate_limiting.route_overrides]]
+route_name = "login-route"
+per_ip_rps = 10                     # Stricter limits for login
+per_ip_burst = 20
+```
+
+**Key Features:**
+- **Composite Keys**: Combine IP + JA3 fingerprint + path for fine-grained limiting
+- **JA3/JA4 Fingerprinting**: Identify clients behind NAT by TLS handshake signature
+- **JWT Subject Extraction**: Rate limit by authenticated user, not just IP
+- **X-Forwarded-For Trust Chain**: Properly handle clients behind trusted proxies
+- **IPv6 Subnet Grouping**: Group /64 subnets to prevent per-host evasion
+- **Adaptive Baseline**: Learns normal traffic patterns and detects anomalies
+- **Layered Limits**: Global → Route → Client hierarchy for defense in depth
 
 ### Load Balancer Configuration
 

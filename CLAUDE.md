@@ -6,9 +6,9 @@ This file provides guidance to Claude Code when working with the PQCrypta Proxy 
 
 PQCrypta Proxy is a high-performance reverse proxy with QUIC/HTTP/3, WebTransport, and Post-Quantum Cryptography TLS support.
 
-**Version**: v1.1.0 (2026-01-23)
+**Version**: v1.2.0 (2026-01-23)
 **Status**: All features complete and integrated
-**Tests**: 38 passing
+**Tests**: 46 passing
 
 ## All Features Fully Integrated
 
@@ -16,7 +16,7 @@ PQCrypta Proxy is a high-performance reverse proxy with QUIC/HTTP/3, WebTranspor
 |---------|--------|--------|-------------|
 | **Load Balancing** | ✅ COMPLETE | `load_balancer.rs` | 6 algorithms, session affinity, health-aware |
 | Circuit Breaker | ✅ COMPLETE | `security.rs` | Integrated in `http_listener.rs` proxy_handler |
-| Rate Limiting | ✅ COMPLETE | `security.rs` | Integrated via security_middleware |
+| **Advanced Rate Limiting** | ✅ COMPLETE | `rate_limiter.rs` | Multi-dimensional: IP, JA3/JA4, JWT, composite |
 | DoS Protection | ✅ COMPLETE | `security.rs` | Integrated via security_middleware |
 | IP Blocking | ✅ COMPLETE | `security.rs` | Integrated with auto-expiration |
 | GeoIP Blocking | ✅ COMPLETE | `security.rs` | MaxMind DB loaded at startup |
@@ -85,7 +85,8 @@ sudo journalctl -u pqcrypta-proxy -f
 │   ├── main.rs             # Entry point
 │   ├── lib.rs              # Library exports
 │   ├── config.rs           # Configuration parsing
-│   ├── load_balancer.rs    # Load balancing algorithms, pools, session affinity (NEW)
+│   ├── load_balancer.rs    # Load balancing algorithms, pools, session affinity
+│   ├── rate_limiter.rs     # Multi-dimensional rate limiting (NEW)
 │   ├── proxy.rs            # Backend pool & request routing
 │   ├── http_listener.rs    # HTTP/1.1 + HTTP/2 listener with PQC TLS
 │   ├── quic_listener.rs    # QUIC/HTTP/3 listener
@@ -110,17 +111,23 @@ sudo journalctl -u pqcrypta-proxy -f
 The middleware stack processes requests in this order:
 
 ```
-Request → Security → HTTP/3 Features → Compression → Alt-Svc → Headers → Handler
-                                                                           ↓
-Response ← Security ← HTTP/3 Features ← Compression ← Alt-Svc ← Headers ← Handler
+Request → Advanced Rate Limit → Security → HTTP/3 Features → Compression → Alt-Svc → Headers → Handler
+                                                                                                   ↓
+Response ← Advanced Rate Limit ← Security ← HTTP/3 Features ← Compression ← Alt-Svc ← Headers ← Handler
 ```
+
+### Advanced Rate Limit Middleware (`rate_limiter.rs`)
+1. Build rate limit context (IP, JA3, JWT, headers)
+2. Resolve key based on strategy (source_ip, xff_trusted, ja3, jwt, composite)
+3. Check layered limits (global → route → client)
+4. Check adaptive baseline anomaly detection
+5. Return 429 with Retry-After header if limited
 
 ### Security Middleware (`security.rs`)
 1. Check if IP is blocked
-2. Apply rate limiting (per-IP token bucket)
-3. Check GeoIP restrictions
-4. Validate request size
-5. Check circuit breaker status
+2. Check GeoIP restrictions
+3. Validate request size
+4. Check circuit breaker status
 
 ### HTTP/3 Features Middleware (`http3_features.rs`)
 1. Add Priority headers (RFC 9218)
@@ -146,12 +153,31 @@ Response ← Security ← HTTP/3 Features ← Compression ← Alt-Svc ← Header
 - Closes after 2 consecutive successes
 - Returns 503 when open
 
-### 2. Rate Limiting (`security.rs`)
+### 2. Advanced Rate Limiting (`rate_limiter.rs`)
 
-- Per-IP token bucket algorithm via `governor` crate
-- Configurable requests/second and burst size
-- Automatic IP blocking after threshold
-- Retry-After headers on rate limit responses
+**New module inspired by Cloudflare, Envoy, HAProxy, Traefik, and ML research:**
+
+- **Multi-Dimensional Keys**: Rate limit by IP, JA3/JA4 fingerprint, JWT subject, headers, or composite
+- **NAT-Friendly**: JA3/JA4 fingerprints identify clients behind shared corporate IPs
+- **Layered Limits**: Global → Route → Client hierarchy (Envoy-style)
+- **X-Forwarded-For Trust Chain**: Properly handle clients behind trusted proxies
+- **IPv6 Subnet Grouping**: Group /64 subnets to prevent per-host evasion
+- **Adaptive Baseline**: ML-inspired anomaly detection learns normal traffic patterns
+- **Sliding Window + Token Bucket**: Hybrid algorithm with per-second/minute/hour windows
+- **Route Overrides**: Per-route rate limit customization
+
+**Key Resolution Strategies:**
+- `source_ip` - Raw source IP (default)
+- `xff_trusted` - X-Forwarded-For with trusted proxy chain
+- `ja3_fingerprint` - TLS handshake signature
+- `jwt_subject` - JWT sub claim extraction
+- `composite` - Combine multiple keys (IP + JA3 + Path)
+
+**Integration Points:**
+- `rate_limiter.rs:AdvancedRateLimiter` - Main rate limiter
+- `rate_limiter.rs:RateLimitContext` - Request context for key resolution
+- `rate_limiter.rs:build_context_from_request()` - Extract context from HTTP request
+- `http_listener.rs:advanced_rate_limit_middleware()` - Axum middleware integration
 
 ### 3. JA3/JA4 Fingerprinting (`fingerprint.rs`)
 
@@ -316,13 +342,15 @@ Same as main PQCrypta project:
 
 ## Security Considerations
 
-- Rate limiting prevents abuse
-- GeoIP blocking for geographic restrictions
-- JA3/JA4 fingerprinting detects suspicious clients
-- Circuit breaker protects backends from cascading failures
-- All TLS 1.3 (enforced by QUIC)
-- PQC hybrid key exchange (X25519MLKEM768)
-- Background cleanup prevents memory leaks
+- **Advanced Rate Limiting**: Multi-dimensional limiting (IP, JA3/JA4, JWT, composite)
+- **NAT-Friendly**: JA3/JA4 fingerprints identify clients behind shared corporate gateways
+- **Adaptive Anomaly Detection**: ML-inspired baseline learning detects traffic anomalies
+- **GeoIP Blocking**: Geographic restrictions via MaxMind DB
+- **JA3/JA4 Fingerprinting**: Detects suspicious clients by TLS handshake signature
+- **Circuit Breaker**: Protects backends from cascading failures
+- **TLS 1.3 Enforced**: All connections use TLS 1.3 (QUIC requirement)
+- **PQC Hybrid Key Exchange**: X25519MLKEM768 for quantum resistance
+- **Background Cleanup**: Auto-cleanup prevents memory leaks
 
 ## Systemd Service
 
@@ -421,11 +449,20 @@ priority = 1
 
 ## Recent Changes (2026-01-23)
 
-1. **Load Balancing Module** - New `load_balancer.rs` with 6 algorithms, session affinity, health-aware routing
-2. **Circuit Breaker Integration** - Now checks backend health before forwarding, records results after
-3. **JA3/JA4 Fingerprinting Module** - New `fingerprint.rs` with full extraction and classification
-4. **TLS Acceptor Module** - New `tls_acceptor.rs` for ClientHello capture
-5. **Background Cleanup** - Auto-spawned task for expired entry cleanup
-6. **FingerprintExtractor in HttpListenerState** - Added to state for request processing
-7. **Tests Fixed** - Updated to use `#[tokio::test]` for async tests
-8. **All 38 tests passing** (5 new load balancer tests)
+1. **Advanced Rate Limiting Module** - New `rate_limiter.rs` with multi-dimensional limiting:
+   - Composite keys (IP + JA3 + Path)
+   - JA3/JA4 fingerprint-based limiting (NAT-friendly)
+   - JWT subject extraction for user-level limiting
+   - X-Forwarded-For trust chain with trusted proxy CIDRs
+   - IPv6 /64 subnet grouping
+   - Adaptive baseline learning with ML-inspired anomaly detection
+   - Sliding window + token bucket hybrid algorithm
+   - Route-specific overrides
+2. **Load Balancing Module** - `load_balancer.rs` with 6 algorithms, session affinity, health-aware routing
+3. **Circuit Breaker Integration** - Now checks backend health before forwarding, records results after
+4. **JA3/JA4 Fingerprinting Module** - `fingerprint.rs` with full extraction and classification
+5. **TLS Acceptor Module** - `tls_acceptor.rs` for ClientHello capture
+6. **Background Cleanup** - Auto-spawned task for expired entry cleanup
+7. **FingerprintExtractor in HttpListenerState** - Added to state for request processing
+8. **Tests Fixed** - Updated to use `#[tokio::test]` for async tests
+9. **All 46 tests passing** (8 new rate limiter tests)
