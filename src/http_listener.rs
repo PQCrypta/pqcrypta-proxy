@@ -9,6 +9,7 @@
 //! - Security headers injection
 //! - CORS handling
 //! - Standalone operation (full nginx replacement)
+//! - **PQC hybrid key exchange** via OpenSSL 3.5+ with ML-KEM support
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -24,6 +25,8 @@ use axum::{
     routing::any,
 };
 use axum_server::tls_rustls::RustlsConfig;
+#[cfg(feature = "pqc")]
+use axum_server::tls_openssl::OpenSSLConfig;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
@@ -31,7 +34,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 
+#[cfg(feature = "pqc")]
+use crate::pqc_tls::PqcTlsProvider;
+
+use crate::compression::{CompressionState, compression_middleware};
 use crate::config::{ProxyConfig, CorsConfig, TlsMode, BackendConfig};
+use crate::http3_features::{Http3FeaturesState, http3_features_middleware};
+use crate::security::{SecurityState, security_middleware};
 
 /// HTTP listener state
 #[derive(Clone)]
@@ -81,16 +90,43 @@ pub async fn run_http_listener(
         https_client,
     };
 
-    // Build router - catch all routes and proxy
+    // Initialize security state from config
+    let security_state = SecurityState::new(&config);
+
+    // Initialize compression state
+    let compression_state = CompressionState::default();
+
+    // Initialize HTTP/3 features state (Early Hints, Priority, Coalescing)
+    let http3_features_state = Http3FeaturesState::new();
+
+    // Build router with full middleware stack
+    // Order (outside to inside): security -> http3 -> compression -> headers -> handler
     let app = Router::new()
         .fallback(any(proxy_handler))
+        // Response headers (innermost - runs last on response)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security_headers_middleware,
         ))
+        // Alt-Svc header
         .layer(middleware::from_fn_with_state(
             state.clone(),
             alt_svc_middleware,
+        ))
+        // Response compression
+        .layer(middleware::from_fn_with_state(
+            compression_state,
+            compression_middleware,
+        ))
+        // HTTP/3 features (Priority hints, Request coalescing)
+        .layer(middleware::from_fn_with_state(
+            http3_features_state,
+            http3_features_middleware,
+        ))
+        // Security middleware (outermost - runs first)
+        .layer(middleware::from_fn_with_state(
+            security_state,
+            security_middleware,
         ))
         .with_state(state);
 
@@ -119,6 +155,124 @@ pub async fn run_http_listener(
 
     // Run HTTPS server
     axum_server::bind_rustls(addr, tls_config)
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+        .await?;
+
+    Ok(())
+}
+
+/// Create and run the HTTP listener with PQC-enabled OpenSSL TLS
+/// Uses OpenSSL 3.5+ with ML-KEM hybrid key exchange for quantum-resistant connections
+#[cfg(feature = "pqc")]
+pub async fn run_http_listener_pqc(
+    addr: SocketAddr,
+    cert_path: &str,
+    key_path: &str,
+    config: Arc<ProxyConfig>,
+    pqc_provider: Arc<PqcTlsProvider>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::path::Path;
+    use crate::pqc_tls::openssl_pqc::create_pqc_acceptor;
+
+    let port = addr.port();
+
+    info!("🔐 Starting PQC-enabled HTTP/1.1 & HTTP/2 reverse proxy on {} (TCP)", addr);
+    info!("📢 Will advertise Alt-Svc: h3=\":{}\"; ma=86400", port);
+
+    // Create HTTP client for plain backend connections (terminate mode)
+    let http_client = Client::builder(TokioExecutor::new())
+        .pool_max_idle_per_host(100)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .build_http();
+
+    // Create HTTPS client for re-encrypt mode
+    let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .expect("Failed to load native root certificates")
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+
+    let https_client = Client::builder(TokioExecutor::new())
+        .pool_max_idle_per_host(100)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .build(https_connector);
+
+    let state = HttpListenerState {
+        config: config.clone(),
+        port,
+        http_client,
+        https_client,
+    };
+
+    // Initialize security state from config
+    let security_state = SecurityState::new(&config);
+
+    // Initialize compression state
+    let compression_state = CompressionState::default();
+
+    // Initialize HTTP/3 features state (Early Hints, Priority, Coalescing)
+    let http3_features_state = Http3FeaturesState::new();
+
+    // Build router with full middleware stack
+    let app = Router::new()
+        .fallback(any(proxy_handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            security_headers_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            alt_svc_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            compression_state,
+            compression_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            http3_features_state,
+            http3_features_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            security_state,
+            security_middleware,
+        ))
+        .with_state(state);
+
+    // Check if cert files exist
+    if !std::path::Path::new(cert_path).exists() {
+        error!("❌ Certificate file not found: {}", cert_path);
+        return Err(format!("Certificate file not found: {}", cert_path).into());
+    }
+    if !std::path::Path::new(key_path).exists() {
+        error!("❌ Key file not found: {}", key_path);
+        return Err(format!("Key file not found: {}", key_path).into());
+    }
+
+    // Create OpenSSL acceptor with PQC support
+    let ssl_acceptor = create_pqc_acceptor(
+        Path::new(cert_path),
+        Path::new(key_path),
+        &pqc_provider,
+    ).map_err(|e| {
+        error!("❌ PQC TLS configuration error: {}", e);
+        e
+    })?;
+
+    // Create OpenSSL config from acceptor
+    let openssl_config = OpenSSLConfig::from_acceptor(Arc::new(ssl_acceptor));
+
+    let pqc_status = pqc_provider.status();
+    info!("✅ PQC TLS configured for HTTP listener");
+    info!("🔒 Post-Quantum HTTPS reverse proxy ready on port {} (TCP)", port);
+    info!("🛡️  PQC KEM: {}", pqc_status.configured_kem.map(|k| k.openssl_name()).unwrap_or("X25519MLKEM768"));
+    info!("🛡️  Hybrid Mode: {}", pqc_status.hybrid_mode);
+    info!("🔄 Routing: api.pqcrypta.com → 127.0.0.1:3003");
+    info!("🔄 Routing: pqcrypta.com → 127.0.0.1:8080");
+
+    // Run HTTPS server with OpenSSL (PQC-enabled)
+    axum_server::bind_openssl(addr, openssl_config)
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await?;
 

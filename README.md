@@ -25,7 +25,7 @@
 ### Security
 - **Security Headers**: HSTS, X-Frame-Options, CSP, COEP, COOP, CORP, and more
 - **CORS Handling**: Full CORS support with preflight OPTIONS handling
-- **Server Branding**: Hide backend identity (Apache/nginx → "PQ Crypta Proxy")
+- **Server Branding**: Hide backend identity (Apache/nginx → "PQCProxy v0.1.0")
 - **Rate Limiting**: Per-IP request and connection rate limiting
 - **DoS Protection**: Connection limits, timeouts, blocked IPs
 
@@ -438,17 +438,24 @@ cargo run --release --bin quic-bench -- --target localhost:443
 
 ## Security
 
-### Checklist
+### Checklist - All Core Features Complete
 
 - [x] TLS 1.3 only (enforced by QUIC)
 - [x] Full security headers (HSTS, COEP, COOP, CORP, etc.)
 - [x] Server identity hidden (custom branding)
 - [x] X-Forwarded-For header support
+- [x] Rate limiting (governor crate, per-IP token bucket with burst handling)
+- [x] DoS protection (connection limits, auto-blocking after threshold)
+- [x] Request size limits (413/431 responses for oversized requests)
+- [x] GeoIP blocking (MaxMind DB integration)
+- [x] JA3/JA4 TLS fingerprinting (implemented)
+- [x] Circuit breaker (backend protection)
+- [x] IP blocking (manual + auto with expiration)
+- [x] Compression (Brotli, Zstd, Gzip, Deflate)
+- [x] Early Hints (103) support
+- [x] Priority Hints (RFC 9218)
+- [x] Request Coalescing (dedupe identical in-flight requests)
 - [ ] Enable PQC hybrid key exchange for quantum resistance
-- [ ] Restrict admin API to localhost or mTLS
-- [ ] Configure rate limiting
-- [ ] Enable DoS protection
-- [ ] Set appropriate request size limits
 - [ ] Use strong TLS certificates (ECDSA P-384 or Ed25519)
 - [ ] Disable 0-RTT if replay attacks are a concern
 - [ ] Monitor with Prometheus metrics

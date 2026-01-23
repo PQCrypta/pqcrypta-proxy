@@ -17,17 +17,24 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 mod admin;
+mod compression;
 mod config;
 mod handlers;
+mod http3_features;
 mod http_listener;
+mod pqc_tls;
 mod proxy;
 mod quic_listener;
+mod security;
 mod tls;
 mod webtransport_server;
 
 use admin::AdminServer;
 use config::{ConfigManager, ConfigReloadEvent};
 use http_listener::{run_http_listener, run_http_redirect_server, run_tls_passthrough_server};
+#[cfg(feature = "pqc")]
+use http_listener::run_http_listener_pqc;
+use pqc_tls::PqcTlsProvider;
 use proxy::BackendPool;
 use tls::TlsProvider;
 use webtransport_server::WebTransportServer;
@@ -119,16 +126,46 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Arc::new(config);
 
-    // Initialize TLS provider
+    // Initialize PQC TLS provider (OpenSSL 3.5 with ML-KEM)
+    info!("Initializing PQC TLS provider...");
+    let pqc_provider = Arc::new(PqcTlsProvider::new(&config.pqc));
+    let pqc_status = pqc_provider.status();
+
+    if pqc_status.available {
+        info!("═══════════════════════════════════════════════════════════════");
+        info!("  🔐 POST-QUANTUM CRYPTOGRAPHY ENABLED");
+        info!("═══════════════════════════════════════════════════════════════");
+        info!("  OpenSSL:       {}", pqc_status.openssl_version);
+        info!("  Hybrid Mode:   {}", if pqc_status.hybrid_mode { "Yes (Classical + PQC)" } else { "No (Pure PQC)" });
+        if let Some(kem) = &pqc_status.configured_kem {
+            info!("  Preferred KEM: {} (NIST Level {})", kem.openssl_name(), kem.security_level());
+        }
+        info!("  Available KEMs: {}", pqc_status.available_kems.len());
+        info!("  Groups:        {}", pqc_provider.groups_string());
+        info!("═══════════════════════════════════════════════════════════════");
+    } else if config.pqc.enabled {
+        warn!("═══════════════════════════════════════════════════════════════");
+        warn!("  ⚠️  PQC REQUESTED BUT NOT AVAILABLE");
+        warn!("═══════════════════════════════════════════════════════════════");
+        if let Some(err) = &pqc_status.error {
+            warn!("  Error: {}", err);
+        }
+        warn!("  Falling back to classical TLS 1.3");
+        warn!("═══════════════════════════════════════════════════════════════");
+    } else {
+        info!("📝 PQC disabled - using classical TLS 1.3");
+    }
+
+    // Initialize TLS provider (rustls for QUIC)
     info!("Initializing TLS provider...");
     let tls_provider = Arc::new(TlsProvider::new(&config.tls, &config.pqc)?);
 
     if tls_provider.is_pqc_enabled() {
         info!("✅ PQC hybrid key exchange enabled (provider: {})", config.pqc.provider);
         info!("   Preferred KEM: {}", config.pqc.preferred_kem);
-    } else if config.pqc.enabled {
-        warn!("⚠️ PQC requested but not available - using classical TLS");
-    } else {
+    } else if config.pqc.enabled && !pqc_status.available {
+        // Already warned above
+    } else if !config.pqc.enabled {
         info!("📝 PQC disabled - using classical TLS 1.3");
     }
 
@@ -264,6 +301,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Start HTTPS reverse proxy listeners (TCP) on all ports
+    // Use PQC-enabled OpenSSL listener when available, otherwise rustls
+    let use_pqc_listener = pqc_status.available && config.pqc.enabled;
+
     for port in all_ports.clone() {
         let bind_addr: std::net::SocketAddr = format!(
             "{}:{}",
@@ -275,6 +315,31 @@ async fn main() -> anyhow::Result<()> {
         let http_key = key_path.clone();
         let http_config = config.clone();
 
+        #[cfg(feature = "pqc")]
+        if use_pqc_listener {
+            let http_pqc_provider = pqc_provider.clone();
+            tokio::spawn(async move {
+                info!("🔐 Starting PQC HTTPS reverse proxy on {} (TCP with ML-KEM)", bind_addr);
+                if let Err(e) = run_http_listener_pqc(
+                    bind_addr,
+                    &http_cert,
+                    &http_key,
+                    http_config,
+                    http_pqc_provider,
+                ).await {
+                    error!("PQC HTTP listener error on port {}: {}", bind_addr.port(), e);
+                }
+            });
+        } else {
+            tokio::spawn(async move {
+                info!("🌐 Starting HTTPS reverse proxy on {} (TCP)", bind_addr);
+                if let Err(e) = run_http_listener(bind_addr, &http_cert, &http_key, http_config).await {
+                    error!("HTTP listener error on port {}: {}", bind_addr.port(), e);
+                }
+            });
+        }
+
+        #[cfg(not(feature = "pqc"))]
         tokio::spawn(async move {
             info!("🌐 Starting HTTPS reverse proxy on {} (TCP)", bind_addr);
             if let Err(e) = run_http_listener(bind_addr, &http_cert, &http_key, http_config).await {
@@ -329,7 +394,11 @@ async fn main() -> anyhow::Result<()> {
         info!("  HTTP Redirect:   0.0.0.0:{} → HTTPS", config.http_redirect.port);
     }
     for port in &all_ports {
-        info!("  HTTPS (TCP):     0.0.0.0:{}", port);
+        if use_pqc_listener {
+            info!("  HTTPS (PQC):     0.0.0.0:{} (ML-KEM hybrid key exchange)", port);
+        } else {
+            info!("  HTTPS (TCP):     0.0.0.0:{}", port);
+        }
         info!("  WebTransport:    0.0.0.0:{} (UDP)", port);
     }
     info!("  Alt-Svc:         {}", alt_svc_parts.join(", "));
