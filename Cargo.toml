@@ -83,9 +83,6 @@ tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "limit"]
 # Metrics (optional feature)
 prometheus = { version = "0.14", optional = true }
 
-# Unix socket support for PHP-FPM backends
-hyperlocal = "0.9"
-
 # Utilities
 anyhow = "1.0"
 thiserror = "2.0"
@@ -152,6 +149,8 @@ windows-service-rs = { version = "0.7", package = "windows-service", optional = 
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "user"] }
+# Unix socket support for PHP-FPM backends (not available on Windows)
+hyperlocal = "0.9"
 
 [dev-dependencies]
 tempfile = "3.14"
