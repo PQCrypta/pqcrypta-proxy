@@ -95,7 +95,11 @@ pub use load_balancer::{
     extract_session_cookie, BackendPool as LbBackendPool, BackendServer, LoadBalancer, PoolStats,
     SelectionContext, SessionCookieConfig,
 };
-pub use pqc_tls::{PqcKemAlgorithm, PqcStatus, PqcTlsProvider};
+#[cfg(feature = "pqc")]
+pub use pqc_tls::openssl_pqc;
+pub use pqc_tls::{
+    verify_pqc_support, PqcHandshakeInfo, PqcKemAlgorithm, PqcStatus, PqcTlsProvider,
+};
 pub use proxy::BackendPool;
 pub use rate_limiter::{
     build_context_from_request, AdvancedRateLimitConfig, AdvancedRateLimiter, RateLimitContext,

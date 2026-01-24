@@ -8,7 +8,14 @@
 //! - Alt-Svc advertisement for HTTP/3 and WebTransport
 //! - Security headers injection
 //! - CORS handling
-//! - **PQC hybrid key exchange** via rustls-post-quantum with ML-KEM support
+//! - **PQC hybrid key exchange** via OpenSSL 3.5+ with native ML-KEM support
+//!
+//! ## TLS Backend Options
+//!
+//! - **OpenSSL 3.5+** (default when `pqc` feature enabled): Native ML-KEM support with
+//!   multiple hybrid modes (X25519MLKEM768, SecP256r1MLKEM768, SecP384r1MLKEM1024),
+//!   hardware acceleration, and broader algorithm choices
+//! - **rustls-post-quantum** (fallback): Pure Rust implementation with X25519MLKEM768 hybrid
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -32,7 +39,7 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "pqc")]
-use crate::pqc_tls::PqcTlsProvider;
+use crate::pqc_tls::{openssl_pqc, PqcTlsProvider};
 
 use crate::compression::{compression_middleware, CompressionState};
 use crate::config::{BackendConfig, CorsConfig, ProxyConfig, TlsMode};
@@ -220,13 +227,8 @@ pub async fn run_http_listener_pqc(
     cert_path: &str,
     key_path: &str,
     config: Arc<ProxyConfig>,
-    _pqc_provider: Arc<PqcTlsProvider>,
+    pqc_provider: Arc<PqcTlsProvider>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    use rustls_pemfile::{certs, ec_private_keys, pkcs8_private_keys, rsa_private_keys};
-    use std::fs::File;
-    use std::io::BufReader;
-
     let port = addr.port();
 
     info!(
@@ -333,7 +335,7 @@ pub async fn run_http_listener_pqc(
         ))
         .with_state(state);
 
-    // Check if cert files exist
+    // Check if cert files exist (OpenSSL will load them directly)
     if !std::path::Path::new(cert_path).exists() {
         error!("❌ Certificate file not found: {}", cert_path);
         return Err(format!("Certificate file not found: {}", cert_path).into());
@@ -343,104 +345,58 @@ pub async fn run_http_listener_pqc(
         return Err(format!("Key file not found: {}", key_path).into());
     }
 
-    // Load certificates
-    let cert_file = File::open(cert_path)?;
-    let mut cert_reader = BufReader::new(cert_file);
-    let cert_chain: Vec<CertificateDer<'static>> =
-        certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+    // =========================================================================
+    // OpenSSL 3.5+ PQC TLS Backend
+    // =========================================================================
+    // Uses native ML-KEM support with multiple hybrid modes:
+    // - X25519MLKEM768 (IETF standard, recommended)
+    // - SecP256r1MLKEM768 (NIST curve variant)
+    // - SecP384r1MLKEM1024 (higher security)
+    // - X448MLKEM1024 (maximum security)
+    // =========================================================================
+    use axum_server::tls_openssl::OpenSSLConfig;
 
-    if cert_chain.is_empty() {
-        return Err("No certificates found in certificate file".into());
-    }
-    info!("📜 Loaded {} certificates", cert_chain.len());
+    // Create OpenSSL SSL acceptor with PQC hybrid key exchange
+    let cert_path_buf = std::path::Path::new(cert_path);
+    let key_path_buf = std::path::Path::new(key_path);
 
-    // Load private key - try multiple formats
-    let key_file = File::open(key_path)?;
-    let mut key_reader = BufReader::new(key_file);
+    let ssl_acceptor = openssl_pqc::create_pqc_acceptor(cert_path_buf, key_path_buf, &pqc_provider)
+        .map_err(|e| format!("Failed to create PQC SSL acceptor: {}", e))?;
 
-    // Try PKCS#8 format first
-    let pkcs8_keys: Vec<_> = pkcs8_private_keys(&mut key_reader).collect::<Result<Vec<_>, _>>()?;
+    // Create OpenSSL config from the PQC-enabled acceptor (requires Arc)
+    let openssl_config = OpenSSLConfig::from_acceptor(Arc::new(ssl_acceptor));
 
-    let private_key: PrivateKeyDer<'static> = if !pkcs8_keys.is_empty() {
-        PrivateKeyDer::Pkcs8(pkcs8_keys.into_iter().next().unwrap())
+    // Get PQC status for logging
+    let pqc_status = pqc_provider.status();
+    let kem_info = if let Some(kem) = pqc_status.configured_kem {
+        format!(
+            "{} (Security Level {})",
+            kem.openssl_name(),
+            kem.security_level()
+        )
     } else {
-        // Try RSA format
-        let key_file = File::open(key_path)?;
-        let mut key_reader = BufReader::new(key_file);
-        let rsa_keys: Vec<_> = rsa_private_keys(&mut key_reader).collect::<Result<Vec<_>, _>>()?;
-
-        if !rsa_keys.is_empty() {
-            PrivateKeyDer::Pkcs1(rsa_keys.into_iter().next().unwrap())
-        } else {
-            // Try EC format
-            let key_file = File::open(key_path)?;
-            let mut key_reader = BufReader::new(key_file);
-            let ec_keys: Vec<_> =
-                ec_private_keys(&mut key_reader).collect::<Result<Vec<_>, _>>()?;
-
-            if !ec_keys.is_empty() {
-                PrivateKeyDer::Sec1(ec_keys.into_iter().next().unwrap())
-            } else {
-                return Err("No valid private key found".into());
-            }
-        }
-    };
-    info!("🔑 Private key loaded successfully");
-
-    // Create rustls config with PQC support via rustls-post-quantum
-    // This provider includes X25519MLKEM768 hybrid key exchange
-    let crypto_provider = std::sync::Arc::new(rustls_post_quantum::provider());
-
-    // Determine TLS protocol versions from config
-    let min_version = config.tls.min_version.as_str();
-    let protocol_versions: Vec<&'static rustls::SupportedProtocolVersion> = match min_version {
-        "1.3" => vec![&rustls::version::TLS13],
-        "1.2" => vec![&rustls::version::TLS12, &rustls::version::TLS13],
-        _ => {
-            warn!(
-                "Unknown min_version '{}' in config, defaulting to TLS 1.3 only",
-                min_version
-            );
-            vec![&rustls::version::TLS13]
-        }
+        "X25519MLKEM768 (default)".to_string()
     };
 
-    let tls_version_info = if protocol_versions.len() == 1 {
-        "TLS 1.3 ONLY - TLS 1.2 disabled to prevent downgrade attacks"
-    } else {
-        "TLS 1.2+ (TLS 1.3 preferred)"
-    };
-
-    let mut rustls_config = rustls::ServerConfig::builder_with_provider(crypto_provider)
-        .with_protocol_versions(&protocol_versions)
-        .map_err(|e| format!("Failed to set protocol versions: {}", e))?
-        .with_no_client_auth()
-        .with_single_cert(cert_chain, private_key)
-        .map_err(|e| format!("Failed to create TLS config: {}", e))?;
-
-    // Configure ALPN for HTTP/1.1 and HTTP/2
-    rustls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-
-    // Create axum-server rustls config
-    let tls_config = RustlsConfig::from_config(std::sync::Arc::new(rustls_config));
-
-    info!("✅ PQC TLS configured via rustls-post-quantum");
-    info!(
-        "🔒 {} (config: min_version = \"{}\")",
-        tls_version_info, min_version
-    );
+    info!("✅ PQC TLS configured via OpenSSL 3.5+ (native ML-KEM)");
+    info!("🔒 OpenSSL version: {}", pqc_status.openssl_version);
+    info!("🔒 TLS 1.3 ONLY - required for ML-KEM key exchange");
     info!(
         "🔒 Post-Quantum HTTPS reverse proxy ready on port {} (TCP)",
         port
     );
-    info!("🛡️  PQC KEM: X25519MLKEM768 (hybrid classical + post-quantum)");
-    info!("🛡️  Hybrid Mode: true");
-    info!("📊 Security Level: NIST Level 3 (192-bit equivalent)");
+    info!("🛡️  PQC KEM: {}", kem_info);
+    info!("🛡️  Hybrid Mode: {}", pqc_status.hybrid_mode);
+    info!(
+        "🛡️  Available KEMs: {}",
+        pqc_status.available_kems.join(", ")
+    );
+    info!("📊 Configured groups: {}", pqc_provider.groups_string());
     info!("🔄 Routing: api.pqcrypta.com → 127.0.0.1:3003");
     info!("🔄 Routing: pqcrypta.com → 127.0.0.1:8080");
 
-    // Run HTTPS server with rustls (PQC-enabled via aws-lc-rs)
-    axum_server::bind_rustls(addr, tls_config)
+    // Run HTTPS server with OpenSSL 3.5+ (PQC-enabled with native ML-KEM)
+    axum_server::bind_openssl(addr, openssl_config)
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await?;
 
