@@ -81,6 +81,9 @@ enabled = true
 # HTTP port (redirects to HTTPS on primary port)
 port = 80
 
+# Redirect all HTTP to HTTPS (301 permanent redirect)
+redirect_to_https = true
+
 # =============================
 # Security Headers
 # =============================
@@ -273,21 +276,46 @@ auto_adjust = false
 min_samples = 1000
 std_dev_multiplier = 3.0  # Requests > mean + 3*std_dev = anomaly
 
-# Example composite key configuration
-# [[advanced_rate_limiting.composite_keys]]
-# name = "ip_plus_path"
-# keys = ["source_ip", "path"]
-# routes = []  # Empty = all routes
-# [advanced_rate_limiting.composite_keys.limits]
-# requests_per_second = 50
-# burst_size = 25
+# Per-route rate limits (uncomment to enable)
+# Each route can have its own rate limits with optional key override and exemptions
 
-# Example per-route rate limits
 # [advanced_rate_limiting.route_limits.api_heavy]
-# pattern = "/api/heavy"
+# pattern = "/api/heavy"                    # Route pattern (path prefix or regex)
+# key_override = "api_key"                  # Override key resolution for this route
+# exempt_keys = ["internal-service-key"]    # Keys exempt from rate limiting
 # [advanced_rate_limiting.route_limits.api_heavy.limits]
 # requests_per_second = 10
 # burst_size = 5
+# requests_per_minute = 300
+# requests_per_hour = 5000
+
+# [advanced_rate_limiting.route_limits.public_api]
+# pattern = "/api/public/.*"
+# [advanced_rate_limiting.route_limits.public_api.limits]
+# requests_per_second = 50
+# burst_size = 25
+# requests_per_minute = 1500
+
+# Composite key configuration (combine multiple keys for rate limiting)
+# Useful for tenant-aware rate limiting or complex scenarios
+
+# [[advanced_rate_limiting.composite_keys]]
+# name = "tenant-user"                      # Name for logging/metrics
+# keys = ["header:X-Tenant-ID", "jwt_subject"]  # Keys to combine
+# routes = ["/api/.*"]                      # Routes this applies to (empty = all)
+# [advanced_rate_limiting.composite_keys.limits]
+# requests_per_second = 500
+# burst_size = 250
+# requests_per_minute = 15000
+# requests_per_hour = 250000
+
+# [[advanced_rate_limiting.composite_keys]]
+# name = "ip_plus_path"
+# keys = ["source_ip", "path"]
+# routes = []                               # Empty = all routes
+# [advanced_rate_limiting.composite_keys.limits]
+# requests_per_second = 50
+# burst_size = 25
 
 # =============================
 # Security Settings
@@ -448,6 +476,9 @@ name = "api-pool"
 algorithm = "least_connections"  # Override default algorithm
 health_aware = true              # Skip unhealthy backends
 affinity = "none"                # Options: none, cookie, ip_hash, header
+# affinity_header = "X-Session-ID"  # Header name when affinity = "header"
+# queue_max_size = 500             # Pool-specific queue size (overrides global)
+# queue_timeout_ms = 3000          # Pool-specific queue timeout (overrides global)
 health_check_path = "/health"
 health_check_interval_secs = 10
 
@@ -516,6 +547,41 @@ address = "192.168.1.11:8000"
 weight = 100
 priority = 1
 max_connections = 100
+
+# Example: Pool with header-based affinity and TLS to backends
+[backend_pools.secure-pool]
+name = "secure-pool"
+algorithm = "round_robin"
+health_aware = true
+affinity = "header"                    # Header-based sticky sessions
+affinity_header = "X-Session-ID"       # Required when affinity = "header"
+queue_max_size = 200                   # Pool-specific queue max size
+queue_timeout_ms = 2000                # Pool-specific queue timeout
+health_check_path = "/health"
+health_check_interval_secs = 15
+
+# Pool server with TLS re-encryption to backend
+[[backend_pools.secure-pool.servers]]
+address = "10.0.0.50:443"
+weight = 100
+priority = 1
+max_connections = 50
+timeout_ms = 30000
+tls_mode = "reencrypt"                 # TLS to backend
+tls_cert = "/etc/pqcrypta/backend-ca.pem"  # CA cert for verification
+tls_skip_verify = false                # DANGEROUS if true - only for testing
+tls_sni = "backend1.internal.com"      # Custom SNI hostname
+
+[[backend_pools.secure-pool.servers]]
+address = "10.0.0.51:443"
+weight = 100
+priority = 1
+max_connections = 50
+timeout_ms = 30000
+tls_mode = "reencrypt"
+tls_cert = "/etc/pqcrypta/backend-ca.pem"
+tls_skip_verify = false
+tls_sni = "backend2.internal.com"
 
 # =============================
 # Backend Definitions (Single)
@@ -764,6 +830,56 @@ backend = "api"
 forward_client_identity = true
 priority = 20
 
+# Exact path match (stricter than path_prefix)
+[[routes]]
+name = "exact-health"
+host = "api.example.com"
+path_exact = "/health"             # Only matches /health exactly, not /health/db
+backend = "api"
+priority = 5
+
+# Route with headers removal
+[[routes]]
+name = "sanitized-api"
+host = "api.example.com"
+path_prefix = "/public"
+backend = "api"
+forward_client_identity = true
+priority = 60
+remove_headers = ["X-Internal-Token", "X-Debug-Info"]  # Headers to strip before sending to backend
+
+[routes.add_headers]
+X-Public-Request = "true"
+
+# Route allowing HTTP/1.1 (for search bots like Googlebot that don't support HTTP/3)
+[[routes]]
+name = "seo-friendly"
+host = "example.com"
+path_prefix = "/sitemap"
+backend = "apache"
+allow_http11 = true                # Allow HTTP/1.1 for this route (search bots)
+skip_bot_blocking = true           # Don't block bots on this route
+priority = 30
+
+# Route with Stripe.js compatibility (removes COEP/COOP headers that break Stripe)
+[[routes]]
+name = "checkout-page"
+host = "example.com"
+path_prefix = "/checkout"
+backend = "apache"
+stripe_compatibility = true        # Removes Cross-Origin-Embedder-Policy and Cross-Origin-Opener-Policy
+priority = 40
+
+# Route with custom timeout override
+[[routes]]
+name = "long-running-api"
+host = "api.example.com"
+path_prefix = "/export"
+backend = "api"
+timeout_override_ms = 120000       # 2 minute timeout for long exports
+forward_client_identity = true
+priority = 45
+
 # Wildcard catch-all route
 [[routes]]
 name = "default"
@@ -825,3 +941,35 @@ priority = 1000
 #   curl -X POST http://127.0.0.1:8081/reload
 # TLS certificates can be reloaded separately:
 #   curl -X POST http://127.0.0.1:8081/reload -d '{"tls_only":true}'
+
+# Route Options Reference:
+# ------------------------
+# Path Matching (use one):
+#   - path_prefix: Matches if path starts with value (e.g., "/api" matches "/api/v1")
+#   - path_exact: Matches only the exact path (e.g., "/health" won't match "/health/db")
+#   - path_regex: Regex pattern for complex matching (e.g., "^/v[0-9]+/.*")
+#
+# Headers:
+#   - add_headers: Headers to add to backend request
+#   - remove_headers: Headers to strip before sending to backend
+#   - headers_override: Override global security headers for this route
+#
+# Special Modes:
+#   - allow_http11: Allow HTTP/1.1 for search bots (Googlebot doesn't support HTTP/3)
+#   - skip_bot_blocking: Don't apply bot protection to this route
+#   - stripe_compatibility: Removes COEP/COOP headers that break Stripe.js
+#   - timeout_override_ms: Custom timeout for slow endpoints
+#
+# Backend Pool Options:
+# ---------------------
+#   - affinity: Session stickiness mode (none, cookie, ip_hash, header)
+#   - affinity_header: Header name when affinity = "header"
+#   - queue_max_size: Pool-specific queue size (overrides [load_balancer.queue])
+#   - queue_timeout_ms: Pool-specific queue timeout
+#
+# Pool Server TLS Options:
+# ------------------------
+#   - tls_mode: terminate, reencrypt, or passthrough
+#   - tls_cert: CA certificate for backend verification
+#   - tls_skip_verify: Skip verification (DANGEROUS - testing only)
+#   - tls_sni: Custom SNI hostname for TLS handshake
