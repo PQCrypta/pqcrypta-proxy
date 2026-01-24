@@ -85,9 +85,11 @@ pub async fn run_http_listener(
     info!("📢 Will advertise Alt-Svc: h3=\":{}\"; ma=86400", port);
 
     // Create HTTP client for plain backend connections (terminate mode)
+    // Using configurable connection pool settings
+    let pool_config = &config.connection_pool;
     let http_client = Client::builder(TokioExecutor::new())
-        .pool_max_idle_per_host(100)
-        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(pool_config.max_idle_per_host)
+        .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
         .build_http();
 
     // Create HTTPS client for re-encrypt mode
@@ -100,8 +102,8 @@ pub async fn run_http_listener(
         .build();
 
     let https_client = Client::builder(TokioExecutor::new())
-        .pool_max_idle_per_host(100)
-        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(pool_config.max_idle_per_host)
+        .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
         .build(https_connector);
 
     // Initialize security state from config (must be created before state)
@@ -238,9 +240,11 @@ pub async fn run_http_listener_pqc(
     info!("📢 Will advertise Alt-Svc: h3=\":{}\"; ma=86400", port);
 
     // Create HTTP client for plain backend connections (terminate mode)
+    // Using configurable connection pool settings
+    let pool_config = &config.connection_pool;
     let http_client = Client::builder(TokioExecutor::new())
-        .pool_max_idle_per_host(100)
-        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(pool_config.max_idle_per_host)
+        .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
         .build_http();
 
     // Create HTTPS client for re-encrypt mode
@@ -253,8 +257,8 @@ pub async fn run_http_listener_pqc(
         .build();
 
     let https_client = Client::builder(TokioExecutor::new())
-        .pool_max_idle_per_host(100)
-        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(pool_config.max_idle_per_host)
+        .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
         .build(https_connector);
 
     // Initialize security state from config (must be created before state)

@@ -20,6 +20,7 @@ use md5::{Digest, Md5};
 use sha2::Sha256;
 use tracing::{debug, warn};
 
+use crate::config::FingerprintConfig;
 use crate::security::{BlockReason, FingerprintClass, SecurityState, TlsFingerprint};
 
 /// TLS fingerprint extractor
@@ -493,6 +494,7 @@ impl FingerprintExtractor {
         client_hello: &[u8],
         client_ip: IpAddr,
         security: &SecurityState,
+        config: &FingerprintConfig,
     ) -> FingerprintResult {
         let fingerprint = match self.extract_ja3(client_hello) {
             Some(fp) => fp,
@@ -542,7 +544,7 @@ impl FingerprintExtractor {
             },
         );
 
-        // Check if this fingerprint should be blocked
+        // Check if this fingerprint should be blocked (using configurable thresholds)
         let allowed = match &classification {
             FingerprintClass::Malicious => {
                 warn!(
@@ -552,15 +554,15 @@ impl FingerprintExtractor {
                 security.block_ip(
                     client_ip,
                     BlockReason::SuspiciousFingerprint,
-                    Some(Duration::from_secs(3600)),
+                    Some(Duration::from_secs(config.malicious_block_duration_secs)),
                 );
                 false
             }
             FingerprintClass::Suspicious => {
-                // Check request rate for suspicious fingerprints
+                // Check request rate for suspicious fingerprints (configurable thresholds)
                 if let Some(cached) = self.cache.get(&ja3_hash) {
-                    if cached.request_count > 100
-                        && cached.first_seen.elapsed() < Duration::from_secs(60)
+                    if cached.request_count > config.suspicious_rate_threshold
+                        && cached.first_seen.elapsed() < Duration::from_secs(config.suspicious_rate_window_secs)
                     {
                         warn!(
                             "High rate from suspicious fingerprint {} (IP: {})",
@@ -569,7 +571,7 @@ impl FingerprintExtractor {
                         security.block_ip(
                             client_ip,
                             BlockReason::SuspiciousFingerprint,
-                            Some(Duration::from_secs(300)),
+                            Some(Duration::from_secs(config.suspicious_block_duration_secs)),
                         );
                         false
                     } else {
@@ -601,9 +603,9 @@ impl FingerprintExtractor {
         }
     }
 
-    /// Cleanup old cache entries
-    pub fn cleanup(&self) {
-        let max_age = Duration::from_secs(3600);
+    /// Cleanup old cache entries (using configurable max age)
+    pub fn cleanup(&self, config: &FingerprintConfig) {
+        let max_age = Duration::from_secs(config.cache_max_age_secs);
         self.cache
             .retain(|_, cached| cached.last_seen.elapsed() < max_age);
     }

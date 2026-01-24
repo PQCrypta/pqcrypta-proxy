@@ -34,7 +34,7 @@ use parking_lot::RwLock;
 use sha2::Digest;
 use tracing::{debug, info, warn};
 
-use crate::config::{ProxyConfig, RateLimitConfig, SecurityConfig};
+use crate::config::{CircuitBreakerConfig, ProxyConfig, RateLimitConfig, SecurityConfig};
 
 /// Security state shared across all requests
 #[derive(Clone)]
@@ -56,6 +56,8 @@ pub struct SecurityState {
     pub config: Arc<RwLock<SecurityConfig>>,
     /// Rate limit configuration
     pub rate_config: Arc<RwLock<RateLimitConfig>>,
+    /// Circuit breaker configuration
+    pub circuit_breaker_config: Arc<RwLock<CircuitBreakerConfig>>,
     /// Global rate limiter (fallback)
     pub global_rate_limiter: Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>,
     /// GeoIP database (optional)
@@ -235,6 +237,7 @@ impl SecurityState {
             circuit_breakers: Arc::new(DashMap::new()),
             config: Arc::new(RwLock::new(config.security.clone())),
             rate_config: Arc::new(RwLock::new(config.rate_limiting.clone())),
+            circuit_breaker_config: Arc::new(RwLock::new(config.circuit_breaker.clone())),
             global_rate_limiter,
             #[cfg(feature = "geoip")]
             geoip_db,
@@ -463,8 +466,13 @@ impl SecurityState {
         }
     }
 
-    /// Check if circuit breaker allows request to backend
+    /// Check if circuit breaker allows request to backend (using configurable settings)
     pub fn circuit_allows(&self, backend: &str) -> bool {
+        let cb_config = self.circuit_breaker_config.read();
+        let half_open_delay = Duration::from_secs(cb_config.half_open_delay_secs);
+        let half_open_max = cb_config.half_open_max_requests;
+        drop(cb_config);
+
         let mut state = self
             .circuit_breakers
             .entry(backend.to_string())
@@ -473,8 +481,8 @@ impl SecurityState {
         match state.state {
             CircuitState::Closed => true,
             CircuitState::Open => {
-                // Check if we should try half-open (after 30 seconds)
-                if state.last_state_change.elapsed() > Duration::from_secs(30) {
+                // Check if we should try half-open (configurable delay)
+                if state.last_state_change.elapsed() > half_open_delay {
                     state.state = CircuitState::HalfOpen;
                     state.half_open_requests = 0;
                     state.last_state_change = Instant::now();
@@ -485,8 +493,8 @@ impl SecurityState {
                 }
             }
             CircuitState::HalfOpen => {
-                // Allow limited requests in half-open state
-                if state.half_open_requests < 3 {
+                // Allow limited requests in half-open state (configurable max)
+                if state.half_open_requests < half_open_max {
                     state.half_open_requests += 1;
                     true
                 } else {
@@ -496,17 +504,21 @@ impl SecurityState {
         }
     }
 
-    /// Cleanup expired entries (call periodically)
+    /// Cleanup expired entries (call periodically, using configurable intervals)
     pub fn cleanup(&self) {
+        let cb_config = self.circuit_breaker_config.read();
+        let stale_cleanup_secs = cb_config.stale_counter_cleanup_secs;
+        drop(cb_config);
+
         // Remove expired blocks
         self.blocked_ips
             .retain(|_, info| info.expires_at.map(|e| Instant::now() < e).unwrap_or(true));
 
-        // Remove old request counters (older than 5 minutes)
+        // Remove old request counters (configurable age)
         self.request_counts.retain(|_, counter| {
             counter
                 .window_start
-                .map(|s| s.elapsed() < Duration::from_secs(300))
+                .map(|s| s.elapsed() < Duration::from_secs(stale_cleanup_secs))
                 .unwrap_or(false)
         });
 

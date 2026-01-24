@@ -23,6 +23,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
 use tracing::{debug, trace, warn};
 
+use crate::config::FingerprintConfig;
 use crate::fingerprint::{FingerprintExtractor, FingerprintResult};
 use crate::security::SecurityState;
 
@@ -97,6 +98,7 @@ pub struct FingerprintingTlsAcceptor {
     tls_acceptor: tokio_rustls::TlsAcceptor,
     fingerprint_extractor: Arc<FingerprintExtractor>,
     security_state: SecurityState,
+    fingerprint_config: FingerprintConfig,
 }
 
 impl FingerprintingTlsAcceptor {
@@ -104,11 +106,13 @@ impl FingerprintingTlsAcceptor {
         config: Arc<rustls::ServerConfig>,
         fingerprint_extractor: Arc<FingerprintExtractor>,
         security_state: SecurityState,
+        fingerprint_config: FingerprintConfig,
     ) -> Self {
         Self {
             tls_acceptor: tokio_rustls::TlsAcceptor::from(config),
             fingerprint_extractor,
             security_state,
+            fingerprint_config,
         }
     }
 
@@ -129,6 +133,7 @@ impl FingerprintingTlsAcceptor {
                     &peek_buf[..n],
                     remote_addr.ip(),
                     &self.security_state,
+                    &self.fingerprint_config,
                 )
             }
             Ok(_) => {

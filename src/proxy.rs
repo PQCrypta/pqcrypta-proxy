@@ -36,11 +36,12 @@ pub struct BackendPool {
 impl BackendPool {
     /// Create a new backend pool
     pub fn new(config: Arc<ProxyConfig>) -> Self {
-        // Create HTTP client
+        // Create HTTP client using configurable connection pool settings
         let connector = hyper_util::client::legacy::connect::HttpConnector::new();
+        let pool_config = &config.connection_pool;
         let http_client = Client::builder(TokioExecutor::new())
-            .pool_idle_timeout(Duration::from_secs(30))
-            .pool_max_idle_per_host(10)
+            .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
+            .pool_max_idle_per_host(pool_config.max_idle_per_host)
             .build(connector);
 
         let pool = Self {
