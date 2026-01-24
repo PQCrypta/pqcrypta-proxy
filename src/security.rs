@@ -8,6 +8,13 @@
 //! - JA3/JA4 TLS fingerprinting for bot detection
 //! - Circuit breaker for backend protection
 //! - GeoIP blocking (optional feature)
+//!
+//! # Integration Status
+//! JA3 calculation and GeoIP features are scaffolded. GeoIP requires MaxMind database
+//! integration. JA3 functions are duplicated in fingerprint.rs with full JA4 support.
+
+// Allow dead code for scaffolded GeoIP and JA3 features
+#![allow(dead_code)]
 
 use std::net::IpAddr;
 use std::num::NonZeroU32;

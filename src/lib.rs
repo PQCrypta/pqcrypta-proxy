@@ -65,7 +65,6 @@
 
 pub mod admin;
 pub mod compression;
-pub mod rate_limiter; // Must be before config (config imports from it)
 pub mod config;
 pub mod fingerprint;
 pub mod handlers;
@@ -75,6 +74,7 @@ pub mod load_balancer;
 pub mod pqc_tls;
 pub mod proxy;
 pub mod quic_listener;
+pub mod rate_limiter; // Must be before config (config imports from it)
 pub mod security;
 pub mod tls;
 pub mod tls_acceptor;
@@ -83,10 +83,6 @@ pub mod webtransport_server;
 // Re-export commonly used types
 pub use compression::{compression_middleware, CompressionConfig, CompressionState};
 pub use config::{ConfigManager, ProxyConfig};
-pub use load_balancer::{
-    BackendPool as LbBackendPool, BackendServer, LoadBalancer, PoolStats, SelectionContext,
-    SessionCookieConfig, extract_session_cookie,
-};
 pub use fingerprint::{FingerprintExtractor, FingerprintResult, FingerprintStats, Ja3Fingerprint};
 pub use http3_features::{
     early_hints_middleware, http3_features_middleware, CoalescingState, EarlyHintsState,
@@ -95,11 +91,15 @@ pub use http3_features::{
 #[cfg(feature = "pqc")]
 pub use http_listener::run_http_listener_pqc;
 pub use http_listener::{run_http_listener, run_http_redirect_server, run_tls_passthrough_server};
-pub use pqc_tls::{verify_pqc_support, PqcKemAlgorithm, PqcStatus, PqcTlsProvider};
+pub use load_balancer::{
+    extract_session_cookie, BackendPool as LbBackendPool, BackendServer, LoadBalancer, PoolStats,
+    SelectionContext, SessionCookieConfig,
+};
+pub use pqc_tls::{PqcKemAlgorithm, PqcStatus, PqcTlsProvider};
 pub use proxy::BackendPool;
 pub use rate_limiter::{
-    AdvancedRateLimitConfig, AdvancedRateLimiter, RateLimitContext, RateLimitKey,
-    RateLimitKeyType, RateLimitResult, RateLimiterSnapshot, build_context_from_request,
+    build_context_from_request, AdvancedRateLimitConfig, AdvancedRateLimiter, RateLimitContext,
+    RateLimitKey, RateLimitKeyType, RateLimitResult, RateLimiterSnapshot,
 };
 pub use security::{security_middleware, SecurityState};
 pub use tls::TlsProvider;

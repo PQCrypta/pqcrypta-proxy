@@ -2,6 +2,14 @@
 //!
 //! Implements JA3/JA4 TLS fingerprinting for bot detection and client identification.
 //! Captures ClientHello during TLS handshake and computes fingerprints.
+//!
+//! # Integration Status
+//! This module is scaffolded for future integration. Full integration requires
+//! a custom TLS acceptor layer to intercept ClientHello before handshake completion.
+//! The FingerprintingTlsAcceptor is ready but not yet wired into the main request flow.
+
+// Allow dead code for scaffolded features pending TLS layer integration
+#![allow(dead_code)]
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -270,8 +278,7 @@ impl FingerprintExtractor {
             return None;
         }
         let extensions_len =
-            u16::from_be_bytes([client_hello_data[offset], client_hello_data[offset + 1]])
-                as usize;
+            u16::from_be_bytes([client_hello_data[offset], client_hello_data[offset + 1]]) as usize;
         offset += 2;
 
         let mut extensions = Vec::new();
@@ -437,7 +444,7 @@ impl FingerprintExtractor {
 
         // Hash of sorted ciphers (truncated to 12 hex chars)
         let mut sorted_ciphers = ciphers.to_vec();
-        sorted_ciphers.sort();
+        sorted_ciphers.sort_unstable();
         let cipher_str: String = sorted_ciphers
             .iter()
             .map(|c| format!("{:04x}", c))
@@ -450,7 +457,7 @@ impl FingerprintExtractor {
 
         // Hash of sorted extensions + signature algorithms
         let mut sorted_exts = extensions.to_vec();
-        sorted_exts.sort();
+        sorted_exts.sort_unstable();
         let ext_str: String = sorted_exts
             .iter()
             .map(|e| format!("{:04x}", e))
@@ -469,7 +476,14 @@ impl FingerprintExtractor {
 
         Some(format!(
             "{}{}{}{}{}{}_{}_{}",
-            proto, version, sni_type, cipher_count, ext_count, alpn_str, cipher_hash_trunc, ext_hash_trunc
+            proto,
+            version,
+            sni_type,
+            cipher_count,
+            ext_count,
+            alpn_str,
+            cipher_hash_trunc,
+            ext_hash_trunc
         ))
     }
 
@@ -493,8 +507,8 @@ impl FingerprintExtractor {
             }
         };
 
-        let ja3_hash = fingerprint.ja3_hash.clone();
-        let ja4_hash = fingerprint.ja4_hash.clone();
+        let ja3_hash = fingerprint.ja3_hash;
+        let ja4_hash = fingerprint.ja4_hash;
 
         // Classify the fingerprint
         let (classification, client_name) = self.known_fingerprints.classify(&ja3_hash);
@@ -596,8 +610,10 @@ impl FingerprintExtractor {
 
     /// Get fingerprint statistics
     pub fn get_stats(&self) -> FingerprintStats {
-        let mut stats = FingerprintStats::default();
-        stats.total_fingerprints = self.cache.len();
+        let mut stats = FingerprintStats {
+            total_fingerprints: self.cache.len(),
+            ..Default::default()
+        };
 
         for entry in self.cache.iter() {
             match entry.classification {
@@ -712,11 +728,7 @@ fn parse_ec_point_formats(data: &[u8]) -> Vec<u8> {
         return Vec::new();
     }
     let list_len = data[0] as usize;
-    data[1..]
-        .iter()
-        .take(list_len)
-        .copied()
-        .collect()
+    data[1..].iter().take(list_len).copied().collect()
 }
 
 /// Parse Signature Algorithms extension

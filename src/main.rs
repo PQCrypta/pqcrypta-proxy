@@ -72,7 +72,6 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 
 mod admin;
 mod compression;
-mod rate_limiter; // Must be before config (config imports from it)
 mod config;
 mod fingerprint;
 mod handlers;
@@ -82,6 +81,7 @@ mod load_balancer;
 mod pqc_tls;
 mod proxy;
 mod quic_listener;
+mod rate_limiter; // Must be before config (config imports from it)
 mod security;
 mod tls;
 mod tls_acceptor;
@@ -265,6 +265,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn config reload handler for hot-reload support
     let reload_tls_provider = tls_provider.clone();
+    let reload_pqc_provider = pqc_provider.clone();
     tokio::spawn(async move {
         while let Some(event) = reload_rx.recv().await {
             match event {
@@ -279,6 +280,10 @@ async fn main() -> anyhow::Result<()> {
                     } else {
                         info!("TLS configuration updated successfully");
                     }
+
+                    // Update PQC provider with new config
+                    reload_pqc_provider.update_config(&new_config.pqc);
+                    info!("PQC configuration updated");
 
                     // Note: BackendPool update requires mutable access
                     // which would require additional synchronization

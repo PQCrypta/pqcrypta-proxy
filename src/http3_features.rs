@@ -4,6 +4,13 @@
 //! - **Early Hints (103)**: Preload critical resources before final response
 //! - **Priority Hints**: Extensible Priorities (RFC 9218) for resource scheduling
 //! - **Request Coalescing**: Deduplicate identical in-flight requests
+//!
+//! # Integration Status
+//! Priority parsing and coalescing features are scaffolded. Early Hints requires
+//! 103 informational response support which is pending HTTP/3 layer integration.
+
+// Allow dead code for scaffolded features pending HTTP/3 integration
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};

@@ -830,6 +830,7 @@ pub enum AffinityMode {
 
 impl AffinityMode {
     /// Get header name for header-based affinity
+    #[allow(dead_code)]
     pub fn header_name(&self) -> Option<&'static str> {
         match self {
             Self::Header => Some("X-Session-ID"),

@@ -52,8 +52,12 @@ pub struct HttpListenerState {
     pub http_client: Client<HttpConnector, Body>,
     pub https_client: Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>,
     pub security: SecurityState,
+    /// Fingerprint extractor for TLS client identification (pending TLS layer integration)
+    #[allow(dead_code)]
     pub fingerprint: Arc<FingerprintExtractor>,
     pub load_balancer: Arc<LoadBalancer>,
+    /// Advanced rate limiter (using security.rate_limiters for now)
+    #[allow(dead_code)]
     pub rate_limiter: Arc<AdvancedRateLimiter>,
 }
 
@@ -834,7 +838,10 @@ async fn advanced_rate_limit_middleware(
         } => {
             debug!(
                 "Rate limited {} {} from {} (reason: {:?})",
-                method, path, client_addr.ip(), reason
+                method,
+                path,
+                client_addr.ip(),
+                reason
             );
 
             let mut response = (
@@ -876,7 +883,10 @@ async fn advanced_rate_limit_middleware(
         RateLimitResult::Blocked { reason } => {
             warn!(
                 "Blocked request {} {} from {} (reason: {})",
-                method, path, client_addr.ip(), reason
+                method,
+                path,
+                client_addr.ip(),
+                reason
             );
 
             (StatusCode::FORBIDDEN, "Access denied").into_response()
@@ -948,7 +958,9 @@ async fn proxy_handler(
                     client_ip: client_addr.ip(),
                     session_cookie,
                     affinity_header: pool.affinity_header.as_ref().and_then(|h| {
-                        headers.get(h).and_then(|v| v.to_str().ok().map(String::from))
+                        headers
+                            .get(h)
+                            .and_then(|v| v.to_str().ok().map(String::from))
                     }),
                     path: path.to_string(),
                     host: host.clone(),
@@ -1126,12 +1138,9 @@ async fn proxy_handler(
 
                 // Record success for load balancer pool
                 if let (Some(server), Some(ref pn)) = (&pool_server, &pool_name) {
-                    state.load_balancer.record_completion(
-                        pn,
-                        server.as_ref(),
-                        response_time,
-                        true,
-                    );
+                    state
+                        .load_balancer
+                        .record_completion(pn, server.as_ref(), response_time, true);
                     server.release_connection();
                 }
 
@@ -1146,7 +1155,10 @@ async fn proxy_handler(
                 if let Some(server) = &pool_server {
                     if let Some(pool) = state.load_balancer.get_pool(&route.backend) {
                         if pool.affinity == crate::config::AffinityMode::Cookie {
-                            let cookie = state.load_balancer.cookie_config.generate_cookie(&server.id);
+                            let cookie = state
+                                .load_balancer
+                                .cookie_config
+                                .generate_cookie(&server.id);
                             if let Ok(val) = HeaderValue::from_str(&cookie) {
                                 parts.headers.insert(header::SET_COOKIE, val);
                             }

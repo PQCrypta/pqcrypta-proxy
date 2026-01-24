@@ -7,6 +7,13 @@
 //! - Request queuing when backends saturated
 //! - Slow start for recovering backends
 //! - Connection draining for graceful removal
+//!
+//! # Integration Status
+//! Connection draining and semaphore-based connection limiting are scaffolded
+//! for future graceful shutdown and connection pooling improvements.
+
+// Allow dead code for scaffolded connection management features
+#![allow(dead_code)]
 
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
@@ -209,7 +216,8 @@ impl BackendServer {
             let elapsed = ss.started_at.elapsed();
             if elapsed < ss.duration {
                 let progress = elapsed.as_secs_f64() / ss.duration.as_secs_f64();
-                let factor = ss.initial_weight_factor + (1.0 - ss.initial_weight_factor) * progress;
+                let factor =
+                    (1.0 - ss.initial_weight_factor).mul_add(progress, ss.initial_weight_factor);
                 return (self.base_weight as f64 * factor) as u32;
             }
         }
@@ -242,7 +250,10 @@ impl BackendServer {
             if health.consecutive_failures >= 5 && !health.circuit_open {
                 health.circuit_open = true;
                 health.healthy = false;
-                warn!("Backend {} circuit breaker opened after {} failures", self.id, health.consecutive_failures);
+                warn!(
+                    "Backend {} circuit breaker opened after {} failures",
+                    self.id, health.consecutive_failures
+                );
             }
         }
 
@@ -276,7 +287,10 @@ impl BackendServer {
             timeout,
             remove_after: false,
         });
-        info!("Backend {} marked for draining ({:?} timeout)", self.id, timeout);
+        info!(
+            "Backend {} marked for draining ({:?} timeout)",
+            self.id, timeout
+        );
     }
 }
 
@@ -419,7 +433,8 @@ impl BackendPool {
         match &self.affinity {
             AffinityMode::Cookie => {
                 if let Some(ref cookie) = ctx.session_cookie {
-                    self.cookie_sessions.insert(cookie.clone(), server.id.clone());
+                    self.cookie_sessions
+                        .insert(cookie.clone(), server.id.clone());
                 }
             }
             AffinityMode::IpHash => {
@@ -427,7 +442,8 @@ impl BackendPool {
             }
             AffinityMode::Header => {
                 if let Some(ref header_val) = ctx.affinity_header {
-                    self.cookie_sessions.insert(header_val.clone(), server.id.clone());
+                    self.cookie_sessions
+                        .insert(header_val.clone(), server.id.clone());
                 }
             }
             AffinityMode::None => {}
@@ -437,7 +453,10 @@ impl BackendPool {
     /// Find server by ID
     fn find_server_by_id(&self, id: &str) -> Option<Arc<BackendServer>> {
         let servers = self.servers.read();
-        servers.iter().find(|s| s.id == id && s.is_available()).cloned()
+        servers
+            .iter()
+            .find(|s| s.id == id && s.is_available())
+            .cloned()
     }
 
     /// Get healthy servers
@@ -460,12 +479,22 @@ impl BackendPool {
         }
 
         // Failover to higher priority numbers
-        servers.iter().filter(|s| s.is_available()).cloned().collect()
+        servers
+            .iter()
+            .filter(|s| s.is_available())
+            .cloned()
+            .collect()
     }
 
     /// Record request completion
-    pub fn record_completion(&self, server: &BackendServer, response_time: Duration, success: bool) {
-        self.algorithm.record_completion(server, response_time, success);
+    pub fn record_completion(
+        &self,
+        server: &BackendServer,
+        response_time: Duration,
+        success: bool,
+    ) {
+        self.algorithm
+            .record_completion(server, response_time, success);
         server.record_result(success, response_time);
     }
 
@@ -569,7 +598,10 @@ impl LoadBalancingAlgorithm for WeightedRoundRobinAlgorithm {
             state.current_weights = healthy_servers.iter().map(|_| 0i64).collect();
         }
 
-        let total_weight: i64 = healthy_servers.iter().map(|s| s.effective_weight() as i64).sum();
+        let total_weight: i64 = healthy_servers
+            .iter()
+            .map(|s| s.effective_weight() as i64)
+            .sum();
 
         // Find server with highest current weight
         let mut max_idx = 0;
@@ -735,7 +767,11 @@ impl LoadBalancer {
     }
 
     /// Select backend for request
-    pub fn select_backend(&self, pool_name: &str, ctx: &SelectionContext) -> Option<Arc<BackendServer>> {
+    pub fn select_backend(
+        &self,
+        pool_name: &str,
+        ctx: &SelectionContext,
+    ) -> Option<Arc<BackendServer>> {
         let pool = self.pools.get(pool_name)?;
         pool.select(ctx)
     }
@@ -777,7 +813,10 @@ impl LoadBalancer {
             if let Some(server) = servers.iter().find(|s| s.id == server_id) {
                 let mut health = server.health.write();
                 health.healthy = false;
-                warn!("Backend {} in pool {} marked unhealthy", server_id, pool_name);
+                warn!(
+                    "Backend {} in pool {} marked unhealthy",
+                    server_id, pool_name
+                );
             }
         }
     }
@@ -851,7 +890,10 @@ impl SessionCookieConfig {
 }
 
 /// Extract session cookie from cookie header
-pub fn extract_session_cookie(cookie_header: Option<&str>, config: &SessionCookieConfig) -> Option<String> {
+pub fn extract_session_cookie(
+    cookie_header: Option<&str>,
+    config: &SessionCookieConfig,
+) -> Option<String> {
     let header = cookie_header?;
 
     for cookie in header.split(';') {
@@ -868,7 +910,6 @@ pub fn extract_session_cookie(cookie_header: Option<&str>, config: &SessionCooki
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
 
     fn create_test_server(address: &str, weight: u32) -> Arc<BackendServer> {
         let config = PoolServerConfig {
@@ -894,7 +935,7 @@ mod tests {
         server1.active_connections.store(10, Ordering::Relaxed);
         server2.active_connections.store(5, Ordering::Relaxed);
 
-        let servers = vec![server1.clone(), server2.clone()];
+        let servers = [server1, server2.clone()];
 
         // Least connections should pick server2
         let selected = servers
