@@ -71,6 +71,7 @@ pub mod handlers;
 pub mod http3_features;
 pub mod http_listener;
 pub mod load_balancer;
+pub mod metrics;
 pub mod ocsp;
 pub mod pqc_extended;
 pub mod pqc_tls;

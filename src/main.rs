@@ -78,6 +78,7 @@ mod handlers;
 mod http3_features;
 mod http_listener;
 mod load_balancer;
+mod metrics;
 mod ocsp;
 mod pqc_extended;
 mod pqc_tls;
@@ -338,6 +339,15 @@ async fn main() -> anyhow::Result<()> {
     // OCSP service is optional - can be enabled via TLS config
     let ocsp_service: Option<Arc<ocsp::OcspService>> = None;
 
+    // Create shared metrics registry
+    let metrics_registry = Arc::new(metrics::MetricsRegistry::new());
+
+    // Initialize TLS metrics
+    metrics_registry.tls.set_pqc_status(
+        tls_provider.is_pqc_enabled(),
+        &config.pqc.preferred_kem,
+    );
+
     let admin_server = AdminServer::new(
         config.admin.clone(),
         config_manager.clone(),
@@ -345,6 +355,7 @@ async fn main() -> anyhow::Result<()> {
         backend_pool.clone(),
         ocsp_service,
         shutdown_tx.clone(),
+        Some(metrics_registry.clone()),
     );
 
     let admin_handle = tokio::spawn(async move {
