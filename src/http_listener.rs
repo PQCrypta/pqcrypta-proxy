@@ -1575,3 +1575,476 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
         ]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+
+    // =========================================================================
+    // PROXY Protocol v2 Header Builder Tests
+    // =========================================================================
+
+    #[test]
+    fn test_proxy_v2_header_ipv4() {
+        let src = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 100), 54321));
+        let dst = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 443));
+
+        let header = build_proxy_v2_header(src, dst);
+
+        // Total size: 12 (signature) + 4 (header) + 12 (addresses) = 28 bytes
+        assert_eq!(header.len(), 28);
+
+        // Verify signature (first 12 bytes)
+        assert_eq!(&header[0..12], &PROXY_V2_SIGNATURE);
+
+        // Version 2 + PROXY command
+        assert_eq!(header[12], proxy_v2::VERSION_PROXY);
+
+        // IPv4 + TCP
+        assert_eq!(header[13], proxy_v2::AF_INET_STREAM);
+
+        // Address length (12 bytes for IPv4)
+        assert_eq!(u16::from_be_bytes([header[14], header[15]]), 12);
+
+        // Source IP: 192.168.1.100
+        assert_eq!(&header[16..20], &[192, 168, 1, 100]);
+
+        // Destination IP: 10.0.0.1
+        assert_eq!(&header[20..24], &[10, 0, 0, 1]);
+
+        // Source port: 54321 (0xD431)
+        assert_eq!(u16::from_be_bytes([header[24], header[25]]), 54321);
+
+        // Destination port: 443 (0x01BB)
+        assert_eq!(u16::from_be_bytes([header[26], header[27]]), 443);
+    }
+
+    #[test]
+    fn test_proxy_v2_header_ipv6() {
+        let src = SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            12345,
+            0,
+            0,
+        ));
+        let dst = SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+            8443,
+            0,
+            0,
+        ));
+
+        let header = build_proxy_v2_header(src, dst);
+
+        // Total size: 12 (signature) + 4 (header) + 36 (addresses) = 52 bytes
+        assert_eq!(header.len(), 52);
+
+        // Verify signature
+        assert_eq!(&header[0..12], &PROXY_V2_SIGNATURE);
+
+        // Version 2 + PROXY command
+        assert_eq!(header[12], proxy_v2::VERSION_PROXY);
+
+        // IPv6 + TCP
+        assert_eq!(header[13], proxy_v2::AF_INET6_STREAM);
+
+        // Address length (36 bytes for IPv6)
+        assert_eq!(u16::from_be_bytes([header[14], header[15]]), 36);
+
+        // Source IP: 2001:db8::1
+        let expected_src = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets();
+        assert_eq!(&header[16..32], &expected_src);
+
+        // Destination IP: fe80::1
+        let expected_dst = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1).octets();
+        assert_eq!(&header[32..48], &expected_dst);
+
+        // Source port: 12345
+        assert_eq!(u16::from_be_bytes([header[48], header[49]]), 12345);
+
+        // Destination port: 8443
+        assert_eq!(u16::from_be_bytes([header[50], header[51]]), 8443);
+    }
+
+    #[test]
+    fn test_proxy_v2_header_mixed_ipv4_to_ipv6() {
+        let src = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 5000));
+        let dst = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 443, 0, 0));
+
+        let header = build_proxy_v2_header(src, dst);
+
+        // Should use IPv6 format (52 bytes)
+        assert_eq!(header.len(), 52);
+
+        // IPv6 + TCP
+        assert_eq!(header[13], proxy_v2::AF_INET6_STREAM);
+
+        // Source should be IPv4-mapped IPv6 (::ffff:127.0.0.1)
+        let expected_src = Ipv4Addr::new(127, 0, 0, 1).to_ipv6_mapped().octets();
+        assert_eq!(&header[16..32], &expected_src);
+    }
+
+    #[test]
+    fn test_proxy_v2_header_mixed_ipv6_to_ipv4() {
+        let src = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 5000, 0, 0));
+        let dst = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 80));
+
+        let header = build_proxy_v2_header(src, dst);
+
+        // Should use IPv6 format (52 bytes)
+        assert_eq!(header.len(), 52);
+
+        // IPv6 + TCP
+        assert_eq!(header[13], proxy_v2::AF_INET6_STREAM);
+
+        // Destination should be IPv4-mapped IPv6 (::ffff:10.0.0.1)
+        let expected_dst = Ipv4Addr::new(10, 0, 0, 1).to_ipv6_mapped().octets();
+        assert_eq!(&header[32..48], &expected_dst);
+    }
+
+    #[test]
+    fn test_proxy_v2_signature_constant() {
+        // Verify the signature matches the PROXY protocol v2 spec
+        let expected = [
+            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+        ];
+        assert_eq!(PROXY_V2_SIGNATURE, expected);
+    }
+
+    #[test]
+    fn test_proxy_v2_constants() {
+        // Version 2, PROXY command = 0x21
+        assert_eq!(proxy_v2::VERSION_PROXY, 0x21);
+
+        // Version 2, LOCAL command = 0x20
+        assert_eq!(proxy_v2::VERSION_LOCAL, 0x20);
+
+        // IPv4 + TCP = 0x11
+        assert_eq!(proxy_v2::AF_INET_STREAM, 0x11);
+
+        // IPv6 + TCP = 0x21
+        assert_eq!(proxy_v2::AF_INET6_STREAM, 0x21);
+
+        // Unspecified = 0x00
+        assert_eq!(proxy_v2::AF_UNSPEC, 0x00);
+    }
+
+    // =========================================================================
+    // ClientHello SNI Parser Tests
+    // =========================================================================
+
+    /// Build a minimal valid TLS 1.2 ClientHello with SNI extension
+    fn build_client_hello_with_sni(hostname: &str) -> Vec<u8> {
+        let hostname_bytes = hostname.as_bytes();
+        let sni_entry_len = 3 + hostname_bytes.len(); // type(1) + len(2) + name
+        let sni_list_len = sni_entry_len;
+        let sni_ext_len = 2 + sni_list_len; // list_len(2) + list
+
+        // Extensions: SNI only
+        let extensions_len = 4 + sni_ext_len; // type(2) + len(2) + data
+
+        // ClientHello body (minimal)
+        let mut client_hello = Vec::new();
+
+        // Version (TLS 1.2 = 0x0303)
+        client_hello.extend_from_slice(&[0x03, 0x03]);
+
+        // Random (32 bytes)
+        client_hello.extend_from_slice(&[0u8; 32]);
+
+        // Session ID length (0)
+        client_hello.push(0);
+
+        // Cipher suites (2 bytes length + 2 cipher suites)
+        client_hello.extend_from_slice(&[0x00, 0x04]); // 4 bytes
+        client_hello.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
+        client_hello.extend_from_slice(&[0x13, 0x02]); // TLS_AES_256_GCM_SHA384
+
+        // Compression methods (1 byte length + null)
+        client_hello.extend_from_slice(&[0x01, 0x00]);
+
+        // Extensions length
+        client_hello.extend_from_slice(&(extensions_len as u16).to_be_bytes());
+
+        // SNI extension (type 0x0000)
+        client_hello.extend_from_slice(&[0x00, 0x00]); // Extension type
+        client_hello.extend_from_slice(&(sni_ext_len as u16).to_be_bytes()); // Extension length
+        client_hello.extend_from_slice(&(sni_list_len as u16).to_be_bytes()); // SNI list length
+        client_hello.push(0x00); // Name type (host_name)
+        client_hello.extend_from_slice(&(hostname_bytes.len() as u16).to_be_bytes());
+        client_hello.extend_from_slice(hostname_bytes);
+
+        // Handshake header
+        let handshake_len = client_hello.len();
+        let mut handshake = Vec::new();
+        handshake.push(0x01); // ClientHello
+        handshake.push(0x00); // Length high byte (always 0 for reasonable sizes)
+        handshake.extend_from_slice(&(handshake_len as u16).to_be_bytes());
+        handshake.extend(client_hello);
+
+        // TLS record header
+        let record_len = handshake.len();
+        let mut record = Vec::new();
+        record.push(0x16); // Handshake
+        record.extend_from_slice(&[0x03, 0x01]); // TLS 1.0 (legacy version in record)
+        record.extend_from_slice(&(record_len as u16).to_be_bytes());
+        record.extend(handshake);
+
+        record
+    }
+
+    #[test]
+    fn test_sni_extraction_simple() {
+        let data = build_client_hello_with_sni("example.com");
+        let sni = extract_sni_from_client_hello(&data);
+        assert_eq!(sni, Some("example.com".to_string()));
+    }
+
+    #[test]
+    fn test_sni_extraction_subdomain() {
+        let data = build_client_hello_with_sni("api.pqcrypta.com");
+        let sni = extract_sni_from_client_hello(&data);
+        assert_eq!(sni, Some("api.pqcrypta.com".to_string()));
+    }
+
+    #[test]
+    fn test_sni_extraction_long_hostname() {
+        let hostname = "very-long-subdomain.another-subdomain.example.domain.com";
+        let data = build_client_hello_with_sni(hostname);
+        let sni = extract_sni_from_client_hello(&data);
+        assert_eq!(sni, Some(hostname.to_string()));
+    }
+
+    #[test]
+    fn test_sni_extraction_with_port_like_name() {
+        // Some hostnames might look unusual
+        let data = build_client_hello_with_sni("server-443.internal.local");
+        let sni = extract_sni_from_client_hello(&data);
+        assert_eq!(sni, Some("server-443.internal.local".to_string()));
+    }
+
+    #[test]
+    fn test_sni_extraction_empty_data() {
+        let sni = extract_sni_from_client_hello(&[]);
+        assert_eq!(sni, None);
+    }
+
+    #[test]
+    fn test_sni_extraction_too_short() {
+        // Less than 5 bytes (TLS record header)
+        let sni = extract_sni_from_client_hello(&[0x16, 0x03, 0x01]);
+        assert_eq!(sni, None);
+    }
+
+    #[test]
+    fn test_sni_extraction_not_handshake() {
+        // Application data record (0x17) instead of handshake (0x16)
+        let data = [0x17, 0x03, 0x03, 0x00, 0x10, 0x00, 0x00, 0x00];
+        let sni = extract_sni_from_client_hello(&data);
+        assert_eq!(sni, None);
+    }
+
+    #[test]
+    fn test_sni_extraction_not_client_hello() {
+        // ServerHello (0x02) instead of ClientHello (0x01)
+        let data = [
+            0x16, 0x03, 0x03, 0x00, 0x05, // TLS record header
+            0x02, 0x00, 0x00, 0x01, 0x00, // ServerHello header
+        ];
+        let sni = extract_sni_from_client_hello(&data);
+        assert_eq!(sni, None);
+    }
+
+    #[test]
+    fn test_sni_extraction_truncated_handshake() {
+        // Valid record header but truncated handshake
+        let data = [
+            0x16, 0x03, 0x03, 0x00, 0x02, // TLS record header (claims 2 bytes)
+            0x01, 0x00, // Truncated ClientHello
+        ];
+        let sni = extract_sni_from_client_hello(&data);
+        assert_eq!(sni, None);
+    }
+
+    #[test]
+    fn test_sni_extraction_no_extensions() {
+        // ClientHello without extensions
+        let mut data = Vec::new();
+
+        // TLS record header
+        data.push(0x16); // Handshake
+        data.extend_from_slice(&[0x03, 0x03]); // TLS 1.2
+
+        // We'll set length later
+        let record_len_pos = data.len();
+        data.extend_from_slice(&[0x00, 0x00]); // Placeholder
+
+        // Handshake header
+        data.push(0x01); // ClientHello
+        let handshake_len_pos = data.len();
+        data.extend_from_slice(&[0x00, 0x00, 0x00]); // Placeholder (3 bytes)
+
+        let client_hello_start = data.len();
+
+        // Version
+        data.extend_from_slice(&[0x03, 0x03]);
+
+        // Random (32 bytes)
+        data.extend_from_slice(&[0u8; 32]);
+
+        // Session ID (0)
+        data.push(0);
+
+        // Cipher suites
+        data.extend_from_slice(&[0x00, 0x02, 0x00, 0xFF]); // 2 bytes, TLS_EMPTY_RENEGOTIATION_INFO_SCSV
+
+        // Compression methods
+        data.extend_from_slice(&[0x01, 0x00]);
+
+        // NO extensions (0 length)
+        data.extend_from_slice(&[0x00, 0x00]);
+
+        // Fix lengths
+        let client_hello_len = data.len() - client_hello_start;
+        let handshake_len = client_hello_len + 4;
+        let record_len = handshake_len;
+
+        data[record_len_pos] = ((record_len >> 8) & 0xFF) as u8;
+        data[record_len_pos + 1] = (record_len & 0xFF) as u8;
+
+        data[handshake_len_pos + 1] = ((client_hello_len >> 8) & 0xFF) as u8;
+        data[handshake_len_pos + 2] = (client_hello_len & 0xFF) as u8;
+
+        let sni = extract_sni_from_client_hello(&data);
+        assert_eq!(sni, None);
+    }
+
+    #[test]
+    fn test_sni_extraction_with_grease_extensions() {
+        // Build ClientHello with GREASE extension before SNI
+        let hostname = "grease-test.example.com";
+        let hostname_bytes = hostname.as_bytes();
+
+        let mut client_hello = Vec::new();
+
+        // Version
+        client_hello.extend_from_slice(&[0x03, 0x03]);
+
+        // Random
+        client_hello.extend_from_slice(&[0u8; 32]);
+
+        // Session ID
+        client_hello.push(0);
+
+        // Cipher suites
+        client_hello.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
+
+        // Compression
+        client_hello.extend_from_slice(&[0x01, 0x00]);
+
+        // Extensions
+        let mut extensions = Vec::new();
+
+        // GREASE extension (0x0A0A)
+        extensions.extend_from_slice(&[0x0A, 0x0A]); // GREASE type
+        extensions.extend_from_slice(&[0x00, 0x01]); // Length 1
+        extensions.push(0x00); // Data
+
+        // SNI extension
+        let sni_list_len = 3 + hostname_bytes.len();
+        let sni_ext_len = 2 + sni_list_len;
+        extensions.extend_from_slice(&[0x00, 0x00]); // SNI type
+        extensions.extend_from_slice(&(sni_ext_len as u16).to_be_bytes());
+        extensions.extend_from_slice(&(sni_list_len as u16).to_be_bytes());
+        extensions.push(0x00); // host_name type
+        extensions.extend_from_slice(&(hostname_bytes.len() as u16).to_be_bytes());
+        extensions.extend_from_slice(hostname_bytes);
+
+        // Another GREASE extension (0xFAFA)
+        extensions.extend_from_slice(&[0xFA, 0xFA]); // GREASE type
+        extensions.extend_from_slice(&[0x00, 0x00]); // Length 0
+
+        client_hello.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        client_hello.extend(extensions);
+
+        // Build full record
+        let mut handshake = Vec::new();
+        handshake.push(0x01);
+        handshake.push(0x00);
+        handshake.extend_from_slice(&(client_hello.len() as u16).to_be_bytes());
+        handshake.extend(client_hello);
+
+        let mut record = Vec::new();
+        record.push(0x16);
+        record.extend_from_slice(&[0x03, 0x01]);
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend(handshake);
+
+        let sni = extract_sni_from_client_hello(&record);
+        assert_eq!(sni, Some(hostname.to_string()));
+    }
+
+    #[test]
+    fn test_sni_extraction_long_session_id() {
+        // ClientHello with maximum session ID (32 bytes)
+        let hostname = "session-test.example.com";
+        let hostname_bytes = hostname.as_bytes();
+
+        let mut client_hello = Vec::new();
+
+        // Version
+        client_hello.extend_from_slice(&[0x03, 0x03]);
+
+        // Random
+        client_hello.extend_from_slice(&[0u8; 32]);
+
+        // Session ID (32 bytes - maximum)
+        client_hello.push(32);
+        client_hello.extend_from_slice(&[0xAB; 32]);
+
+        // Cipher suites
+        client_hello.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
+
+        // Compression
+        client_hello.extend_from_slice(&[0x01, 0x00]);
+
+        // Extensions (SNI only)
+        let sni_list_len = 3 + hostname_bytes.len();
+        let sni_ext_len = 2 + sni_list_len;
+        let extensions_len = 4 + sni_ext_len;
+
+        client_hello.extend_from_slice(&(extensions_len as u16).to_be_bytes());
+        client_hello.extend_from_slice(&[0x00, 0x00]); // SNI type
+        client_hello.extend_from_slice(&(sni_ext_len as u16).to_be_bytes());
+        client_hello.extend_from_slice(&(sni_list_len as u16).to_be_bytes());
+        client_hello.push(0x00);
+        client_hello.extend_from_slice(&(hostname_bytes.len() as u16).to_be_bytes());
+        client_hello.extend_from_slice(hostname_bytes);
+
+        // Build full record
+        let mut handshake = Vec::new();
+        handshake.push(0x01);
+        handshake.push(0x00);
+        handshake.extend_from_slice(&(client_hello.len() as u16).to_be_bytes());
+        handshake.extend(client_hello);
+
+        let mut record = Vec::new();
+        record.push(0x16);
+        record.extend_from_slice(&[0x03, 0x01]);
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend(handshake);
+
+        let sni = extract_sni_from_client_hello(&record);
+        assert_eq!(sni, Some(hostname.to_string()));
+    }
+
+    #[test]
+    fn test_sni_extraction_punycode_hostname() {
+        // International domain name in ASCII-compatible encoding
+        let hostname = "xn--n3h.example.com"; // Contains emoji in punycode
+        let data = build_client_hello_with_sni(hostname);
+        let sni = extract_sni_from_client_hello(&data);
+        assert_eq!(sni, Some(hostname.to_string()));
+    }
+}
