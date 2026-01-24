@@ -3,7 +3,7 @@
 # Multi-stage build for minimal production image
 
 # Stage 1: Build
-FROM rust:1.75-bookworm AS builder
+FROM rust:1-bookworm AS builder
 
 WORKDIR /build
 

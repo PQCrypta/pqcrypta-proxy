@@ -907,7 +907,7 @@ mod geoip {
 
     impl GeoIpDb {
         /// Load GeoIP database from file
-        pub fn new(path: impl AsRef<Path>) -> Result<Self, maxminddb::MaxMindDBError> {
+        pub fn new(path: impl AsRef<Path>) -> Result<Self, maxminddb::MaxMindDbError> {
             let reader = Reader::open_readfile(path)?;
             Ok(Self { reader })
         }
@@ -937,7 +937,7 @@ mod geoip {
                 code: Option<String>,
             }
 
-            let city: City = self.reader.lookup(ip).ok()?;
+            let city: City = self.reader.lookup(ip).ok()?.decode().ok().flatten()?;
 
             Some(GeoLocation {
                 country_code: city.country.as_ref().and_then(|c| c.iso_code.clone()),
