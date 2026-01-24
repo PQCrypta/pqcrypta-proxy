@@ -281,6 +281,21 @@ Multi-dimensional rate limiting with composite keys, JA3/JA4 fingerprinting, and
 | `blocked_fingerprints` | array[string] | `[]` | Block known malicious fingerprints |
 | `trusted_fingerprints` | map[string, PerKeyLimits] | `{}` | Higher limits for known good fingerprints |
 
+#### Unknown Fingerprint Limits
+
+```toml
+[advanced_rate_limiting.fingerprint_limiting.unknown_limits]
+```
+
+More restrictive limits for unrecognized TLS fingerprints.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `requests_per_second` | u32 | `50` | Unknown fingerprint requests per second |
+| `burst_size` | u32 | `25` | Unknown fingerprint burst size |
+| `requests_per_minute` | u32? | `1500` | Unknown fingerprint per minute limit |
+| `requests_per_hour` | u32? | `25000` | Unknown fingerprint per hour limit |
+
 ### Adaptive Rate Limiting
 
 ```toml
@@ -332,6 +347,17 @@ ML-inspired anomaly detection that learns normal traffic patterns.
 | `name` | string | required | Name for logging/metrics |
 | `keys` | array[string] | required | Keys to combine (e.g., `["header:X-Tenant-ID", "jwt_subject"]`) |
 | `routes` | array[string] | `[]` | Routes this applies to (empty = all) |
+
+```toml
+[advanced_rate_limiting.composite_keys.limits]
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `requests_per_second` | u32 | `100` | Composite key requests per second |
+| `burst_size` | u32 | `50` | Composite key burst size |
+| `requests_per_minute` | u32? | `null` | Composite key per minute limit |
+| `requests_per_hour` | u32? | `null` | Composite key per hour limit |
 
 ---
 
