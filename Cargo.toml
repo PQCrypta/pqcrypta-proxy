@@ -125,7 +125,14 @@ maxminddb = { version = "0.27", optional = true }
 
 # JA3/JA4 fingerprinting
 sha2 = "0.10"
+sha1 = "0.10"
 md-5 = "0.10"
+
+# X.509 certificate parsing (for OCSP)
+x509-parser = "0.16"
+
+# HTTP client for OCSP requests
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # CLI argument parsing
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -165,7 +172,6 @@ tempfile = "3.14"
 criterion = { version = "0.5", features = ["async_tokio"] }
 tokio-test = "0.4"
 assert_matches = "1.5"
-reqwest = { version = "0.12", features = ["json"] }
 
 [[bin]]
 name = "pqcrypta-proxy"
