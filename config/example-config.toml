@@ -311,6 +311,83 @@ blocked_ips = []
 # Allowed IP addresses (whitelist mode - empty = allow all)
 allowed_ips = []
 
+# GeoIP database path for country blocking (optional)
+# geoip_db_path = "/var/www/html/pqcrypta-proxy/data/geoip/GeoLite2-City.mmdb"
+
+# Blocked country codes (ISO 3166-1 alpha-2)
+blocked_countries = []  # e.g., ["CN", "RU", "KP", "IR"]
+
+# Maximum connections per IP
+max_connections_per_ip = 100
+
+# Error-based blocking thresholds (prevents false positives from scanners)
+error_4xx_threshold = 100          # 4xx errors before checking rate
+min_requests_for_error_check = 200 # Minimum requests before error check
+error_rate_threshold = 0.7         # 70% error rate triggers suspicious pattern
+error_window_secs = 60             # Sliding window duration (seconds)
+auto_block_threshold = 10          # Suspicious patterns before auto-block
+auto_block_duration_secs = 300     # Block duration (seconds)
+
+# =============================
+# TLS Fingerprint Detection (JA3/JA4)
+# =============================
+[fingerprint]
+# Enable TLS fingerprint detection
+enabled = true
+
+# Block duration for malicious fingerprints (seconds)
+malicious_block_duration_secs = 3600   # 1 hour
+
+# Block duration for suspicious fingerprints with high request rate (seconds)
+suspicious_block_duration_secs = 300   # 5 minutes
+
+# Request count threshold to trigger suspicious fingerprint rate check
+suspicious_rate_threshold = 100
+
+# Time window for suspicious rate detection (seconds)
+suspicious_rate_window_secs = 60       # 1 minute
+
+# Fingerprint cache max age before cleanup (seconds)
+cache_max_age_secs = 3600              # 1 hour
+
+# =============================
+# Circuit Breaker Configuration
+# =============================
+[circuit_breaker]
+# Enable circuit breaker for backend protection
+enabled = true
+
+# Time before circuit breaker transitions from Open to Half-Open (seconds)
+half_open_delay_secs = 30
+
+# Maximum test requests allowed in Half-Open state
+half_open_max_requests = 3
+
+# Failure threshold to open the circuit
+failure_threshold = 5
+
+# Success threshold to close the circuit from Half-Open
+success_threshold = 2
+
+# Stale request counter cleanup interval (seconds)
+stale_counter_cleanup_secs = 300       # 5 minutes
+
+# =============================
+# HTTP Connection Pool Configuration
+# =============================
+[connection_pool]
+# Pool idle timeout - how long idle connections stay in pool (seconds)
+idle_timeout_secs = 90
+
+# Maximum idle connections per backend host
+max_idle_per_host = 10
+
+# Maximum total connections per backend host
+max_connections_per_host = 100
+
+# Connection acquire timeout (milliseconds)
+acquire_timeout_ms = 5000              # 5 seconds
+
 # =============================
 # Load Balancer Configuration
 # =============================
