@@ -70,6 +70,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+mod acme;
 mod admin;
 mod compression;
 mod config;
@@ -348,12 +349,16 @@ async fn main() -> anyhow::Result<()> {
         &config.pqc.preferred_kem,
     );
 
+    // ACME service is optional - can be enabled via ACME config
+    let acme_service: Option<Arc<parking_lot::RwLock<acme::AcmeService>>> = None;
+
     let admin_server = AdminServer::new(
         config.admin.clone(),
         config_manager.clone(),
         tls_provider.clone(),
         backend_pool.clone(),
         ocsp_service,
+        acme_service,
         shutdown_tx.clone(),
         Some(metrics_registry.clone()),
     );

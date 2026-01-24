@@ -63,6 +63,7 @@
 //! - Provides hot-reload of configuration and TLS certificates
 //! - Exposes admin API for health, metrics, and management
 
+pub mod acme;
 pub mod admin;
 pub mod compression;
 pub mod config;
@@ -117,6 +118,7 @@ pub use rate_limiter::{
 };
 pub use security::{security_middleware, SecurityState};
 pub use ocsp::{OcspConfig, OcspService, OcspStatus, OcspStatusInfo};
+pub use acme::{AcmeConfig, AcmeService, AcmeStatusInfo, ChallengeType, CertificateUpdate};
 pub use tls::TlsProvider;
 pub use tls_acceptor::{FingerprintedConnection, FingerprintingTlsAcceptor};
 pub use webtransport_server::WebTransportServer;
