@@ -537,16 +537,40 @@ pub mod openssl_pqc {
             }
         }
 
-        // Set ALPN protocols
+        // Set ALPN protocols - parse length-prefixed protocol list
         builder.set_alpn_select_callback(|_, client_protos| {
-            // Prefer h2, then http/1.1
-            if client_protos.windows(2).any(|w| w == b"\x02h2") {
-                Ok(b"h2")
-            } else if client_protos.windows(8).any(|w| w == b"\x08http/1.1") {
-                Ok(b"http/1.1")
-            } else {
-                Err(openssl::ssl::AlpnError::NOACK)
+            // Parse client's ALPN protocol list (length-prefixed strings)
+            let mut pos = 0;
+            while pos < client_protos.len() {
+                let len = client_protos[pos] as usize;
+                if pos + 1 + len > client_protos.len() {
+                    break;
+                }
+                let proto = &client_protos[pos + 1..pos + 1 + len];
+
+                // Prefer h2 (HTTP/2) over http/1.1
+                if proto == b"h2" {
+                    return Ok(b"h2");
+                }
+                pos += 1 + len;
             }
+
+            // Second pass: accept http/1.1 if no h2
+            pos = 0;
+            while pos < client_protos.len() {
+                let len = client_protos[pos] as usize;
+                if pos + 1 + len > client_protos.len() {
+                    break;
+                }
+                let proto = &client_protos[pos + 1..pos + 1 + len];
+
+                if proto == b"http/1.1" {
+                    return Ok(b"http/1.1");
+                }
+                pos += 1 + len;
+            }
+
+            Err(openssl::ssl::AlpnError::NOACK)
         });
 
         // Set session cache for resumption
