@@ -4,7 +4,7 @@
 
 [![Build Status](https://github.com/PQCrypta/pqcrypta-proxy/workflows/CI/badge.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-46%20passing-brightgreen.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
+[![Tests](https://img.shields.io/badge/tests-77%20passing-brightgreen.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
 
 ## Highlights
 
@@ -13,6 +13,9 @@
 - **Modern Protocols**: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebTransport
 - **Post-Quantum Ready**: Hybrid PQC key exchange (X25519MLKEM768) via OpenSSL 3.5+ with native ML-KEM
 - **Zero Downtime**: Hot reload configuration and TLS certificates
+- **ACME Automation**: Automatic Let's Encrypt certificate provisioning and renewal
+- **OCSP Stapling**: Automated OCSP response fetching and stapling
+- **Prometheus Metrics**: Comprehensive metrics for TLS, connections, requests, and backends
 - **Advanced Security**: JA3/JA4 fingerprinting, circuit breaker, GeoIP blocking
 - **Enterprise Load Balancing**: 6 algorithms, session affinity, health-aware routing
 - **Multi-Dimensional Rate Limiting**: Composite keys, JA3/JA4-based, adaptive ML anomaly detection
@@ -34,6 +37,10 @@
 | Security Headers | ✅ | HSTS, CSP, CORS, Alt-Svc |
 | PQC TLS | ✅ | X25519MLKEM768 hybrid (NIST Level 3) |
 | Background Cleanup | ✅ | Auto-cleanup of expired entries |
+| **ACME Automation** | ✅ | Let's Encrypt HTTP-01/DNS-01 certificate provisioning |
+| **OCSP Stapling** | ✅ | Automated OCSP response fetching with caching |
+| **Prometheus Metrics** | ✅ | TLS, connection, request, backend, and error metrics |
+| PROXY Protocol v2 | ✅ | Client IP preservation for downstream proxies |
 
 ## Features
 
@@ -531,7 +538,14 @@ src/
 ├── http3_features.rs    # Early Hints, Priority, Request Coalescing
 ├── admin.rs             # Admin API endpoints
 ├── tls.rs               # TLS configuration
-└── pqc_tls.rs           # Post-Quantum TLS provider
+├── pqc_tls.rs           # Post-Quantum TLS provider
+├── pqc_extended.rs      # Extended PQC configuration and capabilities
+├── acme.rs              # ACME certificate automation (Let's Encrypt)
+├── ocsp.rs              # OCSP stapling automation
+├── metrics.rs           # Prometheus metrics registry
+├── rate_limiter.rs      # Advanced multi-dimensional rate limiting
+├── proxy_protocol.rs    # PROXY protocol v2 support
+└── webtransport_server.rs  # WebTransport session handling
 ```
 
 ## Post-Quantum Cryptography
@@ -559,6 +573,58 @@ hybrid_mode = true
 fallback_to_classical = true
 ```
 
+## ACME Certificate Automation
+
+Automatic Let's Encrypt certificate provisioning and renewal.
+
+### Configuration
+
+```toml
+[acme]
+enabled = true
+domains = ["example.com", "api.example.com"]
+email = "admin@example.com"
+directory_url = "https://acme-v02.api.letsencrypt.org/directory"  # Production
+# directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory"  # Staging
+challenge_type = "http-01"  # or "dns-01"
+certs_path = "/etc/pqcrypta/certs"
+renewal_days = 30  # Renew 30 days before expiry
+check_interval_hours = 12
+http_port = 80  # For HTTP-01 challenge
+```
+
+### Challenge Types
+
+| Type | Description | Requirements |
+|------|-------------|--------------|
+| `http-01` | HTTP validation | Port 80 accessible |
+| `dns-01` | DNS TXT record | DNS API access |
+
+## OCSP Stapling
+
+Automated OCSP response fetching with background refresh.
+
+### Configuration
+
+```toml
+[ocsp]
+enabled = true
+cache_duration_secs = 3600  # 1 hour cache
+refresh_before_expiry_secs = 300  # Refresh 5 min before expiry
+timeout_secs = 10
+max_retries = 3
+```
+
+### Status Monitoring
+
+```bash
+# Check OCSP status
+curl http://127.0.0.1:8081/ocsp
+
+# Force refresh
+curl -X POST http://127.0.0.1:8081/ocsp/refresh
+```
+
 ## Admin API
 
 ### Endpoints
@@ -566,12 +632,17 @@ fallback_to_classical = true
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check with backend status |
-| `/metrics` | GET | Prometheus metrics |
+| `/metrics` | GET | Prometheus metrics (comprehensive) |
+| `/metrics/json` | GET | JSON metrics snapshot |
 | `/reload` | POST | Reload configuration |
 | `/shutdown` | POST | Graceful shutdown |
 | `/config` | GET | Read-only config view |
 | `/backends` | GET | Backend health status |
 | `/tls` | GET | TLS certificate info |
+| `/ocsp` | GET | OCSP stapling status |
+| `/ocsp/refresh` | POST | Force OCSP response refresh |
+| `/acme` | GET | ACME certificate status |
+| `/acme/renew` | POST | Force certificate renewal |
 
 ### Example
 
