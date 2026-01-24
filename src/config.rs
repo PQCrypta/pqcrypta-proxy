@@ -82,6 +82,15 @@ pub struct ProxyConfig {
     /// Load balancer configuration
     #[serde(default)]
     pub load_balancer: LoadBalancerConfig,
+    /// TLS fingerprint detection configuration
+    #[serde(default)]
+    pub fingerprint: FingerprintConfig,
+    /// Circuit breaker configuration
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerConfig,
+    /// HTTP connection pool configuration
+    #[serde(default)]
+    pub connection_pool: ConnectionPoolConfig,
 }
 
 impl Default for ProxyConfig {
@@ -102,6 +111,9 @@ impl Default for ProxyConfig {
             headers: HeadersConfig::default(),
             http_redirect: HttpRedirectConfig::default(),
             load_balancer: LoadBalancerConfig::default(),
+            fingerprint: FingerprintConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            connection_pool: ConnectionPoolConfig::default(),
         }
     }
 }
@@ -539,6 +551,93 @@ impl Default for SecurityConfig {
             min_requests_for_error_check: 200,  // Need 200+ requests before error check
             error_rate_threshold: 0.7,          // 70% error rate triggers suspicious
             error_window_secs: 60,              // 1 minute sliding window
+        }
+    }
+}
+
+/// Fingerprint detection configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FingerprintConfig {
+    /// Enable TLS fingerprint detection
+    pub enabled: bool,
+    /// Block duration for malicious fingerprints (seconds)
+    pub malicious_block_duration_secs: u64,
+    /// Block duration for suspicious fingerprints with high rate (seconds)
+    pub suspicious_block_duration_secs: u64,
+    /// Request count threshold to trigger suspicious fingerprint rate check
+    pub suspicious_rate_threshold: u64,
+    /// Time window for suspicious rate detection (seconds)
+    pub suspicious_rate_window_secs: u64,
+    /// Fingerprint cache max age before cleanup (seconds)
+    pub cache_max_age_secs: u64,
+}
+
+impl Default for FingerprintConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            malicious_block_duration_secs: 3600,      // 1 hour
+            suspicious_block_duration_secs: 300,       // 5 minutes
+            suspicious_rate_threshold: 100,            // 100 requests
+            suspicious_rate_window_secs: 60,           // 1 minute
+            cache_max_age_secs: 3600,                  // 1 hour
+        }
+    }
+}
+
+/// Circuit breaker configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CircuitBreakerConfig {
+    /// Enable circuit breaker
+    pub enabled: bool,
+    /// Time before circuit breaker transitions from Open to Half-Open (seconds)
+    pub half_open_delay_secs: u64,
+    /// Maximum test requests allowed in Half-Open state
+    pub half_open_max_requests: u32,
+    /// Failure threshold to open the circuit
+    pub failure_threshold: u32,
+    /// Success threshold to close the circuit from Half-Open
+    pub success_threshold: u32,
+    /// Stale request counter cleanup interval (seconds)
+    pub stale_counter_cleanup_secs: u64,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            half_open_delay_secs: 30,                  // 30 seconds
+            half_open_max_requests: 3,                 // 3 test requests
+            failure_threshold: 5,                      // 5 failures to open
+            success_threshold: 2,                      // 2 successes to close
+            stale_counter_cleanup_secs: 300,           // 5 minutes
+        }
+    }
+}
+
+/// HTTP connection pool configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConnectionPoolConfig {
+    /// Pool idle timeout (seconds) - how long idle connections stay in pool
+    pub idle_timeout_secs: u64,
+    /// Maximum idle connections per host
+    pub max_idle_per_host: usize,
+    /// Maximum total connections per host
+    pub max_connections_per_host: usize,
+    /// Connection acquire timeout (milliseconds)
+    pub acquire_timeout_ms: u64,
+}
+
+impl Default for ConnectionPoolConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout_secs: 90,                     // 90 seconds
+            max_idle_per_host: 10,                     // 10 idle connections
+            max_connections_per_host: 100,             // 100 total connections
+            acquire_timeout_ms: 5000,                  // 5 second timeout
         }
     }
 }
