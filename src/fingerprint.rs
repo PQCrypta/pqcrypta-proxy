@@ -806,4 +806,495 @@ mod tests {
         let extractor = FingerprintExtractor::new();
         assert!(extractor.cache.is_empty());
     }
+
+    // ========================================================================
+    // ClientHello/SNI Parser Tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_sni_valid() {
+        // SNI extension format:
+        // Server Name Indication extension (type 0x00)
+        // Data format: list_length(2) + name_type(1) + name_length(2) + name
+        let sni_data = [
+            0x00, 0x10, // List length: 16 bytes
+            0x00,       // Name type: host_name (0)
+            0x00, 0x0d, // Name length: 13 bytes
+            b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm', b'.', b'.', // Oversized for testing
+        ];
+        // Actually build a proper one:
+        let proper_sni = [
+            0x00, 0x0e, // List length: 14 bytes
+            0x00,       // Name type: host_name (0)
+            0x00, 0x0b, // Name length: 11 bytes
+            b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm',
+        ];
+        let result = parse_sni(&proper_sni);
+        assert_eq!(result, Some("example.com".to_string()));
+    }
+
+    #[test]
+    fn test_parse_sni_empty() {
+        let result = parse_sni(&[]);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_sni_too_short() {
+        let result = parse_sni(&[0x00, 0x01, 0x00]);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_sni_wrong_name_type() {
+        // Name type is not 0x00 (host_name)
+        let sni_data = [
+            0x00, 0x08,
+            0x01,       // Wrong name type
+            0x00, 0x05,
+            b'h', b'e', b'l', b'l', b'o',
+        ];
+        let result = parse_sni(&sni_data);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_sni_truncated_name() {
+        // Name length says 20 but we only have 5 bytes
+        let sni_data = [
+            0x00, 0x18,
+            0x00,
+            0x00, 0x14, // Says 20 bytes
+            b'h', b'e', b'l', b'l', b'o', // Only 5 bytes
+        ];
+        let result = parse_sni(&sni_data);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_supported_groups_valid() {
+        // Supported groups extension data:
+        // length(2) + groups (2 bytes each)
+        let data = [
+            0x00, 0x08, // List length: 8 bytes (4 groups)
+            0x00, 0x1d, // x25519 (29)
+            0x00, 0x17, // secp256r1 (23)
+            0x00, 0x18, // secp384r1 (24)
+            0x00, 0x19, // secp521r1 (25)
+        ];
+        let result = parse_supported_groups(&data);
+        assert_eq!(result, vec![0x001d, 0x0017, 0x0018, 0x0019]);
+    }
+
+    #[test]
+    fn test_parse_supported_groups_with_grease() {
+        // Include GREASE values that should be filtered out
+        let data = [
+            0x00, 0x0a, // List length: 10 bytes (5 groups)
+            0x0a, 0x0a, // GREASE (should be filtered)
+            0x00, 0x1d, // x25519
+            0x1a, 0x1a, // GREASE (should be filtered)
+            0x00, 0x17, // secp256r1
+            0xfa, 0xfa, // GREASE (should be filtered)
+        ];
+        let result = parse_supported_groups(&data);
+        assert_eq!(result, vec![0x001d, 0x0017]);
+    }
+
+    #[test]
+    fn test_parse_supported_groups_empty() {
+        let result = parse_supported_groups(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_supported_groups_too_short() {
+        let result = parse_supported_groups(&[0x00]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_ec_point_formats_valid() {
+        // EC point formats extension data:
+        // length(1) + formats (1 byte each)
+        let data = [
+            0x03,       // 3 formats
+            0x00,       // uncompressed
+            0x01,       // ansiX962_compressed_prime
+            0x02,       // ansiX962_compressed_char2
+        ];
+        let result = parse_ec_point_formats(&data);
+        assert_eq!(result, vec![0x00, 0x01, 0x02]);
+    }
+
+    #[test]
+    fn test_parse_ec_point_formats_empty() {
+        let result = parse_ec_point_formats(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_ec_point_formats_single() {
+        let data = [0x01, 0x00]; // 1 format: uncompressed
+        let result = parse_ec_point_formats(&data);
+        assert_eq!(result, vec![0x00]);
+    }
+
+    #[test]
+    fn test_parse_signature_algorithms_valid() {
+        // Signature algorithms extension data:
+        // length(2) + algorithms (2 bytes each)
+        let data = [
+            0x00, 0x08, // List length: 8 bytes (4 algorithms)
+            0x04, 0x01, // rsa_pkcs1_sha256
+            0x04, 0x03, // ecdsa_secp256r1_sha256
+            0x05, 0x01, // rsa_pkcs1_sha384
+            0x06, 0x01, // rsa_pkcs1_sha512
+        ];
+        let result = parse_signature_algorithms(&data);
+        assert_eq!(result, vec![0x0401, 0x0403, 0x0501, 0x0601]);
+    }
+
+    #[test]
+    fn test_parse_signature_algorithms_empty() {
+        let result = parse_signature_algorithms(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_signature_algorithms_too_short() {
+        let result = parse_signature_algorithms(&[0x00]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_alpn_valid() {
+        // ALPN extension data:
+        // list_length(2) + (protocol_length(1) + protocol)*
+        let data = [
+            0x00, 0x0c, // List length: 12 bytes
+            0x02, b'h', b'2', // "h2" (HTTP/2)
+            0x08, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1', // "http/1.1"
+        ];
+        let result = parse_alpn(&data);
+        assert_eq!(result, vec!["h2".to_string(), "http/1.1".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_alpn_empty() {
+        let result = parse_alpn(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_alpn_single_protocol() {
+        let data = [
+            0x00, 0x03, // List length: 3 bytes
+            0x02, b'h', b'2', // "h2"
+        ];
+        let result = parse_alpn(&data);
+        assert_eq!(result, vec!["h2".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_alpn_h3() {
+        let data = [
+            0x00, 0x03, // List length: 3 bytes
+            0x02, b'h', b'3', // "h3"
+        ];
+        let result = parse_alpn(&data);
+        assert_eq!(result, vec!["h3".to_string()]);
+    }
+
+    // ========================================================================
+    // Full ClientHello Parsing Tests
+    // ========================================================================
+
+    #[test]
+    fn test_extract_ja3_invalid_record_type() {
+        // Not a TLS handshake record (wrong content type)
+        let data = [0x17, 0x03, 0x03, 0x00, 0x10]; // Application data type
+        let extractor = FingerprintExtractor::new();
+        let result = extractor.extract_ja3(&data);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_ja3_too_short() {
+        let data = [0x16, 0x03, 0x03]; // Only 3 bytes
+        let extractor = FingerprintExtractor::new();
+        let result = extractor.extract_ja3(&data);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_ja3_not_client_hello() {
+        // TLS handshake but not ClientHello (type 0x02 = ServerHello)
+        let data = [
+            0x16, 0x03, 0x03, 0x00, 0x30, // TLS record header
+            0x02, 0x00, 0x00, 0x2c,        // Handshake header (ServerHello)
+            0x03, 0x03,                    // Version
+            // ... rest would follow
+        ];
+        let extractor = FingerprintExtractor::new();
+        let result = extractor.extract_ja3(&data);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_ja3_minimal_client_hello() {
+        // Minimal valid TLS 1.2 ClientHello
+        let mut client_hello: Vec<u8> = vec![
+            // TLS Record Layer
+            0x16,       // Content type: Handshake
+            0x03, 0x01, // Version: TLS 1.0 (for record layer)
+            0x00, 0x4a, // Length (placeholder, will adjust)
+            // Handshake header
+            0x01,             // Handshake type: ClientHello
+            0x00, 0x00, 0x46, // Length (placeholder)
+            // ClientHello
+            0x03, 0x03, // Version: TLS 1.2
+        ];
+        // Random (32 bytes)
+        client_hello.extend_from_slice(&[0u8; 32]);
+        // Session ID length
+        client_hello.push(0x00);
+        // Cipher suites
+        client_hello.extend_from_slice(&[
+            0x00, 0x04, // Length: 4 bytes (2 cipher suites)
+            0x13, 0x01, // TLS_AES_128_GCM_SHA256
+            0xc0, 0x2f, // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+        ]);
+        // Compression methods
+        client_hello.extend_from_slice(&[
+            0x01, // Length: 1
+            0x00, // Null compression
+        ]);
+        // Extensions length (minimal)
+        client_hello.extend_from_slice(&[0x00, 0x00]);
+
+        let extractor = FingerprintExtractor::new();
+        let result = extractor.extract_ja3(&client_hello);
+        assert!(result.is_some());
+
+        let fp = result.unwrap();
+        assert_eq!(fp.tls_version, 0x0303); // TLS 1.2
+        assert_eq!(fp.ciphers.len(), 2);
+        assert_eq!(fp.ciphers[0], 0x1301);
+        assert_eq!(fp.ciphers[1], 0xc02f);
+    }
+
+    #[test]
+    fn test_extract_ja3_with_sni() {
+        // ClientHello with SNI extension
+        let mut client_hello: Vec<u8> = vec![
+            // TLS Record Layer
+            0x16,       // Content type: Handshake
+            0x03, 0x01, // Version: TLS 1.0 (record layer)
+            0x00, 0x5f, // Length (placeholder)
+            // Handshake header
+            0x01,             // Handshake type: ClientHello
+            0x00, 0x00, 0x5b, // Length (placeholder)
+            // ClientHello
+            0x03, 0x03, // Version: TLS 1.2
+        ];
+        // Random (32 bytes)
+        client_hello.extend_from_slice(&[0u8; 32]);
+        // Session ID length
+        client_hello.push(0x00);
+        // Cipher suites
+        client_hello.extend_from_slice(&[
+            0x00, 0x02, // Length: 2 bytes
+            0x13, 0x01, // TLS_AES_128_GCM_SHA256
+        ]);
+        // Compression methods
+        client_hello.extend_from_slice(&[0x01, 0x00]);
+        // Extensions
+        let sni_ext = [
+            0x00, 0x00, // SNI extension type
+            0x00, 0x0e, // Extension length
+            0x00, 0x0c, // SNI list length
+            0x00,       // Name type: host_name
+            0x00, 0x09, // Name length
+            b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+        ];
+        client_hello.extend_from_slice(&[(sni_ext.len() >> 8) as u8, sni_ext.len() as u8]);
+        client_hello.extend_from_slice(&sni_ext);
+
+        let extractor = FingerprintExtractor::new();
+        let result = extractor.extract_ja3(&client_hello);
+        assert!(result.is_some());
+
+        let fp = result.unwrap();
+        assert_eq!(fp.sni, Some("localhost".to_string()));
+        assert!(fp.extensions.contains(&0)); // SNI extension type
+    }
+
+    #[test]
+    fn test_extract_ja3_grease_filtering() {
+        // ClientHello with GREASE values in ciphers and extensions
+        let mut client_hello: Vec<u8> = vec![
+            0x16, 0x03, 0x01, 0x00, 0x60,
+            0x01, 0x00, 0x00, 0x5c,
+            0x03, 0x03,
+        ];
+        client_hello.extend_from_slice(&[0u8; 32]);
+        client_hello.push(0x00);
+        // Cipher suites with GREASE
+        client_hello.extend_from_slice(&[
+            0x00, 0x06,
+            0x0a, 0x0a, // GREASE
+            0x13, 0x01, // Real cipher
+            0x1a, 0x1a, // GREASE
+        ]);
+        client_hello.extend_from_slice(&[0x01, 0x00]);
+        // Extensions with GREASE
+        let exts = [
+            0x00, 0x08, // Extensions length
+            0x0a, 0x0a, // GREASE extension type
+            0x00, 0x00, // Extension length
+            0x00, 0x0d, // Signature algorithms extension
+            0x00, 0x00, // Extension length
+        ];
+        client_hello.extend_from_slice(&exts);
+
+        let extractor = FingerprintExtractor::new();
+        let result = extractor.extract_ja3(&client_hello);
+        assert!(result.is_some());
+
+        let fp = result.unwrap();
+        // GREASE values should be filtered out
+        assert!(!fp.ciphers.contains(&0x0a0a));
+        assert!(!fp.ciphers.contains(&0x1a1a));
+        assert!(fp.ciphers.contains(&0x1301));
+        assert!(!fp.extensions.contains(&0x0a0a));
+    }
+
+    #[test]
+    fn test_ja3_hash_determinism() {
+        // Same ClientHello should produce same hash
+        let mut client_hello: Vec<u8> = vec![
+            0x16, 0x03, 0x01, 0x00, 0x48,
+            0x01, 0x00, 0x00, 0x44,
+            0x03, 0x03,
+        ];
+        client_hello.extend_from_slice(&[0u8; 32]);
+        client_hello.push(0x00);
+        client_hello.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
+        client_hello.extend_from_slice(&[0x01, 0x00]);
+        client_hello.extend_from_slice(&[0x00, 0x00]);
+
+        let extractor = FingerprintExtractor::new();
+        let result1 = extractor.extract_ja3(&client_hello);
+        let result2 = extractor.extract_ja3(&client_hello);
+
+        assert!(result1.is_some());
+        assert!(result2.is_some());
+        assert_eq!(result1.unwrap().ja3_hash, result2.unwrap().ja3_hash);
+    }
+
+    #[test]
+    fn test_ja4_hash_generation() {
+        let extractor = FingerprintExtractor::new();
+
+        // TLS 1.3 with SNI
+        let ja4 = extractor.calculate_ja4(
+            0x0304,                    // TLS 1.3
+            &[0x1301, 0x1302, 0x1303], // 3 ciphers
+            &[0, 10, 11, 13, 16],      // 5 extensions
+            &["h2".to_string()],       // ALPN
+            &[0x0401, 0x0403],         // Signature algorithms
+            true,                      // Has SNI
+        );
+
+        assert!(ja4.is_some());
+        let ja4_str = ja4.unwrap();
+
+        // Format: t13d0305h2_<cipher_hash>_<ext_hash>
+        assert!(ja4_str.starts_with("t13d"));    // TLS, 1.3, domain
+        assert!(ja4_str.contains("03"));         // 3 ciphers
+        assert!(ja4_str.contains("05"));         // 5 extensions
+        assert!(ja4_str.contains("h2"));         // ALPN
+        assert!(ja4_str.contains("_"));          // Separators
+    }
+
+    #[test]
+    fn test_ja4_no_sni() {
+        let extractor = FingerprintExtractor::new();
+
+        let ja4 = extractor.calculate_ja4(
+            0x0303,           // TLS 1.2
+            &[0xc02f],        // 1 cipher
+            &[],              // No extensions
+            &[],              // No ALPN
+            &[],              // No sig algs
+            false,            // No SNI
+        );
+
+        assert!(ja4.is_some());
+        let ja4_str = ja4.unwrap();
+
+        // Should have 'i' for IP instead of 'd' for domain
+        assert!(ja4_str.starts_with("t12i"));
+    }
+
+    // ========================================================================
+    // Fingerprint Classification Tests
+    // ========================================================================
+
+    #[test]
+    fn test_classify_browser_fingerprints() {
+        let db = KnownFingerprints::default();
+
+        // Chrome
+        let (class, name) = db.classify("cd08e31494f9531f560d64c695473da9");
+        assert_eq!(class, FingerprintClass::Browser);
+        assert!(name.unwrap().contains("Chrome"));
+
+        // Firefox
+        let (class, name) = db.classify("47eca2446b260fac53c5cc2dd4aba2ba");
+        assert_eq!(class, FingerprintClass::Browser);
+        assert!(name.unwrap().contains("Firefox"));
+
+        // Safari
+        let (class, name) = db.classify("773906b0efdefa24a7f2b8eb6985bf37");
+        assert_eq!(class, FingerprintClass::Browser);
+        assert!(name.unwrap().contains("Safari"));
+    }
+
+    #[test]
+    fn test_classify_bot_fingerprints() {
+        let db = KnownFingerprints::default();
+
+        let (class, name) = db.classify("4d7a28d6f2f7e9c8b5a3c1d0e2f6a9b8");
+        assert_eq!(class, FingerprintClass::LegitimateBot);
+        assert!(name.unwrap().contains("Googlebot"));
+    }
+
+    #[test]
+    fn test_classify_malicious_fingerprints() {
+        let db = KnownFingerprints::default();
+
+        let (class, name) = db.classify("e960427dc851bc6c8a87ad68e9e2aa72");
+        assert_eq!(class, FingerprintClass::Malicious);
+        assert!(name.unwrap().contains("SQLMap"));
+    }
+
+    #[test]
+    fn test_classify_scanner_fingerprints() {
+        let db = KnownFingerprints::default();
+
+        let (class, name) = db.classify("72f4b0e61f7f6a1b2c3d4e5f6a7b8c9d");
+        assert_eq!(class, FingerprintClass::Scanner);
+        assert!(name.unwrap().contains("Nmap"));
+    }
+
+    #[test]
+    fn test_classify_api_client_fingerprints() {
+        let db = KnownFingerprints::default();
+
+        let (class, name) = db.classify("1be3ecebe5aa9d3654e6e703d24b6052");
+        assert_eq!(class, FingerprintClass::ApiClient);
+        assert!(name.unwrap().contains("curl"));
+    }
 }
