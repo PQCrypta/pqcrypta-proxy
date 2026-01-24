@@ -78,6 +78,7 @@ mod handlers;
 mod http3_features;
 mod http_listener;
 mod load_balancer;
+mod ocsp;
 mod pqc_extended;
 mod pqc_tls;
 mod proxy;
@@ -334,11 +335,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Start admin API server
+    // OCSP service is optional - can be enabled via TLS config
+    let ocsp_service: Option<Arc<ocsp::OcspService>> = None;
+
     let admin_server = AdminServer::new(
         config.admin.clone(),
         config_manager.clone(),
         tls_provider.clone(),
         backend_pool.clone(),
+        ocsp_service,
         shutdown_tx.clone(),
     );
 

@@ -71,6 +71,7 @@ pub mod handlers;
 pub mod http3_features;
 pub mod http_listener;
 pub mod load_balancer;
+pub mod ocsp;
 pub mod pqc_extended;
 pub mod pqc_tls;
 pub mod proxy;
@@ -114,6 +115,7 @@ pub use rate_limiter::{
     RateLimitKey, RateLimitKeyType, RateLimitResult, RateLimiterSnapshot,
 };
 pub use security::{security_middleware, SecurityState};
+pub use ocsp::{OcspConfig, OcspService, OcspStatus, OcspStatusInfo};
 pub use tls::TlsProvider;
 pub use tls_acceptor::{FingerprintedConnection, FingerprintingTlsAcceptor};
 pub use webtransport_server::WebTransportServer;

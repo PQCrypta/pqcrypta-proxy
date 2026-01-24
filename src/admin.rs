@@ -24,6 +24,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
 use crate::config::{AdminConfig, ConfigManager};
+use crate::ocsp::{OcspService, OcspStatusInfo};
 use crate::proxy::BackendPool;
 use crate::tls::{CertificateInfo, TlsProvider};
 
@@ -35,6 +36,8 @@ pub struct AdminState {
     pub tls_provider: Arc<TlsProvider>,
     /// Backend pool
     pub backend_pool: Arc<BackendPool>,
+    /// OCSP service (optional)
+    pub ocsp_service: Option<Arc<OcspService>>,
     /// Shutdown signal sender
     pub shutdown_tx: mpsc::Sender<()>,
     /// Server start time
@@ -58,12 +61,14 @@ impl AdminServer {
         config_manager: Arc<ConfigManager>,
         tls_provider: Arc<TlsProvider>,
         backend_pool: Arc<BackendPool>,
+        ocsp_service: Option<Arc<OcspService>>,
         shutdown_tx: mpsc::Sender<()>,
     ) -> Self {
         let state = Arc::new(AdminState {
             config_manager,
             tls_provider,
             backend_pool,
+            ocsp_service,
             shutdown_tx,
             start_time: Instant::now(),
             connection_count: Arc::new(RwLock::new(0)),
@@ -94,6 +99,8 @@ impl AdminServer {
             .route("/config", get(config_handler))
             .route("/backends", get(backends_handler))
             .route("/tls", get(tls_handler))
+            .route("/ocsp", get(ocsp_handler))
+            .route("/ocsp/refresh", post(ocsp_refresh_handler))
             .layer(TraceLayer::new_for_http())
             .layer(axum::middleware::from_fn_with_state(
                 (allowed_ips, auth_token),
@@ -443,4 +450,57 @@ async fn backends_handler(State(state): State<Arc<AdminState>>) -> Json<Vec<Back
 /// TLS information endpoint
 async fn tls_handler(State(state): State<Arc<AdminState>>) -> Json<CertificateInfo> {
     Json(state.tls_provider.get_cert_info())
+}
+
+/// OCSP stapling status endpoint
+async fn ocsp_handler(State(state): State<Arc<AdminState>>) -> Json<OcspStatusResponse> {
+    match &state.ocsp_service {
+        Some(service) => Json(OcspStatusResponse {
+            enabled: true,
+            status: Some(service.get_status()),
+            error: None,
+        }),
+        None => Json(OcspStatusResponse {
+            enabled: false,
+            status: None,
+            error: Some("OCSP service not configured".to_string()),
+        }),
+    }
+}
+
+/// OCSP response wrapper
+#[derive(Serialize)]
+struct OcspStatusResponse {
+    enabled: bool,
+    status: Option<OcspStatusInfo>,
+    error: Option<String>,
+}
+
+/// OCSP refresh endpoint (force refresh)
+async fn ocsp_refresh_handler(
+    State(state): State<Arc<AdminState>>,
+) -> Result<Json<OcspRefreshResponse>, StatusCode> {
+    match &state.ocsp_service {
+        Some(service) => match service.force_refresh().await {
+            Ok(()) => Ok(Json(OcspRefreshResponse {
+                success: true,
+                message: "OCSP response refreshed successfully".to_string(),
+                status: Some(service.get_status()),
+            })),
+            Err(e) => Ok(Json(OcspRefreshResponse {
+                success: false,
+                message: format!("OCSP refresh failed: {}", e),
+                status: Some(service.get_status()),
+            })),
+        },
+        None => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+/// OCSP refresh response
+#[derive(Serialize)]
+struct OcspRefreshResponse {
+    success: bool,
+    message: String,
+    status: Option<OcspStatusInfo>,
 }
