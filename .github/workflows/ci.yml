@@ -51,7 +51,7 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
           - os: macos-latest
-            target: x86_64-apple-darwin
+            target: aarch64-apple-darwin  # Native ARM64 for M1/M2 runners
           - os: windows-latest
             target: x86_64-pc-windows-msvc
 
@@ -66,19 +66,23 @@ jobs:
         with:
           key: ${{ matrix.os }}
 
-      # Install OpenSSL on Windows
+      # Install OpenSSL on Windows using vcpkg for reliable paths
       - name: Install OpenSSL (Windows)
         if: matrix.os == 'windows-latest'
         run: |
-          choco install openssl -y
-          echo "OPENSSL_DIR=C:\Program Files\OpenSSL-Win64" >> $env:GITHUB_ENV
+          vcpkg install openssl:x64-windows-static-md
+          echo "OPENSSL_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md" >> $env:GITHUB_ENV
+          echo "OPENSSL_STATIC=1" >> $env:GITHUB_ENV
 
-      # Install OpenSSL on macOS
+      # Install OpenSSL on macOS and set proper environment variables
       - name: Install OpenSSL (macOS)
         if: matrix.os == 'macos-latest'
         run: |
           brew install openssl@3
-          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> $GITHUB_ENV
+          OPENSSL_PREFIX=$(brew --prefix openssl@3)
+          echo "OPENSSL_DIR=$OPENSSL_PREFIX" >> $GITHUB_ENV
+          echo "OPENSSL_LIB_DIR=$OPENSSL_PREFIX/lib" >> $GITHUB_ENV
+          echo "OPENSSL_INCLUDE_DIR=$OPENSSL_PREFIX/include" >> $GITHUB_ENV
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
@@ -114,7 +118,10 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: |
           brew install openssl@3
-          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> $GITHUB_ENV
+          OPENSSL_PREFIX=$(brew --prefix openssl@3)
+          echo "OPENSSL_DIR=$OPENSSL_PREFIX" >> $GITHUB_ENV
+          echo "OPENSSL_LIB_DIR=$OPENSSL_PREFIX/lib" >> $GITHUB_ENV
+          echo "OPENSSL_INCLUDE_DIR=$OPENSSL_PREFIX/include" >> $GITHUB_ENV
 
       - name: Run unit tests
         run: cargo test --all-features -- --nocapture

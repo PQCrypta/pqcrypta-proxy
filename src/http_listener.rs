@@ -1334,12 +1334,10 @@ pub fn create_backend_tls_connector(
         }
     }
 
-    let mut config = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    // Add client certificate for mTLS if provided
-    if let (Some(cert_path), Some(key_path)) = (&backend.tls_client_cert, &backend.tls_client_key) {
+    // Build TLS config - use mTLS if client certs provided, otherwise no client auth
+    let mut config = if let (Some(cert_path), Some(key_path)) =
+        (&backend.tls_client_cert, &backend.tls_client_key)
+    {
         let cert_file = File::open(cert_path)?;
         let mut cert_reader = BufReader::new(cert_file);
         let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
@@ -1350,10 +1348,15 @@ pub fn create_backend_tls_connector(
         let mut key_reader = BufReader::new(key_file);
         let key = rustls_pemfile::private_key(&mut key_reader)?.ok_or("No private key found")?;
 
-        config = ClientConfig::builder()
+        // Note: Using empty root store for mTLS (preserving original behavior)
+        ClientConfig::builder()
             .with_root_certificates(rustls::RootCertStore::empty())
-            .with_client_auth_cert(certs, key)?;
-    }
+            .with_client_auth_cert(certs, key)?
+    } else {
+        ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+    };
 
     // Optionally skip verification (dangerous!)
     if backend.tls_skip_verify {
