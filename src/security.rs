@@ -27,6 +27,16 @@ use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
+
+/// Alt-Svc header value for HTTP/3 advertisement (ports 443, 4433, 4434)
+const ALT_SVC_HEADER: &str = "h3=\":443\"; ma=86400, h3=\":4433\"; ma=86400, h3=\":4434\"; ma=86400";
+
+/// Add Alt-Svc header to a response for HTTP/3 advertisement
+fn add_alt_svc(response: &mut Response) {
+    if let Ok(value) = HeaderValue::from_str(ALT_SVC_HEADER) {
+        response.headers_mut().insert("alt-svc", value);
+    }
+}
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
@@ -641,17 +651,20 @@ fn blocked_response(info: &BlockedIpInfo) -> Response {
         "Retry-After",
         HeaderValue::from_str(&retry_after.to_string()).unwrap_or(HeaderValue::from_static("3600")),
     );
+    add_alt_svc(&mut response);
 
     response
 }
 
 /// Generate GeoIP blocked response
 fn geo_blocked_response() -> Response {
-    (
+    let mut response = (
         StatusCode::FORBIDDEN,
         "Access denied - Your region is not allowed",
     )
-        .into_response()
+        .into_response();
+    add_alt_svc(&mut response);
+    response
 }
 
 /// Generate rate limit exceeded response
@@ -670,17 +683,20 @@ fn rate_limit_response(config: &RateLimitConfig) -> Response {
     response
         .headers_mut()
         .insert("X-RateLimit-Remaining", HeaderValue::from_static("0"));
+    add_alt_svc(&mut response);
 
     response
 }
 
 /// Generate too many connections response
 fn too_many_connections_response() -> Response {
-    (
+    let mut response = (
         StatusCode::SERVICE_UNAVAILABLE,
         "Too many connections from your IP",
     )
-        .into_response()
+        .into_response();
+    add_alt_svc(&mut response);
+    response
 }
 
 /// Generate payload too large response
@@ -696,17 +712,20 @@ fn payload_too_large_response(max_size: usize) -> Response {
         HeaderValue::from_str(&max_size.to_string())
             .unwrap_or(HeaderValue::from_static("10485760")),
     );
+    add_alt_svc(&mut response);
 
     response
 }
 
 /// Generate headers too large response
 fn headers_too_large_response(max_size: usize) -> Response {
-    (
+    let mut response = (
         StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
         format!("Headers exceed maximum size of {} bytes", max_size),
     )
-        .into_response()
+        .into_response();
+    add_alt_svc(&mut response);
+    response
 }
 
 /// JA3 fingerprint calculation from TLS ClientHello

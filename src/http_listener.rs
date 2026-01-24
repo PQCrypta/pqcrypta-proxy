@@ -892,6 +892,22 @@ async fn security_headers_middleware(
 /// - X-Forwarded-For trust for clients behind proxies
 /// - IPv6 /64 subnet grouping
 /// - Adaptive baseline learning with anomaly detection
+/// Build Alt-Svc header value for HTTP/3 advertisement
+fn build_alt_svc_header(port: u16, additional_ports: &[u16]) -> String {
+    let mut parts = vec![format!("h3=\":{}\"; ma=86400", port)];
+    for p in additional_ports {
+        parts.push(format!("h3=\":{}\"; ma=86400", p));
+    }
+    parts.join(", ")
+}
+
+/// Add Alt-Svc header to a response (for early-return paths)
+fn add_alt_svc_to_response(response: &mut Response, alt_svc: &str) {
+    if let Ok(value) = HeaderValue::from_str(alt_svc) {
+        response.headers_mut().insert("alt-svc", value);
+    }
+}
+
 async fn advanced_rate_limit_middleware(
     State(rate_limiter): State<Arc<AdvancedRateLimiter>>,
     ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
@@ -901,6 +917,9 @@ async fn advanced_rate_limit_middleware(
 ) -> Response {
     let method = request.method().as_str().to_string();
     let path = request.uri().path().to_string();
+
+    // Pre-build Alt-Svc header for error responses (ports 443, 4433, 4434)
+    let alt_svc = "h3=\":443\"; ma=86400, h3=\":4433\"; ma=86400, h3=\":4434\"; ma=86400";
 
     // Extract JA3/JA4 fingerprints from headers (set by TLS acceptor)
     let ja3_hash = headers
@@ -987,6 +1006,9 @@ async fn advanced_rate_limit_middleware(
                 headers.insert("x-ratelimit-reset", v);
             }
 
+            // Add Alt-Svc header to advertise HTTP/3
+            add_alt_svc_to_response(&mut response, alt_svc);
+
             response
         }
         RateLimitResult::Blocked { reason } => {
@@ -998,7 +1020,10 @@ async fn advanced_rate_limit_middleware(
                 reason
             );
 
-            (StatusCode::FORBIDDEN, "Access denied").into_response()
+            let mut response = (StatusCode::FORBIDDEN, "Access denied").into_response();
+            // Add Alt-Svc header to advertise HTTP/3
+            add_alt_svc_to_response(&mut response, alt_svc);
+            response
         }
     }
 }
