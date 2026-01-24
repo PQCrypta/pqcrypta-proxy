@@ -365,10 +365,19 @@ impl SecurityState {
 
     /// Record a request for adaptive rate limiting
     pub fn record_request(&self, ip: IpAddr, status: StatusCode) {
+        // Read config values
+        let config = self.config.read();
+        let window_duration = Duration::from_secs(config.error_window_secs);
+        let error_4xx_threshold = config.error_4xx_threshold;
+        let min_requests = config.min_requests_for_error_check;
+        let error_rate_threshold = config.error_rate_threshold;
+        let auto_block_threshold = config.auto_block_threshold;
+        let auto_block_duration = Duration::from_secs(config.auto_block_duration_secs);
+        drop(config);
+
         let mut counter = self.request_counts.entry(ip).or_default();
 
-        // Reset window if needed (1 minute windows)
-        let window_duration = Duration::from_secs(60);
+        // Reset window if needed (configurable window duration)
         if counter
             .window_start
             .map(|s| s.elapsed() > window_duration)
@@ -389,19 +398,19 @@ impl SecurityState {
             counter.error_5xx += 1;
         }
 
-        // Check for suspicious patterns (too many 4xx errors)
-        if counter.error_4xx > 50 && counter.total_requests > 100 {
+        // Check for suspicious patterns (configurable thresholds)
+        if counter.error_4xx > error_4xx_threshold && counter.total_requests > min_requests {
             let error_rate = counter.error_4xx as f64 / counter.total_requests as f64;
-            if error_rate > 0.5 {
+            if error_rate > error_rate_threshold {
                 counter.suspicious_patterns += 1;
 
-                // Auto-block if too suspicious
-                if counter.suspicious_patterns >= 3 {
+                // Auto-block if too suspicious (configurable threshold)
+                if counter.suspicious_patterns >= auto_block_threshold {
                     drop(counter);
                     self.block_ip(
                         ip,
                         BlockReason::TooManyErrors,
-                        Some(Duration::from_secs(300)),
+                        Some(auto_block_duration),
                     );
                 }
             }

@@ -505,10 +505,18 @@ pub struct SecurityConfig {
     pub blocked_countries: Vec<String>,
     /// Maximum connections per IP
     pub max_connections_per_ip: u32,
-    /// Auto-block threshold (errors before auto-block)
+    /// Auto-block threshold (suspicious patterns before auto-block)
     pub auto_block_threshold: u32,
     /// Auto-block duration in seconds
     pub auto_block_duration_secs: u64,
+    /// 4xx error count threshold before checking error rate
+    pub error_4xx_threshold: u32,
+    /// Minimum requests before error rate check applies
+    pub min_requests_for_error_check: u64,
+    /// Error rate threshold (0.0-1.0) to trigger suspicious pattern
+    pub error_rate_threshold: f64,
+    /// Request window duration in seconds for error tracking
+    pub error_window_secs: u64,
 }
 
 impl Default for SecurityConfig {
@@ -525,8 +533,12 @@ impl Default for SecurityConfig {
             )),
             blocked_countries: Vec::new(), // e.g., vec!["CN", "RU", "KP", "IR"]
             max_connections_per_ip: 100,
-            auto_block_threshold: 10,      // 10 violations before auto-block
-            auto_block_duration_secs: 300, // 5 minute auto-block
+            auto_block_threshold: 10,           // 10 suspicious patterns before auto-block
+            auto_block_duration_secs: 300,      // 5 minute auto-block
+            error_4xx_threshold: 100,           // 100 4xx errors before checking rate
+            min_requests_for_error_check: 200,  // Need 200+ requests before error check
+            error_rate_threshold: 0.7,          // 70% error rate triggers suspicious
+            error_window_secs: 60,              // 1 minute sliding window
         }
     }
 }
