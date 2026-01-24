@@ -545,12 +545,12 @@ impl Default for SecurityConfig {
             )),
             blocked_countries: Vec::new(), // e.g., vec!["CN", "RU", "KP", "IR"]
             max_connections_per_ip: 100,
-            auto_block_threshold: 10,           // 10 suspicious patterns before auto-block
-            auto_block_duration_secs: 300,      // 5 minute auto-block
-            error_4xx_threshold: 100,           // 100 4xx errors before checking rate
-            min_requests_for_error_check: 200,  // Need 200+ requests before error check
-            error_rate_threshold: 0.7,          // 70% error rate triggers suspicious
-            error_window_secs: 60,              // 1 minute sliding window
+            auto_block_threshold: 10, // 10 suspicious patterns before auto-block
+            auto_block_duration_secs: 300, // 5 minute auto-block
+            error_4xx_threshold: 100, // 100 4xx errors before checking rate
+            min_requests_for_error_check: 200, // Need 200+ requests before error check
+            error_rate_threshold: 0.7, // 70% error rate triggers suspicious
+            error_window_secs: 60,    // 1 minute sliding window
         }
     }
 }
@@ -577,11 +577,11 @@ impl Default for FingerprintConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            malicious_block_duration_secs: 3600,      // 1 hour
-            suspicious_block_duration_secs: 300,       // 5 minutes
-            suspicious_rate_threshold: 100,            // 100 requests
-            suspicious_rate_window_secs: 60,           // 1 minute
-            cache_max_age_secs: 3600,                  // 1 hour
+            malicious_block_duration_secs: 3600, // 1 hour
+            suspicious_block_duration_secs: 300, // 5 minutes
+            suspicious_rate_threshold: 100,      // 100 requests
+            suspicious_rate_window_secs: 60,     // 1 minute
+            cache_max_age_secs: 3600,            // 1 hour
         }
     }
 }
@@ -608,11 +608,11 @@ impl Default for CircuitBreakerConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            half_open_delay_secs: 30,                  // 30 seconds
-            half_open_max_requests: 3,                 // 3 test requests
-            failure_threshold: 5,                      // 5 failures to open
-            success_threshold: 2,                      // 2 successes to close
-            stale_counter_cleanup_secs: 300,           // 5 minutes
+            half_open_delay_secs: 30,        // 30 seconds
+            half_open_max_requests: 3,       // 3 test requests
+            failure_threshold: 5,            // 5 failures to open
+            success_threshold: 2,            // 2 successes to close
+            stale_counter_cleanup_secs: 300, // 5 minutes
         }
     }
 }
@@ -634,10 +634,10 @@ pub struct ConnectionPoolConfig {
 impl Default for ConnectionPoolConfig {
     fn default() -> Self {
         Self {
-            idle_timeout_secs: 90,                     // 90 seconds
-            max_idle_per_host: 10,                     // 10 idle connections
-            max_connections_per_host: 100,             // 100 total connections
-            acquire_timeout_ms: 5000,                  // 5 second timeout
+            idle_timeout_secs: 90,         // 90 seconds
+            max_idle_per_host: 10,         // 10 idle connections
+            max_connections_per_host: 100, // 100 total connections
+            acquire_timeout_ms: 5000,      // 5 second timeout
         }
     }
 }
