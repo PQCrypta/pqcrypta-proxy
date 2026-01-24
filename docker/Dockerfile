@@ -14,8 +14,9 @@ RUN apt-get update && apt-get install -y \
     cmake \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy manifests
+# Copy manifests and vendored dependencies (needed for path dependencies)
 COPY Cargo.toml Cargo.lock ./
+COPY vendor ./vendor
 
 # Create dummy main.rs to cache dependencies
 RUN mkdir -p src && echo "fn main() {}" > src/main.rs
