@@ -119,11 +119,38 @@ All responses automatically include these security headers. The `Server` header 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enabled` | bool | `true` | Enable PQC hybrid key exchange |
-| `provider` | string | `"openssl3.5"` | PQC provider. Options: `"openssl3.5"`, `"rustls-pqc"` |
+| `provider` | string | `"auto"` | PQC provider. Options: `"auto"`, `"rustls"`, `"openssl3.5"` |
 | `openssl_path` | path? | `"/usr/local/openssl-3.5/bin/openssl"` | Path to OpenSSL 3.5+ binary |
 | `openssl_lib_path` | path? | `"/usr/local/openssl-3.5/lib64"` | OpenSSL library path |
-| `preferred_kem` | string | `"X25519MLKEM768"` | Preferred KEM algorithm. Options: `"X25519MLKEM768"`, `"kyber768"`, `"kyber1024"`, `"mlkem768"`, `"mlkem1024"` |
+| `preferred_kem` | string | `"X25519MLKEM768"` | Preferred KEM algorithm |
 | `fallback_to_classical` | bool | `true` | Fallback to classical TLS if PQC unavailable |
+| `min_security_level` | u8 | `3` | Minimum NIST security level (1-5) |
+| `additional_kems` | array[string] | `[]` | Additional KEMs to enable |
+| `enable_signatures` | bool | `false` | Enable PQC signature algorithms (ML-DSA) |
+| `require_hybrid` | bool | `true` | Require hybrid mode (classical + PQC) |
+| `verify_provider` | bool | `true` | Verify PQC provider at startup |
+| `check_key_permissions` | bool | `true` | Check TLS key file permissions |
+| `strict_key_permissions` | bool | `false` | Fail if key permissions are too permissive |
+
+### PQC KEM Algorithms
+
+| Algorithm | Security Level | Type | Description |
+|-----------|---------------|------|-------------|
+| `X25519MLKEM768` | 3 | Hybrid | X25519 + ML-KEM-768 (IETF standard, recommended) |
+| `SecP256r1MLKEM768` | 3 | Hybrid | P-256 + ML-KEM-768 (NIST curve) |
+| `SecP384r1MLKEM1024` | 5 | Hybrid | P-384 + ML-KEM-1024 (high security) |
+| `X448MLKEM1024` | 5 | Hybrid | X448 + ML-KEM-1024 (maximum security) |
+| `MLKEM512` | 1 | Pure PQC | ML-KEM-512 (smallest, fastest) |
+| `MLKEM768` | 3 | Pure PQC | ML-KEM-768 (balanced) |
+| `MLKEM1024` | 5 | Pure PQC | ML-KEM-1024 (maximum security) |
+
+### PQC Providers
+
+| Provider | Backend | QUIC Support | Algorithms |
+|----------|---------|--------------|------------|
+| `auto` | Auto-detect | Yes | Best available |
+| `rustls` | aws-lc-rs | Yes | X25519MLKEM768 |
+| `openssl3.5` | OpenSSL 3.5+ | No | All ML-KEM variants |
 
 ---
 

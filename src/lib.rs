@@ -71,6 +71,7 @@ pub mod handlers;
 pub mod http3_features;
 pub mod http_listener;
 pub mod load_balancer;
+pub mod pqc_extended;
 pub mod pqc_tls;
 pub mod proxy;
 pub mod quic_listener;
@@ -95,6 +96,13 @@ pub use load_balancer::{
     extract_session_cookie, BackendPool as LbBackendPool, BackendServer, LoadBalancer, PoolStats,
     SelectionContext, SessionCookieConfig,
 };
+// Extended PQC support with unified configuration
+pub use pqc_extended::{
+    ExtendedPqcConfig, KeySecurityCheck, PqcCapabilities, PqcKem, PqcSignature, SecurityLevel,
+    TlsBackend,
+};
+#[cfg(feature = "pqc")]
+pub use pqc_extended::verify_openssl_provider;
 #[cfg(feature = "pqc")]
 pub use pqc_tls::openssl_pqc;
 pub use pqc_tls::{

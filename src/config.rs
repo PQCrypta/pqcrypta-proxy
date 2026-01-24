@@ -208,14 +208,33 @@ impl Default for TlsConfig {
 }
 
 /// Post-quantum cryptography configuration
+///
+/// Supports both TLS backends:
+/// - **rustls** (default): Pure Rust, memory-safe, QUIC support, uses aws-lc-rs
+/// - **OpenSSL 3.5+**: Broader algorithm support, hardware acceleration
+///
+/// ## Algorithm Support
+///
+/// | Algorithm | rustls | OpenSSL 3.5+ |
+/// |-----------|--------|--------------|
+/// | X25519MLKEM768 | ✅ | ✅ |
+/// | SecP256r1MLKEM768 | ⏳ | ✅ |
+/// | SecP384r1MLKEM1024 | ⏳ | ✅ |
+/// | ML-KEM-512/768/1024 | ✅ | ✅ |
+/// | ML-DSA-44/65/87 | 🔧 | ✅ |
+///
+/// ✅ = Available, ⏳ = Planned, 🔧 = Requires `pqc-signatures` feature
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PqcConfig {
     /// Enable PQC hybrid key exchange
     pub enabled: bool,
-    /// PQC provider: "openssl3.5" or "rustls-pqc"
+    /// PQC provider: "auto", "rustls", or "openssl3.5"
+    /// - "auto" (default): Use rustls for QUIC, OpenSSL when broader algorithms needed
+    /// - "rustls": Pure Rust via aws-lc-rs (memory-safe, QUIC support)
+    /// - "openssl3.5": OpenSSL 3.5+ with native ML-KEM (broader algorithms)
     pub provider: String,
-    /// OpenSSL binary path (for OpenSSL 3.5+ with OQS provider)
+    /// OpenSSL binary path (for OpenSSL 3.5+ with native ML-KEM)
     pub openssl_path: Option<PathBuf>,
     /// OpenSSL library path
     pub openssl_lib_path: Option<PathBuf>,
@@ -223,19 +242,61 @@ pub struct PqcConfig {
     pub preferred_kem: String,
     /// Fallback to classical if PQC fails
     pub fallback_to_classical: bool,
+    /// Minimum security level (1-5, corresponding to NIST levels)
+    /// - 1: 128-bit (ML-KEM-512)
+    /// - 3: 192-bit (X25519MLKEM768, ML-KEM-768) - recommended
+    /// - 5: 256-bit (ML-KEM-1024, SecP384r1MLKEM1024)
+    #[serde(default = "default_min_security_level")]
+    pub min_security_level: u8,
+    /// Additional KEM algorithms to offer (in preference order)
+    #[serde(default)]
+    pub additional_kems: Vec<String>,
+    /// Enable PQC signatures (ML-DSA) - requires `pqc-signatures` feature
+    #[serde(default)]
+    pub enable_signatures: bool,
+    /// Require hybrid mode (reject pure PQC or pure classical)
+    #[serde(default)]
+    pub require_hybrid: bool,
+    /// Verify OpenSSL provider integrity at startup
+    #[serde(default = "default_true_pqc")]
+    pub verify_provider: bool,
+    /// Check TLS key file permissions for security
+    #[serde(default = "default_true_pqc")]
+    pub check_key_permissions: bool,
+    /// Fail startup if key permissions are insecure (vs just warning)
+    #[serde(default)]
+    pub strict_key_permissions: bool,
+}
+
+fn default_min_security_level() -> u8 {
+    3 // NIST Level 3 (192-bit equivalent)
+}
+
+fn default_true_pqc() -> bool {
+    true
 }
 
 impl Default for PqcConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            provider: "openssl3.5".to_string(),
+            provider: "auto".to_string(), // Auto-select best available
             openssl_path: Some(PathBuf::from("/usr/local/openssl-3.5/bin/openssl")),
             openssl_lib_path: Some(PathBuf::from("/usr/local/openssl-3.5/lib64")),
             // X25519MLKEM768 is the IETF standard hybrid (classical + PQC)
             // Provides NIST Level 3 security with classical fallback
             preferred_kem: "X25519MLKEM768".to_string(),
             fallback_to_classical: true,
+            min_security_level: 3,
+            additional_kems: vec![
+                "SecP256r1MLKEM768".to_string(),
+                "SecP384r1MLKEM1024".to_string(),
+            ],
+            enable_signatures: false,
+            require_hybrid: false,
+            verify_provider: true,
+            check_key_permissions: true,
+            strict_key_permissions: false,
         }
     }
 }

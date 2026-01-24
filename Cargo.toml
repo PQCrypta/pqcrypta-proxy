@@ -12,8 +12,11 @@ categories = ["network-programming", "cryptography", "web-programming"]
 
 [features]
 default = ["pqc", "metrics", "admin-api", "geoip"]
-# Enable PQC hybrid key exchange (requires OpenSSL 3.5 + OQS provider)
-pqc = ["openssl", "openssl-sys"]
+# Enable PQC hybrid key exchange via OpenSSL 3.5+ (native ML-KEM)
+# Also enables extended algorithm detection and configuration
+pqc = ["openssl", "openssl-sys", "openssl-probe"]
+# Extended PQC with ML-DSA signatures (unstable aws-lc-rs API)
+pqc-signatures = ["aws-lc-rs/unstable"]
 # Prometheus metrics endpoint
 metrics = ["prometheus"]
 # Admin HTTP API for health, reload, shutdown
@@ -24,6 +27,8 @@ acme = []
 windows-service = ["windows-service-rs"]
 # GeoIP blocking support
 geoip = ["maxminddb"]
+# FIPS mode for aws-lc-rs (requires FIPS-validated build)
+fips = ["aws-lc-rs/fips"]
 
 [dependencies]
 # Async runtime
@@ -61,6 +66,10 @@ rustls-post-quantum = "0.2"
 # OpenSSL for PQC support (optional feature)
 openssl = { version = "0.10", optional = true, default-features = false }
 openssl-sys = { version = "0.9", optional = true }
+openssl-probe = { version = "0.1", optional = true }
+
+# aws-lc-rs for extended PQC (ML-KEM direct, ML-DSA when unstable enabled)
+aws-lc-rs = "1.15"
 
 # Configuration
 serde = { version = "1.0", features = ["derive"] }

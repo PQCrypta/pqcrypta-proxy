@@ -78,6 +78,7 @@ mod handlers;
 mod http3_features;
 mod http_listener;
 mod load_balancer;
+mod pqc_extended;
 mod pqc_tls;
 mod proxy;
 mod quic_listener;
@@ -188,6 +189,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let config = Arc::new(config);
+
+    // =========================================================================
+    // Security Checks (Key Permissions, Provider Verification)
+    // =========================================================================
+    perform_security_checks(&config).await?;
 
     // Initialize PQC TLS provider (OpenSSL 3.5 with ML-KEM)
     info!("Initializing PQC TLS provider...");
@@ -650,4 +656,138 @@ fn print_startup_summary(config: &config::ProxyConfig, pqc_enabled: bool) {
     }
 
     info!("═══════════════════════════════════════════════════════════════");
+}
+
+/// Perform security checks before starting the proxy
+///
+/// Checks:
+/// 1. TLS private key file permissions (should be 0600 or 0400)
+/// 2. OpenSSL provider integrity verification (if PQC enabled)
+/// 3. PQC capability detection
+async fn perform_security_checks(config: &config::ProxyConfig) -> anyhow::Result<()> {
+    use pqc_extended::{KeySecurityCheck, PqcCapabilities, ExtendedPqcConfig};
+    use std::path::Path;
+
+    info!("═══════════════════════════════════════════════════════════════");
+    info!("  🔒 SECURITY CHECKS");
+    info!("═══════════════════════════════════════════════════════════════");
+
+    let mut has_warnings = false;
+    let mut has_errors = false;
+
+    // =========================================================================
+    // 1. Check TLS private key file permissions
+    // =========================================================================
+    if config.pqc.check_key_permissions {
+        let key_path = Path::new(&config.tls.key_path);
+        let key_check = KeySecurityCheck::check_key_file(key_path, None);
+
+        if key_check.is_secure() {
+            info!("  ✅ Key file permissions: SECURE");
+        } else {
+            for issue in &key_check.issues {
+                if config.pqc.strict_key_permissions {
+                    error!("  ❌ Key security issue: {}", issue);
+                    has_errors = true;
+                } else {
+                    warn!("  ⚠️  Key security warning: {}", issue);
+                    has_warnings = true;
+                }
+            }
+        }
+    } else {
+        info!("  ⏭️  Key permission checks: SKIPPED (disabled in config)");
+    }
+
+    // =========================================================================
+    // 2. Verify OpenSSL provider integrity (if PQC enabled)
+    // =========================================================================
+    #[cfg(feature = "pqc")]
+    if config.pqc.enabled && config.pqc.verify_provider {
+        // Convert to ExtendedPqcConfig for verification
+        let extended_config = ExtendedPqcConfig {
+            enabled: config.pqc.enabled,
+            openssl_path: config.pqc.openssl_path.clone(),
+            openssl_lib_path: config.pqc.openssl_lib_path.clone(),
+            ..Default::default()
+        };
+
+        match pqc_extended::verify_openssl_provider(&extended_config) {
+            Ok(()) => {
+                info!("  ✅ OpenSSL provider: VERIFIED");
+            }
+            Err(e) => {
+                if config.pqc.fallback_to_classical {
+                    warn!("  ⚠️  OpenSSL provider check failed: {}", e);
+                    warn!("     Will fall back to classical TLS (rustls)");
+                    has_warnings = true;
+                } else {
+                    error!("  ❌ OpenSSL provider verification failed: {}", e);
+                    has_errors = true;
+                }
+            }
+        }
+    } else if config.pqc.enabled {
+        info!("  ⏭️  OpenSSL provider verification: SKIPPED (disabled in config)");
+    }
+
+    // =========================================================================
+    // 3. Detect PQC capabilities
+    // =========================================================================
+    if config.pqc.enabled {
+        let extended_config = ExtendedPqcConfig {
+            enabled: config.pqc.enabled,
+            openssl_path: config.pqc.openssl_path.clone(),
+            openssl_lib_path: config.pqc.openssl_lib_path.clone(),
+            ..Default::default()
+        };
+
+        let capabilities = PqcCapabilities::detect(&extended_config);
+
+        info!("  📊 PQC Capabilities:");
+        info!("     rustls (aws-lc-rs): {}", if capabilities.rustls_available { "✅" } else { "❌" });
+        info!("     OpenSSL 3.5+:       {}", if capabilities.openssl_available { "✅" } else { "❌" });
+
+        if let Some(version) = &capabilities.openssl_version {
+            info!("     OpenSSL version:    {}", version);
+        }
+
+        info!("     Available KEMs:     {}", capabilities.available_kems.len());
+        info!("     FIPS mode:          {}", if capabilities.fips_mode { "✅ ENABLED" } else { "⏹️  disabled" });
+
+        // Check minimum security level
+        let min_level = pqc_extended::SecurityLevel::Level3;
+        if let Some(best_kem) = capabilities.best_kem(min_level, config.pqc.require_hybrid) {
+            info!("     Best available KEM: {} (Level {})",
+                best_kem.openssl_name(),
+                best_kem.security_level() as u8
+            );
+        } else {
+            warn!("  ⚠️  No KEM available at minimum security level");
+            has_warnings = true;
+        }
+
+        // Report any warnings from capability detection
+        for warning in &capabilities.warnings {
+            warn!("  ⚠️  {}", warning);
+            has_warnings = true;
+        }
+    }
+
+    info!("═══════════════════════════════════════════════════════════════");
+
+    // Fail if strict mode and errors found
+    if has_errors {
+        return Err(anyhow::anyhow!(
+            "Security checks failed. Fix the issues above or disable strict mode."
+        ));
+    }
+
+    if has_warnings {
+        warn!("Security checks completed with warnings - review the issues above");
+    } else {
+        info!("✅ All security checks passed");
+    }
+
+    Ok(())
 }

@@ -51,6 +51,139 @@ use crate::rate_limiter::{
 };
 use crate::security::{security_middleware, SecurityState};
 
+// ============================================================================
+// PROXY Protocol v2 Implementation
+// ============================================================================
+// Reference: https://www.haproxy.org/download/2.9/doc/proxy-protocol.txt
+//
+// PROXY protocol v2 allows the proxy to pass the original client connection
+// information to the backend server. This is essential for TLS passthrough
+// where the proxy cannot modify the TLS stream but the backend needs to know
+// the real client IP address.
+
+/// PROXY protocol v2 signature (12 bytes)
+const PROXY_V2_SIGNATURE: [u8; 12] = [
+    0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+];
+
+/// PROXY protocol v2 version and command byte
+mod proxy_v2 {
+    /// Version 2, PROXY command (connection was proxied)
+    pub const VERSION_PROXY: u8 = 0x21;
+    /// Version 2, LOCAL command (connection was local/health check)
+    #[allow(dead_code)]
+    pub const VERSION_LOCAL: u8 = 0x20;
+
+    /// Address family and protocol
+    pub const AF_INET_STREAM: u8 = 0x11;  // IPv4 + TCP
+    pub const AF_INET6_STREAM: u8 = 0x21; // IPv6 + TCP
+    #[allow(dead_code)]
+    pub const AF_UNSPEC: u8 = 0x00;       // Unknown/unspecified
+}
+
+/// Build a PROXY protocol v2 header for the given connection
+///
+/// # Arguments
+/// * `src_addr` - The original client address
+/// * `dst_addr` - The proxy's local address (where client connected to)
+///
+/// # Returns
+/// A byte vector containing the complete PROXY protocol v2 header
+fn build_proxy_v2_header(src_addr: SocketAddr, dst_addr: SocketAddr) -> Vec<u8> {
+    let mut header = Vec::with_capacity(16 + 36); // Max size for IPv6
+
+    // 12-byte signature
+    header.extend_from_slice(&PROXY_V2_SIGNATURE);
+
+    match (src_addr, dst_addr) {
+        (SocketAddr::V4(src), SocketAddr::V4(dst)) => {
+            // Version 2 + PROXY command
+            header.push(proxy_v2::VERSION_PROXY);
+            // IPv4 + TCP
+            header.push(proxy_v2::AF_INET_STREAM);
+            // Address length: 4 + 4 + 2 + 2 = 12 bytes
+            header.extend_from_slice(&12u16.to_be_bytes());
+            // Source IP (4 bytes)
+            header.extend_from_slice(&src.ip().octets());
+            // Destination IP (4 bytes)
+            header.extend_from_slice(&dst.ip().octets());
+            // Source port (2 bytes)
+            header.extend_from_slice(&src.port().to_be_bytes());
+            // Destination port (2 bytes)
+            header.extend_from_slice(&dst.port().to_be_bytes());
+        }
+        (SocketAddr::V6(src), SocketAddr::V6(dst)) => {
+            // Version 2 + PROXY command
+            header.push(proxy_v2::VERSION_PROXY);
+            // IPv6 + TCP
+            header.push(proxy_v2::AF_INET6_STREAM);
+            // Address length: 16 + 16 + 2 + 2 = 36 bytes
+            header.extend_from_slice(&36u16.to_be_bytes());
+            // Source IP (16 bytes)
+            header.extend_from_slice(&src.ip().octets());
+            // Destination IP (16 bytes)
+            header.extend_from_slice(&dst.ip().octets());
+            // Source port (2 bytes)
+            header.extend_from_slice(&src.port().to_be_bytes());
+            // Destination port (2 bytes)
+            header.extend_from_slice(&dst.port().to_be_bytes());
+        }
+        // Mixed IPv4/IPv6 - convert IPv4 to IPv4-mapped IPv6
+        (SocketAddr::V4(src), SocketAddr::V6(dst)) => {
+            let src_v6 = src.ip().to_ipv6_mapped();
+            header.push(proxy_v2::VERSION_PROXY);
+            header.push(proxy_v2::AF_INET6_STREAM);
+            header.extend_from_slice(&36u16.to_be_bytes());
+            header.extend_from_slice(&src_v6.octets());
+            header.extend_from_slice(&dst.ip().octets());
+            header.extend_from_slice(&src.port().to_be_bytes());
+            header.extend_from_slice(&dst.port().to_be_bytes());
+        }
+        (SocketAddr::V6(src), SocketAddr::V4(dst)) => {
+            let dst_v6 = dst.ip().to_ipv6_mapped();
+            header.push(proxy_v2::VERSION_PROXY);
+            header.push(proxy_v2::AF_INET6_STREAM);
+            header.extend_from_slice(&36u16.to_be_bytes());
+            header.extend_from_slice(&src.ip().octets());
+            header.extend_from_slice(&dst_v6.octets());
+            header.extend_from_slice(&src.port().to_be_bytes());
+            header.extend_from_slice(&dst.port().to_be_bytes());
+        }
+    }
+
+    header
+}
+
+/// Send PROXY protocol v2 header to the backend
+async fn send_proxy_v2_header(
+    stream: &TcpStream,
+    client_addr: SocketAddr,
+    local_addr: SocketAddr,
+) -> std::io::Result<()> {
+    let header = build_proxy_v2_header(client_addr, local_addr);
+
+    // We need to write to the stream before it's split
+    // This is a bit tricky - we'll use try_write which doesn't require &mut
+    let mut written = 0;
+    while written < header.len() {
+        stream.writable().await?;
+        match stream.try_write(&header[written..]) {
+            Ok(n) => written += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
+
+    debug!(
+        "Sent PROXY protocol v2 header ({} bytes) for {} -> {}",
+        header.len(),
+        client_addr,
+        local_addr
+    );
+
+    Ok(())
+}
+
 /// HTTP listener state
 #[derive(Clone)]
 pub struct HttpListenerState {
@@ -494,10 +627,26 @@ async fn handle_passthrough_connection(
     .map_err(|_| "Backend connection timeout")?
     .map_err(|e| format!("Backend connection failed: {}", e))?;
 
-    // Send PROXY protocol v2 header if enabled
+    // Send PROXY protocol v2 header if enabled (before stream split)
     if route.proxy_protocol {
-        // TODO: Implement PROXY protocol v2
-        debug!("PROXY protocol v2 not yet implemented");
+        // Get local address (proxy address that client connected to)
+        let local_addr = client_stream
+            .local_addr()
+            .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 0)));
+
+        // Send PROXY protocol v2 header to backend
+        if let Err(e) = send_proxy_v2_header(&backend_stream, client_addr, local_addr).await {
+            warn!(
+                "Failed to send PROXY protocol v2 header to {}: {}",
+                route.backend, e
+            );
+            // Continue anyway - some backends may not require it
+        } else {
+            debug!(
+                "Sent PROXY protocol v2 header: {} → {} (backend: {})",
+                client_addr, local_addr, route.backend
+            );
+        }
     }
 
     // Bidirectional copy
