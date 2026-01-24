@@ -24,6 +24,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
 use crate::config::{AdminConfig, ConfigManager};
+use crate::metrics::MetricsRegistry;
 use crate::ocsp::{OcspService, OcspStatusInfo};
 use crate::proxy::BackendPool;
 use crate::tls::{CertificateInfo, TlsProvider};
@@ -42,10 +43,12 @@ pub struct AdminState {
     pub shutdown_tx: mpsc::Sender<()>,
     /// Server start time
     pub start_time: Instant,
-    /// Connection counter
+    /// Connection counter (legacy)
     pub connection_count: Arc<RwLock<u64>>,
-    /// Request counter
+    /// Request counter (legacy)
     pub request_count: Arc<RwLock<u64>>,
+    /// Comprehensive metrics registry
+    pub metrics: Arc<MetricsRegistry>,
 }
 
 /// Admin API server
@@ -63,7 +66,10 @@ impl AdminServer {
         backend_pool: Arc<BackendPool>,
         ocsp_service: Option<Arc<OcspService>>,
         shutdown_tx: mpsc::Sender<()>,
+        metrics: Option<Arc<MetricsRegistry>>,
     ) -> Self {
+        let metrics = metrics.unwrap_or_else(|| Arc::new(MetricsRegistry::new()));
+
         let state = Arc::new(AdminState {
             config_manager,
             tls_provider,
@@ -73,6 +79,7 @@ impl AdminServer {
             start_time: Instant::now(),
             connection_count: Arc::new(RwLock::new(0)),
             request_count: Arc::new(RwLock::new(0)),
+            metrics,
         });
 
         Self { config, state }
@@ -94,6 +101,7 @@ impl AdminServer {
         let app = Router::new()
             .route("/health", get(health_handler))
             .route("/metrics", get(metrics_handler))
+            .route("/metrics/json", get(metrics_json_handler))
             .route("/reload", post(reload_handler))
             .route("/shutdown", post(shutdown_handler))
             .route("/config", get(config_handler))
@@ -201,46 +209,27 @@ async fn health_handler(State(state): State<Arc<AdminState>>) -> Json<HealthResp
     })
 }
 
-/// Prometheus metrics endpoint
+/// Prometheus metrics endpoint - uses comprehensive MetricsRegistry
 #[cfg(feature = "metrics")]
 async fn metrics_handler(State(state): State<Arc<AdminState>>) -> String {
     use std::fmt::Write;
 
+    // Get comprehensive metrics from registry
+    let mut output = state.metrics.export_prometheus();
+
+    // Add backend health metrics (requires async check)
     let config = state.config_manager.get();
-    let uptime = state.start_time.elapsed().as_secs();
-    let connections = *state.connection_count.read();
-    let requests = *state.request_count.read();
 
-    // Build Prometheus metrics
-    let mut output = String::new();
-
-    output.push_str("# HELP pqcrypta_proxy_uptime_seconds Proxy uptime in seconds\n");
-    output.push_str("# TYPE pqcrypta_proxy_uptime_seconds gauge\n");
-    let _ = writeln!(output, "pqcrypta_proxy_uptime_seconds {uptime}");
-
-    output.push_str("# HELP pqcrypta_proxy_connections_total Total connections handled\n");
-    output.push_str("# TYPE pqcrypta_proxy_connections_total counter\n");
-    let _ = writeln!(output, "pqcrypta_proxy_connections_total {connections}");
-
-    output.push_str("# HELP pqcrypta_proxy_requests_total Total requests handled\n");
-    output.push_str("# TYPE pqcrypta_proxy_requests_total counter\n");
-    let _ = writeln!(output, "pqcrypta_proxy_requests_total {requests}");
-
-    output.push_str("# HELP pqcrypta_proxy_pqc_enabled PQC hybrid key exchange enabled\n");
-    output.push_str("# TYPE pqcrypta_proxy_pqc_enabled gauge\n");
-    let pqc_enabled = i32::from(state.tls_provider.is_pqc_enabled());
-    let _ = writeln!(output, "pqcrypta_proxy_pqc_enabled {pqc_enabled}");
-
-    // Backend metrics
-    output.push_str("# HELP pqcrypta_proxy_backend_up Backend availability\n");
-    output.push_str("# TYPE pqcrypta_proxy_backend_up gauge\n");
+    output.push_str("\n# HELP pqcrypta_backend_up Backend availability (1=up, 0=down)\n");
+    output.push_str("# TYPE pqcrypta_backend_up gauge\n");
 
     for (name, backend) in &config.backends {
         let healthy = state.backend_pool.check_health(backend).await;
         let health_val = i32::from(healthy);
         let _ = writeln!(
             output,
-            "pqcrypta_proxy_backend_up{{name=\"{name}\"}} {health_val}"
+            "pqcrypta_backend_up{{name=\"{name}\",type=\"{:?}\"}} {health_val}",
+            backend.backend_type
         );
     }
 
@@ -250,6 +239,13 @@ async fn metrics_handler(State(state): State<Arc<AdminState>>) -> String {
 #[cfg(not(feature = "metrics"))]
 async fn metrics_handler() -> StatusCode {
     StatusCode::NOT_IMPLEMENTED
+}
+
+/// JSON metrics snapshot endpoint
+async fn metrics_json_handler(
+    State(state): State<Arc<AdminState>>,
+) -> Json<crate::metrics::MetricsSnapshot> {
+    Json(state.metrics.snapshot())
 }
 
 /// Configuration reload request
