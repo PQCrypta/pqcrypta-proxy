@@ -14,7 +14,7 @@ use std::path::Path;
 use std::process::Command;
 
 use parking_lot::RwLock;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::PqcConfig;
 
@@ -465,7 +465,6 @@ impl PqcTlsProvider {
 pub mod openssl_pqc {
     use super::*;
     use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVersion};
-    use std::ffi::CString;
     use std::path::Path;
 
     /// Create an OpenSSL SSL acceptor with PQC hybrid key exchange
@@ -497,73 +496,44 @@ pub mod openssl_pqc {
 
         // Configure PQC groups if available
         if pqc_provider.is_available() {
-            // First try classical groups to verify the API works
-            let classical_groups = "X25519:P-256:P-384";
-            info!(
-                "Testing groups API with classical groups first: {}",
-                classical_groups
-            );
-            builder
-                .set_groups_list(classical_groups)
-                .map_err(|e| format!("Failed to set classical groups: {}", e))?;
-            info!("Classical groups set successfully");
+            // Try different PQC group configurations
+            // OpenSSL 3.5 supports multiple name formats for ML-KEM hybrid groups
+            let pqc_group_options = [
+                // IETF standard hybrid names
+                "X25519MLKEM768:X25519:P-256:P-384",
+                // Alternative format with hyphen
+                "X25519-MLKEM768:X25519:P-256:P-384",
+                // ML-KEM standalone first
+                "ML-KEM-768:X25519:P-256:P-384",
+                // MLKEM without hyphen
+                "MLKEM768:X25519:P-256:P-384",
+            ];
 
-            // Now try to add PQC groups using SSL_set_groups_list on the SSL context
-            // OpenSSL 3.5 should recognize ML-KEM group names
-            let pqc_groups = pqc_provider.groups_string();
-            info!("Attempting to set PQC groups: {}", pqc_groups);
-
-            // Clear any previous errors
-            unsafe { openssl_sys::ERR_clear_error() };
-
-            let groups_cstr =
-                CString::new(pqc_groups.clone()).map_err(|_| "Invalid groups string")?;
-
-            // Get the SSL_CTX and try to set PQC groups
-            let ssl_ctx = builder.as_ptr() as *mut openssl_sys::SSL_CTX;
-            let result =
-                unsafe { openssl_sys::SSL_CTX_set1_groups_list(ssl_ctx, groups_cstr.as_ptr()) };
-
-            if result == 1 {
-                info!("PQC groups configured successfully via FFI: {}", pqc_groups);
-            } else {
-                // Get all errors from the error queue
-                let mut error_messages = Vec::new();
-                loop {
-                    let err_code = unsafe { openssl_sys::ERR_get_error() };
-                    if err_code == 0 {
+            let mut pqc_configured = false;
+            for groups in pqc_group_options {
+                info!("Trying PQC groups configuration: {}", groups);
+                match builder.set_groups_list(groups) {
+                    Ok(()) => {
+                        info!("PQC groups configured successfully: {}", groups);
+                        pqc_configured = true;
                         break;
                     }
-                    let err_reason = unsafe {
-                        let reason_ptr = openssl_sys::ERR_reason_error_string(err_code);
-                        if reason_ptr.is_null() {
-                            format!("Error code: {}", err_code)
-                        } else {
-                            std::ffi::CStr::from_ptr(reason_ptr)
-                                .to_string_lossy()
-                                .to_string()
-                        }
-                    };
-                    error_messages.push(err_reason);
+                    Err(e) => {
+                        debug!("Group config '{}' failed: {}", groups, e);
+                    }
                 }
+            }
 
-                if error_messages.is_empty() {
-                    error!(
-                        "Failed to set PQC groups '{}': No specific error returned",
-                        pqc_groups
-                    );
-                } else {
-                    error!(
-                        "Failed to set PQC groups '{}': {}",
-                        pqc_groups,
-                        error_messages.join("; ")
-                    );
-                }
-
+            if !pqc_configured {
+                // All PQC options failed, fall back to classical
+                let classical_groups = "X25519:P-256:P-384";
                 warn!(
-                    "PQC groups not available, using classical groups: {}",
+                    "All PQC group configurations failed, falling back to classical: {}",
                     classical_groups
                 );
+                builder
+                    .set_groups_list(classical_groups)
+                    .map_err(|e| format!("Failed to set classical groups: {}", e))?;
             }
         }
 

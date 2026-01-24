@@ -11,7 +11,7 @@
 - **Full-Featured Proxy**: Domain-based routing, security headers, CORS, redirects
 - **Three TLS Modes**: Terminate, Re-encrypt, and Passthrough (SNI-based)
 - **Modern Protocols**: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebTransport
-- **Post-Quantum Ready**: Hybrid PQC key exchange (X25519MLKEM768) via rustls-post-quantum
+- **Post-Quantum Ready**: Hybrid PQC key exchange (X25519MLKEM768) via OpenSSL 3.5+ with native ML-KEM
 - **Zero Downtime**: Hot reload configuration and TLS certificates
 - **Advanced Security**: JA3/JA4 fingerprinting, circuit breaker, GeoIP blocking
 - **Enterprise Load Balancing**: 6 algorithms, session affinity, health-aware routing
