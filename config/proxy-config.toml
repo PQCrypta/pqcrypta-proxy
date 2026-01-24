@@ -41,10 +41,10 @@ worker_threads = 0
 # =============================
 [tls]
 # Path to TLS certificate chain (PEM format)
-cert_path = "/etc/letsencrypt/live/example.com/fullchain.pem"
+cert_path = "/etc/letsencrypt/live/pqcrypta.com/fullchain.pem"
 
 # Path to TLS private key (PEM format)
-key_path = "/etc/letsencrypt/live/example.com/privkey.pem"
+key_path = "/etc/letsencrypt/live/pqcrypta.com/privkey.pem"
 
 # Optional: CA certificate for client verification (mTLS)
 # ca_cert_path = "/etc/pqcrypta/ca.pem"

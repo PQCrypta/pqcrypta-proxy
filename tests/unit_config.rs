@@ -1,7 +1,6 @@
 //! Unit tests for configuration parsing and validation
 //!
-//! TODO: Update tests to match new config struct fields (`BackendConfig`, `RouteConfig`)
-//! Tests that construct these structs directly need to include all required fields.
+//! Tests for config struct field parsing, defaults, and validation.
 
 use pqcrypta_proxy::config::*;
 
@@ -109,5 +108,116 @@ fn test_tls_mode_defaults() {
 fn test_pqc_config_defaults() {
     let config = PqcConfig::default();
     assert!(config.enabled);
-    assert_eq!(config.provider, "openssl3.5");
+    assert_eq!(config.provider, "auto");
+    assert!(!config.preferred_kem.is_empty());
+    assert!(config.fallback_to_classical);
+    assert!(config.min_security_level >= 1 && config.min_security_level <= 5);
+}
+
+#[test]
+fn test_pqc_provider_options() {
+    // Test parsing different provider values
+    let toml_auto = r#"
+[server]
+udp_port = 8443
+
+[tls]
+cert_path = "/tmp/test.crt"
+key_path = "/tmp/test.key"
+
+[pqc]
+enabled = true
+provider = "auto"
+"#;
+    let config: ProxyConfig = toml::from_str(toml_auto).unwrap();
+    assert_eq!(config.pqc.provider, "auto");
+
+    let toml_rustls = r#"
+[server]
+udp_port = 8443
+
+[tls]
+cert_path = "/tmp/test.crt"
+key_path = "/tmp/test.key"
+
+[pqc]
+enabled = true
+provider = "rustls"
+"#;
+    let config: ProxyConfig = toml::from_str(toml_rustls).unwrap();
+    assert_eq!(config.pqc.provider, "rustls");
+
+    let toml_openssl = r#"
+[server]
+udp_port = 8443
+
+[tls]
+cert_path = "/tmp/test.crt"
+key_path = "/tmp/test.key"
+
+[pqc]
+enabled = true
+provider = "openssl3.5"
+"#;
+    let config: ProxyConfig = toml::from_str(toml_openssl).unwrap();
+    assert_eq!(config.pqc.provider, "openssl3.5");
+}
+
+#[test]
+fn test_tls_mode_parsing() {
+    // Test parsing TLS modes via TOML
+    let toml_terminate = r#"
+name = "test"
+type = "http2"
+address = "127.0.0.1:8080"
+tls_mode = "terminate"
+"#;
+    let backend: BackendConfig = toml::from_str(toml_terminate).unwrap();
+    assert_eq!(backend.tls_mode, TlsMode::Terminate);
+
+    let toml_reencrypt = r#"
+name = "test"
+type = "http2"
+address = "127.0.0.1:8080"
+tls_mode = "reencrypt"
+"#;
+    let backend: BackendConfig = toml::from_str(toml_reencrypt).unwrap();
+    assert_eq!(backend.tls_mode, TlsMode::Reencrypt);
+
+    let toml_passthrough = r#"
+name = "test"
+type = "http2"
+address = "127.0.0.1:8080"
+tls_mode = "passthrough"
+"#;
+    let backend: BackendConfig = toml::from_str(toml_passthrough).unwrap();
+    assert_eq!(backend.tls_mode, TlsMode::Passthrough);
+}
+
+#[test]
+fn test_passthrough_route_parsing() {
+    let toml_content = r#"
+sni = "*.example.com"
+backend = "10.0.0.1:443"
+proxy_protocol = true
+timeout_ms = 30000
+"#;
+    let route: PassthroughRoute = toml::from_str(toml_content).unwrap();
+    assert!(!route.sni.is_empty());
+    assert!(!route.backend.is_empty());
+    assert!(route.proxy_protocol);
+    assert!(route.timeout_ms > 0);
+}
+
+#[test]
+fn test_rate_limit_parsing() {
+    let toml_content = r#"
+enabled = true
+requests_per_second = 100
+burst_size = 200
+"#;
+    let rate_limit: RateLimitConfig = toml::from_str(toml_content).unwrap();
+    assert!(rate_limit.enabled);
+    assert!(rate_limit.requests_per_second > 0);
+    assert!(rate_limit.burst_size > 0);
 }
