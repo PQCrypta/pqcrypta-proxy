@@ -555,6 +555,7 @@ impl RateLimitContext {
 #[derive(Debug)]
 pub struct SlidingWindowCounter {
     /// Window size in seconds
+    #[allow(dead_code)]
     window_secs: u64,
 
     /// Number of buckets (granularity)
@@ -608,8 +609,7 @@ impl SlidingWindowCounter {
     fn rotate_buckets(&self) {
         let mut last_update = self.last_update.write();
         let elapsed = last_update.elapsed();
-        let buckets_to_rotate =
-            (elapsed.as_secs() / self.bucket_duration_secs) as usize;
+        let buckets_to_rotate = (elapsed.as_secs() / self.bucket_duration_secs) as usize;
 
         if buckets_to_rotate > 0 {
             let current = self.current_bucket.load(Ordering::Relaxed) as usize;
@@ -676,15 +676,16 @@ impl AdaptiveBaseline {
     /// Record a sample
     pub fn record(&self, value: u64) {
         self.sum.fetch_add(value, Ordering::Relaxed);
-        self.sum_squared
-            .fetch_add(value * value, Ordering::Relaxed);
+        self.sum_squared.fetch_add(value * value, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
 
         let mut samples = self.samples.write();
         samples.push((Instant::now(), value));
 
         // Trim old samples
-        let cutoff = Instant::now() - self.window_duration;
+        let cutoff = Instant::now()
+            .checked_sub(self.window_duration)
+            .unwrap_or_else(Instant::now);
         samples.retain(|(t, _)| *t > cutoff);
     }
 
@@ -700,10 +701,12 @@ impl AdaptiveBaseline {
         let n = count as f64;
 
         let mean = sum / n;
-        let variance = (sum_sq / n) - (mean * mean);
+        // variance = E[X²] - E[X]² (correct statistical formula)
+        #[allow(clippy::suspicious_operation_groupings)]
+        let variance = mean.mul_add(-mean, sum_sq / n);
         let std_dev = variance.sqrt();
 
-        let threshold = mean + (self.std_dev_multiplier * std_dev);
+        let threshold = self.std_dev_multiplier.mul_add(std_dev, mean);
 
         value as f64 > threshold
     }
@@ -729,7 +732,9 @@ impl AdaptiveBaseline {
         let n = count as f64;
 
         let mean = sum / n;
-        let variance = (sum_sq / n) - (mean * mean);
+        // variance = E[X²] - E[X]² (correct statistical formula)
+        #[allow(clippy::suspicious_operation_groupings)]
+        let variance = mean.mul_add(-mean, sum_sq / n);
         variance.sqrt()
     }
 }
@@ -751,12 +756,14 @@ pub struct RateLimitBucket {
     pub hour_counter: Option<Arc<SlidingWindowCounter>>,
 
     /// Requests in current second
+    #[allow(dead_code)]
     pub current_second_count: AtomicU64,
 
     /// Last request timestamp
     pub last_request: RwLock<Instant>,
 
     /// Created timestamp
+    #[allow(dead_code)]
     pub created_at: Instant,
 
     /// Total requests (for stats)
@@ -774,9 +781,7 @@ impl RateLimitBucket {
         let quota = Quota::per_second(
             NonZeroU32::new(limits.requests_per_second).unwrap_or(NonZeroU32::new(100).unwrap()),
         )
-        .allow_burst(
-            NonZeroU32::new(limits.burst_size).unwrap_or(NonZeroU32::new(50).unwrap()),
-        );
+        .allow_burst(NonZeroU32::new(limits.burst_size).unwrap_or(NonZeroU32::new(50).unwrap()));
 
         let minute_counter = limits
             .requests_per_minute
@@ -861,7 +866,8 @@ impl RateLimitBucket {
 
         // 4. Check adaptive baseline (if enabled)
         if let Some(ref baseline) = self.baseline {
-            let recent_count = self.minute_counter
+            let recent_count = self
+                .minute_counter
                 .as_ref()
                 .map(|c| c.get_count())
                 .unwrap_or(0);
@@ -905,6 +911,7 @@ pub enum RateLimitResult {
         /// The limit that was exceeded
         limit: u32,
         /// Remaining (always 0 when limited)
+        #[allow(dead_code)]
         remaining: u32,
     },
     /// Key is blocked (fingerprint block, etc.)
@@ -916,6 +923,7 @@ pub enum RateLimitResult {
 
 /// Reason for rate limiting
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum LimitReason {
     /// Per-second limit exceeded
     PerSecond,
@@ -997,16 +1005,21 @@ impl AdvancedRateLimiter {
                 .unwrap_or(NonZeroU32::new(50_000).unwrap()),
         );
 
+        // Extract adaptive config values before moving config
+        let adaptive_baseline_window = config.adaptive.baseline_window_secs;
+        let adaptive_min_samples = config.adaptive.min_samples;
+        let adaptive_std_dev_multiplier = config.adaptive.std_dev_multiplier;
+
         let limiter = Self {
-            config: Arc::new(RwLock::new(config.clone())),
+            config: Arc::new(RwLock::new(config)),
             global_limiter: Arc::new(RateLimiter::direct(global_quota)),
             buckets: Arc::new(DashMap::new()),
             route_buckets: Arc::new(DashMap::new()),
             trusted_cidrs: Arc::new(RwLock::new(trusted_cidrs)),
             global_baseline: Arc::new(AdaptiveBaseline::new(
-                config.adaptive.baseline_window_secs,
-                config.adaptive.min_samples,
-                config.adaptive.std_dev_multiplier,
+                adaptive_baseline_window,
+                adaptive_min_samples,
+                adaptive_std_dev_multiplier,
             )),
             stats: Arc::new(RateLimiterStats::default()),
         };
@@ -1043,7 +1056,11 @@ impl AdvancedRateLimiter {
 
         // 2. Check blocked fingerprints
         if let Some(ref ja3) = ctx.ja3_hash {
-            if config.fingerprint_limiting.blocked_fingerprints.contains(ja3) {
+            if config
+                .fingerprint_limiting
+                .blocked_fingerprints
+                .contains(ja3)
+            {
                 self.stats.total_blocked.fetch_add(1, Ordering::Relaxed);
                 return RateLimitResult::Blocked {
                     reason: format!("Blocked fingerprint: {}", ja3),
@@ -1056,8 +1073,9 @@ impl AdvancedRateLimiter {
 
         // 4. Get or create bucket for this key
         let key_string = key.to_key_string();
-        let bucket = self.buckets
-            .entry(key_string.clone())
+        let bucket = self
+            .buckets
+            .entry(key_string)
             .or_insert_with(|| {
                 self.stats.keys_tracked.fetch_add(1, Ordering::Relaxed);
                 Arc::new(RateLimitBucket::new(&limits, Some(&config.adaptive)))
@@ -1136,7 +1154,10 @@ impl AdvancedRateLimiter {
                 }
 
                 if all_found {
-                    return (RateLimitKey::composite(components), composite.limits.clone());
+                    return (
+                        RateLimitKey::composite(components),
+                        composite.limits.clone(),
+                    );
                 }
             }
         }
@@ -1154,11 +1175,8 @@ impl AdvancedRateLimiter {
             .extract_key_value(&config.key_strategy.fallback, ctx, config)
             .unwrap_or_else(|| ctx.source_ip.to_string());
 
-        let limits = self.get_limits_for_key(
-            &config.key_strategy.fallback,
-            &fallback_value,
-            config,
-        );
+        let limits =
+            self.get_limits_for_key(&config.key_strategy.fallback, &fallback_value, config);
 
         (
             RateLimitKey::new(config.key_strategy.fallback.clone(), fallback_value),
@@ -1178,14 +1196,11 @@ impl AdvancedRateLimiter {
                 Some(self.normalize_ip(ctx.source_ip, config.ipv6_subnet_bits))
             }
 
-            RateLimitKeyType::RealIp => {
-                self.extract_real_ip(ctx, config)
-                    .map(|ip| self.normalize_ip(ip, config.ipv6_subnet_bits))
-            }
+            RateLimitKeyType::RealIp => self
+                .extract_real_ip(ctx, config)
+                .map(|ip| self.normalize_ip(ip, config.ipv6_subnet_bits)),
 
-            RateLimitKeyType::ApiKey => {
-                ctx.get_header(&config.headers.api_key).cloned()
-            }
+            RateLimitKeyType::ApiKey => ctx.get_header(&config.headers.api_key).cloned(),
 
             RateLimitKeyType::JwtSubject => {
                 // Try to extract from Authorization header
@@ -1236,7 +1251,9 @@ impl AdvancedRateLimiter {
     ) -> Option<IpAddr> {
         // Check if source IP is a trusted proxy
         let trusted_cidrs = self.trusted_cidrs.read();
-        let is_trusted = trusted_cidrs.iter().any(|cidr| cidr.contains(&ctx.source_ip));
+        let is_trusted = trusted_cidrs
+            .iter()
+            .any(|cidr| cidr.contains(&ctx.source_ip));
 
         if !is_trusted {
             return None;
@@ -1273,9 +1290,9 @@ impl AdvancedRateLimiter {
 
     /// Extract subject claim from JWT (basic parsing)
     fn extract_jwt_subject(&self, auth_header: &str) -> Option<String> {
-        let token = auth_header.strip_prefix("Bearer ").or_else(|| {
-            auth_header.strip_prefix("bearer ")
-        })?;
+        let token = auth_header
+            .strip_prefix("Bearer ")
+            .or_else(|| auth_header.strip_prefix("bearer "))?;
 
         // JWT format: header.payload.signature
         let parts: Vec<&str> = token.split('.').collect();
@@ -1290,7 +1307,9 @@ impl AdvancedRateLimiter {
 
         // Parse JSON and extract "sub" claim
         let json: serde_json::Value = serde_json::from_str(&payload_str).ok()?;
-        json.get("sub").and_then(|v| v.as_str()).map(|s| s.to_string())
+        json.get("sub")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
     }
 
     /// Get limits for a specific key type and value
@@ -1301,7 +1320,10 @@ impl AdvancedRateLimiter {
         config: &AdvancedRateLimitConfig,
     ) -> PerKeyLimits {
         // Check for fingerprint-specific limits
-        if matches!(key_type, RateLimitKeyType::Ja3Fingerprint | RateLimitKeyType::Ja4Fingerprint) {
+        if matches!(
+            key_type,
+            RateLimitKeyType::Ja3Fingerprint | RateLimitKeyType::Ja4Fingerprint
+        ) {
             if let Some(limits) = config.fingerprint_limiting.trusted_fingerprints.get(value) {
                 return limits.clone();
             }
@@ -1338,27 +1360,28 @@ impl AdvancedRateLimiter {
 
                 // Clean up idle buckets
                 let before_count = buckets.len();
-                buckets.retain(|_, bucket| {
-                    bucket.last_request.read().elapsed() < idle_threshold
-                });
+                buckets.retain(|_, bucket| bucket.last_request.read().elapsed() < idle_threshold);
                 let removed = before_count - buckets.len();
 
                 if removed > 0 {
-                    stats.keys_tracked.fetch_sub(removed as u64, Ordering::Relaxed);
+                    stats
+                        .keys_tracked
+                        .fetch_sub(removed as u64, Ordering::Relaxed);
                     debug!("Cleaned up {} idle rate limit buckets", removed);
                 }
 
                 // Clean up route buckets
                 for entry in route_buckets.iter() {
-                    entry.value().retain(|_, bucket| {
-                        bucket.last_request.read().elapsed() < idle_threshold
-                    });
+                    entry
+                        .value()
+                        .retain(|_, bucket| bucket.last_request.read().elapsed() < idle_threshold);
                 }
             }
         });
     }
 
     /// Get current statistics
+    #[allow(dead_code)]
     pub fn get_stats(&self) -> RateLimiterSnapshot {
         RateLimiterSnapshot {
             total_requests: self.stats.total_requests.load(Ordering::Relaxed),
@@ -1372,6 +1395,7 @@ impl AdvancedRateLimiter {
     }
 
     /// Update configuration
+    #[allow(dead_code)]
     pub fn update_config(&self, config: AdvancedRateLimitConfig) {
         // Update trusted CIDRs
         let trusted_cidrs: Vec<ipnet::IpNet> = config
@@ -1396,6 +1420,7 @@ impl AdvancedRateLimiter {
 
 /// Snapshot of rate limiter statistics
 #[derive(Debug, Clone, Serialize)]
+#[allow(dead_code)]
 pub struct RateLimiterSnapshot {
     pub total_requests: u64,
     pub total_allowed: u64,
@@ -1505,10 +1530,7 @@ mod tests {
 
     #[test]
     fn test_rate_limit_key() {
-        let key = RateLimitKey::new(
-            RateLimitKeyType::SourceIp,
-            "192.168.1.1".to_string(),
-        );
+        let key = RateLimitKey::new(RateLimitKeyType::SourceIp, "192.168.1.1".to_string());
 
         assert_eq!(key.to_key_string(), "SourceIp:192.168.1.1");
     }

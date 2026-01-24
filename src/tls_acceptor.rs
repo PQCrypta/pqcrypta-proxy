@@ -2,6 +2,13 @@
 //!
 //! Wraps the standard TLS acceptor to capture ClientHello bytes for JA3/JA4 fingerprinting
 //! before the TLS handshake completes.
+//!
+//! # Integration Status
+//! This module provides FingerprintingTlsAcceptor which is ready but not yet integrated
+//! into the main request flow. Integration requires replacing the axum-server TLS layer.
+
+// Allow dead code for scaffolded features pending TLS layer integration
+#![allow(dead_code)]
 
 use std::io;
 use std::net::SocketAddr;
@@ -117,11 +124,7 @@ impl FingerprintingTlsAcceptor {
 
         let fingerprint_result = match peek_result {
             Ok(n) if n > 0 => {
-                trace!(
-                    "Peeked {} bytes of ClientHello from {}",
-                    n,
-                    remote_addr
-                );
+                trace!("Peeked {} bytes of ClientHello from {}", n, remote_addr);
                 self.fingerprint_extractor.process_client_hello(
                     &peek_buf[..n],
                     remote_addr.ip(),
