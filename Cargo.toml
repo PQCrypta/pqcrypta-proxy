@@ -98,10 +98,6 @@ arc-swap = "1.7"
 # Hot reload - file watching
 notify = "7.0"
 
-# Signal handling
-signal-hook = "0.3"
-signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
-
 # Rate limiting
 governor = "0.7"
 nonzero_ext = "0.3"
@@ -151,6 +147,9 @@ windows-service-rs = { version = "0.7", package = "windows-service", optional = 
 nix = { version = "0.29", features = ["signal", "user"] }
 # Unix socket support for PHP-FPM backends (not available on Windows)
 hyperlocal = "0.9"
+# Signal handling (uses Unix-specific signal iterators)
+signal-hook = "0.3"
+signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
 
 [dev-dependencies]
 tempfile = "3.14"
