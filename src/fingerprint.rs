@@ -562,7 +562,8 @@ impl FingerprintExtractor {
                 // Check request rate for suspicious fingerprints (configurable thresholds)
                 if let Some(cached) = self.cache.get(&ja3_hash) {
                     if cached.request_count > config.suspicious_rate_threshold
-                        && cached.first_seen.elapsed() < Duration::from_secs(config.suspicious_rate_window_secs)
+                        && cached.first_seen.elapsed()
+                            < Duration::from_secs(config.suspicious_rate_window_secs)
                     {
                         warn!(
                             "High rate from suspicious fingerprint {} (IP: {})",

@@ -410,11 +410,7 @@ impl SecurityState {
                 // Auto-block if too suspicious (configurable threshold)
                 if counter.suspicious_patterns >= auto_block_threshold {
                     drop(counter);
-                    self.block_ip(
-                        ip,
-                        BlockReason::TooManyErrors,
-                        Some(auto_block_duration),
-                    );
+                    self.block_ip(ip, BlockReason::TooManyErrors, Some(auto_block_duration));
                 }
             }
         }
