@@ -779,10 +779,8 @@ pub struct RateLimitBucket {
 impl RateLimitBucket {
     pub fn new(limits: &PerKeyLimits, adaptive_config: Option<&AdaptiveConfig>) -> Self {
         // Use saturating values to prevent panics - MIN is 1
-        let rps = NonZeroU32::new(limits.requests_per_second.max(1))
-            .unwrap_or(NonZeroU32::MIN);
-        let burst = NonZeroU32::new(limits.burst_size.max(1))
-            .unwrap_or(NonZeroU32::MIN);
+        let rps = NonZeroU32::new(limits.requests_per_second.max(1)).unwrap_or(NonZeroU32::MIN);
+        let burst = NonZeroU32::new(limits.burst_size.max(1)).unwrap_or(NonZeroU32::MIN);
 
         let quota = Quota::per_second(rps).allow_burst(burst);
 
@@ -1001,8 +999,8 @@ impl AdvancedRateLimiter {
         // Create global rate limiter with safe NonZeroU32 handling
         let global_rps = NonZeroU32::new(config.global_limits.requests_per_second.max(1))
             .unwrap_or(NonZeroU32::MIN);
-        let global_burst = NonZeroU32::new(config.global_limits.burst_size.max(1))
-            .unwrap_or(NonZeroU32::MIN);
+        let global_burst =
+            NonZeroU32::new(config.global_limits.burst_size.max(1)).unwrap_or(NonZeroU32::MIN);
 
         let global_quota = Quota::per_second(global_rps).allow_burst(global_burst);
 

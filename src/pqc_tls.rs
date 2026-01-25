@@ -372,13 +372,7 @@ impl PqcTlsProvider {
             .to_str()
             .ok_or_else(|| "Key path contains invalid UTF-8".to_string())?;
         let key_output = Command::new(&openssl_bin)
-            .args([
-                "genpkey",
-                "-algorithm",
-                "ML-DSA-87",
-                "-out",
-                key_path_str,
-            ])
+            .args(["genpkey", "-algorithm", "ML-DSA-87", "-out", key_path_str])
             .env("LD_LIBRARY_PATH", &openssl_lib)
             .output()
             .map_err(|e| format!("Failed to generate PQC key: {}", e))?;

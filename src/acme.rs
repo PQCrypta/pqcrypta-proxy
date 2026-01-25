@@ -552,7 +552,9 @@ fn validate_domain(domain: &str) -> anyhow::Result<()> {
             return Err(anyhow::anyhow!("Invalid domain label length"));
         }
         if label.starts_with('-') || label.ends_with('-') {
-            return Err(anyhow::anyhow!("Domain label cannot start or end with hyphen"));
+            return Err(anyhow::anyhow!(
+                "Domain label cannot start or end with hyphen"
+            ));
         }
         if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
             return Err(anyhow::anyhow!(
@@ -651,13 +653,7 @@ fn read_certificate_expiry(cert_path: &Path) -> anyhow::Result<(String, i64)> {
 
     // Also get human-readable format
     let output = Command::new("openssl")
-        .args([
-            "x509",
-            "-enddate",
-            "-noout",
-            "-in",
-            cert_path_str,
-        ])
+        .args(["x509", "-enddate", "-noout", "-in", cert_path_str])
         .output()?;
 
     if !output.status.success() {

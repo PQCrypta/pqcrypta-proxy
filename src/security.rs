@@ -309,7 +309,8 @@ impl SecurityState {
             .or_insert_with(|| {
                 let config = self.rate_config.read();
                 // Safe NonZeroU32 construction - use .max(1) to ensure non-zero
-                let rps = NonZeroU32::new(config.requests_per_second.max(1)).unwrap_or(NonZeroU32::MIN);
+                let rps =
+                    NonZeroU32::new(config.requests_per_second.max(1)).unwrap_or(NonZeroU32::MIN);
                 let burst_nz = NonZeroU32::new(config.burst_size.max(1)).unwrap_or(NonZeroU32::MIN);
                 let quota = Quota::per_second(rps).allow_burst(burst_nz);
                 Arc::new(RateLimiter::direct(quota))
@@ -555,7 +556,12 @@ impl SecurityState {
         if rate_limiter_count > MAX_TRACKED_IPS {
             // Remove random entries since we can't track last-used time
             let to_remove = rate_limiter_count.saturating_sub(MAX_TRACKED_IPS);
-            let keys: Vec<_> = self.ip_rate_limiters.iter().take(to_remove).map(|e| *e.key()).collect();
+            let keys: Vec<_> = self
+                .ip_rate_limiters
+                .iter()
+                .take(to_remove)
+                .map(|e| *e.key())
+                .collect();
             for ip in keys {
                 self.ip_rate_limiters.remove(&ip);
             }
@@ -603,7 +609,14 @@ pub async fn security_middleware(
 ) -> Response {
     let ip = client_addr.ip();
     // Read config values without cloning the entire struct - just read what we need
-    let (dos_protection, max_connections_per_ip, max_request_size, max_header_size, auto_block_threshold, auto_block_duration_secs) = {
+    let (
+        dos_protection,
+        max_connections_per_ip,
+        max_request_size,
+        max_header_size,
+        auto_block_threshold,
+        auto_block_duration_secs,
+    ) = {
         let config = security.config.read();
         (
             config.dos_protection,
