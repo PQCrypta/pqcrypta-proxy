@@ -389,8 +389,8 @@ impl TlsProvider {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| anyhow::anyhow!("Failed to parse PKCS#8 keys: {}", e))?;
 
-        if !pkcs8_keys.is_empty() {
-            return Ok(PrivateKeyDer::Pkcs8(pkcs8_keys.into_iter().next().unwrap()));
+        if let Some(key) = pkcs8_keys.into_iter().next() {
+            return Ok(PrivateKeyDer::Pkcs8(key));
         }
 
         // Try RSA format
@@ -401,8 +401,8 @@ impl TlsProvider {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| anyhow::anyhow!("Failed to parse RSA keys: {}", e))?;
 
-        if !rsa_keys.is_empty() {
-            return Ok(PrivateKeyDer::Pkcs1(rsa_keys.into_iter().next().unwrap()));
+        if let Some(key) = rsa_keys.into_iter().next() {
+            return Ok(PrivateKeyDer::Pkcs1(key));
         }
 
         Err(anyhow::anyhow!("No private key found in {:?}", path))

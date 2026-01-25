@@ -320,34 +320,33 @@ impl QuicListener {
         let host = request.headers().get("host").and_then(|v| v.to_str().ok());
 
         // Find route
-        let route = config.find_route(host, path, false);
+        let route = match config.find_route(host, path, false) {
+            Some(r) => r,
+            None => {
+                // Return 404
+                let response = http::Response::builder()
+                    .status(http::StatusCode::NOT_FOUND)
+                    .body(())?;
 
-        if route.is_none() {
-            // Return 404
-            let response = http::Response::builder()
-                .status(http::StatusCode::NOT_FOUND)
-                .body(())?;
+                stream.send_response(response).await?;
+                stream.finish().await?;
+                return Ok(());
+            }
+        };
 
-            stream.send_response(response).await?;
-            stream.finish().await?;
-            return Ok(());
-        }
+        let backend = match config.get_backend(&route.backend) {
+            Some(b) => b,
+            None => {
+                error!("Backend not found: {}", route.backend);
+                let response = http::Response::builder()
+                    .status(http::StatusCode::BAD_GATEWAY)
+                    .body(())?;
 
-        let route = route.unwrap();
-        let backend = config.get_backend(&route.backend);
-
-        if backend.is_none() {
-            error!("Backend not found: {}", route.backend);
-            let response = http::Response::builder()
-                .status(http::StatusCode::BAD_GATEWAY)
-                .body(())?;
-
-            stream.send_response(response).await?;
-            stream.finish().await?;
-            return Ok(());
-        }
-
-        let backend = backend.unwrap();
+                stream.send_response(response).await?;
+                stream.finish().await?;
+                return Ok(());
+            }
+        };
 
         // Read request body
         let mut body = Vec::new();

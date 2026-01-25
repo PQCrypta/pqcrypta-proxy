@@ -2,8 +2,8 @@
 
 This document provides security hardening guidelines, operational best practices, and a migration plan for deploying PQCrypta Proxy in production environments.
 
-**Last Updated**: 2026-01-23
-**Status**: All security features implemented and integrated
+**Last Updated**: 2026-01-25
+**Status**: All security features implemented with hardening release
 
 ## Security Features Status
 
@@ -20,6 +20,10 @@ This document provides security hardening guidelines, operational best practices
 | Request Size Limits | ✅ Complete | `security.rs` |
 | Security Headers | ✅ Complete | `http_listener.rs` |
 | Background Cleanup | ✅ Complete | `security.rs` |
+| Memory Exhaustion Prevention | ✅ Complete | `security.rs`, `rate_limiter.rs` |
+| ReDoS Prevention | ✅ Complete | `config.rs` |
+| Command Injection Prevention | ✅ Complete | `acme.rs` |
+| Safe Panic Handling | ✅ Complete | All modules |
 
 ## Security Checklist
 
@@ -486,6 +490,78 @@ If issues occur after migration:
    - Collect logs and metrics
    - Identify root cause
    - Create action items
+
+## Security Hardening (v1.3.0)
+
+The following security hardening measures were implemented in the v1.3.0 release:
+
+### Panic Prevention
+
+All `unwrap()` calls on potentially-None values have been replaced with safe patterns:
+
+```rust
+// Before (could panic)
+let rps = NonZeroU32::new(config.requests_per_second).unwrap();
+
+// After (safe)
+let rps = NonZeroU32::new(config.requests_per_second.max(1)).unwrap_or(NonZeroU32::MIN);
+```
+
+### Memory Exhaustion Prevention
+
+DashMap collections are now bounded to prevent DoS attacks:
+
+```rust
+// Constants in security.rs
+const MAX_TRACKED_IPS: usize = 100_000;
+const MAX_JA3_FINGERPRINTS: usize = 50_000;
+
+// Eviction logic in cleanup() function
+if blocked_count > MAX_TRACKED_IPS {
+    // Evict oldest temporary blocks
+}
+```
+
+### ReDoS Prevention
+
+Regex patterns in route configuration are validated during config load:
+
+```rust
+// Length limit
+if regex_str.len() > 1024 {
+    return Err("path_regex exceeding 1024 characters");
+}
+
+// Compiled size limit
+RegexBuilder::new(regex_str)
+    .size_limit(1024 * 1024) // 1MB limit
+    .build()?;
+```
+
+### Command Injection Prevention
+
+Domain names in ACME module are validated per RFC 1035:
+
+```rust
+fn validate_domain(domain: &str) -> Result<()> {
+    // Length validation (1-253 chars total, 1-63 per label)
+    // Character validation (alphanumeric + hyphen only)
+    // No leading/trailing hyphens per label
+}
+```
+
+### Path Handling
+
+All path-to-string conversions use safe error handling:
+
+```rust
+// Before (could panic on non-UTF8 paths)
+let path_str = path.to_str().unwrap();
+
+// After (safe)
+let path_str = path.to_str()
+    .ok_or_else(|| "Path contains invalid UTF-8")?;
+```
 
 ## Compliance Considerations
 

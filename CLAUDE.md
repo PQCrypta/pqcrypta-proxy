@@ -6,8 +6,8 @@ This file provides guidance to Claude Code when working with the PQCrypta Proxy 
 
 PQCrypta Proxy is a high-performance reverse proxy with QUIC/HTTP/3, WebTransport, and Post-Quantum Cryptography TLS support.
 
-**Version**: v1.2.0 (2026-01-23)
-**Status**: All features complete and integrated
+**Version**: v1.3.0 (2026-01-25)
+**Status**: All features complete with security hardening
 **Tests**: 46 passing
 
 ## All Features Fully Integrated
@@ -447,7 +447,32 @@ weight = 100
 priority = 1
 ```
 
-## Recent Changes (2026-01-23)
+## Recent Changes (2026-01-25)
+
+### Security Hardening Release
+
+1. **Critical Security Fixes**:
+   - Fixed `NonZeroU32::new().unwrap()` panic vectors in `security.rs` and `rate_limiter.rs` with safe `.max(1)` pattern
+   - Fixed command injection vulnerability in `acme.rs` - Added RFC 1035 domain validation
+   - Fixed path UTF-8 panic vectors in `pqc_tls.rs` with `ok_or_else()` error handling
+   - Fixed redundant `unwrap()` calls in `quic_listener.rs` and `webtransport.rs` with `match` patterns
+
+2. **DoS Prevention**:
+   - Added `MAX_TRACKED_IPS` constant (100,000) to prevent memory exhaustion
+   - Added `MAX_JA3_FINGERPRINTS` constant (50,000) for fingerprint cache bounds
+   - Updated `cleanup()` function with eviction logic for all DashMaps
+   - Added regex ReDoS prevention in `config.rs` with length and size limits
+
+3. **Performance Optimizations**:
+   - Optimized config reading in `security_middleware()` to avoid cloning entire structs
+   - Added `rate_limit_response_simple()` helper to reduce allocations
+
+4. **Code Quality**:
+   - Fixed all clippy warnings
+   - Added missing `warn` import in `rate_limiter.rs`
+   - Improved error messages with context
+
+### Previous Changes (2026-01-23)
 
 1. **Advanced Rate Limiting Module** - New `rate_limiter.rs` with multi-dimensional limiting:
    - Composite keys (IP + JA3 + Path)

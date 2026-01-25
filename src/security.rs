@@ -32,6 +32,13 @@ use dashmap::DashMap;
 const ALT_SVC_HEADER: &str =
     "h3=\":443\"; ma=86400, h3=\":4433\"; ma=86400, h3=\":4434\"; ma=86400";
 
+/// Maximum number of tracked IPs to prevent memory exhaustion DoS
+/// When exceeded, oldest entries are evicted
+const MAX_TRACKED_IPS: usize = 100_000;
+
+/// Maximum number of tracked JA3 fingerprints
+const MAX_JA3_FINGERPRINTS: usize = 50_000;
+
 /// Add Alt-Svc header to a response for HTTP/3 advertisement
 fn add_alt_svc(response: &mut Response) {
     if let Ok(value) = HeaderValue::from_str(ALT_SVC_HEADER) {
@@ -198,10 +205,10 @@ impl SecurityState {
         let rate_per_second = config.rate_limiting.requests_per_second;
         let burst = config.rate_limiting.burst_size;
 
-        let quota = Quota::per_second(
-            NonZeroU32::new(rate_per_second).unwrap_or(NonZeroU32::new(100).unwrap()),
-        )
-        .allow_burst(NonZeroU32::new(burst).unwrap_or(NonZeroU32::new(50).unwrap()));
+        // Safe NonZeroU32 construction - use .max(1) to ensure non-zero, then unwrap_or(MIN) as fallback
+        let rps = NonZeroU32::new(rate_per_second.max(1)).unwrap_or(NonZeroU32::MIN);
+        let burst_nz = NonZeroU32::new(burst.max(1)).unwrap_or(NonZeroU32::MIN);
+        let quota = Quota::per_second(rps).allow_burst(burst_nz);
 
         let global_rate_limiter = Arc::new(RateLimiter::direct(quota));
 
@@ -301,13 +308,10 @@ impl SecurityState {
             .entry(ip)
             .or_insert_with(|| {
                 let config = self.rate_config.read();
-                let quota = Quota::per_second(
-                    NonZeroU32::new(config.requests_per_second)
-                        .unwrap_or(NonZeroU32::new(100).unwrap()),
-                )
-                .allow_burst(
-                    NonZeroU32::new(config.burst_size).unwrap_or(NonZeroU32::new(50).unwrap()),
-                );
+                // Safe NonZeroU32 construction - use .max(1) to ensure non-zero
+                let rps = NonZeroU32::new(config.requests_per_second.max(1)).unwrap_or(NonZeroU32::MIN);
+                let burst_nz = NonZeroU32::new(config.burst_size.max(1)).unwrap_or(NonZeroU32::MIN);
+                let quota = Quota::per_second(rps).allow_burst(burst_nz);
                 Arc::new(RateLimiter::direct(quota))
             })
             .clone()
@@ -529,8 +533,63 @@ impl SecurityState {
                 .unwrap_or(false)
         });
 
-        // Remove stale rate limiters (not used in 10 minutes)
-        // Note: governor doesn't expose last-used time, so we keep all for now
+        // Evict oldest entries from blocked_ips if over limit (DoS prevention)
+        let blocked_count = self.blocked_ips.len();
+        if blocked_count > MAX_TRACKED_IPS {
+            // Collect and sort by blocked_at time, evict oldest temporary blocks first
+            let mut entries: Vec<_> = self
+                .blocked_ips
+                .iter()
+                .filter(|e| e.value().expires_at.is_some()) // Only evict temporary blocks
+                .map(|e| (*e.key(), e.value().blocked_at))
+                .collect();
+            entries.sort_by_key(|(_, time)| *time);
+            let to_remove = blocked_count.saturating_sub(MAX_TRACKED_IPS);
+            for (ip, _) in entries.into_iter().take(to_remove) {
+                self.blocked_ips.remove(&ip);
+            }
+        }
+
+        // Evict oldest entries from ip_rate_limiters if over limit (DoS prevention)
+        let rate_limiter_count = self.ip_rate_limiters.len();
+        if rate_limiter_count > MAX_TRACKED_IPS {
+            // Remove random entries since we can't track last-used time
+            let to_remove = rate_limiter_count.saturating_sub(MAX_TRACKED_IPS);
+            let keys: Vec<_> = self.ip_rate_limiters.iter().take(to_remove).map(|e| *e.key()).collect();
+            for ip in keys {
+                self.ip_rate_limiters.remove(&ip);
+            }
+        }
+
+        // Evict oldest JA3 fingerprints if over limit
+        let ja3_count = self.ja3_cache.len();
+        if ja3_count > MAX_JA3_FINGERPRINTS {
+            let mut entries: Vec<_> = self
+                .ja3_cache
+                .iter()
+                .map(|e| (e.key().clone(), e.value().first_seen))
+                .collect();
+            entries.sort_by_key(|(_, time)| *time);
+            let to_remove = ja3_count.saturating_sub(MAX_JA3_FINGERPRINTS);
+            for (hash, _) in entries.into_iter().take(to_remove) {
+                self.ja3_cache.remove(&hash);
+            }
+        }
+
+        // Evict oldest request counters if over limit
+        let request_count = self.request_counts.len();
+        if request_count > MAX_TRACKED_IPS {
+            let mut entries: Vec<_> = self
+                .request_counts
+                .iter()
+                .filter_map(|e| e.value().window_start.map(|ws| (*e.key(), ws)))
+                .collect();
+            entries.sort_by_key(|(_, time)| *time);
+            let to_remove = request_count.saturating_sub(MAX_TRACKED_IPS);
+            for (ip, _) in entries.into_iter().take(to_remove) {
+                self.request_counts.remove(&ip);
+            }
+        }
     }
 }
 
@@ -543,8 +602,22 @@ pub async fn security_middleware(
     next: Next,
 ) -> Response {
     let ip = client_addr.ip();
-    let config = security.config.read().clone();
-    let rate_config = security.rate_config.read().clone();
+    // Read config values without cloning the entire struct - just read what we need
+    let (dos_protection, max_connections_per_ip, max_request_size, max_header_size, auto_block_threshold, auto_block_duration_secs) = {
+        let config = security.config.read();
+        (
+            config.dos_protection,
+            config.max_connections_per_ip,
+            config.max_request_size,
+            config.max_header_size,
+            config.auto_block_threshold,
+            config.auto_block_duration_secs,
+        )
+    };
+    let (rate_enabled, rate_rps) = {
+        let rate_config = security.rate_config.read();
+        (rate_config.enabled, rate_config.requests_per_second)
+    };
 
     // 1. Check if IP is blocked
     if let Some(block_info) = security.is_blocked(&ip) {
@@ -563,11 +636,10 @@ pub async fn security_middleware(
     }
 
     // 3. Check DoS protection - connection limits
-    if config.dos_protection {
+    if dos_protection {
         let connections = security.increment_connections(ip);
-        let max_connections = config.max_connections_per_ip;
 
-        if connections > max_connections {
+        if connections > max_connections_per_ip {
             security.decrement_connections(ip);
             security.block_ip(
                 ip,
@@ -580,7 +652,7 @@ pub async fn security_middleware(
     }
 
     // 4. Rate limiting
-    if rate_config.enabled {
+    if rate_enabled {
         let rate_limiter = security.get_ip_rate_limiter(ip);
 
         if rate_limiter.check().is_err() {
@@ -591,13 +663,13 @@ pub async fn security_middleware(
             counter.suspicious_patterns += 1;
 
             // Auto-block after repeated violations (configurable threshold)
-            if counter.suspicious_patterns >= config.auto_block_threshold {
+            if counter.suspicious_patterns >= auto_block_threshold {
                 drop(counter);
-                let block_duration = Duration::from_secs(config.auto_block_duration_secs);
+                let block_duration = Duration::from_secs(auto_block_duration_secs);
                 security.block_ip(ip, BlockReason::RateLimitExceeded, Some(block_duration));
             }
 
-            return rate_limit_response(&rate_config);
+            return rate_limit_response_simple(rate_rps);
         }
     }
 
@@ -605,9 +677,9 @@ pub async fn security_middleware(
     if let Some(content_length) = headers.get("content-length") {
         if let Ok(length_str) = content_length.to_str() {
             if let Ok(length) = length_str.parse::<usize>() {
-                if length > config.max_request_size {
+                if length > max_request_size {
                     warn!("Request too large from {}: {} bytes", ip, length);
-                    return payload_too_large_response(config.max_request_size);
+                    return payload_too_large_response(max_request_size);
                 }
             }
         }
@@ -619,9 +691,9 @@ pub async fn security_middleware(
         .map(|(k, v)| k.as_str().len() + v.len())
         .sum();
 
-    if header_size > config.max_header_size {
+    if header_size > max_header_size {
         warn!("Headers too large from {}: {} bytes", ip, header_size);
-        return headers_too_large_response(config.max_header_size);
+        return headers_too_large_response(max_header_size);
     }
 
     // 7. Process request
@@ -632,7 +704,7 @@ pub async fn security_middleware(
     security.record_request(ip, status);
 
     // 9. Decrement connection count
-    if config.dos_protection {
+    if dos_protection {
         security.decrement_connections(ip);
     }
 
@@ -670,6 +742,11 @@ fn geo_blocked_response() -> Response {
 
 /// Generate rate limit exceeded response
 fn rate_limit_response(config: &RateLimitConfig) -> Response {
+    rate_limit_response_simple(config.requests_per_second)
+}
+
+/// Generate rate limit exceeded response with just the RPS value
+fn rate_limit_response_simple(requests_per_second: u32) -> Response {
     let mut response = (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
 
     // Add standard rate limit headers
@@ -678,7 +755,7 @@ fn rate_limit_response(config: &RateLimitConfig) -> Response {
         .insert("Retry-After", HeaderValue::from_static("1"));
     response.headers_mut().insert(
         "X-RateLimit-Limit",
-        HeaderValue::from_str(&config.requests_per_second.to_string())
+        HeaderValue::from_str(&requests_per_second.to_string())
             .unwrap_or(HeaderValue::from_static("100")),
     );
     response

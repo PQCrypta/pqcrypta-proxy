@@ -4,7 +4,8 @@
 
 [![Build Status](https://github.com/PQCrypta/pqcrypta-proxy/workflows/CI/badge.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-131%20passing-brightgreen.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
+[![Tests](https://img.shields.io/badge/tests-46%20passing-brightgreen.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
+[![Security](https://img.shields.io/badge/security-hardened-green.svg)](docs/SECURITY.md)
 
 ## Highlights
 
@@ -746,6 +747,14 @@ cargo run --release --bin quic-bench -- --target localhost:443
 - [x] Request Coalescing (dedupe identical requests)
 - [x] PQC hybrid key exchange (X25519MLKEM768)
 - [x] Background cleanup (auto-expire blocked IPs)
+
+### Security Hardening (v1.3.0)
+
+- [x] **Panic prevention** - All unsafe `unwrap()` calls replaced with safe patterns
+- [x] **Memory exhaustion prevention** - DashMap collections bounded with eviction
+- [x] **ReDoS prevention** - Regex patterns validated with size limits
+- [x] **Command injection prevention** - RFC 1035 domain validation in ACME
+- [x] **Safe path handling** - All path-to-string conversions use error handling
 
 ### mTLS Configuration
 
