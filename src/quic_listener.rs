@@ -338,6 +338,37 @@ impl QuicListener {
             remote_addr
         );
 
+        // Handle CORS preflight OPTIONS requests directly
+        if request.method() == http::Method::OPTIONS {
+            let origin = request
+                .headers()
+                .get("origin")
+                .and_then(|v| v.to_str().ok());
+
+            if origin.is_some() {
+                // This is a CORS preflight request - respond with CORS headers
+                let origin_value = origin.unwrap_or("*");
+                let response = http::Response::builder()
+                    .status(http::StatusCode::OK)
+                    .header("access-control-allow-origin", origin_value)
+                    .header(
+                        "access-control-allow-methods",
+                        "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+                    )
+                    .header(
+                        "access-control-allow-headers",
+                        "Content-Type, Authorization, X-Requested-With, X-API-Key, X-Forwarded-For, X-Verification-Version, X-Analysis-Type, Cache-Control, signature-agent, signature-input, signature",
+                    )
+                    .header("access-control-allow-credentials", "true")
+                    .header("access-control-max-age", "86400")
+                    .body(())?;
+
+                stream.send_response(response).await?;
+                stream.finish().await?;
+                return Ok(());
+            }
+        }
+
         // Find route
         let route = match config.find_route(host, path, false) {
             Some(r) => {
@@ -424,7 +455,7 @@ impl QuicListener {
         // Forward selected headers from backend
         for (name, value) in &proxy_response.headers {
             let lower_name = name.to_lowercase();
-            // Forward safe response headers
+            // Forward safe response headers including CORS
             if matches!(
                 lower_name.as_str(),
                 "content-type"
@@ -435,6 +466,12 @@ impl QuicListener {
                     | "content-encoding"
                     | "vary"
                     | "x-content-type-options"
+                    | "access-control-allow-origin"
+                    | "access-control-allow-methods"
+                    | "access-control-allow-headers"
+                    | "access-control-allow-credentials"
+                    | "access-control-expose-headers"
+                    | "access-control-max-age"
             ) {
                 response_builder = response_builder.header(name, value);
             }
