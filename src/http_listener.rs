@@ -1324,7 +1324,7 @@ async fn proxy_handler(
                 // Replace Server header with our own branding (hide backend identity)
                 parts
                     .headers
-                    .insert(header::SERVER, HeaderValue::from_static("PQCProxy v0.1.0"));
+                    .insert(header::SERVER, HeaderValue::from_static("PQCProxy v0.2.0"));
 
                 // Convert Incoming body to axum Body
                 let body = Body::new(incoming_body);
