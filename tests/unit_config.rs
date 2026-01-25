@@ -211,11 +211,11 @@ timeout_ms = 30000
 
 #[test]
 fn test_rate_limit_parsing() {
-    let toml_content = r#"
+    let toml_content = r"
 enabled = true
 requests_per_second = 100
 burst_size = 200
-"#;
+";
     let rate_limit: RateLimitConfig = toml::from_str(toml_content).unwrap();
     assert!(rate_limit.enabled);
     assert!(rate_limit.requests_per_second > 0);

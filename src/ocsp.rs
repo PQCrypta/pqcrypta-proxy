@@ -70,8 +70,8 @@ impl Default for OcspConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            refresh_before_expiry: Duration::from_secs(3600),  // 1 hour before expiry
-            min_refresh_interval: Duration::from_secs(300),    // 5 minutes minimum
+            refresh_before_expiry: Duration::from_secs(3600), // 1 hour before expiry
+            min_refresh_interval: Duration::from_secs(300),   // 5 minutes minimum
             request_timeout: Duration::from_secs(10),
             max_retries: 3,
             retry_delay: Duration::from_secs(5),
@@ -185,7 +185,9 @@ impl OcspService {
             info!("OCSP refresh service started");
 
             // Initial fetch
-            if let Err(e) = Self::refresh_ocsp_response(&config, &cached_response, &cert_chain).await {
+            if let Err(e) =
+                Self::refresh_ocsp_response(&config, &cached_response, &cert_chain).await
+            {
                 error!("Initial OCSP fetch failed: {}", e);
             }
 
@@ -233,7 +235,8 @@ impl OcspService {
                 // Use nextUpdate from OCSP response if available
                 if let Some(next_update) = response.next_update {
                     // Calculate refresh time (next_update - refresh_before_expiry)
-                    if let Some(refresh_at) = next_update.checked_sub(config.refresh_before_expiry) {
+                    if let Some(refresh_at) = next_update.checked_sub(config.refresh_before_expiry)
+                    {
                         if refresh_at > now {
                             let delay = refresh_at.duration_since(now);
                             return delay.max(config.min_refresh_interval);
@@ -242,7 +245,10 @@ impl OcspService {
                 }
 
                 // Otherwise use expires_at
-                if let Some(refresh_at) = response.expires_at.checked_sub(config.refresh_before_expiry) {
+                if let Some(refresh_at) = response
+                    .expires_at
+                    .checked_sub(config.refresh_before_expiry)
+                {
                     if refresh_at > now {
                         let delay = refresh_at.duration_since(now);
                         return delay.max(config.min_refresh_interval);
@@ -301,7 +307,8 @@ impl OcspService {
                 tokio::time::sleep(config.retry_delay).await;
             }
 
-            match Self::fetch_ocsp_response(&ocsp_url, &ocsp_request, config.request_timeout).await {
+            match Self::fetch_ocsp_response(&ocsp_url, &ocsp_request, config.request_timeout).await
+            {
                 Ok((response, status, next_update)) => {
                     let now = Instant::now();
 
@@ -354,14 +361,16 @@ impl OcspService {
                     // Check if it's an OCSP access method (OID 1.3.6.1.5.5.7.48.1)
                     if access_desc.access_method.to_id_string() == "1.3.6.1.5.5.7.48.1" {
                         if let GeneralName::URI(uri) = &access_desc.access_location {
-                            return Ok(uri.to_string());
+                            return Ok((*uri).to_string());
                         }
                     }
                 }
             }
         }
 
-        Err(anyhow::anyhow!("No OCSP responder URL found in certificate"))
+        Err(anyhow::anyhow!(
+            "No OCSP responder URL found in certificate"
+        ))
     }
 
     /// Build an OCSP request for the certificate
@@ -369,10 +378,12 @@ impl OcspService {
         cert: &X509Certificate,
         issuer: &X509Certificate,
     ) -> anyhow::Result<Vec<u8>> {
-        use sha1::{Sha1, Digest};
+        use sha1::{Digest, Sha1};
 
         // Hash algorithm OID for SHA-1 (required by OCSP)
-        let sha1_oid = &[0x30, 0x09, 0x06, 0x05, 0x2B, 0x0E, 0x03, 0x02, 0x1A, 0x05, 0x00];
+        let sha1_oid = &[
+            0x30, 0x09, 0x06, 0x05, 0x2B, 0x0E, 0x03, 0x02, 0x1A, 0x05, 0x00,
+        ];
 
         // Hash the issuer's distinguished name
         let issuer_name_hash = {
@@ -453,9 +464,7 @@ impl OcspService {
         request: &[u8],
         timeout: Duration,
     ) -> anyhow::Result<(Vec<u8>, OcspStatus, Option<Duration>)> {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()?;
+        let client = reqwest::Client::builder().timeout(timeout).build()?;
 
         let response = client
             .post(url)
@@ -527,7 +536,9 @@ impl OcspService {
 
         // Check responseStatus (ENUMERATED)
         if offset >= response.len() || response[offset] != 0x0A {
-            return Err(anyhow::anyhow!("Invalid OCSP response: expected ENUMERATED"));
+            return Err(anyhow::anyhow!(
+                "Invalid OCSP response: expected ENUMERATED"
+            ));
         }
         offset += 1;
 
@@ -559,8 +570,8 @@ impl OcspService {
         //   unknown     [2] IMPLICIT UnknownInfo
 
         // Search for context-specific tags [0], [1], or [2] in the response
-        for i in offset..response.len().saturating_sub(2) {
-            match response[i] {
+        for &byte in &response[offset..response.len().saturating_sub(2)] {
+            match byte {
                 0x80 => {
                     // [0] IMPLICIT NULL = good
                     // Default validity period: 7 days
@@ -604,7 +615,10 @@ pub struct OcspStatusInfo {
     pub running: bool,
 }
 
-fn serialize_duration_option<S>(duration: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
+fn serialize_duration_option<S>(
+    duration: &Option<Duration>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {

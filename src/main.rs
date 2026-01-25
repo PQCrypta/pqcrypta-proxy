@@ -70,36 +70,19 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-mod acme;
-mod admin;
-mod compression;
-mod config;
-mod fingerprint;
-mod handlers;
-mod http3_features;
-mod http_listener;
-mod load_balancer;
-mod metrics;
-mod ocsp;
-mod pqc_extended;
-mod pqc_tls;
-mod proxy;
-mod quic_listener;
-mod rate_limiter; // Must be before config (config imports from it)
-mod security;
-mod tls;
-mod tls_acceptor;
-mod webtransport_server;
-
-use admin::AdminServer;
-use config::{ConfigManager, ConfigReloadEvent};
+// Use the library crate instead of re-declaring modules
+use pqcrypta_proxy::acme;
+use pqcrypta_proxy::admin::AdminServer;
+use pqcrypta_proxy::config::{ConfigManager, ConfigReloadEvent, ProxyConfig};
+use pqcrypta_proxy::metrics;
+use pqcrypta_proxy::ocsp;
+use pqcrypta_proxy::pqc_tls::PqcTlsProvider;
+use pqcrypta_proxy::proxy::BackendPool;
+use pqcrypta_proxy::tls::TlsProvider;
+use pqcrypta_proxy::webtransport_server::WebTransportServer;
 #[cfg(feature = "pqc")]
-use http_listener::run_http_listener_pqc;
-use http_listener::{run_http_listener, run_http_redirect_server, run_tls_passthrough_server};
-use pqc_tls::PqcTlsProvider;
-use proxy::BackendPool;
-use tls::TlsProvider;
-use webtransport_server::WebTransportServer;
+use pqcrypta_proxy::run_http_listener_pqc;
+use pqcrypta_proxy::{run_http_listener, run_http_redirect_server, run_tls_passthrough_server};
 
 /// PQCrypta Proxy - QUIC/HTTP3/WebTransport Proxy with PQC TLS
 #[derive(Parser, Debug)]
@@ -344,10 +327,9 @@ async fn main() -> anyhow::Result<()> {
     let metrics_registry = Arc::new(metrics::MetricsRegistry::new());
 
     // Initialize TLS metrics
-    metrics_registry.tls.set_pqc_status(
-        tls_provider.is_pqc_enabled(),
-        &config.pqc.preferred_kem,
-    );
+    metrics_registry
+        .tls
+        .set_pqc_status(tls_provider.is_pqc_enabled(), &config.pqc.preferred_kem);
 
     // ACME service is optional - can be enabled via ACME config
     let acme_service: Option<Arc<parking_lot::RwLock<acme::AcmeService>>> = None;
@@ -623,7 +605,7 @@ async fn shutdown_signal() {
 }
 
 /// Print startup summary
-fn print_startup_summary(config: &config::ProxyConfig, pqc_enabled: bool) {
+fn print_startup_summary(config: &ProxyConfig, pqc_enabled: bool) {
     info!("═══════════════════════════════════════════════════════════════");
     info!("  PQCrypta Proxy v{}", env!("CARGO_PKG_VERSION"));
     info!("═══════════════════════════════════════════════════════════════");
@@ -685,8 +667,8 @@ fn print_startup_summary(config: &config::ProxyConfig, pqc_enabled: bool) {
 /// 1. TLS private key file permissions (should be 0600 or 0400)
 /// 2. OpenSSL provider integrity verification (if PQC enabled)
 /// 3. PQC capability detection
-async fn perform_security_checks(config: &config::ProxyConfig) -> anyhow::Result<()> {
-    use pqc_extended::{KeySecurityCheck, PqcCapabilities, ExtendedPqcConfig};
+async fn perform_security_checks(config: &ProxyConfig) -> anyhow::Result<()> {
+    use pqcrypta_proxy::pqc_extended::{ExtendedPqcConfig, KeySecurityCheck, PqcCapabilities};
     use std::path::Path;
 
     info!("═══════════════════════════════════════════════════════════════");
@@ -733,7 +715,7 @@ async fn perform_security_checks(config: &config::ProxyConfig) -> anyhow::Result
             ..Default::default()
         };
 
-        match pqc_extended::verify_openssl_provider(&extended_config) {
+        match pqcrypta_proxy::pqc_extended::verify_openssl_provider(&extended_config) {
             Ok(()) => {
                 info!("  ✅ OpenSSL provider: VERIFIED");
             }
@@ -766,20 +748,45 @@ async fn perform_security_checks(config: &config::ProxyConfig) -> anyhow::Result
         let capabilities = PqcCapabilities::detect(&extended_config);
 
         info!("  📊 PQC Capabilities:");
-        info!("     rustls (aws-lc-rs): {}", if capabilities.rustls_available { "✅" } else { "❌" });
-        info!("     OpenSSL 3.5+:       {}", if capabilities.openssl_available { "✅" } else { "❌" });
+        info!(
+            "     rustls (aws-lc-rs): {}",
+            if capabilities.rustls_available {
+                "✅"
+            } else {
+                "❌"
+            }
+        );
+        info!(
+            "     OpenSSL 3.5+:       {}",
+            if capabilities.openssl_available {
+                "✅"
+            } else {
+                "❌"
+            }
+        );
 
         if let Some(version) = &capabilities.openssl_version {
             info!("     OpenSSL version:    {}", version);
         }
 
-        info!("     Available KEMs:     {}", capabilities.available_kems.len());
-        info!("     FIPS mode:          {}", if capabilities.fips_mode { "✅ ENABLED" } else { "⏹️  disabled" });
+        info!(
+            "     Available KEMs:     {}",
+            capabilities.available_kems.len()
+        );
+        info!(
+            "     FIPS mode:          {}",
+            if capabilities.fips_mode {
+                "✅ ENABLED"
+            } else {
+                "⏹️  disabled"
+            }
+        );
 
         // Check minimum security level
-        let min_level = pqc_extended::SecurityLevel::Level3;
+        let min_level = pqcrypta_proxy::pqc_extended::SecurityLevel::Level3;
         if let Some(best_kem) = capabilities.best_kem(min_level, config.pqc.require_hybrid) {
-            info!("     Best available KEM: {} (Level {})",
+            info!(
+                "     Best available KEM: {} (Level {})",
                 best_kem.openssl_name(),
                 best_kem.security_level() as u8
             );

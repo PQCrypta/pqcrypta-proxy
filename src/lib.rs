@@ -100,12 +100,14 @@ pub use load_balancer::{
     SelectionContext, SessionCookieConfig,
 };
 // Extended PQC support with unified configuration
+pub use acme::{AcmeConfig, AcmeService, AcmeStatusInfo, CertificateUpdate, ChallengeType};
+pub use ocsp::{OcspConfig, OcspService, OcspStatus, OcspStatusInfo};
+#[cfg(feature = "pqc")]
+pub use pqc_extended::verify_openssl_provider;
 pub use pqc_extended::{
     ExtendedPqcConfig, KeySecurityCheck, PqcCapabilities, PqcKem, PqcSignature, SecurityLevel,
     TlsBackend,
 };
-#[cfg(feature = "pqc")]
-pub use pqc_extended::verify_openssl_provider;
 #[cfg(feature = "pqc")]
 pub use pqc_tls::openssl_pqc;
 pub use pqc_tls::{
@@ -117,8 +119,6 @@ pub use rate_limiter::{
     RateLimitKey, RateLimitKeyType, RateLimitResult, RateLimiterSnapshot,
 };
 pub use security::{security_middleware, SecurityState};
-pub use ocsp::{OcspConfig, OcspService, OcspStatus, OcspStatusInfo};
-pub use acme::{AcmeConfig, AcmeService, AcmeStatusInfo, ChallengeType, CertificateUpdate};
 pub use tls::TlsProvider;
 pub use tls_acceptor::{FingerprintedConnection, FingerprintingTlsAcceptor};
 pub use webtransport_server::WebTransportServer;

@@ -134,7 +134,11 @@ timeout_ms = 5000
 
         // Verify backend parsed correctly
         assert_eq!(config.backends.len(), 1);
-        let backend = config.backends.values().next().expect("Backend should exist");
+        let backend = config
+            .backends
+            .values()
+            .next()
+            .expect("Backend should exist");
         assert!(!backend.name.is_empty());
         assert!(!backend.address.is_empty());
         assert_eq!(backend.tls_mode, TlsMode::Reencrypt);
@@ -233,8 +237,14 @@ timeout_ms = 30000
         assert!(SecurityLevel::Level3 < SecurityLevel::Level5);
 
         // Test KEM security levels
-        assert_eq!(PqcKem::X25519MlKem768.security_level(), SecurityLevel::Level3);
-        assert_eq!(PqcKem::SecP384r1MlKem1024.security_level(), SecurityLevel::Level5);
+        assert_eq!(
+            PqcKem::X25519MlKem768.security_level(),
+            SecurityLevel::Level3
+        );
+        assert_eq!(
+            PqcKem::SecP384r1MlKem1024.security_level(),
+            SecurityLevel::Level5
+        );
 
         // Test OpenSSL names are valid
         assert!(!PqcKem::X25519MlKem768.openssl_name().is_empty());

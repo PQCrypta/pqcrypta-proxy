@@ -75,10 +75,10 @@ mod proxy_v2 {
     pub const VERSION_LOCAL: u8 = 0x20;
 
     /// Address family and protocol
-    pub const AF_INET_STREAM: u8 = 0x11;  // IPv4 + TCP
+    pub const AF_INET_STREAM: u8 = 0x11; // IPv4 + TCP
     pub const AF_INET6_STREAM: u8 = 0x21; // IPv6 + TCP
     #[allow(dead_code)]
-    pub const AF_UNSPEC: u8 = 0x00;       // Unknown/unspecified
+    pub const AF_UNSPEC: u8 = 0x00; // Unknown/unspecified
 }
 
 /// Build a PROXY protocol v2 header for the given connection
@@ -883,16 +883,18 @@ async fn security_headers_middleware(
     response
 }
 
-/// Advanced multi-dimensional rate limiting middleware
-///
-/// Features:
-/// - Multi-key rate limiting (IP, API key, JA3 fingerprint, JWT, headers)
-/// - Layered limits (global → route → client)
-/// - Composite keys (IP + path, fingerprint + method)
-/// - X-Forwarded-For trust for clients behind proxies
-/// - IPv6 /64 subnet grouping
-/// - Adaptive baseline learning with anomaly detection
-/// Build Alt-Svc header value for HTTP/3 advertisement
+// Advanced multi-dimensional rate limiting middleware
+//
+// Features:
+// - Multi-key rate limiting (IP, API key, JA3 fingerprint, JWT, headers)
+// - Layered limits (global → route → client)
+// - Composite keys (IP + path, fingerprint + method)
+// - X-Forwarded-For trust for clients behind proxies
+// - IPv6 /64 subnet grouping
+// - Adaptive baseline learning with anomaly detection
+
+/// Build Alt-Svc header value for HTTP/3 advertisement.
+#[allow(dead_code)]
 fn build_alt_svc_header(port: u16, additional_ports: &[u16]) -> String {
     let mut parts = vec![format!("h3=\":{}\"; ma=86400", port)];
     for p in additional_ports {
@@ -1694,7 +1696,7 @@ mod tests {
 
     #[test]
     fn test_proxy_v2_header_mixed_ipv4_to_ipv6() {
-        let src = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 5000));
+        let src = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000));
         let dst = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 443, 0, 0));
 
         let header = build_proxy_v2_header(src, dst);
@@ -1706,7 +1708,7 @@ mod tests {
         assert_eq!(header[13], proxy_v2::AF_INET6_STREAM);
 
         // Source should be IPv4-mapped IPv6 (::ffff:127.0.0.1)
-        let expected_src = Ipv4Addr::new(127, 0, 0, 1).to_ipv6_mapped().octets();
+        let expected_src = Ipv4Addr::LOCALHOST.to_ipv6_mapped().octets();
         assert_eq!(&header[16..32], &expected_src);
     }
 
