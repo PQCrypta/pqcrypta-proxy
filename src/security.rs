@@ -29,7 +29,8 @@ use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
 
 /// Alt-Svc header value for HTTP/3 advertisement (ports 443, 4433, 4434)
-const ALT_SVC_HEADER: &str = "h3=\":443\"; ma=86400, h3=\":4433\"; ma=86400, h3=\":4434\"; ma=86400";
+const ALT_SVC_HEADER: &str =
+    "h3=\":443\"; ma=86400, h3=\":4433\"; ma=86400, h3=\":4434\"; ma=86400";
 
 /// Add Alt-Svc header to a response for HTTP/3 advertisement
 fn add_alt_svc(response: &mut Response) {

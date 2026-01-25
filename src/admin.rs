@@ -62,6 +62,7 @@ pub struct AdminServer {
 
 impl AdminServer {
     /// Create a new admin server
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: AdminConfig,
         config_manager: Arc<ConfigManager>,
@@ -533,9 +534,7 @@ struct AcmeStatusResponse {
 }
 
 /// ACME certificate renewal endpoint (force renewal)
-async fn acme_renew_handler(
-    State(state): State<Arc<AdminState>>,
-) -> Json<AcmeRenewResponse> {
+async fn acme_renew_handler(State(state): State<Arc<AdminState>>) -> Json<AcmeRenewResponse> {
     match &state.acme_service {
         Some(service) => {
             // Get renewal result - clone what we need to avoid holding lock across await

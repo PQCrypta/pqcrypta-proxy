@@ -816,16 +816,9 @@ mod tests {
         // SNI extension format:
         // Server Name Indication extension (type 0x00)
         // Data format: list_length(2) + name_type(1) + name_length(2) + name
-        let sni_data = [
-            0x00, 0x10, // List length: 16 bytes
-            0x00,       // Name type: host_name (0)
-            0x00, 0x0d, // Name length: 13 bytes
-            b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm', b'.', b'.', // Oversized for testing
-        ];
-        // Actually build a proper one:
         let proper_sni = [
             0x00, 0x0e, // List length: 14 bytes
-            0x00,       // Name type: host_name (0)
+            0x00, // Name type: host_name (0)
             0x00, 0x0b, // Name length: 11 bytes
             b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm',
         ];
@@ -849,10 +842,8 @@ mod tests {
     fn test_parse_sni_wrong_name_type() {
         // Name type is not 0x00 (host_name)
         let sni_data = [
-            0x00, 0x08,
-            0x01,       // Wrong name type
-            0x00, 0x05,
-            b'h', b'e', b'l', b'l', b'o',
+            0x00, 0x08, 0x01, // Wrong name type
+            0x00, 0x05, b'h', b'e', b'l', b'l', b'o',
         ];
         let result = parse_sni(&sni_data);
         assert_eq!(result, None);
@@ -862,9 +853,7 @@ mod tests {
     fn test_parse_sni_truncated_name() {
         // Name length says 20 but we only have 5 bytes
         let sni_data = [
-            0x00, 0x18,
-            0x00,
-            0x00, 0x14, // Says 20 bytes
+            0x00, 0x18, 0x00, 0x00, 0x14, // Says 20 bytes
             b'h', b'e', b'l', b'l', b'o', // Only 5 bytes
         ];
         let result = parse_sni(&sni_data);
@@ -918,10 +907,10 @@ mod tests {
         // EC point formats extension data:
         // length(1) + formats (1 byte each)
         let data = [
-            0x03,       // 3 formats
-            0x00,       // uncompressed
-            0x01,       // ansiX962_compressed_prime
-            0x02,       // ansiX962_compressed_char2
+            0x03, // 3 formats
+            0x00, // uncompressed
+            0x01, // ansiX962_compressed_prime
+            0x02, // ansiX962_compressed_char2
         ];
         let result = parse_ec_point_formats(&data);
         assert_eq!(result, vec![0x00, 0x01, 0x02]);
@@ -1032,9 +1021,9 @@ mod tests {
         // TLS handshake but not ClientHello (type 0x02 = ServerHello)
         let data = [
             0x16, 0x03, 0x03, 0x00, 0x30, // TLS record header
-            0x02, 0x00, 0x00, 0x2c,        // Handshake header (ServerHello)
-            0x03, 0x03,                    // Version
-            // ... rest would follow
+            0x02, 0x00, 0x00, 0x2c, // Handshake header (ServerHello)
+            0x03, 0x03, // Version
+                  // ... rest would follow
         ];
         let extractor = FingerprintExtractor::new();
         let result = extractor.extract_ja3(&data);
@@ -1046,11 +1035,11 @@ mod tests {
         // Minimal valid TLS 1.2 ClientHello
         let mut client_hello: Vec<u8> = vec![
             // TLS Record Layer
-            0x16,       // Content type: Handshake
+            0x16, // Content type: Handshake
             0x03, 0x01, // Version: TLS 1.0 (for record layer)
             0x00, 0x4a, // Length (placeholder, will adjust)
             // Handshake header
-            0x01,             // Handshake type: ClientHello
+            0x01, // Handshake type: ClientHello
             0x00, 0x00, 0x46, // Length (placeholder)
             // ClientHello
             0x03, 0x03, // Version: TLS 1.2
@@ -1089,11 +1078,11 @@ mod tests {
         // ClientHello with SNI extension
         let mut client_hello: Vec<u8> = vec![
             // TLS Record Layer
-            0x16,       // Content type: Handshake
+            0x16, // Content type: Handshake
             0x03, 0x01, // Version: TLS 1.0 (record layer)
             0x00, 0x5f, // Length (placeholder)
             // Handshake header
-            0x01,             // Handshake type: ClientHello
+            0x01, // Handshake type: ClientHello
             0x00, 0x00, 0x5b, // Length (placeholder)
             // ClientHello
             0x03, 0x03, // Version: TLS 1.2
@@ -1114,7 +1103,7 @@ mod tests {
             0x00, 0x00, // SNI extension type
             0x00, 0x0e, // Extension length
             0x00, 0x0c, // SNI list length
-            0x00,       // Name type: host_name
+            0x00, // Name type: host_name
             0x00, 0x09, // Name length
             b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
         ];
@@ -1134,16 +1123,13 @@ mod tests {
     fn test_extract_ja3_grease_filtering() {
         // ClientHello with GREASE values in ciphers and extensions
         let mut client_hello: Vec<u8> = vec![
-            0x16, 0x03, 0x01, 0x00, 0x60,
-            0x01, 0x00, 0x00, 0x5c,
-            0x03, 0x03,
+            0x16, 0x03, 0x01, 0x00, 0x60, 0x01, 0x00, 0x00, 0x5c, 0x03, 0x03,
         ];
         client_hello.extend_from_slice(&[0u8; 32]);
         client_hello.push(0x00);
         // Cipher suites with GREASE
         client_hello.extend_from_slice(&[
-            0x00, 0x06,
-            0x0a, 0x0a, // GREASE
+            0x00, 0x06, 0x0a, 0x0a, // GREASE
             0x13, 0x01, // Real cipher
             0x1a, 0x1a, // GREASE
         ]);
@@ -1174,9 +1160,7 @@ mod tests {
     fn test_ja3_hash_determinism() {
         // Same ClientHello should produce same hash
         let mut client_hello: Vec<u8> = vec![
-            0x16, 0x03, 0x01, 0x00, 0x48,
-            0x01, 0x00, 0x00, 0x44,
-            0x03, 0x03,
+            0x16, 0x03, 0x01, 0x00, 0x48, 0x01, 0x00, 0x00, 0x44, 0x03, 0x03,
         ];
         client_hello.extend_from_slice(&[0u8; 32]);
         client_hello.push(0x00);
@@ -1211,11 +1195,11 @@ mod tests {
         let ja4_str = ja4.unwrap();
 
         // Format: t13d0305h2_<cipher_hash>_<ext_hash>
-        assert!(ja4_str.starts_with("t13d"));    // TLS, 1.3, domain
-        assert!(ja4_str.contains("03"));         // 3 ciphers
-        assert!(ja4_str.contains("05"));         // 5 extensions
-        assert!(ja4_str.contains("h2"));         // ALPN
-        assert!(ja4_str.contains("_"));          // Separators
+        assert!(ja4_str.starts_with("t13d")); // TLS, 1.3, domain
+        assert!(ja4_str.contains("03")); // 3 ciphers
+        assert!(ja4_str.contains("05")); // 5 extensions
+        assert!(ja4_str.contains("h2")); // ALPN
+        assert!(ja4_str.contains("_")); // Separators
     }
 
     #[test]
@@ -1223,12 +1207,12 @@ mod tests {
         let extractor = FingerprintExtractor::new();
 
         let ja4 = extractor.calculate_ja4(
-            0x0303,           // TLS 1.2
-            &[0xc02f],        // 1 cipher
-            &[],              // No extensions
-            &[],              // No ALPN
-            &[],              // No sig algs
-            false,            // No SNI
+            0x0303,    // TLS 1.2
+            &[0xc02f], // 1 cipher
+            &[],       // No extensions
+            &[],       // No ALPN
+            &[],       // No sig algs
+            false,     // No SNI
         );
 
         assert!(ja4.is_some());

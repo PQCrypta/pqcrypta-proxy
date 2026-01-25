@@ -273,7 +273,9 @@ impl AcmeService {
             let mut interval = tokio::time::interval(check_interval);
 
             // Initial check
-            if let Err(e) = check_and_renew_certificates(&config, &pending_challenges, &cert_update_tx).await {
+            if let Err(e) =
+                check_and_renew_certificates(&config, &pending_challenges, &cert_update_tx).await
+            {
                 error!("Initial certificate check failed: {}", e);
             }
 
@@ -373,7 +375,8 @@ impl AcmeService {
             return Err(anyhow::anyhow!("ACME service is disabled"));
         }
 
-        check_and_renew_certificates(&self.config, &self.pending_challenges, &self.cert_update_tx).await
+        check_and_renew_certificates(&self.config, &self.pending_challenges, &self.cert_update_tx)
+            .await
     }
 
     /// Get certificate paths for a domain
@@ -404,10 +407,7 @@ async fn check_and_renew_certificates(
                         );
                         true
                     } else {
-                        debug!(
-                            "Certificate for {} valid for {} more days",
-                            domain, days
-                        );
+                        debug!("Certificate for {} valid for {} more days", domain, days);
                         false
                     }
                 }
@@ -443,7 +443,9 @@ async fn check_and_renew_certificates(
                             .map(|(_, days)| {
                                 SystemTime::now() + Duration::from_secs(days as u64 * 86400)
                             })
-                            .unwrap_or_else(|_| SystemTime::now() + Duration::from_secs(90 * 86400));
+                            .unwrap_or_else(|_| {
+                                SystemTime::now() + Duration::from_secs(90 * 86400)
+                            });
 
                         let _ = tx
                             .send(CertificateUpdate {
@@ -464,9 +466,7 @@ async fn check_and_renew_certificates(
 
     // Clean up expired challenges
     let now = SystemTime::now();
-    pending_challenges
-        .write()
-        .retain(|_, c| c.expires > now);
+    pending_challenges.write().retain(|_, c| c.expires > now);
 
     Ok(())
 }
@@ -602,7 +602,8 @@ fn read_certificate_expiry(cert_path: &Path) -> anyhow::Result<(String, i64)> {
             "x509",
             "-enddate",
             "-noout",
-            "-dateopt", "iso_8601",
+            "-dateopt",
+            "iso_8601",
             "-in",
             cert_path.to_str().unwrap(),
         ])
@@ -665,6 +666,7 @@ fn parse_iso8601_to_days_remaining(date_str: &str) -> i64 {
                 let expiry_days = days_from_epoch(year, month, day);
 
                 // Get current days from epoch
+                #[allow(clippy::cast_possible_wrap)]
                 let now = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap()
@@ -710,6 +712,7 @@ fn parse_openssl_date_to_days_remaining(date_str: &str) -> i64 {
         let expiry_days = days_from_epoch(year, month, day);
 
         // Get current days from epoch
+        #[allow(clippy::cast_possible_wrap)]
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -756,10 +759,7 @@ fn is_leap_year(year: i64) -> bool {
 }
 
 /// HTTP-01 challenge handler for ACME validation
-pub async fn handle_acme_challenge(
-    acme_service: &AcmeService,
-    token: &str,
-) -> Option<String> {
+pub async fn handle_acme_challenge(acme_service: &AcmeService, token: &str) -> Option<String> {
     acme_service.get_challenge_response(token)
 }
 

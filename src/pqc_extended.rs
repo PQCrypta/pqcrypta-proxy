@@ -101,7 +101,9 @@ impl PqcKem {
             | Self::MlKem768
             | Self::Kyber768
             | Self::X25519Kyber768 => SecurityLevel::Level3,
-            Self::SecP384r1MlKem1024 | Self::X448MlKem1024 | Self::MlKem1024 => SecurityLevel::Level5,
+            Self::SecP384r1MlKem1024 | Self::X448MlKem1024 | Self::MlKem1024 => {
+                SecurityLevel::Level5
+            }
         }
     }
 
@@ -155,11 +157,7 @@ impl PqcKem {
 
     /// Parse from string (case-insensitive, flexible formatting)
     pub fn from_str(s: &str) -> Option<Self> {
-        let normalized = s
-            .to_lowercase()
-            .replace('-', "")
-            .replace('_', "")
-            .replace(' ', "");
+        let normalized = s.to_lowercase().replace(['-', '_', ' '], "");
 
         match normalized.as_str() {
             "x25519mlkem768" => Some(Self::X25519MlKem768),
@@ -331,10 +329,7 @@ impl Default for ExtendedPqcConfig {
             backend: TlsBackend::default(),
             preferred_kem: PqcKem::X25519MlKem768,
             min_security_level: SecurityLevel::Level3,
-            additional_kems: vec![
-                PqcKem::SecP256r1MlKem768,
-                PqcKem::SecP384r1MlKem1024,
-            ],
+            additional_kems: vec![PqcKem::SecP256r1MlKem768, PqcKem::SecP384r1MlKem1024],
             enable_pqc_signatures: false,
             preferred_signature: None,
             fallback_to_classical: true,
@@ -440,9 +435,7 @@ impl PqcCapabilities {
                 Ok(output) if output.status.success() => {
                     let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-                    if version.contains("3.5")
-                        || version.contains("3.6")
-                        || version.contains("3.7")
+                    if version.contains("3.5") || version.contains("3.6") || version.contains("3.7")
                     {
                         self.openssl_available = true;
                         self.openssl_version = Some(version.clone());
@@ -461,7 +454,10 @@ impl PqcCapabilities {
                         self.available_signatures.insert(PqcSignature::MlDsa65);
                         self.available_signatures.insert(PqcSignature::MlDsa87);
 
-                        info!("OpenSSL 3.5+ detected: {} - full ML-KEM/ML-DSA support", version);
+                        info!(
+                            "OpenSSL 3.5+ detected: {} - full ML-KEM/ML-DSA support",
+                            version
+                        );
                     } else {
                         self.warnings.push(format!(
                             "OpenSSL {} detected but 3.5+ required for native ML-KEM",
@@ -493,11 +489,10 @@ impl PqcCapabilities {
     fn detect_fips_mode(&mut self) {
         #[cfg(feature = "fips")]
         {
-            // Check if aws-lc-rs is running in FIPS mode
-            self.fips_mode = aws_lc_rs::fips::indicator();
-            if self.fips_mode {
-                info!("FIPS mode: ENABLED (aws-lc-rs FIPS module active)");
-            }
+            // FIPS mode is enabled at compile time via the fips feature
+            // aws-lc-rs FIPS module is active when built with --features fips
+            self.fips_mode = true;
+            info!("FIPS mode: ENABLED (aws-lc-rs FIPS module compiled)");
         }
     }
 
@@ -604,7 +599,9 @@ impl KeySecurityCheck {
 
         // Check existence
         if !path.exists() {
-            check.issues.push(format!("Key file does not exist: {}", path_str));
+            check
+                .issues
+                .push(format!("Key file does not exist: {}", path_str));
             return check;
         }
         check.exists = true;
@@ -645,7 +642,9 @@ impl KeySecurityCheck {
 
         // Warn about group/other access
         if mode & 0o077 != 0 {
-            check.issues.push("Key file is readable by group or others".to_string());
+            check
+                .issues
+                .push("Key file is readable by group or others".to_string());
         }
 
         check
@@ -747,7 +746,10 @@ mod tests {
     #[test]
     fn test_kem_security_levels() {
         assert_eq!(PqcKem::MlKem512.security_level(), SecurityLevel::Level1);
-        assert_eq!(PqcKem::X25519MlKem768.security_level(), SecurityLevel::Level3);
+        assert_eq!(
+            PqcKem::X25519MlKem768.security_level(),
+            SecurityLevel::Level3
+        );
         assert_eq!(PqcKem::MlKem1024.security_level(), SecurityLevel::Level5);
     }
 
@@ -760,9 +762,15 @@ mod tests {
 
     #[test]
     fn test_kem_parsing() {
-        assert_eq!(PqcKem::from_str("X25519MLKEM768"), Some(PqcKem::X25519MlKem768));
+        assert_eq!(
+            PqcKem::from_str("X25519MLKEM768"),
+            Some(PqcKem::X25519MlKem768)
+        );
         assert_eq!(PqcKem::from_str("ml-kem-1024"), Some(PqcKem::MlKem1024));
-        assert_eq!(PqcKem::from_str("P-256-ML-KEM-768"), Some(PqcKem::SecP256r1MlKem768));
+        assert_eq!(
+            PqcKem::from_str("P-256-ML-KEM-768"),
+            Some(PqcKem::SecP256r1MlKem768)
+        );
     }
 
     #[test]

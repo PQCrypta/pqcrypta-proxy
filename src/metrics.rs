@@ -184,34 +184,63 @@ impl RequestMetrics {
 
         output.push_str("# HELP pqcrypta_requests_total Total requests received\n");
         output.push_str("# TYPE pqcrypta_requests_total counter\n");
-        let _ = writeln!(output, "pqcrypta_requests_total {}", self.total.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "pqcrypta_requests_total {}",
+            self.total.load(Ordering::Relaxed)
+        );
 
         output.push_str("# HELP pqcrypta_requests_success_total Successful requests (2xx)\n");
         output.push_str("# TYPE pqcrypta_requests_success_total counter\n");
-        let _ = writeln!(output, "pqcrypta_requests_success_total {}", self.success.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "pqcrypta_requests_success_total {}",
+            self.success.load(Ordering::Relaxed)
+        );
 
         output.push_str("# HELP pqcrypta_requests_client_errors_total Client errors (4xx)\n");
         output.push_str("# TYPE pqcrypta_requests_client_errors_total counter\n");
-        let _ = writeln!(output, "pqcrypta_requests_client_errors_total {}", self.client_errors.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "pqcrypta_requests_client_errors_total {}",
+            self.client_errors.load(Ordering::Relaxed)
+        );
 
         output.push_str("# HELP pqcrypta_requests_server_errors_total Server errors (5xx)\n");
         output.push_str("# TYPE pqcrypta_requests_server_errors_total counter\n");
-        let _ = writeln!(output, "pqcrypta_requests_server_errors_total {}", self.server_errors.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "pqcrypta_requests_server_errors_total {}",
+            self.server_errors.load(Ordering::Relaxed)
+        );
 
         output.push_str("# HELP pqcrypta_requests_in_progress Current requests in progress\n");
         output.push_str("# TYPE pqcrypta_requests_in_progress gauge\n");
-        let _ = writeln!(output, "pqcrypta_requests_in_progress {}", self.in_progress.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "pqcrypta_requests_in_progress {}",
+            self.in_progress.load(Ordering::Relaxed)
+        );
 
         output.push_str("# HELP pqcrypta_bytes_received_total Total bytes received\n");
         output.push_str("# TYPE pqcrypta_bytes_received_total counter\n");
-        let _ = writeln!(output, "pqcrypta_bytes_received_total {}", self.bytes_received.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "pqcrypta_bytes_received_total {}",
+            self.bytes_received.load(Ordering::Relaxed)
+        );
 
         output.push_str("# HELP pqcrypta_bytes_sent_total Total bytes sent\n");
         output.push_str("# TYPE pqcrypta_bytes_sent_total counter\n");
-        let _ = writeln!(output, "pqcrypta_bytes_sent_total {}", self.bytes_sent.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "pqcrypta_bytes_sent_total {}",
+            self.bytes_sent.load(Ordering::Relaxed)
+        );
 
         // Latency histogram
-        self.latency_histogram.export_prometheus(output, "pqcrypta_request_latency_seconds");
+        self.latency_histogram
+            .export_prometheus(output, "pqcrypta_request_latency_seconds");
     }
 
     fn snapshot(&self) -> RequestMetricsSnapshot {
@@ -321,23 +350,55 @@ impl ConnectionMetrics {
 
         output.push_str("# HELP pqcrypta_connections_total Total connections accepted\n");
         output.push_str("# TYPE pqcrypta_connections_total counter\n");
-        let _ = writeln!(output, "pqcrypta_connections_total {}", self.total.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "pqcrypta_connections_total {}",
+            self.total.load(Ordering::Relaxed)
+        );
 
         output.push_str("# HELP pqcrypta_connections_active Current active connections\n");
         output.push_str("# TYPE pqcrypta_connections_active gauge\n");
-        let _ = writeln!(output, "pqcrypta_connections_active {}", self.active.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "pqcrypta_connections_active {}",
+            self.active.load(Ordering::Relaxed)
+        );
 
         output.push_str("# HELP pqcrypta_connections_by_protocol Connections by protocol\n");
         output.push_str("# TYPE pqcrypta_connections_by_protocol counter\n");
-        let _ = writeln!(output, "pqcrypta_connections_by_protocol{{protocol=\"http3\"}} {}", self.http3.load(Ordering::Relaxed));
-        let _ = writeln!(output, "pqcrypta_connections_by_protocol{{protocol=\"http2\"}} {}", self.http2.load(Ordering::Relaxed));
-        let _ = writeln!(output, "pqcrypta_connections_by_protocol{{protocol=\"http1\"}} {}", self.http1.load(Ordering::Relaxed));
-        let _ = writeln!(output, "pqcrypta_connections_by_protocol{{protocol=\"webtransport\"}} {}", self.webtransport.load(Ordering::Relaxed));
-        let _ = writeln!(output, "pqcrypta_connections_by_protocol{{protocol=\"passthrough\"}} {}", self.passthrough.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "pqcrypta_connections_by_protocol{{protocol=\"http3\"}} {}",
+            self.http3.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            output,
+            "pqcrypta_connections_by_protocol{{protocol=\"http2\"}} {}",
+            self.http2.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            output,
+            "pqcrypta_connections_by_protocol{{protocol=\"http1\"}} {}",
+            self.http1.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            output,
+            "pqcrypta_connections_by_protocol{{protocol=\"webtransport\"}} {}",
+            self.webtransport.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            output,
+            "pqcrypta_connections_by_protocol{{protocol=\"passthrough\"}} {}",
+            self.passthrough.load(Ordering::Relaxed)
+        );
 
         output.push_str("# HELP pqcrypta_handshake_failures_total TLS handshake failures\n");
         output.push_str("# TYPE pqcrypta_handshake_failures_total counter\n");
-        let _ = writeln!(output, "pqcrypta_handshake_failures_total {}", self.handshake_failures.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "pqcrypta_handshake_failures_total {}",
+            self.handshake_failures.load(Ordering::Relaxed)
+        );
     }
 
     fn snapshot(&self) -> ConnectionMetricsSnapshot {
@@ -410,21 +471,24 @@ impl RouteMetrics {
         bytes_in: u64,
         bytes_out: u64,
     ) {
-        let stats = self.routes.entry(route_name.to_string()).or_insert_with(|| RouteStats {
-            requests: AtomicU64::new(0),
-            success: AtomicU64::new(0),
-            errors: AtomicU64::new(0),
-            bytes_in: AtomicU64::new(0),
-            bytes_out: AtomicU64::new(0),
-            latency: LatencyHistogram::new(),
-        });
+        let stats = self
+            .routes
+            .entry(route_name.to_string())
+            .or_insert_with(|| RouteStats {
+                requests: AtomicU64::new(0),
+                success: AtomicU64::new(0),
+                errors: AtomicU64::new(0),
+                bytes_in: AtomicU64::new(0),
+                bytes_out: AtomicU64::new(0),
+                latency: LatencyHistogram::new(),
+            });
 
         stats.requests.fetch_add(1, Ordering::Relaxed);
         stats.bytes_in.fetch_add(bytes_in, Ordering::Relaxed);
         stats.bytes_out.fetch_add(bytes_out, Ordering::Relaxed);
         stats.latency.observe(latency);
 
-        if status_code >= 200 && status_code < 400 {
+        if (200..400).contains(&status_code) {
             stats.success.fetch_add(1, Ordering::Relaxed);
         } else {
             stats.errors.fetch_add(1, Ordering::Relaxed);
@@ -440,7 +504,12 @@ impl RouteMetrics {
         for entry in self.routes.iter() {
             let name = entry.key();
             let stats = entry.value();
-            let _ = writeln!(output, "pqcrypta_route_requests_total{{route=\"{}\"}} {}", name, stats.requests.load(Ordering::Relaxed));
+            let _ = writeln!(
+                output,
+                "pqcrypta_route_requests_total{{route=\"{}\"}} {}",
+                name,
+                stats.requests.load(Ordering::Relaxed)
+            );
         }
 
         output.push_str("# HELP pqcrypta_route_success_total Successful requests per route\n");
@@ -449,7 +518,12 @@ impl RouteMetrics {
         for entry in self.routes.iter() {
             let name = entry.key();
             let stats = entry.value();
-            let _ = writeln!(output, "pqcrypta_route_success_total{{route=\"{}\"}} {}", name, stats.success.load(Ordering::Relaxed));
+            let _ = writeln!(
+                output,
+                "pqcrypta_route_success_total{{route=\"{}\"}} {}",
+                name,
+                stats.success.load(Ordering::Relaxed)
+            );
         }
 
         output.push_str("# HELP pqcrypta_route_errors_total Errors per route\n");
@@ -458,16 +532,28 @@ impl RouteMetrics {
         for entry in self.routes.iter() {
             let name = entry.key();
             let stats = entry.value();
-            let _ = writeln!(output, "pqcrypta_route_errors_total{{route=\"{}\"}} {}", name, stats.errors.load(Ordering::Relaxed));
+            let _ = writeln!(
+                output,
+                "pqcrypta_route_errors_total{{route=\"{}\"}} {}",
+                name,
+                stats.errors.load(Ordering::Relaxed)
+            );
         }
 
-        output.push_str("# HELP pqcrypta_route_latency_seconds_p95 95th percentile latency per route\n");
+        output.push_str(
+            "# HELP pqcrypta_route_latency_seconds_p95 95th percentile latency per route\n",
+        );
         output.push_str("# TYPE pqcrypta_route_latency_seconds_p95 gauge\n");
 
         for entry in self.routes.iter() {
             let name = entry.key();
             let stats = entry.value();
-            let _ = writeln!(output, "pqcrypta_route_latency_seconds_p95{{route=\"{}\"}} {:.6}", name, stats.latency.percentile(95) / 1000.0);
+            let _ = writeln!(
+                output,
+                "pqcrypta_route_latency_seconds_p95{{route=\"{}\"}} {:.6}",
+                name,
+                stats.latency.percentile(95) / 1000.0
+            );
         }
     }
 
@@ -540,17 +626,22 @@ impl PoolMetrics {
         }
     }
 
-    fn get_or_create(&self, pool_name: &str) -> dashmap::mapref::one::RefMut<'_, String, PoolStats> {
-        self.pools.entry(pool_name.to_string()).or_insert_with(|| PoolStats {
-            connections_total: AtomicU64::new(0),
-            connections_active: AtomicU64::new(0),
-            connections_idle: AtomicU64::new(0),
-            connection_errors: AtomicU64::new(0),
-            queue_depth: AtomicU64::new(0),
-            queue_dropped: AtomicU64::new(0),
-            circuit_open: AtomicU64::new(0),
-            latency: LatencyHistogram::new(),
-        })
+    fn get_or_create(
+        &self,
+        pool_name: &str,
+    ) -> dashmap::mapref::one::RefMut<'_, String, PoolStats> {
+        self.pools
+            .entry(pool_name.to_string())
+            .or_insert_with(|| PoolStats {
+                connections_total: AtomicU64::new(0),
+                connections_active: AtomicU64::new(0),
+                connections_idle: AtomicU64::new(0),
+                connection_errors: AtomicU64::new(0),
+                queue_depth: AtomicU64::new(0),
+                queue_dropped: AtomicU64::new(0),
+                circuit_open: AtomicU64::new(0),
+                latency: LatencyHistogram::new(),
+            })
     }
 
     /// Record a new connection to pool
@@ -594,7 +685,7 @@ impl PoolMetrics {
     /// Record circuit breaker state
     pub fn set_circuit_open(&self, pool_name: &str, open: bool) {
         let stats = self.get_or_create(pool_name);
-        stats.circuit_open.store(if open { 1 } else { 0 }, Ordering::Relaxed);
+        stats.circuit_open.store(u64::from(open), Ordering::Relaxed);
     }
 
     /// Record backend latency
@@ -612,7 +703,12 @@ impl PoolMetrics {
         for entry in self.pools.iter() {
             let name = entry.key();
             let stats = entry.value();
-            let _ = writeln!(output, "pqcrypta_pool_connections_active{{pool=\"{}\"}} {}", name, stats.connections_active.load(Ordering::Relaxed));
+            let _ = writeln!(
+                output,
+                "pqcrypta_pool_connections_active{{pool=\"{}\"}} {}",
+                name,
+                stats.connections_active.load(Ordering::Relaxed)
+            );
         }
 
         output.push_str("# HELP pqcrypta_pool_connections_idle Idle connections per pool\n");
@@ -621,16 +717,27 @@ impl PoolMetrics {
         for entry in self.pools.iter() {
             let name = entry.key();
             let stats = entry.value();
-            let _ = writeln!(output, "pqcrypta_pool_connections_idle{{pool=\"{}\"}} {}", name, stats.connections_idle.load(Ordering::Relaxed));
+            let _ = writeln!(
+                output,
+                "pqcrypta_pool_connections_idle{{pool=\"{}\"}} {}",
+                name,
+                stats.connections_idle.load(Ordering::Relaxed)
+            );
         }
 
-        output.push_str("# HELP pqcrypta_pool_connection_errors_total Connection errors per pool\n");
+        output
+            .push_str("# HELP pqcrypta_pool_connection_errors_total Connection errors per pool\n");
         output.push_str("# TYPE pqcrypta_pool_connection_errors_total counter\n");
 
         for entry in self.pools.iter() {
             let name = entry.key();
             let stats = entry.value();
-            let _ = writeln!(output, "pqcrypta_pool_connection_errors_total{{pool=\"{}\"}} {}", name, stats.connection_errors.load(Ordering::Relaxed));
+            let _ = writeln!(
+                output,
+                "pqcrypta_pool_connection_errors_total{{pool=\"{}\"}} {}",
+                name,
+                stats.connection_errors.load(Ordering::Relaxed)
+            );
         }
 
         output.push_str("# HELP pqcrypta_pool_queue_depth Current queue depth per pool\n");
@@ -639,16 +746,28 @@ impl PoolMetrics {
         for entry in self.pools.iter() {
             let name = entry.key();
             let stats = entry.value();
-            let _ = writeln!(output, "pqcrypta_pool_queue_depth{{pool=\"{}\"}} {}", name, stats.queue_depth.load(Ordering::Relaxed));
+            let _ = writeln!(
+                output,
+                "pqcrypta_pool_queue_depth{{pool=\"{}\"}} {}",
+                name,
+                stats.queue_depth.load(Ordering::Relaxed)
+            );
         }
 
-        output.push_str("# HELP pqcrypta_pool_circuit_open Circuit breaker state (1=open, 0=closed)\n");
+        output.push_str(
+            "# HELP pqcrypta_pool_circuit_open Circuit breaker state (1=open, 0=closed)\n",
+        );
         output.push_str("# TYPE pqcrypta_pool_circuit_open gauge\n");
 
         for entry in self.pools.iter() {
             let name = entry.key();
             let stats = entry.value();
-            let _ = writeln!(output, "pqcrypta_pool_circuit_open{{pool=\"{}\"}} {}", name, stats.circuit_open.load(Ordering::Relaxed));
+            let _ = writeln!(
+                output,
+                "pqcrypta_pool_circuit_open{{pool=\"{}\"}} {}",
+                name,
+                stats.circuit_open.load(Ordering::Relaxed)
+            );
         }
     }
 
@@ -754,29 +873,56 @@ impl RateLimiterMetrics {
     fn export_prometheus(&self, output: &mut String) {
         use std::fmt::Write;
 
-        output.push_str("# HELP pqcrypta_ratelimit_requests_total Total requests checked by rate limiter\n");
+        output.push_str(
+            "# HELP pqcrypta_ratelimit_requests_total Total requests checked by rate limiter\n",
+        );
         output.push_str("# TYPE pqcrypta_ratelimit_requests_total counter\n");
-        let _ = writeln!(output, "pqcrypta_ratelimit_requests_total {}", self.requests_checked.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "pqcrypta_ratelimit_requests_total {}",
+            self.requests_checked.load(Ordering::Relaxed)
+        );
 
-        output.push_str("# HELP pqcrypta_ratelimit_allowed_total Requests allowed by rate limiter\n");
+        output
+            .push_str("# HELP pqcrypta_ratelimit_allowed_total Requests allowed by rate limiter\n");
         output.push_str("# TYPE pqcrypta_ratelimit_allowed_total counter\n");
-        let _ = writeln!(output, "pqcrypta_ratelimit_allowed_total {}", self.requests_allowed.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "pqcrypta_ratelimit_allowed_total {}",
+            self.requests_allowed.load(Ordering::Relaxed)
+        );
 
         output.push_str("# HELP pqcrypta_ratelimit_limited_total Requests rate limited (429)\n");
         output.push_str("# TYPE pqcrypta_ratelimit_limited_total counter\n");
-        let _ = writeln!(output, "pqcrypta_ratelimit_limited_total {}", self.requests_limited.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "pqcrypta_ratelimit_limited_total {}",
+            self.requests_limited.load(Ordering::Relaxed)
+        );
 
         output.push_str("# HELP pqcrypta_ratelimit_blocked_total Requests blocked\n");
         output.push_str("# TYPE pqcrypta_ratelimit_blocked_total counter\n");
-        let _ = writeln!(output, "pqcrypta_ratelimit_blocked_total {}", self.requests_blocked.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "pqcrypta_ratelimit_blocked_total {}",
+            self.requests_blocked.load(Ordering::Relaxed)
+        );
 
         output.push_str("# HELP pqcrypta_ratelimit_unique_ips Unique IPs tracked\n");
         output.push_str("# TYPE pqcrypta_ratelimit_unique_ips gauge\n");
-        let _ = writeln!(output, "pqcrypta_ratelimit_unique_ips {}", self.unique_ips.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "pqcrypta_ratelimit_unique_ips {}",
+            self.unique_ips.load(Ordering::Relaxed)
+        );
 
         output.push_str("# HELP pqcrypta_ratelimit_blocked_ips Currently blocked IPs\n");
         output.push_str("# TYPE pqcrypta_ratelimit_blocked_ips gauge\n");
-        let _ = writeln!(output, "pqcrypta_ratelimit_blocked_ips {}", self.blocked_ips.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "pqcrypta_ratelimit_blocked_ips {}",
+            self.blocked_ips.load(Ordering::Relaxed)
+        );
     }
 
     fn snapshot(&self) -> RateLimiterMetricsSnapshot {
@@ -882,36 +1028,64 @@ impl TlsMetrics {
 
         output.push_str("# HELP pqcrypta_tls_handshakes_total Total TLS handshakes\n");
         output.push_str("# TYPE pqcrypta_tls_handshakes_total counter\n");
-        let _ = writeln!(output, "pqcrypta_tls_handshakes_total {}", self.handshakes_total.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "pqcrypta_tls_handshakes_total {}",
+            self.handshakes_total.load(Ordering::Relaxed)
+        );
 
         output.push_str("# HELP pqcrypta_tls_handshakes_success Successful TLS handshakes\n");
         output.push_str("# TYPE pqcrypta_tls_handshakes_success counter\n");
-        let _ = writeln!(output, "pqcrypta_tls_handshakes_success {}", self.handshakes_success.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "pqcrypta_tls_handshakes_success {}",
+            self.handshakes_success.load(Ordering::Relaxed)
+        );
 
         output.push_str("# HELP pqcrypta_tls_pqc_handshakes PQC hybrid handshakes\n");
         output.push_str("# TYPE pqcrypta_tls_pqc_handshakes counter\n");
-        let _ = writeln!(output, "pqcrypta_tls_pqc_handshakes {}", self.pqc_handshakes.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "pqcrypta_tls_pqc_handshakes {}",
+            self.pqc_handshakes.load(Ordering::Relaxed)
+        );
 
         output.push_str("# HELP pqcrypta_tls_classical_handshakes Classical-only handshakes\n");
         output.push_str("# TYPE pqcrypta_tls_classical_handshakes counter\n");
-        let _ = writeln!(output, "pqcrypta_tls_classical_handshakes {}", self.classical_handshakes.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "pqcrypta_tls_classical_handshakes {}",
+            self.classical_handshakes.load(Ordering::Relaxed)
+        );
 
         output.push_str("# HELP pqcrypta_pqc_enabled PQC hybrid enabled (1=yes, 0=no)\n");
         output.push_str("# TYPE pqcrypta_pqc_enabled gauge\n");
-        let enabled = if *self.pqc_enabled.read() { 1 } else { 0 };
+        let enabled = i32::from(*self.pqc_enabled.read());
         let _ = writeln!(output, "pqcrypta_pqc_enabled {}", enabled);
 
         output.push_str("# HELP pqcrypta_cert_reloads_total Certificate reload count\n");
         output.push_str("# TYPE pqcrypta_cert_reloads_total counter\n");
-        let _ = writeln!(output, "pqcrypta_cert_reloads_total {}", self.cert_reloads.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "pqcrypta_cert_reloads_total {}",
+            self.cert_reloads.load(Ordering::Relaxed)
+        );
 
         output.push_str("# HELP pqcrypta_ocsp_fetches_total OCSP staple fetch count\n");
         output.push_str("# TYPE pqcrypta_ocsp_fetches_total counter\n");
-        let _ = writeln!(output, "pqcrypta_ocsp_fetches_total {}", self.ocsp_fetches.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "pqcrypta_ocsp_fetches_total {}",
+            self.ocsp_fetches.load(Ordering::Relaxed)
+        );
 
         output.push_str("# HELP pqcrypta_ocsp_failures_total OCSP fetch failures\n");
         output.push_str("# TYPE pqcrypta_ocsp_failures_total counter\n");
-        let _ = writeln!(output, "pqcrypta_ocsp_failures_total {}", self.ocsp_failures.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "pqcrypta_ocsp_failures_total {}",
+            self.ocsp_failures.load(Ordering::Relaxed)
+        );
     }
 
     fn snapshot(&self) -> TlsMetricsSnapshot {
@@ -1012,11 +1186,10 @@ impl LatencyHistogram {
             if cumulative >= target {
                 if i < Self::BUCKET_BOUNDS_MS.len() {
                     return Self::BUCKET_BOUNDS_MS[i] as f64;
-                } else {
-                    // +Inf bucket, use sum/count as estimate
-                    let sum = self.sum_us.load(Ordering::Relaxed) as f64 / 1000.0;
-                    return sum / total as f64;
                 }
+                // +Inf bucket, use sum/count as estimate
+                let sum = self.sum_us.load(Ordering::Relaxed) as f64 / 1000.0;
+                return sum / total as f64;
             }
         }
 
@@ -1033,7 +1206,13 @@ impl LatencyHistogram {
 
         for (i, bound) in Self::BUCKET_BOUNDS_MS.iter().enumerate() {
             cumulative += self.buckets[i].load(Ordering::Relaxed);
-            let _ = writeln!(output, "{}_bucket{{le=\"{}\"}} {}", name, *bound as f64 / 1000.0, cumulative);
+            let _ = writeln!(
+                output,
+                "{}_bucket{{le=\"{}\"}} {}",
+                name,
+                *bound as f64 / 1000.0,
+                cumulative
+            );
         }
 
         cumulative += self.buckets[12].load(Ordering::Relaxed);
@@ -1041,7 +1220,12 @@ impl LatencyHistogram {
 
         let sum = self.sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0;
         let _ = writeln!(output, "{}_sum {:.6}", name, sum);
-        let _ = writeln!(output, "{}_count {}", name, self.count.load(Ordering::Relaxed));
+        let _ = writeln!(
+            output,
+            "{}_count {}",
+            name,
+            self.count.load(Ordering::Relaxed)
+        );
     }
 }
 
@@ -1109,9 +1293,9 @@ mod tests {
     fn test_rate_limiter_metrics() {
         let m = RateLimiterMetrics::new();
 
-        m.request_checked(true, false);  // allowed
+        m.request_checked(true, false); // allowed
         m.request_checked(false, false); // rate limited
-        m.request_checked(false, true);  // blocked
+        m.request_checked(false, true); // blocked
 
         let snapshot = m.snapshot();
         assert_eq!(snapshot.requests_checked, 3);
@@ -1125,8 +1309,12 @@ mod tests {
         let registry = MetricsRegistry::new();
 
         registry.requests.request_start();
-        registry.requests.request_end(200, Duration::from_millis(50), 100, 200);
-        registry.connections.connection_opened(ConnectionProtocol::Http3);
+        registry
+            .requests
+            .request_end(200, Duration::from_millis(50), 100, 200);
+        registry
+            .connections
+            .connection_opened(ConnectionProtocol::Http3);
 
         let prometheus = registry.export_prometheus();
         assert!(prometheus.contains("pqcrypta_uptime_seconds"));

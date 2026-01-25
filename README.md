@@ -4,7 +4,7 @@
 
 [![Build Status](https://github.com/PQCrypta/pqcrypta-proxy/workflows/CI/badge.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-110%20passing-brightgreen.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
+[![Tests](https://img.shields.io/badge/tests-131%20passing-brightgreen.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
 
 ## Highlights
 
