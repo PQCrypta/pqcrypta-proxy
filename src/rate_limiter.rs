@@ -30,7 +30,7 @@ use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 // ============================================================================
 // CONFIGURATION
@@ -778,10 +778,13 @@ pub struct RateLimitBucket {
 
 impl RateLimitBucket {
     pub fn new(limits: &PerKeyLimits, adaptive_config: Option<&AdaptiveConfig>) -> Self {
-        let quota = Quota::per_second(
-            NonZeroU32::new(limits.requests_per_second).unwrap_or(NonZeroU32::new(100).unwrap()),
-        )
-        .allow_burst(NonZeroU32::new(limits.burst_size).unwrap_or(NonZeroU32::new(50).unwrap()));
+        // Use saturating values to prevent panics - MIN is 1
+        let rps = NonZeroU32::new(limits.requests_per_second.max(1))
+            .unwrap_or(NonZeroU32::MIN);
+        let burst = NonZeroU32::new(limits.burst_size.max(1))
+            .unwrap_or(NonZeroU32::MIN);
+
+        let quota = Quota::per_second(rps).allow_burst(burst);
 
         let minute_counter = limits
             .requests_per_minute
@@ -986,24 +989,22 @@ impl AdvancedRateLimiter {
             .iter()
             .filter_map(|s| {
                 s.parse().ok().or_else(|| {
-                    // Try parsing as single IP
-                    s.parse::<IpAddr>().ok().map(|ip| match ip {
-                        IpAddr::V4(v4) => ipnet::IpNet::V4(ipnet::Ipv4Net::new(v4, 32).unwrap()),
-                        IpAddr::V6(v6) => ipnet::IpNet::V6(ipnet::Ipv6Net::new(v6, 128).unwrap()),
+                    // Try parsing as single IP - use safe defaults that can't fail
+                    s.parse::<IpAddr>().ok().and_then(|ip| match ip {
+                        IpAddr::V4(v4) => ipnet::Ipv4Net::new(v4, 32).ok().map(ipnet::IpNet::V4),
+                        IpAddr::V6(v6) => ipnet::Ipv6Net::new(v6, 128).ok().map(ipnet::IpNet::V6),
                     })
                 })
             })
             .collect();
 
-        // Create global rate limiter
-        let global_quota = Quota::per_second(
-            NonZeroU32::new(config.global_limits.requests_per_second)
-                .unwrap_or(NonZeroU32::new(100_000).unwrap()),
-        )
-        .allow_burst(
-            NonZeroU32::new(config.global_limits.burst_size)
-                .unwrap_or(NonZeroU32::new(50_000).unwrap()),
-        );
+        // Create global rate limiter with safe NonZeroU32 handling
+        let global_rps = NonZeroU32::new(config.global_limits.requests_per_second.max(1))
+            .unwrap_or(NonZeroU32::MIN);
+        let global_burst = NonZeroU32::new(config.global_limits.burst_size.max(1))
+            .unwrap_or(NonZeroU32::MIN);
+
+        let global_quota = Quota::per_second(global_rps).allow_burst(global_burst);
 
         // Extract adaptive config values before moving config
         let adaptive_baseline_window = config.adaptive.baseline_window_secs;
@@ -1345,6 +1346,9 @@ impl AdvancedRateLimiter {
         config.global_limits.per_ip.clone()
     }
 
+    /// Maximum number of tracked keys to prevent DoS through memory exhaustion
+    const MAX_TRACKED_KEYS: usize = 100_000;
+
     /// Spawn background cleanup task
     fn spawn_cleanup_task(&self) {
         let buckets = self.buckets.clone();
@@ -1368,6 +1372,33 @@ impl AdvancedRateLimiter {
                         .keys_tracked
                         .fetch_sub(removed as u64, Ordering::Relaxed);
                     debug!("Cleaned up {} idle rate limit buckets", removed);
+                }
+
+                // Enforce max size limit - remove oldest entries if over limit
+                let current_count = buckets.len();
+                if current_count > Self::MAX_TRACKED_KEYS {
+                    // Collect entries with their last request times
+                    let mut entries: Vec<_> = buckets
+                        .iter()
+                        .map(|e| (e.key().clone(), *e.value().last_request.read()))
+                        .collect();
+
+                    // Sort by last request time (oldest first)
+                    entries.sort_by_key(|(_, time)| *time);
+
+                    // Remove oldest entries to get back under limit
+                    let to_remove = current_count - Self::MAX_TRACKED_KEYS;
+                    for (key, _) in entries.into_iter().take(to_remove) {
+                        buckets.remove(&key);
+                    }
+
+                    stats
+                        .keys_tracked
+                        .fetch_sub(to_remove as u64, Ordering::Relaxed);
+                    warn!(
+                        "Rate limiter reached max capacity, evicted {} oldest entries",
+                        to_remove
+                    );
                 }
 
                 // Clean up route buckets
@@ -1397,15 +1428,15 @@ impl AdvancedRateLimiter {
     /// Update configuration
     #[allow(dead_code)]
     pub fn update_config(&self, config: AdvancedRateLimitConfig) {
-        // Update trusted CIDRs
+        // Update trusted CIDRs with safe parsing
         let trusted_cidrs: Vec<ipnet::IpNet> = config
             .trusted_proxies
             .iter()
             .filter_map(|s| {
                 s.parse().ok().or_else(|| {
-                    s.parse::<IpAddr>().ok().map(|ip| match ip {
-                        IpAddr::V4(v4) => ipnet::IpNet::V4(ipnet::Ipv4Net::new(v4, 32).unwrap()),
-                        IpAddr::V6(v6) => ipnet::IpNet::V6(ipnet::Ipv6Net::new(v6, 128).unwrap()),
+                    s.parse::<IpAddr>().ok().and_then(|ip| match ip {
+                        IpAddr::V4(v4) => ipnet::Ipv4Net::new(v4, 32).ok().map(ipnet::IpNet::V4),
+                        IpAddr::V6(v6) => ipnet::Ipv6Net::new(v6, 128).ok().map(ipnet::IpNet::V6),
                     })
                 })
             })

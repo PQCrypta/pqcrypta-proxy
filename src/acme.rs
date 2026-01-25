@@ -538,13 +538,48 @@ fn generate_ec_key() -> anyhow::Result<String> {
     Ok(String::from_utf8(output.stdout)?)
 }
 
+/// Validate domain name to prevent command injection
+/// Only allows alphanumeric characters, hyphens, and dots (RFC 1035 compliant)
+fn validate_domain(domain: &str) -> anyhow::Result<()> {
+    // Domain name validation: alphanumeric, hyphens, dots only
+    // Max 253 characters total, max 63 characters per label
+    if domain.is_empty() || domain.len() > 253 {
+        return Err(anyhow::anyhow!("Invalid domain length: {}", domain.len()));
+    }
+
+    for label in domain.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(anyhow::anyhow!("Invalid domain label length"));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(anyhow::anyhow!("Domain label cannot start or end with hyphen"));
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(anyhow::anyhow!(
+                "Domain contains invalid characters (only alphanumeric and hyphens allowed)"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Generate a self-signed certificate (placeholder for full ACME)
 fn generate_self_signed_cert(domain: &str, key_pem: &str) -> anyhow::Result<String> {
     use std::process::{Command, Stdio};
 
+    // Validate domain to prevent command injection
+    validate_domain(domain)?;
+
     // Write key to temp file
     let key_file = tempfile::NamedTempFile::new()?;
     std::fs::write(key_file.path(), key_pem)?;
+
+    // Get key path, handling non-UTF8 paths safely
+    let key_path = key_file
+        .path()
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Key file path contains invalid UTF-8"))?;
 
     // Generate self-signed cert using OpenSSL
     let child = Command::new("openssl")
@@ -553,7 +588,7 @@ fn generate_self_signed_cert(domain: &str, key_pem: &str) -> anyhow::Result<Stri
             "-new",
             "-x509",
             "-key",
-            key_file.path().to_str().unwrap(),
+            key_path,
             "-days",
             "90",
             "-subj",
@@ -596,6 +631,11 @@ fn base64_url_encode(data: &[u8]) -> String {
 fn read_certificate_expiry(cert_path: &Path) -> anyhow::Result<(String, i64)> {
     use std::process::Command;
 
+    // Get cert path as string, handling non-UTF8 paths safely
+    let cert_path_str = cert_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Certificate path contains invalid UTF-8"))?;
+
     // Get expiry date in epoch seconds format for accurate calculation
     let epoch_output = Command::new("openssl")
         .args([
@@ -605,7 +645,7 @@ fn read_certificate_expiry(cert_path: &Path) -> anyhow::Result<(String, i64)> {
             "-dateopt",
             "iso_8601",
             "-in",
-            cert_path.to_str().unwrap(),
+            cert_path_str,
         ])
         .output()?;
 
@@ -616,7 +656,7 @@ fn read_certificate_expiry(cert_path: &Path) -> anyhow::Result<(String, i64)> {
             "-enddate",
             "-noout",
             "-in",
-            cert_path.to_str().unwrap(),
+            cert_path_str,
         ])
         .output()?;
 
@@ -782,8 +822,8 @@ mod tests {
         let http01 = ChallengeType::Http01;
         let dns01 = ChallengeType::Dns01;
 
-        let http01_json = serde_json::to_string(&http01).unwrap();
-        let dns01_json = serde_json::to_string(&dns01).unwrap();
+        let http01_json = serde_json::to_string(&http01).expect("serialize http01");
+        let dns01_json = serde_json::to_string(&dns01).expect("serialize dns01");
 
         assert_eq!(http01_json, "\"http-01\"");
         assert_eq!(dns01_json, "\"dns-01\"");

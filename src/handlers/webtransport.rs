@@ -86,21 +86,20 @@ impl WebTransportHandler {
         );
 
         // Find matching route
-        let route = self.config.find_route(host, path, true);
-
-        if route.is_none() {
-            warn!("No route found for WebTransport path: {}", path);
-            let error_response = serde_json::json!({
-                "error": "no_route",
-                "message": format!("No route configured for path: {}", path),
-            });
-            let response_bytes = serde_json::to_vec(&error_response)?;
-            send.write_all(&response_bytes).await?;
-            send.finish()?;
-            return Ok(());
-        }
-
-        let route = route.unwrap();
+        let route = match self.config.find_route(host, path, true) {
+            Some(r) => r,
+            None => {
+                warn!("No route found for WebTransport path: {}", path);
+                let error_response = serde_json::json!({
+                    "error": "no_route",
+                    "message": format!("No route configured for path: {}", path),
+                });
+                let response_bytes = serde_json::to_vec(&error_response)?;
+                send.write_all(&response_bytes).await?;
+                send.finish()?;
+                return Ok(());
+            }
+        };
         let backend_name = &route.backend;
 
         // Get backend configuration

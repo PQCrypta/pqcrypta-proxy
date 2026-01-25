@@ -368,13 +368,16 @@ impl PqcTlsProvider {
         let key_path = output_dir.join("pqc-key.pem");
 
         // Generate key with ML-DSA-87 (NIST Level 5 signature)
+        let key_path_str = key_path
+            .to_str()
+            .ok_or_else(|| "Key path contains invalid UTF-8".to_string())?;
         let key_output = Command::new(&openssl_bin)
             .args([
                 "genpkey",
                 "-algorithm",
                 "ML-DSA-87",
                 "-out",
-                key_path.to_str().unwrap(),
+                key_path_str,
             ])
             .env("LD_LIBRARY_PATH", &openssl_lib)
             .output()
@@ -388,15 +391,18 @@ impl PqcTlsProvider {
         }
 
         // Generate self-signed certificate
+        let cert_path_str = cert_path
+            .to_str()
+            .ok_or_else(|| "Cert path contains invalid UTF-8".to_string())?;
         let cert_output = Command::new(&openssl_bin)
             .args([
                 "req",
                 "-new",
                 "-x509",
                 "-key",
-                key_path.to_str().unwrap(),
+                key_path_str,
                 "-out",
-                cert_path.to_str().unwrap(),
+                cert_path_str,
                 "-days",
                 "365",
                 "-subj",

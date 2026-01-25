@@ -1203,6 +1203,44 @@ impl ProxyConfig {
                     route.backend
                 ));
             }
+
+            // Validate path_regex to prevent ReDoS attacks
+            if let Some(ref regex_str) = route.path_regex {
+                // Check regex length limit (prevent extremely long patterns)
+                if regex_str.len() > 1024 {
+                    return Err(anyhow::anyhow!(
+                        "Route {:?} has path_regex exceeding 1024 characters (ReDoS prevention)",
+                        route.name
+                    ));
+                }
+
+                // Validate regex compiles and use regex with size limits
+                match regex::RegexBuilder::new(regex_str)
+                    .size_limit(1024 * 1024) // 1MB compiled size limit
+                    .build()
+                {
+                    Ok(_) => {}
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "Route {:?} has invalid path_regex '{}': {}",
+                            route.name,
+                            regex_str,
+                            e
+                        ));
+                    }
+                }
+            }
+
+            // Validate host pattern format
+            if let Some(ref pattern) = route.host {
+                if pattern.starts_with("*.") && pattern.len() <= 2 {
+                    return Err(anyhow::anyhow!(
+                        "Route {:?} has invalid wildcard host pattern '{}' (missing domain)",
+                        route.name,
+                        pattern
+                    ));
+                }
+            }
         }
 
         // Validate backend pool server addresses
@@ -1284,9 +1322,13 @@ impl ProxyConfig {
             return true;
         }
 
-        // Check path regex
+        // Check path regex (already validated during config load)
         if let Some(ref regex_str) = route.path_regex {
-            if let Ok(re) = regex::Regex::new(regex_str) {
+            // Use RegexBuilder with size limits for safety (matching validation settings)
+            if let Ok(re) = regex::RegexBuilder::new(regex_str)
+                .size_limit(1024 * 1024)
+                .build()
+            {
                 if !re.is_match(path) {
                     return false;
                 }
