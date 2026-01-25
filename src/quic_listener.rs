@@ -230,13 +230,19 @@ impl QuicListener {
                     let method = request.method().clone();
                     let uri = request.uri().clone();
                     let path = uri.path().to_string();
-                    let host = request
-                        .headers()
-                        .get("host")
-                        .and_then(|v| v.to_str().ok())
-                        .map(String::from);
+                    // In HTTP/3, host comes from :authority pseudo-header (in URI) or fallback to host header
+                    let host = uri
+                        .authority()
+                        .map(|a| a.host().to_string())
+                        .or_else(|| {
+                            request
+                                .headers()
+                                .get("host")
+                                .and_then(|v| v.to_str().ok())
+                                .map(String::from)
+                        });
 
-                    debug!("HTTP/3 request: {} {} from {}", method, path, remote_addr);
+                    debug!("HTTP/3 request: {} {} from {} (host: {:?})", method, path, remote_addr, host);
 
                     // Check for WebTransport CONNECT
                     if method == http::Method::CONNECT
@@ -316,13 +322,30 @@ impl QuicListener {
     where
         S: h3::quic::BidiStream<Bytes>,
     {
-        let path = request.uri().path();
-        let host = request.headers().get("host").and_then(|v| v.to_str().ok());
+        let uri = request.uri();
+        let path = uri.path();
+        // In HTTP/3, host comes from :authority pseudo-header (in URI) or fallback to host header
+        let host = uri
+            .authority()
+            .map(|a| a.host())
+            .or_else(|| {
+                request
+                    .headers()
+                    .get("host")
+                    .and_then(|v| v.to_str().ok())
+            });
+
+        info!("HTTP/3 request: {} {} host={:?} from {}", request.method(), path, host, remote_addr);
 
         // Find route
         let route = match config.find_route(host, path, false) {
-            Some(r) => r,
+            Some(r) => {
+                let route_name = r.name.as_deref().unwrap_or("unnamed");
+                info!("HTTP/3 route matched: {} -> backend {}", route_name, r.backend);
+                r
+            }
             None => {
+                warn!("HTTP/3 no route found for host={:?} path={}", host, path);
                 // Return 404
                 let response = http::Response::builder()
                     .status(http::StatusCode::NOT_FOUND)
@@ -370,6 +393,12 @@ impl QuicListener {
 
         // Build headers map
         let mut headers = route.add_headers.clone();
+
+        // Forward Host header to backend (required for virtual host routing)
+        if let Some(host_value) = host {
+            headers.insert("Host".to_string(), host_value.to_string());
+        }
+
         if route.forward_client_identity {
             let header_name = route
                 .client_identity_header
@@ -379,18 +408,37 @@ impl QuicListener {
         }
 
         // Proxy to backend
-        let response_body = backend_pool
-            .proxy_http(backend, request.method().as_str(), path, headers, &body)
+        let proxy_response = backend_pool
+            .proxy_http_full(backend, request.method().as_str(), path, headers, &body)
             .await?;
 
-        // Send response
-        let response = http::Response::builder()
-            .status(http::StatusCode::OK)
-            .header("content-type", "application/octet-stream")
-            .body(())?;
+        // Build HTTP/3 response with headers from backend
+        let mut response_builder = http::Response::builder()
+            .status(http::StatusCode::from_u16(proxy_response.status).unwrap_or(http::StatusCode::OK));
+
+        // Forward selected headers from backend
+        for (name, value) in &proxy_response.headers {
+            let lower_name = name.to_lowercase();
+            // Forward safe response headers
+            if matches!(
+                lower_name.as_str(),
+                "content-type"
+                    | "cache-control"
+                    | "etag"
+                    | "last-modified"
+                    | "content-language"
+                    | "content-encoding"
+                    | "vary"
+                    | "x-content-type-options"
+            ) {
+                response_builder = response_builder.header(name, value);
+            }
+        }
+
+        let response = response_builder.body(())?;
 
         stream.send_response(response).await?;
-        stream.send_data(Bytes::from(response_body)).await?;
+        stream.send_data(Bytes::from(proxy_response.body)).await?;
         stream.finish().await?;
 
         Ok(())
