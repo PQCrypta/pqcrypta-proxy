@@ -279,7 +279,8 @@ async fn handle_uni_stream(
     let max_size = config.security.max_request_size;
 
     let mut buffer = Vec::new();
-    let read_result = tokio::time::timeout(timeout_duration, recv_stream.read_to_end(&mut buffer)).await;
+    let read_result =
+        tokio::time::timeout(timeout_duration, recv_stream.read_to_end(&mut buffer)).await;
 
     match read_result {
         Ok(Ok(_bytes_read)) => {
@@ -338,7 +339,8 @@ async fn handle_bi_stream(
     let max_size = config.security.max_request_size;
 
     let mut buffer = Vec::new();
-    let read_result = tokio::time::timeout(timeout_duration, recv_stream.read_to_end(&mut buffer)).await;
+    let read_result =
+        tokio::time::timeout(timeout_duration, recv_stream.read_to_end(&mut buffer)).await;
 
     match read_result {
         Ok(Ok(_bytes_read)) => {
