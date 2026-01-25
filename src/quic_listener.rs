@@ -231,18 +231,18 @@ impl QuicListener {
                     let uri = request.uri().clone();
                     let path = uri.path().to_string();
                     // In HTTP/3, host comes from :authority pseudo-header (in URI) or fallback to host header
-                    let host = uri
-                        .authority()
-                        .map(|a| a.host().to_string())
-                        .or_else(|| {
-                            request
-                                .headers()
-                                .get("host")
-                                .and_then(|v| v.to_str().ok())
-                                .map(String::from)
-                        });
+                    let host = uri.authority().map(|a| a.host().to_string()).or_else(|| {
+                        request
+                            .headers()
+                            .get("host")
+                            .and_then(|v| v.to_str().ok())
+                            .map(String::from)
+                    });
 
-                    debug!("HTTP/3 request: {} {} from {} (host: {:?})", method, path, remote_addr, host);
+                    debug!(
+                        "HTTP/3 request: {} {} from {} (host: {:?})",
+                        method, path, remote_addr, host
+                    );
 
                     // Check for WebTransport CONNECT
                     if method == http::Method::CONNECT
@@ -328,20 +328,24 @@ impl QuicListener {
         let host = uri
             .authority()
             .map(|a| a.host())
-            .or_else(|| {
-                request
-                    .headers()
-                    .get("host")
-                    .and_then(|v| v.to_str().ok())
-            });
+            .or_else(|| request.headers().get("host").and_then(|v| v.to_str().ok()));
 
-        info!("HTTP/3 request: {} {} host={:?} from {}", request.method(), path, host, remote_addr);
+        info!(
+            "HTTP/3 request: {} {} host={:?} from {}",
+            request.method(),
+            path,
+            host,
+            remote_addr
+        );
 
         // Find route
         let route = match config.find_route(host, path, false) {
             Some(r) => {
                 let route_name = r.name.as_deref().unwrap_or("unnamed");
-                info!("HTTP/3 route matched: {} -> backend {}", route_name, r.backend);
+                info!(
+                    "HTTP/3 route matched: {} -> backend {}",
+                    route_name, r.backend
+                );
                 r
             }
             None => {
@@ -413,8 +417,9 @@ impl QuicListener {
             .await?;
 
         // Build HTTP/3 response with headers from backend
-        let mut response_builder = http::Response::builder()
-            .status(http::StatusCode::from_u16(proxy_response.status).unwrap_or(http::StatusCode::OK));
+        let mut response_builder = http::Response::builder().status(
+            http::StatusCode::from_u16(proxy_response.status).unwrap_or(http::StatusCode::OK),
+        );
 
         // Forward selected headers from backend
         for (name, value) in &proxy_response.headers {
