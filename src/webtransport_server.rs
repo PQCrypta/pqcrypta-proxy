@@ -274,8 +274,34 @@ async fn handle_uni_stream(
     config: Arc<ProxyConfig>,
     backend_pool: Arc<BackendPool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Apply timeout for request reading
+    let timeout_duration = Duration::from_secs(30);
+    let max_size = config.security.max_request_size;
+
     let mut buffer = Vec::new();
-    recv_stream.read_to_end(&mut buffer).await?;
+    let read_result = tokio::time::timeout(timeout_duration, recv_stream.read_to_end(&mut buffer)).await;
+
+    match read_result {
+        Ok(Ok(_bytes_read)) => {
+            if buffer.len() > max_size {
+                error!(
+                    "Request from {} exceeds max size ({} > {})",
+                    remote_addr,
+                    buffer.len(),
+                    max_size
+                );
+                return Err("Request too large".into());
+            }
+        }
+        Ok(Err(e)) => {
+            error!("Read error from {}: {}", remote_addr, e);
+            return Err(format!("Stream read error: {}", e).into());
+        }
+        Err(_) => {
+            error!("Request timeout from {}", remote_addr);
+            return Err("Request timeout".into());
+        }
+    }
 
     debug!(
         "📥 Unidirectional data from {} ({} bytes)",
@@ -307,8 +333,50 @@ async fn handle_bi_stream(
     config: Arc<ProxyConfig>,
     backend_pool: Arc<BackendPool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Apply timeout for request reading
+    let timeout_duration = Duration::from_secs(30);
+    let max_size = config.security.max_request_size;
+
     let mut buffer = Vec::new();
-    recv_stream.read_to_end(&mut buffer).await?;
+    let read_result = tokio::time::timeout(timeout_duration, recv_stream.read_to_end(&mut buffer)).await;
+
+    match read_result {
+        Ok(Ok(_bytes_read)) => {
+            if buffer.len() > max_size {
+                let error_response = json!({
+                    "success": false,
+                    "error": format!("Request exceeds max size of {} bytes", max_size),
+                    "timestamp": chrono::Utc::now().to_rfc3339()
+                });
+                let error_bytes = serde_json::to_vec(&error_response)?;
+                send_stream.write_all(&error_bytes).await?;
+                let _ = send_stream.finish().await;
+                return Err("Request too large".into());
+            }
+        }
+        Ok(Err(e)) => {
+            let error_response = json!({
+                "success": false,
+                "error": e.to_string(),
+                "timestamp": chrono::Utc::now().to_rfc3339()
+            });
+            let error_bytes = serde_json::to_vec(&error_response)?;
+            send_stream.write_all(&error_bytes).await?;
+            let _ = send_stream.finish().await;
+            return Err(format!("Stream read error: {}", e).into());
+        }
+        Err(_) => {
+            let error_response = json!({
+                "success": false,
+                "error": "Request timeout",
+                "timestamp": chrono::Utc::now().to_rfc3339()
+            });
+            let error_bytes = serde_json::to_vec(&error_response)?;
+            send_stream.write_all(&error_bytes).await?;
+            let _ = send_stream.finish().await;
+            return Err("Request timeout".into());
+        }
+    }
 
     debug!(
         "📥 Bidirectional request from {} ({} bytes)",
@@ -356,14 +424,41 @@ async fn handle_datagram(
     config: Arc<ProxyConfig>,
     backend_pool: Arc<BackendPool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Check datagram size limit (datagrams should be small, typically < 64KB)
+    let max_datagram_size = 65535; // Max UDP datagram size
+    if datagram.len() > max_datagram_size {
+        error!(
+            "Datagram from {} exceeds max size ({} > {})",
+            remote_addr,
+            datagram.len(),
+            max_datagram_size
+        );
+        let error_response = json!({
+            "success": false,
+            "error": "Datagram too large",
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        });
+        let error_bytes = serde_json::to_vec(&error_response)?;
+        connection.send_datagram(&error_bytes)?;
+        return Ok(());
+    }
+
     debug!(
         "📦 Processing datagram from {} ({} bytes)",
         remote_addr,
         datagram.len()
     );
 
-    match proxy_request(&datagram, &path, remote_addr, &config, &backend_pool).await {
-        Ok(response) => {
+    // Apply timeout for backend proxy call
+    let timeout_duration = Duration::from_secs(30);
+    let proxy_result = tokio::time::timeout(
+        timeout_duration,
+        proxy_request(&datagram, &path, remote_addr, &config, &backend_pool),
+    )
+    .await;
+
+    match proxy_result {
+        Ok(Ok(response)) => {
             debug!(
                 "📤 Sending datagram response to {} ({} bytes)",
                 remote_addr,
@@ -372,16 +467,23 @@ async fn handle_datagram(
             connection.send_datagram(&response)?;
             debug!("✅ Datagram response sent to {}", remote_addr);
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             error!("❌ Datagram processing failed for {}: {}", remote_addr, e);
-
-            // Send error response
             let error_response = json!({
                 "success": false,
                 "error": e.to_string(),
                 "timestamp": chrono::Utc::now().to_rfc3339()
             });
-
+            let error_bytes = serde_json::to_vec(&error_response)?;
+            connection.send_datagram(&error_bytes)?;
+        }
+        Err(_) => {
+            error!("❌ Datagram proxy timeout for {}", remote_addr);
+            let error_response = json!({
+                "success": false,
+                "error": "Backend timeout",
+                "timestamp": chrono::Utc::now().to_rfc3339()
+            });
             let error_bytes = serde_json::to_vec(&error_response)?;
             connection.send_datagram(&error_bytes)?;
         }
