@@ -62,7 +62,7 @@
 - **GeoIP Blocking**: Block by country/region using MaxMind GeoLite2 database
 - **Security Headers**: HSTS, X-Frame-Options, CSP, COEP, COOP, CORP, and more
 - **CORS Handling**: Full CORS support with preflight OPTIONS handling
-- **Server Branding**: Hide backend identity (Apache/nginx → "PQCProxy v0.1.0")
+- **Server Branding**: Hide backend identity (Apache/nginx → "PQCProxy v0.2.0")
 
 ### Load Balancing
 - **6 Load Balancing Algorithms**:
@@ -80,14 +80,17 @@
 - **Priority Failover**: Primary servers first, then failover to lower priority
 
 ### HTTP/3 Advanced Features
+- **Full HTTP/3 Support**: Native HTTP/3 via `h3` crate with proper header forwarding
 - **Early Hints (103)**: Preload CSS/JS resources via Link headers
 - **Priority Hints**: RFC 9218 Extensible Priorities for resource scheduling
 - **Request Coalescing**: Deduplicate identical GET/HEAD requests in flight
-- **Alt-Svc Advertisement**: Automatic HTTP/3 upgrade headers
+- **Alt-Svc Advertisement**: Automatic HTTP/3 upgrade headers on all ports
+- **Virtual Host Routing**: Proper `:authority` pseudo-header handling for backend routing
 
 ### Protocols
-- **QUIC/HTTP/3**: Full HTTP/3 support with QUIC transport
+- **QUIC/HTTP/3**: Full HTTP/3 support via QuicListener (h3 + quinn crates)
 - **WebTransport**: Native WebTransport session handling for bidirectional streaming
+- **Unified UDP Listener**: Single QuicListener handles both HTTP/3 and WebTransport
 - **X-Forwarded Headers**: X-Real-IP, X-Forwarded-For, X-Forwarded-Proto
 
 ### Operations
@@ -463,7 +466,7 @@ Environment variables: `PQCRYPTA_CONFIG`, `PQCRYPTA_UDP_PORT`, `PQCRYPTA_ADMIN_P
 
 ```
                     ┌──────────────────────────────────────────────────────────┐
-                    │                         PQCProxy v0.1.0                   │
+                    │                         PQCProxy v0.2.0                   │
                     │                                                          │
   Client ──────────►│  Port 80  ─► HTTP Redirect Server ─► HTTPS (301/308)    │
   (Browser/App)     │                                                          │
