@@ -23,6 +23,17 @@ use tracing::{debug, warn};
 
 use crate::config::{BackendConfig, BackendType, ProxyConfig};
 
+/// Response from backend proxy
+#[derive(Debug)]
+pub struct ProxyResponse {
+    /// HTTP status code
+    pub status: u16,
+    /// Response headers
+    pub headers: HashMap<String, String>,
+    /// Response body
+    pub body: Vec<u8>,
+}
+
 /// Backend connection pool manager
 pub struct BackendPool {
     /// HTTP client for HTTP/1.1 and HTTP/2 backends
@@ -140,6 +151,82 @@ impl BackendPool {
         debug!("Received {} bytes from HTTP backend", body_bytes.len());
 
         Ok(body_bytes.to_vec())
+    }
+
+    /// Proxy request to HTTP backend and return full response including headers
+    pub async fn proxy_http_full(
+        &self,
+        backend: &BackendConfig,
+        method: &str,
+        path: &str,
+        headers: HashMap<String, String>,
+        body: &[u8],
+    ) -> anyhow::Result<ProxyResponse> {
+        // Acquire connection permit
+        let _permit = self.acquire_permit(&backend.name).await?;
+
+        // Build URI
+        let uri = if backend.tls {
+            format!("https://{}{}", backend.address, path)
+        } else {
+            format!("http://{}{}", backend.address, path)
+        };
+
+        debug!("Proxying to HTTP backend (full): {} {}", method, uri);
+
+        // Build request
+        let method = method.parse::<Method>()?;
+        let mut request_builder = Request::builder().method(method).uri(&uri);
+
+        // Add headers
+        for (key, value) in &headers {
+            request_builder = request_builder.header(key, value);
+        }
+
+        // Add content-type if not specified
+        if !headers.contains_key("content-type") && !headers.contains_key("Content-Type") {
+            request_builder = request_builder.header("Content-Type", "application/octet-stream");
+        }
+
+        let request = request_builder
+            .body(Full::new(Bytes::copy_from_slice(body)))
+            .map_err(|e| anyhow::anyhow!("Failed to build request: {}", e))?;
+
+        // Send request with timeout
+        let timeout = Duration::from_millis(backend.timeout_ms);
+        let response = tokio::time::timeout(timeout, self.http_client.request(request))
+            .await
+            .map_err(|_| anyhow::anyhow!("Backend request timeout"))?
+            .map_err(|e| anyhow::anyhow!("Backend request failed: {}", e))?;
+
+        // Extract status and headers
+        let status = response.status().as_u16();
+        let mut response_headers = HashMap::new();
+        for (name, value) in response.headers() {
+            if let Ok(v) = value.to_str() {
+                response_headers.insert(name.to_string(), v.to_string());
+            }
+        }
+
+        // Read response body
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read response body: {}", e))?
+            .to_bytes();
+
+        debug!(
+            "Received {} bytes from HTTP backend (status {})",
+            body_bytes.len(),
+            status
+        );
+
+        Ok(ProxyResponse {
+            status,
+            headers: response_headers,
+            body: body_bytes.to_vec(),
+        })
     }
 
     /// Proxy request to Unix socket backend (e.g., PHP-FPM)

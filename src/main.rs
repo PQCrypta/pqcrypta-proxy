@@ -80,8 +80,8 @@ use pqcrypta_proxy::pqc_tls::PqcTlsProvider;
 use pqcrypta_proxy::proxy::BackendPool;
 #[cfg(feature = "pqc")]
 use pqcrypta_proxy::run_http_listener_pqc;
+use pqcrypta_proxy::quic_listener::QuicListener;
 use pqcrypta_proxy::tls::TlsProvider;
-use pqcrypta_proxy::webtransport_server::WebTransportServer;
 use pqcrypta_proxy::{run_http_listener, run_http_redirect_server, run_tls_passthrough_server};
 
 /// PQCrypta Proxy - QUIC/HTTP3/WebTransport Proxy with PQC TLS
@@ -454,31 +454,50 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Start WebTransport servers (UDP) on all ports
-    for port in all_ports.clone() {
-        let bind_addr: std::net::SocketAddr =
-            format!("{}:{}", config.server.bind_address, port).parse()?;
+    // Start QUIC/HTTP3/WebTransport servers (UDP) on all ports
+    // QuicListener handles both standard HTTP/3 requests and WebTransport sessions
+    let mut quic_shutdown_senders: Vec<mpsc::Sender<()>> = Vec::new();
 
-        let wt_cert = cert_path.clone();
-        let wt_key = key_path.clone();
-        let wt_config = config.clone();
-        let wt_backend_pool = backend_pool.clone();
+    for port in all_ports.clone() {
+        // Create config with the specific port for this listener
+        let mut quic_config = (*config).clone();
+        quic_config.server.udp_port = port;
+        let quic_config = Arc::new(quic_config);
+        let quic_tls_provider = tls_provider.clone();
+
+        // Create channels for graceful shutdown
+        let (quic_shutdown_tx, quic_shutdown_rx) = mpsc::channel::<()>(1);
+        let (_reload_tx, reload_rx) = mpsc::channel(1);
+
+        // Store shutdown sender to keep it alive
+        quic_shutdown_senders.push(quic_shutdown_tx);
 
         tokio::spawn(async move {
-            match WebTransportServer::new(bind_addr, &wt_cert, &wt_key, wt_config, wt_backend_pool)
-                .await
+            match QuicListener::new(
+                quic_config.clone(),
+                quic_tls_provider,
+                quic_shutdown_rx,
+                reload_rx,
+            )
+            .await
             {
-                Ok(server) => {
-                    let addr = server.local_addr();
-                    info!("📡 WebTransport server started on {} (UDP)", addr);
-                    if let Err(e) = server.run().await {
-                        error!("WebTransport server error on {}: {}", addr, e);
+                Ok(listener) => {
+                    let addr = match listener.local_addr() {
+                        Ok(a) => a,
+                        Err(e) => {
+                            error!("Failed to get QUIC listener address: {}", e);
+                            return;
+                        }
+                    };
+                    info!("📡 QUIC/HTTP3/WebTransport server started on {} (UDP)", addr);
+                    if let Err(e) = listener.run().await {
+                        error!("QUIC/HTTP3 listener error on {}: {}", addr, e);
                     }
                 }
                 Err(e) => {
                     error!(
-                        "Failed to create WebTransport server on {}: {}",
-                        bind_addr, e
+                        "Failed to create QUIC/HTTP3 listener on port {}: {}",
+                        port, e
                     );
                 }
             }
@@ -508,7 +527,7 @@ async fn main() -> anyhow::Result<()> {
         } else {
             info!("  HTTPS (TCP):     0.0.0.0:{}", port);
         }
-        info!("  WebTransport:    0.0.0.0:{} (UDP)", port);
+        info!("  QUIC/HTTP3:      0.0.0.0:{} (UDP)", port);
     }
     info!("  Alt-Svc:         {}", alt_svc_parts.join(", "));
     info!("═══════════════════════════════════════════════════════════════");
@@ -537,8 +556,13 @@ async fn main() -> anyhow::Result<()> {
     // Stop config watching
     config_manager.stop_watching();
 
-    // Send shutdown signal
+    // Send shutdown signal to admin server
     let _ = shutdown_tx.send(()).await;
+
+    // Send shutdown signals to QUIC listeners
+    for quic_shutdown_tx in quic_shutdown_senders {
+        let _ = quic_shutdown_tx.send(()).await;
+    }
 
     // Wait for admin server to stop
     if let Err(e) = admin_handle.await {

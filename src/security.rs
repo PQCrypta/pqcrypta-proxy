@@ -39,6 +39,29 @@ const MAX_TRACKED_IPS: usize = 100_000;
 /// Maximum number of tracked JA3 fingerprints
 const MAX_JA3_FINGERPRINTS: usize = 50_000;
 
+/// Check if an IP is a trusted/local IP that should bypass security checks
+/// This prevents the server from blocking itself
+fn is_trusted_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            // Localhost
+            v4.is_loopback() ||
+            // Private ranges - typically internal infrastructure
+            v4.is_private() ||
+            // Link-local (169.254.x.x)
+            v4.is_link_local() ||
+            // Server's own public IP (pqcrypta.com)
+            v4.octets() == [66, 179, 95, 51]
+        }
+        IpAddr::V6(v6) => {
+            // Localhost
+            v6.is_loopback() ||
+            // IPv4-mapped localhost
+            v6.to_ipv4_mapped().map(|v4| v4.is_loopback()).unwrap_or(false)
+        }
+    }
+}
+
 /// Add Alt-Svc header to a response for HTTP/3 advertisement
 fn add_alt_svc(response: &mut Response) {
     if let Ok(value) = HeaderValue::from_str(ALT_SVC_HEADER) {
@@ -337,6 +360,15 @@ impl SecurityState {
 
     /// Block an IP address
     pub fn block_ip(&self, ip: IpAddr, reason: BlockReason, duration: Option<Duration>) {
+        // Never block trusted IPs (localhost, private, server IP)
+        if is_trusted_ip(&ip) {
+            debug!(
+                "Skipping block for trusted IP {} (reason: {:?})",
+                ip, reason
+            );
+            return;
+        }
+
         let expires_at = duration.map(|d| Instant::now() + d);
 
         let block_count = self
@@ -384,6 +416,11 @@ impl SecurityState {
 
     /// Record a request for adaptive rate limiting
     pub fn record_request(&self, ip: IpAddr, status: StatusCode) {
+        // Skip tracking for trusted IPs
+        if is_trusted_ip(&ip) {
+            return;
+        }
+
         // Read config values
         let config = self.config.read();
         let window_duration = Duration::from_secs(config.error_window_secs);
@@ -608,6 +645,14 @@ pub async fn security_middleware(
     next: Next,
 ) -> Response {
     let ip = client_addr.ip();
+
+    // Fast path: skip all security checks for trusted IPs (localhost, private, server IP)
+    // This prevents the server from blocking itself or internal services
+    if is_trusted_ip(&ip) {
+        debug!("Trusted IP {} - bypassing security checks", ip);
+        return next.run(request).await;
+    }
+
     // Read config values without cloning the entire struct - just read what we need
     let (
         dos_protection,
