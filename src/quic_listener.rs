@@ -24,6 +24,17 @@ use crate::handlers::WebTransportHandler;
 use crate::proxy::BackendPool;
 use crate::tls::TlsProvider;
 
+/// Build Alt-Svc header value from config ports
+fn build_alt_svc_header(config: &ProxyConfig) -> String {
+    let mut ports = vec![config.server.udp_port];
+    ports.extend(&config.server.additional_ports);
+    ports
+        .iter()
+        .map(|p| format!("h3=\":{}\"; ma=86400", p))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// QUIC/HTTP3/WebTransport listener
 pub struct QuicListener {
     /// QUIC endpoint
@@ -361,6 +372,7 @@ impl QuicListener {
                     )
                     .header("access-control-allow-credentials", "true")
                     .header("access-control-max-age", "86400")
+                    .header("alt-svc", build_alt_svc_header(&config))
                     .body(())?;
 
                 stream.send_response(response).await?;
@@ -476,6 +488,9 @@ impl QuicListener {
                 response_builder = response_builder.header(name, value);
             }
         }
+
+        // Add Alt-Svc header to advertise HTTP/3 support
+        response_builder = response_builder.header("alt-svc", build_alt_svc_header(&config));
 
         let response = response_builder.body(())?;
 
