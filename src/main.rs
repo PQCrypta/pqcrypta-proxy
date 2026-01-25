@@ -78,9 +78,9 @@ use pqcrypta_proxy::metrics;
 use pqcrypta_proxy::ocsp;
 use pqcrypta_proxy::pqc_tls::PqcTlsProvider;
 use pqcrypta_proxy::proxy::BackendPool;
+use pqcrypta_proxy::quic_listener::QuicListener;
 #[cfg(feature = "pqc")]
 use pqcrypta_proxy::run_http_listener_pqc;
-use pqcrypta_proxy::quic_listener::QuicListener;
 use pqcrypta_proxy::tls::TlsProvider;
 use pqcrypta_proxy::{run_http_listener, run_http_redirect_server, run_tls_passthrough_server};
 
@@ -489,7 +489,10 @@ async fn main() -> anyhow::Result<()> {
                             return;
                         }
                     };
-                    info!("📡 QUIC/HTTP3/WebTransport server started on {} (UDP)", addr);
+                    info!(
+                        "📡 QUIC/HTTP3/WebTransport server started on {} (UDP)",
+                        addr
+                    );
                     if let Err(e) = listener.run().await {
                         error!("QUIC/HTTP3 listener error on {}: {}", addr, e);
                     }
