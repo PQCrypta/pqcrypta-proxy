@@ -159,12 +159,13 @@ tokio-rustls = "0.26"
 # Windows service (optional)
 windows-service-rs = { version = "0.7", package = "windows-service", optional = true }
 
+# Temporary files (cross-platform)
+tempfile = "3.14"
+
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "user"] }
 # Unix socket support for PHP-FPM backends (not available on Windows)
 hyperlocal = "0.9"
-# Temporary files
-tempfile = "3.14"
 # Signal handling (uses Unix-specific signal iterators)
 signal-hook = "0.3"
 signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
