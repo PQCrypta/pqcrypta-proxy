@@ -1045,10 +1045,12 @@ async fn proxy_handler(
     let path = uri.path().to_string();
     let method_str = method.to_string();
     let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
-    let user_agent = headers.get(header::USER_AGENT)
+    let user_agent = headers
+        .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .map(String::from);
-    let referer = headers.get(header::REFERER)
+    let referer = headers
+        .get(header::REFERER)
         .and_then(|v| v.to_str().ok())
         .map(String::from);
     let host_str = host.clone();
@@ -1108,7 +1110,7 @@ async fn proxy_handler(
                             .get(h)
                             .and_then(|v| v.to_str().ok().map(String::from))
                     }),
-                    path: path.to_string(),
+                    path: path.clone(),
                     host: host.clone(),
                 };
 

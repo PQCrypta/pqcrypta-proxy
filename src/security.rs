@@ -1152,20 +1152,21 @@ mod tests {
         let config = ProxyConfig::default();
         let security = SecurityState::new(&config);
 
-        let ip: IpAddr = "192.168.1.1".parse().unwrap();
+        // Use a public IP (not private/trusted) so it can actually be blocked
+        let ip: IpAddr = "8.8.8.8".parse().unwrap();
 
-        // Block for 100ms
+        // Block for 200ms (increased for CI reliability)
         security.block_ip(
             ip,
             BlockReason::RateLimitExceeded,
-            Some(Duration::from_millis(100)),
+            Some(Duration::from_millis(200)),
         );
 
         // Should be blocked
         assert!(security.is_blocked(&ip).is_some());
 
-        // Wait for expiration
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Wait for expiration (increased margin for CI reliability)
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Should no longer be blocked
         assert!(security.is_blocked(&ip).is_none());
