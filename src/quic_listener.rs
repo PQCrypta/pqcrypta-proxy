@@ -520,7 +520,7 @@ impl QuicListener {
 
         // Forward Host header to backend (required for virtual host routing)
         if let Some(ref host_value) = host {
-            headers.insert("Host".to_string(), host_value.to_string());
+            headers.insert("Host".to_string(), host_value.clone());
         }
 
         // Forward X-Forwarded headers
