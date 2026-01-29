@@ -8,7 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tracing::{debug, error, info};
 
 /// Access log entry with request and response details
@@ -146,19 +146,17 @@ impl Clone for AccessLogger {
     }
 }
 
-/// Global access logger instance
-static mut ACCESS_LOGGER: Option<AccessLogger> = None;
+/// Global access logger instance using OnceLock for thread-safe initialization
+static ACCESS_LOGGER: OnceLock<AccessLogger> = OnceLock::new();
 
 /// Initialize the global access logger
 pub fn init_access_logger(enabled: bool, path: Option<PathBuf>) {
-    unsafe {
-        ACCESS_LOGGER = Some(AccessLogger::new(enabled, path));
-    }
+    let _ = ACCESS_LOGGER.set(AccessLogger::new(enabled, path));
 }
 
 /// Get the global access logger
 pub fn get_access_logger() -> Option<&'static AccessLogger> {
-    unsafe { ACCESS_LOGGER.as_ref() }
+    ACCESS_LOGGER.get()
 }
 
 /// Log an access entry using the global logger

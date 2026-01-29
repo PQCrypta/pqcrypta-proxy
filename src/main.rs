@@ -184,7 +184,10 @@ async fn main() -> anyhow::Result<()> {
         config.logging.access_log_file.clone(),
     );
     if config.logging.access_log {
-        info!("Access logging enabled: {:?}", config.logging.access_log_file);
+        info!(
+            "Access logging enabled: {:?}",
+            config.logging.access_log_file
+        );
     }
 
     // =========================================================================

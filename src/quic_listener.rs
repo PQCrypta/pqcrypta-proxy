@@ -352,19 +352,27 @@ impl QuicListener {
         let path_with_query = format!("{}{}", path, query);
         let method = request.method().to_string();
         // In HTTP/3, host comes from :authority pseudo-header (in URI) or fallback to host header
-        let host = uri
-            .authority()
-            .map(|a| a.host().to_string())
-            .or_else(|| request.headers().get("host").and_then(|v| v.to_str().ok()).map(|s| s.to_string()));
-        let user_agent = request.headers().get("user-agent").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
-        let referer = request.headers().get("referer").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+        let host = uri.authority().map(|a| a.host().to_string()).or_else(|| {
+            request
+                .headers()
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        });
+        let user_agent = request
+            .headers()
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let referer = request
+            .headers()
+            .get("referer")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
 
         info!(
             "HTTP/3 request: {} {} host={:?} from {}",
-            method,
-            path,
-            host,
-            remote_addr
+            method, path, host, remote_addr
         );
 
         // Find route first so we can use per-route CORS config
@@ -412,7 +420,8 @@ impl QuicListener {
 
                 // Access-Control-Allow-Origin
                 if let Some(ref origin) = cors.allow_origin {
-                    response_builder = response_builder.header("access-control-allow-origin", origin);
+                    response_builder =
+                        response_builder.header("access-control-allow-origin", origin);
                 }
 
                 // Access-Control-Allow-Methods
@@ -437,10 +446,8 @@ impl QuicListener {
 
                 // Access-Control-Max-Age
                 if cors.max_age > 0 {
-                    response_builder = response_builder.header(
-                        "access-control-max-age",
-                        cors.max_age.to_string(),
-                    );
+                    response_builder =
+                        response_builder.header("access-control-max-age", cors.max_age.to_string());
                 }
 
                 let response = response_builder.body(())?;
@@ -531,7 +538,13 @@ impl QuicListener {
 
         // Proxy to backend (include query string in path)
         let proxy_response = backend_pool
-            .proxy_http_full(backend, request.method().as_str(), &path_with_query, headers, &body)
+            .proxy_http_full(
+                backend,
+                request.method().as_str(),
+                &path_with_query,
+                headers,
+                &body,
+            )
             .await?;
 
         // Build HTTP/3 response with headers from backend
