@@ -348,6 +348,8 @@ impl QuicListener {
         let start_time = std::time::Instant::now();
         let uri = request.uri();
         let path = uri.path().to_string();
+        let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
+        let path_with_query = format!("{}{}", path, query);
         let method = request.method().to_string();
         // In HTTP/3, host comes from :authority pseudo-header (in URI) or fallback to host header
         let host = uri
@@ -527,9 +529,9 @@ impl QuicListener {
             headers.insert(header_name.to_string(), remote_addr.ip().to_string());
         }
 
-        // Proxy to backend
+        // Proxy to backend (include query string in path)
         let proxy_response = backend_pool
-            .proxy_http_full(backend, request.method().as_str(), &path, headers, &body)
+            .proxy_http_full(backend, request.method().as_str(), &path_with_query, headers, &body)
             .await?;
 
         // Build HTTP/3 response with headers from backend
