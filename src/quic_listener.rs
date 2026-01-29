@@ -14,12 +14,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
+use h3::ext::Protocol;
 use h3_quinn::Connection as H3Connection;
 use quinn::{Endpoint, ServerConfig as QuinnServerConfig, TransportConfig};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{ConfigReloadEvent, ProxyConfig};
+use crate::config::{ConfigReloadEvent, CorsConfig, ProxyConfig};
 use crate::handlers::WebTransportHandler;
 use crate::proxy::BackendPool;
 use crate::tls::TlsProvider;
@@ -250,23 +251,32 @@ impl QuicListener {
                             .map(String::from)
                     });
 
+                    // Check for protocol extension (RFC 9220 Extended CONNECT)
+                    // In h3 crate, the :protocol pseudo-header is accessed via extensions
+                    let protocol_ext = request.extensions().get::<Protocol>();
                     debug!(
-                        "HTTP/3 request: {} {} from {} (host: {:?})",
-                        method, path, remote_addr, host
+                        "HTTP/3 request: {} {} from {} (host: {:?}, :protocol: {:?})",
+                        method, path, remote_addr, host, protocol_ext
                     );
 
-                    // Check for WebTransport CONNECT
-                    if method == http::Method::CONNECT
-                        && request
-                            .headers()
-                            .get(":protocol")
-                            .map(|v| v == "webtransport")
-                            .unwrap_or(false)
-                    {
+                    // Check for WebTransport CONNECT (RFC 9220)
+                    // WebTransport uses Extended CONNECT with :protocol = webtransport
+                    let is_webtransport = method == http::Method::CONNECT
+                        && protocol_ext
+                            .map(|p| p == &Protocol::WEB_TRANSPORT)
+                            .unwrap_or(false);
+
+                    if is_webtransport {
                         info!(
                             "WebTransport CONNECT request for {} from {} (host: {:?})",
                             path, remote_addr, host
                         );
+
+                        // Send 200 OK to accept the WebTransport session
+                        let response = http::Response::builder()
+                            .status(http::StatusCode::OK)
+                            .header("sec-webtransport-http3-draft", "draft02")
+                            .body(())?;
 
                         // Handle WebTransport session
                         let handler = WebTransportHandler::new(
@@ -275,19 +285,20 @@ impl QuicListener {
                             remote_addr,
                         );
 
-                        // Accept WebTransport session and handle streams/datagrams
                         tokio::spawn(async move {
                             debug!(
                                 "WebTransport session started for {} on path {}",
                                 remote_addr, path
                             );
-                            // Use the handler to process the WebTransport session
-                            // The actual stream handling is done by the dedicated WebTransport server
-                            // This QuicListener handles the HTTP/3 layer
                             if let Err(e) = handler.handle_session().await {
                                 error!("WebTransport session error for {}: {}", remote_addr, e);
                             }
                         });
+
+                        // Respond on the stream
+                        let mut stream = stream;
+                        stream.send_response(response).await.ok();
+                        stream.finish().await.ok();
                     } else {
                         // Regular HTTP/3 request
                         let config_clone = config.clone();
@@ -349,39 +360,7 @@ impl QuicListener {
             remote_addr
         );
 
-        // Handle CORS preflight OPTIONS requests directly
-        if request.method() == http::Method::OPTIONS {
-            let origin = request
-                .headers()
-                .get("origin")
-                .and_then(|v| v.to_str().ok());
-
-            if origin.is_some() {
-                // This is a CORS preflight request - respond with CORS headers
-                let origin_value = origin.unwrap_or("*");
-                let response = http::Response::builder()
-                    .status(http::StatusCode::OK)
-                    .header("access-control-allow-origin", origin_value)
-                    .header(
-                        "access-control-allow-methods",
-                        "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-                    )
-                    .header(
-                        "access-control-allow-headers",
-                        "Content-Type, Authorization, X-Requested-With, X-API-Key, X-Forwarded-For, X-Verification-Version, X-Analysis-Type, Cache-Control, signature-agent, signature-input, signature",
-                    )
-                    .header("access-control-allow-credentials", "true")
-                    .header("access-control-max-age", "86400")
-                    .header("alt-svc", build_alt_svc_header(&config))
-                    .body(())?;
-
-                stream.send_response(response).await?;
-                stream.finish().await?;
-                return Ok(());
-            }
-        }
-
-        // Find route
+        // Find route first so we can use per-route CORS config
         let route = match config.find_route(host, path, false) {
             Some(r) => {
                 let route_name = r.name.as_deref().unwrap_or("unnamed");
@@ -403,6 +382,54 @@ impl QuicListener {
                 return Ok(());
             }
         };
+
+        // Handle CORS preflight OPTIONS requests using route.cors
+        if request.method() == http::Method::OPTIONS {
+            if let Some(ref cors) = route.cors {
+                let mut response_builder = http::Response::builder()
+                    .status(http::StatusCode::OK)
+                    .header("alt-svc", build_alt_svc_header(&config));
+
+                // Access-Control-Allow-Origin
+                if let Some(ref origin) = cors.allow_origin {
+                    response_builder = response_builder.header("access-control-allow-origin", origin);
+                }
+
+                // Access-Control-Allow-Methods
+                if !cors.allow_methods.is_empty() {
+                    let methods = cors.allow_methods.join(", ");
+                    response_builder =
+                        response_builder.header("access-control-allow-methods", methods);
+                }
+
+                // Access-Control-Allow-Headers
+                if !cors.allow_headers.is_empty() {
+                    let hdrs = cors.allow_headers.join(", ");
+                    response_builder =
+                        response_builder.header("access-control-allow-headers", hdrs);
+                }
+
+                // Access-Control-Allow-Credentials
+                if cors.allow_credentials {
+                    response_builder =
+                        response_builder.header("access-control-allow-credentials", "true");
+                }
+
+                // Access-Control-Max-Age
+                if cors.max_age > 0 {
+                    response_builder = response_builder.header(
+                        "access-control-max-age",
+                        cors.max_age.to_string(),
+                    );
+                }
+
+                let response = response_builder.body(())?;
+                stream.send_response(response).await?;
+                stream.finish().await?;
+                return Ok(());
+            }
+            // If no CORS config, fall through to normal handling / backend
+        }
 
         let backend = match config.get_backend(&route.backend) {
             Some(b) => b,
@@ -438,13 +465,41 @@ impl QuicListener {
             }
         }
 
-        // Build headers map
+        // Build headers map - start with route-specific headers
         let mut headers = route.add_headers.clone();
+
+        // Forward original request headers (excluding hop-by-hop headers)
+        for (name, value) in request.headers().iter() {
+            let name_lower = name.as_str().to_lowercase();
+            // Skip hop-by-hop headers and pseudo-headers
+            if !matches!(
+                name_lower.as_str(),
+                "host"
+                    | "connection"
+                    | "transfer-encoding"
+                    | "upgrade"
+                    | "keep-alive"
+                    | "proxy-authenticate"
+                    | "proxy-authorization"
+                    | "te"
+                    | "trailer"
+            ) && !name_lower.starts_with(':')
+            {
+                if let Ok(value_str) = value.to_str() {
+                    headers.insert(name.as_str().to_string(), value_str.to_string());
+                }
+            }
+        }
 
         // Forward Host header to backend (required for virtual host routing)
         if let Some(host_value) = host {
             headers.insert("Host".to_string(), host_value.to_string());
         }
+
+        // Forward X-Forwarded headers
+        headers.insert("X-Forwarded-Proto".to_string(), "https".to_string());
+        headers.insert("X-Forwarded-For".to_string(), remote_addr.ip().to_string());
+        headers.insert("X-Real-IP".to_string(), remote_addr.ip().to_string());
 
         if route.forward_client_identity {
             let header_name = route
@@ -464,10 +519,9 @@ impl QuicListener {
             http::StatusCode::from_u16(proxy_response.status).unwrap_or(http::StatusCode::OK),
         );
 
-        // Forward selected headers from backend
+        // Forward selected headers from backend (including CORS if backend sets them)
         for (name, value) in &proxy_response.headers {
             let lower_name = name.to_lowercase();
-            // Forward safe response headers including CORS
             if matches!(
                 lower_name.as_str(),
                 "content-type"
@@ -491,6 +545,11 @@ impl QuicListener {
 
         // Add Alt-Svc header to advertise HTTP/3 support
         response_builder = response_builder.header("alt-svc", build_alt_svc_header(&config));
+
+        // Add CORS headers from route.cors (proxy-level CORS) if configured
+        if let Some(ref cors) = route.cors {
+            response_builder = add_cors_headers_to_builder(response_builder, cors);
+        }
 
         let response = response_builder.body(())?;
 
@@ -600,4 +659,39 @@ impl QuicListener {
     pub fn local_addr(&self) -> anyhow::Result<SocketAddr> {
         Ok(self.endpoint.local_addr()?)
     }
+}
+
+/// Add CORS headers to an http::Response::builder from CorsConfig
+fn add_cors_headers_to_builder(
+    mut builder: http::response::Builder,
+    cors: &CorsConfig,
+) -> http::response::Builder {
+    // Access-Control-Allow-Origin
+    if let Some(ref origin) = cors.allow_origin {
+        builder = builder.header("access-control-allow-origin", origin);
+    }
+
+    // Access-Control-Allow-Methods
+    if !cors.allow_methods.is_empty() {
+        let methods = cors.allow_methods.join(", ");
+        builder = builder.header("access-control-allow-methods", methods);
+    }
+
+    // Access-Control-Allow-Headers
+    if !cors.allow_headers.is_empty() {
+        let hdrs = cors.allow_headers.join(", ");
+        builder = builder.header("access-control-allow-headers", hdrs);
+    }
+
+    // Access-Control-Allow-Credentials
+    if cors.allow_credentials {
+        builder = builder.header("access-control-allow-credentials", "true");
+    }
+
+    // Access-Control-Max-Age
+    if cors.max_age > 0 {
+        builder = builder.header("access-control-max-age", cors.max_age.to_string());
+    }
+
+    builder
 }
