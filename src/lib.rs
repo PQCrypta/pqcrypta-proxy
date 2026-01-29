@@ -63,6 +63,7 @@
 //! - Provides hot-reload of configuration and TLS certificates
 //! - Exposes admin API for health, metrics, and management
 
+pub mod access_logger;
 pub mod acme;
 pub mod admin;
 pub mod compression;
@@ -85,6 +86,7 @@ pub mod tls_acceptor;
 pub mod webtransport_server;
 
 // Re-export commonly used types
+pub use access_logger::{init_access_logger, log_access, AccessLogEntry, AccessLogger};
 pub use compression::{compression_middleware, CompressionConfig, CompressionState};
 pub use config::{ConfigManager, ProxyConfig};
 pub use fingerprint::{FingerprintExtractor, FingerprintResult, FingerprintStats, Ja3Fingerprint};

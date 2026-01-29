@@ -177,6 +177,17 @@ async fn main() -> anyhow::Result<()> {
     let config = Arc::new(config);
 
     // =========================================================================
+    // Initialize Access Logger
+    // =========================================================================
+    pqcrypta_proxy::init_access_logger(
+        config.logging.access_log,
+        config.logging.access_log_file.clone(),
+    );
+    if config.logging.access_log {
+        info!("Access logging enabled: {:?}", config.logging.access_log_file);
+    }
+
+    // =========================================================================
     // Security Checks (Key Permissions, Provider Verification)
     // =========================================================================
     perform_security_checks(&config).await?;
