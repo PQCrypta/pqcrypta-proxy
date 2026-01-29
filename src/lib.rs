@@ -1,4 +1,8 @@
 // Crate-level lint configuration for pedantic lints
+#![deny(dead_code)]
+#![deny(unused_variables)]
+#![deny(unused_imports)]
+#![deny(unused_mut)]
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_panics_doc)]
