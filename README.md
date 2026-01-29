@@ -62,7 +62,7 @@
 - **GeoIP Blocking**: Block by country/region using MaxMind GeoLite2 database
 - **Security Headers**: HSTS, X-Frame-Options, CSP, COEP, COOP, CORP, and more
 - **CORS Handling**: Full CORS support with preflight OPTIONS handling
-- **Server Branding**: Hide backend identity (Apache/nginx → "PQCProxy v0.2.0")
+- **Server Branding**: Hide backend identity (Apache/nginx → "PQCProxy v0.2.1")
 
 ### Load Balancing
 - **6 Load Balancing Algorithms**:
@@ -466,7 +466,7 @@ Environment variables: `PQCRYPTA_CONFIG`, `PQCRYPTA_UDP_PORT`, `PQCRYPTA_ADMIN_P
 
 ```
                     ┌──────────────────────────────────────────────────────────┐
-                    │                         PQCProxy v0.2.0                   │
+                    │                         PQCProxy v0.2.1                   │
                     │                                                          │
   Client ──────────►│  Port 80  ─► HTTP Redirect Server ─► HTTPS (301/308)    │
   (Browser/App)     │                                                          │
