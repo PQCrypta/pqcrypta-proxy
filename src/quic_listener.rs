@@ -20,6 +20,7 @@ use quinn::{Endpoint, ServerConfig as QuinnServerConfig, TransportConfig};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use crate::access_logger::{log_access, AccessLogEntry};
 use crate::config::{ConfigReloadEvent, CorsConfig, ProxyConfig};
 use crate::handlers::WebTransportHandler;
 use crate::proxy::BackendPool;
@@ -344,24 +345,28 @@ impl QuicListener {
     where
         S: h3::quic::BidiStream<Bytes>,
     {
+        let start_time = std::time::Instant::now();
         let uri = request.uri();
-        let path = uri.path();
+        let path = uri.path().to_string();
+        let method = request.method().to_string();
         // In HTTP/3, host comes from :authority pseudo-header (in URI) or fallback to host header
         let host = uri
             .authority()
-            .map(|a| a.host())
-            .or_else(|| request.headers().get("host").and_then(|v| v.to_str().ok()));
+            .map(|a| a.host().to_string())
+            .or_else(|| request.headers().get("host").and_then(|v| v.to_str().ok()).map(|s| s.to_string()));
+        let user_agent = request.headers().get("user-agent").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+        let referer = request.headers().get("referer").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
 
         info!(
             "HTTP/3 request: {} {} host={:?} from {}",
-            request.method(),
+            method,
             path,
             host,
             remote_addr
         );
 
         // Find route first so we can use per-route CORS config
-        let route = match config.find_route(host, path, false) {
+        let route = match config.find_route(host.as_deref(), &path, false) {
             Some(r) => {
                 let route_name = r.name.as_deref().unwrap_or("unnamed");
                 info!(
@@ -372,6 +377,19 @@ impl QuicListener {
             }
             None => {
                 warn!("HTTP/3 no route found for host={:?} path={}", host, path);
+                // Log 404 response
+                log_access(&AccessLogEntry {
+                    remote_addr,
+                    method: method.clone(),
+                    path: path.clone(),
+                    protocol: "HTTP/3".to_string(),
+                    status: 404,
+                    body_size: 0,
+                    referer: referer.clone(),
+                    user_agent: user_agent.clone(),
+                    host: host.clone(),
+                    response_time_ms: start_time.elapsed().as_millis() as u64,
+                });
                 // Return 404
                 let response = http::Response::builder()
                     .status(http::StatusCode::NOT_FOUND)
@@ -492,7 +510,7 @@ impl QuicListener {
         }
 
         // Forward Host header to backend (required for virtual host routing)
-        if let Some(host_value) = host {
+        if let Some(ref host_value) = host {
             headers.insert("Host".to_string(), host_value.to_string());
         }
 
@@ -511,7 +529,7 @@ impl QuicListener {
 
         // Proxy to backend
         let proxy_response = backend_pool
-            .proxy_http_full(backend, request.method().as_str(), path, headers, &body)
+            .proxy_http_full(backend, request.method().as_str(), &path, headers, &body)
             .await?;
 
         // Build HTTP/3 response with headers from backend
@@ -552,10 +570,26 @@ impl QuicListener {
         }
 
         let response = response_builder.body(())?;
+        let body_size = proxy_response.body.len();
+        let response_status = proxy_response.status;
 
         stream.send_response(response).await?;
         stream.send_data(Bytes::from(proxy_response.body)).await?;
         stream.finish().await?;
+
+        // Log successful response
+        log_access(&AccessLogEntry {
+            remote_addr,
+            method,
+            path,
+            protocol: "HTTP/3".to_string(),
+            status: response_status,
+            body_size,
+            referer,
+            user_agent,
+            host,
+            response_time_ms: start_time.elapsed().as_millis() as u64,
+        });
 
         Ok(())
     }

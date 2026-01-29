@@ -41,6 +41,7 @@ use tracing::{debug, error, info, warn};
 #[cfg(feature = "pqc")]
 use crate::pqc_tls::{openssl_pqc, PqcTlsProvider};
 
+use crate::access_logger::{log_access, AccessLogEntry};
 use crate::compression::{compression_middleware, CompressionState};
 use crate::config::{BackendConfig, CorsConfig, ProxyConfig, TlsMode};
 use crate::fingerprint::FingerprintExtractor;
@@ -1040,8 +1041,17 @@ async fn proxy_handler(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let path = uri.path();
+    let request_start = std::time::Instant::now();
+    let path = uri.path().to_string();
+    let method_str = method.to_string();
     let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
+    let user_agent = headers.get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let referer = headers.get(header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let host_str = host.clone();
 
     debug!(
         "Incoming request: {} {} {} from {}",
@@ -1049,7 +1059,7 @@ async fn proxy_handler(
     );
 
     // Find matching route
-    let route = state.config.find_route(Some(&host), path, false);
+    let route = state.config.find_route(Some(&host), &path, false);
 
     if let Some(route) = route {
         // Handle redirect routes
@@ -1327,8 +1337,24 @@ async fn proxy_handler(
                     .insert(header::SERVER, HeaderValue::from_static("PQCProxy v0.2.0"));
 
                 // Convert Incoming body to axum Body
-                let body = Body::new(incoming_body);
-                Response::from_parts(parts, body)
+                let response_body = Body::new(incoming_body);
+                let response = Response::from_parts(parts, response_body);
+
+                // Log successful response
+                log_access(&AccessLogEntry {
+                    remote_addr: client_addr,
+                    method: method_str,
+                    path,
+                    protocol: "HTTP/1.1".to_string(),
+                    status: response.status().as_u16(),
+                    body_size: 0, // Can't know body size for streaming response
+                    referer,
+                    user_agent,
+                    host: Some(host_str),
+                    response_time_ms: request_start.elapsed().as_millis() as u64,
+                });
+
+                response
             }
             Err(e) => {
                 let response_time = request_start.elapsed();
@@ -1348,12 +1374,42 @@ async fn proxy_handler(
                 }
 
                 error!("Backend request failed: {}", e);
+
+                // Log backend error
+                log_access(&AccessLogEntry {
+                    remote_addr: client_addr,
+                    method: method_str,
+                    path,
+                    protocol: "HTTP/1.1".to_string(),
+                    status: 502,
+                    body_size: 0,
+                    referer,
+                    user_agent,
+                    host: Some(host_str),
+                    response_time_ms: request_start.elapsed().as_millis() as u64,
+                });
+
                 (StatusCode::BAD_GATEWAY, format!("Backend error: {}", e)).into_response()
             }
         }
     } else {
         // No route matched - return 404
         warn!("No route matched for {} {}", host, path);
+
+        // Log 404
+        log_access(&AccessLogEntry {
+            remote_addr: client_addr,
+            method: method_str,
+            path,
+            protocol: "HTTP/1.1".to_string(),
+            status: 404,
+            body_size: 0,
+            referer,
+            user_agent,
+            host: Some(host_str),
+            response_time_ms: request_start.elapsed().as_millis() as u64,
+        });
+
         (StatusCode::NOT_FOUND, "Not Found").into_response()
     }
 }
