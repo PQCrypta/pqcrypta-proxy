@@ -735,14 +735,14 @@ impl Default for FingerprintConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            tls_layer_capture: false,            // Use middleware-based capture by default
+            tls_layer_capture: false, // Use middleware-based capture by default
             malicious_block_duration_secs: 3600, // 1 hour
             suspicious_block_duration_secs: 300, // 5 minutes
-            suspicious_rate_threshold: 100,      // 100 requests
-            suspicious_rate_window_secs: 60,     // 1 minute
-            cache_max_age_secs: 3600,            // 1 hour
-            block_scanners: false,               // Log but don't block by default
-            add_response_headers: false,         // Disabled by default for security
+            suspicious_rate_threshold: 100, // 100 requests
+            suspicious_rate_window_secs: 60, // 1 minute
+            cache_max_age_secs: 3600, // 1 hour
+            block_scanners: false,    // Log but don't block by default
+            add_response_headers: false, // Disabled by default for security
         }
     }
 }

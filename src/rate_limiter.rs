@@ -476,10 +476,8 @@ impl RateLimitKey {
             .join(":");
 
         // Extract key type names for the Composite variant identifier
-        let key_type_names: Vec<String> = components
-            .iter()
-            .map(|(k, _)| format!("{:?}", k))
-            .collect();
+        let key_type_names: Vec<String> =
+            components.iter().map(|(k, _)| format!("{:?}", k)).collect();
 
         Self {
             key_type: RateLimitKeyType::Composite(key_type_names),
@@ -1005,7 +1003,8 @@ impl AdvancedRateLimiter {
                             Err(e) => {
                                 tracing::warn!(
                                     "Failed to parse trusted proxy '{}' as CIDR or IP: {}",
-                                    s, e
+                                    s,
+                                    e
                                 );
                                 None
                             }
@@ -1479,7 +1478,8 @@ impl AdvancedRateLimiter {
                             Err(e) => {
                                 tracing::warn!(
                                     "Failed to parse trusted proxy '{}' as CIDR or IP: {}",
-                                    s, e
+                                    s,
+                                    e
                                 );
                                 None
                             }
@@ -1661,10 +1661,7 @@ mod tests {
     fn test_composite_key_with_fingerprint() {
         // Test composite key with fingerprint + path (NAT-friendly API limiting)
         let key = RateLimitKey::composite(vec![
-            (
-                RateLimitKeyType::Ja3Fingerprint,
-                "abc123def456".to_string(),
-            ),
+            (RateLimitKeyType::Ja3Fingerprint, "abc123def456".to_string()),
             (RateLimitKeyType::Path, "/api/v1/users".to_string()),
         ]);
 

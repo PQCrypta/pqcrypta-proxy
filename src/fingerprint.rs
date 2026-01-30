@@ -836,7 +836,8 @@ pub async fn fingerprint_middleware(
         .map(String::from);
 
     // Create fingerprint info
-    let fp_info = FingerprintInfo::from_headers(ja3_hash.clone(), ja4_hash.clone(), &state.extractor);
+    let fp_info =
+        FingerprintInfo::from_headers(ja3_hash.clone(), ja4_hash.clone(), &state.extractor);
 
     // Check if we should block based on fingerprint
     if let Some(ref classification) = fp_info.classification {
@@ -854,7 +855,9 @@ pub async fn fingerprint_middleware(
                 state.security.block_ip(
                     client_addr.ip(),
                     BlockReason::SuspiciousFingerprint,
-                    Some(Duration::from_secs(state.config.malicious_block_duration_secs)),
+                    Some(Duration::from_secs(
+                        state.config.malicious_block_duration_secs,
+                    )),
                 );
                 return (StatusCode::FORBIDDEN, "Access denied").into_response();
             }
