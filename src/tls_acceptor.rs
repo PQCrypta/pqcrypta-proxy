@@ -3,12 +3,20 @@
 //! Wraps the standard TLS acceptor to capture ClientHello bytes for JA3/JA4 fingerprinting
 //! before the TLS handshake completes.
 //!
-//! # Integration Status
-//! This module provides FingerprintingTlsAcceptor which is ready but not yet integrated
-//! into the main request flow. Integration requires replacing the axum-server TLS layer.
-
-// Allow dead code for scaffolded features pending TLS layer integration
-#![allow(dead_code)]
+//! # Integration
+//! This module is fully integrated into the HTTP listener via `run_http_listener_with_fingerprint`.
+//! The custom TLS accept loop uses `FingerprintingTlsAcceptor` to:
+//! - Capture ClientHello bytes before TLS handshake
+//! - Extract JA3/JA4 fingerprints
+//! - Block malicious clients early (before wasting handshake resources)
+//! - Inject fingerprint data into request headers
+//!
+//! # Usage
+//! ```ignore
+//! let acceptor = FingerprintingTlsAcceptor::new(config, extractor, security, fp_config);
+//! let stream = acceptor.accept(tcp_stream, remote_addr).await?;
+//! // stream.conn_info contains JA3/JA4 fingerprints
+//! ```
 
 use std::io;
 use std::net::SocketAddr;

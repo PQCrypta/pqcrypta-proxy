@@ -298,8 +298,12 @@ impl QuicListener {
 
                         // Respond on the stream
                         let mut stream = stream;
-                        stream.send_response(response).await.ok();
-                        stream.finish().await.ok();
+                        if let Err(e) = stream.send_response(response).await {
+                            debug!("Failed to send WebTransport response to {}: {}", remote_addr, e);
+                        }
+                        if let Err(e) = stream.finish().await {
+                            debug!("Failed to finish WebTransport stream for {}: {}", remote_addr, e);
+                        }
                     } else {
                         // Regular HTTP/3 request
                         let config_clone = config.clone();
