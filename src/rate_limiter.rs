@@ -990,13 +990,28 @@ impl AdvancedRateLimiter {
             .trusted_proxies
             .iter()
             .filter_map(|s| {
-                s.parse().ok().or_else(|| {
-                    // Try parsing as single IP - use safe defaults that can't fail
-                    s.parse::<IpAddr>().ok().and_then(|ip| match ip {
-                        IpAddr::V4(v4) => ipnet::Ipv4Net::new(v4, 32).ok().map(ipnet::IpNet::V4),
-                        IpAddr::V6(v6) => ipnet::Ipv6Net::new(v6, 128).ok().map(ipnet::IpNet::V6),
-                    })
-                })
+                // First try CIDR notation (e.g., "10.0.0.0/8")
+                match s.parse::<ipnet::IpNet>() {
+                    Ok(net) => Some(net),
+                    Err(_) => {
+                        // Try parsing as single IP address
+                        match s.parse::<IpAddr>() {
+                            Ok(IpAddr::V4(v4)) => {
+                                ipnet::Ipv4Net::new(v4, 32).ok().map(ipnet::IpNet::V4)
+                            }
+                            Ok(IpAddr::V6(v6)) => {
+                                ipnet::Ipv6Net::new(v6, 128).ok().map(ipnet::IpNet::V6)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to parse trusted proxy '{}' as CIDR or IP: {}",
+                                    s, e
+                                );
+                                None
+                            }
+                        }
+                    }
+                }
             })
             .collect();
 
@@ -1444,17 +1459,33 @@ impl AdvancedRateLimiter {
 
     /// Update configuration dynamically without restarting
     pub fn update_config(&self, config: AdvancedRateLimitConfig) {
-        // Update trusted CIDRs with safe parsing
+        // Update trusted CIDRs with proper error logging
         let trusted_cidrs: Vec<ipnet::IpNet> = config
             .trusted_proxies
             .iter()
             .filter_map(|s| {
-                s.parse().ok().or_else(|| {
-                    s.parse::<IpAddr>().ok().and_then(|ip| match ip {
-                        IpAddr::V4(v4) => ipnet::Ipv4Net::new(v4, 32).ok().map(ipnet::IpNet::V4),
-                        IpAddr::V6(v6) => ipnet::Ipv6Net::new(v6, 128).ok().map(ipnet::IpNet::V6),
-                    })
-                })
+                // First try CIDR notation (e.g., "10.0.0.0/8")
+                match s.parse::<ipnet::IpNet>() {
+                    Ok(net) => Some(net),
+                    Err(_) => {
+                        // Try parsing as single IP address
+                        match s.parse::<IpAddr>() {
+                            Ok(IpAddr::V4(v4)) => {
+                                ipnet::Ipv4Net::new(v4, 32).ok().map(ipnet::IpNet::V4)
+                            }
+                            Ok(IpAddr::V6(v6)) => {
+                                ipnet::Ipv6Net::new(v6, 128).ok().map(ipnet::IpNet::V6)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to parse trusted proxy '{}' as CIDR or IP: {}",
+                                    s, e
+                                );
+                                None
+                            }
+                        }
+                    }
+                }
             })
             .collect();
 

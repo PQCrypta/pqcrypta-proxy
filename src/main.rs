@@ -82,7 +82,7 @@ use pqcrypta_proxy::quic_listener::QuicListener;
 #[cfg(feature = "pqc")]
 use pqcrypta_proxy::run_http_listener_pqc;
 use pqcrypta_proxy::tls::TlsProvider;
-use pqcrypta_proxy::{run_http_listener, run_http_redirect_server, run_tls_passthrough_server};
+use pqcrypta_proxy::{run_http_listener, run_http_listener_with_fingerprint, run_http_redirect_server, run_tls_passthrough_server};
 
 /// PQCrypta Proxy - QUIC/HTTP3/WebTransport Proxy with PQC TLS
 #[derive(Parser, Debug)]
@@ -465,8 +465,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Start HTTPS reverse proxy listeners (TCP) on all ports
-    // Use PQC-enabled OpenSSL listener when available, otherwise rustls
+    // Priority: TLS-layer fingerprinting > PQC > standard rustls
     let use_pqc_listener = pqc_status.available && config.pqc.enabled;
+    let use_fingerprint_listener = config.fingerprint.enabled && config.fingerprint.tls_layer_capture;
+
+    // Create shutdown channels for fingerprinting listeners (supports graceful shutdown)
+    let mut http_shutdown_senders: Vec<tokio::sync::watch::Sender<()>> = Vec::new();
 
     for port in all_ports.clone() {
         let bind_addr: std::net::SocketAddr =
@@ -476,48 +480,78 @@ async fn main() -> anyhow::Result<()> {
         let http_key = key_path.clone();
         let http_config = config.clone();
 
-        #[cfg(feature = "pqc")]
-        if use_pqc_listener {
-            let http_pqc_provider = pqc_provider.clone();
+        // Use TLS-layer fingerprinting listener when enabled (highest priority)
+        // This captures ClientHello before TLS handshake for early blocking
+        if use_fingerprint_listener {
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+            http_shutdown_senders.push(shutdown_tx);
+
             tokio::spawn(async move {
                 info!(
-                    "🔐 Starting PQC HTTPS reverse proxy on {} (TCP with ML-KEM)",
+                    "🔍 Starting HTTPS reverse proxy on {} (TCP with TLS-layer fingerprinting)",
                     bind_addr
                 );
-                if let Err(e) = run_http_listener_pqc(
+                if let Err(e) = run_http_listener_with_fingerprint(
                     bind_addr,
                     &http_cert,
                     &http_key,
                     http_config,
-                    http_pqc_provider,
+                    shutdown_rx,
                 )
                 .await
                 {
                     error!(
-                        "PQC HTTP listener error on port {}: {}",
+                        "Fingerprinting HTTP listener error on port {}: {}",
                         bind_addr.port(),
                         e
                     );
                 }
             });
         } else {
+            // Fall back to PQC or standard listener
+            #[cfg(feature = "pqc")]
+            if use_pqc_listener {
+                let http_pqc_provider = pqc_provider.clone();
+                tokio::spawn(async move {
+                    info!(
+                        "🔐 Starting PQC HTTPS reverse proxy on {} (TCP with ML-KEM)",
+                        bind_addr
+                    );
+                    if let Err(e) = run_http_listener_pqc(
+                        bind_addr,
+                        &http_cert,
+                        &http_key,
+                        http_config,
+                        http_pqc_provider,
+                    )
+                    .await
+                    {
+                        error!(
+                            "PQC HTTP listener error on port {}: {}",
+                            bind_addr.port(),
+                            e
+                        );
+                    }
+                });
+            } else {
+                tokio::spawn(async move {
+                    info!("🌐 Starting HTTPS reverse proxy on {} (TCP)", bind_addr);
+                    if let Err(e) =
+                        run_http_listener(bind_addr, &http_cert, &http_key, http_config).await
+                    {
+                        error!("HTTP listener error on port {}: {}", bind_addr.port(), e);
+                    }
+                });
+            }
+
+            #[cfg(not(feature = "pqc"))]
             tokio::spawn(async move {
                 info!("🌐 Starting HTTPS reverse proxy on {} (TCP)", bind_addr);
-                if let Err(e) =
-                    run_http_listener(bind_addr, &http_cert, &http_key, http_config).await
-                {
+                if let Err(e) = run_http_listener(bind_addr, &http_cert, &http_key, http_config).await {
                     error!("HTTP listener error on port {}: {}", bind_addr.port(), e);
                 }
             });
         }
-
-        #[cfg(not(feature = "pqc"))]
-        tokio::spawn(async move {
-            info!("🌐 Starting HTTPS reverse proxy on {} (TCP)", bind_addr);
-            if let Err(e) = run_http_listener(bind_addr, &http_cert, &http_key, http_config).await {
-                error!("HTTP listener error on port {}: {}", bind_addr.port(), e);
-            }
-        });
     }
 
     // Start QUIC/HTTP3/WebTransport servers (UDP) on all ports
@@ -588,7 +622,12 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     for port in &all_ports {
-        if use_pqc_listener {
+        if use_fingerprint_listener {
+            info!(
+                "  HTTPS (🔍):      0.0.0.0:{} (TLS-layer fingerprinting)",
+                port
+            );
+        } else if use_pqc_listener {
             info!(
                 "  HTTPS (PQC):     0.0.0.0:{} (ML-KEM hybrid key exchange)",
                 port
@@ -628,6 +667,13 @@ async fn main() -> anyhow::Result<()> {
     // Send shutdown signal to admin server
     // Intentionally ignored: receiver may already be gone during shutdown
     let _ = shutdown_tx.send(()).await;
+
+    // Send shutdown signals to HTTP fingerprinting listeners
+    // Intentionally ignored: receivers may already be gone during shutdown
+    for http_shutdown_tx in http_shutdown_senders {
+        // watch channels don't need await - they use send() not send().await
+        let _ = http_shutdown_tx.send(());
+    }
 
     // Send shutdown signals to QUIC listeners
     // Intentionally ignored: receivers may already be gone during shutdown
