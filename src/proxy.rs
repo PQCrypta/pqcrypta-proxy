@@ -230,6 +230,7 @@ impl BackendPool {
     }
 
     /// Proxy request to Unix socket backend (e.g., PHP-FPM)
+    #[cfg(unix)]
     pub async fn proxy_unix(
         &self,
         backend: &BackendConfig,
@@ -238,6 +239,8 @@ impl BackendPool {
         headers: HashMap<String, String>,
         body: &[u8],
     ) -> anyhow::Result<Vec<u8>> {
+        use tokio::net::UnixStream;
+
         // Acquire connection permit
         let _permit = self.acquire_permit(&backend.name).await?;
 
@@ -250,52 +253,55 @@ impl BackendPool {
         debug!("Proxying to Unix socket: {} {}", socket_path, path);
 
         // Connect to Unix socket
-        #[cfg(unix)]
-        {
-            use tokio::net::UnixStream;
-
-            let mut stream = UnixStream::connect(socket_path)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to connect to Unix socket: {}", e))?;
-
-            // Build FastCGI-style HTTP request
-            let http_request = self.build_http_request(method, path, &headers, body);
-
-            // Send request
-            stream.write_all(http_request.as_bytes()).await?;
-            stream.write_all(body).await?;
-
-            // Read response with timeout
-            let timeout = Duration::from_millis(backend.timeout_ms);
-            let mut response_buf = Vec::new();
-
-            tokio::time::timeout(timeout, async {
-                let mut buf = [0u8; 8192];
-                loop {
-                    match stream.read(&mut buf).await {
-                        Ok(0) => break,
-                        Ok(n) => response_buf.extend_from_slice(&buf[..n]),
-                        Err(e) => return Err(anyhow::anyhow!("Read error: {}", e)),
-                    }
-                }
-                Ok::<_, anyhow::Error>(())
-            })
+        let mut stream = UnixStream::connect(socket_path)
             .await
-            .map_err(|_| anyhow::anyhow!("Unix socket timeout"))??;
+            .map_err(|e| anyhow::anyhow!("Failed to connect to Unix socket: {}", e))?;
 
-            // Parse HTTP response and extract body
-            let response_body = self.extract_http_body(&response_buf)?;
+        // Build FastCGI-style HTTP request
+        let http_request = self.build_http_request(method, path, &headers, body);
 
-            debug!("Received {} bytes from Unix socket", response_body.len());
-            Ok(response_body)
-        }
+        // Send request
+        stream.write_all(http_request.as_bytes()).await?;
+        stream.write_all(body).await?;
 
-        #[cfg(not(unix))]
-        {
-            Err(anyhow::anyhow!(
-                "Unix sockets not supported on this platform"
-            ))
-        }
+        // Read response with timeout
+        let timeout = Duration::from_millis(backend.timeout_ms);
+        let mut response_buf = Vec::new();
+
+        tokio::time::timeout(timeout, async {
+            let mut buf = [0u8; 8192];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => response_buf.extend_from_slice(&buf[..n]),
+                    Err(e) => return Err(anyhow::anyhow!("Read error: {}", e)),
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Unix socket timeout"))??;
+
+        // Parse HTTP response and extract body
+        let response_body = self.extract_http_body(&response_buf)?;
+
+        debug!("Received {} bytes from Unix socket", response_body.len());
+        Ok(response_body)
+    }
+
+    /// Proxy request to Unix socket backend (e.g., PHP-FPM) - Windows stub
+    #[cfg(not(unix))]
+    pub async fn proxy_unix(
+        &self,
+        _backend: &BackendConfig,
+        _method: &str,
+        _path: &str,
+        _headers: HashMap<String, String>,
+        _body: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        Err(anyhow::anyhow!(
+            "Unix sockets not supported on this platform"
+        ))
     }
 
     /// Proxy request to HTTP/3 backend
@@ -494,6 +500,7 @@ impl BackendPool {
     }
 
     /// Build HTTP request string for Unix socket
+    #[cfg(unix)]
     fn build_http_request(
         &self,
         method: &str,
@@ -515,6 +522,7 @@ impl BackendPool {
     }
 
     /// Extract body from HTTP response
+    #[cfg(unix)]
     fn extract_http_body(&self, response: &[u8]) -> anyhow::Result<Vec<u8>> {
         // Find end of headers (double CRLF)
         let response_str = String::from_utf8_lossy(response);
