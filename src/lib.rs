@@ -102,12 +102,12 @@ pub use http3_features::{
     EarlyHintsConfig, EarlyHintsState, Http3FeaturesState, LinkHint, PreloadRule, PriorityConfig,
     PriorityState, ResourcePriority,
 };
-#[cfg(feature = "pqc")]
-pub use http_listener::run_http_listener_pqc;
 pub use http_listener::{
     run_http_listener, run_http_listener_with_fingerprint, run_http_redirect_server,
     run_tls_passthrough_server,
 };
+#[cfg(feature = "pqc")]
+pub use http_listener::{run_http_listener_pqc, run_http_listener_pqc_with_fingerprint};
 pub use load_balancer::{
     extract_session_cookie, BackendPool as LbBackendPool, BackendServer, LoadBalancer, PoolStats,
     SelectionContext, SessionCookieConfig,
