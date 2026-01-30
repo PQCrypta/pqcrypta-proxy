@@ -432,7 +432,8 @@ impl AcmeService {
         let last_check_str = self.last_check.read().map(|t| {
             t.duration_since(SystemTime::UNIX_EPOCH)
                 .map(|d| {
-                    chrono::DateTime::from_timestamp(d.as_secs() as i64, 0)
+                    let secs = i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
+                    chrono::DateTime::from_timestamp(secs, 0)
                         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
                         .unwrap_or_else(|| "unknown".to_string())
                 })
@@ -440,10 +441,11 @@ impl AcmeService {
         });
 
         let next_check_str = self.last_check.read().map(|t| {
-            let next = t + Duration::from_secs(self.config.check_interval_hours as u64 * 3600);
+            let next = t + Duration::from_secs(u64::from(self.config.check_interval_hours) * 3600);
             next.duration_since(SystemTime::UNIX_EPOCH)
                 .map(|d| {
-                    chrono::DateTime::from_timestamp(d.as_secs() as i64, 0)
+                    let secs = i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
+                    chrono::DateTime::from_timestamp(secs, 0)
                         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
                         .unwrap_or_else(|| "unknown".to_string())
                 })
@@ -454,10 +456,7 @@ impl AcmeService {
             enabled: self.config.enabled,
             directory_url: self.config.directory_url.clone(),
             staging: self.config.staging
-                || self
-                    .config
-                    .directory_url
-                    .contains("staging")
+                || self.config.directory_url.contains("staging")
                 || self.config.directory_url.contains("test"),
             domains: self.config.domains.clone(),
             certificates,
@@ -517,15 +516,18 @@ async fn check_and_renew_certificates(
 
                         // Update status cache
                         let mut status = cert_status.write();
-                        status.insert(domain.clone(), CertificateStatus {
-                            domain: domain.clone(),
-                            exists: true,
-                            expires: Some(format!("{} days", days)),
-                            days_remaining: Some(days),
-                            needs_renewal: false,
-                            last_renewed: None,
-                            last_error: None,
-                        });
+                        status.insert(
+                            domain.clone(),
+                            CertificateStatus {
+                                domain: domain.clone(),
+                                exists: true,
+                                expires: Some(format!("{} days", days)),
+                                days_remaining: Some(days),
+                                needs_renewal: false,
+                                last_renewed: None,
+                                last_error: None,
+                            },
+                        );
 
                         (false, Some(days))
                     }
@@ -560,27 +562,38 @@ async fn check_and_renew_certificates(
                         fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
                     }
 
-                    info!("Certificate for {} obtained successfully from {}", domain, config.directory_url);
+                    info!(
+                        "Certificate for {} obtained successfully from {}",
+                        domain, config.directory_url
+                    );
 
                     // Update status cache
                     let (expires, days) = read_certificate_expiry(&cert_path)
-                        .unwrap_or(("90 days".to_string(), 90));
+                        .unwrap_or_else(|_| ("90 days".to_string(), 90));
                     {
                         let mut status = cert_status.write();
-                        status.insert(domain.clone(), CertificateStatus {
-                            domain: domain.clone(),
-                            exists: true,
-                            expires: Some(expires),
-                            days_remaining: Some(days),
-                            needs_renewal: false,
-                            last_renewed: Some(chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string()),
-                            last_error: None,
-                        });
+                        status.insert(
+                            domain.clone(),
+                            CertificateStatus {
+                                domain: domain.clone(),
+                                exists: true,
+                                expires: Some(expires),
+                                days_remaining: Some(days),
+                                needs_renewal: false,
+                                last_renewed: Some(
+                                    chrono::Utc::now()
+                                        .format("%Y-%m-%d %H:%M:%S UTC")
+                                        .to_string(),
+                                ),
+                                last_error: None,
+                            },
+                        );
                     }
 
                     // Notify about certificate update
                     if let Some(tx) = cert_update_tx {
-                        let expires_time = SystemTime::now() + Duration::from_secs(days as u64 * 86400);
+                        let expires_time =
+                            SystemTime::now() + Duration::from_secs(days as u64 * 86400);
 
                         let _ = tx
                             .send(CertificateUpdate {
@@ -597,15 +610,18 @@ async fn check_and_renew_certificates(
 
                     // Update status cache with error
                     let mut status = cert_status.write();
-                    status.insert(domain.clone(), CertificateStatus {
-                        domain: domain.clone(),
-                        exists: cert_path.exists(),
-                        expires: days_remaining.map(|d| format!("{} days", d)),
-                        days_remaining,
-                        needs_renewal: true,
-                        last_renewed: None,
-                        last_error: Some(e.to_string()),
-                    });
+                    status.insert(
+                        domain.clone(),
+                        CertificateStatus {
+                            domain: domain.clone(),
+                            exists: cert_path.exists(),
+                            expires: days_remaining.map(|d| format!("{} days", d)),
+                            days_remaining,
+                            needs_renewal: true,
+                            last_renewed: None,
+                            last_error: Some(e.to_string()),
+                        },
+                    );
                 }
             }
         }
@@ -627,7 +643,10 @@ async fn request_certificate_acme(
 ) -> anyhow::Result<(String, String, String)> {
     use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 
-    info!("Requesting certificate for {} from {}", domain, config.directory_url);
+    info!(
+        "Requesting certificate for {} from {}",
+        domain, config.directory_url
+    );
 
     // Load or create ACME account
     let account = get_or_create_account(config).await?;
@@ -689,16 +708,11 @@ async fn request_certificate_acme(
                     let fresh_authz = order.authorizations().await?;
 
                     // Find the authorization for this domain
-                    let current_authz = fresh_authz.iter()
-                        .find(|a| match &authz.identifier {
-                            Identifier::Dns(d) => {
-                                if let Identifier::Dns(ad) = &a.identifier {
-                                    ad == d
-                                } else {
-                                    false
-                                }
-                            }
-                        });
+                    let current_authz = fresh_authz.iter().find(|a| {
+                        let Identifier::Dns(d) = &authz.identifier;
+                        let Identifier::Dns(ad) = &a.identifier;
+                        ad == d
+                    });
 
                     match current_authz.map(|a| &a.status) {
                         Some(AuthorizationStatus::Valid) => {
@@ -840,11 +854,11 @@ async fn request_certificate_acme(
     };
 
     let chain_pem = if certs.len() > 1 {
-        certs[1..]
-            .iter()
-            .map(|c| format!("{}-----END CERTIFICATE-----\n", c))
-            .collect::<Vec<_>>()
-            .join("")
+        certs[1..].iter().fold(String::new(), |mut acc, c| {
+            acc.push_str(c);
+            acc.push_str("-----END CERTIFICATE-----\n");
+            acc
+        })
     } else {
         String::new()
     };
@@ -864,18 +878,20 @@ async fn get_or_create_account(config: &AcmeConfig) -> anyhow::Result<Account> {
         if let Ok(stored) = load_account_wrapper(&config.account_path) {
             // Verify the account is for the same directory
             if stored.directory_url == config.directory_url {
-                info!("Loading existing ACME account from {:?}", config.account_path);
+                info!(
+                    "Loading existing ACME account from {:?}",
+                    config.account_path
+                );
 
                 // Deserialize the credentials from the stored JSON
                 let credentials: AccountCredentials = serde_json::from_value(stored.credentials)?;
                 let account = Account::from_credentials(credentials).await?;
                 return Ok(account);
-            } else {
-                warn!(
-                    "Existing account is for different directory ({}), creating new account",
-                    stored.directory_url
-                );
             }
+            warn!(
+                "Existing account is for different directory ({}), creating new account",
+                stored.directory_url
+            );
         }
     }
 
@@ -895,28 +911,26 @@ async fn get_or_create_account(config: &AcmeConfig) -> anyhow::Result<Account> {
     };
 
     // Handle External Account Binding if configured (required by some CAs like ZeroSSL)
-    let external_account = if let (Some(kid), Some(hmac_key)) = (&config.eab_kid, &config.eab_hmac_key) {
-        info!("Using External Account Binding (EAB)");
-        // Decode the base64 HMAC key
-        let hmac_bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            hmac_key,
-        ).or_else(|_| {
-            base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                hmac_key,
-            )
-        })?;
-        Some(ExternalAccountKey::new(kid.clone(), &hmac_bytes))
-    } else {
-        None
-    };
+    let external_account =
+        if let (Some(kid), Some(hmac_key)) = (&config.eab_kid, &config.eab_hmac_key) {
+            info!("Using External Account Binding (EAB)");
+            // Decode the base64 HMAC key
+            let hmac_bytes =
+                base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, hmac_key)
+                    .or_else(|_| {
+                        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, hmac_key)
+                    })?;
+            Some(ExternalAccountKey::new(kid.clone(), &hmac_bytes))
+        } else {
+            None
+        };
 
     let (account, credentials) = Account::create(
         &new_account,
         &config.directory_url,
         external_account.as_ref(),
-    ).await?;
+    )
+    .await?;
 
     // Serialize credentials to JSON value for storage
     let credentials_json = serde_json::to_value(&credentials)?;
@@ -925,7 +939,9 @@ async fn get_or_create_account(config: &AcmeConfig) -> anyhow::Result<Account> {
     let stored = StoredAccountWrapper {
         directory_url: config.directory_url.clone(),
         email: config.email.clone(),
-        created: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        created: chrono::Utc::now()
+            .format("%Y-%m-%d %H:%M:%S UTC")
+            .to_string(),
         credentials: credentials_json,
     };
 
@@ -943,7 +959,10 @@ async fn get_or_create_account(config: &AcmeConfig) -> anyhow::Result<Account> {
         fs::set_permissions(&config.account_path, fs::Permissions::from_mode(0o600))?;
     }
 
-    info!("ACME account created and saved to {:?}", config.account_path);
+    info!(
+        "ACME account created and saved to {:?}",
+        config.account_path
+    );
 
     Ok(account)
 }
@@ -983,19 +1002,22 @@ async fn check_and_renew_certificates(
             .unwrap_or(true);
 
         let mut status = cert_status.write();
-        status.insert(domain.clone(), CertificateStatus {
-            domain: domain.clone(),
-            exists,
-            expires,
-            days_remaining,
-            needs_renewal,
-            last_renewed: None,
-            last_error: if needs_renewal && !exists {
-                Some("ACME feature not enabled".to_string())
-            } else {
-                None
+        status.insert(
+            domain.clone(),
+            CertificateStatus {
+                domain: domain.clone(),
+                exists,
+                expires,
+                days_remaining,
+                needs_renewal,
+                last_renewed: None,
+                last_error: if needs_renewal && !exists {
+                    Some("ACME feature not enabled".to_string())
+                } else {
+                    None
+                },
             },
-        });
+        );
     }
 
     Ok(())
@@ -1096,18 +1118,20 @@ mod tests {
 
     #[test]
     fn test_stored_account_serialization() {
-        let stored = StoredAccount {
-            account_url: "https://acme.example.com/account/123".to_string(),
-            private_key_pem: "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----".to_string(),
+        let stored = StoredAccountWrapper {
             directory_url: "https://acme.example.com/directory".to_string(),
             email: Some("test@example.com".to_string()),
             created: "2024-01-01 00:00:00 UTC".to_string(),
+            credentials: serde_json::json!({
+                "id": "https://acme.example.com/account/123",
+                "key_pkcs8": "dGVzdA=="
+            }),
         };
 
         let json = serde_json::to_string(&stored).expect("serialize");
-        let parsed: StoredAccount = serde_json::from_str(&json).expect("deserialize");
+        let parsed: StoredAccountWrapper = serde_json::from_str(&json).expect("deserialize");
 
-        assert_eq!(parsed.account_url, stored.account_url);
         assert_eq!(parsed.directory_url, stored.directory_url);
+        assert_eq!(parsed.email, stored.email);
     }
 }
