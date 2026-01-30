@@ -403,6 +403,7 @@ impl QuicListener {
                 // Return 404
                 let response = http::Response::builder()
                     .status(http::StatusCode::NOT_FOUND)
+                    .header("server", "PQCProxy v0.2.1")
                     .body(())?;
 
                 stream.send_response(response).await?;
@@ -416,7 +417,8 @@ impl QuicListener {
             if let Some(ref cors) = route.cors {
                 let mut response_builder = http::Response::builder()
                     .status(http::StatusCode::OK)
-                    .header("alt-svc", build_alt_svc_header(&config));
+                    .header("alt-svc", build_alt_svc_header(&config))
+                    .header("server", "PQCProxy v0.2.1");
 
                 // Access-Control-Allow-Origin
                 if let Some(ref origin) = cors.allow_origin {
@@ -464,6 +466,7 @@ impl QuicListener {
                 error!("Backend not found: {}", route.backend);
                 let response = http::Response::builder()
                     .status(http::StatusCode::BAD_GATEWAY)
+                    .header("server", "PQCProxy v0.2.1")
                     .body(())?;
 
                 stream.send_response(response).await?;
@@ -578,6 +581,9 @@ impl QuicListener {
 
         // Add Alt-Svc header to advertise HTTP/3 support
         response_builder = response_builder.header("alt-svc", build_alt_svc_header(&config));
+
+        // Add Server header for branding (hide backend identity)
+        response_builder = response_builder.header("server", "PQCProxy v0.2.1");
 
         // Add CORS headers from route.cors (proxy-level CORS) if configured
         if let Some(ref cors) = route.cors {
