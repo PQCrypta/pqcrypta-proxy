@@ -31,10 +31,10 @@ use axum::{
     Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
-use hyper::server::conn::http1;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio_rustls::TlsConnector;
@@ -898,11 +898,436 @@ async fn handle_fingerprinted_connection(
         }
     });
 
-    // Serve HTTP/1.1 connection
+    // Serve HTTP/1.1 and HTTP/2 connections (via ALPN negotiation)
     let io = TokioIo::new(tls_stream);
-    if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
+    let auto_builder = AutoBuilder::new(TokioExecutor::new());
+
+    if let Err(e) = auto_builder.serve_connection(io, service).await {
         if !e.to_string().contains("connection reset") {
             debug!("HTTP connection error for {}: {}", remote_addr, e);
+        }
+    }
+}
+
+// ============================================================================
+// PQC TLS Accept Loop with Full Fingerprinting (OpenSSL 3.5+)
+// ============================================================================
+// Combines post-quantum cryptography (ML-KEM) with TLS fingerprinting.
+// Uses OpenSSL 3.5+ for PQC key exchange while maintaining ClientHello
+// capture for JA3/JA4 fingerprint extraction.
+
+/// Run PQC HTTP listener with custom TLS accept loop and full fingerprinting
+///
+/// This combines PQC (ML-KEM hybrid key exchange) with TLS-layer fingerprinting:
+/// - Post-quantum resistant key exchange via OpenSSL 3.5+ ML-KEM
+/// - Full JA3/JA4 fingerprint capture from ClientHello before handshake
+/// - Early blocking of malicious fingerprints
+/// - Unified security with both quantum resistance and bot detection
+///
+/// # Architecture
+/// ```text
+/// TcpListener
+///    → Peek ClientHello (capture fingerprint)
+///        → Early block if malicious fingerprint
+///        → OpenSSL PQC TLS Handshake (ML-KEM)
+///            → Inject fingerprint into request headers
+///                → Hyper HTTP/1.1 service
+///                    → Axum router with middleware stack
+/// ```
+#[cfg(feature = "pqc")]
+pub async fn run_http_listener_pqc_with_fingerprint(
+    addr: SocketAddr,
+    cert_path: &str,
+    key_path: &str,
+    config: Arc<ProxyConfig>,
+    pqc_provider: Arc<PqcTlsProvider>,
+    mut shutdown_rx: watch::Receiver<()>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use openssl::ssl::SslContext;
+
+    let port = addr.port();
+
+    info!(
+        "🔐🔍 Starting PQC HTTP listener with TLS-layer fingerprinting on {} (TCP)",
+        addr
+    );
+    info!("🔍 Full JA3/JA4 fingerprinting enabled at TLS layer");
+    info!("🛡️  PQC hybrid key exchange: ML-KEM via OpenSSL 3.5+");
+    info!("📢 Will advertise Alt-Svc: h3=\":{}\"; ma=86400", port);
+
+    // Create HTTP client for plain backend connections
+    let pool_config = &config.connection_pool;
+    let http_client = Client::builder(TokioExecutor::new())
+        .pool_max_idle_per_host(pool_config.max_idle_per_host)
+        .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
+        .build_http();
+
+    // Create HTTPS client for re-encrypt mode
+    let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .expect("Failed to load native root certificates")
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+
+    let https_client = Client::builder(TokioExecutor::new())
+        .pool_max_idle_per_host(pool_config.max_idle_per_host)
+        .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
+        .build(https_connector);
+
+    // Initialize security state
+    let security_state = SecurityState::new(&config);
+
+    // Initialize fingerprint extractor
+    let fingerprint_extractor = Arc::new(FingerprintExtractor::new());
+
+    // Initialize load balancer
+    let lb_config = Arc::new(config.load_balancer.clone());
+    let load_balancer = Arc::new(LoadBalancer::new(lb_config));
+
+    for (name, pool_config) in &config.backend_pools {
+        load_balancer.add_pool(pool_config);
+        info!(
+            "⚖️  Added backend pool '{}' with {} servers ({})",
+            name,
+            pool_config.servers.len(),
+            pool_config.algorithm
+        );
+    }
+
+    // Initialize rate limiter
+    let rate_limiter = Arc::new(AdvancedRateLimiter::new(
+        config.advanced_rate_limiting.clone(),
+    ));
+    info!(
+        "🚦 Advanced rate limiter enabled (key strategy: {:?})",
+        config.advanced_rate_limiting.key_strategy.order.first()
+    );
+
+    let state = HttpListenerState {
+        config: config.clone(),
+        port,
+        http_client,
+        https_client,
+        security: security_state.clone(),
+        fingerprint: fingerprint_extractor.clone(),
+        load_balancer,
+    };
+
+    // Initialize middleware states
+    let compression_state = CompressionState::default();
+    let http3_features_state = Http3FeaturesState::from_proxy_config(&config.http3);
+    let fingerprint_state = FingerprintMiddlewareState::new(
+        fingerprint_extractor.clone(),
+        security_state.clone(),
+        Arc::new(config.fingerprint.clone()),
+    );
+
+    // Build router with full middleware stack
+    let app = Router::new()
+        .fallback(any(proxy_handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            security_headers_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            alt_svc_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            compression_state,
+            compression_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            http3_features_state,
+            http3_features_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            security_state.clone(),
+            security_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            fingerprint_state,
+            fingerprint_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            rate_limiter,
+            advanced_rate_limit_middleware,
+        ))
+        .with_state(state);
+
+    // Check cert files
+    if !std::path::Path::new(cert_path).exists() {
+        error!("❌ Certificate file not found: {}", cert_path);
+        return Err(format!("Certificate file not found: {}", cert_path).into());
+    }
+    if !std::path::Path::new(key_path).exists() {
+        error!("❌ Key file not found: {}", key_path);
+        return Err(format!("Key file not found: {}", key_path).into());
+    }
+
+    // Create OpenSSL PQC acceptor
+    let cert_path_buf = std::path::Path::new(cert_path);
+    let key_path_buf = std::path::Path::new(key_path);
+    let ssl_acceptor = openssl_pqc::create_pqc_acceptor(cert_path_buf, key_path_buf, &pqc_provider)
+        .map_err(|e| format!("Failed to create PQC SSL acceptor: {}", e))?;
+
+    // Get SSL context for creating new SSL instances
+    let ssl_context: SslContext = ssl_acceptor.into_context();
+    let ssl_context = Arc::new(ssl_context);
+
+    // Get PQC status for logging
+    let pqc_status = pqc_provider.status();
+    let kem_info = if let Some(kem) = pqc_status.configured_kem {
+        format!(
+            "{} (Security Level {})",
+            kem.openssl_name(),
+            kem.security_level()
+        )
+    } else {
+        "X25519MLKEM768 (default)".to_string()
+    };
+
+    // Bind TCP listener
+    let listener = TcpListener::bind(addr).await?;
+
+    info!("✅ PQC TLS with fingerprinting configured");
+    info!("🔒 OpenSSL version: {}", pqc_status.openssl_version);
+    info!("🛡️  PQC KEM: {}", kem_info);
+    info!(
+        "🔒 Post-Quantum HTTPS reverse proxy ready on port {} (TCP)",
+        port
+    );
+    info!("🔍 JA3/JA4 fingerprinting active at TLS layer");
+    info!("🔄 Routing: api.pqcrypta.com → 127.0.0.1:3003");
+    info!("🔄 Routing: pqcrypta.com → 127.0.0.1:8080");
+
+    // Accept loop with graceful shutdown
+    loop {
+        tokio::select! {
+            accept_result = listener.accept() => {
+                let (stream, remote_addr) = match accept_result {
+                    Ok(result) => result,
+                    Err(e) => {
+                        warn!("Failed to accept TCP connection: {}", e);
+                        continue;
+                    }
+                };
+
+                // Clone resources for spawned task
+                let ssl_ctx = ssl_context.clone();
+                let fp_extractor = fingerprint_extractor.clone();
+                let sec_state = security_state.clone();
+                let fp_config = config.fingerprint.clone();
+                let router = app.clone();
+
+                tokio::spawn(async move {
+                    handle_pqc_fingerprinted_connection(
+                        stream,
+                        remote_addr,
+                        ssl_ctx,
+                        fp_extractor,
+                        sec_state,
+                        fp_config,
+                        router,
+                    )
+                    .await;
+                });
+            }
+
+            _ = shutdown_rx.changed() => {
+                info!("🛑 Received shutdown signal, stopping PQC HTTP listener");
+                break;
+            }
+        }
+    }
+
+    info!("✅ PQC HTTP listener stopped gracefully");
+    Ok(())
+}
+
+/// Handle a single PQC connection with fingerprinting
+#[cfg(feature = "pqc")]
+async fn handle_pqc_fingerprinted_connection(
+    stream: TcpStream,
+    remote_addr: SocketAddr,
+    ssl_context: Arc<openssl::ssl::SslContext>,
+    fingerprint_extractor: Arc<FingerprintExtractor>,
+    security_state: SecurityState,
+    fingerprint_config: crate::config::FingerprintConfig,
+    app: Router,
+) {
+    use openssl::ssl::Ssl;
+    use tokio_openssl::SslStream;
+
+    trace!("New TCP connection from {} (PQC mode)", remote_addr);
+
+    // Peek at the ClientHello before TLS handshake
+    let mut peek_buf = vec![0u8; 4096];
+    let fingerprint_result = match stream.peek(&mut peek_buf).await {
+        Ok(n) if n > 0 => {
+            trace!("Peeked {} bytes of ClientHello from {}", n, remote_addr);
+            fingerprint_extractor.process_client_hello(
+                &peek_buf[..n],
+                remote_addr.ip(),
+                &security_state,
+                &fingerprint_config,
+            )
+        }
+        Ok(_) => {
+            debug!("Empty peek from {}", remote_addr);
+            crate::fingerprint::FingerprintResult {
+                allowed: true,
+                ja3_hash: None,
+                ja4_hash: None,
+                classification: None,
+                client_name: None,
+            }
+        }
+        Err(e) => {
+            debug!("Failed to peek ClientHello from {}: {}", remote_addr, e);
+            crate::fingerprint::FingerprintResult {
+                allowed: true,
+                ja3_hash: None,
+                ja4_hash: None,
+                classification: None,
+                client_name: None,
+            }
+        }
+    };
+
+    // Check if connection should be blocked
+    if !fingerprint_result.allowed {
+        warn!(
+            "Blocking PQC connection from {} due to fingerprint {:?}",
+            remote_addr, fingerprint_result.ja3_hash
+        );
+        return;
+    }
+
+    // Log fingerprint info
+    if let Some(ref ja3) = fingerprint_result.ja3_hash {
+        let client = fingerprint_result
+            .client_name
+            .as_deref()
+            .unwrap_or("unknown");
+        debug!(
+            "PQC TLS fingerprint from {}: JA3={}, JA4={:?}, client={}",
+            remote_addr, ja3, fingerprint_result.ja4_hash, client
+        );
+    }
+
+    // Create SSL instance and perform handshake
+    let ssl = match Ssl::new(&ssl_context) {
+        Ok(ssl) => ssl,
+        Err(e) => {
+            debug!("Failed to create SSL instance for {}: {}", remote_addr, e);
+            return;
+        }
+    };
+
+    let mut ssl_stream = match SslStream::new(ssl, stream) {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("Failed to create SSL stream for {}: {}", remote_addr, e);
+            return;
+        }
+    };
+
+    // Perform async TLS handshake
+    if let Err(e) = std::pin::Pin::new(&mut ssl_stream).accept().await {
+        debug!("PQC TLS handshake failed for {}: {}", remote_addr, e);
+        return;
+    }
+
+    trace!(
+        "PQC TLS connection from {} established (JA3={:?})",
+        remote_addr,
+        fingerprint_result.ja3_hash
+    );
+
+    // Extract fingerprint data for request injection
+    let ja3_hash = fingerprint_result.ja3_hash.clone();
+    let ja4_hash = fingerprint_result.ja4_hash.clone();
+    let client_name = fingerprint_result.client_name.clone();
+    let is_browser = fingerprint_result
+        .classification
+        .as_ref()
+        .map(|c| matches!(c, crate::security::FingerprintClass::Browser))
+        .unwrap_or(false);
+
+    // Create connection info
+    let conn_info = crate::tls_acceptor::FingerprintedConnection {
+        remote_addr,
+        ja3_hash: ja3_hash.clone(),
+        ja4_hash: ja4_hash.clone(),
+        client_name: client_name.clone(),
+        is_browser,
+    };
+
+    // Create service that injects fingerprint headers
+    let service = hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
+        let ja3 = ja3_hash.clone();
+        let ja4 = ja4_hash.clone();
+        let cn = client_name.clone();
+        let ci = conn_info.clone();
+        let router = app.clone();
+
+        async move {
+            // Inject fingerprint headers
+            if let Some(ref hash) = ja3 {
+                if let Ok(v) = HeaderValue::from_str(hash) {
+                    req.headers_mut().insert("x-ja3-hash", v);
+                }
+            }
+            if let Some(ref hash) = ja4 {
+                if let Ok(v) = HeaderValue::from_str(hash) {
+                    req.headers_mut().insert("x-ja4-hash", v);
+                }
+            }
+            if let Some(ref name) = cn {
+                if let Ok(v) = HeaderValue::from_str(name) {
+                    req.headers_mut().insert("x-client-name", v);
+                }
+            }
+            if ci.is_browser {
+                req.headers_mut()
+                    .insert("x-client-type", HeaderValue::from_static("browser"));
+            }
+
+            // Add PQC indicator header
+            req.headers_mut()
+                .insert("x-pqc-enabled", HeaderValue::from_static("true"));
+
+            // Store connection info in extensions
+            req.extensions_mut().insert(ci);
+            req.extensions_mut().insert(ConnectInfo(remote_addr));
+
+            // Convert and route
+            let (parts, body) = req.into_parts();
+            let body = Body::new(body);
+            let req = Request::from_parts(parts, body);
+
+            let response = router.oneshot(req).await;
+
+            match response {
+                Ok(res) => {
+                    let (parts, body) = res.into_parts();
+                    Ok::<_, std::convert::Infallible>(Response::from_parts(parts, body))
+                }
+                Err(infallible) => match infallible {},
+            }
+        }
+    });
+
+    // Serve HTTP/1.1 and HTTP/2 connections over PQC TLS (via ALPN negotiation)
+    let io = TokioIo::new(ssl_stream);
+    let auto_builder = AutoBuilder::new(TokioExecutor::new());
+
+    if let Err(e) = auto_builder.serve_connection(io, service).await {
+        if !e.to_string().contains("connection reset") {
+            debug!("PQC HTTP connection error for {}: {}", remote_addr, e);
         }
     }
 }
