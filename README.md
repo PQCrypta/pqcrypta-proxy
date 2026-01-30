@@ -4,7 +4,7 @@
 
 [![Build Status](https://github.com/PQCrypta/pqcrypta-proxy/workflows/CI/badge.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-46%20passing-brightgreen.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
+[![Tests](https://img.shields.io/badge/tests-130%20passing-brightgreen.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
 [![Security](https://img.shields.io/badge/security-hardened-green.svg)](docs/SECURITY.md)
 
 ## Highlights
@@ -519,7 +519,7 @@ Environment variables: `PQCRYPTA_CONFIG`, `PQCRYPTA_UDP_PORT`, `PQCRYPTA_ADMIN_P
                     │   │ S1 │ S2 │ S3 │ │ S1 │ S2 │ S3 │  │ S1 │ S2 │       │
                     │   └────┴────┴────┘ └────┴────┴────┘  └────┴────┘       │
                     │                                                          │
-                    │  Admin API (HTTP 8081)                                   │
+                    │  Admin API (HTTP 8082)                                   │
                     │    /health, /metrics, /reload, /shutdown                 │
                     └──────────────────────────────────────────────────────────┘
 ```
@@ -623,10 +623,10 @@ max_retries = 3
 
 ```bash
 # Check OCSP status
-curl http://127.0.0.1:8081/ocsp
+curl http://127.0.0.1:8082/ocsp
 
 # Force refresh
-curl -X POST http://127.0.0.1:8081/ocsp/refresh
+curl -X POST http://127.0.0.1:8082/ocsp/refresh
 ```
 
 ## Admin API
@@ -652,16 +652,16 @@ curl -X POST http://127.0.0.1:8081/ocsp/refresh
 
 ```bash
 # Health check
-curl http://127.0.0.1:8081/health
+curl http://127.0.0.1:8082/health
 
 # Prometheus metrics
-curl http://127.0.0.1:8081/metrics
+curl http://127.0.0.1:8082/metrics
 
 # Reload configuration
-curl -X POST http://127.0.0.1:8081/reload
+curl -X POST http://127.0.0.1:8082/reload
 
 # Reload TLS certificates only
-curl -X POST http://127.0.0.1:8081/reload -d '{"tls_only":true}'
+curl -X POST http://127.0.0.1:8082/reload -d '{"tls_only":true}'
 ```
 
 ## Deployment
