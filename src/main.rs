@@ -76,7 +76,7 @@ use pqcrypta_proxy::admin::AdminServer;
 use pqcrypta_proxy::config::{ConfigManager, ConfigReloadEvent, ProxyConfig};
 use pqcrypta_proxy::metrics;
 use pqcrypta_proxy::ocsp;
-use pqcrypta_proxy::pqc_tls::PqcTlsProvider;
+use pqcrypta_proxy::pqc_tls::{verify_pqc_support, PqcTlsProvider};
 use pqcrypta_proxy::proxy::BackendPool;
 use pqcrypta_proxy::quic_listener::QuicListener;
 #[cfg(feature = "pqc")]
@@ -406,6 +406,7 @@ async fn main() -> anyhow::Result<()> {
         backend_pool.clone(),
         ocsp_service,
         acme_service,
+        None, // Rate limiter created per-listener in http_listener
         shutdown_tx.clone(),
         Some(metrics_registry.clone()),
     );
@@ -625,9 +626,11 @@ async fn main() -> anyhow::Result<()> {
     config_manager.stop_watching();
 
     // Send shutdown signal to admin server
+    // Intentionally ignored: receiver may already be gone during shutdown
     let _ = shutdown_tx.send(()).await;
 
     // Send shutdown signals to QUIC listeners
+    // Intentionally ignored: receivers may already be gone during shutdown
     for quic_shutdown_tx in quic_shutdown_senders {
         let _ = quic_shutdown_tx.send(()).await;
     }
@@ -830,6 +833,21 @@ async fn perform_security_checks(config: &ProxyConfig) -> anyhow::Result<()> {
     // 3. Detect PQC capabilities
     // =========================================================================
     if config.pqc.enabled {
+        // Quick PQC support verification
+        match verify_pqc_support() {
+            Ok(status) => {
+                info!(
+                    "  ✅ PQC Support: OpenSSL {} with {} KEMs",
+                    status.openssl_version,
+                    status.available_kems.len()
+                );
+            }
+            Err(e) => {
+                warn!("  ⚠️  PQC verification: {}", e);
+                has_warnings = true;
+            }
+        }
+
         let extended_config = ExtendedPqcConfig {
             enabled: config.pqc.enabled,
             openssl_path: config.pqc.openssl_path.clone(),

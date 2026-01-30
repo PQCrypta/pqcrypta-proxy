@@ -72,22 +72,6 @@ impl BackendPool {
         pool
     }
 
-    /// Update configuration (for hot-reload)
-    #[allow(dead_code)]
-    pub fn update_config(&mut self, config: Arc<ProxyConfig>) {
-        // Update limiters for new/changed backends
-        for (name, backend) in &config.backends {
-            if !self.limiters.contains_key(name) {
-                self.limiters.insert(
-                    name.clone(),
-                    Arc::new(Semaphore::new(backend.max_connections as usize)),
-                );
-            }
-        }
-
-        self.config = config;
-    }
-
     /// Proxy request to HTTP/1.1 or HTTP/2 backend
     pub async fn proxy_http(
         &self,
@@ -327,9 +311,13 @@ impl BackendPool {
         // Create QUIC endpoint for client
         let mut roots = rustls::RootCertStore::empty();
         let native_certs = rustls_native_certs::load_native_certs();
+        let mut added = 0;
         for cert in native_certs.certs {
-            roots.add(cert).ok();
+            if roots.add(cert).is_ok() {
+                added += 1;
+            }
         }
+        debug!("Loaded {} root certificates for backend TLS", added);
 
         let mut crypto = rustls::ClientConfig::builder()
             .with_root_certificates(roots)

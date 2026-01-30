@@ -92,15 +92,22 @@ pub mod webtransport_server;
 // Re-export commonly used types
 pub use access_logger::{init_access_logger, log_access, AccessLogEntry, AccessLogger};
 pub use compression::{compression_middleware, CompressionConfig, CompressionState};
-pub use config::{ConfigManager, ProxyConfig};
-pub use fingerprint::{FingerprintExtractor, FingerprintResult, FingerprintStats, Ja3Fingerprint};
+pub use config::{ConfigManager, Http3Config, ProxyConfig};
+pub use fingerprint::{
+    fingerprint_middleware, FingerprintExtractor, FingerprintInfo, FingerprintMiddlewareState,
+    FingerprintResult, FingerprintStats, Ja3Fingerprint,
+};
 pub use http3_features::{
-    early_hints_middleware, http3_features_middleware, CoalescingState, EarlyHintsState,
-    Http3FeaturesState, PriorityState,
+    early_hints_middleware, http3_features_middleware, CoalescingConfig, CoalescingState,
+    EarlyHintsConfig, EarlyHintsState, Http3FeaturesState, LinkHint, PreloadRule, PriorityConfig,
+    PriorityState, ResourcePriority,
 };
 #[cfg(feature = "pqc")]
 pub use http_listener::run_http_listener_pqc;
-pub use http_listener::{run_http_listener, run_http_redirect_server, run_tls_passthrough_server};
+pub use http_listener::{
+    run_http_listener, run_http_listener_with_fingerprint, run_http_redirect_server,
+    run_tls_passthrough_server,
+};
 pub use load_balancer::{
     extract_session_cookie, BackendPool as LbBackendPool, BackendServer, LoadBalancer, PoolStats,
     SelectionContext, SessionCookieConfig,

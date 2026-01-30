@@ -129,6 +129,53 @@ pub struct ProxyConfig {
     /// ACME certificate automation configuration
     #[serde(default)]
     pub acme: AcmeConfig,
+    /// HTTP/3 advanced features configuration
+    #[serde(default)]
+    pub http3: Http3Config,
+}
+
+/// HTTP/3 advanced features configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Http3Config {
+    /// Enable Early Hints (103 status code)
+    pub early_hints_enabled: bool,
+    /// Enable Priority Hints (RFC 9218)
+    pub priority_hints_enabled: bool,
+    /// Enable Request Coalescing (deduplicate identical requests)
+    pub coalescing_enabled: bool,
+    /// Default preconnect origins for Early Hints
+    pub preconnect_origins: Vec<String>,
+    /// Maximum wait time for coalesced requests (ms)
+    pub coalescing_max_wait_ms: u64,
+    /// Maximum subscribers per coalesced request
+    pub coalescing_max_subscribers: usize,
+    /// HTTP methods to coalesce
+    pub coalescing_methods: Vec<String>,
+    /// Paths to exclude from coalescing
+    pub coalescing_exclude_paths: Vec<String>,
+}
+
+impl Default for Http3Config {
+    fn default() -> Self {
+        Self {
+            early_hints_enabled: true,
+            priority_hints_enabled: true,
+            coalescing_enabled: true,
+            preconnect_origins: vec![
+                "https://fonts.googleapis.com".to_string(),
+                "https://fonts.gstatic.com".to_string(),
+            ],
+            coalescing_max_wait_ms: 100,
+            coalescing_max_subscribers: 100,
+            coalescing_methods: vec!["GET".to_string(), "HEAD".to_string()],
+            coalescing_exclude_paths: vec![
+                "/api/".to_string(),
+                "/ws".to_string(),
+                "/stream".to_string(),
+            ],
+        }
+    }
 }
 
 impl Default for ProxyConfig {
@@ -154,6 +201,7 @@ impl Default for ProxyConfig {
             connection_pool: ConnectionPoolConfig::default(),
             ocsp: OcspConfig::default(),
             acme: AcmeConfig::default(),
+            http3: Http3Config::default(),
         }
     }
 }
@@ -672,6 +720,10 @@ pub struct FingerprintConfig {
     pub suspicious_rate_window_secs: u64,
     /// Fingerprint cache max age before cleanup (seconds)
     pub cache_max_age_secs: u64,
+    /// Block scanner fingerprints (Nmap, Nikto, Burp Suite, etc.)
+    pub block_scanners: bool,
+    /// Add fingerprint info headers to responses (for debugging/monitoring)
+    pub add_response_headers: bool,
 }
 
 impl Default for FingerprintConfig {
@@ -683,6 +735,8 @@ impl Default for FingerprintConfig {
             suspicious_rate_threshold: 100,      // 100 requests
             suspicious_rate_window_secs: 60,     // 1 minute
             cache_max_age_secs: 3600,            // 1 hour
+            block_scanners: false,               // Log but don't block by default
+            add_response_headers: false,         // Disabled by default for security
         }
     }
 }
@@ -1041,12 +1095,13 @@ pub enum AffinityMode {
 }
 
 impl AffinityMode {
-    /// Get header name for header-based affinity
-    #[allow(dead_code)]
-    pub fn header_name(&self) -> Option<&'static str> {
+    /// Get header name for the affinity mode
+    pub fn header_name(&self) -> &'static str {
         match self {
-            Self::Header => Some("X-Session-ID"),
-            _ => None,
+            Self::Header => "X-Session-ID",
+            Self::Cookie => "Cookie",
+            Self::IpHash => "X-Forwarded-For",
+            Self::None => "",
         }
     }
 }

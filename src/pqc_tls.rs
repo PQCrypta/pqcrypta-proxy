@@ -345,24 +345,13 @@ impl PqcTlsProvider {
     }
 
     /// Generate test certificate with PQC (for testing)
-    #[allow(dead_code)]
     pub fn generate_test_cert(&self, output_dir: &Path) -> Result<(), String> {
         if !self.is_available() {
             return Err("PQC not available".to_string());
         }
 
-        let config = self.config.read();
-        let openssl_bin = config
-            .openssl_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "openssl".to_string());
-
-        let openssl_lib = config
-            .openssl_lib_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
+        let openssl_bin = self.openssl_bin_path();
+        let openssl_lib = self.openssl_lib_path();
 
         let cert_path = output_dir.join("pqc-cert.pem");
         let key_path = output_dir.join("pqc-key.pem");
@@ -419,7 +408,6 @@ impl PqcTlsProvider {
 
     /// Get OpenSSL library path for subprocess calls
     /// Returns the LD_LIBRARY_PATH value for OpenSSL 3.5+
-    #[allow(dead_code)] // Used by OpenSSL 3.5+ backend when integrated
     pub fn openssl_lib_path(&self) -> String {
         let config = self.config.read();
         config
@@ -430,7 +418,6 @@ impl PqcTlsProvider {
     }
 
     /// Get OpenSSL binary path
-    #[allow(dead_code)] // Used by OpenSSL 3.5+ backend when integrated
     pub fn openssl_bin_path(&self) -> String {
         let config = self.config.read();
         config
@@ -583,7 +570,6 @@ pub mod openssl_pqc {
     ///
     /// Call this after a TLS handshake to retrieve information about the
     /// negotiated post-quantum key exchange parameters.
-    #[allow(dead_code)] // For future handshake inspection integration
     pub fn get_pqc_info(ssl: &openssl::ssl::SslRef) -> PqcHandshakeInfo {
         let cipher = ssl
             .current_cipher()
@@ -610,7 +596,6 @@ pub mod openssl_pqc {
 /// Used by `openssl_pqc::get_pqc_info()` to return details about the negotiated
 /// post-quantum key exchange after a TLS handshake completes.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Used by OpenSSL 3.5+ backend when integrated
 pub struct PqcHandshakeInfo {
     /// Cipher suite name
     pub cipher: String,
@@ -634,7 +619,6 @@ pub struct PqcHandshakeInfo {
 ///     Err(e) => println!("PQC not available: {}", e),
 /// }
 /// ```
-#[allow(dead_code)] // Utility function for system capability checks
 pub fn verify_pqc_support() -> Result<PqcStatus, String> {
     let config = PqcConfig::default();
     let provider = PqcTlsProvider::new(&config);

@@ -28,6 +28,7 @@ use crate::config::{AdminConfig, ConfigManager};
 use crate::metrics::MetricsRegistry;
 use crate::ocsp::{OcspService, OcspStatusInfo};
 use crate::proxy::BackendPool;
+use crate::rate_limiter::{AdvancedRateLimiter, RateLimiterSnapshot};
 use crate::tls::{CertificateInfo, TlsProvider};
 
 /// Admin API state
@@ -42,6 +43,8 @@ pub struct AdminState {
     pub ocsp_service: Option<Arc<OcspService>>,
     /// ACME service (optional)
     pub acme_service: Option<Arc<RwLock<AcmeService>>>,
+    /// Rate limiter (optional)
+    pub rate_limiter: Option<Arc<AdvancedRateLimiter>>,
     /// Shutdown signal sender
     pub shutdown_tx: mpsc::Sender<()>,
     /// Server start time
@@ -70,6 +73,7 @@ impl AdminServer {
         backend_pool: Arc<BackendPool>,
         ocsp_service: Option<Arc<OcspService>>,
         acme_service: Option<Arc<RwLock<AcmeService>>>,
+        rate_limiter: Option<Arc<AdvancedRateLimiter>>,
         shutdown_tx: mpsc::Sender<()>,
         metrics: Option<Arc<MetricsRegistry>>,
     ) -> Self {
@@ -81,6 +85,7 @@ impl AdminServer {
             backend_pool,
             ocsp_service,
             acme_service,
+            rate_limiter,
             shutdown_tx,
             start_time: Instant::now(),
             connection_count: Arc::new(RwLock::new(0)),
@@ -117,6 +122,7 @@ impl AdminServer {
             .route("/ocsp/refresh", post(ocsp_refresh_handler))
             .route("/acme", get(acme_handler))
             .route("/acme/renew", post(acme_renew_handler))
+            .route("/ratelimit", get(ratelimit_handler))
             .layer(TraceLayer::new_for_http())
             .layer(axum::middleware::from_fn_with_state(
                 (allowed_ips, auth_token),
@@ -565,4 +571,28 @@ struct AcmeRenewResponse {
     success: bool,
     message: String,
     status: Option<AcmeStatusInfo>,
+}
+
+/// Rate limiter status endpoint
+async fn ratelimit_handler(State(state): State<Arc<AdminState>>) -> Json<RateLimitStatusResponse> {
+    match &state.rate_limiter {
+        Some(limiter) => Json(RateLimitStatusResponse {
+            enabled: true,
+            stats: Some(limiter.get_stats()),
+            error: None,
+        }),
+        None => Json(RateLimitStatusResponse {
+            enabled: false,
+            stats: None,
+            error: Some("Rate limiter not configured".to_string()),
+        }),
+    }
+}
+
+/// Rate limiter response wrapper
+#[derive(Serialize)]
+struct RateLimitStatusResponse {
+    enabled: bool,
+    stats: Option<RateLimiterSnapshot>,
+    error: Option<String>,
 }
