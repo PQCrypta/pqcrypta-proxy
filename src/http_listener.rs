@@ -334,7 +334,10 @@ pub async fn run_http_listener(
     // Conditionally add fingerprint middleware (if enabled)
     let app = if let Some(fp_state) = fingerprint_state {
         info!("🔍 TLS fingerprinting middleware enabled");
-        app.layer(middleware::from_fn_with_state(fp_state, fingerprint_middleware))
+        app.layer(middleware::from_fn_with_state(
+            fp_state,
+            fingerprint_middleware,
+        ))
     } else {
         app
     };
@@ -504,7 +507,10 @@ pub async fn run_http_listener_pqc(
     // Conditionally add fingerprint middleware (if enabled)
     let app = if let Some(fp_state) = fingerprint_state {
         info!("🔍 TLS fingerprinting middleware enabled (PQC mode)");
-        app.layer(middleware::from_fn_with_state(fp_state, fingerprint_middleware))
+        app.layer(middleware::from_fn_with_state(
+            fp_state,
+            fingerprint_middleware,
+        ))
     } else {
         app
     };
@@ -814,7 +820,10 @@ async fn handle_fingerprinted_connection(
         Ok(Some(stream)) => stream,
         Ok(None) => {
             // Connection blocked by fingerprint policy
-            debug!("Connection from {} blocked by fingerprint policy", remote_addr);
+            debug!(
+                "Connection from {} blocked by fingerprint policy",
+                remote_addr
+            );
             return;
         }
         Err(e) => {
@@ -891,10 +900,7 @@ async fn handle_fingerprinted_connection(
 
     // Serve HTTP/1.1 connection
     let io = TokioIo::new(tls_stream);
-    if let Err(e) = http1::Builder::new()
-        .serve_connection(io, service)
-        .await
-    {
+    if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
         if !e.to_string().contains("connection reset") {
             debug!("HTTP connection error for {}: {}", remote_addr, e);
         }
@@ -1972,7 +1978,11 @@ pub fn create_backend_tls_connector(
             match cert_result {
                 Ok(cert) => ca_certs.push(cert),
                 Err(e) => {
-                    warn!("Failed to parse CA certificate from {}: {}", ca_path.display(), e);
+                    warn!(
+                        "Failed to parse CA certificate from {}: {}",
+                        ca_path.display(),
+                        e
+                    );
                     parse_errors += 1;
                 }
             }
@@ -2002,7 +2012,11 @@ pub fn create_backend_tls_connector(
             match cert_result {
                 Ok(cert) => certs.push(cert),
                 Err(e) => {
-                    warn!("Failed to parse client certificate from {}: {}", cert_path.display(), e);
+                    warn!(
+                        "Failed to parse client certificate from {}: {}",
+                        cert_path.display(),
+                        e
+                    );
                     parse_errors += 1;
                 }
             }

@@ -82,7 +82,10 @@ use pqcrypta_proxy::quic_listener::QuicListener;
 #[cfg(feature = "pqc")]
 use pqcrypta_proxy::run_http_listener_pqc;
 use pqcrypta_proxy::tls::TlsProvider;
-use pqcrypta_proxy::{run_http_listener, run_http_listener_with_fingerprint, run_http_redirect_server, run_tls_passthrough_server};
+use pqcrypta_proxy::{
+    run_http_listener, run_http_listener_with_fingerprint, run_http_redirect_server,
+    run_tls_passthrough_server,
+};
 
 /// PQCrypta Proxy - QUIC/HTTP3/WebTransport Proxy with PQC TLS
 #[derive(Parser, Debug)]
@@ -467,7 +470,8 @@ async fn main() -> anyhow::Result<()> {
     // Start HTTPS reverse proxy listeners (TCP) on all ports
     // Priority: TLS-layer fingerprinting > PQC > standard rustls
     let use_pqc_listener = pqc_status.available && config.pqc.enabled;
-    let use_fingerprint_listener = config.fingerprint.enabled && config.fingerprint.tls_layer_capture;
+    let use_fingerprint_listener =
+        config.fingerprint.enabled && config.fingerprint.tls_layer_capture;
 
     // Create shutdown channels for fingerprinting listeners (supports graceful shutdown)
     let mut http_shutdown_senders: Vec<tokio::sync::watch::Sender<()>> = Vec::new();
@@ -547,7 +551,9 @@ async fn main() -> anyhow::Result<()> {
             #[cfg(not(feature = "pqc"))]
             tokio::spawn(async move {
                 info!("🌐 Starting HTTPS reverse proxy on {} (TCP)", bind_addr);
-                if let Err(e) = run_http_listener(bind_addr, &http_cert, &http_key, http_config).await {
+                if let Err(e) =
+                    run_http_listener(bind_addr, &http_cert, &http_key, http_config).await
+                {
                     error!("HTTP listener error on port {}: {}", bind_addr.port(), e);
                 }
             });
