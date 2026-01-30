@@ -339,7 +339,9 @@ async fn main() -> anyhow::Result<()> {
         info!("Initializing OCSP stapling service...");
         let ocsp_config = ocsp::OcspConfig {
             enabled: config.ocsp.enabled,
-            refresh_before_expiry: std::time::Duration::from_secs(config.ocsp.refresh_before_expiry_secs),
+            refresh_before_expiry: std::time::Duration::from_secs(
+                config.ocsp.refresh_before_expiry_secs,
+            ),
             min_refresh_interval: std::time::Duration::from_secs(300),
             request_timeout: std::time::Duration::from_secs(config.ocsp.timeout_secs),
             max_retries: config.ocsp.max_retries,
@@ -349,8 +351,9 @@ async fn main() -> anyhow::Result<()> {
 
         // Load certificates for OCSP
         if let Ok(cert_pem) = std::fs::read(&config.tls.cert_path) {
-            if let Ok(certs) = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_pem.as_slice()))
-                .collect::<Result<Vec<_>, _>>()
+            if let Ok(certs) =
+                rustls_pemfile::certs(&mut std::io::BufReader::new(cert_pem.as_slice()))
+                    .collect::<Result<Vec<_>, _>>()
             {
                 service.update_certificates(certs);
             }
@@ -385,7 +388,10 @@ async fn main() -> anyhow::Result<()> {
             error!("Failed to start ACME service: {}", e);
             None
         } else {
-            info!("✅ ACME service started for domains: {:?}", config.acme.domains);
+            info!(
+                "✅ ACME service started for domains: {:?}",
+                config.acme.domains
+            );
             Some(Arc::new(parking_lot::RwLock::new(service)))
         }
     } else {
