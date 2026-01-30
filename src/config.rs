@@ -710,6 +710,11 @@ impl Default for SecurityConfig {
 pub struct FingerprintConfig {
     /// Enable TLS fingerprint detection
     pub enabled: bool,
+    /// Use TLS-layer capture with custom accept loop (captures raw ClientHello)
+    /// When enabled, uses FingerprintingTlsAcceptor for full JA3/JA4 capture
+    /// before TLS handshake, allowing early blocking of malicious clients.
+    /// When disabled, fingerprinting relies on headers from middleware layer.
+    pub tls_layer_capture: bool,
     /// Block duration for malicious fingerprints (seconds)
     pub malicious_block_duration_secs: u64,
     /// Block duration for suspicious fingerprints with high rate (seconds)
@@ -730,6 +735,7 @@ impl Default for FingerprintConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            tls_layer_capture: false,            // Use middleware-based capture by default
             malicious_block_duration_secs: 3600, // 1 hour
             suspicious_block_duration_secs: 300, // 5 minutes
             suspicious_rate_threshold: 100,      // 100 requests
