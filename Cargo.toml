@@ -11,7 +11,7 @@ keywords = ["quic", "http3", "webtransport", "pqc", "proxy", "post-quantum"]
 categories = ["network-programming", "cryptography", "web-programming"]
 
 [features]
-default = ["pqc", "metrics", "admin-api", "geoip"]
+default = ["pqc", "metrics", "admin-api", "geoip", "acme"]
 # Enable PQC hybrid key exchange via OpenSSL 3.5+ (native ML-KEM)
 # Also enables extended algorithm detection and configuration
 pqc = ["openssl", "openssl-sys", "openssl-probe"]
@@ -21,8 +21,8 @@ pqc-signatures = ["aws-lc-rs/unstable"]
 metrics = ["prometheus"]
 # Admin HTTP API for health, reload, shutdown
 admin-api = ["tower-http"]
-# ACME certificate automation
-acme = []
+# ACME certificate automation (works with any ACME CA: Let's Encrypt, ZeroSSL, Buypass, etc.)
+acme = ["instant-acme"]
 # Windows service support
 windows-service = ["windows-service-rs"]
 # GeoIP blocking support
@@ -131,8 +131,11 @@ md-5 = "0.10"
 # X.509 certificate parsing (for OCSP)
 x509-parser = "0.16"
 
-# HTTP client for OCSP requests
+# HTTP client for OCSP requests and ACME
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# ACME client (RFC 8555) - works with any ACME CA
+instant-acme = { version = "0.7", optional = true }
 
 # CLI argument parsing
 clap = { version = "4.5", features = ["derive", "env"] }
