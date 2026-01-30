@@ -5,12 +5,17 @@
 //! - **Priority Hints**: Extensible Priorities (RFC 9218) for resource scheduling
 //! - **Request Coalescing**: Deduplicate identical in-flight requests
 //!
-//! # Integration Status
-//! Priority parsing and coalescing features are scaffolded. Early Hints requires
-//! 103 informational response support which is pending HTTP/3 layer integration.
-
-// Allow dead code for scaffolded features pending HTTP/3 integration
-#![allow(dead_code)]
+//! # Integration
+//! All features are configurable via the `[http3]` section in proxy-config.toml:
+//! - `early_hints_enabled` - Enable 103 Early Hints (Link headers as fallback)
+//! - `priority_hints_enabled` - Enable RFC 9218 Priority headers
+//! - `coalescing_enabled` - Enable request deduplication
+//!
+//! # Usage
+//! ```ignore
+//! let state = Http3FeaturesState::from_proxy_config(&config.http3);
+//! router.layer(middleware::from_fn_with_state(state, http3_features_middleware));
+//! ```
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -31,7 +36,6 @@ use tracing::{debug, trace};
 // ============================================================================
 
 /// Early Hints configuration
-#[allow(dead_code)] // Infrastructure for future HTTP/3 Early Hints feature
 #[derive(Debug, Clone)]
 pub struct EarlyHintsConfig {
     /// Enable Early Hints
@@ -76,7 +80,6 @@ impl Default for EarlyHintsConfig {
 }
 
 /// Preload rule for a path pattern
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PreloadRule {
     /// Path pattern (prefix match)
@@ -86,7 +89,6 @@ pub struct PreloadRule {
 }
 
 /// Link hint types for Early Hints
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum LinkHint {
     /// Preload a resource
@@ -151,7 +153,6 @@ impl LinkHint {
 }
 
 /// State for Early Hints
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct EarlyHintsState {
     pub config: Arc<RwLock<EarlyHintsConfig>>,
@@ -168,7 +169,6 @@ impl Default for EarlyHintsState {
     }
 }
 
-#[allow(dead_code)]
 impl EarlyHintsState {
     /// Get Link headers for a path
     pub fn get_hints_for_path(&self, path: &str) -> Vec<String> {
@@ -204,7 +204,6 @@ impl EarlyHintsState {
 }
 
 /// Build a 103 Early Hints response
-#[allow(dead_code)]
 pub fn build_early_hints_response(hints: &[String]) -> Response<Body> {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::EARLY_HINTS;
@@ -608,7 +607,12 @@ impl CoalescingState {
     pub fn complete(&self, key: &CoalesceKey, response: CoalescedResponse) {
         if let Some((_, request)) = self.in_flight.remove(key) {
             let req = request.read();
-            let _ = req.sender.send(response.clone());
+            if req.sender.send(response.clone()).is_err() {
+                debug!(
+                    "Failed to broadcast coalesced response for {} {} - all receivers dropped",
+                    key.method, key.uri
+                );
+            }
 
             debug!(
                 "Completed coalesced request: {} {} (served {} subscribers)",
@@ -652,6 +656,30 @@ pub struct Http3FeaturesState {
 impl Http3FeaturesState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create from proxy configuration
+    pub fn from_proxy_config(config: &crate::config::Http3Config) -> Self {
+        let early_hints = EarlyHintsConfig {
+            enabled: config.early_hints_enabled,
+            preconnect_origins: config.preconnect_origins.clone(),
+            ..Default::default()
+        };
+
+        let priority = PriorityConfig {
+            enabled: config.priority_hints_enabled,
+            ..Default::default()
+        };
+
+        let coalescing = CoalescingConfig {
+            enabled: config.coalescing_enabled,
+            max_wait_ms: config.coalescing_max_wait_ms,
+            max_subscribers: config.coalescing_max_subscribers,
+            coalesce_methods: config.coalescing_methods.clone(),
+            exclude_paths: config.coalescing_exclude_paths.clone(),
+        };
+
+        Self::with_config(early_hints, priority, coalescing)
     }
 
     /// Create with custom configuration

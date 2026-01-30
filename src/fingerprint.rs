@@ -3,22 +3,30 @@
 //! Implements JA3/JA4 TLS fingerprinting for bot detection and client identification.
 //! Captures ClientHello during TLS handshake and computes fingerprints.
 //!
-//! # Integration Status
-//! This module is scaffolded for future integration. Full integration requires
-//! a custom TLS acceptor layer to intercept ClientHello before handshake completion.
-//! The FingerprintingTlsAcceptor is ready but not yet wired into the main request flow.
+//! # Integration
+//! This module provides:
+//! - `FingerprintExtractor` - Core fingerprint extraction and classification
+//! - `fingerprint_middleware` - Axum middleware for request-level fingerprint handling
+//! - `FingerprintInfo` - Request extension data for downstream handlers
+//!
+//! Fingerprints can be captured either via:
+//! 1. Custom TLS acceptor (`FingerprintingTlsAcceptor`) - captures raw ClientHello
+//! 2. Internal headers (`x-ja3-hash`, `x-ja4-hash`) - set by lower layers
+//! 3. OpenSSL callback mechanism - for PQC-enabled connections
 
-// Allow dead code for scaffolded features pending TLS layer integration
-#![allow(dead_code)]
-
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::body::Body;
+use axum::extract::{ConnectInfo, State};
+use axum::http::{header::HeaderValue, Request, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
 use md5::{Digest, Md5};
 use sha2::Sha256;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::FingerprintConfig;
 use crate::security::{BlockReason, FingerprintClass, SecurityState, TlsFingerprint};
@@ -196,6 +204,13 @@ impl FingerprintExtractor {
             cache: Arc::new(DashMap::new()),
             known_fingerprints: Arc::new(KnownFingerprints::default()),
         }
+    }
+
+    /// Classify a JA3 hash against the known fingerprint database
+    ///
+    /// Returns (classification, optional_client_name)
+    pub fn classify(&self, ja3_hash: &str) -> (FingerprintClass, Option<String>) {
+        self.known_fingerprints.classify(ja3_hash)
     }
 
     /// Extract JA3 fingerprint from TLS ClientHello
@@ -672,7 +687,230 @@ pub struct FingerprintStats {
     pub api_client_count: usize,
 }
 
+// ============================================================================
+// Fingerprint Middleware Integration
+// ============================================================================
+
+/// Fingerprint information stored in request extensions
+///
+/// This struct is added to request extensions by `fingerprint_middleware`
+/// and can be extracted by downstream handlers.
+#[derive(Debug, Clone)]
+pub struct FingerprintInfo {
+    /// JA3 fingerprint hash (MD5)
+    pub ja3_hash: Option<String>,
+    /// JA4 fingerprint hash (SHA256-based)
+    pub ja4_hash: Option<String>,
+    /// Client classification
+    pub classification: Option<FingerprintClass>,
+    /// Friendly client name (e.g., "Chrome/120+", "Googlebot")
+    pub client_name: Option<String>,
+    /// Whether this is a browser client
+    pub is_browser: bool,
+    /// Whether this is a known legitimate bot
+    pub is_legitimate_bot: bool,
+}
+
+impl Default for FingerprintInfo {
+    fn default() -> Self {
+        Self {
+            ja3_hash: None,
+            ja4_hash: None,
+            classification: None,
+            client_name: None,
+            is_browser: false,
+            is_legitimate_bot: false,
+        }
+    }
+}
+
+impl FingerprintInfo {
+    /// Create from a fingerprint result
+    pub fn from_result(result: &FingerprintResult) -> Self {
+        let is_browser = result
+            .classification
+            .as_ref()
+            .map(|c| matches!(c, FingerprintClass::Browser))
+            .unwrap_or(false);
+        let is_legitimate_bot = result
+            .classification
+            .as_ref()
+            .map(|c| matches!(c, FingerprintClass::LegitimateBot))
+            .unwrap_or(false);
+
+        Self {
+            ja3_hash: result.ja3_hash.clone(),
+            ja4_hash: result.ja4_hash.clone(),
+            classification: result.classification.clone(),
+            client_name: result.client_name.clone(),
+            is_browser,
+            is_legitimate_bot,
+        }
+    }
+
+    /// Create from internal fingerprint headers
+    pub fn from_headers(
+        ja3_hash: Option<String>,
+        ja4_hash: Option<String>,
+        extractor: &FingerprintExtractor,
+    ) -> Self {
+        if let Some(ref ja3) = ja3_hash {
+            let (classification, client_name) = extractor.classify(ja3);
+            let is_browser = matches!(classification, FingerprintClass::Browser);
+            let is_legitimate_bot = matches!(classification, FingerprintClass::LegitimateBot);
+
+            Self {
+                ja3_hash,
+                ja4_hash,
+                classification: Some(classification),
+                client_name,
+                is_browser,
+                is_legitimate_bot,
+            }
+        } else {
+            Self {
+                ja3_hash,
+                ja4_hash,
+                ..Default::default()
+            }
+        }
+    }
+}
+
+/// State for fingerprint middleware
+#[derive(Clone)]
+pub struct FingerprintMiddlewareState {
+    /// Fingerprint extractor for classification
+    pub extractor: Arc<FingerprintExtractor>,
+    /// Security state for blocking decisions
+    pub security: SecurityState,
+    /// Configuration
+    pub config: Arc<FingerprintConfig>,
+}
+
+impl FingerprintMiddlewareState {
+    /// Create a new fingerprint middleware state
+    pub fn new(
+        extractor: Arc<FingerprintExtractor>,
+        security: SecurityState,
+        config: Arc<FingerprintConfig>,
+    ) -> Self {
+        Self {
+            extractor,
+            security,
+            config,
+        }
+    }
+}
+
+/// Fingerprint middleware for request handling
+///
+/// This middleware:
+/// 1. Extracts fingerprint data from headers or connection info
+/// 2. Classifies the client (browser, bot, scanner, etc.)
+/// 3. Blocks known malicious fingerprints
+/// 4. Stores fingerprint info in request extensions
+/// 5. Adds fingerprint headers to response for debugging
+///
+/// # Example
+/// ```ignore
+/// let app = Router::new()
+///     .route("/", get(handler))
+///     .layer(middleware::from_fn_with_state(fp_state, fingerprint_middleware));
+/// ```
+pub async fn fingerprint_middleware(
+    State(state): State<FingerprintMiddlewareState>,
+    ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    // Extract fingerprint from internal headers (set by TLS acceptor)
+    let headers = request.headers();
+    let ja3_hash = headers
+        .get("x-ja3-hash")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let ja4_hash = headers
+        .get("x-ja4-hash")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
+    // Create fingerprint info
+    let fp_info = FingerprintInfo::from_headers(ja3_hash.clone(), ja4_hash.clone(), &state.extractor);
+
+    // Check if we should block based on fingerprint
+    if let Some(ref classification) = fp_info.classification {
+        match classification {
+            FingerprintClass::Malicious => {
+                if let Some(ref ja3) = fp_info.ja3_hash {
+                    warn!(
+                        "Blocking malicious fingerprint {} from {} (client: {:?})",
+                        ja3,
+                        client_addr.ip(),
+                        fp_info.client_name
+                    );
+                }
+                // Block the connection
+                state.security.block_ip(
+                    client_addr.ip(),
+                    BlockReason::SuspiciousFingerprint,
+                    Some(Duration::from_secs(state.config.malicious_block_duration_secs)),
+                );
+                return (StatusCode::FORBIDDEN, "Access denied").into_response();
+            }
+            FingerprintClass::Scanner if state.config.block_scanners => {
+                if let Some(ref ja3) = fp_info.ja3_hash {
+                    info!(
+                        "Blocking scanner fingerprint {} from {} (client: {:?})",
+                        ja3,
+                        client_addr.ip(),
+                        fp_info.client_name
+                    );
+                }
+                return (StatusCode::FORBIDDEN, "Scanner detected").into_response();
+            }
+            _ => {}
+        }
+    }
+
+    // Log fingerprint info for debugging
+    if let Some(ref ja3) = fp_info.ja3_hash {
+        debug!(
+            "Request from {} with fingerprint JA3={}, JA4={:?}, client={:?}, classification={:?}",
+            client_addr.ip(),
+            ja3,
+            fp_info.ja4_hash,
+            fp_info.client_name,
+            fp_info.classification
+        );
+    }
+
+    // Store fingerprint info in request extensions
+    request.extensions_mut().insert(fp_info.clone());
+
+    // Process the request
+    let mut response = next.run(request).await;
+
+    // Add fingerprint headers to response (for debugging/monitoring)
+    if state.config.add_response_headers {
+        if let Some(ref ja3) = fp_info.ja3_hash {
+            if let Ok(v) = HeaderValue::from_str(ja3) {
+                response.headers_mut().insert("x-client-fingerprint", v);
+            }
+        }
+        if let Some(ref name) = fp_info.client_name {
+            if let Ok(v) = HeaderValue::from_str(name) {
+                response.headers_mut().insert("x-client-type", v);
+            }
+        }
+    }
+
+    response
+}
+
+// ============================================================================
 // Helper functions
+// ============================================================================
 
 /// Check if a value is a GREASE value (0x?a?a pattern)
 fn is_grease(value: u16) -> bool {

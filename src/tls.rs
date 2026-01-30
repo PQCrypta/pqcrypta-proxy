@@ -18,7 +18,7 @@ use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::ServerConfig as RustlsServerConfig;
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{PqcConfig, TlsConfig};
 
@@ -423,10 +423,25 @@ impl TlsProvider {
         } else {
             // Load system root certificates
             let native_certs = rustls_native_certs::load_native_certs();
+            let mut added = 0;
+            let mut failed = 0;
             for cert in native_certs.certs {
-                root_store.add(cert).ok();
+                match root_store.add(cert) {
+                    Ok(()) => added += 1,
+                    Err(e) => {
+                        debug!("Failed to add system root certificate: {}", e);
+                        failed += 1;
+                    }
+                }
             }
-            info!("Loaded {} system root certificates", root_store.len());
+            if failed > 0 {
+                info!(
+                    "Loaded {} system root certificates ({} failed - likely duplicates)",
+                    added, failed
+                );
+            } else {
+                info!("Loaded {} system root certificates", root_store.len());
+            }
         }
 
         Ok(root_store)
@@ -460,100 +475,4 @@ pub struct CertificateInfo {
     pub last_reloaded: Option<String>,
 }
 
-/// PQC Key Exchange wrapper for hybrid mode
-///
-/// This module provides abstraction for PQC key exchange when OpenSSL 3.5 + OQS is available.
-/// The actual PQC handshake is performed by OpenSSL; this provides monitoring and fallback.
-#[allow(dead_code)]
-pub mod pqc_kex {
-    /// PQC KEX algorithm identifiers
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum PqcKem {
-        /// Kyber768 (NIST Level 3)
-        Kyber768,
-        /// Kyber1024 (NIST Level 5)
-        Kyber1024,
-        /// ML-KEM-768 (FIPS 203 draft)
-        MlKem768,
-        /// ML-KEM-1024 (FIPS 203 draft)
-        MlKem1024,
-        /// X25519 + Kyber768 hybrid
-        X25519Kyber768,
-    }
-
-    impl PqcKem {
-        /// Get OpenSSL algorithm name
-        pub fn openssl_name(&self) -> &'static str {
-            match self {
-                PqcKem::Kyber768 => "kyber768",
-                PqcKem::Kyber1024 => "kyber1024",
-                PqcKem::MlKem768 => "mlkem768",
-                PqcKem::MlKem1024 => "mlkem1024",
-                PqcKem::X25519Kyber768 => "x25519_kyber768",
-            }
-        }
-
-        /// Parse from string
-        pub fn from_str(s: &str) -> Option<Self> {
-            match s.to_lowercase().as_str() {
-                "kyber768" => Some(PqcKem::Kyber768),
-                "kyber1024" => Some(PqcKem::Kyber1024),
-                "mlkem768" | "ml-kem-768" => Some(PqcKem::MlKem768),
-                "mlkem1024" | "ml-kem-1024" => Some(PqcKem::MlKem1024),
-                "x25519_kyber768" | "x25519kyber768" => Some(PqcKem::X25519Kyber768),
-                _ => None,
-            }
-        }
-    }
-
-    /// Check if a specific KEM is available via OpenSSL
-    #[cfg(feature = "pqc")]
-    pub fn is_kem_available(kem: PqcKem, openssl_path: &str, lib_path: &str) -> bool {
-        use std::process::Command;
-
-        let output = Command::new(openssl_path)
-            .args(["list", "-kem-algorithms"])
-            .env("LD_LIBRARY_PATH", lib_path)
-            .output();
-
-        match output {
-            Ok(output) => {
-                let kems = String::from_utf8_lossy(&output.stdout).to_lowercase();
-                kems.contains(kem.openssl_name())
-            }
-            Err(_) => false,
-        }
-    }
-
-    #[cfg(not(feature = "pqc"))]
-    pub fn is_kem_available(_kem: PqcKem, _openssl_path: &str, _lib_path: &str) -> bool {
-        false
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_pqc_kem_names() {
-        assert_eq!(pqc_kex::PqcKem::Kyber768.openssl_name(), "kyber768");
-        assert_eq!(
-            pqc_kex::PqcKem::X25519Kyber768.openssl_name(),
-            "x25519_kyber768"
-        );
-    }
-
-    #[test]
-    fn test_pqc_kem_parsing() {
-        assert_eq!(
-            pqc_kex::PqcKem::from_str("kyber768"),
-            Some(pqc_kex::PqcKem::Kyber768)
-        );
-        assert_eq!(
-            pqc_kex::PqcKem::from_str("ML-KEM-1024"),
-            Some(pqc_kex::PqcKem::MlKem1024)
-        );
-        assert_eq!(pqc_kex::PqcKem::from_str("unknown"), None);
-    }
-}
+// Note: PQC key exchange functionality is provided by pqc_tls::PqcKemAlgorithm

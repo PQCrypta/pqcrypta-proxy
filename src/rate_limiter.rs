@@ -164,6 +164,9 @@ pub enum RateLimitKeyType {
     Method,
     /// ASN (Autonomous System Number)
     Asn,
+    /// Composite key combining multiple dimensions
+    /// The Vec contains the names of combined key types for identification
+    Composite(Vec<String>),
 }
 
 impl Default for RateLimitKeyType {
@@ -465,14 +468,21 @@ impl RateLimitKey {
     }
 
     pub fn composite(components: Vec<(RateLimitKeyType, String)>) -> Self {
+        // Build composite value by joining all component values
         let value = components
             .iter()
             .map(|(_, v)| v.as_str())
             .collect::<Vec<_>>()
             .join(":");
 
+        // Extract key type names for the Composite variant identifier
+        let key_type_names: Vec<String> = components
+            .iter()
+            .map(|(k, _)| format!("{:?}", k))
+            .collect();
+
         Self {
-            key_type: RateLimitKeyType::SourceIp, // Placeholder for composite
+            key_type: RateLimitKeyType::Composite(key_type_names),
             value,
             components: Some(components),
         }
@@ -554,8 +564,7 @@ impl RateLimitContext {
 /// Sliding window rate counter for minute/hour limits
 #[derive(Debug)]
 pub struct SlidingWindowCounter {
-    /// Window size in seconds
-    #[allow(dead_code)]
+    /// Window size in seconds (used for stats/debugging)
     window_secs: u64,
 
     /// Number of buckets (granularity)
@@ -628,6 +637,11 @@ impl SlidingWindowCounter {
 
             *last_update = Instant::now();
         }
+    }
+
+    /// Get window size in seconds
+    pub fn window_seconds(&self) -> u64 {
+        self.window_secs
     }
 }
 
@@ -755,15 +769,13 @@ pub struct RateLimitBucket {
     /// Sliding window counter (per-hour)
     pub hour_counter: Option<Arc<SlidingWindowCounter>>,
 
-    /// Requests in current second
-    #[allow(dead_code)]
+    /// Requests in current second (for burst detection)
     pub current_second_count: AtomicU64,
 
     /// Last request timestamp
     pub last_request: RwLock<Instant>,
 
-    /// Created timestamp
-    #[allow(dead_code)]
+    /// Created timestamp (for bucket age tracking)
     pub created_at: Instant,
 
     /// Total requests (for stats)
@@ -829,7 +841,6 @@ impl RateLimitBucket {
                 reason: LimitReason::PerSecond,
                 retry_after_ms: 1000,
                 limit: limits.requests_per_second,
-                remaining: 0,
             };
         }
 
@@ -843,7 +854,6 @@ impl RateLimitBucket {
                         reason: LimitReason::PerMinute,
                         retry_after_ms: 60_000,
                         limit,
-                        remaining: 0,
                     };
                 }
             }
@@ -859,7 +869,6 @@ impl RateLimitBucket {
                         reason: LimitReason::PerHour,
                         retry_after_ms: 3_600_000,
                         limit,
-                        remaining: 0,
                     };
                 }
             }
@@ -881,7 +890,6 @@ impl RateLimitBucket {
                     reason: LimitReason::AnomalyDetected,
                     retry_after_ms: 60_000,
                     limit: baseline.get_mean() as u32,
-                    remaining: 0,
                 };
             }
         }
@@ -911,9 +919,6 @@ pub enum RateLimitResult {
         retry_after_ms: u64,
         /// The limit that was exceeded
         limit: u32,
-        /// Remaining (always 0 when limited)
-        #[allow(dead_code)]
-        remaining: u32,
     },
     /// Key is blocked (fingerprint block, etc.)
     Blocked {
@@ -924,7 +929,6 @@ pub enum RateLimitResult {
 
 /// Reason for rate limiting
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum LimitReason {
     /// Per-second limit exceeded
     PerSecond,
@@ -1049,7 +1053,6 @@ impl AdvancedRateLimiter {
                 reason: LimitReason::Global,
                 retry_after_ms: 1000,
                 limit: config.global_limits.requests_per_second,
-                remaining: 0,
             };
         }
 
@@ -1222,6 +1225,12 @@ impl AdvancedRateLimiter {
             RateLimitKeyType::Method => Some(ctx.method.clone()),
 
             RateLimitKeyType::Asn => None, // Would require GeoIP/ASN lookup
+
+            RateLimitKeyType::Composite(_) => {
+                // Composite keys are not extracted directly - they are built
+                // from individual components in resolve_key_and_limits
+                None
+            }
         }
     }
 
@@ -1340,6 +1349,17 @@ impl AdvancedRateLimiter {
             };
         }
 
+        // Composite keys get their limits from CompositeKeyConfig directly
+        // in resolve_key_and_limits, but provide sensible defaults if called
+        if matches!(key_type, RateLimitKeyType::Composite(_)) {
+            return PerKeyLimits {
+                requests_per_second: 200,
+                burst_size: 100,
+                requests_per_minute: Some(6_000),
+                requests_per_hour: Some(100_000),
+            };
+        }
+
         // Default per-IP limits
         config.global_limits.per_ip.clone()
     }
@@ -1410,7 +1430,6 @@ impl AdvancedRateLimiter {
     }
 
     /// Get current statistics
-    #[allow(dead_code)]
     pub fn get_stats(&self) -> RateLimiterSnapshot {
         RateLimiterSnapshot {
             total_requests: self.stats.total_requests.load(Ordering::Relaxed),
@@ -1423,8 +1442,7 @@ impl AdvancedRateLimiter {
         }
     }
 
-    /// Update configuration
-    #[allow(dead_code)]
+    /// Update configuration dynamically without restarting
     pub fn update_config(&self, config: AdvancedRateLimitConfig) {
         // Update trusted CIDRs with safe parsing
         let trusted_cidrs: Vec<ipnet::IpNet> = config
@@ -1449,7 +1467,6 @@ impl AdvancedRateLimiter {
 
 /// Snapshot of rate limiter statistics
 #[derive(Debug, Clone, Serialize)]
-#[allow(dead_code)]
 pub struct RateLimiterSnapshot {
     pub total_requests: u64,
     pub total_allowed: u64,
@@ -1571,8 +1588,60 @@ mod tests {
             (RateLimitKeyType::Path, "/api/v1".to_string()),
         ]);
 
-        assert!(key.to_key_string().contains("SourceIp"));
-        assert!(key.to_key_string().contains("Path"));
+        // Verify key_type is Composite with correct component names
+        assert!(matches!(key.key_type, RateLimitKeyType::Composite(_)));
+        if let RateLimitKeyType::Composite(ref names) = key.key_type {
+            assert_eq!(names.len(), 2);
+            assert!(names[0].contains("SourceIp"));
+            assert!(names[1].contains("Path"));
+        }
+
+        // Verify value is joined
+        assert_eq!(key.value, "192.168.1.1:/api/v1");
+
+        // Verify components are stored
+        assert!(key.components.is_some());
+        let components = key.components.as_ref().unwrap();
+        assert_eq!(components.len(), 2);
+
+        // Verify to_key_string output format
+        let key_string = key.to_key_string();
+        assert!(key_string.contains("SourceIp"));
+        assert!(key_string.contains("Path"));
+        assert!(key_string.contains("192.168.1.1"));
+        assert!(key_string.contains("/api/v1"));
+    }
+
+    #[test]
+    fn test_composite_key_multi_dimension() {
+        // Test composite key with IP + Method + Path (common for API rate limiting)
+        let key = RateLimitKey::composite(vec![
+            (RateLimitKeyType::SourceIp, "10.0.0.1".to_string()),
+            (RateLimitKeyType::Method, "POST".to_string()),
+            (RateLimitKeyType::Path, "/api/encrypt".to_string()),
+        ]);
+
+        assert!(matches!(key.key_type, RateLimitKeyType::Composite(_)));
+        assert_eq!(key.value, "10.0.0.1:POST:/api/encrypt");
+        assert_eq!(key.components.as_ref().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_composite_key_with_fingerprint() {
+        // Test composite key with fingerprint + path (NAT-friendly API limiting)
+        let key = RateLimitKey::composite(vec![
+            (
+                RateLimitKeyType::Ja3Fingerprint,
+                "abc123def456".to_string(),
+            ),
+            (RateLimitKeyType::Path, "/api/v1/users".to_string()),
+        ]);
+
+        if let RateLimitKeyType::Composite(ref names) = key.key_type {
+            assert!(names[0].contains("Ja3Fingerprint"));
+            assert!(names[1].contains("Path"));
+        }
+        assert_eq!(key.value, "abc123def456:/api/v1/users");
     }
 
     #[tokio::test]

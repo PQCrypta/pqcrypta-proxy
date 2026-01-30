@@ -31,12 +31,17 @@ use axum::{
     Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
+use hyper::server::conn::http1;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tokio_rustls::TlsConnector;
-use tracing::{debug, error, info, warn};
+use tower::ServiceExt;
+use tracing::{debug, error, info, trace, warn};
+
+use crate::tls_acceptor::FingerprintingTlsAcceptor;
 
 #[cfg(feature = "pqc")]
 use crate::pqc_tls::{openssl_pqc, PqcTlsProvider};
@@ -44,7 +49,9 @@ use crate::pqc_tls::{openssl_pqc, PqcTlsProvider};
 use crate::access_logger::{log_access, AccessLogEntry};
 use crate::compression::{compression_middleware, CompressionState};
 use crate::config::{BackendConfig, CorsConfig, ProxyConfig, TlsMode};
-use crate::fingerprint::FingerprintExtractor;
+use crate::fingerprint::{
+    fingerprint_middleware, FingerprintExtractor, FingerprintMiddlewareState,
+};
 use crate::http3_features::{http3_features_middleware, Http3FeaturesState};
 use crate::load_balancer::{extract_session_cookie, LoadBalancer, SelectionContext};
 use crate::rate_limiter::{
@@ -71,15 +78,16 @@ const PROXY_V2_SIGNATURE: [u8; 12] = [
 mod proxy_v2 {
     /// Version 2, PROXY command (connection was proxied)
     pub const VERSION_PROXY: u8 = 0x21;
-    /// Version 2, LOCAL command (connection was local/health check)
-    #[allow(dead_code)]
+
+    /// Version 2, LOCAL command (connection was not proxied, health check etc.)
+    #[cfg(test)]
     pub const VERSION_LOCAL: u8 = 0x20;
 
     /// Address family and protocol
+    #[cfg(test)]
+    pub const AF_UNSPEC: u8 = 0x00; // Unspecified (used with LOCAL command)
     pub const AF_INET_STREAM: u8 = 0x11; // IPv4 + TCP
     pub const AF_INET6_STREAM: u8 = 0x21; // IPv6 + TCP
-    #[allow(dead_code)]
-    pub const AF_UNSPEC: u8 = 0x00; // Unknown/unspecified
 }
 
 /// Build a PROXY protocol v2 header for the given connection
@@ -193,13 +201,9 @@ pub struct HttpListenerState {
     pub http_client: Client<HttpConnector, Body>,
     pub https_client: Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>,
     pub security: SecurityState,
-    /// Fingerprint extractor for TLS client identification (pending TLS layer integration)
-    #[allow(dead_code)]
+    /// Fingerprint extractor for TLS client identification
     pub fingerprint: Arc<FingerprintExtractor>,
     pub load_balancer: Arc<LoadBalancer>,
-    /// Advanced rate limiter (using security.rate_limiters for now)
-    #[allow(dead_code)]
-    pub rate_limiter: Arc<AdvancedRateLimiter>,
 }
 
 /// Create and run the HTTP listener with TLS termination
@@ -276,19 +280,29 @@ pub async fn run_http_listener(
         http_client,
         https_client,
         security: security_state.clone(),
-        fingerprint: fingerprint_extractor,
+        fingerprint: fingerprint_extractor.clone(),
         load_balancer,
-        rate_limiter: rate_limiter.clone(),
     };
 
     // Initialize compression state
     let compression_state = CompressionState::default();
 
     // Initialize HTTP/3 features state (Early Hints, Priority, Coalescing)
-    let http3_features_state = Http3FeaturesState::new();
+    let http3_features_state = Http3FeaturesState::from_proxy_config(&config.http3);
+
+    // Initialize fingerprint middleware state (if enabled)
+    let fingerprint_state = if config.fingerprint.enabled {
+        Some(FingerprintMiddlewareState::new(
+            fingerprint_extractor,
+            security_state.clone(),
+            Arc::new(config.fingerprint.clone()),
+        ))
+    } else {
+        None
+    };
 
     // Build router with full middleware stack
-    // Order (outside to inside): advanced_rate_limit -> security -> http3 -> compression -> headers -> handler
+    // Order (outside to inside): advanced_rate_limit -> fingerprint -> security -> http3 -> compression -> headers -> handler
     let app = Router::new()
         .fallback(any(proxy_handler))
         // Response headers (innermost - runs last on response)
@@ -315,8 +329,18 @@ pub async fn run_http_listener(
         .layer(middleware::from_fn_with_state(
             security_state,
             security_middleware,
-        ))
-        // Advanced rate limiting (outermost - runs first, multi-dimensional)
+        ));
+
+    // Conditionally add fingerprint middleware (if enabled)
+    let app = if let Some(fp_state) = fingerprint_state {
+        info!("🔍 TLS fingerprinting middleware enabled");
+        app.layer(middleware::from_fn_with_state(fp_state, fingerprint_middleware))
+    } else {
+        app
+    };
+
+    // Add rate limiting (outermost - runs first, multi-dimensional)
+    let app = app
         .layer(middleware::from_fn_with_state(
             rate_limiter,
             advanced_rate_limit_middleware,
@@ -431,19 +455,29 @@ pub async fn run_http_listener_pqc(
         http_client,
         https_client,
         security: security_state.clone(),
-        fingerprint: fingerprint_extractor,
+        fingerprint: fingerprint_extractor.clone(),
         load_balancer,
-        rate_limiter: rate_limiter.clone(),
     };
 
     // Initialize compression state
     let compression_state = CompressionState::default();
 
     // Initialize HTTP/3 features state (Early Hints, Priority, Coalescing)
-    let http3_features_state = Http3FeaturesState::new();
+    let http3_features_state = Http3FeaturesState::from_proxy_config(&config.http3);
+
+    // Initialize fingerprint middleware state (if enabled)
+    let fingerprint_state = if config.fingerprint.enabled {
+        Some(FingerprintMiddlewareState::new(
+            fingerprint_extractor,
+            security_state.clone(),
+            Arc::new(config.fingerprint.clone()),
+        ))
+    } else {
+        None
+    };
 
     // Build router with full middleware stack
-    // Order (outside to inside): advanced_rate_limit -> security -> http3 -> compression -> headers -> handler
+    // Order (outside to inside): advanced_rate_limit -> fingerprint -> security -> http3 -> compression -> headers -> handler
     let app = Router::new()
         .fallback(any(proxy_handler))
         .layer(middleware::from_fn_with_state(
@@ -465,8 +499,18 @@ pub async fn run_http_listener_pqc(
         .layer(middleware::from_fn_with_state(
             security_state,
             security_middleware,
-        ))
-        // Advanced rate limiting (outermost - runs first, multi-dimensional)
+        ));
+
+    // Conditionally add fingerprint middleware (if enabled)
+    let app = if let Some(fp_state) = fingerprint_state {
+        info!("🔍 TLS fingerprinting middleware enabled (PQC mode)");
+        app.layer(middleware::from_fn_with_state(fp_state, fingerprint_middleware))
+    } else {
+        app
+    };
+
+    // Add rate limiting (outermost - runs first, multi-dimensional)
+    let app = app
         .layer(middleware::from_fn_with_state(
             rate_limiter,
             advanced_rate_limit_middleware,
@@ -539,6 +583,356 @@ pub async fn run_http_listener_pqc(
         .await?;
 
     Ok(())
+}
+
+// ============================================================================
+// Custom TLS Accept Loop with Full Fingerprinting
+// ============================================================================
+// This implementation captures ClientHello before TLS handshake, extracts
+// JA3/JA4 fingerprints, and blocks malicious clients before they can waste
+// resources on a full handshake. This is the architecture used by Envoy,
+// HAProxy, and other enterprise proxies.
+
+/// Run HTTP listener with custom TLS accept loop and full fingerprinting
+///
+/// This is the preferred method for production deployments as it provides:
+/// - Full JA3/JA4 fingerprint capture from ClientHello
+/// - Early blocking of malicious fingerprints (before TLS handshake)
+/// - Fingerprint data injected into request extensions
+/// - Unified security posture across all connections
+///
+/// # Architecture
+/// ```text
+/// TcpListener
+///    → FingerprintingTlsAcceptor (captures ClientHello)
+///        → Early block if malicious fingerprint
+///        → TLS Handshake
+///            → Inject fingerprint into connection extensions
+///                → Hyper HTTP/1.1 service
+///                    → Axum router with middleware stack
+/// ```
+pub async fn run_http_listener_with_fingerprint(
+    addr: SocketAddr,
+    cert_path: &str,
+    key_path: &str,
+    config: Arc<ProxyConfig>,
+    mut shutdown_rx: watch::Receiver<()>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let port = addr.port();
+
+    info!(
+        "🔐 Starting HTTP listener with custom TLS accept loop on {} (TCP)",
+        addr
+    );
+    info!("🔍 Full JA3/JA4 fingerprinting enabled at TLS layer");
+    info!("📢 Will advertise Alt-Svc: h3=\":{}\"; ma=86400", port);
+
+    // Create HTTP client for plain backend connections (terminate mode)
+    let pool_config = &config.connection_pool;
+    let http_client = Client::builder(TokioExecutor::new())
+        .pool_max_idle_per_host(pool_config.max_idle_per_host)
+        .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
+        .build_http();
+
+    // Create HTTPS client for re-encrypt mode
+    let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .expect("Failed to load native root certificates")
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+
+    let https_client = Client::builder(TokioExecutor::new())
+        .pool_max_idle_per_host(pool_config.max_idle_per_host)
+        .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
+        .build(https_connector);
+
+    // Initialize security state from config
+    let security_state = SecurityState::new(&config);
+
+    // Initialize fingerprint extractor for JA3/JA4 tracking
+    let fingerprint_extractor = Arc::new(FingerprintExtractor::new());
+
+    // Initialize load balancer from config
+    let lb_config = Arc::new(config.load_balancer.clone());
+    let load_balancer = Arc::new(LoadBalancer::new(lb_config));
+
+    // Add backend pools from configuration
+    for (name, pool_config) in &config.backend_pools {
+        load_balancer.add_pool(pool_config);
+        info!(
+            "⚖️  Added backend pool '{}' with {} servers ({})",
+            name,
+            pool_config.servers.len(),
+            pool_config.algorithm
+        );
+    }
+
+    // Initialize advanced multi-dimensional rate limiter
+    let rate_limiter = Arc::new(AdvancedRateLimiter::new(
+        config.advanced_rate_limiting.clone(),
+    ));
+    info!(
+        "🚦 Advanced rate limiter enabled (key strategy: {:?})",
+        config.advanced_rate_limiting.key_strategy.order.first()
+    );
+
+    let state = HttpListenerState {
+        config: config.clone(),
+        port,
+        http_client,
+        https_client,
+        security: security_state.clone(),
+        fingerprint: fingerprint_extractor.clone(),
+        load_balancer,
+    };
+
+    // Initialize compression state
+    let compression_state = CompressionState::default();
+
+    // Initialize HTTP/3 features state
+    let http3_features_state = Http3FeaturesState::from_proxy_config(&config.http3);
+
+    // Initialize fingerprint middleware state
+    let fingerprint_state = FingerprintMiddlewareState::new(
+        fingerprint_extractor.clone(),
+        security_state.clone(),
+        Arc::new(config.fingerprint.clone()),
+    );
+
+    // Build router with full middleware stack
+    let app = Router::new()
+        .fallback(any(proxy_handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            security_headers_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            alt_svc_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            compression_state,
+            compression_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            http3_features_state,
+            http3_features_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            security_state.clone(),
+            security_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            fingerprint_state,
+            fingerprint_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            rate_limiter,
+            advanced_rate_limit_middleware,
+        ))
+        .with_state(state);
+
+    // Check cert files
+    if !std::path::Path::new(cert_path).exists() {
+        error!("❌ Certificate file not found: {}", cert_path);
+        return Err(format!("Certificate file not found: {}", cert_path).into());
+    }
+    if !std::path::Path::new(key_path).exists() {
+        error!("❌ Key file not found: {}", key_path);
+        return Err(format!("Key file not found: {}", key_path).into());
+    }
+
+    // Build rustls server config
+    let rustls_config = build_rustls_server_config(cert_path, key_path)?;
+    let rustls_config = Arc::new(rustls_config);
+
+    // Create fingerprinting TLS acceptor
+    let fingerprinting_acceptor = Arc::new(FingerprintingTlsAcceptor::new(
+        rustls_config,
+        fingerprint_extractor,
+        security_state,
+        config.fingerprint.clone(),
+    ));
+
+    // Bind TCP listener
+    let listener = TcpListener::bind(addr).await?;
+
+    info!("✅ Custom TLS accept loop configured");
+    info!("🔒 HTTPS reverse proxy ready on port {} (TCP)", port);
+    info!("🔍 JA3/JA4 fingerprinting active at TLS layer");
+    info!("🔄 Routing: api.pqcrypta.com → 127.0.0.1:3003");
+    info!("🔄 Routing: pqcrypta.com → 127.0.0.1:8080");
+
+    // Accept loop with graceful shutdown
+    loop {
+        tokio::select! {
+            // Accept new connections
+            accept_result = listener.accept() => {
+                let (stream, remote_addr) = match accept_result {
+                    Ok(result) => result,
+                    Err(e) => {
+                        warn!("Failed to accept TCP connection: {}", e);
+                        continue;
+                    }
+                };
+
+                // Clone resources for the spawned task
+                let acceptor = fingerprinting_acceptor.clone();
+                let app = app.clone();
+
+                // Spawn connection handler
+                tokio::spawn(async move {
+                    handle_fingerprinted_connection(stream, remote_addr, acceptor, app).await;
+                });
+            }
+
+            // Graceful shutdown signal
+            _ = shutdown_rx.changed() => {
+                info!("🛑 Received shutdown signal, stopping HTTP listener");
+                break;
+            }
+        }
+    }
+
+    info!("✅ HTTP listener stopped gracefully");
+    Ok(())
+}
+
+/// Handle a single connection with fingerprinting
+async fn handle_fingerprinted_connection(
+    stream: TcpStream,
+    remote_addr: SocketAddr,
+    acceptor: Arc<FingerprintingTlsAcceptor>,
+    app: Router,
+) {
+    trace!("New TCP connection from {}", remote_addr);
+
+    // Accept TLS connection with fingerprint capture
+    let tls_stream = match acceptor.accept(stream, remote_addr).await {
+        Ok(Some(stream)) => stream,
+        Ok(None) => {
+            // Connection blocked by fingerprint policy
+            debug!("Connection from {} blocked by fingerprint policy", remote_addr);
+            return;
+        }
+        Err(e) => {
+            debug!("TLS accept failed for {}: {}", remote_addr, e);
+            return;
+        }
+    };
+
+    // Extract fingerprint info from the connection
+    let conn_info = tls_stream.conn_info.clone();
+    let ja3_hash = conn_info.ja3_hash.clone();
+    let ja4_hash = conn_info.ja4_hash.clone();
+
+    trace!(
+        "TLS connection from {} established (JA3={:?}, JA4={:?}, client={:?})",
+        remote_addr,
+        ja3_hash,
+        ja4_hash,
+        conn_info.client_name
+    );
+
+    // Create service that injects fingerprint headers and routes to axum
+    let service = hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
+        // Clone data for async block
+        let ja3 = ja3_hash.clone();
+        let ja4 = ja4_hash.clone();
+        let ci = conn_info.clone();
+        let router = app.clone();
+
+        async move {
+            // Inject fingerprint headers for downstream middleware
+            if let Some(ref hash) = ja3 {
+                if let Ok(v) = HeaderValue::from_str(hash) {
+                    req.headers_mut().insert("x-ja3-hash", v);
+                }
+            }
+            if let Some(ref hash) = ja4 {
+                if let Ok(v) = HeaderValue::from_str(hash) {
+                    req.headers_mut().insert("x-ja4-hash", v);
+                }
+            }
+            if let Some(ref name) = ci.client_name {
+                if let Ok(v) = HeaderValue::from_str(name) {
+                    req.headers_mut().insert("x-client-name", v);
+                }
+            }
+            if ci.is_browser {
+                req.headers_mut()
+                    .insert("x-client-type", HeaderValue::from_static("browser"));
+            }
+
+            // Store connection info in extensions
+            req.extensions_mut().insert(ci);
+            req.extensions_mut().insert(ConnectInfo(remote_addr));
+
+            // Convert hyper request to axum request
+            let (parts, body) = req.into_parts();
+            let body = Body::new(body);
+            let req = Request::from_parts(parts, body);
+
+            // Call the axum router
+            let response = router.oneshot(req).await;
+
+            match response {
+                Ok(res) => {
+                    // Convert axum response to hyper response
+                    let (parts, body) = res.into_parts();
+                    Ok::<_, std::convert::Infallible>(Response::from_parts(parts, body))
+                }
+                Err(infallible) => match infallible {},
+            }
+        }
+    });
+
+    // Serve HTTP/1.1 connection
+    let io = TokioIo::new(tls_stream);
+    if let Err(e) = http1::Builder::new()
+        .serve_connection(io, service)
+        .await
+    {
+        if !e.to_string().contains("connection reset") {
+            debug!("HTTP connection error for {}: {}", remote_addr, e);
+        }
+    }
+}
+
+/// Build rustls server configuration from PEM files
+fn build_rustls_server_config(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<rustls::ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
+    use rustls::pki_types::CertificateDer;
+    use std::fs::File;
+    use std::io::BufReader;
+
+    // Load certificate chain
+    let cert_file = File::open(cert_path)?;
+    let mut cert_reader = BufReader::new(cert_file);
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+        .filter_map(|c| c.ok())
+        .collect();
+
+    if certs.is_empty() {
+        return Err(format!("No certificates found in {}", cert_path).into());
+    }
+
+    // Load private key
+    let key_file = File::open(key_path)?;
+    let mut key_reader = BufReader::new(key_file);
+    let key = rustls_pemfile::private_key(&mut key_reader)?
+        .ok_or_else(|| format!("No private key found in {}", key_path))?;
+
+    // Build server config
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+
+    Ok(config)
 }
 
 /// Run TLS passthrough server (SNI-based routing without termination)
@@ -796,11 +1190,7 @@ async fn alt_svc_middleware(
     let mut response = next.run(request).await;
 
     // Build Alt-Svc header with all ports
-    let mut alt_svc_parts = vec![format!("h3=\":{}\"; ma=86400", state.port)];
-    for port in &state.config.server.additional_ports {
-        alt_svc_parts.push(format!("h3=\":{}\"; ma=86400", port));
-    }
-    let alt_svc_value = alt_svc_parts.join(", ");
+    let alt_svc_value = build_alt_svc_header(state.port, &state.config.server.additional_ports);
 
     if let Ok(value) = HeaderValue::from_str(&alt_svc_value) {
         response.headers_mut().insert("alt-svc", value);
@@ -895,7 +1285,6 @@ async fn security_headers_middleware(
 // - Adaptive baseline learning with anomaly detection
 
 /// Build Alt-Svc header value for HTTP/3 advertisement.
-#[allow(dead_code)]
 fn build_alt_svc_header(port: u16, additional_ports: &[u16]) -> String {
     let mut parts = vec![format!("h3=\":{}\"; ma=86400", port)];
     for p in additional_ports {
@@ -965,7 +1354,6 @@ async fn advanced_rate_limit_middleware(
             reason,
             retry_after_ms,
             limit,
-            remaining: _,
         } => {
             debug!(
                 "Rate limited {} {} from {} (reason: {:?})",
@@ -1543,7 +1931,7 @@ pub async fn run_http_redirect_server(
 }
 
 /// Create TLS connector for re-encrypt mode with optional client cert
-#[allow(dead_code)]
+/// Used for TLS backend connections when tls_mode is set to reencrypt
 pub fn create_backend_tls_connector(
     backend: &BackendConfig,
 ) -> Result<TlsConnector, Box<dyn std::error::Error + Send + Sync>> {
@@ -1556,17 +1944,47 @@ pub fn create_backend_tls_connector(
 
     // Add native root certificates
     let native_certs = rustls_native_certs::load_native_certs();
+    let mut added = 0;
+    let mut failed = 0;
     for cert in native_certs.certs {
-        root_store.add(cert).ok();
+        match root_store.add(cert) {
+            Ok(()) => added += 1,
+            Err(e) => {
+                debug!("Failed to add native root certificate: {}", e);
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        debug!(
+            "Loaded {} native root certificates ({} failed - likely duplicates)",
+            added, failed
+        );
     }
 
     // Add custom CA cert if provided
     if let Some(ref ca_path) = backend.tls_cert {
         let ca_file = File::open(ca_path)?;
         let mut ca_reader = BufReader::new(ca_file);
-        let ca_certs = rustls_pemfile::certs(&mut ca_reader)
-            .filter_map(|c| c.ok())
-            .collect::<Vec<_>>();
+        let mut ca_certs = Vec::new();
+        let mut parse_errors = 0;
+        for cert_result in rustls_pemfile::certs(&mut ca_reader) {
+            match cert_result {
+                Ok(cert) => ca_certs.push(cert),
+                Err(e) => {
+                    warn!("Failed to parse CA certificate from {}: {}", ca_path.display(), e);
+                    parse_errors += 1;
+                }
+            }
+        }
+        if parse_errors > 0 {
+            warn!(
+                "Loaded {} CA certificates from {} ({} failed to parse)",
+                ca_certs.len(),
+                ca_path.display(),
+                parse_errors
+            );
+        }
         for cert in ca_certs {
             root_store.add(cert)?;
         }
@@ -1578,9 +1996,25 @@ pub fn create_backend_tls_connector(
     {
         let cert_file = File::open(cert_path)?;
         let mut cert_reader = BufReader::new(cert_file);
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
-            .filter_map(|c| c.ok())
-            .collect();
+        let mut certs: Vec<CertificateDer<'static>> = Vec::new();
+        let mut parse_errors = 0;
+        for cert_result in rustls_pemfile::certs(&mut cert_reader) {
+            match cert_result {
+                Ok(cert) => certs.push(cert),
+                Err(e) => {
+                    warn!("Failed to parse client certificate from {}: {}", cert_path.display(), e);
+                    parse_errors += 1;
+                }
+            }
+        }
+        if parse_errors > 0 {
+            warn!(
+                "Loaded {} client certificates from {} ({} failed to parse)",
+                certs.len(),
+                cert_path.display(),
+                parse_errors
+            );
+        }
 
         let key_file = File::open(key_path)?;
         let mut key_reader = BufReader::new(key_file);
@@ -1610,8 +2044,7 @@ pub fn create_backend_tls_connector(
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
-/// Dangerous: No-verification TLS verifier (for testing only)
-#[allow(dead_code)]
+/// Dangerous: No-verification TLS verifier for backends with tls_skip_verify
 #[derive(Debug)]
 struct NoVerifier;
 
