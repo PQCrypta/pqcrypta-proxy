@@ -334,8 +334,39 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Start admin API server
-    // OCSP service is optional - can be enabled via TLS config
-    let ocsp_service: Option<Arc<ocsp::OcspService>> = None;
+    // Initialize OCSP stapling service if enabled
+    let ocsp_service: Option<Arc<ocsp::OcspService>> = if config.ocsp.enabled {
+        info!("Initializing OCSP stapling service...");
+        let ocsp_config = ocsp::OcspConfig {
+            enabled: config.ocsp.enabled,
+            refresh_before_expiry: std::time::Duration::from_secs(config.ocsp.refresh_before_expiry_secs),
+            min_refresh_interval: std::time::Duration::from_secs(300),
+            request_timeout: std::time::Duration::from_secs(config.ocsp.timeout_secs),
+            max_retries: config.ocsp.max_retries,
+            retry_delay: std::time::Duration::from_secs(config.ocsp.retry_delay_ms / 1000),
+        };
+        let mut service = ocsp::OcspService::new(ocsp_config);
+
+        // Load certificates for OCSP
+        if let Ok(cert_pem) = std::fs::read(&config.tls.cert_path) {
+            if let Ok(certs) = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_pem.as_slice()))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                service.update_certificates(certs);
+            }
+        }
+
+        // Start the OCSP refresh background task
+        if let Err(e) = service.start() {
+            error!("Failed to start OCSP service: {}", e);
+        } else {
+            info!("✅ OCSP stapling service started");
+        }
+        Some(Arc::new(service))
+    } else {
+        info!("📝 OCSP stapling disabled in config");
+        None
+    };
 
     // Create shared metrics registry
     let metrics_registry = Arc::new(metrics::MetricsRegistry::new());
@@ -345,8 +376,22 @@ async fn main() -> anyhow::Result<()> {
         .tls
         .set_pqc_status(tls_provider.is_pqc_enabled(), &config.pqc.preferred_kem);
 
-    // ACME service is optional - can be enabled via ACME config
-    let acme_service: Option<Arc<parking_lot::RwLock<acme::AcmeService>>> = None;
+    // Initialize ACME certificate automation service if enabled
+    let acme_service: Option<Arc<parking_lot::RwLock<acme::AcmeService>>> = if config.acme.enabled {
+        info!("Initializing ACME certificate automation...");
+        let mut service = acme::AcmeService::new(config.acme.clone());
+
+        if let Err(e) = service.start() {
+            error!("Failed to start ACME service: {}", e);
+            None
+        } else {
+            info!("✅ ACME service started for domains: {:?}", config.acme.domains);
+            Some(Arc::new(parking_lot::RwLock::new(service)))
+        }
+    } else {
+        info!("📝 ACME certificate automation disabled in config");
+        None
+    };
 
     let admin_server = AdminServer::new(
         config.admin.clone(),
