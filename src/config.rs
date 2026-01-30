@@ -15,7 +15,39 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use crate::acme::AcmeConfig;
 use crate::rate_limiter::AdvancedRateLimitConfig;
+
+/// OCSP stapling configuration (TOML-compatible version)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OcspConfig {
+    /// Enable OCSP stapling
+    pub enabled: bool,
+    /// Cache duration for OCSP responses (seconds)
+    pub cache_duration_secs: u64,
+    /// Refresh OCSP response before expiry (seconds)
+    pub refresh_before_expiry_secs: u64,
+    /// OCSP request timeout (seconds)
+    pub timeout_secs: u64,
+    /// Maximum retries for OCSP requests
+    pub max_retries: u32,
+    /// Retry delay between attempts (milliseconds)
+    pub retry_delay_ms: u64,
+}
+
+impl Default for OcspConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cache_duration_secs: 3600,
+            refresh_before_expiry_secs: 300,
+            timeout_secs: 10,
+            max_retries: 3,
+            retry_delay_ms: 1000,
+        }
+    }
+}
 
 /// Global configuration container with hot-reload support
 pub struct ConfigManager {
@@ -91,6 +123,12 @@ pub struct ProxyConfig {
     /// HTTP connection pool configuration
     #[serde(default)]
     pub connection_pool: ConnectionPoolConfig,
+    /// OCSP stapling configuration
+    #[serde(default)]
+    pub ocsp: OcspConfig,
+    /// ACME certificate automation configuration
+    #[serde(default)]
+    pub acme: AcmeConfig,
 }
 
 impl Default for ProxyConfig {
@@ -114,6 +152,8 @@ impl Default for ProxyConfig {
             fingerprint: FingerprintConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
             connection_pool: ConnectionPoolConfig::default(),
+            ocsp: OcspConfig::default(),
+            acme: AcmeConfig::default(),
         }
     }
 }
