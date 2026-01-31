@@ -54,6 +54,7 @@
 
 ### Security
 - **JA3/JA4 TLS Fingerprinting**: Detects browsers, bots, scanners, malware based on TLS ClientHello
+- **PQC + Fingerprinting Combined**: OpenSSL ML-KEM with ClientHello capture for early blocking
 - **Circuit Breaker**: Protects backends from cascading failures with automatic recovery
 - **Advanced Rate Limiting**: Multi-dimensional limiting (IP, JA3/JA4, JWT, headers, composite keys)
 - **NAT-Friendly**: JA3/JA4 fingerprints identify clients behind shared corporate IPs
