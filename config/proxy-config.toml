@@ -134,8 +134,9 @@ nel = '{"report_to":"default","max_age":86400,"include_subdomains":true}'
 # Report-To endpoint configuration for NEL and other reports
 report_to = '{"group":"default","max_age":86400,"endpoints":[{"url":"https://api.pqcrypta.com/reports"}]}'
 
-# HTTP/3 Priority (RFC 9218) - u=0-7 (urgency), i (incremental)
-priority = "u=3"
+# HTTP/3 Priority (RFC 9218) - u=0-7 (urgency), i=?0 (not incremental)
+# u=3 is default urgency, i=?0 means non-incremental delivery
+priority = "u=3,i=?0"
 
 # =============================
 # Post-Quantum Cryptography

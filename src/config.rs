@@ -894,8 +894,8 @@ impl Default for HeadersConfig {
             // Groups for NEL, CSP violations, and other reports
             report_to: r#"{"group":"default","max_age":86400,"endpoints":[{"url":"https://pqcrypta.com/api/reports"}]}"#.to_string(),
 
-            // HTTP/3 Priority (RFC 9218) - u=3 is default urgency, i means incremental
-            priority: "u=3".to_string(),
+            // HTTP/3 Priority (RFC 9218) - u=3 is default urgency, i=?0 means non-incremental
+            priority: "u=3,i=?0".to_string(),
         }
     }
 }
