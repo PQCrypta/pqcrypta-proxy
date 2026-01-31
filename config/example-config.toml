@@ -120,6 +120,37 @@ x_quantum_resistant = "ML-KEM-1024, ML-DSA-87, X25519MLKEM768"
 x_security_level = "Post-Quantum Ready"
 
 # =============================
+# HTTP/3 Performance & Monitoring Headers
+# =============================
+# Enable Server-Timing header for performance metrics
+# Shows proxy processing time in browser DevTools
+server_timing_enabled = true
+
+# Accept-CH header for Client Hints (responsive content delivery)
+# Tells browsers which client hints to send on subsequent requests
+# Enables adaptive content delivery based on device capabilities
+accept_ch = "DPR, Viewport-Width, Width, ECT, RTT, Downlink, Sec-CH-UA-Platform, Sec-CH-UA-Mobile"
+
+# NEL (Network Error Logging) for client-side error reporting
+# JSON configuration for NEL policy - helps diagnose connection failures
+# max_age: How long browsers should report errors (seconds)
+# include_subdomains: Also report for subdomains
+nel = '{"report_to":"default","max_age":86400,"include_subdomains":true}'
+
+# Report-To endpoint configuration for NEL and other reports
+# JSON array defining where browsers should send error reports
+# group: Report group name (must match nel.report_to)
+# endpoints: Array of URLs to receive reports
+report_to = '{"group":"default","max_age":86400,"endpoints":[{"url":"https://api.pqcrypta.com/reports"}]}'
+
+# HTTP/3 Priority (RFC 9218) for response prioritization
+# Format: "u=<urgency>, i" where:
+#   urgency: 0-7 (0=highest priority, 7=lowest)
+#   i: incremental delivery flag
+# Note: If not set, the proxy auto-calculates based on content-type
+priority = "u=3"
+
+# =============================
 # Post-Quantum Cryptography
 # =============================
 # Two TLS backends available:

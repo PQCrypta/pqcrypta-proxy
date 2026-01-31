@@ -760,9 +760,10 @@ pub async fn http3_features_middleware(
     // Process the request
     let mut response = next.run(request).await;
 
-    // Add Priority header based on content type
+    // Add Priority header based on content type (only if not already set)
+    // The security_headers_middleware may have already set a priority from config
     let priority_config = state.priority.config.read();
-    if priority_config.enabled {
+    if priority_config.enabled && !response.headers().contains_key("priority") {
         let content_type = response
             .headers()
             .get(header::CONTENT_TYPE)

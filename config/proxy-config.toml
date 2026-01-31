@@ -120,6 +120,24 @@ x_quantum_resistant = "ML-KEM-1024, ML-DSA-87, X25519MLKEM768"
 x_security_level = "Post-Quantum Ready"
 
 # =============================
+# HTTP/3 Performance & Monitoring Headers
+# =============================
+# Enable Server-Timing header for performance metrics
+server_timing_enabled = true
+
+# Accept-CH header for Client Hints (responsive content delivery)
+accept_ch = "DPR, Viewport-Width, Width, ECT, RTT, Downlink, Sec-CH-UA-Platform, Sec-CH-UA-Mobile"
+
+# NEL (Network Error Logging) for client-side error reporting
+nel = '{"report_to":"default","max_age":86400,"include_subdomains":true}'
+
+# Report-To endpoint configuration for NEL and other reports
+report_to = '{"group":"default","max_age":86400,"endpoints":[{"url":"https://api.pqcrypta.com/reports"}]}'
+
+# HTTP/3 Priority (RFC 9218) - u=0-7 (urgency), i (incremental)
+priority = "u=3"
+
+# =============================
 # Post-Quantum Cryptography
 # =============================
 # Two TLS backends available:
