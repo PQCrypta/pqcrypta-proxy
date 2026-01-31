@@ -83,10 +83,14 @@
 ### HTTP/3 Advanced Features
 - **Full HTTP/3 Support**: Native HTTP/3 via `h3` crate with proper header forwarding
 - **Early Hints (103)**: Preload CSS/JS resources via Link headers
-- **Priority Hints**: RFC 9218 Extensible Priorities for resource scheduling
+- **Priority Hints**: RFC 9218 Extensible Priorities for resource scheduling (`u=3,i=?0`)
 - **Request Coalescing**: Deduplicate identical GET/HEAD requests in flight
 - **Alt-Svc Advertisement**: Automatic HTTP/3 upgrade headers on all ports
 - **Virtual Host Routing**: Proper `:authority` pseudo-header handling for backend routing
+- **Server-Timing**: Performance metrics header for browser DevTools (RFC 6797)
+- **NEL (Network Error Logging)**: Client-side error reporting with configurable policy
+- **Report-To**: Endpoint configuration for NEL and Reporting API
+- **Accept-CH**: Client Hints for responsive content delivery (DPR, Viewport-Width, ECT)
 
 ### Protocols
 - **QUIC/HTTP/3**: Full HTTP/3 support via QuicListener (h3 + quinn crates)
