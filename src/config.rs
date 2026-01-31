@@ -833,6 +833,34 @@ pub struct HeadersConfig {
     pub x_quantum_resistant: String,
     /// X-Security-Level branding header
     pub x_security_level: String,
+
+    // ═══════════════════════════════════════════════════════════════
+    // HTTP/3 Performance & Monitoring Headers
+    // ═══════════════════════════════════════════════════════════════
+
+    /// Enable Server-Timing header (performance metrics)
+    #[serde(default = "default_true")]
+    pub server_timing_enabled: bool,
+
+    /// Accept-CH header for Client Hints (responsive content delivery)
+    /// Example: "DPR, Viewport-Width, Width, ECT, RTT, Downlink, Sec-CH-UA-Platform"
+    #[serde(default)]
+    pub accept_ch: String,
+
+    /// NEL (Network Error Logging) header for client-side error reporting
+    /// JSON configuration for NEL policy
+    #[serde(default)]
+    pub nel: String,
+
+    /// Report-To header endpoint configuration for NEL and other reports
+    /// JSON array of reporting endpoints
+    #[serde(default)]
+    pub report_to: String,
+
+    /// Priority header for HTTP/3 response prioritization (RFC 9218)
+    /// Format: "u=<urgency>, i" where urgency is 0-7 and i indicates incremental
+    #[serde(default)]
+    pub priority: String,
 }
 
 impl Default for HeadersConfig {
@@ -851,6 +879,23 @@ impl Default for HeadersConfig {
             x_dns_prefetch_control: "off".to_string(),
             x_quantum_resistant: "ML-KEM-1024, ML-DSA-87, X25519MLKEM768".to_string(),
             x_security_level: "Post-Quantum Ready".to_string(),
+
+            // HTTP/3 Performance & Monitoring Headers
+            server_timing_enabled: true,
+
+            // Client Hints for responsive content delivery
+            accept_ch: "DPR, Viewport-Width, Width, ECT, RTT, Downlink, Sec-CH-UA-Platform, Sec-CH-UA-Mobile".to_string(),
+
+            // Network Error Logging configuration
+            // Reports connection errors to the configured endpoint
+            nel: r#"{"report_to":"default","max_age":86400,"include_subdomains":true}"#.to_string(),
+
+            // Reporting API endpoint configuration
+            // Groups for NEL, CSP violations, and other reports
+            report_to: r#"{"group":"default","max_age":86400,"endpoints":[{"url":"https://pqcrypta.com/api/reports"}]}"#.to_string(),
+
+            // HTTP/3 Priority (RFC 9218) - u=3 is default urgency, i means incremental
+            priority: "u=3".to_string(),
         }
     }
 }
