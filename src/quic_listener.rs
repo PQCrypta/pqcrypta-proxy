@@ -414,9 +414,10 @@ impl QuicListener {
         if config.http3.early_hints_enabled {
             let hints = early_hints_state.get_hints_for_path(&path);
             if !hints.is_empty() {
-                // Build 103 Early Hints response with Link headers
-                let mut early_response_builder =
-                    http::Response::builder().status(http::StatusCode::EARLY_HINTS);
+                // Build 103 Early Hints response with Link headers and alt-svc for QUIC advertisement
+                let mut early_response_builder = http::Response::builder()
+                    .status(http::StatusCode::EARLY_HINTS)
+                    .header("alt-svc", build_alt_svc_header(&config));
 
                 for hint in &hints {
                     early_response_builder = early_response_builder.header("link", hint.as_str());
