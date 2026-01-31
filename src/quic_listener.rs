@@ -23,6 +23,7 @@ use tracing::{debug, error, info, warn};
 use crate::access_logger::{log_access, AccessLogEntry};
 use crate::config::{ConfigReloadEvent, CorsConfig, ProxyConfig};
 use crate::handlers::WebTransportHandler;
+use crate::http3_features::EarlyHintsState;
 use crate::proxy::BackendPool;
 use crate::tls::TlsProvider;
 
@@ -51,6 +52,8 @@ pub struct QuicListener {
     shutdown_rx: mpsc::Receiver<()>,
     /// Config reload receiver
     reload_rx: mpsc::Receiver<ConfigReloadEvent>,
+    /// Early Hints state for 103 responses
+    early_hints_state: Arc<EarlyHintsState>,
 }
 
 impl QuicListener {
@@ -95,6 +98,12 @@ impl QuicListener {
         // Create backend pool
         let backend_pool = Arc::new(BackendPool::new(config.clone()));
 
+        // Create early hints state from config
+        let early_hints_state = Arc::new(EarlyHintsState::default());
+        if config.http3.early_hints_enabled {
+            info!("HTTP/3 Early Hints (103) enabled");
+        }
+
         Ok(Self {
             endpoint,
             tls_provider,
@@ -102,6 +111,7 @@ impl QuicListener {
             config,
             shutdown_rx,
             reload_rx,
+            early_hints_state,
         })
     }
 
@@ -126,6 +136,7 @@ impl QuicListener {
                     // Spawn connection handler
                     let config = self.config.clone();
                     let backend_pool = self.backend_pool.clone();
+                    let early_hints_state = self.early_hints_state.clone();
 
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_connection(
@@ -133,6 +144,7 @@ impl QuicListener {
                             remote_addr,
                             config,
                             backend_pool,
+                            early_hints_state,
                         ).await {
                             error!("Connection error from {}: {}", remote_addr, e);
                         }
@@ -182,6 +194,7 @@ impl QuicListener {
         remote_addr: SocketAddr,
         config: Arc<ProxyConfig>,
         backend_pool: Arc<BackendPool>,
+        early_hints_state: Arc<EarlyHintsState>,
     ) -> anyhow::Result<()> {
         // Accept connection
         let connecting = incoming.accept()?;
@@ -208,7 +221,14 @@ impl QuicListener {
         match h3::server::Connection::new(h3_conn).await {
             Ok(mut h3) => {
                 // HTTP/3 connection established
-                Self::handle_h3_connection(&mut h3, remote_addr, config, backend_pool).await?;
+                Self::handle_h3_connection(
+                    &mut h3,
+                    remote_addr,
+                    config,
+                    backend_pool,
+                    early_hints_state,
+                )
+                .await?;
             }
             Err(e) => {
                 // Fall back to raw QUIC streams (WebTransport without HTTP/3)
@@ -227,6 +247,7 @@ impl QuicListener {
         remote_addr: SocketAddr,
         config: Arc<ProxyConfig>,
         backend_pool: Arc<BackendPool>,
+        early_hints_state: Arc<EarlyHintsState>,
     ) -> anyhow::Result<()> {
         loop {
             match h3.accept().await {
@@ -314,6 +335,7 @@ impl QuicListener {
                         // Regular HTTP/3 request
                         let config_clone = config.clone();
                         let backend_pool_clone = backend_pool.clone();
+                        let early_hints_clone = early_hints_state.clone();
 
                         tokio::spawn(async move {
                             if let Err(e) = Self::handle_h3_request(
@@ -322,6 +344,7 @@ impl QuicListener {
                                 remote_addr,
                                 config_clone,
                                 backend_pool_clone,
+                                early_hints_clone,
                             )
                             .await
                             {
@@ -351,6 +374,7 @@ impl QuicListener {
         remote_addr: SocketAddr,
         config: Arc<ProxyConfig>,
         backend_pool: Arc<BackendPool>,
+        early_hints_state: Arc<EarlyHintsState>,
     ) -> anyhow::Result<()>
     where
         S: h3::quic::BidiStream<Bytes>,
@@ -384,6 +408,36 @@ impl QuicListener {
             "HTTP/3 request: {} {} host={:?} from {}",
             method, path, host, remote_addr
         );
+
+        // Send 103 Early Hints if enabled and we have hints for this path
+        // This is a key HTTP/3 optimization - send resource hints before proxying to backend
+        if config.http3.early_hints_enabled {
+            let hints = early_hints_state.get_hints_for_path(&path);
+            if !hints.is_empty() {
+                // Build 103 Early Hints response with Link headers
+                let mut early_response_builder =
+                    http::Response::builder().status(http::StatusCode::EARLY_HINTS);
+
+                for hint in &hints {
+                    early_response_builder = early_response_builder.header("link", hint.as_str());
+                }
+
+                if let Ok(early_response) = early_response_builder.body(()) {
+                    if let Err(e) = stream.send_response(early_response).await {
+                        debug!(
+                            "Failed to send 103 Early Hints to {}: {} (continuing with request)",
+                            remote_addr, e
+                        );
+                    } else {
+                        debug!(
+                            "Sent 103 Early Hints to {} with {} link hints",
+                            remote_addr,
+                            hints.len()
+                        );
+                    }
+                }
+            }
+        }
 
         // Find route first so we can use per-route CORS config
         let route = match config.find_route(host.as_deref(), &path, false) {
