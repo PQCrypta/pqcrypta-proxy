@@ -837,7 +837,6 @@ pub struct HeadersConfig {
     // ═══════════════════════════════════════════════════════════════
     // HTTP/3 Performance & Monitoring Headers
     // ═══════════════════════════════════════════════════════════════
-
     /// Enable Server-Timing header (performance metrics)
     #[serde(default = "default_true")]
     pub server_timing_enabled: bool,
