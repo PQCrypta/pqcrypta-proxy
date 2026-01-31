@@ -471,10 +471,10 @@ pub mod openssl_pqc {
             .set_min_proto_version(Some(SslVersion::TLS1_3))
             .map_err(|e| format!("Failed to set TLS version: {}", e))?;
 
-        // Load certificate
+        // Load certificate chain (includes intermediate certificates)
         builder
-            .set_certificate_file(cert_path, SslFiletype::PEM)
-            .map_err(|e| format!("Failed to load certificate: {}", e))?;
+            .set_certificate_chain_file(cert_path)
+            .map_err(|e| format!("Failed to load certificate chain: {}", e))?;
 
         // Load private key
         builder
