@@ -417,7 +417,8 @@ impl QuicListener {
                 // Build 103 Early Hints response with Link headers and alt-svc for QUIC advertisement
                 let mut early_response_builder = http::Response::builder()
                     .status(http::StatusCode::EARLY_HINTS)
-                    .header("alt-svc", build_alt_svc_header(&config));
+                    .header("alt-svc", build_alt_svc_header(&config))
+                    .header("server", "PQCProxy v0.2.1");
 
                 for hint in &hints {
                     early_response_builder = early_response_builder.header("link", hint.as_str());
