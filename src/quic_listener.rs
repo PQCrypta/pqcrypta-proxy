@@ -651,6 +651,53 @@ impl QuicListener {
         // Add Server header for branding (hide backend identity)
         response_builder = response_builder.header("server", "PQCProxy v0.2.1");
 
+        // ═══════════════════════════════════════════════════════════════
+        // HTTP/3 Performance & Monitoring Headers
+        // ═══════════════════════════════════════════════════════════════
+
+        // Server-Timing header - Performance metrics for DevTools
+        if config.headers.server_timing_enabled {
+            let processing_time = start_time.elapsed();
+            let server_timing = format!(
+                "proxy;dur={:.2};desc=\"PQCProxy Processing\", quic;desc=\"QUIC v1\"",
+                processing_time.as_secs_f64() * 1000.0
+            );
+            response_builder = response_builder.header("server-timing", server_timing);
+        }
+
+        // Accept-CH header - Client Hints for adaptive content
+        if !config.headers.accept_ch.is_empty() {
+            response_builder = response_builder.header("accept-ch", &config.headers.accept_ch);
+        }
+
+        // NEL header - Network Error Logging
+        if !config.headers.nel.is_empty() {
+            response_builder = response_builder.header("nel", &config.headers.nel);
+        }
+
+        // Report-To header - Reporting API endpoint
+        if !config.headers.report_to.is_empty() {
+            response_builder = response_builder.header("report-to", &config.headers.report_to);
+        }
+
+        // Priority header (RFC 9218) - HTTP/3 response prioritization
+        if !config.headers.priority.is_empty() {
+            response_builder = response_builder.header("priority", &config.headers.priority);
+        }
+
+        // Security headers
+        response_builder = response_builder
+            .header("strict-transport-security", &config.headers.hsts)
+            .header("x-frame-options", &config.headers.x_frame_options)
+            .header("x-content-type-options", &config.headers.x_content_type_options)
+            .header("referrer-policy", &config.headers.referrer_policy)
+            .header("permissions-policy", &config.headers.permissions_policy)
+            .header("cross-origin-opener-policy", &config.headers.cross_origin_opener_policy)
+            .header("cross-origin-embedder-policy", &config.headers.cross_origin_embedder_policy)
+            .header("cross-origin-resource-policy", &config.headers.cross_origin_resource_policy)
+            .header("x-quantum-resistant", &config.headers.x_quantum_resistant)
+            .header("x-security-level", &config.headers.x_security_level);
+
         // Add CORS headers from route.cors (proxy-level CORS) if configured
         if let Some(ref cors) = route.cors {
             response_builder = add_cors_headers_to_builder(response_builder, cors);
