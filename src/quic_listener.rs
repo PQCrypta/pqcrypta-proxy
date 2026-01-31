@@ -689,12 +689,24 @@ impl QuicListener {
         response_builder = response_builder
             .header("strict-transport-security", &config.headers.hsts)
             .header("x-frame-options", &config.headers.x_frame_options)
-            .header("x-content-type-options", &config.headers.x_content_type_options)
+            .header(
+                "x-content-type-options",
+                &config.headers.x_content_type_options,
+            )
             .header("referrer-policy", &config.headers.referrer_policy)
             .header("permissions-policy", &config.headers.permissions_policy)
-            .header("cross-origin-opener-policy", &config.headers.cross_origin_opener_policy)
-            .header("cross-origin-embedder-policy", &config.headers.cross_origin_embedder_policy)
-            .header("cross-origin-resource-policy", &config.headers.cross_origin_resource_policy)
+            .header(
+                "cross-origin-opener-policy",
+                &config.headers.cross_origin_opener_policy,
+            )
+            .header(
+                "cross-origin-embedder-policy",
+                &config.headers.cross_origin_embedder_policy,
+            )
+            .header(
+                "cross-origin-resource-policy",
+                &config.headers.cross_origin_resource_policy,
+            )
             .header("x-quantum-resistant", &config.headers.x_quantum_resistant)
             .header("x-security-level", &config.headers.x_security_level);
 
