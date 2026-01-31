@@ -1643,7 +1643,14 @@ async fn security_headers_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    // Track request timing for Server-Timing header
+    let start_time = std::time::Instant::now();
+
     let mut response = next.run(request).await;
+
+    // Calculate processing time
+    let processing_time = start_time.elapsed();
+
     let headers = response.headers_mut();
     let config = &state.config.headers;
 
@@ -1700,6 +1707,53 @@ async fn security_headers_middleware(
     }
     if let Ok(v) = HeaderValue::from_str(&config.x_security_level) {
         headers.insert("x-security-level", v);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // HTTP/3 Performance & Monitoring Headers
+    // ═══════════════════════════════════════════════════════════════
+
+    // Server-Timing header (RFC 6797) - Performance metrics
+    // Format: metric;dur=<ms>;desc="description"
+    if config.server_timing_enabled {
+        let server_timing = format!(
+            "proxy;dur={:.2};desc=\"PQCProxy Processing\", quic;desc=\"QUIC v1\"",
+            processing_time.as_secs_f64() * 1000.0
+        );
+        if let Ok(v) = HeaderValue::from_str(&server_timing) {
+            headers.insert("server-timing", v);
+        }
+    }
+
+    // Accept-CH header (Client Hints) - Enables responsive content delivery
+    // Tells browsers which client hints to send on subsequent requests
+    if !config.accept_ch.is_empty() {
+        if let Ok(v) = HeaderValue::from_str(&config.accept_ch) {
+            headers.insert("accept-ch", v);
+        }
+    }
+
+    // NEL header (Network Error Logging) - Client-side error reporting
+    // Helps diagnose connection failures from client perspective
+    if !config.nel.is_empty() {
+        if let Ok(v) = HeaderValue::from_str(&config.nel) {
+            headers.insert("nel", v);
+        }
+    }
+
+    // Report-To header - Defines endpoints for NEL and other reports
+    if !config.report_to.is_empty() {
+        if let Ok(v) = HeaderValue::from_str(&config.report_to) {
+            headers.insert("report-to", v);
+        }
+    }
+
+    // Priority header (RFC 9218) - HTTP/3 response prioritization
+    // u=0-7 (urgency, lower is more urgent), i (incremental delivery)
+    if !config.priority.is_empty() {
+        if let Ok(v) = HeaderValue::from_str(&config.priority) {
+            headers.insert("priority", v);
+        }
     }
 
     response
