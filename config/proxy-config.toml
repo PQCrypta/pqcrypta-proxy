@@ -106,9 +106,10 @@ referrer_policy = "strict-origin-when-cross-origin"
 permissions_policy = "camera=(), microphone=(), geolocation=(), interest-cohort=()"
 
 # Cross-origin isolation headers
-cross_origin_opener_policy = "same-origin"
-cross_origin_embedder_policy = "require-corp"
-cross_origin_resource_policy = "same-origin"
+# NOTE: require-corp/same-origin can break apps like Grafana that use modern JS
+cross_origin_opener_policy = "unsafe-none"
+cross_origin_embedder_policy = "unsafe-none"
+cross_origin_resource_policy = "cross-origin"
 
 # Additional security headers
 x_permitted_cross_domain_policies = "none"
@@ -742,6 +743,28 @@ address = "127.0.0.1:9000"
 timeout_ms = 10000
 max_connections = 100
 
+# Grafana monitoring dashboard
+[backends.grafana]
+name = "grafana"
+type = "http1"
+address = "127.0.0.1:3000"
+tls_mode = "terminate"
+timeout_ms = 30000
+max_connections = 50
+health_check = "/api/health"
+health_check_interval_secs = 30
+
+# Prometheus metrics server
+[backends.prometheus]
+name = "prometheus"
+type = "http1"
+address = "127.0.0.1:9090"
+tls_mode = "terminate"
+timeout_ms = 30000
+max_connections = 50
+health_check = "/-/healthy"
+health_check_interval_secs = 30
+
 # =============================
 # TLS Passthrough Routes (SNI Routing)
 # =============================
@@ -950,12 +973,124 @@ timeout_override_ms = 120000       # 2 minute timeout for long exports
 forward_client_identity = true
 priority = 45
 
+# Grafana monitoring dashboard route
+[[routes]]
+name = "grafana"
+host = "pqcrypta.com"
+path_prefix = "/grafana"
+backend = "grafana"
+forward_client_identity = true
+client_identity_header = "X-Real-IP"
+stripe_compatibility = true        # Removes COEP/COOP headers that can break Grafana login
+priority = 20
+
+[routes.add_headers]
+X-Forwarded-Proto = "https"
+X-Forwarded-Host = "pqcrypta.com"
+
+[routes.headers_override]
+cross_origin_embedder_policy = "unsafe-none"
+cross_origin_opener_policy = "unsafe-none"
+
+# Prometheus metrics route
+[[routes]]
+name = "prometheus"
+host = "pqcrypta.com"
+path_prefix = "/prometheus"
+backend = "prometheus"
+forward_client_identity = true
+client_identity_header = "X-Real-IP"
+priority = 20
+
+[routes.add_headers]
+X-Forwarded-Proto = "https"
+X-Forwarded-Host = "pqcrypta.com"
+
 # Wildcard catch-all route
 [[routes]]
 name = "default"
 path_prefix = "/"
 backend = "apache"
 priority = 1000
+
+# =============================
+# Database Blocklist Sync
+# =============================
+# Synchronize blocklists from PostgreSQL database.
+# The API server's WAF/honeypot system stores detected threats in the database.
+# This enables the proxy to automatically block known malicious IPs/fingerprints.
+
+[database]
+# Enable database sync for blocklists
+enabled = true
+
+# PostgreSQL connection settings
+# Credentials are read from environment variables for security:
+#   PQCRYPTA_DB_HOST, PQCRYPTA_DB_PORT, PQCRYPTA_DB_USER,
+#   PQCRYPTA_DB_PASSWORD, PQCRYPTA_DB_NAME
+host = "localhost"
+port = 5432
+database = "pqcrypta"
+user = "pqcrypta_user"
+# Password should be set via PQCRYPTA_DB_PASSWORD environment variable
+# password = ""  # DO NOT hardcode - use env var
+
+# Connection pool settings
+min_connections = 2
+max_connections = 10
+connection_timeout_secs = 10
+
+# Sync interval in seconds (how often to refresh blocklist from database)
+sync_interval_secs = 60
+
+# Maximum blocklist size (memory protection)
+max_blocklist_size = 50000
+
+# Blocklist queries - customize based on your schema
+[database.blocklist_queries]
+# Query for blocked IPs (should return: ip_address, reason, expires_at)
+blocked_ips = """
+SELECT ip_address, reason, expires_at
+FROM bot_blocklist
+WHERE is_active = true
+  AND (expires_at IS NULL OR expires_at > NOW())
+"""
+
+# Query for blocked fingerprints (should return: fingerprint, type, reason)
+blocked_fingerprints = """
+SELECT fingerprint, fingerprint_type, reason
+FROM fingerprint_blocklist
+WHERE is_active = true
+  AND (expires_at IS NULL OR expires_at > NOW())
+"""
+
+# Query for blocked countries (should return: country_code, reason)
+blocked_countries = """
+SELECT country_code, reason
+FROM country_blocklist
+WHERE is_active = true
+"""
+
+# Query to log proxy-level detections back to database
+# This bridges the gap between proxy detection and API WAF detection
+[database.logging]
+enabled = true
+
+# Log blocked requests to database for analytics
+log_blocked_requests = true
+
+# Log suspicious patterns detected at proxy level
+log_suspicious_patterns = true
+
+# Table for proxy-level detections
+detection_table = "proxy_detections"
+
+# Insert query template (use $1, $2, etc. for parameters)
+insert_detection = """
+INSERT INTO proxy_detections
+  (ip_address, fingerprint, path, method, user_agent, detection_type, blocked, timestamp)
+VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+"""
 
 # =============================
 # Configuration Notes
