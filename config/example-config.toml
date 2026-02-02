@@ -754,6 +754,34 @@ address = "127.0.0.1:9000"
 timeout_ms = 10000
 max_connections = 100
 
+# Grafana monitoring dashboard
+# Required Grafana configuration in /etc/grafana/grafana.ini:
+#   domain = example.com
+#   root_url = https://example.com/grafana/
+#   serve_from_sub_path = true
+[backends.grafana]
+name = "grafana"
+type = "http1"
+address = "127.0.0.1:3000"
+tls_mode = "terminate"
+timeout_ms = 30000
+max_connections = 50
+health_check = "/api/health"
+health_check_interval_secs = 30
+
+# Prometheus metrics server
+# Required Prometheus configuration in /etc/default/prometheus:
+#   ARGS="--web.external-url=https://example.com/prometheus --web.route-prefix=/prometheus"
+[backends.prometheus]
+name = "prometheus"
+type = "http1"
+address = "127.0.0.1:9090"
+tls_mode = "terminate"
+timeout_ms = 30000
+max_connections = 50
+health_check = "/-/healthy"
+health_check_interval_secs = 30
+
 # =============================
 # TLS Passthrough Routes (SNI Routing)
 # =============================
@@ -961,6 +989,36 @@ backend = "api"
 timeout_override_ms = 120000       # 2 minute timeout for long exports
 forward_client_identity = true
 priority = 45
+
+# Grafana monitoring dashboard route
+# Serves Grafana at /grafana/ subpath (requires serve_from_sub_path = true in Grafana config)
+[[routes]]
+name = "grafana"
+host = "example.com"
+path_prefix = "/grafana"
+backend = "grafana"
+forward_client_identity = true
+client_identity_header = "X-Real-IP"
+priority = 20
+
+[routes.add_headers]
+X-Forwarded-Proto = "https"
+X-Forwarded-Host = "example.com"
+
+# Prometheus metrics route
+# Serves Prometheus at /prometheus/ subpath (requires --web.external-url and --web.route-prefix flags)
+[[routes]]
+name = "prometheus"
+host = "example.com"
+path_prefix = "/prometheus"
+backend = "prometheus"
+forward_client_identity = true
+client_identity_header = "X-Real-IP"
+priority = 20
+
+[routes.add_headers]
+X-Forwarded-Proto = "https"
+X-Forwarded-Host = "example.com"
 
 # Wildcard catch-all route
 [[routes]]

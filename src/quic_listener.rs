@@ -634,6 +634,7 @@ impl QuicListener {
                     | "content-encoding"
                     | "vary"
                     | "x-content-type-options"
+                    | "set-cookie"
                     | "access-control-allow-origin"
                     | "access-control-allow-methods"
                     | "access-control-allow-headers"
