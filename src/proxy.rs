@@ -28,8 +28,8 @@ use crate::config::{BackendConfig, BackendType, ProxyConfig};
 pub struct ProxyResponse {
     /// HTTP status code
     pub status: u16,
-    /// Response headers
-    pub headers: HashMap<String, String>,
+    /// Response headers (Vec to support multiple headers with same name, e.g. Set-Cookie)
+    pub headers: Vec<(String, String)>,
     /// Response body
     pub body: Vec<u8>,
 }
@@ -183,12 +183,12 @@ impl BackendPool {
             .map_err(|_| anyhow::anyhow!("Backend request timeout"))?
             .map_err(|e| anyhow::anyhow!("Backend request failed: {}", e))?;
 
-        // Extract status and headers
+        // Extract status and headers (use Vec to preserve multiple headers with same name)
         let status = response.status().as_u16();
-        let mut response_headers = HashMap::new();
+        let mut response_headers = Vec::new();
         for (name, value) in response.headers() {
             if let Ok(v) = value.to_str() {
-                response_headers.insert(name.to_string(), v.to_string());
+                response_headers.push((name.to_string(), v.to_string()));
             }
         }
 
