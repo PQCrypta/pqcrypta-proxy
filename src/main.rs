@@ -653,17 +653,13 @@ async fn main() -> anyhow::Result<()> {
         let wt_key = key_path.clone();
 
         tokio::spawn(async move {
-            let wt_addr: std::net::SocketAddr = format!("0.0.0.0:4433").parse().unwrap();
+            let wt_addr: std::net::SocketAddr = "0.0.0.0:4433".parse().unwrap();
 
             info!("🚀 Starting dedicated WebTransport server on {}", wt_addr);
 
-            match WebTransportServer::new(
-                wt_addr,
-                &wt_cert,
-                &wt_key,
-                wt_config,
-                wt_backend_pool,
-            ).await {
+            match WebTransportServer::new(wt_addr, &wt_cert, &wt_key, wt_config, wt_backend_pool)
+                .await
+            {
                 Ok(server) => {
                     info!("✅ WebTransport server ready on {}", server.local_addr());
                     if let Err(e) = server.run().await {

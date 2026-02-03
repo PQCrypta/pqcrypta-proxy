@@ -224,7 +224,9 @@ impl QuicListener {
             .enable_extended_connect(true)
             .enable_datagram(true)
             .max_webtransport_sessions(1000)
-            .build(h3_conn).await {
+            .build(h3_conn)
+            .await
+        {
             Ok(mut h3) => {
                 // HTTP/3 connection established
                 Self::handle_h3_connection(
