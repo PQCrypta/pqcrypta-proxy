@@ -134,6 +134,17 @@ pub enum BlockReason {
     TooManyErrors,
     /// GeoIP blocked country
     GeoBlocked,
+    /// Synced from database blocklist
+    DatabaseSync,
+}
+
+/// Entry from the database-synced blocklist JSON file
+#[derive(serde::Deserialize)]
+struct BlocklistEntry {
+    ip: String,
+    reason: String,
+    threat_level: String,
+    expires_at: Option<String>,
 }
 
 /// Request counter for adaptive rate limiting
@@ -291,14 +302,18 @@ impl SecurityState {
     }
 
     /// Spawn a background task that periodically cleans up expired entries
+    /// and reloads blocklists from database sync
     fn spawn_cleanup_task(&self) {
         let state = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
+                // Reload blocklists from database sync files
+                state.reload_blocklist_from_files();
+                // Cleanup expired entries
                 state.cleanup();
-                debug!("Security state cleanup completed");
+                debug!("Security state cleanup and blocklist reload completed");
             }
         });
     }
@@ -396,6 +411,74 @@ impl SecurityState {
                 block_count,
             },
         );
+    }
+
+    /// Reload blocklist from JSON files (synced from database)
+    /// Called periodically to pick up new blocks from the sync script
+    pub fn reload_blocklist_from_files(&self) {
+        let blocklist_dir = std::path::Path::new("/var/www/html/pqcrypta-proxy/data/blocklists");
+        let blocked_ips_file = blocklist_dir.join("blocked_ips.json");
+
+        if !blocked_ips_file.exists() {
+            return;
+        }
+
+        match std::fs::read_to_string(&blocked_ips_file) {
+            Ok(content) => {
+                if let Ok(entries) = serde_json::from_str::<Vec<BlocklistEntry>>(&content) {
+                    let mut loaded = 0;
+                    for entry in entries {
+                        // Parse IP from CIDR notation (e.g., "1.2.3.4/32" -> "1.2.3.4")
+                        let ip_str = entry.ip.split('/').next().unwrap_or(&entry.ip);
+                        if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                            // Skip if already blocked with same or longer duration
+                            if self.blocked_ips.contains_key(&ip) {
+                                continue;
+                            }
+
+                            // Calculate expiration from the expires_at field
+                            let expires_at = entry.expires_at.as_ref().and_then(|exp| {
+                                chrono::DateTime::parse_from_rfc3339(exp)
+                                    .ok()
+                                    .map(|dt| {
+                                        let now = chrono::Utc::now();
+                                        let exp_utc = dt.with_timezone(&chrono::Utc);
+                                        if exp_utc > now {
+                                            let duration = (exp_utc - now).to_std().unwrap_or(Duration::from_secs(3600));
+                                            Some(Instant::now() + duration)
+                                        } else {
+                                            None // Already expired
+                                        }
+                                    })
+                                    .flatten()
+                            });
+
+                            // Skip if already expired
+                            if entry.expires_at.is_some() && expires_at.is_none() {
+                                continue;
+                            }
+
+                            self.blocked_ips.insert(
+                                ip,
+                                BlockedIpInfo {
+                                    blocked_at: Instant::now(),
+                                    expires_at,
+                                    reason: BlockReason::DatabaseSync,
+                                    block_count: 1,
+                                },
+                            );
+                            loaded += 1;
+                        }
+                    }
+                    if loaded > 0 {
+                        info!("Loaded {} blocked IPs from database sync", loaded);
+                    }
+                }
+            }
+            Err(e) => {
+                debug!("Could not read blocklist file: {}", e);
+            }
+        }
     }
 
     /// Increment connection count for IP
