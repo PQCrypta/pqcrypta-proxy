@@ -217,8 +217,14 @@ impl QuicListener {
         // Create H3 connection
         let h3_conn = H3Connection::new(connection.clone());
 
-        // Try to establish HTTP/3 connection
-        match h3::server::Connection::new(h3_conn).await {
+        // Try to establish HTTP/3 connection with WebTransport support enabled
+        // This advertises SETTINGS_ENABLE_WEBTRANSPORT=1 to clients
+        match h3::server::builder()
+            .enable_webtransport(true)
+            .enable_extended_connect(true)
+            .enable_datagram(true)
+            .max_webtransport_sessions(1000)
+            .build(h3_conn).await {
             Ok(mut h3) => {
                 // HTTP/3 connection established
                 Self::handle_h3_connection(
@@ -295,12 +301,29 @@ impl QuicListener {
                         );
 
                         // Send 200 OK to accept the WebTransport session
+                        // IMPORTANT: Do NOT finish the stream - WebTransport sessions keep it open
                         let response = http::Response::builder()
                             .status(http::StatusCode::OK)
                             .header("sec-webtransport-http3-draft", "draft02")
                             .body(())?;
 
-                        // Handle WebTransport session
+                        // Respond on the stream first
+                        let mut stream = stream;
+                        if let Err(e) = stream.send_response(response).await {
+                            error!(
+                                "Failed to send WebTransport response to {}: {}",
+                                remote_addr, e
+                            );
+                            continue;
+                        }
+
+                        info!(
+                            "WebTransport session accepted for {} on path {}",
+                            remote_addr, path
+                        );
+
+                        // Handle WebTransport session - pass the stream to the handler
+                        // The session handler will manage bidirectional streams and datagrams
                         let handler = WebTransportHandler::new(
                             config.clone(),
                             backend_pool.clone(),
@@ -309,7 +332,7 @@ impl QuicListener {
 
                         tokio::spawn(async move {
                             debug!(
-                                "WebTransport session started for {} on path {}",
+                                "WebTransport session active for {} on path {}",
                                 remote_addr, path
                             );
                             if let Err(e) = handler.handle_session().await {
@@ -317,20 +340,9 @@ impl QuicListener {
                             }
                         });
 
-                        // Respond on the stream
-                        let mut stream = stream;
-                        if let Err(e) = stream.send_response(response).await {
-                            debug!(
-                                "Failed to send WebTransport response to {}: {}",
-                                remote_addr, e
-                            );
-                        }
-                        if let Err(e) = stream.finish().await {
-                            debug!(
-                                "Failed to finish WebTransport stream for {}: {}",
-                                remote_addr, e
-                            );
-                        }
+                        // NOTE: Stream is intentionally NOT finished here
+                        // The WebTransport session keeps it open for bidirectional communication
+                        // The session will be closed when the client disconnects or on error
                     } else {
                         // Regular HTTP/3 request
                         let config_clone = config.clone();
@@ -635,6 +647,7 @@ impl QuicListener {
                     | "vary"
                     | "x-content-type-options"
                     | "set-cookie"
+                    | "location"
                     | "access-control-allow-origin"
                     | "access-control-allow-methods"
                     | "access-control-allow-headers"

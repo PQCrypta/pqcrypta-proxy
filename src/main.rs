@@ -80,6 +80,7 @@ use pqcrypta_proxy::pqc_tls::{verify_pqc_support, PqcTlsProvider};
 use pqcrypta_proxy::proxy::BackendPool;
 use pqcrypta_proxy::quic_listener::QuicListener;
 use pqcrypta_proxy::tls::TlsProvider;
+use pqcrypta_proxy::webtransport_server::WebTransportServer;
 use pqcrypta_proxy::{
     run_http_listener, run_http_listener_with_fingerprint, run_http_redirect_server,
     run_tls_passthrough_server,
@@ -584,11 +585,17 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Start QUIC/HTTP3/WebTransport servers (UDP) on all ports
-    // QuicListener handles both standard HTTP/3 requests and WebTransport sessions
+    // Start QUIC/HTTP3 servers (UDP) on all ports EXCEPT 4433
+    // Port 4433 is handled by dedicated WebTransportServer for proper WebTransport support
     let mut quic_shutdown_senders: Vec<mpsc::Sender<()>> = Vec::new();
 
     for port in all_ports.clone() {
+        // Skip port 4433 - it's handled by dedicated WebTransportServer
+        if port == 4433 {
+            info!("📡 Port 4433 will be handled by dedicated WebTransport server");
+            continue;
+        }
+
         // Create config with the specific port for this listener
         let mut quic_config = (*config).clone();
         quic_config.server.udp_port = port;
@@ -632,6 +639,39 @@ async fn main() -> anyhow::Result<()> {
                         "Failed to create QUIC/HTTP3 listener on port {}: {}",
                         port, e
                     );
+                }
+            }
+        });
+    }
+
+    // Start dedicated WebTransport server on port 4433
+    // This uses wtransport crate for proper WebTransport protocol support
+    {
+        let wt_config = config.clone();
+        let wt_backend_pool = Arc::new(BackendPool::new(config.clone()));
+        let wt_cert = cert_path.clone();
+        let wt_key = key_path.clone();
+
+        tokio::spawn(async move {
+            let wt_addr: std::net::SocketAddr = format!("0.0.0.0:4433").parse().unwrap();
+
+            info!("🚀 Starting dedicated WebTransport server on {}", wt_addr);
+
+            match WebTransportServer::new(
+                wt_addr,
+                &wt_cert,
+                &wt_key,
+                wt_config,
+                wt_backend_pool,
+            ).await {
+                Ok(server) => {
+                    info!("✅ WebTransport server ready on {}", server.local_addr());
+                    if let Err(e) = server.run().await {
+                        error!("WebTransport server error: {}", e);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to start WebTransport server: {}", e);
                 }
             }
         });
