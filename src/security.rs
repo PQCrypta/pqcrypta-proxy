@@ -440,17 +440,18 @@ impl SecurityState {
                             let expires_at = entry.expires_at.as_ref().and_then(|exp| {
                                 chrono::DateTime::parse_from_rfc3339(exp)
                                     .ok()
-                                    .map(|dt| {
+                                    .and_then(|dt| {
                                         let now = chrono::Utc::now();
                                         let exp_utc = dt.with_timezone(&chrono::Utc);
                                         if exp_utc > now {
-                                            let duration = (exp_utc - now).to_std().unwrap_or(Duration::from_secs(3600));
+                                            let duration = (exp_utc - now)
+                                                .to_std()
+                                                .unwrap_or(Duration::from_secs(3600));
                                             Some(Instant::now() + duration)
                                         } else {
                                             None // Already expired
                                         }
                                     })
-                                    .flatten()
                             });
 
                             // Skip if already expired
