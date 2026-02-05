@@ -230,6 +230,13 @@ impl OcspService {
         let cached = cached_response.read();
         match cached.as_ref() {
             Some(response) => {
+                // For NoResponder or FetchError, use long delay (certificate won't suddenly gain OCSP URL)
+                if response.status == OcspStatus::NoResponder
+                    || response.status == OcspStatus::FetchError
+                {
+                    return Duration::from_secs(3600); // 1 hour
+                }
+
                 let now = Instant::now();
 
                 // Use nextUpdate from OCSP response if available
@@ -283,7 +290,22 @@ impl OcspService {
             .map_err(|e| anyhow::anyhow!("Failed to parse certificate: {:?}", e))?;
 
         // Find OCSP responder URL from Authority Information Access extension
-        let ocsp_url = Self::extract_ocsp_url(&cert)?;
+        let ocsp_url = match Self::extract_ocsp_url(&cert) {
+            Ok(url) => url,
+            Err(e) => {
+                warn!("OCSP: {}", e);
+                // Cache NoResponder status to prevent rapid retries (1 hour backoff)
+                *cached_response.write() = Some(CachedOcspResponse {
+                    response: Vec::new(),
+                    status: OcspStatus::NoResponder,
+                    fetched_at: Instant::now(),
+                    expires_at: Instant::now() + Duration::from_secs(3600),
+                    responder_url: String::new(),
+                    next_update: None,
+                });
+                return Ok(());
+            }
+        };
         info!("OCSP responder URL: {}", ocsp_url);
 
         // Get issuer certificate (second in chain, or self-signed)
