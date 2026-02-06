@@ -669,7 +669,8 @@ impl QuicListener {
         }
 
         // Add content-length from known body size (helps browsers finalize responses)
-        response_builder = response_builder.header("content-length", proxy_response.body.len().to_string());
+        response_builder =
+            response_builder.header("content-length", proxy_response.body.len().to_string());
 
         // For Grafana routes: rewrite set-cookie headers from backend
         // to work around browser H3 cookie handling by adding Domain attribute
@@ -693,7 +694,7 @@ impl QuicListener {
                 // Also add a simple proxy test cookie to verify H3 cookie delivery
                 response_builder = response_builder.header(
                     "set-cookie",
-                    "pqc_h3_test=1; Path=/; Secure; SameSite=None; Max-Age=3600"
+                    "pqc_h3_test=1; Path=/; Secure; SameSite=None; Max-Age=3600",
                 );
             }
         }
