@@ -425,7 +425,8 @@ impl QuicListener {
 
         // Send 103 Early Hints if enabled and we have hints for this path
         // This is a key HTTP/3 optimization - send resource hints before proxying to backend
-        if config.http3.early_hints_enabled {
+        // Only send for GET/HEAD requests - 103 on POST/PUT/DELETE can break cookie handling
+        if config.http3.early_hints_enabled && (method == "GET" || method == "HEAD") {
             let hints = early_hints_state.get_hints_for_path(&path);
             if !hints.is_empty() {
                 // Build 103 Early Hints response with Link headers and alt-svc for QUIC advertisement
@@ -636,8 +637,15 @@ impl QuicListener {
         );
 
         // Forward selected headers from backend (including CORS if backend sets them)
+        // Note: x-content-type-options excluded from whitelist since proxy adds its own
+        // Note: set-cookie for /grafana is handled separately below with Domain rewriting
+        let is_grafana = path.starts_with("/grafana");
         for (name, value) in &proxy_response.headers {
             let lower_name = name.to_lowercase();
+            // Skip set-cookie for Grafana routes (handled below with Domain attribute)
+            if is_grafana && lower_name == "set-cookie" {
+                continue;
+            }
             if matches!(
                 lower_name.as_str(),
                 "content-type"
@@ -647,7 +655,6 @@ impl QuicListener {
                     | "content-language"
                     | "content-encoding"
                     | "vary"
-                    | "x-content-type-options"
                     | "set-cookie"
                     | "location"
                     | "access-control-allow-origin"
@@ -658,6 +665,36 @@ impl QuicListener {
                     | "access-control-max-age"
             ) {
                 response_builder = response_builder.header(name, value);
+            }
+        }
+
+        // Add content-length from known body size (helps browsers finalize responses)
+        response_builder = response_builder.header("content-length", proxy_response.body.len().to_string());
+
+        // For Grafana routes: rewrite set-cookie headers from backend
+        // to work around browser H3 cookie handling by adding Domain attribute
+        if path.starts_with("/grafana") {
+            // Remove set-cookie from whitelist-forwarded headers (already added above)
+            // and re-add with explicit Domain to help browser cookie storage
+            let mut has_cookies = false;
+            for (name, value) in &proxy_response.headers {
+                if name.to_lowercase() == "set-cookie" {
+                    has_cookies = true;
+                    // Add Domain=pqcrypta.com to help browser store cookie
+                    let with_domain = if !value.contains("Domain=") {
+                        format!("{}; Domain=pqcrypta.com", value)
+                    } else {
+                        value.clone()
+                    };
+                    response_builder = response_builder.header("set-cookie", with_domain.as_str());
+                }
+            }
+            if has_cookies {
+                // Also add a simple proxy test cookie to verify H3 cookie delivery
+                response_builder = response_builder.header(
+                    "set-cookie",
+                    "pqc_h3_test=1; Path=/; Secure; SameSite=None; Max-Age=3600"
+                );
             }
         }
 
@@ -729,6 +766,11 @@ impl QuicListener {
         // Add CORS headers from route.cors (proxy-level CORS) if configured
         if let Some(ref cors) = route.cors {
             response_builder = add_cors_headers_to_builder(response_builder, cors);
+        }
+
+        // Apply route-specific header overrides (e.g., COEP/COOP for Grafana)
+        for (key, value) in &route.headers_override {
+            response_builder = response_builder.header(key.as_str(), value.as_str());
         }
 
         let response = response_builder.body(())?;
