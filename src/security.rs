@@ -555,6 +555,11 @@ impl SecurityState {
 
     /// Record circuit breaker result
     pub fn record_backend_result(&self, backend: &str, success: bool) {
+        let cb_config = self.circuit_breaker_config.read();
+        let failure_threshold = cb_config.failure_threshold;
+        let success_threshold = cb_config.success_threshold;
+        drop(cb_config);
+
         let mut state = self
             .circuit_breakers
             .entry(backend.to_string())
@@ -565,7 +570,7 @@ impl SecurityState {
             state.failure_count = 0;
 
             // If half-open and enough successes, close the circuit
-            if state.state == CircuitState::HalfOpen && state.success_count >= 3 {
+            if state.state == CircuitState::HalfOpen && state.success_count >= success_threshold {
                 state.state = CircuitState::Closed;
                 state.last_state_change = Instant::now();
                 info!("Circuit breaker for {} closed (recovered)", backend);
@@ -576,8 +581,8 @@ impl SecurityState {
 
             match state.state {
                 CircuitState::Closed => {
-                    // Open circuit after 5 consecutive failures
-                    if state.failure_count >= 5 {
+                    // Open circuit after configured consecutive failures
+                    if state.failure_count >= failure_threshold {
                         state.state = CircuitState::Open;
                         state.last_state_change = Instant::now();
                         warn!(
