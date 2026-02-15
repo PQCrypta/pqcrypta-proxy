@@ -123,6 +123,7 @@ impl WebTransportServer {
     }
 
     /// Set the metrics registry for connection tracking
+    #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<MetricsRegistry>) -> Self {
         self.metrics = Some(metrics);
         self

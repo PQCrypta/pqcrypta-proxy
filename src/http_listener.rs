@@ -1178,6 +1178,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
 
 /// Handle a single PQC connection with fingerprinting
 #[cfg(feature = "pqc")]
+#[allow(clippy::too_many_arguments)]
 async fn handle_pqc_fingerprinted_connection(
     stream: TcpStream,
     remote_addr: SocketAddr,
