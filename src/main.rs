@@ -583,7 +583,9 @@ async fn main() -> anyhow::Result<()> {
         // Priority 4: Standard Rustls (no PQC, no fingerprinting)
         tokio::spawn(async move {
             info!("🌐 Starting HTTPS reverse proxy on {} (Rustls)", bind_addr);
-            if let Err(e) = run_http_listener(bind_addr, &http_cert, &http_key, http_config, http_metrics).await {
+            if let Err(e) =
+                run_http_listener(bind_addr, &http_cert, &http_key, http_config, http_metrics).await
+            {
                 error!("HTTP listener error on port {}: {}", bind_addr.port(), e);
             }
         });

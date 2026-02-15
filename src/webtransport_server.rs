@@ -155,7 +155,8 @@ impl WebTransportServer {
             let session_metrics = metrics.clone();
             tokio::spawn(async move {
                 if let Some(ref m) = session_metrics {
-                    m.connections.connection_opened(ConnectionProtocol::WebTransport);
+                    m.connections
+                        .connection_opened(ConnectionProtocol::WebTransport);
                 }
                 if let Err(e) =
                     handle_incoming_session(incoming_session, config_clone, backend_clone).await

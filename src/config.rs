@@ -286,7 +286,12 @@ impl Default for TlsConfig {
             key_path: PathBuf::from("/etc/pqcrypta/key.pem"),
             ca_cert_path: None,
             require_client_cert: false,
-            alpn_protocols: vec!["h3".to_string(), "h2".to_string(), "http/1.1".to_string(), "webtransport".to_string()],
+            alpn_protocols: vec![
+                "h3".to_string(),
+                "h2".to_string(),
+                "http/1.1".to_string(),
+                "webtransport".to_string(),
+            ],
             min_version: "1.3".to_string(),
             ocsp_stapling: true,
             cert_reload_interval_secs: 3600,

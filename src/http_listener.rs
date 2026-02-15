@@ -54,10 +54,10 @@ use crate::fingerprint::{
 };
 use crate::http3_features::{http3_features_middleware, Http3FeaturesState};
 use crate::load_balancer::{extract_session_cookie, LoadBalancer, SelectionContext};
+use crate::metrics::{ConnectionProtocol, MetricsRegistry};
 use crate::rate_limiter::{
     build_context_from_request, AdvancedRateLimiter, LimitReason, RateLimitResult,
 };
-use crate::metrics::{ConnectionProtocol, MetricsRegistry};
 use crate::security::{security_middleware, SecurityState};
 
 // ============================================================================
@@ -2452,7 +2452,13 @@ pub async fn run_http_redirect_server(
         let https_url = if https_port_clone == 443 {
             format!("https://{}{}{}", host.to_ascii_lowercase(), path, query)
         } else {
-            format!("https://{}:{}{}{}", host.to_ascii_lowercase(), https_port_clone, path, query)
+            format!(
+                "https://{}:{}{}{}",
+                host.to_ascii_lowercase(),
+                https_port_clone,
+                path,
+                query
+            )
         };
 
         Redirect::permanent(&https_url)

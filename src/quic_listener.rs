@@ -286,13 +286,16 @@ impl QuicListener {
                     let uri = request.uri().clone();
                     let path = uri.path().to_ascii_lowercase();
                     // In HTTP/3, host comes from :authority pseudo-header (in URI) or fallback to host header
-                    let host = uri.authority().map(|a| a.host().to_ascii_lowercase()).or_else(|| {
-                        request
-                            .headers()
-                            .get("host")
-                            .and_then(|v| v.to_str().ok())
-                            .map(String::from)
-                    });
+                    let host = uri
+                        .authority()
+                        .map(|a| a.host().to_ascii_lowercase())
+                        .or_else(|| {
+                            request
+                                .headers()
+                                .get("host")
+                                .and_then(|v| v.to_str().ok())
+                                .map(String::from)
+                        });
 
                     // Check for protocol extension (RFC 9220 Extended CONNECT)
                     // In h3 crate, the :protocol pseudo-header is accessed via extensions
@@ -338,7 +341,9 @@ impl QuicListener {
                         );
 
                         // Track WebTransport session in metrics
-                        metrics.connections.connection_opened(ConnectionProtocol::WebTransport);
+                        metrics
+                            .connections
+                            .connection_opened(ConnectionProtocol::WebTransport);
 
                         // Handle WebTransport session - pass the stream to the handler
                         // The session handler will manage bidirectional streams and datagrams
@@ -422,13 +427,16 @@ impl QuicListener {
         let path_with_query = format!("{}{}", path, query);
         let method = request.method().to_string();
         // In HTTP/3, host comes from :authority pseudo-header (in URI) or fallback to host header
-        let host = uri.authority().map(|a| a.host().to_ascii_lowercase()).or_else(|| {
-            request
-                .headers()
-                .get("host")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        });
+        let host = uri
+            .authority()
+            .map(|a| a.host().to_ascii_lowercase())
+            .or_else(|| {
+                request
+                    .headers()
+                    .get("host")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string())
+            });
         let user_agent = request
             .headers()
             .get("user-agent")
@@ -503,7 +511,9 @@ impl QuicListener {
                     host: host.clone(),
                     response_time_ms: start_time.elapsed().as_millis() as u64,
                 });
-                metrics.requests.request_end(404, start_time.elapsed(), 0, 0);
+                metrics
+                    .requests
+                    .request_end(404, start_time.elapsed(), 0, 0);
                 // Return 404
                 let response = http::Response::builder()
                     .status(http::StatusCode::NOT_FOUND)
@@ -559,7 +569,9 @@ impl QuicListener {
                 let response = response_builder.body(())?;
                 stream.send_response(response).await?;
                 stream.finish().await?;
-                metrics.requests.request_end(200, start_time.elapsed(), 0, 0);
+                metrics
+                    .requests
+                    .request_end(200, start_time.elapsed(), 0, 0);
                 return Ok(());
             }
             // If no CORS config, fall through to normal handling / backend
@@ -569,7 +581,9 @@ impl QuicListener {
             Some(b) => b,
             None => {
                 error!("Backend not found: {}", route.backend);
-                metrics.requests.request_end(502, start_time.elapsed(), 0, 0);
+                metrics
+                    .requests
+                    .request_end(502, start_time.elapsed(), 0, 0);
                 let response = http::Response::builder()
                     .status(http::StatusCode::BAD_GATEWAY)
                     .header("server", "PQCProxy v0.2.1")
@@ -591,7 +605,9 @@ impl QuicListener {
                 chunk.advance(bytes.len());
             }
             if body.len() > config.security.max_request_size {
-                metrics.requests.request_end(413, start_time.elapsed(), body.len() as u64, 0);
+                metrics
+                    .requests
+                    .request_end(413, start_time.elapsed(), body.len() as u64, 0);
                 let response = http::Response::builder()
                     .status(http::StatusCode::PAYLOAD_TOO_LARGE)
                     .body(())?;
@@ -810,7 +826,12 @@ impl QuicListener {
 
         // Record metrics
         let latency = start_time.elapsed();
-        metrics.requests.request_end(response_status, latency, body.len() as u64, body_size as u64);
+        metrics.requests.request_end(
+            response_status,
+            latency,
+            body.len() as u64,
+            body_size as u64,
+        );
 
         // Log successful response
         log_access(&AccessLogEntry {
