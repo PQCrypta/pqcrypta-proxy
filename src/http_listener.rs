@@ -57,6 +57,7 @@ use crate::load_balancer::{extract_session_cookie, LoadBalancer, SelectionContex
 use crate::rate_limiter::{
     build_context_from_request, AdvancedRateLimiter, LimitReason, RateLimitResult,
 };
+use crate::metrics::{ConnectionProtocol, MetricsRegistry};
 use crate::security::{security_middleware, SecurityState};
 
 // ============================================================================
@@ -213,6 +214,7 @@ pub async fn run_http_listener(
     cert_path: &str,
     key_path: &str,
     config: Arc<ProxyConfig>,
+    metrics: Arc<MetricsRegistry>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let port = addr.port();
 
@@ -269,6 +271,7 @@ pub async fn run_http_listener(
     let rate_limiter = Arc::new(AdvancedRateLimiter::new(
         config.advanced_rate_limiting.clone(),
     ));
+    let rl_state = (rate_limiter, metrics);
     info!(
         "🚦 Advanced rate limiter enabled (key strategy: {:?})",
         config.advanced_rate_limiting.key_strategy.order.first()
@@ -345,7 +348,7 @@ pub async fn run_http_listener(
     // Add rate limiting (outermost - runs first, multi-dimensional)
     let app = app
         .layer(middleware::from_fn_with_state(
-            rate_limiter,
+            rl_state,
             advanced_rate_limit_middleware,
         ))
         .with_state(state);
@@ -391,6 +394,7 @@ pub async fn run_http_listener_pqc(
     key_path: &str,
     config: Arc<ProxyConfig>,
     pqc_provider: Arc<PqcTlsProvider>,
+    metrics: Arc<MetricsRegistry>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let port = addr.port();
 
@@ -447,6 +451,7 @@ pub async fn run_http_listener_pqc(
     let rate_limiter = Arc::new(AdvancedRateLimiter::new(
         config.advanced_rate_limiting.clone(),
     ));
+    let rl_state = (rate_limiter, metrics);
     info!(
         "🚦 Advanced rate limiter enabled (key strategy: {:?})",
         config.advanced_rate_limiting.key_strategy.order.first()
@@ -518,7 +523,7 @@ pub async fn run_http_listener_pqc(
     // Add rate limiting (outermost - runs first, multi-dimensional)
     let app = app
         .layer(middleware::from_fn_with_state(
-            rate_limiter,
+            rl_state,
             advanced_rate_limit_middleware,
         ))
         .with_state(state);
@@ -622,8 +627,10 @@ pub async fn run_http_listener_with_fingerprint(
     cert_path: &str,
     key_path: &str,
     config: Arc<ProxyConfig>,
-    mut shutdown_rx: watch::Receiver<()>,
+    shutdown_rx: watch::Receiver<()>,
+    metrics: Arc<MetricsRegistry>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut shutdown_rx = shutdown_rx;
     let port = addr.port();
 
     info!(
@@ -679,6 +686,8 @@ pub async fn run_http_listener_with_fingerprint(
     let rate_limiter = Arc::new(AdvancedRateLimiter::new(
         config.advanced_rate_limiting.clone(),
     ));
+    let conn_metrics = metrics.clone();
+    let rl_state = (rate_limiter, metrics);
     info!(
         "🚦 Advanced rate limiter enabled (key strategy: {:?})",
         config.advanced_rate_limiting.key_strategy.order.first()
@@ -735,7 +744,7 @@ pub async fn run_http_listener_with_fingerprint(
             fingerprint_middleware,
         ))
         .layer(middleware::from_fn_with_state(
-            rate_limiter,
+            rl_state,
             advanced_rate_limit_middleware,
         ))
         .with_state(state);
@@ -789,8 +798,9 @@ pub async fn run_http_listener_with_fingerprint(
                 let app = app.clone();
 
                 // Spawn connection handler
+                let conn_metrics_clone = conn_metrics.clone();
                 tokio::spawn(async move {
-                    handle_fingerprinted_connection(stream, remote_addr, acceptor, app).await;
+                    handle_fingerprinted_connection(stream, remote_addr, acceptor, app, conn_metrics_clone).await;
                 });
             }
 
@@ -812,6 +822,7 @@ async fn handle_fingerprinted_connection(
     remote_addr: SocketAddr,
     acceptor: Arc<FingerprintingTlsAcceptor>,
     app: Router,
+    metrics: Arc<MetricsRegistry>,
 ) {
     trace!("New TCP connection from {}", remote_addr);
 
@@ -831,6 +842,16 @@ async fn handle_fingerprinted_connection(
             return;
         }
     };
+
+    // Detect HTTP protocol from ALPN negotiation
+    let protocol = {
+        let (_, server_conn) = tls_stream.get_ref().get_ref();
+        match server_conn.alpn_protocol() {
+            Some(b"h2") => ConnectionProtocol::Http2,
+            _ => ConnectionProtocol::Http1,
+        }
+    };
+    metrics.connections.connection_opened(protocol);
 
     // Extract fingerprint info from the connection
     let conn_info = tls_stream.conn_info.clone();
@@ -907,6 +928,8 @@ async fn handle_fingerprinted_connection(
             debug!("HTTP connection error for {}: {}", remote_addr, e);
         }
     }
+
+    metrics.connections.connection_closed();
 }
 
 // ============================================================================
@@ -941,8 +964,10 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     key_path: &str,
     config: Arc<ProxyConfig>,
     pqc_provider: Arc<PqcTlsProvider>,
-    mut shutdown_rx: watch::Receiver<()>,
+    shutdown_rx: watch::Receiver<()>,
+    metrics: Arc<MetricsRegistry>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut shutdown_rx = shutdown_rx;
     use openssl::ssl::SslContext;
 
     let port = addr.port();
@@ -1000,6 +1025,8 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     let rate_limiter = Arc::new(AdvancedRateLimiter::new(
         config.advanced_rate_limiting.clone(),
     ));
+    let conn_metrics = metrics.clone();
+    let rl_state = (rate_limiter, metrics);
     info!(
         "🚦 Advanced rate limiter enabled (key strategy: {:?})",
         config.advanced_rate_limiting.key_strategy.order.first()
@@ -1052,7 +1079,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
             fingerprint_middleware,
         ))
         .layer(middleware::from_fn_with_state(
-            rate_limiter,
+            rl_state,
             advanced_rate_limit_middleware,
         ))
         .with_state(state);
@@ -1121,6 +1148,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
                 let sec_state = security_state.clone();
                 let fp_config = config.fingerprint.clone();
                 let router = app.clone();
+                let conn_metrics_clone = conn_metrics.clone();
 
                 tokio::spawn(async move {
                     handle_pqc_fingerprinted_connection(
@@ -1131,6 +1159,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
                         sec_state,
                         fp_config,
                         router,
+                        conn_metrics_clone,
                     )
                     .await;
                 });
@@ -1157,6 +1186,7 @@ async fn handle_pqc_fingerprinted_connection(
     security_state: SecurityState,
     fingerprint_config: crate::config::FingerprintConfig,
     app: Router,
+    metrics: Arc<MetricsRegistry>,
 ) {
     use openssl::ssl::Ssl;
     use tokio_openssl::SslStream;
@@ -1240,6 +1270,13 @@ async fn handle_pqc_fingerprinted_connection(
         debug!("PQC TLS handshake failed for {}: {}", remote_addr, e);
         return;
     }
+
+    // Detect HTTP protocol from ALPN negotiation (OpenSSL)
+    let protocol = match ssl_stream.ssl().selected_alpn_protocol() {
+        Some(b"h2") => ConnectionProtocol::Http2,
+        _ => ConnectionProtocol::Http1,
+    };
+    metrics.connections.connection_opened(protocol);
 
     trace!(
         "PQC TLS connection from {} established (JA3={:?})",
@@ -1330,6 +1367,8 @@ async fn handle_pqc_fingerprinted_connection(
             debug!("PQC HTTP connection error for {}: {}", remote_addr, e);
         }
     }
+
+    metrics.connections.connection_closed();
 }
 
 /// Build rustls server configuration from PEM files
@@ -1359,9 +1398,12 @@ fn build_rustls_server_config(
         .ok_or_else(|| format!("No private key found in {}", key_path))?;
 
     // Build server config
-    let config = rustls::ServerConfig::builder()
+    let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
+
+    // Set ALPN protocols for HTTP/2 and HTTP/1.1 negotiation
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(config)
 }
@@ -1419,14 +1461,16 @@ async fn handle_passthrough_connection(
     let sni = sni.unwrap();
     debug!("SNI from {}: {}", client_addr, sni);
 
-    // Find matching passthrough route
+    // Find matching passthrough route (case-insensitive SNI matching)
+    let sni_lower = sni.to_ascii_lowercase();
     let route = config.passthrough_routes.iter().find(|r| {
-        if r.sni.starts_with("*.") {
+        let r_sni_lower = r.sni.to_ascii_lowercase();
+        if r_sni_lower.starts_with("*.") {
             // Wildcard match
-            let suffix = &r.sni[1..]; // ".example.com"
-            sni.ends_with(suffix) || sni == &r.sni[2..]
+            let suffix = &r_sni_lower[1..]; // ".example.com"
+            sni_lower.ends_with(suffix) || sni_lower == r_sni_lower[2..]
         } else {
-            r.sni == sni
+            r_sni_lower == sni_lower
         }
     });
 
@@ -1786,14 +1830,14 @@ fn add_alt_svc_to_response(response: &mut Response, alt_svc: &str) {
 }
 
 async fn advanced_rate_limit_middleware(
-    State(rate_limiter): State<Arc<AdvancedRateLimiter>>,
+    State((rate_limiter, metrics)): State<(Arc<AdvancedRateLimiter>, Arc<MetricsRegistry>)>,
     ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     request: Request<Body>,
     next: Next,
 ) -> Response {
     let method = request.method().as_str().to_string();
-    let path = request.uri().path().to_string();
+    let path = request.uri().path().to_ascii_lowercase();
 
     // Pre-build Alt-Svc header for error responses (ports 443, 4433, 4434)
     let alt_svc = "h3=\":443\"; ma=86400, h3=\":4433\"; ma=86400, h3=\":4434\"; ma=86400";
@@ -1822,6 +1866,7 @@ async fn advanced_rate_limit_middleware(
     // Check rate limit
     match rate_limiter.check(&ctx) {
         RateLimitResult::Allowed { remaining, limit } => {
+            metrics.rate_limiter.request_checked(true, false);
             // Add rate limit headers to response
             let mut response = next.run(request).await;
             let resp_headers = response.headers_mut();
@@ -1840,6 +1885,7 @@ async fn advanced_rate_limit_middleware(
             retry_after_ms,
             limit,
         } => {
+            metrics.rate_limiter.request_checked(false, false);
             debug!(
                 "Rate limited {} {} from {} (reason: {:?})",
                 method,
@@ -1888,6 +1934,7 @@ async fn advanced_rate_limit_middleware(
             response
         }
         RateLimitResult::Blocked { reason } => {
+            metrics.rate_limiter.request_checked(false, true);
             warn!(
                 "Blocked request {} {} from {} (reason: {})",
                 method,
@@ -1915,7 +1962,7 @@ async fn proxy_handler(
     body: Body,
 ) -> Response {
     let request_start = std::time::Instant::now();
-    let path = uri.path().to_string();
+    let path = uri.path().to_ascii_lowercase();
     let method_str = method.to_string();
     let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
     let user_agent = headers
@@ -1940,8 +1987,13 @@ async fn proxy_handler(
         // Handle redirect routes
         if let Some(ref redirect_to) = route.redirect {
             let new_path = if let Some(ref prefix) = route.path_prefix {
-                // Replace prefix with redirect target, keeping the rest
-                let suffix = path.strip_prefix(prefix).unwrap_or("");
+                // Replace prefix with redirect target, keeping the rest (case-insensitive)
+                let prefix_lower = prefix.to_ascii_lowercase();
+                let suffix = if path.starts_with(&prefix_lower) {
+                    &path[prefix_lower.len()..]
+                } else {
+                    ""
+                };
                 format!("{}{}{}", redirect_to, suffix, query)
             } else {
                 format!("{}{}", redirect_to, query)
@@ -2393,14 +2445,14 @@ pub async fn run_http_redirect_server(
     let https_port_clone = https_port;
 
     let app = Router::new().fallback(move |Host(host): Host, uri: Uri| async move {
-        let path = uri.path();
+        let path = uri.path().to_ascii_lowercase();
         let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
 
-        // Build HTTPS URL
+        // Build HTTPS URL (path already lowercased)
         let https_url = if https_port_clone == 443 {
-            format!("https://{}{}{}", host, path, query)
+            format!("https://{}{}{}", host.to_ascii_lowercase(), path, query)
         } else {
-            format!("https://{}:{}{}{}", host, https_port_clone, path, query)
+            format!("https://{}:{}{}{}", host.to_ascii_lowercase(), https_port_clone, path, query)
         };
 
         Redirect::permanent(&https_url)

@@ -484,6 +484,7 @@ async fn main() -> anyhow::Result<()> {
         let http_cert = cert_path.clone();
         let http_key = key_path.clone();
         let http_config = config.clone();
+        let http_metrics = metrics_registry.clone();
 
         // Priority 1: PQC + TLS-layer fingerprinting (OpenSSL with ClientHello capture)
         // Combines post-quantum cryptography with early fingerprint blocking
@@ -505,6 +506,7 @@ async fn main() -> anyhow::Result<()> {
                     http_config,
                     http_pqc_provider,
                     shutdown_rx,
+                    http_metrics,
                 )
                 .await
                 {
@@ -535,6 +537,7 @@ async fn main() -> anyhow::Result<()> {
                     &http_key,
                     http_config,
                     shutdown_rx,
+                    http_metrics,
                 )
                 .await
                 {
@@ -563,6 +566,7 @@ async fn main() -> anyhow::Result<()> {
                     &http_key,
                     http_config,
                     http_pqc_provider,
+                    http_metrics,
                 )
                 .await
                 {
@@ -579,7 +583,7 @@ async fn main() -> anyhow::Result<()> {
         // Priority 4: Standard Rustls (no PQC, no fingerprinting)
         tokio::spawn(async move {
             info!("🌐 Starting HTTPS reverse proxy on {} (Rustls)", bind_addr);
-            if let Err(e) = run_http_listener(bind_addr, &http_cert, &http_key, http_config).await {
+            if let Err(e) = run_http_listener(bind_addr, &http_cert, &http_key, http_config, http_metrics).await {
                 error!("HTTP listener error on port {}: {}", bind_addr.port(), e);
             }
         });
@@ -601,6 +605,7 @@ async fn main() -> anyhow::Result<()> {
         quic_config.server.udp_port = port;
         let quic_config = Arc::new(quic_config);
         let quic_tls_provider = tls_provider.clone();
+        let quic_metrics = metrics_registry.clone();
 
         // Create channels for graceful shutdown
         let (quic_shutdown_tx, quic_shutdown_rx) = mpsc::channel::<()>(1);
@@ -615,6 +620,7 @@ async fn main() -> anyhow::Result<()> {
                 quic_tls_provider,
                 quic_shutdown_rx,
                 reload_rx,
+                quic_metrics,
             )
             .await
             {
@@ -651,6 +657,7 @@ async fn main() -> anyhow::Result<()> {
         let wt_backend_pool = Arc::new(BackendPool::new(config.clone()));
         let wt_cert = cert_path.clone();
         let wt_key = key_path.clone();
+        let wt_metrics = metrics_registry.clone();
 
         tokio::spawn(async move {
             let wt_addr: std::net::SocketAddr = "0.0.0.0:4433".parse().unwrap();
@@ -661,6 +668,7 @@ async fn main() -> anyhow::Result<()> {
                 .await
             {
                 Ok(server) => {
+                    let server = server.with_metrics(wt_metrics);
                     info!("✅ WebTransport server ready on {}", server.local_addr());
                     if let Err(e) = server.run().await {
                         error!("WebTransport server error: {}", e);

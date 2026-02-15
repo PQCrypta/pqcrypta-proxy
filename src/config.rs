@@ -286,7 +286,7 @@ impl Default for TlsConfig {
             key_path: PathBuf::from("/etc/pqcrypta/key.pem"),
             ca_cert_path: None,
             require_client_cert: false,
-            alpn_protocols: vec!["h3".to_string(), "webtransport".to_string()],
+            alpn_protocols: vec!["h3".to_string(), "h2".to_string(), "http/1.1".to_string(), "webtransport".to_string()],
             min_version: "1.3".to_string(),
             ocsp_stapling: true,
             cert_reload_interval_secs: 3600,
@@ -1436,6 +1436,7 @@ impl ProxyConfig {
     }
 
     /// Check if a route matches the request
+    /// All path and host comparisons are case-insensitive (lowercased)
     fn route_matches(
         &self,
         route: &RouteConfig,
@@ -1448,7 +1449,9 @@ impl ProxyConfig {
             return false;
         }
 
-        // Check host pattern
+        let path_lower = path.to_ascii_lowercase();
+
+        // Check host pattern (case-insensitive)
         if let Some(ref pattern) = route.host {
             if let Some(h) = host {
                 if !self.host_matches(pattern, h) {
@@ -1459,31 +1462,32 @@ impl ProxyConfig {
             }
         }
 
-        // Check path - exact match takes priority
+        // Check path - exact match takes priority (case-insensitive)
         if let Some(ref exact) = route.path_exact {
-            if path != exact {
+            if path_lower != exact.to_ascii_lowercase() {
                 return false;
             }
             return true;
         }
 
         // Check path regex (already validated during config load)
+        // Use case-insensitive matching
         if let Some(ref regex_str) = route.path_regex {
-            // Use RegexBuilder with size limits for safety (matching validation settings)
             if let Ok(re) = regex::RegexBuilder::new(regex_str)
+                .case_insensitive(true)
                 .size_limit(1024 * 1024)
                 .build()
             {
-                if !re.is_match(path) {
+                if !re.is_match(&path_lower) {
                     return false;
                 }
                 return true;
             }
         }
 
-        // Check path prefix
+        // Check path prefix (case-insensitive)
         if let Some(ref prefix) = route.path_prefix {
-            if !path.starts_with(prefix) {
+            if !path_lower.starts_with(&prefix.to_ascii_lowercase()) {
                 return false;
             }
         }
@@ -1492,14 +1496,17 @@ impl ProxyConfig {
     }
 
     /// Check if host matches pattern (supports wildcards)
+    /// Case-insensitive comparison
     fn host_matches(&self, pattern: &str, host: &str) -> bool {
-        if pattern.starts_with("*.") {
+        let pattern_lower = pattern.to_ascii_lowercase();
+        let host_lower = host.to_ascii_lowercase();
+        if pattern_lower.starts_with("*.") {
             // Wildcard subdomain match
-            let suffix = &pattern[1..];
-            host.ends_with(suffix) || host == &pattern[2..]
+            let suffix = &pattern_lower[1..];
+            host_lower.ends_with(suffix) || host_lower == pattern_lower[2..]
         } else {
             // Exact match
-            pattern == host
+            pattern_lower == host_lower
         }
     }
 

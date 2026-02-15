@@ -24,6 +24,7 @@ use crate::access_logger::{log_access, AccessLogEntry};
 use crate::config::{ConfigReloadEvent, CorsConfig, ProxyConfig};
 use crate::handlers::WebTransportHandler;
 use crate::http3_features::EarlyHintsState;
+use crate::metrics::{ConnectionProtocol, MetricsRegistry};
 use crate::proxy::BackendPool;
 use crate::tls::TlsProvider;
 
@@ -54,6 +55,8 @@ pub struct QuicListener {
     reload_rx: mpsc::Receiver<ConfigReloadEvent>,
     /// Early Hints state for 103 responses
     early_hints_state: Arc<EarlyHintsState>,
+    /// Metrics registry for recording request/connection stats
+    metrics: Arc<MetricsRegistry>,
 }
 
 impl QuicListener {
@@ -63,6 +66,7 @@ impl QuicListener {
         tls_provider: Arc<TlsProvider>,
         shutdown_rx: mpsc::Receiver<()>,
         reload_rx: mpsc::Receiver<ConfigReloadEvent>,
+        metrics: Arc<MetricsRegistry>,
     ) -> anyhow::Result<Self> {
         let addr = config.server.socket_addr()?;
 
@@ -112,6 +116,7 @@ impl QuicListener {
             shutdown_rx,
             reload_rx,
             early_hints_state,
+            metrics,
         })
     }
 
@@ -137,17 +142,21 @@ impl QuicListener {
                     let config = self.config.clone();
                     let backend_pool = self.backend_pool.clone();
                     let early_hints_state = self.early_hints_state.clone();
+                    let metrics = self.metrics.clone();
 
                     tokio::spawn(async move {
+                        metrics.connections.connection_opened(ConnectionProtocol::Http3);
                         if let Err(e) = Self::handle_connection(
                             incoming,
                             remote_addr,
                             config,
                             backend_pool,
                             early_hints_state,
+                            metrics.clone(),
                         ).await {
                             error!("Connection error from {}: {}", remote_addr, e);
                         }
+                        metrics.connections.connection_closed();
                     });
                 }
 
@@ -195,6 +204,7 @@ impl QuicListener {
         config: Arc<ProxyConfig>,
         backend_pool: Arc<BackendPool>,
         early_hints_state: Arc<EarlyHintsState>,
+        metrics: Arc<MetricsRegistry>,
     ) -> anyhow::Result<()> {
         // Accept connection
         let connecting = incoming.accept()?;
@@ -202,7 +212,8 @@ impl QuicListener {
 
         info!("QUIC connection established: {}", remote_addr);
 
-        // Log ALPN negotiation
+        // Log ALPN negotiation and record TLS handshake
+        metrics.tls.handshake_completed(true, false);
         if let Some(handshake_data) = connection.handshake_data() {
             if let Some(crypto_data) =
                 handshake_data.downcast_ref::<quinn::crypto::rustls::HandshakeData>()
@@ -235,6 +246,7 @@ impl QuicListener {
                     config,
                     backend_pool,
                     early_hints_state,
+                    metrics,
                 )
                 .await?;
             }
@@ -256,6 +268,7 @@ impl QuicListener {
         config: Arc<ProxyConfig>,
         backend_pool: Arc<BackendPool>,
         early_hints_state: Arc<EarlyHintsState>,
+        metrics: Arc<MetricsRegistry>,
     ) -> anyhow::Result<()> {
         loop {
             match h3.accept().await {
@@ -271,9 +284,9 @@ impl QuicListener {
 
                     let method = request.method().clone();
                     let uri = request.uri().clone();
-                    let path = uri.path().to_string();
+                    let path = uri.path().to_ascii_lowercase();
                     // In HTTP/3, host comes from :authority pseudo-header (in URI) or fallback to host header
-                    let host = uri.authority().map(|a| a.host().to_string()).or_else(|| {
+                    let host = uri.authority().map(|a| a.host().to_ascii_lowercase()).or_else(|| {
                         request
                             .headers()
                             .get("host")
@@ -324,6 +337,9 @@ impl QuicListener {
                             remote_addr, path
                         );
 
+                        // Track WebTransport session in metrics
+                        metrics.connections.connection_opened(ConnectionProtocol::WebTransport);
+
                         // Handle WebTransport session - pass the stream to the handler
                         // The session handler will manage bidirectional streams and datagrams
                         let handler = WebTransportHandler::new(
@@ -332,6 +348,7 @@ impl QuicListener {
                             remote_addr,
                         );
 
+                        let wt_metrics = metrics.clone();
                         tokio::spawn(async move {
                             debug!(
                                 "WebTransport session active for {} on path {}",
@@ -340,6 +357,7 @@ impl QuicListener {
                             if let Err(e) = handler.handle_session().await {
                                 error!("WebTransport session error for {}: {}", remote_addr, e);
                             }
+                            wt_metrics.connections.connection_closed();
                         });
 
                         // NOTE: Stream is intentionally NOT finished here
@@ -350,8 +368,10 @@ impl QuicListener {
                         let config_clone = config.clone();
                         let backend_pool_clone = backend_pool.clone();
                         let early_hints_clone = early_hints_state.clone();
+                        let metrics_clone = metrics.clone();
 
                         tokio::spawn(async move {
+                            metrics_clone.requests.request_start();
                             if let Err(e) = Self::handle_h3_request(
                                 stream,
                                 request,
@@ -359,6 +379,7 @@ impl QuicListener {
                                 config_clone,
                                 backend_pool_clone,
                                 early_hints_clone,
+                                metrics_clone,
                             )
                             .await
                             {
@@ -389,18 +410,19 @@ impl QuicListener {
         config: Arc<ProxyConfig>,
         backend_pool: Arc<BackendPool>,
         early_hints_state: Arc<EarlyHintsState>,
+        metrics: Arc<MetricsRegistry>,
     ) -> anyhow::Result<()>
     where
         S: h3::quic::BidiStream<Bytes>,
     {
         let start_time = std::time::Instant::now();
         let uri = request.uri();
-        let path = uri.path().to_string();
+        let path = uri.path().to_ascii_lowercase();
         let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
         let path_with_query = format!("{}{}", path, query);
         let method = request.method().to_string();
         // In HTTP/3, host comes from :authority pseudo-header (in URI) or fallback to host header
-        let host = uri.authority().map(|a| a.host().to_string()).or_else(|| {
+        let host = uri.authority().map(|a| a.host().to_ascii_lowercase()).or_else(|| {
             request
                 .headers()
                 .get("host")
@@ -481,6 +503,7 @@ impl QuicListener {
                     host: host.clone(),
                     response_time_ms: start_time.elapsed().as_millis() as u64,
                 });
+                metrics.requests.request_end(404, start_time.elapsed(), 0, 0);
                 // Return 404
                 let response = http::Response::builder()
                     .status(http::StatusCode::NOT_FOUND)
@@ -536,6 +559,7 @@ impl QuicListener {
                 let response = response_builder.body(())?;
                 stream.send_response(response).await?;
                 stream.finish().await?;
+                metrics.requests.request_end(200, start_time.elapsed(), 0, 0);
                 return Ok(());
             }
             // If no CORS config, fall through to normal handling / backend
@@ -545,6 +569,7 @@ impl QuicListener {
             Some(b) => b,
             None => {
                 error!("Backend not found: {}", route.backend);
+                metrics.requests.request_end(502, start_time.elapsed(), 0, 0);
                 let response = http::Response::builder()
                     .status(http::StatusCode::BAD_GATEWAY)
                     .header("server", "PQCProxy v0.2.1")
@@ -566,6 +591,7 @@ impl QuicListener {
                 chunk.advance(bytes.len());
             }
             if body.len() > config.security.max_request_size {
+                metrics.requests.request_end(413, start_time.elapsed(), body.len() as u64, 0);
                 let response = http::Response::builder()
                     .status(http::StatusCode::PAYLOAD_TOO_LARGE)
                     .body(())?;
@@ -782,6 +808,10 @@ impl QuicListener {
         stream.send_data(Bytes::from(proxy_response.body)).await?;
         stream.finish().await?;
 
+        // Record metrics
+        let latency = start_time.elapsed();
+        metrics.requests.request_end(response_status, latency, body.len() as u64, body_size as u64);
+
         // Log successful response
         log_access(&AccessLogEntry {
             remote_addr,
@@ -793,7 +823,7 @@ impl QuicListener {
             referer,
             user_agent,
             host,
-            response_time_ms: start_time.elapsed().as_millis() as u64,
+            response_time_ms: latency.as_millis() as u64,
         });
 
         Ok(())

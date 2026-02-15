@@ -17,6 +17,7 @@ use wtransport::config::QuicTransportConfig;
 use wtransport::{Connection, Endpoint, Identity, ServerConfig};
 
 use crate::config::ProxyConfig;
+use crate::metrics::{ConnectionProtocol, MetricsRegistry};
 use crate::proxy::BackendPool;
 
 /// Production WebTransport server with proper ALPN protocol negotiation
@@ -25,6 +26,7 @@ pub struct WebTransportServer {
     addr: SocketAddr,
     config: Arc<ProxyConfig>,
     backend_pool: Arc<BackendPool>,
+    metrics: Option<Arc<MetricsRegistry>>,
 }
 
 impl WebTransportServer {
@@ -116,7 +118,14 @@ impl WebTransportServer {
             addr,
             config,
             backend_pool,
+            metrics: None,
         })
+    }
+
+    /// Set the metrics registry for connection tracking
+    pub fn with_metrics(mut self, metrics: Arc<MetricsRegistry>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Get local address
@@ -128,6 +137,7 @@ impl WebTransportServer {
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let config = self.config.clone();
         let backend_pool = self.backend_pool.clone();
+        let metrics = self.metrics.clone();
 
         info!("🌐 WebTransport server listening on {}", self.addr);
         info!("🔗 Ready to accept WebTransport connections");
@@ -142,11 +152,18 @@ impl WebTransportServer {
             // Spawn task to handle the session
             let config_clone = config.clone();
             let backend_clone = backend_pool.clone();
+            let session_metrics = metrics.clone();
             tokio::spawn(async move {
+                if let Some(ref m) = session_metrics {
+                    m.connections.connection_opened(ConnectionProtocol::WebTransport);
+                }
                 if let Err(e) =
                     handle_incoming_session(incoming_session, config_clone, backend_clone).await
                 {
                     error!("❌ Session handler error: {}", e);
+                }
+                if let Some(ref m) = session_metrics {
+                    m.connections.connection_closed();
                 }
             });
         }

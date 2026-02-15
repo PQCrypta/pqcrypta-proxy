@@ -524,7 +524,13 @@ pub mod openssl_pqc {
             }
         }
 
-        // Set ALPN protocols - parse length-prefixed protocol list
+        // Set ALPN protocols - advertise h2 and http/1.1
+        // Wire format: length-prefixed protocol names
+        builder
+            .set_alpn_protos(b"\x02h2\x08http/1.1")
+            .map_err(|e| format!("Failed to set ALPN protos: {}", e))?;
+
+        // Set ALPN selection callback - prefer h2 over http/1.1
         builder.set_alpn_select_callback(|_, client_protos| {
             // Parse client's ALPN protocol list (length-prefixed strings)
             let mut pos = 0;
