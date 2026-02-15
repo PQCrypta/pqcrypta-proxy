@@ -263,13 +263,28 @@ async fn metrics_json_handler(
     Json(state.metrics.snapshot())
 }
 
+/// Query parameters for the errors endpoint
+#[derive(Deserialize)]
+struct ErrorsQuery {
+    /// Filter by error type: "client" (4xx) or "server" (5xx). Omit for all.
+    #[serde(rename = "type")]
+    error_type: Option<String>,
+}
+
 /// Error details endpoint — per-endpoint error counts and recent failures
 async fn metrics_errors_handler(
     State(state): State<Arc<AdminState>>,
+    axum::extract::Query(query): axum::extract::Query<ErrorsQuery>,
 ) -> Json<ErrorsSnapshot> {
-    let endpoint_errors = state.metrics.requests.endpoint_error_counts();
-    let recent_failures = state.metrics.requests.recent_failures();
-    let total_failed = state.metrics.requests.total_errors();
+    let filter = query.error_type.as_deref();
+    let endpoint_errors = state.metrics.requests.endpoint_error_counts_filtered(filter);
+    let all_failures = state.metrics.requests.recent_failures();
+    let recent_failures = match filter {
+        Some("client") => all_failures.into_iter().filter(|f| f.status >= 400 && f.status < 500).collect(),
+        Some("server") => all_failures.into_iter().filter(|f| f.status >= 500).collect(),
+        _ => all_failures,
+    };
+    let total_failed: u64 = endpoint_errors.iter().map(|e| e.count).sum();
     Json(ErrorsSnapshot {
         total_failed,
         endpoint_errors,

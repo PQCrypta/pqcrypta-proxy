@@ -138,6 +138,8 @@ pub struct FailureEntry {
 pub struct EndpointErrorEntry {
     pub path: String,
     pub count: u64,
+    /// "client" (4xx) or "server" (5xx)
+    pub error_type: String,
 }
 
 /// Global request metrics
@@ -158,7 +160,7 @@ pub struct RequestMetrics {
     bytes_sent: AtomicU64,
     /// Request latency histogram buckets (in ms)
     latency_histogram: LatencyHistogram,
-    /// Per-endpoint error counts
+    /// Per-endpoint error counts keyed by "path\0error_type"
     endpoint_errors: Mutex<HashMap<String, u64>>,
     /// Recent failure log (ring buffer)
     failure_log: Mutex<Vec<FailureEntry>>,
@@ -221,8 +223,10 @@ impl RequestMetrics {
     /// Record a failure entry for error tracking
     fn record_failure(&self, path: &str, status_code: u16) {
         let normalized = normalize_path(path);
-        // Update per-endpoint error count
-        *self.endpoint_errors.lock().entry(normalized.clone()).or_insert(0) += 1;
+        let error_type = if status_code < 500 { "client" } else { "server" };
+        // Update per-endpoint error count keyed by "path\0error_type"
+        let key = format!("{}\0{}", normalized, error_type);
+        *self.endpoint_errors.lock().entry(key).or_insert(0) += 1;
         // Add to failure log ring buffer
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -240,14 +244,27 @@ impl RequestMetrics {
         log.push(entry);
     }
 
-    /// Get per-endpoint error counts sorted by count descending
-    pub fn endpoint_error_counts(&self) -> Vec<EndpointErrorEntry> {
+    /// Get per-endpoint error counts sorted by count descending, optionally filtered by type
+    pub fn endpoint_error_counts_filtered(&self, filter_type: Option<&str>) -> Vec<EndpointErrorEntry> {
         let map = self.endpoint_errors.lock();
         let mut entries: Vec<EndpointErrorEntry> = map.iter()
-            .map(|(k, v)| EndpointErrorEntry { path: k.clone(), count: *v })
+            .filter_map(|(k, v)| {
+                let parts: Vec<&str> = k.splitn(2, '\0').collect();
+                let path = parts[0].to_string();
+                let error_type = parts.get(1).unwrap_or(&"client").to_string();
+                if let Some(ft) = filter_type {
+                    if error_type != ft { return None; }
+                }
+                Some(EndpointErrorEntry { path, count: *v, error_type })
+            })
             .collect();
         entries.sort_by(|a, b| b.count.cmp(&a.count));
         entries
+    }
+
+    /// Get per-endpoint error counts sorted by count descending (all types)
+    pub fn endpoint_error_counts(&self) -> Vec<EndpointErrorEntry> {
+        self.endpoint_error_counts_filtered(None)
     }
 
     /// Get recent failure log entries

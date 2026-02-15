@@ -643,7 +643,7 @@ curl -X POST http://127.0.0.1:8082/ocsp/refresh
 | `/health` | GET | Health check with backend status |
 | `/metrics` | GET | Prometheus metrics (comprehensive) |
 | `/metrics/json` | GET | JSON metrics snapshot |
-| `/metrics/errors` | GET | Per-endpoint error counts and recent failure log |
+| `/metrics/errors` | GET | Per-endpoint error counts and recent failure log. Filter with `?type=client` (4xx) or `?type=server` (5xx) |
 | `/reload` | POST | Reload configuration |
 | `/shutdown` | POST | Graceful shutdown |
 | `/config` | GET | Read-only config view |
