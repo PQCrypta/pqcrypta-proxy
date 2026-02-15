@@ -7,12 +7,16 @@
 //! - TLS/PQC metrics
 //! - System metrics
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
+
+/// Maximum number of recent failures to keep
+const FAILURE_LOG_SIZE: usize = 100;
 
 /// Global metrics registry
 pub struct MetricsRegistry {
@@ -118,6 +122,24 @@ pub struct MetricsSnapshot {
 // Request Metrics
 // ============================================================================
 
+/// A single failure entry with timestamp, path, and status code
+#[derive(Debug, Clone, Serialize)]
+pub struct FailureEntry {
+    /// Unix timestamp in milliseconds
+    pub ts: i64,
+    /// Request path
+    pub path: String,
+    /// HTTP status code
+    pub status: u16,
+}
+
+/// Per-endpoint error count snapshot
+#[derive(Debug, Clone, Serialize)]
+pub struct EndpointErrorEntry {
+    pub path: String,
+    pub count: u64,
+}
+
 /// Global request metrics
 pub struct RequestMetrics {
     /// Total requests received
@@ -136,6 +158,10 @@ pub struct RequestMetrics {
     bytes_sent: AtomicU64,
     /// Request latency histogram buckets (in ms)
     latency_histogram: LatencyHistogram,
+    /// Per-endpoint error counts
+    endpoint_errors: Mutex<HashMap<String, u64>>,
+    /// Recent failure log (ring buffer)
+    failure_log: Mutex<Vec<FailureEntry>>,
 }
 
 impl RequestMetrics {
@@ -149,6 +175,8 @@ impl RequestMetrics {
             bytes_received: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
             latency_histogram: LatencyHistogram::new(),
+            endpoint_errors: Mutex::new(HashMap::new()),
+            failure_log: Mutex::new(Vec::with_capacity(FAILURE_LOG_SIZE)),
         }
     }
 
@@ -158,8 +186,13 @@ impl RequestMetrics {
         self.in_progress.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a request completion
+    /// Record a request completion (without path tracking)
     pub fn request_end(&self, status_code: u16, latency: Duration, bytes_in: u64, bytes_out: u64) {
+        self.request_end_with_path(status_code, latency, bytes_in, bytes_out, None);
+    }
+
+    /// Record a request completion with path tracking for error details
+    pub fn request_end_with_path(&self, status_code: u16, latency: Duration, bytes_in: u64, bytes_out: u64, path: Option<&str>) {
         self.in_progress.fetch_sub(1, Ordering::Relaxed);
         self.bytes_received.fetch_add(bytes_in, Ordering::Relaxed);
         self.bytes_sent.fetch_add(bytes_out, Ordering::Relaxed);
@@ -171,12 +204,60 @@ impl RequestMetrics {
             }
             400..=499 => {
                 self.client_errors.fetch_add(1, Ordering::Relaxed);
+                if let Some(p) = path {
+                    self.record_failure(p, status_code);
+                }
             }
             500..=599 => {
                 self.server_errors.fetch_add(1, Ordering::Relaxed);
+                if let Some(p) = path {
+                    self.record_failure(p, status_code);
+                }
             }
             _ => {}
         }
+    }
+
+    /// Record a failure entry for error tracking
+    fn record_failure(&self, path: &str, status_code: u16) {
+        let normalized = normalize_path(path);
+        // Update per-endpoint error count
+        *self.endpoint_errors.lock().entry(normalized.clone()).or_insert(0) += 1;
+        // Add to failure log ring buffer
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let entry = FailureEntry {
+            ts,
+            path: normalized,
+            status: status_code,
+        };
+        let mut log = self.failure_log.lock();
+        if log.len() >= FAILURE_LOG_SIZE {
+            log.remove(0);
+        }
+        log.push(entry);
+    }
+
+    /// Get per-endpoint error counts sorted by count descending
+    pub fn endpoint_error_counts(&self) -> Vec<EndpointErrorEntry> {
+        let map = self.endpoint_errors.lock();
+        let mut entries: Vec<EndpointErrorEntry> = map.iter()
+            .map(|(k, v)| EndpointErrorEntry { path: k.clone(), count: *v })
+            .collect();
+        entries.sort_by(|a, b| b.count.cmp(&a.count));
+        entries
+    }
+
+    /// Get recent failure log entries
+    pub fn recent_failures(&self) -> Vec<FailureEntry> {
+        self.failure_log.lock().clone()
+    }
+
+    /// Get total error count (client + server errors)
+    pub fn total_errors(&self) -> u64 {
+        self.client_errors.load(Ordering::Relaxed) + self.server_errors.load(Ordering::Relaxed)
     }
 
     fn export_prometheus(&self, output: &mut String) {
@@ -255,6 +336,8 @@ impl RequestMetrics {
             latency_p50_ms: self.latency_histogram.percentile(50),
             latency_p95_ms: self.latency_histogram.percentile(95),
             latency_p99_ms: self.latency_histogram.percentile(99),
+            endpoint_errors: self.endpoint_error_counts(),
+            recent_failures: self.recent_failures(),
         }
     }
 }
@@ -271,6 +354,8 @@ pub struct RequestMetricsSnapshot {
     pub latency_p50_ms: f64,
     pub latency_p95_ms: f64,
     pub latency_p99_ms: f64,
+    pub endpoint_errors: Vec<EndpointErrorEntry>,
+    pub recent_failures: Vec<FailureEntry>,
 }
 
 // ============================================================================
@@ -1229,6 +1314,26 @@ impl LatencyHistogram {
     }
 }
 
+/// Normalize a request path for grouping: strip query strings and collapse
+/// UUIDs/numeric IDs to placeholders so `/keys/abc-123` groups as `/keys/{id}`.
+fn normalize_path(path: &str) -> String {
+    let base = path.split('?').next().unwrap_or(path);
+    let segments: Vec<&str> = base.split('/').collect();
+    let normalized: Vec<String> = segments
+        .iter()
+        .map(|s| {
+            if s.len() > 8 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+                "{id}".to_string()
+            } else if s.parse::<u64>().is_ok() && !s.is_empty() {
+                "{id}".to_string()
+            } else {
+                s.to_string()
+            }
+        })
+        .collect();
+    normalized.join("/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1258,6 +1363,29 @@ mod tests {
         assert_eq!(m.total.load(Ordering::Relaxed), 1);
         assert_eq!(m.success.load(Ordering::Relaxed), 1);
         assert_eq!(m.in_progress.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_failure_tracking() {
+        let m = RequestMetrics::new();
+
+        m.request_start();
+        m.request_end_with_path(404, Duration::from_millis(10), 0, 0, Some("/api/encrypt"));
+        m.request_start();
+        m.request_end_with_path(500, Duration::from_millis(20), 0, 0, Some("/api/encrypt"));
+        m.request_start();
+        m.request_end_with_path(403, Duration::from_millis(5), 0, 0, Some("/api/decrypt"));
+
+        assert_eq!(m.client_errors.load(Ordering::Relaxed), 2);
+        assert_eq!(m.server_errors.load(Ordering::Relaxed), 1);
+
+        let errors = m.endpoint_error_counts();
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0].path, "/api/encrypt");
+        assert_eq!(errors[0].count, 2);
+
+        let failures = m.recent_failures();
+        assert_eq!(failures.len(), 3);
     }
 
     #[test]

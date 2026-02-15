@@ -643,6 +643,7 @@ curl -X POST http://127.0.0.1:8082/ocsp/refresh
 | `/health` | GET | Health check with backend status |
 | `/metrics` | GET | Prometheus metrics (comprehensive) |
 | `/metrics/json` | GET | JSON metrics snapshot |
+| `/metrics/errors` | GET | Per-endpoint error counts and recent failure log |
 | `/reload` | POST | Reload configuration |
 | `/shutdown` | POST | Graceful shutdown |
 | `/config` | GET | Read-only config view |
@@ -652,6 +653,7 @@ curl -X POST http://127.0.0.1:8082/ocsp/refresh
 | `/ocsp/refresh` | POST | Force OCSP response refresh |
 | `/acme` | GET | ACME certificate status |
 | `/acme/renew` | POST | Force certificate renewal |
+| `/ratelimit` | GET | Rate limiter status and statistics |
 
 ### Example
 

@@ -513,7 +513,7 @@ impl QuicListener {
                 });
                 metrics
                     .requests
-                    .request_end(404, start_time.elapsed(), 0, 0);
+                    .request_end_with_path(404, start_time.elapsed(), 0, 0, Some(&path));
                 // Return 404
                 let response = http::Response::builder()
                     .status(http::StatusCode::NOT_FOUND)
@@ -583,7 +583,7 @@ impl QuicListener {
                 error!("Backend not found: {}", route.backend);
                 metrics
                     .requests
-                    .request_end(502, start_time.elapsed(), 0, 0);
+                    .request_end_with_path(502, start_time.elapsed(), 0, 0, Some(&path));
                 let response = http::Response::builder()
                     .status(http::StatusCode::BAD_GATEWAY)
                     .header("server", "PQCProxy v0.2.1")
@@ -607,7 +607,7 @@ impl QuicListener {
             if body.len() > config.security.max_request_size {
                 metrics
                     .requests
-                    .request_end(413, start_time.elapsed(), body.len() as u64, 0);
+                    .request_end_with_path(413, start_time.elapsed(), body.len() as u64, 0, Some(&path));
                 let response = http::Response::builder()
                     .status(http::StatusCode::PAYLOAD_TOO_LARGE)
                     .body(())?;
@@ -826,11 +826,12 @@ impl QuicListener {
 
         // Record metrics
         let latency = start_time.elapsed();
-        metrics.requests.request_end(
+        metrics.requests.request_end_with_path(
             response_status,
             latency,
             body.len() as u64,
             body_size as u64,
+            Some(&path),
         );
 
         // Log successful response

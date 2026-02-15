@@ -113,6 +113,7 @@ impl AdminServer {
             .route("/health", get(health_handler))
             .route("/metrics", get(metrics_handler))
             .route("/metrics/json", get(metrics_json_handler))
+            .route("/metrics/errors", get(metrics_errors_handler))
             .route("/reload", post(reload_handler))
             .route("/shutdown", post(shutdown_handler))
             .route("/config", get(config_handler))
@@ -260,6 +261,28 @@ async fn metrics_json_handler(
     State(state): State<Arc<AdminState>>,
 ) -> Json<crate::metrics::MetricsSnapshot> {
     Json(state.metrics.snapshot())
+}
+
+/// Error details endpoint — per-endpoint error counts and recent failures
+async fn metrics_errors_handler(
+    State(state): State<Arc<AdminState>>,
+) -> Json<ErrorsSnapshot> {
+    let endpoint_errors = state.metrics.requests.endpoint_error_counts();
+    let recent_failures = state.metrics.requests.recent_failures();
+    let total_failed = state.metrics.requests.total_errors();
+    Json(ErrorsSnapshot {
+        total_failed,
+        endpoint_errors,
+        recent_failures,
+    })
+}
+
+/// Snapshot of error details
+#[derive(Serialize)]
+struct ErrorsSnapshot {
+    total_failed: u64,
+    endpoint_errors: Vec<crate::metrics::EndpointErrorEntry>,
+    recent_failures: Vec<crate::metrics::FailureEntry>,
 }
 
 /// Configuration reload request

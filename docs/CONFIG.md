@@ -175,11 +175,18 @@ All responses automatically include these security headers. The `Server` header 
 |----------|--------|-------------|
 | `/health` | GET | Health check with backend status |
 | `/metrics` | GET | Prometheus metrics |
+| `/metrics/json` | GET | JSON metrics snapshot |
+| `/metrics/errors` | GET | Per-endpoint error counts and recent failure log |
 | `/reload` | POST | Reload configuration |
 | `/shutdown` | POST | Graceful shutdown |
 | `/config` | GET | Read-only config view |
 | `/backends` | GET | Backend health status |
 | `/tls` | GET | TLS certificate info |
+| `/ocsp` | GET | OCSP stapling status |
+| `/ocsp/refresh` | POST | Force OCSP response refresh |
+| `/acme` | GET | ACME certificate status |
+| `/acme/renew` | POST | Force certificate renewal |
+| `/ratelimit` | GET | Rate limiter status and statistics |
 
 ---
 

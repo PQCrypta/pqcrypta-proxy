@@ -205,6 +205,8 @@ pub struct HttpListenerState {
     /// Fingerprint extractor for TLS client identification
     pub fingerprint: Arc<FingerprintExtractor>,
     pub load_balancer: Arc<LoadBalancer>,
+    /// Metrics registry for request tracking
+    pub metrics: Arc<MetricsRegistry>,
 }
 
 /// Create and run the HTTP listener with TLS termination
@@ -271,6 +273,7 @@ pub async fn run_http_listener(
     let rate_limiter = Arc::new(AdvancedRateLimiter::new(
         config.advanced_rate_limiting.clone(),
     ));
+    let state_metrics = metrics.clone();
     let rl_state = (rate_limiter, metrics);
     info!(
         "🚦 Advanced rate limiter enabled (key strategy: {:?})",
@@ -285,6 +288,7 @@ pub async fn run_http_listener(
         security: security_state.clone(),
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
+        metrics: state_metrics,
     };
 
     // Initialize compression state
@@ -451,6 +455,7 @@ pub async fn run_http_listener_pqc(
     let rate_limiter = Arc::new(AdvancedRateLimiter::new(
         config.advanced_rate_limiting.clone(),
     ));
+    let state_metrics = metrics.clone();
     let rl_state = (rate_limiter, metrics);
     info!(
         "🚦 Advanced rate limiter enabled (key strategy: {:?})",
@@ -465,6 +470,7 @@ pub async fn run_http_listener_pqc(
         security: security_state.clone(),
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
+        metrics: state_metrics,
     };
 
     // Initialize compression state
@@ -687,6 +693,7 @@ pub async fn run_http_listener_with_fingerprint(
         config.advanced_rate_limiting.clone(),
     ));
     let conn_metrics = metrics.clone();
+    let state_metrics = metrics.clone();
     let rl_state = (rate_limiter, metrics);
     info!(
         "🚦 Advanced rate limiter enabled (key strategy: {:?})",
@@ -701,6 +708,7 @@ pub async fn run_http_listener_with_fingerprint(
         security: security_state.clone(),
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
+        metrics: state_metrics,
     };
 
     // Initialize compression state
@@ -1026,6 +1034,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
         config.advanced_rate_limiting.clone(),
     ));
     let conn_metrics = metrics.clone();
+    let state_metrics = metrics.clone();
     let rl_state = (rate_limiter, metrics);
     info!(
         "🚦 Advanced rate limiter enabled (key strategy: {:?})",
@@ -1040,6 +1049,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
         security: security_state.clone(),
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
+        metrics: state_metrics,
     };
 
     // Initialize middleware states
@@ -1963,6 +1973,7 @@ async fn proxy_handler(
     body: Body,
 ) -> Response {
     let request_start = std::time::Instant::now();
+    state.metrics.requests.request_start();
     let path = uri.path().to_ascii_lowercase();
     let method_str = method.to_string();
     let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
@@ -2268,13 +2279,24 @@ async fn proxy_handler(
                 let response_body = Body::new(incoming_body);
                 let response = Response::from_parts(parts, response_body);
 
+                let resp_status = response.status().as_u16();
+
+                // Record request metrics
+                state.metrics.requests.request_end_with_path(
+                    resp_status,
+                    request_start.elapsed(),
+                    0,
+                    0,
+                    Some(&path),
+                );
+
                 // Log successful response
                 log_access(&AccessLogEntry {
                     remote_addr: client_addr,
                     method: method_str,
                     path,
                     protocol: "HTTP/1.1".to_string(),
-                    status: response.status().as_u16(),
+                    status: resp_status,
                     body_size: 0, // Can't know body size for streaming response
                     referer,
                     user_agent,
@@ -2303,6 +2325,15 @@ async fn proxy_handler(
 
                 error!("Backend request failed: {}", e);
 
+                // Record request metrics
+                state.metrics.requests.request_end_with_path(
+                    502,
+                    request_start.elapsed(),
+                    0,
+                    0,
+                    Some(&path),
+                );
+
                 // Log backend error
                 log_access(&AccessLogEntry {
                     remote_addr: client_addr,
@@ -2323,6 +2354,15 @@ async fn proxy_handler(
     } else {
         // No route matched - return 404
         warn!("No route matched for {} {}", host, path);
+
+        // Record request metrics
+        state.metrics.requests.request_end_with_path(
+            404,
+            request_start.elapsed(),
+            0,
+            0,
+            Some(&path),
+        );
 
         // Log 404
         log_access(&AccessLogEntry {
