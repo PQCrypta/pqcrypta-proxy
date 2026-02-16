@@ -277,11 +277,20 @@ async fn metrics_errors_handler(
     axum::extract::Query(query): axum::extract::Query<ErrorsQuery>,
 ) -> Json<ErrorsSnapshot> {
     let filter = query.error_type.as_deref();
-    let endpoint_errors = state.metrics.requests.endpoint_error_counts_filtered(filter);
+    let endpoint_errors = state
+        .metrics
+        .requests
+        .endpoint_error_counts_filtered(filter);
     let all_failures = state.metrics.requests.recent_failures();
     let recent_failures = match filter {
-        Some("client") => all_failures.into_iter().filter(|f| f.status >= 400 && f.status < 500).collect(),
-        Some("server") => all_failures.into_iter().filter(|f| f.status >= 500).collect(),
+        Some("client") => all_failures
+            .into_iter()
+            .filter(|f| f.status >= 400 && f.status < 500)
+            .collect(),
+        Some("server") => all_failures
+            .into_iter()
+            .filter(|f| f.status >= 500)
+            .collect(),
         _ => all_failures,
     };
     let total_failed: u64 = endpoint_errors.iter().map(|e| e.count).sum();

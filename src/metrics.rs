@@ -194,7 +194,14 @@ impl RequestMetrics {
     }
 
     /// Record a request completion with path tracking for error details
-    pub fn request_end_with_path(&self, status_code: u16, latency: Duration, bytes_in: u64, bytes_out: u64, path: Option<&str>) {
+    pub fn request_end_with_path(
+        &self,
+        status_code: u16,
+        latency: Duration,
+        bytes_in: u64,
+        bytes_out: u64,
+        path: Option<&str>,
+    ) {
         self.in_progress.fetch_sub(1, Ordering::Relaxed);
         self.bytes_received.fetch_add(bytes_in, Ordering::Relaxed);
         self.bytes_sent.fetch_add(bytes_out, Ordering::Relaxed);
@@ -223,7 +230,11 @@ impl RequestMetrics {
     /// Record a failure entry for error tracking
     fn record_failure(&self, path: &str, status_code: u16) {
         let normalized = normalize_path(path);
-        let error_type = if status_code < 500 { "client" } else { "server" };
+        let error_type = if status_code < 500 {
+            "client"
+        } else {
+            "server"
+        };
         // Update per-endpoint error count keyed by "path\0error_type"
         let key = format!("{}\0{}", normalized, error_type);
         *self.endpoint_errors.lock().entry(key).or_insert(0) += 1;
@@ -245,17 +256,27 @@ impl RequestMetrics {
     }
 
     /// Get per-endpoint error counts sorted by count descending, optionally filtered by type
-    pub fn endpoint_error_counts_filtered(&self, filter_type: Option<&str>) -> Vec<EndpointErrorEntry> {
+    pub fn endpoint_error_counts_filtered(
+        &self,
+        filter_type: Option<&str>,
+    ) -> Vec<EndpointErrorEntry> {
         let map = self.endpoint_errors.lock();
-        let mut entries: Vec<EndpointErrorEntry> = map.iter()
+        let mut entries: Vec<EndpointErrorEntry> = map
+            .iter()
             .filter_map(|(k, v)| {
                 let parts: Vec<&str> = k.splitn(2, '\0').collect();
                 let path = parts[0].to_string();
-                let error_type = parts.get(1).unwrap_or(&"client").to_string();
+                let error_type = (*parts.get(1).unwrap_or(&"client")).to_string();
                 if let Some(ft) = filter_type {
-                    if error_type != ft { return None; }
+                    if error_type != ft {
+                        return None;
+                    }
                 }
-                Some(EndpointErrorEntry { path, count: *v, error_type })
+                Some(EndpointErrorEntry {
+                    path,
+                    count: *v,
+                    error_type,
+                })
             })
             .collect();
         entries.sort_by(|a, b| b.count.cmp(&a.count));
@@ -1339,12 +1360,12 @@ fn normalize_path(path: &str) -> String {
     let normalized: Vec<String> = segments
         .iter()
         .map(|s| {
-            if s.len() > 8 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
-                "{id}".to_string()
-            } else if s.parse::<u64>().is_ok() && !s.is_empty() {
+            if (s.len() > 8 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
+                || (!s.is_empty() && s.parse::<u64>().is_ok())
+            {
                 "{id}".to_string()
             } else {
-                s.to_string()
+                (*s).to_string()
             }
         })
         .collect();
@@ -1397,9 +1418,34 @@ mod tests {
         assert_eq!(m.server_errors.load(Ordering::Relaxed), 1);
 
         let errors = m.endpoint_error_counts();
-        assert_eq!(errors.len(), 2);
-        assert_eq!(errors[0].path, "/api/encrypt");
-        assert_eq!(errors[0].count, 2);
+        // Composite key: /api/encrypt has both client(404) and server(500) entries,
+        // /api/decrypt has one client(403) entry = 3 total
+        assert_eq!(errors.len(), 3);
+
+        // Sorted by count desc; all counts are 1 so order is stable by sort
+        let encrypt_total: u64 = errors
+            .iter()
+            .filter(|e| e.path == "/api/encrypt")
+            .map(|e| e.count)
+            .sum();
+        assert_eq!(encrypt_total, 2);
+
+        let decrypt_total: u64 = errors
+            .iter()
+            .filter(|e| e.path == "/api/decrypt")
+            .map(|e| e.count)
+            .sum();
+        assert_eq!(decrypt_total, 1);
+
+        // Verify error_type separation
+        assert_eq!(
+            errors.iter().filter(|e| e.error_type == "client").count(),
+            2
+        ); // /api/encrypt 404 + /api/decrypt 403
+        assert_eq!(
+            errors.iter().filter(|e| e.error_type == "server").count(),
+            1
+        ); // /api/encrypt 500
 
         let failures = m.recent_failures();
         assert_eq!(failures.len(), 3);
