@@ -133,6 +133,14 @@ pub struct FailureEntry {
     pub status: u16,
 }
 
+/// Per-endpoint error tracking (count + last status + last seen)
+#[derive(Debug, Clone)]
+struct EndpointErrorInfo {
+    count: u64,
+    last_status: u16,
+    last_seen_ms: i64,
+}
+
 /// Per-endpoint error count snapshot
 #[derive(Debug, Clone, Serialize)]
 pub struct EndpointErrorEntry {
@@ -140,6 +148,8 @@ pub struct EndpointErrorEntry {
     pub count: u64,
     /// "client" (4xx) or "server" (5xx)
     pub error_type: String,
+    pub last_status: u16,
+    pub last_seen: i64,
 }
 
 /// Global request metrics
@@ -160,8 +170,8 @@ pub struct RequestMetrics {
     bytes_sent: AtomicU64,
     /// Request latency histogram buckets (in ms)
     latency_histogram: LatencyHistogram,
-    /// Per-endpoint error counts keyed by "path\0error_type"
-    endpoint_errors: Mutex<HashMap<String, u64>>,
+    /// Per-endpoint error tracking keyed by "path\0error_type"
+    endpoint_errors: Mutex<HashMap<String, EndpointErrorInfo>>,
     /// Recent failure log (ring buffer)
     failure_log: Mutex<Vec<FailureEntry>>,
 }
@@ -235,14 +245,24 @@ impl RequestMetrics {
         } else {
             "server"
         };
-        // Update per-endpoint error count keyed by "path\0error_type"
+        // Update per-endpoint error tracking keyed by "path\0error_type"
         let key = format!("{}\0{}", normalized, error_type);
-        *self.endpoint_errors.lock().entry(key).or_insert(0) += 1;
-        // Add to failure log ring buffer
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
+        {
+            let mut map = self.endpoint_errors.lock();
+            let info = map.entry(key).or_insert(EndpointErrorInfo {
+                count: 0,
+                last_status: 0,
+                last_seen_ms: 0,
+            });
+            info.count += 1;
+            info.last_status = status_code;
+            info.last_seen_ms = ts;
+        }
+        // Add to failure log ring buffer
         let entry = FailureEntry {
             ts,
             path: normalized,
@@ -274,8 +294,10 @@ impl RequestMetrics {
                 }
                 Some(EndpointErrorEntry {
                     path,
-                    count: *v,
+                    count: v.count,
                     error_type,
+                    last_status: v.last_status,
+                    last_seen: v.last_seen_ms,
                 })
             })
             .collect();
