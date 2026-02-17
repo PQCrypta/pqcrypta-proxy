@@ -1,17 +1,5 @@
 [
   {
-    "ip": "192.140.3.52/32",
-    "reason": "Proxy: 33 suspicious requests",
-    "threat_level": "high",
-    "expires_at": "2026-02-17T00:15:01.612873"
-  },
-  {
-    "ip": "47.253.5.130/32",
-    "reason": "Proxy: 37 suspicious requests",
-    "threat_level": "high",
-    "expires_at": "2026-02-17T06:15:01.389909"
-  },
-  {
     "ip": "165.22.61.50/32",
     "reason": "Proxy: 5 suspicious requests",
     "threat_level": "medium",
@@ -34,5 +22,47 @@
     "reason": "Proxy: 26 suspicious requests",
     "threat_level": "high",
     "expires_at": "2026-02-17T15:20:01.728359"
+  },
+  {
+    "ip": "40.113.19.56/32",
+    "reason": "Proxy: 26 suspicious requests",
+    "threat_level": "high",
+    "expires_at": "2026-02-17T19:20:01.50507"
+  },
+  {
+    "ip": "206.189.230.235/32",
+    "reason": "Proxy: 23 suspicious requests",
+    "threat_level": "high",
+    "expires_at": "2026-02-17T20:00:01.40022"
+  },
+  {
+    "ip": "211.37.11.229/32",
+    "reason": "Proxy: 37 suspicious requests",
+    "threat_level": "high",
+    "expires_at": "2026-02-17T20:50:01.256339"
+  },
+  {
+    "ip": "20.214.155.242/32",
+    "reason": "Proxy: 28 suspicious requests",
+    "threat_level": "high",
+    "expires_at": "2026-02-17T21:00:01.938567"
+  },
+  {
+    "ip": "146.185.239.49/32",
+    "reason": "Proxy: 37 suspicious requests",
+    "threat_level": "high",
+    "expires_at": "2026-02-17T23:00:02.321088"
+  },
+  {
+    "ip": "152.42.193.205/32",
+    "reason": "Proxy: 23 suspicious requests",
+    "threat_level": "high",
+    "expires_at": "2026-02-18T02:35:01.90918"
+  },
+  {
+    "ip": "141.147.57.90/32",
+    "reason": "Proxy: 25 suspicious requests",
+    "threat_level": "high",
+    "expires_at": "2026-02-18T06:00:02.50823"
   }
 ]
