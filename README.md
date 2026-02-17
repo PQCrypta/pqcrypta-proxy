@@ -584,7 +584,16 @@ fallback_to_classical = true
 
 ## ACME Certificate Automation
 
-Automatic Let's Encrypt certificate provisioning and renewal.
+Automatic Let's Encrypt certificate provisioning and renewal with SAN (Subject Alternative Name) support. Issues a single certificate covering all configured domains. Uses ECDSA P-256 keys for smaller certs and faster TLS handshakes.
+
+### How It Works
+
+1. **Daily check** reads the local cert file to check expiry (zero network cost)
+2. **Renewal triggers** when cert is within 30 days of expiry (~day 60 of 90-day cert)
+3. **ACME protocol** runs only during actual renewal (~once every 60 days)
+4. **HTTP-01 challenges** served on port 80 before HTTPS redirect kicks in
+5. **Exponential backoff** on challenge polling (2s → 4s → 8s → 16s cap)
+6. **SAN certificate** — single order, single cert, all domains as SANs
 
 ### Configuration
 
@@ -595,19 +604,35 @@ domains = ["example.com", "api.example.com"]
 email = "admin@example.com"
 directory_url = "https://acme-v02.api.letsencrypt.org/directory"  # Production
 # directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory"  # Staging
-challenge_type = "http-01"  # or "dns-01"
+challenge_type = "http-01"
 certs_path = "/etc/pqcrypta/certs"
-renewal_days = 30  # Renew 30 days before expiry
-check_interval_hours = 12
-http_port = 80  # For HTTP-01 challenge
+account_path = "/etc/pqcrypta/acme/account.json"
+renewal_days = 30           # Renew 30 days before expiry
+check_interval_hours = 24   # Once daily (local check only, no network cost)
+use_ecdsa = true            # ECDSA P-256 (smaller keys, faster handshakes)
+accept_tos = true
+
+# External Account Binding (required by ZeroSSL, optional for Let's Encrypt)
+# eab_kid = "your-kid"
+# eab_hmac_key = "your-hmac-key"
 ```
 
 ### Challenge Types
 
 | Type | Description | Requirements |
 |------|-------------|--------------|
-| `http-01` | HTTP validation | Port 80 accessible |
+| `http-01` | HTTP validation on port 80 | Port 80 accessible, served by redirect server |
 | `dns-01` | DNS TXT record | DNS API access |
+
+### Supported CAs
+
+| CA | Directory URL |
+|----|---------------|
+| Let's Encrypt | `https://acme-v02.api.letsencrypt.org/directory` |
+| Let's Encrypt Staging | `https://acme-staging-v02.api.letsencrypt.org/directory` |
+| ZeroSSL | `https://acme.zerossl.com/v2/DV90` (requires EAB) |
+| Buypass | `https://api.buypass.com/acme/directory` |
+| Google Trust Services | `https://dv.acme-v02.api.pki.goog/directory` |
 
 ## OCSP Stapling
 

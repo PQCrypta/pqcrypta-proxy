@@ -289,6 +289,11 @@ impl AcmeService {
         }
     }
 
+    /// Get shared reference to pending challenges (for HTTP-01 server)
+    pub fn pending_challenges(&self) -> Arc<RwLock<HashMap<String, PendingChallenge>>> {
+        self.pending_challenges.clone()
+    }
+
     /// Set certificate update notification channel
     pub fn set_cert_update_channel(&mut self, tx: mpsc::Sender<CertificateUpdate>) {
         self.cert_update_tx = Some(tx);
@@ -490,7 +495,9 @@ impl AcmeService {
     }
 }
 
-/// Check and renew certificates as needed
+/// Check and renew certificates as needed.
+/// Issues a single SAN certificate covering all configured domains.
+/// Uses the first domain as the primary cert filename.
 #[cfg(feature = "acme")]
 async fn check_and_renew_certificates(
     config: &AcmeConfig,
@@ -498,24 +505,34 @@ async fn check_and_renew_certificates(
     cert_update_tx: &Option<mpsc::Sender<CertificateUpdate>>,
     cert_status: &Arc<RwLock<HashMap<String, CertificateStatus>>>,
 ) -> anyhow::Result<()> {
-    for domain in &config.domains {
-        let cert_path = config.certs_path.join(format!("{}.crt", domain));
-        let key_path = config.certs_path.join(format!("{}.key", domain));
+    if config.domains.is_empty() {
+        return Ok(());
+    }
 
-        let (needs_renewal, days_remaining) = if cert_path.exists() {
-            match read_certificate_expiry(&cert_path) {
-                Ok((_, days)) => {
-                    if days < config.renewal_days as i64 {
-                        info!(
-                            "Certificate for {} expires in {} days, renewal needed",
-                            domain, days
-                        );
-                        (true, Some(days))
-                    } else {
-                        debug!("Certificate for {} valid for {} more days", domain, days);
+    // Use the first domain as the primary cert file (SAN cert covers all)
+    let primary_domain = &config.domains[0];
+    let cert_path = config.certs_path.join(format!("{}.crt", primary_domain));
+    let key_path = config.certs_path.join(format!("{}.key", primary_domain));
 
-                        // Update status cache
-                        let mut status = cert_status.write();
+    // Check if the existing cert needs renewal
+    let (needs_renewal, days_remaining) = if cert_path.exists() {
+        match read_certificate_expiry(&cert_path) {
+            Ok((_, days)) => {
+                if days < config.renewal_days as i64 {
+                    info!(
+                        "Certificate expires in {} days (threshold: {}), renewal needed",
+                        days, config.renewal_days
+                    );
+                    (true, Some(days))
+                } else {
+                    info!(
+                        "Certificate valid for {} more days, no renewal needed",
+                        days
+                    );
+
+                    // Update status cache for all domains
+                    let mut status = cert_status.write();
+                    for domain in &config.domains {
                         status.insert(
                             domain.clone(),
                             CertificateStatus {
@@ -528,88 +545,103 @@ async fn check_and_renew_certificates(
                                 last_error: None,
                             },
                         );
-
-                        (false, Some(days))
                     }
-                }
-                Err(e) => {
-                    warn!("Failed to read certificate expiry for {}: {}", domain, e);
-                    (true, None)
+
+                    (false, Some(days))
                 }
             }
-        } else {
-            info!("No certificate found for {}, requesting new one", domain);
-            (true, None)
-        };
+            Err(e) => {
+                warn!("Failed to read certificate expiry: {}", e);
+                (true, None)
+            }
+        }
+    } else {
+        info!("No certificate found at {:?}, requesting new one", cert_path);
+        (true, None)
+    };
 
-        if needs_renewal {
-            match request_certificate_acme(config, domain, pending_challenges).await {
-                Ok((cert_pem, key_pem, chain_pem)) => {
-                    // Save certificate (with chain) and key
-                    let full_chain = if chain_pem.is_empty() {
-                        cert_pem.clone()
-                    } else {
-                        format!("{}\n{}", cert_pem, chain_pem)
-                    };
+    if needs_renewal {
+        // Request a single SAN cert for all domains
+        match request_san_certificate(config, &config.domains, pending_challenges).await {
+            Ok((cert_pem, key_pem, chain_pem)) => {
+                let full_chain = if chain_pem.is_empty() {
+                    cert_pem.clone()
+                } else {
+                    format!("{}\n{}", cert_pem, chain_pem)
+                };
 
-                    fs::write(&cert_path, &full_chain)?;
-                    fs::write(&key_path, &key_pem)?;
+                fs::write(&cert_path, &full_chain)?;
+                fs::write(&key_path, &key_pem)?;
 
-                    // Set restrictive permissions on key
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
+                }
+
+                // Also write symlinks/copies for each additional domain
+                // so domain-specific lookups work
+                for domain in config.domains.iter().skip(1) {
+                    let domain_cert = config.certs_path.join(format!("{}.crt", domain));
+                    let domain_key = config.certs_path.join(format!("{}.key", domain));
+                    let _ = fs::copy(&cert_path, &domain_cert);
+                    let _ = fs::copy(&key_path, &domain_key);
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
-                        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
+                        let _ = fs::set_permissions(&domain_key, fs::Permissions::from_mode(0o600));
                     }
+                }
 
-                    info!(
-                        "Certificate for {} obtained successfully from {}",
-                        domain, config.directory_url
-                    );
+                info!(
+                    "SAN certificate for {:?} obtained from {}",
+                    config.domains, config.directory_url
+                );
 
-                    // Update status cache
-                    let (expires, days) = read_certificate_expiry(&cert_path)
-                        .unwrap_or_else(|_| ("90 days".to_string(), 90));
-                    {
-                        let mut status = cert_status.write();
+                let (expires, days) = read_certificate_expiry(&cert_path)
+                    .unwrap_or_else(|_| ("90 days".to_string(), 90));
+
+                // Update status for all domains
+                {
+                    let mut status = cert_status.write();
+                    let now_str = chrono::Utc::now()
+                        .format("%Y-%m-%d %H:%M:%S UTC")
+                        .to_string();
+                    for domain in &config.domains {
                         status.insert(
                             domain.clone(),
                             CertificateStatus {
                                 domain: domain.clone(),
                                 exists: true,
-                                expires: Some(expires),
+                                expires: Some(expires.clone()),
                                 days_remaining: Some(days),
                                 needs_renewal: false,
-                                last_renewed: Some(
-                                    chrono::Utc::now()
-                                        .format("%Y-%m-%d %H:%M:%S UTC")
-                                        .to_string(),
-                                ),
+                                last_renewed: Some(now_str.clone()),
                                 last_error: None,
                             },
                         );
                     }
-
-                    // Notify about certificate update
-                    if let Some(tx) = cert_update_tx {
-                        let expires_time =
-                            SystemTime::now() + Duration::from_secs(days as u64 * 86400);
-
-                        let _ = tx
-                            .send(CertificateUpdate {
-                                domain: domain.clone(),
-                                cert_path: cert_path.clone(),
-                                key_path: key_path.clone(),
-                                expires: expires_time,
-                            })
-                            .await;
-                    }
                 }
-                Err(e) => {
-                    error!("Failed to obtain certificate for {}: {}", domain, e);
 
-                    // Update status cache with error
-                    let mut status = cert_status.write();
+                // Notify about certificate update
+                if let Some(tx) = cert_update_tx {
+                    let expires_time =
+                        SystemTime::now() + Duration::from_secs(days as u64 * 86400);
+                    let _ = tx
+                        .send(CertificateUpdate {
+                            domain: primary_domain.clone(),
+                            cert_path: cert_path.clone(),
+                            key_path: key_path.clone(),
+                            expires: expires_time,
+                        })
+                        .await;
+                }
+            }
+            Err(e) => {
+                error!("Failed to obtain SAN certificate: {}", e);
+
+                let mut status = cert_status.write();
+                for domain in &config.domains {
                     status.insert(
                         domain.clone(),
                         CertificateStatus {
@@ -634,48 +666,57 @@ async fn check_and_renew_certificates(
     Ok(())
 }
 
-/// Request a certificate using the ACME protocol
+/// Request a SAN certificate covering multiple domains via ACME protocol.
+/// Single order, single cert, all domains as Subject Alternative Names.
 #[cfg(feature = "acme")]
-async fn request_certificate_acme(
+async fn request_san_certificate(
     config: &AcmeConfig,
-    domain: &str,
+    domains: &[String],
     pending_challenges: &Arc<RwLock<HashMap<String, PendingChallenge>>>,
 ) -> anyhow::Result<(String, String, String)> {
     use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 
     info!(
-        "Requesting certificate for {} from {}",
-        domain, config.directory_url
+        "Requesting SAN certificate for {:?} from {}",
+        domains, config.directory_url
     );
 
-    // Load or create ACME account
     let account = get_or_create_account(config).await?;
 
-    // Create a new order for the domain
+    // Create a single order with all domains as identifiers
+    let identifiers: Vec<Identifier> = domains
+        .iter()
+        .map(|d| Identifier::Dns(d.clone()))
+        .collect();
+
     let mut order = account
         .new_order(&NewOrder {
-            identifiers: &[Identifier::Dns(domain.to_string())],
+            identifiers: &identifiers,
         })
         .await?;
 
-    // Get the authorizations
+    // Process all authorizations (one per domain)
     let authorizations = order.authorizations().await?;
 
-    for authz in authorizations {
+    for authz in &authorizations {
+        let authz_domain = match &authz.identifier {
+            Identifier::Dns(d) => d.clone(),
+        };
+
         match authz.status {
             AuthorizationStatus::Pending => {
-                // Find the HTTP-01 challenge
                 let challenge = authz
                     .challenges
                     .iter()
                     .find(|c| c.r#type == AcmeChallengeType::Http01)
-                    .ok_or_else(|| anyhow::anyhow!("No HTTP-01 challenge found for {}", domain))?;
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("No HTTP-01 challenge found for {}", authz_domain)
+                    })?;
 
                 let key_auth = order.key_authorization(challenge);
                 let challenge_token = challenge.token.clone();
                 let challenge_url = challenge.url.clone();
 
-                // Store the challenge for the HTTP server to respond
                 {
                     let mut challenges = pending_challenges.write();
                     challenges.insert(
@@ -683,7 +724,7 @@ async fn request_certificate_acme(
                         PendingChallenge {
                             token: challenge_token.clone(),
                             key_authorization: key_auth.as_str().to_string(),
-                            domain: domain.to_string(),
+                            domain: authz_domain.clone(),
                             challenge_url: challenge_url.clone(),
                             expires: SystemTime::now() + Duration::from_secs(300),
                         },
@@ -691,128 +732,110 @@ async fn request_certificate_acme(
                 }
 
                 info!(
-                    "HTTP-01 challenge ready for {} at /.well-known/acme-challenge/{}",
-                    domain, challenge_token
+                    "HTTP-01 challenge ready for {} (token: {}...)",
+                    authz_domain,
+                    &challenge_token[..challenge_token.len().min(12)]
                 );
 
-                // Tell the ACME server we're ready
                 order.set_challenge_ready(&challenge_url).await?;
 
-                // Wait for the challenge to be validated by polling the challenge status
+                // Poll with exponential backoff: 2s, 4s, 8s, 16s, then 16s repeating
                 let mut attempts = 0;
+                let mut delay_secs = 2u64;
                 loop {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
 
-                    // Refresh the order and check authorization status
                     order.refresh().await?;
                     let fresh_authz = order.authorizations().await?;
 
-                    // Find the authorization for this domain
-                    let current_authz = fresh_authz.iter().find(|a| {
-                        let Identifier::Dns(d) = &authz.identifier;
-                        let Identifier::Dns(ad) = &a.identifier;
-                        ad == d
-                    });
+                    let current = fresh_authz
+                        .iter()
+                        .find(|a| matches!(&a.identifier, Identifier::Dns(d) if d == &authz_domain));
 
-                    match current_authz.map(|a| &a.status) {
+                    match current.map(|a| &a.status) {
                         Some(AuthorizationStatus::Valid) => {
-                            info!("Challenge validated for {}", domain);
+                            info!("Challenge validated for {}", authz_domain);
                             break;
                         }
                         Some(AuthorizationStatus::Invalid) => {
                             pending_challenges.write().remove(&challenge_token);
                             return Err(anyhow::anyhow!(
                                 "Challenge validation failed for {}",
-                                domain
+                                authz_domain
                             ));
-                        }
-                        Some(AuthorizationStatus::Pending) | None => {
-                            attempts += 1;
-                            if attempts > 30 {
-                                pending_challenges.write().remove(&challenge_token);
-                                return Err(anyhow::anyhow!(
-                                    "Challenge validation timeout for {}",
-                                    domain
-                                ));
-                            }
                         }
                         _ => {
                             attempts += 1;
-                            if attempts > 30 {
+                            if attempts > 15 {
                                 pending_challenges.write().remove(&challenge_token);
                                 return Err(anyhow::anyhow!(
-                                    "Challenge validation timeout for {}",
-                                    domain
+                                    "Challenge validation timeout for {} after {} attempts",
+                                    authz_domain,
+                                    attempts
                                 ));
                             }
+                            delay_secs = (delay_secs * 2).min(16);
                         }
                     }
                 }
 
-                // Clean up the challenge
                 pending_challenges.write().remove(&challenge_token);
             }
             AuthorizationStatus::Valid => {
-                debug!("Authorization already valid for {}", domain);
+                debug!("Authorization already valid for {}", authz_domain);
             }
             _ => {
                 return Err(anyhow::anyhow!(
                     "Unexpected authorization status for {}: {:?}",
-                    domain,
+                    authz_domain,
                     authz.status
                 ));
             }
         }
     }
 
-    // Wait for order to be ready
+    // Wait for order to become ready
     let mut attempts = 0;
+    let mut delay_secs = 2u64;
     loop {
         let state = order.state();
         match state.status {
             OrderStatus::Ready => break,
             OrderStatus::Invalid => {
-                return Err(anyhow::anyhow!("Order became invalid for {}", domain));
-            }
-            OrderStatus::Pending => {
-                attempts += 1;
-                if attempts > 30 {
-                    return Err(anyhow::anyhow!("Order pending timeout for {}", domain));
-                }
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                order.refresh().await?;
+                return Err(anyhow::anyhow!("Order became invalid"));
             }
             _ => {
                 attempts += 1;
-                if attempts > 30 {
-                    return Err(anyhow::anyhow!("Order timeout for {}", domain));
+                if attempts > 15 {
+                    return Err(anyhow::anyhow!("Order ready timeout"));
                 }
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                delay_secs = (delay_secs * 2).min(16);
                 order.refresh().await?;
             }
         }
     }
 
-    // Generate a new key pair for the certificate
+    // Generate ECDSA key (smaller, faster TLS handshakes)
     let key_pair = if config.use_ecdsa {
         KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?
     } else {
-        // Use RSA with configured key size
         KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)?
     };
 
-    // Create CSR
-    let mut params = CertificateParams::new(vec![domain.to_string()])?;
+    // Create CSR with all domains as SANs
+    let domain_strings: Vec<String> = domains.to_vec();
+    let mut params = CertificateParams::new(domain_strings)?;
     params.distinguished_name = DistinguishedName::new();
 
     let csr = params.serialize_request(&key_pair)?;
     let csr_der = csr.der();
 
-    // Finalize the order with our CSR
     order.finalize(csr_der).await?;
 
-    // Wait for certificate to be issued
+    // Wait for certificate issuance
     let mut attempts = 0;
+    let mut delay_secs = 2u64;
     let cert_chain = loop {
         let state = order.state();
         match state.status {
@@ -821,26 +844,21 @@ async fn request_certificate_acme(
                 break cert.ok_or_else(|| anyhow::anyhow!("No certificate returned"))?;
             }
             OrderStatus::Invalid => {
-                return Err(anyhow::anyhow!(
-                    "Order became invalid after finalization for {}",
-                    domain
-                ));
+                return Err(anyhow::anyhow!("Order became invalid after finalization"));
             }
             _ => {
                 attempts += 1;
-                if attempts > 30 {
-                    return Err(anyhow::anyhow!(
-                        "Certificate issuance timeout for {}",
-                        domain
-                    ));
+                if attempts > 15 {
+                    return Err(anyhow::anyhow!("Certificate issuance timeout"));
                 }
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                delay_secs = (delay_secs * 2).min(16);
                 order.refresh().await?;
             }
         }
     };
 
-    // Split the chain into certificate and intermediate(s)
+    // Split chain into leaf cert and intermediates
     let certs: Vec<&str> = cert_chain
         .split("-----END CERTIFICATE-----")
         .filter(|s| s.contains("-----BEGIN CERTIFICATE-----"))
@@ -865,7 +883,11 @@ async fn request_certificate_acme(
 
     let key_pem = key_pair.serialize_pem();
 
-    info!("Certificate obtained successfully for {}", domain);
+    info!(
+        "SAN certificate obtained for {:?} ({} intermediates)",
+        domains,
+        certs.len().saturating_sub(1)
+    );
 
     Ok((cert_pem, key_pem, chain_pem))
 }

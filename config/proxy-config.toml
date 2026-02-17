@@ -41,10 +41,11 @@ worker_threads = 0
 # =============================
 [tls]
 # Path to TLS certificate chain (PEM format)
-cert_path = "/etc/letsencrypt/live/pqcrypta.com/fullchain.pem"
+# Managed by built-in ACME service (see [acme] section below)
+cert_path = "/etc/pqcrypta/certs/pqcrypta.com.crt"
 
 # Path to TLS private key (PEM format)
-key_path = "/etc/letsencrypt/live/pqcrypta.com/privkey.pem"
+key_path = "/etc/pqcrypta/certs/pqcrypta.com.key"
 
 # Optional: CA certificate for client verification (mTLS)
 # ca_cert_path = "/etc/pqcrypta/ca.pem"
@@ -83,6 +84,51 @@ port = 80
 
 # Redirect all HTTP to HTTPS (301 permanent redirect)
 redirect_to_https = true
+
+# =============================
+# ACME Certificate Automation (Let's Encrypt)
+# =============================
+# Automatic TLS certificate provisioning and renewal via ACME protocol (RFC 8555).
+# Checks cert expiry once daily — actual ACME protocol only runs ~once every 60 days
+# when renewal is needed (certs last 90 days, renewal triggers at 30 days remaining).
+# HTTP-01 challenges served on port 80 before HTTPS redirect.
+
+[acme]
+# Enable ACME certificate automation
+enabled = true
+
+# Let's Encrypt production CA
+directory_url = "https://acme-v02.api.letsencrypt.org/directory"
+
+# Contact email for account registration and expiry notifications
+email = "allan@pqcrypta.com"
+
+# Domains to include in the SAN certificate (single cert covers all)
+domains = ["pqcrypta.com", "api.pqcrypta.com"]
+
+# Certificate and key storage path
+certs_path = "/etc/pqcrypta/certs"
+
+# ACME account credentials storage
+account_path = "/etc/pqcrypta/acme/account.json"
+
+# Renew when certificate expires within this many days
+# Let's Encrypt certs last 90 days; 30 days gives a comfortable renewal window
+renewal_days = 30
+
+# How often to check certificate expiry (hours)
+# 24h = once daily. The check is local (reads cert file) — zero network cost.
+# ACME protocol only runs when renewal is actually needed (~once every 60 days).
+check_interval_hours = 24
+
+# Use ECDSA keys (P-256) — smaller keys, faster TLS handshakes than RSA
+use_ecdsa = true
+
+# HTTP-01 challenge validation (served on port 80 redirect server)
+challenge_type = "http-01"
+
+# Accept CA terms of service
+accept_tos = true
 
 # =============================
 # Security Headers

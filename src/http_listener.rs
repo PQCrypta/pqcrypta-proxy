@@ -2488,35 +2488,58 @@ fn is_mobile_user_agent(ua: &str) -> bool {
         || ua_lower.contains("opera mini")
 }
 
-/// Run HTTP redirect server (port 80 → HTTPS)
+/// Run HTTP redirect server (port 80 → HTTPS) with ACME HTTP-01 challenge support
 pub async fn run_http_redirect_server(
     port: u16,
     https_port: u16,
+    acme_challenges: Option<Arc<parking_lot::RwLock<std::collections::HashMap<String, crate::acme::PendingChallenge>>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let https_port_clone = https_port;
 
-    let app = Router::new().fallback(move |Host(host): Host, uri: Uri| async move {
-        let path = uri.path().to_ascii_lowercase();
-        let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
+    let has_acme = acme_challenges.is_some();
 
-        // Build HTTPS URL (path already lowercased)
-        let https_url = if https_port_clone == 443 {
-            format!("https://{}{}{}", host.to_ascii_lowercase(), path, query)
-        } else {
-            format!(
-                "https://{}:{}{}{}",
-                host.to_ascii_lowercase(),
-                https_port_clone,
-                path,
-                query
-            )
-        };
+    let app = Router::new().fallback(move |Host(host): Host, uri: Uri| {
+        let challenges = acme_challenges.clone();
+        async move {
+            let path = uri.path();
 
-        Redirect::permanent(&https_url)
+            // Serve ACME HTTP-01 challenges before redirecting
+            if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
+                if let Some(ref ch) = challenges {
+                    if let Some(challenge) = ch.read().get(token) {
+                        info!("Serving ACME challenge for token: {}...", &token[..token.len().min(12)]);
+                        return (
+                            axum::http::StatusCode::OK,
+                            [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                            challenge.key_authorization.clone(),
+                        ).into_response();
+                    }
+                }
+            }
+
+            let path = path.to_ascii_lowercase();
+            let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
+
+            // Build HTTPS URL
+            let https_url = if https_port_clone == 443 {
+                format!("https://{}{}{}", host.to_ascii_lowercase(), path, query)
+            } else {
+                format!(
+                    "https://{}:{}{}{}",
+                    host.to_ascii_lowercase(),
+                    https_port_clone,
+                    path,
+                    query
+                )
+            };
+
+            Redirect::permanent(&https_url).into_response()
+        }
     });
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    info!("🔀 Starting HTTP→HTTPS redirect server on {}", addr);
+    info!("🔀 Starting HTTP→HTTPS redirect server on {} (ACME challenge support: {})",
+          addr, has_acme);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app.into_make_service()).await?;

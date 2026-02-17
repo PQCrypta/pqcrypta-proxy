@@ -384,9 +384,11 @@ async fn main() -> anyhow::Result<()> {
         .set_pqc_status(tls_provider.is_pqc_enabled(), &config.pqc.preferred_kem);
 
     // Initialize ACME certificate automation service if enabled
+    let acme_challenges: Option<Arc<parking_lot::RwLock<std::collections::HashMap<String, acme::PendingChallenge>>>> ;
     let acme_service: Option<Arc<parking_lot::RwLock<acme::AcmeService>>> = if config.acme.enabled {
         info!("Initializing ACME certificate automation...");
         let mut service = acme::AcmeService::new(config.acme.clone());
+        acme_challenges = Some(service.pending_challenges());
 
         if let Err(e) = service.start() {
             error!("Failed to start ACME service: {}", e);
@@ -400,6 +402,7 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         info!("📝 ACME certificate automation disabled in config");
+        acme_challenges = None;
         None
     };
 
@@ -439,13 +442,14 @@ async fn main() -> anyhow::Result<()> {
     }
     info!("═══════════════════════════════════════════════════════════════");
 
-    // Start HTTP redirect server (port 80 → HTTPS)
+    // Start HTTP redirect server (port 80 → HTTPS) with ACME challenge support
     if config.http_redirect.enabled {
         let redirect_port = config.http_redirect.port;
         let https_port = config.server.udp_port;
+        let challenges = acme_challenges.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = run_http_redirect_server(redirect_port, https_port).await {
+            if let Err(e) = run_http_redirect_server(redirect_port, https_port, challenges).await {
                 error!("HTTP redirect server error: {}", e);
             }
         });
