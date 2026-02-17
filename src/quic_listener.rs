@@ -511,9 +511,13 @@ impl QuicListener {
                     host: host.clone(),
                     response_time_ms: start_time.elapsed().as_millis() as u64,
                 });
-                metrics
-                    .requests
-                    .request_end_with_path(404, start_time.elapsed(), 0, 0, Some(&path));
+                metrics.requests.request_end_with_path(
+                    404,
+                    start_time.elapsed(),
+                    0,
+                    0,
+                    Some(&path),
+                );
                 // Return 404
                 let response = http::Response::builder()
                     .status(http::StatusCode::NOT_FOUND)
@@ -581,9 +585,13 @@ impl QuicListener {
             Some(b) => b,
             None => {
                 error!("Backend not found: {}", route.backend);
-                metrics
-                    .requests
-                    .request_end_with_path(502, start_time.elapsed(), 0, 0, Some(&path));
+                metrics.requests.request_end_with_path(
+                    502,
+                    start_time.elapsed(),
+                    0,
+                    0,
+                    Some(&path),
+                );
                 let response = http::Response::builder()
                     .status(http::StatusCode::BAD_GATEWAY)
                     .header("server", "PQCProxy v0.2.1")
@@ -605,9 +613,13 @@ impl QuicListener {
                 chunk.advance(bytes.len());
             }
             if body.len() > config.security.max_request_size {
-                metrics
-                    .requests
-                    .request_end_with_path(413, start_time.elapsed(), body.len() as u64, 0, Some(&path));
+                metrics.requests.request_end_with_path(
+                    413,
+                    start_time.elapsed(),
+                    body.len() as u64,
+                    0,
+                    Some(&path),
+                );
                 let response = http::Response::builder()
                     .status(http::StatusCode::PAYLOAD_TOO_LARGE)
                     .body(())?;
