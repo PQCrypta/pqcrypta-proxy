@@ -1269,11 +1269,13 @@ pub struct TlsMetricsSnapshot {
 /// Two slots together give 2.5–5 minutes of recent data.
 const ROTATION_INTERVAL_SECS: u64 = 150;
 
+/// Number of histogram buckets (bounds + 1 for +Inf).
+const NUM_BUCKETS: usize = 19;
+
 /// A single histogram slot with atomic bucket counters.
 struct HistogramSlot {
-    /// Bucket counts (in milliseconds)
-    /// Buckets: 1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, +Inf
-    buckets: [AtomicU64; 13],
+    /// Bucket counts — one per bound plus +Inf
+    buckets: [AtomicU64; NUM_BUCKETS],
     /// Sum of all observations (in microseconds)
     sum_us: AtomicU64,
     /// Count of all observations
@@ -1282,13 +1284,11 @@ struct HistogramSlot {
 
 impl HistogramSlot {
     fn new() -> Self {
+        const ZERO: AtomicU64 = AtomicU64::new(0);
         Self {
             buckets: [
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0),
+                ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO,
+                ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO,
             ],
             sum_us: AtomicU64::new(0),
             count: AtomicU64::new(0),
@@ -1305,7 +1305,7 @@ impl HistogramSlot {
         let bucket_idx = LatencyHistogram::BUCKET_BOUNDS_MS
             .iter()
             .position(|&bound| ms <= bound)
-            .unwrap_or(12);
+            .unwrap_or(NUM_BUCKETS - 1);
 
         self.buckets[bucket_idx].fetch_add(1, Ordering::Relaxed);
     }
@@ -1337,7 +1337,12 @@ struct LatencyHistogram {
 }
 
 impl LatencyHistogram {
-    const BUCKET_BOUNDS_MS: [u64; 12] = [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
+    /// Finer-grained bucket boundaries for accurate percentile interpolation.
+    /// 18 bounds + 1 overflow = 19 buckets total.
+    const BUCKET_BOUNDS_MS: [u64; 18] = [
+        1, 5, 10, 25, 50, 100, 150, 200, 300, 500,
+        750, 1000, 1500, 2000, 2500, 5000, 10000, 30000,
+    ];
 
     fn now_secs() -> u64 {
         SystemTime::now()
@@ -1382,7 +1387,9 @@ impl LatencyHistogram {
         self.cumulative_sum_us.fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
     }
 
-    /// Compute a percentile from the merged recent window (both slots).
+    /// Compute a percentile from the merged recent window (both slots)
+    /// using Prometheus-style linear interpolation within buckets for
+    /// accurate sub-bucket estimates.
     fn percentile(&self, p: u32) -> f64 {
         let s0 = &self.slots[0];
         let s1 = &self.slots[1];
@@ -1392,35 +1399,59 @@ impl LatencyHistogram {
             return 0.0;
         }
 
-        let target = (total as f64 * p as f64 / 100.0).ceil() as u64;
+        // Merge bucket counts from both slots
+        let mut merged = [0u64; NUM_BUCKETS];
+        for i in 0..NUM_BUCKETS {
+            merged[i] = s0.buckets[i].load(Ordering::Relaxed)
+                + s1.buckets[i].load(Ordering::Relaxed);
+        }
+
+        // Target rank (fractional for interpolation)
+        let rank = total as f64 * p as f64 / 100.0;
         let mut cumulative = 0u64;
 
-        for i in 0..13 {
-            cumulative += s0.buckets[i].load(Ordering::Relaxed) + s1.buckets[i].load(Ordering::Relaxed);
-            if cumulative >= target {
-                if i < Self::BUCKET_BOUNDS_MS.len() {
-                    return Self::BUCKET_BOUNDS_MS[i] as f64;
+        for i in 0..NUM_BUCKETS {
+            let prev_cum = cumulative;
+            cumulative += merged[i];
+
+            if cumulative as f64 >= rank {
+                if i >= Self::BUCKET_BOUNDS_MS.len() {
+                    // +Inf bucket — estimate from sum/count
+                    let sum = (s0.sum_us.load(Ordering::Relaxed)
+                        + s1.sum_us.load(Ordering::Relaxed)) as f64
+                        / 1000.0;
+                    return sum / total as f64;
                 }
-                // +Inf bucket — estimate from sum/count
-                let sum = (s0.sum_us.load(Ordering::Relaxed) + s1.sum_us.load(Ordering::Relaxed)) as f64 / 1000.0;
-                return sum / total as f64;
+
+                let upper = Self::BUCKET_BOUNDS_MS[i] as f64;
+                let lower = if i == 0 { 0.0 } else { Self::BUCKET_BOUNDS_MS[i - 1] as f64 };
+                let bucket_count = merged[i] as f64;
+
+                if bucket_count == 0.0 {
+                    return upper;
+                }
+
+                // Linear interpolation: how far into this bucket does the
+                // target rank fall?
+                let fraction = (rank - prev_cum as f64) / bucket_count;
+                return lower + (upper - lower) * fraction;
             }
         }
 
         0.0
     }
 
-    /// Export cumulative histogram in Prometheus format (never resets).
+    /// Export windowed histogram in Prometheus format.
     fn export_prometheus(&self, output: &mut String, name: &str) {
         use std::fmt::Write;
 
         let _ = writeln!(output, "# HELP {} Request latency histogram", name);
         let _ = writeln!(output, "# TYPE {} histogram", name);
 
-        // For Prometheus we export the windowed bucket counts (recent data).
         let s0 = &self.slots[0];
         let s1 = &self.slots[1];
         let mut cum = 0u64;
+        let num_bounds = Self::BUCKET_BOUNDS_MS.len();
 
         for (i, bound) in Self::BUCKET_BOUNDS_MS.iter().enumerate() {
             cum += s0.buckets[i].load(Ordering::Relaxed) + s1.buckets[i].load(Ordering::Relaxed);
@@ -1433,7 +1464,9 @@ impl LatencyHistogram {
             );
         }
 
-        cum += s0.buckets[12].load(Ordering::Relaxed) + s1.buckets[12].load(Ordering::Relaxed);
+        // +Inf bucket (last index)
+        cum += s0.buckets[num_bounds].load(Ordering::Relaxed)
+            + s1.buckets[num_bounds].load(Ordering::Relaxed);
         let _ = writeln!(output, "{}_bucket{{le=\"+Inf\"}} {}", name, cum);
 
         let sum = self.cumulative_sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0;
