@@ -1973,7 +1973,14 @@ async fn proxy_handler(
     body: Body,
 ) -> Response {
     let request_start = std::time::Instant::now();
-    state.metrics.requests.request_start();
+    let is_health_check = headers
+        .get("x-health-check-bypass")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !is_health_check {
+        state.metrics.requests.request_start();
+    }
     let path = uri.path().to_ascii_lowercase();
     let method_str = method.to_string();
     let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
@@ -2281,13 +2288,14 @@ async fn proxy_handler(
 
                 let resp_status = response.status().as_u16();
 
-                // Record request metrics
-                state.metrics.requests.request_end_with_path(
+                // Record request metrics (skip error tracking for health check traffic)
+                state.metrics.requests.request_end_full(
                     resp_status,
                     request_start.elapsed(),
                     0,
                     0,
                     Some(&path),
+                    is_health_check,
                 );
 
                 // Log successful response
@@ -2325,13 +2333,14 @@ async fn proxy_handler(
 
                 error!("Backend request failed: {}", e);
 
-                // Record request metrics
-                state.metrics.requests.request_end_with_path(
+                // Record request metrics (skip error tracking for health check traffic)
+                state.metrics.requests.request_end_full(
                     502,
                     request_start.elapsed(),
                     0,
                     0,
                     Some(&path),
+                    is_health_check,
                 );
 
                 // Log backend error
@@ -2355,13 +2364,14 @@ async fn proxy_handler(
         // No route matched - return 404
         warn!("No route matched for {} {}", host, path);
 
-        // Record request metrics
-        state.metrics.requests.request_end_with_path(
+        // Record request metrics (skip error tracking for health check traffic)
+        state.metrics.requests.request_end_full(
             404,
             request_start.elapsed(),
             0,
             0,
             Some(&path),
+            is_health_check,
         );
 
         // Log 404

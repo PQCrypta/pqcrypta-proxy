@@ -200,7 +200,7 @@ impl RequestMetrics {
 
     /// Record a request completion (without path tracking)
     pub fn request_end(&self, status_code: u16, latency: Duration, bytes_in: u64, bytes_out: u64) {
-        self.request_end_with_path(status_code, latency, bytes_in, bytes_out, None);
+        self.request_end_full(status_code, latency, bytes_in, bytes_out, None, false);
     }
 
     /// Record a request completion with path tracking for error details
@@ -212,6 +212,32 @@ impl RequestMetrics {
         bytes_out: u64,
         path: Option<&str>,
     ) {
+        self.request_end_full(status_code, latency, bytes_in, bytes_out, path, false);
+    }
+
+    /// Record a request completion with full control over error tracking.
+    /// When `is_health_check` is true, errors are not counted in client/server error
+    /// totals or per-endpoint failure tracking — health check intentional failures
+    /// (e.g., wrong-key rejection tests) should not appear as real errors.
+    pub fn request_end_full(
+        &self,
+        status_code: u16,
+        latency: Duration,
+        bytes_in: u64,
+        bytes_out: u64,
+        path: Option<&str>,
+        is_health_check: bool,
+    ) {
+        if is_health_check {
+            // Health check traffic is completely invisible to metrics:
+            // no latency recording, no error counters, no failure tracking.
+            // Health check crypto workflows (key gen → encrypt → decrypt)
+            // take 0.5-2s+ per endpoint and would severely skew p95/p99.
+            // Note: request_start() was also skipped for health checks,
+            // so we must NOT decrement in_progress here.
+            return;
+        }
+
         self.in_progress.fetch_sub(1, Ordering::Relaxed);
         self.bytes_received.fetch_add(bytes_in, Ordering::Relaxed);
         self.bytes_sent.fetch_add(bytes_out, Ordering::Relaxed);

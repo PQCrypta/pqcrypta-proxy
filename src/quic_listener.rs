@@ -376,7 +376,7 @@ impl QuicListener {
                         let metrics_clone = metrics.clone();
 
                         tokio::spawn(async move {
-                            metrics_clone.requests.request_start();
+                            // Note: health check detection happens inside handle_h3_request
                             if let Err(e) = Self::handle_h3_request(
                                 stream,
                                 request,
@@ -447,6 +447,16 @@ impl QuicListener {
             .get("referer")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
+        let is_health_check = request
+            .headers()
+            .get("x-health-check-bypass")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
+        if !is_health_check {
+            metrics.requests.request_start();
+        }
 
         info!(
             "HTTP/3 request: {} {} host={:?} from {}",
@@ -511,12 +521,13 @@ impl QuicListener {
                     host: host.clone(),
                     response_time_ms: start_time.elapsed().as_millis() as u64,
                 });
-                metrics.requests.request_end_with_path(
+                metrics.requests.request_end_full(
                     404,
                     start_time.elapsed(),
                     0,
                     0,
                     Some(&path),
+                    is_health_check,
                 );
                 // Return 404
                 let response = http::Response::builder()
@@ -575,7 +586,7 @@ impl QuicListener {
                 stream.finish().await?;
                 metrics
                     .requests
-                    .request_end(200, start_time.elapsed(), 0, 0);
+                    .request_end_full(200, start_time.elapsed(), 0, 0, None, is_health_check);
                 return Ok(());
             }
             // If no CORS config, fall through to normal handling / backend
@@ -585,12 +596,13 @@ impl QuicListener {
             Some(b) => b,
             None => {
                 error!("Backend not found: {}", route.backend);
-                metrics.requests.request_end_with_path(
+                metrics.requests.request_end_full(
                     502,
                     start_time.elapsed(),
                     0,
                     0,
                     Some(&path),
+                    is_health_check,
                 );
                 let response = http::Response::builder()
                     .status(http::StatusCode::BAD_GATEWAY)
@@ -613,12 +625,13 @@ impl QuicListener {
                 chunk.advance(bytes.len());
             }
             if body.len() > config.security.max_request_size {
-                metrics.requests.request_end_with_path(
+                metrics.requests.request_end_full(
                     413,
                     start_time.elapsed(),
                     body.len() as u64,
                     0,
                     Some(&path),
+                    is_health_check,
                 );
                 let response = http::Response::builder()
                     .status(http::StatusCode::PAYLOAD_TOO_LARGE)
@@ -838,12 +851,13 @@ impl QuicListener {
 
         // Record metrics
         let latency = start_time.elapsed();
-        metrics.requests.request_end_with_path(
+        metrics.requests.request_end_full(
             response_status,
             latency,
             body.len() as u64,
             body_size as u64,
             Some(&path),
+            is_health_check,
         );
 
         // Log successful response
