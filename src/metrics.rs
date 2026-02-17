@@ -1262,11 +1262,15 @@ pub struct TlsMetricsSnapshot {
 }
 
 // ============================================================================
-// Latency Histogram
+// Latency Histogram (Sliding Window)
 // ============================================================================
 
-/// Simple latency histogram with fixed buckets
-struct LatencyHistogram {
+/// Rotation interval: every 150 seconds (2.5 minutes).
+/// Two slots together give 2.5–5 minutes of recent data.
+const ROTATION_INTERVAL_SECS: u64 = 150;
+
+/// A single histogram slot with atomic bucket counters.
+struct HistogramSlot {
     /// Bucket counts (in milliseconds)
     /// Buckets: 1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, +Inf
     buckets: [AtomicU64; 13],
@@ -1276,24 +1280,14 @@ struct LatencyHistogram {
     count: AtomicU64,
 }
 
-impl LatencyHistogram {
-    const BUCKET_BOUNDS_MS: [u64; 12] = [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
-
+impl HistogramSlot {
     fn new() -> Self {
         Self {
             buckets: [
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
                 AtomicU64::new(0),
             ],
             sum_us: AtomicU64::new(0),
@@ -1308,8 +1302,7 @@ impl LatencyHistogram {
         self.sum_us.fetch_add(us, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
 
-        // Find the right bucket
-        let bucket_idx = Self::BUCKET_BOUNDS_MS
+        let bucket_idx = LatencyHistogram::BUCKET_BOUNDS_MS
             .iter()
             .position(|&bound| ms <= bound)
             .unwrap_or(12);
@@ -1317,8 +1310,84 @@ impl LatencyHistogram {
         self.buckets[bucket_idx].fetch_add(1, Ordering::Relaxed);
     }
 
+    fn reset(&self) {
+        for bucket in &self.buckets {
+            bucket.store(0, Ordering::Relaxed);
+        }
+        self.sum_us.store(0, Ordering::Relaxed);
+        self.count.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Sliding-window latency histogram using double-buffered slots.
+///
+/// Every `ROTATION_INTERVAL_SECS` the active slot swaps and the newly
+/// active slot is reset.  Percentiles are computed by merging both slots,
+/// giving a window of approximately 2.5–5 minutes of recent data instead
+/// of cumulative lifetime statistics.
+struct LatencyHistogram {
+    slots: [HistogramSlot; 2],
+    /// Which slot is currently active (0 or 1)
+    active: AtomicU64,
+    /// Unix-epoch seconds of last rotation
+    last_rotate: AtomicU64,
+    /// Cumulative totals (for Prometheus export only — never reset)
+    cumulative_count: AtomicU64,
+    cumulative_sum_us: AtomicU64,
+}
+
+impl LatencyHistogram {
+    const BUCKET_BOUNDS_MS: [u64; 12] = [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    fn new() -> Self {
+        Self {
+            slots: [HistogramSlot::new(), HistogramSlot::new()],
+            active: AtomicU64::new(0),
+            last_rotate: AtomicU64::new(Self::now_secs()),
+            cumulative_count: AtomicU64::new(0),
+            cumulative_sum_us: AtomicU64::new(0),
+        }
+    }
+
+    /// Rotate slots if enough time has elapsed. Only one thread performs the
+    /// swap thanks to compare_exchange on `last_rotate`.
+    fn maybe_rotate(&self) {
+        let now = Self::now_secs();
+        let last = self.last_rotate.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= ROTATION_INTERVAL_SECS {
+            if self.last_rotate.compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                let old = self.active.load(Ordering::Relaxed) as usize;
+                let new_slot = 1 - old;
+                // Reset the slot we're about to make active
+                self.slots[new_slot].reset();
+                self.active.store(new_slot as u64, Ordering::Release);
+            }
+        }
+    }
+
+    fn observe(&self, duration: Duration) {
+        self.maybe_rotate();
+        let slot = self.active.load(Ordering::Relaxed) as usize;
+        self.slots[slot].observe(duration);
+
+        // Keep cumulative totals for Prometheus histogram export
+        self.cumulative_count.fetch_add(1, Ordering::Relaxed);
+        self.cumulative_sum_us.fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    /// Compute a percentile from the merged recent window (both slots).
     fn percentile(&self, p: u32) -> f64 {
-        let total = self.count.load(Ordering::Relaxed);
+        let s0 = &self.slots[0];
+        let s1 = &self.slots[1];
+
+        let total = s0.count.load(Ordering::Relaxed) + s1.count.load(Ordering::Relaxed);
         if total == 0 {
             return 0.0;
         }
@@ -1326,14 +1395,14 @@ impl LatencyHistogram {
         let target = (total as f64 * p as f64 / 100.0).ceil() as u64;
         let mut cumulative = 0u64;
 
-        for (i, bucket) in self.buckets.iter().enumerate() {
-            cumulative += bucket.load(Ordering::Relaxed);
+        for i in 0..13 {
+            cumulative += s0.buckets[i].load(Ordering::Relaxed) + s1.buckets[i].load(Ordering::Relaxed);
             if cumulative >= target {
                 if i < Self::BUCKET_BOUNDS_MS.len() {
                     return Self::BUCKET_BOUNDS_MS[i] as f64;
                 }
-                // +Inf bucket, use sum/count as estimate
-                let sum = self.sum_us.load(Ordering::Relaxed) as f64 / 1000.0;
+                // +Inf bucket — estimate from sum/count
+                let sum = (s0.sum_us.load(Ordering::Relaxed) + s1.sum_us.load(Ordering::Relaxed)) as f64 / 1000.0;
                 return sum / total as f64;
             }
         }
@@ -1341,35 +1410,39 @@ impl LatencyHistogram {
         0.0
     }
 
+    /// Export cumulative histogram in Prometheus format (never resets).
     fn export_prometheus(&self, output: &mut String, name: &str) {
         use std::fmt::Write;
 
         let _ = writeln!(output, "# HELP {} Request latency histogram", name);
         let _ = writeln!(output, "# TYPE {} histogram", name);
 
-        let mut cumulative = 0u64;
+        // For Prometheus we export the windowed bucket counts (recent data).
+        let s0 = &self.slots[0];
+        let s1 = &self.slots[1];
+        let mut cum = 0u64;
 
         for (i, bound) in Self::BUCKET_BOUNDS_MS.iter().enumerate() {
-            cumulative += self.buckets[i].load(Ordering::Relaxed);
+            cum += s0.buckets[i].load(Ordering::Relaxed) + s1.buckets[i].load(Ordering::Relaxed);
             let _ = writeln!(
                 output,
                 "{}_bucket{{le=\"{}\"}} {}",
                 name,
                 *bound as f64 / 1000.0,
-                cumulative
+                cum
             );
         }
 
-        cumulative += self.buckets[12].load(Ordering::Relaxed);
-        let _ = writeln!(output, "{}_bucket{{le=\"+Inf\"}} {}", name, cumulative);
+        cum += s0.buckets[12].load(Ordering::Relaxed) + s1.buckets[12].load(Ordering::Relaxed);
+        let _ = writeln!(output, "{}_bucket{{le=\"+Inf\"}} {}", name, cum);
 
-        let sum = self.sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        let sum = self.cumulative_sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0;
         let _ = writeln!(output, "{}_sum {:.6}", name, sum);
         let _ = writeln!(
             output,
             "{}_count {}",
             name,
-            self.count.load(Ordering::Relaxed)
+            self.cumulative_count.load(Ordering::Relaxed)
         );
     }
 }
@@ -1408,7 +1481,7 @@ mod tests {
         h.observe(Duration::from_millis(100));
         h.observe(Duration::from_millis(500));
 
-        assert_eq!(h.count.load(Ordering::Relaxed), 5);
+        assert_eq!(h.cumulative_count.load(Ordering::Relaxed), 5);
         assert!(h.percentile(50) >= 10.0);
         assert!(h.percentile(99) >= 100.0);
     }
