@@ -584,9 +584,14 @@ impl QuicListener {
                 let response = response_builder.body(())?;
                 stream.send_response(response).await?;
                 stream.finish().await?;
-                metrics
-                    .requests
-                    .request_end_full(200, start_time.elapsed(), 0, 0, None, is_health_check);
+                metrics.requests.request_end_full(
+                    200,
+                    start_time.elapsed(),
+                    0,
+                    0,
+                    None,
+                    is_health_check,
+                );
                 return Ok(());
             }
             // If no CORS config, fall through to normal handling / backend

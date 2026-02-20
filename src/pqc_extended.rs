@@ -486,6 +486,7 @@ impl PqcCapabilities {
         }
     }
 
+    #[allow(clippy::needless_pass_by_ref_mut)]
     fn detect_fips_mode(&mut self) {
         #[cfg(feature = "fips")]
         {

@@ -1310,12 +1310,8 @@ struct HistogramSlot {
 
 impl HistogramSlot {
     fn new() -> Self {
-        const ZERO: AtomicU64 = AtomicU64::new(0);
         Self {
-            buckets: [
-                ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO,
-                ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO,
-            ],
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             sum_us: AtomicU64::new(0),
             count: AtomicU64::new(0),
         }
@@ -1366,8 +1362,7 @@ impl LatencyHistogram {
     /// Finer-grained bucket boundaries for accurate percentile interpolation.
     /// 18 bounds + 1 overflow = 19 buckets total.
     const BUCKET_BOUNDS_MS: [u64; 18] = [
-        1, 5, 10, 25, 50, 100, 150, 200, 300, 500,
-        750, 1000, 1500, 2000, 2500, 5000, 10000, 30000,
+        1, 5, 10, 25, 50, 100, 150, 200, 300, 500, 750, 1000, 1500, 2000, 2500, 5000, 10000, 30000,
     ];
 
     fn now_secs() -> u64 {
@@ -1393,7 +1388,11 @@ impl LatencyHistogram {
         let now = Self::now_secs();
         let last = self.last_rotate.load(Ordering::Relaxed);
         if now.saturating_sub(last) >= ROTATION_INTERVAL_SECS {
-            if self.last_rotate.compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            if self
+                .last_rotate
+                .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
                 let old = self.active.load(Ordering::Relaxed) as usize;
                 let new_slot = 1 - old;
                 // Reset the slot we're about to make active
@@ -1410,7 +1409,8 @@ impl LatencyHistogram {
 
         // Keep cumulative totals for Prometheus histogram export
         self.cumulative_count.fetch_add(1, Ordering::Relaxed);
-        self.cumulative_sum_us.fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
+        self.cumulative_sum_us
+            .fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
     }
 
     /// Compute a percentile from the merged recent window (both slots)
@@ -1427,18 +1427,20 @@ impl LatencyHistogram {
 
         // Merge bucket counts from both slots
         let mut merged = [0u64; NUM_BUCKETS];
-        for i in 0..NUM_BUCKETS {
-            merged[i] = s0.buckets[i].load(Ordering::Relaxed)
-                + s1.buckets[i].load(Ordering::Relaxed);
+        for (bucket, (b0, b1)) in merged
+            .iter_mut()
+            .zip(s0.buckets.iter().zip(s1.buckets.iter()))
+        {
+            *bucket = b0.load(Ordering::Relaxed) + b1.load(Ordering::Relaxed);
         }
 
         // Target rank (fractional for interpolation)
         let rank = total as f64 * p as f64 / 100.0;
         let mut cumulative = 0u64;
 
-        for i in 0..NUM_BUCKETS {
+        for (i, &bucket_val) in merged.iter().enumerate() {
             let prev_cum = cumulative;
-            cumulative += merged[i];
+            cumulative += bucket_val;
 
             if cumulative as f64 >= rank {
                 if i >= Self::BUCKET_BOUNDS_MS.len() {
@@ -1450,8 +1452,12 @@ impl LatencyHistogram {
                 }
 
                 let upper = Self::BUCKET_BOUNDS_MS[i] as f64;
-                let lower = if i == 0 { 0.0 } else { Self::BUCKET_BOUNDS_MS[i - 1] as f64 };
-                let bucket_count = merged[i] as f64;
+                let lower = if i == 0 {
+                    0.0
+                } else {
+                    Self::BUCKET_BOUNDS_MS[i - 1] as f64
+                };
+                let bucket_count = bucket_val as f64;
 
                 if bucket_count == 0.0 {
                     return upper;
@@ -1460,7 +1466,7 @@ impl LatencyHistogram {
                 // Linear interpolation: how far into this bucket does the
                 // target rank fall?
                 let fraction = (rank - prev_cum as f64) / bucket_count;
-                return lower + (upper - lower) * fraction;
+                return (upper - lower).mul_add(fraction, lower);
             }
         }
 

@@ -384,7 +384,9 @@ async fn main() -> anyhow::Result<()> {
         .set_pqc_status(tls_provider.is_pqc_enabled(), &config.pqc.preferred_kem);
 
     // Initialize ACME certificate automation service if enabled
-    let acme_challenges: Option<Arc<parking_lot::RwLock<std::collections::HashMap<String, acme::PendingChallenge>>>> ;
+    let acme_challenges: Option<
+        Arc<parking_lot::RwLock<std::collections::HashMap<String, acme::PendingChallenge>>>,
+    >;
     let acme_service: Option<Arc<parking_lot::RwLock<acme::AcmeService>>> = if config.acme.enabled {
         info!("Initializing ACME certificate automation...");
         let mut service = acme::AcmeService::new(config.acme.clone());

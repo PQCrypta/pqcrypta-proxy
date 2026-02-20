@@ -2489,10 +2489,16 @@ fn is_mobile_user_agent(ua: &str) -> bool {
 }
 
 /// Run HTTP redirect server (port 80 → HTTPS) with ACME HTTP-01 challenge support
-pub async fn run_http_redirect_server(
+pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 'static>(
     port: u16,
     https_port: u16,
-    acme_challenges: Option<Arc<parking_lot::RwLock<std::collections::HashMap<String, crate::acme::PendingChallenge>>>>,
+    acme_challenges: Option<
+        Arc<
+            parking_lot::RwLock<
+                std::collections::HashMap<String, crate::acme::PendingChallenge, S>,
+            >,
+        >,
+    >,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let https_port_clone = https_port;
 
@@ -2507,12 +2513,16 @@ pub async fn run_http_redirect_server(
             if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
                 if let Some(ref ch) = challenges {
                     if let Some(challenge) = ch.read().get(token) {
-                        info!("Serving ACME challenge for token: {}...", &token[..token.len().min(12)]);
+                        info!(
+                            "Serving ACME challenge for token: {}...",
+                            &token[..token.len().min(12)]
+                        );
                         return (
                             axum::http::StatusCode::OK,
                             [(axum::http::header::CONTENT_TYPE, "text/plain")],
                             challenge.key_authorization.clone(),
-                        ).into_response();
+                        )
+                            .into_response();
                     }
                 }
             }
@@ -2538,8 +2548,10 @@ pub async fn run_http_redirect_server(
     });
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    info!("🔀 Starting HTTP→HTTPS redirect server on {} (ACME challenge support: {})",
-          addr, has_acme);
+    info!(
+        "🔀 Starting HTTP→HTTPS redirect server on {} (ACME challenge support: {})",
+        addr, has_acme
+    );
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app.into_make_service()).await?;

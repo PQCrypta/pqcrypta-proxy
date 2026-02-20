@@ -556,7 +556,10 @@ async fn check_and_renew_certificates(
             }
         }
     } else {
-        info!("No certificate found at {:?}, requesting new one", cert_path);
+        info!(
+            "No certificate found at {:?}, requesting new one",
+            cert_path
+        );
         (true, None)
     };
 
@@ -625,8 +628,7 @@ async fn check_and_renew_certificates(
 
                 // Notify about certificate update
                 if let Some(tx) = cert_update_tx {
-                    let expires_time =
-                        SystemTime::now() + Duration::from_secs(days as u64 * 86400);
+                    let expires_time = SystemTime::now() + Duration::from_secs(days as u64 * 86400);
                     let _ = tx
                         .send(CertificateUpdate {
                             domain: primary_domain.clone(),
@@ -684,10 +686,7 @@ async fn request_san_certificate(
     let account = get_or_create_account(config).await?;
 
     // Create a single order with all domains as identifiers
-    let identifiers: Vec<Identifier> = domains
-        .iter()
-        .map(|d| Identifier::Dns(d.clone()))
-        .collect();
+    let identifiers: Vec<Identifier> = domains.iter().map(|d| Identifier::Dns(d.clone())).collect();
 
     let mut order = account
         .new_order(&NewOrder {
@@ -748,9 +747,9 @@ async fn request_san_certificate(
                     order.refresh().await?;
                     let fresh_authz = order.authorizations().await?;
 
-                    let current = fresh_authz
-                        .iter()
-                        .find(|a| matches!(&a.identifier, Identifier::Dns(d) if d == &authz_domain));
+                    let current = fresh_authz.iter().find(
+                        |a| matches!(&a.identifier, Identifier::Dns(d) if d == &authz_domain),
+                    );
 
                     match current.map(|a| &a.status) {
                         Some(AuthorizationStatus::Valid) => {
