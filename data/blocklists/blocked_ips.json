@@ -1,23 +1,5 @@
 [
   {
-    "ip": "5.189.139.225/32",
-    "reason": "Proxy: 12 suspicious requests",
-    "threat_level": "medium",
-    "expires_at": "2026-02-20T16:20:01.571089"
-  },
-  {
-    "ip": "40.80.90.214/32",
-    "reason": "Proxy: 27 suspicious requests",
-    "threat_level": "high",
-    "expires_at": "2026-02-20T17:40:01.560446"
-  },
-  {
-    "ip": "118.196.78.37/32",
-    "reason": "Proxy: 37 suspicious requests",
-    "threat_level": "high",
-    "expires_at": "2026-02-20T09:00:02.26422"
-  },
-  {
     "ip": "8.208.115.249/32",
     "reason": "Proxy: 36 suspicious requests",
     "threat_level": "high",
@@ -54,15 +36,63 @@
     "expires_at": "2026-02-21T03:00:01.936054"
   },
   {
-    "ip": "20.24.197.43/32",
-    "reason": "Proxy: 45 suspicious requests",
-    "threat_level": "high",
-    "expires_at": "2026-02-21T05:25:01.860683"
-  },
-  {
     "ip": "36.255.223.167/32",
     "reason": "Proxy: 37 suspicious requests",
     "threat_level": "high",
     "expires_at": "2026-02-21T08:10:01.573069"
+  },
+  {
+    "ip": "20.207.201.18/32",
+    "reason": "Proxy: 16 suspicious requests",
+    "threat_level": "medium",
+    "expires_at": "2026-02-21T11:00:02.241271"
+  },
+  {
+    "ip": "40.80.90.214/32",
+    "reason": "Proxy: 27 suspicious requests",
+    "threat_level": "critical",
+    "expires_at": "2026-02-21T11:05:01.315504"
+  },
+  {
+    "ip": "138.226.244.23/32",
+    "reason": "Proxy: 19 suspicious requests",
+    "threat_level": "high",
+    "expires_at": "2026-02-21T11:45:01.639113"
+  },
+  {
+    "ip": "95.111.241.165/32",
+    "reason": "Proxy: 37 suspicious requests",
+    "threat_level": "high",
+    "expires_at": "2026-02-21T13:00:01.705258"
+  },
+  {
+    "ip": "173.212.239.52/32",
+    "reason": "Proxy: 37 suspicious requests",
+    "threat_level": "high",
+    "expires_at": "2026-02-21T14:35:01.840443"
+  },
+  {
+    "ip": "20.189.202.45/32",
+    "reason": "Proxy: 80 suspicious requests",
+    "threat_level": "critical",
+    "expires_at": "2026-02-21T15:45:01.998054"
+  },
+  {
+    "ip": "104.46.239.31/32",
+    "reason": "Proxy: 42 suspicious requests",
+    "threat_level": "high",
+    "expires_at": "2026-02-21T16:00:01.398272"
+  },
+  {
+    "ip": "20.24.197.43/32",
+    "reason": "Proxy: 45 suspicious requests",
+    "threat_level": "critical",
+    "expires_at": "2026-02-21T18:35:01.729601"
+  },
+  {
+    "ip": "20.219.0.101/32",
+    "reason": "Proxy: 41 suspicious requests",
+    "threat_level": "high",
+    "expires_at": "2026-02-21T19:15:01.364898"
   }
 ]
