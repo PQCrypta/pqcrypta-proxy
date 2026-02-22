@@ -4,7 +4,7 @@
 
 [![Build Status](https://github.com/PQCrypta/pqcrypta-proxy/workflows/CI/badge.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-130%20passing-brightgreen.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
+[![Tests](https://img.shields.io/badge/tests-140%20passing-brightgreen.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
 [![Security](https://img.shields.io/badge/security-hardened-green.svg)](docs/SECURITY.md)
 
 ## Highlights
@@ -152,14 +152,6 @@ To enable fingerprint-based classification (advisory only, never blocks automati
 3. If the file is missing or malformed the proxy starts normally with an empty database
    and logs a warning.
 
-### Changelog — Security Fixes (2026-02-22)
-
-| # | Fix | Detail |
-|---|-----|--------|
-| 1 | **Removed public IP trust bypass** | The hardcoded `66.179.95.51` bypass in `is_trusted_ip()` has been removed. Only loopback and RFC1918 are unconditionally trusted. Additional CIDRs require explicit `trusted_internal_cidrs` config. |
-| 2 | **Blocklists moved out of web root** | Blocklist JSON files now live under `/var/lib/pqcrypta-proxy/blocklists/` (mode `0700`). The sync script no longer overwrites files on DB failure. |
-| 3 | **CRLF injection prevention** | `build_http_request()` (Unix socket proxy) now strips `\r` and `\n` from all header names, values, and the request path before interpolation. |
-| 4 | **JA3/JA4 placeholder hashes removed** | Hardcoded example fingerprints replaced with a file-backed `Ja3Database` loaded from `fingerprint.fingerprint_db_path`. Classification is advisory-only. |
 
 ## Quick Start
 
@@ -496,12 +488,14 @@ path_prefix = "/"
 backend = "api"
 
 [routes.cors]
-allow_origin = "https://example.com"
+allow_origin = "https://example.com"   # must be a specific origin when allow_credentials = true
 allow_methods = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
 allow_headers = ["Content-Type", "Authorization", "X-API-Key"]
 allow_credentials = true
 max_age = 86400
 ```
+
+> **Configuration validation** rejects `allow_origin = "*"` combined with `allow_credentials = true` at startup (RFC 6454 / CORS spec). All modern browsers refuse this combination; the proxy enforces it at load time rather than producing confusing runtime failures. Use a specific origin string when credentials are required.
 
 See [config/example-config.toml](config/example-config.toml) for full documentation.
 
@@ -523,7 +517,9 @@ Options:
   -V, --version             Print version
 ```
 
-Environment variables: `PQCRYPTA_CONFIG`, `PQCRYPTA_UDP_PORT`, `PQCRYPTA_ADMIN_PORT`, `PQCRYPTA_LOG_LEVEL`, `PQCRYPTA_JSON_LOGS`
+Environment variables: `PQCRYPTA_CONFIG`, `PQCRYPTA_UDP_PORT`, `PQCRYPTA_ADMIN_PORT`, `PQCRYPTA_LOG_LEVEL`, `PQCRYPTA_JSON_LOGS`, `PQCRYPTA_ENV`
+
+Set `PQCRYPTA_ENV=production` to explicitly declare a production deployment. Set `PQCRYPTA_ENV=development` to permit development-only options (such as `tls_skip_verify`) when ACME is not enabled. When ACME is active the environment is always treated as production regardless of this variable.
 
 ## Architecture
 
@@ -623,11 +619,17 @@ PQCrypta Proxy supports hybrid PQC key exchange using rustls-post-quantum (X2551
 
 | Algorithm | Security Level | Description |
 |-----------|---------------|-------------|
-| `X25519MLKEM768` | NIST Level 3 | Hybrid X25519 + ML-KEM-768 (default) |
-| `kyber768` | NIST Level 3 | Kyber-768 standalone |
-| `kyber1024` | NIST Level 5 | Kyber-1024 standalone |
-| `mlkem768` | NIST Level 3 | ML-KEM-768 (FIPS 203) |
-| `mlkem1024` | NIST Level 5 | ML-KEM-1024 (FIPS 203) |
+| `X25519MLKEM768` | NIST Level 3 | Hybrid X25519 + ML-KEM-768 — **recommended default** (FIPS 203) |
+| `SecP256r1MLKEM768` | NIST Level 3 | Hybrid P-256 + ML-KEM-768 (FIPS 203) |
+| `SecP384r1MLKEM1024` | NIST Level 5 | Hybrid P-384 + ML-KEM-1024 (FIPS 203) |
+| `X448MLKEM1024` | NIST Level 5 | Hybrid X448 + ML-KEM-1024 (FIPS 203) |
+| `mlkem512` | NIST Level 1 | Pure ML-KEM-512 (FIPS 203) |
+| `mlkem768` | NIST Level 3 | Pure ML-KEM-768 (FIPS 203) |
+| `mlkem1024` | NIST Level 5 | Pure ML-KEM-1024 (FIPS 203) |
+| `kyber768` ⚠️ | NIST Level 3 | **Deprecated** — pre-NIST round-3 draft, not FIPS 203. Requires `--features legacy-pqc` at build time. Not interoperable with ML-KEM peers. Do not use for new deployments. |
+| `x25519_kyber768` ⚠️ | NIST Level 3 | **Deprecated** — pre-NIST round-3 draft hybrid, not FIPS 203. Requires `--features legacy-pqc` at build time. |
+
+> **Only FIPS 203-compliant algorithms are built by default.** `kyber768` and `x25519_kyber768` (pre-standardisation Kyber drafts) are excluded from all default builds. To enable them only for backward-compatible migration periods, compile with `cargo build --release --features legacy-pqc`. A deprecation warning is logged at startup whenever a legacy algorithm is selected.
 
 ### Configuration
 
@@ -898,11 +900,16 @@ The admin API requires **at least one** of the following to be configured, or th
 enabled = true
 bind_address = "127.0.0.1"
 port = 8082
-auth_token = "your-strong-secret-token"   # required unless allowed_ips is loopback-only
+auth_token = "your-strong-secret-token-at-least-32-chars"   # required unless allowed_ips is loopback-only
 allowed_ips = ["127.0.0.1", "::1"]
 ```
 
-Admin token comparison uses constant-time equality to prevent timing side-channel attacks.
+**Token requirements:**
+- Minimum **32 characters** — the proxy rejects shorter tokens at startup. Generate a strong token with `openssl rand -base64 48`.
+- Token comparison uses constant-time equality to prevent timing side-channel attacks.
+
+**Brute-force protection:**
+- Failed authentication attempts are rate-limited per client IP: **10 failures per 60-second window** triggers a `429 Too Many Requests` lockout for that IP. The counter resets automatically after a successful authentication or when the 60-second window expires.
 
 ## JWT Rate Limiting
 
@@ -918,23 +925,32 @@ Without `jwt_secret`, the `jwt_subject` strategy is disabled and falls back to t
 
 ## Insecure Backend TLS
 
-Backends with `tls_skip_verify = true` completely disable certificate verification for that backend. The proxy logs a loud warning for each such backend and requires the `--allow-insecure-backends` CLI flag to start:
+`tls_skip_verify = true` on a backend completely disables certificate and signature verification for that upstream connection, enabling man-in-the-middle attacks on the proxy↔backend leg. The proxy logs a loud warning for every such backend at startup.
 
-```toml
-[[backends]]
-name = "dev-backend"
-tls_skip_verify = true  # requires --allow-insecure-backends at startup
-```
+**Production deployments reject `tls_skip_verify` at config load.** Production is detected automatically when:
+- ACME is enabled (`[acme] enabled = true`), or
+- `PQCRYPTA_ENV=production` is set in the environment.
+
+To use `tls_skip_verify` in a development environment where neither condition applies, set `PQCRYPTA_ENV=development`:
 
 ```sh
-pqcrypta-proxy --config config.toml --allow-insecure-backends
+PQCRYPTA_ENV=development pqcrypta-proxy --config config.toml
 ```
 
-This flag should never be used in production.
+```toml
+# Only valid when PQCRYPTA_ENV=development and acme.enabled = false
+[backends.dev-backend]
+name = "dev-backend"
+tls_mode = "reencrypt"
+address = "localhost:8443"
+tls_skip_verify = true
+```
+
+Replace self-signed backend certificates with CA-signed ones before enabling ACME or moving to production.
 
 ## 0-RTT Early Data
 
-0-RTT is disabled by default. When enabled, only HTTP methods listed in `zero_rtt_safe_methods` are forwarded via early data. Non-listed methods are held until the full TLS handshake completes.
+0-RTT (TLS 1.3 early data) is **disabled by default**. When enabled, the proxy detects early-data connections at the TLS accept layer by inspecting the ClientHello and enforces per-route replay protection at the HTTP dispatch layer.
 
 ```toml
 [tls]
@@ -943,7 +959,11 @@ enable_0rtt = true
 zero_rtt_safe_methods = ["GET", "HEAD"]
 ```
 
-Per-route opt-in:
+### Per-route enforcement (RFC 8470)
+
+Every route has an `allow_0rtt` flag that defaults to `false`. When a request arrives as TLS 1.3 early data on a route where `allow_0rtt = false`, the proxy responds with **425 Too Early** and does not forward the request to the backend. This prevents replay attacks on non-idempotent operations (POST, PUT, DELETE, PATCH, etc.).
+
+Routes that serve purely idempotent, replay-safe content can opt in explicitly:
 
 ```toml
 [[routes]]
@@ -951,8 +971,19 @@ name = "static-assets"
 host = "cdn.example.com"
 path_prefix = "/static/"
 backend = "cdn"
-allow_0rtt = true   # enable 0-RTT for this route only
+allow_0rtt = true   # safe: static files, no side effects
 ```
+
+```toml
+[[routes]]
+name = "api"
+host = "api.example.com"
+path_prefix = "/"
+backend = "api"
+# allow_0rtt = false  ← default; early-data requests receive 425 Too Early
+```
+
+The `x-tls-early-data` header used internally to propagate the early-data flag is stripped from all incoming requests before being set by the accept loop, and is removed from every outgoing backend request, so it cannot be forged by clients or leaked to backends.
 
 ## License
 

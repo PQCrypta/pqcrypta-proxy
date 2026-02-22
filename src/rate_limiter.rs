@@ -1773,28 +1773,73 @@ mod tests {
 
     #[tokio::test]
     async fn test_jwt_subject_extraction() {
+        use jsonwebtoken::{Algorithm, EncodingKey, Header};
+        use serde::Serialize;
+
         let config = AdvancedRateLimitConfig::default();
         let limiter = AdvancedRateLimiter::new(config);
 
+        // SEC-003: Build a token programmatically with a throwaway test key instead of
+        // embedding a static literal that triggers secrets-scanner false positives.
+        const TEST_SECRET: &[u8] = b"test-only-key-not-used-in-production";
+        const WRONG_SECRET: &[u8] = b"wrong-key";
+
+        #[derive(Serialize)]
+        struct TestClaims {
+            sub: String,
+            iat: u64,
+            // jsonwebtoken 9.x requires `exp` by default; set far in the future
+            // so the token remains valid for the duration of any test run.
+            exp: u64,
+        }
+
+        let claims = TestClaims {
+            sub: "user123".to_string(),
+            iat: 1_700_000_000,
+            exp: 9_999_999_999,
+        };
+
+        let jwt = jsonwebtoken::encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(TEST_SECRET),
+        )
+        .expect("test JWT encoding must not fail");
+
         // H-2: Without a configured jwt_secret, extraction must always return None
         // regardless of the JWT content (prevents trust-only mode).
-        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyMTIzIiwiaWF0IjoxMjM0NTY3ODkwfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
         assert_eq!(
             limiter.extract_jwt_subject(&format!("Bearer {}", jwt), None),
             None,
             "JWT extraction must return None when no secret is configured"
         );
 
-        // With a wrong secret the signature fails → None
+        // With the correct secret the sub claim is extracted successfully.
         assert_eq!(
-            limiter.extract_jwt_subject(&format!("Bearer {}", jwt), Some("wrong-secret")),
+            limiter.extract_jwt_subject(
+                &format!("Bearer {}", jwt),
+                Some(std::str::from_utf8(TEST_SECRET).unwrap())
+            ),
+            Some("user123".to_string()),
+            "JWT extraction must return the sub claim on signature match"
+        );
+
+        // With a wrong secret the signature fails → None.
+        assert_eq!(
+            limiter.extract_jwt_subject(
+                &format!("Bearer {}", jwt),
+                Some(std::str::from_utf8(WRONG_SECRET).unwrap())
+            ),
             None,
             "JWT extraction must return None on signature mismatch"
         );
 
-        // Without Bearer prefix → None
+        // Without Bearer prefix → None.
         assert_eq!(
-            limiter.extract_jwt_subject(jwt, Some("secret")),
+            limiter.extract_jwt_subject(
+                &jwt,
+                Some(std::str::from_utf8(TEST_SECRET).unwrap())
+            ),
             None,
             "JWT extraction must return None without Bearer prefix"
         );

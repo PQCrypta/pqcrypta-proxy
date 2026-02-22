@@ -35,9 +35,15 @@ pub enum PqcKemAlgorithm {
     MlKem768,
     /// Pure ML-KEM-1024 (NIST Level 5)
     MlKem1024,
-    /// Kyber768 (legacy, pre-NIST)
+    /// Kyber768 (pre-NIST round-3 draft — not FIPS 203 compliant)
+    /// Gated behind the `legacy-pqc` compile-time feature.  Only available for
+    /// backward-compatibility with deployments that have not yet migrated to
+    /// the finalised ML-KEM standard.  Not suitable for new deployments.
+    #[cfg(feature = "legacy-pqc")]
     Kyber768,
-    /// X25519 + Kyber768 hybrid (legacy)
+    /// X25519 + Kyber768 hybrid (pre-NIST round-3 draft — not FIPS 203 compliant)
+    /// Gated behind the `legacy-pqc` compile-time feature.  See Kyber768 note above.
+    #[cfg(feature = "legacy-pqc")]
     X25519Kyber768,
 }
 
@@ -52,7 +58,9 @@ impl PqcKemAlgorithm {
             Self::MlKem512 => "ML-KEM-512",
             Self::MlKem768 => "ML-KEM-768",
             Self::MlKem1024 => "ML-KEM-1024",
+            #[cfg(feature = "legacy-pqc")]
             Self::Kyber768 => "kyber768",
+            #[cfg(feature = "legacy-pqc")]
             Self::X25519Kyber768 => "x25519_kyber768",
         }
     }
@@ -63,23 +71,24 @@ impl PqcKemAlgorithm {
             Self::MlKem512 => 1,
             Self::X25519MlKem768
             | Self::SecP256r1MlKem768
-            | Self::MlKem768
-            | Self::Kyber768
-            | Self::X25519Kyber768 => 3,
+            | Self::MlKem768 => 3,
+            #[cfg(feature = "legacy-pqc")]
+            Self::Kyber768 | Self::X25519Kyber768 => 3,
             Self::SecP384r1MlKem1024 | Self::X448MlKem1024 | Self::MlKem1024 => 5,
         }
     }
 
     /// Is this a hybrid algorithm (classical + PQC)?
     pub fn is_hybrid(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::X25519MlKem768
-                | Self::SecP256r1MlKem768
-                | Self::SecP384r1MlKem1024
-                | Self::X448MlKem1024
-                | Self::X25519Kyber768
-        )
+            | Self::SecP256r1MlKem768
+            | Self::SecP384r1MlKem1024
+            | Self::X448MlKem1024 => true,
+            #[cfg(feature = "legacy-pqc")]
+            Self::X25519Kyber768 => true,
+            _ => false,
+        }
     }
 
     /// Parse from string
@@ -92,8 +101,25 @@ impl PqcKemAlgorithm {
             "mlkem512" => Some(Self::MlKem512),
             "mlkem768" => Some(Self::MlKem768),
             "mlkem1024" => Some(Self::MlKem1024),
-            "kyber768" => Some(Self::Kyber768),
-            "x25519kyber768" => Some(Self::X25519Kyber768),
+            #[cfg(feature = "legacy-pqc")]
+            "kyber768" => {
+                warn!(
+                    "⚠️  DEPRECATED: Kyber768 is a pre-NIST round-3 draft (not FIPS 203). \
+                     It is NOT interoperable with ML-KEM-compliant peers and lacks the \
+                     security guarantees of the finalised standard. \
+                     Migrate to X25519MlKem768 or another FIPS 203 algorithm."
+                );
+                Some(Self::Kyber768)
+            }
+            #[cfg(feature = "legacy-pqc")]
+            "x25519kyber768" => {
+                warn!(
+                    "⚠️  DEPRECATED: X25519Kyber768 is a pre-NIST round-3 draft hybrid \
+                     (not FIPS 203). It is NOT interoperable with ML-KEM-compliant peers. \
+                     Migrate to X25519MlKem768 (IETF standard, FIPS 203 compliant)."
+                );
+                Some(Self::X25519Kyber768)
+            }
             _ => None,
         }
     }

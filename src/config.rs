@@ -1485,6 +1485,23 @@ impl ProxyConfig {
                     ));
                 }
             }
+
+            // SEC-004: Reject wildcard CORS origin combined with allow_credentials.
+            // The CORS spec (and all modern browsers) forbid Access-Control-Allow-Origin: *
+            // with Access-Control-Allow-Credentials: true.  Silently emitting this combination
+            // causes confusing client failures and may expose credentials to unintended origins
+            // in non-compliant clients.  Fail at config load time rather than at request time.
+            if let Some(ref cors) = route.cors {
+                if cors.allow_credentials && cors.allow_origin.as_deref() == Some("*") {
+                    return Err(anyhow::anyhow!(
+                        "Route {:?} has a CORS misconfiguration: allow_credentials = true cannot \
+                         be combined with allow_origin = \"*\" (RFC 6454, CORS specification). \
+                         All modern browsers will refuse this combination. Set allow_origin to a \
+                         specific origin (e.g. \"https://pqcrypta.com\") instead of the wildcard.",
+                        route.name
+                    ));
+                }
+            }
         }
 
         // Validate backend pool server addresses
@@ -1512,6 +1529,20 @@ impl ProxyConfig {
                 .socket_addr()
                 .map_err(|e| anyhow::anyhow!("Invalid admin bind address: {}", e))?;
 
+            // SEC-005: Enforce a minimum token length to reject trivially weak tokens.
+            // A token shorter than 32 characters offers insufficient entropy against
+            // offline dictionary or brute-force attacks.
+            if let Some(ref token) = self.admin.auth_token {
+                if token.len() < 32 {
+                    return Err(anyhow::anyhow!(
+                        "Admin API auth_token is too short ({} characters). \
+                         The token must be at least 32 characters to ensure sufficient entropy. \
+                         Generate a strong token with: openssl rand -base64 48",
+                        token.len()
+                    ));
+                }
+            }
+
             // H-1: Require auth_token OR loopback-only allowed_ips for admin API.
             // An admin API with no token and no IP restriction is unauthenticated.
             if self.admin.auth_token.is_none() {
@@ -1532,6 +1563,49 @@ impl ProxyConfig {
                          only loopback addresses.",
                         self.admin.allowed_ips
                     ));
+                }
+            }
+        }
+
+        // SEC-001: Reject tls_skip_verify in production environments.
+        // Production is indicated by ACME being enabled (real domain) or PQCRYPTA_ENV=production.
+        {
+            let is_production = self.acme.enabled
+                || std::env::var("PQCRYPTA_ENV").as_deref() == Ok("production");
+
+            if is_production {
+                let signal = if self.acme.enabled {
+                    "ACME is enabled (production domain detected)"
+                } else {
+                    "PQCRYPTA_ENV=production environment variable"
+                };
+
+                for (name, backend) in &self.backends {
+                    if backend.tls_skip_verify {
+                        return Err(anyhow::anyhow!(
+                            "Backend '{}' has tls_skip_verify = true, which is forbidden in \
+                             production environments (detected via {}). Use a valid CA-signed \
+                             certificate. To allow this only in non-production deployments, \
+                             set PQCRYPTA_ENV=development.",
+                            name,
+                            signal
+                        ));
+                    }
+                }
+
+                for (pool_name, pool) in &self.backend_pools {
+                    for server in &pool.servers {
+                        if server.tls_skip_verify {
+                            return Err(anyhow::anyhow!(
+                                "A server in backend pool '{}' has tls_skip_verify = true, which \
+                                 is forbidden in production environments (detected via {}). Use a \
+                                 valid CA-signed certificate. To allow this only in \
+                                 non-production deployments, set PQCRYPTA_ENV=development.",
+                                pool_name,
+                                signal
+                            ));
+                        }
+                    }
                 }
             }
         }

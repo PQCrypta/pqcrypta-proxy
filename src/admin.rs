@@ -9,8 +9,9 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use subtle::ConstantTimeEq;
 
 use axum::extract::{ConnectInfo, State};
@@ -106,8 +107,13 @@ impl AdminServer {
         }
 
         let addr = self.config.socket_addr()?;
-        let allowed_ips = self.config.allowed_ips.clone();
-        let auth_token = self.config.auth_token.clone();
+
+        // SEC-005: Build the auth state with a per-IP failed-attempt tracker.
+        let auth_state = Arc::new(AdminAuthState {
+            allowed_ips: self.config.allowed_ips.clone(),
+            auth_token: self.config.auth_token.clone(),
+            failed_attempts: Arc::new(DashMap::new()),
+        });
         let state = self.state.clone();
 
         // Build router
@@ -127,10 +133,7 @@ impl AdminServer {
             .route("/acme/renew", post(acme_renew_handler))
             .route("/ratelimit", get(ratelimit_handler))
             .layer(TraceLayer::new_for_http())
-            .layer(axum::middleware::from_fn_with_state(
-                (allowed_ips, auth_token),
-                auth_middleware,
-            ))
+            .layer(axum::middleware::from_fn_with_state(auth_state, auth_middleware))
             .with_state(state);
 
         // Start server
@@ -146,9 +149,28 @@ impl AdminServer {
     }
 }
 
+/// SEC-005: Shared state for the admin authentication middleware.
+///
+/// Tracks per-IP failed attempt counts with a sliding 1-minute window so that
+/// brute-force attacks against a weak or leaked token are rate-limited before
+/// they can enumerate secrets.
+#[derive(Clone)]
+struct AdminAuthState {
+    allowed_ips: Vec<String>,
+    auth_token: Option<String>,
+    /// Map from client IP string → (failure_count, window_start).
+    /// Access is lock-free via DashMap.
+    failed_attempts: Arc<DashMap<String, (u32, Instant)>>,
+}
+
+/// Maximum failed authentication attempts per IP per minute before lockout.
+const ADMIN_AUTH_MAX_FAILURES: u32 = 10;
+/// Length of the sliding rate-limit window.
+const ADMIN_AUTH_WINDOW: Duration = Duration::from_secs(60);
+
 /// Authentication middleware for admin API
 async fn auth_middleware(
-    State((allowed_ips, auth_token)): State<(Vec<String>, Option<String>)>,
+    State(auth): State<Arc<AdminAuthState>>,
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     request: axum::extract::Request,
@@ -157,13 +179,34 @@ async fn auth_middleware(
     let client_ip = remote_addr.ip().to_string();
 
     // Check IP whitelist
-    if !allowed_ips.is_empty() && !allowed_ips.contains(&client_ip) {
+    if !auth.allowed_ips.is_empty() && !auth.allowed_ips.contains(&client_ip) {
         warn!("Admin API access denied for IP: {}", client_ip);
         return StatusCode::FORBIDDEN.into_response();
     }
 
     // Check auth token if configured
-    if let Some(expected_token) = auth_token {
+    if let Some(ref expected_token) = auth.auth_token {
+        // SEC-005: Check and enforce per-IP rate limit before doing any token work.
+        {
+            let now = Instant::now();
+            let mut entry = auth.failed_attempts.entry(client_ip.clone()).or_insert((0, now));
+            let (ref mut count, ref mut window_start) = *entry;
+
+            // Reset the window if it has expired.
+            if now.duration_since(*window_start) >= ADMIN_AUTH_WINDOW {
+                *count = 0;
+                *window_start = now;
+            }
+
+            if *count >= ADMIN_AUTH_MAX_FAILURES {
+                warn!(
+                    "Admin API: rate limit exceeded for {} ({} failures in 60s) — blocking",
+                    client_ip, count
+                );
+                return StatusCode::TOO_MANY_REQUESTS.into_response();
+            }
+        }
+
         let provided_token = headers
             .get("Authorization")
             .and_then(|v| v.to_str().ok())
@@ -172,10 +215,30 @@ async fn auth_middleware(
         // H-3: Constant-time comparison to prevent timing side-channel attacks
         let provided_bytes = provided_token.unwrap_or("").as_bytes();
         let authorized: bool = provided_bytes.ct_eq(expected_token.as_bytes()).into();
+
         if !authorized {
-            warn!("Admin API unauthorized access attempt from {}", client_ip);
+            // Record the failure against this IP.
+            {
+                let now = Instant::now();
+                let mut entry = auth.failed_attempts.entry(client_ip.clone()).or_insert((0, now));
+                let (ref mut count, ref mut window_start) = *entry;
+                if now.duration_since(*window_start) >= ADMIN_AUTH_WINDOW {
+                    *count = 0;
+                    *window_start = now;
+                }
+                *count += 1;
+                warn!(
+                    "Admin API unauthorized access attempt from {} ({}/{})",
+                    client_ip,
+                    *count,
+                    ADMIN_AUTH_MAX_FAILURES
+                );
+            }
             return StatusCode::UNAUTHORIZED.into_response();
         }
+
+        // Successful auth: clear failure count for this IP.
+        auth.failed_attempts.remove(&client_ip);
     }
 
     next.run(request).await.into_response()

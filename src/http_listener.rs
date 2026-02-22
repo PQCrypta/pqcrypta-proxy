@@ -777,6 +777,9 @@ pub async fn run_http_listener_with_fingerprint(
         fingerprint_extractor,
         security_state,
         config.fingerprint.clone(),
+        // SEC-002: propagate 0-RTT enabled flag so the acceptor can detect
+        // early data offered in ClientHello and tag the connection accordingly.
+        config.tls.enable_0rtt,
     ));
 
     // Bind TCP listener
@@ -883,6 +886,11 @@ async fn handle_fingerprinted_connection(
         let router = app.clone();
 
         async move {
+            // SEC-002: Strip any client-supplied x-tls-early-data header before
+            // setting it from the TLS connection state.  This prevents external
+            // callers from spoofing the flag by including it in their request.
+            req.headers_mut().remove("x-tls-early-data");
+
             // Inject fingerprint headers for downstream middleware
             if let Some(ref hash) = ja3 {
                 if let Ok(v) = HeaderValue::from_str(hash) {
@@ -902,6 +910,13 @@ async fn handle_fingerprinted_connection(
             if ci.is_browser {
                 req.headers_mut()
                     .insert("x-client-type", HeaderValue::from_static("browser"));
+            }
+
+            // SEC-002: Tag early-data connections so proxy_handler can enforce
+            // per-route allow_0rtt policy and respond 425 Too Early when needed.
+            if ci.is_early_data {
+                req.headers_mut()
+                    .insert("x-tls-early-data", HeaderValue::from_static("1"));
             }
 
             // Store connection info in extensions
@@ -1305,13 +1320,14 @@ async fn handle_pqc_fingerprinted_connection(
         .map(|c| matches!(c, crate::security::FingerprintClass::Browser))
         .unwrap_or(false);
 
-    // Create connection info
+    // Create connection info (OpenSSL PQC path does not use rustls 0-RTT)
     let conn_info = crate::tls_acceptor::FingerprintedConnection {
         remote_addr,
         ja3_hash: ja3_hash.clone(),
         ja4_hash: ja4_hash.clone(),
         client_name: client_name.clone(),
         is_browser,
+        is_early_data: false,
     };
 
     // Create service that injects fingerprint headers
@@ -1323,6 +1339,9 @@ async fn handle_pqc_fingerprinted_connection(
         let router = app.clone();
 
         async move {
+            // SEC-002: Strip any client-supplied x-tls-early-data header.
+            req.headers_mut().remove("x-tls-early-data");
+
             // Inject fingerprint headers
             if let Some(ref hash) = ja3 {
                 if let Ok(v) = HeaderValue::from_str(hash) {
@@ -2059,6 +2078,27 @@ async fn proxy_handler(
             }
         }
 
+        // SEC-002: Enforce per-route 0-RTT (early data) policy (RFC 8470).
+        // x-tls-early-data is set exclusively by the accept loop after stripping
+        // any client-supplied copy, so it cannot be forged by external callers.
+        // Routes with `allow_0rtt = false` (the default) must not receive early
+        // data requests because they can be replayed by a network attacker.
+        let is_early_data = headers
+            .get("x-tls-early-data")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
+        if is_early_data && !route.allow_0rtt {
+            // RFC 8470: 425 Too Early — the server is unwilling to risk
+            // processing a request that might be replayed.
+            debug!(
+                "Rejecting 0-RTT early-data request on route {:?} (allow_0rtt = false): {} {}",
+                route.name, method, path
+            );
+            return StatusCode::TOO_EARLY.into_response();
+        }
+
         // Track request timing for load balancer
         let request_start = std::time::Instant::now();
 
@@ -2166,7 +2206,8 @@ async fn proxy_handler(
         if let Some(h) = proxy_req.headers_mut() {
             // Copy original headers
             for (name, value) in headers.iter() {
-                // Skip hop-by-hop headers
+                // Skip hop-by-hop headers and internal proxy-only headers that
+                // must not be forwarded to backends.
                 let name_str = name.as_str().to_lowercase();
                 if ![
                     "host",
@@ -2178,6 +2219,8 @@ async fn proxy_handler(
                     "proxy-authorization",
                     "te",
                     "trailer",
+                    // SEC-002: internal 0-RTT tag — never forward to backends
+                    "x-tls-early-data",
                 ]
                 .contains(&name_str.as_str())
                 {

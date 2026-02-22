@@ -25,6 +25,12 @@ admin-api = ["tower-http"]
 acme = ["instant-acme"]
 # Windows service support
 windows-service = ["windows-service-rs"]
+# SEC-006: Legacy pre-NIST Kyber768 support (disabled by default).
+# Enables Kyber768 and X25519Kyber768 for backward compatibility with deployments
+# that have not yet migrated to the finalised ML-KEM (FIPS 203) standard.
+# These algorithms are NOT FIPS 203 compliant and NOT interoperable with
+# standard ML-KEM peers.  DO NOT enable in new deployments.
+legacy-pqc = []
 # GeoIP blocking support
 geoip = ["maxminddb"]
 # FIPS mode for aws-lc-rs (requires FIPS-validated build)
