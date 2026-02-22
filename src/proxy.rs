@@ -623,7 +623,10 @@ mod tests {
         let pool = make_pool();
         let mut headers = HashMap::new();
         // Attempt: inject a second header line via the key
-        headers.insert("X-Injected\r\nX-Evil: pwned".to_string(), "value".to_string());
+        headers.insert(
+            "X-Injected\r\nX-Evil: pwned".to_string(),
+            "value".to_string(),
+        );
 
         let request = pool.build_http_request("GET", "/path", &headers, b"");
 
