@@ -188,8 +188,7 @@ impl FingerprintingTlsAcceptor {
 
         // Walk extensions looking for type 0x002a (early_data).
         while offset + 4 <= ext_end {
-            let ext_type =
-                u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]);
+            let ext_type = u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]);
             let ext_len =
                 u16::from_be_bytes([client_hello[offset + 2], client_hello[offset + 3]]) as usize;
             offset += 4;
@@ -347,29 +346,28 @@ mod tests {
         // ClientHello body
         let mut ch: Vec<u8> = Vec::new();
         ch.extend_from_slice(&[0x03, 0x03]); // legacy version
-        ch.extend_from_slice(&[0u8; 32]);    // random
-        ch.push(0x00);                        // session ID length = 0
+        ch.extend_from_slice(&[0u8; 32]); // random
+        ch.push(0x00); // session ID length = 0
         ch.extend_from_slice(&[0x00, 0x02]); // cipher suites length = 2
         ch.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
-        ch.push(0x01);                        // compression methods length = 1
-        ch.push(0x00);                        // null compression
+        ch.push(0x01); // compression methods length = 1
+        ch.push(0x00); // null compression
         ch.extend_from_slice(&ext_len.to_be_bytes());
         ch.extend_from_slice(&ext_bytes);
 
         // Handshake header: type=0x01 (ClientHello) + 3-byte length
         let ch_len = ch.len() as u32;
-        let mut hs: Vec<u8> = Vec::new();
-        hs.push(0x01);
-        hs.push(((ch_len >> 16) & 0xff) as u8);
-        hs.push(((ch_len >> 8) & 0xff) as u8);
-        hs.push((ch_len & 0xff) as u8);
+        let mut hs: Vec<u8> = vec![
+            0x01,
+            ((ch_len >> 16) & 0xff) as u8,
+            ((ch_len >> 8) & 0xff) as u8,
+            (ch_len & 0xff) as u8,
+        ];
         hs.extend_from_slice(&ch);
 
         // TLS record header: content type 0x16, version 0x0301, 2-byte length
         let hs_len = hs.len() as u16;
-        let mut record: Vec<u8> = Vec::new();
-        record.push(0x16);
-        record.extend_from_slice(&[0x03, 0x01]);
+        let mut record: Vec<u8> = vec![0x16, 0x03, 0x01];
         record.extend_from_slice(&hs_len.to_be_bytes());
         record.extend_from_slice(&hs);
         record
@@ -393,7 +391,7 @@ mod tests {
             let mut v = Vec::new();
             let list_len = (name.len() + 3) as u16;
             v.extend_from_slice(&list_len.to_be_bytes()); // list length
-            v.push(0x00);                                  // host_name type
+            v.push(0x00); // host_name type
             v.extend_from_slice(&(name.len() as u16).to_be_bytes());
             v.extend_from_slice(name);
             v

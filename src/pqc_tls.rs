@@ -69,9 +69,7 @@ impl PqcKemAlgorithm {
     pub fn security_level(&self) -> u8 {
         match self {
             Self::MlKem512 => 1,
-            Self::X25519MlKem768
-            | Self::SecP256r1MlKem768
-            | Self::MlKem768 => 3,
+            Self::X25519MlKem768 | Self::SecP256r1MlKem768 | Self::MlKem768 => 3,
             #[cfg(feature = "legacy-pqc")]
             Self::Kyber768 | Self::X25519Kyber768 => 3,
             Self::SecP384r1MlKem1024 | Self::X448MlKem1024 | Self::MlKem1024 => 5,

@@ -133,7 +133,10 @@ impl AdminServer {
             .route("/acme/renew", post(acme_renew_handler))
             .route("/ratelimit", get(ratelimit_handler))
             .layer(TraceLayer::new_for_http())
-            .layer(axum::middleware::from_fn_with_state(auth_state, auth_middleware))
+            .layer(axum::middleware::from_fn_with_state(
+                auth_state,
+                auth_middleware,
+            ))
             .with_state(state);
 
         // Start server
@@ -189,7 +192,10 @@ async fn auth_middleware(
         // SEC-005: Check and enforce per-IP rate limit before doing any token work.
         {
             let now = Instant::now();
-            let mut entry = auth.failed_attempts.entry(client_ip.clone()).or_insert((0, now));
+            let mut entry = auth
+                .failed_attempts
+                .entry(client_ip.clone())
+                .or_insert((0, now));
             let (ref mut count, ref mut window_start) = *entry;
 
             // Reset the window if it has expired.
@@ -220,7 +226,10 @@ async fn auth_middleware(
             // Record the failure against this IP.
             {
                 let now = Instant::now();
-                let mut entry = auth.failed_attempts.entry(client_ip.clone()).or_insert((0, now));
+                let mut entry = auth
+                    .failed_attempts
+                    .entry(client_ip.clone())
+                    .or_insert((0, now));
                 let (ref mut count, ref mut window_start) = *entry;
                 if now.duration_since(*window_start) >= ADMIN_AUTH_WINDOW {
                     *count = 0;
@@ -229,9 +238,7 @@ async fn auth_middleware(
                 *count += 1;
                 warn!(
                     "Admin API unauthorized access attempt from {} ({}/{})",
-                    client_ip,
-                    *count,
-                    ADMIN_AUTH_MAX_FAILURES
+                    client_ip, *count, ADMIN_AUTH_MAX_FAILURES
                 );
             }
             return StatusCode::UNAUTHORIZED.into_response();

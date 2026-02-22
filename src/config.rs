@@ -1570,8 +1570,8 @@ impl ProxyConfig {
         // SEC-001: Reject tls_skip_verify in production environments.
         // Production is indicated by ACME being enabled (real domain) or PQCRYPTA_ENV=production.
         {
-            let is_production = self.acme.enabled
-                || std::env::var("PQCRYPTA_ENV").as_deref() == Ok("production");
+            let is_production =
+                self.acme.enabled || std::env::var("PQCRYPTA_ENV").as_deref() == Ok("production");
 
             if is_production {
                 let signal = if self.acme.enabled {

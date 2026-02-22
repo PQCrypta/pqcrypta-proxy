@@ -1836,10 +1836,7 @@ mod tests {
 
         // Without Bearer prefix → None.
         assert_eq!(
-            limiter.extract_jwt_subject(
-                &jwt,
-                Some(std::str::from_utf8(TEST_SECRET).unwrap())
-            ),
+            limiter.extract_jwt_subject(&jwt, Some(std::str::from_utf8(TEST_SECRET).unwrap())),
             None,
             "JWT extraction must return None without Bearer prefix"
         );
