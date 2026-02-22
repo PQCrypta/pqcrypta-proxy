@@ -487,7 +487,16 @@ impl BackendPool {
             .map_err(|e| anyhow::anyhow!("Failed to acquire connection permit: {}", e))
     }
 
-    /// Build HTTP request string for Unix socket
+    /// Strip CR and LF characters from a string to prevent CRLF injection.
+    #[cfg(unix)]
+    fn strip_crlf(s: &str) -> String {
+        s.chars().filter(|&c| c != '\r' && c != '\n').collect()
+    }
+
+    /// Build HTTP request string for Unix socket.
+    ///
+    /// Header names and values are sanitized: any CR (`\r`) or LF (`\n`) characters
+    /// are removed before interpolation to prevent CRLF injection attacks.
     #[cfg(unix)]
     fn build_http_request(
         &self,
@@ -496,9 +505,16 @@ impl BackendPool {
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> String {
+        // Sanitize method and path
+        let method = Self::strip_crlf(method);
+        let path = Self::strip_crlf(path);
+
         let mut request = format!("{} {} HTTP/1.1\r\n", method, path);
 
         for (key, value) in headers {
+            // Sanitize header key and value to prevent CRLF injection
+            let key = Self::strip_crlf(key);
+            let value = Self::strip_crlf(value);
             request.push_str(&format!("{}: {}\r\n", key, value));
         }
 
@@ -572,5 +588,137 @@ impl BackendPool {
             // No health check configured, assume healthy
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Helper: build a minimal BackendPool for unit testing build_http_request.
+    #[cfg(unix)]
+    fn make_pool() -> BackendPool {
+        let config = Arc::new(ProxyConfig::default());
+        BackendPool::new(config)
+    }
+
+    /// Count the number of HTTP header lines in a raw request by splitting on "\r\n".
+    /// The first line is the request line; subsequent non-empty lines before the blank
+    /// separator are headers.
+    #[cfg(unix)]
+    fn header_lines(request: &str) -> Vec<&str> {
+        request
+            .split("\r\n")
+            .skip(1) // skip request line
+            .take_while(|l| !l.is_empty())
+            .collect()
+    }
+
+    /// Verify that CRLF sequences in header names are stripped, preventing the
+    /// injected content from becoming a separate header line.
+    #[test]
+    #[cfg(unix)]
+    fn test_build_http_request_strips_crlf_in_header_name() {
+        let pool = make_pool();
+        let mut headers = HashMap::new();
+        // Attempt: inject a second header line via the key
+        headers.insert("X-Injected\r\nX-Evil: pwned".to_string(), "value".to_string());
+
+        let request = pool.build_http_request("GET", "/path", &headers, b"");
+
+        // Stripped output must not contain CR or LF in unexpected places.
+        // There should be exactly 3 expected header lines: the injected key (as one
+        // mangled header), Content-Length, and Connection.
+        let hlines = header_lines(&request);
+        for line in &hlines {
+            // No line should start with "X-Evil:" — that would mean injection succeeded.
+            assert!(
+                !line.starts_with("X-Evil:"),
+                "CRLF injection must not create a separate X-Evil header line; got: {:?}",
+                request
+            );
+        }
+
+        // The raw bytes for CR in the injected position must be absent.
+        // (Only the protocol-required \r\n delimiters inserted by us are allowed.)
+        assert!(
+            !request.contains("\r\nX-Evil:"),
+            "Injected CRLF must not produce a header boundary before X-Evil: {:?}",
+            request
+        );
+    }
+
+    /// Verify that CRLF sequences in header values are stripped.
+    #[test]
+    #[cfg(unix)]
+    fn test_build_http_request_strips_crlf_in_header_value() {
+        let pool = make_pool();
+        let mut headers = HashMap::new();
+        // Attempt: inject a second header line via the value
+        headers.insert(
+            "X-Header".to_string(),
+            "legit\r\nX-Injected: injected".to_string(),
+        );
+
+        let request = pool.build_http_request("GET", "/", &headers, b"");
+
+        // The injected CRLF must not split the value into a separate header line.
+        assert!(
+            !request.contains("\r\nX-Injected:"),
+            "CRLF injection in header value must not create a separate header: {:?}",
+            request
+        );
+        for line in header_lines(&request) {
+            assert!(
+                !line.starts_with("X-Injected:"),
+                "Injected header must not appear as a standalone line: {:?}",
+                request
+            );
+        }
+    }
+
+    /// Verify that CRLF sequences in the request path are stripped.
+    #[test]
+    #[cfg(unix)]
+    fn test_build_http_request_strips_crlf_in_path() {
+        let pool = make_pool();
+        let headers = HashMap::new();
+        // Attempt: inject headers by embedding CRLF in the path
+        let path = "/legit\r\nX-Injected: injected";
+
+        let request = pool.build_http_request("GET", path, &headers, b"");
+
+        // The CRLF from the injection must have been stripped, so the injected text
+        // is fused into the path string on the request line — harmless — rather than
+        // appearing as a separate "X-Injected:" header line.
+        assert!(
+            !request.contains("\r\nX-Injected:"),
+            "CRLF injection in path must not produce a separate header line: {:?}",
+            request
+        );
+        for line in header_lines(&request) {
+            assert!(
+                !line.starts_with("X-Injected:"),
+                "Injected header must not appear as a standalone header: {:?}",
+                request
+            );
+        }
+    }
+
+    /// Verify that a well-formed request without injections is unmodified.
+    #[test]
+    #[cfg(unix)]
+    fn test_build_http_request_clean_input_unchanged() {
+        let pool = make_pool();
+        let mut headers = HashMap::new();
+        headers.insert("Host".to_string(), "localhost".to_string());
+        headers.insert("X-Custom".to_string(), "safe-value".to_string());
+
+        let request = pool.build_http_request("POST", "/api/data", &headers, b"body");
+
+        assert!(request.starts_with("POST /api/data HTTP/1.1\r\n"));
+        assert!(request.contains("Content-Length: 4\r\n"));
+        assert!(request.contains("Connection: close\r\n"));
     }
 }

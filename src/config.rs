@@ -8,6 +8,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use ipnet::IpNet;
+
 use arc_swap::ArcSwap;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::RwLock;
@@ -716,6 +718,14 @@ pub struct SecurityConfig {
     pub error_rate_threshold: f64,
     /// Request window duration in seconds for error tracking
     pub error_window_secs: u64,
+    /// Additional trusted CIDR ranges beyond loopback and RFC1918.
+    /// Operators must explicitly add any non-private ranges here.
+    /// Default: empty (loopback 127.0.0.0/8 and RFC1918 are always trusted).
+    #[serde(default)]
+    pub trusted_internal_cidrs: Vec<IpNet>,
+    /// Directory for database-synced blocklist JSON files.
+    /// Must be outside the web root and mode 0700, owned by the service user.
+    pub blocklist_dir: PathBuf,
 }
 
 impl Default for SecurityConfig {
@@ -738,6 +748,8 @@ impl Default for SecurityConfig {
             min_requests_for_error_check: 200, // Need 200+ requests before error check
             error_rate_threshold: 0.7, // 70% error rate triggers suspicious
             error_window_secs: 60,    // 1 minute sliding window
+            trusted_internal_cidrs: Vec::new(),
+            blocklist_dir: PathBuf::from("/var/lib/pqcrypta-proxy/blocklists"),
         }
     }
 }
@@ -767,6 +779,11 @@ pub struct FingerprintConfig {
     pub block_scanners: bool,
     /// Add fingerprint info headers to responses (for debugging/monitoring)
     pub add_response_headers: bool,
+    /// Path to the JA3/JA4 fingerprint database JSON file.
+    /// Format: [{hash, classification, description}] where classification is one of:
+    /// "browser", "bot", "legitimate_bot", "malicious", "scanner", "api_client"
+    /// If None or the file is missing, an empty database is used (advisory only).
+    pub fingerprint_db_path: Option<PathBuf>,
 }
 
 impl Default for FingerprintConfig {
@@ -781,6 +798,9 @@ impl Default for FingerprintConfig {
             cache_max_age_secs: 3600, // 1 hour
             block_scanners: false,    // Log but don't block by default
             add_response_headers: false, // Disabled by default for security
+            fingerprint_db_path: Some(PathBuf::from(
+                "/var/lib/pqcrypta-proxy/fingerprints/ja3.json",
+            )),
         }
     }
 }

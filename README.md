@@ -103,6 +103,64 @@
 - **Admin API**: Health checks, Prometheus metrics, config reload, graceful shutdown
 - **Cross-Platform**: Linux, macOS, and Windows support
 
+## Security
+
+### Runtime Directories
+
+The following directories must exist outside the web root before starting the proxy:
+
+| Directory | Mode | Purpose |
+|-----------|------|---------|
+| `/var/lib/pqcrypta-proxy/blocklists/` | `0700`, owned by `pqcrypta` | Database-synced IP/fingerprint/country blocklists |
+| `/var/lib/pqcrypta-proxy/fingerprints/` | `0700`, owned by `pqcrypta` | JA3/JA4 fingerprint database (`ja3.json`) |
+
+```bash
+# Create directories with correct ownership and permissions
+install -d -m 0700 -o pqcrypta -g pqcrypta /var/lib/pqcrypta-proxy/blocklists
+install -d -m 0700 -o pqcrypta -g pqcrypta /var/lib/pqcrypta-proxy/fingerprints
+```
+
+### Trusted Internal CIDRs
+
+Only loopback (`127.0.0.0/8`) and RFC1918 private ranges are trusted by default.
+If you need to trust additional internal CIDRs (e.g., a VPC range), add them explicitly:
+
+```toml
+[security]
+# Explicit opt-in for any non-private CIDRs that should bypass security checks.
+# Default: empty (only loopback and RFC1918 are trusted).
+trusted_internal_cidrs = ["10.200.0.0/16"]
+```
+
+### JA3/JA4 Fingerprint Database
+
+To enable fingerprint-based classification (advisory only, never blocks automatically):
+
+1. Download an open-source JA3 database (e.g., from [salesforce/ja3](https://github.com/salesforce/ja3))
+   or create your own JSON file with the format:
+   ```json
+   [
+     {"hash": "<md5>", "classification": "browser", "description": "Chrome 120"},
+     {"hash": "<md5>", "classification": "malicious", "description": "Mirai scanner"}
+   ]
+   ```
+   Valid classifications: `browser`, `bot`, `legitimate_bot`, `malicious`, `scanner`, `api_client`
+
+2. Place the file at `/var/lib/pqcrypta-proxy/fingerprints/ja3.json`
+   (or configure a custom path via `fingerprint.fingerprint_db_path`)
+
+3. If the file is missing or malformed the proxy starts normally with an empty database
+   and logs a warning.
+
+### Changelog — Security Fixes (2026-02-22)
+
+| # | Fix | Detail |
+|---|-----|--------|
+| 1 | **Removed public IP trust bypass** | The hardcoded `66.179.95.51` bypass in `is_trusted_ip()` has been removed. Only loopback and RFC1918 are unconditionally trusted. Additional CIDRs require explicit `trusted_internal_cidrs` config. |
+| 2 | **Blocklists moved out of web root** | Blocklist JSON files now live under `/var/lib/pqcrypta-proxy/blocklists/` (mode `0700`). The sync script no longer overwrites files on DB failure. |
+| 3 | **CRLF injection prevention** | `build_http_request()` (Unix socket proxy) now strips `\r` and `\n` from all header names, values, and the request path before interpolation. |
+| 4 | **JA3/JA4 placeholder hashes removed** | Hardcoded example fingerprints replaced with a file-backed `Ja3Database` loaded from `fingerprint.fingerprint_db_path`. Classification is advisory-only. |
+
 ## Quick Start
 
 ### Prerequisites

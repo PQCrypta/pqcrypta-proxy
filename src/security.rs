@@ -21,6 +21,8 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ipnet::IpNet;
+
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
@@ -39,26 +41,49 @@ const MAX_TRACKED_IPS: usize = 100_000;
 /// Maximum number of tracked JA3 fingerprints
 const MAX_JA3_FINGERPRINTS: usize = 50_000;
 
-/// Check if an IP is a trusted/local IP that should bypass security checks
-/// This prevents the server from blocking itself
+/// Check if an IP is within the hardcoded trusted ranges (loopback and RFC1918 private).
+/// This is the minimal set of always-trusted addresses.
+/// For additional CIDRs, operators must configure `trusted_internal_cidrs` explicitly.
 fn is_trusted_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            // Localhost
+            // Loopback (127.0.0.0/8)
             v4.is_loopback() ||
-            // Private ranges - typically internal infrastructure
+            // RFC1918 private ranges (10/8, 172.16/12, 192.168/16)
             v4.is_private() ||
-            // Link-local (169.254.x.x)
-            v4.is_link_local() ||
-            // Server's own public IP (pqcrypta.com)
-            v4.octets() == [66, 179, 95, 51]
+            // Link-local (169.254.0.0/16)
+            v4.is_link_local()
         }
         IpAddr::V6(v6) => {
-            // Localhost
+            // Loopback (::1)
             v6.is_loopback() ||
-            // IPv4-mapped localhost
+            // IPv4-mapped loopback (::ffff:127.0.0.1)
             v6.to_ipv4_mapped().map(|v4| v4.is_loopback()).unwrap_or(false)
         }
+    }
+}
+
+/// Check if a CIDR block (IpNet) contains the given IP address.
+/// Handles IPv4/IPv6 matching; mismatched address families return false.
+fn cidr_contains_ip(net: &IpNet, addr: &IpAddr) -> bool {
+    match (net, addr) {
+        (IpNet::V4(n), IpAddr::V4(a)) => {
+            let prefix = u32::from(n.prefix_len());
+            if prefix == 0 {
+                return true;
+            }
+            let mask: u32 = u32::MAX.wrapping_shl(32 - prefix);
+            u32::from(n.addr()) & mask == u32::from(*a) & mask
+        }
+        (IpNet::V6(n), IpAddr::V6(a)) => {
+            let prefix = u32::from(n.prefix_len());
+            if prefix == 0 {
+                return true;
+            }
+            let mask: u128 = u128::MAX.wrapping_shl(128 - prefix);
+            u128::from(n.addr()) & mask == u128::from(*a) & mask
+        }
+        _ => false,
     }
 }
 
@@ -76,6 +101,66 @@ use sha2::Digest;
 use tracing::{debug, info, warn};
 
 use crate::config::{CircuitBreakerConfig, ProxyConfig, RateLimitConfig, SecurityConfig};
+
+/// Entry in a JA3/JA4 fingerprint database JSON file.
+/// Expected format: [{hash, classification, description}]
+#[derive(serde::Deserialize, Clone, Debug)]
+struct Ja3DbEntry {
+    hash: String,
+    classification: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+/// JA3/JA4 fingerprint database loaded from a JSON file at startup.
+/// Classification is advisory-only and never causes automatic blocking.
+#[derive(Clone, Default, Debug)]
+pub struct Ja3Database {
+    entries: std::collections::HashMap<String, FingerprintClass>,
+}
+
+impl Ja3Database {
+    /// Load fingerprints from a JSON file.
+    /// Returns an error if the file cannot be read or the JSON is malformed.
+    pub fn load_from_file(path: &std::path::Path) -> Result<Self, std::io::Error> {
+        let content = std::fs::read_to_string(path)?;
+        let raw: Vec<Ja3DbEntry> = serde_json::from_str(&content)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        let mut entries = std::collections::HashMap::new();
+        for entry in raw {
+            let class = match entry.classification.as_str() {
+                "browser" => FingerprintClass::Browser,
+                "bot" | "legitimate_bot" => FingerprintClass::LegitimateBot,
+                "malicious" => FingerprintClass::Malicious,
+                "scanner" => FingerprintClass::Scanner,
+                "api_client" => FingerprintClass::ApiClient,
+                _ => FingerprintClass::Suspicious,
+            };
+            entries.insert(entry.hash.to_lowercase(), class);
+        }
+        Ok(Self { entries })
+    }
+
+    /// Classify a JA3/JA4 hash.
+    /// Returns `Suspicious` for hashes not present in the database.
+    pub fn classify(&self, hash: &str) -> FingerprintClass {
+        self.entries
+            .get(&hash.to_lowercase())
+            .cloned()
+            .unwrap_or(FingerprintClass::Suspicious)
+    }
+
+    /// Number of entries in the database.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns true if the database contains no entries.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
 
 /// Security state shared across all requests
 #[derive(Clone)]
@@ -104,6 +189,8 @@ pub struct SecurityState {
     /// GeoIP database (optional)
     #[cfg(feature = "geoip")]
     pub geoip_db: Option<Arc<GeoIpDb>>,
+    /// JA3/JA4 fingerprint database (advisory-only, never blocks)
+    pub ja3_db: Arc<Ja3Database>,
 }
 
 /// Information about a blocked IP
@@ -280,6 +367,36 @@ impl SecurityState {
                     }
                 });
 
+        // Load JA3/JA4 fingerprint database (advisory-only)
+        let ja3_db = if let Some(ref db_path) = config.fingerprint.fingerprint_db_path {
+            match Ja3Database::load_from_file(db_path) {
+                Ok(db) => {
+                    if db.is_empty() {
+                        warn!(
+                            "JA3 fingerprint database at {:?} is empty - classification will return Suspicious for all hashes",
+                            db_path
+                        );
+                    } else {
+                        info!(
+                            "Loaded {} JA3/JA4 fingerprints from {:?}",
+                            db.len(),
+                            db_path
+                        );
+                    }
+                    db
+                }
+                Err(e) => {
+                    warn!(
+                        "Could not load JA3 fingerprint database from {:?}: {} - continuing with empty DB",
+                        db_path, e
+                    );
+                    Ja3Database::default()
+                }
+            }
+        } else {
+            Ja3Database::default()
+        };
+
         let state = Self {
             ip_rate_limiters: Arc::new(DashMap::new()),
             ip_connections: Arc::new(DashMap::new()),
@@ -293,12 +410,30 @@ impl SecurityState {
             global_rate_limiter,
             #[cfg(feature = "geoip")]
             geoip_db,
+            ja3_db: Arc::new(ja3_db),
         };
 
         // Spawn background cleanup task
         state.spawn_cleanup_task();
 
         state
+    }
+
+    /// Check whether an IP should bypass security checks.
+    ///
+    /// Unconditionally trusts loopback and RFC1918 private ranges.
+    /// Additionally trusts any CIDR in `security.trusted_internal_cidrs` (explicit opt-in).
+    pub fn is_trusted(&self, ip: &IpAddr) -> bool {
+        if is_trusted_ip(ip) {
+            return true;
+        }
+        let config = self.config.read();
+        for cidr in &config.trusted_internal_cidrs {
+            if cidr_contains_ip(cidr, ip) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Spawn a background task that periodically cleans up expired entries
@@ -375,8 +510,8 @@ impl SecurityState {
 
     /// Block an IP address
     pub fn block_ip(&self, ip: IpAddr, reason: BlockReason, duration: Option<Duration>) {
-        // Never block trusted IPs (localhost, private, server IP)
-        if is_trusted_ip(&ip) {
+        // Never block trusted IPs (loopback, RFC1918, or operator-configured CIDRs)
+        if self.is_trusted(&ip) {
             debug!(
                 "Skipping block for trusted IP {} (reason: {:?})",
                 ip, reason
@@ -413,10 +548,10 @@ impl SecurityState {
         );
     }
 
-    /// Reload blocklist from JSON files (synced from database)
-    /// Called periodically to pick up new blocks from the sync script
+    /// Reload blocklist from JSON files (synced from database).
+    /// Uses the path configured in `security.blocklist_dir` (default: /var/lib/pqcrypta-proxy/blocklists).
     pub fn reload_blocklist_from_files(&self) {
-        let blocklist_dir = std::path::Path::new("/var/www/html/pqcrypta-proxy/data/blocklists");
+        let blocklist_dir = self.config.read().blocklist_dir.clone();
         let blocked_ips_file = blocklist_dir.join("blocked_ips.json");
 
         if !blocked_ips_file.exists() {
@@ -500,8 +635,8 @@ impl SecurityState {
 
     /// Record a request for adaptive rate limiting
     pub fn record_request(&self, ip: IpAddr, status: StatusCode) {
-        // Skip tracking for trusted IPs
-        if is_trusted_ip(&ip) {
+        // Skip tracking for trusted IPs (loopback, RFC1918, or operator-configured CIDRs)
+        if self.is_trusted(&ip) {
             return;
         }
 
@@ -735,9 +870,9 @@ pub async fn security_middleware(
 ) -> Response {
     let ip = client_addr.ip();
 
-    // Fast path: skip all security checks for trusted IPs (localhost, private, server IP)
-    // This prevents the server from blocking itself or internal services
-    if is_trusted_ip(&ip) {
+    // Fast path: skip all security checks for trusted IPs (loopback, RFC1918, operator CIDRs).
+    // This prevents the server from blocking itself or internal services.
+    if security.is_trusted(&ip) {
         debug!("Trusted IP {} - bypassing security checks", ip);
         return next.run(request).await;
     }
@@ -1104,46 +1239,12 @@ pub fn calculate_ja3(client_hello: &[u8]) -> Option<String> {
     Some(hex::encode(result))
 }
 
-/// Known JA3 fingerprints for classification
-pub fn classify_ja3(ja3_hash: &str) -> FingerprintClass {
-    // Known browser fingerprints (sample)
-    const KNOWN_BROWSERS: &[&str] = &[
-        "e7d705a3286e19ea42f587b344ee6865", // Chrome
-        "b32309a26951912be7dba376398abc3b", // Firefox
-        "773906b0efdefa24a7f2b8eb6985bf37", // Safari
-        "9e10692f1b7f78228b2d4e424db3a98c", // Edge
-    ];
-
-    // Known legitimate bots
-    const KNOWN_BOTS: &[&str] = &[
-        "4d7a28d6f2f7e9c8b5a3c1d0e2f6a9b8", // Googlebot (example)
-        "3b5074b1b5d032e5620f69f9f700ff0e", // Bingbot (example)
-    ];
-
-    // Known malicious fingerprints
-    const KNOWN_MALICIOUS: &[&str] = &[
-        "e960427dc851bc6c8a87ad68e9e2aa72", // Scanner
-        "51c64c77e60f3980eea90869b68c58a8", // Exploit kit
-    ];
-
-    // Known API clients
-    const KNOWN_API_CLIENTS: &[&str] = &[
-        "3b5074b1b5d032e5620f69f9f700ff0e", // curl
-        "555c5c77e60f3980eea90869b68c58a8", // wget
-    ];
-
-    if KNOWN_BROWSERS.contains(&ja3_hash) {
-        FingerprintClass::Browser
-    } else if KNOWN_BOTS.contains(&ja3_hash) {
-        FingerprintClass::LegitimateBot
-    } else if KNOWN_MALICIOUS.contains(&ja3_hash) {
-        FingerprintClass::Malicious
-    } else if KNOWN_API_CLIENTS.contains(&ja3_hash) {
-        FingerprintClass::ApiClient
-    } else {
-        // Unknown fingerprint - treat as suspicious until verified
-        FingerprintClass::Suspicious
-    }
+/// Classify a JA3 fingerprint hash using the provided database.
+///
+/// Classification is **advisory-only** and MUST NOT cause automatic blocking.
+/// Returns `Suspicious` for any hash not found in the database.
+pub fn classify_ja3(ja3_hash: &str, db: &Ja3Database) -> FingerprintClass {
+    db.classify(ja3_hash)
 }
 
 #[cfg(feature = "geoip")]
@@ -1281,13 +1382,83 @@ mod tests {
     }
 
     #[test]
-    fn test_ja3_classification() {
-        // Test known browser fingerprint
-        let chrome_ja3 = "e7d705a3286e19ea42f587b344ee6865";
-        assert_eq!(classify_ja3(chrome_ja3), FingerprintClass::Browser);
+    fn test_ja3_classification_empty_db() {
+        // With an empty database every hash classifies as Suspicious (advisory only).
+        let db = Ja3Database::default();
+        let hash = "e7d705a3286e19ea42f587b344ee6865";
+        assert_eq!(classify_ja3(hash, &db), FingerprintClass::Suspicious);
 
-        // Test unknown fingerprint
         let unknown = "00000000000000000000000000000000";
-        assert_eq!(classify_ja3(unknown), FingerprintClass::Suspicious);
+        assert_eq!(classify_ja3(unknown, &db), FingerprintClass::Suspicious);
+    }
+
+    #[test]
+    fn test_fingerprint_db_load() {
+        // Write a temporary JSON fingerprint database and verify loading.
+        let entries = r#"[
+            {"hash": "aabbccddeeff00112233445566778899", "classification": "browser", "description": "Test Browser"},
+            {"hash": "112233445566778899aabbccddeeff00", "classification": "malicious", "description": "Test Scanner"},
+            {"hash": "deadbeefdeadbeefdeadbeefdeadbeef", "classification": "api_client", "description": "curl"},
+            {"hash": "cafebabecafebabecafebabecafebabe", "classification": "bot", "description": "Googlebot"}
+        ]"#;
+
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("pqcrypta_proxy_test_ja3_db.json");
+        std::fs::write(&test_file, entries).expect("write temp file");
+
+        let db = Ja3Database::load_from_file(&test_file).expect("load db");
+        assert_eq!(db.len(), 4, "all 4 entries loaded");
+        assert!(!db.is_empty());
+
+        assert_eq!(
+            classify_ja3("aabbccddeeff00112233445566778899", &db),
+            FingerprintClass::Browser
+        );
+        assert_eq!(
+            classify_ja3("112233445566778899aabbccddeeff00", &db),
+            FingerprintClass::Malicious
+        );
+        assert_eq!(
+            classify_ja3("deadbeefdeadbeefdeadbeefdeadbeef", &db),
+            FingerprintClass::ApiClient
+        );
+        assert_eq!(
+            classify_ja3("cafebabecafebabecafebabecafebabe", &db),
+            FingerprintClass::LegitimateBot
+        );
+        // Unknown hash still returns Suspicious
+        assert_eq!(
+            classify_ja3("ffffffffffffffffffffffffffffffff", &db),
+            FingerprintClass::Suspicious
+        );
+
+        // Case-insensitive lookup
+        assert_eq!(
+            classify_ja3("AABBCCDDEEFF00112233445566778899", &db),
+            FingerprintClass::Browser
+        );
+
+        let _ = std::fs::remove_file(&test_file);
+    }
+
+    #[test]
+    fn test_trusted_ip_no_public_bypass() {
+        // The server's former public IP must not bypass security checks.
+        let public_ip: IpAddr = "66.179.95.51".parse().unwrap();
+        assert!(
+            !is_trusted_ip(&public_ip),
+            "Public IP must NOT be unconditionally trusted"
+        );
+
+        // Loopback must still be trusted.
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(is_trusted_ip(&loopback), "Loopback must be trusted");
+
+        // RFC1918 must still be trusted.
+        let private: IpAddr = "10.0.0.1".parse().unwrap();
+        assert!(is_trusted_ip(&private), "RFC1918 must be trusted");
+
+        let private2: IpAddr = "192.168.1.1".parse().unwrap();
+        assert!(is_trusted_ip(&private2), "RFC1918 must be trusted");
     }
 }

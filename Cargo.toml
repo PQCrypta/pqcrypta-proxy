@@ -153,7 +153,7 @@ url = "2.5"
 
 # IP address handling
 ipnetwork = "0.20"
-ipnet = "2.10"
+ipnet = { version = "2.10", features = ["serde"] }
 
 # Regex for route matching
 regex = "1.11"
