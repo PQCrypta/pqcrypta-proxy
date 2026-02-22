@@ -825,53 +825,73 @@ require_client_cert = true
 require_mtls = true
 ```
 
-## Security Fixes (v0.2.2)
+## Admin API Authentication
 
-The following vulnerabilities identified in the 2026-02-22 security audit have been resolved:
+The admin API requires **at least one** of the following to be configured, or the proxy refuses to start:
 
-| ID | Severity | Description | Fix |
-|----|----------|-------------|-----|
-| H-1 | High | Admin API unauthenticated by default | Startup now fails unless `auth_token` is set or `allowed_ips` is restricted to loopback |
-| H-2 | High | JWT subject extracted without signature verification | `extract_jwt_subject` requires a configured `jwt_secret`; JWT-based rate limiting is disabled when no secret is set |
-| H-3 | High | Admin token comparison not timing-safe | Replaced `!=` with `subtle::ConstantTimeEq` |
-| M-1 | Medium | Log injection via unsanitized user input | `sanitize_log_field()` strips `\n`, `\r`, and control characters from all logged user-controlled values |
-| M-2 | Medium | `tls_skip_verify` silently enables MITM | Startup now fails if any backend has `tls_skip_verify = true` unless `--allow-insecure-backends` is explicitly passed; loud `warn!()` emitted for each insecure backend |
-| M-3 | Medium | ACME domain names used in file paths without validation | `validate_acme_domain()` rejects domains with `/`, `\\`, `..`, null bytes, or non-RFC-1035 characters |
-| M-4 | Medium | `unwrap()` in TLS passthrough handler | Replaced with `ok_or_else()?` idiom |
-| L-1 | Low | Unmaintained `rustls-pemfile` dependency | Migrated PEM parsing to `rustls-pki-types` (v1.9+) `PemObject` trait |
-| L-3 | Low | Duplicate dependency versions | `cargo update` applied; `rcgen` bumped to 0.14 to unify with vendored wtransport |
-| L-4 | Low | `openssl_path` not validated | Startup validates that configured path is absolute and not world-writable |
-| L-5 | Low | 0-RTT safety guidance insufficient | Added `tls.zero_rtt_safe_methods` config (default: GET, HEAD) and per-route `allow_0rtt` flag; improved startup warning |
+- `auth_token` set in `[admin]` — Bearer token required on every admin request, or
+- `allowed_ips` restricted to loopback addresses (`127.x.x.x`, `::1`)
 
-### Admin API Authentication (H-1)
+```toml
+[admin]
+enabled = true
+bind_address = "127.0.0.1"
+port = 8082
+auth_token = "your-strong-secret-token"   # required unless allowed_ips is loopback-only
+allowed_ips = ["127.0.0.1", "::1"]
+```
 
-The admin API now enforces at least one of:
-- `auth_token` set in `[admin]` config, **or**
-- `allowed_ips` restricted to loopback addresses only (`127.x.x.x`, `::1`)
+Admin token comparison uses constant-time equality to prevent timing side-channel attacks.
 
-Startup fails with a clear error message if neither is configured.
+## JWT Rate Limiting
 
-### JWT Rate Limiting (H-2)
-
-JWT-based rate limiting (`key_strategy = "jwt_subject"`) now requires a signing secret:
+Per-subject JWT rate limiting verifies the token's HMAC-SHA256 signature before trusting the `sub` claim. Configure a shared signing secret that matches the upstream token issuer:
 
 ```toml
 [advanced_rate_limiting]
-jwt_secret = "your-hmac-sha256-secret-min-32-bytes"
+key_strategy = "jwt_subject"
+jwt_secret = "your-hmac-sha256-secret-at-least-32-bytes"
 ```
 
-Without `jwt_secret`, the `jwt_subject` key strategy returns no key (rate limiting falls back to the next configured strategy). This prevents attackers from forging arbitrary `sub` claims to get elevated rate-limit quotas.
+Without `jwt_secret`, the `jwt_subject` strategy is disabled and falls back to the next configured key strategy.
 
-### 0-RTT Configuration (L-5)
+## Insecure Backend TLS
+
+Backends with `tls_skip_verify = true` completely disable certificate verification for that backend. The proxy logs a loud warning for each such backend and requires the `--allow-insecure-backends` CLI flag to start:
+
+```toml
+[[backends]]
+name = "dev-backend"
+tls_skip_verify = true  # requires --allow-insecure-backends at startup
+```
+
+```sh
+pqcrypta-proxy --config config.toml --allow-insecure-backends
+```
+
+This flag should never be used in production.
+
+## 0-RTT Early Data
+
+0-RTT is disabled by default. When enabled, only HTTP methods listed in `zero_rtt_safe_methods` are forwarded via early data. Non-listed methods are held until the full TLS handshake completes.
 
 ```toml
 [tls]
 enable_0rtt = true
-# Only these methods may use 0-RTT early data (replay-safe by default)
+# Methods safe for 0-RTT forwarding (idempotent, no side effects)
 zero_rtt_safe_methods = ["GET", "HEAD"]
 ```
 
-Per-route opt-in via `allow_0rtt = true` in route config.
+Per-route opt-in:
+
+```toml
+[[routes]]
+name = "static-assets"
+host = "cdn.example.com"
+path_prefix = "/static/"
+backend = "cdn"
+allow_0rtt = true   # enable 0-RTT for this route only
+```
 
 ## License
 
