@@ -696,6 +696,29 @@ curl -X POST http://127.0.0.1:8082/reload
 curl -X POST http://127.0.0.1:8082/reload -d '{"tls_only":true}'
 ```
 
+## Metrics
+
+### Latency Percentiles (p50 / p95 / p99)
+
+Latency percentiles are computed from a **double-buffered 5-minute sliding window** rather than a cumulative histogram. The active buffer accumulates request durations; every 2.5 minutes the buffers rotate, so reported percentiles always reflect the last 2.5–5 minutes of live traffic. Historical outliers from startup or past load spikes do not pollute current readings.
+
+Percentiles are interpolated using **Prometheus-style linear interpolation** within each bucket. The histogram uses 18 fine-grained buckets with boundaries chosen to match SLO thresholds: 5, 10, 25, 50, 75, 100, 150, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000, 10000 ms, and +Inf. This eliminates the step-function snapping seen with coarse bucket boundaries (e.g., a p99 of 1001 ms being reported as 2500 ms).
+
+### Health Check Traffic Exclusion
+
+Requests that carry the `x-health-check-bypass: 1` request header are excluded from **all** metrics counters and the latency histogram:
+
+- Not counted in `total_requests`, `successful_requests`, `failed_requests`
+- Not added to the latency histogram (no impact on p50/p95/p99)
+- Not tracked in `in_progress` connections
+- Not recorded as endpoint errors
+
+This prevents the health check cron's synthetic cryptographic workflows (which generate intentional 500s during wrong-key rejection tests) from appearing as real errors or skewing production latency percentiles.
+
+### WAF Blocked Requests
+
+Requests rejected by the security IP-blocklist or bot-blocklist receive an `x-waf-block: 1` response header. The collector tracks these separately in `waf_blocked_requests` (distinct from `failed_requests`) so that bot attack traffic cannot inflate error-rate SLOs or depress domain health scores.
+
 ## Deployment
 
 ### Systemd (Linux)
