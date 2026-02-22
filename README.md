@@ -634,11 +634,14 @@ PQCrypta Proxy supports hybrid PQC key exchange using rustls-post-quantum (X2551
 ```toml
 [pqc]
 enabled = true
-provider = "rustls-pqc"
-preferred_kem = "x25519_mlkem768"
-hybrid_mode = true
+provider = "openssl3.5"
+openssl_path = "/usr/local/openssl-pq/bin/openssl"
+openssl_lib_path = "/usr/local/openssl-pq/lib64"
+preferred_kem = "x25519_kyber768"
 fallback_to_classical = true
 ```
+
+> **Important**: `openssl_path` must point to an OpenSSL 3.5+ binary built with ML-KEM support. The proxy checks this path at startup to determine whether the PQC TCP listener is available. If the path is wrong or the binary is missing, the proxy silently falls back to a standard rustls listener that accepts TLS 1.2 and does not negotiate X25519MLKEM768. Always verify the path exists before deploying.
 
 ## ACME Certificate Automation
 
@@ -846,7 +849,7 @@ cargo run --release --bin quic-bench -- --target localhost:443
 
 ### All Security Features Complete
 
-- [x] TLS 1.3 only (enforced by QUIC)
+- [x] TLS 1.3 only (enforced for both TCP/TLS via OpenSSL 3.5+ and QUIC/HTTP3 via rustls)
 - [x] Full security headers (HSTS, COEP, COOP, CORP, etc.)
 - [x] Server identity hidden (custom branding)
 - [x] X-Forwarded-For header support
