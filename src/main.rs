@@ -129,6 +129,13 @@ struct Args {
     /// Run configuration validation only (don't start server)
     #[arg(long)]
     validate: bool,
+
+    /// M-2: Explicitly allow backends with tls_skip_verify = true.
+    /// This flag MUST be set when any backend disables TLS certificate verification.
+    /// Without it the proxy will refuse to start when an insecure backend is found.
+    /// Never use this in production; it enables full man-in-the-middle of backend traffic.
+    #[arg(long, env = "PQCRYPTA_ALLOW_INSECURE_BACKENDS")]
+    allow_insecure_backends: bool,
 }
 
 #[tokio::main]
@@ -172,6 +179,42 @@ async fn main() -> anyhow::Result<()> {
     // Validate configuration
     config.validate()?;
     info!("Configuration validated successfully");
+
+    // M-2: Warn loudly for every backend that disables TLS certificate verification,
+    // and refuse to start unless --allow-insecure-backends was explicitly passed.
+    {
+        let insecure_backends: Vec<&str> = config
+            .backends
+            .values()
+            .filter(|b| b.tls_skip_verify)
+            .map(|b| b.name.as_str())
+            .collect();
+
+        if !insecure_backends.is_empty() {
+            for name in &insecure_backends {
+                warn!(
+                    "⚠️  Backend '{}' has tls_skip_verify=true — TLS certificate verification \
+                     is DISABLED for this backend (full MITM risk)",
+                    name
+                );
+            }
+            if args.allow_insecure_backends {
+                warn!(
+                    "⚠️  --allow-insecure-backends flag set: continuing with {} insecure backend(s). \
+                     This MUST NOT be used in production.",
+                    insecure_backends.len()
+                );
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Startup aborted: backend(s) {:?} have tls_skip_verify=true but \
+                     --allow-insecure-backends was not passed. \
+                     Either fix the backend TLS configuration or pass \
+                     --allow-insecure-backends to acknowledge the risk.",
+                    insecure_backends
+                ));
+            }
+        }
+    }
 
     if args.validate {
         info!("Configuration validation successful, exiting");
@@ -354,9 +397,12 @@ async fn main() -> anyhow::Result<()> {
         let mut service = ocsp::OcspService::new(ocsp_config);
 
         // Load certificates for OCSP
+        // L-1: Use rustls-pki-types PEM API (replaces unmaintained rustls-pemfile)
         if let Ok(cert_pem) = std::fs::read(&config.tls.cert_path) {
+            use rustls::pki_types::CertificateDer;
+            use rustls_pki_types::pem::PemObject;
             if let Ok(certs) =
-                rustls_pemfile::certs(&mut std::io::BufReader::new(cert_pem.as_slice()))
+                CertificateDer::pem_reader_iter(&mut std::io::BufReader::new(cert_pem.as_slice()))
                     .collect::<Result<Vec<_>, _>>()
             {
                 service.update_certificates(certs);
@@ -889,6 +935,92 @@ fn print_startup_summary(config: &ProxyConfig, pqc_enabled: bool) {
     info!("═══════════════════════════════════════════════════════════════");
 }
 
+/// L-4: Validate the configured OpenSSL binary path for basic safety properties.
+///
+/// Checks:
+/// - The path is absolute (not a bare name that could be hijacked via PATH)
+/// - The file exists and is a regular file
+/// - On Unix: the file is not world-writable (prevents binary substitution)
+#[cfg(feature = "pqc")]
+fn validate_openssl_path(
+    openssl_path: &std::path::Path,
+    has_warnings: &mut bool,
+    has_errors: &mut bool,
+) {
+    if !openssl_path.is_absolute() {
+        error!(
+            "  ❌ openssl_path '{}' is not an absolute path — a relative path can be \
+             hijacked via PATH manipulation",
+            openssl_path.display()
+        );
+        *has_errors = true;
+        return;
+    }
+
+    if !openssl_path.exists() {
+        // Not an error — the PQC code already falls back gracefully when OpenSSL is absent.
+        // The security concern (L-4) is about what the path points to when it *does* exist.
+        warn!(
+            "  ⚠️  openssl_path '{}' does not exist — PQC via OpenSSL unavailable; \
+             will fall back to rustls",
+            openssl_path.display()
+        );
+        *has_warnings = true;
+        return;
+    }
+
+    if !openssl_path.is_file() {
+        warn!(
+            "  ⚠️  openssl_path '{}' exists but is not a regular file",
+            openssl_path.display()
+        );
+        *has_warnings = true;
+        return;
+    }
+
+    // Unix: check that the file is not world-writable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(openssl_path) {
+            Ok(meta) => {
+                let mode = meta.permissions().mode();
+                if mode & 0o002 != 0 {
+                    warn!(
+                        "  ⚠️  openssl_path '{}' is world-writable (mode {:o}) — \
+                         this allows any user to replace the binary",
+                        openssl_path.display(),
+                        mode
+                    );
+                    *has_warnings = true;
+                } else {
+                    info!(
+                        "  ✅ openssl_path '{}' permissions: OK (mode {:o})",
+                        openssl_path.display(),
+                        mode
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "  ⚠️  Could not stat openssl_path '{}': {}",
+                    openssl_path.display(),
+                    e
+                );
+                *has_warnings = true;
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        info!(
+            "  ✅ openssl_path '{}': exists and is absolute",
+            openssl_path.display()
+        );
+    }
+}
+
 /// Perform security checks before starting the proxy
 ///
 /// Checks:
@@ -905,6 +1037,16 @@ async fn perform_security_checks(config: &ProxyConfig) -> anyhow::Result<()> {
 
     let mut has_warnings = false;
     let mut has_errors = false;
+
+    // =========================================================================
+    // 0. L-4: Validate openssl_path before executing the binary
+    // =========================================================================
+    #[cfg(feature = "pqc")]
+    if config.pqc.enabled {
+        if let Some(ref openssl_path) = config.pqc.openssl_path {
+            validate_openssl_path(openssl_path, &mut has_warnings, &mut has_errors);
+        }
+    }
 
     // =========================================================================
     // 1. Check TLS private key file permissions

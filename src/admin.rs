@@ -11,6 +11,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
+use subtle::ConstantTimeEq;
+
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json};
@@ -167,7 +169,10 @@ async fn auth_middleware(
             .and_then(|v| v.to_str().ok())
             .map(|v| v.strip_prefix("Bearer ").unwrap_or(v));
 
-        if provided_token != Some(expected_token.as_str()) {
+        // H-3: Constant-time comparison to prevent timing side-channel attacks
+        let provided_bytes = provided_token.unwrap_or("").as_bytes();
+        let authorized: bool = provided_bytes.ct_eq(expected_token.as_bytes()).into();
+        if !authorized {
             warn!("Admin API unauthorized access attempt from {}", client_ip);
             return StatusCode::UNAUTHORIZED.into_response();
         }

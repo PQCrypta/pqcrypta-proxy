@@ -825,6 +825,54 @@ require_client_cert = true
 require_mtls = true
 ```
 
+## Security Fixes (v0.2.2)
+
+The following vulnerabilities identified in the 2026-02-22 security audit have been resolved:
+
+| ID | Severity | Description | Fix |
+|----|----------|-------------|-----|
+| H-1 | High | Admin API unauthenticated by default | Startup now fails unless `auth_token` is set or `allowed_ips` is restricted to loopback |
+| H-2 | High | JWT subject extracted without signature verification | `extract_jwt_subject` requires a configured `jwt_secret`; JWT-based rate limiting is disabled when no secret is set |
+| H-3 | High | Admin token comparison not timing-safe | Replaced `!=` with `subtle::ConstantTimeEq` |
+| M-1 | Medium | Log injection via unsanitized user input | `sanitize_log_field()` strips `\n`, `\r`, and control characters from all logged user-controlled values |
+| M-2 | Medium | `tls_skip_verify` silently enables MITM | Startup now fails if any backend has `tls_skip_verify = true` unless `--allow-insecure-backends` is explicitly passed; loud `warn!()` emitted for each insecure backend |
+| M-3 | Medium | ACME domain names used in file paths without validation | `validate_acme_domain()` rejects domains with `/`, `\\`, `..`, null bytes, or non-RFC-1035 characters |
+| M-4 | Medium | `unwrap()` in TLS passthrough handler | Replaced with `ok_or_else()?` idiom |
+| L-1 | Low | Unmaintained `rustls-pemfile` dependency | Migrated PEM parsing to `rustls-pki-types` (v1.9+) `PemObject` trait |
+| L-3 | Low | Duplicate dependency versions | `cargo update` applied; `rcgen` bumped to 0.14 to unify with vendored wtransport |
+| L-4 | Low | `openssl_path` not validated | Startup validates that configured path is absolute and not world-writable |
+| L-5 | Low | 0-RTT safety guidance insufficient | Added `tls.zero_rtt_safe_methods` config (default: GET, HEAD) and per-route `allow_0rtt` flag; improved startup warning |
+
+### Admin API Authentication (H-1)
+
+The admin API now enforces at least one of:
+- `auth_token` set in `[admin]` config, **or**
+- `allowed_ips` restricted to loopback addresses only (`127.x.x.x`, `::1`)
+
+Startup fails with a clear error message if neither is configured.
+
+### JWT Rate Limiting (H-2)
+
+JWT-based rate limiting (`key_strategy = "jwt_subject"`) now requires a signing secret:
+
+```toml
+[advanced_rate_limiting]
+jwt_secret = "your-hmac-sha256-secret-min-32-bytes"
+```
+
+Without `jwt_secret`, the `jwt_subject` key strategy returns no key (rate limiting falls back to the next configured strategy). This prevents attackers from forging arbitrary `sub` claims to get elevated rate-limit quotas.
+
+### 0-RTT Configuration (L-5)
+
+```toml
+[tls]
+enable_0rtt = true
+# Only these methods may use 0-RTT early data (replay-safe by default)
+zero_rtt_safe_methods = ["GET", "HEAD"]
+```
+
+Per-route opt-in via `allow_0rtt = true` in route config.
+
 ## License
 
 Licensed under either of:

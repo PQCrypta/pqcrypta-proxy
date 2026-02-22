@@ -15,9 +15,10 @@ use std::time::SystemTime;
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 use rustls::crypto::CryptoProvider;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer};
 use rustls::server::ServerConfig as RustlsServerConfig;
-use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
+// L-1: Migrated from unmaintained rustls-pemfile to rustls-pki-types PEM parsing API
+use rustls_pki_types::pem::PemObject;
 use tracing::{debug, info, warn};
 
 use crate::config::{PqcConfig, TlsConfig};
@@ -339,10 +340,23 @@ impl TlsProvider {
         info!("ALPN protocols: {:?}", tls_config.alpn_protocols);
 
         // Configure 0-RTT (early data)
+        // L-5: 0-RTT is a replay-attack risk. The proxy forwards early data to
+        // backends without deduplication. Only enable on routes whose backends
+        // are safe to receive replayed requests, and restrict to idempotent methods
+        // via `tls.zero_rtt_safe_methods` (default: GET, HEAD only).
         if tls_config.enable_0rtt {
             // Enable 0-RTT with 16KB max early data
             config.max_early_data_size = 16384;
-            warn!("0-RTT enabled - vulnerable to replay attacks. Use only if replay protection is handled at application layer.");
+            warn!(
+                "⚠️  0-RTT (early data) ENABLED — replay-attack risk. \
+                 Safe HTTP methods: {:?}. \
+                 Non-idempotent requests (POST/PUT/DELETE/PATCH) forwarded via 0-RTT \
+                 may be delivered TWICE to backends with no indication. \
+                 Ensure routes serving non-GET/HEAD traffic have `allow_0rtt = false` \
+                 (the default). Set `tls.zero_rtt_safe_methods` if your backends \
+                 implement idempotency-key deduplication.",
+                tls_config.zero_rtt_safe_methods
+            );
         } else {
             // Disable 0-RTT for security
             config.max_early_data_size = 0;
@@ -361,15 +375,16 @@ impl TlsProvider {
         Ok(config)
     }
 
-    /// Load certificates from PEM file
+    /// Load certificates from PEM file.
+    // L-1: Uses rustls-pki-types PEM API (replaces unmaintained rustls-pemfile)
     fn load_certificates(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
         let file = File::open(path)
             .map_err(|e| anyhow::anyhow!("Failed to open certificate file {:?}: {}", path, e))?;
         let mut reader = BufReader::new(file);
 
-        let certs: Vec<CertificateDer<'static>> = certs(&mut reader)
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(&mut reader)
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| anyhow::anyhow!("Failed to parse certificates: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to parse certificates from {:?}: {}", path, e))?;
 
         if certs.is_empty() {
             return Err(anyhow::anyhow!("No certificates found in {:?}", path));
@@ -378,34 +393,36 @@ impl TlsProvider {
         Ok(certs)
     }
 
-    /// Load private key from PEM file
+    /// Load private key from PEM file.
+    // L-1: Uses rustls-pki-types PEM API (replaces unmaintained rustls-pemfile).
+    // Tries PKCS#8 first (most common for modern keys), then PKCS#1 (legacy RSA).
     fn load_private_key(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
-        let file = File::open(path)
-            .map_err(|e| anyhow::anyhow!("Failed to open private key file {:?}: {}", path, e))?;
-        let mut reader = BufReader::new(file);
-
-        // Try PKCS#8 format first
-        let pkcs8_keys: Vec<_> = pkcs8_private_keys(&mut reader)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| anyhow::anyhow!("Failed to parse PKCS#8 keys: {}", e))?;
-
-        if let Some(key) = pkcs8_keys.into_iter().next() {
-            return Ok(PrivateKeyDer::Pkcs8(key));
+        // Try PKCS#8 format first (covers Ed25519, ECDSA, RSA wrapped in PKCS#8)
+        {
+            let file = File::open(path)
+                .map_err(|e| anyhow::anyhow!("Failed to open key file {:?}: {}", path, e))?;
+            let mut reader = BufReader::new(file);
+            if let Some(key) = PrivatePkcs8KeyDer::pem_reader_iter(&mut reader).find_map(|r| r.ok())
+            {
+                return Ok(PrivateKeyDer::Pkcs8(key));
+            }
         }
 
-        // Try RSA format
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
-
-        let rsa_keys: Vec<_> = rsa_private_keys(&mut reader)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| anyhow::anyhow!("Failed to parse RSA keys: {}", e))?;
-
-        if let Some(key) = rsa_keys.into_iter().next() {
-            return Ok(PrivateKeyDer::Pkcs1(key));
+        // Try PKCS#1 (legacy RSA) format
+        {
+            let file = File::open(path)
+                .map_err(|e| anyhow::anyhow!("Failed to open key file {:?}: {}", path, e))?;
+            let mut reader = BufReader::new(file);
+            if let Some(key) = PrivatePkcs1KeyDer::pem_reader_iter(&mut reader).find_map(|r| r.ok())
+            {
+                return Ok(PrivateKeyDer::Pkcs1(key));
+            }
         }
 
-        Err(anyhow::anyhow!("No private key found in {:?}", path))
+        Err(anyhow::anyhow!(
+            "No private key found in {:?} (tried PKCS#8 and PKCS#1 formats)",
+            path
+        ))
     }
 
     /// Load client CA certificates for mTLS

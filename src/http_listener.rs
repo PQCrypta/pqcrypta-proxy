@@ -1382,19 +1382,52 @@ async fn handle_pqc_fingerprinted_connection(
     metrics.connections.connection_closed();
 }
 
+/// Load a private key from a PEM file trying PKCS#8 then PKCS#1 formats.
+// L-1: Uses rustls-pki-types PEM API (replaces unmaintained rustls-pemfile)
+fn load_private_key_from_pem(
+    key_path: &str,
+) -> Result<rustls::pki_types::PrivateKeyDer<'static>, Box<dyn std::error::Error + Send + Sync>> {
+    use rustls::pki_types::{PrivatePkcs1KeyDer, PrivatePkcs8KeyDer};
+    use rustls_pki_types::pem::PemObject;
+    use std::fs::File;
+    use std::io::BufReader;
+
+    // Try PKCS#8 first (modern format)
+    {
+        let mut reader = BufReader::new(File::open(key_path)?);
+        if let Some(key) = PrivatePkcs8KeyDer::pem_reader_iter(&mut reader).find_map(|r| r.ok()) {
+            return Ok(rustls::pki_types::PrivateKeyDer::Pkcs8(key));
+        }
+    }
+    // Try PKCS#1 (legacy RSA)
+    {
+        let mut reader = BufReader::new(File::open(key_path)?);
+        if let Some(key) = PrivatePkcs1KeyDer::pem_reader_iter(&mut reader).find_map(|r| r.ok()) {
+            return Ok(rustls::pki_types::PrivateKeyDer::Pkcs1(key));
+        }
+    }
+    Err(format!(
+        "No private key found in {} (tried PKCS#8 and PKCS#1)",
+        key_path
+    )
+    .into())
+}
+
 /// Build rustls server configuration from PEM files
 fn build_rustls_server_config(
     cert_path: &str,
     key_path: &str,
 ) -> Result<rustls::ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
     use rustls::pki_types::CertificateDer;
+    use rustls_pki_types::pem::PemObject;
     use std::fs::File;
     use std::io::BufReader;
 
     // Load certificate chain
+    // L-1: Uses rustls-pki-types PEM API (replaces unmaintained rustls-pemfile)
     let cert_file = File::open(cert_path)?;
     let mut cert_reader = BufReader::new(cert_file);
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(&mut cert_reader)
         .filter_map(|c| c.ok())
         .collect();
 
@@ -1403,10 +1436,7 @@ fn build_rustls_server_config(
     }
 
     // Load private key
-    let key_file = File::open(key_path)?;
-    let mut key_reader = BufReader::new(key_file);
-    let key = rustls_pemfile::private_key(&mut key_reader)?
-        .ok_or_else(|| format!("No private key found in {}", key_path))?;
+    let key = load_private_key_from_pem(key_path)?;
 
     // Build server config
     let mut config = rustls::ServerConfig::builder()
@@ -1464,12 +1494,11 @@ async fn handle_passthrough_connection(
 
     let sni = extract_sni_from_client_hello(&peek_buf[..n]);
 
-    if sni.is_none() {
+    // M-4: Use ok_or_else instead of unwrap() to avoid fragile guard pattern
+    let sni = sni.ok_or_else(|| {
         warn!("No SNI in ClientHello from {}", client_addr);
-        return Err("No SNI in ClientHello".into());
-    }
-
-    let sni = sni.unwrap();
+        Box::<dyn std::error::Error + Send + Sync>::from("No SNI in ClientHello")
+    })?;
     debug!("SNI from {}: {}", client_addr, sni);
 
     // Find matching passthrough route (case-insensitive SNI matching)
@@ -1485,15 +1514,14 @@ async fn handle_passthrough_connection(
         }
     });
 
-    if route.is_none() {
+    // M-4: Use ok_or_else instead of unwrap() to avoid fragile guard pattern
+    let route = route.ok_or_else(|| {
         warn!(
             "No passthrough route for SNI '{}' from {}",
             sni, client_addr
         );
-        return Err(format!("No route for SNI: {}", sni).into());
-    }
-
-    let route = route.unwrap();
+        Box::<dyn std::error::Error + Send + Sync>::from(format!("No route for SNI: {}", sni))
+    })?;
     info!(
         "Passthrough: {} → {} (SNI: {})",
         client_addr, route.backend, sni
@@ -2597,16 +2625,20 @@ pub fn create_backend_tls_connector(
         let mut ca_reader = BufReader::new(ca_file);
         let mut ca_certs = Vec::new();
         let mut parse_errors = 0;
-        for cert_result in rustls_pemfile::certs(&mut ca_reader) {
-            match cert_result {
-                Ok(cert) => ca_certs.push(cert),
-                Err(e) => {
-                    warn!(
-                        "Failed to parse CA certificate from {}: {}",
-                        ca_path.display(),
-                        e
-                    );
-                    parse_errors += 1;
+        // L-1: Use rustls-pki-types PEM API instead of unmaintained rustls-pemfile
+        {
+            use rustls_pki_types::pem::PemObject;
+            for cert_result in CertificateDer::pem_reader_iter(&mut ca_reader) {
+                match cert_result {
+                    Ok(cert) => ca_certs.push(cert),
+                    Err(e) => {
+                        warn!(
+                            "Failed to parse CA certificate from {}: {}",
+                            ca_path.display(),
+                            e
+                        );
+                        parse_errors += 1;
+                    }
                 }
             }
         }
@@ -2631,16 +2663,20 @@ pub fn create_backend_tls_connector(
         let mut cert_reader = BufReader::new(cert_file);
         let mut certs: Vec<CertificateDer<'static>> = Vec::new();
         let mut parse_errors = 0;
-        for cert_result in rustls_pemfile::certs(&mut cert_reader) {
-            match cert_result {
-                Ok(cert) => certs.push(cert),
-                Err(e) => {
-                    warn!(
-                        "Failed to parse client certificate from {}: {}",
-                        cert_path.display(),
-                        e
-                    );
-                    parse_errors += 1;
+        // L-1: Use rustls-pki-types PEM API instead of unmaintained rustls-pemfile
+        {
+            use rustls_pki_types::pem::PemObject;
+            for cert_result in CertificateDer::pem_reader_iter(&mut cert_reader) {
+                match cert_result {
+                    Ok(cert) => certs.push(cert),
+                    Err(e) => {
+                        warn!(
+                            "Failed to parse client certificate from {}: {}",
+                            cert_path.display(),
+                            e
+                        );
+                        parse_errors += 1;
+                    }
                 }
             }
         }
@@ -2653,9 +2689,11 @@ pub fn create_backend_tls_connector(
             );
         }
 
-        let key_file = File::open(key_path)?;
-        let mut key_reader = BufReader::new(key_file);
-        let key = rustls_pemfile::private_key(&mut key_reader)?.ok_or("No private key found")?;
+        let key = load_private_key_from_pem(
+            key_path
+                .to_str()
+                .ok_or("mTLS key path is not valid UTF-8")?,
+        )?;
 
         // Note: Using empty root store for mTLS (preserving original behavior)
         ClientConfig::builder()

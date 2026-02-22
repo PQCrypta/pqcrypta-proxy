@@ -11,6 +11,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::{debug, error, info};
 
+/// Sanitize a user-controlled log field by stripping newlines and control characters.
+///
+/// Prevents log injection attacks where `\n` in a path or header could inject
+/// fake log entries into structured log files or SIEM systems.
+pub fn sanitize_log_field(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(c, '\n' | '\r' | '\x00'..='\x08' | '\x0b' | '\x0c' | '\x0e'..='\x1f' | '\x7f'))
+        .take(2048)
+        .collect()
+}
+
 /// Access log entry with request and response details
 #[derive(Debug, Clone)]
 pub struct AccessLogEntry {
@@ -73,10 +84,26 @@ impl AccessLogger {
         // Format: nginx combined log format
         // $remote_addr - - [$time_local] "$request" $status $body_bytes_sent "$referer" "$user_agent"
         let timestamp = Local::now().format("%d/%b/%Y:%H:%M:%S %z");
-        let request = format!("{} {} {}", entry.method, entry.path, entry.protocol);
-        let referer = entry.referer.as_deref().unwrap_or("-");
-        let user_agent = entry.user_agent.as_deref().unwrap_or("-");
-        let host = entry.host.as_deref().unwrap_or("-");
+        // M-1: Sanitize all user-controlled fields to prevent log injection
+        let safe_path = sanitize_log_field(&entry.path);
+        let safe_method = sanitize_log_field(&entry.method);
+        let safe_protocol = sanitize_log_field(&entry.protocol);
+        let request = format!("{} {} {}", safe_method, safe_path, safe_protocol);
+        let referer = entry
+            .referer
+            .as_deref()
+            .map(sanitize_log_field)
+            .unwrap_or_else(|| "-".to_string());
+        let user_agent = entry
+            .user_agent
+            .as_deref()
+            .map(sanitize_log_field)
+            .unwrap_or_else(|| "-".to_string());
+        let host = entry
+            .host
+            .as_deref()
+            .map(sanitize_log_field)
+            .unwrap_or_else(|| "-".to_string());
 
         let log_line = format!(
             "{} - - [{}] \"{}\" {} {} \"{}\" \"{}\" host=\"{}\" time={}ms\n",

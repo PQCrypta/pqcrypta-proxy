@@ -78,6 +78,16 @@ pub struct AdvancedRateLimitConfig {
     /// Composite key configurations
     #[serde(default)]
     pub composite_keys: Vec<CompositeKeyConfig>,
+
+    /// H-2: Optional HMAC-SHA256 secret for verifying JWT signatures before using
+    /// the `sub` claim for per-subject rate limiting.
+    ///
+    /// When `None` (the default), JWT-based rate limiting is **disabled** because
+    /// the JWT payload cannot be trusted without signature verification — an attacker
+    /// could forge any `sub` claim to get elevated quotas.  Set this to a strong
+    /// random secret (≥32 bytes, base64-encoded) that matches the secret used by
+    /// the upstream token issuer.
+    pub jwt_secret: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -102,6 +112,7 @@ impl Default for AdvancedRateLimitConfig {
             adaptive: AdaptiveConfig::default(),
             ipv6_subnet_bits: 64,
             composite_keys: vec![],
+            jwt_secret: None, // H-2: disabled by default; set to enable JWT-based rate limiting
         }
     }
 }
@@ -1219,9 +1230,11 @@ impl AdvancedRateLimiter {
             RateLimitKeyType::ApiKey => ctx.get_header(&config.headers.api_key).cloned(),
 
             RateLimitKeyType::JwtSubject => {
-                // Try to extract from Authorization header
+                // H-2: JWT subject extraction requires a configured signing secret.
+                // Without signature verification the `sub` claim is attacker-controlled,
+                // so we return None (disabling JWT-based rate limiting) when no secret is set.
                 ctx.get_header("authorization")
-                    .and_then(|auth| self.extract_jwt_subject(auth))
+                    .and_then(|auth| self.extract_jwt_subject(auth, config.jwt_secret.as_deref()))
             }
 
             RateLimitKeyType::Ja3Fingerprint => ctx.ja3_hash.clone(),
@@ -1310,28 +1323,40 @@ impl AdvancedRateLimiter {
         None
     }
 
-    /// Extract subject claim from JWT (basic parsing)
-    fn extract_jwt_subject(&self, auth_header: &str) -> Option<String> {
+    /// Extract and verify the `sub` claim from a JWT Bearer token.
+    ///
+    /// H-2: Signature verification is mandatory.  If `jwt_secret` is `None` this
+    /// function returns `None`, effectively disabling JWT-based rate limiting.
+    /// This prevents an attacker from forging any `sub` value by crafting a JWT
+    /// with an unsigned or differently-signed payload.
+    fn extract_jwt_subject(&self, auth_header: &str, jwt_secret: Option<&str>) -> Option<String> {
+        use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+        use serde::Deserialize;
+
+        // H-2: No secret → refuse to extract (trust-only mode is insecure for rate limiting)
+        let secret = jwt_secret?;
+
         let token = auth_header
             .strip_prefix("Bearer ")
             .or_else(|| auth_header.strip_prefix("bearer "))?;
 
-        // JWT format: header.payload.signature
-        let parts: Vec<&str> = token.split('.').collect();
-        if parts.len() != 3 {
-            return None;
+        #[derive(Deserialize)]
+        struct Claims {
+            sub: String,
         }
 
-        // Decode payload (base64url)
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-        let payload = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
-        let payload_str = String::from_utf8(payload).ok()?;
+        let key = DecodingKey::from_secret(secret.as_bytes());
+        let mut validation = Validation::new(Algorithm::HS256);
+        // Allow HS384 and HS512 as well for flexibility
+        validation.algorithms = vec![Algorithm::HS256, Algorithm::HS384, Algorithm::HS512];
 
-        // Parse JSON and extract "sub" claim
-        let json: serde_json::Value = serde_json::from_str(&payload_str).ok()?;
-        json.get("sub")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+        match jsonwebtoken::decode::<Claims>(token, &key, &validation) {
+            Ok(token_data) => Some(token_data.claims.sub),
+            Err(e) => {
+                debug!("JWT verification failed for rate limiting: {}", e);
+                None
+            }
+        }
     }
 
     /// Get limits for a specific key type and value
@@ -1751,12 +1776,27 @@ mod tests {
         let config = AdvancedRateLimitConfig::default();
         let limiter = AdvancedRateLimiter::new(config);
 
-        // Create a simple JWT with sub claim
-        // Header: {"alg":"HS256","typ":"JWT"}
-        // Payload: {"sub":"user123","iat":1234567890}
-        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyMTIzIiwiaWF0IjoxMjM0NTY3ODkwfQ.signature";
+        // H-2: Without a configured jwt_secret, extraction must always return None
+        // regardless of the JWT content (prevents trust-only mode).
+        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyMTIzIiwiaWF0IjoxMjM0NTY3ODkwfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        assert_eq!(
+            limiter.extract_jwt_subject(&format!("Bearer {}", jwt), None),
+            None,
+            "JWT extraction must return None when no secret is configured"
+        );
 
-        let subject = limiter.extract_jwt_subject(&format!("Bearer {}", jwt));
-        assert_eq!(subject, Some("user123".to_string()));
+        // With a wrong secret the signature fails → None
+        assert_eq!(
+            limiter.extract_jwt_subject(&format!("Bearer {}", jwt), Some("wrong-secret")),
+            None,
+            "JWT extraction must return None on signature mismatch"
+        );
+
+        // Without Bearer prefix → None
+        assert_eq!(
+            limiter.extract_jwt_subject(jwt, Some("secret")),
+            None,
+            "JWT extraction must return None without Bearer prefix"
+        );
     }
 }

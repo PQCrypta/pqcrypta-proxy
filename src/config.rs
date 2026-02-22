@@ -274,9 +274,25 @@ pub struct TlsConfig {
     pub ocsp_stapling: bool,
     /// Certificate reload interval in seconds (0 = disabled)
     pub cert_reload_interval_secs: u64,
-    /// Enable 0-RTT (early data) - SECURITY WARNING: vulnerable to replay attacks
-    /// Default: false (disabled for security)
+    /// Enable 0-RTT (early data) - SECURITY WARNING: vulnerable to replay attacks.
+    /// Default: false (disabled for security).
+    ///
+    /// When enabled, TLS 0-RTT early data is forwarded to backends WITHOUT replay
+    /// detection. Only enable on routes where ALL of the following are true:
+    ///
+    /// 1. The HTTP method is idempotent (GET or HEAD)
+    /// 2. The backend handles duplicate requests safely
+    /// 3. The route has `allow_0rtt = true` set explicitly
+    ///
+    /// Use `zero_rtt_safe_methods` to declare which HTTP methods may use early data.
     pub enable_0rtt: bool,
+
+    /// L-5: HTTP methods that are safe to forward via 0-RTT early data.
+    /// Defaults to `["GET", "HEAD"]` (the only idempotent, side-effect-free methods).
+    /// POST, PUT, DELETE, PATCH and others must NOT appear here unless the backend
+    /// implements idempotency-key-based deduplication.
+    #[serde(default = "default_zero_rtt_safe_methods")]
+    pub zero_rtt_safe_methods: Vec<String>,
 }
 
 impl Default for TlsConfig {
@@ -296,8 +312,15 @@ impl Default for TlsConfig {
             ocsp_stapling: true,
             cert_reload_interval_secs: 3600,
             enable_0rtt: false, // Disabled by default for security (replay attack risk)
+            zero_rtt_safe_methods: default_zero_rtt_safe_methods(),
         }
     }
+}
+
+fn default_zero_rtt_safe_methods() -> Vec<String> {
+    // L-5: Only GET and HEAD are safe for 0-RTT early data by default.
+    // These are the only idempotent, side-effect-free HTTP methods.
+    vec!["GET".to_string(), "HEAD".to_string()]
 }
 
 /// Post-quantum cryptography configuration
@@ -549,6 +572,16 @@ pub struct RouteConfig {
     pub stripe_compatibility: bool,
     /// Timeout override in milliseconds
     pub timeout_override_ms: Option<u64>,
+
+    /// L-5: Allow 0-RTT (early data) for this route.
+    ///
+    /// When `tls.enable_0rtt = true`, this per-route flag controls whether
+    /// early data is accepted.  Only set to `true` for routes that serve
+    /// **idempotent** requests (GET, HEAD) and whose backends are safe to
+    /// receive duplicate deliveries.  The proxy enforces `tls.zero_rtt_safe_methods`
+    /// when this flag is set.
+    #[serde(default)]
+    pub allow_0rtt: bool,
 }
 
 fn default_priority() -> i32 {
@@ -1319,6 +1352,47 @@ impl ConfigManager {
     }
 }
 
+/// M-3: Validate an ACME domain name against RFC 1035 rules and path-safety requirements.
+///
+/// Rejects domains containing '/', '\\', '..', null bytes, or characters that are
+/// not permitted in domain names, preventing path traversal in certificate file paths.
+pub fn validate_acme_domain(domain: &str) -> Result<(), String> {
+    if domain.is_empty() {
+        return Err("domain name is empty".to_string());
+    }
+    if domain.len() > 253 {
+        return Err(format!(
+            "domain name exceeds 253 characters (len={})",
+            domain.len()
+        ));
+    }
+    // Reject path-traversal characters and null bytes
+    if domain.contains('/') {
+        return Err("domain name contains '/'".to_string());
+    }
+    if domain.contains('\\') {
+        return Err("domain name contains '\\'".to_string());
+    }
+    if domain.contains("..") {
+        return Err("domain name contains '..'".to_string());
+    }
+    if domain.contains('\0') {
+        return Err("domain name contains a null byte".to_string());
+    }
+    // Only allow RFC 1035 characters: letters, digits, hyphens, dots, and leading '*' for wildcards
+    let valid = domain
+        .chars()
+        .enumerate()
+        .all(|(i, c)| c.is_ascii_alphanumeric() || c == '-' || c == '.' || (c == '*' && i == 0));
+    if !valid {
+        return Err(format!(
+            "domain name '{}' contains characters not permitted by RFC 1035",
+            domain
+        ));
+    }
+    Ok(())
+}
+
 impl ProxyConfig {
     /// Validate the configuration
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -1417,6 +1491,39 @@ impl ProxyConfig {
             self.admin
                 .socket_addr()
                 .map_err(|e| anyhow::anyhow!("Invalid admin bind address: {}", e))?;
+
+            // H-1: Require auth_token OR loopback-only allowed_ips for admin API.
+            // An admin API with no token and no IP restriction is unauthenticated.
+            if self.admin.auth_token.is_none() {
+                let loopback_prefixes = ["127.", "::1", "localhost"];
+                let is_loopback_only = !self.admin.allowed_ips.is_empty()
+                    && self.admin.allowed_ips.iter().all(|ip| {
+                        loopback_prefixes
+                            .iter()
+                            .any(|prefix| ip.starts_with(prefix) || ip.as_str() == *prefix)
+                    });
+
+                if !is_loopback_only {
+                    return Err(anyhow::anyhow!(
+                        "Admin API security error: `auth_token` must be configured in [admin] \
+                         when `allowed_ips` is not restricted to loopback addresses (127.x.x.x, ::1). \
+                         Current allowed_ips: {:?}. \
+                         Either set `auth_token = \"<secret>\"` or ensure `allowed_ips` contains \
+                         only loopback addresses.",
+                        self.admin.allowed_ips
+                    ));
+                }
+            }
+        }
+
+        // M-3: Validate ACME domain names against RFC 1035 before they are used in file paths.
+        // Domain names are used directly in PathBuf::join(); a domain like "../etc/cron.d/evil"
+        // would result in arbitrary file writes.
+        if self.acme.enabled {
+            for domain in &self.acme.domains {
+                validate_acme_domain(domain)
+                    .map_err(|e| anyhow::anyhow!("Invalid ACME domain '{}': {}", domain, e))?;
+            }
         }
 
         Ok(())
