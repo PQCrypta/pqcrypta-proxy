@@ -80,6 +80,7 @@ use pqcrypta_proxy::pqc_tls::{verify_pqc_support, PqcTlsProvider};
 use pqcrypta_proxy::proxy::BackendPool;
 use pqcrypta_proxy::quic_listener::QuicListener;
 use pqcrypta_proxy::tls::TlsProvider;
+use pqcrypta_proxy::SecurityState;
 use pqcrypta_proxy::webtransport_server::WebTransportServer;
 use pqcrypta_proxy::{
     run_http_listener, run_http_listener_with_fingerprint, run_http_redirect_server,
@@ -660,6 +661,9 @@ async fn main() -> anyhow::Result<()> {
         let quic_config = Arc::new(quic_config);
         let quic_tls_provider = tls_provider.clone();
         let quic_metrics = metrics_registry.clone();
+        // Each QUIC listener gets its own SecurityState (same pattern as HTTP listeners).
+        // SecurityState is Clone (backed by Arcs) so shared data is reference-counted.
+        let quic_security = SecurityState::new(&quic_config);
 
         // Create channels for graceful shutdown
         let (quic_shutdown_tx, quic_shutdown_rx) = mpsc::channel::<()>(1);
@@ -675,6 +679,7 @@ async fn main() -> anyhow::Result<()> {
                 quic_shutdown_rx,
                 reload_rx,
                 quic_metrics,
+                quic_security,
             )
             .await
             {

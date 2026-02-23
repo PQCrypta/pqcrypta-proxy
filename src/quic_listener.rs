@@ -26,6 +26,7 @@ use crate::handlers::WebTransportHandler;
 use crate::http3_features::EarlyHintsState;
 use crate::metrics::{ConnectionProtocol, MetricsRegistry};
 use crate::proxy::BackendPool;
+use crate::security::{BlockReason, SecurityState};
 use crate::tls::TlsProvider;
 
 /// Build Alt-Svc header value from config ports
@@ -57,6 +58,8 @@ pub struct QuicListener {
     early_hints_state: Arc<EarlyHintsState>,
     /// Metrics registry for recording request/connection stats
     metrics: Arc<MetricsRegistry>,
+    /// Security state for IP blocking, GeoIP country blocking, and rate limiting
+    security: SecurityState,
 }
 
 impl QuicListener {
@@ -67,6 +70,7 @@ impl QuicListener {
         shutdown_rx: mpsc::Receiver<()>,
         reload_rx: mpsc::Receiver<ConfigReloadEvent>,
         metrics: Arc<MetricsRegistry>,
+        security: SecurityState,
     ) -> anyhow::Result<Self> {
         let addr = config.server.socket_addr()?;
 
@@ -117,6 +121,7 @@ impl QuicListener {
             reload_rx,
             early_hints_state,
             metrics,
+            security,
         })
     }
 
@@ -135,29 +140,57 @@ impl QuicListener {
                 Some(incoming) = self.endpoint.accept() => {
                     accept_count += 1;
                     let remote_addr = incoming.remote_address();
+                    let ip = remote_addr.ip();
 
-                    info!("[{}] Incoming QUIC connection from {}", accept_count, remote_addr);
-
-                    // Spawn connection handler
-                    let config = self.config.clone();
-                    let backend_pool = self.backend_pool.clone();
-                    let early_hints_state = self.early_hints_state.clone();
-                    let metrics = self.metrics.clone();
-
-                    tokio::spawn(async move {
-                        metrics.connections.connection_opened(ConnectionProtocol::Http3);
-                        if let Err(e) = Self::handle_connection(
-                            incoming,
-                            remote_addr,
-                            config,
-                            backend_pool,
-                            early_hints_state,
-                            metrics.clone(),
-                        ).await {
-                            error!("Connection error from {}: {}", remote_addr, e);
+                    // Connection-level security checks: IP blocklist and GeoIP country blocking.
+                    // Evaluated before completing the QUIC/TLS handshake so blocked IPs never
+                    // consume cryptographic handshake resources.
+                    let should_refuse = if !self.security.is_trusted(&ip) {
+                        if let Some(block_info) = self.security.is_blocked(&ip) {
+                            warn!(
+                                "[QUIC] Refusing connection from blocked IP {} (reason: {:?})",
+                                ip, block_info.reason
+                            );
+                            true
+                        } else if self.security.is_country_blocked(&ip) {
+                            warn!("[QUIC] Refusing connection from GeoIP-blocked IP {}", ip);
+                            self.security.block_ip(ip, BlockReason::GeoBlocked, None);
+                            true
+                        } else {
+                            false
                         }
-                        metrics.connections.connection_closed();
-                    });
+                    } else {
+                        false
+                    };
+
+                    if should_refuse {
+                        incoming.refuse();
+                    } else {
+                        info!("[{}] Incoming QUIC connection from {}", accept_count, remote_addr);
+
+                        // Spawn connection handler
+                        let config = self.config.clone();
+                        let backend_pool = self.backend_pool.clone();
+                        let early_hints_state = self.early_hints_state.clone();
+                        let metrics = self.metrics.clone();
+                        let security = self.security.clone();
+
+                        tokio::spawn(async move {
+                            metrics.connections.connection_opened(ConnectionProtocol::Http3);
+                            if let Err(e) = Self::handle_connection(
+                                incoming,
+                                remote_addr,
+                                config,
+                                backend_pool,
+                                early_hints_state,
+                                security,
+                                metrics.clone(),
+                            ).await {
+                                error!("Connection error from {}: {}", remote_addr, e);
+                            }
+                            metrics.connections.connection_closed();
+                        });
+                    }
                 }
 
                 // Handle config reload
@@ -204,6 +237,7 @@ impl QuicListener {
         config: Arc<ProxyConfig>,
         backend_pool: Arc<BackendPool>,
         early_hints_state: Arc<EarlyHintsState>,
+        security: SecurityState,
         metrics: Arc<MetricsRegistry>,
     ) -> anyhow::Result<()> {
         // Accept connection
@@ -246,6 +280,7 @@ impl QuicListener {
                     config,
                     backend_pool,
                     early_hints_state,
+                    security,
                     metrics,
                 )
                 .await?;
@@ -268,6 +303,7 @@ impl QuicListener {
         config: Arc<ProxyConfig>,
         backend_pool: Arc<BackendPool>,
         early_hints_state: Arc<EarlyHintsState>,
+        security: SecurityState,
         metrics: Arc<MetricsRegistry>,
     ) -> anyhow::Result<()> {
         loop {
@@ -374,6 +410,7 @@ impl QuicListener {
                         let backend_pool_clone = backend_pool.clone();
                         let early_hints_clone = early_hints_state.clone();
                         let metrics_clone = metrics.clone();
+                        let security_clone = security.clone();
 
                         tokio::spawn(async move {
                             // Note: health check detection happens inside handle_h3_request
@@ -384,6 +421,7 @@ impl QuicListener {
                                 config_clone,
                                 backend_pool_clone,
                                 early_hints_clone,
+                                security_clone,
                                 metrics_clone,
                             )
                             .await
@@ -415,6 +453,7 @@ impl QuicListener {
         config: Arc<ProxyConfig>,
         backend_pool: Arc<BackendPool>,
         early_hints_state: Arc<EarlyHintsState>,
+        security: SecurityState,
         metrics: Arc<MetricsRegistry>,
     ) -> anyhow::Result<()>
     where
@@ -462,6 +501,95 @@ impl QuicListener {
             "HTTP/3 request: {} {} host={:?} from {}",
             method, path, host, remote_addr
         );
+
+        // Per-request security checks: mirrors security_middleware applied on the TCP path.
+        // Connection-level blocking (IP blocklist + GeoIP) is enforced at accept time, but
+        // the blocklist may grow while a connection is live, so we re-check here.
+        let ip = remote_addr.ip();
+        if !security.is_trusted(&ip) {
+            // 1. Re-check IP blocklist (IP may have been blocked after connection was accepted).
+            if let Some(block_info) = security.is_blocked(&ip) {
+                warn!("[QUIC/H3] Blocked request from {} (reason: {:?})", ip, block_info.reason);
+                metrics.requests.request_end_full(
+                    403, start_time.elapsed(), 0, 0, Some(&path), is_health_check,
+                );
+                let retry_after = block_info
+                    .expires_at
+                    .map(|e| {
+                        let now = std::time::Instant::now();
+                        if e > now { e.duration_since(now).as_secs() } else { 0 }
+                    })
+                    .unwrap_or(3600);
+                let response = http::Response::builder()
+                    .status(http::StatusCode::FORBIDDEN)
+                    .header("retry-after", retry_after.to_string())
+                    .header("server", "PQCProxy v0.2.1")
+                    .body(())?;
+                stream.send_response(response).await?;
+                stream.finish().await?;
+                return Ok(());
+            }
+
+            // 2. Per-IP rate limiting.
+            let (rate_enabled, rate_rps) = {
+                let rc = security.rate_config.read();
+                (rc.enabled, rc.requests_per_second)
+            };
+            let (auto_block_threshold, auto_block_duration_secs) = {
+                let sc = security.config.read();
+                (sc.auto_block_threshold, sc.auto_block_duration_secs)
+            };
+            if rate_enabled {
+                let rate_limiter = security.get_ip_rate_limiter(ip);
+                if rate_limiter.check().is_err() {
+                    warn!("[QUIC/H3] Rate limit exceeded for {}", ip);
+                    let mut counter = security.request_counts.entry(ip).or_default();
+                    counter.suspicious_patterns += 1;
+                    if counter.suspicious_patterns >= auto_block_threshold {
+                        drop(counter);
+                        security.block_ip(
+                            ip,
+                            BlockReason::RateLimitExceeded,
+                            Some(Duration::from_secs(auto_block_duration_secs)),
+                        );
+                    }
+                    metrics.requests.request_end_full(
+                        429, start_time.elapsed(), 0, 0, Some(&path), is_health_check,
+                    );
+                    let response = http::Response::builder()
+                        .status(http::StatusCode::TOO_MANY_REQUESTS)
+                        .header("retry-after", "1")
+                        .header("x-ratelimit-limit", rate_rps.to_string())
+                        .header("x-ratelimit-remaining", "0")
+                        .header("server", "PQCProxy v0.2.1")
+                        .body(())?;
+                    stream.send_response(response).await?;
+                    stream.finish().await?;
+                    return Ok(());
+                }
+            }
+
+            // 3. Header size validation.
+            let max_header_size = security.config.read().max_header_size;
+            let header_size: usize = request
+                .headers()
+                .iter()
+                .map(|(k, v)| k.as_str().len() + v.len())
+                .sum();
+            if header_size > max_header_size {
+                warn!("[QUIC/H3] Headers too large from {}: {} bytes", ip, header_size);
+                metrics.requests.request_end_full(
+                    431, start_time.elapsed(), 0, 0, Some(&path), is_health_check,
+                );
+                let response = http::Response::builder()
+                    .status(http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE)
+                    .header("server", "PQCProxy v0.2.1")
+                    .body(())?;
+                stream.send_response(response).await?;
+                stream.finish().await?;
+                return Ok(());
+            }
+        }
 
         // Send 103 Early Hints if enabled and we have hints for this path
         // This is a key HTTP/3 optimization - send resource hints before proxying to backend
