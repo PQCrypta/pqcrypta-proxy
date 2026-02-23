@@ -830,6 +830,8 @@ Requests that carry the `x-health-check-bypass: 1` request header are excluded f
 
 This prevents the health check cron's synthetic cryptographic workflows (which generate intentional 500s during wrong-key rejection tests) from appearing as real errors or skewing production latency percentiles.
 
+The API server's `tower_http::TraceLayer` is also configured with `.on_failure(())` on all three router layers, suppressing the default `ERROR`-level log entries that would otherwise be emitted for every health-check-bypass 500. Genuine non-bypass 5xx responses are still logged as `ERROR` by the metrics middleware, which checks the `x-health-check-bypass` header before deciding whether to emit the log entry.
+
 ### WAF Blocked Requests
 
 Requests rejected by the security IP-blocklist or bot-blocklist receive an `x-waf-block: 1` response header. The collector tracks these separately in `waf_blocked_requests` (distinct from `failed_requests`) so that bot attack traffic cannot inflate error-rate SLOs or depress domain health scores.
