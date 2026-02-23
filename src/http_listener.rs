@@ -2756,6 +2756,10 @@ pub fn create_backend_tls_connector(
         );
         config
             .dangerous()
+            // nosemgrep: rust.lang.security.rustls-dangerous.rustls-dangerous
+            // Safe: gated by config validation (config.rs SEC-001 guard) which
+            // rejects tls_skip_verify=true in production (ACME enabled or
+            // PQCRYPTA_ENV=production).  Only reachable in explicit dev deployments.
             .set_certificate_verifier(Arc::new(NoVerifier));
     }
 

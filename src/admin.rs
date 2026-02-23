@@ -114,6 +114,26 @@ impl AdminServer {
             auth_token: self.config.auth_token.clone(),
             failed_attempts: Arc::new(DashMap::new()),
         });
+
+        // SEC-007: Background eviction task — removes entries whose rate-limit
+        // window has long expired so the map cannot grow without bound under a
+        // rotating source-IP scan.  Runs every ADMIN_AUTH_WINDOW; removes entries
+        // older than 2× the window (i.e. entries that have been idle for at least
+        // two full windows and therefore have no active lockout effect).
+        {
+            let map = Arc::clone(&auth_state.failed_attempts);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(ADMIN_AUTH_WINDOW);
+                loop {
+                    interval.tick().await;
+                    let cutoff = Instant::now()
+                        .checked_sub(ADMIN_AUTH_WINDOW * 2)
+                        .unwrap_or_else(Instant::now);
+                    map.retain(|_, (_, window_start)| *window_start > cutoff);
+                }
+            });
+        }
+
         let state = self.state.clone();
 
         // Build router
