@@ -1,0 +1,30 @@
+name: Cargo Deny
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 3 * * 2'  # Tuesday 03:00 UTC
+
+jobs:
+  deny:
+    name: ${{ matrix.checks }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        checks:
+          - advisories
+          - bans licenses sources
+
+    # advisories may be warn-only; others are hard failures
+    continue-on-error: ${{ matrix.checks == 'advisories' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check ${{ matrix.checks }}
