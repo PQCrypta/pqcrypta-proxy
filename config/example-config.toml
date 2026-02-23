@@ -222,7 +222,9 @@ verify_provider = true
 check_key_permissions = true
 
 # Fail startup if key permissions are insecure (vs just warning)
-strict_key_permissions = false
+# AUD-09: Set to true so a world-readable private key causes a fatal startup
+# error rather than a silent warning.
+strict_key_permissions = true
 
 # =============================
 # Admin API Configuration
@@ -581,7 +583,7 @@ timeout_ms = 30000
 tls_mode = "terminate"
 
 [[backend_pools.api-pool.servers]]
-address = "10.0.0.5:3003"
+address = "192.0.2.5:3003"
 weight = 50           # Half the traffic (weighted algorithms)
 priority = 2          # Failover only (used when priority 1 servers down)
 max_connections = 50
@@ -619,13 +621,13 @@ health_check_path = "/health"
 health_check_interval_secs = 10
 
 [[backend_pools.session-pool.servers]]
-address = "192.168.1.10:8000"
+address = "192.0.2.10:8000"
 weight = 100
 priority = 1
 max_connections = 100
 
 [[backend_pools.session-pool.servers]]
-address = "192.168.1.11:8000"
+address = "192.0.2.11:8000"
 weight = 100
 priority = 1
 max_connections = 100
@@ -644,7 +646,7 @@ health_check_interval_secs = 15
 
 # Pool server with TLS re-encryption to backend
 [[backend_pools.secure-pool.servers]]
-address = "10.0.0.50:443"
+address = "192.0.2.50:443"
 weight = 100
 priority = 1
 max_connections = 50
@@ -655,7 +657,7 @@ tls_skip_verify = false                # DANGEROUS if true - only for testing
 tls_sni = "backend1.internal.com"      # Custom SNI hostname
 
 [[backend_pools.secure-pool.servers]]
-address = "10.0.0.51:443"
+address = "192.0.2.51:443"
 weight = 100
 priority = 1
 max_connections = 50
@@ -790,10 +792,11 @@ health_check_interval_secs = 30
 # Use for services that must handle their own TLS or require end-to-end encryption.
 
 # External service with SNI routing
+# AUD-13: Use RFC 5737 TEST-NET-1 (192.0.2.x) documentation addresses.
 [[passthrough_routes]]
 name = "external-mail"
 sni = "mail.example.com"
-backend = "10.0.0.10:443"
+backend = "192.0.2.10:443"
 proxy_protocol = false  # Enable for client IP preservation
 timeout_ms = 30000
 
@@ -801,7 +804,7 @@ timeout_ms = 30000
 [[passthrough_routes]]
 name = "internal-wildcard"
 sni = "*.internal.example.com"
-backend = "10.0.0.20:443"
+backend = "192.0.2.20:443"
 proxy_protocol = true
 timeout_ms = 30000
 
@@ -809,7 +812,7 @@ timeout_ms = 30000
 [[passthrough_routes]]
 name = "legacy-service"
 sni = "legacy.example.com"
-backend = "192.168.1.100:443"
+backend = "192.0.2.100:443"
 timeout_ms = 60000
 
 # =============================
