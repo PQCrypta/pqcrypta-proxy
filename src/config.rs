@@ -231,6 +231,11 @@ pub struct ServerConfig {
     pub enable_ipv6: bool,
     /// Worker threads (0 = auto-detect)
     pub worker_threads: usize,
+    /// Graceful shutdown drain timeout in seconds (AUD-11).
+    /// After receiving a shutdown signal the proxy waits up to this many seconds
+    /// for in-flight requests to complete before exiting.
+    /// Should not exceed systemd TimeoutStopSec (default 30 s).
+    pub graceful_shutdown_timeout_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -245,6 +250,7 @@ impl Default for ServerConfig {
             max_idle_timeout_secs: 120,
             enable_ipv6: true,
             worker_threads: 0,
+            graceful_shutdown_timeout_secs: 30,
         }
     }
 }
@@ -784,6 +790,12 @@ pub struct FingerprintConfig {
     /// "browser", "bot", "legitimate_bot", "malicious", "scanner", "api_client"
     /// If None or the file is missing, an empty database is used (advisory only).
     pub fingerprint_db_path: Option<PathBuf>,
+    /// AUD-12: Automatically block connections whose JA3/JA4 fingerprint is classified
+    /// as Malicious in the fingerprint database.
+    /// Default: false (advisory-only — Malicious fingerprints are logged, not blocked).
+    /// Set to true only after validating that your fingerprint database does not
+    /// produce false positives against legitimate clients.
+    pub block_malicious: bool,
 }
 
 impl Default for FingerprintConfig {
@@ -801,6 +813,7 @@ impl Default for FingerprintConfig {
             fingerprint_db_path: Some(PathBuf::from(
                 "/var/lib/pqcrypta-proxy/fingerprints/ja3.json",
             )),
+            block_malicious: true,    // Block malicious fingerprints by default (AUD-12)
         }
     }
 }
@@ -967,6 +980,10 @@ pub struct HttpRedirectConfig {
     pub port: u16,
     /// Redirect all HTTP to HTTPS
     pub redirect_to_https: bool,
+    /// AUD-02: Allowed hostnames for the HTTP→HTTPS redirect.
+    /// Requests whose Host header is not in this list receive 400 Bad Request,
+    /// preventing open-redirect abuse.  An empty list disables host validation.
+    pub allowed_domains: Vec<String>,
 }
 
 impl Default for HttpRedirectConfig {
@@ -975,6 +992,7 @@ impl Default for HttpRedirectConfig {
             enabled: true,
             port: 80,
             redirect_to_https: true,
+            allowed_domains: vec![],
         }
     }
 }

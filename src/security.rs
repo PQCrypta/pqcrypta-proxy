@@ -165,9 +165,12 @@ impl Ja3Database {
 /// Security state shared across all requests
 #[derive(Clone)]
 pub struct SecurityState {
-    /// Per-IP rate limiters
+    /// Per-IP rate limiters with last-access timestamp for LRU eviction (AUD-07).
+    /// Tuple: (limiter, last_access_time).  The timestamp is updated on every
+    /// call to get_ip_rate_limiter so that least-recently-used entries are
+    /// evicted first when the map exceeds MAX_TRACKED_IPS.
     pub ip_rate_limiters:
-        Arc<DashMap<IpAddr, Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>>>,
+        Arc<DashMap<IpAddr, (Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>, Instant)>>,
     /// Per-IP connection counters
     pub ip_connections: Arc<DashMap<IpAddr, u32>>,
     /// Blocked IPs with expiration time
@@ -472,12 +475,16 @@ impl SecurityState {
         false
     }
 
-    /// Get or create rate limiter for an IP
+    /// Get or create rate limiter for an IP.
+    ///
+    /// AUD-07: The last-access timestamp is updated on every call so that the
+    /// cleanup task can perform LRU eviction rather than arbitrary eviction.
     pub fn get_ip_rate_limiter(
         &self,
         ip: IpAddr,
     ) -> Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>> {
-        self.ip_rate_limiters
+        let mut entry = self
+            .ip_rate_limiters
             .entry(ip)
             .or_insert_with(|| {
                 let config = self.rate_config.read();
@@ -486,9 +493,11 @@ impl SecurityState {
                     NonZeroU32::new(config.requests_per_second.max(1)).unwrap_or(NonZeroU32::MIN);
                 let burst_nz = NonZeroU32::new(config.burst_size.max(1)).unwrap_or(NonZeroU32::MIN);
                 let quota = Quota::per_second(rps).allow_burst(burst_nz);
-                Arc::new(RateLimiter::direct(quota))
-            })
-            .clone()
+                (Arc::new(RateLimiter::direct(quota)), Instant::now())
+            });
+        // Update last-access time for LRU eviction
+        entry.1 = Instant::now();
+        entry.0.clone()
     }
 
     /// Check if an IP is blocked
@@ -812,18 +821,20 @@ impl SecurityState {
             }
         }
 
-        // Evict oldest entries from ip_rate_limiters if over limit (DoS prevention)
+        // AUD-07: Evict least-recently-used entries from ip_rate_limiters if over limit.
+        // Sort by last-access timestamp (oldest first) and remove the least-recently-used
+        // entries so that active legitimate clients are never evicted ahead of dormant ones.
         let rate_limiter_count = self.ip_rate_limiters.len();
         if rate_limiter_count > MAX_TRACKED_IPS {
-            // Remove random entries since we can't track last-used time
-            let to_remove = rate_limiter_count.saturating_sub(MAX_TRACKED_IPS);
-            let keys: Vec<_> = self
+            let mut entries: Vec<_> = self
                 .ip_rate_limiters
                 .iter()
-                .take(to_remove)
-                .map(|e| *e.key())
+                .map(|e| (*e.key(), e.value().1))
                 .collect();
-            for ip in keys {
+            // Sort oldest last-access time first (least-recently-used first)
+            entries.sort_by_key(|(_, last_access)| *last_access);
+            let to_remove = rate_limiter_count.saturating_sub(MAX_TRACKED_IPS);
+            for (ip, _) in entries.into_iter().take(to_remove) {
                 self.ip_rate_limiters.remove(&ip);
             }
         }

@@ -55,8 +55,11 @@ RUN cargo build --release --locked
 FROM debian:bookworm-slim
 
 # Install runtime dependencies
+# AUD-08: curl is required by the HEALTHCHECK instruction below.
+# Without it the container is immediately marked unhealthy.
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    curl \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
 

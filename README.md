@@ -134,7 +134,7 @@ trusted_internal_cidrs = ["10.200.0.0/16"]
 
 ### JA3/JA4 Fingerprint Database
 
-To enable fingerprint-based classification (advisory only, never blocks automatically):
+To enable fingerprint-based detection:
 
 1. Download an open-source JA3 database (e.g., from [salesforce/ja3](https://github.com/salesforce/ja3))
    or create your own JSON file with the format:
@@ -151,6 +151,55 @@ To enable fingerprint-based classification (advisory only, never blocks automati
 
 3. If the file is missing or malformed the proxy starts normally with an empty database
    and logs a warning.
+
+4. **Enforcement** is controlled by two flags in `[fingerprint]`:
+   - `block_malicious = true` *(default)* — automatically blocks and IP-bans connections whose
+     JA3/JA4 hash is classified as `malicious` in the database.  Set to `false` for advisory-only
+     logging while you build confidence in the database.
+   - `block_scanners = false` *(default)* — set to `true` to also block `scanner` fingerprints.
+
+### HTTP→HTTPS Redirect Host Validation
+
+To prevent open-redirect abuse via a spoofed `Host` header, configure the allowed-domains list:
+
+```toml
+[http_redirect]
+enabled = true
+port = 80
+# Only redirect requests whose Host header matches one of these domains.
+# Requests with an unknown Host receive 400 Bad Request.
+allowed_domains = ["example.com", "api.example.com", "www.example.com"]
+```
+
+Leave `allowed_domains = []` (empty, the default) to disable the check and allow any Host.
+
+### Admin API Authentication
+
+The admin API should always have an authentication token set:
+
+```toml
+[admin]
+bind_address = "127.0.0.1"
+port = 8082
+allowed_ips = ["127.0.0.1", "::1"]
+# Generate with: openssl rand -base64 32
+auth_token = "your-random-token-here"
+```
+
+Without an `auth_token` any process on the host can call destructive endpoints
+(`/shutdown`, `/reload`) without credentials.
+
+### Version-Controlled Configuration
+
+**Never commit your production `config/proxy-config.toml` to version control** — it contains
+secrets (auth token, ACME email), real infrastructure topology, and backend addresses.
+
+Use `config/example-config.toml` as the template:
+
+```bash
+cp config/example-config.toml config/proxy-config.toml
+# Fill in real values; proxy-config.toml is in .gitignore
+```
 
 
 ## Quick Start
@@ -169,6 +218,9 @@ cd pqcrypta-proxy
 
 # Build release binary
 cargo build --release
+
+# Copy example config and fill in real values (proxy-config.toml is gitignored)
+cp config/example-config.toml /etc/pqcrypta/proxy-config.toml
 
 # Validate configuration
 ./target/release/pqcrypta-proxy --config /etc/pqcrypta/proxy-config.toml --validate

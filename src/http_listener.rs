@@ -2570,13 +2570,23 @@ pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 
             >,
         >,
     >,
+    // AUD-02: Allowed hostnames for the HTTPS redirect.  Requests whose Host header
+    // is not in this list receive 400 Bad Request rather than being blindly redirected,
+    // preventing open-redirect attacks where an attacker supplies Host: evil.com.
+    // An empty Vec disables the check (backward-compatible default).
+    allowed_domains: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let https_port_clone = https_port;
 
     let has_acme = acme_challenges.is_some();
+    let allowed_domains_lower: Vec<String> = allowed_domains
+        .iter()
+        .map(|d| d.to_ascii_lowercase())
+        .collect();
 
     let app = Router::new().fallback(move |Host(host): Host, uri: Uri| {
         let challenges = acme_challenges.clone();
+        let permitted = allowed_domains_lower.clone();
         async move {
             let path = uri.path();
 
@@ -2595,6 +2605,28 @@ pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 
                         )
                             .into_response();
                     }
+                }
+            }
+
+            // AUD-02: Validate Host header against allowed domains before redirecting.
+            // This prevents open-redirect attacks where an attacker sends
+            //   GET / HTTP/1.1
+            //   Host: evil.com
+            // and the server responds with Location: https://evil.com/...
+            if !permitted.is_empty() {
+                let host_lower = host.to_ascii_lowercase();
+                // Strip port suffix if present (e.g. "example.com:80" → "example.com")
+                let host_name = host_lower
+                    .split(':')
+                    .next()
+                    .unwrap_or(host_lower.as_str());
+                if !permitted.iter().any(|d| d.as_str() == host_name) {
+                    warn!(
+                        "HTTP redirect: rejected request with unknown Host header: {} — \
+                         not in allowed_domains list",
+                        host_lower
+                    );
+                    return axum::http::StatusCode::BAD_REQUEST.into_response();
                 }
             }
 

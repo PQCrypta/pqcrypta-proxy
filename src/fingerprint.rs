@@ -561,7 +561,11 @@ impl FingerprintExtractor {
 
         // Check if this fingerprint should be blocked (using configurable thresholds)
         let allowed = match &classification {
-            FingerprintClass::Malicious => {
+            // AUD-12: Block Malicious fingerprints only when block_malicious = true (default).
+            // When false, classification is advisory-only: the fingerprint is logged
+            // but the connection is not blocked, allowing operators to build allow-lists
+            // before enabling enforcement.
+            FingerprintClass::Malicious if config.block_malicious => {
                 warn!(
                     "Blocking malicious fingerprint {} from {}",
                     ja3_hash, client_ip
@@ -572,6 +576,14 @@ impl FingerprintExtractor {
                     Some(Duration::from_secs(config.malicious_block_duration_secs)),
                 );
                 false
+            }
+            FingerprintClass::Malicious => {
+                // block_malicious = false: log but do not block
+                info!(
+                    "Advisory: malicious fingerprint {} from {} (block_malicious=false, not blocking)",
+                    ja3_hash, client_ip
+                );
+                true
             }
             FingerprintClass::Suspicious => {
                 // Check request rate for suspicious fingerprints (configurable thresholds)
@@ -842,7 +854,9 @@ pub async fn fingerprint_middleware(
     // Check if we should block based on fingerprint
     if let Some(ref classification) = fp_info.classification {
         match classification {
-            FingerprintClass::Malicious => {
+            // AUD-12: Gated behind block_malicious flag (default: true).
+            // Set block_malicious = false for advisory-only classification.
+            FingerprintClass::Malicious if state.config.block_malicious => {
                 if let Some(ref ja3) = fp_info.ja3_hash {
                     warn!(
                         "Blocking malicious fingerprint {} from {} (client: {:?})",
@@ -860,6 +874,18 @@ pub async fn fingerprint_middleware(
                     )),
                 );
                 return (StatusCode::FORBIDDEN, "Access denied").into_response();
+            }
+            FingerprintClass::Malicious => {
+                // block_malicious = false: advisory-only, log and continue
+                if let Some(ref ja3) = fp_info.ja3_hash {
+                    info!(
+                        "Advisory: malicious fingerprint {} from {} (client: {:?}) — \
+                         block_malicious=false, not blocking",
+                        ja3,
+                        client_addr.ip(),
+                        fp_info.client_name
+                    );
+                }
             }
             FingerprintClass::Scanner if state.config.block_scanners => {
                 if let Some(ref ja3) = fp_info.ja3_hash {

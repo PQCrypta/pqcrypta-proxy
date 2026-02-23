@@ -8,6 +8,7 @@
 //! - GET /config - Read-only config view
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -108,11 +109,13 @@ impl AdminServer {
 
         let addr = self.config.socket_addr()?;
 
-        // SEC-005: Build the auth state with a per-IP failed-attempt tracker.
+        // SEC-005 / AUD-10: Build the auth state with per-IP and global failed-attempt trackers.
         let auth_state = Arc::new(AdminAuthState {
             allowed_ips: self.config.allowed_ips.clone(),
             auth_token: self.config.auth_token.clone(),
             failed_attempts: Arc::new(DashMap::new()),
+            global_failure_count: Arc::new(AtomicU32::new(0)),
+            global_cooldown_until: Arc::new(RwLock::new(None)),
         });
 
         // SEC-007: Background eviction task — removes entries whose rate-limit
@@ -172,11 +175,16 @@ impl AdminServer {
     }
 }
 
-/// SEC-005: Shared state for the admin authentication middleware.
+/// SEC-005 / AUD-10: Shared state for the admin authentication middleware.
 ///
 /// Tracks per-IP failed attempt counts with a sliding 1-minute window so that
 /// brute-force attacks against a weak or leaked token are rate-limited before
 /// they can enumerate secrets.
+///
+/// AUD-10 adds a *global* failed-auth counter so that distributed attacks from
+/// many IPs (each making fewer than ADMIN_AUTH_MAX_FAILURES attempts) are also
+/// caught.  When the global counter reaches ADMIN_GLOBAL_MAX_FAILURES a brief
+/// global cooldown is activated.
 #[derive(Clone)]
 struct AdminAuthState {
     allowed_ips: Vec<String>,
@@ -184,12 +192,21 @@ struct AdminAuthState {
     /// Map from client IP string → (failure_count, window_start).
     /// Access is lock-free via DashMap.
     failed_attempts: Arc<DashMap<String, (u32, Instant)>>,
+    /// AUD-10: Total failed authentication attempts across all IPs since the
+    /// last successful auth or cooldown reset.
+    global_failure_count: Arc<AtomicU32>,
+    /// AUD-10: Optional point in time until which the global cooldown is active.
+    global_cooldown_until: Arc<RwLock<Option<Instant>>>,
 }
 
 /// Maximum failed authentication attempts per IP per minute before lockout.
 const ADMIN_AUTH_MAX_FAILURES: u32 = 10;
 /// Length of the sliding rate-limit window.
 const ADMIN_AUTH_WINDOW: Duration = Duration::from_secs(60);
+/// AUD-10: Total failures across all IPs before a global cooldown is triggered.
+const ADMIN_GLOBAL_MAX_FAILURES: u32 = 50;
+/// AUD-10: Duration of the global cooldown once ADMIN_GLOBAL_MAX_FAILURES is reached.
+const ADMIN_GLOBAL_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Authentication middleware for admin API
 async fn auth_middleware(
@@ -209,6 +226,21 @@ async fn auth_middleware(
 
     // Check auth token if configured
     if let Some(ref expected_token) = auth.auth_token {
+        // AUD-10: Check global cooldown first — this catches distributed brute-force
+        // attacks where each source IP stays below the per-IP threshold.
+        {
+            let cooldown_until = auth.global_cooldown_until.read();
+            if let Some(until) = *cooldown_until {
+                if Instant::now() < until {
+                    warn!(
+                        "Admin API: global auth cooldown active — rejecting request from {}",
+                        client_ip
+                    );
+                    return StatusCode::TOO_MANY_REQUESTS.into_response();
+                }
+            }
+        }
+
         // SEC-005: Check and enforce per-IP rate limit before doing any token work.
         {
             let now = Instant::now();
@@ -261,11 +293,30 @@ async fn auth_middleware(
                     client_ip, *count, ADMIN_AUTH_MAX_FAILURES
                 );
             }
+
+            // AUD-10: Increment global failure counter and trigger cooldown if threshold hit.
+            let global = auth
+                .global_failure_count
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            if global >= ADMIN_GLOBAL_MAX_FAILURES {
+                let mut cooldown_until = auth.global_cooldown_until.write();
+                *cooldown_until = Some(Instant::now() + ADMIN_GLOBAL_COOLDOWN);
+                auth.global_failure_count.store(0, Ordering::Relaxed);
+                warn!(
+                    "Admin API: global failure threshold reached ({} total) — \
+                     activating {}s global cooldown",
+                    global,
+                    ADMIN_GLOBAL_COOLDOWN.as_secs()
+                );
+            }
+
             return StatusCode::UNAUTHORIZED.into_response();
         }
 
-        // Successful auth: clear failure count for this IP.
+        // Successful auth: clear per-IP failure count and reset global counter.
         auth.failed_attempts.remove(&client_ip);
+        auth.global_failure_count.store(0, Ordering::Relaxed);
     }
 
     next.run(request).await.into_response()

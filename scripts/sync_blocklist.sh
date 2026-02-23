@@ -48,8 +48,12 @@ sync_table() {
 
     # Run query; capture output and exit code separately so set -e does not
     # fire before we can inspect the result.
+    # AUD-05: Run as the application user (pqcrypta_user) with SELECT-only privileges,
+    # not as the postgres superuser via sudo.  Grant pqcrypta_user SELECT on
+    # bot_blocklist, fingerprint_blocklist, country_blocklist, and EXECUTE on
+    # cleanup_expired_blocklist_entries() instead of using the superuser.
     local DB_OUTPUT
-    if ! DB_OUTPUT=$(sudo -u postgres psql -d "${DB_NAME}" -t -A -c "${QUERY}" 2>&1); then
+    if ! DB_OUTPUT=$(psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c "${QUERY}" 2>&1); then
         log "WARNING: DB query failed for ${LABEL} (psql exited non-zero) - preserving existing blocklist"
         return 0
     fi
@@ -139,7 +143,7 @@ log "Sync complete: ${IP_COUNT} IPs, ${FP_COUNT} fingerprints, ${COUNTRY_COUNT} 
 MINUTE=$(date '+%M')
 if [ "${MINUTE}" = "00" ]; then
     log "Running hourly cleanup..."
-    sudo -u postgres psql -d "${DB_NAME}" -c "SELECT cleanup_expired_blocklist_entries()" >> "${LOG_FILE}" 2>&1 || \
+    psql -U "${DB_USER}" -d "${DB_NAME}" -c "SELECT cleanup_expired_blocklist_entries()" >> "${LOG_FILE}" 2>&1 || \
         log "WARNING: hourly cleanup query failed"
 fi
 

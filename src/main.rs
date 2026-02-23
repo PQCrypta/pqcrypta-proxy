@@ -497,8 +497,11 @@ async fn main() -> anyhow::Result<()> {
         let https_port = config.server.udp_port;
         let challenges = acme_challenges.clone();
 
+        // AUD-02: Pass the allowed_domains list so the redirect server validates
+        // the Host header before building the HTTPS URL.
+        let redirect_allowed_domains = config.http_redirect.allowed_domains.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_http_redirect_server(redirect_port, https_port, challenges).await {
+            if let Err(e) = run_http_redirect_server(redirect_port, https_port, challenges, redirect_allowed_domains).await {
                 error!("HTTP redirect server error: {}", e);
             }
         });
@@ -824,8 +827,13 @@ async fn main() -> anyhow::Result<()> {
         warn!("Admin server task error during shutdown: {}", e);
     }
 
-    // Give spawned tasks time to complete
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // AUD-11: Wait for in-flight requests to drain using a configurable timeout
+    // instead of a fixed 2-second sleep.  The timeout is set via
+    // server.graceful_shutdown_timeout_secs (default: 30 s, matching
+    // systemd TimeoutStopSec=30 in the unit file).
+    let drain_secs = config.server.graceful_shutdown_timeout_secs;
+    info!("Waiting up to {}s for in-flight requests to drain...", drain_secs);
+    tokio::time::sleep(std::time::Duration::from_secs(drain_secs)).await;
 
     info!("PQCrypta Proxy shutdown complete");
     Ok(())

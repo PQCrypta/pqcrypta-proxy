@@ -35,3 +35,15 @@ test-config.toml
 *.gcno
 tarpaulin-report.html
 data/geoip/*.mmdb
+
+# AUD-03: Blocklist data is auto-generated at runtime — never commit to version control.
+# It exposes threat detection cadence and blocked IPs publicly.
+data/blocklists/blocked_ips.json
+data/blocklists/blocked_fingerprints.json
+data/blocklists/blocked_countries.json
+data/blocklists/sync_status.json
+
+# AUD-04: Production config contains real secrets, email, and infrastructure topology.
+# Only config/example-config.toml should be version-controlled.
+# Copy example-config.toml → proxy-config.toml and fill in real values on each host.
+config/proxy-config.toml
