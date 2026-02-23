@@ -36,6 +36,9 @@ test-config.toml
 tarpaulin-report.html
 data/geoip/*.mmdb
 
+# Runtime state files — auto-updated by the log processor and access monitor
+data/.last_processed_byte
+
 # AUD-03: Blocklist data is auto-generated at runtime — never commit to version control.
 # It exposes threat detection cadence and blocked IPs publicly.
 data/blocklists/blocked_ips.json
