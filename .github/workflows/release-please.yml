@@ -1,0 +1,43 @@
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    name: Release Please
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release-type: rust
+
+      # After a release is created, build and upload release binaries
+      - uses: actions/checkout@v4
+        if: ${{ steps.release.outputs.release_created }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ steps.release.outputs.release_created }}
+
+      - name: Install OpenSSL
+        if: ${{ steps.release.outputs.release_created }}
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Build release binary
+        if: ${{ steps.release.outputs.release_created }}
+        run: cargo build --release
+
+      - name: Upload binary to release
+        if: ${{ steps.release.outputs.release_created }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag_name }}
+          files: target/release/pqcrypta-proxy
