@@ -80,8 +80,8 @@ use pqcrypta_proxy::pqc_tls::{verify_pqc_support, PqcTlsProvider};
 use pqcrypta_proxy::proxy::BackendPool;
 use pqcrypta_proxy::quic_listener::QuicListener;
 use pqcrypta_proxy::tls::TlsProvider;
-use pqcrypta_proxy::SecurityState;
 use pqcrypta_proxy::webtransport_server::WebTransportServer;
+use pqcrypta_proxy::SecurityState;
 use pqcrypta_proxy::{
     run_http_listener, run_http_listener_with_fingerprint, run_http_redirect_server,
     run_tls_passthrough_server,
@@ -501,7 +501,14 @@ async fn main() -> anyhow::Result<()> {
         // the Host header before building the HTTPS URL.
         let redirect_allowed_domains = config.http_redirect.allowed_domains.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_http_redirect_server(redirect_port, https_port, challenges, redirect_allowed_domains).await {
+            if let Err(e) = run_http_redirect_server(
+                redirect_port,
+                https_port,
+                challenges,
+                redirect_allowed_domains,
+            )
+            .await
+            {
                 error!("HTTP redirect server error: {}", e);
             }
         });
@@ -832,7 +839,10 @@ async fn main() -> anyhow::Result<()> {
     // server.graceful_shutdown_timeout_secs (default: 30 s, matching
     // systemd TimeoutStopSec=30 in the unit file).
     let drain_secs = config.server.graceful_shutdown_timeout_secs;
-    info!("Waiting up to {}s for in-flight requests to drain...", drain_secs);
+    info!(
+        "Waiting up to {}s for in-flight requests to drain...",
+        drain_secs
+    );
     tokio::time::sleep(std::time::Duration::from_secs(drain_secs)).await;
 
     info!("PQCrypta Proxy shutdown complete");

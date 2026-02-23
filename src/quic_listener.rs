@@ -446,6 +446,7 @@ impl QuicListener {
     }
 
     /// Handle a single HTTP/3 request
+    #[allow(clippy::too_many_arguments)]
     async fn handle_h3_request<S>(
         mut stream: h3::server::RequestStream<S, Bytes>,
         request: http::Request<()>,
@@ -509,15 +510,27 @@ impl QuicListener {
         if !security.is_trusted(&ip) {
             // 1. Re-check IP blocklist (IP may have been blocked after connection was accepted).
             if let Some(block_info) = security.is_blocked(&ip) {
-                warn!("[QUIC/H3] Blocked request from {} (reason: {:?})", ip, block_info.reason);
+                warn!(
+                    "[QUIC/H3] Blocked request from {} (reason: {:?})",
+                    ip, block_info.reason
+                );
                 metrics.requests.request_end_full(
-                    403, start_time.elapsed(), 0, 0, Some(&path), is_health_check,
+                    403,
+                    start_time.elapsed(),
+                    0,
+                    0,
+                    Some(&path),
+                    is_health_check,
                 );
                 let retry_after = block_info
                     .expires_at
                     .map(|e| {
                         let now = std::time::Instant::now();
-                        if e > now { e.duration_since(now).as_secs() } else { 0 }
+                        if e > now {
+                            e.duration_since(now).as_secs()
+                        } else {
+                            0
+                        }
                     })
                     .unwrap_or(3600);
                 let response = http::Response::builder()
@@ -554,7 +567,12 @@ impl QuicListener {
                         );
                     }
                     metrics.requests.request_end_full(
-                        429, start_time.elapsed(), 0, 0, Some(&path), is_health_check,
+                        429,
+                        start_time.elapsed(),
+                        0,
+                        0,
+                        Some(&path),
+                        is_health_check,
                     );
                     let response = http::Response::builder()
                         .status(http::StatusCode::TOO_MANY_REQUESTS)
@@ -577,9 +595,17 @@ impl QuicListener {
                 .map(|(k, v)| k.as_str().len() + v.len())
                 .sum();
             if header_size > max_header_size {
-                warn!("[QUIC/H3] Headers too large from {}: {} bytes", ip, header_size);
+                warn!(
+                    "[QUIC/H3] Headers too large from {}: {} bytes",
+                    ip, header_size
+                );
                 metrics.requests.request_end_full(
-                    431, start_time.elapsed(), 0, 0, Some(&path), is_health_check,
+                    431,
+                    start_time.elapsed(),
+                    0,
+                    0,
+                    Some(&path),
+                    is_health_check,
                 );
                 let response = http::Response::builder()
                     .status(http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE)

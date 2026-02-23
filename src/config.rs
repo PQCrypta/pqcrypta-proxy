@@ -813,7 +813,7 @@ impl Default for FingerprintConfig {
             fingerprint_db_path: Some(PathBuf::from(
                 "/var/lib/pqcrypta-proxy/fingerprints/ja3.json",
             )),
-            block_malicious: true,    // Block malicious fingerprints by default (AUD-12)
+            block_malicious: true, // Block malicious fingerprints by default (AUD-12)
         }
     }
 }

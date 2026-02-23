@@ -169,8 +169,15 @@ pub struct SecurityState {
     /// Tuple: (limiter, last_access_time).  The timestamp is updated on every
     /// call to get_ip_rate_limiter so that least-recently-used entries are
     /// evicted first when the map exceeds MAX_TRACKED_IPS.
-    pub ip_rate_limiters:
-        Arc<DashMap<IpAddr, (Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>, Instant)>>,
+    pub ip_rate_limiters: Arc<
+        DashMap<
+            IpAddr,
+            (
+                Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>,
+                Instant,
+            ),
+        >,
+    >,
     /// Per-IP connection counters
     pub ip_connections: Arc<DashMap<IpAddr, u32>>,
     /// Blocked IPs with expiration time
@@ -483,18 +490,14 @@ impl SecurityState {
         &self,
         ip: IpAddr,
     ) -> Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>> {
-        let mut entry = self
-            .ip_rate_limiters
-            .entry(ip)
-            .or_insert_with(|| {
-                let config = self.rate_config.read();
-                // Safe NonZeroU32 construction - use .max(1) to ensure non-zero
-                let rps =
-                    NonZeroU32::new(config.requests_per_second.max(1)).unwrap_or(NonZeroU32::MIN);
-                let burst_nz = NonZeroU32::new(config.burst_size.max(1)).unwrap_or(NonZeroU32::MIN);
-                let quota = Quota::per_second(rps).allow_burst(burst_nz);
-                (Arc::new(RateLimiter::direct(quota)), Instant::now())
-            });
+        let mut entry = self.ip_rate_limiters.entry(ip).or_insert_with(|| {
+            let config = self.rate_config.read();
+            // Safe NonZeroU32 construction - use .max(1) to ensure non-zero
+            let rps = NonZeroU32::new(config.requests_per_second.max(1)).unwrap_or(NonZeroU32::MIN);
+            let burst_nz = NonZeroU32::new(config.burst_size.max(1)).unwrap_or(NonZeroU32::MIN);
+            let quota = Quota::per_second(rps).allow_burst(burst_nz);
+            (Arc::new(RateLimiter::direct(quota)), Instant::now())
+        });
         // Update last-access time for LRU eviction
         entry.1 = Instant::now();
         entry.0.clone()

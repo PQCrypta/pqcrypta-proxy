@@ -2616,10 +2616,7 @@ pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 
             if !permitted.is_empty() {
                 let host_lower = host.to_ascii_lowercase();
                 // Strip port suffix if present (e.g. "example.com:80" → "example.com")
-                let host_name = host_lower
-                    .split(':')
-                    .next()
-                    .unwrap_or(host_lower.as_str());
+                let host_name = host_lower.split(':').next().unwrap_or(host_lower.as_str());
                 if !permitted.iter().any(|d| d.as_str() == host_name) {
                     warn!(
                         "HTTP redirect: rejected request with unknown Host header: {} — \
