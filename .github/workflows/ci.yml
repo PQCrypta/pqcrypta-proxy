@@ -88,7 +88,7 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: pqcrypta-proxy-${{ matrix.target }}
           path: |
@@ -306,7 +306,7 @@ jobs:
       - name: Generate docs
         run: cargo doc --no-deps --all-features
       - name: Upload docs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: documentation
           path: target/doc
