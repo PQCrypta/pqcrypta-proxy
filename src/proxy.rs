@@ -343,7 +343,7 @@ impl BackendPool {
                 .parse()
                 .expect("SR-06: INADDR_ANY:0 is always a valid socket address"),
         )
-            .map_err(|e| anyhow::anyhow!("Failed to create endpoint: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to create endpoint: {}", e))?;
         endpoint.set_default_client_config(client_config);
 
         // Extract host for SNI

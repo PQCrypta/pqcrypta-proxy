@@ -736,10 +736,9 @@ async fn main() -> anyhow::Result<()> {
             // SR-04: Use the configured bind_address instead of a hardcoded "0.0.0.0"
             // so the WebTransport server honours the operator's bind_address setting
             // (e.g. a private NIC) rather than always binding on all interfaces.
-            let wt_addr: std::net::SocketAddr =
-                format!("{}:4433", wt_config.server.bind_address)
-                    .parse()
-                    .expect("valid WebTransport bind address from config");
+            let wt_addr: std::net::SocketAddr = format!("{}:4433", wt_config.server.bind_address)
+                .parse()
+                .expect("valid WebTransport bind address from config");
 
             info!("🚀 Starting dedicated WebTransport server on {}", wt_addr);
 
