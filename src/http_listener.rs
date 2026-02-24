@@ -377,8 +377,7 @@ pub async fn run_http_listener(
 
     info!("✅ TLS configured for HTTP listener");
     info!("🔒 HTTPS reverse proxy ready on port {} (TCP)", port);
-    info!("🔄 Routing: api.pqcrypta.com → 127.0.0.1:3003");
-    info!("🔄 Routing: pqcrypta.com → 127.0.0.1:8080");
+    // SEC-A04: Hardcoded backend addresses removed from logs to prevent topology disclosure.
 
     // Run HTTPS server
     axum_server::bind_rustls(addr, tls_config)
@@ -591,8 +590,7 @@ pub async fn run_http_listener_pqc(
         pqc_status.available_kems.join(", ")
     );
     info!("📊 Configured groups: {}", pqc_provider.groups_string());
-    info!("🔄 Routing: api.pqcrypta.com → 127.0.0.1:3003");
-    info!("🔄 Routing: pqcrypta.com → 127.0.0.1:8080");
+    // SEC-A04: Hardcoded backend addresses removed from logs to prevent topology disclosure.
 
     // Run HTTPS server with OpenSSL 3.5+ (PQC-enabled with native ML-KEM)
     axum_server::bind_openssl(addr, openssl_config)
@@ -788,8 +786,7 @@ pub async fn run_http_listener_with_fingerprint(
     info!("✅ Custom TLS accept loop configured");
     info!("🔒 HTTPS reverse proxy ready on port {} (TCP)", port);
     info!("🔍 JA3/JA4 fingerprinting active at TLS layer");
-    info!("🔄 Routing: api.pqcrypta.com → 127.0.0.1:3003");
-    info!("🔄 Routing: pqcrypta.com → 127.0.0.1:8080");
+    // SEC-A04: Hardcoded backend addresses removed from logs to prevent topology disclosure.
 
     // Accept loop with graceful shutdown
     loop {
@@ -1152,8 +1149,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
         port
     );
     info!("🔍 JA3/JA4 fingerprinting active at TLS layer");
-    info!("🔄 Routing: api.pqcrypta.com → 127.0.0.1:3003");
-    info!("🔄 Routing: pqcrypta.com → 127.0.0.1:8080");
+    // SEC-A04: Hardcoded backend addresses removed from logs to prevent topology disclosure.
 
     // Accept loop with graceful shutdown
     loop {

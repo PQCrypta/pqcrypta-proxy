@@ -41,18 +41,19 @@ const MAX_TRACKED_IPS: usize = 100_000;
 /// Maximum number of tracked JA3 fingerprints
 const MAX_JA3_FINGERPRINTS: usize = 50_000;
 
-/// Check if an IP is within the hardcoded trusted ranges (loopback and RFC1918 private).
-/// This is the minimal set of always-trusted addresses.
-/// For additional CIDRs, operators must configure `trusted_internal_cidrs` explicitly.
+/// Check if an IP is within the unconditionally trusted loopback range.
+///
+/// SEC-A05: Only loopback addresses (127.0.0.0/8 and ::1) are unconditionally
+/// trusted.  RFC1918 private ranges are NOT implicitly trusted because an attacker
+/// with LAN access could spoof any private-range address and bypass rate limiting
+/// and IP blocking.  Operators who need to trust specific RFC1918 ranges (e.g. a
+/// known internal load-balancer) must enumerate those CIDRs explicitly in the
+/// `security.trusted_internal_cidrs` config list.
 fn is_trusted_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            // Loopback (127.0.0.0/8)
-            v4.is_loopback() ||
-            // RFC1918 private ranges (10/8, 172.16/12, 192.168/16)
-            v4.is_private() ||
-            // Link-local (169.254.0.0/16)
-            v4.is_link_local()
+            // Loopback only (127.0.0.0/8)
+            v4.is_loopback()
         }
         IpAddr::V6(v6) => {
             // Loopback (::1)
@@ -431,8 +432,9 @@ impl SecurityState {
 
     /// Check whether an IP should bypass security checks.
     ///
-    /// Unconditionally trusts loopback and RFC1918 private ranges.
-    /// Additionally trusts any CIDR in `security.trusted_internal_cidrs` (explicit opt-in).
+    /// SEC-A05: Unconditionally trusts loopback only.  RFC1918 private ranges are
+    /// NOT implicitly trusted — they must be listed in `security.trusted_internal_cidrs`
+    /// to receive bypass treatment, making the trust decision explicit and auditable.
     pub fn is_trusted(&self, ip: &IpAddr) -> bool {
         if is_trusted_ip(ip) {
             return true;
@@ -522,7 +524,7 @@ impl SecurityState {
 
     /// Block an IP address
     pub fn block_ip(&self, ip: IpAddr, reason: BlockReason, duration: Option<Duration>) {
-        // Never block trusted IPs (loopback, RFC1918, or operator-configured CIDRs)
+        // Never block trusted IPs (loopback, or operator-configured trusted_internal_cidrs)
         if self.is_trusted(&ip) {
             debug!(
                 "Skipping block for trusted IP {} (reason: {:?})",
@@ -695,7 +697,7 @@ impl SecurityState {
 
     /// Record a request for adaptive rate limiting
     pub fn record_request(&self, ip: IpAddr, status: StatusCode) {
-        // Skip tracking for trusted IPs (loopback, RFC1918, or operator-configured CIDRs)
+        // Skip tracking for trusted IPs (loopback, or operator-configured trusted_internal_cidrs)
         if self.is_trusted(&ip) {
             return;
         }
@@ -932,8 +934,9 @@ pub async fn security_middleware(
 ) -> Response {
     let ip = client_addr.ip();
 
-    // Fast path: skip all security checks for trusted IPs (loopback, RFC1918, operator CIDRs).
-    // This prevents the server from blocking itself or internal services.
+    // Fast path: skip all security checks for trusted IPs (loopback, or CIDRs listed in
+    // security.trusted_internal_cidrs). RFC1918 ranges are no longer implicitly trusted
+    // (SEC-A05) — this prevents an attacker with LAN access from bypassing rate limiting.
     if security.is_trusted(&ip) {
         debug!("Trusted IP {} - bypassing security checks", ip);
         return next.run(request).await;
@@ -1594,11 +1597,19 @@ mod tests {
         let loopback: IpAddr = "127.0.0.1".parse().unwrap();
         assert!(is_trusted_ip(&loopback), "Loopback must be trusted");
 
-        // RFC1918 must still be trusted.
+        // SEC-A05: RFC1918 private ranges are no longer unconditionally trusted.
+        // Operators who need to trust specific RFC1918 CIDRs must list them in
+        // security.trusted_internal_cidrs (tested via SecurityState::is_trusted).
         let private: IpAddr = "10.0.0.1".parse().unwrap();
-        assert!(is_trusted_ip(&private), "RFC1918 must be trusted");
+        assert!(
+            !is_trusted_ip(&private),
+            "RFC1918 must NOT be unconditionally trusted (SEC-A05)"
+        );
 
         let private2: IpAddr = "192.168.1.1".parse().unwrap();
-        assert!(is_trusted_ip(&private2), "RFC1918 must be trusted");
+        assert!(
+            !is_trusted_ip(&private2),
+            "RFC1918 must NOT be unconditionally trusted (SEC-A05)"
+        );
     }
 }

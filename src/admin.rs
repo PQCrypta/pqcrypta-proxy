@@ -107,7 +107,34 @@ impl AdminServer {
             return Ok(());
         }
 
+        // SEC-A03: The admin API does not yet implement mTLS.  Refuse to start
+        // when require_mtls = true so that operators who set this option are not
+        // silently left with an unprotected endpoint.
+        if self.config.require_mtls {
+            return Err(anyhow::anyhow!(
+                "Admin API: require_mtls = true but mTLS is not supported on the admin \
+                 listener.  Either set require_mtls = false and rely on the auth_token + \
+                 allowed_ips controls, or disable the admin API.  Aborting startup to \
+                 prevent operating without the expected security control."
+            ));
+        }
+
         let addr = self.config.socket_addr()?;
+
+        // SEC-A02: Warn loudly when the admin API is bound to a non-loopback address
+        // because all admin traffic — including the Bearer token — is transmitted as
+        // plain HTTP.  Operators who need remote admin access should place the proxy
+        // behind a TLS-terminating tunnel (e.g. SSH port-forward or WireGuard).
+        let is_loopback = addr.ip().is_loopback();
+        if !is_loopback {
+            warn!(
+                "⚠️  Admin API is bound to {} (non-loopback) without TLS. \
+                 All admin traffic including auth tokens is transmitted in cleartext. \
+                 Consider restricting bind_address to 127.0.0.1 or using a TLS tunnel \
+                 for remote admin access.",
+                addr
+            );
+        }
 
         // SR-03: If no auth_token is configured, generate a random 32-byte
         // session token and log it so the operator can copy it into the config

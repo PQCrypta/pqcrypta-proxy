@@ -86,6 +86,15 @@ impl MetricsRegistry {
         output
     }
 
+    /// Return the current active connection count without a full snapshot allocation.
+    ///
+    /// SEC-A06: Used by the graceful-shutdown drain loop so it can exit early
+    /// once all in-flight connections have closed instead of always sleeping for
+    /// the full graceful_shutdown_timeout_secs duration.
+    pub fn active_connections(&self) -> u64 {
+        self.connections.active.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Get metrics snapshot as JSON
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {

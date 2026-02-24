@@ -40,12 +40,49 @@ deny = []
 # x509-parser: pulled in at 0.16 by direct dep, newer versions by other transitive crates.
 # Update Cargo.toml direct dep when upstreams converge on a single version.
 skip = [
-    { name = "x509-parser", reason = "F-13: three transitive versions (0.16/0.17/0.18); direct dep is 0.16; upstream update tracked" },
+    # x509-parser / asn1-rs chain — multiple crates pull different sub-versions
+    { name = "x509-parser", reason = "F-13: multiple transitive versions; direct dep is 0.16; upstream convergence tracked" },
     { name = "asn1-rs", reason = "transitive of x509-parser multi-version chain" },
+    { name = "asn1-rs-derive", reason = "proc-macro companion of asn1-rs; multiple versions mirror asn1-rs chain" },
+    { name = "der-parser", reason = "transitive of x509-parser chain; 9.x and 10.x pulled by different sub-trees" },
+    { name = "oid-registry", reason = "transitive of x509-parser chain; 0.7 and 0.8 pulled by different sub-trees" },
+    # rand ecosystem — 0.8/0.9 migration still in progress across the crate graph
     { name = "rand", reason = "0.8 and 0.9 pulled by separate dependency subtrees; upstream migration ongoing" },
+    { name = "rand_chacha", reason = "version-mirrors rand; 0.3 and 0.9 pulled by rand 0.8 and 0.9 sub-trees" },
+    { name = "rand_core", reason = "version-mirrors rand; 0.6 and 0.9 pulled by rand 0.8 and 0.9 sub-trees" },
     { name = "getrandom", reason = "multiple versions due to rand/crypto crate ecosystem transition" },
-    { name = "webpki-roots", reason = "0.26 and 1.x pulled by separate crates; update pending upstream" },
+    # bitflags — 1.x → 2.x migration ongoing; many crates still on 1.x
+    { name = "bitflags", reason = "1.3 retained by notify/kqueue; 2.x used by majority; migration tracked" },
+    # brotli — main crate and decompressor sub-crate both have version splits
     { name = "brotli", reason = "7.x and 8.x due to async-compression version pinning" },
+    { name = "brotli-decompressor", reason = "version-mirrors brotli; same async-compression pin as parent" },
+    # hashbrown — std uses 0.14 internally; external crates use 0.15
+    { name = "hashbrown", reason = "0.14 used by std/indexmap internals; 0.15 used by direct crates" },
+    # thiserror — 1.x → 2.x migration; older transitive crates not yet updated
+    { name = "thiserror", reason = "1.x retained by older transitive crates; 2.x used by direct deps" },
+    { name = "thiserror-impl", reason = "proc-macro companion of thiserror; mirrors thiserror version split" },
+    # socket2 — 0.4 used by tokio 1.x internals; 0.5 used by newer crates
+    { name = "socket2", reason = "0.4 pulled by tokio internals; 0.5 used by direct/newer crates" },
+    # ipnetwork — pulled at different versions by database and network crates
+    { name = "ipnetwork", reason = "multiple transitive versions from sqlx and network crate sub-trees" },
+    # openssl-probe — version split between openssl-related crate trees
+    { name = "openssl-probe", reason = "multiple transitive versions from openssl/rustls bridging crates" },
+    # untrusted — 0.7 retained by webpki 0.22; 0.9 used by newer ring-based crates
+    { name = "untrusted", reason = "0.7 retained by webpki 0.22 sub-tree; 0.9 used by newer ring crates" },
+    { name = "webpki-roots", reason = "0.26 and 1.x pulled by separate crates; update pending upstream" },
+    # core-foundation — macOS SDK binding versions split across Apple platform crates
+    { name = "core-foundation", reason = "macOS transitive dep; version split from separate Apple-platform crate trees" },
+    # windows-* — cross-compilation targets; 0.52 vs 0.x splits from indirect Windows crates
+    { name = "windows-sys", reason = "multiple versions from Windows-platform crate tree; harmless on Linux" },
+    { name = "windows-targets", reason = "mirrors windows-sys version split" },
+    { name = "windows_aarch64_gnullvm", reason = "mirrors windows-sys version split" },
+    { name = "windows_aarch64_msvc", reason = "mirrors windows-sys version split" },
+    { name = "windows_i686_gnu", reason = "mirrors windows-sys version split" },
+    { name = "windows_i686_gnullvm", reason = "mirrors windows-sys version split" },
+    { name = "windows_i686_msvc", reason = "mirrors windows-sys version split" },
+    { name = "windows_x86_64_gnu", reason = "mirrors windows-sys version split" },
+    { name = "windows_x86_64_gnullvm", reason = "mirrors windows-sys version split" },
+    { name = "windows_x86_64_msvc", reason = "mirrors windows-sys version split" },
 ]
 
 [sources]

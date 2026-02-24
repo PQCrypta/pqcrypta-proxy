@@ -1,4 +1,8 @@
 // Crate-level lint configuration
+// SEC-A07: Safety-relevant lints (cast_possible_truncation, cast_sign_loss,
+// cast_precision_loss, wildcard_imports) have been removed from this allow-list
+// and are now enforced crate-wide.  Any remaining suppressions below apply only
+// to style/pedantic lints that do not have security implications.
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_panics_doc)]
@@ -10,14 +14,11 @@
 #![allow(clippy::derivable_impls)]
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::single_match_else)]
-#![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::manual_let_else)]
 #![allow(clippy::option_map_or_none)]
 #![allow(clippy::map_unwrap_or)]
 #![allow(clippy::uninlined_format_args)]
 #![allow(clippy::missing_const_for_fn)]
-#![allow(clippy::cast_sign_loss)]
-#![allow(clippy::cast_precision_loss)]
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::struct_excessive_bools)]
 #![allow(clippy::unnecessary_debug_formatting)]
@@ -36,7 +37,6 @@
 #![allow(clippy::op_ref)]
 #![allow(clippy::assigning_clones)]
 #![allow(clippy::collapsible_if)]
-#![allow(clippy::wildcard_imports)]
 #![allow(clippy::items_after_statements)]
 #![allow(clippy::ptr_as_ptr)]
 #![allow(clippy::unnecessary_cast)]
@@ -796,10 +796,6 @@ async fn main() -> anyhow::Result<()> {
     }
     info!("  Alt-Svc:         {}", alt_svc_parts.join(", "));
     info!("═══════════════════════════════════════════════════════════════");
-    info!("  Routing:");
-    info!("    api.pqcrypta.com → 127.0.0.1:3003 (Rust API)");
-    info!("    pqcrypta.com     → 127.0.0.1:8080 (Apache)");
-    info!("═══════════════════════════════════════════════════════════════");
 
     // Print startup summary
     print_startup_summary(&config, tls_provider.is_pqc_enabled());
@@ -843,16 +839,32 @@ async fn main() -> anyhow::Result<()> {
         warn!("Admin server task error during shutdown: {}", e);
     }
 
-    // AUD-11: Wait for in-flight requests to drain using a configurable timeout
-    // instead of a fixed 2-second sleep.  The timeout is set via
-    // server.graceful_shutdown_timeout_secs (default: 30 s, matching
-    // systemd TimeoutStopSec=30 in the unit file).
+    // AUD-11 / SEC-A06: Poll active connections and exit as soon as they reach
+    // zero, rather than always sleeping for the full timeout duration.  This
+    // allows rapid container restarts when the proxy is already idle while still
+    // honouring the configured graceful_shutdown_timeout_secs as an upper bound.
     let drain_secs = config.server.graceful_shutdown_timeout_secs;
     info!(
-        "Waiting up to {}s for in-flight requests to drain...",
+        "Waiting up to {}s for in-flight connections to drain...",
         drain_secs
     );
-    tokio::time::sleep(std::time::Duration::from_secs(drain_secs)).await;
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(drain_secs);
+    loop {
+        let active = metrics_registry.active_connections();
+        if active == 0 {
+            info!("All connections drained — proceeding with shutdown");
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            info!(
+                "Drain timeout reached ({} connection(s) still active)",
+                active
+            );
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 
     info!("PQCrypta Proxy shutdown complete");
     Ok(())

@@ -38,9 +38,13 @@ download_db() {
     local tmp_tar="${DATA_DIR}/${edition}.tar.gz.tmp"
 
     echo "Downloading ${edition}..."
+    # SEC-A08: Credentials are sent via HTTP Basic Auth (--user flag) only.
+    # The license_key query parameter is redundant and was removed because URL
+    # query strings are recorded in web-server logs, CDN logs, and shell history,
+    # making the MaxMind credential easier to exfiltrate accidentally.
     curl --silent --show-error --fail \
         --user "${ACCOUNT_ID}:${LICENSE_KEY}" \
-        "${MAXMIND_BASE}?edition_id=${edition}&license_key=${LICENSE_KEY}&suffix=tar.gz" \
+        "${MAXMIND_BASE}?edition_id=${edition}&suffix=tar.gz" \
         -o "$tmp_tar"
 
     # Extract the .mmdb from the tarball (it's nested in a dated directory)

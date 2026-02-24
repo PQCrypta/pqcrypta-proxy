@@ -1,4 +1,8 @@
 // Crate-level lint configuration for pedantic lints
+// SEC-A07: Safety-relevant lints (cast_possible_truncation, cast_sign_loss,
+// cast_precision_loss, wildcard_imports) have been removed from this allow-list
+// and are now enforced crate-wide.  Any remaining suppressions below apply only
+// to style/pedantic lints that do not have security implications.
 #![deny(dead_code)]
 #![deny(unused_variables)]
 #![deny(unused_imports)]
@@ -16,14 +20,11 @@
 #![allow(clippy::derivable_impls)]
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::single_match_else)]
-#![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::manual_let_else)]
 #![allow(clippy::option_map_or_none)]
 #![allow(clippy::map_unwrap_or)]
 #![allow(clippy::uninlined_format_args)]
 #![allow(clippy::missing_const_for_fn)]
-#![allow(clippy::cast_sign_loss)]
-#![allow(clippy::cast_precision_loss)]
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::struct_excessive_bools)]
 #![allow(clippy::unnecessary_debug_formatting)]
@@ -42,7 +43,6 @@
 #![allow(clippy::op_ref)]
 #![allow(clippy::assigning_clones)]
 #![allow(clippy::collapsible_if)]
-#![allow(clippy::wildcard_imports)]
 #![allow(clippy::items_after_statements)]
 #![allow(clippy::ptr_as_ptr)]
 #![allow(clippy::unnecessary_cast)]
