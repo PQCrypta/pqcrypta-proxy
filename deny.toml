@@ -5,7 +5,9 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # "vulnerability", "notice" keys removed in cargo-deny 0.16+
 unmaintained = "workspace"
 yanked = "warn"
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile deprecated but not a vulnerability; upstream recommends rustls-pki-types which is already in use" },
+]
 
 [licenses]
 # "version", "unlicensed", "copyleft" keys removed in cargo-deny 0.16+
