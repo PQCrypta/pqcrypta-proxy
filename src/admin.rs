@@ -122,10 +122,18 @@ impl AdminServer {
                     .take(48)
                     .map(char::from)
                     .collect();
+                // SEC-06: Print the token to stderr (bypasses structured log pipeline) so
+                // it is not captured by log aggregators/SIEMs in plaintext. The warn!
+                // entry records the event without exposing the secret value.
+                eprintln!(
+                    "[ADMIN] No auth_token configured. Copy the following line into your \
+                     [admin] config section to persist it between restarts:\n  \
+                     auth_token = \"{}\"",
+                    token
+                );
                 warn!(
                     "Admin API: no auth_token configured — generated ephemeral session token. \
-                     Add `auth_token = \"{}\"` to [admin] in your config file to persist it.",
-                    token
+                     Token printed to stderr. Set auth_token in [admin] config to persist it."
                 );
                 Some(token)
             }

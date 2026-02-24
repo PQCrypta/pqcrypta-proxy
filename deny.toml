@@ -29,10 +29,10 @@ allow = [
 ]
 
 [bans]
-# F-05: Duplicate dependency versions expand the binary attack surface.
-# Security-critical parsing/crypto crates are denied from having multiple versions.
-# Other crates that unavoidably accumulate versions are explicitly skipped below.
-multiple-versions = "warn"
+# F-05 / SEC-12: Duplicate dependency versions expand the binary attack surface.
+# Elevated from "warn" to "deny" so CI fails on unexpected version duplication.
+# All known unavoidable duplicates are explicitly skipped below with tracking notes.
+multiple-versions = "deny"
 wildcards = "allow"
 deny = []
 

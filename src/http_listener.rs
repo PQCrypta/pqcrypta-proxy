@@ -1803,6 +1803,13 @@ async fn security_headers_middleware(
         headers.insert("x-dns-prefetch-control", v);
     }
 
+    // SEC-07: Content-Security-Policy
+    if !config.content_security_policy.is_empty() {
+        if let Ok(v) = HeaderValue::from_str(&config.content_security_policy) {
+            headers.insert(header::CONTENT_SECURITY_POLICY, v);
+        }
+    }
+
     // PQC branding headers
     if let Ok(v) = HeaderValue::from_str(&config.x_quantum_resistant) {
         headers.insert("x-quantum-resistant", v);
@@ -2221,6 +2228,12 @@ async fn proxy_handler(
                     "trailer",
                     // SEC-002: internal 0-RTT tag — never forward to backends
                     "x-tls-early-data",
+                    // SEC-03: strip client-supplied forwarding headers; the proxy injects
+                    // trusted values from the actual socket address below.
+                    "x-forwarded-for",
+                    "x-forwarded-proto",
+                    "x-forwarded-port",
+                    "x-real-ip",
                 ]
                 .contains(&name_str.as_str())
                 {
@@ -2348,10 +2361,13 @@ async fn proxy_handler(
                 // Remove Upgrade header (problematic for HTTP/3)
                 parts.headers.remove("upgrade");
 
-                // Replace Server header with our own branding (hide backend identity)
-                parts
-                    .headers
-                    .insert(header::SERVER, HeaderValue::from_static("PQCProxy v0.2.1"));
+                // SEC-08: Use a version-agnostic Server header so the exact build is not
+                // disclosed to clients. Version derived from CARGO_PKG_VERSION at compile
+                // time so it stays accurate without hardcoding.
+                parts.headers.insert(
+                    header::SERVER,
+                    HeaderValue::from_static(concat!("PQCProxy/", env!("CARGO_PKG_VERSION"))),
+                );
 
                 // Convert Incoming body to axum Body
                 let response_body = Body::new(incoming_body);

@@ -17,6 +17,7 @@ use parking_lot::RwLock;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer};
 use rustls::server::ServerConfig as RustlsServerConfig;
+use rustls::version::{TLS12, TLS13};
 // L-1: Migrated from unmaintained rustls-pemfile to rustls-pki-types PEM parsing API
 use rustls_pki_types::pem::PemObject;
 use tracing::{debug, info, warn};
@@ -307,6 +308,17 @@ impl TlsProvider {
         };
 
         // Create base configuration with the appropriate crypto provider
+        // SEC-01: Enforce the configured minimum TLS version instead of accepting
+        // the rustls safe-default range (which includes TLS 1.2).
+        let protocol_versions: &[&rustls::SupportedProtocolVersion] =
+            if tls_config.min_version == "1.3" {
+                info!("TLS min_version = 1.3 — disabling TLS 1.2");
+                &[&TLS13]
+            } else {
+                info!("TLS min_version = 1.2 — allowing TLS 1.2 and 1.3");
+                &[&TLS12, &TLS13]
+            };
+
         let mut config = if tls_config.require_client_cert {
             // mTLS configuration
             let client_ca = Self::load_client_ca(&tls_config.ca_cert_path)?;
@@ -315,7 +327,7 @@ impl TlsProvider {
                 .map_err(|e| anyhow::anyhow!("Failed to create client verifier: {}", e))?;
 
             RustlsServerConfig::builder_with_provider(crypto_provider)
-                .with_safe_default_protocol_versions()
+                .with_protocol_versions(protocol_versions)
                 .map_err(|e| anyhow::anyhow!("Failed to set protocol versions: {}", e))?
                 .with_client_cert_verifier(client_auth)
                 .with_single_cert(cert_chain, private_key)
@@ -323,7 +335,7 @@ impl TlsProvider {
         } else {
             // Standard TLS configuration with PQC support
             RustlsServerConfig::builder_with_provider(crypto_provider)
-                .with_safe_default_protocol_versions()
+                .with_protocol_versions(protocol_versions)
                 .map_err(|e| anyhow::anyhow!("Failed to set protocol versions: {}", e))?
                 .with_no_client_auth()
                 .with_single_cert(cert_chain, private_key)

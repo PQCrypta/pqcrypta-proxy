@@ -637,7 +637,10 @@ pub struct AdminConfig {
 impl Default for AdminConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // SEC-13: Admin API disabled by default — operators must explicitly set
+            // [admin] enabled = true in config. This prevents accidental exposure
+            // in container environments where 127.0.0.1 may be shared across containers.
+            enabled: false,
             bind_address: "127.0.0.1".to_string(),
             port: 8081,
             require_mtls: false,
@@ -940,6 +943,9 @@ pub struct HeadersConfig {
     pub x_quantum_resistant: String,
     /// X-Security-Level branding header
     pub x_security_level: String,
+    /// SEC-07: Content-Security-Policy header.
+    /// Default restricts sources to same-origin. Set to empty string to omit the header.
+    pub content_security_policy: String,
 
     // ═══════════════════════════════════════════════════════════════
     // HTTP/3 Performance & Monitoring Headers
@@ -985,6 +991,8 @@ impl Default for HeadersConfig {
             x_dns_prefetch_control: "off".to_string(),
             x_quantum_resistant: "ML-KEM-1024, ML-DSA-87, X25519MLKEM768".to_string(),
             x_security_level: "Post-Quantum Ready".to_string(),
+            // SEC-07: Provide a safe default CSP. Operators should tighten this per-deployment.
+            content_security_policy: "default-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'".to_string(),
 
             // HTTP/3 Performance & Monitoring Headers
             server_timing_enabled: true,
@@ -1515,9 +1523,13 @@ fn validate_backend_address_ssrf(address: &str, allow_internal: bool) -> anyhow:
 
     // Check if the host is a parseable IP address for range validation
     let Ok(ip) = host.parse::<IpAddr>() else {
-        // Hostname — can't validate without DNS; emit a debug note and continue
-        debug!(
-            "Backend '{}' uses a hostname; SSRF range check skipped (no DNS resolution at config load)",
+        // SEC-04: Hostname backends cannot have their IP range validated at config load
+        // because DNS resolution is deferred. A hostname that resolves to a link-local or
+        // cloud-metadata address (e.g. 169.254.169.254) would bypass SSRF protection.
+        // Operators must ensure backend hostnames only resolve to trusted addresses.
+        warn!(
+            "SEC-04: Backend '{}' is a hostname — SSRF range check skipped (DNS not resolved at \
+             config load). Ensure this hostname cannot resolve to a private/link-local address.",
             address
         );
         return Ok(());
@@ -1587,8 +1599,28 @@ impl ProxyConfig {
 
         // Validate routes reference existing backends or backend_pools (unless they're redirect routes)
         for route in &self.routes {
-            // Skip backend validation for redirect routes
-            if route.redirect.is_some() {
+            // SEC-09: Validate redirect target to prevent open redirect.
+            // Only relative paths (starting with '/') are allowed by default.
+            // Absolute URLs pointing to unknown origins are rejected.
+            if let Some(ref redirect_target) = route.redirect {
+                if !redirect_target.starts_with('/') {
+                    return Err(anyhow::anyhow!(
+                        "Route {:?}: redirect target '{}' must be a relative path starting with \
+                         '/' to prevent open redirect. Absolute URLs pointing to external \
+                         origins are not permitted.",
+                        route.name,
+                        redirect_target
+                    ));
+                }
+                // Reject any attempt to embed absolute URL components in a relative path
+                if redirect_target.contains("://") || redirect_target.contains("//") {
+                    return Err(anyhow::anyhow!(
+                        "Route {:?}: redirect target '{}' contains a protocol separator — \
+                         use a plain relative path to prevent open redirect.",
+                        route.name,
+                        redirect_target
+                    ));
+                }
                 continue;
             }
 
@@ -1640,6 +1672,21 @@ impl ProxyConfig {
                         pattern
                     ));
                 }
+            }
+
+            // SEC-11: Warn whenever allow_0rtt is explicitly enabled on a route.
+            // 0-RTT early data may be replayed by the TLS layer, delivering POST/PUT/
+            // DELETE/PATCH requests twice with no indication to the backend. Operators
+            // must ensure this route only handles GET/HEAD (idempotent) traffic, or
+            // that the backend implements idempotency-key deduplication.
+            if route.allow_0rtt {
+                warn!(
+                    "SEC-11: Route {:?} has allow_0rtt = true. TLS 0-RTT early data is \
+                     susceptible to replay attacks. Ensure this route only accepts idempotent \
+                     methods (GET, HEAD) and that backends handle duplicate requests safely. \
+                     Set allow_0rtt = false if in doubt.",
+                    route.name
+                );
             }
 
             // SEC-004: Reject wildcard CORS origin combined with allow_credentials.

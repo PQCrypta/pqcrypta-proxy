@@ -413,9 +413,12 @@ async fn handle_bi_stream(
             }
         }
         Ok(Err(e)) => {
+            // SEC-02: Log full error server-side; send only a generic message to the client
+            // to prevent leaking internal details (file paths, OS errors, library internals).
+            error!("Stream read error for {}: {}", remote_addr, e);
             let error_response = json!({
                 "success": false,
-                "error": e.to_string(),
+                "error": "Stream error",
                 "timestamp": chrono::Utc::now().to_rfc3339()
             });
             let error_bytes = serde_json::to_vec(&error_response)?;
@@ -455,12 +458,13 @@ async fn handle_bi_stream(
             info!("✅ Bidirectional stream completed: {}", remote_addr);
         }
         Err(e) => {
+            // SEC-02: Log full error server-side; send only a generic message to the client.
             error!("❌ Request processing failed for {}: {}", remote_addr, e);
 
             // Send error response
             let error_response = json!({
                 "success": false,
-                "error": e.to_string(),
+                "error": "Request processing failed",
                 "timestamp": chrono::Utc::now().to_rfc3339()
             });
 
@@ -526,10 +530,11 @@ async fn handle_datagram(
             debug!("✅ Datagram response sent to {}", remote_addr);
         }
         Ok(Err(e)) => {
+            // SEC-02: Log full error server-side; send only a generic message to the client.
             error!("❌ Datagram processing failed for {}: {}", remote_addr, e);
             let error_response = json!({
                 "success": false,
-                "error": e.to_string(),
+                "error": "Datagram processing failed",
                 "timestamp": chrono::Utc::now().to_rfc3339()
             });
             let error_bytes = serde_json::to_vec(&error_response)?;

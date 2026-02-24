@@ -601,6 +601,23 @@ impl SecurityState {
             }
         }
 
+        // SEC-05: Enforce a file size cap before reading to prevent memory exhaustion
+        // if the blocklist file is unexpectedly large.
+        const MAX_BLOCKLIST_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
+        match std::fs::metadata(&blocked_ips_file) {
+            Ok(meta) if meta.len() > MAX_BLOCKLIST_BYTES => {
+                warn!(
+                    "SEC-05: Blocklist file {} exceeds {} bytes ({} bytes) — skipping reload \
+                     to prevent memory exhaustion. Reduce file size and retry.",
+                    blocked_ips_file.display(),
+                    MAX_BLOCKLIST_BYTES,
+                    meta.len()
+                );
+                return;
+            }
+            _ => {}
+        }
+
         match std::fs::read_to_string(&blocked_ips_file) {
             Ok(content) => {
                 if let Ok(entries) = serde_json::from_str::<Vec<BlocklistEntry>>(&content) {

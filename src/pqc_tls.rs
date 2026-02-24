@@ -251,6 +251,24 @@ impl PqcTlsProvider {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
 
+        // SEC-10: Validate that openssl_lib_path is absolute and is a directory owned by
+        // a trusted location to prevent library preload attacks via LD_LIBRARY_PATH.
+        if !openssl_lib.is_empty() {
+            let lib_path_obj = std::path::Path::new(&openssl_lib);
+            if !lib_path_obj.is_absolute() {
+                return Err(format!(
+                    "openssl_lib_path '{}' must be an absolute path (SEC-10).",
+                    openssl_lib
+                ));
+            }
+            if !lib_path_obj.is_dir() {
+                return Err(format!(
+                    "openssl_lib_path '{}' is not a directory (SEC-10).",
+                    openssl_lib
+                ));
+            }
+        }
+
         // F-09: Validate the OpenSSL binary path before executing it.
         // Require an absolute path so PATH-based hijacking is impossible, and
         // verify the target is a regular file (not a directory, device, or
@@ -288,9 +306,16 @@ impl PqcTlsProvider {
         }
 
         // Get version
-        let version_output = Command::new(&openssl_bin)
+        // SEC-10: Clear the subprocess environment and set only the minimum variables
+        // needed. This prevents LD_LIBRARY_PATH (and other inherited env vars) from
+        // being used to preload attacker-controlled shared libraries.
+        let mut version_cmd = Command::new(&openssl_bin);
+        version_cmd.env_clear().env("PATH", "/usr/bin:/bin");
+        if !openssl_lib.is_empty() {
+            version_cmd.env("LD_LIBRARY_PATH", &openssl_lib);
+        }
+        let version_output = version_cmd
             .arg("version")
-            .env("LD_LIBRARY_PATH", &openssl_lib)
             .output()
             .map_err(|e| format!("Failed to run OpenSSL: {}", e))?;
 
@@ -313,10 +338,14 @@ impl PqcTlsProvider {
             ));
         }
 
-        // Get available KEM algorithms
-        let kem_output = Command::new(&openssl_bin)
+        // Get available KEM algorithms (SEC-10: use env_clear)
+        let mut kem_cmd = Command::new(&openssl_bin);
+        kem_cmd.env_clear().env("PATH", "/usr/bin:/bin");
+        if !openssl_lib.is_empty() {
+            kem_cmd.env("LD_LIBRARY_PATH", &openssl_lib);
+        }
+        let kem_output = kem_cmd
             .args(["list", "-kem-algorithms"])
-            .env("LD_LIBRARY_PATH", &openssl_lib)
             .output()
             .map_err(|e| format!("Failed to list KEMs: {}", e))?;
 
@@ -415,9 +444,14 @@ impl PqcTlsProvider {
         let key_path_str = key_path
             .to_str()
             .ok_or_else(|| "Key path contains invalid UTF-8".to_string())?;
-        let key_output = Command::new(&openssl_bin)
+        // SEC-10: use env_clear() to prevent library preload via inherited env vars
+        let mut key_cmd = Command::new(&openssl_bin);
+        key_cmd.env_clear().env("PATH", "/usr/bin:/bin");
+        if !openssl_lib.is_empty() {
+            key_cmd.env("LD_LIBRARY_PATH", &openssl_lib);
+        }
+        let key_output = key_cmd
             .args(["genpkey", "-algorithm", "ML-DSA-87", "-out", key_path_str])
-            .env("LD_LIBRARY_PATH", &openssl_lib)
             .output()
             .map_err(|e| format!("Failed to generate PQC key: {}", e))?;
 
@@ -432,7 +466,13 @@ impl PqcTlsProvider {
         let cert_path_str = cert_path
             .to_str()
             .ok_or_else(|| "Cert path contains invalid UTF-8".to_string())?;
-        let cert_output = Command::new(&openssl_bin)
+        // SEC-10: use env_clear() to prevent library preload via inherited env vars
+        let mut cert_cmd = Command::new(&openssl_bin);
+        cert_cmd.env_clear().env("PATH", "/usr/bin:/bin");
+        if !openssl_lib.is_empty() {
+            cert_cmd.env("LD_LIBRARY_PATH", &openssl_lib);
+        }
+        let cert_output = cert_cmd
             .args([
                 "req",
                 "-new",
@@ -446,7 +486,6 @@ impl PqcTlsProvider {
                 "-subj",
                 "/CN=PQCrypta Test/O=PQCrypta/C=US",
             ])
-            .env("LD_LIBRARY_PATH", &openssl_lib)
             .output()
             .map_err(|e| format!("Failed to generate PQC cert: {}", e))?;
 
