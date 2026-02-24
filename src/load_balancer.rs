@@ -166,11 +166,7 @@ impl BackendServer {
     /// invalid entries rather than crashing the proxy.
     pub fn from_config(config: &PoolServerConfig) -> anyhow::Result<Self> {
         let address: SocketAddr = config.address.parse().map_err(|e| {
-            anyhow::anyhow!(
-                "Invalid backend server address '{}': {}",
-                config.address,
-                e
-            )
+            anyhow::anyhow!("Invalid backend server address '{}': {}", config.address, e)
         })?;
 
         Ok(Self {

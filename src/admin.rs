@@ -372,9 +372,8 @@ async fn auth_middleware(
                 // Exponential back-off: base * 2^(trigger_count-1), capped at max
                 let backoff_secs = ADMIN_GLOBAL_COOLDOWN_BASE.as_secs()
                     * (1u64 << trigger_count.saturating_sub(1).min(5));
-                let cooldown_duration = Duration::from_secs(
-                    backoff_secs.min(ADMIN_GLOBAL_COOLDOWN_MAX.as_secs()),
-                );
+                let cooldown_duration =
+                    Duration::from_secs(backoff_secs.min(ADMIN_GLOBAL_COOLDOWN_MAX.as_secs()));
                 let mut cooldown_until = auth.global_cooldown_until.write();
                 *cooldown_until = Some(Instant::now() + cooldown_duration);
                 auth.global_failure_count.store(0, Ordering::Relaxed);
@@ -770,7 +769,10 @@ async fn ocsp_refresh_handler_with_cooldown(
             let elapsed = t.elapsed();
             if elapsed < OCSP_REFRESH_COOLDOWN {
                 let retry_after = OCSP_REFRESH_COOLDOWN.as_secs() - elapsed.as_secs();
-                warn!("Admin API: /ocsp/refresh rate-limited ({}s cooldown remaining)", retry_after);
+                warn!(
+                    "Admin API: /ocsp/refresh rate-limited ({}s cooldown remaining)",
+                    retry_after
+                );
                 return Err((
                     StatusCode::TOO_MANY_REQUESTS,
                     format!(

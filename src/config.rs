@@ -1470,10 +1470,7 @@ fn validate_backend_address_ssrf(address: &str, allow_internal: bool) -> anyhow:
     // Extract host from host:port — handle IPv6 brackets: [::1]:8080
     let host = if address.starts_with('[') {
         // IPv6 bracket notation: [addr]:port
-        address
-            .find(']')
-            .map(|i| &address[1..i])
-            .unwrap_or(address)
+        address.find(']').map(|i| &address[1..i]).unwrap_or(address)
     } else {
         // IPv4 or hostname: strip trailing :port
         address.rfind(':').map_or(address, |i| &address[..i])
@@ -1481,11 +1478,11 @@ fn validate_backend_address_ssrf(address: &str, allow_internal: bool) -> anyhow:
 
     // Block well-known dangerous hostnames before IP parsing
     const METADATA_HOSTS: &[&str] = &[
-        "169.254.169.254",      // AWS/Azure IMDSv1, GCP
-        "169.254.170.2",        // AWS ECS metadata
+        "169.254.169.254", // AWS/Azure IMDSv1, GCP
+        "169.254.170.2",   // AWS ECS metadata
         "metadata.google.internal",
         "metadata",
-        "instance-data",        // common internal alias
+        "instance-data", // common internal alias
     ];
     if METADATA_HOSTS.contains(&host) {
         return Err(anyhow::anyhow!(
@@ -1535,7 +1532,7 @@ fn validate_backend_address_ssrf(address: &str, allow_internal: bool) -> anyhow:
                 o[0] == 127                                              // loopback
                     || o[0] == 10                                        // 10.0.0.0/8
                     || (o[0] == 172 && (16..=31).contains(&o[1]))       // 172.16.0.0/12
-                    || (o[0] == 192 && o[1] == 168)                     // 192.168.0.0/16
+                    || (o[0] == 192 && o[1] == 168) // 192.168.0.0/16
             }
             IpAddr::V6(v6) => v6.is_loopback(),
         };
