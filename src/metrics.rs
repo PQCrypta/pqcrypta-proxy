@@ -92,7 +92,9 @@ impl MetricsRegistry {
     /// once all in-flight connections have closed instead of always sleeping for
     /// the full graceful_shutdown_timeout_secs duration.
     pub fn active_connections(&self) -> u64 {
-        self.connections.active.load(std::sync::atomic::Ordering::Relaxed)
+        self.connections
+            .active
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Get metrics snapshot as JSON

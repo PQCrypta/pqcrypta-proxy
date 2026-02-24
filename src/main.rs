@@ -848,8 +848,7 @@ async fn main() -> anyhow::Result<()> {
         "Waiting up to {}s for in-flight connections to drain...",
         drain_secs
     );
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(drain_secs);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(drain_secs);
     loop {
         let active = metrics_registry.active_connections();
         if active == 0 {
