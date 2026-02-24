@@ -141,9 +141,13 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Install rustls CryptoProvider before any TLS operations
-    // This is required when both ring and aws-lc-rs features are available
-    rustls::crypto::ring::default_provider()
+    // SR-08: Install aws-lc-rs as the default rustls CryptoProvider.
+    // This ensures the ML-KEM post-quantum key exchange offered by aws-lc-rs is
+    // active for ALL TLS paths, including QUIC/HTTP3.  Previously ring was
+    // installed here even though Cargo.toml declared aws-lc-rs as the preferred
+    // PQC provider; that mismatch meant the QUIC listener did not benefit from
+    // the hybrid PQC key exchange available via aws-lc-rs.
+    rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
@@ -729,7 +733,13 @@ async fn main() -> anyhow::Result<()> {
         let wt_metrics = metrics_registry.clone();
 
         tokio::spawn(async move {
-            let wt_addr: std::net::SocketAddr = "0.0.0.0:4433".parse().unwrap();
+            // SR-04: Use the configured bind_address instead of a hardcoded "0.0.0.0"
+            // so the WebTransport server honours the operator's bind_address setting
+            // (e.g. a private NIC) rather than always binding on all interfaces.
+            let wt_addr: std::net::SocketAddr =
+                format!("{}:4433", wt_config.server.bind_address)
+                    .parse()
+                    .expect("valid WebTransport bind address from config");
 
             info!("🚀 Starting dedicated WebTransport server on {}", wt_addr);
 

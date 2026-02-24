@@ -109,11 +109,33 @@ impl AdminServer {
 
         let addr = self.config.socket_addr()?;
 
+        // SR-03: If no auth_token is configured, generate a random 32-byte
+        // session token and log it so the operator can copy it into the config
+        // for persistence.  This ensures every startup always has token auth
+        // active (the token changes each restart until the operator pins one).
+        let effective_token: Option<String> = match &self.config.auth_token {
+            Some(t) => Some(t.clone()),
+            None => {
+                use rand::Rng;
+                let token: String = rand::thread_rng()
+                    .sample_iter(&rand::distributions::Alphanumeric)
+                    .take(48)
+                    .map(char::from)
+                    .collect();
+                warn!(
+                    "Admin API: no auth_token configured — generated ephemeral session token. \
+                     Add `auth_token = \"{}\"` to [admin] in your config file to persist it.",
+                    token
+                );
+                Some(token)
+            }
+        };
+
         // SEC-005 / AUD-10 / F-08: Build the auth state with per-IP and global
         // failed-attempt trackers plus the exponential back-off counter.
         let auth_state = Arc::new(AdminAuthState {
             allowed_ips: self.config.allowed_ips.clone(),
-            auth_token: self.config.auth_token.clone(),
+            auth_token: effective_token,
             failed_attempts: Arc::new(DashMap::new()),
             global_failure_count: Arc::new(AtomicU32::new(0)),
             global_cooldown_until: Arc::new(RwLock::new(None)),
@@ -400,7 +422,7 @@ async fn auth_middleware(
     next.run(request).await.into_response()
 }
 
-/// Health check response
+/// Health check response (public endpoint — no topology disclosure)
 #[derive(Serialize)]
 struct HealthResponse {
     status: String,
@@ -408,10 +430,24 @@ struct HealthResponse {
     uptime_seconds: u64,
     connections: u64,
     requests: u64,
-    backends: Vec<BackendHealth>,
+    /// SR-01: Only name + healthy — address/type are omitted to prevent
+    /// leaking internal backend topology to unauthenticated callers.
+    backends: Vec<PublicBackendHealth>,
 }
 
-/// Backend health status
+/// SR-01: Minimal backend status for the public /health endpoint.
+///
+/// Deliberately excludes `address` and `backend_type` so that internal service
+/// topology (e.g. "127.0.0.1:3003") cannot be discovered by unauthenticated
+/// clients or via SSRF pivots.  Full backend detail is available on the
+/// authenticated /backends endpoint only.
+#[derive(Serialize)]
+struct PublicBackendHealth {
+    name: String,
+    healthy: bool,
+}
+
+/// Backend health status — full detail, used by the authenticated /backends endpoint only
 #[derive(Serialize)]
 struct BackendHealth {
     name: String,
@@ -421,20 +457,18 @@ struct BackendHealth {
     address: String,
 }
 
-/// Health check endpoint
+/// Health check endpoint (public — no auth required)
 async fn health_handler(State(state): State<Arc<AdminState>>) -> Json<HealthResponse> {
     let config = state.config_manager.get();
     let uptime = state.start_time.elapsed().as_secs();
 
-    // Check backend health
+    // SR-01: Collect only name + healthy status; omit addresses and types.
     let mut backends = Vec::new();
     for (name, backend) in &config.backends {
         let healthy = state.backend_pool.check_health(backend).await;
-        backends.push(BackendHealth {
+        backends.push(PublicBackendHealth {
             name: name.clone(),
             healthy,
-            backend_type: format!("{:?}", backend.backend_type),
-            address: backend.address.clone(),
         });
     }
 

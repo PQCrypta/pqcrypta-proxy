@@ -570,6 +570,37 @@ impl SecurityState {
             return;
         }
 
+        // SR-07: Check that the blocklist file is not world-writable (Unix only).
+        // A world-writable blocklist could let an attacker inject arbitrary block
+        // entries (DoS on legitimate clients) or clear existing blocks (bypass).
+        // Warn loudly so operators can fix the permissions before they cause a
+        // security incident.  The recommended mode is 0640 (owner rw, group r).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(meta) = std::fs::metadata(&blocked_ips_file) {
+                let mode = meta.mode();
+                // Check other-write (bit 1) and other-read (bit 2) and group-write (bit 4)
+                if mode & 0o002 != 0 {
+                    warn!(
+                        "SR-07: Blocklist file {} is world-writable (mode {:o}). \
+                         This allows any local user to tamper with the blocklist. \
+                         Run: chmod 640 {}",
+                        blocked_ips_file.display(),
+                        mode & 0o777,
+                        blocked_ips_file.display(),
+                    );
+                } else if mode & 0o020 != 0 {
+                    warn!(
+                        "SR-07: Blocklist file {} is group-writable (mode {:o}). \
+                         Restrict to mode 640 to prevent unauthorised modification.",
+                        blocked_ips_file.display(),
+                        mode & 0o777,
+                    );
+                }
+            }
+        }
+
         match std::fs::read_to_string(&blocked_ips_file) {
             Ok(content) => {
                 if let Ok(entries) = serde_json::from_str::<Vec<BlocklistEntry>>(&content) {

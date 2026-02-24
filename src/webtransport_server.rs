@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use wtransport::config::QuicTransportConfig;
 use wtransport::{Connection, Endpoint, Identity, ServerConfig};
 
@@ -186,13 +186,50 @@ async fn handle_incoming_session(
 
     let path = session_request.path().to_string();
     let authority = session_request.authority().to_string();
+    let remote_addr = session_request.remote_address();
 
     info!("📥 WebTransport session request received");
     info!("   Path: {}", path);
     info!("   Authority: {}", authority);
 
+    // SR-02: Origin validation.
+    //
+    // The WebTransport spec requires servers to validate the `Origin` header
+    // to prevent cross-origin abuse from arbitrary web pages.  We reject any
+    // session whose origin is not listed in `server.webtransport_allowed_origins`.
+    //
+    // Behaviour matrix:
+    //   allowed_origins is empty  → non-browser (no Origin header) passes;
+    //                               browser sessions (have Origin) are rejected
+    //                               until the operator configures the list.
+    //   allowed_origins non-empty → Origin must match one of the listed values;
+    //                               sessions without an Origin header are also
+    //                               accepted (non-browser / native clients).
+    let allowed_origins = &config.server.webtransport_allowed_origins;
+    if let Some(origin) = session_request.origin() {
+        // Browser-sourced session: check against the allowlist.
+        let is_allowed = if allowed_origins.is_empty() {
+            // No origins configured — reject all browser cross-origin sessions.
+            false
+        } else {
+            allowed_origins.iter().any(|o| o == origin)
+        };
+
+        if !is_allowed {
+            warn!(
+                "SR-02: WebTransport session from {} rejected — Origin '{}' not in allowed list",
+                remote_addr, origin
+            );
+            session_request.forbidden().await;
+            return Ok(());
+        }
+        info!("   Origin: {} ✅", origin);
+    } else {
+        // No Origin header — non-browser / native client; always accepted.
+        info!("   Origin: (none — non-browser client)");
+    }
+
     // Accept the session
-    let remote_addr = session_request.remote_address();
     let connection = session_request.accept().await?;
 
     info!("✅ WebTransport connection established: {}", remote_addr);

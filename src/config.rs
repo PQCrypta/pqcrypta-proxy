@@ -236,6 +236,21 @@ pub struct ServerConfig {
     /// for in-flight requests to complete before exiting.
     /// Should not exceed systemd TimeoutStopSec (default 30 s).
     pub graceful_shutdown_timeout_secs: u64,
+    /// SR-02: Allowed Origin values for incoming WebTransport sessions.
+    ///
+    /// WebTransport sessions carry an HTTP `Origin` header from the browser.
+    /// Any session whose `Origin` is not in this list is rejected with 403 to
+    /// prevent cross-origin abuse from arbitrary web pages.
+    ///
+    /// Set to your frontend origin(s), e.g.:
+    ///   webtransport_allowed_origins = ["https://pqcrypta.com"]
+    ///
+    /// An empty list (the default) rejects ALL cross-origin sessions.
+    /// Sessions without an `Origin` header (non-browser clients) are always
+    /// accepted when the list is empty; if the list is non-empty they must
+    /// match one of the listed origins.
+    #[serde(default)]
+    pub webtransport_allowed_origins: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -251,6 +266,9 @@ impl Default for ServerConfig {
             enable_ipv6: true,
             worker_threads: 0,
             graceful_shutdown_timeout_secs: 30,
+            // SR-02: Empty by default — all cross-origin sessions are rejected
+            // until the operator explicitly lists allowed origins.
+            webtransport_allowed_origins: Vec::new(),
         }
     }
 }

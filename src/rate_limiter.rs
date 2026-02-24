@@ -1376,6 +1376,30 @@ impl AdvancedRateLimiter {
             sub: String,
         }
 
+        // SR-05: Pre-validate the JWT header before attempting signature
+        // verification.  This explicitly catches algorithm confusion attacks
+        // (including any `alg: none` variant) before the full decode path runs,
+        // providing defense-in-depth on top of the algorithm whitelist below.
+        let header = match jsonwebtoken::decode_header(token) {
+            Ok(h) => h,
+            Err(e) => {
+                debug!("SR-05: JWT header decode failed: {}", e);
+                return None;
+            }
+        };
+        // Only HMAC algorithms are accepted; everything else — including any
+        // future `Algorithm::None` variant — is rejected here.
+        if !matches!(
+            header.alg,
+            Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512
+        ) {
+            warn!(
+                "SR-05: JWT with disallowed algorithm {:?} rejected (expected HMAC only)",
+                header.alg
+            );
+            return None;
+        }
+
         // F-10: Parse only the operator-configured HMAC algorithms.
         // Non-HMAC strings are silently skipped; if the list resolves to
         // empty the extraction is disabled (safe default).
