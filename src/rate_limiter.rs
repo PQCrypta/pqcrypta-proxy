@@ -88,10 +88,27 @@ pub struct AdvancedRateLimitConfig {
     /// random secret (≥32 bytes, base64-encoded) that matches the secret used by
     /// the upstream token issuer.
     pub jwt_secret: Option<String>,
+
+    /// F-10: Allowed JWT HMAC algorithms for rate-limit key extraction.
+    ///
+    /// Defaults to `["HS256"]`.  Only HMAC variants (HS256, HS384, HS512) are
+    /// accepted; asymmetric algorithms (RS256, ES256, etc.) require a different
+    /// key format and are rejected at startup if configured here.  Restricting
+    /// to a single algorithm prevents algorithm-confusion attacks where a client
+    /// substitutes a weaker or alternative signing scheme.
+    ///
+    /// Example (TOML):
+    ///   `jwt_algorithms = ["HS256"]`
+    #[serde(default = "default_jwt_algorithms")]
+    pub jwt_algorithms: Vec<String>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_jwt_algorithms() -> Vec<String> {
+    vec!["HS256".to_string()]
 }
 
 impl Default for AdvancedRateLimitConfig {
@@ -113,6 +130,7 @@ impl Default for AdvancedRateLimitConfig {
             ipv6_subnet_bits: 64,
             composite_keys: vec![],
             jwt_secret: None, // H-2: disabled by default; set to enable JWT-based rate limiting
+            jwt_algorithms: default_jwt_algorithms(), // F-10: default HS256 only
         }
     }
 }
@@ -1233,8 +1251,11 @@ impl AdvancedRateLimiter {
                 // H-2: JWT subject extraction requires a configured signing secret.
                 // Without signature verification the `sub` claim is attacker-controlled,
                 // so we return None (disabling JWT-based rate limiting) when no secret is set.
-                ctx.get_header("authorization")
-                    .and_then(|auth| self.extract_jwt_subject(auth, config.jwt_secret.as_deref()))
+                ctx.get_header("authorization").and_then(|auth| {
+                    let algs: Vec<&str> =
+                        config.jwt_algorithms.iter().map(String::as_str).collect();
+                    self.extract_jwt_subject(auth, config.jwt_secret.as_deref(), &algs)
+                })
             }
 
             RateLimitKeyType::Ja3Fingerprint => ctx.ja3_hash.clone(),
@@ -1329,7 +1350,17 @@ impl AdvancedRateLimiter {
     /// function returns `None`, effectively disabling JWT-based rate limiting.
     /// This prevents an attacker from forging any `sub` value by crafting a JWT
     /// with an unsigned or differently-signed payload.
-    fn extract_jwt_subject(&self, auth_header: &str, jwt_secret: Option<&str>) -> Option<String> {
+    ///
+    /// F-10: Only algorithms listed in `allowed_algorithms` are accepted.
+    /// The default is `["HS256"]`.  Non-HMAC algorithms (RS256, ES256, etc.) are
+    /// silently rejected to prevent algorithm-confusion attacks where a client
+    /// substitutes a different signing scheme.
+    fn extract_jwt_subject(
+        &self,
+        auth_header: &str,
+        jwt_secret: Option<&str>,
+        allowed_algorithms: &[&str],
+    ) -> Option<String> {
         use jsonwebtoken::{Algorithm, DecodingKey, Validation};
         use serde::Deserialize;
 
@@ -1345,10 +1376,36 @@ impl AdvancedRateLimiter {
             sub: String,
         }
 
+        // F-10: Parse only the operator-configured HMAC algorithms.
+        // Non-HMAC strings are silently skipped; if the list resolves to
+        // empty the extraction is disabled (safe default).
+        let parsed: Vec<Algorithm> = allowed_algorithms
+            .iter()
+            .filter_map(|alg| match *alg {
+                "HS256" => Some(Algorithm::HS256),
+                "HS384" => Some(Algorithm::HS384),
+                "HS512" => Some(Algorithm::HS512),
+                other => {
+                    warn!(
+                        "F-10: JWT algorithm '{}' is not an HMAC variant (HS256/HS384/HS512) \
+                         and cannot be used with a shared secret; ignoring",
+                        other
+                    );
+                    None
+                }
+            })
+            .collect();
+
+        if parsed.is_empty() {
+            debug!("F-10: No valid HMAC algorithms configured for JWT rate-limit extraction");
+            return None;
+        }
+
         let key = DecodingKey::from_secret(secret.as_bytes());
-        let mut validation = Validation::new(Algorithm::HS256);
-        // Allow HS384 and HS512 as well for flexibility
-        validation.algorithms = vec![Algorithm::HS256, Algorithm::HS384, Algorithm::HS512];
+        // Use the first algorithm as the primary for Validation::new, then
+        // override the full list to accept exactly what was configured.
+        let mut validation = Validation::new(parsed[0]);
+        validation.algorithms = parsed;
 
         match jsonwebtoken::decode::<Claims>(token, &key, &validation) {
             Ok(token_data) => Some(token_data.claims.sub),
@@ -1809,7 +1866,7 @@ mod tests {
         // H-2: Without a configured jwt_secret, extraction must always return None
         // regardless of the JWT content (prevents trust-only mode).
         assert_eq!(
-            limiter.extract_jwt_subject(&format!("Bearer {}", jwt), None),
+            limiter.extract_jwt_subject(&format!("Bearer {}", jwt), None, &["HS256"]),
             None,
             "JWT extraction must return None when no secret is configured"
         );
@@ -1818,7 +1875,8 @@ mod tests {
         assert_eq!(
             limiter.extract_jwt_subject(
                 &format!("Bearer {}", jwt),
-                Some(std::str::from_utf8(TEST_SECRET).unwrap())
+                Some(std::str::from_utf8(TEST_SECRET).unwrap()),
+                &["HS256"],
             ),
             Some("user123".to_string()),
             "JWT extraction must return the sub claim on signature match"
@@ -1828,7 +1886,8 @@ mod tests {
         assert_eq!(
             limiter.extract_jwt_subject(
                 &format!("Bearer {}", jwt),
-                Some(std::str::from_utf8(WRONG_SECRET).unwrap())
+                Some(std::str::from_utf8(WRONG_SECRET).unwrap()),
+                &["HS256"],
             ),
             None,
             "JWT extraction must return None on signature mismatch"
@@ -1836,7 +1895,11 @@ mod tests {
 
         // Without Bearer prefix → None.
         assert_eq!(
-            limiter.extract_jwt_subject(&jwt, Some(std::str::from_utf8(TEST_SECRET).unwrap())),
+            limiter.extract_jwt_subject(
+                &jwt,
+                Some(std::str::from_utf8(TEST_SECRET).unwrap()),
+                &["HS256"],
+            ),
             None,
             "JWT extraction must return None without Bearer prefix"
         );

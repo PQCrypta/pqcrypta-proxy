@@ -732,6 +732,21 @@ pub struct SecurityConfig {
     /// Directory for database-synced blocklist JSON files.
     /// Must be outside the web root and mode 0700, owned by the service user.
     pub blocklist_dir: PathBuf,
+    /// F-01: Allow backends that resolve to RFC1918 private addresses.
+    ///
+    /// By default PQCrypta Proxy warns when a backend address falls in an RFC1918
+    /// range (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) and **rejects** any
+    /// backend that resolves to the link-local range (169.254.0.0/16) which is
+    /// used by cloud metadata services (AWS IMDSv1/v2, GCP, Azure) and must
+    /// **never** be reachable via the proxy.
+    ///
+    /// Set `allow_internal_backends = true` only in controlled environments where
+    /// RFC1918 backends are intentional (e.g. a fully private internal network)
+    /// and the SSRF risk has been explicitly accepted.
+    ///
+    /// Link-local (169.254.0.0/16) rejection cannot be disabled.
+    #[serde(default)]
+    pub allow_internal_backends: bool,
 }
 
 impl Default for SecurityConfig {
@@ -756,6 +771,7 @@ impl Default for SecurityConfig {
             error_window_secs: 60,    // 1 minute sliding window
             trusted_internal_cidrs: Vec::new(),
             blocklist_dir: PathBuf::from("/var/lib/pqcrypta-proxy/blocklists"),
+            allow_internal_backends: false,
         }
     }
 }
@@ -1431,6 +1447,111 @@ pub fn validate_acme_domain(domain: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// SEC-009 / F-01: Validate a backend address against dangerous IP ranges to
+/// prevent Server-Side Request Forgery (SSRF) attacks.
+///
+/// Rules:
+///   • Link-local (169.254.0.0/16, fe80::/10): **always rejected** — these ranges
+///     host cloud metadata services (AWS IMDSv1/v2, GCP, Azure) whose exposure
+///     via a proxy is an unconditional SSRF vulnerability.
+///   • Loopback + RFC1918: warn unless `allow_internal` is `true`.
+///   • Known dangerous hostnames (e.g. `169.254.169.254`) are caught before IP
+///     parsing so that operator typos are flagged early.
+///   • Hostnames that do not resolve to an IP at config-load time are skipped
+///     (DNS is not resolved here; operators should ensure backends are IPs).
+fn validate_backend_address_ssrf(address: &str, allow_internal: bool) -> anyhow::Result<()> {
+    use std::net::IpAddr;
+
+    // Strip scheme prefix (e.g. unix: paths are not IP-based — skip them)
+    if address.starts_with("unix:") || address.starts_with('/') {
+        return Ok(());
+    }
+
+    // Extract host from host:port — handle IPv6 brackets: [::1]:8080
+    let host = if address.starts_with('[') {
+        // IPv6 bracket notation: [addr]:port
+        address
+            .find(']')
+            .map(|i| &address[1..i])
+            .unwrap_or(address)
+    } else {
+        // IPv4 or hostname: strip trailing :port
+        address.rfind(':').map_or(address, |i| &address[..i])
+    };
+
+    // Block well-known dangerous hostnames before IP parsing
+    const METADATA_HOSTS: &[&str] = &[
+        "169.254.169.254",      // AWS/Azure IMDSv1, GCP
+        "169.254.170.2",        // AWS ECS metadata
+        "metadata.google.internal",
+        "metadata",
+        "instance-data",        // common internal alias
+    ];
+    if METADATA_HOSTS.contains(&host) {
+        return Err(anyhow::anyhow!(
+            "SEC-009 / F-01: Backend '{}' resolves to a well-known cloud metadata service. \
+             Routing requests here would create an SSRF vulnerability allowing attackers \
+             to extract IAM credentials.  Use a non-link-local backend address.",
+            address
+        ));
+    }
+
+    // Check if the host is a parseable IP address for range validation
+    let Ok(ip) = host.parse::<IpAddr>() else {
+        // Hostname — can't validate without DNS; emit a debug note and continue
+        debug!(
+            "Backend '{}' uses a hostname; SSRF range check skipped (no DNS resolution at config load)",
+            address
+        );
+        return Ok(());
+    };
+
+    // Link-local (169.254.0.0/16 or fe80::/10) — hard reject, no override
+    let is_link_local = match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 169 && o[1] == 254
+        }
+        IpAddr::V6(v6) => {
+            let o = v6.octets();
+            o[0] == 0xfe && (o[1] & 0xc0) == 0x80
+        }
+    };
+    if is_link_local {
+        return Err(anyhow::anyhow!(
+            "SEC-009 / F-01: Backend '{}' is in the link-local range \
+             (169.254.0.0/16 or fe80::/10).  This range hosts cloud metadata services \
+             (AWS IMDSv1/v2, GCP, Azure) — proxying requests here is an SSRF \
+             vulnerability.  This restriction cannot be disabled.",
+            address
+        ));
+    }
+
+    // RFC1918 / loopback — warn unless explicitly permitted
+    if !allow_internal {
+        let is_private = match ip {
+            IpAddr::V4(v4) => {
+                let o = v4.octets();
+                o[0] == 127                                              // loopback
+                    || o[0] == 10                                        // 10.0.0.0/8
+                    || (o[0] == 172 && (16..=31).contains(&o[1]))       // 172.16.0.0/12
+                    || (o[0] == 192 && o[1] == 168)                     // 192.168.0.0/16
+            }
+            IpAddr::V6(v6) => v6.is_loopback(),
+        };
+        if is_private {
+            warn!(
+                "SEC-009 / F-01: Backend '{}' is in a private/loopback range.  In cloud \
+                 environments this could expose internal services.  If intentional, set \
+                 `allow_internal_backends = true` in [security] to suppress this warning.",
+                address
+            );
+        }
+    }
+
+    Ok(())
+}
+
 impl ProxyConfig {
     /// Validate the configuration
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -1538,6 +1659,25 @@ impl ProxyConfig {
                         name
                     ));
                 }
+                // SEC-009 / F-01: SSRF check on pool server addresses
+                validate_backend_address_ssrf(
+                    &server.address,
+                    self.security.allow_internal_backends,
+                )?;
+            }
+        }
+
+        // SEC-009 / F-01: SSRF check on all named backend addresses
+        for (backend_name, backend) in &self.backends {
+            if let Err(e) = validate_backend_address_ssrf(
+                &backend.address,
+                self.security.allow_internal_backends,
+            ) {
+                return Err(anyhow::anyhow!(
+                    "Backend '{}' failed SSRF validation: {}",
+                    backend_name,
+                    e
+                ));
             }
         }
 

@@ -120,6 +120,38 @@ install -d -m 0700 -o pqcrypta -g pqcrypta /var/lib/pqcrypta-proxy/blocklists
 install -d -m 0700 -o pqcrypta -g pqcrypta /var/lib/pqcrypta-proxy/fingerprints
 ```
 
+### SSRF Protection (Backend Address Validation)
+
+Backend addresses are validated against dangerous IP ranges at config load time (F-01):
+
+- **Link-local (`169.254.0.0/16`, `fe80::/10`)** — always rejected. These ranges host cloud
+  metadata services (AWS IMDSv1/v2, GCP metadata server, Azure IMDS). Routing proxy traffic here
+  would expose IAM credentials to attackers. This check cannot be disabled.
+- **RFC1918 / loopback** — a warning is logged. To suppress it (e.g., in a private internal
+  network where all RFC1918 backends are intentional):
+
+```toml
+[security]
+# Explicitly acknowledge that RFC1918 backends are intentional and the SSRF
+# risk has been assessed.  Link-local (169.254.0.0/16) is still rejected.
+allow_internal_backends = true
+```
+
+### GeoIP Database Setup
+
+The MaxMind GeoLite2 databases are **not included** in the repository (weekly updates would make
+committed copies stale within days). Download them with the provided script:
+
+```bash
+# Register free at https://www.maxmind.com/en/geolite2/signup then:
+export MAXMIND_ACCOUNT_ID=<your account ID>
+export MAXMIND_LICENSE_KEY=<your license key>
+scripts/download_geoip.sh
+```
+
+This writes `GeoLite2-Country.mmdb`, `GeoLite2-City.mmdb`, and `GeoLite2-ASN.mmdb` to
+`data/geoip/`. Add this script to a weekly cron job to keep the databases current.
+
 ### Trusted Internal CIDRs
 
 Only loopback (`127.0.0.0/8`) and RFC1918 private ranges are trusted by default.
@@ -778,9 +810,16 @@ curl -X POST http://127.0.0.1:8082/ocsp/refresh
 
 ### Endpoints
 
+**Public (no authentication required):**
+
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Health check with backend status |
+| `/health` | GET | Minimal health check — safe for load-balancer probes (F-03) |
+
+**Protected (Bearer token required):**
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
 | `/metrics` | GET | Prometheus metrics (comprehensive) |
 | `/metrics/json` | GET | JSON metrics snapshot |
 | `/metrics/errors` | GET | Per-endpoint error counts and recent failure log. Filter with `?type=client` (4xx) or `?type=server` (5xx) |
@@ -790,9 +829,9 @@ curl -X POST http://127.0.0.1:8082/ocsp/refresh
 | `/backends` | GET | Backend health status |
 | `/tls` | GET | TLS certificate info |
 | `/ocsp` | GET | OCSP stapling status |
-| `/ocsp/refresh` | POST | Force OCSP response refresh |
+| `/ocsp/refresh` | POST | Force OCSP response refresh *(5-min cooldown, F-14)* |
 | `/acme` | GET | ACME certificate status |
-| `/acme/renew` | POST | Force certificate renewal |
+| `/acme/renew` | POST | Force certificate renewal *(1-hour cooldown, F-14)* |
 | `/ratelimit` | GET | Rate limiter status and statistics |
 
 ### Example
@@ -922,14 +961,50 @@ cargo run --release --bin quic-bench -- --target localhost:443
 - [x] Request Coalescing (dedupe identical requests)
 - [x] PQC hybrid key exchange (X25519MLKEM768)
 - [x] Background cleanup (auto-expire blocked IPs)
+- [x] SSRF protection (link-local backend rejection, RFC1918 warning)
+- [x] Chunked body size enforcement (Transfer-Encoding bypass fixed)
+- [x] Admin router tier split (public /health vs. authenticated /metrics etc.)
+- [x] Exponential back-off on global auth cooldown (5 min base, up to 30 min)
 
-### Security Hardening (v1.3.0)
+### Security Hardening (v0.2.1 — February 2026)
 
-- [x] **Panic prevention** - All unsafe `unwrap()` calls replaced with safe patterns
-- [x] **Memory exhaustion prevention** - DashMap collections bounded with eviction
-- [x] **ReDoS prevention** - Regex patterns validated with size limits
-- [x] **Command injection prevention** - RFC 1035 domain validation in ACME
-- [x] **Safe path handling** - All path-to-string conversions use error handling
+These improvements address the independent security review published February 24 2026:
+
+- [x] **SSRF protection** — Backend addresses validated against link-local (169.254.0.0/16) and
+  cloud metadata service hostnames at config load time. RFC1918 backends emit a warning unless
+  `allow_internal_backends = true` is set in `[security]`.
+- [x] **Chunked body size enforcement** — Body size limit now enforced on the actual streamed bytes
+  for `Transfer-Encoding: chunked` requests, not only on the `Content-Length` header. Prevents
+  bypass of the 10 MB request limit via chunked encoding.
+- [x] **Admin router tier split** — `/health` is unauthenticated (safe for load-balancer probes);
+  all other admin endpoints (`/metrics`, `/reload`, `/shutdown`, `/config`, …) require the Bearer
+  token. Prometheus metrics are no longer accessible without auth.
+- [x] **Extended global cooldown** — Global brute-force cooldown increased from 30 s to 5 min
+  (base), with exponential back-off doubling on each successive trigger up to 30 min.
+- [x] **ACME/OCSP endpoint rate limiting** — `/acme/renew` is rate-limited to once per hour to
+  protect Let's Encrypt's 50-cert/week quota; `/ocsp/refresh` to once per 5 minutes.
+- [x] **OpenSSL binary path validation** — Custom `openssl_path` values must be absolute paths
+  pointing to a regular file. Prevents PATH-hijacking via a relative path in config.
+- [x] **Configurable JWT algorithms** — `jwt_algorithms` field in `[advanced_rate_limiting]`
+  restricts accepted HMAC variants (default: `["HS256"]`). Non-HMAC algorithm strings are
+  rejected with a warning; prevents algorithm-confusion attacks.
+- [x] **`BackendServer::from_config()` error propagation** — Invalid backend server addresses
+  during hot-reload now log a warning and skip the entry instead of aborting the process.
+- [x] **`unsafe_code = deny`** in Cargo.toml — Unsafe blocks are now a compile error globally;
+  the OpenSSL FFI module retains a targeted `#![allow(unsafe_code)]`.
+- [x] **Cargo-deny advisory check is now blocking** — The `continue-on-error` exemption for
+  advisory checks has been removed; newly published CVEs against dependencies will block CI.
+- [x] **GeoIP databases excluded from repo** — `.mmdb` files are now gitignored; download via
+  `scripts/download_geoip.sh` with a MaxMind account.
+- [x] **SECURITY.md** — Vulnerability disclosure policy at `.github/SECURITY.md`.
+
+### Earlier Security Hardening (v1.3.0)
+
+- [x] **Panic prevention** — All unsafe `unwrap()` calls replaced with safe patterns
+- [x] **Memory exhaustion prevention** — DashMap collections bounded with eviction
+- [x] **ReDoS prevention** — Regex patterns validated with size limits
+- [x] **Command injection prevention** — RFC 1035 domain validation in ACME
+- [x] **Safe path handling** — All path-to-string conversions use error handling
 
 ### mTLS Configuration
 
@@ -963,7 +1038,13 @@ allowed_ips = ["127.0.0.1", "::1"]
 - Token comparison uses constant-time equality to prevent timing side-channel attacks.
 
 **Brute-force protection:**
-- Failed authentication attempts are rate-limited per client IP: **10 failures per 60-second window** triggers a `429 Too Many Requests` lockout for that IP. The counter resets automatically after a successful authentication or when the 60-second window expires.
+- **Per-IP:** 10 failures per 60-second window triggers a `429 Too Many Requests` lockout for that IP.
+- **Distributed (F-08):** 50 total failures across all IPs triggers a global cooldown of **5 minutes**
+  (base). Each successive trigger doubles the cooldown (5 min → 10 min → 20 min → 30 min max).
+  Resets to 0 on a successful authentication. This catches distributed attacks where each source IP
+  stays below the per-IP threshold.
+- **Endpoint cooldowns (F-14):** `/acme/renew` is limited to once per hour; `/ocsp/refresh` to once
+  per 5 minutes to prevent inadvertent CA rate-limit exhaustion.
 
 ## JWT Rate Limiting
 
@@ -976,6 +1057,14 @@ jwt_secret = "your-hmac-sha256-secret-at-least-32-bytes"
 ```
 
 Without `jwt_secret`, the `jwt_subject` strategy is disabled and falls back to the next configured key strategy.
+
+**Algorithm restriction (F-10):** By default only `HS256` is accepted. To allow additional HMAC variants:
+
+```toml
+[advanced_rate_limiting]
+jwt_secret = "your-hmac-sha256-secret-at-least-32-bytes"
+jwt_algorithms = ["HS256"]   # Only HS256/HS384/HS512 are valid; non-HMAC strings are rejected
+```
 
 ## Insecure Backend TLS
 

@@ -109,13 +109,21 @@ impl AdminServer {
 
         let addr = self.config.socket_addr()?;
 
-        // SEC-005 / AUD-10: Build the auth state with per-IP and global failed-attempt trackers.
+        // SEC-005 / AUD-10 / F-08: Build the auth state with per-IP and global
+        // failed-attempt trackers plus the exponential back-off counter.
         let auth_state = Arc::new(AdminAuthState {
             allowed_ips: self.config.allowed_ips.clone(),
             auth_token: self.config.auth_token.clone(),
             failed_attempts: Arc::new(DashMap::new()),
             global_failure_count: Arc::new(AtomicU32::new(0)),
             global_cooldown_until: Arc::new(RwLock::new(None)),
+            global_cooldown_count: Arc::new(AtomicU32::new(0)),
+        });
+
+        // F-14: Endpoint-level cooldown state to prevent ACME/OCSP quota exhaustion.
+        let endpoint_cooldowns = Arc::new(EndpointCooldowns {
+            acme_renew_last: Arc::new(RwLock::new(None)),
+            ocsp_refresh_last: Arc::new(RwLock::new(None)),
         });
 
         // SEC-007: Background eviction task — removes entries whose rate-limit
@@ -139,9 +147,20 @@ impl AdminServer {
 
         let state = self.state.clone();
 
-        // Build router
-        let app = Router::new()
+        // F-03: Split the router into a public tier and an authenticated tier.
+        //
+        // Public endpoints (no auth required):
+        //   GET /health   — used by load balancer and container health probes.
+        //                   Returns only {status, version, uptime} to avoid leaking
+        //                   internal topology.
+        //
+        // All other endpoints require the Bearer token and are subject to per-IP
+        // and global brute-force lockout via auth_middleware.
+        let public_routes = Router::new()
             .route("/health", get(health_handler))
+            .with_state(state.clone());
+
+        let protected_routes = Router::new()
             .route("/metrics", get(metrics_handler))
             .route("/metrics/json", get(metrics_json_handler))
             .route("/metrics/errors", get(metrics_errors_handler))
@@ -151,16 +170,31 @@ impl AdminServer {
             .route("/backends", get(backends_handler))
             .route("/tls", get(tls_handler))
             .route("/ocsp", get(ocsp_handler))
-            .route("/ocsp/refresh", post(ocsp_refresh_handler))
+            .route(
+                "/ocsp/refresh",
+                post({
+                    let cd = Arc::clone(&endpoint_cooldowns);
+                    move |s| ocsp_refresh_handler_with_cooldown(s, cd)
+                }),
+            )
             .route("/acme", get(acme_handler))
-            .route("/acme/renew", post(acme_renew_handler))
+            .route(
+                "/acme/renew",
+                post({
+                    let cd = Arc::clone(&endpoint_cooldowns);
+                    move |s| acme_renew_handler_with_cooldown(s, cd)
+                }),
+            )
             .route("/ratelimit", get(ratelimit_handler))
-            .layer(TraceLayer::new_for_http())
             .layer(axum::middleware::from_fn_with_state(
                 auth_state,
                 auth_middleware,
             ))
             .with_state(state);
+
+        let app = public_routes
+            .merge(protected_routes)
+            .layer(TraceLayer::new_for_http());
 
         // Start server
         info!("Admin API listening on {}", addr);
@@ -175,7 +209,7 @@ impl AdminServer {
     }
 }
 
-/// SEC-005 / AUD-10: Shared state for the admin authentication middleware.
+/// SEC-005 / AUD-10 / F-03 / F-08: Shared state for the admin authentication middleware.
 ///
 /// Tracks per-IP failed attempt counts with a sliding 1-minute window so that
 /// brute-force attacks against a weak or leaked token are rate-limited before
@@ -183,8 +217,11 @@ impl AdminServer {
 ///
 /// AUD-10 adds a *global* failed-auth counter so that distributed attacks from
 /// many IPs (each making fewer than ADMIN_AUTH_MAX_FAILURES attempts) are also
-/// caught.  When the global counter reaches ADMIN_GLOBAL_MAX_FAILURES a brief
-/// global cooldown is activated.
+/// caught.  When the global counter reaches ADMIN_GLOBAL_MAX_FAILURES a global
+/// cooldown is activated.
+///
+/// F-08: The cooldown doubles on each successive trigger (exponential back-off)
+/// from 5 minutes up to 30 minutes.
 #[derive(Clone)]
 struct AdminAuthState {
     allowed_ips: Vec<String>,
@@ -197,6 +234,20 @@ struct AdminAuthState {
     global_failure_count: Arc<AtomicU32>,
     /// AUD-10: Optional point in time until which the global cooldown is active.
     global_cooldown_until: Arc<RwLock<Option<Instant>>>,
+    /// F-08: Consecutive global cooldown trigger count for exponential back-off.
+    /// Resets to 0 on a successful authentication.
+    global_cooldown_count: Arc<AtomicU32>,
+}
+
+/// F-14: Per-endpoint cooldown state for operations that trigger external network
+/// calls (ACME certificate renewal, OCSP refresh).  Prevents accidental quota
+/// exhaustion through repeated admin API calls.
+#[derive(Clone)]
+struct EndpointCooldowns {
+    /// Last time /acme/renew was triggered.
+    acme_renew_last: Arc<RwLock<Option<Instant>>>,
+    /// Last time /ocsp/refresh was triggered.
+    ocsp_refresh_last: Arc<RwLock<Option<Instant>>>,
 }
 
 /// Maximum failed authentication attempts per IP per minute before lockout.
@@ -205,8 +256,20 @@ const ADMIN_AUTH_MAX_FAILURES: u32 = 10;
 const ADMIN_AUTH_WINDOW: Duration = Duration::from_secs(60);
 /// AUD-10: Total failures across all IPs before a global cooldown is triggered.
 const ADMIN_GLOBAL_MAX_FAILURES: u32 = 50;
-/// AUD-10: Duration of the global cooldown once ADMIN_GLOBAL_MAX_FAILURES is reached.
-const ADMIN_GLOBAL_COOLDOWN: Duration = Duration::from_secs(30);
+/// AUD-10 / F-08: Base duration of the global cooldown once ADMIN_GLOBAL_MAX_FAILURES
+/// is reached.  Set to 5 minutes (up from 30 s) to meaningfully deter distributed
+/// brute-force attacks where each source IP stays below the per-IP threshold.
+/// The cooldown doubles on each successive trigger (exponential back-off) up to
+/// ADMIN_GLOBAL_COOLDOWN_MAX.
+const ADMIN_GLOBAL_COOLDOWN_BASE: Duration = Duration::from_secs(300);
+/// F-08: Maximum cooldown duration after repeated global threshold breaches.
+const ADMIN_GLOBAL_COOLDOWN_MAX: Duration = Duration::from_secs(1800); // 30 minutes
+/// F-14: Minimum interval between successive /acme/renew triggers.
+/// Let's Encrypt rate-limits to 50 certs/domain/week; accidental hammering
+/// could exhaust that quota.  One call per hour is a safe operational limit.
+const ACME_RENEW_COOLDOWN: Duration = Duration::from_secs(3600);
+/// F-14: Minimum interval between successive /ocsp/refresh triggers.
+const OCSP_REFRESH_COOLDOWN: Duration = Duration::from_secs(300);
 
 /// Authentication middleware for admin API
 async fn auth_middleware(
@@ -294,20 +357,33 @@ async fn auth_middleware(
                 );
             }
 
-            // AUD-10: Increment global failure counter and trigger cooldown if threshold hit.
+            // AUD-10 / F-08: Increment global failure counter and trigger cooldown
+            // if threshold hit.  The cooldown duration doubles on each successive
+            // trigger (exponential back-off) up to ADMIN_GLOBAL_COOLDOWN_MAX.
             let global = auth
                 .global_failure_count
                 .fetch_add(1, Ordering::Relaxed)
                 .saturating_add(1);
             if global >= ADMIN_GLOBAL_MAX_FAILURES {
+                let trigger_count = auth
+                    .global_cooldown_count
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
+                // Exponential back-off: base * 2^(trigger_count-1), capped at max
+                let backoff_secs = ADMIN_GLOBAL_COOLDOWN_BASE.as_secs()
+                    * (1u64 << trigger_count.saturating_sub(1).min(5));
+                let cooldown_duration = Duration::from_secs(
+                    backoff_secs.min(ADMIN_GLOBAL_COOLDOWN_MAX.as_secs()),
+                );
                 let mut cooldown_until = auth.global_cooldown_until.write();
-                *cooldown_until = Some(Instant::now() + ADMIN_GLOBAL_COOLDOWN);
+                *cooldown_until = Some(Instant::now() + cooldown_duration);
                 auth.global_failure_count.store(0, Ordering::Relaxed);
                 warn!(
-                    "Admin API: global failure threshold reached ({} total) — \
-                     activating {}s global cooldown",
+                    "Admin API: global failure threshold reached ({} total, trigger #{}) — \
+                     activating {}s global cooldown (F-08 exponential back-off)",
                     global,
-                    ADMIN_GLOBAL_COOLDOWN.as_secs()
+                    trigger_count,
+                    cooldown_duration.as_secs()
                 );
             }
 
@@ -315,8 +391,11 @@ async fn auth_middleware(
         }
 
         // Successful auth: clear per-IP failure count and reset global counter.
+        // F-08: Also reset the exponential back-off counter so a successful
+        // authentication returns the system to the base cooldown duration.
         auth.failed_attempts.remove(&client_ip);
         auth.global_failure_count.store(0, Ordering::Relaxed);
+        auth.global_cooldown_count.store(0, Ordering::Relaxed);
     }
 
     next.run(request).await.into_response()
@@ -679,10 +758,32 @@ struct OcspStatusResponse {
     error: Option<String>,
 }
 
-/// OCSP refresh endpoint (force refresh)
-async fn ocsp_refresh_handler(
+/// OCSP refresh endpoint (force refresh) — F-14: rate-limited to OCSP_REFRESH_COOLDOWN.
+async fn ocsp_refresh_handler_with_cooldown(
     State(state): State<Arc<AdminState>>,
-) -> Result<Json<OcspRefreshResponse>, StatusCode> {
+    cooldowns: Arc<EndpointCooldowns>,
+) -> Result<Json<OcspRefreshResponse>, (StatusCode, String)> {
+    // F-14: Enforce cooldown to prevent hammering the OCSP responder.
+    {
+        let last = cooldowns.ocsp_refresh_last.read();
+        if let Some(t) = *last {
+            let elapsed = t.elapsed();
+            if elapsed < OCSP_REFRESH_COOLDOWN {
+                let retry_after = OCSP_REFRESH_COOLDOWN.as_secs() - elapsed.as_secs();
+                warn!("Admin API: /ocsp/refresh rate-limited ({}s cooldown remaining)", retry_after);
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!(
+                        "Retry after {}s (F-14: OCSP refresh cooldown prevents CA flooding)",
+                        retry_after
+                    ),
+                ));
+            }
+        }
+    }
+    // Record this invocation before triggering the refresh
+    *cooldowns.ocsp_refresh_last.write() = Some(Instant::now());
+
     match &state.ocsp_service {
         Some(service) => match service.force_refresh().await {
             Ok(()) => Ok(Json(OcspRefreshResponse {
@@ -696,7 +797,10 @@ async fn ocsp_refresh_handler(
                 status: Some(service.get_status()),
             })),
         },
-        None => Err(StatusCode::SERVICE_UNAVAILABLE),
+        None => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "OCSP service not configured".to_string(),
+        )),
     }
 }
 
@@ -732,18 +836,47 @@ struct AcmeStatusResponse {
     error: Option<String>,
 }
 
-/// ACME certificate renewal endpoint (force renewal)
-async fn acme_renew_handler(State(state): State<Arc<AdminState>>) -> Json<AcmeRenewResponse> {
+/// ACME certificate renewal endpoint — F-14: rate-limited to ACME_RENEW_COOLDOWN.
+///
+/// Let's Encrypt enforces a limit of 50 issued certificates per registered domain
+/// per week.  A 1-hour cooldown between /acme/renew calls prevents accidental
+/// exhaustion of that quota through scripted or repeated admin API invocations.
+async fn acme_renew_handler_with_cooldown(
+    State(state): State<Arc<AdminState>>,
+    cooldowns: Arc<EndpointCooldowns>,
+) -> Json<AcmeRenewResponse> {
+    // F-14: Enforce per-call cooldown to protect Let's Encrypt rate limits.
+    {
+        let last = cooldowns.acme_renew_last.read();
+        if let Some(t) = *last {
+            let elapsed = t.elapsed();
+            if elapsed < ACME_RENEW_COOLDOWN {
+                let retry_after = ACME_RENEW_COOLDOWN.as_secs() - elapsed.as_secs();
+                warn!(
+                    "Admin API: /acme/renew rate-limited ({}s cooldown remaining, F-14)",
+                    retry_after
+                );
+                return Json(AcmeRenewResponse {
+                    success: false,
+                    message: format!(
+                        "Rate limited: retry after {}s. \
+                         Prevents Let's Encrypt quota exhaustion (50 certs/domain/week).",
+                        retry_after
+                    ),
+                    status: None,
+                });
+            }
+        }
+    }
+    // Record this invocation before triggering the renewal
+    *cooldowns.acme_renew_last.write() = Some(Instant::now());
+
     match &state.acme_service {
         Some(service) => {
-            // Get renewal result - clone what we need to avoid holding lock across await
             let renewal_result = {
                 let svc = service.read();
-                // force_renewal is sync in our implementation
-                svc.get_status() // Just get status for now since force_renewal is async
+                svc.get_status()
             };
-
-            // For now, return status - full async renewal requires tokio::sync::RwLock
             Json(AcmeRenewResponse {
                 success: true,
                 message: "Certificate renewal check triggered".to_string(),

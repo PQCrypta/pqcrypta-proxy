@@ -251,8 +251,39 @@ impl PqcTlsProvider {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        // Check if OpenSSL binary exists
-        if !Path::new(&openssl_bin).exists() {
+        // F-09: Validate the OpenSSL binary path before executing it.
+        // Require an absolute path so PATH-based hijacking is impossible, and
+        // verify the target is a regular file (not a directory, device, or
+        // dangling symlink) before passing it to Command::new().
+        let openssl_path_obj = Path::new(&openssl_bin);
+        if openssl_bin != "openssl" {
+            // Only enforce absolute-path and regular-file checks when a custom
+            // path was explicitly configured; the bare "openssl" default relies
+            // on the system PATH which is controlled by the operator.
+            if !openssl_path_obj.is_absolute() {
+                return Err(format!(
+                    "openssl_path '{}' must be an absolute path to prevent PATH-hijacking (F-09). \
+                     Example: /usr/local/ssl35/bin/openssl",
+                    openssl_bin
+                ));
+            }
+            match openssl_path_obj.metadata() {
+                Ok(meta) if !meta.is_file() => {
+                    return Err(format!(
+                        "openssl_path '{}' exists but is not a regular file (F-09). \
+                         Ensure the path points directly to the OpenSSL binary.",
+                        openssl_bin
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(format!(
+                        "OpenSSL not accessible at '{}': {} (F-09)",
+                        openssl_bin, e
+                    ));
+                }
+            }
+        } else if !openssl_path_obj.exists() {
             return Err(format!("OpenSSL not found at {}", openssl_bin));
         }
 

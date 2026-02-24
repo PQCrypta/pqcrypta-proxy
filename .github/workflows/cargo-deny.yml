@@ -19,8 +19,11 @@ jobs:
           - advisories
           - bans licenses sources
 
-    # advisories may be warn-only; others are hard failures
-    continue-on-error: ${{ matrix.checks == 'advisories' }}
+    # F-04: All checks are hard failures. Known-safe advisory exceptions are
+    # documented in deny.toml [advisories].ignore with rationale and are
+    # reviewed before each release. Setting continue-on-error = false ensures
+    # newly-published CVEs against our TLS/crypto dependencies block CI.
+    continue-on-error: false
 
     steps:
       - uses: actions/checkout@v4

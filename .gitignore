@@ -3,6 +3,12 @@
 **/*.rs.bk
 # Note: Cargo.lock is committed for reproducible binary builds
 
+# F-11: GeoIP databases — do NOT commit to version control.
+# MaxMind databases are updated weekly; stale copies silently produce wrong
+# blocking decisions.  They also require a MaxMind account (license terms).
+# Download via: scripts/download_geoip.sh
+data/geoip/*.mmdb
+
 # IDE
 .idea/
 .vscode/

@@ -969,16 +969,94 @@ pub async fn security_middleware(
         }
     }
 
-    // 5. Request size validation
-    if let Some(content_length) = headers.get("content-length") {
-        if let Ok(length_str) = content_length.to_str() {
-            if let Ok(length) = length_str.parse::<usize>() {
-                if length > max_request_size {
-                    warn!("Request too large from {}: {} bytes", ip, length);
-                    return payload_too_large_response(max_request_size);
+    // 5. Request size validation — covers both Content-Length and chunked bodies.
+    //
+    // F-02: The previous implementation checked only the Content-Length header, which
+    // is absent for Transfer-Encoding: chunked requests.  Attackers could bypass the
+    // 10 MB body limit by sending an arbitrarily large chunked body.
+    //
+    // Fix: if a Content-Length is present, use it for a fast pre-flight rejection.
+    // If the request uses chunked encoding (or has no Content-Length at all), buffer
+    // the actual body bytes up to max_request_size and reconstruct the request.
+    // This enforces the limit on streamed bytes regardless of declared size.
+    let is_chunked = headers
+        .get("transfer-encoding")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase().contains("chunked"))
+        .unwrap_or(false);
+    let has_content_length = headers.get("content-length").is_some();
+
+    if has_content_length && !is_chunked {
+        // Fast path: validate the declared size before reading the body.
+        if let Some(content_length) = headers.get("content-length") {
+            if let Ok(length_str) = content_length.to_str() {
+                if let Ok(length) = length_str.parse::<usize>() {
+                    if length > max_request_size {
+                        warn!("Request too large from {}: {} bytes", ip, length);
+                        return payload_too_large_response(max_request_size);
+                    }
                 }
             }
         }
+    } else if is_chunked || !has_content_length {
+        // Slow path: buffer the body and enforce the limit on actual bytes.
+        let (parts, body) = request.into_parts();
+        // Collect up to max_request_size + 1 bytes; excess triggers the error branch.
+        let mut collected_bytes: Vec<u8> = Vec::new();
+        let mut frame_stream = body.into_data_stream();
+        let mut oversized = false;
+
+        while let Some(chunk_result) = {
+            use futures_util::StreamExt;
+            frame_stream.next().await
+        } {
+            match chunk_result {
+                Ok(chunk) => {
+                    collected_bytes.extend_from_slice(&chunk);
+                    if collected_bytes.len() > max_request_size {
+                        oversized = true;
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        if oversized {
+            warn!(
+                "Chunked request body exceeded limit from {}: >{} bytes",
+                ip, max_request_size
+            );
+            if dos_protection {
+                security.decrement_connections(ip);
+            }
+            return payload_too_large_response(max_request_size);
+        }
+
+        // Reconstruct the request with the buffered body and continue.
+        let request = Request::from_parts(parts, Body::from(collected_bytes));
+
+        // 6. Header size validation
+        let header_size: usize = headers
+            .iter()
+            .map(|(k, v)| k.as_str().len() + v.len())
+            .sum();
+        if header_size > max_header_size {
+            warn!("Headers too large from {}: {} bytes", ip, header_size);
+            if dos_protection {
+                security.decrement_connections(ip);
+            }
+            return headers_too_large_response(max_header_size);
+        }
+
+        // 7. Process request
+        let response = next.run(request).await;
+        let status = response.status();
+        security.record_request(ip, status);
+        if dos_protection {
+            security.decrement_connections(ip);
+        }
+        return response;
     }
 
     // 6. Header size validation

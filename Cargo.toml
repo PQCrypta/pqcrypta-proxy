@@ -206,7 +206,10 @@ opt-level = 3
 debug = true
 
 [lints.rust]
-unsafe_code = "warn"
+# F-12: Enforce unsafe_code = deny globally. The pqc_tls.rs module carries
+# a targeted #![allow(unsafe_code)] for its OpenSSL FFI bindings; all other
+# modules must not introduce unsafe blocks without explicit justification.
+unsafe_code = "deny"
 
 [lints.clippy]
 all = "warn"

@@ -158,14 +158,22 @@ pub struct DrainingState {
 }
 
 impl BackendServer {
-    /// Create from configuration
-    pub fn from_config(config: &PoolServerConfig) -> Self {
-        let address: SocketAddr = config
-            .address
-            .parse()
-            .expect("Invalid backend server address");
+    /// Create from configuration.
+    ///
+    /// F-06: Returns `Result` instead of panicking on an invalid address so that
+    /// a hot-reload with a malformed config rejects the pool rather than aborting
+    /// the process.  Callers (including `BackendPool::from_config`) log and skip
+    /// invalid entries rather than crashing the proxy.
+    pub fn from_config(config: &PoolServerConfig) -> anyhow::Result<Self> {
+        let address: SocketAddr = config.address.parse().map_err(|e| {
+            anyhow::anyhow!(
+                "Invalid backend server address '{}': {}",
+                config.address,
+                e
+            )
+        })?;
 
-        Self {
+        Ok(Self {
             id: format!("{}:{}", address.ip(), address.port()),
             address,
             weight: config.weight,
@@ -182,7 +190,7 @@ impl BackendServer {
             health: RwLock::new(BackendHealth::default()),
             slow_start: RwLock::new(None),
             draining: RwLock::new(None),
-        }
+        })
     }
 
     /// Check if server is available for requests
@@ -345,7 +353,15 @@ impl BackendPool {
         let servers: Vec<Arc<BackendServer>> = config
             .servers
             .iter()
-            .map(|s| Arc::new(BackendServer::from_config(s)))
+            .filter_map(|s| match BackendServer::from_config(s) {
+                Ok(server) => Some(Arc::new(server)),
+                Err(e) => {
+                    // F-06: Log and skip rather than panic — preserves proxy liveness
+                    // under a hot-reload that introduces a malformed address.
+                    warn!("Skipping invalid backend server '{}': {}", s.address, e);
+                    None
+                }
+            })
             .collect();
 
         info!(
@@ -923,7 +939,7 @@ mod tests {
             tls_skip_verify: false,
             tls_sni: None,
         };
-        Arc::new(BackendServer::from_config(&config))
+        Arc::new(BackendServer::from_config(&config).expect("test address must be valid"))
     }
 
     #[test]

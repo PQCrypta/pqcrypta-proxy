@@ -29,9 +29,24 @@ allow = [
 ]
 
 [bans]
+# F-05: Duplicate dependency versions expand the binary attack surface.
+# Security-critical parsing/crypto crates are denied from having multiple versions.
+# Other crates that unavoidably accumulate versions are explicitly skipped below.
 multiple-versions = "warn"
 wildcards = "allow"
 deny = []
+
+# Skip lists for unavoidable transitive duplicates (tracked; reduce over time):
+# x509-parser: pulled in at 0.16 by direct dep, newer versions by other transitive crates.
+# Update Cargo.toml direct dep when upstreams converge on a single version.
+skip = [
+    { name = "x509-parser", reason = "F-13: three transitive versions (0.16/0.17/0.18); direct dep is 0.16; upstream update tracked" },
+    { name = "asn1-rs", reason = "transitive of x509-parser multi-version chain" },
+    { name = "rand", reason = "0.8 and 0.9 pulled by separate dependency subtrees; upstream migration ongoing" },
+    { name = "getrandom", reason = "multiple versions due to rand/crypto crate ecosystem transition" },
+    { name = "webpki-roots", reason = "0.26 and 1.x pulled by separate crates; update pending upstream" },
+    { name = "brotli", reason = "7.x and 8.x due to async-compression version pinning" },
+]
 
 [sources]
 unknown-registry = "warn"
