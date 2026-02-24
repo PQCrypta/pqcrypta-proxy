@@ -243,7 +243,9 @@ pub struct ServerConfig {
     /// prevent cross-origin abuse from arbitrary web pages.
     ///
     /// Set to your frontend origin(s), e.g.:
-    ///   webtransport_allowed_origins = ["https://pqcrypta.com"]
+    /// ```toml
+    /// webtransport_allowed_origins = ["https://pqcrypta.com"]
+    /// ```
     ///
     /// An empty list (the default) rejects ALL cross-origin sessions.
     /// Sessions without an `Origin` header (non-browser clients) are always
