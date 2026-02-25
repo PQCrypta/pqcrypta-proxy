@@ -430,10 +430,7 @@ impl SecurityState {
         // P3-fix: Build the Alt-Svc header from the configured ports rather than
         // a hardcoded string.  Collect the primary UDP port + any additional ports.
         let alt_svc_header: Arc<str> = {
-            let mut parts = vec![format!(
-                "h3=\":{}\"; ma=86400",
-                config.server.udp_port
-            )];
+            let mut parts = vec![format!("h3=\":{}\"; ma=86400", config.server.udp_port)];
             for p in &config.server.additional_ports {
                 parts.push(format!("h3=\":{}\"; ma=86400", p));
             }
@@ -1221,18 +1218,13 @@ pub async fn security_middleware(
                 };
                 match waf.inspect(&waf_req_body) {
                     WafVerdict::Block { ref rule, .. } => {
-                        warn!(
-                            "WAF body block: rule={} ip={} path={}",
-                            rule, ip, waf_path
-                        );
+                        warn!("WAF body block: rule={} ip={} path={}", rule, ip, waf_path);
                         if dos_protection {
                             security.decrement_connections(ip);
                         }
-                        let mut resp = (
-                            StatusCode::FORBIDDEN,
-                            "Request blocked by security policy",
-                        )
-                            .into_response();
+                        let mut resp =
+                            (StatusCode::FORBIDDEN, "Request blocked by security policy")
+                                .into_response();
                         resp.headers_mut()
                             .insert("x-waf-block", HeaderValue::from_static("1"));
                         return resp;

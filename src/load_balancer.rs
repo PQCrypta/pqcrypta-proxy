@@ -630,9 +630,7 @@ impl BackendPool {
             loop {
                 ticker.tick().await;
 
-                let servers: Vec<Arc<BackendServer>> = {
-                    pool.servers.read().clone()
-                };
+                let servers: Vec<Arc<BackendServer>> = { pool.servers.read().clone() };
 
                 for server in servers {
                     let addr = server.address;
@@ -640,13 +638,11 @@ impl BackendPool {
                     // backend doesn't stall the entire health-check round.
                     let timeout_dur = interval / 2;
 
-                    let reachable = tokio::time::timeout(
-                        timeout_dur,
-                        tokio::net::TcpStream::connect(addr),
-                    )
-                    .await
-                    .map(|r| r.is_ok())
-                    .unwrap_or(false);
+                    let reachable =
+                        tokio::time::timeout(timeout_dur, tokio::net::TcpStream::connect(addr))
+                            .await
+                            .map(|r| r.is_ok())
+                            .unwrap_or(false);
 
                     let mut health = server.health.write();
                     let was_healthy = health.healthy;
