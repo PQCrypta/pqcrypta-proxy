@@ -1564,7 +1564,6 @@ impl ConfigManager {
     pub fn get(&self) -> Arc<ProxyConfig> {
         self.config.load_full()
     }
-
 } // impl ConfigManager
 
 /// Recursively merge two TOML values.
@@ -1588,7 +1587,8 @@ fn merge_toml_values(base: toml::Value, overlay: toml::Value) -> toml::Value {
     }
 }
 
-impl ConfigManager { // re-open for remaining methods
+impl ConfigManager {
+    // re-open for remaining methods
 
     /// Notify listeners that TLS certificates were reloaded
     pub async fn notify_tls_reload(&self) {
@@ -1641,8 +1641,9 @@ impl ConfigManager { // re-open for remaining methods
 
         let base_val: toml::Value = toml::from_str(&base_str)
             .map_err(|e| anyhow::anyhow!("Failed to re-parse base config: {}", e))?;
-        let overlay_val: toml::Value = toml::from_str(&overlay_str)
-            .map_err(|e| anyhow::anyhow!("Failed to parse env overlay {:?}: {}", overlay_path, e))?;
+        let overlay_val: toml::Value = toml::from_str(&overlay_str).map_err(|e| {
+            anyhow::anyhow!("Failed to parse env overlay {:?}: {}", overlay_path, e)
+        })?;
 
         let merged_val = merge_toml_values(base_val, overlay_val);
         let merged_str = toml::to_string(&merged_val)

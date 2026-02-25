@@ -250,8 +250,7 @@ impl BackendPool {
                             max_retries
                         );
                         tokio::time::sleep(Duration::from_millis(backoff)).await;
-                        last_err =
-                            Some(anyhow::anyhow!("Backend returned status {}", resp.status));
+                        last_err = Some(anyhow::anyhow!("Backend returned status {}", resp.status));
                         continue;
                     }
                     return Ok(resp);

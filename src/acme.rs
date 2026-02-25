@@ -461,7 +461,8 @@ impl AcmeService {
                 if let Some(status) = cached_status.get(domain) {
                     status.clone()
                 } else {
-                    let safe_domain = validate_domain_for_path(domain).unwrap_or_else(|_| "invalid-domain".to_string());
+                    let safe_domain = validate_domain_for_path(domain)
+                        .unwrap_or_else(|_| "invalid-domain".to_string());
                     let cert_path = self.config.certs_path.join(format!("{}.crt", safe_domain));
                     let (exists, expires, days_remaining) = if cert_path.exists() {
                         match read_certificate_expiry(&cert_path) {
@@ -588,7 +589,8 @@ async fn check_and_renew_certificates(
             return Err(anyhow::anyhow!(
                 "M-3: Domain '{}' is unsafe for use in file paths ({}). \
                  Fix the ACME domain configuration before proceeding.",
-                domain, reason
+                domain,
+                reason
             ));
         }
     }
@@ -1100,7 +1102,10 @@ async fn check_and_renew_certificates(
         let safe_domain = match validate_domain_for_path(domain) {
             Ok(d) => d,
             Err(reason) => {
-                warn!("M-3: Skipping unsafe domain '{}' in cert status check: {}", domain, reason);
+                warn!(
+                    "M-3: Skipping unsafe domain '{}' in cert status check: {}",
+                    domain, reason
+                );
                 continue;
             }
         };
@@ -1185,7 +1190,11 @@ pub fn handle_acme_challenge(acme_service: &AcmeService, token: &str) -> Option<
 ///
 /// Failures are non-fatal: operators can still use the certificate even if
 /// CT submission fails.  Errors are logged as warnings.
-async fn submit_to_ct_logs(cert_pem: &str, chain_pem: &str, config: &AcmeConfig) -> anyhow::Result<()> {
+async fn submit_to_ct_logs(
+    cert_pem: &str,
+    chain_pem: &str,
+    config: &AcmeConfig,
+) -> anyhow::Result<()> {
     if !config.certificate_transparency || config.ct_logs.is_empty() {
         return Ok(());
     }
@@ -1252,7 +1261,11 @@ fn extract_pem_base64_blocks(cert_pem: &str, chain_pem: &str) -> Vec<String> {
             let end = chunk.find("-----END CERTIFICATE-----")?;
             let raw = &chunk[..end];
             let cleaned: String = raw.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-            if cleaned.is_empty() { None } else { Some(cleaned) }
+            if cleaned.is_empty() {
+                None
+            } else {
+                Some(cleaned)
+            }
         })
         .collect()
 }

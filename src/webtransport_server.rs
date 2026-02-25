@@ -166,8 +166,13 @@ impl WebTransportServer {
                     m.connections
                         .connection_opened(ConnectionProtocol::WebTransport);
                 }
-                if let Err(e) =
-                    handle_incoming_session(incoming_session, config_clone, backend_clone, counts_clone).await
+                if let Err(e) = handle_incoming_session(
+                    incoming_session,
+                    config_clone,
+                    backend_clone,
+                    counts_clone,
+                )
+                .await
                 {
                     error!("❌ Session handler error: {}", e);
                 }

@@ -149,9 +149,9 @@ impl WafEngine {
                 r"127\.\d+\.\d+\.\d+",
                 r"\[::1\]",
                 r"(?i)localhost",
-                r"(?i)0x7f000001",       // 127.0.0.1 hex
-                r"(?i)2130706433",       // 127.0.0.1 decimal
-                r"(?i)0177\.0\.0\.1",    // 127.0.0.1 octal
+                r"(?i)0x7f000001",    // 127.0.0.1 hex
+                r"(?i)2130706433",    // 127.0.0.1 decimal
+                r"(?i)0177\.0\.0\.1", // 127.0.0.1 octal
                 r"(?i)metadata\.google\.internal",
                 r"(?i)169\.254\.169\.254",
             ])
@@ -162,9 +162,9 @@ impl WafEngine {
         // A03 Injection — OS/command injection (shell metacharacters in parameters)
         let cmd_injection_patterns = compile_patterns(&[
             r"(?i)(;|\||`|&&|\|\|)\s*(ls|cat|id|whoami|uname|nc|curl|wget|bash|sh|cmd|powershell|python|perl|ruby|php|nmap|ping|traceroute)",
-            r"(?i)\$\s*\(.*\)",     // Command substitution $(...)
-            r"`[^`]+`",             // Backtick command substitution
-            r"(?i)\bsystem\s*\(",   // PHP system()
+            r"(?i)\$\s*\(.*\)",   // Command substitution $(...)
+            r"`[^`]+`",           // Backtick command substitution
+            r"(?i)\bsystem\s*\(", // PHP system()
             r"(?i)\bpassthru\s*\(",
             r"(?i)\bshell_exec\s*\(",
             r"(?i)\bpopen\s*\(",
@@ -178,15 +178,15 @@ impl WafEngine {
             r#"(?i)SYSTEM\s+['"]file://"#,
             r#"(?i)SYSTEM\s+['"]https?://"#,
             r"(?i)<!DOCTYPE[^>]+\[",
-            r"(?i)%[a-zA-Z][a-zA-Z0-9]*;",   // Parameter entity reference
+            r"(?i)%[a-zA-Z][a-zA-Z0-9]*;", // Parameter entity reference
         ]);
 
         // A08 — Insecure deserialization (Java serialized objects, PHP unserialize)
         let deserialization_patterns = compile_patterns(&[
-            r"rO0AB",                                      // Java serialised object base64 header
-            r#"(?i)O:\d+:"[a-zA-Z_][a-zA-Z0-9_\\]*""#,   // PHP object injection
-            r"\xac\xed\x00\x05",                          // Java serialisation magic bytes (literal)
-            r"(?i)aced0005",                               // Java serialisation magic hex
+            r"rO0AB",                                  // Java serialised object base64 header
+            r#"(?i)O:\d+:"[a-zA-Z_][a-zA-Z0-9_\\]*""#, // PHP object injection
+            r"\xac\xed\x00\x05",                       // Java serialisation magic bytes (literal)
+            r"(?i)aced0005",                           // Java serialisation magic hex
             r"(?i)java\.lang\.(Runtime|ProcessBuilder|Class)",
             r"(?i)sun\.reflect\.",
             r"(?i)com\.sun\.org\.apache\.xml\.internal\.security\.utils\.Base64",
@@ -221,7 +221,15 @@ impl WafEngine {
         let block_mode = self.config.mode == "block";
 
         // Scan path + query
-        let target = format!("{}{}", req.path, if req.query.is_empty() { String::new() } else { format!("?{}", req.query) });
+        let target = format!(
+            "{}{}",
+            req.path,
+            if req.query.is_empty() {
+                String::new()
+            } else {
+                format!("?{}", req.query)
+            }
+        );
 
         if let Some(verdict) = self.scan_str(&target, block_mode) {
             debug!("WAF hit on path/query: {}", target);
@@ -231,7 +239,10 @@ impl WafEngine {
         // Scan selected request headers (User-Agent, Referer, Cookie, X-* headers)
         for (name, value) in req.headers.iter() {
             let name_str = name.as_str();
-            if matches!(name_str, "user-agent" | "referer" | "cookie" | "x-forwarded-for") {
+            if matches!(
+                name_str,
+                "user-agent" | "referer" | "cookie" | "x-forwarded-for"
+            ) {
                 if let Ok(v) = value.to_str() {
                     if let Some(verdict) = self.scan_str(v, block_mode) {
                         debug!("WAF hit on header {}: {}", name_str, v);
@@ -262,11 +273,20 @@ impl WafEngine {
         // Path traversal checked first (highest signal)
         for pat in &self.path_traversal_patterns {
             if pat.is_match(input) {
-                let rule = format!("path-traversal:{}", pat.as_str().chars().take(40).collect::<String>());
+                let rule = format!(
+                    "path-traversal:{}",
+                    pat.as_str().chars().take(40).collect::<String>()
+                );
                 return Some(if block_mode {
-                    WafVerdict::Block { rule, severity: Severity::High }
+                    WafVerdict::Block {
+                        rule,
+                        severity: Severity::High,
+                    }
                 } else {
-                    WafVerdict::Detect { rule, severity: Severity::High }
+                    WafVerdict::Detect {
+                        rule,
+                        severity: Severity::High,
+                    }
                 });
             }
         }
@@ -275,9 +295,15 @@ impl WafEngine {
             if pat.is_match(input) {
                 let rule = format!("sqli:{}", pat.as_str().chars().take(40).collect::<String>());
                 return Some(if block_mode {
-                    WafVerdict::Block { rule, severity: Severity::High }
+                    WafVerdict::Block {
+                        rule,
+                        severity: Severity::High,
+                    }
                 } else {
-                    WafVerdict::Detect { rule, severity: Severity::High }
+                    WafVerdict::Detect {
+                        rule,
+                        severity: Severity::High,
+                    }
                 });
             }
         }
@@ -286,20 +312,35 @@ impl WafEngine {
             if pat.is_match(input) {
                 let rule = format!("xss:{}", pat.as_str().chars().take(40).collect::<String>());
                 return Some(if block_mode {
-                    WafVerdict::Block { rule, severity: Severity::Medium }
+                    WafVerdict::Block {
+                        rule,
+                        severity: Severity::Medium,
+                    }
                 } else {
-                    WafVerdict::Detect { rule, severity: Severity::Medium }
+                    WafVerdict::Detect {
+                        rule,
+                        severity: Severity::Medium,
+                    }
                 });
             }
         }
 
         for pat in &self.nosqli_patterns {
             if pat.is_match(input) {
-                let rule = format!("nosqli:{}", pat.as_str().chars().take(40).collect::<String>());
+                let rule = format!(
+                    "nosqli:{}",
+                    pat.as_str().chars().take(40).collect::<String>()
+                );
                 return Some(if block_mode {
-                    WafVerdict::Block { rule, severity: Severity::Medium }
+                    WafVerdict::Block {
+                        rule,
+                        severity: Severity::Medium,
+                    }
                 } else {
-                    WafVerdict::Detect { rule, severity: Severity::Medium }
+                    WafVerdict::Detect {
+                        rule,
+                        severity: Severity::Medium,
+                    }
                 });
             }
         }
@@ -308,9 +349,15 @@ impl WafEngine {
             if pat.is_match(input) {
                 let rule = format!("ssrf:{}", pat.as_str().chars().take(40).collect::<String>());
                 return Some(if block_mode {
-                    WafVerdict::Block { rule, severity: Severity::Critical }
+                    WafVerdict::Block {
+                        rule,
+                        severity: Severity::Critical,
+                    }
                 } else {
-                    WafVerdict::Detect { rule, severity: Severity::Critical }
+                    WafVerdict::Detect {
+                        rule,
+                        severity: Severity::Critical,
+                    }
                 });
             }
         }
@@ -318,11 +365,20 @@ impl WafEngine {
         // A03 command injection
         for pat in &self.cmd_injection_patterns {
             if pat.is_match(input) {
-                let rule = format!("cmd-injection:{}", pat.as_str().chars().take(40).collect::<String>());
+                let rule = format!(
+                    "cmd-injection:{}",
+                    pat.as_str().chars().take(40).collect::<String>()
+                );
                 return Some(if block_mode {
-                    WafVerdict::Block { rule, severity: Severity::Critical }
+                    WafVerdict::Block {
+                        rule,
+                        severity: Severity::Critical,
+                    }
                 } else {
-                    WafVerdict::Detect { rule, severity: Severity::Critical }
+                    WafVerdict::Detect {
+                        rule,
+                        severity: Severity::Critical,
+                    }
                 });
             }
         }
@@ -332,9 +388,15 @@ impl WafEngine {
             if pat.is_match(input) {
                 let rule = format!("xxe:{}", pat.as_str().chars().take(40).collect::<String>());
                 return Some(if block_mode {
-                    WafVerdict::Block { rule, severity: Severity::High }
+                    WafVerdict::Block {
+                        rule,
+                        severity: Severity::High,
+                    }
                 } else {
-                    WafVerdict::Detect { rule, severity: Severity::High }
+                    WafVerdict::Detect {
+                        rule,
+                        severity: Severity::High,
+                    }
                 });
             }
         }
@@ -342,22 +404,40 @@ impl WafEngine {
         // A08 deserialization
         for pat in &self.deserialization_patterns {
             if pat.is_match(input) {
-                let rule = format!("deser:{}", pat.as_str().chars().take(40).collect::<String>());
+                let rule = format!(
+                    "deser:{}",
+                    pat.as_str().chars().take(40).collect::<String>()
+                );
                 return Some(if block_mode {
-                    WafVerdict::Block { rule, severity: Severity::Critical }
+                    WafVerdict::Block {
+                        rule,
+                        severity: Severity::Critical,
+                    }
                 } else {
-                    WafVerdict::Detect { rule, severity: Severity::Critical }
+                    WafVerdict::Detect {
+                        rule,
+                        severity: Severity::Critical,
+                    }
                 });
             }
         }
 
         for pat in &self.custom_patterns {
             if pat.is_match(input) {
-                let rule = format!("custom:{}", pat.as_str().chars().take(40).collect::<String>());
+                let rule = format!(
+                    "custom:{}",
+                    pat.as_str().chars().take(40).collect::<String>()
+                );
                 return Some(if block_mode {
-                    WafVerdict::Block { rule, severity: Severity::High }
+                    WafVerdict::Block {
+                        rule,
+                        severity: Severity::High,
+                    }
                 } else {
-                    WafVerdict::Detect { rule, severity: Severity::High }
+                    WafVerdict::Detect {
+                        rule,
+                        severity: Severity::High,
+                    }
                 });
             }
         }

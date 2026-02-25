@@ -266,11 +266,14 @@ impl FingerprintExtractor {
             return None;
         }
         let window = Duration::from_secs(config.replay_window_secs);
-        let mut entry = self.replay_cache.entry(ja3.to_string()).or_insert_with(|| ReplayEntry {
-            ips: Vec::new(),
-            first_seen: Instant::now(),
-            count: 0,
-        });
+        let mut entry = self
+            .replay_cache
+            .entry(ja3.to_string())
+            .or_insert_with(|| ReplayEntry {
+                ips: Vec::new(),
+                first_seen: Instant::now(),
+                count: 0,
+            });
 
         // Reset window if expired
         if entry.first_seen.elapsed() > window {
@@ -287,7 +290,10 @@ impl FingerprintExtractor {
         // Flag if more than 5 distinct IPs used the same JA3 in window
         let ip_count = entry.ips.len();
         if ip_count > 5 {
-            return Some(FingerprintThreat::Replay { ja3: ja3.to_string(), ip_count });
+            return Some(FingerprintThreat::Replay {
+                ja3: ja3.to_string(),
+                ip_count,
+            });
         }
 
         None
@@ -309,13 +315,16 @@ impl FingerprintExtractor {
         let ext_hash = hash_u16_slice(extensions);
         let window = Duration::from_secs(config.drift_window_secs);
 
-        let mut entry = self.drift_cache.entry(ja3.to_string()).or_insert_with(|| DriftState {
-            cipher_suite_hash: cipher_hash,
-            extension_hash: ext_hash,
-            first_seen: Instant::now(),
-            total: 0,
-            drift_count: 0,
-        });
+        let mut entry = self
+            .drift_cache
+            .entry(ja3.to_string())
+            .or_insert_with(|| DriftState {
+                cipher_suite_hash: cipher_hash,
+                extension_hash: ext_hash,
+                first_seen: Instant::now(),
+                total: 0,
+                drift_count: 0,
+            });
 
         // Reset window if expired
         if entry.first_seen.elapsed() > window {
@@ -338,7 +347,10 @@ impl FingerprintExtractor {
         };
 
         if entry.total >= 10 && drift_score >= config.drift_threshold {
-            return Some(FingerprintThreat::Drift { ja3: ja3.to_string(), drift_score });
+            return Some(FingerprintThreat::Drift {
+                ja3: ja3.to_string(),
+                drift_score,
+            });
         }
 
         None

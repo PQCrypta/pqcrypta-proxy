@@ -630,7 +630,11 @@ async fn reload_handler(
     Json(request): Json<Option<ReloadRequest>>,
 ) -> Json<ReloadResponse> {
     let tls_only = request.map(|r| r.tls_only).unwrap_or(false);
-    let action = if tls_only { "tls_reload" } else { "config_reload" };
+    let action = if tls_only {
+        "tls_reload"
+    } else {
+        "config_reload"
+    };
 
     if tls_only {
         // Reload TLS certificates only
@@ -1067,9 +1071,7 @@ struct WebTransportHealthResponse {
 }
 
 /// QUIC protocol health endpoint (protected — requires auth)
-async fn health_quic_handler(
-    State(state): State<Arc<AdminState>>,
-) -> Json<QuicHealthResponse> {
+async fn health_quic_handler(State(state): State<Arc<AdminState>>) -> Json<QuicHealthResponse> {
     let config = state.config_manager.get();
     let connections = *state.connection_count.read();
 
