@@ -127,6 +127,12 @@ struct Args {
     #[arg(long, default_value = "true")]
     watch_config: bool,
 
+    /// Environment name for per-env config overlay.
+    /// When set, loads <config-dir>/<config-stem>.<env>.toml and merges it over the base config.
+    /// Example: --env prod loads /etc/pqcrypta/config.prod.toml
+    #[arg(long, env = "PQCRYPTA_ENV")]
+    env: Option<String>,
+
     /// Run configuration validation only (don't start server)
     #[arg(long)]
     validate: bool,
@@ -162,6 +168,31 @@ async fn main() -> anyhow::Result<()> {
     // Load configuration
     let (config_manager, mut reload_rx) = ConfigManager::new(&args.config).await?;
     let config_manager = Arc::new(config_manager);
+
+    // STEP 15: Apply per-environment config overlay (--env / PQCRYPTA_ENV).
+    if let Some(ref env_name) = args.env {
+        let base_path = std::path::Path::new(&args.config);
+        let base_dir = base_path.parent().unwrap_or(std::path::Path::new("."));
+        let base_stem = base_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("config");
+        let overlay_path = base_dir.join(format!("{}.{}.toml", base_stem, env_name));
+        if overlay_path.exists() {
+            config_manager
+                .apply_env_overlay(&overlay_path)
+                .map_err(|e| anyhow::anyhow!("--env {}: overlay failed: {}", env_name, e))?;
+            info!(
+                "✅ Applied env overlay {:?} (--env {})",
+                overlay_path, env_name
+            );
+        } else {
+            warn!(
+                "--env {}: overlay file {:?} not found — using base config only",
+                env_name, overlay_path
+            );
+        }
+    }
 
     // Apply CLI overrides
     let mut config = (*config_manager.get()).clone();
@@ -469,6 +500,7 @@ async fn main() -> anyhow::Result<()> {
         None, // Rate limiter created per-listener in http_listener
         shutdown_tx.clone(),
         Some(metrics_registry.clone()),
+        None, // audit_logger — wired up when AuditLogger is constructed at the call site
     );
 
     let admin_handle = tokio::spawn(async move {

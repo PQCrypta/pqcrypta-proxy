@@ -213,6 +213,70 @@ impl BackendPool {
         })
     }
 
+    /// Proxy request to HTTP backend with per-backend retry policy.
+    ///
+    /// Retry behaviour is controlled by `BackendConfig.retries`, `retry_backoff_ms`, and
+    /// `retry_on`.  Backoff doubles on each successive attempt (exponential), starting
+    /// from `retry_backoff_ms`.
+    pub async fn proxy_http_full_with_retry(
+        &self,
+        backend: &BackendConfig,
+        method: &str,
+        path: &str,
+        headers: HashMap<String, String>,
+        body: &[u8],
+    ) -> anyhow::Result<ProxyResponse> {
+        let max_retries = backend.retries.unwrap_or(3) as usize;
+        let base_backoff_ms = backend.retry_backoff_ms.unwrap_or(50);
+        let retry_on: Vec<String> = backend
+            .retry_on
+            .clone()
+            .unwrap_or_else(|| vec!["connect-failure".to_string(), "5xx".to_string()]);
+
+        let mut last_err: Option<anyhow::Error> = None;
+
+        for attempt in 0..=max_retries {
+            match self
+                .proxy_http_full(backend, method, path, headers.clone(), body)
+                .await
+            {
+                Ok(resp) => {
+                    if should_retry_status(resp.status, &retry_on) && attempt < max_retries {
+                        let backoff = base_backoff_ms.saturating_mul(1u64 << attempt.min(9));
+                        warn!(
+                            "Backend returned {}, retrying (attempt {}/{})...",
+                            resp.status,
+                            attempt + 1,
+                            max_retries
+                        );
+                        tokio::time::sleep(Duration::from_millis(backoff)).await;
+                        last_err =
+                            Some(anyhow::anyhow!("Backend returned status {}", resp.status));
+                        continue;
+                    }
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    if is_retryable_error(&e, &retry_on) && attempt < max_retries {
+                        let backoff = base_backoff_ms.saturating_mul(1u64 << attempt.min(9));
+                        warn!(
+                            "Backend request failed (attempt {}/{}): {} — retrying...",
+                            attempt + 1,
+                            max_retries,
+                            e
+                        );
+                        tokio::time::sleep(Duration::from_millis(backoff)).await;
+                        last_err = Some(e);
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("All retry attempts exhausted")))
+    }
+
     /// Proxy request to Unix socket backend (e.g., PHP-FPM)
     #[cfg(unix)]
     pub async fn proxy_unix(
@@ -593,6 +657,24 @@ impl BackendPool {
             true
         }
     }
+}
+
+/// Returns true if the HTTP status code is in the retry set.
+/// Currently only "5xx" is recognised — matching any 5xx response.
+fn should_retry_status(status: u16, retry_on: &[String]) -> bool {
+    status >= 500 && retry_on.iter().any(|s| s == "5xx")
+}
+
+/// Returns true if the error string suggests a retryable failure category.
+fn is_retryable_error(e: &anyhow::Error, retry_on: &[String]) -> bool {
+    let msg = e.to_string().to_lowercase();
+    let is_connect = msg.contains("connect")
+        || msg.contains("connection")
+        || msg.contains("refused")
+        || msg.contains("reset");
+    let is_timeout = msg.contains("timeout");
+    (is_connect && retry_on.iter().any(|s| s == "connect-failure"))
+        || (is_timeout && retry_on.iter().any(|s| s == "timeout"))
 }
 
 #[cfg(test)]

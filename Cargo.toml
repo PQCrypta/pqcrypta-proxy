@@ -11,7 +11,7 @@ keywords = ["quic", "http3", "webtransport", "pqc", "proxy", "post-quantum"]
 categories = ["network-programming", "cryptography", "web-programming"]
 
 [features]
-default = ["pqc", "metrics", "admin-api", "geoip", "acme"]
+default = ["pqc", "pqc-signatures", "metrics", "admin-api", "geoip", "acme"]
 # Enable PQC hybrid key exchange via OpenSSL 3.5+ (native ML-KEM)
 # Also enables extended algorithm detection and configuration
 pqc = ["openssl", "openssl-sys", "openssl-probe"]

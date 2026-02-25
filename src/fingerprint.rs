@@ -14,6 +14,8 @@
 //! 2. Internal headers (`x-ja3-hash`, `x-ja4-hash`) - set by lower layers
 //! 3. OpenSSL callback mechanism - for PQC-enabled connections
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher as StdHasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,6 +33,39 @@ use tracing::{debug, info, warn};
 use crate::config::FingerprintConfig;
 use crate::security::{BlockReason, FingerprintClass, SecurityState, TlsFingerprint};
 
+/// A fingerprint-related threat detected at the TLS layer
+#[derive(Debug, Clone)]
+pub enum FingerprintThreat {
+    /// Same JA3 hash seen from multiple IPs in replay window
+    Replay { ja3: String, ip_count: usize },
+    /// Same JA3 hash but different cipher/extension composition (drift)
+    Drift { ja3: String, drift_score: f64 },
+}
+
+/// State for JA3 replay detection
+struct ReplayEntry {
+    /// Set of IPs that used this fingerprint within the window
+    ips: Vec<IpAddr>,
+    /// Window start
+    first_seen: Instant,
+    /// Total uses in this window
+    count: u64,
+}
+
+/// State for JA3 drift detection
+struct DriftState {
+    /// Hash of cipher suite order seen first for this JA3
+    cipher_suite_hash: u64,
+    /// Hash of extension list order seen first for this JA3
+    extension_hash: u64,
+    /// First observation
+    first_seen: Instant,
+    /// Total requests in drift window
+    total: u64,
+    /// Requests where composition differed
+    drift_count: u64,
+}
+
 /// TLS fingerprint extractor
 #[derive(Clone)]
 pub struct FingerprintExtractor {
@@ -38,6 +73,17 @@ pub struct FingerprintExtractor {
     cache: Arc<DashMap<String, CachedFingerprint>>,
     /// Known fingerprint database
     known_fingerprints: Arc<KnownFingerprints>,
+    /// Replay detection: ja3_hash -> ReplayEntry
+    replay_cache: Arc<DashMap<String, ReplayEntry>>,
+    /// Drift detection: ja3_hash -> DriftState
+    drift_cache: Arc<DashMap<String, DriftState>>,
+}
+
+/// Hash a slice of u16 values to a u64 for composition tracking
+fn hash_u16_slice(values: &[u16]) -> u64 {
+    let mut h = DefaultHasher::new();
+    values.hash(&mut h);
+    h.finish()
 }
 
 /// Cached fingerprint with metadata
@@ -203,7 +249,99 @@ impl FingerprintExtractor {
         Self {
             cache: Arc::new(DashMap::new()),
             known_fingerprints: Arc::new(KnownFingerprints::default()),
+            replay_cache: Arc::new(DashMap::new()),
+            drift_cache: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Check whether a JA3 hash exhibits replay behaviour (same fingerprint from many IPs
+    /// within the configured window).  Returns a threat if the IP count threshold is exceeded.
+    pub fn check_replay(
+        &self,
+        ja3: &str,
+        ip: IpAddr,
+        config: &FingerprintConfig,
+    ) -> Option<FingerprintThreat> {
+        if !config.replay_detection {
+            return None;
+        }
+        let window = Duration::from_secs(config.replay_window_secs);
+        let mut entry = self.replay_cache.entry(ja3.to_string()).or_insert_with(|| ReplayEntry {
+            ips: Vec::new(),
+            first_seen: Instant::now(),
+            count: 0,
+        });
+
+        // Reset window if expired
+        if entry.first_seen.elapsed() > window {
+            entry.ips.clear();
+            entry.count = 0;
+            entry.first_seen = Instant::now();
+        }
+
+        entry.count += 1;
+        if !entry.ips.contains(&ip) {
+            entry.ips.push(ip);
+        }
+
+        // Flag if more than 5 distinct IPs used the same JA3 in window
+        let ip_count = entry.ips.len();
+        if ip_count > 5 {
+            return Some(FingerprintThreat::Replay { ja3: ja3.to_string(), ip_count });
+        }
+
+        None
+    }
+
+    /// Check whether a JA3 hash shows composition drift (same hash but different cipher/
+    /// extension order), which can indicate fingerprint spoofing.
+    pub fn check_drift(
+        &self,
+        ja3: &str,
+        ciphers: &[u16],
+        extensions: &[u16],
+        config: &FingerprintConfig,
+    ) -> Option<FingerprintThreat> {
+        if !config.drift_detection {
+            return None;
+        }
+        let cipher_hash = hash_u16_slice(ciphers);
+        let ext_hash = hash_u16_slice(extensions);
+        let window = Duration::from_secs(config.drift_window_secs);
+
+        let mut entry = self.drift_cache.entry(ja3.to_string()).or_insert_with(|| DriftState {
+            cipher_suite_hash: cipher_hash,
+            extension_hash: ext_hash,
+            first_seen: Instant::now(),
+            total: 0,
+            drift_count: 0,
+        });
+
+        // Reset window if expired
+        if entry.first_seen.elapsed() > window {
+            entry.cipher_suite_hash = cipher_hash;
+            entry.extension_hash = ext_hash;
+            entry.total = 0;
+            entry.drift_count = 0;
+            entry.first_seen = Instant::now();
+        }
+
+        entry.total += 1;
+        if cipher_hash != entry.cipher_suite_hash || ext_hash != entry.extension_hash {
+            entry.drift_count += 1;
+        }
+
+        let drift_score = if entry.total > 0 {
+            entry.drift_count as f64 / entry.total as f64
+        } else {
+            0.0
+        };
+
+        if entry.total >= 10 && drift_score >= config.drift_threshold {
+            return Some(FingerprintThreat::Drift { ja3: ja3.to_string(), drift_score });
+        }
+
+        None
     }
 
     /// Classify a JA3 hash against the known fingerprint database

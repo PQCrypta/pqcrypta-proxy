@@ -23,9 +23,12 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use axum::extract::connect_info::Connected;
+use dashmap::DashMap;
 use pin_project_lite::pin_project;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
@@ -37,6 +40,56 @@ use crate::security::SecurityState;
 
 /// Maximum size to peek for ClientHello (typically < 1KB but can be up to 16KB with extensions)
 const MAX_CLIENT_HELLO_SIZE: usize = 4096;
+
+/// 0-RTT replay protection nonce store.
+///
+/// Stores SHA-256 digests of the first 64 bytes of observed ClientHello messages
+/// to detect replayed early-data attempts.  Entries older than `window_secs` are
+/// evicted lazily on each `check_and_insert` call.
+pub struct ZeroRttNonceStore {
+    /// nonce → insertion time
+    nonces: DashMap<[u8; 32], Instant>,
+    /// Retention window in seconds
+    window_secs: u64,
+}
+
+impl ZeroRttNonceStore {
+    /// Create a new nonce store with the given replay window.
+    pub fn new(window_secs: u64) -> Self {
+        Self {
+            nonces: DashMap::new(),
+            window_secs,
+        }
+    }
+
+    /// Compute a 32-byte nonce from the raw ClientHello bytes (first 64 bytes).
+    fn nonce_from_client_hello(data: &[u8]) -> [u8; 32] {
+        let slice = &data[..data.len().min(64)];
+        let digest = Sha256::digest(slice);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&digest);
+        out
+    }
+
+    /// Returns `true` if this ClientHello is a replay (nonce seen before);
+    /// `false` if it is new (nonce recorded for future comparison).
+    ///
+    /// Expired entries are evicted before the lookup.
+    pub fn check_and_insert(&self, client_hello: &[u8]) -> bool {
+        let now = Instant::now();
+        let window = self.window_secs;
+        // Lazy eviction of expired entries
+        self.nonces
+            .retain(|_, inserted_at| now.duration_since(*inserted_at).as_secs() < window);
+
+        let nonce = Self::nonce_from_client_hello(client_hello);
+        if self.nonces.contains_key(&nonce) {
+            return true; // replay
+        }
+        self.nonces.insert(nonce, now);
+        false
+    }
+}
 
 /// Connection info with fingerprint data
 #[derive(Clone, Debug)]
@@ -116,6 +169,10 @@ pub struct FingerprintingTlsAcceptor {
     /// Used to set `FingerprintedConnection::is_early_data` only when the server
     /// would actually accept early data from a resumed session.
     zero_rtt_enabled: bool,
+    /// 0-RTT replay protection mode: "strict" | "session" | "none"
+    zero_rtt_replay_mode: String,
+    /// Nonce store for strict 0-RTT replay protection
+    zero_rtt_nonce_store: Option<Arc<ZeroRttNonceStore>>,
 }
 
 impl FingerprintingTlsAcceptor {
@@ -132,7 +189,22 @@ impl FingerprintingTlsAcceptor {
             security_state,
             fingerprint_config,
             zero_rtt_enabled,
+            zero_rtt_replay_mode: "strict".to_string(),
+            zero_rtt_nonce_store: Some(Arc::new(ZeroRttNonceStore::new(60))),
         }
+    }
+
+    /// Configure 0-RTT replay protection mode and nonce window.
+    ///
+    /// Call this after `new()` when the TLS config has non-default 0-RTT settings.
+    pub fn with_zero_rtt_protection(mut self, mode: &str, window_secs: u64) -> Self {
+        self.zero_rtt_replay_mode = mode.to_string();
+        self.zero_rtt_nonce_store = if mode == "strict" {
+            Some(Arc::new(ZeroRttNonceStore::new(window_secs)))
+        } else {
+            None
+        };
+        self
     }
 
     /// SEC-002: Scan a raw ClientHello record for the TLS 1.3 `early_data`
@@ -212,6 +284,8 @@ impl FingerprintingTlsAcceptor {
         // Peek at the ClientHello before TLS handshake
         let mut peek_buf = vec![0u8; MAX_CLIENT_HELLO_SIZE];
         let peek_result = stream.peek(&mut peek_buf).await;
+        // Save peeked length for use after the match (peek_result is consumed there)
+        let peek_len = peek_result.as_ref().map(|n| *n).unwrap_or(0);
 
         let (fingerprint_result, offered_early_data) = match peek_result {
             Ok(n) if n > 0 => {
@@ -262,6 +336,23 @@ impl FingerprintingTlsAcceptor {
                 remote_addr, fingerprint_result.ja3_hash
             );
             return Ok(None);
+        }
+
+        // SEC-002 / STEP 10: 0-RTT replay protection (strict mode).
+        // Only runs when early_data was offered AND strict mode is configured.
+        if offered_early_data && self.zero_rtt_replay_mode == "strict" && peek_len > 0 {
+            if let Some(ref store) = self.zero_rtt_nonce_store {
+                if store.check_and_insert(&peek_buf[..peek_len]) {
+                    warn!(
+                        "0-RTT replay detected from {} — rejecting early data",
+                        remote_addr
+                    );
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "0-RTT replay protection: duplicate early data rejected",
+                    ));
+                }
+            }
         }
 
         // Log fingerprint info

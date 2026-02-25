@@ -87,6 +87,12 @@ pub struct BackendServer {
     /// TLS mode
     pub tls_mode: TlsMode,
 
+    // === Circuit breaker thresholds (per-backend overrides) ===
+    /// Consecutive failures before tripping the circuit breaker
+    pub cb_failure_threshold: u32,
+    /// Consecutive successes to close a tripped circuit breaker
+    pub cb_success_threshold: u32,
+
     // === Metrics ===
     /// Current active connections
     pub active_connections: AtomicU32,
@@ -178,6 +184,8 @@ impl BackendServer {
             max_connections: config.max_connections,
             timeout: Duration::from_millis(config.timeout_ms),
             tls_mode: config.tls_mode.clone(),
+            cb_failure_threshold: config.cb_failure_threshold.unwrap_or(5),
+            cb_success_threshold: config.cb_success_threshold.unwrap_or(3),
             active_connections: AtomicU32::new(0),
             total_requests: AtomicU64::new(0),
             total_failures: AtomicU64::new(0),
@@ -239,8 +247,8 @@ impl BackendServer {
             health.consecutive_failures = 0;
             health.consecutive_successes += 1;
 
-            // Recover from circuit breaker
-            if health.circuit_open && health.consecutive_successes >= 3 {
+            // Recover from circuit breaker (use per-backend threshold)
+            if health.circuit_open && health.consecutive_successes >= self.cb_success_threshold {
                 health.circuit_open = false;
                 health.healthy = true;
                 info!("Backend {} circuit breaker closed", self.id);
@@ -252,8 +260,8 @@ impl BackendServer {
             health.consecutive_successes = 0;
             health.consecutive_failures += 1;
 
-            // Open circuit breaker after 5 failures
-            if health.consecutive_failures >= 5 && !health.circuit_open {
+            // Open circuit breaker after per-backend failure threshold
+            if health.consecutive_failures >= self.cb_failure_threshold && !health.circuit_open {
                 health.circuit_open = true;
                 health.healthy = false;
                 warn!(
@@ -937,6 +945,9 @@ mod tests {
             tls_cert: None,
             tls_skip_verify: false,
             tls_sni: None,
+            cb_failure_threshold: None,
+            cb_half_open_delay_secs: None,
+            cb_success_threshold: None,
         };
         Arc::new(BackendServer::from_config(&config).expect("test address must be valid"))
     }

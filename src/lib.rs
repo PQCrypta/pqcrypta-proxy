@@ -70,6 +70,7 @@
 pub mod access_logger;
 pub mod acme;
 pub mod admin;
+pub mod audit_logger;
 pub mod compression;
 pub mod config;
 pub mod fingerprint;
@@ -87,6 +88,7 @@ pub mod rate_limiter; // Must be before config (config imports from it)
 pub mod security;
 pub mod tls;
 pub mod tls_acceptor;
+pub mod waf;
 pub mod webtransport_server;
 
 // Re-export commonly used types

@@ -96,6 +96,13 @@ impl QuicListener {
             QuinnServerConfig::with_crypto(tls_provider.get_quic_server_config());
         server_config.transport = Arc::new(transport_config);
 
+        // STEP 12: Gate connection migration on server config.
+        // `migration()` is a method on ServerConfig, not TransportConfig.
+        if !config.server.enable_quic_migration {
+            server_config.migration(false);
+            info!("QUIC connection migration disabled by configuration");
+        }
+
         // Create endpoint
         let endpoint = Endpoint::server(server_config, addr)?;
 

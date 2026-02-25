@@ -4,7 +4,7 @@
 
 [![Build Status](https://github.com/PQCrypta/pqcrypta-proxy/workflows/CI/badge.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-140%20passing-brightgreen.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
+[![Tests](https://img.shields.io/badge/tests-142%20passing-brightgreen.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
 [![Security](https://img.shields.io/badge/security-hardened-green.svg)](docs/SECURITY.md)
 
 ## Highlights
@@ -12,15 +12,17 @@
 - **Full-Featured Proxy**: Domain-based routing, custom header injection, per-route timeouts, security headers, CORS, redirects
 - **Three TLS Modes**: Terminate, Re-encrypt, and Passthrough (SNI-based)
 - **Modern Protocols**: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebTransport
-- **Post-Quantum Ready**: Hybrid PQC key exchange (X25519MLKEM768) via OpenSSL 3.5+ with native ML-KEM
-- **Zero Downtime**: Hot reload configuration and TLS certificates
-- **ACME Automation**: Automatic Let's Encrypt certificate provisioning and renewal
+- **Post-Quantum Ready**: Hybrid PQC key exchange (X25519MLKEM768) via OpenSSL 3.5+ with native ML-KEM; PQC downgrade detection
+- **Zero Downtime**: Hot reload configuration and TLS certificates; environment-specific config overlay (`--env`)
+- **ACME Automation**: Automatic Let's Encrypt certificate provisioning, renewal, and Certificate Transparency log submission
 - **OCSP Stapling**: Automated OCSP response fetching and stapling
-- **Prometheus Metrics**: Comprehensive metrics for TLS, connections, requests, and backends
-- **Advanced Security**: JA3/JA4 fingerprinting, circuit breaker, GeoIP blocking, DB-synced IP blocklists, WebTransport origin validation
+- **Prometheus Metrics**: Comprehensive metrics for TLS, connections, requests, backends, and WAF blocks
+- **WAF**: OWASP Top 10 pattern-based request inspection (SQLi, XSS, path traversal, NoSQLi, SSRF, CMDi, XXE, deserialization) in detect or block mode
+- **Advanced Security**: JA3/JA4 fingerprinting with replay and drift detection, circuit breaker, GeoIP blocking, DB-synced IP blocklists, WebTransport origin validation, 0-RTT replay protection
+- **Structured Audit Logging**: Async JSON audit log for admin actions, auth failures, WAF blocks, IP blocks, rate limit hits, PQC downgrades, config reloads
 - **Structured Access Logging**: Per-request JSON or text logs with latency, bytes, upstream, and client IP
-- **Enterprise Load Balancing**: 6 algorithms, session affinity, health-aware routing
-- **Multi-Dimensional Rate Limiting**: Composite keys, JA3/JA4-based, adaptive ML anomaly detection
+- **Enterprise Load Balancing**: 6 algorithms, session affinity, health-aware routing, per-backend retry policies, per-backend circuit breaker overrides
+- **Multi-Dimensional Rate Limiting**: Composite keys, JA3/JA4-based, JWT-verified, adaptive ML anomaly detection
 
 ## All Features Implemented
 
@@ -45,11 +47,27 @@
 | PROXY Protocol v2 | ✅ | Client IP preservation for downstream proxies |
 | Access Logging | ✅ | Per-request logging in JSON or text format with configurable file output |
 | WebTransport Origin Validation | ✅ | SR-02 cross-origin blocking with configurable allowlist |
+| WebTransport Per-Origin Rate Limiting | ✅ | Max sessions per origin, streams per session, datagrams/sec enforced |
 | IP Blocklists (DB-synced) | ✅ | Live-synced IP/fingerprint/country blocklists from application database |
 | Per-Route Timeouts | ✅ | Per-route timeout overrides independent of global defaults |
 | Custom Header Injection | ✅ | Inject arbitrary headers per route before forwarding to backends |
 | Multiple Listener Ports | ✅ | Primary port plus any number of additional ports via `additional_ports` |
 | WebTransport Operations | ✅ | JSON operation routing over streams (encrypt/decrypt/keygen/health/ping) |
+| **WAF** | ✅ | OWASP Top 10 pattern inspection — SQLi, XSS, path traversal, NoSQLi, SSRF, CMDi, XXE, deserialization |
+| **Audit Logger** | ✅ | Async structured JSON audit log — admin actions, auth failures, WAF events, rate limits, PQC downgrades |
+| **JA3/JA4 Replay Detection** | ✅ | Flags same fingerprint from multiple IPs within configurable window |
+| **JA3/JA4 Drift Detection** | ✅ | Flags cipher/extension composition changes on the same fingerprint hash |
+| **PQC Downgrade Detection** | ✅ | Detects classical-only TLS negotiation when PQC is required; block/log/allow action |
+| **Per-Backend Retry** | ✅ | Configurable retries with exponential backoff per backend; retry on 5xx/connect-failure/timeout |
+| **Per-Backend Circuit Breaker** | ✅ | Per-backend overrides for failure threshold, half-open delay, and success threshold |
+| **0-RTT Replay Protection** | ✅ | Nonce store (strict/session/none); rejects replayed early-data nonces |
+| **Certificate Transparency** | ✅ | Submits new certs to CT logs via `POST /ct/v1/add-chain` after ACME issuance |
+| **QUIC Connection Migration** | ✅ | Configurable enable/disable of QUIC connection migration (`enable_quic_migration`) |
+| **Per-Route Security Policy** | ✅ | Per-route mTLS requirement, JA3 allowlist, rate limit override, WAF mode, 0-RTT control |
+| **Body Size Limit** | ✅ | Global `max_request_body_bytes` enforced (default 50 MB); 413 on excess |
+| **Config Schema Versioning** | ✅ | `version` field in config; warns if absent, errors if version > current |
+| **Config Conflict Validation** | ✅ | Startup validation catches conflicting settings (PQC+passthrough, 0-RTT non-safe, mTLS without CA) |
+| **Environment Config Overlay** | ✅ | `--env <name>` flag loads `config.<name>.toml` overlay merged on top of base config |
 
 ## Features
 
@@ -64,18 +82,25 @@
 - **Multiple Listener Ports**: Primary port plus any number of additional ports (`additional_ports`) all supporting QUIC/HTTP3/WebTransport
 
 ### Security
+- **WAF**: OWASP Top 10 pattern-based inspection — SQLi, XSS, path traversal, NoSQLi, SSRF, command injection, XXE, insecure deserialization; detect or block mode; custom patterns; body scanning
 - **JA3/JA4 TLS Fingerprinting**: Detects browsers, bots, scanners, malware based on TLS ClientHello
+- **JA3/JA4 Replay Detection**: Flags same fingerprint arriving from multiple IPs within a configurable window — catches credential-stuffing and fingerprint spoofing
+- **JA3/JA4 Drift Detection**: Flags cipher/extension composition changes on the same fingerprint hash — detects TLS library upgrades or evasion attempts
+- **PQC Downgrade Detection**: Detects classical-only TLS negotiation when PQC is required; configurable action: block (421), log, or allow
 - **PQC + Fingerprinting Combined**: OpenSSL ML-KEM with ClientHello capture for early blocking
-- **Circuit Breaker**: Protects backends from cascading failures with automatic recovery
-- **Advanced Rate Limiting**: Multi-dimensional limiting (IP, JA3/JA4, JWT, headers, composite keys)
+- **0-RTT Replay Protection**: Nonce store (strict/session/none modes) — rejects replayed TLS 1.3 early-data nonces within configurable window
+- **Circuit Breaker**: Per-backend protection from cascading failures; per-backend threshold/delay overrides
+- **Advanced Rate Limiting**: Multi-dimensional limiting (IP, JA3/JA4, JWT-verified subject, headers, composite keys)
 - **NAT-Friendly**: JA3/JA4 fingerprints identify clients behind shared corporate IPs
 - **Adaptive Baseline**: ML-inspired anomaly detection learns normal traffic patterns
-- **DoS Protection**: Connection limits, request size validation, auto-blocking
+- **DoS Protection**: Connection limits, body size enforcement, request validation, auto-blocking
 - **GeoIP Blocking**: Block by country/region using MaxMind GeoLite2 database
+- **Per-Route Security Policy**: Per-route mTLS requirement, JA3 allowlist, rate limit override, WAF mode override, 0-RTT control
 - **Security Headers**: HSTS, X-Frame-Options, CSP, COEP, COOP, CORP, and more
 - **CORS Handling**: Full CORS support with preflight OPTIONS handling
 - **Server Branding**: Hide backend identity (Apache/nginx → "PQCProxy v0.2.1")
 - **IP Blocklists (DB-synced)**: Live-synced IP, fingerprint, and country blocklists pulled from the application database — updates without restart
+- **ACME Domain Path Sanitization**: Domain names validated against RFC 1035 before use in file-system paths — prevents path traversal via config
 
 ### Load Balancing
 - **6 Load Balancing Algorithms**:
@@ -114,8 +139,13 @@
 
 ### Operations
 - **Hot Reload**: Configuration and TLS certificate reload without restart
-- **Access Logging**: Per-request structured logging in JSON or plain-text format; configurable output file, includes method, path, status, latency, bytes, client IP, and upstream
-- **Admin API**: Health checks, Prometheus metrics, config reload, graceful shutdown
+- **Environment Config Overlay**: `--env <name>` CLI flag (or `PQCRYPTA_ENV`) loads `config.<name>.toml` and merges it on top of the base config — shared base with environment-specific overrides
+- **Config Conflict Validation**: Startup-time validation catches conflicting settings (PQC + passthrough, 0-RTT on non-safe routes without replay protection, mTLS required but no CA cert configured)
+- **Access Logging**: Per-request structured logging in JSON or plain-text format; configurable output file, includes method, path, status, latency, bytes, client IP, and upstream; user-controlled fields sanitized to prevent log injection
+- **Audit Logging**: Async structured JSON audit log for security-relevant events — admin actions, auth failures, WAF blocks/detects, IP blocks, rate limit hits, PQC downgrade events, config and TLS reloads, JA3 replay/drift detections
+- **Admin API**: Health checks, Prometheus metrics, config reload, graceful shutdown, QUIC health, WebTransport health
+- **Certificate Transparency**: New ACME-issued certs submitted to configured CT logs via `POST /ct/v1/add-chain` for public auditability
+- **Per-Backend Retry**: Configurable retry count and exponential backoff per backend; retry on 5xx responses, connect failures, or timeouts
 - **Cross-Platform**: Linux, macOS, and Windows support
 
 ## Security
@@ -442,6 +472,128 @@ per_ip_burst = 20
 - **Adaptive Baseline**: Learns normal traffic patterns and detects anomalies
 - **Layered Limits**: Global → Route → Client hierarchy for defense in depth
 
+### WAF Configuration
+
+```toml
+[waf]
+enabled = true
+mode = "block"          # "detect" logs only; "block" returns 403
+sqli = true             # SQL injection patterns
+xss = true              # Cross-site scripting patterns
+path_traversal = true   # Directory traversal (../, %2e%2e, null bytes)
+nosqli = true           # NoSQL injection ($where, $gt, $regex, etc.)
+ssrf = false            # SSRF patterns (higher false-positive rate — tune before enabling)
+scan_json_body = true   # Scan request bodies
+max_body_scan_bytes = 65536   # Max bytes of body to scan (default 64 KB)
+custom_patterns = [
+    "(?i)\\bmy-banned-keyword\\b",
+]
+```
+
+Route-level WAF override:
+```toml
+[[routes]]
+name = "public-api"
+host = "api.example.com"
+path_prefix = "/"
+backend = "api"
+
+[routes.security]
+waf_enabled = true
+waf_mode = "block"   # override global mode for this route
+```
+
+### Audit Logging Configuration
+
+```toml
+[logging]
+audit_log_enabled = true
+audit_log_path = "/var/log/pqcrypta-proxy/audit.json"   # omit to write to stderr
+```
+
+Each audit event is a JSON object with `timestamp`, `level`, `category`, and event-specific fields. Event categories: `admin_action`, `auth_failure`, `ip_blocked`, `rate_limit`, `pqc_downgrade`, `waf_block`, `waf_detect`, `config_reload`, `tls_reload`, `ja3_replay`, `ja3_drift`.
+
+### Per-Backend Retry Configuration
+
+```toml
+[backends.api]
+name = "api"
+address = "127.0.0.1:3003"
+retries = 3                                        # default 3
+retry_backoff_ms = 50                              # initial backoff; doubles each attempt
+retry_on = ["connect-failure", "5xx", "timeout"]   # default: connect-failure + 5xx
+```
+
+### Per-Backend Circuit Breaker Override
+
+```toml
+[backends.critical-api]
+name = "critical-api"
+address = "127.0.0.1:4000"
+
+[backends.critical-api.circuit_breaker]
+failure_threshold = 3        # trip after 3 failures (global default: 5)
+half_open_delay_secs = 10    # half-open probe delay (global default: 30)
+success_threshold = 1        # close after 1 success (global default: 2)
+```
+
+### Environment Config Overlay
+
+```bash
+# Load base config, then merge /etc/pqcrypta/proxy-config.prod.toml on top
+pqcrypta-proxy --config /etc/pqcrypta/proxy-config.toml --env prod
+
+# Or via environment variable
+PQCRYPTA_ENV=prod pqcrypta-proxy --config /etc/pqcrypta/proxy-config.toml
+```
+
+Overlay values win for all matching keys; unmatched keys from the base are kept. The overlay is re-applied on hot-reload.
+
+### Certificate Transparency Configuration
+
+```toml
+[acme]
+enabled = true
+certificate_transparency = true
+ct_logs = [
+    "https://ct.googleapis.com/logs/xenon2025h1/",
+    "https://yeti2025.ct.digicert.com/log/",
+]
+```
+
+### WebTransport Rate Limiting Configuration
+
+```toml
+[server]
+webtransport_max_sessions_per_origin = 100    # max concurrent sessions per Origin header
+webtransport_max_streams_per_session = 1000   # max concurrent streams per session
+webtransport_max_datagrams_per_sec = 500      # datagram rate limit per session
+```
+
+### QUIC Connection Migration
+
+```toml
+[server]
+enable_quic_migration = true   # default true; set false to disable client IP migration
+```
+
+### Per-Route Security Policy
+
+```toml
+[[routes]]
+name = "secure-api"
+host = "api.example.com"
+path_prefix = "/"
+backend = "api"
+
+[routes.security]
+mtls_required = true                          # require client certificate on this route
+allowed_ja3 = ["abc123...", "def456..."]      # allowlist of known-good JA3 fingerprints
+waf_enabled = true
+waf_mode = "block"
+enable_0rtt = false                           # deny 0-RTT early data on this route
+```
+
 ### Load Balancer Configuration
 
 ```toml
@@ -688,28 +840,31 @@ Set `PQCRYPTA_ENV=production` to explicitly declare a production deployment. Set
 
 ```
 src/
-├── main.rs              # Entry point
+├── main.rs              # Entry point; --env overlay; startup validation
 ├── lib.rs               # Library exports
-├── config.rs            # Configuration parsing
-├── load_balancer.rs     # Load balancing algorithms, pools, session affinity
-├── proxy.rs             # Backend pool & request routing
+├── config.rs            # Configuration parsing, schema versioning, conflict validation, env overlay
+├── load_balancer.rs     # Load balancing algorithms, pools, session affinity, per-backend CB overrides
+├── proxy.rs             # Backend pool, request routing, per-backend retry with exponential backoff
 ├── http_listener.rs     # HTTP/1.1 + HTTP/2 listener with PQC TLS
-├── quic_listener.rs     # QUIC/HTTP/3 listener
-├── security.rs          # Rate limiting, DoS, GeoIP, circuit breaker
-├── fingerprint.rs       # JA3/JA4 TLS fingerprint extraction
-├── tls_acceptor.rs      # Custom TLS acceptor with fingerprint capture
+├── quic_listener.rs     # QUIC/HTTP/3 listener; configurable connection migration
+├── security.rs          # Rate limiting, DoS, GeoIP, circuit breaker, WAF hook, body size limit
+├── fingerprint.rs       # JA3/JA4 TLS fingerprint extraction, replay cache, drift detector
+├── tls_acceptor.rs      # Custom TLS acceptor with fingerprint capture; 0-RTT nonce store
 ├── compression.rs       # Brotli/Zstd/Gzip compression
 ├── http3_features.rs    # Early Hints, Priority, Request Coalescing
-├── admin.rs             # Admin API endpoints
-├── tls.rs               # TLS configuration
-├── pqc_tls.rs           # Post-Quantum TLS provider
+├── admin.rs             # Admin API endpoints; audit logging; /health/quic; /health/webtransport
+├── tls.rs               # TLS configuration; PQC session tickets
+├── pqc_tls.rs           # Post-Quantum TLS provider; downgrade detection
 ├── pqc_extended.rs      # Extended PQC configuration and capabilities
-├── acme.rs              # ACME certificate automation (Let's Encrypt)
+├── acme.rs              # ACME certificate automation; Certificate Transparency log submission; domain path validation
 ├── ocsp.rs              # OCSP stapling automation
 ├── metrics.rs           # Prometheus metrics registry
-├── rate_limiter.rs      # Advanced multi-dimensional rate limiting
+├── rate_limiter.rs      # Advanced multi-dimensional rate limiting; JWT HMAC verification
 ├── proxy_protocol.rs    # PROXY protocol v2 support
-└── webtransport_server.rs  # WebTransport session handling
+├── access_logger.rs     # Structured access log with log-injection sanitization
+├── waf.rs               # WAF engine — OWASP Top 10 pattern sets, detect/block modes
+├── audit_logger.rs      # Async structured JSON audit logger for security events
+└── webtransport_server.rs  # WebTransport session handling; per-origin session rate limiting
 ```
 
 ## Post-Quantum Cryptography
@@ -840,16 +995,18 @@ curl -X POST http://127.0.0.1:8082/ocsp/refresh
 | `/metrics` | GET | Prometheus metrics (comprehensive) |
 | `/metrics/json` | GET | JSON metrics snapshot |
 | `/metrics/errors` | GET | Per-endpoint error counts and recent failure log. Filter with `?type=client` (4xx) or `?type=server` (5xx) |
-| `/reload` | POST | Reload configuration |
-| `/shutdown` | POST | Graceful shutdown |
+| `/reload` | POST | Reload configuration — audit logged |
+| `/shutdown` | POST | Graceful shutdown — audit logged |
 | `/config` | GET | Read-only config view |
 | `/backends` | GET | Backend health status |
 | `/tls` | GET | TLS certificate info |
 | `/ocsp` | GET | OCSP stapling status |
-| `/ocsp/refresh` | POST | Force OCSP response refresh *(5-min cooldown, F-14)* |
+| `/ocsp/refresh` | POST | Force OCSP response refresh *(5-min cooldown)* |
 | `/acme` | GET | ACME certificate status |
-| `/acme/renew` | POST | Force certificate renewal *(1-hour cooldown, F-14)* |
+| `/acme/renew` | POST | Force certificate renewal *(1-hour cooldown)* |
 | `/ratelimit` | GET | Rate limiter status and statistics |
+| `/health/quic` | GET | QUIC listener health — port, migration status, active connections |
+| `/health/webtransport` | GET | WebTransport health — active sessions, allowed origins, limits |
 
 ### Example
 
@@ -959,101 +1116,60 @@ cargo run --release --bin quic-bench -- --target localhost:443
 
 ## Security
 
-### All Security Features Complete
+### All Security Features
 
 - [x] TLS 1.3 only (enforced for both TCP/TLS via OpenSSL 3.5+ and QUIC/HTTP3 via rustls)
 - [x] Full security headers (HSTS, COEP, COOP, CORP, etc.)
 - [x] Server identity hidden (custom branding)
 - [x] X-Forwarded-For header support
-- [x] Rate limiting (per-IP token bucket with burst handling)
-- [x] DoS protection (connection limits, auto-blocking)
-- [x] Request size limits (413/431 responses)
+- [x] Rate limiting (per-IP token bucket with burst handling; multi-dimensional composite keys)
+- [x] DoS protection (connection limits, body size limit, request validation, auto-blocking)
+- [x] Request size limits (413/431 responses); chunked body size enforced (Transfer-Encoding bypass closed)
 - [x] GeoIP blocking (MaxMind DB integration)
 - [x] JA3/JA4 TLS fingerprinting (browser/bot/malware detection)
-- [x] Circuit breaker (backend protection)
-- [x] IP blocking (manual + auto with expiration)
+- [x] JA3/JA4 replay detection (same fingerprint from multiple IPs in window)
+- [x] JA3/JA4 drift detection (cipher/extension composition change on same hash)
+- [x] Circuit breaker (backend protection; per-backend failure threshold and half-open delay overrides)
+- [x] Per-backend retry (configurable count, exponential backoff, retry-on conditions)
+- [x] IP blocking (manual + auto with expiration; DB-synced blocklists)
 - [x] Compression (Brotli, Zstd, Gzip, Deflate)
 - [x] Early Hints (103) support
 - [x] Priority Hints (RFC 9218)
 - [x] Request Coalescing (dedupe identical requests)
-- [x] PQC hybrid key exchange (X25519MLKEM768)
+- [x] PQC hybrid key exchange (X25519MLKEM768 — NIST FIPS 203)
+- [x] PQC downgrade detection (block/log/allow when classical-only TLS negotiated)
+- [x] 0-RTT replay protection (nonce store with strict/session/none modes; window configurable)
 - [x] Background cleanup (auto-expire blocked IPs)
-- [x] SSRF protection (link-local backend rejection, RFC1918 warning)
-- [x] Chunked body size enforcement (Transfer-Encoding bypass fixed)
-- [x] Admin router tier split (public /health vs. authenticated /metrics etc.)
+- [x] SSRF protection (link-local backend rejection, RFC1918 warning, WAF SSRF pattern set)
+- [x] WAF (OWASP Top 10: SQLi, XSS, path traversal, NoSQLi, SSRF, CMDi, XXE, deserialization; detect/block modes; custom patterns)
+- [x] Structured audit logging (async JSON — admin actions, auth failures, WAF events, rate limits, PQC downgrades, config reloads, JA3 replay/drift)
+- [x] Admin router tier split (public /health vs. authenticated /metrics, /reload, etc.)
+- [x] Admin token auth (ephemeral if not configured; constant-time comparison; per-IP + global brute-force lockout with exponential back-off)
+- [x] JWT rate limiting with HMAC-SHA256 signature verification (no unsigned sub claim trust)
+- [x] Configurable JWT algorithms (default HS256; non-HMAC rejected — prevents algorithm-confusion attacks)
 - [x] Exponential back-off on global auth cooldown (5 min base, up to 30 min)
-
-### Security Hardening (v0.2.2 — February 2026)
-
-These improvements address the independent security review published February 24 2026 (SEC-A01 – SEC-A09):
-
-- [x] **SEC-A01/A09 — Bot-detection script SQL injection and privilege** — Rewrote
-  `scripts/detect_bots_from_logs.sh` to connect as `pqcrypta_user` instead of the postgres
-  superuser, and replaced all string-interpolated SQL with parameterised `psql -v` / `:'variable'`
-  literals. Added a strict `sanitize_path()` whitelist that rejects control characters before any
-  value reaches the database.
-- [x] **SEC-A02 — Admin API non-loopback warning** — A startup `WARN` is now emitted when
-  `bind_address` resolves to a non-loopback interface, alerting operators that the admin API is
-  reachable over the network without TLS.
-- [x] **SEC-A03 — `require_mtls` enforcement** — Setting `require_mtls = true` in `[admin]` now
-  returns a hard error at startup rather than silently ignoring the flag, preventing a false sense
-  of security while mTLS is not yet implemented.
-- [x] **SEC-A04 — Hardcoded backend addresses removed from logs** — Startup log lines that printed
-  resolved backend host:port pairs (`api.pqcrypta.com → 127.0.0.1:3003`, etc.) were removed.
-  Backend topology is no longer disclosed in plain-text logs.
-- [x] **SEC-A05 — Loopback-only trust for `is_trusted_ip()`** — `is_trusted_ip()` in `security.rs`
-  now trusts only loopback addresses (`127.x.x.x` / `::1`). RFC1918 private ranges are no longer
-  trusted by default, closing an XFF/Real-IP bypass on multi-tenant or shared networks.
-- [x] **SEC-A06 — Graceful shutdown drain polling** — The static `sleep(drain_secs)` that blocked
-  shutdown for the full configured drain duration regardless of connection state has been replaced
-  with a 100 ms polling loop that exits as soon as active connections reach zero.
-- [x] **SEC-A07 — Excessive Clippy suppressions removed** — Four crate-level `#![allow()]`
-  annotations (`cast_possible_truncation`, `cast_sign_loss`, `cast_precision_loss`,
-  `wildcard_imports`) were removed from `main.rs` and `lib.rs`. All surfaced warnings were
-  resolved properly using `try_from().unwrap_or(MAX)`, `.clamp()`, and explicit imports.
-- [x] **SEC-A08 — GeoIP license key removed from URL** — `scripts/download_geoip.sh` no longer
-  appends `&license_key=…` to the download URL. The key is transmitted exclusively via HTTP Basic
-  Auth (`--user`) as intended by the MaxMind API.
-
-### Security Hardening (v0.2.1 — February 2026)
-
-These improvements address the independent security review published February 24 2026:
-
-- [x] **SSRF protection** — Backend addresses validated against link-local (169.254.0.0/16) and
-  cloud metadata service hostnames at config load time. RFC1918 backends emit a warning unless
-  `allow_internal_backends = true` is set in `[security]`.
-- [x] **Chunked body size enforcement** — Body size limit now enforced on the actual streamed bytes
-  for `Transfer-Encoding: chunked` requests, not only on the `Content-Length` header. Prevents
-  bypass of the 10 MB request limit via chunked encoding.
-- [x] **Admin router tier split** — `/health` is unauthenticated (safe for load-balancer probes);
-  all other admin endpoints (`/metrics`, `/reload`, `/shutdown`, `/config`, …) require the Bearer
-  token. Prometheus metrics are no longer accessible without auth.
-- [x] **Extended global cooldown** — Global brute-force cooldown increased from 30 s to 5 min
-  (base), with exponential back-off doubling on each successive trigger up to 30 min.
-- [x] **ACME/OCSP endpoint rate limiting** — `/acme/renew` is rate-limited to once per hour to
-  protect Let's Encrypt's 50-cert/week quota; `/ocsp/refresh` to once per 5 minutes.
-- [x] **OpenSSL binary path validation** — Custom `openssl_path` values must be absolute paths
-  pointing to a regular file. Prevents PATH-hijacking via a relative path in config.
-- [x] **Configurable JWT algorithms** — `jwt_algorithms` field in `[advanced_rate_limiting]`
-  restricts accepted HMAC variants (default: `["HS256"]`). Non-HMAC algorithm strings are
-  rejected with a warning; prevents algorithm-confusion attacks.
-- [x] **`BackendServer::from_config()` error propagation** — Invalid backend server addresses
-  during hot-reload now log a warning and skip the entry instead of aborting the process.
-- [x] **`unsafe_code = deny`** in Cargo.toml — Unsafe blocks are now a compile error globally;
-  the OpenSSL FFI module retains a targeted `#![allow(unsafe_code)]`.
-- [x] **Cargo-deny advisory check is now blocking** — The `continue-on-error` exemption for
-  advisory checks has been removed; newly published CVEs against dependencies will block CI.
-- [x] **GeoIP databases excluded from repo** — `.mmdb` files are now gitignored; download via
-  `scripts/download_geoip.sh` with a MaxMind account.
-- [x] **SECURITY.md** — Vulnerability disclosure policy at `.github/SECURITY.md`.
-
-### Earlier Security Hardening (v1.3.0)
-
-- [x] **Panic prevention** — All unsafe `unwrap()` calls replaced with safe patterns
-- [x] **Memory exhaustion prevention** — DashMap collections bounded with eviction
-- [x] **ReDoS prevention** — Regex patterns validated with size limits
-- [x] **Command injection prevention** — RFC 1035 domain validation in ACME
-- [x] **Safe path handling** — All path-to-string conversions use error handling
+- [x] ACME/OCSP endpoint rate limiting (/acme/renew 1-hour cooldown; /ocsp/refresh 5-min cooldown)
+- [x] Certificate Transparency — new ACME certs submitted to CT logs after issuance
+- [x] ACME domain path sanitization — RFC 1035 validation before any certs_path join
+- [x] QUIC connection migration (configurable enable/disable via `enable_quic_migration`)
+- [x] WebTransport per-origin session rate limiting (max sessions, streams, datagrams/sec)
+- [x] Per-route security policy (mTLS, JA3 allowlist, rate limit override, WAF mode, 0-RTT control)
+- [x] Config conflict validation at startup and hot-reload (PQC+passthrough, 0-RTT without replay protection, mTLS without CA cert)
+- [x] Environment config overlay (`--env <name>` merges `config.<name>.toml` over base)
+- [x] Config schema versioning (warns on absent version; errors on future version)
+- [x] Admin API non-loopback warning (WARN when bind_address is not loopback)
+- [x] `require_mtls = true` hard startup error (prevents false sense of security — mTLS not yet implemented on admin listener)
+- [x] Backend topology not disclosed in logs (resolved host:port pairs removed from startup output)
+- [x] Loopback-only trust for `is_trusted_ip()` (RFC1918 not trusted by default — closes XFF bypass)
+- [x] Graceful shutdown drain polling (100 ms poll loop exits when connections reach zero — no fixed sleep)
+- [x] OpenSSL binary path validation (must be absolute, pointing to a regular file)
+- [x] Log injection prevention (newlines and control characters stripped from all user-controlled log fields)
+- [x] `tls_skip_verify` blocked in production (rejected at config load; requires `--allow-insecure-backends`)
+- [x] `unsafe_code = deny` globally (OpenSSL FFI retains targeted allow)
+- [x] Panic prevention (no production-path unwrap(); ok_or/? throughout)
+- [x] Memory exhaustion prevention (DashMap collections bounded with eviction)
+- [x] ReDoS prevention (regex patterns size-limited)
+- [x] SECURITY.md vulnerability disclosure policy
 
 ### mTLS Configuration
 

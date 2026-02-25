@@ -102,6 +102,7 @@ use sha2::Digest;
 use tracing::{debug, info, warn};
 
 use crate::config::{CircuitBreakerConfig, ProxyConfig, RateLimitConfig, SecurityConfig};
+use crate::waf::{WafEngine, WafRequest, WafVerdict};
 
 /// Entry in a JA3/JA4 fingerprint database JSON file.
 /// Expected format: [{hash, classification, description}]
@@ -202,6 +203,8 @@ pub struct SecurityState {
     pub geoip_db: Option<Arc<GeoIpDb>>,
     /// JA3/JA4 fingerprint database (advisory-only, never blocks)
     pub ja3_db: Arc<Ja3Database>,
+    /// WAF engine (None if WAF disabled)
+    pub waf_engine: Option<Arc<WafEngine>>,
 }
 
 /// Information about a blocked IP
@@ -408,6 +411,13 @@ impl SecurityState {
             Ja3Database::default()
         };
 
+        // Build WAF engine if enabled
+        let waf_engine = if config.waf.enabled {
+            Some(Arc::new(WafEngine::new(&config.waf)))
+        } else {
+            None
+        };
+
         let state = Self {
             ip_rate_limiters: Arc::new(DashMap::new()),
             ip_connections: Arc::new(DashMap::new()),
@@ -422,6 +432,7 @@ impl SecurityState {
             #[cfg(feature = "geoip")]
             geoip_db,
             ja3_db: Arc::new(ja3_db),
+            waf_engine,
         };
 
         // Spawn background cleanup task
@@ -1022,7 +1033,43 @@ pub async fn security_middleware(
         }
     }
 
-    // 5. Request size validation — covers both Content-Length and chunked bodies.
+    // 5. WAF inspection (path + query + headers; body scanned in chunked path below)
+    if let Some(ref waf) = security.waf_engine {
+        let (path, query) = {
+            let uri = request.uri();
+            (
+                uri.path().to_string(),
+                uri.query().unwrap_or("").to_string(),
+            )
+        };
+        let waf_req = WafRequest {
+            method: request.method().as_str(),
+            path: &path,
+            query: &query,
+            headers: request.headers(),
+            body: None, // body scan happens in chunked path
+        };
+        match waf.inspect(&waf_req) {
+            WafVerdict::Block { ref rule, .. } => {
+                warn!("WAF block: rule={} ip={} path={}", rule, ip, path);
+                if dos_protection {
+                    security.decrement_connections(ip);
+                }
+                let mut resp =
+                    (StatusCode::FORBIDDEN, "Request blocked by security policy").into_response();
+                resp.headers_mut()
+                    .insert("x-waf-block", HeaderValue::from_static("1"));
+                return resp;
+            }
+            WafVerdict::Detect { ref rule, .. } => {
+                warn!("WAF detect: rule={} ip={} path={}", rule, ip, path);
+                // Log only — continue processing
+            }
+            WafVerdict::Allow => {}
+        }
+    }
+
+    // 6. Request size validation — covers both Content-Length and chunked bodies.
     //
     // F-02: The previous implementation checked only the Content-Length header, which
     // is absent for Transfer-Encoding: chunked requests.  Attackers could bypass the

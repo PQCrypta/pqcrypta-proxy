@@ -28,6 +28,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
 use crate::acme::{AcmeService, AcmeStatusInfo};
+use crate::audit_logger::{AuditEvent, AuditLogger};
 use crate::config::{AdminConfig, ConfigManager};
 use crate::metrics::MetricsRegistry;
 use crate::ocsp::{OcspService, OcspStatusInfo};
@@ -59,6 +60,8 @@ pub struct AdminState {
     pub request_count: Arc<RwLock<u64>>,
     /// Comprehensive metrics registry
     pub metrics: Arc<MetricsRegistry>,
+    /// Structured audit logger for security-relevant events
+    pub audit_logger: Option<Arc<AuditLogger>>,
 }
 
 /// Admin API server
@@ -80,6 +83,7 @@ impl AdminServer {
         rate_limiter: Option<Arc<AdvancedRateLimiter>>,
         shutdown_tx: mpsc::Sender<()>,
         metrics: Option<Arc<MetricsRegistry>>,
+        audit_logger: Option<Arc<AuditLogger>>,
     ) -> Self {
         let metrics = metrics.unwrap_or_else(|| Arc::new(MetricsRegistry::new()));
 
@@ -95,6 +99,7 @@ impl AdminServer {
             connection_count: Arc::new(RwLock::new(0)),
             request_count: Arc::new(RwLock::new(0)),
             metrics,
+            audit_logger,
         });
 
         Self { config, state }
@@ -243,6 +248,8 @@ impl AdminServer {
                 }),
             )
             .route("/ratelimit", get(ratelimit_handler))
+            .route("/health/quic", get(health_quic_handler))
+            .route("/health/webtransport", get(health_webtransport_handler))
             .layer(axum::middleware::from_fn_with_state(
                 auth_state,
                 auth_middleware,
@@ -618,10 +625,12 @@ struct ReloadResponse {
 
 /// Configuration reload endpoint
 async fn reload_handler(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AdminState>>,
     Json(request): Json<Option<ReloadRequest>>,
 ) -> Json<ReloadResponse> {
     let tls_only = request.map(|r| r.tls_only).unwrap_or(false);
+    let action = if tls_only { "tls_reload" } else { "config_reload" };
 
     if tls_only {
         // Reload TLS certificates only
@@ -630,6 +639,14 @@ async fn reload_handler(
                 info!("TLS certificates reloaded via admin API");
                 // Notify other components
                 state.config_manager.notify_tls_reload().await;
+                if let Some(ref logger) = state.audit_logger {
+                    logger.log(AuditEvent::AdminAction {
+                        ip: remote_addr.ip().to_string(),
+                        action: action.to_string(),
+                        success: true,
+                        detail: None,
+                    });
+                }
                 Json(ReloadResponse {
                     success: true,
                     message: "TLS certificates reloaded successfully".to_string(),
@@ -637,6 +654,14 @@ async fn reload_handler(
             }
             Err(e) => {
                 error!("TLS reload failed: {}", e);
+                if let Some(ref logger) = state.audit_logger {
+                    logger.log(AuditEvent::AdminAction {
+                        ip: remote_addr.ip().to_string(),
+                        action: action.to_string(),
+                        success: false,
+                        detail: Some(e.to_string()),
+                    });
+                }
                 Json(ReloadResponse {
                     success: false,
                     message: format!("TLS reload failed: {}", e),
@@ -648,6 +673,14 @@ async fn reload_handler(
         match state.config_manager.reload().await {
             Ok(()) => {
                 info!("Configuration reloaded via admin API");
+                if let Some(ref logger) = state.audit_logger {
+                    logger.log(AuditEvent::AdminAction {
+                        ip: remote_addr.ip().to_string(),
+                        action: action.to_string(),
+                        success: true,
+                        detail: None,
+                    });
+                }
                 Json(ReloadResponse {
                     success: true,
                     message: "Configuration reloaded successfully".to_string(),
@@ -655,6 +688,14 @@ async fn reload_handler(
             }
             Err(e) => {
                 error!("Config reload failed: {}", e);
+                if let Some(ref logger) = state.audit_logger {
+                    logger.log(AuditEvent::AdminAction {
+                        ip: remote_addr.ip().to_string(),
+                        action: action.to_string(),
+                        success: false,
+                        detail: Some(e.to_string()),
+                    });
+                }
                 Json(ReloadResponse {
                     success: false,
                     message: format!("Configuration reload failed: {}", e),
@@ -671,8 +712,20 @@ struct ShutdownResponse {
 }
 
 /// Graceful shutdown endpoint
-async fn shutdown_handler(State(state): State<Arc<AdminState>>) -> Json<ShutdownResponse> {
-    info!("Shutdown requested via admin API");
+async fn shutdown_handler(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AdminState>>,
+) -> Json<ShutdownResponse> {
+    info!("Shutdown requested via admin API from {}", remote_addr);
+
+    if let Some(ref logger) = state.audit_logger {
+        logger.log(AuditEvent::AdminAction {
+            ip: remote_addr.ip().to_string(),
+            action: "shutdown".to_string(),
+            success: true,
+            detail: None,
+        });
+    }
 
     // Send shutdown signal
     let _ = state.shutdown_tx.send(()).await;
@@ -992,4 +1045,54 @@ struct RateLimitStatusResponse {
     enabled: bool,
     stats: Option<RateLimiterSnapshot>,
     error: Option<String>,
+}
+
+/// QUIC health response
+#[derive(Serialize)]
+struct QuicHealthResponse {
+    status: String,
+    port: u16,
+    migration_enabled: bool,
+    connections: u64,
+}
+
+/// WebTransport health response
+#[derive(Serialize)]
+struct WebTransportHealthResponse {
+    status: String,
+    active_connections: u64,
+    allowed_origins: Vec<String>,
+    max_sessions_per_origin: u32,
+    max_streams_per_session: u32,
+}
+
+/// QUIC protocol health endpoint (protected — requires auth)
+async fn health_quic_handler(
+    State(state): State<Arc<AdminState>>,
+) -> Json<QuicHealthResponse> {
+    let config = state.config_manager.get();
+    let connections = *state.connection_count.read();
+
+    Json(QuicHealthResponse {
+        status: "ok".to_string(),
+        port: config.server.udp_port,
+        migration_enabled: config.server.enable_quic_migration,
+        connections,
+    })
+}
+
+/// WebTransport health endpoint (protected — requires auth)
+async fn health_webtransport_handler(
+    State(state): State<Arc<AdminState>>,
+) -> Json<WebTransportHealthResponse> {
+    let config = state.config_manager.get();
+    let connections = *state.connection_count.read();
+
+    Json(WebTransportHealthResponse {
+        status: "ok".to_string(),
+        active_connections: connections,
+        allowed_origins: config.server.webtransport_allowed_origins.clone(),
+        max_sessions_per_origin: config.server.webtransport_max_sessions_per_origin,
+        max_streams_per_session: config.server.webtransport_max_streams_per_session,
+    })
 }

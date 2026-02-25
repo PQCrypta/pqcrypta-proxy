@@ -708,6 +708,52 @@ pub struct PqcHandshakeInfo {
     pub pqc_active: bool,
 }
 
+/// Action to take when a PQC downgrade is detected
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DowngradeAction {
+    /// Allow the classical-only connection silently
+    Allow,
+    /// Log the downgrade event and allow the connection
+    Log { classical_kem: String },
+    /// Block the connection (return 421)
+    Block { classical_kem: String },
+}
+
+impl PqcTlsProvider {
+    /// Determine whether a completed TLS handshake constitutes a PQC downgrade
+    /// and what action to take according to `PqcConfig.downgrade_action`.
+    ///
+    /// Returns `DowngradeAction::Allow` if PQC was used, PQC enforcement is
+    /// disabled, or logging/blocking is turned off.
+    pub fn check_downgrade(&self, handshake_info: &PqcHandshakeInfo) -> DowngradeAction {
+        let config = self.config.read();
+
+        if !config.enabled {
+            return DowngradeAction::Allow;
+        }
+
+        // If PQC was active in this handshake, no downgrade occurred.
+        if handshake_info.pqc_active {
+            return DowngradeAction::Allow;
+        }
+
+        // PQC enabled but classical-only KEM was negotiated → downgrade.
+        if !config.log_downgrades {
+            return DowngradeAction::Allow;
+        }
+
+        match config.downgrade_action.as_str() {
+            "block" => DowngradeAction::Block {
+                classical_kem: handshake_info.key_exchange.clone(),
+            },
+            "log" => DowngradeAction::Log {
+                classical_kem: handshake_info.key_exchange.clone(),
+            },
+            _ => DowngradeAction::Allow,
+        }
+    }
+}
+
 /// Verify that the system supports PQC TLS
 ///
 /// This function creates a temporary PQC provider and checks if the system

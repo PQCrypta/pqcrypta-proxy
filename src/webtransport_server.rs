@@ -6,9 +6,11 @@
 //! - Proper session handling
 //! - Bidirectional/unidirectional streams and datagrams
 
+use dashmap::DashMap;
 use serde_json::json;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -27,6 +29,8 @@ pub struct WebTransportServer {
     config: Arc<ProxyConfig>,
     backend_pool: Arc<BackendPool>,
     metrics: Option<Arc<MetricsRegistry>>,
+    /// Per-origin active session counter (origin string → count)
+    origin_session_counts: Arc<DashMap<String, Arc<AtomicU32>>>,
 }
 
 impl WebTransportServer {
@@ -119,6 +123,7 @@ impl WebTransportServer {
             config,
             backend_pool,
             metrics: None,
+            origin_session_counts: Arc::new(DashMap::new()),
         })
     }
 
@@ -139,6 +144,7 @@ impl WebTransportServer {
         let config = self.config.clone();
         let backend_pool = self.backend_pool.clone();
         let metrics = self.metrics.clone();
+        let origin_counts = Arc::clone(&self.origin_session_counts);
 
         info!("🌐 WebTransport server listening on {}", self.addr);
         info!("🔗 Ready to accept WebTransport connections");
@@ -154,13 +160,14 @@ impl WebTransportServer {
             let config_clone = config.clone();
             let backend_clone = backend_pool.clone();
             let session_metrics = metrics.clone();
+            let counts_clone = Arc::clone(&origin_counts);
             tokio::spawn(async move {
                 if let Some(ref m) = session_metrics {
                     m.connections
                         .connection_opened(ConnectionProtocol::WebTransport);
                 }
                 if let Err(e) =
-                    handle_incoming_session(incoming_session, config_clone, backend_clone).await
+                    handle_incoming_session(incoming_session, config_clone, backend_clone, counts_clone).await
                 {
                     error!("❌ Session handler error: {}", e);
                 }
@@ -177,6 +184,7 @@ async fn handle_incoming_session(
     incoming_session: wtransport::endpoint::IncomingSession,
     config: Arc<ProxyConfig>,
     backend_pool: Arc<BackendPool>,
+    origin_session_counts: Arc<DashMap<String, Arc<AtomicU32>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("📨 Processing incoming WebTransport session...");
     info!("📍 Remote address: {}", incoming_session.remote_address());
@@ -206,6 +214,11 @@ async fn handle_incoming_session(
     //                               sessions without an Origin header are also
     //                               accepted (non-browser / native clients).
     let allowed_origins = &config.server.webtransport_allowed_origins;
+    let origin_key = session_request
+        .origin()
+        .map(|o| o.to_string())
+        .unwrap_or_else(|| "no-origin".to_string());
+
     if let Some(origin) = session_request.origin() {
         // Browser-sourced session: check against the allowlist.
         let is_allowed = if allowed_origins.is_empty() {
@@ -229,13 +242,38 @@ async fn handle_incoming_session(
         info!("   Origin: (none — non-browser client)");
     }
 
+    // WT-RL-01: Per-origin session limit.
+    let max_sessions = config.server.webtransport_max_sessions_per_origin;
+    let counter = origin_session_counts
+        .entry(origin_key.clone())
+        .or_insert_with(|| Arc::new(AtomicU32::new(0)));
+    let counter = Arc::clone(counter.value());
+    let current = counter.load(Ordering::Relaxed);
+    if current >= max_sessions {
+        warn!(
+            "WT-RL-01: WebTransport session limit ({}) reached for origin '{}' — rejecting {}",
+            max_sessions, origin_key, remote_addr
+        );
+        session_request.forbidden().await;
+        return Ok(());
+    }
+    counter.fetch_add(1, Ordering::Relaxed);
+
     // Accept the session
-    let connection = session_request.accept().await?;
+    let connection = match session_request.accept().await {
+        Ok(c) => c,
+        Err(e) => {
+            counter.fetch_sub(1, Ordering::Relaxed);
+            return Err(e.into());
+        }
+    };
 
     info!("✅ WebTransport connection established: {}", remote_addr);
 
-    // Handle the connection
-    handle_connection(connection, remote_addr, path, config, backend_pool).await
+    // Handle the connection; decrement counter when it closes
+    let result = handle_connection(connection, remote_addr, path, config, backend_pool).await;
+    counter.fetch_sub(1, Ordering::Relaxed);
+    result
 }
 
 /// Handle an established WebTransport connection

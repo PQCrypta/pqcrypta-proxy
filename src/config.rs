@@ -78,12 +78,17 @@ pub enum ConfigReloadEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProxyConfig {
+    /// Config schema version (default 1; warn if absent, error if > CURRENT_CONFIG_VERSION)
+    pub version: Option<u32>,
     /// Server bind configuration
     pub server: ServerConfig,
     /// TLS configuration
     pub tls: TlsConfig,
     /// Post-quantum cryptography settings
     pub pqc: PqcConfig,
+    /// Web Application Firewall configuration
+    #[serde(default)]
+    pub waf: WafConfig,
     /// Backend definitions (single backend per name)
     #[serde(default)]
     pub backends: HashMap<String, BackendConfig>,
@@ -136,6 +141,69 @@ pub struct ProxyConfig {
     pub http3: Http3Config,
 }
 
+/// Current config schema version supported by this binary
+pub const CURRENT_CONFIG_VERSION: u32 = 1;
+
+/// Web Application Firewall configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WafConfig {
+    /// Enable WAF (default false — opt-in)
+    pub enabled: bool,
+    /// Mode: "detect" (log only) | "block" (reject request) — default "block"
+    pub mode: String,
+    /// Enable SQLi pattern matching
+    pub sqli: bool,
+    /// Enable XSS pattern matching
+    pub xss: bool,
+    /// Enable path traversal detection
+    pub path_traversal: bool,
+    /// Enable NoSQL injection detection
+    pub nosqli: bool,
+    /// Enable SSRF pattern detection (higher false-positive rate)
+    pub ssrf: bool,
+    /// Scan JSON request bodies
+    pub scan_json_body: bool,
+    /// Maximum body bytes to scan (default 65536)
+    pub max_body_scan_bytes: usize,
+    /// User-supplied extra regex patterns (applied in block mode)
+    pub custom_patterns: Vec<String>,
+}
+
+impl Default for WafConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: "block".to_string(),
+            sqli: true,
+            xss: true,
+            path_traversal: true,
+            nosqli: true,
+            ssrf: false,
+            scan_json_body: true,
+            max_body_scan_bytes: 65_536,
+            custom_patterns: Vec::new(),
+        }
+    }
+}
+
+/// Per-route security policy override
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RouteSecurityPolicy {
+    /// Require mTLS for this route
+    pub mtls_required: Option<bool>,
+    /// Allowlisted JA3 fingerprint hashes for this route
+    pub allowed_ja3: Option<Vec<String>>,
+    /// Rate limit override for this route
+    pub rate_limit_override: Option<RateLimitConfig>,
+    /// Allow 0-RTT for this route (overrides global tls.enable_0rtt)
+    pub enable_0rtt: Option<bool>,
+    /// Enable WAF for this route (overrides global waf.enabled)
+    pub waf_enabled: Option<bool>,
+    /// WAF mode for this route: "detect" | "block"
+    pub waf_mode: Option<String>,
+}
+
 /// HTTP/3 advanced features configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -183,9 +251,11 @@ impl Default for Http3Config {
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
+            version: Some(CURRENT_CONFIG_VERSION),
             server: ServerConfig::default(),
             tls: TlsConfig::default(),
             pqc: PqcConfig::default(),
+            waf: WafConfig::default(),
             backends: HashMap::new(),
             backend_pools: HashMap::new(),
             routes: Vec::new(),
@@ -253,6 +323,29 @@ pub struct ServerConfig {
     /// match one of the listed origins.
     #[serde(default)]
     pub webtransport_allowed_origins: Vec<String>,
+
+    /// Maximum request body size in bytes (default 50 MiB).
+    /// Requests with Content-Length exceeding this are rejected with 413.
+    #[serde(default = "default_max_request_body_bytes")]
+    pub max_request_body_bytes: u64,
+
+    /// Enable QUIC connection migration (RFC 9000 §9).
+    /// Allows clients to migrate to a new network path without losing the session.
+    /// Default: true (enabled — Quinn default behaviour).
+    #[serde(default = "default_true")]
+    pub enable_quic_migration: bool,
+
+    /// Maximum concurrent WebTransport sessions per origin (default 100).
+    #[serde(default = "default_wt_max_sessions")]
+    pub webtransport_max_sessions_per_origin: u32,
+
+    /// Maximum concurrent streams per WebTransport session (default 1000).
+    #[serde(default = "default_wt_max_streams")]
+    pub webtransport_max_streams_per_session: u32,
+
+    /// Maximum datagrams per second per WebTransport session (default 500).
+    #[serde(default = "default_wt_max_datagrams")]
+    pub webtransport_max_datagrams_per_sec: u32,
 }
 
 impl Default for ServerConfig {
@@ -271,8 +364,29 @@ impl Default for ServerConfig {
             // SR-02: Empty by default — all cross-origin sessions are rejected
             // until the operator explicitly lists allowed origins.
             webtransport_allowed_origins: Vec::new(),
+            max_request_body_bytes: 52_428_800, // 50 MiB
+            enable_quic_migration: true,
+            webtransport_max_sessions_per_origin: 100,
+            webtransport_max_streams_per_session: 1000,
+            webtransport_max_datagrams_per_sec: 500,
         }
     }
+}
+
+fn default_max_request_body_bytes() -> u64 {
+    52_428_800 // 50 MiB
+}
+
+fn default_wt_max_sessions() -> u32 {
+    100
+}
+
+fn default_wt_max_streams() -> u32 {
+    1000
+}
+
+fn default_wt_max_datagrams() -> u32 {
+    500
 }
 
 impl ServerConfig {
@@ -321,6 +435,23 @@ pub struct TlsConfig {
     /// implements idempotency-key-based deduplication.
     #[serde(default = "default_zero_rtt_safe_methods")]
     pub zero_rtt_safe_methods: Vec<String>,
+
+    /// 0-RTT replay protection mode: "strict" | "session" | "none" — default "strict".
+    /// - "strict": nonce tracked globally; duplicate nonces rejected with 425.
+    /// - "session": nonce tracked per TLS session only.
+    /// - "none": no replay protection (not recommended).
+    #[serde(default = "default_zero_rtt_replay_protection")]
+    pub zero_rtt_replay_protection: String,
+
+    /// Time window (seconds) for 0-RTT nonce tracking (default 60).
+    #[serde(default = "default_zero_rtt_nonce_window")]
+    pub zero_rtt_nonce_window_secs: u64,
+
+    /// Enable PQC-wrapped session tickets (experimental).
+    /// When true, session ticket HKDF keys are encapsulated with ML-KEM-1024.
+    /// Default: false.
+    #[serde(default)]
+    pub pqc_session_tickets: bool,
 }
 
 impl Default for TlsConfig {
@@ -341,8 +472,19 @@ impl Default for TlsConfig {
             cert_reload_interval_secs: 3600,
             enable_0rtt: false, // Disabled by default for security (replay attack risk)
             zero_rtt_safe_methods: default_zero_rtt_safe_methods(),
+            zero_rtt_replay_protection: default_zero_rtt_replay_protection(),
+            zero_rtt_nonce_window_secs: default_zero_rtt_nonce_window(),
+            pqc_session_tickets: false,
         }
     }
+}
+
+fn default_zero_rtt_replay_protection() -> String {
+    "strict".to_string()
+}
+
+fn default_zero_rtt_nonce_window() -> u64 {
+    60
 }
 
 fn default_zero_rtt_safe_methods() -> Vec<String> {
@@ -395,6 +537,15 @@ pub struct PqcConfig {
     /// Additional KEM algorithms to offer (in preference order)
     #[serde(default)]
     pub additional_kems: Vec<String>,
+    /// PQC downgrade action: "allow" | "log" | "block" — default "log".
+    /// "block" rejects connections that negotiate classical-only KEM when PQC is enabled.
+    #[serde(default = "default_downgrade_action")]
+    pub downgrade_action: String,
+
+    /// Log PQC downgrade events (default true).
+    #[serde(default = "default_true_pqc")]
+    pub log_downgrades: bool,
+
     /// Enable PQC signatures (ML-DSA) - requires `pqc-signatures` feature
     #[serde(default)]
     pub enable_signatures: bool,
@@ -436,6 +587,8 @@ impl Default for PqcConfig {
                 "SecP256r1MLKEM768".to_string(),
                 "SecP384r1MLKEM1024".to_string(),
             ],
+            downgrade_action: default_downgrade_action(),
+            log_downgrades: true,
             enable_signatures: false,
             require_hybrid: false,
             verify_provider: true,
@@ -443,6 +596,10 @@ impl Default for PqcConfig {
             strict_key_permissions: false,
         }
     }
+}
+
+fn default_downgrade_action() -> String {
+    "log".to_string()
 }
 
 /// Backend server configuration
@@ -483,6 +640,26 @@ pub struct BackendConfig {
     /// Health check interval in seconds
     #[serde(default = "default_health_interval")]
     pub health_check_interval_secs: u64,
+
+    /// Retry count for failed requests (default 3)
+    pub retries: Option<u8>,
+    /// Initial retry backoff in milliseconds (doubles each attempt, default 50)
+    pub retry_backoff_ms: Option<u64>,
+    /// Conditions that trigger a retry: "connect-failure", "timeout", "5xx"
+    pub retry_on: Option<Vec<String>>,
+    /// Per-backend circuit breaker parameter overrides
+    pub circuit_breaker: Option<CircuitBreakerOverride>,
+}
+
+/// Per-backend circuit breaker parameter overrides
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerOverride {
+    /// Failure count before opening circuit (overrides global)
+    pub failure_threshold: Option<u32>,
+    /// Seconds to wait before moving from Open to Half-Open (overrides global)
+    pub half_open_delay_secs: Option<u64>,
+    /// Success count in Half-Open before closing circuit (overrides global)
+    pub success_threshold: Option<u32>,
 }
 
 /// TLS mode for backend connections
@@ -610,6 +787,9 @@ pub struct RouteConfig {
     /// when this flag is set.
     #[serde(default)]
     pub allow_0rtt: bool,
+
+    /// Per-route security policy override (mTLS, JA3 allowlist, rate limit, WAF mode)
+    pub security: Option<RouteSecurityPolicy>,
 }
 
 fn default_priority() -> i32 {
@@ -671,6 +851,11 @@ pub struct LoggingConfig {
     pub access_log: bool,
     /// Access log file path
     pub access_log_file: Option<PathBuf>,
+    /// Audit log file path (None = write to stderr)
+    pub audit_log_path: Option<PathBuf>,
+    /// Enable structured audit logging (default true)
+    #[serde(default = "default_true")]
+    pub audit_log_enabled: bool,
 }
 
 impl Default for LoggingConfig {
@@ -681,6 +866,8 @@ impl Default for LoggingConfig {
             file: None,
             access_log: true,
             access_log_file: None,
+            audit_log_path: None,
+            audit_log_enabled: true,
         }
     }
 }
@@ -835,6 +1022,34 @@ pub struct FingerprintConfig {
     /// Set to true only after validating that your fingerprint database does not
     /// produce false positives against legitimate clients.
     pub block_malicious: bool,
+
+    /// Enable JA3 replay detection (same fingerprint from many IPs in short window)
+    #[serde(default = "default_true")]
+    pub replay_detection: bool,
+    /// Time window in seconds for replay detection (default 60)
+    #[serde(default = "default_fp_replay_window")]
+    pub replay_window_secs: u64,
+    /// Enable JA3 drift detection (same hash but different cipher/extension composition)
+    #[serde(default = "default_true")]
+    pub drift_detection: bool,
+    /// Time window in seconds for drift detection (default 300)
+    #[serde(default = "default_fp_drift_window")]
+    pub drift_window_secs: u64,
+    /// Fraction of requests with drift to flag (0.0–1.0, default 0.7)
+    #[serde(default = "default_fp_drift_threshold")]
+    pub drift_threshold: f64,
+}
+
+fn default_fp_replay_window() -> u64 {
+    60
+}
+
+fn default_fp_drift_window() -> u64 {
+    300
+}
+
+fn default_fp_drift_threshold() -> f64 {
+    0.7
 }
 
 impl Default for FingerprintConfig {
@@ -853,6 +1068,11 @@ impl Default for FingerprintConfig {
                 "/var/lib/pqcrypta-proxy/fingerprints/ja3.json",
             )),
             block_malicious: true, // Block malicious fingerprints by default (AUD-12)
+            replay_detection: true,
+            replay_window_secs: 60,
+            drift_detection: true,
+            drift_window_secs: 300,
+            drift_threshold: 0.7,
         }
     }
 }
@@ -1239,6 +1459,15 @@ pub struct PoolServerConfig {
     pub tls_skip_verify: bool,
     /// Custom SNI hostname
     pub tls_sni: Option<String>,
+    /// Circuit breaker: number of consecutive failures before tripping (overrides global default of 5)
+    #[serde(default)]
+    pub cb_failure_threshold: Option<u32>,
+    /// Circuit breaker: number of consecutive successes to close the circuit (overrides global default of 3)
+    #[serde(default)]
+    pub cb_success_threshold: Option<u32>,
+    /// Circuit breaker: half-open delay in seconds (overrides global default of 0)
+    #[serde(default)]
+    pub cb_half_open_delay_secs: Option<u64>,
 }
 
 fn default_weight() -> u32 {
@@ -1336,6 +1565,31 @@ impl ConfigManager {
         self.config.load_full()
     }
 
+} // impl ConfigManager
+
+/// Recursively merge two TOML values.
+///
+/// For `Table` values the overlay keys are merged on top of the base; all
+/// other value types are replaced by the overlay value (overlay wins).
+fn merge_toml_values(base: toml::Value, overlay: toml::Value) -> toml::Value {
+    match (base, overlay) {
+        (toml::Value::Table(mut base_table), toml::Value::Table(overlay_table)) => {
+            for (key, overlay_val) in overlay_table {
+                let merged = match base_table.remove(&key) {
+                    Some(base_val) => merge_toml_values(base_val, overlay_val),
+                    None => overlay_val,
+                };
+                base_table.insert(key, merged);
+            }
+            toml::Value::Table(base_table)
+        }
+        // For all other combinations the overlay wins unconditionally.
+        (_, overlay) => overlay,
+    }
+}
+
+impl ConfigManager { // re-open for remaining methods
+
     /// Notify listeners that TLS certificates were reloaded
     pub async fn notify_tls_reload(&self) {
         let _ = self
@@ -1368,6 +1622,39 @@ impl ConfigManager {
                 Err(e)
             }
         }
+    }
+
+    /// Apply an environment-specific TOML overlay on top of the currently loaded config.
+    ///
+    /// The overlay is a partial TOML file whose keys win over the base config.
+    /// Tables are merged recursively; all other value types are replaced.
+    /// After merging, `ProxyConfig::validate()` is called so any conflicts introduced
+    /// by the overlay are caught at startup.
+    pub fn apply_env_overlay(&self, overlay_path: &Path) -> anyhow::Result<()> {
+        let overlay_str = std::fs::read_to_string(overlay_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read env overlay {:?}: {}", overlay_path, e))?;
+
+        // Serialise the live config back to a TOML value so we can merge.
+        let current = self.config.load_full();
+        let base_str = toml::to_string(current.as_ref())
+            .map_err(|e| anyhow::anyhow!("Failed to serialise base config: {}", e))?;
+
+        let base_val: toml::Value = toml::from_str(&base_str)
+            .map_err(|e| anyhow::anyhow!("Failed to re-parse base config: {}", e))?;
+        let overlay_val: toml::Value = toml::from_str(&overlay_str)
+            .map_err(|e| anyhow::anyhow!("Failed to parse env overlay {:?}: {}", overlay_path, e))?;
+
+        let merged_val = merge_toml_values(base_val, overlay_val);
+        let merged_str = toml::to_string(&merged_val)
+            .map_err(|e| anyhow::anyhow!("Failed to serialise merged config: {}", e))?;
+
+        let new_config: ProxyConfig = toml::from_str(&merged_str)
+            .map_err(|e| anyhow::anyhow!("Failed to parse merged config: {}", e))?;
+        new_config.validate()?;
+
+        self.config.store(Arc::new(new_config));
+        info!("Environment overlay applied from {:?}", overlay_path);
+        Ok(())
     }
 
     /// Start watching configuration file for changes
@@ -1584,6 +1871,77 @@ fn validate_backend_address_ssrf(address: &str, allow_internal: bool) -> anyhow:
 impl ProxyConfig {
     /// Validate the configuration
     pub fn validate(&self) -> anyhow::Result<()> {
+        // Config schema version check
+        match self.version {
+            None => {
+                warn!("Config missing 'version' field — assuming v{}. Add `version = 1` to suppress this warning.", CURRENT_CONFIG_VERSION);
+            }
+            Some(v) if v > CURRENT_CONFIG_VERSION => {
+                return Err(anyhow::anyhow!(
+                    "Config version {} is newer than this binary supports (max {}). \
+                     Please upgrade pqcrypta-proxy.",
+                    v,
+                    CURRENT_CONFIG_VERSION
+                ));
+            }
+            Some(_) => {}
+        }
+
+        // Config conflict: mTLS required but no CA cert
+        if self.tls.require_client_cert && self.tls.ca_cert_path.is_none() {
+            return Err(anyhow::anyhow!(
+                "tls.require_client_cert = true but tls.ca_cert_path is not set. \
+                 Provide a CA certificate path to verify client certificates."
+            ));
+        }
+
+        // Config conflict: admin require_mtls (not yet implemented)
+        if self.admin.require_mtls {
+            return Err(anyhow::anyhow!(
+                "admin.require_mtls = true is not yet implemented. \
+                 Remove this setting to start the proxy."
+            ));
+        }
+
+        // Config conflict: 0-RTT enabled with non-safe methods and no replay protection
+        if self.tls.enable_0rtt && self.tls.zero_rtt_replay_protection == "none" {
+            for route in &self.routes {
+                if route.allow_0rtt {
+                    // Check if any non-safe method route could accept 0-RTT
+                    warn!(
+                        "SEC-11: Route {:?} has allow_0rtt = true with zero_rtt_replay_protection = \"none\". \
+                         This allows replay attacks. Use \"strict\" or \"session\" replay protection.",
+                        route.name
+                    );
+                }
+            }
+        }
+
+        // Config conflict: WebTransport routes but no allowed origins
+        let has_wt_routes = self.routes.iter().any(|r| r.webtransport);
+        if has_wt_routes && self.server.webtransport_allowed_origins.is_empty() {
+            warn!(
+                "SR-02: WebTransport routes are configured but server.webtransport_allowed_origins is empty. \
+                 All cross-origin WebTransport sessions will be rejected. \
+                 Set webtransport_allowed_origins to your frontend origins."
+            );
+        }
+
+        // PQC passthrough conflict
+        for route in &self.routes {
+            if let Some(backend_name) = route.backend.split(',').next() {
+                if let Some(backend) = self.backends.get(backend_name.trim()) {
+                    if backend.tls_mode == TlsMode::Passthrough && self.pqc.enabled {
+                        warn!(
+                            "Route {:?} backend '{}' uses TLS passthrough — PQC headers cannot \
+                             be added to passthrough connections.",
+                            route.name, backend_name
+                        );
+                    }
+                }
+            }
+        }
+
         // Validate server config
         self.server
             .socket_addr()

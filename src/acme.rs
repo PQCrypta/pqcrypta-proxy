@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use parking_lot::RwLock;
+use reqwest;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -31,6 +32,44 @@ use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType as AcmeChallengeType,
     ExternalAccountKey, Identifier, NewAccount, NewOrder, OrderStatus,
 };
+
+/// M-3: Validate a domain name for safe use in file-system paths.
+///
+/// Rejects any domain that contains characters that could escape the
+/// configured `certs_path` directory:
+///   - `/`  — path separator
+///   - `..` — parent-directory component
+///   - `\0` — null byte
+///   - Non-ASCII bytes — not valid in RFC 1035 hostnames
+///   - Empty string
+///
+/// Returns the domain unchanged if it passes validation, or an error message.
+fn validate_domain_for_path(domain: &str) -> Result<String, &'static str> {
+    if domain.is_empty() {
+        return Err("domain is empty");
+    }
+    // Reject null bytes and non-ASCII
+    if domain.contains('\0') || !domain.is_ascii() {
+        return Err("domain contains non-ASCII or null bytes");
+    }
+    // Reject path separators (both Unix and Windows)
+    if domain.contains('/') || domain.contains('\\') {
+        return Err("domain contains path separators");
+    }
+    // Reject parent-directory escape
+    if domain.split('.').any(|label| label == "..") || domain.starts_with("..") {
+        return Err("domain contains parent-directory component");
+    }
+    // Reject labels that start/end with hyphens (RFC 1035) and
+    // ensure only [A-Za-z0-9\-\.] are present
+    let valid_chars = domain
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '*');
+    if !valid_chars {
+        return Err("domain contains characters not allowed in RFC 1035 hostnames");
+    }
+    Ok(domain.to_string())
+}
 
 /// ACME configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -103,6 +142,19 @@ pub struct AcmeConfig {
     /// Use ECDSA instead of RSA (P-256 curve)
     #[serde(default)]
     pub use_ecdsa: bool,
+
+    /// Submit issued certificates to Certificate Transparency logs (default true).
+    #[serde(default = "default_true")]
+    pub certificate_transparency: bool,
+
+    /// CT log submission endpoints (POST /ct/v1/add-chain).
+    /// Default: Google Xenon 2025H1 log.
+    #[serde(default = "default_ct_logs")]
+    pub ct_logs: Vec<String>,
+}
+
+fn default_ct_logs() -> Vec<String> {
+    vec!["https://ct.googleapis.com/logs/xenon2025h1/".to_string()]
 }
 
 fn default_directory_url() -> String {
@@ -160,6 +212,8 @@ impl Default for AcmeConfig {
             eab_hmac_key: None,
             key_size: default_key_size(),
             use_ecdsa: false,
+            certificate_transparency: true,
+            ct_logs: default_ct_logs(),
         }
     }
 }
@@ -407,7 +461,8 @@ impl AcmeService {
                 if let Some(status) = cached_status.get(domain) {
                     status.clone()
                 } else {
-                    let cert_path = self.config.certs_path.join(format!("{}.crt", domain));
+                    let safe_domain = validate_domain_for_path(domain).unwrap_or_else(|_| "invalid-domain".to_string());
+                    let cert_path = self.config.certs_path.join(format!("{}.crt", safe_domain));
                     let (exists, expires, days_remaining) = if cert_path.exists() {
                         match read_certificate_expiry(&cert_path) {
                             Ok((exp, days)) => (true, Some(exp), Some(days)),
@@ -487,10 +542,27 @@ impl AcmeService {
         .await
     }
 
-    /// Get certificate paths for a domain
+    /// Get certificate paths for a domain.
+    ///
+    /// M-3: The domain is validated against RFC 1035 before being used in a
+    /// `PathBuf::join()` call.  A domain containing `/`, `..`, or null bytes
+    /// would resolve to an arbitrary path outside `certs_path`, enabling an
+    /// attacker with config-write access to write files to arbitrary locations.
+    /// We reject any domain that fails the safe-label check and return paths to
+    /// a deterministic "invalid-domain" sentinel instead, causing downstream
+    /// certificate checks to fail gracefully rather than operating on an
+    /// attacker-controlled path.
     pub fn get_cert_paths(&self, domain: &str) -> (PathBuf, PathBuf) {
-        let cert_path = self.config.certs_path.join(format!("{}.crt", domain));
-        let key_path = self.config.certs_path.join(format!("{}.key", domain));
+        let safe_domain = validate_domain_for_path(domain).unwrap_or_else(|_| {
+            warn!(
+                "M-3: Domain '{}' contains unsafe characters and cannot be used in a file path. \
+                 Returning sentinel paths to prevent arbitrary file write.",
+                domain
+            );
+            "invalid-domain".to_string()
+        });
+        let cert_path = self.config.certs_path.join(format!("{}.crt", safe_domain));
+        let key_path = self.config.certs_path.join(format!("{}.key", safe_domain));
         (cert_path, key_path)
     }
 }
@@ -510,6 +582,16 @@ async fn check_and_renew_certificates(
     }
 
     // Use the first domain as the primary cert file (SAN cert covers all)
+    // M-3: Validate all domains before using them in file-system paths.
+    for domain in &config.domains {
+        if let Err(reason) = validate_domain_for_path(domain) {
+            return Err(anyhow::anyhow!(
+                "M-3: Domain '{}' is unsafe for use in file paths ({}). \
+                 Fix the ACME domain configuration before proceeding.",
+                domain, reason
+            ));
+        }
+    }
     let primary_domain = &config.domains[0];
     let cert_path = config.certs_path.join(format!("{}.crt", primary_domain));
     let key_path = config.certs_path.join(format!("{}.key", primary_domain));
@@ -580,6 +662,11 @@ async fn check_and_renew_certificates(
                 {
                     use std::os::unix::fs::PermissionsExt;
                     fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
+                }
+
+                // STEP 11: Submit certificate to Certificate Transparency logs.
+                if let Err(e) = submit_to_ct_logs(&cert_pem, &chain_pem, config).await {
+                    warn!("CT log submission failed (non-fatal): {}", e);
                 }
 
                 // Also write symlinks/copies for each additional domain
@@ -1009,7 +1096,15 @@ async fn check_and_renew_certificates(
 
     // Still check existing certificates
     for domain in &config.domains {
-        let cert_path = config.certs_path.join(format!("{}.crt", domain));
+        // M-3: Validate domain before using in file path
+        let safe_domain = match validate_domain_for_path(domain) {
+            Ok(d) => d,
+            Err(reason) => {
+                warn!("M-3: Skipping unsafe domain '{}' in cert status check: {}", domain, reason);
+                continue;
+            }
+        };
+        let cert_path = config.certs_path.join(format!("{}.crt", safe_domain));
         let (exists, expires, days_remaining) = if cert_path.exists() {
             match read_certificate_expiry(&cert_path) {
                 Ok((exp, days)) => (true, Some(exp), Some(days)),
@@ -1081,6 +1176,87 @@ pub fn handle_acme_challenge(acme_service: &AcmeService, token: &str) -> Option<
     acme_service.get_challenge_response(token)
 }
 
+/// Submit an issued certificate to configured Certificate Transparency logs.
+///
+/// CT logs expect a `POST /ct/v1/add-chain` request with the certificate chain
+/// as base64-encoded DER in a JSON array.  PEM already contains base64-DER
+/// between the `-----BEGIN/END CERTIFICATE-----` markers, so we extract it
+/// directly without a re-encode step.
+///
+/// Failures are non-fatal: operators can still use the certificate even if
+/// CT submission fails.  Errors are logged as warnings.
+async fn submit_to_ct_logs(cert_pem: &str, chain_pem: &str, config: &AcmeConfig) -> anyhow::Result<()> {
+    if !config.certificate_transparency || config.ct_logs.is_empty() {
+        return Ok(());
+    }
+
+    let chain_b64 = extract_pem_base64_blocks(cert_pem, chain_pem);
+    if chain_b64.is_empty() {
+        warn!("CT: no certificate DER blocks found in PEM chain — skipping submission");
+        return Ok(());
+    }
+
+    let body = serde_json::json!({ "chain": chain_b64 });
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| anyhow::anyhow!("CT: failed to build HTTP client: {}", e))?;
+
+    for log_url in &config.ct_logs {
+        let submit_url = {
+            let base = log_url.trim_end_matches('/');
+            format!("{}/ct/v1/add-chain", base)
+        };
+
+        match client.post(&submit_url).json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(sct) => {
+                        let log_id = sct.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        let ts = sct.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+                        info!(
+                            "CT log submission to {} succeeded (log_id={}, timestamp={}ms)",
+                            log_url, log_id, ts
+                        );
+                    }
+                    Err(e) => warn!("CT log {}: SCT parse error: {}", log_url, e),
+                }
+            }
+            Ok(resp) => {
+                warn!(
+                    "CT log {}: submission rejected with status {}",
+                    log_url,
+                    resp.status()
+                );
+            }
+            Err(e) => {
+                warn!("CT log {}: HTTP request failed: {}", log_url, e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Extract base64-encoded DER blocks from one or more PEM certificate strings.
+///
+/// PEM stores DER data as base64 with whitespace; we strip the whitespace so
+/// the resulting strings are valid base64 for the CT JSON body.
+fn extract_pem_base64_blocks(cert_pem: &str, chain_pem: &str) -> Vec<String> {
+    let combined = format!("{}\n{}", cert_pem, chain_pem);
+    combined
+        .split("-----BEGIN CERTIFICATE-----")
+        .skip(1)
+        .filter_map(|chunk| {
+            let end = chunk.find("-----END CERTIFICATE-----")?;
+            let raw = &chunk[..end];
+            let cleaned: String = raw.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+            if cleaned.is_empty() { None } else { Some(cleaned) }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1136,6 +1312,43 @@ mod tests {
 
         assert_eq!(cert, PathBuf::from("/etc/certs/example.com.crt"));
         assert_eq!(key, PathBuf::from("/etc/certs/example.com.key"));
+    }
+
+    #[test]
+    fn test_validate_domain_for_path() {
+        // Valid domains
+        assert!(validate_domain_for_path("example.com").is_ok());
+        assert!(validate_domain_for_path("sub.example.com").is_ok());
+        assert!(validate_domain_for_path("my-host.example.com").is_ok());
+        assert!(validate_domain_for_path("*.example.com").is_ok());
+
+        // Invalid: path traversal
+        assert!(validate_domain_for_path("../etc/cron.d/evil").is_err());
+        assert!(validate_domain_for_path("..").is_err());
+        assert!(validate_domain_for_path("evil/etc/passwd").is_err());
+        assert!(validate_domain_for_path("evil\\path").is_err());
+
+        // Invalid: null byte
+        assert!(validate_domain_for_path("evil\x00domain").is_err());
+
+        // Invalid: non-ASCII
+        assert!(validate_domain_for_path("ünïcödé.example.com").is_err());
+
+        // Invalid: empty
+        assert!(validate_domain_for_path("").is_err());
+    }
+
+    #[test]
+    fn test_get_cert_paths_with_invalid_domain() {
+        let config = AcmeConfig {
+            certs_path: PathBuf::from("/etc/certs"),
+            ..Default::default()
+        };
+        let service = AcmeService::new(config);
+        // An invalid domain should return sentinel paths, not escape certs_path
+        let (cert, key) = service.get_cert_paths("../etc/cron.d/evil");
+        assert_eq!(cert, PathBuf::from("/etc/certs/invalid-domain.crt"));
+        assert_eq!(key, PathBuf::from("/etc/certs/invalid-domain.key"));
     }
 
     #[test]
