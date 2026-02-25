@@ -696,6 +696,8 @@ impl SecurityState {
     }
 
     /// Record a request for adaptive rate limiting
+    // Prometheus gauge values are f64; precision loss on large counter values is acceptable.
+    #[allow(clippy::cast_precision_loss)]
     pub fn record_request(&self, ip: IpAddr, status: StatusCode) {
         // Skip tracking for trusted IPs (loopback, or operator-configured trusted_internal_cidrs)
         if self.is_trusted(&ip) {

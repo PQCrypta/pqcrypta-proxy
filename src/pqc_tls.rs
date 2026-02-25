@@ -14,7 +14,7 @@ use std::path::Path;
 use std::process::Command;
 
 use parking_lot::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::PqcConfig;
 
@@ -544,9 +544,10 @@ impl PqcTlsProvider {
 /// Used by `http_listener::run_http_listener_pqc` for post-quantum TLS.
 #[cfg(feature = "pqc")]
 pub mod openssl_pqc {
-    use super::*;
+    use super::{PqcHandshakeInfo, PqcTlsProvider};
     use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVersion};
     use std::path::Path;
+    use tracing::{debug, info, warn};
 
     /// Create an OpenSSL SSL acceptor with PQC hybrid key exchange
     ///

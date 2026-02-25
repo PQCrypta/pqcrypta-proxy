@@ -673,7 +673,7 @@ impl QuicListener {
                     referer: referer.clone(),
                     user_agent: user_agent.clone(),
                     host: host.clone(),
-                    response_time_ms: start_time.elapsed().as_millis() as u64,
+                    response_time_ms: start_time.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
                 });
                 metrics.requests.request_end_full(
                     404,
@@ -1030,7 +1030,7 @@ impl QuicListener {
             referer,
             user_agent,
             host,
-            response_time_ms: latency.as_millis() as u64,
+            response_time_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
         });
 
         Ok(())

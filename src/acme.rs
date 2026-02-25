@@ -628,7 +628,7 @@ async fn check_and_renew_certificates(
 
                 // Notify about certificate update
                 if let Some(tx) = cert_update_tx {
-                    let expires_time = SystemTime::now() + Duration::from_secs(days as u64 * 86400);
+                    let expires_time = SystemTime::now() + Duration::from_secs(u64::try_from(days.max(0)).unwrap_or(0) * 86400);
                     let _ = tx
                         .send(CertificateUpdate {
                             domain: primary_domain.clone(),

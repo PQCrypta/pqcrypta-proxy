@@ -284,10 +284,13 @@ impl RequestMetrics {
         };
         // Update per-endpoint error tracking keyed by "path\0error_type"
         let key = format!("{}\0{}", normalized, error_type);
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        let ts = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX);
         {
             let mut map = self.endpoint_errors.lock();
             let info = map.entry(key).or_insert(EndpointErrorInfo {
@@ -1329,8 +1332,8 @@ impl HistogramSlot {
     }
 
     fn observe(&self, duration: Duration) {
-        let ms = duration.as_millis() as u64;
-        let us = duration.as_micros() as u64;
+        let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        let us = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
 
         self.sum_us.fetch_add(us, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
@@ -1404,7 +1407,7 @@ impl LatencyHistogram {
                 .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                let old = self.active.load(Ordering::Relaxed) as usize;
+                let old = usize::try_from(self.active.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
                 let new_slot = 1 - old;
                 // Reset the slot we're about to make active
                 self.slots[new_slot].reset();
@@ -1415,18 +1418,20 @@ impl LatencyHistogram {
 
     fn observe(&self, duration: Duration) {
         self.maybe_rotate();
-        let slot = self.active.load(Ordering::Relaxed) as usize;
+        let slot = usize::try_from(self.active.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
         self.slots[slot].observe(duration);
 
         // Keep cumulative totals for Prometheus histogram export
         self.cumulative_count.fetch_add(1, Ordering::Relaxed);
         self.cumulative_sum_us
-            .fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
+            .fetch_add(u64::try_from(duration.as_micros()).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
     /// Compute a percentile from the merged recent window (both slots)
     /// using Prometheus-style linear interpolation within buckets for
     /// accurate sub-bucket estimates.
+    // Prometheus gauge values are f64; precision loss on large counter values is acceptable.
+    #[allow(clippy::cast_precision_loss)]
     fn percentile(&self, p: u32) -> f64 {
         let s0 = &self.slots[0];
         let s1 = &self.slots[1];
@@ -1485,6 +1490,8 @@ impl LatencyHistogram {
     }
 
     /// Export windowed histogram in Prometheus format.
+    // Prometheus gauge values are f64; precision loss on large counter values is acceptable.
+    #[allow(clippy::cast_precision_loss)]
     fn export_prometheus(&self, output: &mut String, name: &str) {
         use std::fmt::Write;
 

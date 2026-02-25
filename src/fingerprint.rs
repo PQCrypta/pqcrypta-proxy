@@ -944,7 +944,7 @@ pub async fn fingerprint_middleware(
 /// Check if a value is a GREASE value (0x?a?a pattern)
 fn is_grease(value: u16) -> bool {
     let hi = (value >> 8) as u8;
-    let lo = value as u8;
+    let lo = (value & 0xff) as u8;
     hi == lo && (hi & 0x0f) == 0x0a
 }
 
@@ -1374,7 +1374,7 @@ mod tests {
             0x00, 0x09, // Name length
             b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
         ];
-        client_hello.extend_from_slice(&[(sni_ext.len() >> 8) as u8, sni_ext.len() as u8]);
+        client_hello.extend_from_slice(&[u8::try_from((sni_ext.len() >> 8) & 0xff).unwrap_or(u8::MAX), u8::try_from(sni_ext.len() & 0xff).unwrap_or(u8::MAX)]);
         client_hello.extend_from_slice(&sni_ext);
 
         let extractor = FingerprintExtractor::new();

@@ -629,7 +629,7 @@ impl SlidingWindowCounter {
     pub fn increment(&self) -> u64 {
         self.rotate_buckets();
 
-        let current = self.current_bucket.load(Ordering::Relaxed) as usize % self.num_buckets;
+        let current = usize::try_from(self.current_bucket.load(Ordering::Relaxed)).unwrap_or(usize::MAX) % self.num_buckets;
         self.buckets[current].fetch_add(1, Ordering::Relaxed);
 
         self.get_count()
@@ -645,10 +645,10 @@ impl SlidingWindowCounter {
     fn rotate_buckets(&self) {
         let mut last_update = self.last_update.write();
         let elapsed = last_update.elapsed();
-        let buckets_to_rotate = (elapsed.as_secs() / self.bucket_duration_secs) as usize;
+        let buckets_to_rotate = usize::try_from(elapsed.as_secs() / self.bucket_duration_secs).unwrap_or(usize::MAX);
 
         if buckets_to_rotate > 0 {
-            let current = self.current_bucket.load(Ordering::Relaxed) as usize;
+            let current = usize::try_from(self.current_bucket.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
 
             // Clear old buckets
             for i in 1..=buckets_to_rotate.min(self.num_buckets) {
@@ -731,6 +731,8 @@ impl AdaptiveBaseline {
     }
 
     /// Check if value is anomalous
+    // Prometheus gauge values are f64; precision loss on large counter values is acceptable.
+    #[allow(clippy::cast_precision_loss)]
     pub fn is_anomaly(&self, value: u64) -> bool {
         let count = self.count.load(Ordering::Relaxed);
         if count < self.min_samples {
@@ -753,6 +755,8 @@ impl AdaptiveBaseline {
     }
 
     /// Get current mean
+    // Prometheus gauge values are f64; precision loss on large counter values is acceptable.
+    #[allow(clippy::cast_precision_loss)]
     pub fn get_mean(&self) -> f64 {
         let count = self.count.load(Ordering::Relaxed);
         if count == 0 {
@@ -762,6 +766,8 @@ impl AdaptiveBaseline {
     }
 
     /// Get current standard deviation
+    // Prometheus gauge values are f64; precision loss on large counter values is acceptable.
+    #[allow(clippy::cast_precision_loss)]
     pub fn get_std_dev(&self) -> f64 {
         let count = self.count.load(Ordering::Relaxed);
         if count < 2 {
@@ -916,7 +922,9 @@ impl RateLimitBucket {
                 return RateLimitResult::Limited {
                     reason: LimitReason::AnomalyDetected,
                     retry_after_ms: 60_000,
-                    limit: baseline.get_mean() as u32,
+                    // clamp(0.0, u32::MAX as f64) ensures value is non-negative and within u32 range.
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    limit: baseline.get_mean().clamp(0.0, u32::MAX as f64) as u32,
                 };
             }
         }

@@ -222,7 +222,9 @@ impl BackendServer {
                 let progress = elapsed.as_secs_f64() / ss.duration.as_secs_f64();
                 let factor =
                     (1.0 - ss.initial_weight_factor).mul_add(progress, ss.initial_weight_factor);
-                return (self.base_weight as f64 * factor) as u32;
+                // clamp(0.0, u32::MAX as f64) ensures value is non-negative and within u32 range.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                return (self.base_weight as f64 * factor).clamp(0.0, u32::MAX as f64) as u32;
             }
         }
         self.base_weight
@@ -262,7 +264,7 @@ impl BackendServer {
         }
 
         // Update response time EMA (alpha = 0.3)
-        let new_time = response_time.as_micros() as u64;
+        let new_time = response_time.as_micros().try_into().unwrap_or(u64::MAX);
         let old_time = self.avg_response_time_us.load(Ordering::Relaxed);
         let ema = if old_time == 0 {
             new_time
@@ -565,7 +567,7 @@ impl LoadBalancingAlgorithm for RoundRobinAlgorithm {
             return None;
         }
 
-        let idx = pool.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+        let idx = usize::try_from(pool.rr_counter.fetch_add(1, Ordering::Relaxed)).unwrap_or(usize::MAX);
         Some(healthy_servers[idx % healthy_servers.len()].clone())
     }
 
@@ -674,7 +676,7 @@ impl LoadBalancingAlgorithm for IpHashAlgorithm {
         ctx.client_ip.hash(&mut hasher);
         let hash = hasher.finish();
 
-        let idx = (hash as usize) % healthy_servers.len();
+        let idx = usize::try_from(hash).unwrap_or(usize::MAX) % healthy_servers.len();
         Some(healthy_servers[idx].clone())
     }
 

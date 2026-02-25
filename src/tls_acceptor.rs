@@ -338,10 +338,10 @@ mod tests {
         let mut ext_bytes: Vec<u8> = Vec::new();
         for (ext_type, ext_data) in extensions {
             ext_bytes.extend_from_slice(&ext_type.to_be_bytes());
-            ext_bytes.extend_from_slice(&(ext_data.len() as u16).to_be_bytes());
+            ext_bytes.extend_from_slice(&u16::try_from(ext_data.len()).unwrap_or(u16::MAX).to_be_bytes());
             ext_bytes.extend_from_slice(ext_data);
         }
-        let ext_len = ext_bytes.len() as u16;
+        let ext_len = u16::try_from(ext_bytes.len()).unwrap_or(u16::MAX);
 
         // ClientHello body
         let mut ch: Vec<u8> = Vec::new();
@@ -356,7 +356,7 @@ mod tests {
         ch.extend_from_slice(&ext_bytes);
 
         // Handshake header: type=0x01 (ClientHello) + 3-byte length
-        let ch_len = ch.len() as u32;
+        let ch_len = u32::try_from(ch.len()).unwrap_or(u32::MAX);
         let mut hs: Vec<u8> = vec![
             0x01,
             ((ch_len >> 16) & 0xff) as u8,
@@ -366,7 +366,7 @@ mod tests {
         hs.extend_from_slice(&ch);
 
         // TLS record header: content type 0x16, version 0x0301, 2-byte length
-        let hs_len = hs.len() as u16;
+        let hs_len = u16::try_from(hs.len()).unwrap_or(u16::MAX);
         let mut record: Vec<u8> = vec![0x16, 0x03, 0x01];
         record.extend_from_slice(&hs_len.to_be_bytes());
         record.extend_from_slice(&hs);
@@ -389,10 +389,10 @@ mod tests {
         let sni_ext = {
             let name = b"example.com";
             let mut v = Vec::new();
-            let list_len = (name.len() + 3) as u16;
+            let list_len = u16::try_from(name.len() + 3).unwrap_or(u16::MAX);
             v.extend_from_slice(&list_len.to_be_bytes()); // list length
             v.push(0x00); // host_name type
-            v.extend_from_slice(&(name.len() as u16).to_be_bytes());
+            v.extend_from_slice(&u16::try_from(name.len()).unwrap_or(u16::MAX).to_be_bytes());
             v.extend_from_slice(name);
             v
         };

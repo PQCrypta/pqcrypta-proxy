@@ -430,15 +430,15 @@ impl OcspService {
         cert_id.extend_from_slice(sha1_oid);
         // issuerNameHash (OCTET STRING)
         cert_id.push(0x04);
-        cert_id.push(issuer_name_hash.len() as u8);
+        cert_id.push(u8::try_from(issuer_name_hash.len()).unwrap_or(u8::MAX));
         cert_id.extend_from_slice(&issuer_name_hash);
         // issuerKeyHash (OCTET STRING)
         cert_id.push(0x04);
-        cert_id.push(issuer_key_hash.len() as u8);
+        cert_id.push(u8::try_from(issuer_key_hash.len()).unwrap_or(u8::MAX));
         cert_id.extend_from_slice(&issuer_key_hash);
         // serialNumber (INTEGER)
         cert_id.push(0x02);
-        cert_id.push(serial.len() as u8);
+        cert_id.push(u8::try_from(serial.len()).unwrap_or(u8::MAX));
         cert_id.extend_from_slice(&serial);
 
         // Wrap CertID in SEQUENCE
@@ -466,14 +466,14 @@ impl OcspService {
 
         // Length encoding
         if data.len() < 128 {
-            result.push(data.len() as u8);
+            result.push(u8::try_from(data.len()).unwrap_or(u8::MAX));
         } else if data.len() < 256 {
             result.push(0x81);
-            result.push(data.len() as u8);
+            result.push(u8::try_from(data.len()).unwrap_or(u8::MAX));
         } else {
             result.push(0x82);
-            result.push((data.len() >> 8) as u8);
-            result.push(data.len() as u8);
+            result.push(u8::try_from((data.len() >> 8) & 0xFF).unwrap_or(u8::MAX));
+            result.push(u8::try_from(data.len() & 0xFF).unwrap_or(u8::MAX));
         }
 
         result.extend_from_slice(data);
