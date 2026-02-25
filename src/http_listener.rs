@@ -1799,8 +1799,11 @@ async fn security_headers_middleware(
         headers.insert("x-dns-prefetch-control", v);
     }
 
-    // SEC-07: Content-Security-Policy
-    if !config.content_security_policy.is_empty() {
+    // SEC-07: Content-Security-Policy — only inject if the backend did not already set one,
+    // so page-level nonce-based CSPs from PHP are preserved.
+    if !config.content_security_policy.is_empty()
+        && !headers.contains_key(header::CONTENT_SECURITY_POLICY)
+    {
         if let Ok(v) = HeaderValue::from_str(&config.content_security_policy) {
             headers.insert(header::CONTENT_SECURITY_POLICY, v);
         }
