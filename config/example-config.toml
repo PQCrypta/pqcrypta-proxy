@@ -16,7 +16,17 @@ bind_address = "0.0.0.0"
 udp_port = 443
 
 # Additional ports to listen on (all support QUIC/HTTP3/WebTransport)
-additional_ports = [4433, 4434]
+# Note: port 4433 is omitted — the proxy binds it exclusively as the dedicated
+# WebTransport server (see main.rs). Adding it here would start a second QUIC
+# listener on the same port and incorrectly advertise it in Alt-Svc as a generic
+# h3 endpoint.
+additional_ports = [4434]
+
+# Allowed origins for browser WebTransport sessions (SR-02).
+# Browsers send an Origin header; sessions whose origin is not listed are
+# rejected with 403.  Non-browser / native clients (no Origin header) are
+# always accepted.  An empty list rejects ALL browser WebTransport connections.
+webtransport_allowed_origins = ["https://example.com", "https://www.example.com"]
 
 # Maximum concurrent connections
 max_connections = 10000
