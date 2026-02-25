@@ -338,7 +338,11 @@ mod tests {
         let mut ext_bytes: Vec<u8> = Vec::new();
         for (ext_type, ext_data) in extensions {
             ext_bytes.extend_from_slice(&ext_type.to_be_bytes());
-            ext_bytes.extend_from_slice(&u16::try_from(ext_data.len()).unwrap_or(u16::MAX).to_be_bytes());
+            ext_bytes.extend_from_slice(
+                &u16::try_from(ext_data.len())
+                    .unwrap_or(u16::MAX)
+                    .to_be_bytes(),
+            );
             ext_bytes.extend_from_slice(ext_data);
         }
         let ext_len = u16::try_from(ext_bytes.len()).unwrap_or(u16::MAX);

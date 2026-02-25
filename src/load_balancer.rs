@@ -567,7 +567,8 @@ impl LoadBalancingAlgorithm for RoundRobinAlgorithm {
             return None;
         }
 
-        let idx = usize::try_from(pool.rr_counter.fetch_add(1, Ordering::Relaxed)).unwrap_or(usize::MAX);
+        let idx =
+            usize::try_from(pool.rr_counter.fetch_add(1, Ordering::Relaxed)).unwrap_or(usize::MAX);
         Some(healthy_servers[idx % healthy_servers.len()].clone())
     }
 

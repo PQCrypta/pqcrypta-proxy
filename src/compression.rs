@@ -344,8 +344,8 @@ pub async fn compression_middleware(
     let compressed_size = compressed.len();
     // clamp(0.0, u32::MAX as f64) ensures value is non-negative and within u32 range.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let ratio = (compressed_size as f64 / original_size as f64 * 100.0)
-        .clamp(0.0, u32::MAX as f64) as u32;
+    let ratio =
+        (compressed_size as f64 / original_size as f64 * 100.0).clamp(0.0, u32::MAX as f64) as u32;
 
     debug!(
         "Compressed response: {} -> {} bytes ({}%, {})",

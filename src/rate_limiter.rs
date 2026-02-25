@@ -629,7 +629,9 @@ impl SlidingWindowCounter {
     pub fn increment(&self) -> u64 {
         self.rotate_buckets();
 
-        let current = usize::try_from(self.current_bucket.load(Ordering::Relaxed)).unwrap_or(usize::MAX) % self.num_buckets;
+        let current = usize::try_from(self.current_bucket.load(Ordering::Relaxed))
+            .unwrap_or(usize::MAX)
+            % self.num_buckets;
         self.buckets[current].fetch_add(1, Ordering::Relaxed);
 
         self.get_count()
@@ -645,10 +647,12 @@ impl SlidingWindowCounter {
     fn rotate_buckets(&self) {
         let mut last_update = self.last_update.write();
         let elapsed = last_update.elapsed();
-        let buckets_to_rotate = usize::try_from(elapsed.as_secs() / self.bucket_duration_secs).unwrap_or(usize::MAX);
+        let buckets_to_rotate =
+            usize::try_from(elapsed.as_secs() / self.bucket_duration_secs).unwrap_or(usize::MAX);
 
         if buckets_to_rotate > 0 {
-            let current = usize::try_from(self.current_bucket.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
+            let current =
+                usize::try_from(self.current_bucket.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
 
             // Clear old buckets
             for i in 1..=buckets_to_rotate.min(self.num_buckets) {

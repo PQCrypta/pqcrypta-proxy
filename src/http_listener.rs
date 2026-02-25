@@ -2392,7 +2392,11 @@ async fn proxy_handler(
                     referer,
                     user_agent,
                     host: Some(host_str),
-                    response_time_ms: request_start.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                    response_time_ms: request_start
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
                 });
 
                 response
@@ -2437,7 +2441,11 @@ async fn proxy_handler(
                     referer,
                     user_agent,
                     host: Some(host_str),
-                    response_time_ms: request_start.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                    response_time_ms: request_start
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
                 });
 
                 (StatusCode::BAD_GATEWAY, format!("Backend error: {}", e)).into_response()
@@ -2468,7 +2476,11 @@ async fn proxy_handler(
             referer,
             user_agent,
             host: Some(host_str),
-            response_time_ms: request_start.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            response_time_ms: request_start
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
         });
 
         (StatusCode::NOT_FOUND, "Not Found").into_response()
@@ -3045,14 +3057,27 @@ mod tests {
         client_hello.extend_from_slice(&[0x01, 0x00]);
 
         // Extensions length
-        client_hello.extend_from_slice(&u16::try_from(extensions_len).unwrap_or(u16::MAX).to_be_bytes());
+        client_hello.extend_from_slice(
+            &u16::try_from(extensions_len)
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        );
 
         // SNI extension (type 0x0000)
         client_hello.extend_from_slice(&[0x00, 0x00]); // Extension type
-        client_hello.extend_from_slice(&u16::try_from(sni_ext_len).unwrap_or(u16::MAX).to_be_bytes()); // Extension length
-        client_hello.extend_from_slice(&u16::try_from(sni_list_len).unwrap_or(u16::MAX).to_be_bytes()); // SNI list length
+        client_hello
+            .extend_from_slice(&u16::try_from(sni_ext_len).unwrap_or(u16::MAX).to_be_bytes()); // Extension length
+        client_hello.extend_from_slice(
+            &u16::try_from(sni_list_len)
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        ); // SNI list length
         client_hello.push(0x00); // Name type (host_name)
-        client_hello.extend_from_slice(&u16::try_from(hostname_bytes.len()).unwrap_or(u16::MAX).to_be_bytes());
+        client_hello.extend_from_slice(
+            &u16::try_from(hostname_bytes.len())
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        );
         client_hello.extend_from_slice(hostname_bytes);
 
         // Handshake header
@@ -3060,7 +3085,11 @@ mod tests {
         let mut handshake = Vec::new();
         handshake.push(0x01); // ClientHello
         handshake.push(0x00); // Length high byte (always 0 for reasonable sizes)
-        handshake.extend_from_slice(&u16::try_from(handshake_len).unwrap_or(u16::MAX).to_be_bytes());
+        handshake.extend_from_slice(
+            &u16::try_from(handshake_len)
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        );
         handshake.extend(client_hello);
 
         // TLS record header
@@ -3193,7 +3222,8 @@ mod tests {
         data[record_len_pos] = u8::try_from((record_len >> 8) & 0xFF).unwrap_or(u8::MAX);
         data[record_len_pos + 1] = u8::try_from(record_len & 0xFF).unwrap_or(u8::MAX);
 
-        data[handshake_len_pos + 1] = u8::try_from((client_hello_len >> 8) & 0xFF).unwrap_or(u8::MAX);
+        data[handshake_len_pos + 1] =
+            u8::try_from((client_hello_len >> 8) & 0xFF).unwrap_or(u8::MAX);
         data[handshake_len_pos + 2] = u8::try_from(client_hello_len & 0xFF).unwrap_or(u8::MAX);
 
         let sni = extract_sni_from_client_hello(&data);
@@ -3236,29 +3266,49 @@ mod tests {
         let sni_ext_len = 2 + sni_list_len;
         extensions.extend_from_slice(&[0x00, 0x00]); // SNI type
         extensions.extend_from_slice(&u16::try_from(sni_ext_len).unwrap_or(u16::MAX).to_be_bytes());
-        extensions.extend_from_slice(&u16::try_from(sni_list_len).unwrap_or(u16::MAX).to_be_bytes());
+        extensions.extend_from_slice(
+            &u16::try_from(sni_list_len)
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        );
         extensions.push(0x00); // host_name type
-        extensions.extend_from_slice(&u16::try_from(hostname_bytes.len()).unwrap_or(u16::MAX).to_be_bytes());
+        extensions.extend_from_slice(
+            &u16::try_from(hostname_bytes.len())
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        );
         extensions.extend_from_slice(hostname_bytes);
 
         // Another GREASE extension (0xFAFA)
         extensions.extend_from_slice(&[0xFA, 0xFA]); // GREASE type
         extensions.extend_from_slice(&[0x00, 0x00]); // Length 0
 
-        client_hello.extend_from_slice(&u16::try_from(extensions.len()).unwrap_or(u16::MAX).to_be_bytes());
+        client_hello.extend_from_slice(
+            &u16::try_from(extensions.len())
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        );
         client_hello.extend(extensions);
 
         // Build full record
         let mut handshake = Vec::new();
         handshake.push(0x01);
         handshake.push(0x00);
-        handshake.extend_from_slice(&u16::try_from(client_hello.len()).unwrap_or(u16::MAX).to_be_bytes());
+        handshake.extend_from_slice(
+            &u16::try_from(client_hello.len())
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        );
         handshake.extend(client_hello);
 
         let mut record = Vec::new();
         record.push(0x16);
         record.extend_from_slice(&[0x03, 0x01]);
-        record.extend_from_slice(&u16::try_from(handshake.len()).unwrap_or(u16::MAX).to_be_bytes());
+        record.extend_from_slice(
+            &u16::try_from(handshake.len())
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        );
         record.extend(handshake);
 
         let sni = extract_sni_from_client_hello(&record);
@@ -3294,25 +3344,46 @@ mod tests {
         let sni_ext_len = 2 + sni_list_len;
         let extensions_len = 4 + sni_ext_len;
 
-        client_hello.extend_from_slice(&u16::try_from(extensions_len).unwrap_or(u16::MAX).to_be_bytes());
+        client_hello.extend_from_slice(
+            &u16::try_from(extensions_len)
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        );
         client_hello.extend_from_slice(&[0x00, 0x00]); // SNI type
-        client_hello.extend_from_slice(&u16::try_from(sni_ext_len).unwrap_or(u16::MAX).to_be_bytes());
-        client_hello.extend_from_slice(&u16::try_from(sni_list_len).unwrap_or(u16::MAX).to_be_bytes());
+        client_hello
+            .extend_from_slice(&u16::try_from(sni_ext_len).unwrap_or(u16::MAX).to_be_bytes());
+        client_hello.extend_from_slice(
+            &u16::try_from(sni_list_len)
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        );
         client_hello.push(0x00);
-        client_hello.extend_from_slice(&u16::try_from(hostname_bytes.len()).unwrap_or(u16::MAX).to_be_bytes());
+        client_hello.extend_from_slice(
+            &u16::try_from(hostname_bytes.len())
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        );
         client_hello.extend_from_slice(hostname_bytes);
 
         // Build full record
         let mut handshake = Vec::new();
         handshake.push(0x01);
         handshake.push(0x00);
-        handshake.extend_from_slice(&u16::try_from(client_hello.len()).unwrap_or(u16::MAX).to_be_bytes());
+        handshake.extend_from_slice(
+            &u16::try_from(client_hello.len())
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        );
         handshake.extend(client_hello);
 
         let mut record = Vec::new();
         record.push(0x16);
         record.extend_from_slice(&[0x03, 0x01]);
-        record.extend_from_slice(&u16::try_from(handshake.len()).unwrap_or(u16::MAX).to_be_bytes());
+        record.extend_from_slice(
+            &u16::try_from(handshake.len())
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        );
         record.extend(handshake);
 
         let sni = extract_sni_from_client_hello(&record);

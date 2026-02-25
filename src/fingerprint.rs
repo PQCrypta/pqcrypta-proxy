@@ -1374,7 +1374,10 @@ mod tests {
             0x00, 0x09, // Name length
             b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
         ];
-        client_hello.extend_from_slice(&[u8::try_from((sni_ext.len() >> 8) & 0xff).unwrap_or(u8::MAX), u8::try_from(sni_ext.len() & 0xff).unwrap_or(u8::MAX)]);
+        client_hello.extend_from_slice(&[
+            u8::try_from((sni_ext.len() >> 8) & 0xff).unwrap_or(u8::MAX),
+            u8::try_from(sni_ext.len() & 0xff).unwrap_or(u8::MAX),
+        ]);
         client_hello.extend_from_slice(&sni_ext);
 
         let extractor = FingerprintExtractor::new();

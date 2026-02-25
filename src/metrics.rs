@@ -1407,7 +1407,8 @@ impl LatencyHistogram {
                 .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                let old = usize::try_from(self.active.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
+                let old =
+                    usize::try_from(self.active.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
                 let new_slot = 1 - old;
                 // Reset the slot we're about to make active
                 self.slots[new_slot].reset();
@@ -1423,8 +1424,10 @@ impl LatencyHistogram {
 
         // Keep cumulative totals for Prometheus histogram export
         self.cumulative_count.fetch_add(1, Ordering::Relaxed);
-        self.cumulative_sum_us
-            .fetch_add(u64::try_from(duration.as_micros()).unwrap_or(u64::MAX), Ordering::Relaxed);
+        self.cumulative_sum_us.fetch_add(
+            u64::try_from(duration.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     /// Compute a percentile from the merged recent window (both slots)
