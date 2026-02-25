@@ -83,7 +83,7 @@ impl WafEngine {
                 r"(?i)(;|--)\s*(drop|select|insert|update|delete|create|alter)",
                 r"'[^']*'(\s*(or|and)\s+'[^']*')*\s*=\s*'",
                 r"(?i)\b(information_schema|sys\.tables|sysobjects|syscolumns)\b",
-                r#"(?i)(xp_cmdshell|sp_execute|sp_executesql)"#,
+                r"(?i)(xp_cmdshell|sp_execute|sp_executesql)",
                 r"(?i)\bload_file\s*\(",
                 r"(?i)\binto\s+(outfile|dumpfile)\s+",
             ])
@@ -129,8 +129,8 @@ impl WafEngine {
 
         let nosqli_patterns = if config.nosqli {
             compile_patterns(&[
-                r#"(?i)\$\s*(where|gt|gte|lt|lte|ne|eq|in|nin|or|and|not|nor|exists|type|mod|regex|text|where)\b"#,
-                r#"(?i)\$\s*regex\s*[:\{]"#,
+                r"(?i)\$\s*(where|gt|gte|lt|lte|ne|eq|in|nin|or|and|not|nor|exists|type|mod|regex|text|where)\b",
+                r"(?i)\$\s*regex\s*[:\{]",
                 r#"\{\s*"\$[a-zA-Z]+"\s*:"#,
                 r"(?i)\$\s*javascript\s*:",
                 r"(?i)\$\s*accumulator\s*[:\{]",

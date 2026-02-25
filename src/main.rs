@@ -172,7 +172,9 @@ async fn main() -> anyhow::Result<()> {
     // STEP 15: Apply per-environment config overlay (--env / PQCRYPTA_ENV).
     if let Some(ref env_name) = args.env {
         let base_path = std::path::Path::new(&args.config);
-        let base_dir = base_path.parent().unwrap_or(std::path::Path::new("."));
+        let base_dir = base_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
         let base_stem = base_path
             .file_stem()
             .and_then(|s| s.to_str())

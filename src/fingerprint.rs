@@ -340,6 +340,7 @@ impl FingerprintExtractor {
             entry.drift_count += 1;
         }
 
+        #[allow(clippy::cast_precision_loss)]
         let drift_score = if entry.total > 0 {
             entry.drift_count as f64 / entry.total as f64
         } else {

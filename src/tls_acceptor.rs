@@ -197,6 +197,7 @@ impl FingerprintingTlsAcceptor {
     /// Configure 0-RTT replay protection mode and nonce window.
     ///
     /// Call this after `new()` when the TLS config has non-default 0-RTT settings.
+    #[must_use]
     pub fn with_zero_rtt_protection(mut self, mode: &str, window_secs: u64) -> Self {
         self.zero_rtt_replay_mode = mode.to_string();
         self.zero_rtt_nonce_store = if mode == "strict" {
