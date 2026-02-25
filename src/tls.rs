@@ -181,9 +181,14 @@ impl TlsProvider {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
 
-            // Check OpenSSL version
+            // P1-fix: clear the parent environment before spawning.
+            // pqc_tls.rs::check_openssl35 already does this; tls.rs previously did not,
+            // leaving LD_PRELOAD, DYLD_INSERT_LIBRARIES, etc. from the parent process
+            // open to injection.  Align with the hardened pattern from pqc_tls.rs.
             let version_output = Command::new(&openssl_path)
                 .arg("version")
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
                 .env("LD_LIBRARY_PATH", &lib_path)
                 .output();
 
@@ -199,6 +204,8 @@ impl TlsProvider {
                         // Check for OQS provider
                         let provider_output = Command::new(&openssl_path)
                             .args(["list", "-providers"])
+                            .env_clear()
+                            .env("PATH", "/usr/bin:/bin")
                             .env("LD_LIBRARY_PATH", &lib_path)
                             .output();
 
@@ -215,6 +222,8 @@ impl TlsProvider {
                                 // Check for built-in Kyber support (OpenSSL 3.5+)
                                 let kem_output = Command::new(&openssl_path)
                                     .args(["list", "-kem-algorithms"])
+                                    .env_clear()
+                                    .env("PATH", "/usr/bin:/bin")
                                     .env("LD_LIBRARY_PATH", &lib_path)
                                     .output();
 

@@ -73,6 +73,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 // Use the library crate instead of re-declaring modules
 use pqcrypta_proxy::acme;
 use pqcrypta_proxy::admin::AdminServer;
+use pqcrypta_proxy::audit_logger::AuditLogger;
 use pqcrypta_proxy::config::{ConfigManager, ConfigReloadEvent, ProxyConfig};
 use pqcrypta_proxy::metrics;
 use pqcrypta_proxy::ocsp;
@@ -492,6 +493,10 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // P2-fix: Construct the audit logger and pass it to the admin server.
+    // Previously this was always None which silently disabled audit logging.
+    let audit_logger = Arc::new(AuditLogger::new(&config.logging));
+
     let admin_server = AdminServer::new(
         config.admin.clone(),
         config_manager.clone(),
@@ -502,7 +507,7 @@ async fn main() -> anyhow::Result<()> {
         None, // Rate limiter created per-listener in http_listener
         shutdown_tx.clone(),
         Some(metrics_registry.clone()),
-        None, // audit_logger — wired up when AuditLogger is constructed at the call site
+        Some(audit_logger),
     );
 
     let admin_handle = tokio::spawn(async move {
@@ -692,14 +697,25 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Start QUIC/HTTP3 servers (UDP) on all ports EXCEPT 4433
-    // Port 4433 is handled by dedicated WebTransportServer for proper WebTransport support
+    // Start QUIC/HTTP3 servers (UDP) on all ports EXCEPT the WebTransport port
+    // The WebTransport port is handled by dedicated WebTransportServer
+    let webtransport_port = config.server.webtransport_port;
     let mut quic_shutdown_senders: Vec<mpsc::Sender<()>> = Vec::new();
 
+    // P1-fix: Create ONE shared SecurityState before the QUIC listener loop.
+    // Previously each listener constructed an independent SecurityState, so an IP
+    // blocked by one listener was invisible to all others (no shared blocklist,
+    // rate-limiter, or connection counter).  SecurityState is #[derive(Clone)]
+    // backed entirely by Arc<...> fields — cloning it shares the underlying maps.
+    let shared_quic_security = SecurityState::new(&config);
+
     for port in all_ports.clone() {
-        // Skip port 4433 - it's handled by dedicated WebTransportServer
-        if port == 4433 {
-            info!("📡 Port 4433 will be handled by dedicated WebTransport server");
+        // Skip webtransport_port - it's handled by dedicated WebTransportServer
+        if port == webtransport_port {
+            info!(
+                "📡 Port {} will be handled by dedicated WebTransport server",
+                webtransport_port
+            );
             continue;
         }
 
@@ -709,9 +725,9 @@ async fn main() -> anyhow::Result<()> {
         let quic_config = Arc::new(quic_config);
         let quic_tls_provider = tls_provider.clone();
         let quic_metrics = metrics_registry.clone();
-        // Each QUIC listener gets its own SecurityState (same pattern as HTTP listeners).
-        // SecurityState is Clone (backed by Arcs) so shared data is reference-counted.
-        let quic_security = SecurityState::new(&quic_config);
+        // Clone the shared SecurityState — all QUIC listeners now share the same
+        // underlying DashMaps (blocked IPs, rate limiters, connection counters).
+        let quic_security = shared_quic_security.clone();
 
         // Create channels for graceful shutdown
         let (quic_shutdown_tx, quic_shutdown_rx) = mpsc::channel::<()>(1);
@@ -766,13 +782,17 @@ async fn main() -> anyhow::Result<()> {
         let wt_key = key_path.clone();
         let wt_metrics = metrics_registry.clone();
 
+        let wt_port = webtransport_port;
         tokio::spawn(async move {
             // SR-04: Use the configured bind_address instead of a hardcoded "0.0.0.0"
             // so the WebTransport server honours the operator's bind_address setting
             // (e.g. a private NIC) rather than always binding on all interfaces.
-            let wt_addr: std::net::SocketAddr = format!("{}:4433", wt_config.server.bind_address)
-                .parse()
-                .expect("valid WebTransport bind address from config");
+            // P3-fix: use the configurable webtransport_port from ServerConfig instead
+            // of the previously hardcoded 4433.
+            let wt_addr: std::net::SocketAddr =
+                format!("{}:{}", wt_config.server.bind_address, wt_port)
+                    .parse()
+                    .expect("valid WebTransport bind address from config");
 
             info!("🚀 Starting dedicated WebTransport server on {}", wt_addr);
 

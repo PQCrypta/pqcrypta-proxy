@@ -141,6 +141,19 @@ impl AdminServer {
             );
         }
 
+        // P1-fix: Refuse to start when require_loopback = true (default) and the
+        // admin bind address is not loopback.  Operators who need remote admin
+        // access must set [admin] require_loopback = false and accept the risk of
+        // transmitting Bearer tokens in cleartext (or place a TLS tunnel in front).
+        if self.config.require_loopback && !is_loopback {
+            return Err(anyhow::anyhow!(
+                "Admin API: bind address {} is not loopback and require_loopback = true. \
+                 Set [admin] require_loopback = false to allow non-loopback binds, \
+                 or restrict bind_address to 127.0.0.1 / ::1.",
+                addr
+            ));
+        }
+
         // SR-03: If no auth_token is configured, generate a random 32-byte
         // session token and log it so the operator can copy it into the config
         // for persistence.  This ensures every startup always has token auth
@@ -148,8 +161,11 @@ impl AdminServer {
         let effective_token: Option<String> = match &self.config.auth_token {
             Some(t) => Some(t.clone()),
             None => {
+                // P3-fix: use OsRng (cryptographically secure) instead of thread_rng
+                // (designed for simulation, not secret generation).
                 use rand::Rng;
-                let token: String = rand::thread_rng()
+                use rand::rngs::OsRng;
+                let token: String = OsRng
                     .sample_iter(&rand::distributions::Alphanumeric)
                     .take(48)
                     .map(char::from)

@@ -68,6 +68,17 @@
 | **Config Schema Versioning** | ✅ | `version` field in config; warns if absent, errors if version > current |
 | **Config Conflict Validation** | ✅ | Startup validation catches conflicting settings (PQC+passthrough, 0-RTT non-safe, mTLS without CA) |
 | **Environment Config Overlay** | ✅ | `--env <name>` flag loads `config.<name>.toml` overlay merged on top of base config |
+| **CIDR Blocklist Support** | ✅ | Blocklist files now match full subnet ranges (e.g. `192.0.2.0/24`); previously only host addresses were matched |
+| **Session Affinity TTL** | ✅ | Sticky session maps evict stale entries after configurable TTL; header affinity uses its own dedicated map |
+| **Proactive Backend Health Checks** | ✅ | Background TCP-connect health task marks backends unreachable before traffic hits them; configurable interval |
+| **Configurable GeoIP Block Duration** | ✅ | `geoip_block_duration_secs` in `[security]` (default 24 h); previously blocks were permanent with no expiry |
+| **Configurable WebTransport Port** | ✅ | `webtransport_port` in `[server]` replaces the hardcoded port 4433 for the dedicated WebTransport server |
+| **Dynamic Alt-Svc Header** | ✅ | Alt-Svc value built from `udp_port` + `additional_ports` at startup instead of a hardcoded constant |
+| **Admin Loopback Enforcement** | ✅ | `require_loopback = true` (default) aborts startup when admin API is bound to a non-loopback address |
+| **Shared Security State (QUIC)** | ✅ | All QUIC listeners now share one `SecurityState`; blocked IPs and rate limiters are visible across all ports |
+| **Audit Logger Wired** | ✅ | `AuditLogger` constructed at startup and passed to the admin server; audit events are now actually written |
+| **Cryptographically Secure Admin Token** | ✅ | Ephemeral admin tokens use `OsRng` instead of `thread_rng` |
+| **OpenSSL Subprocess Env Sanitisation** | ✅ | All `openssl` subprocesses clear the environment before execution (`env_clear()`) to prevent PATH/LD_PRELOAD injection |
 
 ## Features
 
@@ -94,12 +105,12 @@
 - **NAT-Friendly**: JA3/JA4 fingerprints identify clients behind shared corporate IPs
 - **Adaptive Baseline**: ML-inspired anomaly detection learns normal traffic patterns
 - **DoS Protection**: Connection limits, body size enforcement, request validation, auto-blocking
-- **GeoIP Blocking**: Block by country/region using MaxMind GeoLite2 database
+- **GeoIP Blocking**: Block by country/region using MaxMind GeoLite2 database; configurable block duration via `geoip_block_duration_secs` (default 24 h)
 - **Per-Route Security Policy**: Per-route mTLS requirement, JA3 allowlist, rate limit override, WAF mode override, 0-RTT control
 - **Security Headers**: HSTS, X-Frame-Options, CSP, COEP, COOP, CORP, and more
 - **CORS Handling**: Full CORS support with preflight OPTIONS handling
-- **Server Branding**: Hide backend identity (Apache/nginx → "PQCProxy v0.2.1")
-- **IP Blocklists (DB-synced)**: Live-synced IP, fingerprint, and country blocklists pulled from the application database — updates without restart
+- **Server Branding**: Hide backend identity (Apache/nginx → "PQCProxy v0.2.2")
+- **IP Blocklists (DB-synced)**: Live-synced IP, fingerprint, and country blocklists pulled from the application database — supports individual IPs and CIDR subnet ranges (e.g. `192.0.2.0/24`); updates without restart
 - **ACME Domain Path Sanitization**: Domain names validated against RFC 1035 before use in file-system paths — prevents path traversal via config
 
 ### Load Balancing
@@ -111,8 +122,8 @@
   - `ip_hash`: Consistent hashing by client IP for sticky sessions
   - `least_response_time`: Routes to fastest responding server (EMA tracking)
 - **Backend Pools**: Group multiple servers per route for high availability
-- **Session Affinity**: Cookie-based, IP hash, or custom header sticky sessions
-- **Health-Aware Routing**: Automatically bypasses unhealthy backends
+- **Session Affinity**: Cookie-based, IP hash, or custom header sticky sessions; each mode uses its own dedicated map with TTL eviction
+- **Health-Aware Routing**: Automatically bypasses unhealthy backends; proactive TCP-connect health checks on configurable interval detect failures before traffic hits them
 - **Slow Start**: Gradually increases traffic to recovering servers
 - **Connection Draining**: Graceful server removal without dropping connections
 - **Priority Failover**: Primary servers first, then failover to lower priority
@@ -122,7 +133,7 @@
 - **Early Hints (103)**: Preload CSS/JS resources via Link headers
 - **Priority Hints**: RFC 9218 Extensible Priorities for resource scheduling (`u=3,i=?0`)
 - **Request Coalescing**: Deduplicate identical GET/HEAD requests in flight
-- **Alt-Svc Advertisement**: Automatic HTTP/3 upgrade headers on all ports
+- **Alt-Svc Advertisement**: Dynamic HTTP/3 upgrade headers on all ports — built from `udp_port` and `additional_ports` at startup so every listener advertises its actual address
 - **Virtual Host Routing**: Proper `:authority` pseudo-header handling for backend routing
 - **Server-Timing**: Performance metrics header for browser DevTools (RFC 6797)
 - **NEL (Network Error Logging)**: Client-side error reporting with configurable policy
@@ -135,6 +146,8 @@
 - **WebTransport Origin Validation**: SR-02 cross-origin enforcement — configurable `webtransport_allowed_origins` allowlist rejects browser sessions from unlisted origins with 403; non-browser clients (no Origin header) always accepted
 - **WebTransport JSON Operations**: JSON operation routing over streams — encrypt, decrypt, keygen, health, ping dispatched to backend by operation type
 - **Unified UDP Listener**: Single QuicListener handles both HTTP/3 and WebTransport
+- **Shared Security State (QUIC)**: All QUIC listeners share one security context — blocked IPs, rate limiters, and fingerprint databases are consistent across every port
+- **Configurable WebTransport Port**: `webtransport_port` in `[server]` controls the dedicated WebTransport server bind port (default 4433)
 - **X-Forwarded Headers**: X-Real-IP, X-Forwarded-For, X-Forwarded-Proto
 
 ### Operations
@@ -143,7 +156,7 @@
 - **Config Conflict Validation**: Startup-time validation catches conflicting settings (PQC + passthrough, 0-RTT on non-safe routes without replay protection, mTLS required but no CA cert configured)
 - **Access Logging**: Per-request structured logging in JSON or plain-text format; configurable output file, includes method, path, status, latency, bytes, client IP, and upstream; user-controlled fields sanitized to prevent log injection
 - **Audit Logging**: Async structured JSON audit log for security-relevant events — admin actions, auth failures, WAF blocks/detects, IP blocks, rate limit hits, PQC downgrade events, config and TLS reloads, JA3 replay/drift detections
-- **Admin API**: Health checks, Prometheus metrics, config reload, graceful shutdown, QUIC health, WebTransport health
+- **Admin API**: Health checks, Prometheus metrics, config reload, graceful shutdown, QUIC health, WebTransport health; loopback enforcement prevents plain-HTTP token exposure on non-loopback interfaces; ephemeral session tokens use `OsRng` for cryptographic security
 - **Certificate Transparency**: New ACME-issued certs submitted to configured CT logs via `POST /ct/v1/add-chain` for public auditability
 - **Per-Backend Retry**: Configurable retry count and exponential backoff per backend; retry on 5xx responses, connect failures, or timeouts
 - **Cross-Platform**: Linux, macOS, and Windows support
@@ -263,10 +276,22 @@ port = 8082
 allowed_ips = ["127.0.0.1", "::1"]
 # Generate with: openssl rand -base64 32
 auth_token = "your-random-token-here"
+# require_loopback = true  ← default: aborts startup when bind_address is non-loopback
 ```
 
 Without an `auth_token` any process on the host can call destructive endpoints
 (`/shutdown`, `/reload`) without credentials.
+
+**Loopback enforcement (`require_loopback`):** By default the proxy refuses to start when the
+admin `bind_address` resolves to a non-loopback interface, because all admin traffic — including
+the Bearer token — is plain HTTP. To intentionally expose the admin API on a non-loopback address
+(e.g. behind a TLS-terminating SSH tunnel), set:
+
+```toml
+[admin]
+bind_address = "0.0.0.0"
+require_loopback = false  # explicitly acknowledge the risk
+```
 
 ### Version-Controlled Configuration
 
@@ -778,7 +803,7 @@ Set `PQCRYPTA_ENV=production` to explicitly declare a production deployment. Set
 
 ```
                     ┌──────────────────────────────────────────────────────────┐
-                    │                         PQCProxy v0.2.1                   │
+                    │                         PQCProxy v0.2.2                   │
                     │                                                          │
   Client ──────────►│  Port 80  ─► HTTP Redirect Server ─► HTTPS (301/308)    │
   (Browser/App)     │                                                          │

@@ -346,6 +346,16 @@ pub struct ServerConfig {
     /// Maximum datagrams per second per WebTransport session (default 500).
     #[serde(default = "default_wt_max_datagrams")]
     pub webtransport_max_datagrams_per_sec: u32,
+
+    /// UDP port reserved for the dedicated WebTransport server (default 4433).
+    ///
+    /// P3-fix: previously hardcoded as the literal `4433` in main.rs.  This
+    /// port is skipped in the generic QUIC listener loop and handed to the
+    /// wtransport-based WebTransportServer instead.  Must be listed in
+    /// `additional_ports` (or be the primary `udp_port`) for the Alt-Svc
+    /// advertisement to include it.
+    #[serde(default = "default_webtransport_port")]
+    pub webtransport_port: u16,
 }
 
 impl Default for ServerConfig {
@@ -369,6 +379,7 @@ impl Default for ServerConfig {
             webtransport_max_sessions_per_origin: 100,
             webtransport_max_streams_per_session: 1000,
             webtransport_max_datagrams_per_sec: 500,
+            webtransport_port: 4433,
         }
     }
 }
@@ -383,6 +394,10 @@ fn default_wt_max_sessions() -> u32 {
 
 fn default_wt_max_streams() -> u32 {
     1000
+}
+
+fn default_webtransport_port() -> u16 {
+    4433
 }
 
 fn default_wt_max_datagrams() -> u32 {
@@ -812,6 +827,16 @@ pub struct AdminConfig {
     pub auth_token: Option<String>,
     /// Allowed IP addresses for admin API
     pub allowed_ips: Vec<String>,
+    /// Refuse to start if the admin bind address is not loopback (default: true).
+    /// Admin traffic is plain HTTP; a non-loopback bind transmits Bearer tokens in
+    /// cleartext.  Set to `false` only when the bind interface is protected by a
+    /// TLS tunnel (e.g. SSH port-forward or WireGuard).
+    #[serde(default = "default_require_loopback")]
+    pub require_loopback: bool,
+}
+
+fn default_require_loopback() -> bool {
+    true
 }
 
 impl Default for AdminConfig {
@@ -826,6 +851,7 @@ impl Default for AdminConfig {
             require_mtls: false,
             auth_token: None,
             allowed_ips: vec!["127.0.0.1".to_string(), "::1".to_string()],
+            require_loopback: default_require_loopback(),
         }
     }
 }
@@ -957,6 +983,15 @@ pub struct SecurityConfig {
     /// Link-local (169.254.0.0/16) rejection cannot be disabled.
     #[serde(default)]
     pub allow_internal_backends: bool,
+    /// Duration in seconds for GeoIP-based IP blocks.
+    /// `None` means permanent (old behaviour); `Some(n)` expires the block after n seconds.
+    /// Default: Some(86400) — 24 h, giving operators recourse for mis-classified IPs.
+    #[serde(default = "default_geoip_block_duration_secs")]
+    pub geoip_block_duration_secs: Option<u64>,
+}
+
+fn default_geoip_block_duration_secs() -> Option<u64> {
+    Some(86400) // 24 hours — prevents permanent blocks from stale GeoIP data
 }
 
 impl Default for SecurityConfig {
@@ -982,6 +1017,7 @@ impl Default for SecurityConfig {
             trusted_internal_cidrs: Vec::new(),
             blocklist_dir: PathBuf::from("/var/lib/pqcrypta-proxy/blocklists"),
             allow_internal_backends: false,
+            geoip_block_duration_secs: default_geoip_block_duration_secs(),
         }
     }
 }

@@ -15,6 +15,11 @@
 // Allow dead code for scaffolded connection management features
 #![allow(dead_code)]
 
+/// Maximum age of a sticky session mapping before it is silently evicted.
+/// Prevents cookie_sessions / ip_sessions / header_sessions from growing without bound
+/// on long-running instances with many unique clients.
+const SESSION_TTL: Duration = Duration::from_secs(3600); // 1 hour
+
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -205,19 +210,30 @@ impl BackendServer {
         health.healthy && !health.circuit_open && draining.is_none()
     }
 
-    /// Acquire connection to this server
+    /// Acquire connection to this server.
+    ///
+    /// P1-fix: Previously `try_acquire().is_ok()` dropped the `SemaphorePermit`
+    /// immediately (auto-release on drop), while `release_connection` called
+    /// `add_permits(1)` unconditionally — causing the semaphore to grow without
+    /// bound on every completed connection.  `permit.forget()` suppresses the
+    /// auto-release so that the semaphore slot stays taken until `release_connection`
+    /// explicitly restores it with `add_permits(1)`.
     pub fn try_acquire_connection(&self) -> bool {
-        if self.connection_limiter.try_acquire().is_ok() {
-            self.active_connections.fetch_add(1, Ordering::Relaxed);
-            true
-        } else {
-            false
+        match self.connection_limiter.try_acquire() {
+            Ok(permit) => {
+                // Keep the semaphore slot taken until release_connection is called.
+                permit.forget();
+                self.active_connections.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Err(_) => false,
         }
     }
 
-    /// Release connection
+    /// Release connection (counterpart to a successful try_acquire_connection).
     pub fn release_connection(&self) {
         self.active_connections.fetch_sub(1, Ordering::Relaxed);
+        // Restore the slot that was forgotten in try_acquire_connection.
         self.connection_limiter.add_permits(1);
     }
 
@@ -332,10 +348,13 @@ pub struct BackendPool {
     pub health_check_interval: Duration,
 
     // === Session tracking ===
-    /// Cookie to server mapping (for cookie affinity)
-    cookie_sessions: DashMap<String, String>,
-    /// IP to server mapping (for ip_hash affinity)
-    ip_sessions: DashMap<IpAddr, String>,
+    /// Cookie → (server_id, last_access) for cookie affinity with TTL eviction.
+    cookie_sessions: DashMap<String, (String, Instant)>,
+    /// IP → (server_id, last_access) for IP-hash affinity with TTL eviction.
+    ip_sessions: DashMap<IpAddr, (String, Instant)>,
+    /// Header-value → (server_id, last_access) for header-based affinity.
+    /// P2-fix: previously used cookie_sessions (shared map), causing cross-mode confusion.
+    header_sessions: DashMap<String, (String, Instant)>,
 
     // === Round-robin state ===
     rr_counter: AtomicU64,
@@ -388,6 +407,7 @@ impl BackendPool {
             health_check_interval: Duration::from_secs(config.health_check_interval_secs),
             cookie_sessions: DashMap::new(),
             ip_sessions: DashMap::new(),
+            header_sessions: DashMap::new(),
             rr_counter: AtomicU64::new(0),
             wrr_state: RwLock::new(WeightedRoundRobinState::default()),
         }
@@ -423,25 +443,56 @@ impl BackendPool {
         Some(server)
     }
 
-    /// Check for existing sticky session
+    /// Check for existing sticky session.
+    ///
+    /// P2-fix: TTL eviction prevents cookie_sessions / ip_sessions / header_sessions
+    /// from growing without bound.  Entries older than SESSION_TTL are treated as
+    /// missing and removed inline so no separate eviction task is needed.
+    ///
+    /// P2-fix: Header affinity now uses a dedicated `header_sessions` map rather than
+    /// sharing `cookie_sessions`, preventing cross-mode routing confusion.
     fn check_sticky_session(&self, ctx: &SelectionContext) -> Option<Arc<BackendServer>> {
         match &self.affinity {
             AffinityMode::Cookie => {
                 if let Some(ref cookie) = ctx.session_cookie {
-                    if let Some(server_id) = self.cookie_sessions.get(cookie) {
-                        return self.find_server_by_id(&server_id);
+                    if let Some(mut entry) = self.cookie_sessions.get_mut(cookie) {
+                        if entry.1.elapsed() > SESSION_TTL {
+                            drop(entry);
+                            self.cookie_sessions.remove(cookie);
+                            return None;
+                        }
+                        entry.1 = Instant::now(); // refresh TTL on access
+                        let id = entry.0.clone();
+                        drop(entry);
+                        return self.find_server_by_id(&id);
                     }
                 }
             }
             AffinityMode::IpHash => {
-                if let Some(server_id) = self.ip_sessions.get(&ctx.client_ip) {
-                    return self.find_server_by_id(&server_id);
+                if let Some(mut entry) = self.ip_sessions.get_mut(&ctx.client_ip) {
+                    if entry.1.elapsed() > SESSION_TTL {
+                        drop(entry);
+                        self.ip_sessions.remove(&ctx.client_ip);
+                        return None;
+                    }
+                    entry.1 = Instant::now();
+                    let id = entry.0.clone();
+                    drop(entry);
+                    return self.find_server_by_id(&id);
                 }
             }
             AffinityMode::Header => {
                 if let Some(ref header_val) = ctx.affinity_header {
-                    if let Some(server_id) = self.cookie_sessions.get(header_val) {
-                        return self.find_server_by_id(&server_id);
+                    if let Some(mut entry) = self.header_sessions.get_mut(header_val) {
+                        if entry.1.elapsed() > SESSION_TTL {
+                            drop(entry);
+                            self.header_sessions.remove(header_val);
+                            return None;
+                        }
+                        entry.1 = Instant::now();
+                        let id = entry.0.clone();
+                        drop(entry);
+                        return self.find_server_by_id(&id);
                     }
                 }
             }
@@ -450,22 +501,23 @@ impl BackendPool {
         None
     }
 
-    /// Record sticky session mapping
+    /// Record sticky session mapping.
     fn record_sticky_session(&self, ctx: &SelectionContext, server: &BackendServer) {
         match &self.affinity {
             AffinityMode::Cookie => {
                 if let Some(ref cookie) = ctx.session_cookie {
                     self.cookie_sessions
-                        .insert(cookie.clone(), server.id.clone());
+                        .insert(cookie.clone(), (server.id.clone(), Instant::now()));
                 }
             }
             AffinityMode::IpHash => {
-                self.ip_sessions.insert(ctx.client_ip, server.id.clone());
+                self.ip_sessions
+                    .insert(ctx.client_ip, (server.id.clone(), Instant::now()));
             }
             AffinityMode::Header => {
                 if let Some(ref header_val) = ctx.affinity_header {
-                    self.cookie_sessions
-                        .insert(header_val.clone(), server.id.clone());
+                    self.header_sessions
+                        .insert(header_val.clone(), (server.id.clone(), Instant::now()));
                 }
             }
             AffinityMode::None => {}
@@ -546,6 +598,81 @@ impl BackendPool {
             total_connections,
             total_requests,
         }
+    }
+
+    /// Start a background health-check task for this pool.
+    ///
+    /// P2-fix: previously the pool only reacted to failures seen during real
+    /// requests (`record_result`).  A backend could be completely unreachable
+    /// yet still receive requests until one happened to land on it.  This task
+    /// proactively checks each server on the configured interval via a TCP
+    /// connect (sufficient to detect port-closed / firewall-dropped backends)
+    /// and updates `BackendHealth::healthy` accordingly.
+    ///
+    /// # Arguments
+    /// `pool` — the pool wrapped in `Arc` so the spawned task can hold a reference.
+    pub fn start_health_check_task(pool: Arc<Self>) {
+        if !pool.health_aware {
+            return; // Health-check disabled for this pool
+        }
+        let interval = pool.health_check_interval;
+        if interval.is_zero() {
+            return;
+        }
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // Skip the first tick so we don't check immediately on startup
+            // (all servers start healthy by default and the first real request
+            // will quickly surface any that are unreachable).
+            ticker.tick().await;
+
+            loop {
+                ticker.tick().await;
+
+                let servers: Vec<Arc<BackendServer>> = {
+                    pool.servers.read().clone()
+                };
+
+                for server in servers {
+                    let addr = server.address;
+                    // Use half the interval as the connect timeout so a slow
+                    // backend doesn't stall the entire health-check round.
+                    let timeout_dur = interval / 2;
+
+                    let reachable = tokio::time::timeout(
+                        timeout_dur,
+                        tokio::net::TcpStream::connect(addr),
+                    )
+                    .await
+                    .map(|r| r.is_ok())
+                    .unwrap_or(false);
+
+                    let mut health = server.health.write();
+                    let was_healthy = health.healthy;
+
+                    if reachable {
+                        if !was_healthy {
+                            info!(
+                                "Health check: backend {} is now reachable — marking healthy",
+                                addr
+                            );
+                        }
+                        health.healthy = true;
+                        health.last_check = Instant::now();
+                    } else {
+                        if was_healthy {
+                            warn!(
+                                "Health check: backend {} is unreachable — marking unhealthy",
+                                addr
+                            );
+                        }
+                        health.healthy = false;
+                        health.last_check = Instant::now();
+                    }
+                }
+            }
+        });
     }
 }
 

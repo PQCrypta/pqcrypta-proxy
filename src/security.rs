@@ -30,9 +30,8 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
 
-/// Alt-Svc header value for HTTP/3 advertisement (ports 443, 4433, 4434)
-const ALT_SVC_HEADER: &str =
-    "h3=\":443\"; ma=86400, h3=\":4433\"; ma=86400, h3=\":4434\"; ma=86400";
+// ALT_SVC_HEADER constant removed — P3-fix: header now built dynamically from
+// config ports and stored in SecurityState::alt_svc_header.
 
 /// Maximum number of tracked IPs to prevent memory exhaustion DoS
 /// When exceeded, oldest entries are evicted
@@ -88,9 +87,11 @@ fn cidr_contains_ip(net: &IpNet, addr: &IpAddr) -> bool {
     }
 }
 
-/// Add Alt-Svc header to a response for HTTP/3 advertisement
-fn add_alt_svc(response: &mut Response) {
-    if let Ok(value) = HeaderValue::from_str(ALT_SVC_HEADER) {
+/// Add Alt-Svc header to a response for HTTP/3 advertisement.
+/// P3-fix: header value is now passed in from SecurityState::alt_svc_header
+/// (built from config ports) rather than a hardcoded constant.
+fn add_alt_svc(response: &mut Response, header: &str) {
+    if let Ok(value) = HeaderValue::from_str(header) {
         response.headers_mut().insert("alt-svc", value);
     }
 }
@@ -205,6 +206,14 @@ pub struct SecurityState {
     pub ja3_db: Arc<Ja3Database>,
     /// WAF engine (None if WAF disabled)
     pub waf_engine: Option<Arc<WafEngine>>,
+    /// CIDR ranges from database-synced blocklist files.
+    /// P2-fix: single-IP parsing previously ignored subnet notation; CIDRs now stored
+    /// separately and checked in is_blocked() via cidr_contains_ip().
+    pub blocked_cidrs: Arc<RwLock<Vec<(IpNet, BlockedIpInfo)>>>,
+    /// Pre-built Alt-Svc header value derived from config ports at construction.
+    /// P3-fix: previously a hardcoded constant listing ports 443/4433/4434.
+    /// Now reflects the actual configured udp_port and additional_ports.
+    pub alt_svc_header: Arc<str>,
 }
 
 /// Information about a blocked IP
@@ -418,6 +427,19 @@ impl SecurityState {
             None
         };
 
+        // P3-fix: Build the Alt-Svc header from the configured ports rather than
+        // a hardcoded string.  Collect the primary UDP port + any additional ports.
+        let alt_svc_header: Arc<str> = {
+            let mut parts = vec![format!(
+                "h3=\":{}\"; ma=86400",
+                config.server.udp_port
+            )];
+            for p in &config.server.additional_ports {
+                parts.push(format!("h3=\":{}\"; ma=86400", p));
+            }
+            parts.join(", ").into()
+        };
+
         let state = Self {
             ip_rate_limiters: Arc::new(DashMap::new()),
             ip_connections: Arc::new(DashMap::new()),
@@ -433,6 +455,8 @@ impl SecurityState {
             geoip_db,
             ja3_db: Arc::new(ja3_db),
             waf_engine,
+            blocked_cidrs: Arc::new(RwLock::new(Vec::new())),
+            alt_svc_header,
         };
 
         // Spawn background cleanup task
@@ -516,20 +540,36 @@ impl SecurityState {
         entry.0.clone()
     }
 
-    /// Check if an IP is blocked
+    /// Check if an IP is blocked (single-IP list or CIDR range).
     pub fn is_blocked(&self, ip: &IpAddr) -> Option<BlockedIpInfo> {
+        // 1. Single-IP block list
         if let Some(info) = self.blocked_ips.get(ip) {
-            // Check if block has expired
             if let Some(expires) = info.expires_at {
                 if Instant::now() > expires {
-                    // Remove expired block
                     drop(info);
                     self.blocked_ips.remove(ip);
-                    return None;
+                    // Fall through to CIDR check in case the IP also matches a range.
+                } else {
+                    return Some(info.clone());
+                }
+            } else {
+                return Some(info.clone());
+            }
+        }
+
+        // 2. P2-fix: CIDR range block list (skips expired entries inline).
+        let cidrs = self.blocked_cidrs.read();
+        for (net, info) in cidrs.iter() {
+            if let Some(expires) = info.expires_at {
+                if Instant::now() > expires {
+                    continue; // expired entry — evicted during next cleanup()
                 }
             }
-            return Some(info.clone());
+            if cidr_contains_ip(net, ip) {
+                return Some(info.clone());
+            }
         }
+
         None
     }
 
@@ -636,51 +676,58 @@ impl SecurityState {
                 if let Ok(entries) = serde_json::from_str::<Vec<BlocklistEntry>>(&content) {
                     let mut loaded = 0;
                     for entry in entries {
-                        // Parse IP from CIDR notation (e.g., "1.2.3.4/32" -> "1.2.3.4")
-                        let ip_str = entry.ip.split('/').next().unwrap_or(&entry.ip);
-                        if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                            // Skip if already blocked with same or longer duration
+                        // Calculate expiration from the expires_at field (shared logic)
+                        let expires_at = entry.expires_at.as_ref().and_then(|exp| {
+                            chrono::DateTime::parse_from_rfc3339(exp)
+                                .ok()
+                                .and_then(|dt| {
+                                    let now = chrono::Utc::now();
+                                    let exp_utc = dt.with_timezone(&chrono::Utc);
+                                    if exp_utc > now {
+                                        let duration = (exp_utc - now)
+                                            .to_std()
+                                            .unwrap_or(Duration::from_secs(3600));
+                                        Some(Instant::now() + duration)
+                                    } else {
+                                        None // Already expired
+                                    }
+                                })
+                        });
+
+                        // Skip entries that are already expired
+                        if entry.expires_at.is_some() && expires_at.is_none() {
+                            continue;
+                        }
+
+                        let block_info = BlockedIpInfo {
+                            blocked_at: Instant::now(),
+                            expires_at,
+                            reason: BlockReason::DatabaseSync,
+                            block_count: 1,
+                        };
+
+                        if entry.ip.contains('/') {
+                            // P2-fix: CIDR entry — parse as IpNet and store in blocked_cidrs.
+                            // The old code stripped the prefix length and only blocked the
+                            // host address, ignoring the subnet entirely.
+                            if let Ok(net) = entry.ip.parse::<IpNet>() {
+                                let mut cidrs = self.blocked_cidrs.write();
+                                if !cidrs.iter().any(|(n, _)| n == &net) {
+                                    cidrs.push((net, block_info));
+                                    loaded += 1;
+                                }
+                            }
+                        } else if let Ok(ip) = entry.ip.parse::<IpAddr>() {
+                            // Single-IP entry — existing behaviour
                             if self.blocked_ips.contains_key(&ip) {
                                 continue;
                             }
-
-                            // Calculate expiration from the expires_at field
-                            let expires_at = entry.expires_at.as_ref().and_then(|exp| {
-                                chrono::DateTime::parse_from_rfc3339(exp)
-                                    .ok()
-                                    .and_then(|dt| {
-                                        let now = chrono::Utc::now();
-                                        let exp_utc = dt.with_timezone(&chrono::Utc);
-                                        if exp_utc > now {
-                                            let duration = (exp_utc - now)
-                                                .to_std()
-                                                .unwrap_or(Duration::from_secs(3600));
-                                            Some(Instant::now() + duration)
-                                        } else {
-                                            None // Already expired
-                                        }
-                                    })
-                            });
-
-                            // Skip if already expired
-                            if entry.expires_at.is_some() && expires_at.is_none() {
-                                continue;
-                            }
-
-                            self.blocked_ips.insert(
-                                ip,
-                                BlockedIpInfo {
-                                    blocked_at: Instant::now(),
-                                    expires_at,
-                                    reason: BlockReason::DatabaseSync,
-                                    block_count: 1,
-                                },
-                            );
+                            self.blocked_ips.insert(ip, block_info);
                             loaded += 1;
                         }
                     }
                     if loaded > 0 {
-                        info!("Loaded {} blocked IPs from database sync", loaded);
+                        info!("Loaded {} blocked IPs/CIDRs from database sync", loaded);
                     }
                 }
             }
@@ -858,9 +905,15 @@ impl SecurityState {
         let stale_cleanup_secs = cb_config.stale_counter_cleanup_secs;
         drop(cb_config);
 
-        // Remove expired blocks
+        // Remove expired blocks (single-IP)
         self.blocked_ips
             .retain(|_, info| info.expires_at.map(|e| Instant::now() < e).unwrap_or(true));
+
+        // Remove expired CIDR blocks
+        {
+            let mut cidrs = self.blocked_cidrs.write();
+            cidrs.retain(|(_, info)| info.expires_at.map(|e| Instant::now() < e).unwrap_or(true));
+        }
 
         // Remove old request counters (configurable age)
         self.request_counts.retain(|_, counter| {
@@ -979,20 +1032,31 @@ pub async fn security_middleware(
         (rate_config.enabled, rate_config.requests_per_second)
     };
 
+    // Pre-borrow alt_svc_header for use in all early-return helpers below.
+    let alt_svc = security.alt_svc_header.as_ref();
+
     // 1. Check if IP is blocked
     if let Some(block_info) = security.is_blocked(&ip) {
         warn!(
             "Blocked request from {} (reason: {:?})",
             ip, block_info.reason
         );
-        return blocked_response(&block_info);
+        return blocked_response(&block_info, alt_svc);
     }
 
     // 2. GeoIP country blocking
     if security.is_country_blocked(&ip) {
         warn!("GeoIP blocked request from {}", ip);
-        security.block_ip(ip, BlockReason::GeoBlocked, None);
-        return geo_blocked_response();
+        // P2-fix: use a configurable duration instead of None (permanent).
+        // Permanent GeoIP blocks have no recourse when a database mis-classifies an IP
+        // or the IP moves between countries.  Default: 24 h (see SecurityConfig).
+        let geoip_duration = security
+            .config
+            .read()
+            .geoip_block_duration_secs
+            .map(Duration::from_secs);
+        security.block_ip(ip, BlockReason::GeoBlocked, geoip_duration);
+        return geo_blocked_response(alt_svc);
     }
 
     // 3. Check DoS protection - connection limits
@@ -1007,7 +1071,7 @@ pub async fn security_middleware(
                 Some(Duration::from_secs(60)),
             );
             warn!("Connection limit exceeded for {}: {}", ip, connections);
-            return too_many_connections_response();
+            return too_many_connections_response(alt_svc);
         }
     }
 
@@ -1029,7 +1093,14 @@ pub async fn security_middleware(
                 security.block_ip(ip, BlockReason::RateLimitExceeded, Some(block_duration));
             }
 
-            return rate_limit_response_simple(rate_rps);
+            // P1-fix: decrement the DoS connection counter that was incremented in
+            // step 3 before this early return.  Previously the counter leaked on
+            // every rate-limited request, eventually triggering DoS protection even
+            // when the client's actual concurrency was within limits.
+            if dos_protection {
+                security.decrement_connections(ip);
+            }
+            return rate_limit_response_simple(rate_rps, alt_svc);
         }
     }
 
@@ -1093,7 +1164,7 @@ pub async fn security_middleware(
                 if let Ok(length) = length_str.parse::<usize>() {
                     if length > max_request_size {
                         warn!("Request too large from {}: {} bytes", ip, length);
-                        return payload_too_large_response(max_request_size);
+                        return payload_too_large_response(max_request_size, alt_svc);
                     }
                 }
             }
@@ -1130,7 +1201,51 @@ pub async fn security_middleware(
             if dos_protection {
                 security.decrement_connections(ip);
             }
-            return payload_too_large_response(max_request_size);
+            return payload_too_large_response(max_request_size, alt_svc);
+        }
+
+        // P1-fix: WAF body inspection on the now-buffered bytes.
+        // Step 5 above inspected path/query/headers without a body; this second
+        // pass supplies the buffered bytes so that body-embedded payloads
+        // (SQLi, XSS, command injection, etc.) are detected.
+        if !collected_bytes.is_empty() {
+            if let Some(ref waf) = security.waf_engine {
+                let waf_path = parts.uri.path().to_string();
+                let waf_query = parts.uri.query().unwrap_or("").to_string();
+                let waf_req_body = WafRequest {
+                    method: parts.method.as_str(),
+                    path: &waf_path,
+                    query: &waf_query,
+                    headers: &parts.headers,
+                    body: Some(collected_bytes.as_slice()),
+                };
+                match waf.inspect(&waf_req_body) {
+                    WafVerdict::Block { ref rule, .. } => {
+                        warn!(
+                            "WAF body block: rule={} ip={} path={}",
+                            rule, ip, waf_path
+                        );
+                        if dos_protection {
+                            security.decrement_connections(ip);
+                        }
+                        let mut resp = (
+                            StatusCode::FORBIDDEN,
+                            "Request blocked by security policy",
+                        )
+                            .into_response();
+                        resp.headers_mut()
+                            .insert("x-waf-block", HeaderValue::from_static("1"));
+                        return resp;
+                    }
+                    WafVerdict::Detect { ref rule, .. } => {
+                        warn!(
+                            "WAF body detect (non-blocking): rule={} ip={} path={}",
+                            rule, ip, waf_path
+                        );
+                    }
+                    WafVerdict::Allow => {}
+                }
+            }
         }
 
         // Reconstruct the request with the buffered body and continue.
@@ -1146,7 +1261,7 @@ pub async fn security_middleware(
             if dos_protection {
                 security.decrement_connections(ip);
             }
-            return headers_too_large_response(max_header_size);
+            return headers_too_large_response(max_header_size, alt_svc);
         }
 
         // 7. Process request
@@ -1167,7 +1282,11 @@ pub async fn security_middleware(
 
     if header_size > max_header_size {
         warn!("Headers too large from {}: {} bytes", ip, header_size);
-        return headers_too_large_response(max_header_size);
+        // P1-fix: decrement the DoS counter that was incremented in step 3.
+        if dos_protection {
+            security.decrement_connections(ip);
+        }
+        return headers_too_large_response(max_header_size, alt_svc);
     }
 
     // 7. Process request
@@ -1186,10 +1305,13 @@ pub async fn security_middleware(
 }
 
 /// Generate blocked IP response
-fn blocked_response(info: &BlockedIpInfo) -> Response {
+fn blocked_response(info: &BlockedIpInfo, alt_svc: &str) -> Response {
+    // P1-fix: `duration_since` panics (in debug) / saturates (in release) when the
+    // reference instant is in the past — a TOCTOU race between is_blocked() and here.
+    // `saturating_duration_since` returns zero for expired blocks without panicking.
     let retry_after = info
         .expires_at
-        .map(|e| e.duration_since(Instant::now()).as_secs())
+        .map(|e| e.saturating_duration_since(Instant::now()).as_secs())
         .unwrap_or(3600);
 
     let mut response = (StatusCode::FORBIDDEN, "Access denied - IP blocked").into_response();
@@ -1198,29 +1320,29 @@ fn blocked_response(info: &BlockedIpInfo) -> Response {
         "Retry-After",
         HeaderValue::from_str(&retry_after.to_string()).unwrap_or(HeaderValue::from_static("3600")),
     );
-    add_alt_svc(&mut response);
+    add_alt_svc(&mut response, alt_svc);
 
     response
 }
 
 /// Generate GeoIP blocked response
-fn geo_blocked_response() -> Response {
+fn geo_blocked_response(alt_svc: &str) -> Response {
     let mut response = (
         StatusCode::FORBIDDEN,
         "Access denied - Your region is not allowed",
     )
         .into_response();
-    add_alt_svc(&mut response);
+    add_alt_svc(&mut response, alt_svc);
     response
 }
 
 /// Generate rate limit exceeded response
-fn rate_limit_response(config: &RateLimitConfig) -> Response {
-    rate_limit_response_simple(config.requests_per_second)
+fn rate_limit_response(config: &RateLimitConfig, alt_svc: &str) -> Response {
+    rate_limit_response_simple(config.requests_per_second, alt_svc)
 }
 
 /// Generate rate limit exceeded response with just the RPS value
-fn rate_limit_response_simple(requests_per_second: u32) -> Response {
+fn rate_limit_response_simple(requests_per_second: u32, alt_svc: &str) -> Response {
     let mut response = (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
 
     // Add standard rate limit headers
@@ -1235,24 +1357,24 @@ fn rate_limit_response_simple(requests_per_second: u32) -> Response {
     response
         .headers_mut()
         .insert("X-RateLimit-Remaining", HeaderValue::from_static("0"));
-    add_alt_svc(&mut response);
+    add_alt_svc(&mut response, alt_svc);
 
     response
 }
 
 /// Generate too many connections response
-fn too_many_connections_response() -> Response {
+fn too_many_connections_response(alt_svc: &str) -> Response {
     let mut response = (
         StatusCode::SERVICE_UNAVAILABLE,
         "Too many connections from your IP",
     )
         .into_response();
-    add_alt_svc(&mut response);
+    add_alt_svc(&mut response, alt_svc);
     response
 }
 
 /// Generate payload too large response
-fn payload_too_large_response(max_size: usize) -> Response {
+fn payload_too_large_response(max_size: usize, alt_svc: &str) -> Response {
     let mut response = (
         StatusCode::PAYLOAD_TOO_LARGE,
         format!("Request body exceeds maximum size of {} bytes", max_size),
@@ -1264,19 +1386,19 @@ fn payload_too_large_response(max_size: usize) -> Response {
         HeaderValue::from_str(&max_size.to_string())
             .unwrap_or(HeaderValue::from_static("10485760")),
     );
-    add_alt_svc(&mut response);
+    add_alt_svc(&mut response, alt_svc);
 
     response
 }
 
 /// Generate headers too large response
-fn headers_too_large_response(max_size: usize) -> Response {
+fn headers_too_large_response(max_size: usize, alt_svc: &str) -> Response {
     let mut response = (
         StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
         format!("Headers exceed maximum size of {} bytes", max_size),
     )
         .into_response();
-    add_alt_svc(&mut response);
+    add_alt_svc(&mut response, alt_svc);
     response
 }
 
