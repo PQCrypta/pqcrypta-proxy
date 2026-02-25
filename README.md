@@ -154,13 +154,15 @@ This writes `GeoLite2-Country.mmdb`, `GeoLite2-City.mmdb`, and `GeoLite2-ASN.mmd
 
 ### Trusted Internal CIDRs
 
-Only loopback (`127.0.0.0/8`) and RFC1918 private ranges are trusted by default.
-If you need to trust additional internal CIDRs (e.g., a VPC range), add them explicitly:
+Only loopback (`127.0.0.0/8` / `::1`) is trusted by default (SEC-A05). RFC1918 private ranges
+are treated as untrusted external traffic — this prevents XFF/Real-IP spoofing attacks from
+RFC1918 sources (e.g., on multi-tenant or shared networks). If you operate a genuinely isolated
+private network where RFC1918 sources are legitimate, add them explicitly:
 
 ```toml
 [security]
-# Explicit opt-in for any non-private CIDRs that should bypass security checks.
-# Default: empty (only loopback and RFC1918 are trusted).
+# Explicit opt-in for CIDRs that should bypass security checks.
+# Default: empty (only loopback 127.x/::1 is trusted; RFC1918 is NOT trusted by default).
 trusted_internal_cidrs = ["10.200.0.0/16"]
 ```
 
@@ -965,6 +967,38 @@ cargo run --release --bin quic-bench -- --target localhost:443
 - [x] Chunked body size enforcement (Transfer-Encoding bypass fixed)
 - [x] Admin router tier split (public /health vs. authenticated /metrics etc.)
 - [x] Exponential back-off on global auth cooldown (5 min base, up to 30 min)
+
+### Security Hardening (v0.2.2 — February 2026)
+
+These improvements address the independent security review published February 24 2026 (SEC-A01 – SEC-A09):
+
+- [x] **SEC-A01/A09 — Bot-detection script SQL injection and privilege** — Rewrote
+  `scripts/detect_bots_from_logs.sh` to connect as `pqcrypta_user` instead of the postgres
+  superuser, and replaced all string-interpolated SQL with parameterised `psql -v` / `:'variable'`
+  literals. Added a strict `sanitize_path()` whitelist that rejects control characters before any
+  value reaches the database.
+- [x] **SEC-A02 — Admin API non-loopback warning** — A startup `WARN` is now emitted when
+  `bind_address` resolves to a non-loopback interface, alerting operators that the admin API is
+  reachable over the network without TLS.
+- [x] **SEC-A03 — `require_mtls` enforcement** — Setting `require_mtls = true` in `[admin]` now
+  returns a hard error at startup rather than silently ignoring the flag, preventing a false sense
+  of security while mTLS is not yet implemented.
+- [x] **SEC-A04 — Hardcoded backend addresses removed from logs** — Startup log lines that printed
+  resolved backend host:port pairs (`api.pqcrypta.com → 127.0.0.1:3003`, etc.) were removed.
+  Backend topology is no longer disclosed in plain-text logs.
+- [x] **SEC-A05 — Loopback-only trust for `is_trusted_ip()`** — `is_trusted_ip()` in `security.rs`
+  now trusts only loopback addresses (`127.x.x.x` / `::1`). RFC1918 private ranges are no longer
+  trusted by default, closing an XFF/Real-IP bypass on multi-tenant or shared networks.
+- [x] **SEC-A06 — Graceful shutdown drain polling** — The static `sleep(drain_secs)` that blocked
+  shutdown for the full configured drain duration regardless of connection state has been replaced
+  with a 100 ms polling loop that exits as soon as active connections reach zero.
+- [x] **SEC-A07 — Excessive Clippy suppressions removed** — Four crate-level `#![allow()]`
+  annotations (`cast_possible_truncation`, `cast_sign_loss`, `cast_precision_loss`,
+  `wildcard_imports`) were removed from `main.rs` and `lib.rs`. All surfaced warnings were
+  resolved properly using `try_from().unwrap_or(MAX)`, `.clamp()`, and explicit imports.
+- [x] **SEC-A08 — GeoIP license key removed from URL** — `scripts/download_geoip.sh` no longer
+  appends `&license_key=…` to the download URL. The key is transmitted exclusively via HTTP Basic
+  Auth (`--user`) as intended by the MaxMind API.
 
 ### Security Hardening (v0.2.1 — February 2026)
 
