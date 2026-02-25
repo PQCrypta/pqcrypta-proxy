@@ -9,7 +9,7 @@
 
 ## Highlights
 
-- **Full-Featured Proxy**: Domain-based routing, security headers, CORS, redirects
+- **Full-Featured Proxy**: Domain-based routing, custom header injection, per-route timeouts, security headers, CORS, redirects
 - **Three TLS Modes**: Terminate, Re-encrypt, and Passthrough (SNI-based)
 - **Modern Protocols**: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebTransport
 - **Post-Quantum Ready**: Hybrid PQC key exchange (X25519MLKEM768) via OpenSSL 3.5+ with native ML-KEM
@@ -17,7 +17,8 @@
 - **ACME Automation**: Automatic Let's Encrypt certificate provisioning and renewal
 - **OCSP Stapling**: Automated OCSP response fetching and stapling
 - **Prometheus Metrics**: Comprehensive metrics for TLS, connections, requests, and backends
-- **Advanced Security**: JA3/JA4 fingerprinting, circuit breaker, GeoIP blocking
+- **Advanced Security**: JA3/JA4 fingerprinting, circuit breaker, GeoIP blocking, DB-synced IP blocklists, WebTransport origin validation
+- **Structured Access Logging**: Per-request JSON or text logs with latency, bytes, upstream, and client IP
 - **Enterprise Load Balancing**: 6 algorithms, session affinity, health-aware routing
 - **Multi-Dimensional Rate Limiting**: Composite keys, JA3/JA4-based, adaptive ML anomaly detection
 
@@ -42,6 +43,13 @@
 | **OCSP Stapling** | ✅ | Automated OCSP response fetching with caching |
 | **Prometheus Metrics** | ✅ | TLS, connection, request, backend, and error metrics |
 | PROXY Protocol v2 | ✅ | Client IP preservation for downstream proxies |
+| Access Logging | ✅ | Per-request logging in JSON or text format with configurable file output |
+| WebTransport Origin Validation | ✅ | SR-02 cross-origin blocking with configurable allowlist |
+| IP Blocklists (DB-synced) | ✅ | Live-synced IP/fingerprint/country blocklists from application database |
+| Per-Route Timeouts | ✅ | Per-route timeout overrides independent of global defaults |
+| Custom Header Injection | ✅ | Inject arbitrary headers per route before forwarding to backends |
+| Multiple Listener Ports | ✅ | Primary port plus any number of additional ports via `additional_ports` |
+| WebTransport Operations | ✅ | JSON operation routing over streams (encrypt/decrypt/keygen/health/ping) |
 
 ## Features
 
@@ -51,6 +59,9 @@
 - **TLS Re-encryption**: Decrypt at proxy, re-encrypt HTTPS to backend with mTLS support
 - **TLS Passthrough**: SNI-based routing without decryption
 - **HTTP→HTTPS Redirect**: Automatic port 80 to 443 redirect server
+- **Custom Header Injection**: Inject arbitrary response or request headers per route before forwarding to backends
+- **Per-Route Timeout Overrides**: Independent timeout configuration per route, overriding global defaults
+- **Multiple Listener Ports**: Primary port plus any number of additional ports (`additional_ports`) all supporting QUIC/HTTP3/WebTransport
 
 ### Security
 - **JA3/JA4 TLS Fingerprinting**: Detects browsers, bots, scanners, malware based on TLS ClientHello
@@ -64,6 +75,7 @@
 - **Security Headers**: HSTS, X-Frame-Options, CSP, COEP, COOP, CORP, and more
 - **CORS Handling**: Full CORS support with preflight OPTIONS handling
 - **Server Branding**: Hide backend identity (Apache/nginx → "PQCProxy v0.2.1")
+- **IP Blocklists (DB-synced)**: Live-synced IP, fingerprint, and country blocklists pulled from the application database — updates without restart
 
 ### Load Balancing
 - **6 Load Balancing Algorithms**:
@@ -94,12 +106,15 @@
 
 ### Protocols
 - **QUIC/HTTP/3**: Full HTTP/3 support via QuicListener (h3 + quinn crates)
-- **WebTransport**: Native WebTransport session handling for bidirectional streaming
+- **WebTransport**: Native WebTransport session handling with bidirectional streams, unidirectional streams, and datagrams
+- **WebTransport Origin Validation**: SR-02 cross-origin enforcement — configurable `webtransport_allowed_origins` allowlist rejects browser sessions from unlisted origins with 403; non-browser clients (no Origin header) always accepted
+- **WebTransport JSON Operations**: JSON operation routing over streams — encrypt, decrypt, keygen, health, ping dispatched to backend by operation type
 - **Unified UDP Listener**: Single QuicListener handles both HTTP/3 and WebTransport
 - **X-Forwarded Headers**: X-Real-IP, X-Forwarded-For, X-Forwarded-Proto
 
 ### Operations
 - **Hot Reload**: Configuration and TLS certificate reload without restart
+- **Access Logging**: Per-request structured logging in JSON or plain-text format; configurable output file, includes method, path, status, latency, bytes, client IP, and upstream
 - **Admin API**: Health checks, Prometheus metrics, config reload, graceful shutdown
 - **Cross-Platform**: Linux, macOS, and Windows support
 
