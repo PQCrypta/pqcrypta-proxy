@@ -887,6 +887,9 @@ async fn handle_fingerprinted_connection(
             // setting it from the TLS connection state.  This prevents external
             // callers from spoofing the flag by including it in their request.
             req.headers_mut().remove("x-tls-early-data");
+            // Strip any client-supplied x-client-cert header before injecting
+            // the authoritative value from the TLS handshake result.
+            req.headers_mut().remove("x-client-cert");
 
             // Inject fingerprint headers for downstream middleware
             if let Some(ref hash) = ja3 {
@@ -914,6 +917,13 @@ async fn handle_fingerprinted_connection(
             if ci.is_early_data {
                 req.headers_mut()
                     .insert("x-tls-early-data", HeaderValue::from_static("1"));
+            }
+
+            // Tag connections where the client presented a TLS certificate so
+            // proxy_handler can enforce per-route internal mTLS requirements.
+            if ci.client_cert_present {
+                req.headers_mut()
+                    .insert("x-client-cert", HeaderValue::from_static("1"));
             }
 
             // Store connection info in extensions
@@ -1316,6 +1326,9 @@ async fn handle_pqc_fingerprinted_connection(
         .map(|c| matches!(c, crate::security::FingerprintClass::Browser))
         .unwrap_or(false);
 
+    // Detect whether client presented a certificate (for per-route mTLS enforcement).
+    let client_cert_present = ssl_stream.ssl().peer_certificate().is_some();
+
     // Create connection info (OpenSSL PQC path does not use rustls 0-RTT)
     let conn_info = crate::tls_acceptor::FingerprintedConnection {
         remote_addr,
@@ -1324,6 +1337,7 @@ async fn handle_pqc_fingerprinted_connection(
         client_name: client_name.clone(),
         is_browser,
         is_early_data: false,
+        client_cert_present,
     };
 
     // Create service that injects fingerprint headers
@@ -1337,6 +1351,9 @@ async fn handle_pqc_fingerprinted_connection(
         async move {
             // SEC-002: Strip any client-supplied x-tls-early-data header.
             req.headers_mut().remove("x-tls-early-data");
+            // Strip any client-supplied x-client-cert header before injecting
+            // the authoritative value from the TLS handshake result.
+            req.headers_mut().remove("x-client-cert");
 
             // Inject fingerprint headers
             if let Some(ref hash) = ja3 {
@@ -1362,6 +1379,13 @@ async fn handle_pqc_fingerprinted_connection(
             // Add PQC indicator header
             req.headers_mut()
                 .insert("x-pqc-enabled", HeaderValue::from_static("true"));
+
+            // Tag connections where the client presented a TLS certificate so
+            // proxy_handler can enforce per-route internal mTLS requirements.
+            if ci.client_cert_present {
+                req.headers_mut()
+                    .insert("x-client-cert", HeaderValue::from_static("1"));
+            }
 
             // Store connection info in extensions
             req.extensions_mut().insert(ci);
@@ -2103,6 +2127,84 @@ async fn proxy_handler(
                 route.name, method, path
             );
             return StatusCode::TOO_EARLY.into_response();
+        }
+
+        // Internal route mTLS enforcement.
+        // x-client-cert is set exclusively by the TLS accept loop (stripped from any
+        // client-supplied copy) so it cannot be forged by external callers.
+        if route.internal {
+            let mtls_required = route
+                .security
+                .as_ref()
+                .and_then(|s| s.mtls_required)
+                .unwrap_or(true); // default true when internal = true
+
+            if mtls_required {
+                let client_cert_present = headers
+                    .get("x-client-cert")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
+                if !client_cert_present {
+                    warn!(
+                        "Internal route {:?} rejected request from {}: no client certificate",
+                        route.name, client_addr.ip()
+                    );
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+            }
+        }
+
+        // Per-route HMAC proof-of-possession.
+        // Signature = HMAC-SHA256(METHOD + "\n" + PATH + "\n" + TIMESTAMP, secret).
+        // Timestamp must be within 300 s of server time (replay protection).
+        if let Some(ref secret) = route
+            .security
+            .as_ref()
+            .and_then(|s| s.hmac_secret.as_ref())
+            .map(String::clone)
+        {
+            use hmac::{Hmac, Mac};
+            use sha2::Sha256;
+
+            let sig = headers
+                .get("x-request-signature")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let ts = headers
+                .get("x-request-timestamp")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+
+            let ts_i: i64 = ts.parse().unwrap_or(0);
+            let now_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            if (now_ts - ts_i).abs() > 300 {
+                warn!(
+                    "Route {:?} HMAC timestamp out of 300s window from {}",
+                    route.name, client_addr.ip()
+                );
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+
+            let message = format!("{}\n{}\n{}", method.as_str(), path, ts);
+            type HmacSha256 = Hmac<Sha256>;
+            let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+                .expect("HMAC accepts any key size");
+            mac.update(message.as_bytes());
+            let expected = hex::encode(mac.finalize().into_bytes());
+
+            use subtle::ConstantTimeEq;
+            let valid: bool = sig.as_bytes().ct_eq(expected.as_bytes()).into();
+            if !valid {
+                warn!(
+                    "Route {:?} HMAC signature invalid from {}",
+                    route.name, client_addr.ip()
+                );
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
         }
 
         // Track request timing for load balancer

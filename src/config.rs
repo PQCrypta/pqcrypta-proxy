@@ -202,6 +202,11 @@ pub struct RouteSecurityPolicy {
     pub waf_enabled: Option<bool>,
     /// WAF mode for this route: "detect" | "block"
     pub waf_mode: Option<String>,
+    /// HMAC-SHA256 secret for per-request signing on this route.
+    /// When set, requests must carry X-Request-Signature and X-Request-Timestamp headers.
+    /// Signature = HMAC-SHA256(METHOD + "\n" + PATH + "\n" + TIMESTAMP, secret).
+    /// Timestamp must be within 300 seconds of server time (replay protection).
+    pub hmac_secret: Option<String>,
 }
 
 /// HTTP/3 advanced features configuration
@@ -803,6 +808,10 @@ pub struct RouteConfig {
     #[serde(default)]
     pub allow_0rtt: bool,
 
+    /// Mark this route as internal-only (service-to-service).
+    /// When true: mTLS is required by default, HMAC signing is enforced if hmac_secret set.
+    #[serde(default)]
+    pub internal: bool,
     /// Per-route security policy override (mTLS, JA3 allowlist, rate limit, WAF mode)
     pub security: Option<RouteSecurityPolicy>,
 }
@@ -827,6 +836,11 @@ pub struct AdminConfig {
     pub auth_token: Option<String>,
     /// Allowed IP addresses for admin API
     pub allowed_ips: Vec<String>,
+    /// Proof-of-possession HMAC secret for admin API.
+    /// When set, all admin requests must include X-Admin-Signature and X-Admin-Timestamp.
+    /// Signature = HMAC-SHA256(METHOD + "\n" + PATH + "\n" + TIMESTAMP, secret).
+    /// Provides per-request proof without replacing the bearer token.
+    pub hmac_secret: Option<String>,
     /// Refuse to start if the admin bind address is not loopback (default: true).
     /// Admin traffic is plain HTTP; a non-loopback bind transmits Bearer tokens in
     /// cleartext.  Set to `false` only when the bind interface is protected by a
@@ -851,6 +865,7 @@ impl Default for AdminConfig {
             require_mtls: false,
             auth_token: None,
             allowed_ips: vec!["127.0.0.1".to_string(), "::1".to_string()],
+            hmac_secret: None,
             require_loopback: default_require_loopback(),
         }
     }
@@ -988,6 +1003,13 @@ pub struct SecurityConfig {
     /// Default: Some(86400) — 24 h, giving operators recourse for mis-classified IPs.
     #[serde(default = "default_geoip_block_duration_secs")]
     pub geoip_block_duration_secs: Option<u64>,
+    /// Enable zero-trust mode. At startup, enforces:
+    /// - All backends must use tls_mode = "reencrypt" or "passthrough" (no plaintext)
+    /// - trusted_internal_cidrs must be empty
+    /// - TLS require_client_cert must be true
+    /// Startup aborts if any constraint is violated.
+    #[serde(default)]
+    pub zero_trust_mode: bool,
 }
 
 fn default_geoip_block_duration_secs() -> Option<u64> {
@@ -1018,6 +1040,7 @@ impl Default for SecurityConfig {
             blocklist_dir: PathBuf::from("/var/lib/pqcrypta-proxy/blocklists"),
             allow_internal_backends: false,
             geoip_block_duration_secs: default_geoip_block_duration_secs(),
+            zero_trust_mode: false,
         }
     }
 }

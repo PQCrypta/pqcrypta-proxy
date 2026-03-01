@@ -104,6 +104,10 @@ pub struct FingerprintedConnection {
     /// matched route's `allow_0rtt` flag and return 425 Too Early for
     /// non-idempotent routes to prevent replay attacks.
     pub is_early_data: bool,
+    /// True when the client presented a valid certificate during the TLS handshake.
+    /// Used by per-route internal mTLS enforcement: routes with `internal = true`
+    /// default to requiring a client certificate.
+    pub client_cert_present: bool,
 }
 
 impl Connected<&FingerprintedTlsStream<TlsStream<TcpStream>>> for FingerprintedConnection {
@@ -374,6 +378,14 @@ impl FingerprintingTlsAcceptor {
             io::Error::new(io::ErrorKind::ConnectionAborted, e)
         })?;
 
+        // Detect whether client presented a certificate (for per-route mTLS enforcement).
+        let client_cert_present = tls_stream
+            .get_ref()
+            .1
+            .peer_certificates()
+            .map(|certs| !certs.is_empty())
+            .unwrap_or(false);
+
         // Create connection info
         let is_browser = fingerprint_result
             .classification
@@ -388,6 +400,7 @@ impl FingerprintingTlsAcceptor {
             client_name: fingerprint_result.client_name,
             is_browser,
             is_early_data: offered_early_data,
+            client_cert_present,
         };
 
         Ok(Some(FingerprintedTlsStream::new(tls_stream, conn_info)))
@@ -520,6 +533,7 @@ mod tests {
             client_name: Some("Chrome".to_string()),
             is_browser: true,
             is_early_data: false,
+            client_cert_present: false,
         };
 
         assert_eq!(conn.ja3_hash(), Some("abc123"));

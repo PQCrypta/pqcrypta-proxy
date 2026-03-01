@@ -74,7 +74,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 use pqcrypta_proxy::acme;
 use pqcrypta_proxy::admin::AdminServer;
 use pqcrypta_proxy::audit_logger::AuditLogger;
-use pqcrypta_proxy::config::{ConfigManager, ConfigReloadEvent, ProxyConfig};
+use pqcrypta_proxy::config::{ConfigManager, ConfigReloadEvent, ProxyConfig, TlsMode};
 use pqcrypta_proxy::metrics;
 use pqcrypta_proxy::ocsp;
 use pqcrypta_proxy::pqc_tls::{verify_pqc_support, PqcTlsProvider};
@@ -253,6 +253,61 @@ async fn main() -> anyhow::Result<()> {
                 ));
             }
         }
+    }
+
+    // Deprecation warning: trusted_internal_cidrs will be removed in a future release.
+    if !config.security.trusted_internal_cidrs.is_empty() {
+        warn!(
+            "DEPRECATION: security.trusted_internal_cidrs is deprecated. \
+             {} CIDR(s) are configured. Replace with mTLS client certificate \
+             verification (tls.require_client_cert = true) for identity-bound trust. \
+             IP-based trust will be removed in a future release.",
+            config.security.trusted_internal_cidrs.len()
+        );
+    }
+
+    // Zero-trust mode: enforce strict startup constraints.
+    if config.security.zero_trust_mode {
+        info!("Zero-trust mode enabled — validating constraints");
+        let mut zt_errors: Vec<String> = Vec::new();
+
+        // 1. No plaintext (terminate) backends.
+        for (name, backend) in &config.backends {
+            if backend.tls_mode == TlsMode::Terminate {
+                zt_errors.push(format!(
+                    "backend '{}' uses tls_mode=terminate (plaintext); \
+                     zero_trust_mode requires reencrypt or passthrough",
+                    name
+                ));
+            }
+        }
+
+        // 2. No trusted_internal_cidrs.
+        if !config.security.trusted_internal_cidrs.is_empty() {
+            zt_errors.push(
+                "security.trusted_internal_cidrs must be empty in zero_trust_mode; \
+                 use mTLS client certificates for identity-based trust"
+                    .to_string(),
+            );
+        }
+
+        // 3. require_client_cert must be true.
+        if !config.tls.require_client_cert {
+            zt_errors.push(
+                "tls.require_client_cert must be true in zero_trust_mode".to_string(),
+            );
+        }
+
+        if !zt_errors.is_empty() {
+            for e in &zt_errors {
+                error!("zero_trust_mode violation: {}", e);
+            }
+            anyhow::bail!(
+                "Startup aborted: {} zero_trust_mode constraint(s) violated",
+                zt_errors.len()
+            );
+        }
+        info!("Zero-trust mode: all constraints satisfied");
     }
 
     if args.validate {

@@ -192,6 +192,7 @@ impl AdminServer {
         let auth_state = Arc::new(AdminAuthState {
             allowed_ips: self.config.allowed_ips.clone(),
             auth_token: effective_token,
+            hmac_secret: self.config.hmac_secret.clone(),
             failed_attempts: Arc::new(DashMap::new()),
             global_failure_count: Arc::new(AtomicU32::new(0)),
             global_cooldown_until: Arc::new(RwLock::new(None)),
@@ -306,6 +307,10 @@ impl AdminServer {
 struct AdminAuthState {
     allowed_ips: Vec<String>,
     auth_token: Option<String>,
+    /// Proof-of-possession HMAC-SHA256 secret.  When set, every admin request
+    /// must carry X-Admin-Signature and X-Admin-Timestamp headers in addition
+    /// to the bearer token.
+    hmac_secret: Option<String>,
     /// Map from client IP string → (failure_count, window_start).
     /// Access is lock-free via DashMap.
     failed_attempts: Arc<DashMap<String, (u32, Instant)>>,
@@ -475,6 +480,54 @@ async fn auth_middleware(
         auth.failed_attempts.remove(&client_ip);
         auth.global_failure_count.store(0, Ordering::Relaxed);
         auth.global_cooldown_count.store(0, Ordering::Relaxed);
+    }
+
+    // Proof-of-possession: verify HMAC-SHA256 per-request signature if configured.
+    // This runs after bearer-token authorization succeeds so an attacker cannot
+    // probe the HMAC path without first holding a valid token.
+    if let Some(ref secret) = auth.hmac_secret {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let sig = headers
+            .get("x-admin-signature")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let ts = headers
+            .get("x-admin-timestamp")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        // Validate timestamp freshness (±300 s replay window).
+        let ts_i: i64 = ts.parse().unwrap_or(0);
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        if (now_ts - ts_i).abs() > 300 {
+            warn!(
+                "Admin API HMAC timestamp out of 300s window from {}",
+                client_ip
+            );
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+
+        // Canonicalized message: METHOD\nPATH\nTIMESTAMP
+        let req_method = request.method().as_str().to_owned();
+        let req_path = request.uri().path().to_owned();
+        let message = format!("{}\n{}\n{}", req_method, req_path, ts);
+
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+            .expect("HMAC accepts any key size");
+        mac.update(message.as_bytes());
+        let expected = hex::encode(mac.finalize().into_bytes());
+
+        let sig_valid: bool = sig.as_bytes().ct_eq(expected.as_bytes()).into();
+        if !sig_valid {
+            warn!("Admin API HMAC signature invalid from {}", client_ip);
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
     }
 
     next.run(request).await.into_response()

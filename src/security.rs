@@ -472,6 +472,10 @@ impl SecurityState {
             return true;
         }
         let config = self.config.read();
+        // DEPRECATED: trusted_internal_cidrs is deprecated in favour of mTLS
+        // client certificate verification (tls.require_client_cert = true).
+        // A startup warning is emitted in main.rs when any CIDRs are configured.
+        // IP-based trust will be removed in a future release.
         for cidr in &config.trusted_internal_cidrs {
             if cidr_contains_ip(cidr, ip) {
                 return true;

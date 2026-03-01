@@ -106,6 +106,7 @@ uuid = { version = "1.11", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 hex = "0.4"
+hmac = "0.12"
 rand = "0.8"
 subtle = "2.6"
 jsonwebtoken = "9.3"
