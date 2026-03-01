@@ -79,6 +79,36 @@
 | **Audit Logger Wired** | ✅ | `AuditLogger` constructed at startup and passed to the admin server; audit events are now actually written |
 | **Cryptographically Secure Admin Token** | ✅ | Ephemeral admin tokens use `OsRng` instead of `thread_rng` |
 | **OpenSSL Subprocess Env Sanitisation** | ✅ | All `openssl` subprocesses clear the environment before execution (`env_clear()`) to prevent PATH/LD_PRELOAD injection |
+| **Hot Reload** | ✅ | Configuration and TLS certificates reloaded at runtime without dropping connections or restarting |
+| **Log Rotation (SIGHUP)** | ✅ | `SIGHUP` reopens all log file handles in-place; compatible with logrotate `postrotate` — no restart required |
+| **TLS 1.3 Enforcement** | ✅ | TLS 1.3 minimum enforced on all listeners (OpenSSL 3.5+ for TCP/TLS, rustls for QUIC/HTTP3) |
+| **Server Identity Concealment** | ✅ | Server header suppressed and replaced with configurable custom branding |
+| **JWT Rate Limiting** | ✅ | Per-subject rate limiting with HMAC-SHA256 signature verification; unsigned `sub` claims rejected; non-HMAC algorithms blocked |
+| **Log Injection Prevention** | ✅ | Newlines and control characters stripped from all user-controlled fields before writing to access and audit logs |
+| **NEL (Network Error Logging)** | ✅ | Network Error Logging headers with configurable policy for client-side error reporting |
+| **`tls_skip_verify` Production Block** | ✅ | `tls_skip_verify = true` rejected at config load unless `--allow-insecure-backends` CLI flag is passed |
+| **SSRF Protection** | ✅ | Link-local and loopback backend addresses rejected; RFC1918 logged with warning; WAF SSRF pattern set active |
+| **Admin Brute-Force Lockout** | ✅ | Per-IP and global lockout with exponential back-off (5 min base, up to 30 min) on repeated auth failures |
+| **Connection Draining** | ✅ | Graceful backend removal with configurable drain timeout; in-flight requests complete before backend is taken out of rotation |
+| **Request Queuing** | ✅ | Queues requests when all backends are saturated; configurable queue depth and wait timeout |
+| **Slow Start** | ✅ | Gradually ramps traffic to recovered backends to avoid thundering herd after a circuit breaker reopens |
+| **Connection Pool** | ✅ | Per-backend connection pool with configurable max idle, max total, acquire timeout, and idle timeout |
+| **Session Affinity Modes** | ✅ | Sticky sessions via IP hash, custom header, or Set-Cookie with configurable SameSite attribute |
+| **Path Regex Routing** | ✅ | Per-route regex pattern matching with ReDoS prevention (pattern size-limited) |
+| **PQC Session Tickets** | ✅ | TLS session ticket HKDF keys wrapped with ML-KEM-1024 encapsulation (`pqc_session_tickets`) |
+| **TLS Key Permission Checks** | ✅ | Validates private key file permissions at startup; configurable strict mode aborts on insecure permissions |
+| **Malicious Fingerprint Blocking** | ✅ | JA3/JA4 database classification blocks known-malicious fingerprints (`block_malicious`) with configurable cache TTL |
+| **Server-Timing Header** | ✅ | Per-request `Server-Timing` header with proxy latency breakdown for performance visibility |
+| **Accept-CH Header** | ✅ | `Accept-CH` client hints advertisement for adaptive content delivery |
+| **Graceful Shutdown Drain** | ✅ | Configurable drain timeout polls active connections at 100 ms intervals; exits as soon as connections reach zero |
+| **Weighted Load Balancing** | ✅ | Per-server weight (1–1000) with smooth weighted round-robin for proportional traffic distribution |
+| **Least Response Time Routing** | ✅ | Routes requests to the backend with the lowest moving-average response time |
+| **IP Hash Load Balancing** | ✅ | Deterministic backend selection by client IP hash for implicit session stickiness |
+| **Per-Server Priority** | ✅ | Failover priority levels; lower-priority backends only receive traffic when higher-priority ones are unhealthy |
+| **Per-Server Keep-Alive** | ✅ | Configurable QUIC keep-alive interval per server to prevent idle connection timeouts |
+| **DNS Prefetch / Preconnect / Prerender Hints** | ✅ | Early Hints Link headers for dns-prefetch, preconnect, modulepreload, and speculative prerender |
+| **Report-To Header** | ✅ | Reporting endpoint configuration injected into responses for NEL and CSP violation delivery |
+| **Fingerprint Cache TTL** | ✅ | JA3/JA4 fingerprint classification cache with configurable max-age and background cleanup |
 
 ## Features
 
