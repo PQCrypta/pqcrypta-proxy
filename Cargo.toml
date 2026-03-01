@@ -138,7 +138,7 @@ sha1 = "0.10"
 md-5 = "0.10"
 
 # X.509 certificate parsing (for OCSP)
-x509-parser = "0.16"
+x509-parser = "0.18"
 
 # HTTP client for OCSP requests and ACME
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
