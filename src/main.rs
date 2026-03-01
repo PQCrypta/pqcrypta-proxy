@@ -293,9 +293,7 @@ async fn main() -> anyhow::Result<()> {
 
         // 3. require_client_cert must be true.
         if !config.tls.require_client_cert {
-            zt_errors.push(
-                "tls.require_client_cert must be true in zero_trust_mode".to_string(),
-            );
+            zt_errors.push("tls.require_client_cert must be true in zero_trust_mode".to_string());
         }
 
         // 4. Admin API must require proof-of-possession.

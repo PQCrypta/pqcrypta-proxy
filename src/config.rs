@@ -1007,6 +1007,8 @@ pub struct SecurityConfig {
     /// - All backends must use tls_mode = "reencrypt" or "passthrough" (no plaintext)
     /// - trusted_internal_cidrs must be empty
     /// - TLS require_client_cert must be true
+    /// - admin.hmac_secret must be set (bearer-only admin auth is insufficient)
+    ///
     /// Startup aborts if any constraint is violated.
     #[serde(default)]
     pub zero_trust_mode: bool,

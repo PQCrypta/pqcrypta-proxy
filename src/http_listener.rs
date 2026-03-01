@@ -2154,7 +2154,8 @@ async fn proxy_handler(
                 if !client_cert_present {
                     warn!(
                         "Internal route {:?} rejected request from {}: no client certificate",
-                        route.name, client_addr.ip()
+                        route.name,
+                        client_addr.ip()
                     );
                     return StatusCode::UNAUTHORIZED.into_response();
                 }
@@ -2169,7 +2170,7 @@ async fn proxy_handler(
             .security
             .as_ref()
             .and_then(|s| s.hmac_secret.as_ref())
-            .map(String::clone)
+            .cloned()
         {
             use hmac::{Hmac, Mac};
             use sha2::Sha256;
@@ -2182,19 +2183,18 @@ async fn proxy_handler(
                 .get("x-request-timestamp")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
-            let nonce_val = headers
-                .get("x-request-nonce")
-                .and_then(|v| v.to_str().ok());
+            let nonce_val = headers.get("x-request-nonce").and_then(|v| v.to_str().ok());
 
-            let ts_i: i64 = ts.parse().unwrap_or(0);
+            let ts_u: u64 = ts.parse().unwrap_or(0);
             let now_ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_secs() as i64;
-            if (now_ts - ts_i).abs() > 300 {
+                .as_secs();
+            if now_ts.abs_diff(ts_u) > 300 {
                 warn!(
                     "Route {:?} HMAC timestamp out of 300s window from {}",
-                    route.name, client_addr.ip()
+                    route.name,
+                    client_addr.ip()
                 );
                 return StatusCode::UNAUTHORIZED.into_response();
             }
@@ -2203,16 +2203,16 @@ async fn proxy_handler(
             let path_and_query = uri
                 .path_and_query()
                 .map(|pq| pq.as_str())
-                .unwrap_or(uri.path());
+                .unwrap_or_else(|| uri.path());
 
             let message = match nonce_val {
                 Some(n) => format!("{}\n{}\n{}\n{}", method.as_str(), path_and_query, ts, n),
-                None    => format!("{}\n{}\n{}",    method.as_str(), path_and_query, ts),
+                None => format!("{}\n{}\n{}", method.as_str(), path_and_query, ts),
             };
 
             type HmacSha256 = Hmac<Sha256>;
-            let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-                .expect("HMAC accepts any key size");
+            let mut mac =
+                HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key size");
             mac.update(message.as_bytes());
             let expected = hex::encode(mac.finalize().into_bytes());
 
@@ -2221,7 +2221,8 @@ async fn proxy_handler(
             if !valid {
                 warn!(
                     "Route {:?} HMAC signature invalid from {}",
-                    route.name, client_addr.ip()
+                    route.name,
+                    client_addr.ip()
                 );
                 return StatusCode::UNAUTHORIZED.into_response();
             }
@@ -2232,7 +2233,8 @@ async fn proxy_handler(
                 if state.hmac_nonce_store.check_and_insert(n) {
                     warn!(
                         "Route {:?} HMAC nonce replay detected from {}",
-                        route.name, client_addr.ip()
+                        route.name,
+                        client_addr.ip()
                     );
                     return StatusCode::UNAUTHORIZED.into_response();
                 }

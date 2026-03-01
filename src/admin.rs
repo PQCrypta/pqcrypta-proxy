@@ -500,17 +500,15 @@ async fn auth_middleware(
             .get("x-admin-timestamp")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        let nonce_val = headers
-            .get("x-admin-nonce")
-            .and_then(|v| v.to_str().ok());
+        let nonce_val = headers.get("x-admin-nonce").and_then(|v| v.to_str().ok());
 
         // Validate timestamp freshness (±300 s replay window).
-        let ts_i: i64 = ts.parse().unwrap_or(0);
+        let ts_u: u64 = ts.parse().unwrap_or(0);
         let now_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs() as i64;
-        if (now_ts - ts_i).abs() > 300 {
+            .as_secs();
+        if now_ts.abs_diff(ts_u) > 300 {
             warn!(
                 "Admin API HMAC timestamp out of 300s window from {}",
                 client_ip
@@ -529,12 +527,12 @@ async fn auth_middleware(
 
         let message = match nonce_val {
             Some(n) => format!("{}\n{}\n{}\n{}", req_method, req_path_and_query, ts, n),
-            None    => format!("{}\n{}\n{}",    req_method, req_path_and_query, ts),
+            None => format!("{}\n{}\n{}", req_method, req_path_and_query, ts),
         };
 
         type HmacSha256 = Hmac<Sha256>;
-        let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-            .expect("HMAC accepts any key size");
+        let mut mac =
+            HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key size");
         mac.update(message.as_bytes());
         let expected = hex::encode(mac.finalize().into_bytes());
 
