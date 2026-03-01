@@ -81,7 +81,7 @@
 | **OpenSSL Subprocess Env Sanitisation** | ✅ | All `openssl` subprocesses clear the environment before execution (`env_clear()`) to prevent PATH/LD_PRELOAD injection |
 | **Hot Reload** | ✅ | Configuration and TLS certificates reloaded at runtime without dropping connections or restarting |
 | **Log Rotation (SIGHUP)** | ✅ | `SIGHUP` reopens all log file handles in-place; compatible with logrotate `postrotate` — no restart required |
-| **TLS 1.3 Enforcement** | ✅ | TLS 1.3 minimum enforced on all listeners (OpenSSL 3.5+ for TCP/TLS, rustls for QUIC/HTTP3) |
+| **TLS 1.3 Default** | ✅ | TLS 1.3 minimum by default on all listeners (`min_version = "1.3"`); configurable to allow TLS 1.2 via `min_version` in `[tls]` |
 | **Server Identity Concealment** | ✅ | Server header suppressed and replaced with configurable custom branding |
 | **JWT Rate Limiting** | ✅ | Per-subject rate limiting with HMAC-SHA256 signature verification; unsigned `sub` claims rejected; non-HMAC algorithms blocked |
 | **Log Injection Prevention** | ✅ | Newlines and control characters stripped from all user-controlled fields before writing to access and audit logs |
@@ -132,7 +132,7 @@
 - **PQC Downgrade Detection**: Detects classical-only TLS negotiation when PQC is required; configurable action: block (421), log, or allow
 - **PQC + Fingerprinting Combined**: OpenSSL ML-KEM with ClientHello capture for early blocking
 - **PQC Session Tickets**: TLS session ticket HKDF keys wrapped with ML-KEM-1024 encapsulation (`pqc_session_tickets`) to protect resumed sessions against harvest-now-decrypt-later attacks
-- **TLS 1.3 Enforcement**: TLS 1.2 and below rejected on all listeners — OpenSSL 3.5+ for TCP/TLS, rustls for QUIC/HTTP3
+- **TLS 1.3 Default**: TLS 1.3 minimum on all listeners by default (`min_version = "1.3"` in `[tls]`); TLS 1.2 can be permitted via config — OpenSSL 3.5+ for TCP/TLS, rustls for QUIC/HTTP3
 - **TLS Key Permission Checks**: Private key file permissions validated at startup; `strict_key_permissions = true` aborts if permissions are too permissive
 - **0-RTT Replay Protection**: Nonce store (strict/session/none modes) — rejects replayed TLS 1.3 early-data nonces within configurable window
 - **Circuit Breaker**: Per-backend protection from cascading failures; per-backend threshold/delay overrides
@@ -1188,7 +1188,7 @@ cargo run --release --bin quic-bench -- --target localhost:443
 
 ### All Security Features
 
-- [x] TLS 1.3 only (enforced for both TCP/TLS via OpenSSL 3.5+ and QUIC/HTTP3 via rustls)
+- [x] TLS 1.3 minimum by default (configurable via `min_version`; applies to both TCP/TLS via OpenSSL 3.5+ and QUIC/HTTP3 via rustls)
 - [x] Full security headers (HSTS, COEP, COOP, CORP, etc.)
 - [x] Server identity hidden (custom branding)
 - [x] X-Forwarded-For header support
