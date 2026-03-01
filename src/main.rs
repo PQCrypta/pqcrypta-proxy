@@ -298,6 +298,15 @@ async fn main() -> anyhow::Result<()> {
             );
         }
 
+        // 4. Admin API must require proof-of-possession.
+        if config.admin.hmac_secret.is_none() {
+            zt_errors.push(
+                "admin.hmac_secret must be set in zero_trust_mode; \
+                 bearer-only admin auth is insufficient for zero-trust"
+                    .to_string(),
+            );
+        }
+
         if !zt_errors.is_empty() {
             for e in &zt_errors {
                 error!("zero_trust_mode violation: {}", e);

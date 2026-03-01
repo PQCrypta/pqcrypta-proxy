@@ -91,6 +91,54 @@ impl ZeroRttNonceStore {
     }
 }
 
+/// Per-request nonce store for HMAC proof-of-possession replay protection.
+///
+/// Clients include a unique `X-Request-Nonce` (or `X-Admin-Nonce`) whose value
+/// is incorporated into the HMAC signature. The server records SHA-256 digests
+/// of seen nonces and rejects duplicates within the retention window.
+///
+/// Nonces are stored as SHA-256 digests to bound memory regardless of input length.
+/// Entries are lazily evicted on each `check_and_insert` call.
+pub struct HmacNonceStore {
+    /// nonce-digest → insertion time
+    nonces: DashMap<[u8; 32], Instant>,
+    /// Retention window in seconds (should equal the HMAC timestamp window)
+    window_secs: u64,
+}
+
+impl HmacNonceStore {
+    pub fn new(window_secs: u64) -> Self {
+        Self {
+            nonces: DashMap::new(),
+            window_secs,
+        }
+    }
+
+    /// Returns `true` if this nonce has been seen before within the window
+    /// (replay detected); `false` if it is new (nonce recorded).
+    ///
+    /// Expired entries are lazily evicted on each call.
+    pub fn check_and_insert(&self, nonce: &str) -> bool {
+        let now = Instant::now();
+        let window = self.window_secs;
+        self.nonces
+            .retain(|_, inserted_at| now.duration_since(*inserted_at).as_secs() < window);
+        let digest = Self::digest(nonce);
+        if self.nonces.contains_key(&digest) {
+            return true; // replay
+        }
+        self.nonces.insert(digest, now);
+        false
+    }
+
+    fn digest(nonce: &str) -> [u8; 32] {
+        let d = Sha256::digest(nonce.as_bytes());
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&d);
+        out
+    }
+}
+
 /// Connection info with fingerprint data
 #[derive(Clone, Debug)]
 pub struct FingerprintedConnection {

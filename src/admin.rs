@@ -193,6 +193,7 @@ impl AdminServer {
             allowed_ips: self.config.allowed_ips.clone(),
             auth_token: effective_token,
             hmac_secret: self.config.hmac_secret.clone(),
+            hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(300)),
             failed_attempts: Arc::new(DashMap::new()),
             global_failure_count: Arc::new(AtomicU32::new(0)),
             global_cooldown_until: Arc::new(RwLock::new(None)),
@@ -311,6 +312,8 @@ struct AdminAuthState {
     /// must carry X-Admin-Signature and X-Admin-Timestamp headers in addition
     /// to the bearer token.
     hmac_secret: Option<String>,
+    /// Nonce store for admin API HMAC replay protection.
+    hmac_nonce_store: Arc<crate::tls_acceptor::HmacNonceStore>,
     /// Map from client IP string → (failure_count, window_start).
     /// Access is lock-free via DashMap.
     failed_attempts: Arc<DashMap<String, (u32, Instant)>>,
@@ -497,6 +500,9 @@ async fn auth_middleware(
             .get("x-admin-timestamp")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
+        let nonce_val = headers
+            .get("x-admin-nonce")
+            .and_then(|v| v.to_str().ok());
 
         // Validate timestamp freshness (±300 s replay window).
         let ts_i: i64 = ts.parse().unwrap_or(0);
@@ -512,10 +518,19 @@ async fn auth_middleware(
             return StatusCode::UNAUTHORIZED.into_response();
         }
 
-        // Canonicalized message: METHOD\nPATH\nTIMESTAMP
+        // Sign path + query string.
+        let req_path_and_query = {
+            let uri = request.uri();
+            uri.path_and_query()
+                .map(|pq| pq.as_str().to_owned())
+                .unwrap_or_else(|| uri.path().to_owned())
+        };
         let req_method = request.method().as_str().to_owned();
-        let req_path = request.uri().path().to_owned();
-        let message = format!("{}\n{}\n{}", req_method, req_path, ts);
+
+        let message = match nonce_val {
+            Some(n) => format!("{}\n{}\n{}\n{}", req_method, req_path_and_query, ts, n),
+            None    => format!("{}\n{}\n{}",    req_method, req_path_and_query, ts),
+        };
 
         type HmacSha256 = Hmac<Sha256>;
         let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
@@ -527,6 +542,14 @@ async fn auth_middleware(
         if !sig_valid {
             warn!("Admin API HMAC signature invalid from {}", client_ip);
             return StatusCode::UNAUTHORIZED.into_response();
+        }
+
+        // Nonce deduplication: reject replays within the 300s window.
+        if let Some(n) = nonce_val {
+            if auth.hmac_nonce_store.check_and_insert(n) {
+                warn!("Admin API HMAC nonce replay detected from {}", client_ip);
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
         }
     }
 

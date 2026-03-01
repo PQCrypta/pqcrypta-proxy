@@ -207,6 +207,8 @@ pub struct HttpListenerState {
     pub load_balancer: Arc<LoadBalancer>,
     /// Metrics registry for request tracking
     pub metrics: Arc<MetricsRegistry>,
+    /// Nonce store for per-route HMAC replay protection (shared across all routes).
+    pub hmac_nonce_store: Arc<crate::tls_acceptor::HmacNonceStore>,
 }
 
 /// Create and run the HTTP listener with TLS termination
@@ -289,6 +291,7 @@ pub async fn run_http_listener(
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
         metrics: state_metrics,
+        hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(300)),
     };
 
     // Initialize compression state
@@ -470,6 +473,7 @@ pub async fn run_http_listener_pqc(
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
         metrics: state_metrics,
+        hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(300)),
     };
 
     // Initialize compression state
@@ -707,6 +711,7 @@ pub async fn run_http_listener_with_fingerprint(
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
         metrics: state_metrics,
+        hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(300)),
     };
 
     // Initialize compression state
@@ -1072,6 +1077,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
         metrics: state_metrics,
+        hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(300)),
     };
 
     // Initialize middleware states
@@ -2156,8 +2162,9 @@ async fn proxy_handler(
         }
 
         // Per-route HMAC proof-of-possession.
-        // Signature = HMAC-SHA256(METHOD + "\n" + PATH + "\n" + TIMESTAMP, secret).
-        // Timestamp must be within 300 s of server time (replay protection).
+        // Signature = HMAC-SHA256(METHOD\nPATH_AND_QUERY\nTIMESTAMP[\nNONCE], secret).
+        // X-Request-Nonce, when present, is bound into the signature and checked for
+        // uniqueness within the window (full replay prevention).
         if let Some(ref secret) = route
             .security
             .as_ref()
@@ -2175,6 +2182,9 @@ async fn proxy_handler(
                 .get("x-request-timestamp")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
+            let nonce_val = headers
+                .get("x-request-nonce")
+                .and_then(|v| v.to_str().ok());
 
             let ts_i: i64 = ts.parse().unwrap_or(0);
             let now_ts = std::time::SystemTime::now()
@@ -2189,7 +2199,17 @@ async fn proxy_handler(
                 return StatusCode::UNAUTHORIZED.into_response();
             }
 
-            let message = format!("{}\n{}\n{}", method.as_str(), path, ts);
+            // Sign full path + query string to prevent query-parameter mutation attacks.
+            let path_and_query = uri
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or(uri.path());
+
+            let message = match nonce_val {
+                Some(n) => format!("{}\n{}\n{}\n{}", method.as_str(), path_and_query, ts, n),
+                None    => format!("{}\n{}\n{}",    method.as_str(), path_and_query, ts),
+            };
+
             type HmacSha256 = Hmac<Sha256>;
             let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
                 .expect("HMAC accepts any key size");
@@ -2204,6 +2224,18 @@ async fn proxy_handler(
                     route.name, client_addr.ip()
                 );
                 return StatusCode::UNAUTHORIZED.into_response();
+            }
+
+            // Nonce deduplication: reject replays within the 300s window.
+            // Run after signature validation to avoid polluting the store on bad sigs.
+            if let Some(n) = nonce_val {
+                if state.hmac_nonce_store.check_and_insert(n) {
+                    warn!(
+                        "Route {:?} HMAC nonce replay detected from {}",
+                        route.name, client_addr.ip()
+                    );
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
             }
         }
 

@@ -23,7 +23,7 @@
 - **Structured Access Logging**: Per-request JSON or text logs with latency, bytes, upstream, and client IP
 - **Enterprise Load Balancing**: 6 algorithms, session affinity, health-aware routing, per-backend retry policies, per-backend circuit breaker overrides
 - **Multi-Dimensional Rate Limiting**: Composite keys, JA3/JA4-based, JWT-verified, adaptive ML anomaly detection
-- **Zero-Trust Primitives**: Per-route HMAC proof-of-possession, internal route mTLS auto-enforcement, zero-trust mode startup validation, admin proof-of-possession, `trusted_internal_cidrs` deprecation
+- **Zero-Trust Primitives**: Per-route HMAC proof-of-possession (path+query signed, nonce replay prevention), internal route mTLS auto-enforcement, zero-trust mode startup validation (includes admin HMAC requirement), admin proof-of-possession, `trusted_internal_cidrs` deprecation
 
 ## All Features Implemented
 
@@ -79,10 +79,10 @@
 | **Shared Security State (QUIC)** | ✅ | All QUIC listeners now share one `SecurityState`; blocked IPs and rate limiters are visible across all ports |
 | **Audit Logger Wired** | ✅ | `AuditLogger` constructed at startup and passed to the admin server; audit events are now actually written |
 | **Cryptographically Secure Admin Token** | ✅ | Ephemeral admin tokens use `OsRng` instead of `thread_rng` |
-| **`zero_trust_mode`** | ✅ | Startup validation enforcing mTLS, no plaintext backends, no CIDR trust |
-| **Per-Route HMAC Signing** | ✅ | HMAC-SHA256 proof-of-possession per request via `hmac_secret` in route security policy |
+| **`zero_trust_mode`** | ✅ | Startup validation enforcing mTLS, no plaintext backends, no CIDR trust, and admin HMAC proof-of-possession |
+| **Per-Route HMAC Signing** | ✅ | HMAC-SHA256 proof-of-possession signing full path+query string; optional `X-Request-Nonce` binds nonce into signature for full replay prevention within 300 s window |
 | **Internal Route Auto-mTLS** | ✅ | `internal = true` routes default to requiring client certificate |
-| **Admin HMAC Proof-of-Possession** | ✅ | Optional per-request HMAC signature alongside bearer token for admin API |
+| **Admin HMAC Proof-of-Possession** | ✅ | Optional per-request HMAC signature (path+query signed) alongside bearer token; optional `X-Admin-Nonce` for full replay prevention |
 | **`trusted_internal_cidrs` Deprecation** | ✅ | Startup warning directing operators to cert-based trust |
 | **OpenSSL Subprocess Env Sanitisation** | ✅ | All `openssl` subprocesses clear the environment before execution (`env_clear()`) to prevent PATH/LD_PRELOAD injection |
 | **Hot Reload** | ✅ | Configuration and TLS certificates reloaded at runtime without dropping connections or restarting |
