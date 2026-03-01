@@ -854,6 +854,20 @@ async fn main() -> anyhow::Result<()> {
     // Print startup summary
     print_startup_summary(&config, tls_provider.is_pqc_enabled());
 
+    // SIGHUP handler: reopen log files without restarting (for log rotation)
+    #[cfg(unix)]
+    tokio::spawn(async {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sighup = signal(SignalKind::hangup()).expect("Failed to install SIGHUP handler");
+        loop {
+            sighup.recv().await;
+            info!("Received SIGHUP — reopening log files");
+            if let Some(logger) = pqcrypta_proxy::access_logger::get_access_logger() {
+                logger.reopen();
+            }
+        }
+    });
+
     // Wait for shutdown signal
     info!("Press Ctrl+C to shutdown gracefully");
     tokio::select! {
