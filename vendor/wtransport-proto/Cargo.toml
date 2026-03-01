@@ -1,6 +1,6 @@
 [package]
 name = "wtransport-proto"
-version = "0.6.1"
+version = "0.7.0"
 license = "MIT OR Apache-2.0"
 authors = ["Biagio Festa"]
 description = "Implementation of the WebTransport (over HTTP3) protocol"
@@ -23,6 +23,7 @@ tokio = { version = "1.28.1", default-features = false, features = ["macros", "r
 [features]
 default = []
 async = []
+
 
 [package.metadata.docs.rs]
 all-features = true

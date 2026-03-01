@@ -1,6 +1,6 @@
 [package]
 name = "wtransport"
-version = "0.6.1"
+version = "0.7.0"
 license = "MIT OR Apache-2.0"
 authors = ["Biagio Festa"]
 description = "Implementation of the WebTransport (over HTTP3) protocol"
@@ -41,7 +41,7 @@ time = "0.3.21"
 tokio = { version = "1.28.1", default-features = false, features = ["macros", "fs", "io-util"] }
 tracing = "0.1.37"
 url = "2.4.0"
-wtransport-proto = { version = "0.6.1", path = "../wtransport-proto", features = ["async"] }
+wtransport-proto = { version = "0.7.0", path = "../wtransport-proto", features = ["async"] }
 x509-parser = "0.17.0"
 
 [dev-dependencies]
@@ -62,6 +62,7 @@ quinn-log = ["quinn/log"]
 ring = ["quinn/ring", "quinn/rustls", "rustls/ring", "rcgen?/ring"]
 self-signed = ["dep:rcgen"]
 
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
@@ -70,7 +71,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 allowed_external_types = [
     "bytes::bytes::Bytes",
     "quinn",
+    "quinn::connection::Connecting",
     "quinn::connection::Connection",
+    "quinn::incoming::Incoming",
     "quinn::recv_stream::ReadError",
     "quinn::recv_stream::RecvStream",
     "quinn::send_stream::SendStream",

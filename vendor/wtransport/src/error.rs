@@ -56,7 +56,6 @@ impl ConnectionError {
         match quic_connection.close_reason() {
             Some(reason) => reason.into(),
             None => {
-                // Connection still alive but driver reported NotConnected.
                 // This race condition can occur when driver threads are processing
                 // incoming streams while connection cleanup is triggered.
                 ConnectionError::LocallyClosed
@@ -124,7 +123,6 @@ impl ConnectingError {
         ConnectingError::ConnectionError(match quic_connection.close_reason() {
             Some(reason) => reason.into(),
             None => {
-                // Connection still alive but error reported.
                 // This race condition can occur when driver threads are processing
                 // incoming streams while connection cleanup is triggered.
                 ConnectionError::LocallyClosed
