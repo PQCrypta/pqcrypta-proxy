@@ -121,25 +121,35 @@
 - **Custom Header Injection**: Inject arbitrary response or request headers per route before forwarding to backends
 - **Per-Route Timeout Overrides**: Independent timeout configuration per route, overriding global defaults
 - **Multiple Listener Ports**: Primary port plus any number of additional ports (`additional_ports`) all supporting QUIC/HTTP3/WebTransport
+- **Path Regex Routing**: Per-route regex pattern matching alongside exact and prefix matching; ReDoS prevention via pattern size limit
 
 ### Security
 - **WAF**: OWASP Top 10 pattern-based inspection — SQLi, XSS, path traversal, NoSQLi, SSRF, command injection, XXE, insecure deserialization; detect or block mode; custom patterns; body scanning
 - **JA3/JA4 TLS Fingerprinting**: Detects browsers, bots, scanners, malware based on TLS ClientHello
 - **JA3/JA4 Replay Detection**: Flags same fingerprint arriving from multiple IPs within a configurable window — catches credential-stuffing and fingerprint spoofing
 - **JA3/JA4 Drift Detection**: Flags cipher/extension composition changes on the same fingerprint hash — detects TLS library upgrades or evasion attempts
+- **Malicious Fingerprint Blocking**: `block_malicious = true` in fingerprint config automatically blocks connections whose JA3/JA4 hash matches a known-malicious entry in the classification database; fingerprint cache with configurable TTL and background cleanup
 - **PQC Downgrade Detection**: Detects classical-only TLS negotiation when PQC is required; configurable action: block (421), log, or allow
 - **PQC + Fingerprinting Combined**: OpenSSL ML-KEM with ClientHello capture for early blocking
+- **PQC Session Tickets**: TLS session ticket HKDF keys wrapped with ML-KEM-1024 encapsulation (`pqc_session_tickets`) to protect resumed sessions against harvest-now-decrypt-later attacks
+- **TLS 1.3 Enforcement**: TLS 1.2 and below rejected on all listeners — OpenSSL 3.5+ for TCP/TLS, rustls for QUIC/HTTP3
+- **TLS Key Permission Checks**: Private key file permissions validated at startup; `strict_key_permissions = true` aborts if permissions are too permissive
 - **0-RTT Replay Protection**: Nonce store (strict/session/none modes) — rejects replayed TLS 1.3 early-data nonces within configurable window
 - **Circuit Breaker**: Per-backend protection from cascading failures; per-backend threshold/delay overrides
 - **Advanced Rate Limiting**: Multi-dimensional limiting (IP, JA3/JA4, JWT-verified subject, headers, composite keys)
+- **JWT Rate Limiting**: Per-subject limiting with HMAC-SHA256 signature verification before trusting the `sub` claim; unsigned tokens and non-HMAC algorithms rejected
+- **Admin Brute-Force Lockout**: Per-IP and global lockout with exponential back-off (5 min base, up to 30 min) on repeated admin authentication failures
 - **NAT-Friendly**: JA3/JA4 fingerprints identify clients behind shared corporate IPs
 - **Adaptive Baseline**: ML-inspired anomaly detection learns normal traffic patterns
 - **DoS Protection**: Connection limits, body size enforcement, request validation, auto-blocking
 - **GeoIP Blocking**: Block by country/region using MaxMind GeoLite2 database; configurable block duration via `geoip_block_duration_secs` (default 24 h)
+- **SSRF Protection**: Link-local (169.254.x.x) and loopback backend addresses rejected at config load; RFC1918 backends log a warning; WAF SSRF pattern set active for request inspection
 - **Per-Route Security Policy**: Per-route mTLS requirement, JA3 allowlist, rate limit override, WAF mode override, 0-RTT control
 - **Security Headers**: HSTS, X-Frame-Options, CSP, COEP, COOP, CORP, and more
 - **CORS Handling**: Full CORS support with preflight OPTIONS handling
-- **Server Branding**: Hide backend identity (Apache/nginx → "PQCProxy v0.2.2")
+- **Server Identity Concealment**: Server header suppressed; configurable custom branding replaces backend identity
+- **Log Injection Prevention**: Newlines and all control characters stripped from every user-controlled field before writing to access or audit logs
+- **`tls_skip_verify` Production Block**: `tls_skip_verify = true` rejected at config load; requires explicit `--allow-insecure-backends` CLI flag to override
 - **IP Blocklists (DB-synced)**: Live-synced IP, fingerprint, and country blocklists pulled from the application database — supports individual IPs and CIDR subnet ranges (e.g. `192.0.2.0/24`); updates without restart
 - **ACME Domain Path Sanitization**: Domain names validated against RFC 1035 before use in file-system paths — prevents path traversal via config
 
@@ -154,13 +164,16 @@
 - **Backend Pools**: Group multiple servers per route for high availability
 - **Session Affinity**: Cookie-based, IP hash, or custom header sticky sessions; each mode uses its own dedicated map with TTL eviction
 - **Health-Aware Routing**: Automatically bypasses unhealthy backends; proactive TCP-connect health checks on configurable interval detect failures before traffic hits them
-- **Slow Start**: Gradually increases traffic to recovering servers
-- **Connection Draining**: Graceful server removal without dropping connections
+- **Slow Start**: Gradually increases traffic to recovering servers to avoid thundering herd after circuit breaker reopens
+- **Connection Draining**: Graceful server removal with configurable drain timeout; in-flight requests complete before backend is taken out of rotation
+- **Request Queuing**: Queues requests when all backends are saturated; configurable queue depth and wait timeout
+- **Connection Pool**: Per-backend connection pool with configurable max idle connections, max total connections, acquire timeout, and idle timeout
+- **Per-Server Keep-Alive**: Configurable QUIC keep-alive interval per server to prevent idle connection timeouts
 - **Priority Failover**: Primary servers first, then failover to lower priority
 
 ### HTTP/3 Advanced Features
 - **Full HTTP/3 Support**: Native HTTP/3 via `h3` crate with proper header forwarding
-- **Early Hints (103)**: Preload CSS/JS resources via Link headers
+- **Early Hints (103)**: Preload CSS/JS resources via Link headers — dns-prefetch, preconnect, modulepreload, and speculative prerender hint types supported
 - **Priority Hints**: RFC 9218 Extensible Priorities for resource scheduling (`u=3,i=?0`)
 - **Request Coalescing**: Deduplicate identical GET/HEAD requests in flight
 - **Alt-Svc Advertisement**: Dynamic HTTP/3 upgrade headers on all ports — built from `udp_port` and `additional_ports` at startup so every listener advertises its actual address
@@ -187,7 +200,8 @@
 - **Access Logging**: Per-request structured logging in JSON or plain-text format; configurable output file, includes method, path, status, latency, bytes, client IP, and upstream; user-controlled fields sanitized to prevent log injection
 - **Audit Logging**: Async structured JSON audit log for security-relevant events — admin actions, auth failures, WAF blocks/detects, IP blocks, rate limit hits, PQC downgrade events, config and TLS reloads, JA3 replay/drift detections
 - **Log Rotation via SIGHUP**: Sending `SIGHUP` to the proxy reopens all log file handles without dropping connections or restarting — compatible with standard logrotate `postrotate` hooks (`systemctl kill -s HUP pqcrypta-proxy`)
-- **Admin API**: Health checks, Prometheus metrics, config reload, graceful shutdown, QUIC health, WebTransport health; loopback enforcement prevents plain-HTTP token exposure on non-loopback interfaces; ephemeral session tokens use `OsRng` for cryptographic security
+- **Admin API**: Health checks, Prometheus metrics, config reload, graceful shutdown, QUIC health, WebTransport health; loopback enforcement prevents plain-HTTP token exposure on non-loopback interfaces; ephemeral session tokens use `OsRng` for cryptographic security; per-IP and global brute-force lockout with exponential back-off
+- **Graceful Shutdown Drain**: Configurable drain timeout polls active connections at 100 ms intervals and exits as soon as they reach zero — no unnecessary delay on idle restarts
 - **Certificate Transparency**: New ACME-issued certs submitted to configured CT logs via `POST /ct/v1/add-chain` for public auditability
 - **Per-Backend Retry**: Configurable retry count and exponential backoff per backend; retry on 5xx responses, connect failures, or timeouts
 - **Cross-Platform**: Linux, macOS, and Windows support
