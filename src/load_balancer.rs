@@ -8,12 +8,8 @@
 //! - Slow start for recovering backends
 //! - Connection draining for graceful removal
 //!
-//! # Integration Status
-//! Connection draining and semaphore-based connection limiting are scaffolded
-//! for future graceful shutdown and connection pooling improvements.
-
-// Allow dead code for scaffolded connection management features
-#![allow(dead_code)]
+//! Connection draining is fully implemented via `BackendServer::start_draining()`,
+//! invoked through `LoadBalancer::drain_server()` for graceful backend removal.
 
 /// Maximum age of a sticky session mapping before it is silently evicted.
 /// Prevents cookie_sessions / ip_sessions / header_sessions from growing without bound

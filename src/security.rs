@@ -9,12 +9,9 @@
 //! - Circuit breaker for backend protection
 //! - GeoIP blocking (optional feature)
 //!
-//! # Integration Status
-//! JA3 calculation and GeoIP features are scaffolded. GeoIP requires MaxMind database
-//! integration. JA3 functions are duplicated in fingerprint.rs with full JA4 support.
-
-// Allow dead code for scaffolded GeoIP and JA3 features
-#![allow(dead_code)]
+//! # GeoIP
+//! GeoIP blocking is an optional feature requiring MaxMind database integration
+//! (enable with `--features geoip`). Active JA3/JA4 fingerprinting lives in `fingerprint.rs`.
 
 use std::net::IpAddr;
 use std::num::NonZeroU32;
@@ -99,7 +96,6 @@ use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
 use parking_lot::RwLock;
-use sha2::Digest;
 use tracing::{debug, info, warn};
 
 use crate::config::{CircuitBreakerConfig, ProxyConfig, RateLimitConfig, SecurityConfig};
@@ -111,8 +107,6 @@ use crate::waf::{WafEngine, WafRequest, WafVerdict};
 struct Ja3DbEntry {
     hash: String,
     classification: String,
-    #[serde(default)]
-    description: Option<String>,
 }
 
 /// JA3/JA4 fingerprint database loaded from a JSON file at startup.
@@ -252,8 +246,6 @@ pub enum BlockReason {
 #[derive(serde::Deserialize)]
 struct BlocklistEntry {
     ip: String,
-    reason: String,
-    threat_level: String,
     expires_at: Option<String>,
 }
 
@@ -1332,11 +1324,6 @@ fn geo_blocked_response(alt_svc: &str) -> Response {
     response
 }
 
-/// Generate rate limit exceeded response
-fn rate_limit_response(config: &RateLimitConfig, alt_svc: &str) -> Response {
-    rate_limit_response_simple(config.requests_per_second, alt_svc)
-}
-
 /// Generate rate limit exceeded response with just the RPS value
 fn rate_limit_response_simple(requests_per_second: u32, alt_svc: &str) -> Response {
     let mut response = (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
@@ -1396,157 +1383,6 @@ fn headers_too_large_response(max_size: usize, alt_svc: &str) -> Response {
         .into_response();
     add_alt_svc(&mut response, alt_svc);
     response
-}
-
-/// JA3 fingerprint calculation from TLS ClientHello
-///
-/// JA3 format: SSLVersion,Ciphers,Extensions,EllipticCurves,EllipticCurvePointFormats
-pub fn calculate_ja3(client_hello: &[u8]) -> Option<String> {
-    // Parse TLS ClientHello to extract:
-    // - SSL/TLS version
-    // - Cipher suites
-    // - Extensions
-    // - Elliptic curves (supported_groups)
-    // - EC point formats
-
-    if client_hello.len() < 43 {
-        return None;
-    }
-
-    // Skip record layer header (5 bytes) and handshake header (4 bytes)
-    let handshake = if client_hello[0] == 0x16 {
-        &client_hello[9..]
-    } else {
-        client_hello
-    };
-
-    if handshake.len() < 38 {
-        return None;
-    }
-
-    // TLS version (2 bytes at offset 0)
-    let tls_version = u16::from_be_bytes([handshake[0], handshake[1]]);
-
-    // Skip random (32 bytes) and session ID
-    let mut offset = 34;
-    if offset >= handshake.len() {
-        return None;
-    }
-    let session_id_len = handshake[offset] as usize;
-    offset += 1 + session_id_len;
-
-    // Cipher suites
-    if offset + 2 > handshake.len() {
-        return None;
-    }
-    let cipher_suites_len = u16::from_be_bytes([handshake[offset], handshake[offset + 1]]) as usize;
-    offset += 2;
-
-    if offset + cipher_suites_len > handshake.len() {
-        return None;
-    }
-
-    let mut ciphers = Vec::new();
-    for i in (0..cipher_suites_len).step_by(2) {
-        if offset + i + 2 <= handshake.len() {
-            let cipher = u16::from_be_bytes([handshake[offset + i], handshake[offset + i + 1]]);
-            // Skip GREASE values (0x?a?a pattern)
-            if cipher & 0x0f0f != 0x0a0a {
-                ciphers.push(cipher);
-            }
-        }
-    }
-    offset += cipher_suites_len;
-
-    // Compression methods
-    if offset >= handshake.len() {
-        return None;
-    }
-    let compression_len = handshake[offset] as usize;
-    offset += 1 + compression_len;
-
-    // Extensions
-    if offset + 2 > handshake.len() {
-        return None;
-    }
-    let extensions_len = u16::from_be_bytes([handshake[offset], handshake[offset + 1]]) as usize;
-    offset += 2;
-
-    let mut extensions = Vec::new();
-    let mut elliptic_curves = Vec::new();
-    let mut ec_point_formats = Vec::new();
-
-    let extensions_end = offset + extensions_len;
-    while offset + 4 <= extensions_end && offset + 4 <= handshake.len() {
-        let ext_type = u16::from_be_bytes([handshake[offset], handshake[offset + 1]]);
-        let ext_len = u16::from_be_bytes([handshake[offset + 2], handshake[offset + 3]]) as usize;
-        offset += 4;
-
-        // Skip GREASE extensions
-        if ext_type & 0x0f0f != 0x0a0a {
-            extensions.push(ext_type);
-
-            // Parse supported_groups (extension 10)
-            if ext_type == 10 && ext_len >= 2 && offset + ext_len <= handshake.len() {
-                let groups_len =
-                    u16::from_be_bytes([handshake[offset], handshake[offset + 1]]) as usize;
-                for i in (2..2 + groups_len).step_by(2) {
-                    if offset + i + 2 <= handshake.len() {
-                        let group =
-                            u16::from_be_bytes([handshake[offset + i], handshake[offset + i + 1]]);
-                        if group & 0x0f0f != 0x0a0a {
-                            elliptic_curves.push(group);
-                        }
-                    }
-                }
-            }
-
-            // Parse EC point formats (extension 11)
-            if ext_type == 11 && ext_len >= 1 && offset + ext_len <= handshake.len() {
-                let formats_len = handshake[offset] as usize;
-                for i in 1..=formats_len {
-                    if offset + i < handshake.len() {
-                        ec_point_formats.push(handshake[offset + i] as u16);
-                    }
-                }
-            }
-        }
-
-        offset += ext_len;
-    }
-
-    // Build JA3 string
-    let ja3_string = format!(
-        "{},{},{},{},{}",
-        tls_version,
-        ciphers
-            .iter()
-            .map(|c| c.to_string())
-            .collect::<Vec<_>>()
-            .join("-"),
-        extensions
-            .iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>()
-            .join("-"),
-        elliptic_curves
-            .iter()
-            .map(|c| c.to_string())
-            .collect::<Vec<_>>()
-            .join("-"),
-        ec_point_formats
-            .iter()
-            .map(|f| f.to_string())
-            .collect::<Vec<_>>()
-            .join("-"),
-    );
-
-    // Calculate MD5 hash
-    let mut hasher = md5::Md5::new();
-    hasher.update(ja3_string.as_bytes());
-    let result = hasher.finalize();
-
-    Some(hex::encode(result))
 }
 
 /// Classify a JA3 fingerprint hash using the provided database.
