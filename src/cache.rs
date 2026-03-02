@@ -49,7 +49,7 @@ pub struct ResponseCacheConfig {
     pub excluded_paths: Vec<String>,
     /// Hostnames that are never cached (exact match or subdomain suffix).
     /// Use this to exclude API subdomains whose backends do not set
-    /// Cache-Control: no-store.  Example: ["api.example.com"]
+    /// `Cache-Control: no-store`.  Example: `["api.example.com"]`
     pub excluded_hosts: Vec<String>,
     /// Do not cache responses that set cookies (default: true)
     pub no_cache_set_cookie: bool,

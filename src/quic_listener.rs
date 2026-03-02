@@ -70,6 +70,7 @@ pub struct QuicListener {
 
 impl QuicListener {
     /// Create a new QUIC listener
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         config: Arc<ProxyConfig>,
         tls_provider: Arc<TlsProvider>,
@@ -957,7 +958,8 @@ impl QuicListener {
                             tls_client_key: None,
                             tls_skip_verify: false,
                             tls_sni: None,
-                            timeout_ms: server.timeout.as_millis() as u64,
+                            timeout_ms: u64::try_from(server.timeout.as_millis())
+                                .unwrap_or(u64::MAX),
                             max_connections: server.max_connections,
                             health_check: None,
                             health_check_interval_secs: 30,
@@ -1041,13 +1043,13 @@ impl QuicListener {
         }
 
         // --- Response cache lookup (GET / HEAD only, HTTP/3 path) ---
-        let _cache_host_str = host.as_deref().unwrap_or("");
+        let cache_host_str = host.as_deref().unwrap_or("");
         if (method == "GET" || method == "HEAD")
             && cache.config.enabled
             && !cache.is_excluded_path(&path)
-            && !cache.is_excluded_host(_cache_host_str)
+            && !cache.is_excluded_host(cache_host_str)
         {
-            let host_str = _cache_host_str;
+            let host_str = cache_host_str;
             let cache_key = ResponseCache::build_key(&method, host_str, &path_with_query);
             let if_none_match = request
                 .headers()
@@ -1262,10 +1264,10 @@ impl QuicListener {
                                 }
                                 Ok(Ok(_)) => {}
                                 Ok(Err(e)) => {
-                                    warn!("H3 Shadow error for '{}': {}", shadow_name, e)
+                                    warn!("H3 Shadow error for '{}': {}", shadow_name, e);
                                 }
                                 Err(_) => {
-                                    warn!("H3 Shadow timeout for '{}'", shadow_name)
+                                    warn!("H3 Shadow timeout for '{}'", shadow_name);
                                 }
                             }
                         });
@@ -1294,9 +1296,9 @@ impl QuicListener {
         if (method == "GET" || method == "HEAD")
             && cache.config.enabled
             && !cache.is_excluded_path(&path)
-            && !cache.is_excluded_host(_cache_host_str)
+            && !cache.is_excluded_host(cache_host_str)
         {
-            let host_str = _cache_host_str;
+            let host_str = cache_host_str;
             let cache_key = ResponseCache::build_key(&method, host_str, &path_with_query);
             cache.put(
                 &cache_key,
