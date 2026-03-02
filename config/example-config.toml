@@ -95,6 +95,45 @@ port = 80
 redirect_to_https = true
 
 # =============================
+# Response Cache (RFC 9111)
+# =============================
+# Shared response cache active on HTTP/1.1, HTTP/2, and HTTP/3/QUIC.
+# Disabled by default — set enabled = true to activate.
+#
+# Cache-Control directives (max-age, s-maxage, no-cache, no-store,
+# private, public) are honoured. Conditional requests using
+# If-None-Match/ETag and If-Modified-Since/Last-Modified return
+# 304 Not Modified without a backend round-trip. Vary: * bypasses
+# the cache. Responses with Set-Cookie or Content-Encoding are
+# never stored. x-cache: HIT/MISS and Age headers are added to
+# every response.
+[cache]
+# Enable response caching (opt-in)
+enabled = false
+
+# Maximum total cache size in MiB
+max_size_mb = 128
+
+# Default TTL in seconds when the backend sends no Cache-Control header
+default_ttl_secs = 60
+
+# Maximum individual response body size to cache (bytes). Responses
+# larger than this are forwarded but never stored.
+max_body_size_bytes = 2097152   # 2 MiB
+
+# URL path prefixes that are never cached regardless of headers
+excluded_paths = [
+    "/api/",
+    "/ws",
+    "/stream",
+    "/auth",
+    "/admin",
+]
+
+# Do not cache responses that contain a Set-Cookie header
+no_cache_set_cookie = true
+
+# =============================
 # Security Headers
 # =============================
 # These headers are automatically injected into all responses.
