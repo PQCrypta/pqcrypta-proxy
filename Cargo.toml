@@ -91,7 +91,7 @@ tracing-appender = "0.2"
 # OpenTelemetry distributed tracing — W3C TraceContext + B3 propagation, OTLP export
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["trace", "http-json", "reqwest-client"] }
+opentelemetry-otlp = { version = "0.27", default-features = false, features = ["trace", "http-json", "reqwest-client"] }
 tracing-opentelemetry = "0.28"
 
 # Admin API and HTTP listener
