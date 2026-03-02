@@ -21,6 +21,35 @@ use crate::acme::AcmeConfig;
 use crate::cache::ResponseCacheConfig;
 use crate::rate_limiter::AdvancedRateLimitConfig;
 
+/// OpenTelemetry distributed tracing configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OtelConfig {
+    /// Enable OpenTelemetry tracing and OTLP export (default: false)
+    pub enabled: bool,
+    /// Service name reported to the tracing backend
+    pub service_name: String,
+    /// OTLP HTTP/JSON endpoint for span export (default: http://localhost:4318)
+    pub otlp_endpoint: String,
+    /// Sampling ratio: 1.0 = always sample, 0.0 = never, 0.1 = 10% (default: 1.0)
+    pub sample_ratio: f64,
+    /// Additional OpenTelemetry resource attributes (key = "value" pairs)
+    pub resource_attributes: HashMap<String, String>,
+}
+
+impl Default for OtelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            service_name: "pqcrypta-proxy".to_string(),
+            // Standard OTLP HTTP port — compatible with Jaeger, Tempo, Honeycomb, etc.
+            otlp_endpoint: "http://localhost:4318".to_string(),
+            sample_ratio: 1.0,
+            resource_attributes: HashMap::new(),
+        }
+    }
+}
+
 /// OCSP stapling configuration (TOML-compatible version)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -143,6 +172,9 @@ pub struct ProxyConfig {
     /// Response cache configuration
     #[serde(default)]
     pub cache: ResponseCacheConfig,
+    /// OpenTelemetry distributed tracing configuration
+    #[serde(default)]
+    pub otel: OtelConfig,
 }
 
 /// Current config schema version supported by this binary
@@ -284,6 +316,7 @@ impl Default for ProxyConfig {
             acme: AcmeConfig::default(),
             http3: Http3Config::default(),
             cache: ResponseCacheConfig::default(),
+            otel: OtelConfig::default(),
         }
     }
 }

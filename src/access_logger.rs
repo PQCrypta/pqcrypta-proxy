@@ -11,6 +11,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::{debug, error, info};
 
+use crate::otel;
+
 /// Sanitize a user-controlled log field by stripping newlines and control characters.
 ///
 /// Prevents log injection attacks where `\n` in a path or header could inject
@@ -105,8 +107,17 @@ impl AccessLogger {
             .map(sanitize_log_field)
             .unwrap_or_else(|| "-".to_string());
 
+        // Capture the trace ID from the active span so log entries can be
+        // correlated with distributed traces in Jaeger / Tempo / etc.
+        let trace_id = otel::current_trace_id();
+        let trace_field = if trace_id.is_empty() {
+            String::new()
+        } else {
+            format!(" trace_id={}", trace_id)
+        };
+
         let log_line = format!(
-            "{} - - [{}] \"{}\" {} {} \"{}\" \"{}\" host=\"{}\" time={}ms\n",
+            "{} - - [{}] \"{}\" {} {} \"{}\" \"{}\" host=\"{}\" time={}ms{}\n",
             entry.remote_addr.ip(),
             timestamp,
             request,
@@ -115,7 +126,8 @@ impl AccessLogger {
             referer,
             user_agent,
             host,
-            entry.response_time_ms
+            entry.response_time_ms,
+            trace_field
         );
 
         // Write to file if available

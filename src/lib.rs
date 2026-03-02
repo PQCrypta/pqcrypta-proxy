@@ -81,6 +81,7 @@ pub mod http_listener;
 pub mod load_balancer;
 pub mod metrics;
 pub mod ocsp;
+pub mod otel;
 pub mod pqc_extended;
 pub mod pqc_tls;
 pub mod proxy;
@@ -96,7 +97,7 @@ pub mod webtransport_server;
 pub use access_logger::{init_access_logger, log_access, AccessLogEntry, AccessLogger};
 pub use cache::{cache_middleware, CacheLookup, ResponseCache, ResponseCacheConfig};
 pub use compression::{compression_middleware, CompressionConfig, CompressionState};
-pub use config::{ConfigManager, Http3Config, ProxyConfig};
+pub use config::{ConfigManager, Http3Config, OtelConfig, ProxyConfig};
 pub use fingerprint::{
     fingerprint_middleware, FingerprintExtractor, FingerprintInfo, FingerprintMiddlewareState,
     FingerprintResult, FingerprintStats, Ja3Fingerprint,
@@ -115,6 +116,10 @@ pub use http_listener::{run_http_listener_pqc, run_http_listener_pqc_with_finger
 pub use load_balancer::{
     extract_session_cookie, BackendPool as LbBackendPool, BackendServer, LoadBalancer, PoolStats,
     SelectionContext, SessionCookieConfig,
+};
+pub use otel::{
+    extract_context_from_headers, extract_context_from_map, inject_current_context_into_headers,
+    inject_current_context_into_map, set_parent_from_headers, set_parent_from_map,
 };
 // Extended PQC support with unified configuration
 pub use acme::{AcmeConfig, AcmeService, AcmeStatusInfo, CertificateUpdate, ChallengeType};

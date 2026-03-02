@@ -24,6 +24,7 @@
 - **Enterprise Load Balancing**: 6 algorithms, session affinity, health-aware routing, per-backend retry policies, per-backend circuit breaker overrides, canary / percentage traffic splitting with sticky assignment and auto-rollback, traffic shadowing / mirroring
 - **Multi-Dimensional Rate Limiting**: Composite keys, JA3/JA4-based, JWT-verified, adaptive ML anomaly detection; optional Redis backend distributes counters across all proxy instances
 - **Zero-Trust Primitives**: Per-route HMAC proof-of-possession (path+query signed, nonce replay prevention), internal route mTLS auto-enforcement, zero-trust mode startup validation (includes admin HMAC requirement), admin proof-of-possession, `trusted_internal_cidrs` deprecation
+- **OpenTelemetry Distributed Tracing**: W3C TraceContext + B3 propagation on all transports, OTLP HTTP/JSON export, configurable sampling, access-log trace-ID correlation
 
 ## All Features Implemented
 
@@ -111,6 +112,7 @@
 | **Canary / Traffic Splitting** | ✅ | Percentage-based canary routing with sticky cookie assignment, per-pool auto-rollback on error rate threshold, and live admin control — active on HTTP/1.1, HTTP/2, HTTP/3/QUIC |
 | **Traffic Shadowing / Mirroring** | ✅ | Per-route fire-and-forget copy of requests to a secondary backend; client only sees primary response; all parameters configurable (backend, percent, timeout, marker header) — active on HTTP/1.1, HTTP/2, HTTP/3/QUIC |
 | **RFC 9111 Response Cache** | ✅ | Full Cache-Control parsing (max-age, s-maxage, no-cache, no-store, private, public); ETag/If-None-Match → 304; Last-Modified/If-Modified-Since → 304; Vary header support; TTL-based expiry; size-bounded DashMap store — active on HTTP/1.1, HTTP/2, HTTP/3/QUIC |
+| **OpenTelemetry Distributed Tracing** | ✅ | W3C TraceContext (`traceparent`/`tracestate`, RFC 9543) + B3 multi-header + B3 single-header extraction and injection; composite propagator on all transports (HTTP/1.1, HTTP/2, HTTP/3/QUIC, WebTransport); OTLP HTTP/JSON export; `ParentBased(TraceIdRatioBased)` sampler; trace IDs in access-log lines |
 | **Least Response Time Routing** | ✅ | Routes requests to the backend with the lowest moving-average response time |
 | **IP Hash Load Balancing** | ✅ | Deterministic backend selection by client IP hash for implicit session stickiness |
 | **Per-Server Priority** | ✅ | Failover priority levels; lower-priority backends only receive traffic when higher-priority ones are unhealthy |
@@ -1286,6 +1288,64 @@ The API server's `tower_http::TraceLayer` is also configured with `.on_failure((
 ### WAF Blocked Requests
 
 Requests rejected by the security IP-blocklist or bot-blocklist receive an `x-waf-block: 1` response header. The collector tracks these separately in `waf_blocked_requests` (distinct from `failed_requests`) so that bot attack traffic cannot inflate error-rate SLOs or depress domain health scores.
+
+## OpenTelemetry Distributed Tracing
+
+PQCrypta Proxy supports end-to-end distributed tracing via the OpenTelemetry SDK. When enabled, every HTTP request creates a span that is stitched into the incoming trace (if one is present) and propagated to upstream backends.
+
+### Propagation Formats
+
+| Format | Headers | Notes |
+|--------|---------|-------|
+| W3C TraceContext (RFC 9543) | `traceparent`, `tracestate` | Extracted first; highest priority |
+| B3 Multi-header | `x-b3-traceid`, `x-b3-spanid`, `x-b3-sampled` | Fallback extract; always injected |
+| B3 Single-header | `b3` | `{traceId}-{spanId}-{flag}` compact form; also injected |
+
+Both W3C and B3 formats are injected into every upstream request so Jaeger, Zipkin, Tempo, and W3C-compatible backends can all correlate traces from a single proxy deployment.
+
+### Transport Coverage
+
+Trace context extraction and injection is active on **all four transports**:
+- **HTTP/1.1 + HTTP/2** — axum `trace_context_middleware` extracts from `HeaderMap` before the first handler runs
+- **HTTP/3 / QUIC** — extracted from the incoming H3 header map before any routing
+- **WebTransport** — same QUIC path; context propagated into backend requests
+- **Backend requests** — `inject_current_context_into_map()` stamps both formats into every proxied request
+
+### Configuration
+
+```toml
+[otel]
+# Enable distributed tracing (disabled by default)
+enabled = true
+
+# Service name reported in spans and to the collector
+service_name = "pqcrypta-proxy"
+
+# OTLP HTTP/JSON endpoint — works with Jaeger, Grafana Tempo,
+# OpenTelemetry Collector, Honeycomb, Lightstep, etc.
+otlp_endpoint = "http://localhost:4318"
+
+# Sampling ratio: 1.0 = always, 0.0 = never, 0.1 = 10% of root spans
+# Uses ParentBased(TraceIdRatioBased) — child spans inherit parent decision
+sample_ratio = 1.0
+
+# Optional resource attributes added to every exported span
+# [otel.resource_attributes]
+# deployment.environment = "production"
+# host.name = "proxy-1"
+```
+
+### Access Log Correlation
+
+When tracing is active, every access-log line includes a `trace_id=<hex>` field so log entries can be looked up directly in Jaeger or Tempo:
+
+```
+203.0.113.42 - - [02/Mar/2026:14:23:01 +0000] "GET /api/v1/users HTTP/3" 200 1542 "-" "curl/8.5.0" host="api.pqcrypta.com" time=18ms trace_id=4bf92f3577b34da6a3ce929d0e0e4736
+```
+
+### Span Export
+
+Spans are batched and exported asynchronously via OTLP HTTP/JSON (no protobuf dependency — uses the existing `reqwest` client). The global tracer provider is a NOOP until `init_otel()` is called after config loads, so startup spans are silently dropped; all request-handling spans are fully exported. On graceful shutdown, the batch queue is flushed before the process exits.
 
 ## Deployment
 

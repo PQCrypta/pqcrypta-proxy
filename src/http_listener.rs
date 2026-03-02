@@ -60,6 +60,7 @@ use crate::load_balancer::{
     extract_cookie_by_name, extract_session_cookie, LoadBalancer, SelectionContext,
 };
 use crate::metrics::{ConnectionProtocol, MetricsRegistry};
+use crate::otel;
 use crate::rate_limiter::{
     build_context_from_request, AdvancedRateLimiter, LimitReason, RateLimitResult,
 };
@@ -358,12 +359,15 @@ pub async fn run_http_listener(
         app
     };
 
-    // Add rate limiting (outermost - runs first, multi-dimensional)
+    // Add rate limiting and trace context extraction (outermost layers)
     let app = app
         .layer(middleware::from_fn_with_state(
             rl_state,
             advanced_rate_limit_middleware,
         ))
+        // Trace context extraction is the absolute outermost layer so the trace
+        // ID is available to all inner middleware and the access logger.
+        .layer(middleware::from_fn(trace_context_middleware))
         .with_state(state);
 
     // Check if cert files exist
@@ -534,12 +538,13 @@ pub async fn run_http_listener_pqc(
         app
     };
 
-    // Add rate limiting (outermost - runs first, multi-dimensional)
+    // Add rate limiting and trace context extraction (outermost layers)
     let app = app
         .layer(middleware::from_fn_with_state(
             rl_state,
             advanced_rate_limit_middleware,
         ))
+        .layer(middleware::from_fn(trace_context_middleware))
         .with_state(state);
 
     // Check if cert files exist (OpenSSL will load them directly)
@@ -762,6 +767,7 @@ pub async fn run_http_listener_with_fingerprint(
             rl_state,
             advanced_rate_limit_middleware,
         ))
+        .layer(middleware::from_fn(trace_context_middleware))
         .with_state(state);
 
     // Check cert files
@@ -1127,6 +1133,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
             rl_state,
             advanced_rate_limit_middleware,
         ))
+        .layer(middleware::from_fn(trace_context_middleware))
         .with_state(state);
 
     // Check cert files
@@ -1745,6 +1752,40 @@ fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {
     }
 
     None
+}
+
+/// Middleware that extracts the incoming distributed trace context and makes it
+/// the parent of the current request span.
+///
+/// Supports W3C TraceContext (`traceparent`/`tracestate`) and B3 headers
+/// (`x-b3-traceid` / `x-b3-spanid` / `x-b3-sampled` / `b3`).
+/// Works across HTTP/1.1 and HTTP/2; the QUIC/HTTP3 path has its own extraction.
+///
+/// When OTEL is disabled (default NOOP provider) this middleware is a no-op.
+async fn trace_context_middleware(request: Request<Body>, next: Next) -> Response {
+    use tracing::Instrument;
+
+    let span = tracing::info_span!(
+        "http.request",
+        http.method = %request.method(),
+        http.uri = %request.uri().path(),
+        otel.kind = "server",
+        trace_id = tracing::field::Empty,
+    );
+
+    // Stitch the incoming trace context into the span so this proxy hop appears
+    // as a child of the caller's span in the distributed trace.
+    otel::set_parent_from_headers(&span, request.headers());
+
+    // Record the resolved trace ID as a span field for easy log correlation.
+    {
+        let trace_id = otel::current_trace_id();
+        if !trace_id.is_empty() {
+            span.record("trace_id", trace_id);
+        }
+    }
+
+    next.run(request).instrument(span).await
 }
 
 /// Middleware to add Alt-Svc header to all responses

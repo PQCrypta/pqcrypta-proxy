@@ -88,6 +88,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 
+# OpenTelemetry distributed tracing — W3C TraceContext + B3 propagation, OTLP export
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["trace", "http-json", "reqwest-client"] }
+tracing-opentelemetry = "0.28"
+
 # Admin API and HTTP listener
 axum = { version = "0.7", features = ["macros"] }
 axum-server = { version = "0.7", features = ["tls-rustls", "tls-openssl"] }

@@ -24,6 +24,7 @@ use crate::handlers::WebTransportHandler;
 use crate::http3_features::EarlyHintsState;
 use crate::load_balancer::{LoadBalancer, SelectionContext};
 use crate::metrics::{ConnectionProtocol, MetricsRegistry};
+use crate::otel;
 use crate::proxy::BackendPool;
 use crate::rate_limiter::{build_context_from_request, AdvancedRateLimiter, RateLimitResult};
 use crate::security::{BlockReason, SecurityState};
@@ -1214,6 +1215,12 @@ impl QuicListener {
         if let Some(ref host_value) = host {
             headers.insert("Host".to_string(), host_value.clone());
         }
+
+        // Extract distributed trace context from the incoming QUIC/HTTP3 request
+        // headers and stitch this request into the caller's trace.  The current
+        // span becomes a child of the caller's span; proxy.rs then injects the
+        // new child span context into the upstream backend request.
+        otel::set_parent_from_map(&tracing::Span::current(), &headers);
 
         // Forward X-Forwarded headers
         headers.insert("X-Forwarded-Proto".to_string(), "https".to_string());

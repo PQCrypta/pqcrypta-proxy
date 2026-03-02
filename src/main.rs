@@ -325,6 +325,32 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // =========================================================================
+    // Initialise OpenTelemetry distributed tracing (if enabled)
+    //
+    // The tracing_opentelemetry subscriber layer was added at startup with a
+    // NOOP global provider.  Calling init_otel() here installs a real OTLP
+    // provider so all subsequent request-handling spans are exported.
+    // =========================================================================
+    let otel_provider = if config.otel.enabled {
+        match pqcrypta_proxy::otel::init_otel(&config.otel) {
+            Ok(provider) => {
+                info!(
+                    "OpenTelemetry tracing enabled (endpoint: {})",
+                    config.otel.otlp_endpoint
+                );
+                Some(provider)
+            }
+            Err(e) => {
+                warn!("OpenTelemetry init failed — tracing disabled: {}", e);
+                None
+            }
+        }
+    } else {
+        info!("OpenTelemetry tracing disabled (otel.enabled = false)");
+        None
+    };
+
     let config = Arc::new(config);
 
     // =========================================================================
@@ -1042,23 +1068,39 @@ async fn main() -> anyhow::Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
+    // Flush and shut down OTEL before process exit so buffered spans are exported
+    if let Some(provider) = otel_provider {
+        pqcrypta_proxy::otel::shutdown_otel(&provider);
+    }
+
     info!("PQCrypta Proxy shutdown complete");
     Ok(())
 }
 
-/// Initialize logging
+/// Initialize logging with an optional OpenTelemetry layer.
+///
+/// The `tracing_opentelemetry::layer()` here references the **global** tracer
+/// provider which starts as a NOOP.  Once `otel::init_otel()` is called later
+/// in `main` (after config is loaded), the global provider is replaced and all
+/// subsequent spans are exported via OTLP.  Startup spans created during config
+/// loading are silently dropped — this is acceptable.
 fn init_logging(level: &str, json: bool) -> anyhow::Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-
+    // tracing_opentelemetry::layer() references the global tracer provider.
+    // It is a NOOP until otel::init_otel() replaces the global provider after
+    // config is loaded.  Instantiated fresh in each branch so the subscriber
+    // type is correctly inferred without needing type erasure via .boxed().
     if json {
         tracing_subscriber::registry()
             .with(env_filter)
             .with(fmt::layer().json())
+            .with(tracing_opentelemetry::layer())
             .init();
     } else {
         tracing_subscriber::registry()
             .with(env_filter)
             .with(fmt::layer().with_target(true).with_thread_ids(true))
+            .with(tracing_opentelemetry::layer())
             .init();
     }
 
@@ -1115,6 +1157,14 @@ fn print_startup_summary(config: &ProxyConfig, pqc_enabled: bool) {
         "  PQC Enabled:   {}",
         if pqc_enabled { "✅ Yes" } else { "❌ No" }
     );
+    if config.otel.enabled {
+        info!(
+            "  OTEL Tracing:  ✅ {} → {}",
+            config.otel.service_name, config.otel.otlp_endpoint
+        );
+    } else {
+        info!("  OTEL Tracing:  ❌ Disabled");
+    }
     info!("  ALPN:          {:?}", config.tls.alpn_protocols);
     info!("  Backends:      {} configured", config.backends.len());
     info!("  Routes:        {} configured", config.routes.len());

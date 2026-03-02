@@ -22,6 +22,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 use crate::config::{BackendConfig, BackendType, ProxyConfig};
+use crate::otel;
 
 /// Response from backend proxy
 #[derive(Debug)]
@@ -78,11 +79,14 @@ impl BackendPool {
         backend: &BackendConfig,
         method: &str,
         path: &str,
-        headers: HashMap<String, String>,
+        mut headers: HashMap<String, String>,
         body: &[u8],
     ) -> anyhow::Result<Vec<u8>> {
         // Acquire connection permit
         let _permit = self.acquire_permit(&backend.name).await?;
+
+        // Inject W3C TraceContext + B3 headers so the backend can continue the trace
+        otel::inject_current_context_into_map(&mut headers);
 
         // Build URI
         let uri = if backend.tls {
@@ -143,11 +147,14 @@ impl BackendPool {
         backend: &BackendConfig,
         method: &str,
         path: &str,
-        headers: HashMap<String, String>,
+        mut headers: HashMap<String, String>,
         body: &[u8],
     ) -> anyhow::Result<ProxyResponse> {
         // Acquire connection permit
         let _permit = self.acquire_permit(&backend.name).await?;
+
+        // Inject W3C TraceContext + B3 headers so the backend can continue the trace
+        otel::inject_current_context_into_map(&mut headers);
 
         // Build URI
         let uri = if backend.tls {
