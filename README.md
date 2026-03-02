@@ -108,8 +108,8 @@
 | **Accept-CH Header** | ✅ | `Accept-CH` client hints advertisement for adaptive content delivery |
 | **Graceful Shutdown Drain** | ✅ | Configurable drain timeout polls active connections at 100 ms intervals; exits as soon as connections reach zero |
 | **Weighted Load Balancing** | ✅ | Per-server weight (1–1000) with smooth weighted round-robin for proportional traffic distribution |
-| **Canary / Traffic Splitting** | ✅ | Percentage-based canary routing with sticky cookie assignment, per-pool auto-rollback on error rate threshold, and live admin control |
-| **Traffic Shadowing / Mirroring** | ✅ | Per-route fire-and-forget copy of requests to a secondary backend; client only sees primary response; all parameters configurable (backend, percent, timeout, marker header) |
+| **Canary / Traffic Splitting** | ✅ | Percentage-based canary routing with sticky cookie assignment, per-pool auto-rollback on error rate threshold, and live admin control — active on HTTP/1.1, HTTP/2, HTTP/3/QUIC |
+| **Traffic Shadowing / Mirroring** | ✅ | Per-route fire-and-forget copy of requests to a secondary backend; client only sees primary response; all parameters configurable (backend, percent, timeout, marker header) — active on HTTP/1.1, HTTP/2, HTTP/3/QUIC |
 | **Least Response Time Routing** | ✅ | Routes requests to the backend with the lowest moving-average response time |
 | **IP Hash Load Balancing** | ✅ | Deterministic backend selection by client IP hash for implicit session stickiness |
 | **Per-Server Priority** | ✅ | Failover priority levels; lower-priority backends only receive traffic when higher-priority ones are unhealthy |
@@ -816,7 +816,7 @@ priority = 100
 
 ### Canary / Percentage Traffic Splitting
 
-Canary routing lets you ship a new server version to a small percentage of traffic while stable servers handle the rest. The configuration lives in a `[backend_pools.NAME.canary]` subsection placed **before** the first `[[NAME.servers]]` entry.
+Canary routing lets you ship a new server version to a small percentage of traffic while stable servers handle the rest. The configuration lives in a `[backend_pools.NAME.canary]` subsection placed **before** the first `[[NAME.servers]]` entry. Canary routing is active on **all transport protocols**: HTTP/1.1, HTTP/2, and HTTP/3/QUIC.
 
 ```toml
 # Pool-level canary settings — place before [[servers]] entries
@@ -877,7 +877,7 @@ curl -s http://127.0.0.1:8082/canary \
 
 ### Traffic Shadowing / Mirroring
 
-Add a `[routes.shadow]` subsection to any route to mirror traffic to a secondary backend. The client only receives the primary response; the shadow response is logged and discarded. All values are configurable — nothing is hardcoded.
+Add a `[routes.shadow]` subsection to any route to mirror traffic to a secondary backend. The client only receives the primary response; the shadow response is logged and discarded. All values are configurable — nothing is hardcoded. Shadow mirroring is active on **all transport protocols**: HTTP/1.1, HTTP/2, and HTTP/3/QUIC.
 
 ```toml
 [[routes]]

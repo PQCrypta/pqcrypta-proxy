@@ -18,9 +18,10 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::access_logger::{log_access, AccessLogEntry};
-use crate::config::{ConfigReloadEvent, CorsConfig, ProxyConfig};
+use crate::config::{BackendConfig, BackendType, ConfigReloadEvent, CorsConfig, ProxyConfig};
 use crate::handlers::WebTransportHandler;
 use crate::http3_features::EarlyHintsState;
+use crate::load_balancer::{LoadBalancer, SelectionContext};
 use crate::metrics::{ConnectionProtocol, MetricsRegistry};
 use crate::proxy::BackendPool;
 use crate::rate_limiter::{build_context_from_request, AdvancedRateLimiter, RateLimitResult};
@@ -60,6 +61,8 @@ pub struct QuicListener {
     security: SecurityState,
     /// Advanced multi-dimensional rate limiter (shared with TCP listeners)
     advanced_rate_limiter: Arc<AdvancedRateLimiter>,
+    /// Shared load balancer for canary routing and pool-based selection
+    load_balancer: Arc<LoadBalancer>,
 }
 
 impl QuicListener {
@@ -72,6 +75,7 @@ impl QuicListener {
         metrics: Arc<MetricsRegistry>,
         security: SecurityState,
         advanced_rate_limiter: Arc<AdvancedRateLimiter>,
+        load_balancer: Arc<LoadBalancer>,
     ) -> anyhow::Result<Self> {
         let addr = config.server.socket_addr()?;
 
@@ -131,6 +135,7 @@ impl QuicListener {
             metrics,
             security,
             advanced_rate_limiter,
+            load_balancer,
         })
     }
 
@@ -184,6 +189,7 @@ impl QuicListener {
                         let metrics = self.metrics.clone();
                         let security = self.security.clone();
                         let advanced_rate_limiter = self.advanced_rate_limiter.clone();
+                        let load_balancer = self.load_balancer.clone();
 
                         tokio::spawn(async move {
                             metrics.connections.connection_opened(ConnectionProtocol::Http3);
@@ -196,6 +202,7 @@ impl QuicListener {
                                 security,
                                 metrics.clone(),
                                 advanced_rate_limiter,
+                                load_balancer,
                             ).await {
                                 error!("Connection error from {}: {}", remote_addr, e);
                             }
@@ -252,6 +259,7 @@ impl QuicListener {
         security: SecurityState,
         metrics: Arc<MetricsRegistry>,
         advanced_rate_limiter: Arc<AdvancedRateLimiter>,
+        load_balancer: Arc<LoadBalancer>,
     ) -> anyhow::Result<()> {
         // Accept connection
         let connecting = incoming.accept()?;
@@ -296,6 +304,7 @@ impl QuicListener {
                     security,
                     metrics,
                     advanced_rate_limiter,
+                    load_balancer,
                 )
                 .await?;
             }
@@ -321,6 +330,7 @@ impl QuicListener {
         security: SecurityState,
         metrics: Arc<MetricsRegistry>,
         advanced_rate_limiter: Arc<AdvancedRateLimiter>,
+        load_balancer: Arc<LoadBalancer>,
     ) -> anyhow::Result<()> {
         loop {
             match h3.accept().await {
@@ -428,6 +438,7 @@ impl QuicListener {
                         let metrics_clone = metrics.clone();
                         let security_clone = security.clone();
                         let rl_clone = advanced_rate_limiter.clone();
+                        let lb_clone = load_balancer.clone();
 
                         tokio::spawn(async move {
                             // Note: health check detection happens inside handle_h3_request
@@ -441,6 +452,7 @@ impl QuicListener {
                                 security_clone,
                                 metrics_clone,
                                 rl_clone,
+                                lb_clone,
                             )
                             .await
                             {
@@ -475,6 +487,7 @@ impl QuicListener {
         security: SecurityState,
         metrics: Arc<MetricsRegistry>,
         advanced_rate_limiter: Arc<AdvancedRateLimiter>,
+        load_balancer: Arc<LoadBalancer>,
     ) -> anyhow::Result<()>
     where
         S: h3::quic::BidiStream<Bytes>,
@@ -854,26 +867,139 @@ impl QuicListener {
             // If no CORS config, fall through to normal handling / backend
         }
 
-        let backend = match config.get_backend(&route.backend) {
-            Some(b) => b,
-            None => {
-                error!("Backend not found: {}", route.backend);
-                metrics.requests.request_end_full(
-                    502,
-                    start_time.elapsed(),
-                    0,
-                    0,
-                    Some(&path),
-                    is_health_check,
-                );
-                let response = http::Response::builder()
-                    .status(http::StatusCode::BAD_GATEWAY)
-                    .header("server", "PQCProxy v0.2.1")
-                    .body(())?;
+        // Pool-aware backend selection: supports canary routing and load balancing.
+        // Falls back to direct backend config lookup if no matching pool is configured.
+        let (backend, canary_cookie_to_set): (BackendConfig, Option<String>) = {
+            // Extract cookies from request headers for sticky session / canary routing
+            let cookie_str = request
+                .headers()
+                .get("cookie")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
 
-                stream.send_response(response).await?;
-                stream.finish().await?;
-                return Ok(());
+            if let Some(pool) = load_balancer.get_pool(&route.backend) {
+                // Determine canary sticky cookie name from pool config (default "PQCPROXY_CANARY")
+                let canary_cookie_name = pool
+                    .canary_config
+                    .as_ref()
+                    .map(|c| c.sticky_cookie_name.clone())
+                    .unwrap_or_else(|| "PQCPROXY_CANARY".to_string());
+
+                // Extract canary cookie value from cookie header
+                let canary_cookie_val = cookie_str
+                    .split(';')
+                    .find_map(|part| {
+                        let part = part.trim();
+                        part.strip_prefix(&format!("{}=", canary_cookie_name))
+                            .map(|v| v.to_string())
+                    });
+
+                // Extract canary sticky header value if pool has one configured
+                let canary_header_val = pool
+                    .canary_config
+                    .as_ref()
+                    .and_then(|c| c.sticky_header.as_deref())
+                    .and_then(|hdr_name| {
+                        request
+                            .headers()
+                            .get(hdr_name)
+                            .and_then(|v| v.to_str().ok())
+                            .map(|s| s.to_string())
+                    });
+
+                // Extract session affinity cookie
+                let session_cookie_val = cookie_str
+                    .split(';')
+                    .find_map(|part| {
+                        let part = part.trim();
+                        // Generic session cookie extraction – key=value
+                        if part.contains('=') {
+                            let (k, v) = part.split_once('=').unwrap_or(("", ""));
+                            if !k.starts_with("PQCPROXY_CANARY") {
+                                return Some(v.to_string());
+                            }
+                        }
+                        None
+                    });
+
+                let ctx = SelectionContext {
+                    client_ip: remote_addr.ip(),
+                    session_cookie: session_cookie_val,
+                    affinity_header: None,
+                    path: path.clone(),
+                    host: host.clone().unwrap_or_default(),
+                    canary_cookie: canary_cookie_val,
+                    canary_header: canary_header_val,
+                };
+
+                match pool.select(&ctx) {
+                    Some(result) => {
+                        let server = &result.server;
+                        let tls = matches!(server.tls_mode, crate::config::TlsMode::Reencrypt);
+                        let cfg = BackendConfig {
+                            name: server.id.clone(),
+                            backend_type: BackendType::Http1,
+                            address: server.address.to_string(),
+                            tls_mode: server.tls_mode.clone(),
+                            tls,
+                            tls_cert: None,
+                            tls_client_cert: None,
+                            tls_client_key: None,
+                            tls_skip_verify: false,
+                            tls_sni: None,
+                            timeout_ms: server.timeout.as_millis() as u64,
+                            max_connections: server.max_connections,
+                            health_check: None,
+                            health_check_interval_secs: 30,
+                            retries: None,
+                            retry_backoff_ms: None,
+                            retry_on: None,
+                            circuit_breaker: None,
+                        };
+                        (cfg, result.set_canary_cookie)
+                    }
+                    None => {
+                        error!("No healthy server available in pool: {}", route.backend);
+                        metrics.requests.request_end_full(
+                            503,
+                            start_time.elapsed(),
+                            0,
+                            0,
+                            Some(&path),
+                            is_health_check,
+                        );
+                        let response = http::Response::builder()
+                            .status(http::StatusCode::SERVICE_UNAVAILABLE)
+                            .header("server", "PQCProxy v0.2.1")
+                            .body(())?;
+                        stream.send_response(response).await?;
+                        stream.finish().await?;
+                        return Ok(());
+                    }
+                }
+            } else {
+                match config.get_backend(&route.backend) {
+                    Some(b) => (b.clone(), None),
+                    None => {
+                        error!("Backend not found: {}", route.backend);
+                        metrics.requests.request_end_full(
+                            502,
+                            start_time.elapsed(),
+                            0,
+                            0,
+                            Some(&path),
+                            is_health_check,
+                        );
+                        let response = http::Response::builder()
+                            .status(http::StatusCode::BAD_GATEWAY)
+                            .header("server", "PQCProxy v0.2.1")
+                            .body(())?;
+                        stream.send_response(response).await?;
+                        stream.finish().await?;
+                        return Ok(());
+                    }
+                }
             }
         };
 
@@ -949,10 +1075,66 @@ impl QuicListener {
             headers.insert(header_name.to_string(), remote_addr.ip().to_string());
         }
 
+        // Traffic shadowing: fire-and-forget async copy to shadow backend (if configured)
+        if let Some(ref shadow_cfg) = route.shadow {
+            if !shadow_cfg.backend.is_empty() && shadow_cfg.percent > 0 {
+                let roll: u8 = rand::random::<u8>() % 100;
+                if roll < shadow_cfg.percent.min(100) {
+                    if let Some(shadow_backend) = config.get_backend(&shadow_cfg.backend).cloned() {
+                        let mut shadow_headers = headers.clone();
+                        shadow_headers.insert(
+                            shadow_cfg.shadow_header.clone(),
+                            shadow_cfg.shadow_header_value.clone(),
+                        );
+                        let shadow_body = body.clone();
+                        let shadow_method = method.clone();
+                        let shadow_path = path_with_query.clone();
+                        let shadow_bp = backend_pool.clone();
+                        let shadow_timeout_ms = shadow_cfg.timeout_ms;
+                        let shadow_log = shadow_cfg.log_responses;
+                        let shadow_name = shadow_cfg.backend.clone();
+                        tokio::task::spawn(async move {
+                            let result = tokio::time::timeout(
+                                Duration::from_millis(shadow_timeout_ms),
+                                shadow_bp.proxy_http_full(
+                                    &shadow_backend,
+                                    &shadow_method,
+                                    &shadow_path,
+                                    shadow_headers,
+                                    &shadow_body,
+                                ),
+                            )
+                            .await;
+                            match result {
+                                Ok(Ok(resp)) if shadow_log => {
+                                    info!(
+                                        "H3 Shadow → '{}' status={}",
+                                        shadow_name, resp.status
+                                    );
+                                }
+                                Ok(Ok(_)) => {}
+                                Ok(Err(e)) => {
+                                    warn!("H3 Shadow error for '{}': {}", shadow_name, e)
+                                }
+                                Err(_) => {
+                                    warn!("H3 Shadow timeout for '{}'", shadow_name)
+                                }
+                            }
+                        });
+                    } else {
+                        warn!(
+                            "H3 Shadow backend '{}' not found in config",
+                            shadow_cfg.backend
+                        );
+                    }
+                }
+            }
+        }
+
         // Proxy to backend (include query string in path)
         let proxy_response = backend_pool
             .proxy_http_full(
-                backend,
+                &backend,
                 request.method().as_str(),
                 &path_with_query,
                 headers,
@@ -1026,6 +1208,11 @@ impl QuicListener {
                     "pqc_h3_test=1; Path=/; Secure; SameSite=None; Max-Age=3600",
                 );
             }
+        }
+
+        // Inject canary sticky cookie if pool selection assigned one
+        if let Some(ref cookie_header) = canary_cookie_to_set {
+            response_builder = response_builder.header("set-cookie", cookie_header.as_str());
         }
 
         // Add Alt-Svc header to advertise HTTP/3 support

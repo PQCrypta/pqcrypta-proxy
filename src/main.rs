@@ -832,6 +832,7 @@ async fn main() -> anyhow::Result<()> {
         let quic_advanced_rl = Arc::new(AdvancedRateLimiter::new(
             quic_config.advanced_rate_limiting.clone(),
         ));
+        let quic_lb = shared_lb.clone();
 
         tokio::spawn(async move {
             match QuicListener::new(
@@ -842,6 +843,7 @@ async fn main() -> anyhow::Result<()> {
                 quic_metrics,
                 quic_security,
                 quic_advanced_rl,
+                quic_lb,
             )
             .await
             {
