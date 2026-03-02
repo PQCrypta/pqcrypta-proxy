@@ -89,7 +89,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 
 # Admin API and HTTP listener
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.8", features = ["macros"] }
 axum-server = { version = "0.7", features = ["tls-rustls", "tls-openssl"] }
 tower = "0.5"
 # Async OpenSSL for TLS connections with PQC
