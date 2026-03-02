@@ -814,10 +814,74 @@ pub struct RouteConfig {
     pub internal: bool,
     /// Per-route security policy override (mTLS, JA3 allowlist, rate limit, WAF mode)
     pub security: Option<RouteSecurityPolicy>,
+    /// Shadow / traffic-mirroring — async fire-and-forget copy of requests sent to a
+    /// secondary backend without affecting the client response.
+    #[serde(default)]
+    pub shadow: Option<ShadowConfig>,
 }
 
 fn default_priority() -> i32 {
     100
+}
+
+fn default_shadow_percent() -> u8 {
+    100
+}
+
+fn default_shadow_timeout_ms() -> u64 {
+    5000
+}
+
+fn default_shadow_header() -> String {
+    "X-Shadow-Request".to_string()
+}
+
+fn default_shadow_header_value() -> String {
+    "1".to_string()
+}
+
+/// Shadow / traffic-mirroring configuration.
+///
+/// When present on a route, a fire-and-forget copy of each selected request is
+/// sent asynchronously to `backend`.  The client only ever sees the primary
+/// backend response; the shadow response is logged and discarded.  The shadow
+/// backend receives an identical request body with the configurable marker header
+/// appended so it can distinguish mirror traffic from real traffic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShadowConfig {
+    /// Backend name that receives the mirrored copy (must be a key in `[backends.*]`)
+    pub backend: String,
+    /// Percentage of requests to mirror (0–100, default 100)
+    #[serde(default = "default_shadow_percent")]
+    pub percent: u8,
+    /// Timeout for the shadow request in milliseconds — independent of the primary
+    /// backend timeout (default 5000 ms).  Shadow tasks are abandoned after this.
+    #[serde(default = "default_shadow_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Name of the request header injected on shadow requests so the shadow
+    /// backend can identify mirror traffic (default "X-Shadow-Request")
+    #[serde(default = "default_shadow_header")]
+    pub shadow_header: String,
+    /// Value written into `shadow_header` (default "1")
+    #[serde(default = "default_shadow_header_value")]
+    pub shadow_header_value: String,
+    /// Log shadow response status and latency at INFO level (default true)
+    #[serde(default = "default_true")]
+    pub log_responses: bool,
+}
+
+impl Default for ShadowConfig {
+    fn default() -> Self {
+        Self {
+            backend: String::new(),
+            percent: default_shadow_percent(),
+            timeout_ms: default_shadow_timeout_ms(),
+            shadow_header: default_shadow_header(),
+            shadow_header_value: default_shadow_header_value(),
+            log_responses: true,
+        }
+    }
 }
 
 /// Admin API configuration

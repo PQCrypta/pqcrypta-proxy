@@ -21,6 +21,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes;
+
 use axum::{
     body::Body,
     extract::{ConnectInfo, Host, State},
@@ -48,7 +50,7 @@ use crate::pqc_tls::{openssl_pqc, PqcTlsProvider};
 
 use crate::access_logger::{log_access, AccessLogEntry};
 use crate::compression::{compression_middleware, CompressionState};
-use crate::config::{BackendConfig, CorsConfig, ProxyConfig, TlsMode};
+use crate::config::{BackendConfig, CorsConfig, ProxyConfig, ShadowConfig, TlsMode};
 use crate::fingerprint::{
     fingerprint_middleware, FingerprintExtractor, FingerprintMiddlewareState,
 };
@@ -2396,8 +2398,35 @@ async fn proxy_handler(
             }
         }
 
+        // Buffer request body when shadow mirroring is configured on this route.
+        // Only incurs allocation cost when a shadow backend is configured with percent > 0.
+        // Both shadow_body_bytes and forward_body are derived from a single move of `body`
+        // so the borrow checker is satisfied regardless of which branch is taken.
+        let needs_shadow = route
+            .shadow
+            .as_ref()
+            .map(|s| !s.backend.is_empty() && s.percent > 0)
+            .unwrap_or(false);
+        let (shadow_body_bytes, forward_body) = if needs_shadow {
+            match axum::body::to_bytes(body, usize::MAX).await {
+                Ok(b) => {
+                    let fwd = Body::from(b.clone());
+                    (Some(b), fwd)
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to buffer request body for shadow mirroring (shadow skipped): {}",
+                        e
+                    );
+                    (None, Body::empty())
+                }
+            }
+        } else {
+            (None, body)
+        };
+
         // Build and send request
-        let proxy_request = match proxy_req.body(body) {
+        let proxy_request = match proxy_req.body(forward_body) {
             Ok(req) => req,
             Err(e) => {
                 error!("Failed to build proxy request: {}", e);
@@ -2405,6 +2434,36 @@ async fn proxy_handler(
                     .into_response();
             }
         };
+
+        // Shadow mirroring: spawn fire-and-forget task concurrently with primary forward.
+        // The client only receives the primary response; shadow response is logged + discarded.
+        if let (Some(shadow_cfg), Some(shadow_bytes)) = (&route.shadow, &shadow_body_bytes) {
+            let roll: u8 = rand::random::<u8>() % 100;
+            if roll < shadow_cfg.percent.min(100) {
+                if let Some(shadow_backend) = state.config.get_backend(&shadow_cfg.backend) {
+                    spawn_shadow_request(
+                        shadow_cfg,
+                        shadow_bytes.clone(),
+                        shadow_backend,
+                        &method,
+                        &headers,
+                        &host,
+                        &path,
+                        &query,
+                        client_addr,
+                        state.port,
+                        &route.add_headers,
+                        state.http_client.clone(),
+                        state.https_client.clone(),
+                    );
+                } else {
+                    warn!(
+                        "Shadow backend '{}' not found in config for route {:?}",
+                        shadow_cfg.backend, route.name
+                    );
+                }
+            }
+        }
 
         // Send request to backend (using appropriate client)
         let result = if use_https {
@@ -2604,6 +2663,150 @@ async fn proxy_handler(
 
         (StatusCode::NOT_FOUND, "Not Found").into_response()
     }
+}
+
+/// Spawn a fire-and-forget shadow request to a secondary backend.
+///
+/// The spawned task runs independently of the caller; the client never sees the shadow
+/// response.  All configurable values (timeout, marker header name/value, logging) come
+/// from [`ShadowConfig`] — nothing is hardcoded.
+#[allow(clippy::too_many_arguments)]
+fn spawn_shadow_request(
+    shadow_cfg: &ShadowConfig,
+    body_bytes: bytes::Bytes,
+    shadow_backend: &BackendConfig,
+    method: &Method,
+    headers: &HeaderMap,
+    host: &str,
+    path: &str,
+    query: &str,
+    client_addr: SocketAddr,
+    proxy_port: u16,
+    route_add_headers: &std::collections::HashMap<String, String>,
+    http_client: Client<HttpConnector, Body>,
+    https_client: Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>,
+) {
+    let shadow_use_https = shadow_backend.tls;
+    let shadow_url = if shadow_use_https {
+        format!("https://{}{}{}", shadow_backend.address, path, query)
+    } else {
+        format!("http://{}{}{}", shadow_backend.address, path, query)
+    };
+
+    // Clone all values needed inside the spawned task
+    let timeout_ms = shadow_cfg.timeout_ms;
+    let shdr_name = shadow_cfg.shadow_header.clone();
+    let shdr_val = shadow_cfg.shadow_header_value.clone();
+    let log_responses = shadow_cfg.log_responses;
+    let backend_name = shadow_cfg.backend.clone();
+    let method = method.clone();
+    let headers = headers.clone();
+    let host = host.to_owned();
+    let add_headers = route_add_headers.clone();
+
+    tokio::task::spawn(async move {
+        let start = std::time::Instant::now();
+
+        let mut req_builder = Request::builder().method(method).uri(&shadow_url);
+
+        if let Some(h) = req_builder.headers_mut() {
+            // Copy original headers, stripping hop-by-hop and internal proxy tags
+            for (name, value) in headers.iter() {
+                let n = name.as_str().to_lowercase();
+                if ![
+                    "host",
+                    "connection",
+                    "transfer-encoding",
+                    "upgrade",
+                    "keep-alive",
+                    "proxy-authenticate",
+                    "proxy-authorization",
+                    "te",
+                    "trailer",
+                    "x-tls-early-data",
+                    "x-forwarded-for",
+                    "x-forwarded-proto",
+                    "x-forwarded-port",
+                    "x-real-ip",
+                ]
+                .contains(&n.as_str())
+                {
+                    h.insert(name.clone(), value.clone());
+                }
+            }
+            // Correct Host for shadow backend
+            if let Ok(v) = HeaderValue::from_str(&host) {
+                h.insert(header::HOST, v);
+            }
+            // Forwarded-for headers
+            if let Ok(v) = HeaderValue::from_str(&client_addr.ip().to_string()) {
+                h.insert("x-real-ip", v.clone());
+                h.insert("x-forwarded-for", v);
+            }
+            h.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+            if let Ok(v) = HeaderValue::from_str(&proxy_port.to_string()) {
+                h.insert("x-forwarded-port", v);
+            }
+            // Route add_headers
+            for (key, value) in &add_headers {
+                if let (Ok(hn), Ok(hv)) = (
+                    header::HeaderName::from_bytes(key.as_bytes()),
+                    HeaderValue::from_str(value),
+                ) {
+                    h.insert(hn, hv);
+                }
+            }
+            // Shadow marker header — configurable name and value
+            if let (Ok(hn), Ok(hv)) = (
+                header::HeaderName::from_bytes(shdr_name.as_bytes()),
+                HeaderValue::from_str(&shdr_val),
+            ) {
+                h.insert(hn, hv);
+            }
+        }
+
+        let shadow_req = match req_builder.body(Body::from(body_bytes)) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    "Shadow request build failed for backend '{}': {}",
+                    backend_name, e
+                );
+                return;
+            }
+        };
+
+        let result = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
+            if shadow_use_https {
+                https_client.request(shadow_req).await
+            } else {
+                http_client.request(shadow_req).await
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok(resp)) => {
+                if log_responses {
+                    info!(
+                        "Shadow → '{}' status={} latency={}ms",
+                        backend_name,
+                        resp.status().as_u16(),
+                        start.elapsed().as_millis()
+                    );
+                }
+            }
+            Ok(Err(e)) => {
+                warn!("Shadow request to '{}' failed: {}", backend_name, e);
+            }
+            Err(_) => {
+                warn!(
+                    "Shadow request to '{}' timed out after {}ms",
+                    backend_name, timeout_ms
+                );
+            }
+        }
+    });
 }
 
 /// Handle CORS preflight OPTIONS request

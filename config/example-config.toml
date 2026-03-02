@@ -946,6 +946,22 @@ max_age = 86400
 X-Forwarded-Proto = "https"
 X-API-Version = "v1"
 
+# ------------------------------------------------
+# Traffic Shadowing / Mirroring
+# ------------------------------------------------
+# When [routes.shadow] is set, a fire-and-forget copy of each request is sent
+# asynchronously to `backend`.  The client only ever sees the primary response;
+# the shadow response is logged and discarded.  Nothing below is hardcoded —
+# every value is configurable.
+#
+# [routes.shadow]
+# backend   = "api-canary"     # Must be a key in [backends.*]
+# percent   = 100              # 0–100: fraction of requests to mirror (default 100)
+# timeout_ms = 5000            # Abandon shadow after this many ms (default 5000)
+# shadow_header       = "X-Shadow-Request"  # Header injected on mirrored requests (default)
+# shadow_header_value = "1"                 # Value for that header (default "1")
+# log_responses       = true               # Log shadow status + latency at INFO (default true)
+
 # Main site route (Apache backend)
 [[routes]]
 name = "main-site"
