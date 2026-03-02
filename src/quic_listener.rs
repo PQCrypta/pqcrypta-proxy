@@ -1041,11 +1041,13 @@ impl QuicListener {
         }
 
         // --- Response cache lookup (GET / HEAD only, HTTP/3 path) ---
+        let _cache_host_str = host.as_deref().unwrap_or("");
         if (method == "GET" || method == "HEAD")
             && cache.config.enabled
             && !cache.is_excluded_path(&path)
+            && !cache.is_excluded_host(_cache_host_str)
         {
-            let host_str = host.as_deref().unwrap_or("");
+            let host_str = _cache_host_str;
             let cache_key = ResponseCache::build_key(&method, host_str, &path_with_query);
             let if_none_match = request
                 .headers()
@@ -1292,8 +1294,9 @@ impl QuicListener {
         if (method == "GET" || method == "HEAD")
             && cache.config.enabled
             && !cache.is_excluded_path(&path)
+            && !cache.is_excluded_host(_cache_host_str)
         {
-            let host_str = host.as_deref().unwrap_or("");
+            let host_str = _cache_host_str;
             let cache_key = ResponseCache::build_key(&method, host_str, &path_with_query);
             cache.put(
                 &cache_key,

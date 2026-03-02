@@ -47,6 +47,10 @@ pub struct ResponseCacheConfig {
     pub max_body_size_bytes: usize,
     /// URL path prefixes that are never cached
     pub excluded_paths: Vec<String>,
+    /// Hostnames that are never cached (exact match or subdomain suffix).
+    /// Use this to exclude API subdomains whose backends do not set
+    /// Cache-Control: no-store.  Example: ["api.example.com"]
+    pub excluded_hosts: Vec<String>,
     /// Do not cache responses that set cookies (default: true)
     pub no_cache_set_cookie: bool,
 }
@@ -65,6 +69,7 @@ impl Default for ResponseCacheConfig {
                 "/auth".to_string(),
                 "/admin".to_string(),
             ],
+            excluded_hosts: vec![],
             no_cache_set_cookie: true,
         }
     }
@@ -412,6 +417,20 @@ impl ResponseCache {
             .any(|p| path.starts_with(p.as_str()))
     }
 
+    /// Return `true` if `host` matches any entry in `excluded_hosts`.
+    /// Matches exact hostname or any subdomain of an entry that starts with `.`
+    /// (e.g., ".example.com" excludes "api.example.com" and "www.example.com").
+    pub fn is_excluded_host(&self, host: &str) -> bool {
+        let host = host.split(':').next().unwrap_or(host); // strip port
+        self.config.excluded_hosts.iter().any(|h| {
+            if h.starts_with('.') {
+                host.ends_with(h.as_str()) || host == &h[1..]
+            } else {
+                host == h.as_str()
+            }
+        })
+    }
+
     /// Evict all expired entries and reclaim their size accounting.
     pub fn evict_expired(&self) {
         let mut removed = 0usize;
@@ -489,12 +508,23 @@ pub async fn cache_middleware(
         return next.run(request).await;
     }
 
-    let host = request
-        .headers()
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    // Prefer URI authority (set for HTTP/2 :authority pseudo-header and HTTP/1.1 absolute-form
+    // requests) and fall back to the Host header (HTTP/1.1 origin-form requests).
+    let host = uri
+        .authority()
+        .map(|a| a.host().to_ascii_lowercase())
+        .or_else(|| {
+            request
+                .headers()
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .map(|h| h.split(':').next().unwrap_or(h).to_ascii_lowercase())
+        })
+        .unwrap_or_default();
+
+    if cache.is_excluded_host(&host) {
+        return next.run(request).await;
+    }
 
     let cache_key = ResponseCache::build_key(method.as_str(), &host, &path_with_query);
 
