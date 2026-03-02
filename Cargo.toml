@@ -126,7 +126,7 @@ redis = { version = "0.27", default-features = false, features = ["tokio-comp", 
 
 # Compression
 async-compression = { version = "0.4", features = ["tokio", "brotli", "zstd", "gzip", "deflate"] }
-brotli = "7.0"
+brotli = "8.0"
 zstd = "0.13"
 flate2 = "1.0"
 
