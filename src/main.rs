@@ -75,10 +75,10 @@ use pqcrypta_proxy::acme;
 use pqcrypta_proxy::admin::AdminServer;
 use pqcrypta_proxy::audit_logger::AuditLogger;
 use pqcrypta_proxy::config::{ConfigManager, ConfigReloadEvent, ProxyConfig, TlsMode};
+use pqcrypta_proxy::load_balancer::LoadBalancer;
 use pqcrypta_proxy::metrics;
 use pqcrypta_proxy::ocsp;
 use pqcrypta_proxy::pqc_tls::{verify_pqc_support, PqcTlsProvider};
-use pqcrypta_proxy::load_balancer::LoadBalancer;
 use pqcrypta_proxy::proxy::BackendPool;
 use pqcrypta_proxy::quic_listener::QuicListener;
 use pqcrypta_proxy::rate_limiter::AdvancedRateLimiter;
@@ -775,8 +775,15 @@ async fn main() -> anyhow::Result<()> {
         // Priority 4: Standard Rustls (no PQC, no fingerprinting)
         tokio::spawn(async move {
             info!("🌐 Starting HTTPS reverse proxy on {} (Rustls)", bind_addr);
-            if let Err(e) =
-                run_http_listener(bind_addr, &http_cert, &http_key, http_config, http_metrics, http_lb).await
+            if let Err(e) = run_http_listener(
+                bind_addr,
+                &http_cert,
+                &http_key,
+                http_config,
+                http_metrics,
+                http_lb,
+            )
+            .await
             {
                 error!("HTTP listener error on port {}: {}", bind_addr.port(), e);
             }

@@ -1232,9 +1232,7 @@ struct CanaryPoolStatus {
 }
 
 /// GET /canary — return canary status for all pools that have canary configuration
-async fn canary_handler(
-    State(state): State<Arc<AdminState>>,
-) -> impl IntoResponse {
+async fn canary_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     let Some(ref lb) = state.load_balancer else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1304,7 +1302,10 @@ async fn canary_suspend_handler(
     };
 
     if pool.suspend_canary_server(&server_id) {
-        info!("Canary server '{}' in pool '{}' suspended via admin API", server_id, body.pool);
+        info!(
+            "Canary server '{}' in pool '{}' suspended via admin API",
+            server_id, body.pool
+        );
         Json(serde_json::json!({
             "success": true,
             "message": format!("Canary server '{}' suspended", server_id)
@@ -1344,7 +1345,10 @@ async fn canary_resume_handler(
     };
 
     if pool.resume_canary_server(&server_id) {
-        info!("Canary server '{}' in pool '{}' resumed via admin API", server_id, body.pool);
+        info!(
+            "Canary server '{}' in pool '{}' resumed via admin API",
+            server_id, body.pool
+        );
         Json(serde_json::json!({
             "success": true,
             "message": format!("Canary server '{}' resumed and window reset", server_id)

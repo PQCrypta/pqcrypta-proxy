@@ -953,6 +953,7 @@ async fn handle_fingerprinted_connection(
 ///                    → Axum router with middleware stack
 /// ```
 #[cfg(feature = "pqc")]
+#[allow(clippy::too_many_arguments)]
 pub async fn run_http_listener_pqc_with_fingerprint(
     addr: SocketAddr,
     cert_path: &str,
@@ -2197,10 +2198,8 @@ async fn proxy_handler(
             if let Some(pool) = state.load_balancer.get_pool(&route.backend) {
                 // Extract session cookie for sticky sessions
                 let cookie_header = headers.get("cookie").and_then(|v| v.to_str().ok());
-                let session_cookie = extract_session_cookie(
-                    cookie_header,
-                    &state.load_balancer.cookie_config,
-                );
+                let session_cookie =
+                    extract_session_cookie(cookie_header, &state.load_balancer.cookie_config);
 
                 // Extract canary sticky cookie
                 let canary_name = pool
@@ -2242,7 +2241,12 @@ async fn proxy_handler(
                         let address = result.server.address.to_string();
                         let tls = result.server.tls_mode.clone();
                         canary_cookie_to_set = result.set_canary_cookie;
-                        (address, tls, Some(result.server), Some(route.backend.clone()))
+                        (
+                            address,
+                            tls,
+                            Some(result.server),
+                            Some(route.backend.clone()),
+                        )
                     }
                     None => {
                         warn!(

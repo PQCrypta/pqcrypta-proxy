@@ -390,6 +390,7 @@ impl BackendServer {
     }
 
     /// Return the current error rate in the sliding window (0.0–1.0).
+    #[allow(clippy::cast_precision_loss)]
     pub fn canary_error_rate(&self) -> f64 {
         let requests = self.canary_window_requests.load(Ordering::Relaxed);
         if requests == 0 {
@@ -403,6 +404,7 @@ impl BackendServer {
     ///
     /// Returns `true` if auto-rollback was just triggered (i.e. the canary was
     /// suspended by this call).  The caller should log a warning in that case.
+    #[allow(clippy::cast_precision_loss)]
     pub fn record_canary_result(&self, success: bool, config: &CanaryPoolConfig) -> bool {
         if !config.auto_rollback {
             return false;
@@ -1639,7 +1641,7 @@ mod tests {
         // With 50% weight, expect roughly 40–60% canary hits.
         let ratio = canary_hits as f64 / iterations as f64;
         assert!(
-            ratio >= 0.35 && ratio <= 0.65,
+            (0.35..=0.65).contains(&ratio),
             "Expected ~50% canary hits, got {:.1}%",
             ratio * 100.0
         );
@@ -1745,7 +1747,10 @@ mod tests {
 
         assert!(triggered, "auto-rollback should have triggered");
         assert!(server.canary_suspended.load(Ordering::Relaxed));
-        assert!(!server.is_available(), "suspended canary should be unavailable");
+        assert!(
+            !server.is_available(),
+            "suspended canary should be unavailable"
+        );
     }
 
     #[test]
