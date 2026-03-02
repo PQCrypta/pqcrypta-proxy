@@ -110,6 +110,7 @@
 | **Weighted Load Balancing** | ✅ | Per-server weight (1–1000) with smooth weighted round-robin for proportional traffic distribution |
 | **Canary / Traffic Splitting** | ✅ | Percentage-based canary routing with sticky cookie assignment, per-pool auto-rollback on error rate threshold, and live admin control — active on HTTP/1.1, HTTP/2, HTTP/3/QUIC |
 | **Traffic Shadowing / Mirroring** | ✅ | Per-route fire-and-forget copy of requests to a secondary backend; client only sees primary response; all parameters configurable (backend, percent, timeout, marker header) — active on HTTP/1.1, HTTP/2, HTTP/3/QUIC |
+| **RFC 9111 Response Cache** | ✅ | Full Cache-Control parsing (max-age, s-maxage, no-cache, no-store, private, public); ETag/If-None-Match → 304; Last-Modified/If-Modified-Since → 304; Vary header support; TTL-based expiry; size-bounded DashMap store — active on HTTP/1.1, HTTP/2, HTTP/3/QUIC |
 | **Least Response Time Routing** | ✅ | Routes requests to the backend with the lowest moving-average response time |
 | **IP Hash Load Balancing** | ✅ | Deterministic backend selection by client IP hash for implicit session stickiness |
 | **Per-Server Priority** | ✅ | Failover priority levels; lower-priority backends only receive traffic when higher-priority ones are unhealthy |
