@@ -579,25 +579,29 @@ requests_per_minute = 6000
 requests_per_hour   = 100000
 ```
 
-**How it works (both TCP and QUIC/HTTP3 paths):**
+**How it works (HTTP/1.1, HTTP/2 via TCP and HTTP/3 via QUIC):**
 
 ```
-Request arrives (HTTP/1.1, HTTP/2 via TCP  OR  HTTP/3 via QUIC)
+Request arrives on any path
   │
-  ├─ [QUIC only] Simple per-IP governor (SecurityState) + auto-block trigger
+  ├─ [QUIC/HTTP3 only] Simple per-IP SecurityState governor + auto-block
+  │   (fast in-process check; increments suspicious_patterns counter and
+  │   auto-blocks repeat offenders — runs before the advanced limiter)
   │
-  ├─ Global token-bucket (IN-MEMORY — per-node DDoS protection)
-  │
-  ├─ Resolve key (IP / API key / JA3 / JWT)
-  │
-  ├─ Redis available?
-  │    YES → Lua token-bucket  (per-second, distributed, atomic EVAL)
-  │          Lua fixed-window  (per-minute, distributed, atomic INCR+EXPIRE)
-  │          Lua fixed-window  (per-hour,   distributed, atomic INCR+EXPIRE)
-  │          ── any command timeout → local DashMap fallback ──
-  │    NO  → local DashMap bucket (original behaviour, zero config change)
-  │
-  └─ Adaptive anomaly detection (always local, per-node)
+  ├─ Advanced rate limiter (ALL paths: TCP HTTP/1.1 + HTTP/2 + QUIC HTTP/3)
+  │     │
+  │     ├─ Global token-bucket (IN-MEMORY — per-node DDoS protection)
+  │     │
+  │     ├─ Resolve key (IP / API key / JA3 / JWT / composite)
+  │     │
+  │     ├─ Redis available?
+  │     │    YES → Lua token-bucket  (per-second, distributed, atomic EVAL)
+  │     │          Lua fixed-window  (per-minute, distributed, INCR+EXPIRE)
+  │     │          Lua fixed-window  (per-hour,   distributed, INCR+EXPIRE)
+  │     │          ── any command timeout → local DashMap fallback ──
+  │     │    NO  → local DashMap bucket (original behaviour)
+  │     │
+  │     └─ Adaptive anomaly detection (always local, per-node)
 ```
 
 **Graceful fallback**: if Redis is unreachable or a command exceeds `command_timeout_ms`, that single request silently falls back to the local in-memory bucket. No error is returned to the client and no exception is thrown. The proxy remains fully functional without Redis.
