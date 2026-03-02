@@ -595,7 +595,7 @@ pub struct CompositeKeyConfig {
 ///
 /// Returns: {1, remaining}  if allowed
 ///          {0, 0}          if denied
-const TOKEN_BUCKET_LUA: &str = r#"
+const TOKEN_BUCKET_LUA: &str = r"
 local key        = KEYS[1]
 local max_tokens = tonumber(ARGV[1])
 local rate_ms    = tonumber(ARGV[2])
@@ -621,7 +621,7 @@ else
     redis.call('PEXPIRE', key, ttl_ms)
     return {0, 0}
 end
-"#;
+";
 
 /// Lua script: atomic fixed-window counter.
 ///
@@ -631,7 +631,7 @@ end
 ///
 /// Returns: {1, remaining}  if allowed
 ///          {0, 0}          if denied
-const SLIDING_WINDOW_LUA: &str = r#"
+const SLIDING_WINDOW_LUA: &str = r"
 local key   = KEYS[1]
 local limit = tonumber(ARGV[1])
 local ttl   = tonumber(ARGV[2])
@@ -646,7 +646,7 @@ if count > limit then
 else
     return {1, limit - count}
 end
-"#;
+";
 
 /// Redis-backed distributed rate-limit counters.
 ///
@@ -708,10 +708,11 @@ impl RedisBackend {
         let redis_key = self.tb_key(key_str);
         let max_tokens = burst as f64;
         let tokens_per_ms = rps as f64 / 1000.0;
-        let now_ms = std::time::SystemTime::now()
+        let now_ms: u64 = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() as u64;
+            .as_secs()
+            .saturating_mul(1000);
 
         let mut conn = self.conn.clone();
         let result: Result<(i64, i64), _> = tokio::time::timeout(self.cmd_timeout, async {
