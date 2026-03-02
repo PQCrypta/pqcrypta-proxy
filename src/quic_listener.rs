@@ -3,11 +3,8 @@
 //! Accepts QUIC connections, negotiates HTTP/3, and handles WebTransport sessions.
 //! Routes streams and datagrams to configured backends.
 //!
-//! Note: This is an alternative to WebTransportServer using h3/quinn directly.
-//! Currently scaffolded for future use - the wtransport-based WebTransportServer
-//! is the primary implementation.
-
-#![allow(dead_code)]
+//! This listener handles QUIC/HTTP3 connections (h3/quinn stack) and runs alongside
+//! `WebTransportServer` (wtransport stack), which handles the dedicated WebTransport port.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -26,6 +23,7 @@ use crate::handlers::WebTransportHandler;
 use crate::http3_features::EarlyHintsState;
 use crate::metrics::{ConnectionProtocol, MetricsRegistry};
 use crate::proxy::BackendPool;
+use crate::rate_limiter::{build_context_from_request, AdvancedRateLimiter, RateLimitResult};
 use crate::security::{BlockReason, SecurityState};
 use crate::tls::TlsProvider;
 
@@ -60,6 +58,8 @@ pub struct QuicListener {
     metrics: Arc<MetricsRegistry>,
     /// Security state for IP blocking, GeoIP country blocking, and rate limiting
     security: SecurityState,
+    /// Advanced multi-dimensional rate limiter (shared with TCP listeners)
+    advanced_rate_limiter: Arc<AdvancedRateLimiter>,
 }
 
 impl QuicListener {
@@ -71,6 +71,7 @@ impl QuicListener {
         reload_rx: mpsc::Receiver<ConfigReloadEvent>,
         metrics: Arc<MetricsRegistry>,
         security: SecurityState,
+        advanced_rate_limiter: Arc<AdvancedRateLimiter>,
     ) -> anyhow::Result<Self> {
         let addr = config.server.socket_addr()?;
 
@@ -129,6 +130,7 @@ impl QuicListener {
             early_hints_state,
             metrics,
             security,
+            advanced_rate_limiter,
         })
     }
 
@@ -181,6 +183,7 @@ impl QuicListener {
                         let early_hints_state = self.early_hints_state.clone();
                         let metrics = self.metrics.clone();
                         let security = self.security.clone();
+                        let advanced_rate_limiter = self.advanced_rate_limiter.clone();
 
                         tokio::spawn(async move {
                             metrics.connections.connection_opened(ConnectionProtocol::Http3);
@@ -192,6 +195,7 @@ impl QuicListener {
                                 early_hints_state,
                                 security,
                                 metrics.clone(),
+                                advanced_rate_limiter,
                             ).await {
                                 error!("Connection error from {}: {}", remote_addr, e);
                             }
@@ -238,6 +242,7 @@ impl QuicListener {
     }
 
     /// Handle a single QUIC connection
+    #[allow(clippy::too_many_arguments)]
     async fn handle_connection(
         incoming: quinn::Incoming,
         remote_addr: SocketAddr,
@@ -246,6 +251,7 @@ impl QuicListener {
         early_hints_state: Arc<EarlyHintsState>,
         security: SecurityState,
         metrics: Arc<MetricsRegistry>,
+        advanced_rate_limiter: Arc<AdvancedRateLimiter>,
     ) -> anyhow::Result<()> {
         // Accept connection
         let connecting = incoming.accept()?;
@@ -289,6 +295,7 @@ impl QuicListener {
                     early_hints_state,
                     security,
                     metrics,
+                    advanced_rate_limiter,
                 )
                 .await?;
             }
@@ -304,6 +311,7 @@ impl QuicListener {
     }
 
     /// Handle HTTP/3 connection with WebTransport support
+    #[allow(clippy::too_many_arguments)]
     async fn handle_h3_connection(
         h3: &mut h3::server::Connection<H3Connection, Bytes>,
         remote_addr: SocketAddr,
@@ -312,6 +320,7 @@ impl QuicListener {
         early_hints_state: Arc<EarlyHintsState>,
         security: SecurityState,
         metrics: Arc<MetricsRegistry>,
+        advanced_rate_limiter: Arc<AdvancedRateLimiter>,
     ) -> anyhow::Result<()> {
         loop {
             match h3.accept().await {
@@ -418,6 +427,7 @@ impl QuicListener {
                         let early_hints_clone = early_hints_state.clone();
                         let metrics_clone = metrics.clone();
                         let security_clone = security.clone();
+                        let rl_clone = advanced_rate_limiter.clone();
 
                         tokio::spawn(async move {
                             // Note: health check detection happens inside handle_h3_request
@@ -430,6 +440,7 @@ impl QuicListener {
                                 early_hints_clone,
                                 security_clone,
                                 metrics_clone,
+                                rl_clone,
                             )
                             .await
                             {
@@ -463,6 +474,7 @@ impl QuicListener {
         early_hints_state: Arc<EarlyHintsState>,
         security: SecurityState,
         metrics: Arc<MetricsRegistry>,
+        advanced_rate_limiter: Arc<AdvancedRateLimiter>,
     ) -> anyhow::Result<()>
     where
         S: h3::quic::BidiStream<Bytes>,
@@ -594,7 +606,87 @@ impl QuicListener {
                 }
             }
 
-            // 3. Header size validation.
+            // 3. Advanced multi-dimensional rate limiting (same logic as TCP path).
+            {
+                let ja3_hash = request
+                    .headers()
+                    .get("x-ja3-hash")
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from);
+                let ja4_hash = request
+                    .headers()
+                    .get("x-ja4-hash")
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from);
+                let adv_ctx = build_context_from_request(
+                    ip,
+                    request.headers(),
+                    &path,
+                    &method,
+                    ja3_hash,
+                    ja4_hash,
+                    None,
+                );
+                match advanced_rate_limiter.check(&adv_ctx).await {
+                    RateLimitResult::Allowed { .. } => {}
+                    RateLimitResult::Limited {
+                        reason,
+                        retry_after_ms,
+                        limit,
+                    } => {
+                        warn!(
+                            "[QUIC/H3] Advanced rate limit exceeded for {} (reason: {:?})",
+                            ip, reason
+                        );
+                        metrics.requests.request_end_full(
+                            429,
+                            start_time.elapsed(),
+                            0,
+                            0,
+                            Some(&path),
+                            is_health_check,
+                        );
+                        let retry_secs = (retry_after_ms / 1000).max(1);
+                        let response = http::Response::builder()
+                            .status(http::StatusCode::TOO_MANY_REQUESTS)
+                            .header("retry-after", retry_secs.to_string())
+                            .header("x-ratelimit-limit", limit.to_string())
+                            .header("x-ratelimit-remaining", "0")
+                            .header(
+                                "x-ratelimit-reason",
+                                format!("{:?}", reason).to_ascii_lowercase(),
+                            )
+                            .header("server", "PQCProxy v0.2.2")
+                            .body(())?;
+                        stream.send_response(response).await?;
+                        stream.finish().await?;
+                        return Ok(());
+                    }
+                    RateLimitResult::Blocked { reason } => {
+                        warn!(
+                            "[QUIC/H3] Advanced rate limiter blocked {} (reason: {})",
+                            ip, reason
+                        );
+                        metrics.requests.request_end_full(
+                            403,
+                            start_time.elapsed(),
+                            0,
+                            0,
+                            Some(&path),
+                            is_health_check,
+                        );
+                        let response = http::Response::builder()
+                            .status(http::StatusCode::FORBIDDEN)
+                            .header("server", "PQCProxy v0.2.2")
+                            .body(())?;
+                        stream.send_response(response).await?;
+                        stream.finish().await?;
+                        return Ok(());
+                    }
+                }
+            }
+
+            // 4. Header size validation.
             let max_header_size = security.config.read().max_header_size;
             let header_size: usize = request
                 .headers()

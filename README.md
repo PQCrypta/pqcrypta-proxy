@@ -22,7 +22,7 @@
 - **Structured Audit Logging**: Async JSON audit log for admin actions, auth failures, WAF blocks, IP blocks, rate limit hits, PQC downgrades, config reloads
 - **Structured Access Logging**: Per-request JSON or text logs with latency, bytes, upstream, and client IP
 - **Enterprise Load Balancing**: 6 algorithms, session affinity, health-aware routing, per-backend retry policies, per-backend circuit breaker overrides
-- **Multi-Dimensional Rate Limiting**: Composite keys, JA3/JA4-based, JWT-verified, adaptive ML anomaly detection
+- **Multi-Dimensional Rate Limiting**: Composite keys, JA3/JA4-based, JWT-verified, adaptive ML anomaly detection; optional Redis backend distributes counters across all proxy instances
 - **Zero-Trust Primitives**: Per-route HMAC proof-of-possession (path+query signed, nonce replay prevention), internal route mTLS auto-enforcement, zero-trust mode startup validation (includes admin HMAC requirement), admin proof-of-possession, `trusted_internal_cidrs` deprecation
 
 ## All Features Implemented
@@ -31,7 +31,7 @@
 |---------|--------|-------------|
 | **Load Balancing** | ✅ | 6 algorithms with session affinity and health-aware routing |
 | Circuit Breaker | ✅ | Backend health monitoring with auto-recovery |
-| **Advanced Rate Limiting** | ✅ | Multi-dimensional: IP, JA3/JA4, JWT, headers, composite keys |
+| **Advanced Rate Limiting** | ✅ | Multi-dimensional: IP, JA3/JA4, JWT, headers, composite keys on all paths (TCP + QUIC/HTTP3); optional Redis backend for distributed cross-instance coordination |
 | DoS Protection | ✅ | Connection limits, request validation |
 | GeoIP Blocking | ✅ | Country-based blocking (MaxMind DB) |
 | JA3/JA4 Fingerprinting | ✅ | TLS client fingerprint detection and classification |
@@ -142,7 +142,7 @@
 - **TLS Key Permission Checks**: Private key file permissions validated at startup; `strict_key_permissions = true` aborts if permissions are too permissive
 - **0-RTT Replay Protection**: Nonce store (strict/session/none modes) — rejects replayed TLS 1.3 early-data nonces within configurable window
 - **Circuit Breaker**: Per-backend protection from cascading failures; per-backend threshold/delay overrides
-- **Advanced Rate Limiting**: Multi-dimensional limiting (IP, JA3/JA4, JWT-verified subject, headers, composite keys)
+- **Advanced Rate Limiting**: Multi-dimensional limiting (IP, JA3/JA4, JWT-verified subject, headers, composite keys) applied on both TCP (HTTP/1.1, HTTP/2) and QUIC/HTTP3 paths; optional Redis backend distributes counters across all proxy instances
 - **JWT Rate Limiting**: Per-subject limiting with HMAC-SHA256 signature verification before trusting the `sub` claim; unsigned tokens and non-HMAC algorithms rejected
 - **Admin Brute-Force Lockout**: Per-IP and global lockout with exponential back-off (5 min base, up to 30 min) on repeated admin authentication failures
 - **NAT-Friendly**: JA3/JA4 fingerprints identify clients behind shared corporate IPs
@@ -547,6 +547,64 @@ per_ip_burst = 20
 - **IPv6 Subnet Grouping**: Group /64 subnets to prevent per-host evasion
 - **Adaptive Baseline**: Learns normal traffic patterns and detects anomalies
 - **Layered Limits**: Global → Route → Client hierarchy for defense in depth
+
+### Distributed Rate Limiting (Redis)
+
+By default all rate limit state lives in per-process memory (DashMap). Each proxy instance counts independently, so in a multi-instance deployment one client can consume their full quota on every node.
+
+Enabling the Redis backend makes all per-key counters shared across every instance. The global token bucket stays in-process (one per node, for local DDoS protection); per-IP, per-fingerprint, per-API-key, and per-composite sliding windows move to Redis using atomic Lua scripts.
+
+```toml
+[advanced_rate_limiting.redis]
+url                  = "redis://127.0.0.1:6379"
+key_prefix           = "pqcp"          # Namespace prefix for all Redis keys
+connect_timeout_ms   = 2000            # Abort connection attempt after 2 s
+command_timeout_ms   = 50             # Per-command timeout; on timeout → silent local fallback
+distribute_per_second = true           # Include per-second window in Redis (recommended)
+```
+
+**Per-key limit tunables** (all keys in `[advanced_rate_limiting.global_limits.*]`):
+
+```toml
+[advanced_rate_limiting.global_limits.per_api_key]
+requests_per_second = 500
+burst_size          = 250
+requests_per_minute = 15000
+requests_per_hour   = 250000
+
+[advanced_rate_limiting.global_limits.per_composite]
+requests_per_second = 200
+burst_size          = 100
+requests_per_minute = 6000
+requests_per_hour   = 100000
+```
+
+**How it works (both TCP and QUIC/HTTP3 paths):**
+
+```
+Request arrives (HTTP/1.1, HTTP/2 via TCP  OR  HTTP/3 via QUIC)
+  │
+  ├─ [QUIC only] Simple per-IP governor (SecurityState) + auto-block trigger
+  │
+  ├─ Global token-bucket (IN-MEMORY — per-node DDoS protection)
+  │
+  ├─ Resolve key (IP / API key / JA3 / JWT)
+  │
+  ├─ Redis available?
+  │    YES → Lua token-bucket  (per-second, distributed, atomic EVAL)
+  │          Lua fixed-window  (per-minute, distributed, atomic INCR+EXPIRE)
+  │          Lua fixed-window  (per-hour,   distributed, atomic INCR+EXPIRE)
+  │          ── any command timeout → local DashMap fallback ──
+  │    NO  → local DashMap bucket (original behaviour, zero config change)
+  │
+  └─ Adaptive anomaly detection (always local, per-node)
+```
+
+**Graceful fallback**: if Redis is unreachable or a command exceeds `command_timeout_ms`, that single request silently falls back to the local in-memory bucket. No error is returned to the client and no exception is thrown. The proxy remains fully functional without Redis.
+
+**Admin API** reports `redis_connected: true/false` in the rate limiter stats snapshot so you can verify the connection is live.
+
+**No Redis = zero behaviour change.** The `[advanced_rate_limiting.redis]` section is optional. Omitting it leaves the proxy running exactly as before with in-memory limiting.
 
 ### WAF Configuration
 

@@ -22,6 +22,7 @@ use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
 use parking_lot::RwLock;
+use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -30,7 +31,79 @@ use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::RwLock as AsyncRwLock;
 use tracing::{debug, info, warn};
+
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
+// ============================================================================
+// REDIS DISTRIBUTED BACKEND CONFIGURATION
+// ============================================================================
+
+/// Redis configuration for distributed rate limiting.
+///
+/// When configured, all per-key counters (per-second token buckets,
+/// per-minute and per-hour sliding windows) are stored in Redis so every
+/// proxy instance in a cluster shares the same quotas.  The global token
+/// bucket always remains in-process to provide fast local DDoS protection.
+/// If Redis becomes unreachable any command that times out or errors falls
+/// back transparently to the in-memory DashMap bucket for that request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedisConfig {
+    /// Redis connection URL.
+    /// Examples:
+    ///   redis://127.0.0.1:6379
+    ///   redis://:password@sentinel-host:26379/0
+    ///   rediss://tls-host:6380
+    pub url: String,
+
+    /// Prefix for all rate-limit keys stored in Redis (avoids collisions with
+    /// other applications that share the same Redis instance).
+    #[serde(default = "default_redis_prefix")]
+    pub key_prefix: String,
+
+    /// Initial connection timeout in milliseconds.
+    #[serde(default = "default_redis_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+
+    /// Per-command timeout in milliseconds.  When a command exceeds this
+    /// deadline the request falls back to the local in-memory bucket.
+    #[serde(default = "default_redis_cmd_timeout_ms")]
+    pub command_timeout_ms: u64,
+
+    /// Also distribute per-second (token bucket) checks through Redis.
+    /// Defaults to `true`.  Set to `false` to keep sub-millisecond
+    /// per-second enforcement local while only synchronising longer
+    /// per-minute/per-hour windows across the cluster.
+    #[serde(default = "default_true")]
+    pub distribute_per_second: bool,
+}
+
+fn default_redis_prefix() -> String {
+    "pqcp".to_string()
+}
+
+fn default_redis_connect_timeout_ms() -> u64 {
+    2_000
+}
+
+fn default_redis_cmd_timeout_ms() -> u64 {
+    50
+}
+
+impl Default for RedisConfig {
+    fn default() -> Self {
+        Self {
+            url: "redis://127.0.0.1:6379".to_string(),
+            key_prefix: default_redis_prefix(),
+            connect_timeout_ms: default_redis_connect_timeout_ms(),
+            command_timeout_ms: default_redis_cmd_timeout_ms(),
+            distribute_per_second: true,
+        }
+    }
+}
 
 // ============================================================================
 // CONFIGURATION
@@ -101,6 +174,14 @@ pub struct AdvancedRateLimitConfig {
     ///   `jwt_algorithms = ["HS256"]`
     #[serde(default = "default_jwt_algorithms")]
     pub jwt_algorithms: Vec<String>,
+
+    /// Redis configuration for distributed (cluster-wide) rate limiting.
+    ///
+    /// When `None` (the default), all rate-limit state lives in-process.
+    /// Provide a `[advanced_rate_limiting.redis]` section in the TOML config
+    /// to enable cross-instance quota sharing.
+    #[serde(default)]
+    pub redis: Option<RedisConfig>,
 }
 
 fn default_true() -> bool {
@@ -131,6 +212,7 @@ impl Default for AdvancedRateLimitConfig {
             composite_keys: vec![],
             jwt_secret: None, // H-2: disabled by default; set to enable JWT-based rate limiting
             jwt_algorithms: default_jwt_algorithms(), // F-10: default HS256 only
+            redis: None, // Disabled by default; add [advanced_rate_limiting.redis] to enable
         }
     }
 }
@@ -222,6 +304,16 @@ pub struct GlobalLimits {
     /// Per-fingerprint limits (for NAT scenarios)
     #[serde(default)]
     pub per_fingerprint: PerKeyLimits,
+
+    /// Default limits applied when the rate-limit key resolves to an API key.
+    /// These are intentionally higher than per-IP limits to reward authenticated
+    /// callers.  Override per-key in `[advanced_rate_limiting.route_limits]`.
+    #[serde(default = "default_per_api_key_limits")]
+    pub per_api_key: PerKeyLimits,
+
+    /// Default limits applied to composite (multi-dimension) keys.
+    #[serde(default = "default_per_composite_limits")]
+    pub per_composite: PerKeyLimits,
 }
 
 fn default_global_rps() -> u32 {
@@ -230,6 +322,24 @@ fn default_global_rps() -> u32 {
 
 fn default_global_burst() -> u32 {
     50_000
+}
+
+fn default_per_api_key_limits() -> PerKeyLimits {
+    PerKeyLimits {
+        requests_per_second: 500,
+        burst_size: 250,
+        requests_per_minute: Some(15_000),
+        requests_per_hour: Some(250_000),
+    }
+}
+
+fn default_per_composite_limits() -> PerKeyLimits {
+    PerKeyLimits {
+        requests_per_second: 200,
+        burst_size: 100,
+        requests_per_minute: Some(6_000),
+        requests_per_hour: Some(100_000),
+    }
 }
 
 impl Default for GlobalLimits {
@@ -249,6 +359,8 @@ impl Default for GlobalLimits {
                 requests_per_minute: Some(3_000),
                 requests_per_hour: Some(50_000),
             },
+            per_api_key: default_per_api_key_limits(),
+            per_composite: default_per_composite_limits(),
         }
     }
 }
@@ -468,6 +580,239 @@ pub struct CompositeKeyConfig {
     /// Routes this applies to (empty = all)
     #[serde(default)]
     pub routes: Vec<String>,
+}
+
+// ============================================================================
+// REDIS BACKEND
+// ============================================================================
+
+/// Lua script: atomic token-bucket check-and-consume.
+///
+/// KEYS[1]  = hash key  (e.g. "pqcp:tb:SourceIp:1.2.3.4")
+/// ARGV[1]  = max_tokens  (burst capacity, integer)
+/// ARGV[2]  = tokens_per_ms  (rate as float string, e.g. "0.1" for 100 rps)
+/// ARGV[3]  = now_ms  (current Unix time in milliseconds)
+///
+/// Returns: {1, remaining}  if allowed
+///          {0, 0}          if denied
+const TOKEN_BUCKET_LUA: &str = r#"
+local key        = KEYS[1]
+local max_tokens = tonumber(ARGV[1])
+local rate_ms    = tonumber(ARGV[2])
+local now        = tonumber(ARGV[3])
+
+local data       = redis.call('HMGET', key, 't', 'ts')
+local tokens     = tonumber(data[1]) or max_tokens
+local last_ts    = tonumber(data[2]) or now
+
+local elapsed    = math.max(0, now - last_ts)
+tokens           = math.min(max_tokens, tokens + elapsed * rate_ms)
+
+-- TTL: time to refill from 0 to max_tokens plus a generous buffer
+local ttl_ms = math.ceil(max_tokens / math.max(rate_ms, 0.000001)) + 5000
+
+if tokens >= 1.0 then
+    tokens = tokens - 1.0
+    redis.call('HMSET', key, 't', tostring(tokens), 'ts', tostring(now))
+    redis.call('PEXPIRE', key, ttl_ms)
+    return {1, math.floor(tokens)}
+else
+    redis.call('HMSET', key, 't', tostring(tokens), 'ts', tostring(now))
+    redis.call('PEXPIRE', key, ttl_ms)
+    return {0, 0}
+end
+"#;
+
+/// Lua script: atomic fixed-window counter.
+///
+/// KEYS[1]  = counter key  (e.g. "pqcp:sw:1m:SourceIp:1.2.3.4:28123456")
+/// ARGV[1]  = limit  (integer)
+/// ARGV[2]  = window_ttl  (seconds, integer)
+///
+/// Returns: {1, remaining}  if allowed
+///          {0, 0}          if denied
+const SLIDING_WINDOW_LUA: &str = r#"
+local key   = KEYS[1]
+local limit = tonumber(ARGV[1])
+local ttl   = tonumber(ARGV[2])
+
+local count = redis.call('INCR', key)
+if count == 1 then
+    redis.call('EXPIRE', key, ttl)
+end
+
+if count > limit then
+    return {0, 0}
+else
+    return {1, limit - count}
+end
+"#;
+
+/// Redis-backed distributed rate-limit counters.
+///
+/// One `RedisBackend` is shared (via `Arc`) across all requests on a single
+/// proxy node.  `ConnectionManager` handles reconnection transparently.
+pub struct RedisBackend {
+    conn: ConnectionManager,
+    prefix: String,
+    cmd_timeout: Duration,
+    distribute_per_second: bool,
+}
+
+impl RedisBackend {
+    /// Establish a `ConnectionManager` to Redis.
+    pub async fn connect(config: &RedisConfig) -> Result<Self, redis::RedisError> {
+        let client = redis::Client::open(config.url.as_str())?;
+        let conn = tokio::time::timeout(
+            Duration::from_millis(config.connect_timeout_ms),
+            ConnectionManager::new(client),
+        )
+        .await
+        .map_err(|_| {
+            redis::RedisError::from((
+                redis::ErrorKind::IoError,
+                "Redis connect timeout",
+            ))
+        })??;
+
+        Ok(Self {
+            conn,
+            prefix: config.key_prefix.clone(),
+            cmd_timeout: Duration::from_millis(config.command_timeout_ms),
+            distribute_per_second: config.distribute_per_second,
+        })
+    }
+
+    // ── Key helpers ─────────────────────────────────────────────────────────
+
+    fn tb_key(&self, key_str: &str) -> String {
+        format!("{}:tb:{}", self.prefix, key_str)
+    }
+
+    fn sw_key(&self, label: &str, key_str: &str, bucket: u64) -> String {
+        format!("{}:sw:{}:{}:{}", self.prefix, label, key_str, bucket)
+    }
+
+    // ── Token-bucket (per-second) ────────────────────────────────────────────
+
+    /// Distributed token-bucket check.  Returns `None` on Redis error
+    /// (caller should fall back to in-memory).
+    #[allow(clippy::cast_precision_loss)]
+    pub async fn check_token_bucket(
+        &self,
+        key_str: &str,
+        rps: u32,
+        burst: u32,
+    ) -> Option<RateLimitResult> {
+        if !self.distribute_per_second {
+            return None; // caller uses local governor
+        }
+
+        let redis_key = self.tb_key(key_str);
+        let max_tokens = burst as f64;
+        let tokens_per_ms = rps as f64 / 1000.0;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let mut conn = self.conn.clone();
+        let result: Result<(i64, i64), _> = tokio::time::timeout(self.cmd_timeout, async {
+            redis::Script::new(TOKEN_BUCKET_LUA)
+                .key(&redis_key)
+                .arg(max_tokens)
+                .arg(tokens_per_ms)
+                .arg(now_ms)
+                .invoke_async(&mut conn)
+                .await
+        })
+        .await
+        .map_err(|_| ())
+        .and_then(|r| r.map_err(|_| ()));
+
+        match result {
+            Ok((1, remaining)) => Some(RateLimitResult::Allowed {
+                remaining: u32::try_from(remaining.max(0)).unwrap_or(0),
+                limit: rps,
+            }),
+            Ok(_) => Some(RateLimitResult::Limited {
+                reason: LimitReason::PerSecond,
+                retry_after_ms: 1_000,
+                limit: rps,
+            }),
+            Err(()) => {
+                warn!("Redis token-bucket error for key '{}', falling back to local", key_str);
+                None
+            }
+        }
+    }
+
+    // ── Sliding-window (per-minute / per-hour) ───────────────────────────────
+
+    /// Distributed sliding-window check.
+    ///
+    /// `window_secs` must be 60 (per-minute) or 3600 (per-hour).
+    /// Returns `None` on Redis error.
+    pub async fn check_sliding_window(
+        &self,
+        key_str: &str,
+        limit: u32,
+        window_secs: u64,
+        label: &str,
+    ) -> Option<RateLimitResult> {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let bucket = now_secs / window_secs;
+        let redis_key = self.sw_key(label, key_str, bucket);
+
+        // TTL = 2× window so the key expires cleanly even if there's clock skew.
+        let ttl = window_secs * 2;
+
+        let mut conn = self.conn.clone();
+        let result: Result<(i64, i64), _> = tokio::time::timeout(self.cmd_timeout, async {
+            redis::Script::new(SLIDING_WINDOW_LUA)
+                .key(&redis_key)
+                .arg(limit)
+                .arg(ttl)
+                .invoke_async(&mut conn)
+                .await
+        })
+        .await
+        .map_err(|_| ())
+        .and_then(|r| r.map_err(|_| ()));
+
+        let retry_after_ms: u64 = {
+            // Time remaining until the current window expires.
+            let window_start = bucket * window_secs;
+            let window_end = window_start + window_secs;
+            (window_end.saturating_sub(now_secs)) * 1_000
+        };
+
+        match result {
+            Ok((1, remaining)) => Some(RateLimitResult::Allowed {
+                remaining: u32::try_from(remaining.max(0)).unwrap_or(0),
+                limit,
+            }),
+            Ok(_) => Some(RateLimitResult::Limited {
+                reason: if window_secs <= 60 {
+                    LimitReason::PerMinute
+                } else {
+                    LimitReason::PerHour
+                },
+                retry_after_ms,
+                limit,
+            }),
+            Err(()) => {
+                warn!(
+                    "Redis sliding-window error for key '{}' ({}), falling back to local",
+                    key_str, label
+                );
+                None
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -992,10 +1337,10 @@ pub struct AdvancedRateLimiter {
     /// Configuration
     config: Arc<RwLock<AdvancedRateLimitConfig>>,
 
-    /// Global rate limiter
+    /// Global rate limiter (always in-process for fast DDoS protection)
     global_limiter: Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>,
 
-    /// Per-key rate limit buckets
+    /// Per-key rate limit buckets (in-memory fallback / local-only path)
     buckets: Arc<DashMap<String, Arc<RateLimitBucket>>>,
 
     /// Per-route rate limit buckets
@@ -1009,6 +1354,12 @@ pub struct AdvancedRateLimiter {
 
     /// Statistics
     stats: Arc<RateLimiterStats>,
+
+    /// Optional Redis backend for distributed rate limiting.
+    ///
+    /// `None` until the async connection task completes (or when Redis is not
+    /// configured).  Falls back to `buckets` (in-memory) on every `None`.
+    redis_backend: Arc<AsyncRwLock<Option<Arc<RedisBackend>>>>,
 }
 
 /// Rate limiter statistics
@@ -1022,7 +1373,11 @@ pub struct RateLimiterStats {
 }
 
 impl AdvancedRateLimiter {
-    /// Create a new advanced rate limiter
+    /// Create a new advanced rate limiter.
+    ///
+    /// If `config.redis` is present, a background task is spawned to establish
+    /// the Redis connection.  Until that task completes (or if Redis is absent)
+    /// all rate-limiting falls back to the in-memory DashMap buckets.
     pub fn new(config: AdvancedRateLimitConfig) -> Self {
         // Parse trusted proxy CIDRs
         let trusted_cidrs: Vec<ipnet::IpNet> = config
@@ -1068,6 +1423,11 @@ impl AdvancedRateLimiter {
         let adaptive_min_samples = config.adaptive.min_samples;
         let adaptive_std_dev_multiplier = config.adaptive.std_dev_multiplier;
 
+        // Stash the Redis config before consuming `config`.
+        let redis_cfg = config.redis.clone();
+
+        let redis_backend = Arc::new(AsyncRwLock::new(None::<Arc<RedisBackend>>));
+
         let limiter = Self {
             config: Arc::new(RwLock::new(config)),
             global_limiter: Arc::new(RateLimiter::direct(global_quota)),
@@ -1080,74 +1440,140 @@ impl AdvancedRateLimiter {
                 adaptive_std_dev_multiplier,
             )),
             stats: Arc::new(RateLimiterStats::default()),
+            redis_backend,
         };
 
         // Spawn cleanup task
         limiter.spawn_cleanup_task();
 
+        // Spawn Redis connection task (if configured)
+        if let Some(rcfg) = redis_cfg {
+            let slot = limiter.redis_backend.clone();
+            tokio::spawn(async move {
+                match RedisBackend::connect(&rcfg).await {
+                    Ok(backend) => {
+                        *slot.write().await = Some(Arc::new(backend));
+                        info!(
+                            "Distributed rate limiting: Redis connected at {}",
+                            rcfg.url
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Distributed rate limiting: could not connect to Redis at {} — \
+                             falling back to in-memory rate limiting. Error: {}",
+                            rcfg.url, e
+                        );
+                    }
+                }
+            });
+        }
+
         limiter
     }
 
-    /// Check if request is allowed
-    pub fn check(&self, ctx: &RateLimitContext) -> RateLimitResult {
+    /// Check if the request is allowed.
+    ///
+    /// When a Redis backend is connected the per-key token-bucket and
+    /// sliding-window checks are performed against Redis so that all proxy
+    /// instances in the cluster share the same counters.  On any Redis error
+    /// (timeout, connection loss, etc.) the check falls back silently to the
+    /// in-process `DashMap` bucket for that single request.
+    ///
+    /// The **global** token-bucket always runs in-process so that each node
+    /// can protect itself from being overwhelmed even when Redis is down.
+    pub async fn check(&self, ctx: &RateLimitContext) -> RateLimitResult {
         self.stats.total_requests.fetch_add(1, Ordering::Relaxed);
 
-        let config = self.config.read();
-
-        if !config.enabled {
-            return RateLimitResult::Allowed {
-                remaining: u32::MAX,
-                limit: u32::MAX,
-            };
+        // ── SYNC PHASE ───────────────────────────────────────────────────────
+        // `parking_lot::RwLockReadGuard` is `!Send`.  If it is alive when the
+        // compiler encounters any `.await` point the resulting future becomes
+        // `!Send`, which breaks axum's middleware requirement.
+        //
+        // Strategy: do ALL config access inside a scope block so the guard is
+        // dropped before we enter the async phase below.
+        struct SyncData {
+            key_string: String,
+            limits: PerKeyLimits,
+            adaptive_enabled: bool,
+            adaptive_cfg: AdaptiveConfig,
         }
 
-        // 1. Check global limit first (DDoS protection)
-        if self.global_limiter.check().is_err() {
-            self.stats.total_limited.fetch_add(1, Ordering::Relaxed);
-            return RateLimitResult::Limited {
-                reason: LimitReason::Global,
-                retry_after_ms: 1000,
-                limit: config.global_limits.requests_per_second,
-            };
-        }
+        let sync_data: Option<SyncData> = {
+            let config = self.config.read(); // !Send guard — dropped at end of block
 
-        // 2. Check blocked fingerprints
-        if let Some(ref ja3) = ctx.ja3_hash {
-            if config
-                .fingerprint_limiting
-                .blocked_fingerprints
-                .contains(ja3)
-            {
-                self.stats.total_blocked.fetch_add(1, Ordering::Relaxed);
-                return RateLimitResult::Blocked {
-                    reason: format!("Blocked fingerprint: {}", ja3),
+            if !config.enabled {
+                return RateLimitResult::Allowed {
+                    remaining: u32::MAX,
+                    limit: u32::MAX,
                 };
             }
-        }
 
-        // 3. Resolve rate limit key
-        let (key, limits) = self.resolve_key_and_limits(ctx, &config);
+            // Global limit (in-process DDoS protection per node)
+            if self.global_limiter.check().is_err() {
+                self.stats.total_limited.fetch_add(1, Ordering::Relaxed);
+                return RateLimitResult::Limited {
+                    reason: LimitReason::Global,
+                    retry_after_ms: 1000,
+                    limit: config.global_limits.requests_per_second,
+                };
+            }
 
-        // 4. Get or create bucket for this key
-        let key_string = key.to_key_string();
-        let bucket = self
-            .buckets
-            .entry(key_string)
-            .or_insert_with(|| {
-                self.stats.keys_tracked.fetch_add(1, Ordering::Relaxed);
-                Arc::new(RateLimitBucket::new(&limits, Some(&config.adaptive)))
+            // Blocked fingerprint check (config-driven, no I/O)
+            if let Some(ref ja3) = ctx.ja3_hash {
+                if config
+                    .fingerprint_limiting
+                    .blocked_fingerprints
+                    .contains(ja3)
+                {
+                    self.stats.total_blocked.fetch_add(1, Ordering::Relaxed);
+                    return RateLimitResult::Blocked {
+                        reason: format!("Blocked fingerprint: {}", ja3),
+                    };
+                }
+            }
+
+            // Resolve key + limits; clone what we need for the async phase.
+            let (key, limits) = self.resolve_key_and_limits(ctx, &config);
+            Some(SyncData {
+                key_string: key.to_key_string(),
+                limits,
+                adaptive_enabled: config.adaptive.enabled,
+                adaptive_cfg: config.adaptive.clone(),
             })
-            .clone();
+            // config guard is dropped here — safe to .await after this point
+        };
 
-        // 5. Check the bucket
-        let result = bucket.check(&limits);
+        let SyncData {
+            key_string,
+            limits,
+            adaptive_enabled,
+            adaptive_cfg,
+        } = sync_data.expect("sync_data is always Some when we reach this line");
 
-        // 6. Record global baseline
-        if config.adaptive.enabled {
+        // ── ASYNC PHASE ──────────────────────────────────────────────────────
+        // The parking_lot guard is gone; it is safe to `.await` here.
+
+        // Clone the Redis backend Arc out from under the async RwLock before
+        // any downstream `.await` so the tokio RwLockReadGuard is not held
+        // across any subsequent await point either.
+        let redis_backend: Option<Arc<RedisBackend>> = {
+            let guard = self.redis_backend.read().await;
+            guard.clone() // cheap Arc::clone; guard dropped immediately
+        };
+
+        let result = if let Some(ref backend) = redis_backend {
+            self.check_distributed(backend, &key_string, &limits, &adaptive_cfg)
+                .await
+        } else {
+            // No Redis configured or not yet connected — use local bucket
+            self.check_local(&key_string, &limits, &adaptive_cfg)
+        };
+
+        if adaptive_enabled {
             self.global_baseline.record(1);
         }
 
-        // 7. Update stats
         match &result {
             RateLimitResult::Allowed { .. } => {
                 self.stats.total_allowed.fetch_add(1, Ordering::Relaxed);
@@ -1161,6 +1587,149 @@ impl AdvancedRateLimiter {
         }
 
         result
+    }
+
+    // ── Internal: distributed Redis path ────────────────────────────────────
+
+    async fn check_distributed(
+        &self,
+        backend: &RedisBackend,
+        key_string: &str,
+        limits: &PerKeyLimits,
+        adaptive_cfg: &AdaptiveConfig,
+    ) -> RateLimitResult {
+        // Per-second token bucket via Redis (or local governor fallback)
+        let tb_result = backend
+            .check_token_bucket(key_string, limits.requests_per_second, limits.burst_size)
+            .await;
+
+        let token_result = match tb_result {
+            Some(r) => r,
+            // Redis failed → local governor
+            None => self.check_local(key_string, limits, adaptive_cfg),
+        };
+
+        if !matches!(token_result, RateLimitResult::Allowed { .. }) {
+            return token_result;
+        }
+
+        // Per-minute sliding window
+        if let Some(rpm) = limits.requests_per_minute {
+            let sw = backend
+                .check_sliding_window(key_string, rpm, 60, "1m")
+                .await;
+            match sw {
+                Some(r @ RateLimitResult::Limited { .. }) => return r,
+                Some(_) => {} // allowed
+                None => {
+                    // Redis failed — check local minute counter
+                    let local = self.get_or_create_bucket(key_string, limits, adaptive_cfg);
+                    if let Some(ref counter) = local.minute_counter {
+                        let count = counter.increment();
+                        if count > u64::from(rpm) {
+                            local.total_blocked.fetch_add(1, Ordering::Relaxed);
+                            return RateLimitResult::Limited {
+                                reason: LimitReason::PerMinute,
+                                retry_after_ms: 60_000,
+                                limit: rpm,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
+        // Per-hour sliding window
+        if let Some(rph) = limits.requests_per_hour {
+            let sw = backend
+                .check_sliding_window(key_string, rph, 3600, "1h")
+                .await;
+            match sw {
+                Some(r @ RateLimitResult::Limited { .. }) => return r,
+                Some(_) => {} // allowed
+                None => {
+                    // Redis failed — check local hour counter
+                    let local = self.get_or_create_bucket(key_string, limits, adaptive_cfg);
+                    if let Some(ref counter) = local.hour_counter {
+                        let count = counter.increment();
+                        if count > u64::from(rph) {
+                            local.total_blocked.fetch_add(1, Ordering::Relaxed);
+                            return RateLimitResult::Limited {
+                                reason: LimitReason::PerHour,
+                                retry_after_ms: 3_600_000,
+                                limit: rph,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
+        // Adaptive anomaly detection (always local — per-node baseline)
+        self.check_adaptive(key_string, limits, adaptive_cfg)
+    }
+
+    // ── Internal: local in-memory path ──────────────────────────────────────
+
+    fn check_local(
+        &self,
+        key_string: &str,
+        limits: &PerKeyLimits,
+        adaptive_cfg: &AdaptiveConfig,
+    ) -> RateLimitResult {
+        let bucket = self.get_or_create_bucket(key_string, limits, adaptive_cfg);
+        bucket.check(limits)
+    }
+
+    fn get_or_create_bucket(
+        &self,
+        key_string: &str,
+        limits: &PerKeyLimits,
+        adaptive_cfg: &AdaptiveConfig,
+    ) -> Arc<RateLimitBucket> {
+        self.buckets
+            .entry(key_string.to_owned())
+            .or_insert_with(|| {
+                self.stats.keys_tracked.fetch_add(1, Ordering::Relaxed);
+                Arc::new(RateLimitBucket::new(limits, Some(adaptive_cfg)))
+            })
+            .clone()
+    }
+
+    fn check_adaptive(
+        &self,
+        key_string: &str,
+        limits: &PerKeyLimits,
+        adaptive_cfg: &AdaptiveConfig,
+    ) -> RateLimitResult {
+        if !adaptive_cfg.enabled {
+            return RateLimitResult::Allowed {
+                remaining: limits.requests_per_second.saturating_sub(1),
+                limit: limits.requests_per_second,
+            };
+        }
+        let bucket = self.get_or_create_bucket(key_string, limits, adaptive_cfg);
+        if let Some(ref baseline) = bucket.baseline {
+            let recent_count = bucket
+                .minute_counter
+                .as_ref()
+                .map(|c| c.get_count())
+                .unwrap_or(0);
+            baseline.record(recent_count);
+            if baseline.is_anomaly(recent_count) {
+                bucket.total_blocked.fetch_add(1, Ordering::Relaxed);
+                return RateLimitResult::Limited {
+                    reason: LimitReason::AnomalyDetected,
+                    retry_after_ms: 60_000,
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    limit: baseline.get_mean().clamp(0.0, f64::from(u32::MAX)) as u32,
+                };
+            }
+        }
+        RateLimitResult::Allowed {
+            remaining: limits.requests_per_second.saturating_sub(1),
+            limit: limits.requests_per_second,
+        }
     }
 
     /// Resolve rate limit key and applicable limits
@@ -1470,29 +2039,18 @@ impl AdvancedRateLimiter {
             return config.fingerprint_limiting.unknown_limits.clone();
         }
 
-        // Check for API key-specific limits (could be extended with database lookup)
+        // API key limits — configurable via [advanced_rate_limiting.global_limits.per_api_key]
         if matches!(key_type, RateLimitKeyType::ApiKey) {
-            // Default API key limits (higher than fingerprint)
-            return PerKeyLimits {
-                requests_per_second: 500,
-                burst_size: 250,
-                requests_per_minute: Some(15_000),
-                requests_per_hour: Some(250_000),
-            };
+            return config.global_limits.per_api_key.clone();
         }
 
         // Composite keys get their limits from CompositeKeyConfig directly
-        // in resolve_key_and_limits, but provide sensible defaults if called
+        // in resolve_key_and_limits, but fall back to the configurable default here.
         if matches!(key_type, RateLimitKeyType::Composite(_)) {
-            return PerKeyLimits {
-                requests_per_second: 200,
-                burst_size: 100,
-                requests_per_minute: Some(6_000),
-                requests_per_hour: Some(100_000),
-            };
+            return config.global_limits.per_composite.clone();
         }
 
-        // Default per-IP limits
+        // Default per-IP limits — configurable via [advanced_rate_limiting.global_limits.per_ip]
         config.global_limits.per_ip.clone()
     }
 
@@ -1561,8 +2119,16 @@ impl AdvancedRateLimiter {
         });
     }
 
-    /// Get current statistics
+    /// Get current statistics (sync snapshot — does not await Redis).
     pub fn get_stats(&self) -> RateLimiterSnapshot {
+        // Non-blocking peek at whether Redis is up.  We try_read() so this
+        // method remains synchronous and can be called from non-async contexts.
+        let redis_connected = self
+            .redis_backend
+            .try_read()
+            .map(|g| g.is_some())
+            .unwrap_or(false); // lock held → assume state unknown, report false
+
         RateLimiterSnapshot {
             total_requests: self.stats.total_requests.load(Ordering::Relaxed),
             total_allowed: self.stats.total_allowed.load(Ordering::Relaxed),
@@ -1571,6 +2137,7 @@ impl AdvancedRateLimiter {
             keys_tracked: self.buckets.len(),
             global_baseline_mean: self.global_baseline.get_mean(),
             global_baseline_std_dev: self.global_baseline.get_std_dev(),
+            redis_connected,
         }
     }
 
@@ -1624,6 +2191,8 @@ pub struct RateLimiterSnapshot {
     pub keys_tracked: usize,
     pub global_baseline_mean: f64,
     pub global_baseline_std_dev: f64,
+    /// Whether the Redis distributed backend is currently connected.
+    pub redis_connected: bool,
 }
 
 // ============================================================================
@@ -1808,7 +2377,7 @@ mod tests {
         };
 
         // First request should be allowed
-        let result = limiter.check(&ctx);
+        let result = limiter.check(&ctx).await;
         assert!(matches!(result, RateLimitResult::Allowed { .. }));
     }
 
@@ -1839,7 +2408,7 @@ mod tests {
         // Make many requests
         let mut limited_count = 0;
         for _ in 0..20 {
-            let result = limiter.check(&ctx);
+            let result = limiter.check(&ctx).await;
             if matches!(result, RateLimitResult::Limited { .. }) {
                 limited_count += 1;
             }

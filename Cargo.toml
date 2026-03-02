@@ -121,6 +121,9 @@ notify = "7.0"
 governor = "0.7"
 nonzero_ext = "0.3"
 
+# Distributed rate limiting (Redis backend)
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
+
 # Compression
 async-compression = { version = "0.4", features = ["tokio", "brotli", "zstd", "gzip", "deflate"] }
 brotli = "7.0"

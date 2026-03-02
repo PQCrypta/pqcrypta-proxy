@@ -80,6 +80,7 @@ use pqcrypta_proxy::ocsp;
 use pqcrypta_proxy::pqc_tls::{verify_pqc_support, PqcTlsProvider};
 use pqcrypta_proxy::proxy::BackendPool;
 use pqcrypta_proxy::quic_listener::QuicListener;
+use pqcrypta_proxy::rate_limiter::AdvancedRateLimiter;
 use pqcrypta_proxy::tls::TlsProvider;
 use pqcrypta_proxy::webtransport_server::WebTransportServer;
 use pqcrypta_proxy::SecurityState;
@@ -798,6 +799,10 @@ async fn main() -> anyhow::Result<()> {
         // Store shutdown sender to keep it alive
         quic_shutdown_senders.push(quic_shutdown_tx);
 
+        let quic_advanced_rl = Arc::new(AdvancedRateLimiter::new(
+            quic_config.advanced_rate_limiting.clone(),
+        ));
+
         tokio::spawn(async move {
             match QuicListener::new(
                 quic_config.clone(),
@@ -806,6 +811,7 @@ async fn main() -> anyhow::Result<()> {
                 reload_rx,
                 quic_metrics,
                 quic_security,
+                quic_advanced_rl,
             )
             .await
             {

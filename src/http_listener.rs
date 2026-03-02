@@ -1957,8 +1957,8 @@ async fn advanced_rate_limit_middleware(
         None, // Route name resolved later
     );
 
-    // Check rate limit
-    match rate_limiter.check(&ctx) {
+    // Check rate limit (async — uses Redis when configured, local fallback otherwise)
+    match rate_limiter.check(&ctx).await {
         RateLimitResult::Allowed { remaining, limit } => {
             metrics.rate_limiter.request_checked(true, false);
             // Add rate limit headers to response

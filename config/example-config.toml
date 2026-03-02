@@ -348,6 +348,21 @@ burst_size = 50
 requests_per_minute = 3000
 requests_per_hour = 50000
 
+# Default limits applied when the rate-limit key resolves to an API key.
+# Authenticated callers get intentionally higher headroom than anonymous IPs.
+[advanced_rate_limiting.global_limits.per_api_key]
+requests_per_second = 500
+burst_size = 250
+requests_per_minute = 15000
+requests_per_hour = 250000
+
+# Default limits applied to composite (multi-dimension) keys.
+[advanced_rate_limiting.global_limits.per_composite]
+requests_per_second = 200
+burst_size = 100
+requests_per_minute = 6000
+requests_per_hour = 100000
+
 # JA3/JA4 fingerprint-based limiting (NAT-friendly)
 [advanced_rate_limiting.fingerprint_limiting]
 enabled = true
@@ -410,6 +425,49 @@ std_dev_multiplier = 3.0  # Requests > mean + 3*std_dev = anomaly
 # [advanced_rate_limiting.composite_keys.limits]
 # requests_per_second = 50
 # burst_size = 25
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Distributed Rate Limiting — Redis Backend
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# When this section is present, per-key rate-limit counters (token buckets and
+# sliding windows) are stored in Redis so that ALL proxy instances in a cluster
+# share the same quotas.  Without this section each node counts independently,
+# which means a single client can reach their quota multiple times by hitting
+# different nodes.
+#
+# The global token-bucket (DDoS guard) always runs in-process; only per-key
+# limits are distributed.
+#
+# On any Redis error (timeout, connection loss) the affected request falls back
+# transparently to the in-memory bucket — no dropped requests, no crashes.
+#
+# Uncomment the section below to enable:
+#
+# [advanced_rate_limiting.redis]
+# # Redis connection URL.
+# # Single instance:
+# url = "redis://127.0.0.1:6379"
+# # With password:
+# # url = "redis://:yourpassword@127.0.0.1:6379/0"
+# # TLS:
+# # url = "rediss://redis.internal:6380"
+#
+# # Namespace prefix for all keys written by this proxy.
+# # Change if multiple services share the same Redis instance.
+# key_prefix = "pqcp"
+#
+# # How long (ms) to wait when establishing the initial connection.
+# connect_timeout_ms = 2000
+#
+# # Per-command deadline (ms).  Requests that exceed this fall back to
+# # in-memory limiting for that single check — tune to your network RTT.
+# command_timeout_ms = 50
+#
+# # Also run per-second (token-bucket) checks through Redis so every instance
+# # enforces the same burst limit.  Set to false to keep sub-millisecond
+# # per-second enforcement local while only synchronising minute/hour windows.
+# distribute_per_second = true
 
 # =============================
 # Security Settings
