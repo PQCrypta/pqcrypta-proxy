@@ -18,7 +18,7 @@ const SESSION_TTL: Duration = Duration::from_secs(3600); // 1 hour
 
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,7 +29,8 @@ use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 use crate::config::{
-    AffinityMode, BackendPoolConfig, LoadBalancerConfig, PoolServerConfig, TlsMode,
+    AffinityMode, BackendPoolConfig, CanaryPoolConfig, LoadBalancerConfig, PoolServerConfig,
+    TlsMode,
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -63,6 +64,26 @@ pub struct SelectionContext {
     pub path: String,
     /// Request host
     pub host: String,
+    /// Value of the canary sticky cookie from the request (e.g. "PQCPROXY_CANARY=<server_id>").
+    /// Extracted by http_listener using the pool's canary.sticky_cookie_name.
+    pub canary_cookie: Option<String>,
+    /// Value of the canary sticky header from the request (e.g. "X-Canary-Group: true").
+    /// Present when the pool's canary.sticky_header matches a header in the request.
+    pub canary_header: Option<String>,
+}
+
+/// Result of `BackendPool::select()`.
+///
+/// Carries the chosen server and an optional `Set-Cookie` header value that
+/// the HTTP listener must inject into the response to establish a sticky
+/// canary assignment for the client.
+#[derive(Clone)]
+pub struct SelectionResult {
+    /// The selected backend server.
+    pub server: Arc<BackendServer>,
+    /// If `Some(header_value)`, the listener should append this as a `Set-Cookie`
+    /// response header (format: "PQCPROXY_CANARY=<id>; Path=/; …").
+    pub set_canary_cookie: Option<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -113,6 +134,20 @@ pub struct BackendServer {
     pub slow_start: RwLock<Option<SlowStartState>>,
     /// Draining state
     pub draining: RwLock<Option<DrainingState>>,
+
+    // === Canary state ===
+    /// Whether this server is designated as a canary deployment target
+    pub is_canary: bool,
+    /// Fraction of *new* traffic to route here when it is the active canary (0–100)
+    pub canary_weight_percent: AtomicU8,
+    /// True when the canary has been suspended (manually or by auto-rollback)
+    pub canary_suspended: AtomicBool,
+    /// Start of the current error-rate measurement window
+    canary_window_start: RwLock<Instant>,
+    /// Total requests seen in the current window
+    canary_window_requests: AtomicU64,
+    /// Error requests seen in the current window
+    canary_window_errors: AtomicU64,
 }
 
 /// Backend health status
@@ -195,15 +230,33 @@ impl BackendServer {
             health: RwLock::new(BackendHealth::default()),
             slow_start: RwLock::new(None),
             draining: RwLock::new(None),
+            is_canary: config.canary,
+            canary_weight_percent: AtomicU8::new(config.canary_weight_percent),
+            canary_suspended: AtomicBool::new(false),
+            canary_window_start: RwLock::new(Instant::now()),
+            canary_window_requests: AtomicU64::new(0),
+            canary_window_errors: AtomicU64::new(0),
         })
     }
 
-    /// Check if server is available for requests
+    /// Check if server is available for requests.
+    ///
+    /// Canary servers that have been suspended (manually or by auto-rollback)
+    /// are treated as unavailable so they don't receive traffic via normal routing
+    /// or sticky-session recovery paths either.
     pub fn is_available(&self) -> bool {
         let health = self.health.read();
         let draining = self.draining.read();
 
-        health.healthy && !health.circuit_open && draining.is_none()
+        health.healthy
+            && !health.circuit_open
+            && draining.is_none()
+            && !(self.is_canary && self.canary_suspended.load(Ordering::Relaxed))
+    }
+
+    /// Check if this canary server is available for canary-specific routing.
+    pub fn is_canary_available(&self) -> bool {
+        self.is_canary && self.is_available()
     }
 
     /// Acquire connection to this server.
@@ -318,6 +371,79 @@ impl BackendServer {
             self.id, timeout
         );
     }
+
+    // ── Canary helpers ────────────────────────────────────────────────────────
+
+    /// Suspend this canary server so it receives no further traffic.
+    pub fn suspend_canary(&self) {
+        self.canary_suspended.store(true, Ordering::Relaxed);
+        warn!("Canary server {} suspended", self.id);
+    }
+
+    /// Resume a suspended canary server and reset its error-rate window.
+    pub fn resume_canary(&self) {
+        self.canary_suspended.store(false, Ordering::Relaxed);
+        *self.canary_window_start.write() = Instant::now();
+        self.canary_window_requests.store(0, Ordering::Relaxed);
+        self.canary_window_errors.store(0, Ordering::Relaxed);
+        info!("Canary server {} resumed", self.id);
+    }
+
+    /// Return the current error rate in the sliding window (0.0–1.0).
+    pub fn canary_error_rate(&self) -> f64 {
+        let requests = self.canary_window_requests.load(Ordering::Relaxed);
+        if requests == 0 {
+            return 0.0;
+        }
+        let errors = self.canary_window_errors.load(Ordering::Relaxed);
+        errors as f64 / requests as f64
+    }
+
+    /// Record a canary request outcome and potentially trigger auto-rollback.
+    ///
+    /// Returns `true` if auto-rollback was just triggered (i.e. the canary was
+    /// suspended by this call).  The caller should log a warning in that case.
+    pub fn record_canary_result(&self, success: bool, config: &CanaryPoolConfig) -> bool {
+        if !config.auto_rollback {
+            return false;
+        }
+
+        let window_dur = Duration::from_secs(config.rollback_window_secs);
+
+        // Reset window if it has expired.
+        {
+            let mut window_start = self.canary_window_start.write();
+            if window_start.elapsed() >= window_dur {
+                *window_start = Instant::now();
+                self.canary_window_requests.store(0, Ordering::Relaxed);
+                self.canary_window_errors.store(0, Ordering::Relaxed);
+            }
+        }
+
+        self.canary_window_requests.fetch_add(1, Ordering::Relaxed);
+        if !success {
+            self.canary_window_errors.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let requests = self.canary_window_requests.load(Ordering::Relaxed);
+        let errors = self.canary_window_errors.load(Ordering::Relaxed);
+
+        if requests >= config.rollback_min_requests {
+            let error_rate = errors as f64 / requests as f64;
+            if error_rate > config.rollback_error_rate {
+                // Use compare-and-swap so we only return true once (first trigger).
+                if self
+                    .canary_suspended
+                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -357,6 +483,12 @@ pub struct BackendPool {
 
     // === Weighted round-robin state ===
     wrr_state: RwLock<WeightedRoundRobinState>,
+
+    // === Canary state ===
+    /// Pool-level canary configuration (None when canary is not configured).
+    pub canary_config: Option<CanaryPoolConfig>,
+    /// Canary sticky-cookie → (server_id, last_access) with TTL eviction.
+    canary_sessions: DashMap<String, (String, Instant)>,
 }
 
 /// State for weighted round-robin algorithm
@@ -406,6 +538,8 @@ impl BackendPool {
             header_sessions: DashMap::new(),
             rr_counter: AtomicU64::new(0),
             wrr_state: RwLock::new(WeightedRoundRobinState::default()),
+            canary_config: config.canary.clone(),
+            canary_sessions: DashMap::new(),
         }
     }
 
@@ -421,22 +555,149 @@ impl BackendPool {
         }
     }
 
-    /// Select a backend server
-    pub fn select(&self, ctx: &SelectionContext) -> Option<Arc<BackendServer>> {
-        // Check sticky session first
+    /// Select a backend server.
+    ///
+    /// Canary routing is attempted first (when configured and enabled), then
+    /// falls back to normal sticky-session / algorithm selection among non-canary
+    /// servers.  Returns a `SelectionResult` that may carry a `Set-Cookie` header
+    /// value that the caller must inject into the HTTP response.
+    pub fn select(&self, ctx: &SelectionContext) -> Option<SelectionResult> {
+        // Try canary routing first.
+        if let Some(result) = self.try_canary_select(ctx) {
+            return Some(result);
+        }
+
+        // Normal routing (canary servers are excluded from get_healthy_servers).
         if let Some(server) = self.check_sticky_session(ctx) {
             if server.is_available() {
-                return Some(server);
+                return Some(SelectionResult {
+                    server,
+                    set_canary_cookie: None,
+                });
             }
         }
 
-        // Use algorithm to select
         let server = self.algorithm.select(self, ctx)?;
-
-        // Record sticky session if needed
         self.record_sticky_session(ctx, &server);
 
-        Some(server)
+        Some(SelectionResult {
+            server,
+            set_canary_cookie: None,
+        })
+    }
+
+    /// Canary-specific selection logic.  Returns `None` if canary is not
+    /// configured/enabled or no canary server is available.
+    fn try_canary_select(&self, ctx: &SelectionContext) -> Option<SelectionResult> {
+        let canary_cfg = self.canary_config.as_ref()?;
+        if !canary_cfg.enabled {
+            return None;
+        }
+
+        // Collect available canary servers.
+        let available_canaries: Vec<Arc<BackendServer>> = {
+            let servers = self.servers.read();
+            servers
+                .iter()
+                .filter(|s| s.is_canary_available())
+                .cloned()
+                .collect()
+        };
+
+        if available_canaries.is_empty() {
+            return None;
+        }
+
+        // 1. Check canary sticky cookie from the request.
+        if canary_cfg.sticky {
+            if let Some(ref cookie_val) = ctx.canary_cookie {
+                let ttl = Duration::from_secs(canary_cfg.sticky_cookie_ttl_secs);
+                if let Some(mut entry) = self.canary_sessions.get_mut(cookie_val) {
+                    if entry.1.elapsed() <= ttl {
+                        entry.1 = Instant::now(); // refresh TTL
+                        let id = entry.0.clone();
+                        drop(entry);
+                        if let Some(server) =
+                            available_canaries.iter().find(|s| s.id == id).cloned()
+                        {
+                            return Some(SelectionResult {
+                                server,
+                                set_canary_cookie: None, // already set on a previous request
+                            });
+                        }
+                    } else {
+                        drop(entry);
+                        self.canary_sessions.remove(cookie_val);
+                    }
+                }
+            }
+        }
+
+        // 2. Check canary sticky-header pre-assignment.
+        //    Any request carrying the configured header is routed to canary,
+        //    and a sticky cookie is set so subsequent requests also land here.
+        if ctx.canary_header.is_some() {
+            if let Some(server) = available_canaries
+                .iter()
+                .min_by_key(|s| s.active_connections.load(Ordering::Relaxed))
+                .cloned()
+            {
+                let set_cookie = if canary_cfg.sticky {
+                    self.canary_sessions
+                        .insert(server.id.clone(), (server.id.clone(), Instant::now()));
+                    Some(self.build_canary_cookie(&server.id, canary_cfg))
+                } else {
+                    None
+                };
+                return Some(SelectionResult {
+                    server,
+                    set_canary_cookie: set_cookie,
+                });
+            }
+        }
+
+        // 3. Probabilistic roll — route `canary_weight_percent`% of new requests.
+        let max_pct = available_canaries
+            .iter()
+            .map(|s| s.canary_weight_percent.load(Ordering::Relaxed))
+            .max()
+            .unwrap_or(0);
+
+        if max_pct == 0 {
+            return None;
+        }
+
+        let roll: u8 = rand::thread_rng().gen_range(0..100);
+        if roll >= max_pct {
+            return None;
+        }
+
+        // Select least-connections canary.
+        let server = available_canaries
+            .iter()
+            .min_by_key(|s| s.active_connections.load(Ordering::Relaxed))
+            .cloned()?;
+
+        let set_canary_cookie = if canary_cfg.sticky {
+            self.canary_sessions
+                .insert(server.id.clone(), (server.id.clone(), Instant::now()));
+            Some(self.build_canary_cookie(&server.id, canary_cfg))
+        } else {
+            None
+        };
+
+        Some(SelectionResult {
+            server,
+            set_canary_cookie,
+        })
+    }
+
+    /// Build a `Set-Cookie` header value for the canary sticky cookie.
+    fn build_canary_cookie(&self, server_id: &str, cfg: &CanaryPoolConfig) -> String {
+        format!(
+            "{}={}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={}",
+            cfg.sticky_cookie_name, server_id, cfg.sticky_cookie_ttl_secs
+        )
     }
 
     /// Check for existing sticky session.
@@ -529,18 +790,23 @@ impl BackendPool {
             .cloned()
     }
 
-    /// Get healthy servers
+    /// Get healthy servers for normal (non-canary) routing.
+    ///
+    /// Canary servers (`is_canary = true`) are always excluded so normal load-
+    /// balancing algorithms never accidentally pick them.  They are selected
+    /// exclusively through the canary routing path in `select()`.
     pub fn get_healthy_servers(&self) -> Vec<Arc<BackendServer>> {
         let servers = self.servers.read();
 
         if !self.health_aware {
-            return servers.clone();
+            // Still exclude canary servers even when health-checking is off.
+            return servers.iter().filter(|s| !s.is_canary).cloned().collect();
         }
 
-        // First, try priority 1 healthy servers
+        // First, try priority 1 healthy non-canary servers
         let priority_1: Vec<_> = servers
             .iter()
-            .filter(|s| s.is_available() && s.priority == 1)
+            .filter(|s| s.is_available() && s.priority == 1 && !s.is_canary)
             .cloned()
             .collect();
 
@@ -548,15 +814,15 @@ impl BackendPool {
             return priority_1;
         }
 
-        // Failover to higher priority numbers
+        // Failover to higher priority numbers (still excluding canary servers)
         servers
             .iter()
-            .filter(|s| s.is_available())
+            .filter(|s| s.is_available() && !s.is_canary)
             .cloned()
             .collect()
     }
 
-    /// Record request completion
+    /// Record request completion and update canary auto-rollback counters.
     pub fn record_completion(
         &self,
         server: &BackendServer,
@@ -566,11 +832,79 @@ impl BackendPool {
         self.algorithm
             .record_completion(server, response_time, success);
         server.record_result(success, response_time);
+
+        // Canary error-rate tracking and auto-rollback.
+        if server.is_canary {
+            if let Some(ref canary_cfg) = self.canary_config {
+                if server.record_canary_result(success, canary_cfg) {
+                    warn!(
+                        "Canary server {} in pool '{}' auto-suspended: error rate {:.1}% exceeded threshold {:.1}%",
+                        server.id,
+                        self.name,
+                        server.canary_error_rate() * 100.0,
+                        canary_cfg.rollback_error_rate * 100.0
+                    );
+                }
+            }
+        }
     }
 
     /// Get algorithm name
     pub fn algorithm_name(&self) -> &'static str {
         self.algorithm.name()
+    }
+
+    /// Suspend a canary server by its ID.  Returns true if found and suspended.
+    pub fn suspend_canary_server(&self, server_id: &str) -> bool {
+        let servers = self.servers.read();
+        if let Some(s) = servers.iter().find(|s| s.id == server_id && s.is_canary) {
+            s.suspend_canary();
+            return true;
+        }
+        false
+    }
+
+    /// Resume a suspended canary server by its ID.  Returns true if found and resumed.
+    pub fn resume_canary_server(&self, server_id: &str) -> bool {
+        let servers = self.servers.read();
+        if let Some(s) = servers.iter().find(|s| s.id == server_id && s.is_canary) {
+            s.resume_canary();
+            return true;
+        }
+        false
+    }
+
+    /// Update `canary_weight_percent` for a canary server by its ID.
+    /// Returns true if found and updated.
+    pub fn set_canary_weight(&self, server_id: &str, percent: u8) -> bool {
+        if percent > 100 {
+            return false;
+        }
+        let servers = self.servers.read();
+        for s in servers.iter() {
+            if s.id == server_id && s.is_canary {
+                s.canary_weight_percent.store(percent, Ordering::Relaxed);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Return a snapshot of canary server status for the admin API.
+    pub fn canary_status(&self) -> Vec<CanaryServerStatus> {
+        let servers = self.servers.read();
+        servers
+            .iter()
+            .filter(|s| s.is_canary)
+            .map(|s| CanaryServerStatus {
+                id: s.id.clone(),
+                canary_weight_percent: s.canary_weight_percent.load(Ordering::Relaxed),
+                suspended: s.canary_suspended.load(Ordering::Relaxed),
+                error_rate: s.canary_error_rate(),
+                window_requests: s.canary_window_requests.load(Ordering::Relaxed),
+                window_errors: s.canary_window_errors.load(Ordering::Relaxed),
+            })
+            .collect()
     }
 
     /// Get pool statistics
@@ -666,6 +1000,17 @@ impl BackendPool {
             }
         });
     }
+}
+
+/// Canary server status snapshot (used by admin API)
+#[derive(Debug, Clone)]
+pub struct CanaryServerStatus {
+    pub id: String,
+    pub canary_weight_percent: u8,
+    pub suspended: bool,
+    pub error_rate: f64,
+    pub window_requests: u64,
+    pub window_errors: u64,
 }
 
 /// Pool statistics
@@ -908,12 +1253,21 @@ impl LoadBalancer {
         self.pools.get(name).map(|p| p.clone())
     }
 
-    /// Select backend for request
+    /// Iterate over all pool names and their Arc references.
+    pub fn all_pools(&self) -> Vec<(String, Arc<BackendPool>)> {
+        self.pools
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect()
+    }
+
+    /// Select backend for request.  Returns a `SelectionResult` that may carry
+    /// a canary `Set-Cookie` header value to inject into the response.
     pub fn select_backend(
         &self,
         pool_name: &str,
         ctx: &SelectionContext,
-    ) -> Option<Arc<BackendServer>> {
+    ) -> Option<SelectionResult> {
         let pool = self.pools.get(pool_name)?;
         pool.select(ctx)
     }
@@ -1036,12 +1390,20 @@ pub fn extract_session_cookie(
     cookie_header: Option<&str>,
     config: &SessionCookieConfig,
 ) -> Option<String> {
+    extract_cookie_by_name(cookie_header, &config.name)
+}
+
+/// Extract any named cookie value from a raw `Cookie:` header.
+///
+/// Looks for `<name>=<value>` (case-sensitive) in the semicolon-separated list.
+pub fn extract_cookie_by_name(cookie_header: Option<&str>, name: &str) -> Option<String> {
     let header = cookie_header?;
 
     for cookie in header.split(';') {
         let cookie = cookie.trim();
-        if cookie.starts_with(&config.name) {
-            if let Some(value) = cookie.split('=').nth(1) {
+        // Match "<name>=" prefix exactly.
+        if let Some(rest) = cookie.strip_prefix(name) {
+            if let Some(value) = rest.strip_prefix('=') {
                 return Some(value.trim().to_string());
             }
         }
@@ -1054,6 +1416,15 @@ mod tests {
     use super::*;
 
     fn create_test_server(address: &str, weight: u32) -> Arc<BackendServer> {
+        create_test_server_full(address, weight, false, 0)
+    }
+
+    fn create_test_server_full(
+        address: &str,
+        weight: u32,
+        canary: bool,
+        canary_pct: u8,
+    ) -> Arc<BackendServer> {
         let config = PoolServerConfig {
             address: address.to_string(),
             weight,
@@ -1067,8 +1438,42 @@ mod tests {
             cb_failure_threshold: None,
             cb_half_open_delay_secs: None,
             cb_success_threshold: None,
+            canary,
+            canary_weight_percent: canary_pct,
         };
         Arc::new(BackendServer::from_config(&config).expect("test address must be valid"))
+    }
+
+    fn make_pool_config(
+        algorithm: &str,
+        servers: Vec<PoolServerConfig>,
+        canary: Option<CanaryPoolConfig>,
+    ) -> BackendPoolConfig {
+        BackendPoolConfig {
+            name: "test-pool".to_string(),
+            algorithm: algorithm.to_string(),
+            health_aware: false,
+            affinity: AffinityMode::None,
+            affinity_header: None,
+            queue_max_size: None,
+            queue_timeout_ms: None,
+            health_check_path: None,
+            health_check_interval_secs: 10,
+            servers,
+            canary,
+        }
+    }
+
+    fn default_ctx() -> SelectionContext {
+        SelectionContext {
+            client_ip: "127.0.0.1".parse().unwrap(),
+            session_cookie: None,
+            affinity_header: None,
+            path: "/".to_string(),
+            host: "localhost".to_string(),
+            canary_cookie: None,
+            canary_header: None,
+        }
     }
 
     #[test]
@@ -1161,5 +1566,251 @@ mod tests {
         }
 
         assert!(server.is_available());
+    }
+
+    // ── Canary tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_canary_probabilistic_routing() {
+        // Pool: one stable server + one 50% canary server.
+        let stable_cfg = PoolServerConfig {
+            address: "127.0.0.1:9001".to_string(),
+            weight: 100,
+            priority: 1,
+            max_connections: 100,
+            timeout_ms: 30000,
+            tls_mode: TlsMode::Terminate,
+            tls_cert: None,
+            tls_skip_verify: false,
+            tls_sni: None,
+            cb_failure_threshold: None,
+            cb_half_open_delay_secs: None,
+            cb_success_threshold: None,
+            canary: false,
+            canary_weight_percent: 0,
+        };
+        let canary_cfg = PoolServerConfig {
+            address: "127.0.0.1:9002".to_string(),
+            weight: 100,
+            priority: 1,
+            max_connections: 100,
+            timeout_ms: 30000,
+            tls_mode: TlsMode::Terminate,
+            tls_cert: None,
+            tls_skip_verify: false,
+            tls_sni: None,
+            cb_failure_threshold: None,
+            cb_half_open_delay_secs: None,
+            cb_success_threshold: None,
+            canary: true,
+            canary_weight_percent: 50,
+        };
+
+        let pool_cfg = make_pool_config(
+            "random",
+            vec![stable_cfg, canary_cfg],
+            Some(CanaryPoolConfig {
+                enabled: true,
+                sticky: false,
+                sticky_cookie_name: "PQCPROXY_CANARY".to_string(),
+                sticky_cookie_ttl_secs: 3600,
+                sticky_header: None,
+                auto_rollback: false,
+                rollback_error_rate: 0.05,
+                rollback_window_secs: 60,
+                rollback_min_requests: 10,
+            }),
+        );
+
+        let lb_config = Arc::new(LoadBalancerConfig::default());
+        let pool = BackendPool::from_config(&pool_cfg, &lb_config);
+        let ctx = default_ctx();
+
+        let mut canary_hits = 0u32;
+        let iterations = 1000;
+        for _ in 0..iterations {
+            if let Some(result) = pool.select(&ctx) {
+                if result.server.is_canary {
+                    canary_hits += 1;
+                }
+            }
+        }
+
+        // With 50% weight, expect roughly 40–60% canary hits.
+        let ratio = canary_hits as f64 / iterations as f64;
+        assert!(
+            ratio >= 0.35 && ratio <= 0.65,
+            "Expected ~50% canary hits, got {:.1}%",
+            ratio * 100.0
+        );
+    }
+
+    #[test]
+    fn test_canary_sticky_cookie() {
+        let pool_cfg = make_pool_config(
+            "round_robin",
+            vec![
+                PoolServerConfig {
+                    address: "127.0.0.1:9001".to_string(),
+                    weight: 100,
+                    priority: 1,
+                    max_connections: 100,
+                    timeout_ms: 30000,
+                    tls_mode: TlsMode::Terminate,
+                    tls_cert: None,
+                    tls_skip_verify: false,
+                    tls_sni: None,
+                    cb_failure_threshold: None,
+                    cb_half_open_delay_secs: None,
+                    cb_success_threshold: None,
+                    canary: false,
+                    canary_weight_percent: 0,
+                },
+                PoolServerConfig {
+                    address: "127.0.0.1:9002".to_string(),
+                    weight: 100,
+                    priority: 1,
+                    max_connections: 100,
+                    timeout_ms: 30000,
+                    tls_mode: TlsMode::Terminate,
+                    tls_cert: None,
+                    tls_skip_verify: false,
+                    tls_sni: None,
+                    cb_failure_threshold: None,
+                    cb_half_open_delay_secs: None,
+                    cb_success_threshold: None,
+                    canary: true,
+                    canary_weight_percent: 100, // always canary for test
+                },
+            ],
+            Some(CanaryPoolConfig {
+                enabled: true,
+                sticky: true,
+                sticky_cookie_name: "PQCPROXY_CANARY".to_string(),
+                sticky_cookie_ttl_secs: 3600,
+                sticky_header: None,
+                auto_rollback: false,
+                rollback_error_rate: 0.05,
+                rollback_window_secs: 60,
+                rollback_min_requests: 10,
+            }),
+        );
+
+        let lb_config = Arc::new(LoadBalancerConfig::default());
+        let pool = BackendPool::from_config(&pool_cfg, &lb_config);
+
+        // First select — no cookie yet.
+        let result1 = pool.select(&default_ctx()).expect("should select");
+        assert!(result1.server.is_canary);
+        let cookie_header = result1
+            .set_canary_cookie
+            .expect("should set canary cookie on first assignment");
+        // Cookie value is the server ID.
+        let server_id = result1.server.id.clone();
+        assert!(cookie_header.contains(&server_id));
+        assert!(cookie_header.contains("PQCPROXY_CANARY="));
+
+        // Second select — send cookie back.
+        let mut ctx2 = default_ctx();
+        ctx2.canary_cookie = Some(server_id.clone());
+        let result2 = pool.select(&ctx2).expect("should select");
+        // Sticky: must return the same server.
+        assert_eq!(result2.server.id, server_id);
+        // Already assigned — no new Set-Cookie.
+        assert!(result2.set_canary_cookie.is_none());
+    }
+
+    #[test]
+    fn test_canary_auto_rollback() {
+        let server = create_test_server_full("127.0.0.1:9003", 100, true, 50);
+        let cfg = CanaryPoolConfig {
+            enabled: true,
+            sticky: false,
+            sticky_cookie_name: "PQCPROXY_CANARY".to_string(),
+            sticky_cookie_ttl_secs: 3600,
+            sticky_header: None,
+            auto_rollback: true,
+            rollback_error_rate: 0.5, // 50% threshold for easy testing
+            rollback_window_secs: 60,
+            rollback_min_requests: 10,
+        };
+
+        // Feed 15 failures — should trigger rollback.
+        let mut triggered = false;
+        for _ in 0..15 {
+            if server.record_canary_result(false, &cfg) {
+                triggered = true;
+            }
+        }
+
+        assert!(triggered, "auto-rollback should have triggered");
+        assert!(server.canary_suspended.load(Ordering::Relaxed));
+        assert!(!server.is_available(), "suspended canary should be unavailable");
+    }
+
+    #[test]
+    fn test_canary_excluded_from_normal_routing() {
+        // Canary server must not appear in get_healthy_servers().
+        let pool_cfg = make_pool_config(
+            "round_robin",
+            vec![
+                PoolServerConfig {
+                    address: "127.0.0.1:9001".to_string(),
+                    weight: 100,
+                    priority: 1,
+                    max_connections: 100,
+                    timeout_ms: 30000,
+                    tls_mode: TlsMode::Terminate,
+                    tls_cert: None,
+                    tls_skip_verify: false,
+                    tls_sni: None,
+                    cb_failure_threshold: None,
+                    cb_half_open_delay_secs: None,
+                    cb_success_threshold: None,
+                    canary: false,
+                    canary_weight_percent: 0,
+                },
+                PoolServerConfig {
+                    address: "127.0.0.1:9002".to_string(),
+                    weight: 100,
+                    priority: 1,
+                    max_connections: 100,
+                    timeout_ms: 30000,
+                    tls_mode: TlsMode::Terminate,
+                    tls_cert: None,
+                    tls_skip_verify: false,
+                    tls_sni: None,
+                    cb_failure_threshold: None,
+                    cb_half_open_delay_secs: None,
+                    cb_success_threshold: None,
+                    canary: true,
+                    canary_weight_percent: 0, // 0% → no probabilistic routing
+                },
+            ],
+            None, // canary config disabled
+        );
+
+        let lb_config = Arc::new(LoadBalancerConfig::default());
+        let pool = BackendPool::from_config(&pool_cfg, &lb_config);
+
+        let healthy = pool.get_healthy_servers();
+        assert_eq!(healthy.len(), 1);
+        assert!(!healthy[0].is_canary);
+    }
+
+    #[test]
+    fn test_extract_cookie_by_name() {
+        let hdr = "other=value; PQCPROXY_CANARY=127.0.0.1:9002; another=test";
+        let extracted = extract_cookie_by_name(Some(hdr), "PQCPROXY_CANARY");
+        assert_eq!(extracted, Some("127.0.0.1:9002".to_string()));
+
+        // Not present
+        let none = extract_cookie_by_name(Some(hdr), "NONEXISTENT");
+        assert!(none.is_none());
+
+        // Prefix match must not fire (PQCPROXY_CANARY_EXTRA is a different cookie)
+        let hdr2 = "PQCPROXY_CANARY_EXTRA=yes; PQCPROXY_CANARY=target";
+        let extracted2 = extract_cookie_by_name(Some(hdr2), "PQCPROXY_CANARY");
+        assert_eq!(extracted2, Some("target".to_string()));
     }
 }

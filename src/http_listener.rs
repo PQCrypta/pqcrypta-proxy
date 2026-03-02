@@ -53,7 +53,9 @@ use crate::fingerprint::{
     fingerprint_middleware, FingerprintExtractor, FingerprintMiddlewareState,
 };
 use crate::http3_features::{http3_features_middleware, Http3FeaturesState};
-use crate::load_balancer::{extract_session_cookie, LoadBalancer, SelectionContext};
+use crate::load_balancer::{
+    extract_cookie_by_name, extract_session_cookie, LoadBalancer, SelectionContext,
+};
 use crate::metrics::{ConnectionProtocol, MetricsRegistry};
 use crate::rate_limiter::{
     build_context_from_request, AdvancedRateLimiter, LimitReason, RateLimitResult,
@@ -219,6 +221,7 @@ pub async fn run_http_listener(
     key_path: &str,
     config: Arc<ProxyConfig>,
     metrics: Arc<MetricsRegistry>,
+    load_balancer: Arc<LoadBalancer>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let port = addr.port();
 
@@ -255,21 +258,6 @@ pub async fn run_http_listener(
 
     // Initialize fingerprint extractor for JA3/JA4 tracking
     let fingerprint_extractor = Arc::new(FingerprintExtractor::new());
-
-    // Initialize load balancer from config
-    let lb_config = Arc::new(config.load_balancer.clone());
-    let load_balancer = Arc::new(LoadBalancer::new(lb_config));
-
-    // Add backend pools from configuration
-    for (name, pool_config) in &config.backend_pools {
-        load_balancer.add_pool(pool_config);
-        info!(
-            "⚖️  Added backend pool '{}' with {} servers ({})",
-            name,
-            pool_config.servers.len(),
-            pool_config.algorithm
-        );
-    }
 
     // Initialize advanced multi-dimensional rate limiter
     let rate_limiter = Arc::new(AdvancedRateLimiter::new(
@@ -401,6 +389,7 @@ pub async fn run_http_listener_pqc(
     config: Arc<ProxyConfig>,
     pqc_provider: Arc<PqcTlsProvider>,
     metrics: Arc<MetricsRegistry>,
+    load_balancer: Arc<LoadBalancer>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let port = addr.port();
 
@@ -437,21 +426,6 @@ pub async fn run_http_listener_pqc(
 
     // Initialize fingerprint extractor for JA3/JA4 tracking
     let fingerprint_extractor = Arc::new(FingerprintExtractor::new());
-
-    // Initialize load balancer from config
-    let lb_config = Arc::new(config.load_balancer.clone());
-    let load_balancer = Arc::new(LoadBalancer::new(lb_config));
-
-    // Add backend pools from configuration
-    for (name, pool_config) in &config.backend_pools {
-        load_balancer.add_pool(pool_config);
-        info!(
-            "⚖️  Added backend pool '{}' with {} servers ({})",
-            name,
-            pool_config.servers.len(),
-            pool_config.algorithm
-        );
-    }
 
     // Initialize advanced multi-dimensional rate limiter
     let rate_limiter = Arc::new(AdvancedRateLimiter::new(
@@ -637,6 +611,7 @@ pub async fn run_http_listener_with_fingerprint(
     config: Arc<ProxyConfig>,
     shutdown_rx: watch::Receiver<()>,
     metrics: Arc<MetricsRegistry>,
+    load_balancer: Arc<LoadBalancer>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut shutdown_rx = shutdown_rx;
     let port = addr.port();
@@ -674,21 +649,6 @@ pub async fn run_http_listener_with_fingerprint(
 
     // Initialize fingerprint extractor for JA3/JA4 tracking
     let fingerprint_extractor = Arc::new(FingerprintExtractor::new());
-
-    // Initialize load balancer from config
-    let lb_config = Arc::new(config.load_balancer.clone());
-    let load_balancer = Arc::new(LoadBalancer::new(lb_config));
-
-    // Add backend pools from configuration
-    for (name, pool_config) in &config.backend_pools {
-        load_balancer.add_pool(pool_config);
-        info!(
-            "⚖️  Added backend pool '{}' with {} servers ({})",
-            name,
-            pool_config.servers.len(),
-            pool_config.algorithm
-        );
-    }
 
     // Initialize advanced multi-dimensional rate limiter
     let rate_limiter = Arc::new(AdvancedRateLimiter::new(
@@ -1001,6 +961,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     pqc_provider: Arc<PqcTlsProvider>,
     shutdown_rx: watch::Receiver<()>,
     metrics: Arc<MetricsRegistry>,
+    load_balancer: Arc<LoadBalancer>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut shutdown_rx = shutdown_rx;
     use openssl::ssl::SslContext;
@@ -1041,20 +1002,6 @@ pub async fn run_http_listener_pqc_with_fingerprint(
 
     // Initialize fingerprint extractor
     let fingerprint_extractor = Arc::new(FingerprintExtractor::new());
-
-    // Initialize load balancer
-    let lb_config = Arc::new(config.load_balancer.clone());
-    let load_balancer = Arc::new(LoadBalancer::new(lb_config));
-
-    for (name, pool_config) in &config.backend_pools {
-        load_balancer.add_pool(pool_config);
-        info!(
-            "⚖️  Added backend pool '{}' with {} servers ({})",
-            name,
-            pool_config.servers.len(),
-            pool_config.algorithm
-        );
-    }
 
     // Initialize rate limiter
     let rate_limiter = Arc::new(AdvancedRateLimiter::new(
@@ -2245,14 +2192,33 @@ async fn proxy_handler(
         let request_start = std::time::Instant::now();
 
         // Check if backend is a pool first, then fall back to single backend
+        let mut canary_cookie_to_set: Option<String> = None;
         let (backend_address, tls_mode, pool_server, pool_name) =
             if let Some(pool) = state.load_balancer.get_pool(&route.backend) {
                 // Extract session cookie for sticky sessions
-                let session_cookie = headers
-                    .get("cookie")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|cookies| {
-                        extract_session_cookie(Some(cookies), &state.load_balancer.cookie_config)
+                let cookie_header = headers.get("cookie").and_then(|v| v.to_str().ok());
+                let session_cookie = extract_session_cookie(
+                    cookie_header,
+                    &state.load_balancer.cookie_config,
+                );
+
+                // Extract canary sticky cookie
+                let canary_name = pool
+                    .canary_config
+                    .as_ref()
+                    .map(|c| c.sticky_cookie_name.as_str())
+                    .unwrap_or("PQCPROXY_CANARY");
+                let canary_cookie = extract_cookie_by_name(cookie_header, canary_name);
+
+                // Extract canary sticky header (pre-assigned group)
+                let canary_header = pool
+                    .canary_config
+                    .as_ref()
+                    .and_then(|c| c.sticky_header.as_ref())
+                    .and_then(|h| {
+                        headers
+                            .get(h.as_str())
+                            .and_then(|v| v.to_str().ok().map(String::from))
                     });
 
                 // Build selection context
@@ -2266,14 +2232,17 @@ async fn proxy_handler(
                     }),
                     path: path.clone(),
                     host: host.clone(),
+                    canary_cookie,
+                    canary_header,
                 };
 
                 // Select backend from pool
                 match pool.select(&ctx) {
-                    Some(server) => {
-                        let address = server.address.to_string();
-                        let tls = server.tls_mode.clone();
-                        (address, tls, Some(server), Some(route.backend.clone()))
+                    Some(result) => {
+                        let address = result.server.address.to_string();
+                        let tls = result.server.tls_mode.clone();
+                        canary_cookie_to_set = result.set_canary_cookie;
+                        (address, tls, Some(result.server), Some(route.backend.clone()))
                     }
                     None => {
                         warn!(
@@ -2474,6 +2443,13 @@ async fn proxy_handler(
                                 parts.headers.insert(header::SET_COOKIE, val);
                             }
                         }
+                    }
+                }
+
+                // Inject canary sticky cookie on first canary assignment
+                if let Some(ref cookie_hdr) = canary_cookie_to_set {
+                    if let Ok(val) = HeaderValue::from_str(cookie_hdr) {
+                        parts.headers.append(header::SET_COOKIE, val);
                     }
                 }
 

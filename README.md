@@ -21,7 +21,7 @@
 - **Advanced Security**: JA3/JA4 fingerprinting with replay and drift detection, circuit breaker, GeoIP blocking, DB-synced IP blocklists, WebTransport origin validation, 0-RTT replay protection
 - **Structured Audit Logging**: Async JSON audit log for admin actions, auth failures, WAF blocks, IP blocks, rate limit hits, PQC downgrades, config reloads
 - **Structured Access Logging**: Per-request JSON or text logs with latency, bytes, upstream, and client IP
-- **Enterprise Load Balancing**: 6 algorithms, session affinity, health-aware routing, per-backend retry policies, per-backend circuit breaker overrides
+- **Enterprise Load Balancing**: 6 algorithms, session affinity, health-aware routing, per-backend retry policies, per-backend circuit breaker overrides, canary / percentage traffic splitting with sticky assignment and auto-rollback
 - **Multi-Dimensional Rate Limiting**: Composite keys, JA3/JA4-based, JWT-verified, adaptive ML anomaly detection; optional Redis backend distributes counters across all proxy instances
 - **Zero-Trust Primitives**: Per-route HMAC proof-of-possession (path+query signed, nonce replay prevention), internal route mTLS auto-enforcement, zero-trust mode startup validation (includes admin HMAC requirement), admin proof-of-possession, `trusted_internal_cidrs` deprecation
 
@@ -108,6 +108,7 @@
 | **Accept-CH Header** | ✅ | `Accept-CH` client hints advertisement for adaptive content delivery |
 | **Graceful Shutdown Drain** | ✅ | Configurable drain timeout polls active connections at 100 ms intervals; exits as soon as connections reach zero |
 | **Weighted Load Balancing** | ✅ | Per-server weight (1–1000) with smooth weighted round-robin for proportional traffic distribution |
+| **Canary / Traffic Splitting** | ✅ | Percentage-based canary routing with sticky cookie assignment, per-pool auto-rollback on error rate threshold, and live admin control |
 | **Least Response Time Routing** | ✅ | Routes requests to the backend with the lowest moving-average response time |
 | **IP Hash Load Balancing** | ✅ | Deterministic backend selection by client IP hash for implicit session stickiness |
 | **Per-Server Priority** | ✅ | Failover priority levels; lower-priority backends only receive traffic when higher-priority ones are unhealthy |
@@ -169,6 +170,7 @@
   - `least_response_time`: Routes to fastest responding server (EMA tracking)
 - **Backend Pools**: Group multiple servers per route for high availability
 - **Session Affinity**: Cookie-based, IP hash, or custom header sticky sessions; each mode uses its own dedicated map with TTL eviction
+- **Canary / Percentage Traffic Splitting**: Route a configurable percentage of new traffic to a canary server while stable servers handle the rest; once assigned, clients receive a sticky `PQCPROXY_CANARY` cookie so they stay on the same server for the duration of the experiment; auto-rollback suspends the canary if its sliding-window error rate exceeds a configured threshold; live admin endpoints (`GET /canary`, `POST /canary/suspend/:id`, `POST /canary/resume/:id`, `POST /canary/weight/:id`) allow runtime inspection and control without restarting the proxy
 - **Health-Aware Routing**: Automatically bypasses unhealthy backends; proactive TCP-connect health checks on configurable interval detect failures before traffic hits them
 - **Slow Start**: Gradually increases traffic to recovering servers to avoid thundering herd after circuit breaker reopens
 - **Connection Draining**: Graceful server removal with configurable drain timeout; in-flight requests complete before backend is taken out of rotation
@@ -206,7 +208,7 @@
 - **Access Logging**: Per-request structured logging in JSON or plain-text format; configurable output file, includes method, path, status, latency, bytes, client IP, and upstream; user-controlled fields sanitized to prevent log injection
 - **Audit Logging**: Async structured JSON audit log for security-relevant events — admin actions, auth failures, WAF blocks/detects, IP blocks, rate limit hits, PQC downgrade events, config and TLS reloads, JA3 replay/drift detections
 - **Log Rotation via SIGHUP**: Sending `SIGHUP` to the proxy reopens all log file handles without dropping connections or restarting — compatible with standard logrotate `postrotate` hooks (`systemctl kill -s HUP pqcrypta-proxy`)
-- **Admin API**: Health checks, Prometheus metrics, config reload, graceful shutdown, QUIC health, WebTransport health; loopback enforcement prevents plain-HTTP token exposure on non-loopback interfaces; ephemeral session tokens use `OsRng` for cryptographic security; per-IP and global brute-force lockout with exponential back-off
+- **Admin API**: Health checks, Prometheus metrics, config reload, graceful shutdown, QUIC health, WebTransport health, canary status and live weight/suspend/resume control; loopback enforcement prevents plain-HTTP token exposure on non-loopback interfaces; ephemeral session tokens use `OsRng` for cryptographic security; per-IP and global brute-force lockout with exponential back-off
 - **Graceful Shutdown Drain**: Configurable drain timeout polls active connections at 100 ms intervals and exits as soon as they reach zero — no unnecessary delay on idle restarts
 - **Certificate Transparency**: New ACME-issued certs submitted to configured CT logs via `POST /ct/v1/add-chain` for public auditability
 - **Per-Backend Retry**: Configurable retry count and exponential backoff per backend; retry on 5xx responses, connect failures, or timeouts
@@ -808,6 +810,67 @@ host = "api.example.com"
 path_prefix = "/"
 backend = "api"  # References backend_pools.api
 priority = 100
+```
+
+### Canary / Percentage Traffic Splitting
+
+Canary routing lets you ship a new server version to a small percentage of traffic while stable servers handle the rest. The configuration lives in a `[backend_pools.NAME.canary]` subsection placed **before** the first `[[NAME.servers]]` entry.
+
+```toml
+# Pool-level canary settings — place before [[servers]] entries
+[backend_pools.api-pool.canary]
+enabled                = true               # activate canary routing
+sticky                 = true               # keep each client on the same canary
+sticky_cookie_name     = "PQCPROXY_CANARY"  # cookie set on first canary assignment
+sticky_cookie_ttl_secs = 3600              # sticky assignment lifetime (seconds)
+sticky_header          = "X-Canary-Group"  # optional: pre-assign group via request header
+auto_rollback          = true              # suspend canary on high error rate
+rollback_error_rate    = 0.05             # error rate threshold (5 %)
+rollback_window_secs   = 60              # sliding window length (seconds)
+rollback_min_requests  = 10             # minimum requests before rollback can trigger
+
+# Canary server — mark with canary = true, set canary_weight_percent
+[[backend_pools.api-pool.servers]]
+address               = "127.0.0.1:3005"
+canary                = true             # designate as canary
+canary_weight_percent = 5                # route 5 % of new traffic here
+weight                = 100
+priority              = 1
+max_connections       = 100
+timeout_ms            = 30000
+tls_mode              = "terminate"
+
+# Stable server — receives remaining 95 % of traffic
+[[backend_pools.api-pool.servers]]
+address = "127.0.0.1:3003"
+weight  = 100
+priority = 1
+max_connections = 100
+timeout_ms = 30000
+tls_mode = "terminate"
+```
+
+**How it works:**
+1. A request arrives. If it carries a `PQCPROXY_CANARY` cookie matching a live canary server, it is routed there (sticky assignment).
+2. Otherwise, a random roll (0–99) is compared against `canary_weight_percent`. If the roll is lower, the request goes to the canary and a `Set-Cookie` header is added to the response for future stickiness.
+3. If `auto_rollback = true` and the canary's error count within the sliding window exceeds `rollback_error_rate × requests`, the canary is suspended and all traffic falls back to stable servers.
+
+**Live admin control** (all endpoints require Bearer token auth):
+
+```
+GET  /canary                     — current status of every canary server across all pools
+POST /canary/suspend/:server_id  — suspend a canary immediately
+POST /canary/resume/:server_id   — re-enable a suspended canary (resets error window)
+POST /canary/weight/:server_id   — adjust weight at runtime
+                                   body: {"percent": 10}
+```
+
+Example:
+```bash
+curl -s http://127.0.0.1:8082/canary \
+     -H "Authorization: Bearer <token>"
+# {"pools":[{"pool":"api-pool","servers":[{"id":"127.0.0.1:3005","is_canary":true,
+#   "canary_weight_percent":5,"suspended":false,"error_rate":0.0,...}]}]}
 ```
 
 ### TLS Modes

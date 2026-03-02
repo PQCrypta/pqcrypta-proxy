@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use subtle::ConstantTimeEq;
 
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
@@ -30,6 +30,7 @@ use tracing::{error, info, warn};
 use crate::acme::{AcmeService, AcmeStatusInfo};
 use crate::audit_logger::{AuditEvent, AuditLogger};
 use crate::config::{AdminConfig, ConfigManager};
+use crate::load_balancer::LoadBalancer;
 use crate::metrics::MetricsRegistry;
 use crate::ocsp::{OcspService, OcspStatusInfo};
 use crate::proxy::BackendPool;
@@ -62,6 +63,8 @@ pub struct AdminState {
     pub metrics: Arc<MetricsRegistry>,
     /// Structured audit logger for security-relevant events
     pub audit_logger: Option<Arc<AuditLogger>>,
+    /// Shared load balancer (provides canary control across all listeners)
+    pub load_balancer: Option<Arc<LoadBalancer>>,
 }
 
 /// Admin API server
@@ -84,6 +87,7 @@ impl AdminServer {
         shutdown_tx: mpsc::Sender<()>,
         metrics: Option<Arc<MetricsRegistry>>,
         audit_logger: Option<Arc<AuditLogger>>,
+        load_balancer: Option<Arc<LoadBalancer>>,
     ) -> Self {
         let metrics = metrics.unwrap_or_else(|| Arc::new(MetricsRegistry::new()));
 
@@ -100,6 +104,7 @@ impl AdminServer {
             request_count: Arc::new(RwLock::new(0)),
             metrics,
             audit_logger,
+            load_balancer,
         });
 
         Self { config, state }
@@ -268,6 +273,10 @@ impl AdminServer {
             .route("/ratelimit", get(ratelimit_handler))
             .route("/health/quic", get(health_quic_handler))
             .route("/health/webtransport", get(health_webtransport_handler))
+            .route("/canary", get(canary_handler))
+            .route("/canary/suspend/:server_id", post(canary_suspend_handler))
+            .route("/canary/resume/:server_id", post(canary_resume_handler))
+            .route("/canary/weight/:server_id", post(canary_weight_handler))
             .layer(axum::middleware::from_fn_with_state(
                 auth_state,
                 auth_middleware,
@@ -1187,4 +1196,225 @@ async fn health_webtransport_handler(
         max_sessions_per_origin: config.server.webtransport_max_sessions_per_origin,
         max_streams_per_session: config.server.webtransport_max_streams_per_session,
     })
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Canary Deployment Control Endpoints
+// ═══════════════════════════════════════════════════════════════
+
+/// Per-server canary status entry in the admin response
+#[derive(Serialize)]
+struct CanaryServerInfo {
+    id: String,
+    canary_weight_percent: u8,
+    suspended: bool,
+    error_rate: f64,
+    window_requests: u64,
+    window_errors: u64,
+    auto_rollback_threshold: f64,
+}
+
+/// Response shape for GET /canary
+#[derive(Serialize)]
+struct CanaryStatusResponse {
+    pools: Vec<CanaryPoolStatus>,
+}
+
+#[derive(Serialize)]
+struct CanaryPoolStatus {
+    pool: String,
+    canary_enabled: bool,
+    sticky: bool,
+    sticky_cookie_name: String,
+    auto_rollback: bool,
+    rollback_error_rate: f64,
+    servers: Vec<CanaryServerInfo>,
+}
+
+/// GET /canary — return canary status for all pools that have canary configuration
+async fn canary_handler(
+    State(state): State<Arc<AdminState>>,
+) -> impl IntoResponse {
+    let Some(ref lb) = state.load_balancer else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "load balancer not available"})),
+        )
+            .into_response();
+    };
+
+    let pools: Vec<CanaryPoolStatus> = lb
+        .all_pools()
+        .into_iter()
+        .filter_map(|(name, pool)| {
+            let cfg = pool.canary_config.as_ref()?;
+            let servers = pool.canary_status();
+            Some(CanaryPoolStatus {
+                pool: name,
+                canary_enabled: cfg.enabled,
+                sticky: cfg.sticky,
+                sticky_cookie_name: cfg.sticky_cookie_name.clone(),
+                auto_rollback: cfg.auto_rollback,
+                rollback_error_rate: cfg.rollback_error_rate,
+                servers: servers
+                    .into_iter()
+                    .map(|s| CanaryServerInfo {
+                        id: s.id,
+                        canary_weight_percent: s.canary_weight_percent,
+                        suspended: s.suspended,
+                        error_rate: s.error_rate,
+                        window_requests: s.window_requests,
+                        window_errors: s.window_errors,
+                        auto_rollback_threshold: cfg.rollback_error_rate,
+                    })
+                    .collect(),
+            })
+        })
+        .collect();
+
+    Json(CanaryStatusResponse { pools }).into_response()
+}
+
+/// Request body for POST /canary/suspend/:id and /resume/:id
+#[derive(Deserialize)]
+struct CanaryPoolRequest {
+    pool: String,
+}
+
+/// POST /canary/suspend/:server_id — suspend a canary server
+async fn canary_suspend_handler(
+    State(state): State<Arc<AdminState>>,
+    Path(server_id): Path<String>,
+    Json(body): Json<CanaryPoolRequest>,
+) -> impl IntoResponse {
+    let Some(ref lb) = state.load_balancer else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "load balancer not available"})),
+        )
+            .into_response();
+    };
+
+    let Some(pool) = lb.get_pool(&body.pool) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("pool '{}' not found", body.pool)})),
+        )
+            .into_response();
+    };
+
+    if pool.suspend_canary_server(&server_id) {
+        info!("Canary server '{}' in pool '{}' suspended via admin API", server_id, body.pool);
+        Json(serde_json::json!({
+            "success": true,
+            "message": format!("Canary server '{}' suspended", server_id)
+        }))
+        .into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("canary server '{}' not found in pool '{}'", server_id, body.pool)
+            })),
+        )
+            .into_response()
+    }
+}
+
+/// POST /canary/resume/:server_id — resume a suspended canary server
+async fn canary_resume_handler(
+    State(state): State<Arc<AdminState>>,
+    Path(server_id): Path<String>,
+    Json(body): Json<CanaryPoolRequest>,
+) -> impl IntoResponse {
+    let Some(ref lb) = state.load_balancer else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "load balancer not available"})),
+        )
+            .into_response();
+    };
+
+    let Some(pool) = lb.get_pool(&body.pool) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("pool '{}' not found", body.pool)})),
+        )
+            .into_response();
+    };
+
+    if pool.resume_canary_server(&server_id) {
+        info!("Canary server '{}' in pool '{}' resumed via admin API", server_id, body.pool);
+        Json(serde_json::json!({
+            "success": true,
+            "message": format!("Canary server '{}' resumed and window reset", server_id)
+        }))
+        .into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("canary server '{}' not found in pool '{}'", server_id, body.pool)
+            })),
+        )
+            .into_response()
+    }
+}
+
+/// Request body for POST /canary/weight/:id
+#[derive(Deserialize)]
+struct CanaryWeightRequest {
+    pool: String,
+    percent: u8,
+}
+
+/// POST /canary/weight/:server_id — update canary_weight_percent at runtime
+async fn canary_weight_handler(
+    State(state): State<Arc<AdminState>>,
+    Path(server_id): Path<String>,
+    Json(body): Json<CanaryWeightRequest>,
+) -> impl IntoResponse {
+    if body.percent > 100 {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "percent must be 0–100"})),
+        )
+            .into_response();
+    }
+
+    let Some(ref lb) = state.load_balancer else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "load balancer not available"})),
+        )
+            .into_response();
+    };
+
+    let Some(pool) = lb.get_pool(&body.pool) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("pool '{}' not found", body.pool)})),
+        )
+            .into_response();
+    };
+
+    if pool.set_canary_weight(&server_id, body.percent) {
+        info!(
+            "Canary server '{}' in pool '{}' weight updated to {}% via admin API",
+            server_id, body.pool, body.percent
+        );
+        Json(serde_json::json!({
+            "success": true,
+            "message": format!("Canary server '{}' weight set to {}%", server_id, body.percent)
+        }))
+        .into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("canary server '{}' not found in pool '{}'", server_id, body.pool)
+            })),
+        )
+            .into_response()
+    }
 }

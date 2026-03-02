@@ -658,6 +658,42 @@ max_connections = 50
 timeout_ms = 30000
 tls_mode = "terminate"
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Canary / Percentage Traffic Splitting
+# ──────────────────────────────────────────────────────────────────────────────
+# Gradually shift traffic to a new server version without all-or-nothing deploys.
+# Add a [backend_pools.NAME.canary] BEFORE the first [[NAME.servers]] entry and
+# set canary = true on the server(s) you want to receive canary traffic.
+#
+# [backend_pools.api-pool.canary]
+# enabled                = true               # Activate canary routing for this pool
+# sticky                 = true               # Keep users on the same canary for consistency
+# sticky_cookie_name     = "PQCPROXY_CANARY"  # Cookie name written on first assignment
+# sticky_cookie_ttl_secs = 3600              # Cookie lifetime in seconds (default: 1 hour)
+# sticky_header          = "X-Canary-Group"  # Optional: pre-assign a group via request header
+# auto_rollback          = true              # Automatically suspend canary on high error rate
+# rollback_error_rate    = 0.05             # Suspend when error rate exceeds this (default: 5 %)
+# rollback_window_secs   = 60              # Sliding window length for error tracking (seconds)
+# rollback_min_requests  = 10              # Minimum requests before rollback can trigger
+#
+# Canary server entry (place before stable servers in the pool):
+# [[backend_pools.api-pool.servers]]
+# address               = "192.0.2.9:3003"
+# canary                = true             # Mark this server as the canary
+# canary_weight_percent = 5                # Send 5 % of new requests here
+# weight                = 100
+# priority              = 1
+# max_connections       = 100
+# timeout_ms            = 30000
+# tls_mode              = "terminate"
+#
+# Admin API endpoints for live canary management (all require Bearer token auth):
+#   GET  /canary                     — status of all canary servers across all pools
+#   POST /canary/suspend/:server_id  — suspend canary immediately (all traffic → stable)
+#   POST /canary/resume/:server_id   — re-enable a suspended canary
+#   POST /canary/weight/:server_id   — adjust canary_weight_percent at runtime
+#                                      body: {"percent": 10}
+
 # Example: Apache pool with IP hash for session stickiness
 [backend_pools.apache-pool]
 name = "apache-pool"

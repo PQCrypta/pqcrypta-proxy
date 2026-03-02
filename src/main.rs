@@ -78,6 +78,7 @@ use pqcrypta_proxy::config::{ConfigManager, ConfigReloadEvent, ProxyConfig, TlsM
 use pqcrypta_proxy::metrics;
 use pqcrypta_proxy::ocsp;
 use pqcrypta_proxy::pqc_tls::{verify_pqc_support, PqcTlsProvider};
+use pqcrypta_proxy::load_balancer::LoadBalancer;
 use pqcrypta_proxy::proxy::BackendPool;
 use pqcrypta_proxy::quic_listener::QuicListener;
 use pqcrypta_proxy::rate_limiter::AdvancedRateLimiter;
@@ -560,6 +561,23 @@ async fn main() -> anyhow::Result<()> {
     // Previously this was always None which silently disabled audit logging.
     let audit_logger = Arc::new(AuditLogger::new(&config.logging));
 
+    // Create shared load balancer so admin API and all HTTP listeners share state
+    // (canary suspend/resume, weight changes via admin are reflected in live routing)
+    let shared_lb = {
+        let lb_config = Arc::new(config.load_balancer.clone());
+        let lb = Arc::new(LoadBalancer::new(lb_config));
+        for (name, pool_config) in &config.backend_pools {
+            lb.add_pool(pool_config);
+            info!(
+                "⚖️  Added backend pool '{}' with {} servers ({})",
+                name,
+                pool_config.servers.len(),
+                pool_config.algorithm
+            );
+        }
+        lb
+    };
+
     let admin_server = AdminServer::new(
         config.admin.clone(),
         config_manager.clone(),
@@ -571,6 +589,7 @@ async fn main() -> anyhow::Result<()> {
         shutdown_tx.clone(),
         Some(metrics_registry.clone()),
         Some(audit_logger),
+        Some(shared_lb.clone()),
     );
 
     let admin_handle = tokio::spawn(async move {
@@ -654,6 +673,7 @@ async fn main() -> anyhow::Result<()> {
         let http_key = key_path.clone();
         let http_config = config.clone();
         let http_metrics = metrics_registry.clone();
+        let http_lb = shared_lb.clone();
 
         // Priority 1: PQC + TLS-layer fingerprinting (OpenSSL with ClientHello capture)
         // Combines post-quantum cryptography with early fingerprint blocking
@@ -676,6 +696,7 @@ async fn main() -> anyhow::Result<()> {
                     http_pqc_provider,
                     shutdown_rx,
                     http_metrics,
+                    http_lb,
                 )
                 .await
                 {
@@ -707,6 +728,7 @@ async fn main() -> anyhow::Result<()> {
                     http_config,
                     shutdown_rx,
                     http_metrics,
+                    http_lb,
                 )
                 .await
                 {
@@ -736,6 +758,7 @@ async fn main() -> anyhow::Result<()> {
                     http_config,
                     http_pqc_provider,
                     http_metrics,
+                    http_lb,
                 )
                 .await
                 {
@@ -753,7 +776,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             info!("🌐 Starting HTTPS reverse proxy on {} (Rustls)", bind_addr);
             if let Err(e) =
-                run_http_listener(bind_addr, &http_cert, &http_key, http_config, http_metrics).await
+                run_http_listener(bind_addr, &http_cert, &http_key, http_config, http_metrics, http_lb).await
             {
                 error!("HTTP listener error on port {}: {}", bind_addr.port(), e);
             }

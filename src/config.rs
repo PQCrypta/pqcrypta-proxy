@@ -1479,6 +1479,9 @@ pub struct BackendPoolConfig {
     /// Servers in this pool
     #[serde(default)]
     pub servers: Vec<PoolServerConfig>,
+    /// Canary deployment configuration for this pool
+    #[serde(default)]
+    pub canary: Option<CanaryPoolConfig>,
 }
 
 fn default_lb_algorithm() -> String {
@@ -1491,6 +1494,51 @@ fn default_true() -> bool {
 
 fn default_pool_health_interval() -> u64 {
     10
+}
+
+/// Pool-level canary deployment configuration.
+///
+/// When enabled, a fraction of new traffic is probabilistically routed to
+/// servers marked `canary = true`, with optional sticky-cookie assignment and
+/// automatic rollback on error-rate threshold.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CanaryPoolConfig {
+    /// Enable canary routing for this pool (default: false)
+    pub enabled: bool,
+    /// Stick an assigned client to the same canary via a response cookie (default: true)
+    pub sticky: bool,
+    /// Name of the sticky-canary Set-Cookie (default: "PQCPROXY_CANARY")
+    pub sticky_cookie_name: String,
+    /// Max-Age of the sticky cookie in seconds (default: 3600)
+    pub sticky_cookie_ttl_secs: u64,
+    /// Optional request header that pre-assigns a client to canary (e.g. "X-Canary-Group").
+    /// Any request carrying this header (regardless of value) is routed to the canary.
+    pub sticky_header: Option<String>,
+    /// Automatically suspend the canary when its error rate exceeds `rollback_error_rate` (default: false)
+    pub auto_rollback: bool,
+    /// Error-rate threshold that triggers auto-rollback (0.0–1.0, default: 0.05 = 5%)
+    pub rollback_error_rate: f64,
+    /// Sliding window length for error-rate measurement in seconds (default: 60)
+    pub rollback_window_secs: u64,
+    /// Minimum requests in the window before rollback can trigger (default: 10)
+    pub rollback_min_requests: u64,
+}
+
+impl Default for CanaryPoolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sticky: true,
+            sticky_cookie_name: "PQCPROXY_CANARY".to_string(),
+            sticky_cookie_ttl_secs: 3600,
+            sticky_header: None,
+            auto_rollback: false,
+            rollback_error_rate: 0.05,
+            rollback_window_secs: 60,
+            rollback_min_requests: 10,
+        }
+    }
 }
 
 /// Individual server within a backend pool
@@ -1529,6 +1577,13 @@ pub struct PoolServerConfig {
     /// Circuit breaker: half-open delay in seconds (overrides global default of 0)
     #[serde(default)]
     pub cb_half_open_delay_secs: Option<u64>,
+    /// Mark this server as a canary deployment target
+    #[serde(default)]
+    pub canary: bool,
+    /// Percentage of new traffic to route to this canary server (0–100).
+    /// Only used when canary = true and pool.canary.enabled = true.
+    #[serde(default)]
+    pub canary_weight_percent: u8,
 }
 
 fn default_weight() -> u32 {
