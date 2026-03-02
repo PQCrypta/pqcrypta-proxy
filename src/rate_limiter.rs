@@ -212,7 +212,7 @@ impl Default for AdvancedRateLimitConfig {
             composite_keys: vec![],
             jwt_secret: None, // H-2: disabled by default; set to enable JWT-based rate limiting
             jwt_algorithms: default_jwt_algorithms(), // F-10: default HS256 only
-            redis: None, // Disabled by default; add [advanced_rate_limiting.redis] to enable
+            redis: None,      // Disabled by default; add [advanced_rate_limiting.redis] to enable
         }
     }
 }
@@ -669,10 +669,7 @@ impl RedisBackend {
         )
         .await
         .map_err(|_| {
-            redis::RedisError::from((
-                redis::ErrorKind::IoError,
-                "Redis connect timeout",
-            ))
+            redis::RedisError::from((redis::ErrorKind::IoError, "Redis connect timeout"))
         })??;
 
         Ok(Self {
@@ -741,7 +738,10 @@ impl RedisBackend {
                 limit: rps,
             }),
             Err(()) => {
-                warn!("Redis token-bucket error for key '{}', falling back to local", key_str);
+                warn!(
+                    "Redis token-bucket error for key '{}', falling back to local",
+                    key_str
+                );
                 None
             }
         }
@@ -1453,10 +1453,7 @@ impl AdvancedRateLimiter {
                 match RedisBackend::connect(&rcfg).await {
                     Ok(backend) => {
                         *slot.write().await = Some(Arc::new(backend));
-                        info!(
-                            "Distributed rate limiting: Redis connected at {}",
-                            rcfg.url
-                        );
+                        info!("Distributed rate limiting: Redis connected at {}", rcfg.url);
                     }
                     Err(e) => {
                         warn!(
