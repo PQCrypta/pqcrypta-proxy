@@ -118,7 +118,7 @@ arc-swap = "1.7"
 notify = "7.0"
 
 # Rate limiting
-governor = "0.7"
+governor = "0.10"
 nonzero_ext = "0.3"
 
 # Distributed rate limiting (Redis backend)
