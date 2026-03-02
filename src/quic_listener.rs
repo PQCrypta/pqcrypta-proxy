@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::access_logger::{log_access, AccessLogEntry};
+use crate::cache::{CacheLookup, ResponseCache};
 use crate::config::{BackendConfig, BackendType, ConfigReloadEvent, CorsConfig, ProxyConfig};
 use crate::handlers::WebTransportHandler;
 use crate::http3_features::EarlyHintsState;
@@ -63,6 +64,8 @@ pub struct QuicListener {
     advanced_rate_limiter: Arc<AdvancedRateLimiter>,
     /// Shared load balancer for canary routing and pool-based selection
     load_balancer: Arc<LoadBalancer>,
+    /// Shared response cache (HTTP/3 path)
+    cache: Arc<ResponseCache>,
 }
 
 impl QuicListener {
@@ -76,6 +79,7 @@ impl QuicListener {
         security: SecurityState,
         advanced_rate_limiter: Arc<AdvancedRateLimiter>,
         load_balancer: Arc<LoadBalancer>,
+        cache: Arc<ResponseCache>,
     ) -> anyhow::Result<Self> {
         let addr = config.server.socket_addr()?;
 
@@ -136,6 +140,7 @@ impl QuicListener {
             security,
             advanced_rate_limiter,
             load_balancer,
+            cache,
         })
     }
 
@@ -190,6 +195,7 @@ impl QuicListener {
                         let security = self.security.clone();
                         let advanced_rate_limiter = self.advanced_rate_limiter.clone();
                         let load_balancer = self.load_balancer.clone();
+                        let cache = self.cache.clone();
 
                         tokio::spawn(async move {
                             metrics.connections.connection_opened(ConnectionProtocol::Http3);
@@ -203,6 +209,7 @@ impl QuicListener {
                                 metrics.clone(),
                                 advanced_rate_limiter,
                                 load_balancer,
+                                cache,
                             ).await {
                                 error!("Connection error from {}: {}", remote_addr, e);
                             }
@@ -260,6 +267,7 @@ impl QuicListener {
         metrics: Arc<MetricsRegistry>,
         advanced_rate_limiter: Arc<AdvancedRateLimiter>,
         load_balancer: Arc<LoadBalancer>,
+        cache: Arc<ResponseCache>,
     ) -> anyhow::Result<()> {
         // Accept connection
         let connecting = incoming.accept()?;
@@ -305,6 +313,7 @@ impl QuicListener {
                     metrics,
                     advanced_rate_limiter,
                     load_balancer,
+                    cache,
                 )
                 .await?;
             }
@@ -331,6 +340,7 @@ impl QuicListener {
         metrics: Arc<MetricsRegistry>,
         advanced_rate_limiter: Arc<AdvancedRateLimiter>,
         load_balancer: Arc<LoadBalancer>,
+        cache: Arc<ResponseCache>,
     ) -> anyhow::Result<()> {
         loop {
             match h3.accept().await {
@@ -439,6 +449,7 @@ impl QuicListener {
                         let security_clone = security.clone();
                         let rl_clone = advanced_rate_limiter.clone();
                         let lb_clone = load_balancer.clone();
+                        let cache_clone = cache.clone();
 
                         tokio::spawn(async move {
                             // Note: health check detection happens inside handle_h3_request
@@ -453,6 +464,7 @@ impl QuicListener {
                                 metrics_clone,
                                 rl_clone,
                                 lb_clone,
+                                cache_clone,
                             )
                             .await
                             {
@@ -488,6 +500,7 @@ impl QuicListener {
         metrics: Arc<MetricsRegistry>,
         advanced_rate_limiter: Arc<AdvancedRateLimiter>,
         load_balancer: Arc<LoadBalancer>,
+        cache: Arc<ResponseCache>,
     ) -> anyhow::Result<()>
     where
         S: h3::quic::BidiStream<Bytes>,
@@ -887,13 +900,11 @@ impl QuicListener {
                     .unwrap_or_else(|| "PQCPROXY_CANARY".to_string());
 
                 // Extract canary cookie value from cookie header
-                let canary_cookie_val = cookie_str
-                    .split(';')
-                    .find_map(|part| {
-                        let part = part.trim();
-                        part.strip_prefix(&format!("{}=", canary_cookie_name))
-                            .map(|v| v.to_string())
-                    });
+                let canary_cookie_val = cookie_str.split(';').find_map(|part| {
+                    let part = part.trim();
+                    part.strip_prefix(&format!("{}=", canary_cookie_name))
+                        .map(|v| v.to_string())
+                });
 
                 // Extract canary sticky header value if pool has one configured
                 let canary_header_val = pool
@@ -909,19 +920,17 @@ impl QuicListener {
                     });
 
                 // Extract session affinity cookie
-                let session_cookie_val = cookie_str
-                    .split(';')
-                    .find_map(|part| {
-                        let part = part.trim();
-                        // Generic session cookie extraction – key=value
-                        if part.contains('=') {
-                            let (k, v) = part.split_once('=').unwrap_or(("", ""));
-                            if !k.starts_with("PQCPROXY_CANARY") {
-                                return Some(v.to_string());
-                            }
+                let session_cookie_val = cookie_str.split(';').find_map(|part| {
+                    let part = part.trim();
+                    // Generic session cookie extraction – key=value
+                    if part.contains('=') {
+                        let (k, v) = part.split_once('=').unwrap_or(("", ""));
+                        if !k.starts_with("PQCPROXY_CANARY") {
+                            return Some(v.to_string());
                         }
-                        None
-                    });
+                    }
+                    None
+                });
 
                 let ctx = SelectionContext {
                     client_ip: remote_addr.ip(),
@@ -1031,6 +1040,146 @@ impl QuicListener {
             }
         }
 
+        // --- Response cache lookup (GET / HEAD only, HTTP/3 path) ---
+        if (method == "GET" || method == "HEAD")
+            && cache.config.enabled
+            && !cache.is_excluded_path(&path)
+        {
+            let host_str = host.as_deref().unwrap_or("");
+            let cache_key = ResponseCache::build_key(&method, host_str, &path_with_query);
+            let if_none_match = request
+                .headers()
+                .get("if-none-match")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            let if_modified_since = request
+                .headers()
+                .get("if-modified-since")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+
+            match cache.get(
+                &cache_key,
+                if_none_match.as_deref(),
+                if_modified_since.as_deref(),
+            ) {
+                CacheLookup::Hit {
+                    status,
+                    headers: cached_headers,
+                    body: cached_body,
+                    age_secs,
+                } => {
+                    debug!(
+                        "HTTP/3 cache HIT: {} {} (age {}s)",
+                        method, path_with_query, age_secs
+                    );
+                    let status_code =
+                        http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::OK);
+                    let mut response_builder = http::Response::builder()
+                        .status(status_code)
+                        .header("age", age_secs.to_string())
+                        .header("x-cache", "HIT")
+                        .header("alt-svc", build_alt_svc_header(&config))
+                        .header("server", "PQCProxy v0.2.1");
+                    for (k, v) in &cached_headers {
+                        if k.to_lowercase() != "content-length" {
+                            response_builder = response_builder.header(k.as_str(), v.as_str());
+                        }
+                    }
+                    let body_bytes: Vec<u8> = if method == "HEAD" {
+                        Vec::new()
+                    } else {
+                        (*cached_body).clone()
+                    };
+                    response_builder =
+                        response_builder.header("content-length", body_bytes.len().to_string());
+                    let response = response_builder.body(())?;
+                    let body_size = body_bytes.len();
+                    let latency = start_time.elapsed();
+                    stream.send_response(response).await?;
+                    if !body_bytes.is_empty() {
+                        stream.send_data(Bytes::from(body_bytes)).await?;
+                    }
+                    stream.finish().await?;
+                    metrics.requests.request_end_full(
+                        status,
+                        latency,
+                        body.len() as u64,
+                        body_size as u64,
+                        Some(&path),
+                        is_health_check,
+                    );
+                    log_access(&AccessLogEntry {
+                        remote_addr,
+                        method,
+                        path,
+                        protocol: "HTTP/3".to_string(),
+                        status,
+                        body_size,
+                        referer,
+                        user_agent,
+                        host,
+                        response_time_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
+                    });
+                    return Ok(());
+                }
+
+                CacheLookup::NotModified {
+                    etag,
+                    last_modified,
+                    cache_control,
+                    age_secs,
+                } => {
+                    debug!(
+                        "HTTP/3 cache 304: {} {} (age {}s)",
+                        method, path_with_query, age_secs
+                    );
+                    let mut response_builder = http::Response::builder()
+                        .status(http::StatusCode::NOT_MODIFIED)
+                        .header("age", age_secs.to_string())
+                        .header("x-cache", "HIT")
+                        .header("alt-svc", build_alt_svc_header(&config))
+                        .header("server", "PQCProxy v0.2.1");
+                    if let Some(et) = etag {
+                        response_builder = response_builder.header("etag", et);
+                    }
+                    if let Some(lm) = last_modified {
+                        response_builder = response_builder.header("last-modified", lm);
+                    }
+                    if let Some(cc) = cache_control {
+                        response_builder = response_builder.header("cache-control", cc);
+                    }
+                    let response = response_builder.body(())?;
+                    let latency = start_time.elapsed();
+                    stream.send_response(response).await?;
+                    stream.finish().await?;
+                    metrics.requests.request_end_full(
+                        304,
+                        latency,
+                        body.len() as u64,
+                        0,
+                        Some(&path),
+                        is_health_check,
+                    );
+                    log_access(&AccessLogEntry {
+                        remote_addr,
+                        method,
+                        path,
+                        protocol: "HTTP/3".to_string(),
+                        status: 304,
+                        body_size: 0,
+                        referer,
+                        user_agent,
+                        host,
+                        response_time_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
+                    });
+                    return Ok(());
+                }
+
+                CacheLookup::Miss => {}
+            }
+        }
+
         // Build headers map - start with route-specific headers
         let mut headers = route.add_headers.clone();
 
@@ -1107,10 +1256,7 @@ impl QuicListener {
                             .await;
                             match result {
                                 Ok(Ok(resp)) if shadow_log => {
-                                    info!(
-                                        "H3 Shadow → '{}' status={}",
-                                        shadow_name, resp.status
-                                    );
+                                    info!("H3 Shadow → '{}' status={}", shadow_name, resp.status);
                                 }
                                 Ok(Ok(_)) => {}
                                 Ok(Err(e)) => {
@@ -1141,6 +1287,21 @@ impl QuicListener {
                 &body,
             )
             .await?;
+
+        // Store response in cache (GET / HEAD only; cache.put() enforces all Cache-Control rules)
+        if (method == "GET" || method == "HEAD")
+            && cache.config.enabled
+            && !cache.is_excluded_path(&path)
+        {
+            let host_str = host.as_deref().unwrap_or("");
+            let cache_key = ResponseCache::build_key(&method, host_str, &path_with_query);
+            cache.put(
+                &cache_key,
+                proxy_response.status,
+                &proxy_response.headers,
+                proxy_response.body.clone(),
+            );
+        }
 
         // Build HTTP/3 response with headers from backend
         let mut response_builder = http::Response::builder().status(

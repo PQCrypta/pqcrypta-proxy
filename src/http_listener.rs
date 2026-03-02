@@ -49,6 +49,7 @@ use crate::tls_acceptor::FingerprintingTlsAcceptor;
 use crate::pqc_tls::{openssl_pqc, PqcTlsProvider};
 
 use crate::access_logger::{log_access, AccessLogEntry};
+use crate::cache::{cache_middleware, ResponseCache};
 use crate::compression::{compression_middleware, CompressionState};
 use crate::config::{BackendConfig, CorsConfig, ProxyConfig, ShadowConfig, TlsMode};
 use crate::fingerprint::{
@@ -290,6 +291,16 @@ pub async fn run_http_listener(
     // Initialize HTTP/3 features state (Early Hints, Priority, Coalescing)
     let http3_features_state = Http3FeaturesState::from_proxy_config(&config.http3);
 
+    // Initialize response cache (innermost layer — security headers, alt-svc, and
+    // compression all run on top of it for both cache hits and cache misses)
+    let response_cache = Arc::new(ResponseCache::new(config.cache.clone()));
+    if config.cache.enabled {
+        info!(
+            "💾 Response cache enabled (max {}MiB, default TTL {}s)",
+            config.cache.max_size_mb, config.cache.default_ttl_secs
+        );
+    }
+
     // Initialize fingerprint middleware state (if enabled)
     let fingerprint_state = if config.fingerprint.enabled {
         Some(FingerprintMiddlewareState::new(
@@ -302,10 +313,15 @@ pub async fn run_http_listener(
     };
 
     // Build router with full middleware stack
-    // Order (outside to inside): advanced_rate_limit -> fingerprint -> security -> http3 -> compression -> headers -> handler
+    // Order (outside to inside): advanced_rate_limit -> fingerprint -> security -> http3 -> compression -> alt_svc -> security_headers -> cache -> handler
     let app = Router::new()
         .fallback(any(proxy_handler))
-        // Response headers (innermost - runs last on response)
+        // Cache (innermost — stores pre-compression bodies; outer layers apply to hits+misses)
+        .layer(middleware::from_fn_with_state(
+            response_cache,
+            cache_middleware,
+        ))
+        // Response headers (runs after cache — applied to both hits and misses)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security_headers_middleware,
@@ -458,6 +474,15 @@ pub async fn run_http_listener_pqc(
     // Initialize HTTP/3 features state (Early Hints, Priority, Coalescing)
     let http3_features_state = Http3FeaturesState::from_proxy_config(&config.http3);
 
+    // Initialize response cache
+    let response_cache = Arc::new(ResponseCache::new(config.cache.clone()));
+    if config.cache.enabled {
+        info!(
+            "💾 Response cache enabled (max {}MiB, default TTL {}s)",
+            config.cache.max_size_mb, config.cache.default_ttl_secs
+        );
+    }
+
     // Initialize fingerprint middleware state (if enabled)
     let fingerprint_state = if config.fingerprint.enabled {
         Some(FingerprintMiddlewareState::new(
@@ -470,9 +495,13 @@ pub async fn run_http_listener_pqc(
     };
 
     // Build router with full middleware stack
-    // Order (outside to inside): advanced_rate_limit -> fingerprint -> security -> http3 -> compression -> headers -> handler
+    // Order (outside to inside): advanced_rate_limit -> fingerprint -> security -> http3 -> compression -> alt_svc -> security_headers -> cache -> handler
     let app = Router::new()
         .fallback(any(proxy_handler))
+        .layer(middleware::from_fn_with_state(
+            response_cache,
+            cache_middleware,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security_headers_middleware,
@@ -682,6 +711,15 @@ pub async fn run_http_listener_with_fingerprint(
     // Initialize HTTP/3 features state
     let http3_features_state = Http3FeaturesState::from_proxy_config(&config.http3);
 
+    // Initialize response cache
+    let response_cache = Arc::new(ResponseCache::new(config.cache.clone()));
+    if config.cache.enabled {
+        info!(
+            "💾 Response cache enabled (max {}MiB, default TTL {}s)",
+            config.cache.max_size_mb, config.cache.default_ttl_secs
+        );
+    }
+
     // Initialize fingerprint middleware state
     let fingerprint_state = FingerprintMiddlewareState::new(
         fingerprint_extractor.clone(),
@@ -692,6 +730,10 @@ pub async fn run_http_listener_with_fingerprint(
     // Build router with full middleware stack
     let app = Router::new()
         .fallback(any(proxy_handler))
+        .layer(middleware::from_fn_with_state(
+            response_cache,
+            cache_middleware,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security_headers_middleware,
@@ -1033,6 +1075,16 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     // Initialize middleware states
     let compression_state = CompressionState::default();
     let http3_features_state = Http3FeaturesState::from_proxy_config(&config.http3);
+
+    // Initialize response cache
+    let response_cache = Arc::new(ResponseCache::new(config.cache.clone()));
+    if config.cache.enabled {
+        info!(
+            "💾 Response cache enabled (max {}MiB, default TTL {}s)",
+            config.cache.max_size_mb, config.cache.default_ttl_secs
+        );
+    }
+
     let fingerprint_state = FingerprintMiddlewareState::new(
         fingerprint_extractor.clone(),
         security_state.clone(),
@@ -1040,8 +1092,13 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     );
 
     // Build router with full middleware stack
+    // Order (outside to inside): advanced_rate_limit -> fingerprint -> security -> http3 -> compression -> alt_svc -> security_headers -> cache -> handler
     let app = Router::new()
         .fallback(any(proxy_handler))
+        .layer(middleware::from_fn_with_state(
+            response_cache,
+            cache_middleware,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security_headers_middleware,

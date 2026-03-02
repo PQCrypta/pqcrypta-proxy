@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::acme::AcmeConfig;
+use crate::cache::ResponseCacheConfig;
 use crate::rate_limiter::AdvancedRateLimitConfig;
 
 /// OCSP stapling configuration (TOML-compatible version)
@@ -139,6 +140,9 @@ pub struct ProxyConfig {
     /// HTTP/3 advanced features configuration
     #[serde(default)]
     pub http3: Http3Config,
+    /// Response cache configuration
+    #[serde(default)]
+    pub cache: ResponseCacheConfig,
 }
 
 /// Current config schema version supported by this binary
@@ -279,6 +283,7 @@ impl Default for ProxyConfig {
             ocsp: OcspConfig::default(),
             acme: AcmeConfig::default(),
             http3: Http3Config::default(),
+            cache: ResponseCacheConfig::default(),
         }
     }
 }

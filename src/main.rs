@@ -84,6 +84,7 @@ use pqcrypta_proxy::quic_listener::QuicListener;
 use pqcrypta_proxy::rate_limiter::AdvancedRateLimiter;
 use pqcrypta_proxy::tls::TlsProvider;
 use pqcrypta_proxy::webtransport_server::WebTransportServer;
+use pqcrypta_proxy::ResponseCache;
 use pqcrypta_proxy::SecurityState;
 use pqcrypta_proxy::{
     run_http_listener, run_http_listener_with_fingerprint, run_http_redirect_server,
@@ -833,6 +834,13 @@ async fn main() -> anyhow::Result<()> {
             quic_config.advanced_rate_limiting.clone(),
         ));
         let quic_lb = shared_lb.clone();
+        let quic_cache = Arc::new(ResponseCache::new(quic_config.cache.clone()));
+        if quic_config.cache.enabled {
+            info!(
+                "💾 Response cache enabled on QUIC port {} (max {}MiB, default TTL {}s)",
+                port, quic_config.cache.max_size_mb, quic_config.cache.default_ttl_secs
+            );
+        }
 
         tokio::spawn(async move {
             match QuicListener::new(
@@ -844,6 +852,7 @@ async fn main() -> anyhow::Result<()> {
                 quic_security,
                 quic_advanced_rl,
                 quic_lb,
+                quic_cache,
             )
             .await
             {

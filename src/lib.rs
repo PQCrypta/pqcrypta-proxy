@@ -71,6 +71,7 @@ pub mod access_logger;
 pub mod acme;
 pub mod admin;
 pub mod audit_logger;
+pub mod cache;
 pub mod compression;
 pub mod config;
 pub mod fingerprint;
@@ -93,6 +94,7 @@ pub mod webtransport_server;
 
 // Re-export commonly used types
 pub use access_logger::{init_access_logger, log_access, AccessLogEntry, AccessLogger};
+pub use cache::{cache_middleware, CacheLookup, ResponseCache, ResponseCacheConfig};
 pub use compression::{compression_middleware, CompressionConfig, CompressionState};
 pub use config::{ConfigManager, Http3Config, ProxyConfig};
 pub use fingerprint::{
