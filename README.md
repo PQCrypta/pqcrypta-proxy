@@ -21,7 +21,7 @@
 - **Advanced Security**: JA3/JA4 fingerprinting with replay and drift detection, circuit breaker, GeoIP blocking, DB-synced IP blocklists, WebTransport origin validation, 0-RTT replay protection
 - **Structured Audit Logging**: Async JSON audit log for admin actions, auth failures, WAF blocks, IP blocks, rate limit hits, PQC downgrades, config reloads
 - **Structured Access Logging**: Per-request JSON or text logs with latency, bytes, upstream, and client IP
-- **Enterprise Load Balancing**: 6 algorithms, session affinity, health-aware routing, per-backend retry policies, per-backend circuit breaker overrides, canary / percentage traffic splitting with sticky assignment and auto-rollback
+- **Enterprise Load Balancing**: 6 algorithms, session affinity, health-aware routing, per-backend retry policies, per-backend circuit breaker overrides, canary / percentage traffic splitting with sticky assignment and auto-rollback, traffic shadowing / mirroring
 - **Multi-Dimensional Rate Limiting**: Composite keys, JA3/JA4-based, JWT-verified, adaptive ML anomaly detection; optional Redis backend distributes counters across all proxy instances
 - **Zero-Trust Primitives**: Per-route HMAC proof-of-possession (path+query signed, nonce replay prevention), internal route mTLS auto-enforcement, zero-trust mode startup validation (includes admin HMAC requirement), admin proof-of-possession, `trusted_internal_cidrs` deprecation
 
@@ -109,6 +109,7 @@
 | **Graceful Shutdown Drain** | ✅ | Configurable drain timeout polls active connections at 100 ms intervals; exits as soon as connections reach zero |
 | **Weighted Load Balancing** | ✅ | Per-server weight (1–1000) with smooth weighted round-robin for proportional traffic distribution |
 | **Canary / Traffic Splitting** | ✅ | Percentage-based canary routing with sticky cookie assignment, per-pool auto-rollback on error rate threshold, and live admin control |
+| **Traffic Shadowing / Mirroring** | ✅ | Per-route fire-and-forget copy of requests to a secondary backend; client only sees primary response; all parameters configurable (backend, percent, timeout, marker header) |
 | **Least Response Time Routing** | ✅ | Routes requests to the backend with the lowest moving-average response time |
 | **IP Hash Load Balancing** | ✅ | Deterministic backend selection by client IP hash for implicit session stickiness |
 | **Per-Server Priority** | ✅ | Failover priority levels; lower-priority backends only receive traffic when higher-priority ones are unhealthy |
@@ -171,6 +172,7 @@
 - **Backend Pools**: Group multiple servers per route for high availability
 - **Session Affinity**: Cookie-based, IP hash, or custom header sticky sessions; each mode uses its own dedicated map with TTL eviction
 - **Canary / Percentage Traffic Splitting**: Route a configurable percentage of new traffic to a canary server while stable servers handle the rest; once assigned, clients receive a sticky `PQCPROXY_CANARY` cookie so they stay on the same server for the duration of the experiment; auto-rollback suspends the canary if its sliding-window error rate exceeds a configured threshold; live admin endpoints (`GET /canary`, `POST /canary/suspend/:id`, `POST /canary/resume/:id`, `POST /canary/weight/:id`) allow runtime inspection and control without restarting the proxy
+- **Traffic Shadowing / Mirroring**: Per-route `[routes.shadow]` block sends a fire-and-forget async copy of each request to a secondary backend; client only ever sees the primary response and the shadow response is discarded; configurable percentage (0–100), independent timeout, custom marker header name+value, and per-route response logging — zero overhead on routes without shadow configured
 - **Health-Aware Routing**: Automatically bypasses unhealthy backends; proactive TCP-connect health checks on configurable interval detect failures before traffic hits them
 - **Slow Start**: Gradually increases traffic to recovering servers to avoid thundering herd after circuit breaker reopens
 - **Connection Draining**: Graceful server removal with configurable drain timeout; in-flight requests complete before backend is taken out of rotation
@@ -872,6 +874,40 @@ curl -s http://127.0.0.1:8082/canary \
 # {"pools":[{"pool":"api-pool","servers":[{"id":"127.0.0.1:3005","is_canary":true,
 #   "canary_weight_percent":5,"suspended":false,"error_rate":0.0,...}]}]}
 ```
+
+### Traffic Shadowing / Mirroring
+
+Add a `[routes.shadow]` subsection to any route to mirror traffic to a secondary backend. The client only receives the primary response; the shadow response is logged and discarded. All values are configurable — nothing is hardcoded.
+
+```toml
+[[routes]]
+name    = "api-route"
+host    = "api.example.com"
+backend = "api-stable"
+
+# Mirror 10 % of traffic to a canary instance for dark testing
+[routes.shadow]
+backend             = "api-canary"      # Must be a key in [backends.*]
+percent             = 10                # 0–100 % of requests to mirror (default 100)
+timeout_ms          = 5000              # Abandon shadow after this many ms (default 5000)
+shadow_header       = "X-Shadow-Request"   # Header injected on shadow requests (default)
+shadow_header_value = "1"              # Value for that header (default "1")
+log_responses       = true             # Log shadow status + latency at INFO (default true)
+```
+
+**How it works:**
+
+1. Request arrives → body is buffered (only when shadow is configured).
+2. A `tokio::task::spawn` fires the shadow copy asynchronously — the primary forward proceeds in parallel.
+3. The primary response is returned to the client immediately; the spawned task runs independently.
+4. The shadow backend receives an identical request with the configurable marker header appended so it can distinguish mirror traffic.
+5. Shadow errors, timeouts, and 5xx responses are logged as warnings but never affect the client.
+
+**Activating on the running config:**
+
+1. Add a `[backends.api-canary]` entry pointing at the canary instance (e.g. `127.0.0.1:3004`).
+2. Add the `[routes.shadow]` block to the desired route in `/etc/pqcrypta/proxy-config.toml`.
+3. Reload config: `curl -s -X POST http://127.0.0.1:8082/reload -H "Authorization: Bearer $TOKEN"`.
 
 ### TLS Modes
 
