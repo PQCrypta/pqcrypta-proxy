@@ -17,7 +17,7 @@
 - **ACME Automation**: Automatic Let's Encrypt certificate provisioning, renewal, and Certificate Transparency log submission
 - **OCSP Stapling**: Automated OCSP response fetching and stapling
 - **Prometheus Metrics**: Comprehensive metrics for TLS, connections, requests, backends, and WAF blocks
-- **WAF**: OWASP Top 10 pattern-based request inspection (SQLi, XSS, path traversal, NoSQLi, SSRF, CMDi, XXE, deserialization) in detect or block mode
+- **WAF**: Pattern-based request inspection for injection and traversal attacks (SQLi, XSS, path traversal, NoSQLi, SSRF, CMDi, XXE, deserialization) in detect or block mode — covers OWASP A01/A03/A08/A10 attack patterns; categories requiring architectural or supply-chain controls (A02, A04, A05, A06, A09) are handled at other layers
 - **Advanced Security**: JA3/JA4 fingerprinting with replay and drift detection, circuit breaker, GeoIP blocking, DB-synced IP blocklists, WebTransport origin validation, 0-RTT replay protection
 - **Structured Audit Logging**: Async JSON audit log for admin actions, auth failures, WAF blocks, IP blocks, rate limit hits, PQC downgrades, config reloads
 - **Structured Access Logging**: Per-request JSON or text logs with latency, bytes, upstream, and client IP
@@ -54,7 +54,7 @@
 | Custom Header Injection | ✅ | Inject arbitrary headers per route before forwarding to backends |
 | Multiple Listener Ports | ✅ | Primary port plus any number of additional ports via `additional_ports` |
 | WebTransport Operations | ✅ | JSON operation routing over streams (encrypt/decrypt/keygen/health/ping) |
-| **WAF** | ✅ | OWASP Top 10 pattern inspection — SQLi, XSS, path traversal, NoSQLi, SSRF, CMDi, XXE, deserialization |
+| **WAF** | ✅ | Pattern-based injection and traversal inspection — SQLi, XSS, path traversal, NoSQLi, SSRF, CMDi, XXE, deserialization; covers OWASP A01/A03/A08/A10 attack patterns |
 | **Audit Logger** | ✅ | Async structured JSON audit log — admin actions, auth failures, WAF events, rate limits, PQC downgrades |
 | **JA3/JA4 Replay Detection** | ✅ | Flags same fingerprint from multiple IPs within configurable window |
 | **JA3/JA4 Drift Detection** | ✅ | Flags cipher/extension composition changes on the same fingerprint hash |
@@ -130,7 +130,7 @@
 - **Path Regex Routing**: Per-route regex pattern matching alongside exact and prefix matching; ReDoS prevention via pattern size limit
 
 ### Security
-- **WAF**: OWASP Top 10 pattern-based inspection — SQLi, XSS, path traversal, NoSQLi, SSRF, command injection, XXE, insecure deserialization; detect or block mode; custom patterns; body scanning
+- **WAF**: Pattern-based injection and traversal inspection — SQLi, XSS, path traversal, NoSQLi, SSRF, command injection, XXE, insecure deserialization; detect or block mode; custom patterns; body scanning; covers OWASP A01/A03/A08/A10 attack patterns
 - **JA3/JA4 TLS Fingerprinting**: Detects browsers, bots, scanners, malware based on TLS ClientHello
 - **JA3/JA4 Replay Detection**: Flags same fingerprint arriving from multiple IPs within a configurable window — catches credential-stuffing and fingerprint spoofing
 - **JA3/JA4 Drift Detection**: Flags cipher/extension composition changes on the same fingerprint hash — detects TLS library upgrades or evasion attempts
@@ -938,7 +938,7 @@ src/
 ├── rate_limiter.rs      # Advanced multi-dimensional rate limiting; JWT HMAC verification
 ├── proxy_protocol.rs    # PROXY protocol v2 support
 ├── access_logger.rs     # Structured access log with log-injection sanitization
-├── waf.rs               # WAF engine — OWASP Top 10 pattern sets, detect/block modes
+├── waf.rs               # WAF engine — injection/traversal pattern detection (A01/A03/A08/A10), detect/block modes
 ├── audit_logger.rs      # Async structured JSON audit logger for security events
 └── webtransport_server.rs  # WebTransport session handling; per-origin session rate limiting
 ```
@@ -1217,7 +1217,7 @@ cargo run --release --bin quic-bench -- --target localhost:443
 - [x] 0-RTT replay protection (nonce store with strict/session/none modes; window configurable)
 - [x] Background cleanup (auto-expire blocked IPs)
 - [x] SSRF protection (link-local backend rejection, RFC1918 warning, WAF SSRF pattern set)
-- [x] WAF (OWASP Top 10: SQLi, XSS, path traversal, NoSQLi, SSRF, CMDi, XXE, deserialization; detect/block modes; custom patterns)
+- [x] WAF (pattern-based injection and traversal detection: SQLi, XSS, path traversal, NoSQLi, SSRF, CMDi, XXE, deserialization; covers OWASP A01/A03/A08/A10; detect/block modes; custom patterns)
 - [x] Structured audit logging (async JSON — admin actions, auth failures, WAF events, rate limits, PQC downgrades, config reloads, JA3 replay/drift)
 - [x] Admin router tier split (public /health vs. authenticated /metrics, /reload, etc.)
 - [x] Admin token auth (ephemeral if not configured; constant-time comparison; per-IP + global brute-force lockout with exponential back-off)
