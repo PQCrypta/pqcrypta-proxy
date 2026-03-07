@@ -135,7 +135,7 @@
 - **Path Regex Routing**: Per-route regex pattern matching alongside exact and prefix matching; ReDoS prevention via pattern size limit
 
 ### Security
-- **WAF**: Pattern-based injection and traversal inspection — SQLi, XSS, path traversal, NoSQLi, SSRF, command injection, XXE, insecure deserialization; detect or block mode; custom patterns; body scanning; covers OWASP A01/A03/A08/A10 attack patterns
+- **WAF**: Pattern-based injection and traversal inspection — SQLi, XSS, path traversal, NoSQLi, SSRF, command injection, XXE, insecure deserialization; detect or block mode; custom patterns; body scanning; covers OWASP A01/A03/A08/A10 attack patterns; `X-Forwarded-For` headers scanned without SSRF patterns (localhost/RFC1918 IPs in XFF are legitimate proxy hops, not SSRF — prevents false positives for clients behind local reverse proxies)
 - **JA3/JA4 TLS Fingerprinting**: Detects browsers, bots, scanners, malware based on TLS ClientHello
 - **JA3/JA4 Replay Detection**: Flags same fingerprint arriving from multiple IPs within a configurable window — catches credential-stuffing and fingerprint spoofing
 - **JA3/JA4 Drift Detection**: Flags cipher/extension composition changes on the same fingerprint hash — detects TLS library upgrades or evasion attempts
@@ -154,7 +154,7 @@
 - **Adaptive Baseline**: ML-inspired anomaly detection learns normal traffic patterns
 - **DoS Protection**: Connection limits, body size enforcement, request validation, auto-blocking
 - **GeoIP Blocking**: Block by country/region using MaxMind GeoLite2 database; configurable block duration via `geoip_block_duration_secs` (default 24 h)
-- **SSRF Protection**: Link-local (169.254.x.x) and loopback backend addresses rejected at config load; RFC1918 backends log a warning; WAF SSRF pattern set active for request inspection
+- **SSRF Protection**: Link-local (169.254.x.x) and loopback backend addresses rejected at config load; RFC1918 backends log a warning; WAF SSRF pattern set active for path, query, and body inspection; `X-Forwarded-For` exempt from SSRF patterns since proxy hops legitimately insert loopback/RFC1918 IPs into the forwarded chain
 - **Per-Route Security Policy**: Per-route mTLS requirement, JA3 allowlist, rate limit override, WAF mode override, 0-RTT control
 - **Security Headers**: HSTS, X-Frame-Options, CSP, COEP, COOP, CORP, and more
 - **CORS Handling**: Full CORS support with preflight OPTIONS handling
@@ -627,7 +627,7 @@ sqli = true             # SQL injection patterns
 xss = true              # Cross-site scripting patterns
 path_traversal = true   # Directory traversal (../, %2e%2e, null bytes)
 nosqli = true           # NoSQL injection ($where, $gt, $regex, etc.)
-ssrf = false            # SSRF patterns (higher false-positive rate — tune before enabling)
+ssrf = false            # SSRF patterns for path/query/body (X-Forwarded-For always exempt — proxy hops add loopback IPs legitimately)
 scan_json_body = true   # Scan request bodies
 max_body_scan_bytes = 65536   # Max bytes of body to scan (default 64 KB)
 custom_patterns = [

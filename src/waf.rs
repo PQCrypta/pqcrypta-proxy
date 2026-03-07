@@ -244,8 +244,17 @@ impl WafEngine {
                 "user-agent" | "referer" | "cookie" | "x-forwarded-for"
             ) {
                 if let Ok(v) = value.to_str() {
-                    if let Some(verdict) = self.scan_str(v, block_mode) {
-                        debug!("WAF hit on header {}: {}", name_str, v);
+                    // X-Forwarded-For is a proxy routing header that legitimately contains
+                    // internal IPs (127.0.0.1, 10.x.x.x, etc.) added by local proxy hops.
+                    // Applying SSRF patterns to it causes false positives for any user whose
+                    // request passes through the local reverse proxy. Skip SSRF checks here.
+                    let verdict = if name_str == "x-forwarded-for" {
+                        self.scan_str_no_ssrf(v, block_mode)
+                    } else {
+                        self.scan_str(v, block_mode)
+                    };
+                    if let Some(verdict) = verdict {
+                        debug!("WAF hit on header {}: {:?}", name_str, verdict);
                         return verdict;
                     }
                 }
@@ -442,6 +451,156 @@ impl WafEngine {
             }
         }
 
+        None
+    }
+
+    /// Same as `scan_str` but skips SSRF patterns. Used for headers like X-Forwarded-For
+    /// that legitimately contain internal IPs added by proxy hops.
+    fn scan_str_no_ssrf(&self, input: &str, block_mode: bool) -> Option<WafVerdict> {
+        for pat in &self.path_traversal_patterns {
+            if pat.is_match(input) {
+                let rule = format!(
+                    "path-traversal:{}",
+                    pat.as_str().chars().take(40).collect::<String>()
+                );
+                return Some(if block_mode {
+                    WafVerdict::Block {
+                        rule,
+                        severity: Severity::High,
+                    }
+                } else {
+                    WafVerdict::Detect {
+                        rule,
+                        severity: Severity::High,
+                    }
+                });
+            }
+        }
+        for pat in &self.sqli_patterns {
+            if pat.is_match(input) {
+                let rule = format!("sqli:{}", pat.as_str().chars().take(40).collect::<String>());
+                return Some(if block_mode {
+                    WafVerdict::Block {
+                        rule,
+                        severity: Severity::High,
+                    }
+                } else {
+                    WafVerdict::Detect {
+                        rule,
+                        severity: Severity::High,
+                    }
+                });
+            }
+        }
+        for pat in &self.xss_patterns {
+            if pat.is_match(input) {
+                let rule = format!("xss:{}", pat.as_str().chars().take(40).collect::<String>());
+                return Some(if block_mode {
+                    WafVerdict::Block {
+                        rule,
+                        severity: Severity::Medium,
+                    }
+                } else {
+                    WafVerdict::Detect {
+                        rule,
+                        severity: Severity::Medium,
+                    }
+                });
+            }
+        }
+        for pat in &self.nosqli_patterns {
+            if pat.is_match(input) {
+                let rule = format!(
+                    "nosqli:{}",
+                    pat.as_str().chars().take(40).collect::<String>()
+                );
+                return Some(if block_mode {
+                    WafVerdict::Block {
+                        rule,
+                        severity: Severity::Medium,
+                    }
+                } else {
+                    WafVerdict::Detect {
+                        rule,
+                        severity: Severity::Medium,
+                    }
+                });
+            }
+        }
+        // SSRF patterns intentionally skipped — XFF header contains internal proxy IPs by design
+        for pat in &self.cmd_injection_patterns {
+            if pat.is_match(input) {
+                let rule = format!(
+                    "cmd-injection:{}",
+                    pat.as_str().chars().take(40).collect::<String>()
+                );
+                return Some(if block_mode {
+                    WafVerdict::Block {
+                        rule,
+                        severity: Severity::Critical,
+                    }
+                } else {
+                    WafVerdict::Detect {
+                        rule,
+                        severity: Severity::Critical,
+                    }
+                });
+            }
+        }
+        for pat in &self.xxe_patterns {
+            if pat.is_match(input) {
+                let rule = format!("xxe:{}", pat.as_str().chars().take(40).collect::<String>());
+                return Some(if block_mode {
+                    WafVerdict::Block {
+                        rule,
+                        severity: Severity::High,
+                    }
+                } else {
+                    WafVerdict::Detect {
+                        rule,
+                        severity: Severity::High,
+                    }
+                });
+            }
+        }
+        for pat in &self.deserialization_patterns {
+            if pat.is_match(input) {
+                let rule = format!(
+                    "deser:{}",
+                    pat.as_str().chars().take(40).collect::<String>()
+                );
+                return Some(if block_mode {
+                    WafVerdict::Block {
+                        rule,
+                        severity: Severity::Critical,
+                    }
+                } else {
+                    WafVerdict::Detect {
+                        rule,
+                        severity: Severity::Critical,
+                    }
+                });
+            }
+        }
+        for pat in &self.custom_patterns {
+            if pat.is_match(input) {
+                let rule = format!(
+                    "custom:{}",
+                    pat.as_str().chars().take(40).collect::<String>()
+                );
+                return Some(if block_mode {
+                    WafVerdict::Block {
+                        rule,
+                        severity: Severity::High,
+                    }
+                } else {
+                    WafVerdict::Detect {
+                        rule,
+                        severity: Severity::High,
+                    }
+                });
+            }
+        }
         None
     }
 }
