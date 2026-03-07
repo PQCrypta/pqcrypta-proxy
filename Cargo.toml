@@ -1,6 +1,6 @@
 [package]
 name = "pqcrypta-proxy"
-version = "0.2.2"
+version = "0.1.0"
 edition = "2021"
 authors = ["PQCrypta Team <team@pqcrypta.com>"]
 description = "Production-ready QUIC/HTTP/3/WebTransport proxy with hybrid PQC TLS support"
