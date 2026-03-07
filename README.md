@@ -112,6 +112,7 @@
 | **Canary / Traffic Splitting** | ✅ | Percentage-based canary routing with sticky cookie assignment, per-pool auto-rollback on error rate threshold, and live admin control — active on HTTP/1.1, HTTP/2, HTTP/3/QUIC |
 | **Traffic Shadowing / Mirroring** | ✅ | Per-route fire-and-forget copy of requests to a secondary backend; client only sees primary response; all parameters configurable (backend, percent, timeout, marker header) — active on HTTP/1.1, HTTP/2, HTTP/3/QUIC |
 | **RFC 9111 Response Cache** | ✅ | Full Cache-Control parsing (max-age, s-maxage, no-cache, no-store, private, public); ETag/If-None-Match → 304; Last-Modified/If-Modified-Since → 304; Vary header support; TTL-based expiry; size-bounded DashMap store — active on HTTP/1.1, HTTP/2, HTTP/3/QUIC |
+| **Hop-by-Hop Header Stripping** | ✅ | HTTP/1.1 connection-specific headers (`Transfer-Encoding`, `Connection`, `Keep-Alive`, `Proxy-Connection`, `Upgrade`, `TE`, `Trailer`, `Proxy-Authenticate`, `Proxy-Authorization`) stripped from backend responses before caching and forwarding — compliant with RFC 9113 §8.2.2 and RFC 9114 §4.2; prevents `ERR_QUIC_PROTOCOL_ERROR` on HTTP/3/QUIC and stream errors on HTTP/2 |
 | **OpenTelemetry Distributed Tracing** | ✅ | W3C TraceContext (`traceparent`/`tracestate`, RFC 9543) + B3 multi-header + B3 single-header extraction and injection; composite propagator on all transports (HTTP/1.1, HTTP/2, HTTP/3/QUIC, WebTransport); OTLP HTTP/JSON export; `ParentBased(TraceIdRatioBased)` sampler; trace IDs in access-log lines |
 | **Least Response Time Routing** | ✅ | Routes requests to the backend with the lowest moving-average response time |
 | **IP Hash Load Balancing** | ✅ | Deterministic backend selection by client IP hash for implicit session stickiness |
@@ -185,7 +186,7 @@
 - **Priority Failover**: Primary servers first, then failover to lower priority
 
 ### HTTP/3 Advanced Features
-- **Full HTTP/3 Support**: Native HTTP/3 via `h3` crate with proper header forwarding
+- **Full HTTP/3 Support**: Native HTTP/3 via `h3` crate with proper header forwarding; hop-by-hop headers (`Transfer-Encoding`, `Connection`, etc.) stripped from all backend responses before forwarding or caching — prevents `ERR_QUIC_PROTOCOL_ERROR` per RFC 9114 §4.2
 - **Early Hints (103)**: Preload CSS/JS resources via Link headers — dns-prefetch, preconnect, modulepreload, and speculative prerender hint types supported
 - **Priority Hints**: RFC 9218 Extensible Priorities for resource scheduling (`u=3,i=?0`)
 - **Request Coalescing**: Deduplicate identical GET/HEAD requests in flight
@@ -205,6 +206,7 @@
 - **Shared Security State (QUIC)**: All QUIC listeners share one security context — blocked IPs, rate limiters, and fingerprint databases are consistent across every port
 - **Configurable WebTransport Port**: `webtransport_port` in `[server]` controls the dedicated WebTransport server bind port (default 4433)
 - **X-Forwarded Headers**: X-Real-IP, X-Forwarded-For, X-Forwarded-Proto
+- **Hop-by-Hop Header Stripping**: HTTP/1.1 connection-specific headers stripped from backend responses at the proxy layer before any caching or forwarding — safe across HTTP/1.1, HTTP/2, HTTP/3/QUIC, and WebTransport
 
 ### Operations
 - **Hot Reload**: Configuration and TLS certificate reload without restart

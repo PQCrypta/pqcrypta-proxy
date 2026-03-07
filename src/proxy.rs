@@ -190,10 +190,28 @@ impl BackendPool {
             .map_err(|_| anyhow::anyhow!("Backend request timeout"))?
             .map_err(|e| anyhow::anyhow!("Backend request failed: {}", e))?;
 
-        // Extract status and headers (use Vec to preserve multiple headers with same name)
+        // Extract status and headers (use Vec to preserve multiple headers with same name).
+        // Strip HTTP/1.1 hop-by-hop headers — these are connection-specific and forbidden
+        // in HTTP/2 and HTTP/3 (RFC 9113 §8.2.2, RFC 9114 §4.2). Forwarding them over
+        // QUIC/HTTP3 causes ERR_QUIC_PROTOCOL_ERROR in browsers.
+        const HOP_BY_HOP: &[&str] = &[
+            "transfer-encoding",
+            "connection",
+            "keep-alive",
+            "proxy-connection",
+            "upgrade",
+            "te",
+            "trailer",
+            "proxy-authenticate",
+            "proxy-authorization",
+        ];
         let status = response.status().as_u16();
         let mut response_headers = Vec::new();
         for (name, value) in response.headers() {
+            let name_lower = name.as_str().to_ascii_lowercase();
+            if HOP_BY_HOP.contains(&name_lower.as_str()) {
+                continue;
+            }
             if let Ok(v) = value.to_str() {
                 response_headers.push((name.to_string(), v.to_string()));
             }
