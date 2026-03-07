@@ -67,6 +67,8 @@ pub struct WafEngine {
     xxe_patterns: Vec<Regex>,
     deserialization_patterns: Vec<Regex>,
     custom_patterns: Vec<Regex>,
+    /// Path-only patterns for scanner/reconnaissance probes (.git, .env, AWS paths, etc.)
+    scanner_probe_patterns: Vec<Regex>,
     config: WafConfig,
 }
 
@@ -202,6 +204,69 @@ impl WafEngine {
             })
             .collect();
 
+        // Scanner/reconnaissance probe paths — matched against req.path only (not query/body).
+        // These paths have no legitimate use on an API server and indicate automated scanning.
+        let scanner_probe_patterns = if config.scanner_probe {
+            compile_patterns(&[
+                // Version control / source leakage
+                r"(?i)(^|/)\.git(/|$)",
+                r"(?i)(^|/)\.svn(/|$)",
+                r"(?i)(^|/)\.hg(/|$)",
+                r"(?i)(^|/)\.bzr(/|$)",
+                // Environment / secrets
+                r"(?i)(^|/)\.env($|[\./])",
+                r"(?i)(^|/)\.env\.(local|production|staging|dev|test|example)$",
+                // Cloud provider credentials / metadata
+                r"(?i)(^|/)\.aws(/|$)",
+                r"(?i)(^|/)\.gcloud(/|$)",
+                // Infrastructure-as-code state / config
+                r"(?i)(^|/)terraform\.tfstate",
+                r"(?i)(^|/)\.terraform(/|$)",
+                r"(?i)(^|/)docker-compose\.(yml|yaml)$",
+                r"(?i)(^|/)Dockerfile$",
+                r"(?i)(^|/)kubernetes\.(yml|yaml)$",
+                r"(?i)(^|/)k8s\.(yml|yaml)$",
+                // WordPress / common CMS probes
+                r"(?i)(^|/)wp-login\.php$",
+                r"(?i)(^|/)wp-admin(/|$)",
+                r"(?i)(^|/)xmlrpc\.php$",
+                r"(?i)(^|/)wp-config\.php$",
+                // Database / backup files
+                r"(?i)(^|/)database\.yml$",
+                r"(?i)\.(sql|bak|backup|dump|tar\.gz|tgz|zip)$",
+                // Apache / web server config
+                r"(?i)(^|/)\.htaccess$",
+                r"(?i)(^|/)\.htpasswd$",
+                r"(?i)(^|/)server-status(/|$)",
+                r"(?i)(^|/)server-info(/|$)",
+                // SSH / credentials
+                r"(?i)(^|/)\.ssh(/|$)",
+                r"(?i)(^|/)id_rsa$",
+                r"(?i)(^|/)id_ed25519$",
+                // PHP admin panels
+                r"(?i)(^|/)(phpmyadmin|pma|phpMyAdmin)(/|$)",
+                r"(?i)(^|/)adminer\.php$",
+                // Java / Spring actuator
+                r"(?i)(^|/)actuator(/|$)",
+                // macOS filesystem artifacts
+                r"(?i)(^|/)\.DS_Store$",
+                // Config dumps
+                r"(?i)(^|/)config\.(php|yml|yaml|json|ini|xml)$",
+                r"(?i)(^|/)settings\.(php|yml|yaml|json|ini)$",
+                r"(?i)(^|/)secrets\.(yml|yaml|json)$",
+                // Package manager manifests (shouldn't be publicly accessible)
+                r"(?i)(^|/)composer\.(json|lock)$",
+                r"(?i)(^|/)package(-lock)?\.json$",
+                r"(?i)(^|/)yarn\.lock$",
+                // CI/CD pipeline files
+                r"(?i)(^|/)\.github(/|$)",
+                r"(?i)(^|/)\.gitlab-ci\.yml$",
+                r"(?i)(^|/)Jenkinsfile$",
+            ])
+        } else {
+            Vec::new()
+        };
+
         Self {
             sqli_patterns,
             xss_patterns,
@@ -212,6 +277,7 @@ impl WafEngine {
             xxe_patterns,
             deserialization_patterns,
             custom_patterns,
+            scanner_probe_patterns,
             config: config.clone(),
         }
     }
@@ -219,6 +285,30 @@ impl WafEngine {
     /// Inspect a request and return a WAF verdict.
     pub fn inspect(&self, req: &WafRequest<'_>) -> WafVerdict {
         let block_mode = self.config.mode == "block";
+
+        // Check path-only scanner/reconnaissance probe patterns first.
+        // These match exclusively on req.path (not query/body) because the paths
+        // themselves are the signal — no legitimate API client requests .git, .env, etc.
+        for pat in &self.scanner_probe_patterns {
+            if pat.is_match(req.path) {
+                let rule = format!(
+                    "scanner-probe:{}",
+                    pat.as_str().chars().take(40).collect::<String>()
+                );
+                debug!("WAF scanner probe blocked: {}", req.path);
+                return if block_mode {
+                    WafVerdict::Block {
+                        rule,
+                        severity: Severity::Medium,
+                    }
+                } else {
+                    WafVerdict::Detect {
+                        rule,
+                        severity: Severity::Medium,
+                    }
+                };
+            }
+        }
 
         // Scan path + query
         let target = format!(

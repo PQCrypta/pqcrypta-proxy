@@ -204,6 +204,8 @@ pub struct WafConfig {
     pub max_body_scan_bytes: usize,
     /// User-supplied extra regex patterns (applied in block mode)
     pub custom_patterns: Vec<String>,
+    /// Block known scanner/reconnaissance probe paths (default true)
+    pub scanner_probe: bool,
 }
 
 impl Default for WafConfig {
@@ -219,6 +221,7 @@ impl Default for WafConfig {
             scan_json_body: true,
             max_body_scan_bytes: 65_536,
             custom_patterns: Vec::new(),
+            scanner_probe: true,
         }
     }
 }
