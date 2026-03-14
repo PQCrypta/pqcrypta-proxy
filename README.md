@@ -40,7 +40,7 @@
 | Request Coalescing | ✅ | Deduplicates identical in-flight requests |
 | Early Hints (103) | ✅ | Link headers for preload/preconnect |
 | Compression | ✅ | Brotli/gzip/deflate/zstd |
-| Security Headers | ✅ | HSTS, CSP, CORS, Alt-Svc |
+| Security Headers | ✅ | HSTS, CSP, CORS, Alt-Svc; CORS headers injected on 429 rate-limit responses so browsers surface the status code instead of a misleading CORS error |
 | PQC TLS | ✅ | X25519MLKEM768 hybrid (NIST Level 3) |
 | Background Cleanup | ✅ | Auto-cleanup of expired entries |
 | **ACME Automation** | ✅ | Let's Encrypt HTTP-01/DNS-01 certificate provisioning |
@@ -158,7 +158,7 @@
 - **SSRF Protection**: Link-local (169.254.x.x) and loopback backend addresses rejected at config load; RFC1918 backends log a warning; WAF SSRF pattern set active for path, query, and body inspection; `X-Forwarded-For` exempt from SSRF patterns since proxy hops legitimately insert loopback/RFC1918 IPs into the forwarded chain
 - **Per-Route Security Policy**: Per-route mTLS requirement, JA3 allowlist, rate limit override, WAF mode override, 0-RTT control
 - **Security Headers**: HSTS, X-Frame-Options, CSP, COEP, COOP, CORP, and more
-- **CORS Handling**: Full CORS support with preflight OPTIONS handling
+- **CORS Handling**: Full CORS support with preflight OPTIONS handling; all rate-limit 429 responses include `Access-Control-Allow-Origin` and `Access-Control-Allow-Credentials` headers when the request Origin matches an allowed origin — prevents browsers from reporting rate-limit errors as CORS failures
 - **Server Identity Concealment**: Server header suppressed; configurable custom branding replaces backend identity
 - **Log Injection Prevention**: Newlines and all control characters stripped from every user-controlled field before writing to access or audit logs
 - **`tls_skip_verify` Production Block**: `tls_skip_verify = true` rejected at config load; requires explicit `--allow-insecure-backends` CLI flag to override

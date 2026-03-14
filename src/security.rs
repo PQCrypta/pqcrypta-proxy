@@ -1093,7 +1093,11 @@ pub async fn security_middleware(
             if dos_protection {
                 security.decrement_connections(ip);
             }
-            return rate_limit_response_simple(rate_rps, alt_svc);
+            let request_origin = headers
+                .get("origin")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            return rate_limit_response_simple(rate_rps, alt_svc, request_origin.as_deref());
         }
     }
 
@@ -1325,7 +1329,11 @@ fn geo_blocked_response(alt_svc: &str) -> Response {
 }
 
 /// Generate rate limit exceeded response with just the RPS value
-fn rate_limit_response_simple(requests_per_second: u32, alt_svc: &str) -> Response {
+fn rate_limit_response_simple(
+    requests_per_second: u32,
+    alt_svc: &str,
+    request_origin: Option<&str>,
+) -> Response {
     let mut response = (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
 
     // Add standard rate limit headers
@@ -1340,6 +1348,25 @@ fn rate_limit_response_simple(requests_per_second: u32, alt_svc: &str) -> Respon
     response
         .headers_mut()
         .insert("X-RateLimit-Remaining", HeaderValue::from_static("0"));
+
+    // CORS headers on 429 so browsers see the status code instead of a CORS error
+    const ALLOWED_ORIGINS: &[&str] = &["https://pqcrypta.com", "https://www.pqcrypta.com"];
+    let origin = request_origin.unwrap_or("");
+    if ALLOWED_ORIGINS.contains(&origin) {
+        if let Ok(v) = HeaderValue::from_str(origin) {
+            response
+                .headers_mut()
+                .insert("access-control-allow-origin", v);
+        }
+        response.headers_mut().insert(
+            "access-control-allow-credentials",
+            HeaderValue::from_static("true"),
+        );
+        response
+            .headers_mut()
+            .insert("vary", HeaderValue::from_static("Origin"));
+    }
+
     add_alt_svc(&mut response, alt_svc);
 
     response

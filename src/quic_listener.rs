@@ -621,13 +621,27 @@ impl QuicListener {
                         Some(&path),
                         is_health_check,
                     );
-                    let response = http::Response::builder()
+                    // CORS headers on 429 so browsers see the status code
+                    const CORS_ORIGINS: &[&str] =
+                        &["https://pqcrypta.com", "https://www.pqcrypta.com"];
+                    let req_origin = request
+                        .headers()
+                        .get("origin")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    let mut builder = http::Response::builder()
                         .status(http::StatusCode::TOO_MANY_REQUESTS)
                         .header("retry-after", "1")
                         .header("x-ratelimit-limit", rate_rps.to_string())
                         .header("x-ratelimit-remaining", "0")
-                        .header("server", "PQCProxy v0.2.1")
-                        .body(())?;
+                        .header("server", "PQCProxy v0.2.1");
+                    if CORS_ORIGINS.contains(&req_origin) {
+                        builder = builder
+                            .header("access-control-allow-origin", req_origin)
+                            .header("access-control-allow-credentials", "true")
+                            .header("vary", "Origin");
+                    }
+                    let response = builder.body(())?;
                     stream.send_response(response).await?;
                     stream.finish().await?;
                     return Ok(());
@@ -674,8 +688,16 @@ impl QuicListener {
                             Some(&path),
                             is_health_check,
                         );
+                        // CORS headers on 429 so browsers see the status code
+                        const CORS_ORIGINS_ADV: &[&str] =
+                            &["https://pqcrypta.com", "https://www.pqcrypta.com"];
+                        let req_origin_adv = request
+                            .headers()
+                            .get("origin")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("");
                         let retry_secs = (retry_after_ms / 1000).max(1);
-                        let response = http::Response::builder()
+                        let mut builder_adv = http::Response::builder()
                             .status(http::StatusCode::TOO_MANY_REQUESTS)
                             .header("retry-after", retry_secs.to_string())
                             .header("x-ratelimit-limit", limit.to_string())
@@ -684,8 +706,14 @@ impl QuicListener {
                                 "x-ratelimit-reason",
                                 format!("{:?}", reason).to_ascii_lowercase(),
                             )
-                            .header("server", "PQCProxy v0.2.2")
-                            .body(())?;
+                            .header("server", "PQCProxy v0.2.2");
+                        if CORS_ORIGINS_ADV.contains(&req_origin_adv) {
+                            builder_adv = builder_adv
+                                .header("access-control-allow-origin", req_origin_adv)
+                                .header("access-control-allow-credentials", "true")
+                                .header("vary", "Origin");
+                        }
+                        let response = builder_adv.body(())?;
                         stream.send_response(response).await?;
                         stream.finish().await?;
                         return Ok(());

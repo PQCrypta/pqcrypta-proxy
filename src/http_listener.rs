@@ -2036,6 +2036,12 @@ async fn advanced_rate_limit_middleware(
                 reason
             );
 
+            // Capture request Origin before consuming headers into response
+            let request_origin = headers
+                .get("origin")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+
             let mut response = (
                 StatusCode::TOO_MANY_REQUESTS,
                 match reason {
@@ -2049,16 +2055,16 @@ async fn advanced_rate_limit_middleware(
             )
                 .into_response();
 
-            let headers = response.headers_mut();
+            let resp_headers = response.headers_mut();
 
             // Standard rate limit headers
             if let Ok(v) = HeaderValue::from_str(&(retry_after_ms / 1000).to_string()) {
-                headers.insert("retry-after", v);
+                resp_headers.insert("retry-after", v);
             }
             if let Ok(v) = HeaderValue::from_str(&limit.to_string()) {
-                headers.insert("x-ratelimit-limit", v);
+                resp_headers.insert("x-ratelimit-limit", v);
             }
-            headers.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
+            resp_headers.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
 
             // Reset time (approximate)
             let reset_time = std::time::SystemTime::now()
@@ -2067,7 +2073,25 @@ async fn advanced_rate_limit_middleware(
                 .as_secs()
                 + (retry_after_ms / 1000);
             if let Ok(v) = HeaderValue::from_str(&reset_time.to_string()) {
-                headers.insert("x-ratelimit-reset", v);
+                resp_headers.insert("x-ratelimit-reset", v);
+            }
+
+            // CORS headers on 429 so browser sees the status code, not a CORS error
+            const ALLOWED_ORIGINS: &[&str] =
+                &["https://pqcrypta.com", "https://www.pqcrypta.com"];
+            let origin_value = request_origin.as_deref().unwrap_or("");
+            if ALLOWED_ORIGINS.contains(&origin_value) {
+                if let Ok(v) = HeaderValue::from_str(origin_value) {
+                    resp_headers.insert("access-control-allow-origin", v);
+                }
+                resp_headers.insert(
+                    "access-control-allow-credentials",
+                    HeaderValue::from_static("true"),
+                );
+                resp_headers.insert(
+                    "vary",
+                    HeaderValue::from_static("Origin"),
+                );
             }
 
             // Add Alt-Svc header to advertise HTTP/3
