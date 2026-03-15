@@ -1729,8 +1729,11 @@ impl AffinityMode {
 /// CORS configuration for routes
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CorsConfig {
-    /// Allowed origin (e.g., "https://pqcrypta.com")
+    /// Allowed origin (e.g., "https://pqcrypta.com") — single origin, legacy
     pub allow_origin: Option<String>,
+    /// Allowed origins list — when set, the matching request origin is reflected
+    #[serde(default)]
+    pub allow_origins: Vec<String>,
     /// Allowed methods
     #[serde(default)]
     pub allow_methods: Vec<String>,

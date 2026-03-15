@@ -862,8 +862,19 @@ impl QuicListener {
                     .header("alt-svc", build_alt_svc_header(&config))
                     .header("server", "PQCProxy v0.2.1");
 
-                // Access-Control-Allow-Origin
-                if let Some(ref origin) = cors.allow_origin {
+                // Access-Control-Allow-Origin — reflect when allow_origins list is set
+                let req_origin_str = request
+                    .headers()
+                    .get("origin")
+                    .and_then(|v| v.to_str().ok());
+                let resolved_origin = if !cors.allow_origins.is_empty() {
+                    req_origin_str
+                        .filter(|o| cors.allow_origins.iter().any(|a| a == *o))
+                        .map(String::from)
+                } else {
+                    cors.allow_origin.clone()
+                };
+                if let Some(ref origin) = resolved_origin {
                     response_builder =
                         response_builder.header("access-control-allow-origin", origin);
                 }
@@ -1483,7 +1494,11 @@ impl QuicListener {
 
         // Add CORS headers from route.cors (proxy-level CORS) if configured
         if let Some(ref cors) = route.cors {
-            response_builder = add_cors_headers_to_builder(response_builder, cors);
+            let req_origin = request
+                .headers()
+                .get("origin")
+                .and_then(|v| v.to_str().ok());
+            response_builder = add_cors_headers_to_builder(response_builder, cors, req_origin);
         }
 
         // Apply route-specific header overrides (e.g., COEP/COOP for Grafana)
@@ -1632,9 +1647,17 @@ impl QuicListener {
 fn add_cors_headers_to_builder(
     mut builder: http::response::Builder,
     cors: &CorsConfig,
+    request_origin: Option<&str>,
 ) -> http::response::Builder {
-    // Access-Control-Allow-Origin
-    if let Some(ref origin) = cors.allow_origin {
+    // Access-Control-Allow-Origin — reflect when allow_origins list is set
+    let resolved_origin = if !cors.allow_origins.is_empty() {
+        request_origin
+            .filter(|o| cors.allow_origins.iter().any(|a| a == *o))
+            .map(String::from)
+    } else {
+        cors.allow_origin.clone()
+    };
+    if let Some(ref origin) = resolved_origin {
         builder = builder.header("access-control-allow-origin", origin);
     }
 

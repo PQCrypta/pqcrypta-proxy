@@ -2077,8 +2077,12 @@ async fn advanced_rate_limit_middleware(
             }
 
             // CORS headers on 429 so browser sees the status code, not a CORS error
-            const ALLOWED_ORIGINS: &[&str] =
-                &["https://pqcrypta.com", "https://www.pqcrypta.com"];
+            const ALLOWED_ORIGINS: &[&str] = &[
+                "https://pqcrypta.com",
+                "https://www.pqcrypta.com",
+                "https://pqpdf.com",
+                "https://www.pqpdf.com",
+            ];
             let origin_value = request_origin.as_deref().unwrap_or("");
             if ALLOWED_ORIGINS.contains(&origin_value) {
                 if let Ok(v) = HeaderValue::from_str(origin_value) {
@@ -2088,10 +2092,7 @@ async fn advanced_rate_limit_middleware(
                     "access-control-allow-credentials",
                     HeaderValue::from_static("true"),
                 );
-                resp_headers.insert(
-                    "vary",
-                    HeaderValue::from_static("Origin"),
-                );
+                resp_headers.insert("vary", HeaderValue::from_static("Origin"));
             }
 
             // Add Alt-Svc header to advertise HTTP/3
@@ -2182,7 +2183,8 @@ async fn proxy_handler(
         // Handle OPTIONS preflight for CORS
         if method == Method::OPTIONS {
             if let Some(ref cors) = route.cors {
-                return handle_cors_preflight(cors);
+                let req_origin = headers.get("origin").and_then(|v| v.to_str().ok());
+                return handle_cors_preflight(cors, req_origin);
             }
         }
 
@@ -2613,7 +2615,8 @@ async fn proxy_handler(
 
                 // Add CORS headers if configured
                 if let Some(ref cors) = route.cors {
-                    add_cors_headers(&mut parts.headers, cors);
+                    let req_origin = headers.get("origin").and_then(|v| v.to_str().ok());
+                    add_cors_headers(&mut parts.headers, cors, req_origin);
                 }
 
                 // Add sticky session cookie if using pool with cookie affinity
@@ -2932,13 +2935,21 @@ fn spawn_shadow_request(
 }
 
 /// Handle CORS preflight OPTIONS request
-fn handle_cors_preflight(cors: &CorsConfig) -> Response {
+fn handle_cors_preflight(cors: &CorsConfig, request_origin: Option<&str>) -> Response {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::NO_CONTENT;
 
     let headers = response.headers_mut();
 
-    if let Some(ref origin) = cors.allow_origin {
+    // Multi-origin reflection: prefer allow_origins list; fall back to allow_origin
+    let resolved_origin = if !cors.allow_origins.is_empty() {
+        request_origin
+            .filter(|o| cors.allow_origins.iter().any(|a| a == *o))
+            .map(String::from)
+    } else {
+        cors.allow_origin.clone()
+    };
+    if let Some(ref origin) = resolved_origin {
         if let Ok(v) = HeaderValue::from_str(origin) {
             headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
         }
@@ -2978,8 +2989,16 @@ fn handle_cors_preflight(cors: &CorsConfig) -> Response {
 }
 
 /// Add CORS headers to response
-fn add_cors_headers(headers: &mut HeaderMap, cors: &CorsConfig) {
-    if let Some(ref origin) = cors.allow_origin {
+fn add_cors_headers(headers: &mut HeaderMap, cors: &CorsConfig, request_origin: Option<&str>) {
+    // Multi-origin reflection: prefer allow_origins list; fall back to allow_origin
+    let resolved_origin = if !cors.allow_origins.is_empty() {
+        request_origin
+            .filter(|o| cors.allow_origins.iter().any(|a| a == *o))
+            .map(String::from)
+    } else {
+        cors.allow_origin.clone()
+    };
+    if let Some(ref origin) = resolved_origin {
         if let Ok(v) = HeaderValue::from_str(origin) {
             headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
         }
