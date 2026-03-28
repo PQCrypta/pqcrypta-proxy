@@ -54,7 +54,7 @@
 | Per-Route Timeouts | ✅ | Per-route timeout overrides independent of global defaults |
 | Custom Header Injection | ✅ | Inject arbitrary headers per route before forwarding to backends |
 | Multiple Listener Ports | ✅ | Primary port plus any number of additional ports via `additional_ports` |
-| WebTransport Operations | ✅ | JSON operation routing over streams (encrypt/decrypt/keygen/health/ping) |
+| WebTransport Operations | ✅ | JSON operation routing over streams (encrypt/decrypt/keygen/health/ping/speedtest); QUIC-native speed test server with datagram RTT probing, stream throughput download/upload, packet-loss measurement, MTR-based hop traceroute with GeoIP annotation, and per-client info lookup |
 | **WAF** | ✅ | Pattern-based injection and traversal inspection — SQLi, XSS, path traversal, NoSQLi, SSRF, CMDi, XXE, deserialization; covers OWASP A01/A03/A08/A10 attack patterns. Scanner probe blocking: path-level block for `.git`, `.env`, `.aws`, `wp-login.php`, terraform state, SSH keys, CI/CD files, and 40+ other reconnaissance targets |
 | **Audit Logger** | ✅ | Async structured JSON audit log — admin actions, auth failures, WAF events, rate limits, PQC downgrades |
 | **JA3/JA4 Replay Detection** | ✅ | Flags same fingerprint from multiple IPs within configurable window |
@@ -201,7 +201,7 @@
 - **QUIC/HTTP/3**: Full HTTP/3 support via QuicListener (h3 + quinn crates)
 - **WebTransport**: Native WebTransport session handling with bidirectional streams, unidirectional streams, and datagrams
 - **WebTransport Origin Validation**: SR-02 cross-origin enforcement — configurable `webtransport_allowed_origins` allowlist rejects browser sessions from unlisted origins with 403; non-browser clients (no Origin header) always accepted
-- **WebTransport JSON Operations**: JSON operation routing over streams — encrypt, decrypt, keygen, health, ping dispatched to backend by operation type
+- **WebTransport JSON Operations**: JSON operation routing over streams — encrypt, decrypt, keygen, health, ping dispatched to backend by operation type; plus a built-in QUIC-native speed test server (`speedtest` operation) providing datagram RTT probing, stream download/upload throughput measurement, packet-loss counting, MTR-based hop traceroute with GeoIP city/ASN/country annotation, and client IP info lookup
 - **Unified UDP Listener**: Single QuicListener handles both HTTP/3 and WebTransport
 - **Shared Security State (QUIC)**: All QUIC listeners share one security context — blocked IPs, rate limiters, and fingerprint databases are consistent across every port
 - **Configurable WebTransport Port**: `webtransport_port` in `[server]` controls the dedicated WebTransport server bind port (default 4433)
