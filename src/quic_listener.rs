@@ -30,6 +30,8 @@ use crate::rate_limiter::{build_context_from_request, AdvancedRateLimiter, RateL
 use crate::security::{BlockReason, SecurityState};
 use crate::tls::TlsProvider;
 
+const SERVER_HEADER: &str = concat!("PQ Crypta/", env!("CARGO_PKG_VERSION"));
+
 /// Build Alt-Svc header value from config ports
 fn build_alt_svc_header(config: &ProxyConfig) -> String {
     let mut ports = vec![config.server.udp_port];
@@ -583,7 +585,7 @@ impl QuicListener {
                 let response = http::Response::builder()
                     .status(http::StatusCode::FORBIDDEN)
                     .header("retry-after", retry_after.to_string())
-                    .header("server", "PQCProxy v0.2.1")
+                    .header("server", SERVER_HEADER)
                     .body(())?;
                 stream.send_response(response).await?;
                 stream.finish().await?;
@@ -634,7 +636,7 @@ impl QuicListener {
                         .header("retry-after", "1")
                         .header("x-ratelimit-limit", rate_rps.to_string())
                         .header("x-ratelimit-remaining", "0")
-                        .header("server", "PQCProxy v0.2.1");
+                        .header("server", SERVER_HEADER);
                     if CORS_ORIGINS.contains(&req_origin) {
                         builder = builder
                             .header("access-control-allow-origin", req_origin)
@@ -706,7 +708,7 @@ impl QuicListener {
                                 "x-ratelimit-reason",
                                 format!("{:?}", reason).to_ascii_lowercase(),
                             )
-                            .header("server", "PQCProxy v0.2.2");
+                            .header("server", SERVER_HEADER);
                         if CORS_ORIGINS_ADV.contains(&req_origin_adv) {
                             builder_adv = builder_adv
                                 .header("access-control-allow-origin", req_origin_adv)
@@ -733,7 +735,7 @@ impl QuicListener {
                         );
                         let response = http::Response::builder()
                             .status(http::StatusCode::FORBIDDEN)
-                            .header("server", "PQCProxy v0.2.2")
+                            .header("server", SERVER_HEADER)
                             .body(())?;
                         stream.send_response(response).await?;
                         stream.finish().await?;
@@ -764,7 +766,7 @@ impl QuicListener {
                 );
                 let response = http::Response::builder()
                     .status(http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE)
-                    .header("server", "PQCProxy v0.2.1")
+                    .header("server", SERVER_HEADER)
                     .body(())?;
                 stream.send_response(response).await?;
                 stream.finish().await?;
@@ -782,24 +784,38 @@ impl QuicListener {
                 let mut early_response_builder = http::Response::builder()
                     .status(http::StatusCode::EARLY_HINTS)
                     .header("alt-svc", build_alt_svc_header(&config))
-                    .header("server", "PQCProxy v0.2.1");
+                    .header("server", SERVER_HEADER);
 
                 for hint in &hints {
                     early_response_builder = early_response_builder.header("link", hint.as_str());
                 }
 
                 if let Ok(early_response) = early_response_builder.body(()) {
-                    if let Err(e) = stream.send_response(early_response).await {
-                        debug!(
-                            "Failed to send 103 Early Hints to {}: {} (continuing with request)",
-                            remote_addr, e
-                        );
-                    } else {
-                        debug!(
-                            "Sent 103 Early Hints to {} with {} link hints",
-                            remote_addr,
-                            hints.len()
-                        );
+                    match tokio::time::timeout(
+                        Duration::from_millis(50),
+                        stream.send_response(early_response),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {
+                            debug!(
+                                "Sent 103 Early Hints to {} with {} link hints",
+                                remote_addr,
+                                hints.len()
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            debug!(
+                                "Failed to send 103 Early Hints to {}: {} (continuing with request)",
+                                remote_addr, e
+                            );
+                        }
+                        Err(_) => {
+                            debug!(
+                                "103 Early Hints timed out for {} (QUIC window full, continuing)",
+                                remote_addr
+                            );
+                        }
                     }
                 }
             }
@@ -845,7 +861,7 @@ impl QuicListener {
                 // Return 404
                 let response = http::Response::builder()
                     .status(http::StatusCode::NOT_FOUND)
-                    .header("server", "PQCProxy v0.2.1")
+                    .header("server", SERVER_HEADER)
                     .body(())?;
 
                 stream.send_response(response).await?;
@@ -860,7 +876,7 @@ impl QuicListener {
                 let mut response_builder = http::Response::builder()
                     .status(http::StatusCode::OK)
                     .header("alt-svc", build_alt_svc_header(&config))
-                    .header("server", "PQCProxy v0.2.1");
+                    .header("server", SERVER_HEADER);
 
                 // Access-Control-Allow-Origin — reflect when allow_origins list is set
                 let req_origin_str = request
@@ -1022,7 +1038,7 @@ impl QuicListener {
                         );
                         let response = http::Response::builder()
                             .status(http::StatusCode::SERVICE_UNAVAILABLE)
-                            .header("server", "PQCProxy v0.2.1")
+                            .header("server", SERVER_HEADER)
                             .body(())?;
                         stream.send_response(response).await?;
                         stream.finish().await?;
@@ -1044,7 +1060,7 @@ impl QuicListener {
                         );
                         let response = http::Response::builder()
                             .status(http::StatusCode::BAD_GATEWAY)
-                            .header("server", "PQCProxy v0.2.1")
+                            .header("server", SERVER_HEADER)
                             .body(())?;
                         stream.send_response(response).await?;
                         stream.finish().await?;
@@ -1124,7 +1140,7 @@ impl QuicListener {
                         .header("age", age_secs.to_string())
                         .header("x-cache", "HIT")
                         .header("alt-svc", build_alt_svc_header(&config))
-                        .header("server", "PQCProxy v0.2.1");
+                        .header("server", SERVER_HEADER);
                     for (k, v) in &cached_headers {
                         if k.to_lowercase() != "content-length" {
                             response_builder = response_builder.header(k.as_str(), v.as_str());
@@ -1183,7 +1199,7 @@ impl QuicListener {
                         .header("age", age_secs.to_string())
                         .header("x-cache", "HIT")
                         .header("alt-svc", build_alt_svc_header(&config))
-                        .header("server", "PQCProxy v0.2.1");
+                        .header("server", SERVER_HEADER);
                     if let Some(et) = etag {
                         response_builder = response_builder.header("etag", et);
                     }
@@ -1431,7 +1447,7 @@ impl QuicListener {
         response_builder = response_builder.header("alt-svc", build_alt_svc_header(&config));
 
         // Add Server header for branding (hide backend identity)
-        response_builder = response_builder.header("server", "PQCProxy v0.2.1");
+        response_builder = response_builder.header("server", SERVER_HEADER);
 
         // ═══════════════════════════════════════════════════════════════
         // HTTP/3 Performance & Monitoring Headers
@@ -1441,7 +1457,7 @@ impl QuicListener {
         if config.headers.server_timing_enabled {
             let processing_time = start_time.elapsed();
             let server_timing = format!(
-                "proxy;dur={:.2};desc=\"PQCProxy Processing\", quic;desc=\"QUIC v1\"",
+                "proxy;dur={:.2};desc=\"PQ Crypta Processing\", quic;desc=\"QUIC v1\"",
                 processing_time.as_secs_f64() * 1000.0
             );
             response_builder = response_builder.header("server-timing", server_timing);
