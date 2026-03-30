@@ -76,6 +76,7 @@
 | **Configurable GeoIP Block Duration** | ✅ | `geoip_block_duration_secs` in `[security]` (default 24 h); previously blocks were permanent with no expiry |
 | **Configurable WebTransport Port** | ✅ | `webtransport_port` in `[server]` replaces the hardcoded port 4433 for the dedicated WebTransport server |
 | **Dynamic Alt-Svc Header** | ✅ | Alt-Svc value built from `udp_port` + `additional_ports` at startup instead of a hardcoded constant |
+| **TCP-Only Hosts** | ✅ | `tcp_only_hosts` in `[server]` — listed hostnames receive `Alt-Svc: clear`, evicting cached QUIC upgrades so browsers always connect via TCP/TLS |
 | **Admin Loopback Enforcement** | ✅ | `require_loopback = true` (default) aborts startup when admin API is bound to a non-loopback address |
 | **Shared Security State (QUIC)** | ✅ | All QUIC listeners now share one `SecurityState`; blocked IPs and rate limiters are visible across all ports |
 | **Audit Logger Wired** | ✅ | `AuditLogger` constructed at startup and passed to the admin server; audit events are now actually written |
@@ -190,7 +191,7 @@
 - **Early Hints (103)**: Preload CSS/JS resources via Link headers — dns-prefetch, preconnect, modulepreload, and speculative prerender hint types supported
 - **Priority Hints**: RFC 9218 Extensible Priorities for resource scheduling (`u=3,i=?0`)
 - **Request Coalescing**: Deduplicate identical GET/HEAD requests in flight
-- **Alt-Svc Advertisement**: Dynamic HTTP/3 upgrade headers on all ports — built from `udp_port` and `additional_ports` at startup so every listener advertises its actual address
+- **Alt-Svc Advertisement**: Dynamic HTTP/3 upgrade headers on all ports — built from `udp_port` and `additional_ports` at startup so every listener advertises its actual address; `tcp_only_hosts` in `[server]` sends `Alt-Svc: clear` for designated TCP-only origins to prevent browser QUIC upgrades
 - **Virtual Host Routing**: Proper `:authority` pseudo-header handling for backend routing
 - **Server-Timing**: Performance metrics header for browser DevTools (RFC 6797)
 - **NEL (Network Error Logging)**: Client-side error reporting with configurable policy
