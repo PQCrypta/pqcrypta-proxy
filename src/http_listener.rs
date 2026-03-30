@@ -2222,6 +2222,11 @@ async fn tcp_upload_measure_handler(body: Body) -> Response {
         throughput_mbps
     };
 
+    info!(
+        "[speedtest-ul/tcp] {} bytes in {}ms ({:.1} Mbps avg, {:.1} Mbps steady)",
+        total_bytes, elapsed_ms, throughput_mbps, steady_mbps
+    );
+
     let json_body = serde_json::json!({
         "ok": true,
         "bytes_received": total_bytes,

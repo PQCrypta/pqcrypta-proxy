@@ -1027,10 +1027,12 @@ impl QuicListener {
                     Some(&path),
                     is_health_check,
                 );
-                // Return 404
+                // Return 404 — include Alt-Svc so tcp_only_hosts origins
+                // receive "clear" and the browser stops upgrading to HTTP/3.
                 let response = http::Response::builder()
                     .status(http::StatusCode::NOT_FOUND)
                     .header("server", SERVER_HEADER)
+                    .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
                     .body(())?;
 
                 stream.send_response(response).await?;
