@@ -875,6 +875,7 @@ async fn handle_fingerprinted_connection(
         }
     };
     metrics.connections.connection_opened(protocol);
+    let is_http1 = protocol == ConnectionProtocol::Http1;
 
     // Extract fingerprint info from the connection
     let conn_info = tls_stream.conn_info.clone();
@@ -905,6 +906,9 @@ async fn handle_fingerprinted_connection(
             // Strip any client-supplied x-client-cert header before injecting
             // the authoritative value from the TLS handshake result.
             req.headers_mut().remove("x-client-cert");
+            // Strip any client-supplied x-connection-protocol header before
+            // injecting the authoritative value from ALPN negotiation.
+            req.headers_mut().remove("x-connection-protocol");
 
             // Inject fingerprint headers for downstream middleware
             if let Some(ref hash) = ja3 {
@@ -939,6 +943,14 @@ async fn handle_fingerprinted_connection(
             if ci.client_cert_present {
                 req.headers_mut()
                     .insert("x-client-cert", HeaderValue::from_static("1"));
+            }
+
+            // Tag HTTP/1.1 connections so proxy_handler can enforce per-route
+            // allow_http11 policy and respond 426 Upgrade Required when needed.
+            // The header is stripped above so it cannot be forged by clients.
+            if is_http1 {
+                req.headers_mut()
+                    .insert("x-connection-protocol", HeaderValue::from_static("h1"));
             }
 
             // Store connection info in extensions
@@ -1329,6 +1341,7 @@ async fn handle_pqc_fingerprinted_connection(
         _ => ConnectionProtocol::Http1,
     };
     metrics.connections.connection_opened(protocol);
+    let is_http1 = protocol == ConnectionProtocol::Http1;
 
     trace!(
         "PQC TLS connection from {} established (JA3={:?})",
@@ -1374,6 +1387,9 @@ async fn handle_pqc_fingerprinted_connection(
             // Strip any client-supplied x-client-cert header before injecting
             // the authoritative value from the TLS handshake result.
             req.headers_mut().remove("x-client-cert");
+            // Strip any client-supplied x-connection-protocol header before
+            // injecting the authoritative value from ALPN negotiation.
+            req.headers_mut().remove("x-connection-protocol");
 
             // Inject fingerprint headers
             if let Some(ref hash) = ja3 {
@@ -1405,6 +1421,14 @@ async fn handle_pqc_fingerprinted_connection(
             if ci.client_cert_present {
                 req.headers_mut()
                     .insert("x-client-cert", HeaderValue::from_static("1"));
+            }
+
+            // Tag HTTP/1.1 connections so proxy_handler can enforce per-route
+            // allow_http11 policy and respond 426 Upgrade Required when needed.
+            // The header is stripped above so it cannot be forged by clients.
+            if is_http1 {
+                req.headers_mut()
+                    .insert("x-connection-protocol", HeaderValue::from_static("h1"));
             }
 
             // Store connection info in extensions
@@ -2207,6 +2231,28 @@ async fn proxy_handler(
                 route.name, method, path
             );
             return StatusCode::TOO_EARLY.into_response();
+        }
+
+        // Enforce per-route HTTP/1.1 restriction (RFC 7231 §6.5.15).
+        // x-connection-protocol is set exclusively by the accept loop after stripping
+        // any client-supplied copy, so it cannot be forged by external callers.
+        // Routes with allow_http11 = false (the default) require HTTP/2 or HTTP/3.
+        let is_http1 = headers
+            .get("x-connection-protocol")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == "h1")
+            .unwrap_or(false);
+
+        if is_http1 && !route.allow_http11 {
+            debug!(
+                "Rejecting HTTP/1.1 request on route {:?} (allow_http11 = false): {} {}",
+                route.name, method, path
+            );
+            let mut resp = StatusCode::UPGRADE_REQUIRED.into_response();
+            if let Ok(v) = HeaderValue::from_str("h2, h3") {
+                resp.headers_mut().insert("upgrade", v);
+            }
+            return resp;
         }
 
         // Internal route mTLS enforcement.
