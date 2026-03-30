@@ -977,8 +977,15 @@ async fn handle_fingerprinted_connection(
     });
 
     // Serve HTTP/1.1 and HTTP/2 connections (via ALPN negotiation)
+    // HTTP/2 flow control windows set to 16 MB per stream / 64 MB per connection.
+    // The hyper default (65535 bytes) caps all streams to ~8 Mbps at 60 ms RTT —
+    // matching QUIC's initial window eliminates this bottleneck for download tests.
     let io = TokioIo::new(tls_stream);
-    let auto_builder = AutoBuilder::new(TokioExecutor::new());
+    let mut auto_builder = AutoBuilder::new(TokioExecutor::new());
+    auto_builder
+        .http2()
+        .initial_stream_window_size(16 * 1024 * 1024u32)
+        .initial_connection_window_size(64 * 1024 * 1024u32);
 
     if let Err(e) = auto_builder.serve_connection(io, service).await {
         if !e.to_string().contains("connection reset") {
@@ -1453,8 +1460,14 @@ async fn handle_pqc_fingerprinted_connection(
     });
 
     // Serve HTTP/1.1 and HTTP/2 connections over PQC TLS (via ALPN negotiation)
+    // HTTP/2 flow control windows set to 16 MB per stream / 64 MB per connection
+    // (same rationale as Rustls listener above).
     let io = TokioIo::new(ssl_stream);
-    let auto_builder = AutoBuilder::new(TokioExecutor::new());
+    let mut auto_builder = AutoBuilder::new(TokioExecutor::new());
+    auto_builder
+        .http2()
+        .initial_stream_window_size(16 * 1024 * 1024u32)
+        .initial_connection_window_size(64 * 1024 * 1024u32);
 
     if let Err(e) = auto_builder.serve_connection(io, service).await {
         if !e.to_string().contains("connection reset") {
