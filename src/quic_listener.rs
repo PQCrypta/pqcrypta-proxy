@@ -32,7 +32,9 @@ use crate::tls::TlsProvider;
 
 const SERVER_HEADER: &str = concat!("PQ Crypta/", env!("CARGO_PKG_VERSION"));
 
-/// Build Alt-Svc header value from config ports
+/// Build Alt-Svc header value from config ports.
+/// Returns "clear" for hosts listed in `server.tcp_only_hosts` so browsers
+/// evict any cached QUIC upgrade and fall back to TCP/TLS.
 fn build_alt_svc_header(config: &ProxyConfig) -> String {
     let mut ports = vec![config.server.udp_port];
     ports.extend(&config.server.additional_ports);
@@ -41,6 +43,15 @@ fn build_alt_svc_header(config: &ProxyConfig) -> String {
         .map(|p| format!("h3=\":{}\"; ma=86400", p))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn alt_svc_for_host(config: &ProxyConfig, host: Option<&str>) -> String {
+    if let Some(h) = host {
+        if config.server.tcp_only_hosts.iter().any(|t| t == h) {
+            return "clear".to_string();
+        }
+    }
+    build_alt_svc_header(config)
 }
 
 /// QUIC/HTTP3/WebTransport listener
@@ -788,7 +799,7 @@ impl QuicListener {
                 // Build 103 Early Hints response with Link headers and alt-svc for QUIC advertisement
                 let mut early_response_builder = http::Response::builder()
                     .status(http::StatusCode::EARLY_HINTS)
-                    .header("alt-svc", build_alt_svc_header(&config))
+                    .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
                     .header("server", SERVER_HEADER);
 
                 for hint in &hints {
@@ -961,6 +972,7 @@ impl QuicListener {
                 .header("content-length", json_len.to_string())
                 .header("cache-control", "no-store")
                 .header("server", SERVER_HEADER)
+                .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
                 .body(())?;
             stream.send_response(response).await?;
             stream.send_data(json_bytes).await?;
@@ -1032,7 +1044,7 @@ impl QuicListener {
             if let Some(ref cors) = route.cors {
                 let mut response_builder = http::Response::builder()
                     .status(http::StatusCode::OK)
-                    .header("alt-svc", build_alt_svc_header(&config))
+                    .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
                     .header("server", SERVER_HEADER);
 
                 // Access-Control-Allow-Origin — reflect when allow_origins list is set
@@ -1323,7 +1335,7 @@ impl QuicListener {
                         .status(status_code)
                         .header("age", age_secs.to_string())
                         .header("x-cache", "HIT")
-                        .header("alt-svc", build_alt_svc_header(&config))
+                        .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
                         .header("server", SERVER_HEADER);
                     for (k, v) in &cached_headers {
                         if k.to_lowercase() != "content-length" {
@@ -1382,7 +1394,7 @@ impl QuicListener {
                         .status(http::StatusCode::NOT_MODIFIED)
                         .header("age", age_secs.to_string())
                         .header("x-cache", "HIT")
-                        .header("alt-svc", build_alt_svc_header(&config))
+                        .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
                         .header("server", SERVER_HEADER);
                     if let Some(et) = etag {
                         response_builder = response_builder.header("etag", et);
@@ -1628,7 +1640,8 @@ impl QuicListener {
         }
 
         // Add Alt-Svc header to advertise HTTP/3 support
-        response_builder = response_builder.header("alt-svc", build_alt_svc_header(&config));
+        response_builder =
+            response_builder.header("alt-svc", alt_svc_for_host(&config, host.as_deref()));
 
         // Add Server header for branding (hide backend identity)
         response_builder = response_builder.header("server", SERVER_HEADER);

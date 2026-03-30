@@ -402,6 +402,19 @@ pub struct ServerConfig {
     /// advertisement to include it.
     #[serde(default = "default_webtransport_port")]
     pub webtransport_port: u16,
+
+    /// Hosts that must never advertise HTTP/3 upgrade.
+    ///
+    /// When a request arrives from one of these hostnames, the proxy sends
+    /// `Alt-Svc: clear` instead of an h3 advertisement, actively evicting any
+    /// cached Alt-Svc in the browser so it always connects via TCP/TLS.
+    ///
+    /// Example — a dedicated TCP-only speedtest subdomain:
+    /// ```toml
+    /// tcp_only_hosts = ["tcp.pqcrypta.com"]
+    /// ```
+    #[serde(default)]
+    pub tcp_only_hosts: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -426,6 +439,7 @@ impl Default for ServerConfig {
             webtransport_max_streams_per_session: 1000,
             webtransport_max_datagrams_per_sec: 500,
             webtransport_port: 4433,
+            tcp_only_hosts: Vec::new(),
         }
     }
 }

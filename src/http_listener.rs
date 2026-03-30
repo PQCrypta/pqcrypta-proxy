@@ -492,7 +492,7 @@ pub async fn run_http_listener_pqc(
     let app = Router::new()
         .route(
             "/speedtest/tcp-upload-stream",
-            post(tcp_upload_measure_handler),
+            post(tcp_upload_measure_handler).options(tcp_upload_cors_preflight),
         )
         .fallback(any(proxy_handler))
         .layer(middleware::from_fn_with_state(
@@ -727,7 +727,7 @@ pub async fn run_http_listener_with_fingerprint(
     let app = Router::new()
         .route(
             "/speedtest/tcp-upload-stream",
-            post(tcp_upload_measure_handler),
+            post(tcp_upload_measure_handler).options(tcp_upload_cors_preflight),
         )
         .fallback(any(proxy_handler))
         .layer(middleware::from_fn_with_state(
@@ -1106,7 +1106,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     let app = Router::new()
         .route(
             "/speedtest/tcp-upload-stream",
-            post(tcp_upload_measure_handler),
+            post(tcp_upload_measure_handler).options(tcp_upload_cors_preflight),
         )
         .fallback(any(proxy_handler))
         .layer(middleware::from_fn_with_state(
@@ -1815,20 +1815,33 @@ async fn alt_svc_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let host = request
+    // HTTP/2 uses the :authority pseudo-header which hyper surfaces via URI,
+    // not the Host header. Fall back to URI host so both HTTP/1.1 and HTTP/2
+    // requests are checked correctly.
+    let host_hdr = request
         .headers()
         .get("host")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let skip_alt_svc =
-        host == "tcp.pqcrypta.com" || request.uri().path().starts_with("/speedtest/tcp-");
+    let uri_host = request.uri().host().unwrap_or("");
+    let host = if host_hdr.is_empty() {
+        uri_host
+    } else {
+        host_hdr
+    };
+    let is_tcp_only = state.config.server.tcp_only_hosts.iter().any(|h| h == host);
 
     let mut response = next.run(request).await;
 
-    if !skip_alt_svc {
-        // Build Alt-Svc header with all ports
+    if is_tcp_only {
+        // Actively clear any cached Alt-Svc so browsers stop upgrading to HTTP/3
+        // for this TCP-only origin. Without "clear", a cached Alt-Svc keeps Chrome
+        // on QUIC even after we stop advertising it.
+        response
+            .headers_mut()
+            .insert("alt-svc", HeaderValue::from_static("clear"));
+    } else {
         let alt_svc_value = build_alt_svc_header(state.port, &state.config.server.additional_ports);
-
         if let Ok(value) = HeaderValue::from_str(&alt_svc_value) {
             response.headers_mut().insert("alt-svc", value);
         }
@@ -2230,6 +2243,32 @@ async fn tcp_upload_measure_handler(body: Body) -> Response {
     if let Ok(v) = HeaderValue::from_str("https://pqcrypta.com") {
         resp.headers_mut().insert("access-control-allow-origin", v);
     }
+    resp
+}
+
+/// CORS preflight handler for the TCP upload route.
+/// Browsers send OPTIONS before the POST because Content-Type: application/octet-stream
+/// is not a "simple" request type. Without this, Axum returns 405 and the upload is blocked.
+async fn tcp_upload_cors_preflight() -> Response {
+    let mut resp = Response::new(axum::body::Body::empty());
+    *resp.status_mut() = StatusCode::NO_CONTENT;
+    let h = resp.headers_mut();
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("https://pqcrypta.com"),
+    );
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("POST, OPTIONS"),
+    );
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("content-type"),
+    );
+    h.insert(
+        header::ACCESS_CONTROL_MAX_AGE,
+        HeaderValue::from_static("86400"),
+    );
     resp
 }
 
