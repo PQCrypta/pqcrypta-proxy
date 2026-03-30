@@ -1070,31 +1070,58 @@ impl QuicListener {
             }
         };
 
-        // Read request body
+        // Read request body — handle recv_data errors gracefully so a single
+        // stream error (e.g. QUIC flow-control exhaustion on large uploads) does
+        // not propagate up and kill the entire QUIC connection.
         let mut body = Vec::new();
-        while let Some(mut chunk) = stream.recv_data().await? {
-            // Convert impl Buf to bytes
-            while chunk.has_remaining() {
-                let bytes = chunk.chunk();
-                body.extend_from_slice(bytes);
-                chunk.advance(bytes.len());
-            }
-            if body.len() > config.security.max_request_size {
-                metrics.requests.request_end_full(
-                    413,
-                    start_time.elapsed(),
-                    body.len() as u64,
-                    0,
-                    Some(&path),
-                    is_health_check,
-                );
-                let response = http::Response::builder()
-                    .status(http::StatusCode::PAYLOAD_TOO_LARGE)
-                    .body(())?;
+        loop {
+            match stream.recv_data().await {
+                Ok(None) => break, // body fully received
+                Ok(Some(mut chunk)) => {
+                    while chunk.has_remaining() {
+                        let bytes = chunk.chunk();
+                        body.extend_from_slice(bytes);
+                        chunk.advance(bytes.len());
+                    }
+                    if body.len() > config.security.max_request_size {
+                        metrics.requests.request_end_full(
+                            413,
+                            start_time.elapsed(),
+                            body.len() as u64,
+                            0,
+                            Some(&path),
+                            is_health_check,
+                        );
+                        let response = http::Response::builder()
+                            .status(http::StatusCode::PAYLOAD_TOO_LARGE)
+                            .body(())?;
 
-                stream.send_response(response).await?;
-                stream.finish().await?;
-                return Ok(());
+                        stream.send_response(response).await?;
+                        stream.finish().await?;
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    // Stream-level error (flow-control, reset, etc.) — respond 500
+                    // and return Ok so the QUIC connection stays alive for other streams.
+                    debug!("QUIC recv_data error on {} {}: {}", method, path, e);
+                    metrics.requests.request_end_full(
+                        500,
+                        start_time.elapsed(),
+                        body.len() as u64,
+                        0,
+                        Some(&path),
+                        is_health_check,
+                    );
+                    if let Ok(response) = http::Response::builder()
+                        .status(http::StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(())
+                    {
+                        let _ = stream.send_response(response).await;
+                        let _ = stream.finish().await;
+                    }
+                    return Ok(());
+                }
             }
         }
 
