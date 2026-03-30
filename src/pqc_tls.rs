@@ -797,6 +797,34 @@ pub mod openssl_pqc {
         builder
             .set_alpn_protos(b"\x02h2\x08http/1.1")
             .map_err(|e| format!("Failed to set ALPN: {}", e))?;
+        // ALPN select callback: prefer h2, accept http/1.1.
+        // Required on every SslContext — without it OpenSSL does not negotiate any
+        // protocol after an SNI context switch, causing HTTP 426 Upgrade Required.
+        builder.set_alpn_select_callback(|_, client_protos| {
+            let mut pos = 0;
+            while pos < client_protos.len() {
+                let len = client_protos[pos] as usize;
+                if pos + 1 + len > client_protos.len() {
+                    break;
+                }
+                if &client_protos[pos + 1..pos + 1 + len] == b"h2" {
+                    return Ok(b"h2");
+                }
+                pos += 1 + len;
+            }
+            pos = 0;
+            while pos < client_protos.len() {
+                let len = client_protos[pos] as usize;
+                if pos + 1 + len > client_protos.len() {
+                    break;
+                }
+                if &client_protos[pos + 1..pos + 1 + len] == b"http/1.1" {
+                    return Ok(b"http/1.1");
+                }
+                pos += 1 + len;
+            }
+            Err(openssl::ssl::AlpnError::NOACK)
+        });
         builder.set_session_cache_mode(openssl::ssl::SslSessionCacheMode::SERVER);
         Ok(builder.build())
     }
