@@ -568,9 +568,19 @@ impl AcmeService {
     }
 }
 
+/// Write a file atomically: write to a .tmp sibling then rename into place.
+/// Prevents partial reads if two goroutines write simultaneously.
+fn write_atomic(path: &std::path::Path, content: &str) -> anyhow::Result<()> {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, content)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// Check and renew certificates as needed.
-/// Issues a single SAN certificate covering all configured domains.
-/// Uses the first domain as the primary cert filename.
+/// Issues one individual certificate per domain — no SAN bundling.
+/// Each domain gets its own `{domain}.crt` / `{domain}.key` pair written
+/// atomically so concurrent renewal of different domains cannot corrupt each other.
 #[cfg(feature = "acme")]
 async fn check_and_renew_certificates(
     config: &AcmeConfig,
@@ -582,8 +592,7 @@ async fn check_and_renew_certificates(
         return Ok(());
     }
 
-    // Use the first domain as the primary cert file (SAN cert covers all)
-    // M-3: Validate all domains before using them in file-system paths.
+    // M-3: Validate all domains before touching the file system.
     for domain in &config.domains {
         if let Err(reason) = validate_domain_for_path(domain) {
             return Err(anyhow::anyhow!(
@@ -594,30 +603,28 @@ async fn check_and_renew_certificates(
             ));
         }
     }
-    let primary_domain = &config.domains[0];
-    let cert_path = config.certs_path.join(format!("{}.crt", primary_domain));
-    let key_path = config.certs_path.join(format!("{}.key", primary_domain));
 
-    // Check if the existing cert needs renewal
-    let (needs_renewal, days_remaining) = if cert_path.exists() {
-        match read_certificate_expiry(&cert_path) {
-            Ok((_, days)) => {
-                if days < config.renewal_days as i64 {
-                    info!(
-                        "Certificate expires in {} days (threshold: {}), renewal needed",
-                        days, config.renewal_days
-                    );
-                    (true, Some(days))
-                } else {
-                    info!(
-                        "Certificate valid for {} more days, no renewal needed",
-                        days
-                    );
+    // Issue one certificate per domain independently.
+    for domain in &config.domains {
+        let cert_path = config.certs_path.join(format!("{}.crt", domain));
+        let key_path = config.certs_path.join(format!("{}.key", domain));
 
-                    // Update status cache for all domains
-                    let mut status = cert_status.write();
-                    for domain in &config.domains {
-                        status.insert(
+        // Check if this domain's cert needs renewal
+        let (needs_renewal, days_remaining) = if cert_path.exists() {
+            match read_certificate_expiry(&cert_path) {
+                Ok((_, days)) => {
+                    if days < config.renewal_days as i64 {
+                        info!(
+                            "[{}] Certificate expires in {} days (threshold: {}), renewal needed",
+                            domain, days, config.renewal_days
+                        );
+                        (true, Some(days))
+                    } else {
+                        info!(
+                            "[{}] Certificate valid for {} more days, no renewal needed",
+                            domain, days
+                        );
+                        cert_status.write().insert(
                             domain.clone(),
                             CertificateStatus {
                                 domain: domain.clone(),
@@ -629,112 +636,90 @@ async fn check_and_renew_certificates(
                                 last_error: None,
                             },
                         );
+                        (false, Some(days))
                     }
-
-                    (false, Some(days))
+                }
+                Err(e) => {
+                    warn!("[{}] Failed to read certificate expiry: {}", domain, e);
+                    (true, None)
                 }
             }
-            Err(e) => {
-                warn!("Failed to read certificate expiry: {}", e);
-                (true, None)
-            }
-        }
-    } else {
-        info!(
-            "No certificate found at {:?}, requesting new one",
-            cert_path
-        );
-        (true, None)
-    };
+        } else {
+            info!("[{}] No certificate found, requesting new one", domain);
+            (true, None)
+        };
 
-    if needs_renewal {
-        // Request a single SAN cert for all domains
-        match request_san_certificate(config, &config.domains, pending_challenges).await {
-            Ok((cert_pem, key_pem, chain_pem)) => {
-                let full_chain = if chain_pem.is_empty() {
-                    cert_pem.clone()
-                } else {
-                    format!("{}\n{}", cert_pem, chain_pem)
-                };
+        if needs_renewal {
+            // Request individual cert for this domain only
+            match request_san_certificate(config, &[domain.clone()], pending_challenges).await {
+                Ok((cert_pem, key_pem, chain_pem)) => {
+                    let full_chain = if chain_pem.is_empty() {
+                        cert_pem.clone()
+                    } else {
+                        // Ensure a clean newline between cert and chain
+                        let sep = if cert_pem.ends_with('\n') { "" } else { "\n" };
+                        format!("{}{}{}", cert_pem, sep, chain_pem)
+                    };
 
-                fs::write(&cert_path, &full_chain)?;
-                fs::write(&key_path, &key_pem)?;
+                    // Atomic write: write to .tmp then rename — prevents partial reads
+                    write_atomic(&cert_path, &full_chain).map_err(|e| {
+                        anyhow::anyhow!("Failed to write cert for {}: {}", domain, e)
+                    })?;
+                    write_atomic(&key_path, &key_pem).map_err(|e| {
+                        anyhow::anyhow!("Failed to write key for {}: {}", domain, e)
+                    })?;
 
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
-                }
-
-                // STEP 11: Submit certificate to Certificate Transparency logs.
-                if let Err(e) = submit_to_ct_logs(&cert_pem, &chain_pem, config).await {
-                    warn!("CT log submission failed (non-fatal): {}", e);
-                }
-
-                // Also write symlinks/copies for each additional domain
-                // so domain-specific lookups work
-                for domain in config.domains.iter().skip(1) {
-                    let domain_cert = config.certs_path.join(format!("{}.crt", domain));
-                    let domain_key = config.certs_path.join(format!("{}.key", domain));
-                    let _ = fs::copy(&cert_path, &domain_cert);
-                    let _ = fs::copy(&key_path, &domain_key);
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
-                        let _ = fs::set_permissions(&domain_key, fs::Permissions::from_mode(0o600));
+                        let _ = fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600));
                     }
-                }
 
-                info!(
-                    "SAN certificate for {:?} obtained from {}",
-                    config.domains, config.directory_url
-                );
+                    if let Err(e) = submit_to_ct_logs(&cert_pem, &chain_pem, config).await {
+                        warn!("[{}] CT log submission failed (non-fatal): {}", domain, e);
+                    }
 
-                let (expires, days) = read_certificate_expiry(&cert_path)
-                    .unwrap_or_else(|_| ("90 days".to_string(), 90));
+                    info!(
+                        "[{}] Individual certificate obtained from {}",
+                        domain, config.directory_url
+                    );
 
-                // Update status for all domains
-                {
-                    let mut status = cert_status.write();
+                    let (expires, days) = read_certificate_expiry(&cert_path)
+                        .unwrap_or_else(|_| ("90 days".to_string(), 90));
+
                     let now_str = chrono::Utc::now()
                         .format("%Y-%m-%d %H:%M:%S UTC")
                         .to_string();
-                    for domain in &config.domains {
-                        status.insert(
-                            domain.clone(),
-                            CertificateStatus {
+                    cert_status.write().insert(
+                        domain.clone(),
+                        CertificateStatus {
+                            domain: domain.clone(),
+                            exists: true,
+                            expires: Some(expires),
+                            days_remaining: Some(days),
+                            needs_renewal: false,
+                            last_renewed: Some(now_str),
+                            last_error: None,
+                        },
+                    );
+
+                    // Notify listeners so they can reload the SNI cert resolver
+                    if let Some(tx) = cert_update_tx {
+                        let expires_time = SystemTime::now()
+                            + Duration::from_secs(u64::try_from(days.max(0)).unwrap_or(0) * 86400);
+                        let _ = tx
+                            .send(CertificateUpdate {
                                 domain: domain.clone(),
-                                exists: true,
-                                expires: Some(expires.clone()),
-                                days_remaining: Some(days),
-                                needs_renewal: false,
-                                last_renewed: Some(now_str.clone()),
-                                last_error: None,
-                            },
-                        );
+                                cert_path: cert_path.clone(),
+                                key_path: key_path.clone(),
+                                expires: expires_time,
+                            })
+                            .await;
                     }
                 }
-
-                // Notify about certificate update
-                if let Some(tx) = cert_update_tx {
-                    let expires_time = SystemTime::now()
-                        + Duration::from_secs(u64::try_from(days.max(0)).unwrap_or(0) * 86400);
-                    let _ = tx
-                        .send(CertificateUpdate {
-                            domain: primary_domain.clone(),
-                            cert_path: cert_path.clone(),
-                            key_path: key_path.clone(),
-                            expires: expires_time,
-                        })
-                        .await;
-                }
-            }
-            Err(e) => {
-                error!("Failed to obtain SAN certificate: {}", e);
-
-                let mut status = cert_status.write();
-                for domain in &config.domains {
-                    status.insert(
+                Err(e) => {
+                    error!("[{}] Failed to obtain certificate: {}", domain, e);
+                    cert_status.write().insert(
                         domain.clone(),
                         CertificateStatus {
                             domain: domain.clone(),
@@ -749,7 +734,7 @@ async fn check_and_renew_certificates(
                 }
             }
         }
-    }
+    } // end per-domain loop
 
     // Clean up expired challenges
     let now = SystemTime::now();
@@ -955,15 +940,15 @@ async fn request_san_certificate(
         .collect();
 
     let cert_pem = if !certs.is_empty() {
-        format!("{}-----END CERTIFICATE-----\n", certs[0])
+        format!("{}\n-----END CERTIFICATE-----\n", certs[0].trim_end())
     } else {
         cert_chain.clone()
     };
 
     let chain_pem = if certs.len() > 1 {
         certs[1..].iter().fold(String::new(), |mut acc, c| {
-            acc.push_str(c);
-            acc.push_str("-----END CERTIFICATE-----\n");
+            acc.push_str(c.trim_end());
+            acc.push_str("\n-----END CERTIFICATE-----\n");
             acc
         })
     } else {

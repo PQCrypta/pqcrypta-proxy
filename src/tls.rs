@@ -6,9 +6,10 @@
 //! - Hot-reload of certificates
 //! - mTLS for client authentication
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -24,6 +25,131 @@ use tracing::{debug, info, warn};
 
 use crate::config::{PqcConfig, TlsConfig};
 
+// ── SNI-based per-domain certificate resolver ────────────────────────────────
+
+/// Resolves TLS server certificates by SNI hostname.
+/// Reads every `{domain}.crt` / `{domain}.key` pair from the certs directory.
+/// Thread-safe hot-reload via `reload()` — all listeners sharing the same `Arc`
+/// immediately serve the refreshed certificate after a call to `reload()`.
+#[derive(Debug)]
+pub struct MultiDomainCertResolver {
+    /// domain → `CertifiedKey` map, updated atomically on reload
+    certs: RwLock<HashMap<String, Arc<rustls::sign::CertifiedKey>>>,
+    /// Directory containing `{domain}.crt` / `{domain}.key` files
+    certs_dir: PathBuf,
+}
+
+impl MultiDomainCertResolver {
+    /// Build a resolver from all cert/key pairs found in `certs_dir`.
+    pub fn new(certs_dir: &Path) -> anyhow::Result<Self> {
+        let resolver = Self {
+            certs: RwLock::new(HashMap::new()),
+            certs_dir: certs_dir.to_path_buf(),
+        };
+        resolver.reload()?;
+        Ok(resolver)
+    }
+
+    /// Re-read every `*.crt` + `*.key` pair from the certs directory.
+    /// Existing entries are replaced; domains whose files disappeared are removed.
+    pub fn reload(&self) -> anyhow::Result<()> {
+        let mut new_certs = HashMap::new();
+
+        let read_dir = std::fs::read_dir(&self.certs_dir).map_err(|e| {
+            anyhow::anyhow!("Cannot read certs directory {:?}: {}", self.certs_dir, e)
+        })?;
+
+        for entry in read_dir.flatten() {
+            let cert_path = entry.path();
+            if cert_path.extension().and_then(|e| e.to_str()) != Some("crt") {
+                continue;
+            }
+            let key_path = cert_path.with_extension("key");
+            if !key_path.exists() {
+                continue;
+            }
+            let domain = match cert_path.file_stem().and_then(|s| s.to_str()) {
+                Some(d) => d.to_ascii_lowercase(),
+                None => continue,
+            };
+            match load_certified_key(&cert_path, &key_path) {
+                Ok(ck) => {
+                    new_certs.insert(domain.clone(), Arc::new(ck));
+                    debug!("SNI resolver loaded cert for '{}'", domain);
+                }
+                Err(e) => {
+                    warn!("SNI resolver: skipping '{}' — {}", domain, e);
+                }
+            }
+        }
+
+        info!(
+            "SNI cert resolver reloaded: {} domains ({})",
+            new_certs.len(),
+            new_certs.keys().cloned().collect::<Vec<_>>().join(", ")
+        );
+        *self.certs.write() = new_certs;
+        Ok(())
+    }
+}
+
+impl rustls::server::ResolvesServerCert for MultiDomainCertResolver {
+    fn resolve(
+        &self,
+        client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let sni = client_hello.server_name()?;
+        self.certs.read().get(sni).cloned()
+    }
+}
+
+/// Load a `CertifiedKey` from PEM cert and key files.
+pub fn load_certified_key(
+    cert_path: &Path,
+    key_path: &Path,
+) -> anyhow::Result<rustls::sign::CertifiedKey> {
+    // Load certificate chain
+    let cert_file = File::open(cert_path)
+        .map_err(|e| anyhow::anyhow!("Cannot open cert {:?}: {}", cert_path, e))?;
+    let mut reader = BufReader::new(cert_file);
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("Cannot parse cert {:?}: {}", cert_path, e))?;
+    if certs.is_empty() {
+        return Err(anyhow::anyhow!("No certificates in {:?}", cert_path));
+    }
+
+    // Load private key (PKCS#8 first, then PKCS#1)
+    let private_key = {
+        let file = File::open(key_path)
+            .map_err(|e| anyhow::anyhow!("Cannot open key {:?}: {}", key_path, e))?;
+        let mut r = BufReader::new(file);
+        if let Some(k) = PrivatePkcs8KeyDer::pem_reader_iter(&mut r).find_map(|r| r.ok()) {
+            PrivateKeyDer::Pkcs8(k)
+        } else {
+            let file2 = File::open(key_path)
+                .map_err(|e| anyhow::anyhow!("Cannot open key {:?}: {}", key_path, e))?;
+            let mut r2 = BufReader::new(file2);
+            PrivatePkcs1KeyDer::pem_reader_iter(&mut r2)
+                .find_map(|r| r.ok())
+                .map(PrivateKeyDer::Pkcs1)
+                .ok_or_else(|| anyhow::anyhow!("No private key found in {:?}", key_path))?
+        }
+    };
+
+    // Create a signing key using the installed crypto provider
+    let provider = CryptoProvider::get_default()
+        .ok_or_else(|| anyhow::anyhow!("No rustls CryptoProvider installed"))?;
+    let signing_key = provider
+        .key_provider
+        .load_private_key(private_key)
+        .map_err(|e| anyhow::anyhow!("Cannot load signing key from {:?}: {}", key_path, e))?;
+
+    Ok(rustls::sign::CertifiedKey::new(certs, signing_key))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// TLS provider abstraction
 pub struct TlsProvider {
     /// Current TLS server configuration (atomic swap for hot-reload)
@@ -32,10 +158,12 @@ pub struct TlsProvider {
     tls_config: RwLock<TlsConfig>,
     /// PQC configuration
     pqc_config: RwLock<PqcConfig>,
-    /// Last certificate modification time
+    /// Last certificate modification time (watches certs_dir mtime)
     last_cert_modified: RwLock<Option<SystemTime>>,
     /// PQC availability status
     pqc_available: RwLock<bool>,
+    /// SNI cert resolver — shared across all listeners
+    pub resolver: Arc<MultiDomainCertResolver>,
 }
 
 impl TlsProvider {
@@ -52,13 +180,25 @@ impl TlsProvider {
             warn!("PQC requested but not available - falling back to classical TLS");
         }
 
-        // Create initial server config
-        let rustls_config = Self::create_rustls_config(tls_config, pqc_config, pqc_available)?;
+        // Build per-domain SNI resolver from the certs directory
+        let certs_dir = tls_config
+            .cert_path
+            .parent()
+            .unwrap_or(Path::new("/etc/pqcrypta/certs"));
+        let resolver = Arc::new(MultiDomainCertResolver::new(certs_dir)?);
+
+        // Create initial QUIC server config using the resolver
+        let rustls_config = Self::create_rustls_config_with_resolver(
+            tls_config,
+            pqc_config,
+            pqc_available,
+            Arc::clone(&resolver),
+        )?;
         let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
             .map_err(|e| anyhow::anyhow!("Failed to create QUIC server config: {}", e))?;
 
-        // Get initial cert modification time
-        let cert_modified = std::fs::metadata(&tls_config.cert_path)
+        // Watch the certs directory mtime for change detection
+        let cert_modified = std::fs::metadata(certs_dir)
             .ok()
             .and_then(|m| m.modified().ok());
 
@@ -68,6 +208,7 @@ impl TlsProvider {
             pqc_config: RwLock::new(pqc_config.clone()),
             last_cert_modified: RwLock::new(cert_modified),
             pqc_available: RwLock::new(pqc_available),
+            resolver,
         })
     }
 
@@ -81,34 +222,51 @@ impl TlsProvider {
         *self.pqc_available.read()
     }
 
-    /// Reload TLS certificates
+    /// Reload TLS certificates — refreshes the shared SNI resolver then rebuilds QUIC config.
+    /// Called when ACME issues a new cert or the certs directory changes.
     pub fn reload_certificates(&self) -> anyhow::Result<()> {
         let tls_config = self.tls_config.read().clone();
         let pqc_config = self.pqc_config.read().clone();
         let pqc_available = *self.pqc_available.read();
 
-        // Create new rustls config
-        let rustls_config = Self::create_rustls_config(&tls_config, &pqc_config, pqc_available)?;
+        // Reload all per-domain certs from disk into the shared resolver.
+        // HTTP listeners that hold Arc::clone(&resolver) see the new certs immediately.
+        self.resolver.reload()?;
+
+        // Rebuild the QUIC server config with the refreshed resolver
+        let rustls_config = Self::create_rustls_config_with_resolver(
+            &tls_config,
+            &pqc_config,
+            pqc_available,
+            Arc::clone(&self.resolver),
+        )?;
         let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
             .map_err(|e| anyhow::anyhow!("Failed to create QUIC server config: {}", e))?;
 
-        // Atomically swap configuration
         self.server_config.store(Arc::new(quic_config));
 
-        // Update modification time
-        let cert_modified = std::fs::metadata(&tls_config.cert_path)
+        // Update the watched directory mtime
+        let certs_dir = tls_config
+            .cert_path
+            .parent()
+            .unwrap_or(Path::new("/etc/pqcrypta/certs"));
+        let cert_modified = std::fs::metadata(certs_dir)
             .ok()
             .and_then(|m| m.modified().ok());
         *self.last_cert_modified.write() = cert_modified;
 
-        info!("TLS certificates reloaded successfully");
+        info!("TLS certificates reloaded (SNI resolver + QUIC config refreshed)");
         Ok(())
     }
 
-    /// Check if certificates need reloading
+    /// Check if certificates need reloading by watching the certs directory mtime.
     pub fn needs_reload(&self) -> bool {
         let tls_config = self.tls_config.read();
-        let current_modified = std::fs::metadata(&tls_config.cert_path)
+        let certs_dir = tls_config
+            .cert_path
+            .parent()
+            .unwrap_or(Path::new("/etc/pqcrypta/certs"));
+        let current_modified = std::fs::metadata(certs_dir)
             .ok()
             .and_then(|m| m.modified().ok());
 
@@ -290,20 +448,13 @@ impl TlsProvider {
         }
     }
 
-    /// Create rustls server configuration
-    fn create_rustls_config(
+    /// Create rustls server configuration using the shared SNI cert resolver.
+    fn create_rustls_config_with_resolver(
         tls_config: &TlsConfig,
         pqc_config: &PqcConfig,
         pqc_available: bool,
+        resolver: Arc<MultiDomainCertResolver>,
     ) -> anyhow::Result<RustlsServerConfig> {
-        // Load certificate chain
-        let cert_chain = Self::load_certificates(&tls_config.cert_path)?;
-        info!("Loaded {} certificates from chain", cert_chain.len());
-
-        // Load private key
-        let private_key = Self::load_private_key(&tls_config.key_path)?;
-        info!("Private key loaded successfully");
-
         // Get the crypto provider - always use rustls-post-quantum provider
         // It's based on aws-lc-rs and includes X25519MLKEM768 hybrid key exchange
         let crypto_provider = if pqc_config.enabled && pqc_available {
@@ -339,16 +490,14 @@ impl TlsProvider {
                 .with_protocol_versions(protocol_versions)
                 .map_err(|e| anyhow::anyhow!("Failed to set protocol versions: {}", e))?
                 .with_client_cert_verifier(client_auth)
-                .with_single_cert(cert_chain, private_key)
-                .map_err(|e| anyhow::anyhow!("Failed to create mTLS config: {}", e))?
+                .with_cert_resolver(resolver)
         } else {
-            // Standard TLS configuration with PQC support
+            // Standard TLS configuration with SNI per-domain cert resolver
             RustlsServerConfig::builder_with_provider(crypto_provider)
                 .with_protocol_versions(protocol_versions)
                 .map_err(|e| anyhow::anyhow!("Failed to set protocol versions: {}", e))?
                 .with_no_client_auth()
-                .with_single_cert(cert_chain, private_key)
-                .map_err(|e| anyhow::anyhow!("Failed to create TLS config: {}", e))?
+                .with_cert_resolver(resolver)
         };
 
         // Configure ALPN protocols
@@ -412,38 +561,6 @@ impl TlsProvider {
         }
 
         Ok(certs)
-    }
-
-    /// Load private key from PEM file.
-    // L-1: Uses rustls-pki-types PEM API (replaces unmaintained rustls-pemfile).
-    // Tries PKCS#8 first (most common for modern keys), then PKCS#1 (legacy RSA).
-    fn load_private_key(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
-        // Try PKCS#8 format first (covers Ed25519, ECDSA, RSA wrapped in PKCS#8)
-        {
-            let file = File::open(path)
-                .map_err(|e| anyhow::anyhow!("Failed to open key file {:?}: {}", path, e))?;
-            let mut reader = BufReader::new(file);
-            if let Some(key) = PrivatePkcs8KeyDer::pem_reader_iter(&mut reader).find_map(|r| r.ok())
-            {
-                return Ok(PrivateKeyDer::Pkcs8(key));
-            }
-        }
-
-        // Try PKCS#1 (legacy RSA) format
-        {
-            let file = File::open(path)
-                .map_err(|e| anyhow::anyhow!("Failed to open key file {:?}: {}", path, e))?;
-            let mut reader = BufReader::new(file);
-            if let Some(key) = PrivatePkcs1KeyDer::pem_reader_iter(&mut reader).find_map(|r| r.ok())
-            {
-                return Ok(PrivateKeyDer::Pkcs1(key));
-            }
-        }
-
-        Err(anyhow::anyhow!(
-            "No private key found in {:?} (tried PKCS#8 and PKCS#1 formats)",
-            path
-        ))
     }
 
     /// Load client CA certificates for mTLS

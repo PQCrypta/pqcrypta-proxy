@@ -43,7 +43,7 @@
 | Security Headers | ✅ | HSTS, CSP, CORS, Alt-Svc; CORS headers injected on 429 rate-limit responses so browsers surface the status code instead of a misleading CORS error |
 | PQC TLS | ✅ | X25519MLKEM768 hybrid (NIST Level 3) |
 | Background Cleanup | ✅ | Auto-cleanup of expired entries |
-| **ACME Automation** | ✅ | Let's Encrypt HTTP-01/DNS-01 certificate provisioning |
+| **ACME Automation** | ✅ | Let's Encrypt HTTP-01/DNS-01; one individual cert per domain with atomic writes and immediate hot-reload |
 | **OCSP Stapling** | ✅ | Automated OCSP response fetching with caching |
 | **Prometheus Metrics** | ✅ | TLS, connection, request, backend, and error metrics |
 | PROXY Protocol v2 | ✅ | Client IP preservation for downstream proxies |
@@ -1145,16 +1145,18 @@ fallback_to_classical = true
 
 ## ACME Certificate Automation
 
-Automatic Let's Encrypt certificate provisioning and renewal with SAN (Subject Alternative Name) support. Issues a single certificate covering all configured domains. Uses ECDSA P-256 keys for smaller certs and faster TLS handshakes.
+Automatic Let's Encrypt certificate provisioning and renewal. Issues one **individual certificate per domain** — each domain gets its own `{domain}.crt` / `{domain}.key` pair written atomically (write-to-`.tmp`-then-rename) to prevent corruption on concurrent renewal. Uses ECDSA P-256 keys for smaller certs and faster TLS handshakes.
+
+SNI-based cert selection is handled by `MultiDomainCertResolver` (rustls/QUIC) and `create_pqc_acceptor_with_sni` (OpenSSL/TCP), both loading all cert pairs from the certs directory at startup and on every ACME renewal.
 
 ### How It Works
 
-1. **Daily check** reads the local cert file to check expiry (zero network cost)
-2. **Renewal triggers** when cert is within 30 days of expiry (~day 60 of 90-day cert)
-3. **ACME protocol** runs only during actual renewal (~once every 60 days)
+1. **Daily check** reads each domain's cert file to check expiry (zero network cost)
+2. **Renewal triggers** per-domain when cert is within 30 days of expiry (~day 60 of 90-day cert)
+3. **ACME protocol** runs only during actual renewal (~once every 60 days per domain)
 4. **HTTP-01 challenges** served on port 80 before HTTPS redirect kicks in
 5. **Exponential backoff** on challenge polling (2s → 4s → 8s → 16s cap)
-6. **SAN certificate** — single order, single cert, all domains as SANs
+6. **Hot reload** — ACME notifies the TLS provider immediately after each cert is written; no restart required
 
 ### Configuration
 

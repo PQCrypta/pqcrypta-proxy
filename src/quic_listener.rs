@@ -13,7 +13,7 @@ use std::time::Duration;
 use bytes::{Buf, Bytes};
 use h3::ext::Protocol;
 use h3_quinn::Connection as H3Connection;
-use quinn::{Endpoint, ServerConfig as QuinnServerConfig, TransportConfig};
+use quinn::{Endpoint, ServerConfig as QuinnServerConfig, TransportConfig, VarInt};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -98,6 +98,11 @@ impl QuicListener {
         transport_config.keep_alive_interval(Some(Duration::from_secs(
             config.server.keepalive_interval_secs,
         )));
+        // Match WebTransport server flow-control windows so HTTP/3 upload streams
+        // achieve the same per-stream throughput as WebTransport streams.
+        // Quinn defaults (~256 KB) cause 5 Mbps/stream; 8 MB raises that to ~100+ Mbps.
+        transport_config.receive_window(VarInt::from_u32(16 * 1024 * 1024)); // 16 MB connection
+        transport_config.stream_receive_window(VarInt::from_u32(8 * 1024 * 1024)); // 8 MB per stream
         transport_config.max_idle_timeout(Some(
             Duration::from_secs(config.server.max_idle_timeout_secs)
                 .try_into()
@@ -820,6 +825,158 @@ impl QuicListener {
                 }
             }
         }
+
+        // ── Speedtest: direct download streaming (H3) ─────────────────────────
+        // The default proxy path buffers the entire PHP response before sending —
+        // for 12 parallel 100 MB streams that's 1.2 GB RAM and a ~10× throughput
+        // hit. Intercept here and stream bytes directly over H3 without PHP.
+        if path == "/speedtest/tcp-download.php" && (method == "GET" || method == "HEAD") {
+            let bytes_requested: u64 = uri
+                .query()
+                .and_then(|q| {
+                    q.split('&').find_map(|kv| {
+                        let mut parts = kv.splitn(2, '=');
+                        if parts.next()? == "bytes" {
+                            parts.next()?.parse().ok()
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .unwrap_or(10 * 1024 * 1024);
+            let bytes_to_send: u64 = bytes_requested.max(65536).min(100 * 1024 * 1024);
+
+            let dl_start = std::time::Instant::now();
+            let response = http::Response::builder()
+                .status(http::StatusCode::OK)
+                .header("content-type", "application/octet-stream")
+                .header("content-length", bytes_to_send.to_string())
+                .header("cache-control", "no-store")
+                .header("x-content-type-options", "nosniff")
+                .header("server", SERVER_HEADER)
+                .body(())?;
+            stream.send_response(response).await?;
+
+            if method != "HEAD" {
+                // 256 KB chunk — pseudo-random bytes (LCG); QUIC doesn't compress
+                // data payloads so any pattern gives accurate bandwidth measurement.
+                const CHUNK: usize = 256 * 1024;
+                let mut chunk_buf = vec![0u8; CHUNK];
+                let mut lcg: u64 = 0xdeadbeef_cafebabe;
+                for b in chunk_buf.iter_mut() {
+                    lcg = lcg
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    *b = (lcg >> 56) as u8;
+                }
+                let chunk_bytes = Bytes::from(chunk_buf);
+
+                let mut remaining = bytes_to_send as usize;
+                while remaining > 0 {
+                    let n = remaining.min(CHUNK);
+                    // Client cancels when the time limit hits — that's normal; just stop.
+                    if stream
+                        .send_data(if n == CHUNK {
+                            chunk_bytes.clone()
+                        } else {
+                            chunk_bytes.slice(..n)
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    remaining -= n;
+                }
+            }
+
+            let _ = stream.finish().await; // ignore error if client already cancelled
+            let elapsed = dl_start.elapsed();
+            info!(
+                "[speedtest-dl/h3] sent {} bytes in {:.2}s from {}",
+                bytes_to_send,
+                elapsed.as_secs_f64(),
+                remote_addr
+            );
+            metrics.requests.request_end_full(
+                200,
+                elapsed,
+                0,
+                bytes_to_send,
+                Some(&path),
+                is_health_check,
+            );
+            return Ok(());
+        }
+
+        // ── Speedtest: server-side upload measurement ─────────────────────────
+        // Chrome upgrades all pqcrypta.com:443 requests to HTTP/3 via cached Alt-Svc,
+        // so the "TCP" upload stream arrives here. Count bytes received; the client
+        // uses the known test duration as the time denominator — no server-side timing.
+        if path == "/speedtest/tcp-upload-stream" && method == "POST" {
+            let measure_start = std::time::Instant::now();
+            let mut total_bytes: u64 = 0;
+            let mut chunk_count: u64 = 0;
+
+            loop {
+                match stream.recv_data().await {
+                    Ok(None) => break,
+                    Ok(Some(mut chunk)) => {
+                        let n = chunk.remaining();
+                        chunk.advance(n);
+                        total_bytes += n as u64;
+                        chunk_count += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            let total_elapsed = measure_start.elapsed();
+            info!(
+                "[speedtest-upload/h3] {} bytes in {:.2}s ({} chunks) from {}",
+                total_bytes,
+                total_elapsed.as_secs_f64(),
+                chunk_count,
+                remote_addr
+            );
+            // Return bytes_received only — client divides by the known test duration
+            // for an accurate mbps figure with no server-side timing complexity.
+            let steady_mbps = 0.0_f64; // unused; client computes from bytes + duration
+            let duration_ms = total_elapsed.as_millis() as u64;
+
+            info!(
+                "[speedtest-upload/h3] result: bytes={} steady_mbps={:.2} duration_ms={} from {}",
+                total_bytes, steady_mbps, duration_ms, remote_addr
+            );
+            let json = format!(
+                r#"{{"ok":true,"bytes_received":{},"duration_ms":{},"steady_mbps":{:.2},"throughput_mbps":{:.2}}}"#,
+                total_bytes, duration_ms, steady_mbps, steady_mbps,
+            );
+            let json_bytes = Bytes::from(json);
+            let json_len = json_bytes.len();
+
+            let response = http::Response::builder()
+                .status(http::StatusCode::OK)
+                .header("content-type", "application/json")
+                .header("content-length", json_len.to_string())
+                .header("cache-control", "no-store")
+                .header("server", SERVER_HEADER)
+                .body(())?;
+            stream.send_response(response).await?;
+            stream.send_data(json_bytes).await?;
+            stream.finish().await?;
+
+            metrics.requests.request_end_full(
+                200,
+                total_elapsed,
+                total_bytes,
+                json_len as u64,
+                Some(&path),
+                is_health_check,
+            );
+            return Ok(());
+        }
+        // ── End speedtest upload handler ───────────────────────────────────────
 
         // Find route first so we can use per-route CORS config
         let route = match config.find_route(host.as_deref(), &path, false) {

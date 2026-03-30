@@ -667,6 +667,166 @@ pub mod openssl_pqc {
         Ok(builder.build())
     }
 
+    /// Create an OpenSSL SSL acceptor with SNI-based per-domain certificate selection.
+    ///
+    /// Loads every `{domain}.crt` / `{domain}.key` pair from `certs_dir` and installs
+    /// a servername callback that switches to the matching SSL context for each SNI.
+    /// Falls back to the default cert (`default_cert_path` / `default_key_path`) when
+    /// the SNI name is unknown.
+    pub fn create_pqc_acceptor_with_sni(
+        default_cert_path: &Path,
+        default_key_path: &Path,
+        certs_dir: &Path,
+        pqc_provider: &PqcTlsProvider,
+    ) -> Result<openssl::ssl::SslAcceptor, String> {
+        use openssl::ssl::{NameType, SslMethod};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        // Build a context map: domain → SslContext (built with that domain's cert/key)
+        let mut ctx_map: HashMap<String, Arc<openssl::ssl::SslContext>> = HashMap::new();
+        if let Ok(entries) = std::fs::read_dir(certs_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("crt") {
+                    continue;
+                }
+                let domain = match path.file_stem().and_then(|s| s.to_str()) {
+                    Some(d) => d.to_string(),
+                    None => continue,
+                };
+                let key_path = path.with_extension("key");
+                if !key_path.exists() {
+                    continue;
+                }
+                // Build an SslContextBuilder configured identically to the main acceptor
+                match build_ssl_context(&path, &key_path, pqc_provider) {
+                    Ok(ctx) => {
+                        ctx_map.insert(domain.clone(), Arc::new(ctx));
+                    }
+                    Err(e) => {
+                        warn!("SNI: skipping '{}' — {}", domain, e);
+                    }
+                }
+            }
+        }
+        let ctx_map = Arc::new(ctx_map);
+        info!(
+            "SNI OpenSSL acceptor loaded {} domain context(s)",
+            ctx_map.len()
+        );
+
+        // Build the main acceptor with the default cert
+        let mut builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls_server())
+            .map_err(|e| format!("Failed to create SSL acceptor: {}", e))?;
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .map_err(|e| format!("Failed to set TLS version: {}", e))?;
+        builder
+            .set_certificate_chain_file(default_cert_path)
+            .map_err(|e| format!("Failed to load default certificate chain: {}", e))?;
+        builder
+            .set_private_key_file(default_key_path, SslFiletype::PEM)
+            .map_err(|e| format!("Failed to load default private key: {}", e))?;
+        apply_pqc_groups(&mut *builder, pqc_provider);
+        builder
+            .set_alpn_protos(b"\x02h2\x08http/1.1")
+            .map_err(|e| format!("Failed to set ALPN protos: {}", e))?;
+        builder.set_alpn_select_callback(|_, client_protos| {
+            let mut pos = 0;
+            while pos < client_protos.len() {
+                let len = client_protos[pos] as usize;
+                if pos + 1 + len > client_protos.len() {
+                    break;
+                }
+                if &client_protos[pos + 1..pos + 1 + len] == b"h2" {
+                    return Ok(b"h2");
+                }
+                pos += 1 + len;
+            }
+            pos = 0;
+            while pos < client_protos.len() {
+                let len = client_protos[pos] as usize;
+                if pos + 1 + len > client_protos.len() {
+                    break;
+                }
+                if &client_protos[pos + 1..pos + 1 + len] == b"http/1.1" {
+                    return Ok(b"http/1.1");
+                }
+                pos += 1 + len;
+            }
+            Err(openssl::ssl::AlpnError::NOACK)
+        });
+        builder.set_session_cache_mode(openssl::ssl::SslSessionCacheMode::SERVER);
+
+        // SNI callback: switch to the per-domain context if we have one
+        builder.set_servername_callback(move |ssl, _alert| {
+            let sni = match ssl.servername(NameType::HOST_NAME) {
+                Some(s) => s.to_string(),
+                None => return Ok(()),
+            };
+            if let Some(ctx) = ctx_map.get(&sni) {
+                ssl.set_ssl_context(ctx)
+                    .map_err(|_| openssl::ssl::SniError::ALERT_FATAL)?;
+            }
+            Ok(())
+        });
+
+        Ok(builder.build())
+    }
+
+    /// Build a standalone `SslContext` for a single domain — used by the SNI map.
+    fn build_ssl_context(
+        cert_path: &Path,
+        key_path: &Path,
+        pqc_provider: &PqcTlsProvider,
+    ) -> Result<openssl::ssl::SslContext, String> {
+        use openssl::ssl::SslMethod;
+        let mut builder = openssl::ssl::SslContext::builder(SslMethod::tls_server())
+            .map_err(|e| format!("Failed to create SslContext builder: {}", e))?;
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .map_err(|e| format!("Failed to set TLS version: {}", e))?;
+        builder
+            .set_certificate_chain_file(cert_path)
+            .map_err(|e| format!("Failed to load cert {:?}: {}", cert_path, e))?;
+        builder
+            .set_private_key_file(key_path, SslFiletype::PEM)
+            .map_err(|e| format!("Failed to load key {:?}: {}", key_path, e))?;
+        apply_pqc_groups(&mut builder, pqc_provider);
+        builder
+            .set_alpn_protos(b"\x02h2\x08http/1.1")
+            .map_err(|e| format!("Failed to set ALPN: {}", e))?;
+        builder.set_session_cache_mode(openssl::ssl::SslSessionCacheMode::SERVER);
+        Ok(builder.build())
+    }
+
+    /// Apply PQC group list to an SslContextBuilder.
+    /// Works for `SslAcceptorBuilder` too via `DerefMut` — call as `apply_pqc_groups(&mut *builder, ...)`.
+    fn apply_pqc_groups(
+        builder: &mut openssl::ssl::SslContextBuilder,
+        pqc_provider: &PqcTlsProvider,
+    ) {
+        if pqc_provider.is_available() {
+            let pqc_options = [
+                "X25519MLKEM768:X25519:P-256:P-384",
+                "X25519-MLKEM768:X25519:P-256:P-384",
+                "ML-KEM-768:X25519:P-256:P-384",
+                "MLKEM768:X25519:P-256:P-384",
+            ];
+            let mut configured = false;
+            for groups in pqc_options {
+                if builder.set_groups_list(groups).is_ok() {
+                    configured = true;
+                    break;
+                }
+            }
+            if !configured {
+                let _ = builder.set_groups_list("X25519:P-256:P-384");
+            }
+        }
+    }
+
     /// Get PQC handshake info from SSL connection
     ///
     /// Call this after a TLS handshake to retrieve information about the

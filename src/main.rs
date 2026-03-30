@@ -568,6 +568,23 @@ async fn main() -> anyhow::Result<()> {
         let mut service = acme::AcmeService::new(config.acme.clone());
         acme_challenges = Some(service.pending_challenges());
 
+        // Wire ACME cert-update notifications → TLS provider reload
+        let (cert_update_tx, mut cert_update_rx) =
+            tokio::sync::mpsc::channel::<acme::CertificateUpdate>(16);
+        service.set_cert_update_channel(cert_update_tx);
+        let acme_tls_provider = tls_provider.clone();
+        tokio::spawn(async move {
+            while let Some(update) = cert_update_rx.recv().await {
+                info!(
+                    "ACME cert issued for '{}', reloading SNI resolver",
+                    update.domain
+                );
+                if let Err(e) = acme_tls_provider.reload_certificates() {
+                    error!("Failed to reload TLS certificates after ACME update: {}", e);
+                }
+            }
+        });
+
         if let Err(e) = service.start() {
             error!("Failed to start ACME service: {}", e);
             None

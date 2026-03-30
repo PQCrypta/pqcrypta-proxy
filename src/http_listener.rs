@@ -29,7 +29,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
-    routing::any,
+    routing::{any, post},
     Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
@@ -370,25 +370,14 @@ pub async fn run_http_listener(
         .layer(middleware::from_fn(trace_context_middleware))
         .with_state(state);
 
-    // Check if cert files exist
-    if !std::path::Path::new(cert_path).exists() {
-        error!("❌ Certificate file not found: {}", cert_path);
-        return Err(format!("Certificate file not found: {}", cert_path).into());
-    }
-    if !std::path::Path::new(key_path).exists() {
-        error!("❌ Key file not found: {}", key_path);
-        return Err(format!("Key file not found: {}", key_path).into());
-    }
+    // Build TLS config using the per-domain SNI resolver (no single cert required)
+    let rustls_server_config = build_rustls_server_config(cert_path, key_path).map_err(|e| {
+        error!("❌ TLS configuration error: {}", e);
+        e
+    })?;
+    let tls_config = RustlsConfig::from_config(Arc::new(rustls_server_config));
 
-    // Configure TLS
-    let tls_config = RustlsConfig::from_pem_file(cert_path, key_path)
-        .await
-        .map_err(|e| {
-            error!("❌ TLS configuration error: {}", e);
-            e
-        })?;
-
-    info!("✅ TLS configured for HTTP listener");
+    info!("✅ TLS configured for HTTP listener (SNI per-domain resolver)");
     info!("🔒 HTTPS reverse proxy ready on port {} (TCP)", port);
     // SEC-A04: Hardcoded backend addresses removed from logs to prevent topology disclosure.
 
@@ -501,6 +490,10 @@ pub async fn run_http_listener_pqc(
     // Build router with full middleware stack
     // Order (outside to inside): advanced_rate_limit -> fingerprint -> security -> http3 -> compression -> alt_svc -> security_headers -> cache -> handler
     let app = Router::new()
+        .route(
+            "/speedtest/tcp-upload-stream",
+            post(tcp_upload_measure_handler),
+        )
         .fallback(any(proxy_handler))
         .layer(middleware::from_fn_with_state(
             response_cache,
@@ -547,16 +540,6 @@ pub async fn run_http_listener_pqc(
         .layer(middleware::from_fn(trace_context_middleware))
         .with_state(state);
 
-    // Check if cert files exist (OpenSSL will load them directly)
-    if !std::path::Path::new(cert_path).exists() {
-        error!("❌ Certificate file not found: {}", cert_path);
-        return Err(format!("Certificate file not found: {}", cert_path).into());
-    }
-    if !std::path::Path::new(key_path).exists() {
-        error!("❌ Key file not found: {}", key_path);
-        return Err(format!("Key file not found: {}", key_path).into());
-    }
-
     // =========================================================================
     // OpenSSL 3.5+ PQC TLS Backend
     // =========================================================================
@@ -568,12 +551,20 @@ pub async fn run_http_listener_pqc(
     // =========================================================================
     use axum_server::tls_openssl::OpenSSLConfig;
 
-    // Create OpenSSL SSL acceptor with PQC hybrid key exchange
+    // Create OpenSSL SSL acceptor with PQC hybrid key exchange + SNI multi-domain support
     let cert_path_buf = std::path::Path::new(cert_path);
     let key_path_buf = std::path::Path::new(key_path);
+    let certs_dir = cert_path_buf
+        .parent()
+        .unwrap_or(std::path::Path::new("/etc/pqcrypta/certs"));
 
-    let ssl_acceptor = openssl_pqc::create_pqc_acceptor(cert_path_buf, key_path_buf, &pqc_provider)
-        .map_err(|e| format!("Failed to create PQC SSL acceptor: {}", e))?;
+    let ssl_acceptor = openssl_pqc::create_pqc_acceptor_with_sni(
+        cert_path_buf,
+        key_path_buf,
+        certs_dir,
+        &pqc_provider,
+    )
+    .map_err(|e| format!("Failed to create PQC SSL acceptor: {}", e))?;
 
     // Create OpenSSL config from the PQC-enabled acceptor (requires Arc)
     let openssl_config = OpenSSLConfig::from_acceptor(Arc::new(ssl_acceptor));
@@ -734,6 +725,10 @@ pub async fn run_http_listener_with_fingerprint(
 
     // Build router with full middleware stack
     let app = Router::new()
+        .route(
+            "/speedtest/tcp-upload-stream",
+            post(tcp_upload_measure_handler),
+        )
         .fallback(any(proxy_handler))
         .layer(middleware::from_fn_with_state(
             response_cache,
@@ -769,16 +764,6 @@ pub async fn run_http_listener_with_fingerprint(
         ))
         .layer(middleware::from_fn(trace_context_middleware))
         .with_state(state);
-
-    // Check cert files
-    if !std::path::Path::new(cert_path).exists() {
-        error!("❌ Certificate file not found: {}", cert_path);
-        return Err(format!("Certificate file not found: {}", cert_path).into());
-    }
-    if !std::path::Path::new(key_path).exists() {
-        error!("❌ Key file not found: {}", key_path);
-        return Err(format!("Key file not found: {}", key_path).into());
-    }
 
     // Build rustls server config
     let rustls_config = build_rustls_server_config(cert_path, key_path)?;
@@ -1119,6 +1104,10 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     // Build router with full middleware stack
     // Order (outside to inside): advanced_rate_limit -> fingerprint -> security -> http3 -> compression -> alt_svc -> security_headers -> cache -> handler
     let app = Router::new()
+        .route(
+            "/speedtest/tcp-upload-stream",
+            post(tcp_upload_measure_handler),
+        )
         .fallback(any(proxy_handler))
         .layer(middleware::from_fn_with_state(
             response_cache,
@@ -1155,21 +1144,19 @@ pub async fn run_http_listener_pqc_with_fingerprint(
         .layer(middleware::from_fn(trace_context_middleware))
         .with_state(state);
 
-    // Check cert files
-    if !std::path::Path::new(cert_path).exists() {
-        error!("❌ Certificate file not found: {}", cert_path);
-        return Err(format!("Certificate file not found: {}", cert_path).into());
-    }
-    if !std::path::Path::new(key_path).exists() {
-        error!("❌ Key file not found: {}", key_path);
-        return Err(format!("Key file not found: {}", key_path).into());
-    }
-
-    // Create OpenSSL PQC acceptor
+    // Create OpenSSL PQC acceptor with SNI multi-domain support
     let cert_path_buf = std::path::Path::new(cert_path);
     let key_path_buf = std::path::Path::new(key_path);
-    let ssl_acceptor = openssl_pqc::create_pqc_acceptor(cert_path_buf, key_path_buf, &pqc_provider)
-        .map_err(|e| format!("Failed to create PQC SSL acceptor: {}", e))?;
+    let certs_dir = cert_path_buf
+        .parent()
+        .unwrap_or(std::path::Path::new("/etc/pqcrypta/certs"));
+    let ssl_acceptor = openssl_pqc::create_pqc_acceptor_with_sni(
+        cert_path_buf,
+        key_path_buf,
+        certs_dir,
+        &pqc_provider,
+    )
+    .map_err(|e| format!("Failed to create PQC SSL acceptor: {}", e))?;
 
     // Get SSL context for creating new SSL instances
     let ssl_context: SslContext = ssl_acceptor.into_context();
@@ -1509,35 +1496,28 @@ fn load_private_key_from_pem(
     .into())
 }
 
-/// Build rustls server configuration from PEM files
+/// Build rustls server configuration using the per-domain SNI cert resolver.
+/// Loads all `{domain}.crt` / `{domain}.key` pairs from the certs directory.
 fn build_rustls_server_config(
     cert_path: &str,
-    key_path: &str,
+    _key_path: &str,
 ) -> Result<rustls::ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
-    use rustls::pki_types::CertificateDer;
-    use rustls_pki_types::pem::PemObject;
-    use std::fs::File;
-    use std::io::BufReader;
+    use std::path::Path;
 
-    // Load certificate chain
-    // L-1: Uses rustls-pki-types PEM API (replaces unmaintained rustls-pemfile)
-    let cert_file = File::open(cert_path)?;
-    let mut cert_reader = BufReader::new(cert_file);
-    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(&mut cert_reader)
-        .filter_map(|c| c.ok())
-        .collect();
+    let certs_dir = Path::new(cert_path)
+        .parent()
+        .unwrap_or(Path::new("/etc/pqcrypta/certs"));
 
-    if certs.is_empty() {
-        return Err(format!("No certificates found in {}", cert_path).into());
-    }
+    let resolver = crate::tls::MultiDomainCertResolver::new(certs_dir).map_err(|e| {
+        format!(
+            "Failed to build SNI cert resolver from {:?}: {}",
+            certs_dir, e
+        )
+    })?;
 
-    // Load private key
-    let key = load_private_key_from_pem(key_path)?;
-
-    // Build server config
     let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(certs, key)?;
+        .with_cert_resolver(std::sync::Arc::new(resolver));
 
     // Set ALPN protocols for HTTP/2 and HTTP/1.1 negotiation
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
@@ -1826,16 +1806,22 @@ async fn trace_context_middleware(request: Request<Body>, next: Next) -> Respons
 }
 
 /// Middleware to add Alt-Svc header to all responses.
-/// TCP speedtest endpoints are excluded so the browser stops upgrading those
-/// requests to QUIC once the existing 24-hour Alt-Svc cache entry expires.
-/// This allows the TCP test to actually use TCP (HTTP/2) instead of QUIC.
+/// Excluded for:
+///   - /speedtest/tcp-* paths on any host (stops Chrome from upgrading to H3)
+///   - ALL requests to tcp.pqcrypta.com (dedicated TCP-only speedtest origin;
+///     never advertises QUIC so Chrome always connects with TCP/TLS)
 async fn alt_svc_middleware(
     State(state): State<HttpListenerState>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    // Check path before consuming the request
-    let skip_alt_svc = request.uri().path().starts_with("/speedtest/tcp-");
+    let host = request
+        .headers()
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let skip_alt_svc =
+        host == "tcp.pqcrypta.com" || request.uri().path().starts_with("/speedtest/tcp-");
 
     let mut response = next.run(request).await;
 
@@ -2163,6 +2149,90 @@ async fn advanced_rate_limit_middleware(
     }
 }
 
+/// Server-measured HTTP/2 upload throughput handler.
+///
+/// Receives a streaming POST body via HTTP/2, measures throughput from first byte
+/// to stream EOF with a 2-second warmup phase excluded — identical methodology to
+/// the WebTransport upload handler. Eliminates the client-side XHR send-buffer
+/// illusion by counting bytes at the server as they arrive over the wire.
+///
+/// Wire: POST /speedtest/tcp-upload-stream  (Content-Type: application/octet-stream)
+/// Response: { ok, bytes_received, duration_ms, throughput_mbps, steady_mbps }
+#[allow(clippy::cast_precision_loss)]
+async fn tcp_upload_measure_handler(body: Body) -> Response {
+    use futures_util::StreamExt as _;
+    use std::time::Instant;
+
+    const WARMUP_SECS: f64 = 2.0;
+
+    let mut stream = body.into_data_stream();
+    let mut start: Option<Instant> = None;
+    let mut total_bytes: u64 = 0;
+    let mut post_warmup_bytes: u64 = 0;
+
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(data) => {
+                let n = data.len() as u64;
+                if n == 0 {
+                    continue;
+                }
+                if start.is_none() {
+                    start = Some(Instant::now());
+                }
+                total_bytes += n;
+                if start.is_some_and(|s| s.elapsed().as_secs_f64() >= WARMUP_SECS) {
+                    post_warmup_bytes += n;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    let elapsed_secs = start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
+    let elapsed_ms = (elapsed_secs * 1000.0) as u64;
+
+    let throughput_mbps = if elapsed_secs > 0.0 {
+        (total_bytes as f64 * 8.0) / (elapsed_secs * 1_000_000.0)
+    } else {
+        0.0
+    };
+
+    let steady_mbps = if elapsed_secs > WARMUP_SECS {
+        let steady_secs = elapsed_secs - WARMUP_SECS;
+        if steady_secs >= 0.5 && post_warmup_bytes > 0 {
+            (post_warmup_bytes as f64 * 8.0) / (steady_secs * 1_000_000.0)
+        } else {
+            throughput_mbps
+        }
+    } else {
+        throughput_mbps
+    };
+
+    let json_body = serde_json::json!({
+        "ok": true,
+        "bytes_received": total_bytes,
+        "duration_ms": elapsed_ms,
+        "throughput_mbps": (throughput_mbps * 100.0).round() / 100.0,
+        "steady_mbps": (steady_mbps * 100.0).round() / 100.0,
+    });
+
+    let mut resp = (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+        ],
+        axum::Json(json_body),
+    )
+        .into_response();
+    // Add CORS header so tcp.pqcrypta.com cross-origin uploads work.
+    if let Ok(v) = HeaderValue::from_str("https://pqcrypta.com") {
+        resp.headers_mut().insert("access-control-allow-origin", v);
+    }
+    resp
+}
+
 /// Main proxy handler - routes requests to appropriate backends
 async fn proxy_handler(
     State(state): State<HttpListenerState>,
@@ -2199,6 +2269,129 @@ async fn proxy_handler(
         "Incoming request: {} {} {} from {}",
         method, host, path, client_addr
     );
+
+    // ── tcp.pqcrypta.com — true TCP-only speedtest (no Alt-Svc, no QUIC) ────
+    // Handled in-process before route lookup so no backend is required.
+    if host == "tcp.pqcrypta.com" {
+        const CORS_ORIGIN: &str = "https://pqcrypta.com";
+
+        // CORS preflight
+        if method == Method::OPTIONS {
+            let mut resp = Response::new(Body::empty());
+            *resp.status_mut() = StatusCode::NO_CONTENT;
+            let h = resp.headers_mut();
+            h.insert(
+                header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                HeaderValue::from_static(CORS_ORIGIN),
+            );
+            h.insert(
+                header::ACCESS_CONTROL_ALLOW_METHODS,
+                HeaderValue::from_static("GET, POST, OPTIONS"),
+            );
+            h.insert(
+                header::ACCESS_CONTROL_ALLOW_HEADERS,
+                HeaderValue::from_static("content-type"),
+            );
+            h.insert(
+                header::ACCESS_CONTROL_MAX_AGE,
+                HeaderValue::from_static("86400"),
+            );
+            return resp;
+        }
+
+        // Ping
+        if method == Method::GET
+            && (path == "/speedtest/tcp-ping" || path == "/speedtest/tcp-ping.php")
+        {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let mut resp = axum::Json(serde_json::json!({ "ok": true, "ts": ts })).into_response();
+            resp.headers_mut().insert(
+                "access-control-allow-origin",
+                HeaderValue::from_static(CORS_ORIGIN),
+            );
+            resp.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store, no-cache"),
+            );
+            return resp;
+        }
+
+        // Download — stream LCG-generated random bytes directly over TCP/H2
+        if method == Method::GET && path == "/speedtest/tcp-download.php" {
+            let bytes_requested: u64 = uri
+                .query()
+                .and_then(|q| {
+                    q.split('&').find_map(|kv| {
+                        let mut parts = kv.splitn(2, '=');
+                        match (parts.next(), parts.next()) {
+                            (Some("size"), Some(v)) => v.parse::<u64>().ok(),
+                            _ => None,
+                        }
+                    })
+                })
+                .unwrap_or(10 * 1024 * 1024);
+            let bytes_to_send: u64 = bytes_requested.max(65_536).min(100 * 1024 * 1024);
+
+            // Pre-compute a 256 KiB pseudo-random chunk via LCG
+            const CHUNK: usize = 256 * 1024;
+            let mut lcg: u64 = 0xdead_beef_cafe_babe;
+            let chunk_data: Vec<u8> = (0..CHUNK)
+                .map(|_| {
+                    lcg = lcg
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    (lcg >> 33) as u8
+                })
+                .collect();
+            let chunk_bytes = bytes::Bytes::from(chunk_data);
+
+            let data_stream = futures_util::stream::unfold(
+                (bytes_to_send, chunk_bytes),
+                move |(mut rem, chunk)| async move {
+                    if rem == 0 {
+                        return None;
+                    }
+                    let n = rem.min(CHUNK as u64) as usize;
+                    let data = chunk.slice(..n);
+                    rem -= n as u64;
+                    Some((Ok::<bytes::Bytes, std::io::Error>(data), (rem, chunk)))
+                },
+            );
+
+            let mut resp = axum::response::Response::new(Body::from_stream(data_stream));
+            *resp.status_mut() = StatusCode::OK;
+            resp.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            if let Ok(v) = HeaderValue::from_str(&bytes_to_send.to_string()) {
+                resp.headers_mut().insert(header::CONTENT_LENGTH, v);
+            }
+            resp.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+            );
+            resp.headers_mut().insert(
+                "access-control-allow-origin",
+                HeaderValue::from_static(CORS_ORIGIN),
+            );
+            resp.headers_mut()
+                .insert("x-accel-buffering", HeaderValue::from_static("no"));
+            info!(
+                "[speedtest-dl/tcp] {} bytes → {}",
+                bytes_to_send, client_addr
+            );
+            return resp;
+        }
+
+        // Upload POST is caught by the router before reaching proxy_handler;
+        // all other paths on tcp.pqcrypta.com return 404.
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     // Find matching route
     let route = state.config.find_route(Some(&host), &path, false);
