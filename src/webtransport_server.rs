@@ -296,6 +296,11 @@ async fn handle_connection(
 
     let connection = Arc::new(connection);
 
+    // Native speed test handler — serves /speedtest without backend proxying
+    if path == "/speedtest" {
+        return crate::speedtest::handle_speedtest_session(connection, remote_addr).await;
+    }
+
     loop {
         tokio::select! {
             // Handle unidirectional streams (client -> server)
