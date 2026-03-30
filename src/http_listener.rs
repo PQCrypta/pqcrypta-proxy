@@ -1812,19 +1812,27 @@ async fn trace_context_middleware(request: Request<Body>, next: Next) -> Respons
     next.run(request).instrument(span).await
 }
 
-/// Middleware to add Alt-Svc header to all responses
+/// Middleware to add Alt-Svc header to all responses.
+/// TCP speedtest endpoints are excluded so the browser stops upgrading those
+/// requests to QUIC once the existing 24-hour Alt-Svc cache entry expires.
+/// This allows the TCP test to actually use TCP (HTTP/2) instead of QUIC.
 async fn alt_svc_middleware(
     State(state): State<HttpListenerState>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    // Check path before consuming the request
+    let skip_alt_svc = request.uri().path().starts_with("/speedtest/tcp-");
+
     let mut response = next.run(request).await;
 
-    // Build Alt-Svc header with all ports
-    let alt_svc_value = build_alt_svc_header(state.port, &state.config.server.additional_ports);
+    if !skip_alt_svc {
+        // Build Alt-Svc header with all ports
+        let alt_svc_value = build_alt_svc_header(state.port, &state.config.server.additional_ports);
 
-    if let Ok(value) = HeaderValue::from_str(&alt_svc_value) {
-        response.headers_mut().insert("alt-svc", value);
+        if let Ok(value) = HeaderValue::from_str(&alt_svc_value) {
+            response.headers_mut().insert("alt-svc", value);
+        }
     }
 
     // Add WebTransport port header
