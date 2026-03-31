@@ -328,6 +328,16 @@ async fn handle_op_download(
     )
     .unwrap_or(MAX_DOWNLOAD_BYTES);
 
+    // Client passes max_secs so the server timeout matches the client-side test duration.
+    // This prevents server download tasks from running past the client's cancel point, which
+    // would cause download and upload to compete on the same QUIC connection.
+    // Default 10 s is used only for clients that don't send max_secs (backward compat).
+    let max_secs = command
+        .get("max_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10)
+        .clamp(1, 30);
+
     if requested == 0 || requested > MAX_DOWNLOAD_BYTES {
         send.write_all(&[0x01_u8]).await?;
         write_framed_json(
@@ -346,13 +356,12 @@ async fn handle_op_download(
     let chunk = generate_chunk(DOWNLOAD_CHUNK);
     let mut remaining = requested;
     let started = Instant::now();
-    // 30-second hard cap: the client time-limits to 5–10 s and cancels via STOP_SENDING.
-    // Without this, a client that never cancels holds the task pumping up to 1 GB indefinitely.
-    // 10 s hard cap — client time-limits to 5–10 s and cancels via STOP_SENDING.
-    // Without this, a client that doesn't propagate STOP_SENDING quickly holds the
-    // task pumping up to 1 GB for 30 s. 10 s is 2× the deepest test phase, enough
-    // to handle any cancellation delay while bounding wasted server resources.
-    let download_timeout = std::time::Duration::from_secs(10);
+    // Hard timeout = client's test duration (max_secs) + 1 s grace period.
+    // STOP_SENDING from the client often does not unblock a write() that is stalled on
+    // QUIC flow-control backpressure, so without this the download task keeps running for
+    // the full 10 s default even though the client moved on to upload at 5 s.
+    // The extra second allows the connection's QUIC CWND / window to drain normally.
+    let download_timeout = std::time::Duration::from_secs(max_secs + 1);
 
     let result = tokio::time::timeout(download_timeout, async {
         while remaining > 0 {
@@ -373,7 +382,11 @@ async fn handle_op_download(
             debug!("Download stream ended early for {}: {}", remote_addr, e);
         }
         Err(_) => {
-            info!("Download timeout for {} after 10s", remote_addr);
+            info!(
+                "Download timeout for {} after {}s",
+                remote_addr,
+                max_secs + 1
+            );
         }
     }
 
