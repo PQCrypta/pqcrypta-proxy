@@ -678,12 +678,15 @@ pub mod openssl_pqc {
         default_key_path: &Path,
         certs_dir: &Path,
         pqc_provider: &PqcTlsProvider,
+        http11_only_hosts: &[String],
     ) -> Result<openssl::ssl::SslAcceptor, String> {
         use openssl::ssl::{NameType, SslMethod};
         use std::collections::HashMap;
         use std::sync::Arc;
 
-        // Build a context map: domain → SslContext (built with that domain's cert/key)
+        // Build a context map: domain → SslContext (built with that domain's cert/key).
+        // Domains listed in http11_only_hosts get an HTTP/1.1-only SslContext so the
+        // browser cannot coalesce parallel streams onto a single HTTP/2 connection.
         let mut ctx_map: HashMap<String, Arc<openssl::ssl::SslContext>> = HashMap::new();
         if let Ok(entries) = std::fs::read_dir(certs_dir) {
             for entry in entries.flatten() {
@@ -699,8 +702,16 @@ pub mod openssl_pqc {
                 if !key_path.exists() {
                     continue;
                 }
-                // Build an SslContextBuilder configured identically to the main acceptor
-                match build_ssl_context(&path, &key_path, pqc_provider) {
+                let use_http11_only = http11_only_hosts
+                    .iter()
+                    .any(|h| h.eq_ignore_ascii_case(&domain));
+                let build_result = if use_http11_only {
+                    info!("SNI: using HTTP/1.1-only ALPN for '{}'", domain);
+                    build_ssl_context_http11_only(&path, &key_path, pqc_provider)
+                } else {
+                    build_ssl_context(&path, &key_path, pqc_provider)
+                };
+                match build_result {
                     Ok(ctx) => {
                         ctx_map.insert(domain.clone(), Arc::new(ctx));
                     }
@@ -813,6 +824,50 @@ pub mod openssl_pqc {
                 pos += 1 + len;
             }
             pos = 0;
+            while pos < client_protos.len() {
+                let len = client_protos[pos] as usize;
+                if pos + 1 + len > client_protos.len() {
+                    break;
+                }
+                if &client_protos[pos + 1..pos + 1 + len] == b"http/1.1" {
+                    return Ok(b"http/1.1");
+                }
+                pos += 1 + len;
+            }
+            Err(openssl::ssl::AlpnError::NOACK)
+        });
+        builder.set_session_cache_mode(openssl::ssl::SslSessionCacheMode::SERVER);
+        Ok(builder.build())
+    }
+
+    /// Build an SslContext that advertises HTTP/1.1 only — no h2 in ALPN.
+    ///
+    /// Used for `http11_only_hosts` so the browser cannot coalesce parallel
+    /// `fetch()` streams onto one HTTP/2 TCP connection.
+    fn build_ssl_context_http11_only(
+        cert_path: &Path,
+        key_path: &Path,
+        pqc_provider: &PqcTlsProvider,
+    ) -> Result<openssl::ssl::SslContext, String> {
+        use openssl::ssl::SslMethod;
+        let mut builder = openssl::ssl::SslContext::builder(SslMethod::tls_server())
+            .map_err(|e| format!("Failed to create SslContext builder: {}", e))?;
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .map_err(|e| format!("Failed to set TLS version: {}", e))?;
+        builder
+            .set_certificate_chain_file(cert_path)
+            .map_err(|e| format!("Failed to load cert {:?}: {}", cert_path, e))?;
+        builder
+            .set_private_key_file(key_path, SslFiletype::PEM)
+            .map_err(|e| format!("Failed to load key {:?}: {}", key_path, e))?;
+        apply_pqc_groups(&mut builder, pqc_provider);
+        // HTTP/1.1 only — no h2 advertised
+        builder
+            .set_alpn_protos(b"\x08http/1.1")
+            .map_err(|e| format!("Failed to set HTTP/1.1-only ALPN: {}", e))?;
+        builder.set_alpn_select_callback(|_, client_protos| {
+            let mut pos = 0;
             while pos < client_protos.len() {
                 let len = client_protos[pos] as usize;
                 if pos + 1 + len > client_protos.len() {

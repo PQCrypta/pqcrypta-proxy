@@ -225,6 +225,12 @@ pub struct FingerprintingTlsAcceptor {
     zero_rtt_replay_mode: String,
     /// Nonce store for strict 0-RTT replay protection
     zero_rtt_nonce_store: Option<Arc<ZeroRttNonceStore>>,
+    /// HTTP/1.1-only TLS acceptor used when the SNI matches http11_only_hosts.
+    /// Advertises only "http/1.1" in ALPN so browsers open independent TCP
+    /// connections per fetch() stream instead of coalescing into one HTTP/2 pipe.
+    http11_only_tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
+    /// Hostnames for which only HTTP/1.1 ALPN is advertised (no h2).
+    http11_only_hosts: Vec<String>,
 }
 
 impl FingerprintingTlsAcceptor {
@@ -243,7 +249,26 @@ impl FingerprintingTlsAcceptor {
             zero_rtt_enabled,
             zero_rtt_replay_mode: "strict".to_string(),
             zero_rtt_nonce_store: Some(Arc::new(ZeroRttNonceStore::new(60))),
+            http11_only_tls_acceptor: None,
+            http11_only_hosts: Vec::new(),
         }
+    }
+
+    /// Configure HTTP/1.1-only ALPN for the given hostnames.
+    ///
+    /// When a ClientHello SNI matches one of `hosts`, the acceptor uses
+    /// `config` (which must advertise only "http/1.1") instead of the default
+    /// TLS config.  This prevents HTTP/2 connection coalescing so parallel
+    /// `fetch()` streams open independent TCP connections.
+    #[must_use]
+    pub fn with_http11_only_acceptor(
+        mut self,
+        config: Arc<rustls::ServerConfig>,
+        hosts: Vec<String>,
+    ) -> Self {
+        self.http11_only_tls_acceptor = Some(Arc::new(tokio_rustls::TlsAcceptor::from(config)));
+        self.http11_only_hosts = hosts;
+        self
     }
 
     /// Configure 0-RTT replay protection mode and nonce window.
@@ -258,6 +283,76 @@ impl FingerprintingTlsAcceptor {
             None
         };
         self
+    }
+
+    /// Extract the SNI hostname from a raw TLS ClientHello record.
+    ///
+    /// Parses the SNI extension (type 0x0000) and returns the first `host_name`
+    /// entry as a UTF-8 string.  Returns `None` if SNI is absent, malformed, or
+    /// the data is too short to parse.
+    fn extract_sni(data: &[u8]) -> Option<String> {
+        // TLS record header: 5 bytes.  Handshake header: 4 bytes.
+        if data.len() < 9 {
+            return None;
+        }
+        let ch = &data[9..]; // ClientHello body starts here
+        if ch.len() < 34 {
+            return None;
+        }
+        // Skip legacy_version (2) + random (32)
+        let mut off = 34usize;
+        // Session ID
+        if off >= ch.len() {
+            return None;
+        }
+        let sid_len = ch[off] as usize;
+        off = off.saturating_add(1 + sid_len);
+        // Cipher suites
+        if off + 2 > ch.len() {
+            return None;
+        }
+        let cs_len = u16::from_be_bytes([ch[off], ch[off + 1]]) as usize;
+        off = off.saturating_add(2 + cs_len);
+        // Compression methods
+        if off >= ch.len() {
+            return None;
+        }
+        let cm_len = ch[off] as usize;
+        off = off.saturating_add(1 + cm_len);
+        // Extensions block
+        if off + 2 > ch.len() {
+            return None;
+        }
+        let ext_total = u16::from_be_bytes([ch[off], ch[off + 1]]) as usize;
+        off += 2;
+        let ext_end = off.saturating_add(ext_total);
+        if ext_end > ch.len() {
+            return None;
+        }
+        // Walk extensions looking for SNI (type 0x0000)
+        while off + 4 <= ext_end {
+            let ext_type = u16::from_be_bytes([ch[off], ch[off + 1]]);
+            let ext_len = u16::from_be_bytes([ch[off + 2], ch[off + 3]]) as usize;
+            off += 4;
+            if ext_type == 0x0000 {
+                // SNI extension: 2 bytes list_length, 1 byte name_type, 2 bytes name_length, N bytes name
+                if off + 5 > ext_end {
+                    return None;
+                }
+                let name_type = ch[off + 2];
+                if name_type != 0x00 {
+                    return None; // only host_name (0x00) is supported
+                }
+                let name_len = u16::from_be_bytes([ch[off + 3], ch[off + 4]]) as usize;
+                let name_off = off + 5;
+                if name_off + name_len > ch.len() {
+                    return None;
+                }
+                return String::from_utf8(ch[name_off..name_off + name_len].to_vec()).ok();
+            }
+            off = off.saturating_add(ext_len);
+        }
+        None
     }
 
     /// SEC-002: Scan a raw ClientHello record for the TLS 1.3 `early_data`
@@ -420,8 +515,36 @@ impl FingerprintingTlsAcceptor {
             );
         }
 
+        // Select TLS acceptor based on SNI: use the HTTP/1.1-only acceptor when
+        // the client is connecting to a host that must not use HTTP/2.  This
+        // prevents the browser from coalescing all parallel fetch() streams onto
+        // a single HTTP/2 TCP connection (which would stall all streams together).
+        let sni = Self::extract_sni(&peek_buf[..peek_len]);
+        let use_http11_only = sni
+            .as_deref()
+            .map(|name| {
+                self.http11_only_hosts
+                    .iter()
+                    .any(|h| h.eq_ignore_ascii_case(name))
+            })
+            .unwrap_or(false);
+
         // Perform TLS handshake
-        let tls_stream = self.tls_acceptor.accept(stream).await.map_err(|e| {
+        let tls_stream = if use_http11_only {
+            if let Some(ref h11_acceptor) = self.http11_only_tls_acceptor {
+                trace!(
+                    "Using HTTP/1.1-only TLS config for SNI {:?} from {}",
+                    sni,
+                    remote_addr
+                );
+                h11_acceptor.accept(stream).await
+            } else {
+                self.tls_acceptor.accept(stream).await
+            }
+        } else {
+            self.tls_acceptor.accept(stream).await
+        }
+        .map_err(|e| {
             debug!("TLS handshake failed for {}: {}", remote_addr, e);
             io::Error::new(io::ErrorKind::ConnectionAborted, e)
         })?;

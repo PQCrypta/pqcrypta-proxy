@@ -563,6 +563,7 @@ pub async fn run_http_listener_pqc(
         key_path_buf,
         certs_dir,
         &pqc_provider,
+        &config.server.http11_only_hosts,
     )
     .map_err(|e| format!("Failed to create PQC SSL acceptor: {}", e))?;
 
@@ -765,12 +766,22 @@ pub async fn run_http_listener_with_fingerprint(
         .layer(middleware::from_fn(trace_context_middleware))
         .with_state(state);
 
-    // Build rustls server config
+    // Build rustls server config (h2 + http/1.1)
     let rustls_config = build_rustls_server_config(cert_path, key_path)?;
     let rustls_config = Arc::new(rustls_config);
 
+    // Build HTTP/1.1-only config for SNI-selected hosts that must not use HTTP/2.
+    // Browsers that negotiate http/1.1 open independent TCP connections per stream
+    // (up to 6 per origin) instead of coalescing all streams on one HTTP/2 pipe.
+    let http11_only_config = if !config.server.http11_only_hosts.is_empty() {
+        let cfg = build_rustls_server_config_http11_only(cert_path, key_path)?;
+        Some(Arc::new(cfg))
+    } else {
+        None
+    };
+
     // Create fingerprinting TLS acceptor
-    let fingerprinting_acceptor = Arc::new(FingerprintingTlsAcceptor::new(
+    let mut acceptor_builder = FingerprintingTlsAcceptor::new(
         rustls_config,
         fingerprint_extractor,
         security_state,
@@ -778,7 +789,16 @@ pub async fn run_http_listener_with_fingerprint(
         // SEC-002: propagate 0-RTT enabled flag so the acceptor can detect
         // early data offered in ClientHello and tag the connection accordingly.
         config.tls.enable_0rtt,
-    ));
+    );
+    if let Some(h11_cfg) = http11_only_config {
+        acceptor_builder = acceptor_builder
+            .with_http11_only_acceptor(h11_cfg, config.server.http11_only_hosts.clone());
+        info!(
+            "🔒 HTTP/1.1-only ALPN active for: {:?}",
+            config.server.http11_only_hosts
+        );
+    }
+    let fingerprinting_acceptor = Arc::new(acceptor_builder);
 
     // Bind TCP listener
     let listener = TcpListener::bind(addr).await?;
@@ -1155,6 +1175,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
         key_path_buf,
         certs_dir,
         &pqc_provider,
+        &config.server.http11_only_hosts,
     )
     .map_err(|e| format!("Failed to create PQC SSL acceptor: {}", e))?;
 
@@ -1521,6 +1542,37 @@ fn build_rustls_server_config(
 
     // Set ALPN protocols for HTTP/2 and HTTP/1.1 negotiation
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    Ok(config)
+}
+
+/// Build a rustls ServerConfig that advertises only HTTP/1.1 (no h2).
+///
+/// Used for hostnames in `http11_only_hosts` so browsers open independent
+/// TCP connections per fetch() rather than coalescing onto one HTTP/2 pipe.
+fn build_rustls_server_config_http11_only(
+    cert_path: &str,
+    _key_path: &str,
+) -> Result<rustls::ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
+    use std::path::Path;
+
+    let certs_dir = Path::new(cert_path)
+        .parent()
+        .unwrap_or(Path::new("/etc/pqcrypta/certs"));
+
+    let resolver = crate::tls::MultiDomainCertResolver::new(certs_dir).map_err(|e| {
+        format!(
+            "Failed to build SNI cert resolver from {:?}: {}",
+            certs_dir, e
+        )
+    })?;
+
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(std::sync::Arc::new(resolver));
+
+    // HTTP/1.1 only — browser cannot coalesce streams onto a single TCP pipe
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
     Ok(config)
 }

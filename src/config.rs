@@ -415,6 +415,22 @@ pub struct ServerConfig {
     /// ```
     #[serde(default)]
     pub tcp_only_hosts: Vec<String>,
+
+    /// Hosts that must negotiate HTTP/1.1 only — `h2` is NOT included in the
+    /// ALPN list for these SNI names.
+    ///
+    /// When a browser connects to one of these hosts it cannot coalesce all
+    /// `fetch()` streams into a single HTTP/2 connection.  Instead, each stream
+    /// opens an independent TCP connection (up to the browser's 6-per-origin
+    /// HTTP/1.1 limit), which eliminates head-of-line blocking across parallel
+    /// speed test streams.
+    ///
+    /// Example:
+    /// ```toml
+    /// http11_only_hosts = ["tcp.pqcrypta.com"]
+    /// ```
+    #[serde(default)]
+    pub http11_only_hosts: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -440,6 +456,7 @@ impl Default for ServerConfig {
             webtransport_max_datagrams_per_sec: 500,
             webtransport_port: 4433,
             tcp_only_hosts: Vec::new(),
+            http11_only_hosts: Vec::new(),
         }
     }
 }
