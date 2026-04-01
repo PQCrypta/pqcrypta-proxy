@@ -65,6 +65,8 @@ skip = [
     { name = "socket2", reason = "0.4 pulled by tokio internals; 0.5 used by direct/newer crates" },
     # ipnetwork — pulled at different versions by database and network crates
     { name = "ipnetwork", reason = "multiple transitive versions from sqlx and network crate sub-trees" },
+    # itertools — 0.10 retained by older transitive deps; 0.13 used by aws-lc-sys 0.39+
+    { name = "itertools", reason = "0.10 and 0.13 pulled by separate transitive subtrees after aws-lc-sys upgrade" },
     # openssl-probe — version split between openssl-related crate trees
     { name = "openssl-probe", reason = "multiple transitive versions from openssl/rustls bridging crates" },
     # untrusted — 0.7 retained by webpki 0.22; 0.9 used by newer ring-based crates
