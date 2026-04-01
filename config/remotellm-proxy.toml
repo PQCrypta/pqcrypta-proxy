@@ -21,6 +21,11 @@ webtransport_allowed_origins = [
     "https://pqcrypta.com",
     "https://www.pqcrypta.com"
 ]
+
+# tcp2.pqcrypta.com = HTTP/1.1-only TCP speedtest endpoint
+# api2.pqcrypta.com = QUIC/WebTransport speedtest endpoint (no restriction)
+tcp_only_hosts  = ["tcp2.pqcrypta.com"]
+http11_only_hosts = ["tcp2.pqcrypta.com"]
 max_connections = 2000
 max_streams_per_connection = 500
 keepalive_interval_secs = 15
@@ -33,6 +38,7 @@ graceful_shutdown_timeout_secs = 30
 # TLS Configuration
 # =============================
 [tls]
+# SAN cert covers both tcp2 and api2 — ACME provisions under the first domain name
 cert_path = "/etc/pqcrypta/certs/tcp2.pqcrypta.com.crt"
 key_path  = "/etc/pqcrypta/certs/tcp2.pqcrypta.com.key"
 require_client_cert = false
@@ -49,7 +55,7 @@ enable_0rtt = false
 enabled = true
 port = 80
 redirect_to_https = true
-allowed_domains = ["tcp2.pqcrypta.com"]
+allowed_domains = ["tcp2.pqcrypta.com", "api2.pqcrypta.com"]
 
 # =============================
 # ACME — auto-provision tcp2.pqcrypta.com
@@ -58,7 +64,7 @@ allowed_domains = ["tcp2.pqcrypta.com"]
 enabled = true
 directory_url = "https://acme-v02.api.letsencrypt.org/directory"
 email = "admin@pqcrypta.com"
-domains = ["tcp2.pqcrypta.com"]
+domains = ["tcp2.pqcrypta.com", "api2.pqcrypta.com"]
 certs_path = "/etc/pqcrypta/certs"
 account_path = "/etc/pqcrypta/acme/account.json"
 renewal_days = 30

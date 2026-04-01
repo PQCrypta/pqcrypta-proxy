@@ -74,20 +74,28 @@ fi
 log "IP changed: $STORED_IP -> $CURRENT_IP"
 
 # ── Update GoDaddy DNS ────────────────────────────────────────────────────
-GODADDY_URL="https://api.godaddy.com/v1/domains/${GODADDY_DOMAIN}/records/A/${GODADDY_RECORD}"
+update_godaddy_record() {
+    local record="$1"
+    local url="https://api.godaddy.com/v1/domains/${GODADDY_DOMAIN}/records/A/${record}"
+    local status
+    status=$(curl -s -o /dev/null -w "%{http_code}" \
+        -X PUT "$url" \
+        -H "Authorization: sso-key ${GODADDY_KEY}:${GODADDY_SECRET}" \
+        -H "Content-Type: application/json" \
+        -d "[{\"data\": \"${CURRENT_IP}\", \"ttl\": ${GODADDY_TTL}}]")
+    if [[ "$status" == "200" ]]; then
+        log "GoDaddy DNS updated: ${record}.${GODADDY_DOMAIN} -> $CURRENT_IP"
+        return 0
+    else
+        log "ERROR: GoDaddy update failed for ${record} (HTTP $status)"
+        return 1
+    fi
+}
 
-HTTP_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
-    -X PUT "$GODADDY_URL" \
-    -H "Authorization: sso-key ${GODADDY_KEY}:${GODADDY_SECRET}" \
-    -H "Content-Type: application/json" \
-    -d "[{\"data\": \"${CURRENT_IP}\", \"ttl\": ${GODADDY_TTL}}]" || echo "000")
-
-if [[ "$HTTP_STATUS" == "200" ]]; then
-    log "GoDaddy DNS updated: ${GODADDY_RECORD}.${GODADDY_DOMAIN} -> $CURRENT_IP"
-else
-    log "ERROR: GoDaddy update failed (HTTP $HTTP_STATUS)"
-    exit 1
-fi
+# Update both speedtest subdomains: tcp2 (HTTP/1.1) and api2 (QUIC/WebTransport)
+GODADDY_RECORD2="${GODADDY_RECORD2:-api2}"
+update_godaddy_record "$GODADDY_RECORD"  || exit 1
+update_godaddy_record "$GODADDY_RECORD2" || exit 1
 
 # ── Notify pqcrypta.com ───────────────────────────────────────────────────
 NOTIFY_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
