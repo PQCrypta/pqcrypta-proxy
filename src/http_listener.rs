@@ -2366,10 +2366,24 @@ async fn proxy_handler(
         method, host, path, client_addr
     );
 
-    // ── tcp.pqcrypta.com — true TCP-only speedtest (no Alt-Svc, no QUIC) ────
+    // ── TCP-only speedtest hosts — true TCP-only speedtest (no Alt-Svc, no QUIC) ─
     // Handled in-process before route lookup so no backend is required.
-    if host == "tcp.pqcrypta.com" {
-        const CORS_ORIGIN: &str = "https://pqcrypta.com";
+    // Covers tcp.pqcrypta.com (primary) and any host in tcp_only_hosts config.
+    let is_native_tcp_speedtest = host == "tcp.pqcrypta.com"
+        || state
+            .config
+            .server
+            .tcp_only_hosts
+            .iter()
+            .any(|h| h == &host);
+    if is_native_tcp_speedtest {
+        let cors_origin: String = state
+            .config
+            .server
+            .webtransport_allowed_origins
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "https://pqcrypta.com".to_string());
 
         // CORS preflight
         if method == Method::OPTIONS {
@@ -2378,7 +2392,8 @@ async fn proxy_handler(
             let h = resp.headers_mut();
             h.insert(
                 header::ACCESS_CONTROL_ALLOW_ORIGIN,
-                HeaderValue::from_static(CORS_ORIGIN),
+                HeaderValue::from_str(&cors_origin)
+                    .unwrap_or_else(|_| HeaderValue::from_static("https://pqcrypta.com")),
             );
             h.insert(
                 header::ACCESS_CONTROL_ALLOW_METHODS,
@@ -2406,7 +2421,8 @@ async fn proxy_handler(
             let mut resp = axum::Json(serde_json::json!({ "ok": true, "ts": ts })).into_response();
             resp.headers_mut().insert(
                 "access-control-allow-origin",
-                HeaderValue::from_static(CORS_ORIGIN),
+                HeaderValue::from_str(&cors_origin)
+                    .unwrap_or_else(|_| HeaderValue::from_static("https://pqcrypta.com")),
             );
             resp.headers_mut().insert(
                 header::CACHE_CONTROL,
@@ -2472,7 +2488,8 @@ async fn proxy_handler(
             );
             resp.headers_mut().insert(
                 "access-control-allow-origin",
-                HeaderValue::from_static(CORS_ORIGIN),
+                HeaderValue::from_str(&cors_origin)
+                    .unwrap_or_else(|_| HeaderValue::from_static("https://pqcrypta.com")),
             );
             resp.headers_mut()
                 .insert("x-accel-buffering", HeaderValue::from_static("no"));
@@ -2484,7 +2501,7 @@ async fn proxy_handler(
         }
 
         // Upload POST is caught by the router before reaching proxy_handler;
-        // all other paths on tcp.pqcrypta.com return 404.
+        // all other paths on TCP-only speedtest hosts return 404.
         return (StatusCode::NOT_FOUND, "Not Found").into_response();
     }
     // ─────────────────────────────────────────────────────────────────────────

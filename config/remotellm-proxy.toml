@@ -15,7 +15,7 @@
 # =============================
 [server]
 bind_address = "0.0.0.0"
-udp_port = 443
+udp_port = 4433
 additional_ports = []
 webtransport_allowed_origins = [
     "https://pqcrypta.com",
