@@ -491,7 +491,7 @@ async fn handle_op_upload(
     // Steady-state throughput: bytes received after the warmup period / (elapsed - warmup).
     // Falls back to throughput_mbps if the test was too short to produce a steady window.
     let steady_mbps = if elapsed > warmup_dur {
-        let steady_secs = (elapsed - warmup_dur).as_secs_f64();
+        let steady_secs = elapsed.saturating_sub(warmup_dur).as_secs_f64();
         if steady_secs >= 0.5 && post_warmup_bytes > 0 {
             (post_warmup_bytes as f64 * 8.0) / (steady_secs * 1_000_000.0)
         } else {
