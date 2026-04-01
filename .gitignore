@@ -56,3 +56,4 @@ data/blocklists/sync_status.json
 # Only config/example-config.toml should be version-controlled.
 # Copy example-config.toml → proxy-config.toml and fill in real values on each host.
 config/proxy-config.toml
+config/remotellm-proxy.toml
