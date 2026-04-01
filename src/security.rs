@@ -1027,6 +1027,8 @@ pub async fn security_middleware(
 
     // Pre-borrow alt_svc_header for use in all early-return helpers below.
     let alt_svc = security.alt_svc_header.as_ref();
+    // Extract path once here so it's available to both WAF and size checks.
+    let request_path = request.uri().path().to_ascii_lowercase();
 
     // 1. Check if IP is blocked
     if let Some(block_info) = security.is_blocked(&ip) {
@@ -1138,6 +1140,13 @@ pub async fn security_middleware(
     }
 
     // 6. Request size validation — covers both Content-Length and chunked bodies.
+    //
+    // Streaming speedtest upload endpoints are exempt: the proxy handler reads
+    // and discards the body incrementally without buffering, so applying a size
+    // limit here would reject legitimate high-throughput upload measurements.
+    if request_path == "/speedtest/tcp-upload-stream" {
+        return next.run(request).await;
+    }
     //
     // F-02: The previous implementation checked only the Content-Length header, which
     // is absent for Transfer-Encoding: chunked requests.  Attackers could bypass the

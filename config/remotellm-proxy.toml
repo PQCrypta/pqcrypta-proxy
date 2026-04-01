@@ -138,6 +138,12 @@ per_ip_limit = 20
 block_duration_secs = 60
 
 # =============================
+# Security — body size must accommodate speedtest 50MB upload payloads
+# =============================
+[security]
+max_request_size = 104857600
+
+# =============================
 # WAF — basic protection
 # =============================
 [waf]
