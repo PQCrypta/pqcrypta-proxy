@@ -316,6 +316,10 @@ pub async fn run_http_listener(
     // Build router with full middleware stack
     // Order (outside to inside): advanced_rate_limit -> fingerprint -> security -> http3 -> compression -> alt_svc -> security_headers -> cache -> handler
     let app = Router::new()
+        .route(
+            "/speedtest/tcp-upload-stream",
+            post(tcp_upload_measure_handler).options(tcp_upload_cors_preflight),
+        )
         .fallback(any(proxy_handler))
         // Cache (innermost — stores pre-compression bodies; outer layers apply to hits+misses)
         .layer(middleware::from_fn_with_state(
