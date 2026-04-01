@@ -291,10 +291,15 @@ async fn run_speedtest_stream(
 async fn handle_op_info(
     send: &mut wtransport::stream::SendStream,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let server_name =
+        std::env::var("SPEEDTEST_SERVER_NAME").unwrap_or_else(|_| "PQ Crypta".to_string());
+    let location_id =
+        std::env::var("SPEEDTEST_LOCATION_ID").unwrap_or_else(|_| "primary".to_string());
     let info = json!({
         "op": "info_result",
         "protocol": "speedtest/1",
-        "server": "PQ Crypta",
+        "server": server_name,
+        "location_id": location_id,
         "version": env!("CARGO_PKG_VERSION"),
         "capabilities": {
             "download":        true,

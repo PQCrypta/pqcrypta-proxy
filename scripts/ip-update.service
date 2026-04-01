@@ -1,0 +1,10 @@
+[Unit]
+Description=PQCrypta IP Update — sync dynamic IP to GoDaddy DNS + notify pqcrypta.com
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pqcrypta-ip-update
+StandardOutput=journal
+StandardError=journal

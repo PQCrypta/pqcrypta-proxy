@@ -1,0 +1,12 @@
+[Unit]
+Description=PQCrypta IP Update — check every 5 minutes
+After=network-online.target
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=5min
+AccuracySec=30
+RandomizedDelaySec=20
+
+[Install]
+WantedBy=timers.target
