@@ -63,30 +63,35 @@ impl WebTransportServer {
 
         info!("✅ TLS identity loaded successfully");
 
-        // Create custom transport configuration to prevent ExcessiveLoad errors
-        // Increase buffer sizes for better handling of burst traffic
+        // Transport configuration — tuned for speedtest bulk data + concurrent datagrams.
+        //
+        // ExcessiveLoad root cause: during simultaneous download stream + datagram latency
+        // probes, the 64KB datagram receive buffer fills and quinn aborts the connection
+        // with ExcessiveLoad (QUIC error 0x4). Fix: large datagram buffers + flow-control
+        // windows sized for ≥200 Mbps at ~50ms RTT (BDP ≈ 1.25 MB per stream).
         use quinn::VarInt;
         let mut transport_config = QuicTransportConfig::default();
 
-        // Increase receive window (connection-level) - 16MB
-        transport_config.receive_window(VarInt::from_u32(16 * 1024 * 1024));
+        // Connection-level receive window — 64 MB (supports multiple concurrent streams)
+        transport_config.receive_window(VarInt::from_u32(64 * 1024 * 1024));
 
-        // Increase stream receive window (per-stream) - 8MB
-        transport_config.stream_receive_window(VarInt::from_u32(8 * 1024 * 1024));
+        // Per-stream receive window — 32 MB
+        transport_config.stream_receive_window(VarInt::from_u32(32 * 1024 * 1024));
 
-        // Increase send window - 16MB
-        transport_config.send_window(16 * 1024 * 1024);
+        // Send window — 64 MB
+        transport_config.send_window(64 * 1024 * 1024);
 
-        // Increase concurrent streams
+        // Concurrent streams
         transport_config.max_concurrent_bidi_streams(VarInt::from_u32(1000));
         transport_config.max_concurrent_uni_streams(VarInt::from_u32(1000));
 
-        // Datagram settings
-        transport_config.datagram_receive_buffer_size(Some(65536));
-        transport_config.datagram_send_buffer_size(65536);
+        // Datagram buffers — 4 MB each prevents ExcessiveLoad when datagrams
+        // arrive during high-throughput download/upload streams.
+        transport_config.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
+        transport_config.datagram_send_buffer_size(4 * 1024 * 1024);
 
         info!(
-            "🔧 Custom transport config: receive_window=16MB, stream_window=8MB, send_window=16MB"
+            "🔧 Transport config: receive_window=64MB, stream_window=32MB, send_window=64MB, datagram_buf=4MB"
         );
 
         // Create server configuration with WebTransport support
