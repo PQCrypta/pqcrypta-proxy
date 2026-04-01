@@ -67,13 +67,7 @@ fi
 # ── Compare to stored IP ──────────────────────────────────────────────────
 STORED_IP=$(cat "$IP_FILE" 2>/dev/null || echo "")
 
-if [[ "$CURRENT_IP" == "$STORED_IP" ]]; then
-    exit 0  # No change — nothing to do
-fi
-
-log "IP changed: $STORED_IP -> $CURRENT_IP"
-
-# ── Update GoDaddy DNS ────────────────────────────────────────────────────
+# ── Update GoDaddy DNS on IP change (best-effort — does not block heartbeat) ──
 update_godaddy_record() {
     local record="$1"
     local url="https://api.godaddy.com/v1/domains/${GODADDY_DOMAIN}/records/A/${record}"
@@ -92,23 +86,26 @@ update_godaddy_record() {
     fi
 }
 
-# Update both speedtest subdomains: tcp2 (HTTP/1.1) and api2 (QUIC/WebTransport)
-GODADDY_RECORD2="${GODADDY_RECORD2:-api2}"
-update_godaddy_record "$GODADDY_RECORD"  || exit 1
-update_godaddy_record "$GODADDY_RECORD2" || exit 1
+if [[ "$CURRENT_IP" != "$STORED_IP" ]]; then
+    log "IP changed: $STORED_IP -> $CURRENT_IP"
 
-# ── Notify pqcrypta.com ───────────────────────────────────────────────────
+    # Update both speedtest subdomains: tcp2 (HTTP/1.1) and api2 (QUIC/WebTransport)
+    # Failures are logged but do not prevent the heartbeat below.
+    GODADDY_RECORD2="${GODADDY_RECORD2:-api2}"
+    update_godaddy_record "$GODADDY_RECORD"  || true
+    update_godaddy_record "$GODADDY_RECORD2" || true
+
+    echo "$CURRENT_IP" > "$IP_FILE"
+    log "Stored IP: $CURRENT_IP"
+fi
+
+# ── Always heartbeat pqcrypta.com (keeps location marked available) ───────
+# Runs every timer interval regardless of IP change or DNS update outcome.
 NOTIFY_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
     -X POST "$NOTIFY_URL" \
     -H "Content-Type: application/json" \
     -d "{\"action\":\"update_ip\",\"location_id\":\"${LOCATION_ID}\",\"ip\":\"${CURRENT_IP}\",\"token\":\"${NOTIFY_TOKEN}\"}" || echo "000")
 
-if [[ "$NOTIFY_STATUS" == "200" ]]; then
-    log "pqcrypta.com notified of new IP"
-else
-    log "WARNING: pqcrypta.com notification failed (HTTP $NOTIFY_STATUS) — DNS was updated"
+if [[ "$NOTIFY_STATUS" != "200" ]]; then
+    log "WARNING: pqcrypta.com heartbeat failed (HTTP $NOTIFY_STATUS)"
 fi
-
-# ── Save current IP ───────────────────────────────────────────────────────
-echo "$CURRENT_IP" > "$IP_FILE"
-log "Done. Stored IP: $CURRENT_IP"

@@ -44,10 +44,12 @@
 //! Any datagram >= 8 bytes is echoed back immediately. The client uses send
 //! timestamps (embedded in the payload) to compute RTT and loss statistics.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
+
+use tokio::sync::mpsc;
 
 use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
@@ -598,9 +600,9 @@ async fn run_mtr_probe(ip_str: String, mode: &'static str, port: u16) -> Vec<Mtr
         "--json".into(),
         "--no-dns".into(),
         "--report-cycles".into(),
-        "3".into(),
+        "1".into(),   // 1 cycle is enough for path discovery; was 3 (3× slower)
         "--max-ttl".into(),
-        "20".into(),
+        "15".into(),  // virtually all internet paths are ≤ 15 hops; was 20
         "--timeout".into(),
         "1".into(),
     ];
@@ -620,7 +622,7 @@ async fn run_mtr_probe(ip_str: String, mode: &'static str, port: u16) -> Vec<Mtr
     args.push(ip_str);
 
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(18),
+        std::time::Duration::from_secs(12), // 15 hops × 1s timeout + 3s buffer; was 18
         tokio::process::Command::new("/usr/bin/mtr")
             .args(&args)
             .output(),
@@ -668,74 +670,21 @@ async fn run_mtr_probe(ip_str: String, mode: &'static str, port: u16) -> Vec<Mtr
 
 /// Merge three sets of per-TTL hop data into one unified hop list.
 /// Preference: known IP over ???; lowest avg RTT; union of probe methods.
-fn merge_mtr_probes(
-    icmp: Vec<MtrHopRaw>,
-    udp: Vec<MtrHopRaw>,
-    tcp: Vec<MtrHopRaw>,
-) -> Vec<MergedHop> {
-    let mut by_ttl: BTreeMap<u32, MergedHop> = BTreeMap::new();
 
-    let labeled: Vec<(&'static str, Vec<MtrHopRaw>)> =
-        vec![("icmp", icmp), ("udp", udp), ("tcp", tcp)];
-
-    for (method, hops) in labeled {
-        for raw in hops {
-            let entry = by_ttl.entry(raw.ttl).or_insert_with(|| MergedHop {
-                ttl: raw.ttl,
-                ..Default::default()
-            });
-
-            // Prefer a known IP over ???
-            if entry.ip.is_none() {
-                entry.ip = raw.ip.clone();
-            }
-
-            // Use lowest avg RTT from any responding method
-            match (entry.avg_rtt_ms, raw.avg_rtt_ms) {
-                (None, Some(v)) => entry.avg_rtt_ms = Some(v),
-                (Some(a), Some(b)) if b < a => entry.avg_rtt_ms = Some(b),
-                _ => {}
-            }
-            // Lowest best RTT
-            match (entry.best_rtt_ms, raw.best_rtt_ms) {
-                (None, Some(v)) => entry.best_rtt_ms = Some(v),
-                (Some(a), Some(b)) if b < a => entry.best_rtt_ms = Some(b),
-                _ => {}
-            }
-            // Highest worst RTT
-            match (entry.worst_rtt_ms, raw.worst_rtt_ms) {
-                (None, Some(v)) => entry.worst_rtt_ms = Some(v),
-                (Some(a), Some(b)) if b > a => entry.worst_rtt_ms = Some(b),
-                _ => {}
-            }
-            // Loss: take from the method that saw the hop
-            if raw.ip.is_some() && entry.loss_pct.is_none() {
-                entry.loss_pct = raw.loss_pct;
-            }
-
-            // Track which methods produced this hop
-            if !entry.probe_methods.contains(&method) {
-                entry.probe_methods.push(method);
-            }
-        }
-    }
-
-    // Sort by TTL (BTreeMap already ordered) and compute RTT deltas
-    let mut hops: Vec<MergedHop> = by_ttl.into_values().collect();
+/// Re-compute RTT deltas and congestion suspects on a BTreeMap of hops.
+/// Called after each probe method's results are merged in.
+fn annotate_rtt_deltas(hops: &mut BTreeMap<u32, MergedHop>) {
     let mut prev_rtt: Option<f64> = None;
-    for hop in &mut hops {
+    for hop in hops.values_mut() {
         if let (Some(curr), Some(prev)) = (hop.avg_rtt_ms, prev_rtt) {
             let delta = curr - prev;
             hop.rtt_delta_ms = Some(delta);
-            // Mark as congestion suspect if RTT jumps > 20 ms at a single hop
             hop.congestion_suspect = delta > 20.0;
         }
         if hop.avg_rtt_ms.is_some() {
             prev_rtt = hop.avg_rtt_ms;
         }
     }
-
-    hops
 }
 
 /// Binary-search the path MTU toward `ip_str` using ping with the DF bit set.
@@ -792,13 +741,21 @@ async fn handle_op_traceroute(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client_ip = normalise_ip(remote_addr.ip());
 
+    // Always send the client GeoIP frame first so the UI can show origin even when
+    // traceroute probing isn't possible (e.g. when the client is on the same LAN and
+    // the QUIC endpoint sees a private/RFC-1918 source address).
+    let client_geo = lookup_geoip(client_ip);
+    let mut origin = geo_to_json(&client_ip.to_string(), &client_geo);
+    origin["type"] = json!("client");
+    write_framed_json(send, &origin).await?;
+
     if is_unsafe_for_traceroute(&client_ip) {
         write_framed_json(
             send,
             &json!({
                 "type": "error",
                 "error": "private_ip",
-                "message": "Route analysis not available for private/loopback addresses"
+                "message": "Route analysis not available: server sees a private address for this connection"
             }),
         )
         .await?;
@@ -808,112 +765,147 @@ async fn handle_op_traceroute(
 
     info!("🗺️  Multi-method traceroute → {} starting", client_ip);
 
-    // Send client GeoIP as the first (origin) frame
-    let client_geo = lookup_geoip(client_ip);
-    let mut origin = geo_to_json(&client_ip.to_string(), &client_geo);
-    origin["type"] = json!("client");
-    write_framed_json(send, &origin).await?;
-
-    // ── Run ICMP, UDP/53, TCP/80 probes and path MTU in parallel ─────────
     let ip_str = client_ip.to_string();
-    let (icmp_hops, udp_hops, tcp_hops, path_mtu) = tokio::join!(
-        run_mtr_probe(ip_str.clone(), "icmp", 0),
-        run_mtr_probe(ip_str.clone(), "udp", 53),
-        run_mtr_probe(ip_str.clone(), "tcp", 80),
-        probe_path_mtu(ip_str.clone()),
-    );
 
-    // Merge and annotate hops
-    let merged = merge_mtr_probes(icmp_hops, udp_hops, tcp_hops);
+    // ── Spawn four concurrent probe methods ───────────────────────────────
+    // UDP/4433 targets the live QUIC port: routers that silently drop ICMP or
+    // UDP/53 probes often still generate TTL-exceeded ICMP for traffic toward
+    // a port they've already seen in use, giving hop visibility others miss.
+    let (tx, mut rx) = mpsc::channel::<(&'static str, Vec<MtrHopRaw>)>(5);
+    for &(label, mode, port) in &[
+        ("icmp",     "icmp", 0u16),
+        ("udp/53",   "udp",  53),
+        ("tcp/80",   "tcp",  80),
+        ("udp/4433", "udp",  4433),
+    ] {
+        let ip  = ip_str.clone();
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            let hops = run_mtr_probe(ip, mode, port).await;
+            let _ = tx2.send((label, hops)).await;
+        });
+    }
+    drop(tx); // channel closes when all four tasks have sent
 
-    // Stream each visible hop frame
-    let mut hop_count: u32 = 0;
-    let mut hidden_count: u32 = 0;
-    let mut congestion_count: u32 = 0;
+    // Path MTU runs in the background; we await it just before the done frame.
+    let mtu_handle = tokio::spawn(probe_path_mtu(ip_str.clone()));
 
-    for hop in &merged {
-        let ip_ref = match &hop.ip {
-            Some(s) => s.as_str(),
-            None => {
-                hidden_count += 1; // all methods returned ???
+    // ── Receive method results and stream hops as each method completes ───
+    let mut merged: BTreeMap<u32, MergedHop> = BTreeMap::new();
+    let mut sent_ttls: HashSet<u32> = HashSet::new();
+    let mut probe_methods_tried: Vec<&'static str> = Vec::new();
+
+    while let Some((label, raw_hops)) = rx.recv().await {
+        probe_methods_tried.push(label);
+
+        // Merge this method's data into the shared hop map
+        for raw in raw_hops {
+            let entry = merged
+                .entry(raw.ttl)
+                .or_insert_with(|| MergedHop { ttl: raw.ttl, ..Default::default() });
+            let raw_had_ip = raw.ip.is_some();
+            if entry.ip.is_none() {
+                entry.ip = raw.ip;
+            }
+            match (entry.avg_rtt_ms, raw.avg_rtt_ms) {
+                (None, Some(v)) => entry.avg_rtt_ms = Some(v),
+                (Some(a), Some(b)) if b < a => entry.avg_rtt_ms = Some(b),
+                _ => {}
+            }
+            match (entry.best_rtt_ms, raw.best_rtt_ms) {
+                (None, Some(v)) => entry.best_rtt_ms = Some(v),
+                (Some(a), Some(b)) if b < a => entry.best_rtt_ms = Some(b),
+                _ => {}
+            }
+            match (entry.worst_rtt_ms, raw.worst_rtt_ms) {
+                (None, Some(v)) => entry.worst_rtt_ms = Some(v),
+                (Some(a), Some(b)) if b > a => entry.worst_rtt_ms = Some(b),
+                _ => {}
+            }
+            if raw_had_ip && entry.loss_pct.is_none() {
+                entry.loss_pct = raw.loss_pct;
+            }
+            if !entry.probe_methods.contains(&label) {
+                entry.probe_methods.push(label);
+            }
+        }
+
+        // Re-annotate RTT deltas with the updated merged set
+        annotate_rtt_deltas(&mut merged);
+
+        // Stream any newly-visible hops (not yet sent to client)
+        for (&ttl, hop) in &merged {
+            if hop.ip.is_none() || sent_ttls.contains(&ttl) {
                 continue;
             }
-        };
+            sent_ttls.insert(ttl);
 
-        hop_count += 1;
-        if hop.congestion_suspect {
-            congestion_count += 1;
-        }
+            let ip_ref = hop.ip.as_deref().unwrap_or("");
+            let mut frame = json!({
+                "type":               "hop",
+                "hop":                hop.ttl,
+                "ip":                 ip_ref,
+                "avg_rtt_ms":         hop.avg_rtt_ms,
+                "best_rtt_ms":        hop.best_rtt_ms,
+                "worst_rtt_ms":       hop.worst_rtt_ms,
+                "loss_pct":           hop.loss_pct,
+                "probe_methods":      hop.probe_methods,
+                "rtt_delta_ms":       hop.rtt_delta_ms,
+                "congestion_suspect": hop.congestion_suspect,
+            });
 
-        let mut frame = json!({
-            "type":              "hop",
-            "hop":               hop.ttl,
-            "ip":                ip_ref,
-            "avg_rtt_ms":        hop.avg_rtt_ms,
-            "best_rtt_ms":       hop.best_rtt_ms,
-            "worst_rtt_ms":      hop.worst_rtt_ms,
-            "loss_pct":          hop.loss_pct,
-            "probe_methods":     hop.probe_methods,
-            "rtt_delta_ms":      hop.rtt_delta_ms,
-            "congestion_suspect": hop.congestion_suspect,
-        });
-
-        // GeoIP annotate
-        if let Ok(hop_ip) = ip_ref.parse::<IpAddr>() {
-            if !is_unsafe_for_traceroute(&hop_ip) {
-                let geo = lookup_geoip(hop_ip);
-                frame["city"] = json!(geo.city);
-                frame["country"] = json!(geo.country);
-                frame["country_code"] = json!(geo.country_code);
-                frame["lat"] = json!(geo.lat);
-                frame["lon"] = json!(geo.lon);
-                frame["asn"] = json!(geo.asn);
-                frame["org"] = json!(geo.org);
+            if let Ok(hop_ip) = ip_ref.parse::<IpAddr>() {
+                if !is_unsafe_for_traceroute(&hop_ip) {
+                    let geo = lookup_geoip(hop_ip);
+                    frame["city"]         = json!(geo.city);
+                    frame["country"]      = json!(geo.country);
+                    frame["country_code"] = json!(geo.country_code);
+                    frame["lat"]          = json!(geo.lat);
+                    frame["lon"]          = json!(geo.lon);
+                    frame["asn"]          = json!(geo.asn);
+                    frame["org"]          = json!(geo.org);
+                }
             }
-        }
 
-        write_framed_json(send, &frame).await?;
+            write_framed_json(send, &frame).await?;
+        }
     }
+
+    // Final counts
+    let hop_count       = merged.values().filter(|h| h.ip.is_some()).count() as u32;
+    let hidden_count    = merged.values().filter(|h| h.ip.is_none()).count() as u32;
+    let congestion_count = merged.values().filter(|h| h.congestion_suspect).count() as u32;
 
     // ── Server terminal frame ─────────────────────────────────────────────
     let server_ip_str = get_server_public_ip().await;
-    let server_geo = if let Some(ref ip_str_ref) = server_ip_str {
-        if let Ok(ip) = ip_str_ref.parse::<IpAddr>() {
-            Some(lookup_geoip(ip))
-        } else {
-            None
-        }
+    let server_geo = if let Some(ref s) = server_ip_str {
+        s.parse::<IpAddr>().ok().map(lookup_geoip)
     } else {
         None
     };
-
-    let server_frame = json!({
+    write_framed_json(send, &json!({
         "type":         "server",
         "ip":           server_ip_str,
         "city":         server_geo.as_ref().and_then(|g| g.city.as_deref()),
         "country":      server_geo.as_ref().and_then(|g| g.country.as_deref()),
         "country_code": server_geo.as_ref().and_then(|g| g.country_code.as_deref()),
         "org":          server_geo.as_ref().and_then(|g| g.org.as_deref()),
-    });
-    write_framed_json(send, &server_frame).await?;
+    })).await?;
 
-    // ── Done frame — include path MTU, probe summary, congestion ─────────
-    write_framed_json(
-        send,
-        &json!({
-            "type":                "done",
-            "total_hops":          hop_count,
-            "hidden_hops":         hidden_count,
-            "path_mtu_bytes":      path_mtu,
-            "congestion_hops":     congestion_count,
-            "probe_methods_tried": ["icmp", "udp", "tcp"],
-        }),
-    )
-    .await?;
+    // ── Done frame ────────────────────────────────────────────────────────
+    let path_mtu = mtu_handle.await.unwrap_or(None);
+    write_framed_json(send, &json!({
+        "type":                "done",
+        "total_hops":          hop_count,
+        "hidden_hops":         hidden_count,
+        "path_mtu_bytes":      path_mtu,
+        "congestion_hops":     congestion_count,
+        "probe_methods_tried": probe_methods_tried,
+    })).await?;
 
     info!(
-        "🗺️  Multi-method traceroute done: {} visible, {} filtered, {} congestion suspects, path MTU {:?} → {}",
-        hop_count, hidden_count, congestion_count, path_mtu, client_ip
+        "🗺️  Traceroute done: {} visible, {} filtered, {} congestion suspects, MTU {:?}, methods {:?} → {}",
+        hop_count, hidden_count, congestion_count, path_mtu, probe_methods_tried, client_ip
     );
     send.finish().await?;
     Ok(())

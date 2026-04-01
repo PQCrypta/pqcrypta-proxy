@@ -38,9 +38,10 @@ graceful_shutdown_timeout_secs = 30
 # TLS Configuration
 # =============================
 [tls]
-# SAN cert covers both tcp2 and api2 — ACME provisions under the first domain name
-cert_path = "/etc/pqcrypta/certs/tcp2.pqcrypta.com.crt"
-key_path  = "/etc/pqcrypta/certs/tcp2.pqcrypta.com.key"
+# QUIC listener only serves api2.pqcrypta.com (tcp2 is http11_only, no QUIC).
+# HTTP/1.1 listener uses SNI dir-scan and loads both certs automatically.
+cert_path = "/etc/pqcrypta/certs/api2.pqcrypta.com.crt"
+key_path  = "/etc/pqcrypta/certs/api2.pqcrypta.com.key"
 require_client_cert = false
 alpn_protocols = ["h3", "h2", "http/1.1", "webtransport"]
 min_version = "1.3"
