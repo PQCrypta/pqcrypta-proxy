@@ -2352,6 +2352,25 @@ async fn proxy_handler(
     if !is_health_check {
         state.metrics.requests.request_start();
     }
+    // Strip port from host if present — axum's Host extractor includes the port
+    // for non-standard ports (e.g. "tcp2.pqcrypta.com:4433"). All subsequent host
+    // comparisons (tcp_only_hosts, route matching, etc.) expect bare hostnames.
+    let host: String = {
+        let h: &str = &host;
+        if !h.starts_with('[') {
+            if let Some(colon) = h.rfind(':') {
+                if h[colon + 1..].bytes().all(|b| b.is_ascii_digit()) {
+                    h[..colon].to_string()
+                } else {
+                    h.to_string()
+                }
+            } else {
+                h.to_string()
+            }
+        } else {
+            h.to_string()
+        }
+    };
     let path = uri.path().to_ascii_lowercase();
     let method_str = method.to_string();
     let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
