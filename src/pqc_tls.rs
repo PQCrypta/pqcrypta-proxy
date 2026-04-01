@@ -739,7 +739,7 @@ pub mod openssl_pqc {
         builder
             .set_private_key_file(default_key_path, SslFiletype::PEM)
             .map_err(|e| format!("Failed to load default private key: {}", e))?;
-        apply_pqc_groups(&mut *builder, pqc_provider);
+        apply_pqc_groups(&mut builder, pqc_provider);
         builder
             .set_alpn_protos(b"\x02h2\x08http/1.1")
             .map_err(|e| format!("Failed to set ALPN protos: {}", e))?;

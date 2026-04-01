@@ -600,9 +600,9 @@ async fn run_mtr_probe(ip_str: String, mode: &'static str, port: u16) -> Vec<Mtr
         "--json".into(),
         "--no-dns".into(),
         "--report-cycles".into(),
-        "1".into(),   // 1 cycle is enough for path discovery; was 3 (3× slower)
+        "1".into(), // 1 cycle is enough for path discovery; was 3 (3× slower)
         "--max-ttl".into(),
-        "15".into(),  // virtually all internet paths are ≤ 15 hops; was 20
+        "15".into(), // virtually all internet paths are ≤ 15 hops; was 20
         "--timeout".into(),
         "1".into(),
     ];
@@ -667,9 +667,6 @@ async fn run_mtr_probe(ip_str: String, mode: &'static str, port: u16) -> Vec<Mtr
     }
     hops
 }
-
-/// Merge three sets of per-TTL hop data into one unified hop list.
-/// Preference: known IP over ???; lowest avg RTT; union of probe methods.
 
 /// Re-compute RTT deltas and congestion suspects on a BTreeMap of hops.
 /// Called after each probe method's results are merged in.
@@ -773,12 +770,12 @@ async fn handle_op_traceroute(
     // a port they've already seen in use, giving hop visibility others miss.
     let (tx, mut rx) = mpsc::channel::<(&'static str, Vec<MtrHopRaw>)>(5);
     for &(label, mode, port) in &[
-        ("icmp",     "icmp", 0u16),
-        ("udp/53",   "udp",  53),
-        ("tcp/80",   "tcp",  80),
-        ("udp/4433", "udp",  4433),
+        ("icmp", "icmp", 0u16),
+        ("udp/53", "udp", 53),
+        ("tcp/80", "tcp", 80),
+        ("udp/4433", "udp", 4433),
     ] {
-        let ip  = ip_str.clone();
+        let ip = ip_str.clone();
         let tx2 = tx.clone();
         tokio::spawn(async move {
             let hops = run_mtr_probe(ip, mode, port).await;
@@ -800,9 +797,10 @@ async fn handle_op_traceroute(
 
         // Merge this method's data into the shared hop map
         for raw in raw_hops {
-            let entry = merged
-                .entry(raw.ttl)
-                .or_insert_with(|| MergedHop { ttl: raw.ttl, ..Default::default() });
+            let entry = merged.entry(raw.ttl).or_insert_with(|| MergedHop {
+                ttl: raw.ttl,
+                ..Default::default()
+            });
             let raw_had_ip = raw.ip.is_some();
             if entry.ip.is_none() {
                 entry.ip = raw.ip;
@@ -857,13 +855,13 @@ async fn handle_op_traceroute(
             if let Ok(hop_ip) = ip_ref.parse::<IpAddr>() {
                 if !is_unsafe_for_traceroute(&hop_ip) {
                     let geo = lookup_geoip(hop_ip);
-                    frame["city"]         = json!(geo.city);
-                    frame["country"]      = json!(geo.country);
+                    frame["city"] = json!(geo.city);
+                    frame["country"] = json!(geo.country);
                     frame["country_code"] = json!(geo.country_code);
-                    frame["lat"]          = json!(geo.lat);
-                    frame["lon"]          = json!(geo.lon);
-                    frame["asn"]          = json!(geo.asn);
-                    frame["org"]          = json!(geo.org);
+                    frame["lat"] = json!(geo.lat);
+                    frame["lon"] = json!(geo.lon);
+                    frame["asn"] = json!(geo.asn);
+                    frame["org"] = json!(geo.org);
                 }
             }
 
@@ -872,9 +870,12 @@ async fn handle_op_traceroute(
     }
 
     // Final counts
-    let hop_count       = merged.values().filter(|h| h.ip.is_some()).count() as u32;
-    let hidden_count    = merged.values().filter(|h| h.ip.is_none()).count() as u32;
-    let congestion_count = merged.values().filter(|h| h.congestion_suspect).count() as u32;
+    let hop_count =
+        u32::try_from(merged.values().filter(|h| h.ip.is_some()).count()).unwrap_or(u32::MAX);
+    let hidden_count =
+        u32::try_from(merged.values().filter(|h| h.ip.is_none()).count()).unwrap_or(u32::MAX);
+    let congestion_count =
+        u32::try_from(merged.values().filter(|h| h.congestion_suspect).count()).unwrap_or(u32::MAX);
 
     // ── Server terminal frame ─────────────────────────────────────────────
     let server_ip_str = get_server_public_ip().await;
@@ -883,25 +884,33 @@ async fn handle_op_traceroute(
     } else {
         None
     };
-    write_framed_json(send, &json!({
-        "type":         "server",
-        "ip":           server_ip_str,
-        "city":         server_geo.as_ref().and_then(|g| g.city.as_deref()),
-        "country":      server_geo.as_ref().and_then(|g| g.country.as_deref()),
-        "country_code": server_geo.as_ref().and_then(|g| g.country_code.as_deref()),
-        "org":          server_geo.as_ref().and_then(|g| g.org.as_deref()),
-    })).await?;
+    write_framed_json(
+        send,
+        &json!({
+            "type":         "server",
+            "ip":           server_ip_str,
+            "city":         server_geo.as_ref().and_then(|g| g.city.as_deref()),
+            "country":      server_geo.as_ref().and_then(|g| g.country.as_deref()),
+            "country_code": server_geo.as_ref().and_then(|g| g.country_code.as_deref()),
+            "org":          server_geo.as_ref().and_then(|g| g.org.as_deref()),
+        }),
+    )
+    .await?;
 
     // ── Done frame ────────────────────────────────────────────────────────
     let path_mtu = mtu_handle.await.unwrap_or(None);
-    write_framed_json(send, &json!({
-        "type":                "done",
-        "total_hops":          hop_count,
-        "hidden_hops":         hidden_count,
-        "path_mtu_bytes":      path_mtu,
-        "congestion_hops":     congestion_count,
-        "probe_methods_tried": probe_methods_tried,
-    })).await?;
+    write_framed_json(
+        send,
+        &json!({
+            "type":                "done",
+            "total_hops":          hop_count,
+            "hidden_hops":         hidden_count,
+            "path_mtu_bytes":      path_mtu,
+            "congestion_hops":     congestion_count,
+            "probe_methods_tried": probe_methods_tried,
+        }),
+    )
+    .await?;
 
     info!(
         "🗺️  Traceroute done: {} visible, {} filtered, {} congestion suspects, MTU {:?}, methods {:?} → {}",

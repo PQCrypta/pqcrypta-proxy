@@ -560,7 +560,7 @@ pub async fn run_http_listener_pqc(
     let key_path_buf = std::path::Path::new(key_path);
     let certs_dir = cert_path_buf
         .parent()
-        .unwrap_or(std::path::Path::new("/etc/pqcrypta/certs"));
+        .unwrap_or_else(|| std::path::Path::new("/etc/pqcrypta/certs"));
 
     let ssl_acceptor = openssl_pqc::create_pqc_acceptor_with_sni(
         cert_path_buf,
@@ -1173,7 +1173,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     let key_path_buf = std::path::Path::new(key_path);
     let certs_dir = cert_path_buf
         .parent()
-        .unwrap_or(std::path::Path::new("/etc/pqcrypta/certs"));
+        .unwrap_or_else(|| std::path::Path::new("/etc/pqcrypta/certs"));
     let ssl_acceptor = openssl_pqc::create_pqc_acceptor_with_sni(
         cert_path_buf,
         key_path_buf,
@@ -1531,7 +1531,7 @@ fn build_rustls_server_config(
 
     let certs_dir = Path::new(cert_path)
         .parent()
-        .unwrap_or(Path::new("/etc/pqcrypta/certs"));
+        .unwrap_or_else(|| Path::new("/etc/pqcrypta/certs"));
 
     let resolver = crate::tls::MultiDomainCertResolver::new(certs_dir).map_err(|e| {
         format!(
@@ -1562,7 +1562,7 @@ fn build_rustls_server_config_http11_only(
 
     let certs_dir = Path::new(cert_path)
         .parent()
-        .unwrap_or(Path::new("/etc/pqcrypta/certs"));
+        .unwrap_or_else(|| Path::new("/etc/pqcrypta/certs"));
 
     let resolver = crate::tls::MultiDomainCertResolver::new(certs_dir).map_err(|e| {
         format!(
@@ -2259,7 +2259,8 @@ async fn tcp_upload_measure_handler(body: Body) -> Response {
     }
 
     let elapsed_secs = start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
-    let elapsed_ms = (elapsed_secs * 1000.0) as u64;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let elapsed_ms = (elapsed_secs * 1000.0).max(0.0) as u64;
 
     let throughput_mbps = if elapsed_secs > 0.0 {
         (total_bytes as f64 * 8.0) / (elapsed_secs * 1_000_000.0)
@@ -2440,7 +2441,9 @@ async fn proxy_handler(
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_millis() as u64;
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX);
             let mut resp = axum::Json(serde_json::json!({ "ok": true, "ts": ts })).into_response();
             resp.headers_mut().insert(
                 "access-control-allow-origin",
@@ -2468,7 +2471,7 @@ async fn proxy_handler(
                     })
                 })
                 .unwrap_or(10 * 1024 * 1024);
-            let bytes_to_send: u64 = bytes_requested.max(65_536).min(100 * 1024 * 1024);
+            let bytes_to_send: u64 = bytes_requested.clamp(65_536, 100 * 1024 * 1024);
 
             // Pre-compute a 256 KiB pseudo-random chunk via LCG
             const CHUNK: usize = 256 * 1024;
@@ -2478,7 +2481,7 @@ async fn proxy_handler(
                     lcg = lcg
                         .wrapping_mul(6_364_136_223_846_793_005)
                         .wrapping_add(1_442_695_040_888_963_407);
-                    (lcg >> 33) as u8
+                    u8::try_from(lcg >> 33 & 0xFF).unwrap_or(0)
                 })
                 .collect();
             let chunk_bytes = bytes::Bytes::from(chunk_data);
@@ -2489,7 +2492,7 @@ async fn proxy_handler(
                     if rem == 0 {
                         return None;
                     }
-                    let n = rem.min(CHUNK as u64) as usize;
+                    let n = usize::try_from(rem.min(CHUNK as u64)).unwrap_or(CHUNK);
                     let data = chunk.slice(..n);
                     rem -= n as u64;
                     Some((Ok::<bytes::Bytes, std::io::Error>(data), (rem, chunk)))

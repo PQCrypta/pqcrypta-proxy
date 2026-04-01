@@ -651,7 +651,9 @@ async fn check_and_renew_certificates(
 
         if needs_renewal {
             // Request individual cert for this domain only
-            match request_san_certificate(config, &[domain.clone()], pending_challenges).await {
+            match request_san_certificate(config, std::slice::from_ref(&domain), pending_challenges)
+                .await
+            {
                 Ok((cert_pem, key_pem, chain_pem)) => {
                     let full_chain = if chain_pem.is_empty() {
                         cert_pem.clone()

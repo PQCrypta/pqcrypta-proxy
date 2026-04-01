@@ -27,10 +27,11 @@ use crate::config::{PqcConfig, TlsConfig};
 
 // ── SNI-based per-domain certificate resolver ────────────────────────────────
 
-/// Resolves TLS server certificates by SNI hostname.
-/// Reads every `{domain}.crt` / `{domain}.key` pair from the certs directory.
-/// Thread-safe hot-reload via `reload()` — all listeners sharing the same `Arc`
-/// immediately serve the refreshed certificate after a call to `reload()`.
+/// SNI-based per-domain certificate resolver.
+///
+/// Reads `{domain}.crt` / `{domain}.key` pairs from the certs directory.
+/// Thread-safe hot-reload via `reload()` — all listeners sharing the same
+/// `Arc` immediately serve the refreshed certificate after a call to `reload()`.
 #[derive(Debug)]
 pub struct MultiDomainCertResolver {
     /// domain → `CertifiedKey` map, updated atomically on reload
@@ -184,7 +185,7 @@ impl TlsProvider {
         let certs_dir = tls_config
             .cert_path
             .parent()
-            .unwrap_or(Path::new("/etc/pqcrypta/certs"));
+            .unwrap_or_else(|| Path::new("/etc/pqcrypta/certs"));
         let resolver = Arc::new(MultiDomainCertResolver::new(certs_dir)?);
 
         // Create initial QUIC server config using the resolver
@@ -249,7 +250,7 @@ impl TlsProvider {
         let certs_dir = tls_config
             .cert_path
             .parent()
-            .unwrap_or(Path::new("/etc/pqcrypta/certs"));
+            .unwrap_or_else(|| Path::new("/etc/pqcrypta/certs"));
         let cert_modified = std::fs::metadata(certs_dir)
             .ok()
             .and_then(|m| m.modified().ok());
@@ -265,7 +266,7 @@ impl TlsProvider {
         let certs_dir = tls_config
             .cert_path
             .parent()
-            .unwrap_or(Path::new("/etc/pqcrypta/certs"));
+            .unwrap_or_else(|| Path::new("/etc/pqcrypta/certs"));
         let current_modified = std::fs::metadata(certs_dir)
             .ok()
             .and_then(|m| m.modified().ok());

@@ -855,7 +855,7 @@ impl QuicListener {
                     })
                 })
                 .unwrap_or(10 * 1024 * 1024);
-            let bytes_to_send: u64 = bytes_requested.max(65536).min(100 * 1024 * 1024);
+            let bytes_to_send: u64 = bytes_requested.clamp(65_536, 100 * 1024 * 1024);
 
             let dl_start = std::time::Instant::now();
             let response = http::Response::builder()
@@ -873,12 +873,12 @@ impl QuicListener {
                 // data payloads so any pattern gives accurate bandwidth measurement.
                 const CHUNK: usize = 256 * 1024;
                 let mut chunk_buf = vec![0u8; CHUNK];
-                let mut lcg: u64 = 0xdeadbeef_cafebabe;
+                let mut lcg: u64 = 0xdead_beef_cafe_babe;
                 for b in chunk_buf.iter_mut() {
                     lcg = lcg
                         .wrapping_mul(6_364_136_223_846_793_005)
                         .wrapping_add(1_442_695_040_888_963_407);
-                    *b = (lcg >> 56) as u8;
+                    *b = u8::try_from(lcg >> 56 & 0xFF).unwrap_or(0);
                 }
                 let chunk_bytes = Bytes::from(chunk_buf);
 
@@ -953,7 +953,7 @@ impl QuicListener {
             // Return bytes_received only — client divides by the known test duration
             // for an accurate mbps figure with no server-side timing complexity.
             let steady_mbps = 0.0_f64; // unused; client computes from bytes + duration
-            let duration_ms = total_elapsed.as_millis() as u64;
+            let duration_ms = total_elapsed.as_millis().try_into().unwrap_or(u64::MAX);
 
             info!(
                 "[speedtest-upload/h3] result: bytes={} steady_mbps={:.2} duration_ms={} from {}",

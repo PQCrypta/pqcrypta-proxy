@@ -935,7 +935,7 @@ async fn main() -> anyhow::Result<()> {
         // from the certs directory.  Fall back to the primary cert if not found.
         let wt_certs_dir = std::path::Path::new(&cert_path)
             .parent()
-            .unwrap_or(std::path::Path::new("/etc/pqcrypta/certs"));
+            .unwrap_or_else(|| std::path::Path::new("/etc/pqcrypta/certs"));
         let primary_domain = std::path::Path::new(&cert_path)
             .file_stem()
             .and_then(|s| s.to_str())
