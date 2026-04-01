@@ -28,11 +28,10 @@ tcp_only_hosts  = ["tcp2.pqcrypta.com"]
 http11_only_hosts = ["tcp2.pqcrypta.com"]
 max_connections = 200
 max_streams_per_connection = 200
-worker_threads = 4
 keepalive_interval_secs = 15
 max_idle_timeout_secs = 120
 enable_ipv6 = false
-worker_threads = 0
+worker_threads = 4
 graceful_shutdown_timeout_secs = 30
 
 # =============================
