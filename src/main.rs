@@ -930,27 +930,42 @@ async fn main() -> anyhow::Result<()> {
     {
         let wt_config = config.clone();
         let wt_backend_pool = Arc::new(BackendPool::new(config.clone()));
-        // The WebTransport server uses a single cert (no SNI).  The speedtest client
-        // connects to api.<primary-domain>:4433, so look up that domain's individual cert
-        // from the certs directory.  Fall back to the primary cert if not found.
-        let wt_certs_dir = std::path::Path::new(&cert_path)
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("/etc/pqcrypta/certs"));
-        let primary_domain = std::path::Path::new(&cert_path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        let api_domain = format!("api.{}", primary_domain);
-        let api_cert = wt_certs_dir.join(format!("{}.crt", api_domain));
-        let api_key = wt_certs_dir.join(format!("{}.key", api_domain));
-        let (wt_cert, wt_key) = if api_cert.exists() && api_key.exists() {
-            info!("WebTransport server: using cert for {}", api_domain);
+        // The WebTransport server uses a single cert (no SNI).  Resolution order:
+        //   1. Explicit webtransport_cert_path / webtransport_key_path from config.
+        //   2. Auto-detect: look for api.<primary-domain>.crt in the certs directory.
+        //   3. Fall back to the primary cert.
+        let (wt_cert, wt_key) = if let (Some(wt_c), Some(wt_k)) = (
+            config.server.webtransport_cert_path.as_ref(),
+            config.server.webtransport_key_path.as_ref(),
+        ) {
+            info!(
+                "WebTransport server: using explicit cert {}",
+                wt_c.display()
+            );
             (
-                api_cert.to_string_lossy().to_string(),
-                api_key.to_string_lossy().to_string(),
+                wt_c.to_string_lossy().to_string(),
+                wt_k.to_string_lossy().to_string(),
             )
         } else {
-            (cert_path.clone(), key_path.clone())
+            let wt_certs_dir = std::path::Path::new(&cert_path)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("/etc/pqcrypta/certs"));
+            let primary_domain = std::path::Path::new(&cert_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            let api_domain = format!("api.{}", primary_domain);
+            let api_cert = wt_certs_dir.join(format!("{}.crt", api_domain));
+            let api_key = wt_certs_dir.join(format!("{}.key", api_domain));
+            if api_cert.exists() && api_key.exists() {
+                info!("WebTransport server: using cert for {}", api_domain);
+                (
+                    api_cert.to_string_lossy().to_string(),
+                    api_key.to_string_lossy().to_string(),
+                )
+            } else {
+                (cert_path.clone(), key_path.clone())
+            }
         };
         let wt_metrics = metrics_registry.clone();
 

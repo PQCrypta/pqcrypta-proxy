@@ -431,6 +431,24 @@ pub struct ServerConfig {
     /// ```
     #[serde(default)]
     pub http11_only_hosts: Vec<String>,
+
+    /// Explicit TLS certificate for the WebTransport server (port 4433).
+    ///
+    /// When set, overrides the auto-detection logic that looks for
+    /// `api.{primary_domain}.crt` in the certs directory.  Use this when
+    /// the WebTransport hostname doesn't follow the `api.` prefix convention
+    /// (e.g. `api2.pqcrypta.com` served from a `tcp2.pqcrypta.com` config).
+    ///
+    /// Example:
+    /// ```toml
+    /// webtransport_cert_path = "/etc/pqcrypta/certs/api2.pqcrypta.com.crt"
+    /// webtransport_key_path  = "/etc/pqcrypta/certs/api2.pqcrypta.com.key"
+    /// ```
+    #[serde(default)]
+    pub webtransport_cert_path: Option<std::path::PathBuf>,
+
+    #[serde(default)]
+    pub webtransport_key_path: Option<std::path::PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -457,6 +475,8 @@ impl Default for ServerConfig {
             webtransport_port: 4433,
             tcp_only_hosts: Vec::new(),
             http11_only_hosts: Vec::new(),
+            webtransport_cert_path: None,
+            webtransport_key_path: None,
         }
     }
 }
