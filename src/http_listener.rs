@@ -1887,12 +1887,41 @@ async fn alt_svc_middleware(
     };
     let is_tcp_only = state.config.server.tcp_only_hosts.iter().any(|h| h == host);
 
+    // Search engine indexing bots must use HTTP/1.1 — send alt-svc: clear so
+    // they never upgrade to QUIC/HTTP3, which causes connection errors on crawl.
+    let is_indexing_bot = request
+        .headers()
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|ua| {
+            let ua = ua.to_lowercase();
+            ua.contains("googlebot")
+                || ua.contains("adsbot-google")
+                || ua.contains("google-inspectiontool")
+                || ua.contains("googleother")
+                || ua.contains("bingbot")
+                || ua.contains("msnbot")
+                || ua.contains("yandexbot")
+                || ua.contains("baiduspider")
+                || ua.contains("duckduckbot")
+                || ua.contains("slurp")
+                || ua.contains("applebot")
+                || ua.contains("semrushbot")
+                || ua.contains("ahrefsbot")
+                || ua.contains("dotbot")
+                || ua.contains("sogou")
+                || ua.contains("exabot")
+                || ua.contains("facebot")
+                || ua.contains("ia_archiver")
+        })
+        .unwrap_or(false);
+
     let mut response = next.run(request).await;
 
-    if is_tcp_only {
-        // Actively clear any cached Alt-Svc so browsers stop upgrading to HTTP/3
-        // for this TCP-only origin. Without "clear", a cached Alt-Svc keeps Chrome
-        // on QUIC even after we stop advertising it.
+    if is_tcp_only || is_indexing_bot {
+        // Actively clear any cached Alt-Svc so browsers/bots stop upgrading to
+        // HTTP/3. Without "clear", a cached Alt-Svc keeps Chrome on QUIC even
+        // after we stop advertising it.
         response
             .headers_mut()
             .insert("alt-svc", HeaderValue::from_static("clear"));
@@ -3002,15 +3031,23 @@ async fn proxy_handler(
                 // Record success for circuit breaker (single backend)
                 state.security.record_backend_result(&route.backend, true);
 
-                // Record success for load balancer pool
+                let (mut parts, incoming_body) = backend_response.into_parts();
+
+                // Buffer the response body BEFORE releasing the backend connection.
+                // For HTTP/1.1 streaming responses, releasing the connection closes the
+                // socket — any subsequent to_bytes() call in cache/compression middleware
+                // then fails and returns Body::empty() (0-byte response to client).
+                let body_bytes = axum::body::to_bytes(Body::new(incoming_body), 100 * 1024 * 1024)
+                    .await
+                    .unwrap_or_default();
+
+                // Record success for load balancer pool — safe to release now that body is buffered
                 if let (Some(server), Some(ref pn)) = (&pool_server, &pool_name) {
                     state
                         .load_balancer
                         .record_completion(pn, server.as_ref(), response_time, true);
                     server.release_connection();
                 }
-
-                let (mut parts, incoming_body) = backend_response.into_parts();
 
                 // Add CORS headers if configured
                 if let Some(ref cors) = route.cors {
@@ -3056,7 +3093,14 @@ async fn proxy_handler(
                     parts.headers.remove("cross-origin-opener-policy");
                 }
 
-                // Remove Upgrade header (problematic for HTTP/3)
+                // Strip hop-by-hop headers that must not be forwarded (RFC 9110 §7.6.1).
+                // Apache sends `Connection: Upgrade` on HTTP/1.1 responses (suggesting
+                // h2 upgrade), which hyper interprets as a protocol-upgrade response and
+                // omits the HTTP body, causing clients to receive "Empty reply".
+                // `transfer-encoding` is also hop-by-hop and is irrelevant after we've
+                // already buffered the full body above.
+                parts.headers.remove("connection");
+                parts.headers.remove("transfer-encoding");
                 parts.headers.remove("upgrade");
 
                 // SEC-08: Use a version-agnostic Server header so the exact build is not
@@ -3067,8 +3111,8 @@ async fn proxy_handler(
                     HeaderValue::from_static(concat!("PQCProxy/", env!("CARGO_PKG_VERSION"))),
                 );
 
-                // Convert Incoming body to axum Body
-                let response_body = Body::new(incoming_body);
+                // Build response from buffered body bytes
+                let response_body = Body::from(body_bytes);
                 let response = Response::from_parts(parts, response_body);
 
                 let resp_status = response.status().as_u16();
