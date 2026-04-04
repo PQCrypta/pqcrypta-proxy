@@ -78,6 +78,11 @@ const MAX_FRAME_BYTES: usize = 65_536;
 const MIN_DATAGRAM_BYTES: usize = 8;
 const STATS_INTERVAL_MS: u64 = 100; // 10 Hz stats push
 
+/// Session idle timeout: close if no stream or datagram activity for this long.
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+/// Hard cap on total session lifetime regardless of activity.
+const SESSION_MAX_DURATION: Duration = Duration::from_secs(3600); // 60 minutes
+
 // ─── Impairment types ─────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq)]
@@ -356,10 +361,21 @@ pub async fn handle_telemetry_session(
         });
     }
 
+    // Hard cap: close after SESSION_MAX_DURATION regardless of activity.
+    let session_deadline = sleep(SESSION_MAX_DURATION);
+    tokio::pin!(session_deadline);
+
+    // Idle timer: reset on any stream or datagram; fires if nothing arrives for
+    // SESSION_IDLE_TIMEOUT. Catches clients that disconnect without a clean QUIC
+    // close while keep-alive PINGs hold the transport open.
+    let idle_deadline = sleep(SESSION_IDLE_TIMEOUT);
+    tokio::pin!(idle_deadline);
+
     // Main loop: datagram echo + accept control streams
     loop {
         tokio::select! {
             bidi_result = connection.accept_bi() => {
+                idle_deadline.as_mut().reset(tokio::time::Instant::now() + SESSION_IDLE_TIMEOUT);
                 match bidi_result {
                     Ok((send_s, recv_s)) => {
                         let ch = Arc::clone(&channels);
@@ -377,6 +393,7 @@ pub async fn handle_telemetry_session(
             }
 
             dg_result = connection.receive_datagram() => {
+                idle_deadline.as_mut().reset(tokio::time::Instant::now() + SESSION_IDLE_TIMEOUT);
                 match dg_result {
                     Ok(dg) => {
                         if dg.len() >= MIN_DATAGRAM_BYTES {
@@ -390,6 +407,24 @@ pub async fn handle_telemetry_session(
                         break;
                     }
                 }
+            }
+
+            _ = &mut idle_deadline => {
+                warn!(
+                    "⏰ Telemetry session idle timeout ({}s no activity): {}",
+                    SESSION_IDLE_TIMEOUT.as_secs(),
+                    remote_addr
+                );
+                break;
+            }
+
+            _ = &mut session_deadline => {
+                warn!(
+                    "⏰ Telemetry session max duration ({}s) reached: {}",
+                    SESSION_MAX_DURATION.as_secs(),
+                    remote_addr
+                );
+                break;
             }
         }
     }

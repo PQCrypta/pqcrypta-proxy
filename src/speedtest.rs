@@ -47,13 +47,22 @@
 use std::collections::{BTreeMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
+use tokio::time::sleep;
 
 use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 use wtransport::Connection;
+
+/// Session idle timeout: close session if no stream or datagram activity for this long.
+/// Prevents sessions from leaking when a client disconnects without a clean QUIC close
+/// (e.g., browser tab closed, network loss) while keep-alive PINGs keep the transport alive.
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+
+/// Hard cap on total session lifetime regardless of activity.
+const SESSION_MAX_DURATION: Duration = Duration::from_secs(1800); // 30 minutes
 
 /// Maximum size for a single download: 1 GB (client enforces a time limit of 5–10 s;
 /// this cap exists only to prevent runaway sessions on very slow paths).
@@ -198,9 +207,20 @@ pub async fn handle_speedtest_session(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("🏎️  Speed test session started: {}", remote_addr);
 
+    // Hard cap: close after SESSION_MAX_DURATION regardless of activity.
+    let session_deadline = sleep(SESSION_MAX_DURATION);
+    tokio::pin!(session_deadline);
+
+    // Idle timer: reset on every stream or datagram; fires if nothing arrives for
+    // SESSION_IDLE_TIMEOUT. This catches clients that disappear without a clean QUIC
+    // close (e.g., browser tab closed) while keep-alive PINGs keep the transport alive.
+    let idle_deadline = sleep(SESSION_IDLE_TIMEOUT);
+    tokio::pin!(idle_deadline);
+
     loop {
         tokio::select! {
             bidi_result = connection.accept_bi() => {
+                idle_deadline.as_mut().reset(tokio::time::Instant::now() + SESSION_IDLE_TIMEOUT);
                 match bidi_result {
                     Ok((send_stream, recv_stream)) => {
                         debug!("📊 Speed test stream accepted from {}", remote_addr);
@@ -218,6 +238,7 @@ pub async fn handle_speedtest_session(
             }
 
             datagram_result = connection.receive_datagram() => {
+                idle_deadline.as_mut().reset(tokio::time::Instant::now() + SESSION_IDLE_TIMEOUT);
                 match datagram_result {
                     Ok(datagram) => {
                         if datagram.len() < MIN_DATAGRAM_BYTES {
@@ -237,6 +258,24 @@ pub async fn handle_speedtest_session(
                         break;
                     }
                 }
+            }
+
+            _ = &mut idle_deadline => {
+                warn!(
+                    "⏰ Speed test session idle timeout ({}s no activity): {}",
+                    SESSION_IDLE_TIMEOUT.as_secs(),
+                    remote_addr
+                );
+                break;
+            }
+
+            _ = &mut session_deadline => {
+                warn!(
+                    "⏰ Speed test session max duration ({}s) reached: {}",
+                    SESSION_MAX_DURATION.as_secs(),
+                    remote_addr
+                );
+                break;
             }
         }
     }
