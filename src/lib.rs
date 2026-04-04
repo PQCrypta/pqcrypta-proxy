@@ -89,6 +89,7 @@ pub mod quic_listener;
 pub mod rate_limiter; // Must be before config (config imports from it)
 pub mod security;
 pub mod speedtest;
+pub mod telemetry;
 pub mod tls;
 pub mod tls_acceptor;
 pub mod waf;

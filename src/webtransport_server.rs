@@ -306,6 +306,11 @@ async fn handle_connection(
         return crate::speedtest::handle_speedtest_session(connection, remote_addr).await;
     }
 
+    // Native telemetry wall handler — serves /telemetry without backend proxying
+    if path == "/telemetry" {
+        return crate::telemetry::handle_telemetry_session(connection, remote_addr).await;
+    }
+
     loop {
         tokio::select! {
             // Handle unidirectional streams (client -> server)
