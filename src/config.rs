@@ -248,6 +248,23 @@ pub struct RouteSecurityPolicy {
     pub hmac_secret: Option<String>,
 }
 
+/// A single resource to preload via 103 Early Hints
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreloadResourceConfig {
+    /// Hostname to restrict this rule to (e.g. "stlweb.dev"). None = all hosts.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Path prefix that triggers this preload (e.g. "/" matches all pages)
+    pub path: String,
+    /// Resource href (e.g. "/css/style.css")
+    pub href: String,
+    /// Resource type for the `as=` attribute (style, script, font, image, etc.)
+    pub as_type: String,
+    /// Optional crossorigin attribute value
+    #[serde(default)]
+    pub crossorigin: Option<String>,
+}
+
 /// HTTP/3 advanced features configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -260,6 +277,9 @@ pub struct Http3Config {
     pub coalescing_enabled: bool,
     /// Default preconnect origins for Early Hints
     pub preconnect_origins: Vec<String>,
+    /// Resources to preload via 103 Early Hints.
+    /// Each entry maps a path prefix to a resource. Empty = no preloads.
+    pub preload_resources: Vec<PreloadResourceConfig>,
     /// Maximum wait time for coalesced requests (ms)
     pub coalescing_max_wait_ms: u64,
     /// Maximum subscribers per coalesced request
@@ -280,6 +300,7 @@ impl Default for Http3Config {
                 "https://fonts.googleapis.com".to_string(),
                 "https://fonts.gstatic.com".to_string(),
             ],
+            preload_resources: vec![],
             coalescing_max_wait_ms: 100,
             coalescing_max_subscribers: 100,
             coalescing_methods: vec!["GET".to_string(), "HEAD".to_string()],

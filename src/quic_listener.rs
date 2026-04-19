@@ -30,7 +30,7 @@ use crate::rate_limiter::{build_context_from_request, AdvancedRateLimiter, RateL
 use crate::security::{BlockReason, SecurityState};
 use crate::tls::TlsProvider;
 
-const SERVER_HEADER: &str = concat!("PQ Crypta/", env!("CARGO_PKG_VERSION"));
+const SERVER_HEADER: &str = "pqcrypta"; // SEC-08: no version disclosure
 
 /// Build Alt-Svc header value from config ports.
 /// Returns "clear" for hosts listed in `server.tcp_only_hosts` so browsers
@@ -143,7 +143,7 @@ impl QuicListener {
         let backend_pool = Arc::new(BackendPool::new(config.clone()));
 
         // Create early hints state from config
-        let early_hints_state = Arc::new(EarlyHintsState::default());
+        let early_hints_state = Arc::new(EarlyHintsState::from_http3_config(&config.http3));
         if config.http3.early_hints_enabled {
             info!("HTTP/3 Early Hints (103) enabled");
         }
@@ -794,7 +794,10 @@ impl QuicListener {
         // This is a key HTTP/3 optimization - send resource hints before proxying to backend
         // Only send for GET/HEAD requests - 103 on POST/PUT/DELETE can break cookie handling
         if config.http3.early_hints_enabled && (method == "GET" || method == "HEAD") {
-            let hints = early_hints_state.get_hints_for_path(&path);
+            let hints = early_hints_state.get_hints_for_request(
+                host.as_deref().unwrap_or(""),
+                &path,
+            );
             if !hints.is_empty() {
                 // Build 103 Early Hints response with Link headers and alt-svc for QUIC advertisement
                 let mut early_response_builder = http::Response::builder()

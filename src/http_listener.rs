@@ -405,6 +405,7 @@ pub async fn run_http_listener_pqc(
     pqc_provider: Arc<PqcTlsProvider>,
     metrics: Arc<MetricsRegistry>,
     load_balancer: Arc<LoadBalancer>,
+    sni_map: openssl_pqc::PqcSniMap,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let port = addr.port();
 
@@ -555,19 +556,16 @@ pub async fn run_http_listener_pqc(
     // =========================================================================
     use axum_server::tls_openssl::OpenSSLConfig;
 
-    // Create OpenSSL SSL acceptor with PQC hybrid key exchange + SNI multi-domain support
+    // Create OpenSSL SSL acceptor with PQC hybrid key exchange + SNI multi-domain support.
+    // `sni_map` is shared with the ACME handler so hot-reload works without restart.
     let cert_path_buf = std::path::Path::new(cert_path);
     let key_path_buf = std::path::Path::new(key_path);
-    let certs_dir = cert_path_buf
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("/etc/pqcrypta/certs"));
 
     let ssl_acceptor = openssl_pqc::create_pqc_acceptor_with_sni(
         cert_path_buf,
         key_path_buf,
-        certs_dir,
         &pqc_provider,
-        &config.server.http11_only_hosts,
+        sni_map,
     )
     .map_err(|e| format!("Failed to create PQC SSL acceptor: {}", e))?;
 
@@ -1041,6 +1039,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     shutdown_rx: watch::Receiver<()>,
     metrics: Arc<MetricsRegistry>,
     load_balancer: Arc<LoadBalancer>,
+    sni_map: openssl_pqc::PqcSniMap,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut shutdown_rx = shutdown_rx;
     use openssl::ssl::SslContext;
@@ -1168,18 +1167,16 @@ pub async fn run_http_listener_pqc_with_fingerprint(
         .layer(middleware::from_fn(trace_context_middleware))
         .with_state(state);
 
-    // Create OpenSSL PQC acceptor with SNI multi-domain support
+    // Create OpenSSL PQC acceptor with SNI multi-domain support.
+    // The `sni_map` was pre-built by the caller and is shared with the ACME
+    // cert-update handler, so new certificates are hot-reloaded without restart.
     let cert_path_buf = std::path::Path::new(cert_path);
     let key_path_buf = std::path::Path::new(key_path);
-    let certs_dir = cert_path_buf
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("/etc/pqcrypta/certs"));
     let ssl_acceptor = openssl_pqc::create_pqc_acceptor_with_sni(
         cert_path_buf,
         key_path_buf,
-        certs_dir,
         &pqc_provider,
-        &config.server.http11_only_hosts,
+        sni_map,
     )
     .map_err(|e| format!("Failed to create PQC SSL acceptor: {}", e))?;
 
@@ -1887,9 +1884,64 @@ async fn alt_svc_middleware(
     };
     let is_tcp_only = state.config.server.tcp_only_hosts.iter().any(|h| h == host);
 
-    // Search engine indexing bots must use HTTP/1.1 — send alt-svc: clear so
-    // they never upgrade to QUIC/HTTP3, which causes connection errors on crawl.
-    let is_indexing_bot = request
+    // Search engine indexing bots and security scanners must use HTTP/1.1 —
+    // send alt-svc: clear so they never upgrade to QUIC/HTTP3, which causes
+    // connection errors on crawl or empty MIME types on security scans.
+    //
+    // Cloudflare Radar / URLScan uses a generic Chrome UA so it cannot be
+    // detected by user-agent alone — detect by source IP against Cloudflare's
+    // published IPv4/IPv6 infrastructure ranges instead.
+    let client_ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip());
+
+    let is_cloudflare_ip = client_ip.map(|ip| {
+        use std::net::IpAddr;
+        use std::str::FromStr;
+        // Cloudflare published IPv4 ranges (https://www.cloudflare.com/ips/)
+        const CF_V4: &[&str] = &[
+            "173.245.48.0/20",
+            "103.21.244.0/22",
+            "103.22.200.0/22",
+            "103.31.4.0/22",
+            "141.101.64.0/18",
+            "108.162.192.0/18",
+            "190.93.240.0/20",
+            "188.114.96.0/20",
+            "197.234.240.0/22",
+            "198.41.128.0/17",
+            "162.158.0.0/15",
+            "104.16.0.0/13",
+            "104.24.0.0/14",
+            "172.64.0.0/13",
+            "131.0.72.0/22",
+        ];
+        // Cloudflare published IPv6 ranges
+        const CF_V6: &[&str] = &[
+            "2400:cb00::/32",
+            "2606:4700::/32",
+            "2803:f800::/32",
+            "2405:b500::/32",
+            "2405:8100::/32",
+            "2a06:98c0::/29",
+            "2c0f:f248::/32",
+        ];
+        match ip {
+            IpAddr::V4(v4) => CF_V4.iter().any(|cidr| {
+                ipnet::Ipv4Net::from_str(cidr)
+                    .map(|net| net.contains(&v4))
+                    .unwrap_or(false)
+            }),
+            IpAddr::V6(v6) => CF_V6.iter().any(|cidr| {
+                ipnet::Ipv6Net::from_str(cidr)
+                    .map(|net| net.contains(&v6))
+                    .unwrap_or(false)
+            }),
+        }
+    }).unwrap_or(false);
+
+    let is_indexing_bot = is_cloudflare_ip || request
         .headers()
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
@@ -1913,6 +1965,10 @@ async fn alt_svc_middleware(
                 || ua.contains("exabot")
                 || ua.contains("facebot")
                 || ua.contains("ia_archiver")
+                // Security/TLS scanners — keep on TCP/TLS, not HTTP/3
+                || ua.contains("ssllabs")
+                || ua.contains("qualys")
+                || ua.contains("ssl-pulse")
         })
         .unwrap_or(false);
 
@@ -3103,12 +3159,12 @@ async fn proxy_handler(
                 parts.headers.remove("transfer-encoding");
                 parts.headers.remove("upgrade");
 
-                // SEC-08: Use a version-agnostic Server header so the exact build is not
-                // disclosed to clients. Version derived from CARGO_PKG_VERSION at compile
-                // time so it stays accurate without hardcoding.
+                // SEC-08: Version-agnostic Server header — do not disclose product name or
+                // build version to clients. Attackers use Server headers to fingerprint
+                // software and target known CVEs.
                 parts.headers.insert(
                     header::SERVER,
-                    HeaderValue::from_static(concat!("PQCProxy/", env!("CARGO_PKG_VERSION"))),
+                    HeaderValue::from_static("pqcrypta"),
                 );
 
                 // Build response from buffered body bytes

@@ -396,11 +396,9 @@ impl PqcTlsProvider {
             }
         }
 
-        // Add classical fallback if configured
+        // Classical fallback: P-384 only (secp384r1, 192-bit = 100% SSL Labs score).
+        // P-256 and X25519 are excluded — both 128-bit, both score 90% on SSL Labs.
         if config.fallback_to_classical {
-            // Add classical ECDHE groups for compatibility
-            groups.push("X25519".to_string());
-            groups.push("P-256".to_string());
             groups.push("P-384".to_string());
         }
 
@@ -546,8 +544,92 @@ impl PqcTlsProvider {
 pub mod openssl_pqc {
     use super::{PqcHandshakeInfo, PqcTlsProvider};
     use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVersion};
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
     use std::path::Path;
+    use std::sync::Arc;
     use tracing::{debug, info, warn};
+
+    /// Live-reloadable OpenSSL SNI context map.
+    ///
+    /// `Arc<RwLock<...>>` is shared between the SNI servername callback (reader)
+    /// and the ACME cert-update handler (writer).  A reload atomically replaces
+    /// the entire `HashMap`, so in-flight handshakes complete against the old
+    /// contexts while new handshakes immediately use the fresh certificates.
+    pub type PqcSniMap = Arc<RwLock<HashMap<String, Arc<openssl::ssl::SslContext>>>>;
+
+    /// Build a fresh `PqcSniMap` by scanning every `{domain}.crt` / `{domain}.key`
+    /// pair in `certs_dir`.  Call this once at startup, then pass the returned map
+    /// to `create_pqc_acceptor_with_sni` and keep a clone for later hot-reloads.
+    pub fn build_sni_map(
+        certs_dir: &Path,
+        pqc_provider: &PqcTlsProvider,
+        http11_only_hosts: &[String],
+    ) -> PqcSniMap {
+        let map = build_sni_hashmap(certs_dir, pqc_provider, http11_only_hosts);
+        info!("OpenSSL SNI map built: {} domain context(s)", map.len());
+        Arc::new(RwLock::new(map))
+    }
+
+    /// Reload an existing `PqcSniMap` in-place by rescanning `certs_dir`.
+    ///
+    /// Called from the ACME cert-update handler whenever a new certificate is
+    /// issued.  The write lock is held only while swapping the `HashMap`; reads
+    /// from the SNI callback are blocked for at most microseconds.
+    pub fn reload_sni_map(
+        sni_map: &PqcSniMap,
+        certs_dir: &Path,
+        pqc_provider: &PqcTlsProvider,
+        http11_only_hosts: &[String],
+    ) {
+        let new_map = build_sni_hashmap(certs_dir, pqc_provider, http11_only_hosts);
+        let n = new_map.len();
+        *sni_map.write() = new_map;
+        info!("OpenSSL SNI map reloaded: {} domain context(s)", n);
+    }
+
+    /// Scan `certs_dir` and return a populated `HashMap` of domain → `SslContext`.
+    fn build_sni_hashmap(
+        certs_dir: &Path,
+        pqc_provider: &PqcTlsProvider,
+        http11_only_hosts: &[String],
+    ) -> HashMap<String, Arc<openssl::ssl::SslContext>> {
+        let mut map = HashMap::new();
+        if let Ok(entries) = std::fs::read_dir(certs_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("crt") {
+                    continue;
+                }
+                let domain = match path.file_stem().and_then(|s| s.to_str()) {
+                    Some(d) => d.to_string(),
+                    None => continue,
+                };
+                let key_path = path.with_extension("key");
+                if !key_path.exists() {
+                    continue;
+                }
+                let use_http11_only = http11_only_hosts
+                    .iter()
+                    .any(|h| h.eq_ignore_ascii_case(&domain));
+                let build_result = if use_http11_only {
+                    info!("SNI: using HTTP/1.1-only ALPN for '{}'", domain);
+                    build_ssl_context_http11_only(&path, &key_path, pqc_provider)
+                } else {
+                    build_ssl_context(&path, &key_path, pqc_provider)
+                };
+                match build_result {
+                    Ok(ctx) => {
+                        map.insert(domain.clone(), Arc::new(ctx));
+                    }
+                    Err(e) => {
+                        warn!("SNI: skipping '{}' — {}", domain, e);
+                    }
+                }
+            }
+        }
+        map
+    }
 
     /// Create an OpenSSL SSL acceptor with PQC hybrid key exchange
     ///
@@ -580,15 +662,13 @@ pub mod openssl_pqc {
         if pqc_provider.is_available() {
             // Try different PQC group configurations
             // OpenSSL 3.5 supports multiple name formats for ML-KEM hybrid groups
+            // X25519 and P-256 excluded: both 128-bit = 90% SSL Labs key exchange score.
+            // P-384 (secp384r1, 192-bit) is the only classical group.
             let pqc_group_options = [
-                // IETF standard hybrid names
-                "X25519MLKEM768:X25519:P-256:P-384",
-                // Alternative format with hyphen
-                "X25519-MLKEM768:X25519:P-256:P-384",
-                // ML-KEM standalone first
-                "ML-KEM-768:X25519:P-256:P-384",
-                // MLKEM without hyphen
-                "MLKEM768:X25519:P-256:P-384",
+                "X25519MLKEM768:P-384",
+                "X25519-MLKEM768:P-384",
+                "ML-KEM-768:P-384",
+                "MLKEM768:P-384",
             ];
 
             let mut pqc_configured = false;
@@ -607,8 +687,7 @@ pub mod openssl_pqc {
             }
 
             if !pqc_configured {
-                // All PQC options failed, fall back to classical
-                let classical_groups = "X25519:P-256:P-384";
+                let classical_groups = "P-384";
                 warn!(
                     "All PQC group configurations failed, falling back to classical: {}",
                     classical_groups
@@ -616,6 +695,13 @@ pub mod openssl_pqc {
                 builder
                     .set_groups_list(classical_groups)
                     .map_err(|e| format!("Failed to set classical groups: {}", e))?;
+            }
+
+            // Restrict to 256-bit TLS 1.3 cipher suites
+            if let Err(e) = builder
+                .set_ciphersuites("TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256")
+            {
+                warn!("Failed to restrict TLS 1.3 ciphersuites: {}", e);
             }
         }
 
@@ -673,59 +759,22 @@ pub mod openssl_pqc {
     /// a servername callback that switches to the matching SSL context for each SNI.
     /// Falls back to the default cert (`default_cert_path` / `default_key_path`) when
     /// the SNI name is unknown.
+    /// Create an OpenSSL SSL acceptor with SNI-based per-domain certificate selection.
+    ///
+    /// The acceptor's servername callback reads from `sni_map` on every TLS handshake.
+    /// Because `sni_map` is an `Arc<RwLock<...>>`, calling `reload_sni_map()` from the
+    /// ACME handler immediately makes new certificates available to all in-progress and
+    /// future handshakes without restarting the listener.
+    ///
+    /// Build the initial map with `build_sni_map()` and pass it here; keep a clone
+    /// around so `reload_sni_map()` can update it when ACME issues new certs.
     pub fn create_pqc_acceptor_with_sni(
         default_cert_path: &Path,
         default_key_path: &Path,
-        certs_dir: &Path,
         pqc_provider: &PqcTlsProvider,
-        http11_only_hosts: &[String],
+        sni_map: PqcSniMap,
     ) -> Result<openssl::ssl::SslAcceptor, String> {
-        use openssl::ssl::{NameType, SslMethod};
-        use std::collections::HashMap;
-        use std::sync::Arc;
-
-        // Build a context map: domain → SslContext (built with that domain's cert/key).
-        // Domains listed in http11_only_hosts get an HTTP/1.1-only SslContext so the
-        // browser cannot coalesce parallel streams onto a single HTTP/2 connection.
-        let mut ctx_map: HashMap<String, Arc<openssl::ssl::SslContext>> = HashMap::new();
-        if let Ok(entries) = std::fs::read_dir(certs_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("crt") {
-                    continue;
-                }
-                let domain = match path.file_stem().and_then(|s| s.to_str()) {
-                    Some(d) => d.to_string(),
-                    None => continue,
-                };
-                let key_path = path.with_extension("key");
-                if !key_path.exists() {
-                    continue;
-                }
-                let use_http11_only = http11_only_hosts
-                    .iter()
-                    .any(|h| h.eq_ignore_ascii_case(&domain));
-                let build_result = if use_http11_only {
-                    info!("SNI: using HTTP/1.1-only ALPN for '{}'", domain);
-                    build_ssl_context_http11_only(&path, &key_path, pqc_provider)
-                } else {
-                    build_ssl_context(&path, &key_path, pqc_provider)
-                };
-                match build_result {
-                    Ok(ctx) => {
-                        ctx_map.insert(domain.clone(), Arc::new(ctx));
-                    }
-                    Err(e) => {
-                        warn!("SNI: skipping '{}' — {}", domain, e);
-                    }
-                }
-            }
-        }
-        let ctx_map = Arc::new(ctx_map);
-        info!(
-            "SNI OpenSSL acceptor loaded {} domain context(s)",
-            ctx_map.len()
-        );
+        use openssl::ssl::NameType;
 
         // Build the main acceptor with the default cert
         let mut builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls_server())
@@ -770,14 +819,17 @@ pub mod openssl_pqc {
         });
         builder.set_session_cache_mode(openssl::ssl::SslSessionCacheMode::SERVER);
 
-        // SNI callback: switch to the per-domain context if we have one
+        // SNI callback: read the live map on every handshake so certificates issued
+        // by ACME after startup are picked up without restarting the listener.
+        // `sni_map` is an Arc<RwLock<...>>; the read lock is held only long enough
+        // to clone the Arc<SslContext>, keeping contention near zero.
         builder.set_servername_callback(move |ssl, _alert| {
             let sni = match ssl.servername(NameType::HOST_NAME) {
                 Some(s) => s.to_string(),
                 None => return Ok(()),
             };
-            if let Some(ctx) = ctx_map.get(&sni) {
-                ssl.set_ssl_context(ctx)
+            if let Some(ctx) = sni_map.read().get(&sni).cloned() {
+                ssl.set_ssl_context(&ctx)
                     .map_err(|_| openssl::ssl::SniError::ALERT_FATAL)?;
             }
             Ok(())
@@ -884,29 +936,61 @@ pub mod openssl_pqc {
         Ok(builder.build())
     }
 
-    /// Apply PQC group list to an SslContextBuilder.
-    /// Works for `SslAcceptorBuilder` too via `DerefMut` — call as `apply_pqc_groups(&mut *builder, ...)`.
+    /// Apply PQC group list and 256-bit-only TLS 1.3 cipher restriction to an SslContextBuilder.
+    ///
+    /// Named groups: X25519MLKEM768 (PQC hybrid) → P-384 (secp384r1, 192-bit = 100% key exchange).
+    /// P-256 (secp256r1) is intentionally excluded: if it were present SSL Labs' test client
+    /// (which sends a secp256r1 key_share) would negotiate secp256r1 (128-bit = 90%) instead of
+    /// being sent HelloRetryRequest for secp384r1. All TLS 1.3 clients that support secp256r1
+    /// also support secp384r1, so removing secp256r1 only adds one HRR round-trip.
+    /// X25519 is also excluded for the same 128-bit reason.
+    ///
+    /// Cipher suites: TLS_AES_256_GCM_SHA384 + TLS_CHACHA20_POLY1305_SHA256 only.
+    /// TLS_AES_128_GCM_SHA256 is excluded (128-bit → 90% SSL Labs cipher strength score).
+    /// Works for `SslAcceptorBuilder` too via `DerefMut`.
     fn apply_pqc_groups(
         builder: &mut openssl::ssl::SslContextBuilder,
         pqc_provider: &PqcTlsProvider,
     ) {
+        // ── A+ Key Exchange: 192-bit minimum ──────────────────────────────────
+        // X25519MLKEM768 first (PQC hybrid, ~256-bit).
+        // P-384 (secp384r1, 192-bit) only for classical fallback.
+        // P-256 and X25519 are excluded: both are 128-bit and score 90% on SSL Labs.
+        // Clients offering only a secp256r1 or X25519 key_share will receive HRR
+        // requesting secp384r1 — all major TLS 1.3 stacks support it.
         if pqc_provider.is_available() {
             let pqc_options = [
-                "X25519MLKEM768:X25519:P-256:P-384",
-                "X25519-MLKEM768:X25519:P-256:P-384",
-                "ML-KEM-768:X25519:P-256:P-384",
-                "MLKEM768:X25519:P-256:P-384",
+                "X25519MLKEM768:P-384",
+                "X25519-MLKEM768:P-384",
+                "ML-KEM-768:P-384",
+                "MLKEM768:P-384",
             ];
             let mut configured = false;
             for groups in pqc_options {
                 if builder.set_groups_list(groups).is_ok() {
+                    info!("TLS named groups configured: {}", groups);
                     configured = true;
                     break;
                 }
             }
             if !configured {
-                let _ = builder.set_groups_list("X25519:P-256:P-384");
+                let _ = builder.set_groups_list("P-384");
+                info!("TLS named groups configured (classical fallback): P-384");
             }
+        } else {
+            let _ = builder.set_groups_list("P-384");
+            info!("TLS named groups configured (no PQC): P-384");
+        }
+
+        // ── A+ Cipher Strength: 256-bit TLS 1.3 ciphers only ─────────────────
+        // Remove TLS_AES_128_GCM_SHA256 (128-bit → 90% SSL Labs cipher strength).
+        // Retain: TLS_AES_256_GCM_SHA384 (256-bit) + TLS_CHACHA20_POLY1305_SHA256 (256-bit).
+        if let Err(e) = builder
+            .set_ciphersuites("TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256")
+        {
+            warn!("Failed to restrict TLS 1.3 ciphersuites to 256-bit: {}", e);
+        } else {
+            info!("TLS 1.3 cipher suites (256-bit only): TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256");
         }
     }
 

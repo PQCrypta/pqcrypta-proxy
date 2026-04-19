@@ -139,9 +139,16 @@ pub struct AcmeConfig {
     #[serde(default = "default_key_size")]
     pub key_size: u32,
 
-    /// Use ECDSA instead of RSA (P-256 curve)
+    /// Use ECDSA instead of RSA. When true, uses P-384 (secp384r1) by default.
+    /// P-384 is 192-bit security (7680-bit RSA equivalent) and scores 100% on SSL Labs
+    /// key exchange. P-256 is 128-bit and scores only 90%.
     #[serde(default)]
     pub use_ecdsa: bool,
+
+    /// ECDSA curve to use when use_ecdsa = true.
+    /// "P-384" (default, 192-bit, SSL Labs A+) or "P-256" (128-bit, SSL Labs A).
+    #[serde(default = "default_ecdsa_curve")]
+    pub ecdsa_curve: String,
 
     /// Submit issued certificates to Certificate Transparency logs (default true).
     #[serde(default = "default_true")]
@@ -193,6 +200,10 @@ fn default_key_size() -> u32 {
     2048
 }
 
+fn default_ecdsa_curve() -> String {
+    "P-384".to_string()
+}
+
 impl Default for AcmeConfig {
     fn default() -> Self {
         Self {
@@ -212,6 +223,7 @@ impl Default for AcmeConfig {
             eab_hmac_key: None,
             key_size: default_key_size(),
             use_ecdsa: false,
+            ecdsa_curve: default_ecdsa_curve(),
             certificate_transparency: true,
             ct_logs: default_ct_logs(),
         }
@@ -892,9 +904,19 @@ async fn request_san_certificate(
         }
     }
 
-    // Generate ECDSA key (smaller, faster TLS handshakes)
+    // Generate certificate key pair.
+    // P-384 (secp384r1) is the default ECDSA curve: 192-bit security = 7680-bit RSA
+    // equivalent, scoring 100% on SSL Labs key exchange. P-256 (128-bit) scores only 90%.
+    // Key generation: ECDSA (P-384 default) or RSA (via rcgen's generate_rsa_for,
+    // which delegates to aws-lc-rs and supports up to RSA-4096).
     let key_pair = if config.use_ecdsa {
-        KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?
+        match config.ecdsa_curve.to_uppercase().as_str() {
+            "P-256" | "SECP256R1" => KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?,
+            _ => KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384)?,
+        }
+    } else if config.key_size == 4096 {
+        // aws-lc-rs backend supports RSA-4096; ring only supports up to 3072.
+        KeyPair::generate_rsa_for(&rcgen::PKCS_RSA_SHA256, rcgen::RsaKeySize::_4096)?
     } else {
         KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)?
     };

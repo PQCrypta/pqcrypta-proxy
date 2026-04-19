@@ -456,17 +456,41 @@ impl TlsProvider {
         pqc_available: bool,
         resolver: Arc<MultiDomainCertResolver>,
     ) -> anyhow::Result<RustlsServerConfig> {
-        // Get the crypto provider - always use rustls-post-quantum provider
-        // It's based on aws-lc-rs and includes X25519MLKEM768 hybrid key exchange
-        let crypto_provider = if pqc_config.enabled && pqc_available {
+        // Build the base PQC-aware crypto provider
+        let mut pq_provider = rustls_post_quantum::provider();
+
+        // ── A+ Key Exchange ───────────────────────────────────────────────────
+        // NOTE: TLS_AES_128_GCM_SHA256 is intentionally kept in rustls cipher suites.
+        // QUIC (RFC 9001) requires it for initial packet protection; removing it
+        // causes QuicServerConfig creation to fail. The 256-bit cipher restriction
+        // for HTTP/1.1 and HTTP/2 (what SSL Labs tests) is handled by the OpenSSL
+        // stack via apply_pqc_groups() in pqc_tls.rs.
+        // Remove X25519 (128-bit / ~3072-bit RSA equivalent → 90% SSL Labs score).
+        // Clients that offer only an X25519 key_share receive HelloRetryRequest
+        // and fall back to secp384r1 (192-bit → 100%). secp256r1 is kept as a
+        // last-resort fallback since RFC 8446 mandates all TLS 1.3 implementations
+        // support it.  Preferred order: X25519MLKEM768 (PQC) → secp384r1 → secp256r1.
+        pq_provider.kx_groups.retain(|g| g.name() != rustls::NamedGroup::X25519);
+        pq_provider.kx_groups.sort_by_key(|g| match g.name() {
+            rustls::NamedGroup::X25519MLKEM768 => 0u8,
+            rustls::NamedGroup::secp384r1      => 1,
+            rustls::NamedGroup::secp521r1      => 2,
+            rustls::NamedGroup::secp256r1      => 3,
+            _                                  => 4,
+        });
+
+        if pqc_config.enabled && pqc_available {
             info!("Using rustls-post-quantum crypto provider with X25519MLKEM768 (PQC enabled)");
-            Arc::new(rustls_post_quantum::provider())
         } else {
-            // Still use rustls-post-quantum provider but PQC won't be negotiated
-            // if the client doesn't support it
             info!("Using rustls-post-quantum crypto provider (PQC fallback to classical)");
-            Arc::new(rustls_post_quantum::provider())
-        };
+        }
+        info!(
+            "TLS (QUIC/HTTP3) cipher suites: {} — named groups: {:?}",
+            pq_provider.cipher_suites.len(),
+            pq_provider.kx_groups.iter().map(|g| g.name()).collect::<Vec<_>>()
+        );
+
+        let crypto_provider = Arc::new(pq_provider);
 
         // Create base configuration with the appropriate crypto provider
         // SEC-01: Enforce the configured minimum TLS version instead of accepting

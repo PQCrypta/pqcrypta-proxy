@@ -52,24 +52,7 @@ impl Default for EarlyHintsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            preload_rules: vec![
-                // Common static assets
-                PreloadRule {
-                    path_pattern: "/".to_string(),
-                    hints: vec![
-                        LinkHint::Preload {
-                            href: "/css/main.css".to_string(),
-                            as_type: "style".to_string(),
-                            crossorigin: None,
-                        },
-                        LinkHint::Preload {
-                            href: "/js/app.js".to_string(),
-                            as_type: "script".to_string(),
-                            crossorigin: None,
-                        },
-                    ],
-                },
-            ],
+            preload_rules: vec![],
             preconnect_origins: vec![
                 "https://fonts.googleapis.com".to_string(),
                 "https://fonts.gstatic.com".to_string(),
@@ -82,6 +65,8 @@ impl Default for EarlyHintsConfig {
 /// Preload rule for a path pattern
 #[derive(Debug, Clone)]
 pub struct PreloadRule {
+    /// Optional hostname to restrict this rule (exact match, no www). None = all hosts.
+    pub host_pattern: Option<String>,
     /// Path pattern (prefix match)
     pub path_pattern: String,
     /// Link hints to send
@@ -170,24 +155,72 @@ impl Default for EarlyHintsState {
 }
 
 impl EarlyHintsState {
-    /// Get Link headers for a path
-    pub fn get_hints_for_path(&self, path: &str) -> Vec<String> {
-        // Check cache first
-        if let Some(cached) = self.hints_cache.get(path) {
+    /// Create from the [http3] section of proxy-config.toml.
+    /// Converts `preload_resources` entries into `PreloadRule`s grouped by (host, path),
+    /// so the TOML drives exactly what gets sent in 103 Early Hints.
+    pub fn from_http3_config(config: &crate::config::Http3Config) -> Self {
+        use std::collections::HashMap;
+
+        // Group preload resources by (host, path) key
+        let mut by_key: HashMap<(Option<String>, String), Vec<LinkHint>> = HashMap::new();
+        for res in &config.preload_resources {
+            by_key
+                .entry((res.host.clone(), res.path.clone()))
+                .or_default()
+                .push(LinkHint::Preload {
+                    href: res.href.clone(),
+                    as_type: res.as_type.clone(),
+                    crossorigin: res.crossorigin.clone(),
+                });
+        }
+        let preload_rules: Vec<PreloadRule> = by_key
+            .into_iter()
+            .map(|((host_pattern, path_pattern), hints)| PreloadRule {
+                host_pattern,
+                path_pattern,
+                hints,
+            })
+            .collect();
+
+        let hints_config = EarlyHintsConfig {
+            enabled: config.early_hints_enabled,
+            preconnect_origins: config.preconnect_origins.clone(),
+            preload_rules,
+            auto_detect: false,
+        };
+
+        Self {
+            config: Arc::new(RwLock::new(hints_config)),
+            hints_cache: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Get Link headers for a request (host + path).
+    /// Rules with a `host_pattern` only fire for that exact hostname.
+    /// Rules with no `host_pattern` fire for every host.
+    pub fn get_hints_for_request(&self, host: &str, path: &str) -> Vec<String> {
+        // Cache key includes host so per-domain rules don't bleed across domains
+        let cache_key = format!("{}:{}", host, path);
+        if let Some(cached) = self.hints_cache.get(&cache_key) {
             return cached.clone();
         }
 
         let config = self.config.read();
         let mut hints = Vec::new();
 
-        // Add preconnect hints
+        // Add preconnect hints (global — no per-host filtering needed)
         for origin in &config.preconnect_origins {
             hints.push(format!("<{}>; rel=preconnect", origin));
         }
 
-        // Find matching preload rules
+        // Find matching preload rules, respecting host and path filters
         for rule in &config.preload_rules {
-            if path.starts_with(&rule.path_pattern) || rule.path_pattern == "*" {
+            let host_matches = match &rule.host_pattern {
+                Some(h) => h == host,
+                None => true,
+            };
+            let path_matches = path.starts_with(&rule.path_pattern) || rule.path_pattern == "*";
+            if host_matches && path_matches {
                 for hint in &rule.hints {
                     hints.push(hint.to_link_header());
                 }
@@ -196,7 +229,7 @@ impl EarlyHintsState {
 
         // Cache the result
         if !hints.is_empty() {
-            self.hints_cache.insert(path.to_string(), hints.clone());
+            self.hints_cache.insert(cache_key, hints.clone());
         }
 
         hints
@@ -660,11 +693,8 @@ impl Http3FeaturesState {
 
     /// Create from proxy configuration
     pub fn from_proxy_config(config: &crate::config::Http3Config) -> Self {
-        let early_hints = EarlyHintsConfig {
-            enabled: config.early_hints_enabled,
-            preconnect_origins: config.preconnect_origins.clone(),
-            ..Default::default()
-        };
+        let early_hints_state = EarlyHintsState::from_http3_config(config);
+        let early_hints = early_hints_state.config.read().clone();
 
         let priority = PriorityConfig {
             enabled: config.priority_hints_enabled,
@@ -786,14 +816,20 @@ pub async fn early_hints_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response<Body> {
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     let path = request.uri().path().to_string();
     let config = state.config.read().clone();
 
     if config.enabled {
-        let hints = state.get_hints_for_path(&path);
+        let hints = state.get_hints_for_request(&host, &path);
 
         if !hints.is_empty() {
-            trace!("Would send Early Hints for {}: {:?}", path, hints);
+            trace!("Would send Early Hints for {}{}: {:?}", host, path, hints);
             // Note: Actually sending 103 requires low-level HTTP/3 access
             // For now, we add Link headers to the final response as fallback
         }
@@ -803,7 +839,7 @@ pub async fn early_hints_middleware(
 
     // Add Link headers as fallback (for preload)
     if config.enabled {
-        let hints = state.get_hints_for_path(&path);
+        let hints = state.get_hints_for_request(&host, &path);
         for hint in hints {
             if let Ok(value) = HeaderValue::from_str(&hint) {
                 response.headers_mut().append(header::LINK, value);

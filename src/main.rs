@@ -92,6 +92,8 @@ use pqcrypta_proxy::{
 };
 #[cfg(feature = "pqc")]
 use pqcrypta_proxy::{run_http_listener_pqc, run_http_listener_pqc_with_fingerprint};
+#[cfg(feature = "pqc")]
+use pqcrypta_proxy::pqc_tls::openssl_pqc;
 
 /// PQCrypta Proxy - QUIC/HTTP3/WebTransport Proxy with PQC TLS
 #[derive(Parser, Debug)]
@@ -559,6 +561,19 @@ async fn main() -> anyhow::Result<()> {
         .tls
         .set_pqc_status(tls_provider.is_pqc_enabled(), &config.pqc.preferred_kem);
 
+    // Build the shared OpenSSL SNI map used by PQC listeners.
+    // Created here (before the ACME handler) so both the ACME reload task and
+    // the listener loop can hold a clone of the same Arc<RwLock<...>>.
+    #[cfg(feature = "pqc")]
+    let pqc_sni_map = {
+        let certs_dir = config
+            .tls
+            .cert_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("/etc/pqcrypta/certs"));
+        openssl_pqc::build_sni_map(certs_dir, &pqc_provider, &config.server.http11_only_hosts)
+    };
+
     // Initialize ACME certificate automation service if enabled
     let acme_challenges: Option<
         Arc<parking_lot::RwLock<std::collections::HashMap<String, acme::PendingChallenge>>>,
@@ -573,6 +588,19 @@ async fn main() -> anyhow::Result<()> {
             tokio::sync::mpsc::channel::<acme::CertificateUpdate>(16);
         service.set_cert_update_channel(cert_update_tx);
         let acme_tls_provider = tls_provider.clone();
+        #[cfg(feature = "pqc")]
+        let acme_pqc_sni_map = pqc_sni_map.clone();
+        #[cfg(feature = "pqc")]
+        let acme_pqc_provider = pqc_provider.clone();
+        #[cfg(feature = "pqc")]
+        let acme_certs_dir = config
+            .tls
+            .cert_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("/etc/pqcrypta/certs"))
+            .to_path_buf();
+        #[cfg(feature = "pqc")]
+        let acme_http11_only = config.server.http11_only_hosts.clone();
         tokio::spawn(async move {
             while let Some(update) = cert_update_rx.recv().await {
                 info!(
@@ -582,6 +610,15 @@ async fn main() -> anyhow::Result<()> {
                 if let Err(e) = acme_tls_provider.reload_certificates() {
                     error!("Failed to reload TLS certificates after ACME update: {}", e);
                 }
+                // Also hot-reload the OpenSSL SNI map so the TCP listener
+                // serves the new cert immediately without a restart.
+                #[cfg(feature = "pqc")]
+                openssl_pqc::reload_sni_map(
+                    &acme_pqc_sni_map,
+                    &acme_certs_dir,
+                    &acme_pqc_provider,
+                    &acme_http11_only,
+                );
             }
         });
 
@@ -726,6 +763,7 @@ async fn main() -> anyhow::Result<()> {
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
             http_shutdown_senders.push(shutdown_tx);
             let http_pqc_provider = pqc_provider.clone();
+            let http_sni_map = pqc_sni_map.clone();
 
             tokio::spawn(async move {
                 info!(
@@ -741,6 +779,7 @@ async fn main() -> anyhow::Result<()> {
                     shutdown_rx,
                     http_metrics,
                     http_lb,
+                    http_sni_map,
                 )
                 .await
                 {
@@ -790,6 +829,7 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "pqc")]
         if use_pqc_listener {
             let http_pqc_provider = pqc_provider.clone();
+            let http_sni_map = pqc_sni_map.clone();
             tokio::spawn(async move {
                 info!(
                     "🔐 Starting PQC HTTPS reverse proxy on {} (OpenSSL ML-KEM)",
@@ -803,6 +843,7 @@ async fn main() -> anyhow::Result<()> {
                     http_pqc_provider,
                     http_metrics,
                     http_lb,
+                    http_sni_map,
                 )
                 .await
                 {
