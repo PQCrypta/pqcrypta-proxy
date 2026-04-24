@@ -13,6 +13,7 @@ use std::time::Duration;
 use bytes::{Buf, Bytes};
 use h3::ext::Protocol;
 use h3_quinn::Connection as H3Connection;
+use http_body_util::BodyExt as _;
 use quinn::{Endpoint, ServerConfig as QuinnServerConfig, TransportConfig, VarInt};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -794,10 +795,8 @@ impl QuicListener {
         // This is a key HTTP/3 optimization - send resource hints before proxying to backend
         // Only send for GET/HEAD requests - 103 on POST/PUT/DELETE can break cookie handling
         if config.http3.early_hints_enabled && (method == "GET" || method == "HEAD") {
-            let hints = early_hints_state.get_hints_for_request(
-                host.as_deref().unwrap_or(""),
-                &path,
-            );
+            let hints =
+                early_hints_state.get_hints_for_request(host.as_deref().unwrap_or(""), &path);
             if !hints.is_empty() {
                 // Build 103 Early Hints response with Link headers and alt-svc for QUIC advertisement
                 let mut early_response_builder = http::Response::builder()
@@ -1544,9 +1543,11 @@ impl QuicListener {
             }
         }
 
-        // Proxy to backend (include query string in path)
-        let proxy_response = backend_pool
-            .proxy_http_full(
+        // Proxy to backend (include query string in path).
+        // Use the streaming path for all requests: inspect content-type from response
+        // headers to decide whether to pump chunks (SSE) or buffer (everything else).
+        let (stream_status, stream_headers, stream_body) = backend_pool
+            .proxy_http_stream(
                 &backend,
                 request.method().as_str(),
                 &path_with_query,
@@ -1554,6 +1555,81 @@ impl QuicListener {
                 &body,
             )
             .await?;
+
+        let is_sse = stream_headers.iter().any(|(k, v)| {
+            k.to_ascii_lowercase() == "content-type" && v.contains("text/event-stream")
+        });
+
+        // SSE fast path: send headers immediately, then pump body frames as they arrive.
+        if is_sse {
+            let mut sse_builder = http::Response::builder()
+                .status(http::StatusCode::from_u16(stream_status).unwrap_or(http::StatusCode::OK));
+            for (name, value) in &stream_headers {
+                let lower = name.to_ascii_lowercase();
+                // Skip content-length (SSE has no fixed length) and hop-by-hop headers
+                if lower == "content-length" || lower == "transfer-encoding" {
+                    continue;
+                }
+                sse_builder = sse_builder.header(name, value);
+            }
+            sse_builder = sse_builder.header("cache-control", "no-cache");
+            sse_builder = sse_builder.header("server", SERVER_HEADER);
+            sse_builder = sse_builder.header("alt-svc", alt_svc_for_host(&config, host.as_deref()));
+            stream.send_response(sse_builder.body(())?).await?;
+
+            let mut body_stream = stream_body;
+            while let Some(frame_result) = body_stream.frame().await {
+                match frame_result {
+                    Ok(frame) => {
+                        if let Some(data) = frame.data_ref() {
+                            if !data.is_empty() {
+                                stream.send_data(data.clone()).await?;
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            stream.finish().await?;
+
+            metrics.requests.request_end_full(
+                stream_status,
+                start_time.elapsed(),
+                body.len() as u64,
+                0,
+                Some(&path),
+                is_health_check,
+            );
+            log_access(&AccessLogEntry {
+                remote_addr,
+                method,
+                path,
+                protocol: "HTTP/3".to_string(),
+                status: stream_status,
+                body_size: 0,
+                referer,
+                user_agent,
+                host,
+                response_time_ms: start_time
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            });
+            return Ok(());
+        }
+
+        // Non-SSE: buffer the body we already started receiving.
+        let body_bytes = stream_body
+            .collect()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read response body: {}", e))?
+            .to_bytes();
+        let proxy_response = crate::proxy::ProxyResponse {
+            status: stream_status,
+            headers: stream_headers,
+            body: body_bytes.to_vec(),
+        };
 
         // Store response in cache (GET / HEAD only; cache.put() enforces all Cache-Control rules)
         if (method == "GET" || method == "HEAD")

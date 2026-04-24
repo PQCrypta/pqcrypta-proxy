@@ -1896,58 +1896,61 @@ async fn alt_svc_middleware(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip());
 
-    let is_cloudflare_ip = client_ip.map(|ip| {
-        use std::net::IpAddr;
-        use std::str::FromStr;
-        // Cloudflare published IPv4 ranges (https://www.cloudflare.com/ips/)
-        const CF_V4: &[&str] = &[
-            "173.245.48.0/20",
-            "103.21.244.0/22",
-            "103.22.200.0/22",
-            "103.31.4.0/22",
-            "141.101.64.0/18",
-            "108.162.192.0/18",
-            "190.93.240.0/20",
-            "188.114.96.0/20",
-            "197.234.240.0/22",
-            "198.41.128.0/17",
-            "162.158.0.0/15",
-            "104.16.0.0/13",
-            "104.24.0.0/14",
-            "172.64.0.0/13",
-            "131.0.72.0/22",
-        ];
-        // Cloudflare published IPv6 ranges
-        const CF_V6: &[&str] = &[
-            "2400:cb00::/32",
-            "2606:4700::/32",
-            "2803:f800::/32",
-            "2405:b500::/32",
-            "2405:8100::/32",
-            "2a06:98c0::/29",
-            "2c0f:f248::/32",
-        ];
-        match ip {
-            IpAddr::V4(v4) => CF_V4.iter().any(|cidr| {
-                ipnet::Ipv4Net::from_str(cidr)
-                    .map(|net| net.contains(&v4))
-                    .unwrap_or(false)
-            }),
-            IpAddr::V6(v6) => CF_V6.iter().any(|cidr| {
-                ipnet::Ipv6Net::from_str(cidr)
-                    .map(|net| net.contains(&v6))
-                    .unwrap_or(false)
-            }),
-        }
-    }).unwrap_or(false);
+    let is_cloudflare_ip = client_ip
+        .map(|ip| {
+            use std::net::IpAddr;
+            use std::str::FromStr;
+            // Cloudflare published IPv4 ranges (https://www.cloudflare.com/ips/)
+            const CF_V4: &[&str] = &[
+                "173.245.48.0/20",
+                "103.21.244.0/22",
+                "103.22.200.0/22",
+                "103.31.4.0/22",
+                "141.101.64.0/18",
+                "108.162.192.0/18",
+                "190.93.240.0/20",
+                "188.114.96.0/20",
+                "197.234.240.0/22",
+                "198.41.128.0/17",
+                "162.158.0.0/15",
+                "104.16.0.0/13",
+                "104.24.0.0/14",
+                "172.64.0.0/13",
+                "131.0.72.0/22",
+            ];
+            // Cloudflare published IPv6 ranges
+            const CF_V6: &[&str] = &[
+                "2400:cb00::/32",
+                "2606:4700::/32",
+                "2803:f800::/32",
+                "2405:b500::/32",
+                "2405:8100::/32",
+                "2a06:98c0::/29",
+                "2c0f:f248::/32",
+            ];
+            match ip {
+                IpAddr::V4(v4) => CF_V4.iter().any(|cidr| {
+                    ipnet::Ipv4Net::from_str(cidr)
+                        .map(|net| net.contains(&v4))
+                        .unwrap_or(false)
+                }),
+                IpAddr::V6(v6) => CF_V6.iter().any(|cidr| {
+                    ipnet::Ipv6Net::from_str(cidr)
+                        .map(|net| net.contains(&v6))
+                        .unwrap_or(false)
+                }),
+            }
+        })
+        .unwrap_or(false);
 
-    let is_indexing_bot = is_cloudflare_ip || request
-        .headers()
-        .get("user-agent")
-        .and_then(|v| v.to_str().ok())
-        .map(|ua| {
-            let ua = ua.to_lowercase();
-            ua.contains("googlebot")
+    let is_indexing_bot = is_cloudflare_ip
+        || request
+            .headers()
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .map(|ua| {
+                let ua = ua.to_lowercase();
+                ua.contains("googlebot")
                 || ua.contains("adsbot-google")
                 || ua.contains("google-inspectiontool")
                 || ua.contains("googleother")
@@ -1969,8 +1972,8 @@ async fn alt_svc_middleware(
                 || ua.contains("ssllabs")
                 || ua.contains("qualys")
                 || ua.contains("ssl-pulse")
-        })
-        .unwrap_or(false);
+            })
+            .unwrap_or(false);
 
     let mut response = next.run(request).await;
 
@@ -3089,6 +3092,74 @@ async fn proxy_handler(
 
                 let (mut parts, incoming_body) = backend_response.into_parts();
 
+                // SSE / chunked-streaming fast path: skip buffering and pipe the body
+                // directly to the client. Buffering an SSE stream would hold the entire
+                // generation in memory and deliver it all at once when finished.
+                let content_type = parts
+                    .headers
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if content_type.contains("text/event-stream") {
+                    // Release pool slot immediately — the streaming hyper connection keeps
+                    // the underlying TCP socket open for as long as the body is live.
+                    if let (Some(server), Some(ref pn)) = (&pool_server, &pool_name) {
+                        state.load_balancer.record_completion(
+                            pn,
+                            server.as_ref(),
+                            response_time,
+                            true,
+                        );
+                        server.release_connection();
+                    }
+                    if let Some(ref cors) = route.cors {
+                        let req_origin = headers.get("origin").and_then(|v| v.to_str().ok());
+                        add_cors_headers(&mut parts.headers, cors, req_origin);
+                    }
+                    for (key, value) in &route.headers_override {
+                        if let (Ok(name), Ok(val)) = (
+                            header::HeaderName::from_bytes(key.as_bytes()),
+                            HeaderValue::from_str(value),
+                        ) {
+                            parts.headers.insert(name, val);
+                        }
+                    }
+                    parts.headers.remove("connection");
+                    parts.headers.remove("transfer-encoding");
+                    parts.headers.remove("upgrade");
+                    parts
+                        .headers
+                        .insert(header::SERVER, HeaderValue::from_static("pqcrypta"));
+                    // Remove content-length — SSE has no fixed length
+                    parts.headers.remove("content-length");
+                    let resp_status = parts.status.as_u16();
+                    state.metrics.requests.request_end_full(
+                        resp_status,
+                        request_start.elapsed(),
+                        0,
+                        0,
+                        Some(&path),
+                        is_health_check,
+                    );
+                    log_access(&AccessLogEntry {
+                        remote_addr: client_addr,
+                        method: method_str,
+                        path,
+                        protocol: "HTTP/1.1".to_string(),
+                        status: resp_status,
+                        body_size: 0,
+                        referer,
+                        user_agent,
+                        host: Some(host_str),
+                        response_time_ms: request_start
+                            .elapsed()
+                            .as_millis()
+                            .try_into()
+                            .unwrap_or(u64::MAX),
+                    });
+                    return Response::from_parts(parts, Body::new(incoming_body));
+                }
+
                 // Buffer the response body BEFORE releasing the backend connection.
                 // For HTTP/1.1 streaming responses, releasing the connection closes the
                 // socket — any subsequent to_bytes() call in cache/compression middleware
@@ -3162,10 +3233,9 @@ async fn proxy_handler(
                 // SEC-08: Version-agnostic Server header — do not disclose product name or
                 // build version to clients. Attackers use Server headers to fingerprint
                 // software and target known CVEs.
-                parts.headers.insert(
-                    header::SERVER,
-                    HeaderValue::from_static("pqcrypta"),
-                );
+                parts
+                    .headers
+                    .insert(header::SERVER, HeaderValue::from_static("pqcrypta"));
 
                 // Build response from buffered body bytes
                 let response_body = Body::from(body_bytes);
@@ -3633,7 +3703,9 @@ pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 
         }
     });
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr: SocketAddr = format!("[::]:{}", port)
+        .parse()
+        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], port)));
     info!(
         "🔀 Starting HTTP→HTTPS redirect server on {} (ACME challenge support: {})",
         addr, has_acme

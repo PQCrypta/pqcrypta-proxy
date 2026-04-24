@@ -238,6 +238,70 @@ impl BackendPool {
         })
     }
 
+    /// Proxy request to HTTP backend and return response parts + raw streaming body.
+    /// Used for SSE / chunked responses where buffering the full body is undesirable.
+    /// The caller is responsible for draining the body.
+    pub async fn proxy_http_stream(
+        &self,
+        backend: &BackendConfig,
+        method: &str,
+        path: &str,
+        headers: HashMap<String, String>,
+        body: &[u8],
+    ) -> anyhow::Result<(u16, Vec<(String, String)>, hyper::body::Incoming)> {
+        let _permit = self.acquire_permit(&backend.name).await?;
+
+        let mut headers = headers;
+        otel::inject_current_context_into_map(&mut headers);
+
+        let uri = if backend.tls {
+            format!("https://{}{}", backend.address, path)
+        } else {
+            format!("http://{}{}", backend.address, path)
+        };
+
+        let method_parsed = method.parse::<Method>()?;
+        let mut req_builder = Request::builder().method(method_parsed).uri(&uri);
+        for (k, v) in &headers {
+            req_builder = req_builder.header(k, v);
+        }
+        let request = req_builder
+            .body(Full::new(Bytes::copy_from_slice(body)))
+            .map_err(|e| anyhow::anyhow!("Failed to build request: {}", e))?;
+
+        let timeout = Duration::from_millis(backend.timeout_ms);
+        let response = tokio::time::timeout(timeout, self.http_client.request(request))
+            .await
+            .map_err(|_| anyhow::anyhow!("Backend stream request timeout"))?
+            .map_err(|e| anyhow::anyhow!("Backend stream request failed: {}", e))?;
+
+        const HOP_BY_HOP: &[&str] = &[
+            "transfer-encoding",
+            "connection",
+            "keep-alive",
+            "proxy-connection",
+            "upgrade",
+            "te",
+            "trailer",
+            "proxy-authenticate",
+            "proxy-authorization",
+        ];
+        let status = response.status().as_u16();
+        let mut response_headers = Vec::new();
+        for (name, value) in response.headers() {
+            let lower = name.as_str().to_ascii_lowercase();
+            if HOP_BY_HOP.contains(&lower.as_str()) {
+                continue;
+            }
+            if let Ok(v) = value.to_str() {
+                response_headers.push((name.to_string(), v.to_string()));
+            }
+        }
+
+        let (_, body_part) = response.into_parts();
+        Ok((status, response_headers, body_part))
+    }
+
     /// Proxy request to HTTP backend with per-backend retry policy.
     ///
     /// Retry behaviour is controlled by `BackendConfig.retries`, `retry_backoff_ms`, and
