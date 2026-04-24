@@ -377,7 +377,11 @@ impl QuicListener {
 
                     let method = request.method().clone();
                     let uri = request.uri().clone();
-                    let path = uri.path().to_ascii_lowercase();
+                    let path = if config.server.normalize_paths {
+                        uri.path().to_ascii_lowercase()
+                    } else {
+                        uri.path().to_string()
+                    };
                     // In HTTP/3, host comes from :authority pseudo-header (in URI) or fallback to host header
                     let host = uri
                         .authority()
@@ -528,7 +532,11 @@ impl QuicListener {
     {
         let start_time = std::time::Instant::now();
         let uri = request.uri();
-        let path = uri.path().to_ascii_lowercase();
+        let path = if config.server.normalize_paths {
+            uri.path().to_ascii_lowercase()
+        } else {
+            uri.path().to_string()
+        };
         let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
         let path_with_query = format!("{}{}", path, query);
         let method = request.method().to_string();

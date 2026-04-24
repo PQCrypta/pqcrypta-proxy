@@ -470,6 +470,24 @@ pub struct ServerConfig {
 
     #[serde(default)]
     pub webtransport_key_path: Option<std::path::PathBuf>,
+
+    /// Lowercase request paths before route matching and before forwarding to backends.
+    ///
+    /// When `true` (default) all incoming paths are lowercased, mirroring the
+    /// historical behaviour of the proxy and the Apache `RewriteMap tolower`
+    /// pattern used on most hosted sites.
+    ///
+    /// Set to `false` for backends that have case-sensitive URL paths (e.g.
+    /// REST APIs, AI chat endpoints, PHP apps that use mixed-case slugs).
+    ///
+    /// Route matching remains case-insensitive regardless of this setting —
+    /// only the path forwarded to the backend is affected.
+    ///
+    /// ```toml
+    /// normalize_paths = false
+    /// ```
+    #[serde(default = "default_true")]
+    pub normalize_paths: bool,
 }
 
 impl Default for ServerConfig {
@@ -498,6 +516,7 @@ impl Default for ServerConfig {
             http11_only_hosts: Vec::new(),
             webtransport_cert_path: None,
             webtransport_key_path: None,
+            normalize_paths: true,
         }
     }
 }

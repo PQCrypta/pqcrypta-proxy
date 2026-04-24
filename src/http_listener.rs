@@ -2460,7 +2460,11 @@ async fn proxy_handler(
             h.to_string()
         }
     };
-    let path = uri.path().to_ascii_lowercase();
+    let path = if state.config.server.normalize_paths {
+        uri.path().to_ascii_lowercase()
+    } else {
+        uri.path().to_string()
+    };
     let method_str = method.to_string();
     let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
     let user_agent = headers
