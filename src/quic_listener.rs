@@ -419,7 +419,14 @@ impl QuicListener {
                         // Without this check the proxy accepts every CONNECT unconditionally,
                         // leaving the session open until a 5-second idle timeout fires — which
                         // stalls scanners and health checks on non-WebTransport hosts.
-                        if config.find_route(host.as_deref(), &path, true).is_none() {
+                        // Note: find_route(is_webtransport=true) still returns non-WT routes
+                        // (route_matches only prevents WT-only routes matching non-WT requests,
+                        // not the reverse), so we must additionally check route.webtransport.
+                        let has_wt_route = config
+                            .find_route(host.as_deref(), &path, true)
+                            .filter(|r| r.webtransport)
+                            .is_some();
+                        if !has_wt_route {
                             debug!(
                                 "WebTransport CONNECT rejected (no WT route) for {} from {}",
                                 path, remote_addr
