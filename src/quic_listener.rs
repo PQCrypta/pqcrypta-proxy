@@ -415,6 +415,23 @@ impl QuicListener {
                             path, remote_addr, host
                         );
 
+                        // Reject WebTransport sessions for hosts/paths with no matching WT route.
+                        // Without this check the proxy accepts every CONNECT unconditionally,
+                        // leaving the session open until a 5-second idle timeout fires — which
+                        // stalls scanners and health checks on non-WebTransport hosts.
+                        if config.find_route(host.as_deref(), &path, true).is_none() {
+                            debug!(
+                                "WebTransport CONNECT rejected (no WT route) for {} from {}",
+                                path, remote_addr
+                            );
+                            let reject = http::Response::builder()
+                                .status(http::StatusCode::NOT_FOUND)
+                                .body(())?;
+                            let mut stream = stream;
+                            let _ = stream.send_response(reject).await;
+                            continue;
+                        }
+
                         // Send 200 OK to accept the WebTransport session
                         // IMPORTANT: Do NOT finish the stream - WebTransport sessions keep it open
                         let response = http::Response::builder()
