@@ -110,7 +110,8 @@ pub use http3_features::{
     PriorityState, ResourcePriority,
 };
 pub use http_listener::{
-    run_http_listener, run_http_listener_with_fingerprint, run_http_redirect_server,
+    run_http_listener, run_http_listener_with_fingerprint,
+    run_http_listener_with_fingerprint_and_resolver, run_http_redirect_server,
     run_tls_passthrough_server,
 };
 #[cfg(feature = "pqc")]

@@ -1469,7 +1469,18 @@ impl QuicListener {
             ) && !name_lower.starts_with(':')
             {
                 if let Ok(value_str) = value.to_str() {
-                    headers.insert(name.as_str().to_string(), value_str.to_string());
+                    if name_lower == "cookie" {
+                        // HTTP/3 splits Cookie across multiple header fields (RFC 9114 §4.2.1).
+                        // Combine them with "; " so the HTTP/1.1 backend sees one Cookie header.
+                        headers
+                            .entry("cookie".to_string())
+                            .and_modify(|existing| {
+                                *existing = format!("{}; {}", existing, value_str);
+                            })
+                            .or_insert_with(|| value_str.to_string());
+                    } else {
+                        headers.insert(name.as_str().to_string(), value_str.to_string());
+                    }
                 }
             }
         }
@@ -1565,7 +1576,7 @@ impl QuicListener {
             .await?;
 
         let is_sse = stream_headers.iter().any(|(k, v)| {
-            k.to_ascii_lowercase() == "content-type" && v.contains("text/event-stream")
+            k.eq_ignore_ascii_case("content-type") && v.contains("text/event-stream")
         });
 
         // SSE fast path: send headers immediately, then pump body frames as they arrive.

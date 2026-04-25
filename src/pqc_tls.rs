@@ -558,9 +558,7 @@ pub mod openssl_pqc {
     /// contexts while new handshakes immediately use the fresh certificates.
     pub type PqcSniMap = Arc<RwLock<HashMap<String, Arc<openssl::ssl::SslContext>>>>;
 
-    /// Build a fresh `PqcSniMap` by scanning every `{domain}.crt` / `{domain}.key`
-    /// pair in `certs_dir`.  Call this once at startup, then pass the returned map
-    /// to `create_pqc_acceptor_with_sni` and keep a clone for later hot-reloads.
+    /// Build a fresh `PqcSniMap` from all cert/key pairs in `certs_dir`.
     pub fn build_sni_map(
         certs_dir: &Path,
         pqc_provider: &PqcTlsProvider,
@@ -698,8 +696,8 @@ pub mod openssl_pqc {
             }
 
             // Restrict to 256-bit TLS 1.3 cipher suites
-            if let Err(e) = builder
-                .set_ciphersuites("TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256")
+            if let Err(e) =
+                builder.set_ciphersuites("TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256")
             {
                 warn!("Failed to restrict TLS 1.3 ciphersuites: {}", e);
             }
@@ -828,7 +826,8 @@ pub mod openssl_pqc {
                 Some(s) => s.to_string(),
                 None => return Ok(()),
             };
-            if let Some(ctx) = sni_map.read().get(&sni).cloned() {
+            let ctx = sni_map.read().get(&sni).cloned();
+            if let Some(ctx) = ctx {
                 ssl.set_ssl_context(&ctx)
                     .map_err(|_| openssl::ssl::SniError::ALERT_FATAL)?;
             }
@@ -985,8 +984,8 @@ pub mod openssl_pqc {
         // ── A+ Cipher Strength: 256-bit TLS 1.3 ciphers only ─────────────────
         // Remove TLS_AES_128_GCM_SHA256 (128-bit → 90% SSL Labs cipher strength).
         // Retain: TLS_AES_256_GCM_SHA384 (256-bit) + TLS_CHACHA20_POLY1305_SHA256 (256-bit).
-        if let Err(e) = builder
-            .set_ciphersuites("TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256")
+        if let Err(e) =
+            builder.set_ciphersuites("TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256")
         {
             warn!("Failed to restrict TLS 1.3 ciphersuites to 256-bit: {}", e);
         } else {

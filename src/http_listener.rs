@@ -396,7 +396,7 @@ pub async fn run_http_listener(
 /// Create and run the HTTP listener with PQC-enabled OpenSSL TLS
 /// Uses OpenSSL 3.5+ with ML-KEM hybrid key exchange for quantum-resistant connections
 #[cfg(feature = "pqc")]
-#[allow(clippy::similar_names)]
+#[allow(clippy::similar_names, clippy::too_many_arguments)]
 pub async fn run_http_listener_pqc(
     addr: SocketAddr,
     cert_path: &str,
@@ -643,6 +643,35 @@ pub async fn run_http_listener_with_fingerprint(
     metrics: Arc<MetricsRegistry>,
     load_balancer: Arc<LoadBalancer>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_http_listener_with_fingerprint_and_resolver(
+        addr,
+        cert_path,
+        key_path,
+        config,
+        shutdown_rx,
+        metrics,
+        load_balancer,
+        None,
+    )
+    .await
+}
+
+/// Like `run_http_listener_with_fingerprint` but with a shared SNI cert resolver.
+///
+/// When `shared_resolver` is `Some`, the same `MultiDomainCertResolver` instance
+/// used by the ACME subsystem is wired into the TLS config so that newly-issued
+/// certificates are served immediately without restarting the listener.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_http_listener_with_fingerprint_and_resolver(
+    addr: SocketAddr,
+    cert_path: &str,
+    key_path: &str,
+    config: Arc<ProxyConfig>,
+    shutdown_rx: watch::Receiver<()>,
+    metrics: Arc<MetricsRegistry>,
+    load_balancer: Arc<LoadBalancer>,
+    shared_resolver: Option<std::sync::Arc<crate::tls::MultiDomainCertResolver>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut shutdown_rx = shutdown_rx;
     let port = addr.port();
 
@@ -768,15 +797,25 @@ pub async fn run_http_listener_with_fingerprint(
         .layer(middleware::from_fn(trace_context_middleware))
         .with_state(state);
 
-    // Build rustls server config (h2 + http/1.1)
-    let rustls_config = build_rustls_server_config(cert_path, key_path)?;
+    // Build rustls server config (h2 + http/1.1).
+    // Use the shared resolver when provided so ACME-issued certs are hot-reloaded
+    // without restarting the listener; fall back to a private resolver otherwise.
+    let rustls_config = if let Some(ref resolver) = shared_resolver {
+        build_rustls_server_config_with_resolver(std::sync::Arc::clone(resolver))?
+    } else {
+        build_rustls_server_config(cert_path, key_path)?
+    };
     let rustls_config = Arc::new(rustls_config);
 
     // Build HTTP/1.1-only config for SNI-selected hosts that must not use HTTP/2.
     // Browsers that negotiate http/1.1 open independent TCP connections per stream
     // (up to 6 per origin) instead of coalescing all streams on one HTTP/2 pipe.
     let http11_only_config = if !config.server.http11_only_hosts.is_empty() {
-        let cfg = build_rustls_server_config_http11_only(cert_path, key_path)?;
+        let cfg = if let Some(ref resolver) = shared_resolver {
+            build_rustls_server_config_http11_only_with_resolver(std::sync::Arc::clone(resolver))?
+        } else {
+            build_rustls_server_config_http11_only(cert_path, key_path)?
+        };
         Some(Arc::new(cfg))
     } else {
         None
@@ -1575,6 +1614,30 @@ fn build_rustls_server_config_http11_only(
     // HTTP/1.1 only — browser cannot coalesce streams onto a single TCP pipe
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
+    Ok(config)
+}
+
+/// Build a rustls ServerConfig using an already-constructed shared SNI resolver.
+/// The resolver is shared with the ACME subsystem so hot-reloaded certs are
+/// served immediately without restarting the TLS listener.
+fn build_rustls_server_config_with_resolver(
+    resolver: std::sync::Arc<crate::tls::MultiDomainCertResolver>,
+) -> Result<rustls::ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(config)
+}
+
+/// Like `build_rustls_server_config_with_resolver` but advertises only HTTP/1.1.
+fn build_rustls_server_config_http11_only_with_resolver(
+    resolver: std::sync::Arc<crate::tls::MultiDomainCertResolver>,
+) -> Result<rustls::ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(config)
 }
 

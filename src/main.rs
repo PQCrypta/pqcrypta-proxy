@@ -78,6 +78,8 @@ use pqcrypta_proxy::config::{ConfigManager, ConfigReloadEvent, ProxyConfig, TlsM
 use pqcrypta_proxy::load_balancer::LoadBalancer;
 use pqcrypta_proxy::metrics;
 use pqcrypta_proxy::ocsp;
+#[cfg(feature = "pqc")]
+use pqcrypta_proxy::pqc_tls::openssl_pqc;
 use pqcrypta_proxy::pqc_tls::{verify_pqc_support, PqcTlsProvider};
 use pqcrypta_proxy::proxy::BackendPool;
 use pqcrypta_proxy::quic_listener::QuicListener;
@@ -87,13 +89,11 @@ use pqcrypta_proxy::webtransport_server::WebTransportServer;
 use pqcrypta_proxy::ResponseCache;
 use pqcrypta_proxy::SecurityState;
 use pqcrypta_proxy::{
-    run_http_listener, run_http_listener_with_fingerprint, run_http_redirect_server,
+    run_http_listener, run_http_listener_with_fingerprint_and_resolver, run_http_redirect_server,
     run_tls_passthrough_server,
 };
 #[cfg(feature = "pqc")]
 use pqcrypta_proxy::{run_http_listener_pqc, run_http_listener_pqc_with_fingerprint};
-#[cfg(feature = "pqc")]
-use pqcrypta_proxy::pqc_tls::openssl_pqc;
 
 /// PQCrypta Proxy - QUIC/HTTP3/WebTransport Proxy with PQC TLS
 #[derive(Parser, Debug)]
@@ -755,6 +755,7 @@ async fn main() -> anyhow::Result<()> {
         let http_config = config.clone();
         let http_metrics = metrics_registry.clone();
         let http_lb = shared_lb.clone();
+        let http_resolver = std::sync::Arc::clone(&tls_provider.resolver);
 
         // Priority 1: PQC + TLS-layer fingerprinting (OpenSSL with ClientHello capture)
         // Combines post-quantum cryptography with early fingerprint blocking
@@ -804,7 +805,7 @@ async fn main() -> anyhow::Result<()> {
                     "🔍 Starting HTTPS reverse proxy on {} (Rustls with TLS-layer fingerprinting)",
                     bind_addr
                 );
-                if let Err(e) = run_http_listener_with_fingerprint(
+                if let Err(e) = run_http_listener_with_fingerprint_and_resolver(
                     bind_addr,
                     &http_cert,
                     &http_key,
@@ -812,6 +813,7 @@ async fn main() -> anyhow::Result<()> {
                     shutdown_rx,
                     http_metrics,
                     http_lb,
+                    Some(http_resolver),
                 )
                 .await
                 {

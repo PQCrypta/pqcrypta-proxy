@@ -470,13 +470,15 @@ impl TlsProvider {
         // and fall back to secp384r1 (192-bit → 100%). secp256r1 is kept as a
         // last-resort fallback since RFC 8446 mandates all TLS 1.3 implementations
         // support it.  Preferred order: X25519MLKEM768 (PQC) → secp384r1 → secp256r1.
-        pq_provider.kx_groups.retain(|g| g.name() != rustls::NamedGroup::X25519);
+        pq_provider
+            .kx_groups
+            .retain(|g| g.name() != rustls::NamedGroup::X25519);
         pq_provider.kx_groups.sort_by_key(|g| match g.name() {
             rustls::NamedGroup::X25519MLKEM768 => 0u8,
-            rustls::NamedGroup::secp384r1      => 1,
-            rustls::NamedGroup::secp521r1      => 2,
-            rustls::NamedGroup::secp256r1      => 3,
-            _                                  => 4,
+            rustls::NamedGroup::secp384r1 => 1,
+            rustls::NamedGroup::secp521r1 => 2,
+            rustls::NamedGroup::secp256r1 => 3,
+            _ => 4,
         });
 
         if pqc_config.enabled && pqc_available {
@@ -487,7 +489,11 @@ impl TlsProvider {
         info!(
             "TLS (QUIC/HTTP3) cipher suites: {} — named groups: {:?}",
             pq_provider.cipher_suites.len(),
-            pq_provider.kx_groups.iter().map(|g| g.name()).collect::<Vec<_>>()
+            pq_provider
+                .kx_groups
+                .iter()
+                .map(|g| g.name())
+                .collect::<Vec<_>>()
         );
 
         let crypto_provider = Arc::new(pq_provider);
