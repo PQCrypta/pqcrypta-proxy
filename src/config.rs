@@ -950,10 +950,27 @@ pub struct RouteConfig {
     /// secondary backend without affecting the client response.
     #[serde(default)]
     pub shadow: Option<ShadowConfig>,
+
+    /// Enable WebSocket upgrade proxying for this route.
+    /// When true the proxy passes HTTP/1.1 upgrade handshakes and pipes the raw upgraded TCP
+    /// stream bidirectionally, bypassing the normal body-buffering path.
+    /// Implies HTTP/1.1 is permitted for the upgrade request regardless of `allow_http11`.
+    #[serde(default)]
+    pub supports_websocket: bool,
+
+    /// Idle timeout for proxied WebSocket connections, in seconds.
+    /// A connection with no data in either direction for this long is dropped.
+    /// Set to 0 to disable (not recommended for production).
+    #[serde(default = "default_ws_idle_timeout_secs")]
+    pub ws_idle_timeout_secs: u64,
 }
 
 fn default_priority() -> i32 {
     100
+}
+
+fn default_ws_idle_timeout_secs() -> u64 {
+    300
 }
 
 fn default_shadow_percent() -> u8 {
