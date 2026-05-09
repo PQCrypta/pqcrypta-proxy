@@ -1112,12 +1112,20 @@ pub async fn security_middleware(
                 uri.query().unwrap_or("").to_string(),
             )
         };
+        // Skip bot UA check for health-check requests and automated internal clients
+        let skip_bot_ua = request
+            .headers()
+            .get("x-health-check-bypass")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == "1")
+            .unwrap_or(false);
         let waf_req = WafRequest {
             method: request.method().as_str(),
             path: &path,
             query: &query,
             headers: request.headers(),
             body: None, // body scan happens in chunked path
+            skip_bot_ua_check: skip_bot_ua,
         };
         match waf.inspect(&waf_req) {
             WafVerdict::Block { ref rule, .. } => {
@@ -1218,12 +1226,19 @@ pub async fn security_middleware(
             if let Some(ref waf) = security.waf_engine {
                 let waf_path = parts.uri.path().to_string();
                 let waf_query = parts.uri.query().unwrap_or("").to_string();
+                let skip_bot_ua_body = parts
+                    .headers
+                    .get("x-health-check-bypass")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
                 let waf_req_body = WafRequest {
                     method: parts.method.as_str(),
                     path: &waf_path,
                     query: &waf_query,
                     headers: &parts.headers,
                     body: Some(collected_bytes.as_slice()),
+                    skip_bot_ua_check: skip_bot_ua_body,
                 };
                 match waf.inspect(&waf_req_body) {
                     WafVerdict::Block { ref rule, .. } => {

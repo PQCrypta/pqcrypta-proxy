@@ -21,6 +21,7 @@
 //! All regex patterns are compiled once at startup for performance.
 
 use axum::http::HeaderMap;
+use percent_encoding::percent_decode_str;
 use regex::Regex;
 use tracing::debug;
 
@@ -54,6 +55,8 @@ pub struct WafRequest<'a> {
     pub headers: &'a HeaderMap,
     /// Request body bytes (already limited to `max_body_scan_bytes`)
     pub body: Option<&'a [u8]>,
+    /// Skip bot UA pattern check (set true for routes that allow automated clients)
+    pub skip_bot_ua_check: bool,
 }
 
 /// Compiled WAF engine
@@ -275,17 +278,20 @@ impl WafEngine {
         // reduces noise in access logs.
         let bad_bot_ua_patterns = if config.block_scanner_uas {
             compile_patterns(&[
+                // Security scanners — exact tool names
                 r"(?i)\bsqlmap\b",
                 r"(?i)\bnikto\b",
                 r"(?i)\bmasscan\b",
                 r"(?i)\bnmap\b",
                 r"(?i)\bnuclei\b",
                 r"(?i)\bzgrab\b",
+                r"(?i)ZGrab",
                 r"(?i)\bshodan\b",
                 r"(?i)\bburpsuite\b",
                 r"(?i)burp\s+suite",
                 r"(?i)\bdirbuster\b",
                 r"(?i)\bgobuster\b",
+                r"(?i)\bferoxbuster\b",
                 r"(?i)\bffuf\b",
                 r"(?i)\bwfuzz\b",
                 r"(?i)\bhavij\b",
@@ -295,18 +301,27 @@ impl WafEngine {
                 r"(?i)\bNessus\b",
                 r"(?i)\bAcunetix\b",
                 r"(?i)\bAppScan\b",
-                r"(?i)\bsf/msf\b",
-                r"(?i)python-requests/[0-9].*\(automated\)",
-                r"(?i)\bscrapy\b",
-                r"(?i)\bGo-http-client/1\.1$",
-                r"(?i)\bPython-urllib/[0-9]",
-                r"(?i)\blibwww-perl\b",
-                r"(?i)\bcurl/[0-9].*\(automated\)",
                 r"(?i)\bwpscan\b",
                 r"(?i)\bjoomscan\b",
-                r"(?i)ZmEu",
-                r"(?i)ZGrab",
-                r"(?i)masscan-ng",
+                r"(?i)\bZmEu\b",
+                r"(?i)\bmasscan-ng\b",
+                r"(?i)\bhydra\b",
+                r"(?i)\bmedusa\b",
+                r"(?i)\bthc-hydra\b",
+                r"(?i)\bjohn\b.*\bpassword\b",
+                r"(?i)\bhtttrack\b",
+                r"(?i)\bscrapy\b",
+                r"(?i)\blibwww-perl\b",
+                r"(?i)\bperl\b.*\blibwww\b",
+                r"(?i)\bpython-urllib/[0-9]",
+                r"(?i)\bHeadlessChrome\b",
+                r"(?i)\bPhantomJS\b",
+                r"(?i)\bSlimerJS\b",
+                r"(?i)\bCasperJS\b",
+                r"(?i)\bselenium\b",
+                r"(?i)\bwebdriver\b",
+                r"(?i)\bplaywright\b",
+                r"(?i)\bpuppeteer\b",
             ])
         } else {
             Vec::new()
@@ -356,8 +371,9 @@ impl WafEngine {
             }
         }
 
-        // Scan path + query
-        let target = format!(
+        // Scan path + query — raw, percent-decoded, and form-decoded (+ → space).
+        // All three passes are needed to catch attacks encoded for URL transmission.
+        let raw_target = format!(
             "{}{}",
             req.path,
             if req.query.is_empty() {
@@ -366,36 +382,81 @@ impl WafEngine {
                 format!("?{}", req.query)
             }
         );
-
-        if let Some(verdict) = self.scan_str(&target, block_mode) {
-            debug!("WAF hit on path/query: {}", target);
+        // Pass 1: raw (catches unencoded payloads)
+        if let Some(verdict) = self.scan_str(&raw_target, block_mode) {
+            debug!("WAF hit on path/query (raw): {}", raw_target);
             return verdict;
+        }
+        // Pass 2: percent-decoded (catches %3Cscript%3E etc.)
+        let pct_decoded = percent_decode_str(&raw_target)
+            .decode_utf8()
+            .map(|s| s.into_owned())
+            .unwrap_or_default();
+        if !pct_decoded.is_empty() && pct_decoded != raw_target {
+            if let Some(verdict) = self.scan_str(&pct_decoded, block_mode) {
+                debug!("WAF hit on path/query (pct-decoded): {}", pct_decoded);
+                return verdict;
+            }
+        }
+        // Pass 3: form-decoded (replaces + with space in query for %27+OR+1%3D1 patterns)
+        if !req.query.is_empty() {
+            let form_decoded = percent_decode_str(&req.query.replace('+', " "))
+                .decode_utf8()
+                .map(|s| format!("{}?{}", req.path, s))
+                .unwrap_or_default();
+            if !form_decoded.is_empty() && form_decoded != pct_decoded {
+                if let Some(verdict) = self.scan_str(&form_decoded, block_mode) {
+                    debug!("WAF hit on path/query (form-decoded): {}", form_decoded);
+                    return verdict;
+                }
+            }
         }
 
         // Block known malicious scanner/bot user-agents before injection pattern checks.
         // Matching against UA specifically avoids false-positives from injection patterns
         // that might appear in legitimate referer or cookie headers.
-        if !self.bad_bot_ua_patterns.is_empty() {
-            if let Some(ua_value) = req.headers.get("user-agent") {
-                if let Ok(ua_str) = ua_value.to_str() {
-                    for pat in &self.bad_bot_ua_patterns {
-                        if pat.is_match(ua_str) {
-                            let rule = format!(
-                                "bad-bot-ua:{}",
-                                pat.as_str().chars().take(40).collect::<String>()
-                            );
-                            debug!("WAF blocked scanner UA: {}", ua_str);
-                            return if block_mode {
-                                WafVerdict::Block {
-                                    rule,
-                                    severity: Severity::High,
-                                }
-                            } else {
-                                WafVerdict::Detect {
-                                    rule,
-                                    severity: Severity::High,
-                                }
-                            };
+        // Skip this check for routes that explicitly allow automated clients (health checks, APIs).
+        if !req.skip_bot_ua_check && !self.bad_bot_ua_patterns.is_empty() {
+            match req.headers.get("user-agent") {
+                None => {
+                    // No User-Agent header — block in strict posture
+                    if self.config.block_scanner_uas {
+                        debug!("WAF blocked missing User-Agent");
+                        let rule = "bad-bot-ua:missing-user-agent".to_string();
+                        return if block_mode {
+                            WafVerdict::Block {
+                                rule,
+                                severity: Severity::Medium,
+                            }
+                        } else {
+                            WafVerdict::Detect {
+                                rule,
+                                severity: Severity::Medium,
+                            }
+                        };
+                    }
+                }
+                Some(ua_value) => {
+                    if let Ok(ua_str) = ua_value.to_str() {
+                        for pat in &self.bad_bot_ua_patterns {
+                            if pat.is_match(ua_str) {
+                                let rule = format!(
+                                    "bad-bot-ua:{}",
+                                    pat.as_str().chars().take(40).collect::<String>()
+                                );
+                                debug!("WAF blocked scanner UA: {}", ua_str);
+                                return if block_mode {
+                                    WafVerdict::Block {
+                                        rule,
+                                        severity: Severity::High,
+                                    }
+                                } else {
+                                    WafVerdict::Detect {
+                                        rule,
+                                        severity: Severity::High,
+                                    }
+                                };
+                            }
                         }
                     }
                 }
@@ -403,6 +464,7 @@ impl WafEngine {
         }
 
         // Scan selected request headers (User-Agent, Referer, Cookie, X-* headers)
+        // Both raw and URL-decoded values are scanned to catch encoded payloads.
         for (name, value) in req.headers.iter() {
             let name_str = name.as_str();
             if matches!(
@@ -422,6 +484,19 @@ impl WafEngine {
                     if let Some(verdict) = verdict {
                         debug!("WAF hit on header {}: {:?}", name_str, verdict);
                         return verdict;
+                    }
+                    // Also scan URL-decoded form for encoded payloads in referer/cookie
+                    if matches!(name_str, "referer" | "cookie") {
+                        let decoded = percent_decode_str(v)
+                            .decode_utf8()
+                            .map(|s| s.into_owned())
+                            .unwrap_or_default();
+                        if decoded != v {
+                            if let Some(verdict) = self.scan_str(&decoded, block_mode) {
+                                debug!("WAF hit on decoded header {}", name_str);
+                                return verdict;
+                            }
+                        }
                     }
                 }
             }
