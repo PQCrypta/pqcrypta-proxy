@@ -69,6 +69,8 @@ pub struct WafEngine {
     custom_patterns: Vec<Regex>,
     /// Path-only patterns for scanner/reconnaissance probes (.git, .env, AWS paths, etc.)
     scanner_probe_patterns: Vec<Regex>,
+    /// Known malicious scanner/bot user-agent patterns (matched against User-Agent header only)
+    bad_bot_ua_patterns: Vec<Regex>,
     config: WafConfig,
 }
 
@@ -267,6 +269,49 @@ impl WafEngine {
             Vec::new()
         };
 
+        // Known malicious scanner/bot user-agents — matched against the User-Agent header only.
+        // These strings appear exclusively in automated security tools and are never sent by
+        // legitimate browsers. Blocking them eliminates unsophisticated automated attacks and
+        // reduces noise in access logs.
+        let bad_bot_ua_patterns = if config.block_scanner_uas {
+            compile_patterns(&[
+                r"(?i)\bsqlmap\b",
+                r"(?i)\bnikto\b",
+                r"(?i)\bmasscan\b",
+                r"(?i)\bnmap\b",
+                r"(?i)\bnuclei\b",
+                r"(?i)\bzgrab\b",
+                r"(?i)\bshodan\b",
+                r"(?i)\bburpsuite\b",
+                r"(?i)burp\s+suite",
+                r"(?i)\bdirbuster\b",
+                r"(?i)\bgobuster\b",
+                r"(?i)\bffuf\b",
+                r"(?i)\bwfuzz\b",
+                r"(?i)\bhavij\b",
+                r"(?i)\bmetasploit\b",
+                r"(?i)\bw3af\b",
+                r"(?i)\bOpenVAS\b",
+                r"(?i)\bNessus\b",
+                r"(?i)\bAcunetix\b",
+                r"(?i)\bAppScan\b",
+                r"(?i)\bsf/msf\b",
+                r"(?i)python-requests/[0-9].*\(automated\)",
+                r"(?i)\bscrapy\b",
+                r"(?i)\bGo-http-client/1\.1$",
+                r"(?i)\bPython-urllib/[0-9]",
+                r"(?i)\blibwww-perl\b",
+                r"(?i)\bcurl/[0-9].*\(automated\)",
+                r"(?i)\bwpscan\b",
+                r"(?i)\bjoomscan\b",
+                r"(?i)ZmEu",
+                r"(?i)ZGrab",
+                r"(?i)masscan-ng",
+            ])
+        } else {
+            Vec::new()
+        };
+
         Self {
             sqli_patterns,
             xss_patterns,
@@ -278,6 +323,7 @@ impl WafEngine {
             deserialization_patterns,
             custom_patterns,
             scanner_probe_patterns,
+            bad_bot_ua_patterns,
             config: config.clone(),
         }
     }
@@ -324,6 +370,36 @@ impl WafEngine {
         if let Some(verdict) = self.scan_str(&target, block_mode) {
             debug!("WAF hit on path/query: {}", target);
             return verdict;
+        }
+
+        // Block known malicious scanner/bot user-agents before injection pattern checks.
+        // Matching against UA specifically avoids false-positives from injection patterns
+        // that might appear in legitimate referer or cookie headers.
+        if !self.bad_bot_ua_patterns.is_empty() {
+            if let Some(ua_value) = req.headers.get("user-agent") {
+                if let Ok(ua_str) = ua_value.to_str() {
+                    for pat in &self.bad_bot_ua_patterns {
+                        if pat.is_match(ua_str) {
+                            let rule = format!(
+                                "bad-bot-ua:{}",
+                                pat.as_str().chars().take(40).collect::<String>()
+                            );
+                            debug!("WAF blocked scanner UA: {}", ua_str);
+                            return if block_mode {
+                                WafVerdict::Block {
+                                    rule,
+                                    severity: Severity::High,
+                                }
+                            } else {
+                                WafVerdict::Detect {
+                                    rule,
+                                    severity: Severity::High,
+                                }
+                            };
+                        }
+                    }
+                }
+            }
         }
 
         // Scan selected request headers (User-Agent, Referer, Cookie, X-* headers)

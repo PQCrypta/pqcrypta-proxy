@@ -206,6 +206,9 @@ pub struct WafConfig {
     pub custom_patterns: Vec<String>,
     /// Block known scanner/reconnaissance probe paths (default true)
     pub scanner_probe: bool,
+    /// Block known malicious scanner/bot user-agents (sqlmap, nikto, masscan, etc.)
+    #[serde(default = "default_true")]
+    pub block_scanner_uas: bool,
 }
 
 impl Default for WafConfig {
@@ -222,6 +225,7 @@ impl Default for WafConfig {
             max_body_scan_bytes: 65_536,
             custom_patterns: Vec::new(),
             scanner_probe: true,
+            block_scanner_uas: true,
         }
     }
 }
@@ -963,6 +967,18 @@ pub struct RouteConfig {
     /// Set to 0 to disable (not recommended for production).
     #[serde(default = "default_ws_idle_timeout_secs")]
     pub ws_idle_timeout_secs: u64,
+
+    /// JSON fields to strip from backend response bodies (application/json only).
+    /// Use to remove internal stack traces (e.g. Frappe `exc` field) before
+    /// forwarding responses to clients.
+    #[serde(default)]
+    pub strip_response_json_fields: Vec<String>,
+
+    /// Enforce HttpOnly and Secure attributes on all Set-Cookie headers from
+    /// the backend. Use for backends (e.g. Frappe/ERPNext) that intentionally
+    /// omit HttpOnly on non-session cookies but where the proxy should add it.
+    #[serde(default)]
+    pub enforce_cookie_security: bool,
 }
 
 fn default_priority() -> i32 {

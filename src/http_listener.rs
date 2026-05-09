@@ -217,6 +217,8 @@ pub struct HttpListenerState {
     pub metrics: Arc<MetricsRegistry>,
     /// Nonce store for per-route HMAC replay protection (shared across all routes).
     pub hmac_nonce_store: Arc<crate::tls_acceptor::HmacNonceStore>,
+    /// Rate limiter for per-route secondary rate limit checks.
+    pub rate_limiter: Arc<AdvancedRateLimiter>,
 }
 
 /// Create and run the HTTP listener with TLS termination
@@ -270,7 +272,7 @@ pub async fn run_http_listener(
         config.advanced_rate_limiting.clone(),
     ));
     let state_metrics = metrics.clone();
-    let rl_state = (rate_limiter, metrics);
+    let rl_state = (rate_limiter.clone(), metrics);
     info!(
         "🚦 Advanced rate limiter enabled (key strategy: {:?})",
         config.advanced_rate_limiting.key_strategy.order.first()
@@ -286,6 +288,7 @@ pub async fn run_http_listener(
         load_balancer,
         metrics: state_metrics,
         hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(300)),
+        rate_limiter,
     };
 
     // Initialize compression state
@@ -450,7 +453,7 @@ pub async fn run_http_listener_pqc(
         config.advanced_rate_limiting.clone(),
     ));
     let state_metrics = metrics.clone();
-    let rl_state = (rate_limiter, metrics);
+    let rl_state = (rate_limiter.clone(), metrics);
     info!(
         "🚦 Advanced rate limiter enabled (key strategy: {:?})",
         config.advanced_rate_limiting.key_strategy.order.first()
@@ -466,6 +469,7 @@ pub async fn run_http_listener_pqc(
         load_balancer,
         metrics: state_metrics,
         hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(300)),
+        rate_limiter,
     };
 
     // Initialize compression state
@@ -717,7 +721,7 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
     ));
     let conn_metrics = metrics.clone();
     let state_metrics = metrics.clone();
-    let rl_state = (rate_limiter, metrics);
+    let rl_state = (rate_limiter.clone(), metrics);
     info!(
         "🚦 Advanced rate limiter enabled (key strategy: {:?})",
         config.advanced_rate_limiting.key_strategy.order.first()
@@ -733,6 +737,7 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
         load_balancer,
         metrics: state_metrics,
         hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(300)),
+        rate_limiter: rate_limiter.clone(),
     };
 
     // Initialize compression state
@@ -1128,7 +1133,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     ));
     let conn_metrics = metrics.clone();
     let state_metrics = metrics.clone();
-    let rl_state = (rate_limiter, metrics);
+    let rl_state = (rate_limiter.clone(), metrics);
     info!(
         "🚦 Advanced rate limiter enabled (key strategy: {:?})",
         config.advanced_rate_limiting.key_strategy.order.first()
@@ -1144,6 +1149,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
         load_balancer,
         metrics: state_metrics,
         hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(300)),
+        rate_limiter,
     };
 
     // Initialize middleware states
@@ -2108,15 +2114,23 @@ async fn security_headers_middleware(
         headers.insert("permissions-policy", v);
     }
 
-    // Cross-Origin headers
-    if let Ok(v) = HeaderValue::from_str(&config.cross_origin_opener_policy) {
-        headers.insert("cross-origin-opener-policy", v);
+    // Cross-Origin headers — conditional so route-level headers_override takes precedence.
+    // A route that sets COOP/COEP/CORP in headers_override will have already populated
+    // these in the response; skip the global default to avoid overwriting per-route values.
+    if !headers.contains_key("cross-origin-opener-policy") {
+        if let Ok(v) = HeaderValue::from_str(&config.cross_origin_opener_policy) {
+            headers.insert("cross-origin-opener-policy", v);
+        }
     }
-    if let Ok(v) = HeaderValue::from_str(&config.cross_origin_embedder_policy) {
-        headers.insert("cross-origin-embedder-policy", v);
+    if !headers.contains_key("cross-origin-embedder-policy") {
+        if let Ok(v) = HeaderValue::from_str(&config.cross_origin_embedder_policy) {
+            headers.insert("cross-origin-embedder-policy", v);
+        }
     }
-    if let Ok(v) = HeaderValue::from_str(&config.cross_origin_resource_policy) {
-        headers.insert("cross-origin-resource-policy", v);
+    if !headers.contains_key("cross-origin-resource-policy") {
+        if let Ok(v) = HeaderValue::from_str(&config.cross_origin_resource_policy) {
+            headers.insert("cross-origin-resource-policy", v);
+        }
     }
 
     // Additional security headers
@@ -2698,6 +2712,50 @@ async fn proxy_handler(
     let route = state.config.find_route(Some(&host), &path, false);
 
     if let Some(route) = route {
+        // Per-route secondary rate limit check.
+        // The outer middleware checks rate limits before route resolution (route_name = None).
+        // Routes listed in advanced_rate_limiting.route_limits get an additional targeted check
+        // here, after route matching, using the route name as the limiter key.
+        if let Some(ref route_name) = route.name {
+            if state
+                .config
+                .advanced_rate_limiting
+                .route_limits
+                .contains_key(route_name.as_str())
+            {
+                let route_ctx = build_context_from_request(
+                    client_addr.ip(),
+                    &headers,
+                    &path,
+                    method.as_str(),
+                    None,
+                    None,
+                    Some(route_name.clone()),
+                );
+                if let RateLimitResult::Limited {
+                    retry_after_ms,
+                    limit,
+                    ..
+                } = state.rate_limiter.check(&route_ctx).await
+                {
+                    let mut resp = (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "Rate limit exceeded for this endpoint",
+                    )
+                        .into_response();
+                    let h = resp.headers_mut();
+                    if let Ok(v) = HeaderValue::from_str(&(retry_after_ms / 1000).to_string()) {
+                        h.insert("retry-after", v);
+                    }
+                    if let Ok(v) = HeaderValue::from_str(&limit.to_string()) {
+                        h.insert("x-ratelimit-limit", v);
+                    }
+                    h.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
+                    return resp;
+                }
+            }
+        }
+
         // Handle redirect routes
         if let Some(ref redirect_to) = route.redirect {
             let new_path = if let Some(ref prefix) = route.path_prefix {
@@ -3271,9 +3329,38 @@ async fn proxy_handler(
                 // For HTTP/1.1 streaming responses, releasing the connection closes the
                 // socket — any subsequent to_bytes() call in cache/compression middleware
                 // then fails and returns Body::empty() (0-byte response to client).
-                let body_bytes = axum::body::to_bytes(Body::new(incoming_body), 100 * 1024 * 1024)
-                    .await
-                    .unwrap_or_default();
+                let mut body_bytes =
+                    axum::body::to_bytes(Body::new(incoming_body), 100 * 1024 * 1024)
+                        .await
+                        .unwrap_or_default();
+
+                // Strip specified JSON fields from the response body (e.g. Frappe `exc` traces).
+                // Only applied when Content-Type is application/json and the field list is non-empty.
+                if !route.strip_response_json_fields.is_empty() {
+                    let is_json = parts
+                        .headers
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|ct| ct.contains("application/json"))
+                        .unwrap_or(false);
+                    if is_json {
+                        if let Ok(mut json) =
+                            serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                        {
+                            if let Some(obj) = json.as_object_mut() {
+                                for field in &route.strip_response_json_fields {
+                                    obj.remove(field.as_str());
+                                }
+                            }
+                            if let Ok(stripped) = serde_json::to_vec(&json) {
+                                if let Ok(v) = HeaderValue::from_str(&stripped.len().to_string()) {
+                                    parts.headers.insert(header::CONTENT_LENGTH, v);
+                                }
+                                body_bytes = stripped.into();
+                            }
+                        }
+                    }
+                }
 
                 // Record success for load balancer pool — safe to release now that body is buffered
                 if let (Some(server), Some(ref pn)) = (&pool_server, &pool_name) {
@@ -3318,6 +3405,37 @@ async fn proxy_handler(
                         HeaderValue::from_str(value),
                     ) {
                         parts.headers.insert(name, val);
+                    }
+                }
+
+                // Enforce HttpOnly + Secure on all Set-Cookie headers from the backend.
+                // Used for backends (e.g. Frappe/ERPNext) that intentionally omit HttpOnly
+                // on informational cookies (user_id, full_name) but where the proxy should add it.
+                if route.enforce_cookie_security {
+                    let existing: Vec<String> = parts
+                        .headers
+                        .get_all(header::SET_COOKIE)
+                        .iter()
+                        .filter_map(|v| v.to_str().ok())
+                        .map(|cookie| {
+                            let mut c = cookie.to_string();
+                            let lower = c.to_lowercase();
+                            if !lower.contains("httponly") {
+                                c.push_str("; HttpOnly");
+                            }
+                            if !lower.contains("secure") {
+                                c.push_str("; Secure");
+                            }
+                            c
+                        })
+                        .collect();
+                    if !existing.is_empty() {
+                        parts.headers.remove(header::SET_COOKIE);
+                        for cookie in existing {
+                            if let Ok(val) = HeaderValue::from_str(&cookie) {
+                                parts.headers.append(header::SET_COOKIE, val);
+                            }
+                        }
                     }
                 }
 
