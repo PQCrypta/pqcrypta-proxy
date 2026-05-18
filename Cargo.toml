@@ -154,7 +154,7 @@ x509-parser = "0.16"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # ACME client (RFC 8555) - works with any ACME CA
-instant-acme = { version = "0.7", optional = true }
+instant-acme = { version = "0.8", optional = true }
 
 # CLI argument parsing
 clap = { version = "4.5", features = ["derive", "env"] }
