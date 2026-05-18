@@ -12,6 +12,7 @@ BLOCKLIST_DIR="/var/lib/pqcrypta-proxy/blocklists"
 PROXY_USER="pqcrypta"
 DB_NAME="pqcrypta"
 DB_USER="pqcrypta_user"
+DB_HOST="localhost"
 LOG_FILE="/var/log/pqcrypta-proxy/blocklist_sync.log"
 
 # Ensure log directory exists
@@ -53,7 +54,7 @@ sync_table() {
     # bot_blocklist, fingerprint_blocklist, country_blocklist, and EXECUTE on
     # cleanup_expired_blocklist_entries() instead of using the superuser.
     local DB_OUTPUT
-    if ! DB_OUTPUT=$(psql -U "${DB_USER}" -d "${DB_NAME}" -t -A -c "${QUERY}" 2>&1); then
+    if ! DB_OUTPUT=$(psql -h "${DB_HOST}" -U "${DB_USER}" -d "${DB_NAME}" -t -A -c "${QUERY}" 2>&1); then
         log "WARNING: DB query failed for ${LABEL} (psql exited non-zero) - preserving existing blocklist"
         return 0
     fi
@@ -143,7 +144,7 @@ log "Sync complete: ${IP_COUNT} IPs, ${FP_COUNT} fingerprints, ${COUNTRY_COUNT} 
 MINUTE=$(date '+%M')
 if [ "${MINUTE}" = "00" ]; then
     log "Running hourly cleanup..."
-    psql -U "${DB_USER}" -d "${DB_NAME}" -c "SELECT cleanup_expired_blocklist_entries()" >> "${LOG_FILE}" 2>&1 || \
+    psql -h "${DB_HOST}" -U "${DB_USER}" -d "${DB_NAME}" -c "SELECT cleanup_expired_blocklist_entries()" >> "${LOG_FILE}" 2>&1 || \
         log "WARNING: hourly cleanup query failed"
 fi
 

@@ -1001,6 +1001,15 @@ pub async fn security_middleware(
         return next.run(request).await;
     }
 
+    // Error pages are public content — exempt from all blocks so geo-redirected users can
+    // reach /error_pages/ even after their IP has been added to the temporary blocklist.
+    {
+        let path = request.uri().path();
+        if path.starts_with("/error_pages/") {
+            return next.run(request).await;
+        }
+    }
+
     // Read config values without cloning the entire struct - just read what we need
     let (
         dos_protection,
@@ -1133,6 +1142,18 @@ pub async fn security_middleware(
                 if dos_protection {
                     security.decrement_connections(ip);
                 }
+                // Escalate repeated WAF blocks to IP ban using the same suspicious_patterns
+                // counter as the rate-limit path.  WAF blocks return before record_request()
+                // is called, so without this they never accumulate toward auto-block.
+                {
+                    let mut counter = security.request_counts.entry(ip).or_default();
+                    counter.suspicious_patterns += 1;
+                    if counter.suspicious_patterns >= auto_block_threshold {
+                        drop(counter);
+                        let block_duration = Duration::from_secs(auto_block_duration_secs);
+                        security.block_ip(ip, BlockReason::TooManyErrors, Some(block_duration));
+                    }
+                }
                 let mut resp =
                     (StatusCode::FORBIDDEN, "Request blocked by security policy").into_response();
                 resp.headers_mut()
@@ -1246,6 +1267,16 @@ pub async fn security_middleware(
                         if dos_protection {
                             security.decrement_connections(ip);
                         }
+                        // Same escalation as the header/path WAF block path above.
+                        {
+                            let mut counter = security.request_counts.entry(ip).or_default();
+                            counter.suspicious_patterns += 1;
+                            if counter.suspicious_patterns >= auto_block_threshold {
+                                drop(counter);
+                                let block_duration = Duration::from_secs(auto_block_duration_secs);
+                                security.block_ip(ip, BlockReason::TooManyErrors, Some(block_duration));
+                            }
+                        }
                         let mut resp =
                             (StatusCode::FORBIDDEN, "Request blocked by security policy")
                                 .into_response();
@@ -1341,11 +1372,13 @@ fn blocked_response(info: &BlockedIpInfo, alt_svc: &str) -> Response {
     response
 }
 
-/// Generate GeoIP blocked response
+/// Generate GeoIP blocked response — redirects to the styled 403 error page.
+/// The error page path is exempt from security checks so the redirect always resolves.
 fn geo_blocked_response(alt_svc: &str) -> Response {
     let mut response = (
-        StatusCode::FORBIDDEN,
-        "Access denied - Your region is not allowed",
+        StatusCode::FOUND,
+        [("Location", "https://pqcrypta.com/error_pages/pqcrypt_403.html")],
+        "",
     )
         .into_response();
     add_alt_svc(&mut response, alt_svc);
