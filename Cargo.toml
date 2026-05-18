@@ -108,7 +108,7 @@ prometheus = { version = "0.14", optional = true }
 # Utilities
 anyhow = "1.0"
 thiserror = "2.0"
-uuid = { version = "1.11", features = ["v4", "serde"] }
+uuid = { version = "1.23", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 hex = "0.4"
