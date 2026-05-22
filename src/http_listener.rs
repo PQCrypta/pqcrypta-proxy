@@ -3854,6 +3854,7 @@ fn is_mobile_user_agent(ua: &str) -> bool {
 ///   4. Verify the backend returns 101 Switching Protocols
 ///   5. Return 101 to the client; spawn a copy-loop that awaits both upgrade
 ///      futures and pipes bytes until one side closes or idle-timeout fires
+#[allow(clippy::too_many_arguments)]
 async fn handle_websocket_tunnel(
     backend_address: &str,
     use_https: bool,
@@ -3937,6 +3938,7 @@ async fn handle_websocket_tunnel(
 
 /// Inner WebSocket tunnel — generic over the concrete stream type to avoid boxing.
 /// Performs the HTTP/1.1 upgrade handshake with the backend and sets up the copy loop.
+#[allow(clippy::too_many_arguments)]
 async fn ws_run_tunnel<S>(
     stream: S,
     req_headers: &HeaderMap,

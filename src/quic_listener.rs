@@ -2195,14 +2195,9 @@ async fn ws_h3_tunnel(
 
     // H3 → backend: dedicated task reads DATA frames and writes raw WS bytes to backend
     tokio::spawn(async move {
-        loop {
-            match recv_half.recv_data().await {
-                Ok(Some(buf)) => {
-                    if backend_write.write_all(buf.chunk()).await.is_err() {
-                        break;
-                    }
-                }
-                _ => break,
+        while let Ok(Some(buf)) = recv_half.recv_data().await {
+            if backend_write.write_all(buf.chunk()).await.is_err() {
+                break;
             }
         }
     });
