@@ -93,6 +93,15 @@ impl WafEngine {
                 r"(?i)(xp_cmdshell|sp_execute|sp_executesql)",
                 r"(?i)\bload_file\s*\(",
                 r"(?i)\binto\s+(outfile|dumpfile)\s+",
+                // SQL comment evasion: OR/AND separated by /**/ or /*!...*/ or + (MySQL)
+                r"(?i)'\s*(/\*.*?\*/|/\*!.*?\*/|\+)\s*(or|and)\s*(/\*.*?\*/|\+)?\s*['\d]",
+                // MySQL conditional comments executing SQL keywords: /*!OR*/ /*!UNION*/ etc.
+                r"(?i)/\*!\s*(or|and|union|select|insert|delete|drop|update|exec|execute)\s*\*/",
+                // Encoded whitespace (newline/tab) as SQL token separator: 1'%0aOR%0a1=1
+                r"(?i)'(%0[ad]|%09|\s)+(or|and)(%0[ad]|%09|\s)+['\d]",
+                // Trailing SQL comment injection: auth bypass via 'admin'-- or username'--
+                r"(?i)'\s*(-{2}|#)\s*$",
+                r"(?i)'\s*(-{2}|#)\s+",
             ])
         } else {
             Vec::new()
@@ -314,6 +323,10 @@ impl WafEngine {
                 r"(?i)\blibwww-perl\b",
                 r"(?i)\bperl\b.*\blibwww\b",
                 r"(?i)\bpython-urllib/[0-9]",
+                r"(?i)\bpython-requests/[0-9]",
+                r"(?i)\bGo-http-client/[0-9]",
+                r"(?i)^curl/[0-9]",
+                r"(?i)^Wget/[0-9]",
                 r"(?i)\bHeadlessChrome\b",
                 r"(?i)\bPhantomJS\b",
                 r"(?i)\bSlimerJS\b",
@@ -438,6 +451,25 @@ impl WafEngine {
                 }
                 Some(ua_value) => {
                     if let Ok(ua_str) = ua_value.to_str() {
+                        // Also block empty User-Agent (header present but blank) —
+                        // curl -H 'User-Agent:' sends Some("") not None.
+                        if ua_str.trim().is_empty() {
+                            if self.config.block_scanner_uas {
+                                debug!("WAF blocked empty User-Agent");
+                                let rule = "bad-bot-ua:empty-user-agent".to_string();
+                                return if block_mode {
+                                    WafVerdict::Block {
+                                        rule,
+                                        severity: Severity::Medium,
+                                    }
+                                } else {
+                                    WafVerdict::Detect {
+                                        rule,
+                                        severity: Severity::Medium,
+                                    }
+                                };
+                            }
+                        }
                         for pat in &self.bad_bot_ua_patterns {
                             if pat.is_match(ua_str) {
                                 let rule = format!(

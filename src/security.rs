@@ -988,7 +988,7 @@ pub async fn security_middleware(
     State(security): State<SecurityState>,
     ConnectInfo(client_addr): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
     let ip = client_addr.ip();
@@ -1009,6 +1009,14 @@ pub async fn security_middleware(
             return next.run(request).await;
         }
     }
+
+    // Authorized pentest bypass: skip rate-limiting and auto-block but still run WAF.
+    // Pentest IPs get proper 403 for blocked attacks without being banned mid-run.
+    let is_pentest_bypass = {
+        let config = security.config.read();
+        let ip_str = ip.to_string();
+        config.pentest_bypass_ips.iter().any(|p| p == &ip_str)
+    };
 
     // Read config values without cloning the entire struct - just read what we need
     let (
@@ -1039,77 +1047,86 @@ pub async fn security_middleware(
     // Extract path once here so it's available to both WAF and size checks.
     let request_path = request.uri().path().to_ascii_lowercase();
 
-    // 1. Check if IP is blocked
-    if let Some(block_info) = security.is_blocked(&ip) {
-        warn!(
-            "Blocked request from {} (reason: {:?})",
-            ip, block_info.reason
-        );
-        return blocked_response(&block_info, alt_svc);
-    }
-
-    // 2. GeoIP country blocking
-    if security.is_country_blocked(&ip) {
-        warn!("GeoIP blocked request from {}", ip);
-        // P2-fix: use a configurable duration instead of None (permanent).
-        // Permanent GeoIP blocks have no recourse when a database mis-classifies an IP
-        // or the IP moves between countries.  Default: 24 h (see SecurityConfig).
-        let geoip_duration = security
-            .config
-            .read()
-            .geoip_block_duration_secs
-            .map(Duration::from_secs);
-        security.block_ip(ip, BlockReason::GeoBlocked, geoip_duration);
-        return geo_blocked_response(alt_svc);
-    }
-
-    // 3. Check DoS protection - connection limits
-    if dos_protection {
-        let connections = security.increment_connections(ip);
-
-        if connections > max_connections_per_ip {
-            security.decrement_connections(ip);
-            security.block_ip(
-                ip,
-                BlockReason::ConnectionLimitExceeded,
-                Some(Duration::from_secs(60)),
+    if !is_pentest_bypass {
+        // 1. Check if IP is blocked
+        if let Some(block_info) = security.is_blocked(&ip) {
+            warn!(
+                "Blocked request from {} (reason: {:?})",
+                ip, block_info.reason
             );
-            warn!("Connection limit exceeded for {}: {}", ip, connections);
-            return too_many_connections_response(alt_svc);
+            return blocked_response(&block_info, alt_svc);
         }
-    }
 
-    // 4. Rate limiting
-    if rate_enabled {
-        let rate_limiter = security.get_ip_rate_limiter(ip);
+        // 2. GeoIP country blocking
+        if security.is_country_blocked(&ip) {
+            warn!("GeoIP blocked request from {}", ip);
+            // P2-fix: use a configurable duration instead of None (permanent).
+            // Permanent GeoIP blocks have no recourse when a database mis-classifies an IP
+            // or the IP moves between countries.  Default: 24 h (see SecurityConfig).
+            let geoip_duration = security
+                .config
+                .read()
+                .geoip_block_duration_secs
+                .map(Duration::from_secs);
+            security.block_ip(ip, BlockReason::GeoBlocked, geoip_duration);
+            return geo_blocked_response(alt_svc);
+        }
 
-        if rate_limiter.check().is_err() {
-            debug!("Rate limit exceeded for {}", ip);
+        // 3. Check DoS protection - connection limits
+        if dos_protection {
+            let connections = security.increment_connections(ip);
 
-            // Track rate limit violations
-            let mut counter = security.request_counts.entry(ip).or_default();
-            counter.suspicious_patterns += 1;
-
-            // Auto-block after repeated violations (configurable threshold)
-            if counter.suspicious_patterns >= auto_block_threshold {
-                drop(counter);
-                let block_duration = Duration::from_secs(auto_block_duration_secs);
-                security.block_ip(ip, BlockReason::RateLimitExceeded, Some(block_duration));
-            }
-
-            // P1-fix: decrement the DoS connection counter that was incremented in
-            // step 3 before this early return.  Previously the counter leaked on
-            // every rate-limited request, eventually triggering DoS protection even
-            // when the client's actual concurrency was within limits.
-            if dos_protection {
+            if connections > max_connections_per_ip {
                 security.decrement_connections(ip);
+                security.block_ip(
+                    ip,
+                    BlockReason::ConnectionLimitExceeded,
+                    Some(Duration::from_secs(60)),
+                );
+                warn!("Connection limit exceeded for {}: {}", ip, connections);
+                return too_many_connections_response(alt_svc);
             }
-            let request_origin = headers
-                .get("origin")
-                .and_then(|v| v.to_str().ok())
-                .map(String::from);
-            return rate_limit_response_simple(rate_rps, alt_svc, request_origin.as_deref());
         }
+
+        // 4. Rate limiting
+        if rate_enabled {
+            let rate_limiter = security.get_ip_rate_limiter(ip);
+
+            if rate_limiter.check().is_err() {
+                debug!("Rate limit exceeded for {}", ip);
+
+                // Track rate limit violations
+                let mut counter = security.request_counts.entry(ip).or_default();
+                counter.suspicious_patterns += 1;
+
+                // Auto-block after repeated violations (configurable threshold)
+                if counter.suspicious_patterns >= auto_block_threshold {
+                    drop(counter);
+                    let block_duration = Duration::from_secs(auto_block_duration_secs);
+                    security.block_ip(ip, BlockReason::RateLimitExceeded, Some(block_duration));
+                }
+
+                // P1-fix: decrement the DoS connection counter that was incremented in
+                // step 3 before this early return.  Previously the counter leaked on
+                // every rate-limited request, eventually triggering DoS protection even
+                // when the client's actual concurrency was within limits.
+                if dos_protection {
+                    security.decrement_connections(ip);
+                }
+                let request_origin = headers
+                    .get("origin")
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from);
+                return rate_limit_response_simple(rate_rps, alt_svc, request_origin.as_deref());
+            }
+        }
+    } else {
+        // Pentest IP: still track DoS connection counter so cleanup runs correctly,
+        // but never rate-limit or auto-block.
+        if dos_protection {
+            security.increment_connections(ip);
+        }
+        debug!("Pentest bypass IP {} — skipping rate-limit/auto-block", ip);
     }
 
     // 5. WAF inspection (path + query + headers; body scanned in chunked path below)
@@ -1145,7 +1162,8 @@ pub async fn security_middleware(
                 // Escalate repeated WAF blocks to IP ban using the same suspicious_patterns
                 // counter as the rate-limit path.  WAF blocks return before record_request()
                 // is called, so without this they never accumulate toward auto-block.
-                {
+                // Pentest IPs are exempt — they deliberately send attack payloads.
+                if !is_pentest_bypass {
                     let mut counter = security.request_counts.entry(ip).or_default();
                     counter.suspicious_patterns += 1;
                     if counter.suspicious_patterns >= auto_block_threshold {
@@ -1193,7 +1211,7 @@ pub async fn security_middleware(
     let has_content_length = headers.get("content-length").is_some();
 
     if has_content_length && !is_chunked {
-        // Fast path: validate the declared size before reading the body.
+        // Fast path: validate declared size, then buffer up to scan limit for WAF.
         if let Some(content_length) = headers.get("content-length") {
             if let Ok(length_str) = content_length.to_str() {
                 if let Ok(length) = length_str.parse::<usize>() {
@@ -1203,6 +1221,88 @@ pub async fn security_middleware(
                     }
                 }
             }
+        }
+        // WAF body scan for Content-Length requests — previously skipped.
+        // Buffer up to max_body_scan_bytes (65 KB) and inspect with WAF.
+        if security.waf_engine.is_some() {
+            let scan_limit = 65_536usize;
+            let (parts, body) = request.into_parts();
+            let mut collected_bytes: Vec<u8> = Vec::new();
+            let mut frame_stream = body.into_data_stream();
+            while let Some(chunk_result) = {
+                use futures_util::StreamExt;
+                frame_stream.next().await
+            } {
+                match chunk_result {
+                    Ok(chunk) => {
+                        collected_bytes.extend_from_slice(&chunk);
+                        if collected_bytes.len() >= scan_limit {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            if !collected_bytes.is_empty() {
+                if let Some(ref waf) = security.waf_engine {
+                    let waf_path = parts.uri.path().to_string();
+                    let waf_query = parts.uri.query().unwrap_or("").to_string();
+                    let skip_bot_ua_cl = parts
+                        .headers
+                        .get("x-health-check-bypass")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|v| v == "1")
+                        .unwrap_or(false);
+                    let waf_req_cl = WafRequest {
+                        method: parts.method.as_str(),
+                        path: &waf_path,
+                        query: &waf_query,
+                        headers: &parts.headers,
+                        body: Some(collected_bytes.as_slice()),
+                        skip_bot_ua_check: skip_bot_ua_cl,
+                    };
+                    match waf.inspect(&waf_req_cl) {
+                        WafVerdict::Block { ref rule, .. } => {
+                            warn!(
+                                "WAF body block (CL): rule={} ip={} path={}",
+                                rule, ip, waf_path
+                            );
+                            if dos_protection {
+                                security.decrement_connections(ip);
+                            }
+                            if !is_pentest_bypass {
+                                let mut counter = security.request_counts.entry(ip).or_default();
+                                counter.suspicious_patterns += 1;
+                                if counter.suspicious_patterns >= auto_block_threshold {
+                                    drop(counter);
+                                    let block_duration =
+                                        Duration::from_secs(auto_block_duration_secs);
+                                    security.block_ip(
+                                        ip,
+                                        BlockReason::TooManyErrors,
+                                        Some(block_duration),
+                                    );
+                                }
+                            }
+                            let mut resp =
+                                (StatusCode::FORBIDDEN, "Request blocked by security policy")
+                                    .into_response();
+                            resp.headers_mut()
+                                .insert("x-waf-block", HeaderValue::from_static("1"));
+                            return resp;
+                        }
+                        WafVerdict::Detect { ref rule, .. } => {
+                            warn!(
+                                "WAF body detect (CL): rule={} ip={} path={}",
+                                rule, ip, waf_path
+                            );
+                        }
+                        WafVerdict::Allow => {}
+                    }
+                }
+            }
+            // Reconstruct request with buffered body for the backend.
+            request = Request::from_parts(parts, Body::from(collected_bytes));
         }
     } else if is_chunked || !has_content_length {
         // Slow path: buffer the body and enforce the limit on actual bytes.
@@ -1274,7 +1374,11 @@ pub async fn security_middleware(
                             if counter.suspicious_patterns >= auto_block_threshold {
                                 drop(counter);
                                 let block_duration = Duration::from_secs(auto_block_duration_secs);
-                                security.block_ip(ip, BlockReason::TooManyErrors, Some(block_duration));
+                                security.block_ip(
+                                    ip,
+                                    BlockReason::TooManyErrors,
+                                    Some(block_duration),
+                                );
                             }
                         }
                         let mut resp =
@@ -1377,7 +1481,10 @@ fn blocked_response(info: &BlockedIpInfo, alt_svc: &str) -> Response {
 fn geo_blocked_response(alt_svc: &str) -> Response {
     let mut response = (
         StatusCode::FOUND,
-        [("Location", "https://pqcrypta.com/error_pages/pqcrypt_403.html")],
+        [(
+            "Location",
+            "https://pqcrypta.com/error_pages/pqcrypt_403.html",
+        )],
         "",
     )
         .into_response();

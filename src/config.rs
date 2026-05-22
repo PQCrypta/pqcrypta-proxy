@@ -1241,6 +1241,11 @@ pub struct SecurityConfig {
     /// Startup aborts if any constraint is violated.
     #[serde(default)]
     pub zero_trust_mode: bool,
+    /// Authorized pentest IPs — skip rate-limiting and auto-block but still run WAF.
+    /// Each blocked attack still returns 403; the IP is never auto-banned mid-run.
+    /// Remove these entries after the pentest engagement ends.
+    #[serde(default)]
+    pub pentest_bypass_ips: Vec<String>,
 }
 
 fn default_geoip_block_duration_secs() -> Option<u64> {
@@ -1272,6 +1277,7 @@ impl Default for SecurityConfig {
             allow_internal_backends: false,
             geoip_block_duration_secs: default_geoip_block_duration_secs(),
             zero_trust_mode: false,
+            pentest_bypass_ips: Vec::new(),
         }
     }
 }
