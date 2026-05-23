@@ -521,7 +521,7 @@ async fn main() -> anyhow::Result<()> {
             refresh_before_expiry: std::time::Duration::from_secs(
                 config.ocsp.refresh_before_expiry_secs,
             ),
-            min_refresh_interval: std::time::Duration::from_secs(300),
+            min_refresh_interval: std::time::Duration::from_mins(5),
             request_timeout: std::time::Duration::from_secs(config.ocsp.timeout_secs),
             max_retries: config.ocsp.max_retries,
             retry_delay: std::time::Duration::from_secs(config.ocsp.retry_delay_ms / 1000),

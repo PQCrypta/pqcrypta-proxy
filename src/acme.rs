@@ -814,7 +814,7 @@ async fn request_san_certificate(
                             key_authorization: key_auth.as_str().to_string(),
                             domain: authz_domain.clone(),
                             challenge_url: challenge_url.clone(),
-                            expires: SystemTime::now() + Duration::from_secs(300),
+                            expires: SystemTime::now() + Duration::from_mins(5),
                         },
                     );
                 }

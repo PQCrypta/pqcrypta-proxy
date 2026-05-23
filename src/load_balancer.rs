@@ -14,7 +14,7 @@
 /// Maximum age of a sticky session mapping before it is silently evicted.
 /// Prevents cookie_sessions / ip_sessions / header_sessions from growing without bound
 /// on long-running instances with many unique clients.
-const SESSION_TTL: Duration = Duration::from_secs(3600); // 1 hour
+const SESSION_TTL: Duration = Duration::from_hours(1); // 1 hour
 
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
@@ -1518,7 +1518,7 @@ mod tests {
     fn test_session_cookie_generation() {
         let config = SessionCookieConfig {
             name: "PQCPROXY_BACKEND".to_string(),
-            ttl: Duration::from_secs(3600),
+            ttl: Duration::from_hours(1),
             secure: true,
             httponly: true,
             samesite: SameSite::Lax,
@@ -1537,7 +1537,7 @@ mod tests {
     fn test_extract_session_cookie() {
         let config = SessionCookieConfig {
             name: "PQCPROXY_BACKEND".to_string(),
-            ttl: Duration::from_secs(3600),
+            ttl: Duration::from_hours(1),
             secure: true,
             httponly: true,
             samesite: SameSite::Lax,

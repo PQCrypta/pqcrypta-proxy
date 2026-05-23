@@ -79,9 +79,9 @@ const MIN_DATAGRAM_BYTES: usize = 8;
 const STATS_INTERVAL_MS: u64 = 100; // 10 Hz stats push
 
 /// Session idle timeout: close if no stream or datagram activity for this long.
-const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_mins(5); // 5 minutes
 /// Hard cap on total session lifetime regardless of activity.
-const SESSION_MAX_DURATION: Duration = Duration::from_secs(3600); // 60 minutes
+const SESSION_MAX_DURATION: Duration = Duration::from_hours(1); // 60 minutes
 
 // ─── Impairment types ─────────────────────────────────────────────────────────
 

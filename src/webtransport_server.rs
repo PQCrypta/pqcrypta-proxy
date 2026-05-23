@@ -103,7 +103,7 @@ impl WebTransportServer {
             .with_bind_address(addr)
             .with_custom_transport(identity, transport_config)
             .keep_alive_interval(Some(Duration::from_secs(15)))
-            .max_idle_timeout(Some(Duration::from_secs(120)))
+            .max_idle_timeout(Some(Duration::from_mins(2)))
             .map_err(|e| format!("Invalid idle timeout: {}", e))?
             .build();
 

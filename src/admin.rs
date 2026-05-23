@@ -350,7 +350,7 @@ struct EndpointCooldowns {
 /// Maximum failed authentication attempts per IP per minute before lockout.
 const ADMIN_AUTH_MAX_FAILURES: u32 = 10;
 /// Length of the sliding rate-limit window.
-const ADMIN_AUTH_WINDOW: Duration = Duration::from_secs(60);
+const ADMIN_AUTH_WINDOW: Duration = Duration::from_mins(1);
 /// AUD-10: Total failures across all IPs before a global cooldown is triggered.
 const ADMIN_GLOBAL_MAX_FAILURES: u32 = 50;
 /// AUD-10 / F-08: Base duration of the global cooldown once ADMIN_GLOBAL_MAX_FAILURES
@@ -358,15 +358,15 @@ const ADMIN_GLOBAL_MAX_FAILURES: u32 = 50;
 /// brute-force attacks where each source IP stays below the per-IP threshold.
 /// The cooldown doubles on each successive trigger (exponential back-off) up to
 /// ADMIN_GLOBAL_COOLDOWN_MAX.
-const ADMIN_GLOBAL_COOLDOWN_BASE: Duration = Duration::from_secs(300);
+const ADMIN_GLOBAL_COOLDOWN_BASE: Duration = Duration::from_mins(5);
 /// F-08: Maximum cooldown duration after repeated global threshold breaches.
-const ADMIN_GLOBAL_COOLDOWN_MAX: Duration = Duration::from_secs(1800); // 30 minutes
+const ADMIN_GLOBAL_COOLDOWN_MAX: Duration = Duration::from_mins(30); // 30 minutes
 /// F-14: Minimum interval between successive /acme/renew triggers.
 /// Let's Encrypt rate-limits to 50 certs/domain/week; accidental hammering
 /// could exhaust that quota.  One call per hour is a safe operational limit.
-const ACME_RENEW_COOLDOWN: Duration = Duration::from_secs(3600);
+const ACME_RENEW_COOLDOWN: Duration = Duration::from_hours(1);
 /// F-14: Minimum interval between successive /ocsp/refresh triggers.
-const OCSP_REFRESH_COOLDOWN: Duration = Duration::from_secs(300);
+const OCSP_REFRESH_COOLDOWN: Duration = Duration::from_mins(5);
 
 /// Authentication middleware for admin API
 async fn auth_middleware(

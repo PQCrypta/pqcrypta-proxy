@@ -59,10 +59,10 @@ use wtransport::Connection;
 /// Session idle timeout: close session if no stream or datagram activity for this long.
 /// Prevents sessions from leaking when a client disconnects without a clean QUIC close
 /// (e.g., browser tab closed, network loss) while keep-alive PINGs keep the transport alive.
-const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_mins(5); // 5 minutes
 
 /// Hard cap on total session lifetime regardless of activity.
-const SESSION_MAX_DURATION: Duration = Duration::from_secs(1800); // 30 minutes
+const SESSION_MAX_DURATION: Duration = Duration::from_mins(30); // 30 minutes
 
 /// Maximum size for a single download: 1 GB (client enforces a time limit of 5–10 s;
 /// this cap exists only to prevent runaway sessions on very slow paths).
@@ -479,12 +479,12 @@ async fn handle_op_upload(
     // Warmup: discard bytes received in the first 2 s (QUIC slow-start / CWND ramp-up).
     // steady_mbps is computed over the remaining window and is what the client displays.
     // throughput_mbps (overall average) is also reported for diagnostics.
-    let warmup_dur = std::time::Duration::from_millis(2000);
+    let warmup_dur = std::time::Duration::from_secs(2);
     let mut start: Option<Instant> = None; // set on first data byte — excludes command-frame RTT
     let mut total_bytes: usize = 0;
     let mut post_warmup_bytes: usize = 0;
     let mut buf = vec![0u8; DOWNLOAD_CHUNK];
-    let upload_timeout = std::time::Duration::from_secs(120);
+    let upload_timeout = std::time::Duration::from_mins(2);
 
     let read_result = tokio::time::timeout(upload_timeout, async {
         loop {

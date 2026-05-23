@@ -433,8 +433,8 @@ impl QuicListener {
                         // not the reverse), so we must additionally check route.webtransport.
                         let has_wt_route = config
                             .find_route(host.as_deref(), &path, true)
-                            .filter(|r| r.webtransport)
-                            .is_some();
+                            .as_ref()
+                            .is_some_and(|r| r.webtransport);
                         if !has_wt_route {
                             debug!(
                                 "WebTransport CONNECT rejected (no WT route) for {} from {}",

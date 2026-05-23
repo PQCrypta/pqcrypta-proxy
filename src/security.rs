@@ -481,7 +481,7 @@ impl SecurityState {
     fn spawn_cleanup_task(&self) {
         let state = self.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            let mut interval = tokio::time::interval(Duration::from_mins(1));
             loop {
                 interval.tick().await;
                 // Reload blocklists from database sync files
@@ -679,7 +679,7 @@ impl SecurityState {
                                     if exp_utc > now {
                                         let duration = (exp_utc - now)
                                             .to_std()
-                                            .unwrap_or(Duration::from_secs(3600));
+                                            .unwrap_or(Duration::from_hours(1));
                                         Some(Instant::now() + duration)
                                     } else {
                                         None // Already expired
@@ -1081,7 +1081,7 @@ pub async fn security_middleware(
                 security.block_ip(
                     ip,
                     BlockReason::ConnectionLimitExceeded,
-                    Some(Duration::from_secs(60)),
+                    Some(Duration::from_mins(1)),
                 );
                 warn!("Connection limit exceeded for {}: {}", ip, connections);
                 return too_many_connections_response(alt_svc);

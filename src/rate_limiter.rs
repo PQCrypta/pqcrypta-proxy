@@ -2062,11 +2062,11 @@ impl AdvancedRateLimiter {
         let stats = self.stats.clone();
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            let mut interval = tokio::time::interval(Duration::from_mins(1));
             loop {
                 interval.tick().await;
 
-                let idle_threshold = Duration::from_secs(300); // 5 minutes
+                let idle_threshold = Duration::from_mins(5); // 5 minutes
 
                 // Clean up idle buckets
                 let before_count = buckets.len();

@@ -70,8 +70,8 @@ impl Default for OcspConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            refresh_before_expiry: Duration::from_secs(3600), // 1 hour before expiry
-            min_refresh_interval: Duration::from_secs(300),   // 5 minutes minimum
+            refresh_before_expiry: Duration::from_hours(1), // 1 hour before expiry
+            min_refresh_interval: Duration::from_mins(5),   // 5 minutes minimum
             request_timeout: Duration::from_secs(10),
             max_retries: 3,
             retry_delay: Duration::from_secs(5),
@@ -234,7 +234,7 @@ impl OcspService {
                 if response.status == OcspStatus::NoResponder
                     || response.status == OcspStatus::FetchError
                 {
-                    return Duration::from_secs(3600); // 1 hour
+                    return Duration::from_hours(1); // 1 hour
                 }
 
                 let now = Instant::now();
@@ -299,7 +299,7 @@ impl OcspService {
                     response: Vec::new(),
                     status: OcspStatus::NoResponder,
                     fetched_at: Instant::now(),
-                    expires_at: Instant::now() + Duration::from_secs(3600),
+                    expires_at: Instant::now() + Duration::from_hours(1),
                     responder_url: String::new(),
                     next_update: None,
                 });
@@ -337,7 +337,7 @@ impl OcspService {
                     // Calculate expiration (default to 7 days if not specified)
                     let expires_at = next_update
                         .map(|d| now + d)
-                        .unwrap_or_else(|| now + Duration::from_secs(7 * 24 * 3600));
+                        .unwrap_or_else(|| now + Duration::from_hours(168));
 
                     let cached = CachedOcspResponse {
                         response,
@@ -353,7 +353,7 @@ impl OcspService {
                     info!(
                         "OCSP response fetched successfully (status: {:?}, expires in: {:?})",
                         status,
-                        next_update.unwrap_or(Duration::from_secs(7 * 24 * 3600))
+                        next_update.unwrap_or(Duration::from_hours(168))
                     );
 
                     return Ok(());
@@ -597,7 +597,7 @@ impl OcspService {
                 0x80 => {
                     // [0] IMPLICIT NULL = good
                     // Default validity period: 7 days
-                    return Ok((OcspStatus::Good, Some(Duration::from_secs(7 * 24 * 3600))));
+                    return Ok((OcspStatus::Good, Some(Duration::from_hours(168))));
                 }
                 0x81 | 0xA1 => {
                     // [1] IMPLICIT or EXPLICIT RevokedInfo = revoked
@@ -614,7 +614,7 @@ impl OcspService {
         // If we can't find certStatus but responseStatus was 0, assume good
         // This is lenient but avoids rejecting valid responses we can't fully parse
         warn!("Could not parse certStatus from OCSP response, assuming good");
-        Ok((OcspStatus::Good, Some(Duration::from_secs(7 * 24 * 3600))))
+        Ok((OcspStatus::Good, Some(Duration::from_hours(168))))
     }
 
     /// Force an immediate OCSP refresh
@@ -658,8 +658,8 @@ mod tests {
     fn test_ocsp_config_defaults() {
         let config = OcspConfig::default();
         assert!(config.enabled);
-        assert_eq!(config.refresh_before_expiry, Duration::from_secs(3600));
-        assert_eq!(config.min_refresh_interval, Duration::from_secs(300));
+        assert_eq!(config.refresh_before_expiry, Duration::from_hours(1));
+        assert_eq!(config.min_refresh_interval, Duration::from_mins(5));
         assert_eq!(config.request_timeout, Duration::from_secs(10));
         assert_eq!(config.max_retries, 3);
     }
@@ -687,8 +687,8 @@ mod tests {
             enabled: true,
             status: OcspStatus::Good,
             responder_url: Some("http://ocsp.example.com".to_string()),
-            fetched_at: Some(Duration::from_secs(60)),
-            expires_in: Some(Duration::from_secs(3600)),
+            fetched_at: Some(Duration::from_mins(1)),
+            expires_in: Some(Duration::from_hours(1)),
             is_valid: true,
             running: true,
         };
