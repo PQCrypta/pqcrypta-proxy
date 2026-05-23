@@ -204,6 +204,9 @@
 - **WebTransport**: Native WebTransport session handling with bidirectional streams, unidirectional streams, and datagrams
 - **WebTransport Origin Validation**: SR-02 cross-origin enforcement — configurable `webtransport_allowed_origins` allowlist rejects browser sessions from unlisted origins with 403; non-browser clients (no Origin header) always accepted
 - **WebTransport JSON Operations**: JSON operation routing over streams — encrypt, decrypt, keygen, health, ping dispatched to backend by operation type; plus a built-in QUIC-native speed test server (`speedtest` operation) providing datagram RTT probing, stream download/upload throughput measurement, packet-loss counting, MTR-based hop traceroute with GeoIP city/ASN/country annotation, and client IP info lookup
+- **Telemetry Wall** (`/telemetry`): Native WebTransport handler that pushes 6 independent QUIC uni-streams at 20 Hz each (~5 Mbps virtual throughput per channel), demonstrating true QUIC stream isolation. A stats channel pushes RTT, CWND, CPU, and memory at 10 Hz. A control bidi-stream accepts impairment commands (delay, loss, bandwidth cap, jitter, disconnect) scoped to individual channels, leaving others unaffected — the opposite of TCP head-of-line blocking.
+- **QUIC vs TCP Speed Test** (`/speedtest`): Side-by-side throughput comparison over QUIC and TCP. WebTransport path measures download/upload throughput, datagram RTT, and packet loss. The `tcp_only_hosts` + `http11_only_hosts` config options force a parallel HTTP/1.1 connection so the browser opens one TCP stream per fetch rather than coalescing onto HTTP/2 — enabling a true protocol-level comparison.
+- **Pentest Suite** (`pentests/`): 32 automated black-box attack scripts across 12 phases covering WAF bypass, HTTP smuggling (HTTP/1.1 CL.TE, HTTP/2 Rapid Reset, HTTP/3, WebTransport), SSRF, timing oracles, race conditions, and AI/LLM attack surface. Use `pentest_bypass_ips` in `[security]` to skip rate-limiting and auto-block for test runner IPs while keeping the WAF active.
 - **Unified UDP Listener**: Single QuicListener handles both HTTP/3 and WebTransport
 - **Shared Security State (QUIC)**: All QUIC listeners share one security context — blocked IPs, rate limiters, and fingerprint databases are consistent across every port
 - **Configurable WebTransport Port**: `webtransport_port` in `[server]` controls the dedicated WebTransport server bind port (default 4433)
@@ -1269,6 +1272,193 @@ curl -X POST http://127.0.0.1:8082/reload
 # Reload TLS certificates only
 curl -X POST http://127.0.0.1:8082/reload -d '{"tls_only":true}'
 ```
+
+## Telemetry Wall
+
+The Telemetry Wall is a native WebTransport handler at `/telemetry` (default `wss://api.pqcrypta.com:4433/telemetry`) that streams real-time transport-layer data without any backend involvement.
+
+### What it demonstrates
+
+QUIC's key advantage over TCP is that stream-level impairment on one stream does **not** affect other streams. The Telemetry Wall makes this concrete: impair channel `ch3` and watch channels `ch1`, `ch2`, `ch4`, `ch5`, `ch6` continue uninterrupted. The equivalent on HTTP/2 or WebSocket over TCP would stall all streams.
+
+### Session structure
+
+| Stream | Type | Rate | Content |
+|--------|------|------|---------|
+| `ch1`–`ch6` | Server uni-streams | 20 Hz | Throughput frames (~32 KB virtual per frame ≈ 5 Mbps per channel) |
+| Stats | Server uni-stream | 10 Hz | RTT, CWND, CPU %, memory %, uptime |
+| Control | Bidi-stream | Client-driven | Impairment and heal commands |
+| Datagrams | — | Echo | RTT and packet-loss measurement |
+
+Session idle timeout: 5 minutes. Hard cap: 60 minutes.
+
+### Wire protocol
+
+All stream frames use a 4-byte big-endian length prefix followed by JSON:
+
+```
+[u32 BE length][JSON bytes]
+```
+
+**Channel header** (first frame on each uni-stream):
+```json
+{"stream_type":"channel_header","channel":"ch1","rate_hz":20}
+```
+
+**Throughput frame**:
+```json
+{"t":1234567.890,"seq":42,"channel":"ch1","bytes_total":1048576,"impaired":false,"impairment":null}
+```
+
+**Stats frame**:
+```json
+{"t":1234567.890,"rtt_ms":23.5,"cwnd_bytes":1250000,"cpu_pct":8.3,"mem_pct":42.1,"uptime_s":86400}
+```
+
+### Impairment commands (client → server on control bidi-stream)
+
+```json
+{"cmd":"impair","channel":"ch3","type":"delay_ms","intensity":200.0,
+ "pattern":"burst","burst_freq_s":5.0,"burst_dur_ms":500.0,"duration_s":30.0}
+
+{"cmd":"heal","channel":"ch3"}
+{"cmd":"heal_all"}
+```
+
+**Impairment types**: `delay_ms`, `loss_pct`, `bandwidth_kbps`, `jitter_ms`, `disconnect`
+
+**Patterns**: `constant`, `burst` (periodic spike), `random`
+
+Server acknowledges each command:
+```json
+{"type":"ack","cmd":"impair","channel":"ch3","ok":true}
+```
+
+---
+
+## Speed Test
+
+The speed test handler at `/speedtest` (`wss://api.pqcrypta.com:4433/speedtest`) provides a side-by-side QUIC vs TCP throughput comparison from the same server.
+
+### How the QUIC vs TCP comparison works
+
+The proxy has two config options that together enable independent TCP and QUIC measurements in the browser:
+
+- `tcp_only_hosts` in `[server]`: listed hostnames get `Alt-Svc: clear`, evicting any cached QUIC upgrade so the browser stays on TCP/TLS.
+- `http11_only_hosts` in `[server]`: listed hostnames suppress the `h2` ALPN token, forcing HTTP/1.1. The browser then opens one TCP connection per `fetch()` stream instead of coalescing onto an HTTP/2 pipe — giving each parallel speed test stream its own TCP flow.
+
+The QUIC path uses WebTransport streams natively; the TCP path uses HTTP/1.1 connections to the same backend. Both paths hit the same server, measuring the protocol itself rather than network distance.
+
+### Operations (JSON over length-prefixed frames)
+
+| Operation | Client sends | Server sends |
+|-----------|-------------|--------------|
+| `download` | `{"op":"download","bytes":N}` | 1-byte status + N raw bytes |
+| `upload` | `{"op":"upload","bytes":N}` + N raw bytes | `{"bytes_received":M,"duration_ms":D,"throughput_mbps":T}` |
+| `info` | `{"op":"info"}` | Server capabilities JSON |
+| `geoip` | `{"op":"geoip"}` | Client IP, city, country, ASN |
+| `traceroute` | `{"op":"traceroute"}` | Stream of hop frames with per-hop GeoIP, then `{"type":"done"}` |
+
+**Datagram echo**: any datagram ≥ 8 bytes is echoed immediately. Client embeds a send timestamp in the payload to compute RTT and count loss.
+
+### Limits
+
+| Parameter | Value |
+|-----------|-------|
+| Max download | 1 GB (client time-limits to 5–10 s in practice) |
+| Max upload | 500 MB |
+| Download chunk | 256 KB (keeps QUIC send buffer full) |
+| Session idle timeout | 5 minutes |
+| Session hard cap | 30 minutes |
+
+---
+
+## Pentest Suite
+
+The `pentests/` directory contains 32 automated black-box attack scripts across 12 phases, used to continuously validate pqcrypta-proxy's security posture. No source access is required — all scripts target the public HTTP surface.
+
+### Quick start
+
+```bash
+cd pqcrypta-proxy/pentests
+cp config.demo.sh config.sh
+vi config.sh   # set TARGET and API_TARGET at minimum
+
+./preflight.sh             # check required tools
+./run_all.sh               # all 32 scripts
+./run_all.sh --skip-slow   # skip TLS deep-scan and resilience/chaos
+./run_all.sh --local        # tighter timing thresholds (LAN / same datacenter)
+./run_all.sh --phase 5     # single phase
+```
+
+### Phase map
+
+| Phase | Scripts | Attack category |
+|-------|---------|-----------------|
+| 1 | 14 | Reconnaissance & information disclosure |
+| 2 | 01, 12 | WAF bypass & advanced evasion |
+| 3 | 02, 03 | Bot detection bypass, header injection |
+| 4 | 07, 06, 13 | HTTP smuggling (1.1/2/3/WebTransport), TLS/SSL, WebSocket |
+| 5 | 08, 09, 05, 10, 11, 04 | SSRF, cache poisoning, API auth, crypto fuzzing, timing oracles, rate limiting |
+| 6 | 15, 19, 20 | Auth hardening, session security, MFA bypass, access control |
+| 7 | 16, 17, 23 | Business logic, race conditions, CSP, client-side JS |
+| 8 | 21, 22, 18 | Supply chain, cloud/infra, resilience & chaos |
+| 9 | 24 | Data privacy & PII exposure |
+| 10 | 25, 26, 27 | Container/K8s runtime, CI/CD pipeline, database & storage |
+| 11 | 28 | AI / LLM attack surface (prompt injection, context bleed) |
+| 12 | 29, 30, 31, 32 | XXE, SSTI, file upload, gRPC/Protobuf |
+
+### Protocol coverage
+
+| Protocol | Coverage |
+|----------|----------|
+| HTTP/1.1 | CL.TE and TE.CL smuggling via raw `nc`, all WAF / auth / API tests |
+| HTTP/2 | TE rejection (RFC 9113 §8.2.2), Rapid Reset (CVE-2023-44487), all API tests |
+| HTTP/3 / QUIC | `curl --http3` with Alt-Svc fallback detection; WAF and rate-limit tests |
+| WebTransport | TCP probe on `QUIC_PORT`, HTTP/3 QUIC framing |
+| WebSocket | RFC 6455 upgrade, auth bypass, token-in-query-string, RFC 8441 H2 WS |
+
+### Pentest bypass IP
+
+Add your test runner IP to `pentest_bypass_ips` in `[security]` to skip rate-limiting and auto-block **without disabling the WAF**:
+
+```toml
+[security]
+# Remove after the engagement ends.
+pentest_bypass_ips = ["YOUR.RUNNER.IP.HERE"]
+```
+
+Effect: rate limiting and auto-block are disabled for listed IPs (preventing mid-run lockout), but the WAF still executes — attack payloads still return 403, confirming WAF detection is working. Script 04 (rate limiting) needs a non-bypassed IP to test the limiter itself.
+
+### Output
+
+Each run writes to `results/run_YYYYMMDD_HHMMSS/`:
+
+```
+results/run_20260522_153000/
+├── MASTER_REPORT.txt     # full concatenated output
+├── SUMMARY.tsv           # machine-readable: phase<TAB>script<TAB>name<TAB>status<TAB>findings<TAB>warns<TAB>duration_s
+├── 01_waf_bypass.txt
+├── 07_advanced_smuggling.txt
+└── ...
+```
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | All scripts passed — no findings, no warnings |
+| `1` | At least one `[WARN]` or `[VULN]` finding |
+| `2` | One or more scripts failed with an execution error |
+| `3` | Preflight check failed or `scope_guard.sh` refused the target |
+
+### Timing oracle methodology (script 11)
+
+50 samples per test group, `python3 statistics.mean` + `pstdev` per group, alert threshold 3σ above baseline mean. Minimum floor: 15 ms remote, 3 ms with `--local`. Tests: API key oracle, admin login timing, decrypt padding oracle, WAF timing side-channel.
+
+### Required tools
+
+`bash 5.0+`, `curl`, `python3`, `openssl`, `nc`, `dig`, `jq`. Optional: `hey` (race conditions), `websocat` (WebSocket), `grpcurl` (gRPC), `testssl.sh` (TLS deep-scan), `nikto` (web scan).
+
+---
 
 ## Metrics
 
