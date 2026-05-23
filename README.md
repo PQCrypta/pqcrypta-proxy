@@ -60,6 +60,8 @@
 | **JA3/JA4 Replay Detection** | ✅ | Flags same fingerprint from multiple IPs within configurable window |
 | **JA3/JA4 Drift Detection** | ✅ | Flags cipher/extension composition changes on the same fingerprint hash |
 | **PQC Downgrade Detection** | ✅ | Detects classical-only TLS negotiation when PQC is required; block/log/allow action |
+| **Response Cache (RFC 9111)** | ✅ | Optional RFC 9111-compliant HTTP cache with Cache-Control parsing, ETag/If-None-Match, Last-Modified/If-Modified-Since, Vary header support, size-bounded DashMap store, and configurable path/host exclusions |
+| **Per-Backend Connection Pool** | ✅ | Per-host idle timeout, max idle connections, max total connections, and acquire timeout for the HTTP/1.1 backend pool |
 | **Per-Backend Retry** | ✅ | Configurable retries with exponential backoff per backend; retry on 5xx/connect-failure/timeout |
 | **Per-Backend Circuit Breaker** | ✅ | Per-backend overrides for failure threshold, half-open delay, and success threshold |
 | **0-RTT Replay Protection** | ✅ | Nonce store (strict/session/none); rejects replayed early-data nonces |
@@ -637,10 +639,13 @@ nosqli = true           # NoSQL injection ($where, $gt, $regex, etc.)
 ssrf = false            # SSRF patterns for path/query/body (X-Forwarded-For always exempt — proxy hops add loopback IPs legitimately)
 scan_json_body = true   # Scan request bodies
 max_body_scan_bytes = 65536   # Max bytes of body to scan (default 64 KB)
+block_scanner_uas = true      # Block known security scanner User-Agents (sqlmap, nikto, nmap, masscan, burp, etc.) — default true
 custom_patterns = [
     "(?i)\\bmy-banned-keyword\\b",
 ]
 ```
+
+`block_scanner_uas` matches against a built-in regex set covering common attack tools. It operates independently from path/payload pattern matching — a request can be blocked purely by its User-Agent even if the body is clean. Disable per-route via `waf_mode = "detect"` if you need to allow scanner tools from specific paths (e.g., an internal security tooling endpoint).
 
 Route-level WAF override:
 ```toml
@@ -688,6 +693,20 @@ failure_threshold = 3        # trip after 3 failures (global default: 5)
 half_open_delay_secs = 10    # half-open probe delay (global default: 30)
 success_threshold = 1        # close after 1 success (global default: 2)
 ```
+
+### Connection Pool Configuration
+
+Controls the HTTP/1.1 connection pool used for requests to backends over TCP. All fields are optional — defaults are production-ready for moderate traffic.
+
+```toml
+[connection_pool]
+idle_timeout_secs        = 90    # Close idle connections after 90 s
+max_idle_per_host        = 10    # Keep up to 10 idle connections per backend
+max_connections_per_host = 100   # Hard cap on total open connections per backend
+acquire_timeout_ms       = 5000  # Fail the request if a connection can't be acquired in 5 s
+```
+
+Reducing `max_idle_per_host` lowers file-descriptor usage on backends with many idle periods. Increasing `max_connections_per_host` improves burst throughput at the cost of backend fd pressure.
 
 ### Environment Config Overlay
 
@@ -918,6 +937,32 @@ log_responses       = true             # Log shadow status + latency at INFO (de
 1. Add a `[backends.api-canary]` entry pointing at the canary instance (e.g. `127.0.0.1:3004`).
 2. Add the `[routes.shadow]` block to the desired route in `/etc/pqcrypta/proxy-config.toml`.
 3. Reload config: `curl -s -X POST http://127.0.0.1:8082/reload -H "Authorization: Bearer $TOKEN"`.
+
+### Response Cache Configuration
+
+The proxy includes an RFC 9111-compliant HTTP response cache. It is **disabled by default** — add a `[cache]` section to opt in. The cache stores raw backend response bodies (pre-compression); all outer middleware layers (security headers, Alt-Svc, Brotli/gzip) run on every served response, including cache hits.
+
+**What is cached**: GET and HEAD responses with a cacheable status code (200, 203, 204, 206, 300, 301, 410) that carry `Cache-Control: public` or no `Cache-Control` directive. Responses with `Cache-Control: no-store`, `private`, `no-cache`, or `Vary: *` are never stored. Responses that set cookies are skipped by default.
+
+**Conditional request support**: ETag / `If-None-Match` (strong and weak) and `Last-Modified` / `If-Modified-Since` — the cache returns `304 Not Modified` and avoids body transfer when content is unchanged.
+
+```toml
+[cache]
+enabled              = true    # default false — must opt in
+max_size_mb          = 128     # total cache size cap in MiB
+default_ttl_secs     = 60      # TTL when backend sends no Cache-Control max-age
+max_body_size_bytes  = 2097152 # responses larger than ~2 MiB are forwarded but not stored
+no_cache_set_cookie  = true    # skip caching responses that set cookies
+
+# Path prefixes that bypass the cache entirely
+excluded_paths = ["/api/", "/ws", "/stream", "/auth", "/admin"]
+
+# Exact hostnames (or subdomain suffixes) whose responses are never cached.
+# Use this for API subdomains whose backends omit Cache-Control: no-store.
+excluded_hosts = ["api.example.com"]
+```
+
+The cache layer is placed as the innermost Axum layer so security headers and compression always apply regardless of whether the response came from the cache or the backend.
 
 ### TLS Modes
 
