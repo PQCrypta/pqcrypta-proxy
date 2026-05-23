@@ -23,6 +23,7 @@ allow = [
     "Zlib",
     "CC0-1.0",
     "CDLA-Permissive-2.0",
+    "OpenSSL",
 ]
 
 [bans]
@@ -66,6 +67,8 @@ skip = [
     { name = "itertools", reason = "0.10 and 0.13 pulled by separate transitive subtrees after aws-lc-sys upgrade" },
     # openssl-probe — version split between openssl-related crate trees
     { name = "openssl-probe", reason = "multiple transitive versions from openssl/rustls bridging crates" },
+    # redox_syscall — 0.5 via parking_lot_core; 0.7 via libredox/filetime/notify
+    { name = "redox_syscall", reason = "0.5.x pulled by parking_lot_core; 0.7.x pulled by libredox/filetime/notify; both target-specific to Redox OS, harmless on Linux" },
     # untrusted — 0.7 retained by webpki 0.22; 0.9 used by newer ring-based crates
     { name = "untrusted", reason = "0.7 retained by webpki 0.22 sub-tree; 0.9 used by newer ring crates" },
     { name = "webpki-roots", reason = "0.26 and 1.x pulled by separate crates; update pending upstream" },
