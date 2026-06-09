@@ -308,6 +308,7 @@ impl ResponseCache {
         let mut vary: Option<String> = None;
         let mut has_set_cookie = false;
         let mut has_content_encoding = false;
+        let mut has_content_range = false;
 
         for (name, value) in response_headers {
             match name.to_lowercase().as_str() {
@@ -317,8 +318,19 @@ impl ResponseCache {
                 "vary" => vary = Some(value.clone()),
                 "set-cookie" => has_set_cookie = true,
                 "content-encoding" => has_content_encoding = true,
+                "content-range" => has_content_range = true,
                 _ => {}
             }
+        }
+
+        // Never cache partial content. This cache keys on method+host+path with no
+        // range component and has no range-recombination logic, so storing a 206 (or
+        // any Content-Range response) would let one byte range be served for a
+        // different range — corrupting media/video playback. Let range requests
+        // always reach the backend.
+        if status == 206 || status == 416 || has_content_range {
+            trace!("Not caching {}: partial/range response (status {})", key, status);
+            return;
         }
 
         // Never cache responses that set cookies (opt-out via config)

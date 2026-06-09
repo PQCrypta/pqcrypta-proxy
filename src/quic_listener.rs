@@ -1400,8 +1400,13 @@ impl QuicListener {
         }
 
         // --- Response cache lookup (GET / HEAD only, HTTP/3 path) ---
+        // Range requests bypass the cache entirely: the cache stores whole responses
+        // and must hand range requests to the backend so they get a correct 206 with
+        // a matching Content-Range, rather than a cached full 200 body.
         let cache_host_str = host.as_deref().unwrap_or("");
+        let is_range_request = request.headers().contains_key("range");
         if (method == "GET" || method == "HEAD")
+            && !is_range_request
             && cache.config.enabled
             && !cache.is_excluded_path(&path)
             && !cache.is_excluded_host(cache_host_str)
@@ -1782,6 +1787,9 @@ impl QuicListener {
                     | "last-modified"
                     | "content-language"
                     | "content-encoding"
+                    | "content-range"
+                    | "accept-ranges"
+                    | "content-disposition"
                     | "vary"
                     | "set-cookie"
                     | "location"
