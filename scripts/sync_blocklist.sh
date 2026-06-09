@@ -84,13 +84,38 @@ sync_table() {
 
 # ---------------------------------------------------------------------------
 # Sync blocked IPs
+# Merges security_blocklist (API-detected threats) and waf_blocked_ips (WAF blocks).
+# bot_blocklist is legacy — the active detection systems write to these two tables.
 # ---------------------------------------------------------------------------
-IP_QUERY="SELECT json_agg(json_build_object(
-    'ip', ip_address::text,
-    'reason', reason,
-    'threat_level', threat_level,
-    'expires_at', expires_at
-)) FROM bot_blocklist WHERE is_active = true AND (expires_at IS NULL OR expires_at > NOW())"
+IP_QUERY="SELECT json_agg(sub.*) FROM (
+    SELECT DISTINCT ON (ip) ip, reason, threat_level, expires_at FROM (
+        SELECT
+            CASE WHEN masklen(ip_address) = 32 OR family(ip_address) = 6 AND masklen(ip_address) = 128
+                THEN host(ip_address)
+                ELSE ip_address::text
+            END AS ip,
+            reason,
+            risk_level AS threat_level,
+            expires_at,
+            1 AS priority
+        FROM security_blocklist
+        WHERE is_active = true
+          AND ip_address IS NOT NULL
+          AND whitelist_override IS NOT TRUE
+          AND (expires_at IS NULL OR expires_at > NOW())
+        UNION ALL
+        SELECT
+            ip_address AS ip,
+            block_reason AS reason,
+            highest_severity AS threat_level,
+            expires_at,
+            2 AS priority
+        FROM waf_blocked_ips
+        WHERE is_active = true
+          AND (expires_at IS NULL OR expires_at > NOW())
+    ) combined
+    ORDER BY ip, priority
+) sub"
 
 IP_COUNT=$(sync_table "${IP_QUERY}" "${BLOCKLIST_DIR}/blocked_ips.json" "blocked IPs")
 IP_COUNT="${IP_COUNT:-0}"
