@@ -3,6 +3,11 @@
 **/*.rs.bk
 # Note: Cargo.lock is committed for reproducible binary builds
 
+# Built proxy binaries copied to the repo root (deploy artifacts, not source)
+/pqcrypta-proxy
+/pqcrypta-proxy-bin
+/pqcrypta-proxy.bak-*
+
 # F-11: GeoIP databases — do NOT commit to version control.
 # MaxMind databases are updated weekly; stale copies silently produce wrong
 # blocking decisions.  They also require a MaxMind account (license terms).
