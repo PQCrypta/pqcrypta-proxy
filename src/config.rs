@@ -1489,6 +1489,39 @@ pub struct HeadersConfig {
     /// Format: "u=<urgency>, i" where urgency is 0-7 and i indicates incremental
     #[serde(default)]
     pub priority: String,
+
+    // ═══════════════════════════════════════════════════════════════
+    // Outlook add-in surface exception
+    // ═══════════════════════════════════════════════════════════════
+    // Office hosts the add-in task pane in a cross-origin iframe, so this URL
+    // prefix must NOT receive X-Frame-Options and instead gets an add-in CSP
+    // (frame-ancestors for the Office hosts). Leave addin_csp empty to disable.
+    /// Hosts on which the add-in exception applies (matched against the Host header).
+    #[serde(default = "default_addin_hosts")]
+    pub addin_hosts: Vec<String>,
+    /// URL path prefix that identifies the add-in surface.
+    #[serde(default = "default_addin_path_prefix")]
+    pub addin_path_prefix: String,
+    /// CSP applied to the add-in surface. Empty disables the exception entirely.
+    #[serde(default = "default_addin_csp")]
+    pub addin_csp: String,
+}
+
+fn default_addin_hosts() -> Vec<String> {
+    vec!["pqpdf.com".to_string(), "www.pqpdf.com".to_string()]
+}
+fn default_addin_path_prefix() -> String {
+    "/outlook/".to_string()
+}
+fn default_addin_csp() -> String {
+    "default-src 'self'; \
+script-src 'self' 'unsafe-inline' https://appsforoffice.microsoft.com https://*.officeapps.live.com; \
+style-src 'self' 'unsafe-inline'; \
+img-src 'self' data: https:; \
+font-src 'self' data:; \
+connect-src 'self' https://api.pqpdf.com https://*.office.com https://*.officeapps.live.com; \
+frame-ancestors https://outlook.office.com https://outlook.office365.com https://outlook.live.com https://*.office.com https://*.officeapps.live.com 'self'"
+        .to_string()
 }
 
 impl Default for HeadersConfig {
@@ -1526,6 +1559,11 @@ impl Default for HeadersConfig {
 
             // HTTP/3 Priority (RFC 9218) - u=3 is default urgency, i=?0 means non-incremental
             priority: "u=3,i=?0".to_string(),
+
+            // Outlook add-in surface exception
+            addin_hosts: default_addin_hosts(),
+            addin_path_prefix: default_addin_path_prefix(),
+            addin_csp: default_addin_csp(),
         }
     }
 }

@@ -2081,6 +2081,31 @@ async fn security_headers_middleware(
     // Track request timing for Server-Timing header
     let start_time = std::time::Instant::now();
 
+    // Detect the Outlook add-in surface BEFORE consuming the request. Office hosts
+    // the task pane in a cross-origin iframe, so this surface must NOT receive
+    // X-Frame-Options: DENY and needs an add-in-friendly CSP. Host/path/CSP are all
+    // configured in [headers] (addin_hosts, addin_path_prefix, addin_csp); an empty
+    // addin_csp disables the exception.
+    let is_outlook_addin = {
+        let hc = &state.config.headers;
+        if hc.addin_csp.is_empty() || hc.addin_path_prefix.is_empty() {
+            false
+        } else {
+            let path = request.uri().path();
+            let host = request
+                .headers()
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            path.starts_with(&hc.addin_path_prefix)
+                && hc.addin_hosts.iter().any(|h| h.eq_ignore_ascii_case(&host))
+        }
+    };
+
     let mut response = next.run(request).await;
 
     // Calculate processing time
@@ -2094,9 +2119,12 @@ async fn security_headers_middleware(
         headers.insert(header::STRICT_TRANSPORT_SECURITY, v);
     }
 
-    // X-Frame-Options
-    if let Ok(v) = HeaderValue::from_str(&config.x_frame_options) {
-        headers.insert(header::X_FRAME_OPTIONS, v);
+    // X-Frame-Options — skipped for the Outlook add-in surface, which is framed
+    // cross-origin by Office (framing is governed there by CSP frame-ancestors).
+    if !is_outlook_addin {
+        if let Ok(v) = HeaderValue::from_str(&config.x_frame_options) {
+            headers.insert(header::X_FRAME_OPTIONS, v);
+        }
     }
 
     // X-Content-Type-Options
@@ -2144,9 +2172,15 @@ async fn security_headers_middleware(
         headers.insert("x-dns-prefetch-control", v);
     }
 
-    // SEC-07: Content-Security-Policy — only inject if the backend did not already set one,
-    // so page-level nonce-based CSPs from PHP are preserved.
-    if !config.content_security_policy.is_empty()
+    // SEC-07: Content-Security-Policy.
+    // Outlook add-in surface gets a dedicated CSP (frame-ancestors for the Office
+    // hosts, allows the office.js CDN and api.pqpdf.com). Otherwise inject the global
+    // CSP only when the backend did not set one (preserves PHP nonce-based CSPs).
+    if is_outlook_addin {
+        if let Ok(v) = HeaderValue::from_str(&config.addin_csp) {
+            headers.insert(header::CONTENT_SECURITY_POLICY, v);
+        }
+    } else if !config.content_security_policy.is_empty()
         && !headers.contains_key(header::CONTENT_SECURITY_POLICY)
     {
         if let Ok(v) = HeaderValue::from_str(&config.content_security_policy) {
