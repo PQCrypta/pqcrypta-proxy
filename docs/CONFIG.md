@@ -47,6 +47,31 @@ Complete reference for all configuration options in PQCrypta Proxy.
 | `max_idle_timeout_secs` | u64 | `120` | Maximum idle timeout in seconds |
 | `enable_ipv6` | bool | `true` | Enable IPv6 dual-stack binding |
 | `worker_threads` | usize | `0` | Worker threads (0 = auto-detect based on CPU cores) |
+| `enable_quic_migration` | bool | `true` | Enable QUIC connection migration (RFC 9000 §9) |
+| `enable_ack_frequency` | bool | `true` | Enable the QUIC ACK Frequency extension (draft-ietf-quic-ack-frequency) — fewer, batched ACKs on high-throughput connections |
+
+---
+
+## MASQUE / CONNECT-UDP (RFC 9298)
+
+```toml
+[masque]
+```
+
+UDP proxying over HTTP/3 Extended CONNECT. The proxy accepts requests with
+`:protocol = connect-udp` and relays UDP datagrams between the client and a
+target `host:port`, with UDP payloads carried as HTTP Datagrams (RFC 9297).
+
+**Disabled by default.** An open UDP relay can be abused for amplification,
+scanning, and exfiltration, so a target MUST match `allowed_targets` before a
+session is established.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `false` | Master switch for CONNECT-UDP |
+| `allowed_targets` | array[string] | `[]` | Permitted targets as `host:port`; `host`/`port` may be `*`. Empty = deny all |
+| `session_idle_timeout_secs` | u64 | `60` | Close a session after no datagrams in either direction for this long |
+| `max_sessions_per_connection` | usize | `8` | Maximum concurrent CONNECT-UDP sessions per QUIC connection |
 
 ---
 

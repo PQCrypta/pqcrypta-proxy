@@ -90,6 +90,15 @@ impl WebTransportServer {
         transport_config.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
         transport_config.datagram_send_buffer_size(4 * 1024 * 1024);
 
+        // ACK Frequency extension (draft-ietf-quic-ack-frequency): fewer batched
+        // ACKs cut overhead during bulk speedtest transfers. Negotiated, so it is
+        // inert against clients that do not support it.
+        if config.server.enable_ack_frequency {
+            transport_config
+                .ack_frequency_config(Some(quinn::AckFrequencyConfig::default()));
+            info!("🔧 QUIC ACK Frequency extension enabled");
+        }
+
         info!(
             "🔧 Transport config: receive_window=64MB, stream_window=32MB, send_window=64MB, datagram_buf=4MB"
         );

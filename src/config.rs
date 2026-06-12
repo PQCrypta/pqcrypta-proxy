@@ -175,6 +175,9 @@ pub struct ProxyConfig {
     /// OpenTelemetry distributed tracing configuration
     #[serde(default)]
     pub otel: OtelConfig,
+    /// MASQUE / CONNECT-UDP proxying configuration (RFC 9298)
+    #[serde(default)]
+    pub masque: MasqueConfig,
 }
 
 /// Current config schema version supported by this binary
@@ -345,7 +348,68 @@ impl Default for ProxyConfig {
             http3: Http3Config::default(),
             cache: ResponseCacheConfig::default(),
             otel: OtelConfig::default(),
+            masque: MasqueConfig::default(),
         }
+    }
+}
+
+/// MASQUE / CONNECT-UDP proxying configuration (RFC 9298).
+///
+/// When enabled, the proxy accepts HTTP/3 Extended CONNECT requests with
+/// `:protocol = connect-udp` and relays UDP datagrams between the client and a
+/// target `host:port`. UDP payloads travel as HTTP Datagrams (RFC 9297) bound
+/// to the CONNECT request stream.
+///
+/// **Security:** disabled by default. An open UDP relay can be abused for
+/// amplification, scanning, and exfiltration, so a target MUST match
+/// `allowed_targets` before a session is established.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MasqueConfig {
+    /// Master switch for CONNECT-UDP. Default: false.
+    pub enabled: bool,
+
+    /// Allowlist of permitted relay targets. Each entry is `host:port`, where
+    /// `host` may be an exact name/IP or `*` (any host), and `port` may be an
+    /// exact port or `*` (any port). A request is permitted only if it matches
+    /// at least one entry. An empty list permits nothing.
+    ///
+    /// Examples:
+    /// ```toml
+    /// allowed_targets = ["dns.example.com:853", "*:443"]
+    /// ```
+    pub allowed_targets: Vec<String>,
+
+    /// Per-session idle timeout in seconds. A session with no datagrams in
+    /// either direction for this long is closed. Default: 60.
+    pub session_idle_timeout_secs: u64,
+
+    /// Maximum concurrent CONNECT-UDP sessions per QUIC connection. Default: 8.
+    pub max_sessions_per_connection: usize,
+}
+
+impl Default for MasqueConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_targets: Vec::new(),
+            session_idle_timeout_secs: 60,
+            max_sessions_per_connection: 8,
+        }
+    }
+}
+
+impl MasqueConfig {
+    /// Returns true if the given target host/port is permitted by the allowlist.
+    pub fn is_target_allowed(&self, host: &str, port: u16) -> bool {
+        self.allowed_targets.iter().any(|entry| {
+            let Some((h, p)) = entry.rsplit_once(':') else {
+                return false;
+            };
+            let host_ok = h == "*" || h.eq_ignore_ascii_case(host);
+            let port_ok = p == "*" || p.parse::<u16>().map(|v| v == port).unwrap_or(false);
+            host_ok && port_ok
+        })
     }
 }
 
@@ -405,6 +469,16 @@ pub struct ServerConfig {
     /// Default: true (enabled — Quinn default behaviour).
     #[serde(default = "default_true")]
     pub enable_quic_migration: bool,
+
+    /// Enable the QUIC ACK Frequency extension (draft-ietf-quic-ack-frequency).
+    ///
+    /// Lets the peer request fewer, batched acknowledgements, cutting ACK
+    /// traffic and CPU on high-throughput connections (bulk download/upload,
+    /// speedtest). Only takes effect when the peer also negotiates the
+    /// extension, so enabling it is safe for clients that do not support it.
+    /// Default: true.
+    #[serde(default = "default_true")]
+    pub enable_ack_frequency: bool,
 
     /// Maximum concurrent WebTransport sessions per origin (default 100).
     #[serde(default = "default_wt_max_sessions")]
@@ -512,6 +586,7 @@ impl Default for ServerConfig {
             webtransport_allowed_origins: Vec::new(),
             max_request_body_bytes: 52_428_800, // 50 MiB
             enable_quic_migration: true,
+            enable_ack_frequency: true,
             webtransport_max_sessions_per_origin: 100,
             webtransport_max_streams_per_session: 1000,
             webtransport_max_datagrams_per_sec: 500,
@@ -2317,6 +2392,15 @@ impl ProxyConfig {
                 "SR-02: WebTransport routes are configured but server.webtransport_allowed_origins is empty. \
                  All cross-origin WebTransport sessions will be rejected. \
                  Set webtransport_allowed_origins to your frontend origins."
+            );
+        }
+
+        // MASQUE / CONNECT-UDP: enabled with no allowlist accepts no targets.
+        if self.masque.enabled && self.masque.allowed_targets.is_empty() {
+            warn!(
+                "masque.enabled = true but masque.allowed_targets is empty. \
+                 Every CONNECT-UDP request will be rejected with 403. \
+                 Add entries like \"host:port\" (host/port may be \"*\")."
             );
         }
 

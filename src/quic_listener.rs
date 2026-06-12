@@ -16,7 +16,10 @@ use h3_quinn::Connection as H3Connection;
 use http_body_util::{BodyExt as _, Empty};
 use hyper::client::conn::http1 as h1_client;
 use hyper_util::rt::TokioIo;
-use quinn::{Endpoint, ServerConfig as QuinnServerConfig, TransportConfig, VarInt};
+use quinn::{
+    AckFrequencyConfig, Connection as QuinnConnection, Endpoint, ServerConfig as QuinnServerConfig,
+    TransportConfig, VarInt,
+};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -24,6 +27,7 @@ use tracing::{debug, error, info, warn};
 use crate::access_logger::{log_access, AccessLogEntry};
 use crate::cache::{CacheLookup, ResponseCache};
 use crate::config::{BackendConfig, BackendType, ConfigReloadEvent, CorsConfig, ProxyConfig};
+use crate::connect_udp::{self, DatagramRouter};
 use crate::handlers::WebTransportHandler;
 use crate::http3_features::EarlyHintsState;
 use crate::load_balancer::{LoadBalancer, SelectionContext};
@@ -123,6 +127,14 @@ impl QuicListener {
                 .try_into()
                 .map_err(|e| anyhow::anyhow!("Invalid idle timeout: {}", e))?,
         ));
+
+        // ACK Frequency extension (draft-ietf-quic-ack-frequency): allow the peer
+        // to request fewer, batched ACKs, reducing ACK traffic and CPU on
+        // high-throughput connections. Negotiated — inert if the peer lacks it.
+        if config.server.enable_ack_frequency {
+            transport_config.ack_frequency_config(Some(AckFrequencyConfig::default()));
+            info!("QUIC ACK Frequency extension enabled");
+        }
 
         // Create QUIC server configuration
         let mut server_config =
@@ -329,6 +341,7 @@ impl QuicListener {
                 // HTTP/3 connection established
                 Self::handle_h3_connection(
                     &mut h3,
+                    connection,
                     remote_addr,
                     config,
                     backend_pool,
@@ -356,6 +369,7 @@ impl QuicListener {
     #[allow(clippy::too_many_arguments)]
     async fn handle_h3_connection(
         h3: &mut h3::server::Connection<H3Connection, Bytes>,
+        quic_connection: QuinnConnection,
         remote_addr: SocketAddr,
         config: Arc<ProxyConfig>,
         backend_pool: Arc<BackendPool>,
@@ -366,6 +380,9 @@ impl QuicListener {
         load_balancer: Arc<LoadBalancer>,
         cache: Arc<ResponseCache>,
     ) -> anyhow::Result<()> {
+        // Lazily created on the first CONNECT-UDP session so connections that
+        // never use MASQUE pay nothing for the datagram reader task.
+        let mut datagram_router: Option<Arc<DatagramRouter>> = None;
         loop {
             match h3.accept().await {
                 Ok(Some(resolver)) => {
@@ -416,6 +433,12 @@ impl QuicListener {
                     let is_ws_h3 = method == http::Method::CONNECT
                         && protocol_ext
                             .map(|p| p.as_str() == "websocket")
+                            .unwrap_or(false);
+
+                    // RFC 9298: CONNECT-UDP uses Extended CONNECT with :protocol = connect-udp
+                    let is_connect_udp = method == http::Method::CONNECT
+                        && protocol_ext
+                            .map(|p| p.as_str() == "connect-udp")
                             .unwrap_or(false);
 
                     if is_webtransport {
@@ -498,6 +521,128 @@ impl QuicListener {
                         // NOTE: Stream is intentionally NOT finished here
                         // The WebTransport session keeps it open for bidirectional communication
                         // The session will be closed when the client disconnects or on error
+                    } else if is_connect_udp {
+                        // RFC 9298: CONNECT-UDP. Relay UDP datagrams between the
+                        // client and an allowlisted target host:port.
+                        let mut stream = stream;
+
+                        if !config.masque.enabled {
+                            debug!("CONNECT-UDP rejected (disabled) from {}", remote_addr);
+                            let reject = http::Response::builder()
+                                .status(http::StatusCode::NOT_FOUND)
+                                .body(())?;
+                            let _ = stream.send_response(reject).await;
+                            continue;
+                        }
+
+                        let Some((target_host, target_port)) = connect_udp::parse_target(&path)
+                        else {
+                            debug!("CONNECT-UDP bad target path '{}' from {}", path, remote_addr);
+                            let reject = http::Response::builder()
+                                .status(http::StatusCode::BAD_REQUEST)
+                                .body(())?;
+                            let _ = stream.send_response(reject).await;
+                            continue;
+                        };
+
+                        if !config.masque.is_target_allowed(&target_host, target_port) {
+                            warn!(
+                                "CONNECT-UDP target {}:{} not allowed (from {})",
+                                target_host, target_port, remote_addr
+                            );
+                            let reject = http::Response::builder()
+                                .status(http::StatusCode::FORBIDDEN)
+                                .body(())?;
+                            let _ = stream.send_response(reject).await;
+                            continue;
+                        }
+
+                        // Resolve target to a socket address.
+                        let resolved = tokio::net::lookup_host((
+                            target_host.as_str(),
+                            target_port,
+                        ))
+                        .await
+                        .ok()
+                        .and_then(|mut addrs| addrs.next());
+                        let Some(target_addr) = resolved else {
+                            warn!(
+                                "CONNECT-UDP: cannot resolve {}:{} (from {})",
+                                target_host, target_port, remote_addr
+                            );
+                            let reject = http::Response::builder()
+                                .status(http::StatusCode::BAD_GATEWAY)
+                                .body(())?;
+                            let _ = stream.send_response(reject).await;
+                            continue;
+                        };
+
+                        // Start (or reuse) the per-connection datagram router.
+                        let router = datagram_router
+                            .get_or_insert_with(|| DatagramRouter::new(quic_connection.clone()))
+                            .clone();
+
+                        if router.session_count().await
+                            >= config.masque.max_sessions_per_connection
+                        {
+                            warn!(
+                                "CONNECT-UDP: session limit reached for {}",
+                                remote_addr
+                            );
+                            let reject = http::Response::builder()
+                                .status(http::StatusCode::SERVICE_UNAVAILABLE)
+                                .body(())?;
+                            let _ = stream.send_response(reject).await;
+                            continue;
+                        }
+
+                        // Quarter Stream ID = request stream id / 4 (RFC 9297).
+                        let quarter_id = stream.id().into_inner() / 4;
+                        let from_client = router.register_session(quarter_id).await;
+
+                        // Accept the session (RFC 9298 §3: 2xx).
+                        let accept = http::Response::builder()
+                            .status(http::StatusCode::OK)
+                            .body(())?;
+                        if let Err(e) = stream.send_response(accept).await {
+                            error!("CONNECT-UDP: failed to accept for {}: {}", remote_addr, e);
+                            router.unregister_session(quarter_id).await;
+                            continue;
+                        }
+
+                        info!(
+                            "CONNECT-UDP session opened: {} -> {} (qsid={})",
+                            remote_addr, target_addr, quarter_id
+                        );
+                        metrics
+                            .connections
+                            .connection_opened(ConnectionProtocol::WebTransport);
+
+                        let idle = Duration::from_secs(
+                            config.masque.session_idle_timeout_secs.max(1),
+                        );
+                        let conn_clone = quic_connection.clone();
+                        let metrics_clone = metrics.clone();
+                        tokio::spawn(async move {
+                            // The request stream stays open for the session; reading it
+                            // to end (FIN/RESET) signals the client closed the tunnel.
+                            let (_send, mut recv) = stream.split();
+                            let stream_closed = async move {
+                                // Drain any capsule data; FIN/RESET ends the loop.
+                                while let Ok(Some(_)) = recv.recv_data().await {}
+                            };
+                            connect_udp::run_session(
+                                router,
+                                conn_clone,
+                                quarter_id,
+                                target_addr,
+                                idle,
+                                from_client,
+                                stream_closed,
+                            )
+                            .await;
+                            metrics_clone.connections.connection_closed();
+                        });
                     } else if is_ws_h3 {
                         // RFC 9220: WebSocket-over-HTTP/3 extended CONNECT tunnel.
                         // Respond with 200 OK (not 101), then bridge the HTTP/3 bidi stream

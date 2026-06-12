@@ -46,6 +46,32 @@ enable_ipv6 = false
 # Worker threads (0 = auto-detect based on CPU cores)
 worker_threads = 0
 
+# Enable QUIC connection migration (RFC 9000 §9). Default: true.
+enable_quic_migration = true
+
+# Enable the QUIC ACK Frequency extension (draft-ietf-quic-ack-frequency).
+# Lets peers request fewer, batched ACKs — less ACK traffic and CPU on
+# high-throughput connections. Negotiated, so it is safely ignored by clients
+# that do not support it. Default: true.
+enable_ack_frequency = true
+
+# =============================
+# MASQUE / CONNECT-UDP (RFC 9298)
+# =============================
+# UDP proxying over HTTP/3 Extended CONNECT. Disabled by default — an open UDP
+# relay can be abused for amplification and scanning, so a target must match the
+# allowlist before a session is established.
+[masque]
+enabled = false
+# Permitted relay targets: "host:port". host or port may be "*" (wildcard).
+# A request is allowed only if it matches at least one entry; empty = deny all.
+allowed_targets = []
+# allowed_targets = ["dns.example.com:853", "*:443"]
+# Idle timeout (seconds) — session closes after no datagrams in either direction.
+session_idle_timeout_secs = 60
+# Maximum concurrent CONNECT-UDP sessions per QUIC connection.
+max_sessions_per_connection = 8
+
 # =============================
 # TLS Configuration
 # =============================

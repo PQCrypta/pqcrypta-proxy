@@ -74,6 +74,7 @@ pub mod audit_logger;
 pub mod cache;
 pub mod compression;
 pub mod config;
+pub mod connect_udp;
 pub mod fingerprint;
 pub mod handlers;
 pub mod http3_features;

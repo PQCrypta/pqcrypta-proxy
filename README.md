@@ -125,6 +125,8 @@
 | **DNS Prefetch / Preconnect / Prerender Hints** | ✅ | Early Hints Link headers for dns-prefetch, preconnect, modulepreload, and speculative prerender |
 | **Report-To Header** | ✅ | Reporting endpoint configuration injected into responses for NEL and CSP violation delivery |
 | **Fingerprint Cache TTL** | ✅ | JA3/JA4 fingerprint classification cache with configurable max-age and background cleanup |
+| **QUIC ACK Frequency** | ✅ | draft-ietf-quic-ack-frequency extension (`enable_ack_frequency`, default on) — peers may request fewer, batched ACKs, cutting ACK traffic and CPU on high-throughput connections; negotiated, so inert against clients that lack it |
+| **MASQUE / CONNECT-UDP (RFC 9298)** | ✅ | UDP proxying over HTTP/3 Extended CONNECT (`:protocol = connect-udp`); UDP payloads relayed as HTTP Datagrams (RFC 9297) bound to the request stream; disabled by default with `host:port` allowlist, per-session idle timeout, and per-connection session cap (`[masque]`) |
 
 ## Features
 
