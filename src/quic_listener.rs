@@ -156,6 +156,37 @@ impl QuicListener {
         // is misleading (and a client that selected one would fail), so restrict the
         // list to v1 only. quinn still adds its reserved/GREASE version automatically.
         let socket = std::net::UdpSocket::bind(addr)?;
+
+        // Explicitly size the kernel UDP socket buffers. quinn-udp enables GSO/GRO
+        // automatically but does NOT set SO_RCVBUF/SO_SNDBUF — it inherits the host's
+        // net.core.{r,w}mem_default. On a stock host that default is ~212 KB, which
+        // drops datagrams under bulk QUIC load *before* quinn sees them (distinct from
+        // the QUIC-level flow-control windows below). Setting it here makes throughput
+        // portable across hosts instead of depending on a hand-tuned sysctl. The kernel
+        // clamps the request to net.core.{r,w}mem_max and reports back ~2x the granted
+        // size. 16 MB matches the 16 MB connection receive_window configured below.
+        {
+            const UDP_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+            let sock_ref = socket2::SockRef::from(&socket);
+            if let Err(e) = sock_ref.set_recv_buffer_size(UDP_BUFFER_BYTES) {
+                warn!("Failed to set UDP SO_RCVBUF to {UDP_BUFFER_BYTES} bytes: {e}");
+            }
+            if let Err(e) = sock_ref.set_send_buffer_size(UDP_BUFFER_BYTES) {
+                warn!("Failed to set UDP SO_SNDBUF to {UDP_BUFFER_BYTES} bytes: {e}");
+            }
+            // getsockopt returns roughly double the granted size on Linux (bookkeeping
+            // overhead); halve for an honest figure. If these come back far below the
+            // request, net.core.{r,w}mem_max is clamping and should be raised.
+            let rcv = sock_ref.recv_buffer_size().map(|v| v / 2).unwrap_or(0);
+            let snd = sock_ref.send_buffer_size().map(|v| v / 2).unwrap_or(0);
+            info!(
+                "QUIC UDP socket buffers: SO_RCVBUF≈{} KB, SO_SNDBUF≈{} KB (requested {} KB each)",
+                rcv / 1024,
+                snd / 1024,
+                UDP_BUFFER_BYTES / 1024
+            );
+        }
+
         let runtime = quinn::default_runtime()
             .ok_or_else(|| anyhow::anyhow!("no async runtime found for QUIC endpoint"))?;
         let mut endpoint_config = quinn::EndpointConfig::default();
