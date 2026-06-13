@@ -221,3 +221,58 @@ burst_size = 200
     assert!(rate_limit.requests_per_second > 0);
     assert!(rate_limit.burst_size > 0);
 }
+
+#[test]
+fn test_ack_frequency_default_enabled() {
+    // ACK Frequency is on by default; absent from config it must stay enabled.
+    assert!(ServerConfig::default().enable_ack_frequency);
+}
+
+#[test]
+fn test_masque_defaults_disabled() {
+    // MASQUE must be off by default — it is a UDP relay.
+    let config = ProxyConfig::default();
+    assert!(!config.masque.enabled);
+    assert!(config.masque.allowed_targets.is_empty());
+}
+
+#[test]
+fn test_masque_parsing() {
+    let toml_content = r#"
+enabled = true
+allowed_targets = ["127.0.0.53:53", "*:443", "dns.example.com:*"]
+session_idle_timeout_secs = 30
+max_sessions_per_connection = 4
+"#;
+    let masque: MasqueConfig = toml::from_str(toml_content).unwrap();
+    assert!(masque.enabled);
+    assert_eq!(masque.session_idle_timeout_secs, 30);
+    assert_eq!(masque.max_sessions_per_connection, 4);
+}
+
+#[test]
+fn test_masque_allowlist_matching() {
+    let toml_content = r#"
+enabled = true
+allowed_targets = ["127.0.0.53:53", "*:443", "dns.example.com:*"]
+"#;
+    let masque: MasqueConfig = toml::from_str(toml_content).unwrap();
+
+    // Exact host:port
+    assert!(masque.is_target_allowed("127.0.0.53", 53));
+    // Wildcard host, exact port
+    assert!(masque.is_target_allowed("anything.example", 443));
+    // Exact host (case-insensitive), wildcard port
+    assert!(masque.is_target_allowed("DNS.example.com", 8853));
+
+    // Not allowed
+    assert!(!masque.is_target_allowed("127.0.0.53", 54));
+    assert!(!masque.is_target_allowed("evil.example", 53));
+}
+
+#[test]
+fn test_masque_empty_allowlist_denies_all() {
+    let masque = MasqueConfig::default();
+    assert!(!masque.is_target_allowed("127.0.0.53", 53));
+    assert!(!masque.is_target_allowed("anything", 443));
+}
