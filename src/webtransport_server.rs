@@ -102,13 +102,42 @@ impl WebTransportServer {
             "🔧 Transport config: receive_window=64MB, stream_window=32MB, send_window=64MB, datagram_buf=4MB"
         );
 
+        // Bind the UDP socket ourselves so we can size SO_RCVBUF/SO_SNDBUF
+        // explicitly. wtransport/quinn-udp enable GSO/GRO automatically but never
+        // set the kernel socket buffers — they inherit net.core.{r,w}mem_default,
+        // which varies per host (e.g. 8 MB on the speedtest node vs 25 MB
+        // elsewhere). On a speedtest server an undersized send/recv buffer caps
+        // measured throughput, so request a fixed 16 MB; the kernel clamps to
+        // net.core.{r,w}mem_max. with_bind_socket() takes the socket as-is, and
+        // the address path sets no extra socket options, so this is equivalent.
+        let socket = std::net::UdpSocket::bind(addr)?;
+        {
+            const UDP_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+            let sock_ref = socket2::SockRef::from(&socket);
+            if let Err(e) = sock_ref.set_recv_buffer_size(UDP_BUFFER_BYTES) {
+                warn!("Failed to set WebTransport UDP SO_RCVBUF to {UDP_BUFFER_BYTES} bytes: {e}");
+            }
+            if let Err(e) = sock_ref.set_send_buffer_size(UDP_BUFFER_BYTES) {
+                warn!("Failed to set WebTransport UDP SO_SNDBUF to {UDP_BUFFER_BYTES} bytes: {e}");
+            }
+            // Linux reports ~2x the granted size; halve for an honest figure.
+            let rcv = sock_ref.recv_buffer_size().map(|v| v / 2).unwrap_or(0);
+            let snd = sock_ref.send_buffer_size().map(|v| v / 2).unwrap_or(0);
+            info!(
+                "WebTransport UDP socket buffers: SO_RCVBUF≈{} KB, SO_SNDBUF≈{} KB (requested {} KB each)",
+                rcv / 1024,
+                snd / 1024,
+                UDP_BUFFER_BYTES / 1024
+            );
+        }
+
         // Create server configuration with WebTransport support
         // The wtransport crate automatically:
         // - Configures ALPN with "h3" protocol
         // - Sends SETTINGS_ENABLE_WEBTRANSPORT=1 frame
         // - Handles QUIC connection establishment
         let config_builder = ServerConfig::builder()
-            .with_bind_address(addr)
+            .with_bind_socket(socket)
             .with_custom_transport(identity, transport_config)
             .keep_alive_interval(Some(Duration::from_secs(15)))
             .max_idle_timeout(Some(Duration::from_mins(2)))
