@@ -75,6 +75,7 @@ use pqcrypta_proxy::acme;
 use pqcrypta_proxy::admin::AdminServer;
 use pqcrypta_proxy::audit_logger::AuditLogger;
 use pqcrypta_proxy::config::{ConfigManager, ConfigReloadEvent, ProxyConfig, TlsMode};
+use pqcrypta_proxy::http3_features::EarlyHintsState;
 use pqcrypta_proxy::load_balancer::LoadBalancer;
 use pqcrypta_proxy::metrics;
 use pqcrypta_proxy::ocsp;
@@ -448,14 +449,25 @@ async fn main() -> anyhow::Result<()> {
         info!("Configuration file watching enabled");
     }
 
+    // Shared Early Hints (103) state — created once here and cloned into every
+    // QUIC listener so the reload handler below can update preload rules live.
+    let early_hints_state = Arc::new(EarlyHintsState::from_http3_config(&config.http3));
+
     // Spawn config reload handler for hot-reload support
     let reload_tls_provider = tls_provider.clone();
     let reload_pqc_provider = pqc_provider.clone();
+    let reload_early_hints = early_hints_state.clone();
+    let reload_config_manager = config_manager.clone();
     tokio::spawn(async move {
         while let Some(event) = reload_rx.recv().await {
             match event {
                 ConfigReloadEvent::ConfigReloaded(new_config) => {
                     info!("Configuration reloaded - applying changes");
+
+                    // Refresh the central config snapshot. The file-watcher emits
+                    // the event but does not update the ArcSwap itself, so do it
+                    // here to keep `config_manager.get()` consistent with what we apply.
+                    reload_config_manager.store_config(new_config.clone());
 
                     // Update TLS provider with new config
                     if let Err(e) =
@@ -469,6 +481,12 @@ async fn main() -> anyhow::Result<()> {
                     // Update PQC provider with new config
                     reload_pqc_provider.update_config(&new_config.pqc);
                     info!("PQC configuration updated");
+
+                    // Update HTTP/3 Early Hints (103) rules live — preconnect
+                    // origins and per-host preload resources take effect on the
+                    // next request without a restart.
+                    reload_early_hints.update_from_http3_config(&new_config.http3);
+                    info!("HTTP/3 Early Hints configuration updated");
 
                     // Note: BackendPool update requires mutable access
                     // which would require additional synchronization
@@ -920,6 +938,7 @@ async fn main() -> anyhow::Result<()> {
             quic_config.advanced_rate_limiting.clone(),
         ));
         let quic_lb = shared_lb.clone();
+        let quic_early_hints = early_hints_state.clone();
         let quic_cache = Arc::new(ResponseCache::new(quic_config.cache.clone()));
         if quic_config.cache.enabled {
             info!(
@@ -939,6 +958,7 @@ async fn main() -> anyhow::Result<()> {
                 quic_advanced_rl,
                 quic_lb,
                 quic_cache,
+                quic_early_hints,
             )
             .await
             {

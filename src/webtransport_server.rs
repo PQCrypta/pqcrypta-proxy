@@ -94,8 +94,7 @@ impl WebTransportServer {
         // ACKs cut overhead during bulk speedtest transfers. Negotiated, so it is
         // inert against clients that do not support it.
         if config.server.enable_ack_frequency {
-            transport_config
-                .ack_frequency_config(Some(quinn::AckFrequencyConfig::default()));
+            transport_config.ack_frequency_config(Some(quinn::AckFrequencyConfig::default()));
             info!("🔧 QUIC ACK Frequency extension enabled");
         }
 

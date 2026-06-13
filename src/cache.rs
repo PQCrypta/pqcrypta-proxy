@@ -329,7 +329,11 @@ impl ResponseCache {
         // different range — corrupting media/video playback. Let range requests
         // always reach the backend.
         if status == 206 || status == 416 || has_content_range {
-            trace!("Not caching {}: partial/range response (status {})", key, status);
+            trace!(
+                "Not caching {}: partial/range response (status {})",
+                key,
+                status
+            );
             return;
         }
 

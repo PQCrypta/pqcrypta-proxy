@@ -103,6 +103,7 @@ impl QuicListener {
         advanced_rate_limiter: Arc<AdvancedRateLimiter>,
         load_balancer: Arc<LoadBalancer>,
         cache: Arc<ResponseCache>,
+        early_hints_state: Arc<EarlyHintsState>,
     ) -> anyhow::Result<Self> {
         let addr = config.server.socket_addr()?;
 
@@ -158,9 +159,9 @@ impl QuicListener {
         // Create backend pool
         let backend_pool = Arc::new(BackendPool::new(config.clone()));
 
-        // Create early hints state from config
-        let early_hints_state = Arc::new(EarlyHintsState::from_http3_config(&config.http3));
-        if config.http3.early_hints_enabled {
+        // Early Hints state is created once in main() and shared across all QUIC
+        // listeners so the config reload handler can update it live.
+        if early_hints_state.is_enabled() {
             info!("HTTP/3 Early Hints (103) enabled");
         }
 
@@ -537,7 +538,10 @@ impl QuicListener {
 
                         let Some((target_host, target_port)) = connect_udp::parse_target(&path)
                         else {
-                            debug!("CONNECT-UDP bad target path '{}' from {}", path, remote_addr);
+                            debug!(
+                                "CONNECT-UDP bad target path '{}' from {}",
+                                path, remote_addr
+                            );
                             let reject = http::Response::builder()
                                 .status(http::StatusCode::BAD_REQUEST)
                                 .body(())?;
@@ -558,13 +562,10 @@ impl QuicListener {
                         }
 
                         // Resolve target to a socket address.
-                        let resolved = tokio::net::lookup_host((
-                            target_host.as_str(),
-                            target_port,
-                        ))
-                        .await
-                        .ok()
-                        .and_then(|mut addrs| addrs.next());
+                        let resolved = tokio::net::lookup_host((target_host.as_str(), target_port))
+                            .await
+                            .ok()
+                            .and_then(|mut addrs| addrs.next());
                         let Some(target_addr) = resolved else {
                             warn!(
                                 "CONNECT-UDP: cannot resolve {}:{} (from {})",
@@ -582,13 +583,9 @@ impl QuicListener {
                             .get_or_insert_with(|| DatagramRouter::new(quic_connection.clone()))
                             .clone();
 
-                        if router.session_count().await
-                            >= config.masque.max_sessions_per_connection
+                        if router.session_count().await >= config.masque.max_sessions_per_connection
                         {
-                            warn!(
-                                "CONNECT-UDP: session limit reached for {}",
-                                remote_addr
-                            );
+                            warn!("CONNECT-UDP: session limit reached for {}", remote_addr);
                             let reject = http::Response::builder()
                                 .status(http::StatusCode::SERVICE_UNAVAILABLE)
                                 .body(())?;
@@ -618,9 +615,8 @@ impl QuicListener {
                             .connections
                             .connection_opened(ConnectionProtocol::WebTransport);
 
-                        let idle = Duration::from_secs(
-                            config.masque.session_idle_timeout_secs.max(1),
-                        );
+                        let idle =
+                            Duration::from_secs(config.masque.session_idle_timeout_secs.max(1));
                         let conn_clone = quic_connection.clone();
                         let metrics_clone = metrics.clone();
                         tokio::spawn(async move {
@@ -1040,7 +1036,7 @@ impl QuicListener {
         // Send 103 Early Hints if enabled and we have hints for this path
         // This is a key HTTP/3 optimization - send resource hints before proxying to backend
         // Only send for GET/HEAD requests - 103 on POST/PUT/DELETE can break cookie handling
-        if config.http3.early_hints_enabled && (method == "GET" || method == "HEAD") {
+        if early_hints_state.is_enabled() && (method == "GET" || method == "HEAD") {
             let hints =
                 early_hints_state.get_hints_for_request(host.as_deref().unwrap_or(""), &path);
             if !hints.is_empty() {
@@ -1593,9 +1589,20 @@ impl QuicListener {
                         .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
                         .header("server", SERVER_HEADER);
                     for (k, v) in &cached_headers {
-                        if k.to_lowercase() != "content-length" {
-                            response_builder = response_builder.header(k.as_str(), v.as_str());
+                        // Skip headers the proxy sets itself in this block. The cached
+                        // entry holds the raw backend headers, so replaying `server`
+                        // would emit a second `server: <backend>` alongside our own
+                        // SERVER_HEADER — duplicate `server` values that leak the backend
+                        // identity and shadow ours for some HTTP/3 clients. Same for
+                        // alt-svc/age/x-cache/content-length which are set above.
+                        let lk = k.to_lowercase();
+                        if matches!(
+                            lk.as_str(),
+                            "content-length" | "server" | "alt-svc" | "age" | "x-cache"
+                        ) {
+                            continue;
                         }
+                        response_builder = response_builder.header(k.as_str(), v.as_str());
                     }
                     let body_bytes: Vec<u8> = if method == "HEAD" {
                         Vec::new()

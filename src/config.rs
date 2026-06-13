@@ -2031,6 +2031,14 @@ impl ConfigManager {
     pub fn get(&self) -> Arc<ProxyConfig> {
         self.config.load_full()
     }
+
+    /// Atomically swap in a freshly-loaded configuration so subsequent `get()`
+    /// calls observe it. The file-watcher path (`start_watching`) emits a reload
+    /// event but does not update this `ArcSwap` itself; the reload handler calls
+    /// this to keep the central snapshot consistent with what listeners apply.
+    pub fn store_config(&self, config: Arc<ProxyConfig>) {
+        self.config.store(config);
+    }
 } // impl ConfigManager
 
 /// Recursively merge two TOML values.

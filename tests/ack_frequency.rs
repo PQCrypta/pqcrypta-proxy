@@ -16,9 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{
-    AckFrequencyConfig, ClientConfig, Endpoint, ServerConfig, TransportConfig, VarInt,
-};
+use quinn::{AckFrequencyConfig, ClientConfig, Endpoint, ServerConfig, TransportConfig, VarInt};
 
 /// Accept any server certificate — this is a localhost loopback test.
 #[derive(Debug)]

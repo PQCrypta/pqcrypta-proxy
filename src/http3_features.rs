@@ -155,10 +155,10 @@ impl Default for EarlyHintsState {
 }
 
 impl EarlyHintsState {
-    /// Create from the [http3] section of proxy-config.toml.
+    /// Build an [`EarlyHintsConfig`] from the [http3] section of proxy-config.toml.
     /// Converts `preload_resources` entries into `PreloadRule`s grouped by (host, path),
     /// so the TOML drives exactly what gets sent in 103 Early Hints.
-    pub fn from_http3_config(config: &crate::config::Http3Config) -> Self {
+    fn build_config(config: &crate::config::Http3Config) -> EarlyHintsConfig {
         use std::collections::HashMap;
 
         // Group preload resources by (host, path) key
@@ -182,17 +182,34 @@ impl EarlyHintsState {
             })
             .collect();
 
-        let hints_config = EarlyHintsConfig {
+        EarlyHintsConfig {
             enabled: config.early_hints_enabled,
             preconnect_origins: config.preconnect_origins.clone(),
             preload_rules,
             auto_detect: false,
-        };
+        }
+    }
 
+    /// Create from the [http3] section of proxy-config.toml.
+    pub fn from_http3_config(config: &crate::config::Http3Config) -> Self {
         Self {
-            config: Arc::new(RwLock::new(hints_config)),
+            config: Arc::new(RwLock::new(Self::build_config(config))),
             hints_cache: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Live-reload the early-hints rules from a new [http3] config section.
+    /// Swaps the inner config in place (so every `Arc` clone held by in-flight
+    /// connections sees the change) and clears the compiled-hints cache so the
+    /// next request rebuilds Link headers from the new rules.
+    pub fn update_from_http3_config(&self, config: &crate::config::Http3Config) {
+        *self.config.write() = Self::build_config(config);
+        self.hints_cache.clear();
+    }
+
+    /// Whether Early Hints (103) are currently enabled (reads live config).
+    pub fn is_enabled(&self) -> bool {
+        self.config.read().enabled
     }
 
     /// Get Link headers for a request (host + path).
