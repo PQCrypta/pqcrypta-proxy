@@ -10,6 +10,8 @@ Complete reference for all configuration options in PQCrypta Proxy.
 ## Table of Contents
 
 - [Server Configuration](#server-configuration)
+- [MASQUE / CONNECT-UDP](#masque--connect-udp-rfc-9298)
+- [HTTP/3 Advanced Features](#http3-advanced-features)
 - [TLS Configuration](#tls-configuration)
 - [HTTP Redirect](#http-redirect)
 - [Security Headers](#security-headers)
@@ -72,6 +74,55 @@ session is established.
 | `allowed_targets` | array[string] | `[]` | Permitted targets as `host:port`; `host`/`port` may be `*`. Empty = deny all |
 | `session_idle_timeout_secs` | u64 | `60` | Close a session after no datagrams in either direction for this long |
 | `max_sessions_per_connection` | usize | `8` | Maximum concurrent CONNECT-UDP sessions per QUIC connection |
+
+---
+
+## HTTP/3 Advanced Features
+
+```toml
+[http3]
+```
+
+Optional HTTP/3 optimizations layered on the QUIC listener. All settings
+hot-reload at runtime — editing this section applies on the next request with no
+restart. The proxy advertises **QUIC v1 (RFC 9000) only** in Version Negotiation;
+it does not offer the obsolete `draft-29..34` versions.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `early_hints_enabled` | bool | `true` | Send `103 Early Hints` (for `GET`/`HEAD`) when preconnect/preload rules match |
+| `priority_hints_enabled` | bool | `true` | Honour RFC 9218 Extensible Priorities |
+| `coalescing_enabled` | bool | `true` | Deduplicate identical in-flight requests |
+| `preconnect_origins` | array[string] | `[]` | Origins added to every 103 response as `<origin>; rel=preconnect` (global, all hosts) |
+| `coalescing_max_wait_ms` | u64 | `100` | Max time a coalesced request waits for the in-flight leader |
+| `coalescing_max_subscribers` | usize | `100` | Max requests coalesced onto one leader |
+| `coalescing_methods` | array[string] | `["GET","HEAD"]` | Methods eligible for coalescing |
+| `coalescing_exclude_paths` | array[string] | `["/api/","/ws","/stream"]` | Path prefixes never coalesced |
+
+### Preload Resources (103 Early Hints)
+
+Each `[[http3.preload_resources]]` entry adds a `Link: …; rel=preload` header to
+the 103 response for matching requests.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `host` | string | optional | Hostname this rule applies to. Omit = all hosts |
+| `path` | string | required | Path prefix that triggers the preload (`/` matches every page) |
+| `href` | string | required | Resource URL to preload |
+| `as_type` | string | required | `as=` attribute: `style`, `script`, `font`, `image`, … |
+| `crossorigin` | string | optional | `crossorigin` attribute value (e.g. `anonymous`) |
+
+> **Note:** a browser only *uses* a preload whose `href` byte-matches the URL in
+> the page HTML — including any `?v=` cache-buster. Pin versioned assets to their
+> current value (and re-pin when the file changes), or serve them unversioned.
+
+```toml
+[[http3.preload_resources]]
+host = "example.com"
+path = "/"
+href = "/css/style.css"
+as_type = "style"
+```
 
 ---
 

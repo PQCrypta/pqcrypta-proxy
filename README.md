@@ -193,6 +193,7 @@
 
 ### HTTP/3 Advanced Features
 - **Full HTTP/3 Support**: Native HTTP/3 via `h3` crate with proper header forwarding; hop-by-hop headers (`Transfer-Encoding`, `Connection`, etc.) stripped from all backend responses before forwarding or caching — prevents `ERR_QUIC_PROTOCOL_ERROR` per RFC 9114 §4.2
+- **QUIC v1 only**: The endpoint advertises **QUIC v1 (RFC 9000)** in Version Negotiation and nothing else. quinn's default version list also includes the obsolete `draft-29..34` (which it cannot actually handshake); the listener overrides `EndpointConfig::supported_versions` to v1 so VN advertises only what the server really speaks (plus quinn's reserved/GREASE version per RFC 9287)
 - **Early Hints (103)**: Preload CSS/JS resources via Link headers — dns-prefetch, preconnect, modulepreload, and speculative prerender hint types supported. Preload rules are scoped per host/path in `[[http3.preload_resources]]` and hot-reload at runtime (preconnect origins + preload rules apply on the next request, no restart). Note: an `href` is only used by the browser when it byte-matches the page URL, so any `?v=` cache-buster must be included and kept in sync.
 - **Priority Hints**: RFC 9218 Extensible Priorities for resource scheduling (`u=3,i=?0`)
 - **Request Coalescing**: Deduplicate identical GET/HEAD requests in flight

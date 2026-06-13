@@ -149,8 +149,18 @@ impl QuicListener {
             info!("QUIC connection migration disabled by configuration");
         }
 
-        // Create endpoint
-        let endpoint = Endpoint::server(server_config, addr)?;
+        // Create endpoint. Built manually (rather than Endpoint::server) so we can
+        // override quinn's advertised QUIC version list. quinn-proto's
+        // DEFAULT_SUPPORTED_VERSIONS is v1 + draft-29..34, but this proxy only
+        // handshakes v1 — advertising those obsolete drafts in Version Negotiation
+        // is misleading (and a client that selected one would fail), so restrict the
+        // list to v1 only. quinn still adds its reserved/GREASE version automatically.
+        let socket = std::net::UdpSocket::bind(addr)?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| anyhow::anyhow!("no async runtime found for QUIC endpoint"))?;
+        let mut endpoint_config = quinn::EndpointConfig::default();
+        endpoint_config.supported_versions(vec![0x0000_0001]); // QUIC v1 (RFC 9000) only
+        let endpoint = Endpoint::new(endpoint_config, Some(server_config), socket, runtime)?;
 
         info!("QUIC endpoint created on {}", addr);
         info!("ALPN protocols: {:?}", config.tls.alpn_protocols);
