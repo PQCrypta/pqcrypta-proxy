@@ -101,8 +101,11 @@ fi
 
 # ── Always heartbeat pqcrypta.com (keeps location marked available) ───────
 # Runs every timer interval regardless of IP change or DNS update outcome.
+# UA + bypass header required: the pqcrypta-proxy WAF 403s default curl as a bot.
 NOTIFY_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
     -X POST "$NOTIFY_URL" \
+    -A "pqcrypta-ip-update/1.0 (us-midwest heartbeat)" \
+    -H "X-Health-Check-Bypass: 1" \
     -H "Content-Type: application/json" \
     -d "{\"action\":\"update_ip\",\"location_id\":\"${LOCATION_ID}\",\"ip\":\"${CURRENT_IP}\",\"token\":\"${NOTIFY_TOKEN}\"}" || echo "000")
 
