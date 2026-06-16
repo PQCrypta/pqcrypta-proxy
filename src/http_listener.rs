@@ -2611,12 +2611,18 @@ async fn proxy_handler(
             .iter()
             .any(|h| h == &host);
     if is_native_tcp_speedtest {
-        let cors_origin: String = state
-            .config
-            .server
-            .webtransport_allowed_origins
-            .first()
-            .cloned()
+        // Echo the request's Origin when it is in the allowlist, so the TCP
+        // speedtest works from any allowed front-end regardless of list order.
+        // Fall back to the first allowed origin (then pqcrypta.com) when the
+        // request has no Origin or it is not allowed.
+        let allowed = &state.config.server.webtransport_allowed_origins;
+        let req_origin = headers
+            .get(header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let cors_origin: String = req_origin
+            .filter(|o| allowed.iter().any(|a| a == o))
+            .or_else(|| allowed.first().cloned())
             .unwrap_or_else(|| "https://pqcrypta.com".to_string());
 
         // CORS preflight
