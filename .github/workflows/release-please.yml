@@ -37,7 +37,7 @@ jobs:
 
       - name: Upload binary to release
         if: ${{ steps.release.outputs.release_created }}
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.release.outputs.tag_name }}
           files: target/release/pqcrypta-proxy
