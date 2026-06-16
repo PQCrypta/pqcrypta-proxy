@@ -147,7 +147,7 @@ maxminddb = { version = "0.27", optional = true }
 
 # JA3/JA4 fingerprinting
 sha2 = "0.10"
-sha1 = "0.10"
+sha1 = "0.11"
 md-5 = "0.10"
 
 # X.509 certificate parsing (for OCSP)
