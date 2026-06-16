@@ -16,11 +16,12 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tracing::{debug, error, info, warn};
 use wtransport::config::QuicTransportConfig;
-use wtransport::{Connection, Endpoint, Identity, ServerConfig};
+use wtransport::{Connection, Endpoint, ServerConfig};
 
 use crate::config::ProxyConfig;
 use crate::metrics::{ConnectionProtocol, MetricsRegistry};
 use crate::proxy::BackendPool;
+use crate::tls::{MultiDomainCertResolver, TlsProvider};
 
 /// Production WebTransport server with proper ALPN protocol negotiation
 pub struct WebTransportServer {
@@ -51,17 +52,36 @@ impl WebTransportServer {
         info!("🔑 Private Key: {}", key_path);
         info!("🔧 ALPN Protocol: h3 (HTTP/3) - automatically configured");
 
-        // Load TLS identity from PEM files
-        let identity = Identity::load_pemfiles(cert_path, key_path)
-            .await
-            .map_err(|e| {
-                error!("❌ TLS certificate load failed: {}", e);
-                error!("   Certificate: {}", cert_path);
-                error!("   Private key: {}", key_path);
-                e
-            })?;
+        // Build an SNI-based multi-cert resolver from the certs directory (the
+        // parent of the configured cert_path) so the WebTransport server presents
+        // the correct per-domain certificate for each SNI — matching the :443
+        // HTTPS listener. Without this the dedicated WT server can only serve a
+        // single static cert, breaking WebTransport for every other host on the box.
+        let certs_dir = std::path::Path::new(cert_path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("/etc/pqcrypta/certs"));
+        let resolver = Arc::new(MultiDomainCertResolver::new(certs_dir).map_err(|e| {
+            error!(
+                "❌ WebTransport SNI resolver build failed from {:?}: {}",
+                certs_dir, e
+            );
+            e
+        })?);
+        let rustls_config = TlsProvider::create_rustls_config_with_resolver(
+            &config.tls,
+            &config.pqc,
+            config.pqc.enabled,
+            resolver,
+        )
+        .map_err(|e| {
+            error!("❌ WebTransport rustls config build failed: {}", e);
+            e
+        })?;
 
-        info!("✅ TLS identity loaded successfully");
+        info!(
+            "✅ WebTransport SNI cert resolver loaded from {:?}",
+            certs_dir
+        );
 
         // Transport configuration — tuned for speedtest bulk data + concurrent datagrams.
         //
@@ -138,7 +158,7 @@ impl WebTransportServer {
         // - Handles QUIC connection establishment
         let config_builder = ServerConfig::builder()
             .with_bind_socket(socket)
-            .with_custom_transport(identity, transport_config)
+            .with_custom_tls_and_transport(rustls_config, transport_config)
             .keep_alive_interval(Some(Duration::from_secs(15)))
             .max_idle_timeout(Some(Duration::from_mins(2)))
             .map_err(|e| format!("Invalid idle timeout: {}", e))?

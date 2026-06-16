@@ -450,7 +450,7 @@ impl TlsProvider {
     }
 
     /// Create rustls server configuration using the shared SNI cert resolver.
-    fn create_rustls_config_with_resolver(
+    pub(crate) fn create_rustls_config_with_resolver(
         tls_config: &TlsConfig,
         pqc_config: &PqcConfig,
         pqc_available: bool,
