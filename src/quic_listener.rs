@@ -1885,6 +1885,17 @@ impl QuicListener {
             sse_builder = sse_builder.header("cache-control", "no-cache");
             sse_builder = sse_builder.header("server", SERVER_HEADER);
             sse_builder = sse_builder.header("alt-svc", alt_svc_for_host(&config, host.as_deref()));
+            // CORS headers must be present on the streamed response itself, not
+            // just the preflight — otherwise browsers block the SSE fetch with
+            // "No 'Access-Control-Allow-Origin' header". The non-SSE path adds
+            // these below; the SSE fast path must do the same.
+            if let Some(ref cors) = route.cors {
+                let req_origin = request
+                    .headers()
+                    .get("origin")
+                    .and_then(|v| v.to_str().ok());
+                sse_builder = add_cors_headers_to_builder(sse_builder, cors, req_origin);
+            }
             stream.send_response(sse_builder.body(())?).await?;
 
             let mut body_stream = stream_body;
