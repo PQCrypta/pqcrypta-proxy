@@ -30,7 +30,7 @@ use tracing::{debug, error, info, warn};
 #[cfg(feature = "acme")]
 use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType as AcmeChallengeType,
-    ExternalAccountKey, Identifier, NewAccount, NewOrder, OrderStatus,
+    ExternalAccountKey, Identifier, NewAccount, NewOrder, OrderStatus, RetryPolicy,
 };
 
 /// M-3: Validate a domain name for safe use in file-system paths.
@@ -777,131 +777,82 @@ async fn request_san_certificate(
     // Create a single order with all domains as identifiers
     let identifiers: Vec<Identifier> = domains.iter().map(|d| Identifier::Dns(d.clone())).collect();
 
-    let mut order = account
-        .new_order(&NewOrder {
-            identifiers: &identifiers,
-        })
-        .await?;
+    let mut order = account.new_order(&NewOrder::new(&identifiers)).await?;
 
-    // Process all authorizations (one per domain)
-    let authorizations = order.authorizations().await?;
+    // Register the HTTP-01 response for every pending authorization, then mark
+    // each challenge ready. Tokens are tracked so they can be cleared once the
+    // order finishes validating.
+    let mut registered_tokens: Vec<String> = Vec::new();
+    {
+        let mut authorizations = order.authorizations();
+        while let Some(result) = authorizations.next().await {
+            let mut authz = result?;
+            let authz_domain = authz.identifier().to_string();
 
-    for authz in &authorizations {
-        let authz_domain = match &authz.identifier {
-            Identifier::Dns(d) => d.clone(),
-        };
-
-        match authz.status {
-            AuthorizationStatus::Pending => {
-                let challenge = authz
-                    .challenges
-                    .iter()
-                    .find(|c| c.r#type == AcmeChallengeType::Http01)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("No HTTP-01 challenge found for {}", authz_domain)
-                    })?;
-
-                let key_auth = order.key_authorization(challenge);
-                let challenge_token = challenge.token.clone();
-                let challenge_url = challenge.url.clone();
-
-                {
-                    let mut challenges = pending_challenges.write();
-                    challenges.insert(
-                        challenge_token.clone(),
-                        PendingChallenge {
-                            token: challenge_token.clone(),
-                            key_authorization: key_auth.as_str().to_string(),
-                            domain: authz_domain.clone(),
-                            challenge_url: challenge_url.clone(),
-                            expires: SystemTime::now() + Duration::from_mins(5),
-                        },
-                    );
+            match authz.status {
+                AuthorizationStatus::Pending => {}
+                AuthorizationStatus::Valid => {
+                    debug!("Authorization already valid for {}", authz_domain);
+                    continue;
                 }
+                ref other => {
+                    return Err(anyhow::anyhow!(
+                        "Unexpected authorization status for {}: {:?}",
+                        authz_domain,
+                        other
+                    ));
+                }
+            }
 
-                info!(
-                    "HTTP-01 challenge ready for {} (token: {}...)",
-                    authz_domain,
-                    &challenge_token[..challenge_token.len().min(12)]
+            let mut challenge = authz
+                .challenge(AcmeChallengeType::Http01)
+                .ok_or_else(|| anyhow::anyhow!("No HTTP-01 challenge found for {}", authz_domain))?;
+
+            let key_auth = challenge.key_authorization();
+            let challenge_token = challenge.token.clone();
+            let challenge_url = challenge.url.clone();
+
+            {
+                let mut challenges = pending_challenges.write();
+                challenges.insert(
+                    challenge_token.clone(),
+                    PendingChallenge {
+                        token: challenge_token.clone(),
+                        key_authorization: key_auth.as_str().to_string(),
+                        domain: authz_domain.clone(),
+                        challenge_url,
+                        expires: SystemTime::now() + Duration::from_mins(5),
+                    },
                 );
-
-                order.set_challenge_ready(&challenge_url).await?;
-
-                // Poll with exponential backoff: 2s, 4s, 8s, 16s, then 16s repeating
-                let mut attempts = 0;
-                let mut delay_secs = 2u64;
-                loop {
-                    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-
-                    order.refresh().await?;
-                    let fresh_authz = order.authorizations().await?;
-
-                    let current = fresh_authz.iter().find(
-                        |a| matches!(&a.identifier, Identifier::Dns(d) if d == &authz_domain),
-                    );
-
-                    match current.map(|a| &a.status) {
-                        Some(AuthorizationStatus::Valid) => {
-                            info!("Challenge validated for {}", authz_domain);
-                            break;
-                        }
-                        Some(AuthorizationStatus::Invalid) => {
-                            pending_challenges.write().remove(&challenge_token);
-                            return Err(anyhow::anyhow!(
-                                "Challenge validation failed for {}",
-                                authz_domain
-                            ));
-                        }
-                        _ => {
-                            attempts += 1;
-                            if attempts > 15 {
-                                pending_challenges.write().remove(&challenge_token);
-                                return Err(anyhow::anyhow!(
-                                    "Challenge validation timeout for {} after {} attempts",
-                                    authz_domain,
-                                    attempts
-                                ));
-                            }
-                            delay_secs = (delay_secs * 2).min(16);
-                        }
-                    }
-                }
-
-                pending_challenges.write().remove(&challenge_token);
             }
-            AuthorizationStatus::Valid => {
-                debug!("Authorization already valid for {}", authz_domain);
-            }
-            _ => {
-                return Err(anyhow::anyhow!(
-                    "Unexpected authorization status for {}: {:?}",
-                    authz_domain,
-                    authz.status
-                ));
-            }
+
+            info!(
+                "HTTP-01 challenge ready for {} (token: {}...)",
+                authz_domain,
+                &challenge_token[..challenge_token.len().min(12)]
+            );
+
+            challenge.set_ready().await?;
+            registered_tokens.push(challenge_token);
         }
     }
 
-    // Wait for order to become ready
-    let mut attempts = 0;
-    let mut delay_secs = 2u64;
-    loop {
-        let state = order.state();
-        match state.status {
-            OrderStatus::Ready => break,
-            OrderStatus::Invalid => {
-                return Err(anyhow::anyhow!("Order became invalid"));
-            }
-            _ => {
-                attempts += 1;
-                if attempts > 15 {
-                    return Err(anyhow::anyhow!("Order ready timeout"));
-                }
-                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-                delay_secs = (delay_secs * 2).min(16);
-                order.refresh().await?;
-            }
+    // Poll the whole order until every authorization validates (or one fails).
+    // RetryPolicy provides the exponential backoff the manual loop used to do.
+    let ready_status = order.poll_ready(&RetryPolicy::default()).await?;
+
+    // Validation is complete (success or failure) — drop the served responses.
+    {
+        let mut challenges = pending_challenges.write();
+        for token in &registered_tokens {
+            challenges.remove(token);
         }
+    }
+
+    match ready_status {
+        OrderStatus::Ready => {}
+        OrderStatus::Invalid => return Err(anyhow::anyhow!("Order became invalid during validation")),
+        other => return Err(anyhow::anyhow!("Order not ready after validation: {:?}", other)),
     }
 
     // Generate certificate key pair.
@@ -929,32 +880,10 @@ async fn request_san_certificate(
     let csr = params.serialize_request(&key_pair)?;
     let csr_der = csr.der();
 
-    order.finalize(csr_der).await?;
+    order.finalize_csr(csr_der).await?;
 
-    // Wait for certificate issuance
-    let mut attempts = 0;
-    let mut delay_secs = 2u64;
-    let cert_chain = loop {
-        let state = order.state();
-        match state.status {
-            OrderStatus::Valid => {
-                let cert = order.certificate().await?;
-                break cert.ok_or_else(|| anyhow::anyhow!("No certificate returned"))?;
-            }
-            OrderStatus::Invalid => {
-                return Err(anyhow::anyhow!("Order became invalid after finalization"));
-            }
-            _ => {
-                attempts += 1;
-                if attempts > 15 {
-                    return Err(anyhow::anyhow!("Certificate issuance timeout"));
-                }
-                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-                delay_secs = (delay_secs * 2).min(16);
-                order.refresh().await?;
-            }
-        }
-    };
+    // Poll until the certificate is issued; RetryPolicy handles the backoff.
+    let cert_chain = order.poll_certificate(&RetryPolicy::default()).await?;
 
     // Split chain into leaf cert and intermediates
     let certs: Vec<&str> = cert_chain
@@ -1005,7 +934,7 @@ async fn get_or_create_account(config: &AcmeConfig) -> anyhow::Result<Account> {
 
                 // Deserialize the credentials from the stored JSON
                 let credentials: AccountCredentials = serde_json::from_value(stored.credentials)?;
-                let account = Account::from_credentials(credentials).await?;
+                let account = Account::builder()?.from_credentials(credentials).await?;
                 return Ok(account);
             }
             warn!(
@@ -1045,12 +974,13 @@ async fn get_or_create_account(config: &AcmeConfig) -> anyhow::Result<Account> {
             None
         };
 
-    let (account, credentials) = Account::create(
-        &new_account,
-        &config.directory_url,
-        external_account.as_ref(),
-    )
-    .await?;
+    let (account, credentials) = Account::builder()?
+        .create(
+            &new_account,
+            config.directory_url.clone(),
+            external_account.as_ref(),
+        )
+        .await?;
 
     // Serialize credentials to JSON value for storage
     let credentials_json = serde_json::to_value(&credentials)?;
