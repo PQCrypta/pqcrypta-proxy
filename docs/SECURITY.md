@@ -151,14 +151,14 @@ x_security_level = "Post-Quantum Ready"
 
 - [ ] **Install OpenSSL 3.5+** with OQS provider
 - [ ] **Enable hybrid PQC** (combines classical + quantum-resistant)
-- [ ] **Use x25519_kyber768** as preferred KEM
+- [ ] **Use X25519MLKEM768** (FIPS 203 / IETF standard) as preferred KEM
 - [ ] **Enable fallback** to classical TLS for incompatible clients
 
 ```toml
 [pqc]
 enabled = true
 provider = "openssl3.5"
-preferred_kem = "x25519_kyber768"
+preferred_kem = "X25519MLKEM768"
 fallback_to_classical = true
 ```
 

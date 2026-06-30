@@ -1191,7 +1191,7 @@ enabled = true
 provider = "openssl3.5"
 openssl_path = "/usr/local/openssl-pq/bin/openssl"
 openssl_lib_path = "/usr/local/openssl-pq/lib64"
-preferred_kem = "x25519_kyber768"
+preferred_kem = "X25519MLKEM768"
 fallback_to_classical = true
 ```
 

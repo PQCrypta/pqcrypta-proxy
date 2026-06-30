@@ -201,6 +201,19 @@ impl PqcTlsProvider {
                 // Parse preferred KEM
                 let preferred = PqcKemAlgorithm::from_str(&config.preferred_kem);
 
+                // A non-empty but unrecognised value silently falls through to the
+                // recommended-hybrid chain, which previously masked stale config such
+                // as the deprecated `x25519_kyber768` name. Surface it so metrics and
+                // the admin API never advertise a KEM that isn't actually offered.
+                if preferred.is_none() && !config.preferred_kem.trim().is_empty() {
+                    warn!(
+                        "preferred_kem = \"{}\" was not recognised (legacy Kyber names \
+                         require the `legacy-pqc` build feature); falling back to the \
+                         recommended hybrid order starting with X25519MLKEM768",
+                        config.preferred_kem
+                    );
+                }
+
                 // Build groups string with fallback chain
                 let groups = self.build_groups_string(&config, &kems, preferred);
                 *self.groups_string.write() = groups.clone();
