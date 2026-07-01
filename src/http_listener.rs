@@ -3297,6 +3297,19 @@ async fn proxy_handler(
 
                 let (mut parts, incoming_body) = backend_response.into_parts();
 
+                // The TLS-terminating proxy speaks plain HTTP to the backend, so the
+                // backend's self-referential redirects (Apache mod_speling case-fixes,
+                // DirectorySlash, etc.) come back as `Location: http://…`. Clients are
+                // always on HTTPS, so an http:// redirect is unusable and is blocked by
+                // the browser as mixed content. Upgrade the redirect scheme to https.
+                if let Some(loc) = parts.headers.get(header::LOCATION) {
+                    if let Some(rest) = loc.to_str().ok().and_then(|s| s.strip_prefix("http://")) {
+                        if let Ok(fixed) = HeaderValue::from_str(&format!("https://{rest}")) {
+                            parts.headers.insert(header::LOCATION, fixed);
+                        }
+                    }
+                }
+
                 // SSE / chunked-streaming fast path: skip buffering and pipe the body
                 // directly to the client. Buffering an SSE stream would hold the entire
                 // generation in memory and deliver it all at once when finished.
