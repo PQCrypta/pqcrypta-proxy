@@ -18,7 +18,8 @@ jobs:
         id: release
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          release-type: rust
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
 
       # After a release is created, build and upload release binaries
       - uses: actions/checkout@v4
