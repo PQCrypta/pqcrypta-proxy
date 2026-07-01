@@ -804,9 +804,9 @@ async fn request_san_certificate(
                 }
             }
 
-            let mut challenge = authz
-                .challenge(AcmeChallengeType::Http01)
-                .ok_or_else(|| anyhow::anyhow!("No HTTP-01 challenge found for {}", authz_domain))?;
+            let mut challenge = authz.challenge(AcmeChallengeType::Http01).ok_or_else(|| {
+                anyhow::anyhow!("No HTTP-01 challenge found for {}", authz_domain)
+            })?;
 
             let key_auth = challenge.key_authorization();
             let challenge_token = challenge.token.clone();
@@ -851,8 +851,15 @@ async fn request_san_certificate(
 
     match ready_status {
         OrderStatus::Ready => {}
-        OrderStatus::Invalid => return Err(anyhow::anyhow!("Order became invalid during validation")),
-        other => return Err(anyhow::anyhow!("Order not ready after validation: {:?}", other)),
+        OrderStatus::Invalid => {
+            return Err(anyhow::anyhow!("Order became invalid during validation"))
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "Order not ready after validation: {:?}",
+                other
+            ))
+        }
     }
 
     // Generate certificate key pair.
