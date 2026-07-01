@@ -2,10 +2,11 @@
 
 **Production-ready HTTP/3/QUIC/WebTransport reverse proxy with hybrid Post-Quantum Cryptography (PQC) TLS support.**
 
-[![Build Status](https://github.com/PQCrypta/pqcrypta-proxy/workflows/CI/badge.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
+[![CI](https://github.com/PQCrypta/pqcrypta-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions/workflows/ci.yml)
+[![Cargo Deny](https://github.com/PQCrypta/pqcrypta-proxy/actions/workflows/cargo-deny.yml/badge.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions/workflows/cargo-deny.yml)
+[![OSSF Scorecard](https://github.com/PQCrypta/pqcrypta-proxy/actions/workflows/ossf-scorecard.yml/badge.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions/workflows/ossf-scorecard.yml)
+[![CodeQL](https://github.com/PQCrypta/pqcrypta-proxy/actions/workflows/codeql.yml/badge.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions/workflows/codeql.yml)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-142%20passing-brightgreen.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions)
-[![Security](https://img.shields.io/badge/security-hardened-green.svg)](docs/SECURITY.md)
 
 ## Highlights
 
