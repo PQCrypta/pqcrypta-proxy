@@ -498,7 +498,7 @@ async fn auth_middleware(
     // This runs after bearer-token authorization succeeds so an attacker cannot
     // probe the HMAC path without first holding a valid token.
     if let Some(ref secret) = auth.hmac_secret {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
 
         let sig = headers

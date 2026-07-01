@@ -115,7 +115,7 @@ uuid = { version = "1.11", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 hex = "0.4"
-hmac = "0.12"
+hmac = "0.13"
 rand = "0.8"
 subtle = "2.6"
 jsonwebtoken = "9.3"
@@ -146,9 +146,9 @@ failsafe = "1.3"
 maxminddb = { version = "0.27", optional = true }
 
 # JA3/JA4 fingerprinting
-sha2 = "0.10"
-sha1 = "0.10"
-md-5 = "0.10"
+sha2 = "0.11"
+sha1 = "0.11"
+md-5 = "0.11"
 
 # X.509 certificate parsing (for OCSP)
 x509-parser = "0.16"
@@ -195,7 +195,7 @@ nix = { version = "0.29", features = ["signal", "user"] }
 # Unix socket support for PHP-FPM backends (not available on Windows)
 hyperlocal = "0.9"
 # Signal handling (uses Unix-specific signal iterators)
-signal-hook = "0.3"
+signal-hook = "0.4"
 signal-hook-tokio = { version = "0.4", features = ["futures-v0_3"] }
 
 [dev-dependencies]

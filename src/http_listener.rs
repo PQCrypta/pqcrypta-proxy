@@ -2908,7 +2908,7 @@ async fn proxy_handler(
             .and_then(|s| s.hmac_secret.as_ref())
             .cloned()
         {
-            use hmac::{Hmac, Mac};
+            use hmac::{Hmac, KeyInit, Mac};
             use sha2::Sha256;
 
             let sig = headers
