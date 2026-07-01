@@ -63,8 +63,15 @@ skip = [
     { name = "socket2", reason = "0.4 pulled by tokio internals; 0.5 used by direct/newer crates" },
     # ipnetwork — pulled at different versions by database and network crates
     { name = "ipnetwork", reason = "multiple transitive versions from sqlx and network crate sub-trees" },
+    # itertools — retained across transitive subtrees; multi-version only surfaces
+    # under cargo-deny --all-features / all-targets (as CI runs it), not host-default.
+    { name = "itertools", reason = "0.10 and 0.13 pulled by separate transitive subtrees under --all-features" },
     # openssl-probe — version split between openssl-related crate trees
     { name = "openssl-probe", reason = "multiple transitive versions from openssl/rustls bridging crates" },
+    # redox_syscall — 0.5 via parking_lot_core; 0.7 via libredox/filetime/notify.
+    # Duplicate is target-specific (Redox OS) and only flagged under CI's
+    # --all-features/all-targets evaluation; harmless on Linux/musl builds.
+    { name = "redox_syscall", reason = "0.5.x pulled by parking_lot_core; 0.7.x pulled by libredox/filetime/notify; multi-version under --all-features" },
     # untrusted — 0.7 retained by webpki 0.22; 0.9 used by newer ring-based crates
     { name = "untrusted", reason = "0.7 retained by webpki 0.22 sub-tree; 0.9 used by newer ring crates" },
     { name = "webpki-roots", reason = "0.26 and 1.x pulled by separate crates; update pending upstream" },
