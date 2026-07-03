@@ -76,6 +76,7 @@
 | **CIDR Blocklist Support** | ✅ | Blocklist files now match full subnet ranges (e.g. `192.0.2.0/24`); previously only host addresses were matched |
 | **Session Affinity TTL** | ✅ | Sticky session maps evict stale entries after configurable TTL; header affinity uses its own dedicated map |
 | **Proactive Backend Health Checks** | ✅ | Background TCP-connect health task marks backends unreachable before traffic hits them; configurable interval |
+| **Enforced Backend Request Timeout** | ✅ | Per-backend/pool-server `timeout_ms` bounds the forwarded request itself (not just connection setup) — a hung backend returns 504 Gateway Timeout instead of holding the client connection open indefinitely |
 | **Configurable GeoIP Block Duration** | ✅ | `geoip_block_duration_secs` in `[security]` (default 24 h); previously blocks were permanent with no expiry |
 | **Configurable WebTransport Port** | ✅ | `webtransport_port` in `[server]` replaces the hardcoded port 4433 for the dedicated WebTransport server |
 | **Dynamic Alt-Svc Header** | ✅ | Alt-Svc value built from `udp_port` + `additional_ports` at startup instead of a hardcoded constant |
@@ -652,6 +653,8 @@ custom_patterns = [
 
 `block_scanner_uas` matches against a built-in regex set covering common attack tools. It operates independently from path/payload pattern matching — a request can be blocked purely by its User-Agent even if the body is clean. Disable per-route via `waf_mode = "detect"` if you need to allow scanner tools from specific paths (e.g., an internal security tooling endpoint).
 
+The scanner-UA check also matches the default `curl/N` and `Wget/N` User-Agents, which are the expected clients for public binary-download endpoints (e.g. install scripts distributed as `curl -o file https://.../stream/downloads/...`). Paths under `/stream/downloads/` are hard-exempted from this specific check (same mechanism as the `X-Health-Check-Bypass` header) so documented `curl`/`wget` install commands aren't blocked — injection and path-traversal scanning still runs on these paths.
+
 Route-level WAF override:
 ```toml
 [[routes]]
@@ -818,7 +821,7 @@ address = "127.0.0.1:3003"
 weight = 100
 priority = 1
 max_connections = 100
-timeout_ms = 30000
+timeout_ms = 30000     # Bounds the forwarded request; on expiry the client gets 504 Gateway Timeout
 tls_mode = "terminate"
 
 # Secondary server
