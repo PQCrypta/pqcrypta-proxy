@@ -1138,13 +1138,17 @@ pub async fn security_middleware(
                 uri.query().unwrap_or("").to_string(),
             )
         };
-        // Skip bot UA check for health-check requests and automated internal clients
+        // Skip bot UA check for health-check requests, automated internal clients,
+        // and public binary downloads — the discovery-agent download docs instruct
+        // users to fetch these via `curl`/`wget`/PowerShell, which is exactly the
+        // traffic the scanner-UA heuristic is designed to block.
         let skip_bot_ua = request
             .headers()
             .get("x-health-check-bypass")
             .and_then(|v| v.to_str().ok())
             .map(|v| v == "1")
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || request_path.starts_with("/stream/downloads/");
         let waf_req = WafRequest {
             method: request.method().as_str(),
             path: &path,

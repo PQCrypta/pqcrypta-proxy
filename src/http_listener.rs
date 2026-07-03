@@ -2982,7 +2982,7 @@ async fn proxy_handler(
 
         // Check if backend is a pool first, then fall back to single backend
         let mut canary_cookie_to_set: Option<String> = None;
-        let (backend_address, tls_mode, pool_server, pool_name) =
+        let (backend_address, tls_mode, pool_server, pool_name, backend_timeout) =
             if let Some(pool) = state.load_balancer.get_pool(&route.backend) {
                 // Extract session cookie for sticky sessions
                 let cookie_header = headers.get("cookie").and_then(|v| v.to_str().ok());
@@ -3028,12 +3028,14 @@ async fn proxy_handler(
                     Some(result) => {
                         let address = result.server.address.to_string();
                         let tls = result.server.tls_mode.clone();
+                        let timeout = result.server.timeout;
                         canary_cookie_to_set = result.set_canary_cookie;
                         (
                             address,
                             tls,
                             Some(result.server),
                             Some(route.backend.clone()),
+                            timeout,
                         )
                     }
                     None => {
@@ -3070,7 +3072,13 @@ async fn proxy_handler(
                     backend.tls_mode.clone()
                 };
 
-                (backend.address.clone(), tls_mode, None, None)
+                (
+                    backend.address.clone(),
+                    tls_mode,
+                    None,
+                    None,
+                    Duration::from_millis(backend.timeout_ms),
+                )
             } else {
                 error!("Backend or pool not found: {}", route.backend);
                 return (StatusCode::BAD_GATEWAY, "Backend not configured").into_response();
@@ -3281,15 +3289,77 @@ async fn proxy_handler(
             }
         }
 
-        // Send request to backend (using appropriate client)
-        let result = if use_https {
-            state.https_client.request(proxy_request).await
-        } else {
-            state.http_client.request(proxy_request).await
-        };
+        // Send request to backend (using appropriate client), bounded by the
+        // per-backend/pool-server timeout so a hung backend can't hold the
+        // connection open indefinitely.
+        let result = tokio::time::timeout(backend_timeout, async {
+            if use_https {
+                state.https_client.request(proxy_request).await
+            } else {
+                state.http_client.request(proxy_request).await
+            }
+        })
+        .await;
 
         match result {
-            Ok(backend_response) => {
+            Err(_) => {
+                let response_time = request_start.elapsed();
+
+                // Record failure for circuit breaker
+                state.security.record_backend_result(&route.backend, false);
+
+                // Record failure for load balancer pool
+                if let (Some(server), Some(ref pn)) = (&pool_server, &pool_name) {
+                    state.load_balancer.record_completion(
+                        pn,
+                        server.as_ref(),
+                        response_time,
+                        false,
+                    );
+                    server.release_connection();
+                }
+
+                warn!(
+                    "Backend request to '{}' timed out after {}ms",
+                    route.backend,
+                    backend_timeout.as_millis()
+                );
+
+                // Record request metrics (skip error tracking for health check traffic)
+                state.metrics.requests.request_end_full(
+                    504,
+                    request_start.elapsed(),
+                    0,
+                    0,
+                    Some(&path),
+                    is_health_check,
+                );
+
+                // Log backend timeout
+                log_access(&AccessLogEntry {
+                    remote_addr: client_addr,
+                    method: method_str,
+                    path,
+                    protocol: "HTTP/1.1".to_string(),
+                    status: 504,
+                    body_size: 0,
+                    referer,
+                    user_agent,
+                    host: Some(host_str),
+                    response_time_ms: request_start
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                });
+
+                (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!("Backend timeout after {}ms", backend_timeout.as_millis()),
+                )
+                    .into_response()
+            }
+            Ok(Ok(backend_response)) => {
                 let response_time = request_start.elapsed();
 
                 // Record success for circuit breaker (single backend)
@@ -3551,7 +3621,7 @@ async fn proxy_handler(
 
                 response
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 let response_time = request_start.elapsed();
 
                 // Record failure for circuit breaker
