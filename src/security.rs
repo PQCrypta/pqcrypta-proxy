@@ -1231,6 +1231,14 @@ pub async fn security_middleware(
         if security.waf_engine.is_some() {
             let scan_limit = 65_536usize;
             let (parts, body) = request.into_parts();
+            // Collect the ENTIRE body (matching the declared Content-Length) —
+            // only the first `scan_limit` bytes are actually inspected by the WAF
+            // below. Previously this loop broke out (and the request was
+            // reconstructed) as soon as scan_limit was reached, silently
+            // truncating any body over 64 KB while forwarding the original,
+            // now-too-large Content-Length header. The backend would then wait
+            // forever for the remaining bytes the proxy had already discarded,
+            // hanging every request whose body crossed the 64 KB mark.
             let mut collected_bytes: Vec<u8> = Vec::new();
             let mut frame_stream = body.into_data_stream();
             while let Some(chunk_result) = {
@@ -1240,9 +1248,6 @@ pub async fn security_middleware(
                 match chunk_result {
                     Ok(chunk) => {
                         collected_bytes.extend_from_slice(&chunk);
-                        if collected_bytes.len() >= scan_limit {
-                            break;
-                        }
                     }
                     Err(_) => break,
                 }
@@ -1257,12 +1262,13 @@ pub async fn security_middleware(
                         .and_then(|v| v.to_str().ok())
                         .map(|v| v == "1")
                         .unwrap_or(false);
+                    let scan_slice_end = collected_bytes.len().min(scan_limit);
                     let waf_req_cl = WafRequest {
                         method: parts.method.as_str(),
                         path: &waf_path,
                         query: &waf_query,
                         headers: &parts.headers,
-                        body: Some(collected_bytes.as_slice()),
+                        body: Some(&collected_bytes[..scan_slice_end]),
                         skip_bot_ua_check: skip_bot_ua_cl,
                     };
                     match waf.inspect(&waf_req_cl) {

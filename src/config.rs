@@ -880,6 +880,13 @@ pub struct BackendConfig {
     pub retry_on: Option<Vec<String>>,
     /// Per-backend circuit breaker parameter overrides
     pub circuit_breaker: Option<CircuitBreakerOverride>,
+    /// Disable connection pooling/reuse for this backend — every request opens a
+    /// brand-new connection instead of reusing one from the pool. Costs a fresh
+    /// TCP handshake per request (negligible for loopback backends), but
+    /// sidesteps pooled-connection-reuse hangs/resets seen under sustained
+    /// concurrent load on some backends.
+    #[serde(default)]
+    pub disable_pooling: bool,
 }
 
 /// Per-backend circuit breaker parameter overrides

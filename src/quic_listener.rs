@@ -1479,6 +1479,7 @@ impl QuicListener {
                             retry_backoff_ms: None,
                             retry_on: None,
                             circuit_breaker: None,
+                            disable_pooling: false,
                         };
                         (cfg, result.set_canary_cookie)
                     }

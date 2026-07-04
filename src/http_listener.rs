@@ -209,6 +209,14 @@ pub struct HttpListenerState {
     pub port: u16,
     pub http_client: Client<HttpConnector, Body>,
     pub https_client: Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>,
+    /// Dedicated client with connection pooling disabled (`pool_max_idle_per_host(0)`)
+    /// — used instead of `http_client` when `BackendConfig::disable_pooling` is set.
+    /// Every request opens a fresh connection rather than reusing a pooled one;
+    /// for backends under sustained concurrent load that occasionally hang or
+    /// reset on a *reused* pooled connection (root cause not yet isolated further
+    /// upstream — see pqcrypta-api's connection handling), this trades a bit of
+    /// per-request handshake overhead for reliability. Cheap on loopback backends.
+    pub direct_client: Client<HttpConnector, Body>,
     pub security: SecurityState,
     /// Fingerprint extractor for TLS client identification
     pub fingerprint: Arc<FingerprintExtractor>,
@@ -247,6 +255,13 @@ pub async fn run_http_listener(
         .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
         .build_http();
 
+    // Client with pooling disabled, for backends configured with disable_pooling = true.
+    // pool_max_idle_per_host(0) means a connection is never returned to the pool
+    // after a response completes, so every request pays for a fresh connection.
+    let direct_client = Client::builder(TokioExecutor::new())
+        .pool_max_idle_per_host(0)
+        .build_http();
+
     // Create HTTPS client for re-encrypt mode
     let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_native_roots()
@@ -283,6 +298,7 @@ pub async fn run_http_listener(
         port,
         http_client,
         https_client,
+        direct_client,
         security: security_state.clone(),
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
@@ -428,6 +444,13 @@ pub async fn run_http_listener_pqc(
         .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
         .build_http();
 
+    // Client with pooling disabled, for backends configured with disable_pooling = true.
+    // pool_max_idle_per_host(0) means a connection is never returned to the pool
+    // after a response completes, so every request pays for a fresh connection.
+    let direct_client = Client::builder(TokioExecutor::new())
+        .pool_max_idle_per_host(0)
+        .build_http();
+
     // Create HTTPS client for re-encrypt mode
     let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_native_roots()
@@ -464,6 +487,7 @@ pub async fn run_http_listener_pqc(
         port,
         http_client,
         https_client,
+        direct_client,
         security: security_state.clone(),
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
@@ -695,6 +719,13 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
         .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
         .build_http();
 
+    // Client with pooling disabled, for backends configured with disable_pooling = true.
+    // pool_max_idle_per_host(0) means a connection is never returned to the pool
+    // after a response completes, so every request pays for a fresh connection.
+    let direct_client = Client::builder(TokioExecutor::new())
+        .pool_max_idle_per_host(0)
+        .build_http();
+
     // Create HTTPS client for re-encrypt mode
     let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_native_roots()
@@ -732,6 +763,7 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
         port,
         http_client,
         https_client,
+        direct_client,
         security: security_state.clone(),
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
@@ -1107,6 +1139,13 @@ pub async fn run_http_listener_pqc_with_fingerprint(
         .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
         .build_http();
 
+    // Client with pooling disabled, for backends configured with disable_pooling = true.
+    // pool_max_idle_per_host(0) means a connection is never returned to the pool
+    // after a response completes, so every request pays for a fresh connection.
+    let direct_client = Client::builder(TokioExecutor::new())
+        .pool_max_idle_per_host(0)
+        .build_http();
+
     // Create HTTPS client for re-encrypt mode
     let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_native_roots()
@@ -1144,6 +1183,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
         port,
         http_client,
         https_client,
+        direct_client,
         security: security_state.clone(),
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
@@ -2982,7 +3022,7 @@ async fn proxy_handler(
 
         // Check if backend is a pool first, then fall back to single backend
         let mut canary_cookie_to_set: Option<String> = None;
-        let (backend_address, tls_mode, pool_server, pool_name, backend_timeout) =
+        let (backend_address, tls_mode, pool_server, pool_name, backend_timeout, disable_pooling) =
             if let Some(pool) = state.load_balancer.get_pool(&route.backend) {
                 // Extract session cookie for sticky sessions
                 let cookie_header = headers.get("cookie").and_then(|v| v.to_str().ok());
@@ -3036,6 +3076,9 @@ async fn proxy_handler(
                             Some(result.server),
                             Some(route.backend.clone()),
                             timeout,
+                            // Pool servers don't carry a disable_pooling field today —
+                            // no pool member currently needs it.
+                            false,
                         )
                     }
                     None => {
@@ -3078,6 +3121,7 @@ async fn proxy_handler(
                     None,
                     None,
                     Duration::from_millis(backend.timeout_ms),
+                    backend.disable_pooling,
                 )
             } else {
                 error!("Backend or pool not found: {}", route.backend);
@@ -3295,6 +3339,8 @@ async fn proxy_handler(
         let result = tokio::time::timeout(backend_timeout, async {
             if use_https {
                 state.https_client.request(proxy_request).await
+            } else if disable_pooling {
+                state.direct_client.request(proxy_request).await
             } else {
                 state.http_client.request(proxy_request).await
             }
@@ -3638,7 +3684,11 @@ async fn proxy_handler(
                     server.release_connection();
                 }
 
-                error!("Backend request failed: {}", e);
+                error!(
+                    "Backend request failed: {:?} (source: {:?})",
+                    e,
+                    std::error::Error::source(&e)
+                );
 
                 // Record request metrics (skip error tracking for health check traffic)
                 state.metrics.requests.request_end_full(
