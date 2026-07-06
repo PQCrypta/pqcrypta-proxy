@@ -103,7 +103,7 @@ axum-server = { version = "0.7", features = ["tls-rustls", "tls-openssl"] }
 tower = "0.5"
 # Async OpenSSL for TLS connections with PQC
 tokio-openssl = "0.6"
-tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "limit"], optional = true }
+tower-http = { version = "0.7", features = ["cors", "trace", "timeout", "limit"], optional = true }
 
 # Metrics (optional feature)
 prometheus = { version = "0.14", optional = true }
