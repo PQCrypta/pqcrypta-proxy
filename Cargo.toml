@@ -2,7 +2,7 @@
 name = "pqcrypta-proxy"
 version = "0.2.2"
 edition = "2021"
-authors = ["PQCrypta Team <team@pqcrypta.com>"]
+authors = ["PQCrypta Team <contact@pqcrypta.com>"]
 description = "Production-ready QUIC/HTTP/3/WebTransport proxy with hybrid PQC TLS support"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/PQCrypta/pqcrypta-proxy"
