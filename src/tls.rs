@@ -138,6 +138,20 @@ pub fn load_certified_key(
         }
     };
 
+    // ML-DSA-87 keys (FIPS 204) are not handled by the aws-lc-rs provider's
+    // key loader — route them through the dedicated PQC signing key instead.
+    #[cfg(feature = "pqc-signatures")]
+    if let PrivateKeyDer::Pkcs8(ref k) = private_key {
+        if mldsa::is_ml_dsa_87_pkcs8(k.secret_pkcs8_der()) {
+            let signing_key = Arc::new(mldsa::MlDsa87SigningKey::load(k.secret_pkcs8_der())?);
+            info!(
+                "Loaded ML-DSA-87 (FIPS 204) certificate key from {:?}",
+                key_path
+            );
+            return Ok(rustls::sign::CertifiedKey::new(certs, signing_key));
+        }
+    }
+
     // Create a signing key using the installed crypto provider
     let provider = CryptoProvider::get_default()
         .ok_or_else(|| anyhow::anyhow!("No rustls CryptoProvider installed"))?;
@@ -147,6 +161,222 @@ pub fn load_certified_key(
         .map_err(|e| anyhow::anyhow!("Cannot load signing key from {:?}: {}", key_path, e))?;
 
     Ok(rustls::sign::CertifiedKey::new(certs, signing_key))
+}
+
+// ── ML-DSA-87 certificate signing (TLS signature scheme 0x0906) ──────────────
+
+/// Server-side ML-DSA-87 (FIPS 204) certificate signing for TLS 1.3.
+///
+/// rustls knows the `ML_DSA_87` signature scheme codepoint but its aws-lc-rs
+/// provider cannot load ML-DSA private keys, so this module supplies a custom
+/// [`rustls::sign::SigningKey`] backed by aws-lc-rs's PQDSA implementation.
+/// A handshake completes only when the client offers `mldsa87` (0x0906) in its
+/// `signature_algorithms` extension (e.g. `openssl s_client -sigalgs mldsa87`).
+#[cfg(feature = "pqc-signatures")]
+mod mldsa {
+    use std::sync::Arc;
+
+    use aws_lc_rs::unstable::signature::{PqdsaKeyPair, ML_DSA_87_SIGNING};
+    use rustls::sign::{Signer, SigningKey};
+    use rustls::{SignatureAlgorithm, SignatureScheme};
+
+    /// DER encoding of OID 2.16.840.1.101.3.4.3.19 (id-ml-dsa-87)
+    const ML_DSA_87_OID: [u8; 11] = [
+        0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x13,
+    ];
+
+    /// ML-DSA-87 private-key seed length (FIPS 204)
+    const SEED_LEN: usize = 32;
+
+    /// ML-DSA-87 expanded private-key length (FIPS 204)
+    const EXPANDED_KEY_LEN: usize = 4896;
+
+    /// Detect an ML-DSA-87 PKCS#8 key by its AlgorithmIdentifier OID.
+    /// The OID sits inside the fixed-size PKCS#8 header, so a windowed scan
+    /// over the first bytes suffices without pulling in a DER parser.
+    pub(super) fn is_ml_dsa_87_pkcs8(der: &[u8]) -> bool {
+        der.len() > 32
+            && der[..32]
+                .windows(ML_DSA_87_OID.len())
+                .any(|w| w == ML_DSA_87_OID)
+    }
+
+    /// Read one DER TLV at `buf[pos..]`; returns (tag, content_start, content_end).
+    fn der_tlv(buf: &[u8], pos: usize) -> Option<(u8, usize, usize)> {
+        let tag = *buf.get(pos)?;
+        let first_len = *buf.get(pos + 1)? as usize;
+        let (len, hdr) = if first_len < 0x80 {
+            (first_len, 2)
+        } else {
+            let n = first_len & 0x7f;
+            if n == 0 || n > 4 {
+                return None;
+            }
+            let mut len = 0usize;
+            for i in 0..n {
+                len = (len << 8) | *buf.get(pos + 2 + i)? as usize;
+            }
+            (len, 2 + n)
+        };
+        let start = pos + hdr;
+        let end = start.checked_add(len)?;
+        (end <= buf.len()).then_some((tag, start, end))
+    }
+
+    /// Extract the seed (preferred) or expanded key from the PKCS#8 privateKey
+    /// field, handling all three CHOICE forms from
+    /// draft-ietf-lamps-dilithium-certificates: seed `[0]`, expandedKey
+    /// OCTET STRING, and the `both` SEQUENCE (what OpenSSL 3.5 writes).
+    fn extract_key_material(pkcs8: &[u8]) -> Option<(&[u8], bool)> {
+        // PKCS#8: SEQUENCE { version INTEGER, algorithm SEQUENCE, privateKey OCTET STRING }
+        let (0x30, mut pos, outer_end) = der_tlv(pkcs8, 0)? else {
+            return None;
+        };
+        let mut private_key: Option<&[u8]> = None;
+        let mut field = 0;
+        while pos < outer_end {
+            let (tag, start, end) = der_tlv(pkcs8, pos)?;
+            if field == 2 && tag == 0x04 {
+                private_key = Some(&pkcs8[start..end]);
+                break;
+            }
+            pos = end;
+            field += 1;
+        }
+        let inner = private_key?;
+
+        // Inner CHOICE
+        let (tag, start, end) = der_tlv(inner, 0)?;
+        match tag {
+            // both SEQUENCE { seed OCTET STRING, expandedKey OCTET STRING }
+            0x30 => {
+                let (0x04, s, e) = der_tlv(inner, start)? else {
+                    return None;
+                };
+                (e - s == SEED_LEN).then_some((&inner[s..e], true))
+            }
+            // seed [0] IMPLICIT OCTET STRING
+            0x80 => (end - start == SEED_LEN).then_some((&inner[start..end], true)),
+            // expandedKey OCTET STRING (or bare 32-byte seed as OCTET STRING)
+            0x04 => match end - start {
+                SEED_LEN => Some((&inner[start..end], true)),
+                EXPANDED_KEY_LEN => Some((&inner[start..end], false)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// A rustls signing key backed by an ML-DSA-87 key pair.
+    #[derive(Debug)]
+    pub(super) struct MlDsa87SigningKey {
+        keypair: Arc<PqdsaKeyPair>,
+    }
+
+    impl MlDsa87SigningKey {
+        /// Load from PKCS#8 DER. Tries aws-lc-rs's own PKCS#8 parser first,
+        /// then falls back to manual extraction of the seed / expanded key for
+        /// CHOICE encodings it does not accept.
+        pub(super) fn load(pkcs8: &[u8]) -> anyhow::Result<Self> {
+            let keypair = PqdsaKeyPair::from_pkcs8(&ML_DSA_87_SIGNING, pkcs8).or_else(|_| {
+                let (material, is_seed) = extract_key_material(pkcs8).ok_or_else(|| {
+                    anyhow::anyhow!("Unrecognised ML-DSA-87 PKCS#8 private-key encoding")
+                })?;
+                let result = if is_seed {
+                    PqdsaKeyPair::from_seed(&ML_DSA_87_SIGNING, material)
+                } else {
+                    PqdsaKeyPair::from_raw_private_key(&ML_DSA_87_SIGNING, material)
+                };
+                result.map_err(|e| anyhow::anyhow!("ML-DSA-87 key rejected: {:?}", e))
+            })?;
+            Ok(Self {
+                keypair: Arc::new(keypair),
+            })
+        }
+    }
+
+    impl SigningKey for MlDsa87SigningKey {
+        fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
+            offered.contains(&SignatureScheme::ML_DSA_87).then(|| {
+                Box::new(MlDsa87Signer {
+                    keypair: Arc::clone(&self.keypair),
+                }) as Box<dyn Signer>
+            })
+        }
+
+        fn algorithm(&self) -> SignatureAlgorithm {
+            // No legacy TLS 1.2 SignatureAlgorithm codepoint exists for ML-DSA;
+            // TLS 1.3 cipher-suite selection ignores this value.
+            SignatureAlgorithm::Unknown(0x06)
+        }
+    }
+
+    #[derive(Debug)]
+    struct MlDsa87Signer {
+        keypair: Arc<PqdsaKeyPair>,
+    }
+
+    impl Signer for MlDsa87Signer {
+        fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
+            let mut sig = vec![0u8; self.keypair.algorithm().signature_len()];
+            let n = self
+                .keypair
+                .sign(message, &mut sig)
+                .map_err(|_| rustls::Error::General("ML-DSA-87 signing failed".into()))?;
+            sig.truncate(n);
+            Ok(sig)
+        }
+
+        fn scheme(&self) -> SignatureScheme {
+            SignatureScheme::ML_DSA_87
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use aws_lc_rs::signature::{KeyPair, UnparsedPublicKey};
+        use aws_lc_rs::unstable::signature::ML_DSA_87;
+
+        use super::*;
+
+        #[test]
+        fn pkcs8_roundtrip_sign_verify() {
+            let generated = PqdsaKeyPair::generate(&ML_DSA_87_SIGNING).unwrap();
+            let pkcs8 = generated.to_pkcs8().unwrap();
+            assert!(is_ml_dsa_87_pkcs8(pkcs8.as_ref()));
+
+            let key = MlDsa87SigningKey::load(pkcs8.as_ref()).unwrap();
+            let signer = key
+                .choose_scheme(&[SignatureScheme::ED25519, SignatureScheme::ML_DSA_87])
+                .expect("ML_DSA_87 offered but not chosen");
+            assert_eq!(signer.scheme(), SignatureScheme::ML_DSA_87);
+
+            let msg = b"tls certificate verify test message";
+            let sig = signer.sign(msg).unwrap();
+            UnparsedPublicKey::new(&ML_DSA_87, generated.public_key().as_ref())
+                .verify(msg, &sig)
+                .expect("signature must verify");
+        }
+
+        #[test]
+        fn refuses_without_mldsa_offer() {
+            let generated = PqdsaKeyPair::generate(&ML_DSA_87_SIGNING).unwrap();
+            let pkcs8 = generated.to_pkcs8().unwrap();
+            let key = MlDsa87SigningKey::load(pkcs8.as_ref()).unwrap();
+            assert!(key
+                .choose_scheme(&[
+                    SignatureScheme::ED25519,
+                    SignatureScheme::ECDSA_NISTP256_SHA256
+                ])
+                .is_none());
+        }
+
+        #[test]
+        fn rejects_non_mldsa_pkcs8() {
+            // Any small DER without the ML-DSA-87 OID must be rejected
+            assert!(!is_ml_dsa_87_pkcs8(&[0x30, 0x03, 0x02, 0x01, 0x00]));
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

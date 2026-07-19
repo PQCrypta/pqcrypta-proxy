@@ -13,7 +13,7 @@
 - **Full-Featured Proxy**: Domain-based routing, custom header injection, per-route timeouts, security headers, CORS, redirects
 - **Three TLS Modes**: Terminate, Re-encrypt, and Passthrough (SNI-based)
 - **Modern Protocols**: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebTransport
-- **Post-Quantum Ready**: Hybrid PQC key exchange (X25519MLKEM768) via OpenSSL 3.5+ with native ML-KEM; PQC downgrade detection
+- **Post-Quantum Ready**: Hybrid PQC key exchange (X25519MLKEM768) via OpenSSL 3.5+ with native ML-KEM; ML-DSA-87 (FIPS 204) server certificates per SNI; PQC downgrade detection
 - **Zero Downtime**: Hot reload configuration and TLS certificates; environment-specific config overlay (`--env`)
 - **ACME Automation**: Automatic Let's Encrypt certificate provisioning, renewal, and Certificate Transparency log submission
 - **OCSP Stapling**: Automated OCSP response fetching and stapling
@@ -42,7 +42,7 @@
 | Early Hints (103) | ✅ | Link headers for preload/preconnect |
 | Compression | ✅ | Brotli/gzip/deflate/zstd |
 | Security Headers | ✅ | HSTS, CSP, CORS, Alt-Svc; CORS headers injected on 429 rate-limit responses so browsers surface the status code instead of a misleading CORS error |
-| PQC TLS | ✅ | X25519MLKEM768 hybrid (NIST Level 3) |
+| PQC TLS | ✅ | X25519MLKEM768 hybrid key exchange (NIST Level 3) + ML-DSA-87 server certificates (NIST Level 5, FIPS 204) |
 | Background Cleanup | ✅ | Auto-cleanup of expired entries |
 | **ACME Automation** | ✅ | Let's Encrypt HTTP-01/DNS-01; one individual cert per domain with atomic writes and immediate hot-reload |
 | **OCSP Stapling** | ✅ | Automated OCSP response fetching with caching |
@@ -1186,6 +1186,21 @@ PQCrypta Proxy supports hybrid PQC key exchange using rustls-post-quantum (X2551
 | `x25519_kyber768` ⚠️ | NIST Level 3 | **Deprecated** — pre-NIST round-3 draft hybrid, not FIPS 203. Requires `--features legacy-pqc` at build time. |
 
 > **Only FIPS 203-compliant algorithms are built by default.** `kyber768` and `x25519_kyber768` (pre-standardisation Kyber drafts) are excluded from all default builds. To enable them only for backward-compatible migration periods, compile with `cargo build --release --features legacy-pqc`. A deprecation warning is logged at startup whenever a legacy algorithm is selected.
+
+### ML-DSA-87 Server Certificates (FIPS 204)
+
+With the default `pqc-signatures` feature, the SNI certificate resolver serves **ML-DSA-87-signed X.509 certificates** for domains whose key file contains an ML-DSA-87 PKCS#8 private key (OID `2.16.840.1.101.3.4.3.19`). Drop `{domain}.crt` (full PQ chain) and `{domain}.key` into the certs directory alongside the classical pairs — detection is automatic per domain, on the same TCP :443 and QUIC listeners.
+
+- The TLS 1.3 `CertificateVerify` is signed with ML-DSA-87 (TLS signature scheme `mldsa87`, codepoint `0x0906`) via aws-lc-rs
+- All three PKCS#8 CHOICE encodings from draft-ietf-lamps-dilithium-certificates are accepted: `seed [0]`, `expandedKey`, and the seed+expanded `both` form OpenSSL 3.5 writes
+- Clients that do not offer `mldsa87` in `signature_algorithms` are refused (no silent classical fallback on that SNI)
+- Combined with `-groups X25519MLKEM768` this yields a fully post-quantum handshake: PQ key exchange + PQ certificate signature
+
+```bash
+# Connect with OpenSSL 3.5+
+openssl s_client -connect pqc.pqcrypta.com:443 -sigalgs mldsa87 \
+    -groups X25519MLKEM768 -CAfile root-ca.crt
+```
 
 ### Configuration
 
