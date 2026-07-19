@@ -140,7 +140,8 @@ pub fn load_certified_key(
 
     // ML-DSA-87 keys (FIPS 204) are not handled by the aws-lc-rs provider's
     // key loader — route them through the dedicated PQC signing key instead.
-    #[cfg(feature = "pqc-signatures")]
+    // aws-lc-rs gates `unstable` (PQDSA) out of FIPS builds — mirror that here
+    #[cfg(all(feature = "pqc-signatures", not(feature = "fips")))]
     if let PrivateKeyDer::Pkcs8(ref k) = private_key {
         if mldsa::is_ml_dsa_87_pkcs8(k.secret_pkcs8_der()) {
             let signing_key = Arc::new(mldsa::MlDsa87SigningKey::load(k.secret_pkcs8_der())?);
@@ -172,7 +173,7 @@ pub fn load_certified_key(
 /// [`rustls::sign::SigningKey`] backed by aws-lc-rs's PQDSA implementation.
 /// A handshake completes only when the client offers `mldsa87` (0x0906) in its
 /// `signature_algorithms` extension (e.g. `openssl s_client -sigalgs mldsa87`).
-#[cfg(feature = "pqc-signatures")]
+#[cfg(all(feature = "pqc-signatures", not(feature = "fips")))]
 mod mldsa {
     use std::sync::Arc;
 

@@ -4,7 +4,7 @@
 //!
 //! Skips (passes trivially) when the deployment cert files are not present,
 //! so CI machines without `/etc/pqcrypta/pqc-certs` are unaffected.
-#![cfg(feature = "pqc-signatures")]
+#![cfg(all(feature = "pqc-signatures", not(feature = "fips")))]
 
 use std::path::Path;
 
