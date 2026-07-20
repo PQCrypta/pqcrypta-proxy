@@ -515,6 +515,14 @@ pub async fn cache_middleware(
         return next.run(request).await;
     }
 
+    // Range requests bypass the cache entirely: the cache stores whole responses
+    // and must hand range requests to the backend so they get a correct 206 with
+    // a matching Content-Range, rather than a cached full 200 body (which breaks
+    // media playback). Mirrors the HTTP/3 path in quic_listener.rs.
+    if request.headers().contains_key("range") {
+        return next.run(request).await;
+    }
+
     let uri = request.uri().clone();
     let path = uri.path().to_string();
     let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
