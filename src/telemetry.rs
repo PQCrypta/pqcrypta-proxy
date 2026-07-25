@@ -643,7 +643,14 @@ async fn run_stats_channel(
 
         let rtt_ms = connection.rtt().as_secs_f64() * 1000.0;
         let qs = connection.quic_connection().stats();
-        let cwnd = qs.path.cwnd;
+        // noq is multipath: congestion window is per-path, not a single
+        // connection-level value. Report the initial path's cwnd (the
+        // single-path equivalent), 0 if that path isn't currently present.
+        let cwnd = connection
+            .quic_connection()
+            .path_stats(quinn::PathId::ZERO)
+            .map(|p| p.cwnd)
+            .unwrap_or(0);
         let sent_b = qs.udp_tx.bytes;
         let recv_b = qs.udp_rx.bytes;
 

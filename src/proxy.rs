@@ -490,7 +490,7 @@ impl BackendPool {
                 .map_err(|e| anyhow::anyhow!("Failed to create QUIC config: {}", e))?,
         ));
 
-        let mut endpoint = quinn::Endpoint::client(
+        let endpoint = quinn::Endpoint::client(
             "0.0.0.0:0"
                 .parse()
                 .expect("SR-06: INADDR_ANY:0 is always a valid socket address"),

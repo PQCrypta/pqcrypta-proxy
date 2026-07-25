@@ -1,0 +1,24 @@
+[package]
+name = "h3-noq"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.88"
+description = "QUIC transport implementation for h3 backed by noq (multipath-capable quinn fork)."
+license = "MIT"
+publish = false
+
+[lib]
+name = "h3_noq"
+path = "src/lib.rs"
+
+[features]
+tracing = ["dep:tracing"]
+
+[dependencies]
+bytes = "1"
+futures = "0.3.28"
+h3 = "0.0.8"
+noq = { path = "../noq/noq", default-features = false, features = ["runtime-tokio", "rustls", "aws-lc-rs", "bloom"] }
+tokio = { version = "1", default-features = false, features = ["io-util"] }
+tokio-util = "0.7.9"
+tracing = { version = "0.1.40", optional = true }

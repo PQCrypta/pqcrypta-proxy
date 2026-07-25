@@ -577,7 +577,8 @@ impl From<quinn::ReadError> for StreamReadError {
             quinn::ReadError::ConnectionLost(_) | quinn::ReadError::ClosedStream => {
                 StreamReadError::NotConnected
             }
-            quinn::ReadError::IllegalOrderedRead => StreamReadError::QuicProto,
+            // noq has no `IllegalOrderedRead` variant (wtransport only does
+            // ordered reads anyway).
             quinn::ReadError::ZeroRttRejected => StreamReadError::QuicProto,
         }
     }

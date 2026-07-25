@@ -26,7 +26,9 @@ use std::time::Duration;
 use bytes::{BufMut, Bytes, BytesMut};
 use percent_encoding::percent_decode_str;
 use quinn::{Connection, VarInt};
-use quinn_proto::coding::Codec;
+// noq split quinn-proto's single `Codec` trait into `Encodable`/`Decodable`
+// (same `encode`/`decode` method names).
+use quinn_proto::coding::{Decodable, Encodable};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Instant;

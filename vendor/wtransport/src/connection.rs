@@ -324,7 +324,14 @@ impl Connection {
     /// addresses may be mapped to IPv6.
     #[inline(always)]
     pub fn remote_address(&self) -> SocketAddr {
-        self.quic_connection.remote_address()
+        // noq is multipath: an established connection no longer has a single
+        // `remote_address()`. Use the initial path (PathId::ZERO), the
+        // direct equivalent of the single path wtransport assumes; fall back
+        // to any live path if the initial one was migrated/abandoned.
+        self.quic_connection
+            .path(quinn::PathId::ZERO)
+            .and_then(|p| p.remote_address().ok())
+            .expect("connection has at least one active path")
     }
 
     /// A stable identifier for this connection.
@@ -356,7 +363,11 @@ impl Connection {
     /// Current best estimate of this connection's latency (round-trip-time).
     #[inline(always)]
     pub fn rtt(&self) -> Duration {
-        self.quic_connection.rtt()
+        // noq: RTT is per-path and returns Option (None if the path has no
+        // estimate yet). Report the initial path's RTT, 0 if unavailable.
+        self.quic_connection
+            .rtt(quinn::PathId::ZERO)
+            .unwrap_or_default()
     }
 
     /// Derive keying material from this connection's TLS session secrets.

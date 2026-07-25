@@ -55,6 +55,15 @@ enable_quic_migration = true
 # that do not support it. Default: true.
 enable_ack_frequency = true
 
+# Enable QUIC Retry for explicit source-address validation (RFC 9000 §8.1.2).
+# A new, unvalidated connection is answered with a Retry token that the client
+# must echo before the handshake proceeds, proving it controls the address it
+# claims — hardening the server against spoofed-source amplification/DDoS. Cost:
+# one extra round trip on every new connection. When false (default), the
+# server uses RFC 9000's implicit validation via the 3x anti-amplification
+# limit, which adds no per-connection latency. Default: false.
+enable_quic_retry = false
+
 # =============================
 # MASQUE / CONNECT-UDP (RFC 9298)
 # =============================

@@ -106,7 +106,7 @@ fn client_endpoint(ack_frequency: bool) -> Endpoint {
         ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto).unwrap()));
     client_config.transport_config(transport(ack_frequency));
 
-    let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    let endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
     endpoint.set_default_client_config(client_config);
     endpoint
 }

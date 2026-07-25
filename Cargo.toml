@@ -42,11 +42,17 @@ tokio = { version = "1.43", features = ["full", "tracing", "signal"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 
-# QUIC and HTTP/3
-quinn = "0.11"
-quinn-proto = "0.11"
+# QUIC and HTTP/3 — the QUIC stack is noq (n0-computer's multipath-capable
+# quinn fork), aliased as `quinn`/`quinn_proto` so the small amount of direct
+# quinn API the proxy uses compiles unchanged; genuine API divergences
+# (noq's per-path multipath API) are patched at the call sites. This brings
+# real, full draft-ietf-quic-multipath support (concurrent data-carrying
+# paths, PATH_ACK/ABANDON/STATUS, per-path loss recovery), superseding the
+# earlier narrow single-path probe fork.
+quinn = { package = "noq", path = "vendor/noq/noq", default-features = false, features = ["runtime-tokio", "rustls", "aws-lc-rs", "bloom", "platform-verifier"] }
+quinn-proto = { package = "noq-proto", path = "vendor/noq/noq-proto" }
 h3 = "0.0.8"
-h3-quinn = "0.0.10"
+h3-quinn = { package = "h3-noq", path = "vendor/h3-noq" }
 # Explicit UDP socket buffer sizing (SO_RCVBUF/SO_SNDBUF) for the QUIC listener.
 # Matches the version quinn-udp already pulls, so no extra crate copy is added.
 socket2 = "0.6"
@@ -221,6 +227,21 @@ opt-level = 3
 
 [profile.bench]
 debug = true
+
+# Adds real server-side ECH (Encrypted Client Hello, draft-ietf-tls-esni-25)
+# support, absent from upstream rustls (client-side only in every version up
+# to 0.23.42). AEAD/HPKE decryption is delegated entirely to rustls's own
+# already-implemented Hpke::open (src/crypto/aws_lc_rs/hpke.rs, RFC 9180's
+# skR operation) - no new cryptography was written for this, only protocol-
+# level ClientHello reconstruction wired in ahead of the existing, unmodified
+# handshake pipeline. See vendor/rustls-fixed/rustls/src/server/ech.rs.
+[patch.crates-io]
+rustls = { path = "vendor/rustls-fixed/rustls" }
+# NOTE: the QUIC stack moved from the narrow-probe quinn fork to noq (see the
+# quinn/quinn-proto aliases in [dependencies]); the old quinn/quinn-proto
+# [patch.crates-io] entries were removed since nothing depends on the
+# crates.io `quinn` any more. vendor/quinn-fixed and vendor/quinn-proto-fixed
+# are retained only for history and can be deleted.
 
 [lints.rust]
 # F-12: Enforce unsafe_code = deny globally. The pqc_tls.rs module carries

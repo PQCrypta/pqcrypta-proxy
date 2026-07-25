@@ -429,10 +429,8 @@ impl TlsProvider {
         let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
             .map_err(|e| anyhow::anyhow!("Failed to create QUIC server config: {}", e))?;
 
-        // Watch the certs directory mtime for change detection
-        let cert_modified = std::fs::metadata(certs_dir)
-            .ok()
-            .and_then(|m| m.modified().ok());
+        // Watch the certs + ECH configs directory mtimes for change detection
+        let cert_modified = Self::combined_watched_mtime(certs_dir);
 
         Ok(Self {
             server_config: ArcSwap::new(Arc::new(quic_config)),
@@ -477,30 +475,27 @@ impl TlsProvider {
 
         self.server_config.store(Arc::new(quic_config));
 
-        // Update the watched directory mtime
+        // Update the watched directory mtime (certs + ECH configs)
         let certs_dir = tls_config
             .cert_path
             .parent()
             .unwrap_or_else(|| Path::new("/etc/pqcrypta/certs"));
-        let cert_modified = std::fs::metadata(certs_dir)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        *self.last_cert_modified.write() = cert_modified;
+        *self.last_cert_modified.write() = Self::combined_watched_mtime(certs_dir);
 
         info!("TLS certificates reloaded (SNI resolver + QUIC config refreshed)");
         Ok(())
     }
 
-    /// Check if certificates need reloading by watching the certs directory mtime.
+    /// Check if certificates (or ECH configs — see `ech_config::ECH_CONFIG_DIR`,
+    /// rotated independently by `ech-keygen`) need reloading, by watching
+    /// both directories' mtimes.
     pub fn needs_reload(&self) -> bool {
         let tls_config = self.tls_config.read();
         let certs_dir = tls_config
             .cert_path
             .parent()
             .unwrap_or_else(|| Path::new("/etc/pqcrypta/certs"));
-        let current_modified = std::fs::metadata(certs_dir)
-            .ok()
-            .and_then(|m| m.modified().ok());
+        let current_modified = Self::combined_watched_mtime(certs_dir);
 
         let last_modified = *self.last_cert_modified.read();
 
@@ -509,6 +504,18 @@ impl TlsProvider {
             (Some(_), None) => true,
             _ => false,
         }
+    }
+
+    /// The newer of the certs directory's and the ECH configs directory's
+    /// mtime — either one changing is a reason to rebuild the TLS config.
+    fn combined_watched_mtime(certs_dir: &Path) -> Option<SystemTime> {
+        let certs_mtime = std::fs::metadata(certs_dir)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        let ech_mtime = std::fs::metadata(crate::ech_config::ECH_CONFIG_DIR)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        certs_mtime.max(ech_mtime)
     }
 
     /// Update configuration (for hot-reload)
@@ -770,6 +777,11 @@ impl TlsProvider {
             .collect();
 
         info!("ALPN protocols: {:?}", tls_config.alpn_protocols);
+
+        // Encrypted Client Hello (ECH) - optional, loaded from disk (rotated
+        // by ech-keygen/ech-rotate.timer). Absent -> normal non-ECH TLS,
+        // exactly as before this existed.
+        config.ech = crate::ech_config::load();
 
         // Configure 0-RTT (early data)
         // L-5: 0-RTT is a replay-attack risk. The proxy forwards early data to

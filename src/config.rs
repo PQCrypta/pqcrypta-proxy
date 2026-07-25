@@ -480,6 +480,21 @@ pub struct ServerConfig {
     #[serde(default = "default_true")]
     pub enable_ack_frequency: bool,
 
+    /// Enable QUIC Retry for explicit address validation (RFC 9000 §8.1.2).
+    ///
+    /// When enabled, a new connection whose source address has not yet been
+    /// validated is answered with a Retry packet carrying a token; the client
+    /// must re-send its Initial echoing that token before the handshake
+    /// proceeds. This proves the client controls the address it claims,
+    /// hardening the server against spoofed-source amplification/DDoS - at the
+    /// cost of ONE extra round trip on every new connection. When disabled
+    /// (the default), the server relies on RFC 9000's implicit validation via
+    /// the 3x anti-amplification limit, which most production QUIC servers use
+    /// and which adds no per-connection latency.
+    /// Default: false.
+    #[serde(default)]
+    pub enable_quic_retry: bool,
+
     /// Maximum concurrent WebTransport sessions per origin (default 100).
     #[serde(default = "default_wt_max_sessions")]
     pub webtransport_max_sessions_per_origin: u32,
@@ -587,6 +602,7 @@ impl Default for ServerConfig {
             max_request_body_bytes: 52_428_800, // 50 MiB
             enable_quic_migration: true,
             enable_ack_frequency: true,
+            enable_quic_retry: false,
             webtransport_max_sessions_per_origin: 100,
             webtransport_max_streams_per_session: 1000,
             webtransport_max_datagrams_per_sec: 500,

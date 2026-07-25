@@ -29,7 +29,13 @@ required-features = ["self-signed"]
 [dependencies]
 bytes = "1.4.0"
 pem = "3.0.4"
-quinn = { version = "0.11.6", default-features = false, features = ["runtime-tokio"] }
+# Ported from quinn to noq (multipath-capable quinn fork) by aliasing noq as
+# `quinn` — noq exposes the same public API surface wtransport uses
+# (Connection/Endpoint/SendStream/RecvStream/Incoming/Connecting/ServerConfig/
+# ClientConfig/TransportConfig/crypto::rustls::*/error types), so the ~138
+# `quinn::` references compile unchanged; only genuine API divergences are
+# patched in the source (e.g. noq dropped ReadError::IllegalOrderedRead).
+quinn = { package = "noq", path = "../noq/noq", default-features = false, features = ["runtime-tokio"] }
 rcgen = { version = "0.14.5", default-features = false, optional = true }
 rustls = { version = "0.23.23", default-features = false }
 rustls-native-certs = "0.8.0"
@@ -54,11 +60,11 @@ tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 [features]
 default = ["self-signed", "ring"]
 aws-lc-rs = ["quinn/aws-lc-rs", "quinn/rustls-aws-lc-rs", "rustls/aws-lc-rs", "rcgen?/aws_lc_rs"]
-aws-lc-rs-fips = ["quinn/aws-lc-rs-fips", "quinn/rustls-aws-lc-rs-fips", "rustls/fips", "rcgen?/fips"]
+aws-lc-rs-fips = ["quinn/aws-lc-rs-fips", "rustls/fips", "rcgen?/fips"]
 dangerous-configuration = []
 fips = ["aws-lc-rs-fips"]
 quinn = []
-quinn-log = ["quinn/log"]
+quinn-log = ["quinn/rustls-log"]
 ring = ["quinn/ring", "quinn/rustls", "rustls/ring", "rcgen?/ring"]
 self-signed = ["dep:rcgen"]
 

@@ -1,5 +1,7 @@
 # Rust build artifacts
 /target/
+# Nested build dirs inside vendored path-dependency crates (vendor/*/target)
+**/target/
 **/*.rs.bk
 # Note: Cargo.lock is committed for reproducible binary builds
 

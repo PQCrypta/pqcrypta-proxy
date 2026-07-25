@@ -66,6 +66,7 @@
 | **Per-Backend Retry** | ✅ | Configurable retries with exponential backoff per backend; retry on 5xx/connect-failure/timeout |
 | **Per-Backend Circuit Breaker** | ✅ | Per-backend overrides for failure threshold, half-open delay, and success threshold |
 | **0-RTT Replay Protection** | ✅ | Nonce store (strict/session/none); rejects replayed early-data nonces |
+| **QUIC Retry** | ✅ | Optional RFC 9000 source-address validation (`enable_quic_retry`); Retry token echoed before handshake, anti-spoofing at +1 RTT |
 | **Certificate Transparency** | ✅ | Submits new certs to CT logs via `POST /ct/v1/add-chain` after ACME issuance |
 | **QUIC Connection Migration** | ✅ | Configurable enable/disable of QUIC connection migration (`enable_quic_migration`) |
 | **Per-Route Security Policy** | ✅ | Per-route mTLS requirement, JA3 allowlist, rate limit override, WAF mode, 0-RTT control |
@@ -155,6 +156,7 @@
 - **TLS 1.3 Default**: TLS 1.3 minimum on all listeners by default (`min_version = "1.3"` in `[tls]`); TLS 1.2 can be permitted via config — OpenSSL 3.5+ for TCP/TLS, rustls for QUIC/HTTP3
 - **TLS Key Permission Checks**: Private key file permissions validated at startup; `strict_key_permissions = true` aborts if permissions are too permissive
 - **0-RTT Replay Protection**: Nonce store (strict/session/none modes) — rejects replayed TLS 1.3 early-data nonces within configurable window
+- **QUIC Retry (source-address validation)**: Optional RFC 9000 §8.1.2 Retry — a new, unvalidated connection is answered with a Retry token the client must echo before the handshake proceeds, hardening against spoofed-source amplification/DDoS at the cost of one extra round trip per new connection. Configurable via `enable_quic_retry` in `[server]` (default off, in which case RFC 9000's implicit 3× anti-amplification validation is used instead — no per-connection latency).
 - **Circuit Breaker**: Per-backend protection from cascading failures; per-backend threshold/delay overrides
 - **Advanced Rate Limiting**: Multi-dimensional limiting (IP, JA3/JA4, JWT-verified subject, headers, composite keys) applied on both TCP (HTTP/1.1, HTTP/2) and QUIC/HTTP3 paths; optional Redis backend distributes counters across all proxy instances
 - **JWT Rate Limiting**: Per-subject limiting with HMAC-SHA256 signature verification before trusting the `sub` claim; unsigned tokens and non-HMAC algorithms rejected
@@ -195,7 +197,7 @@
 
 ### HTTP/3 Advanced Features
 - **Full HTTP/3 Support**: Native HTTP/3 via `h3` crate with proper header forwarding; hop-by-hop headers (`Transfer-Encoding`, `Connection`, etc.) stripped from all backend responses before forwarding or caching — prevents `ERR_QUIC_PROTOCOL_ERROR` per RFC 9114 §4.2
-- **QUIC v1 only**: The endpoint advertises **QUIC v1 (RFC 9000)** in Version Negotiation and nothing else. quinn's default version list also includes the obsolete `draft-29..34` (which it cannot actually handshake); the listener overrides `EndpointConfig::supported_versions` to v1 so VN advertises only what the server really speaks (plus quinn's reserved/GREASE version per RFC 9287)
+- **QUIC v1 only**: The endpoint advertises **QUIC v1 (RFC 9000)** in Version Negotiation and nothing else. The QUIC stack's default version list also includes the obsolete `draft-29..34` (which it cannot actually handshake); the listener overrides `EndpointConfig::supported_versions` to v1 so VN advertises only what the server really speaks (plus the reserved/GREASE version per RFC 9287)
 - **Early Hints (103)**: Preload CSS/JS resources via Link headers — dns-prefetch, preconnect, modulepreload, and speculative prerender hint types supported. Preload rules are scoped per host/path in `[[http3.preload_resources]]` and hot-reload at runtime (preconnect origins + preload rules apply on the next request, no restart). Note: an `href` is only used by the browser when it byte-matches the page URL, so any `?v=` cache-buster must be included and kept in sync.
 - **Priority Hints**: RFC 9218 Extensible Priorities for resource scheduling (`u=3,i=?0`)
 - **Request Coalescing**: Deduplicate identical GET/HEAD requests in flight
@@ -207,7 +209,8 @@
 - **Accept-CH**: Client Hints for responsive content delivery (DPR, Viewport-Width, ECT)
 
 ### Protocols
-- **QUIC/HTTP/3**: Full HTTP/3 support via QuicListener (h3 + quinn crates)
+- **QUIC/HTTP/3**: Full HTTP/3 support via QuicListener (h3 + noq crates — noq is n0-computer's multipath-capable quinn fork; see Multipath QUIC above)
+- **Multipath QUIC (draft-ietf-quic-multipath)**: Full multipath support. The QUIC stack is [noq](https://github.com/n0-computer/noq) (n0-computer's multipath-capable quinn fork), which implements the complete extension — concurrent, data-carrying paths with per-path packet-number spaces, per-path loss recovery and congestion control, the full lifecycle frame set (ACK_MP/PATH_ABANDON/PATH_STATUS/MAX_PATH_ID/PATHS_BLOCKED), per-path connection-ID spaces, and a scheduler. Enabled via `TransportConfig::max_concurrent_multipath_paths(4)`; path creation/validation/teardown is automatic once negotiated. HTTP/3 and WebTransport both run over noq (via the in-tree `h3-noq` binding and the noq-ported `wtransport`). Verify: scan pqcrypta.com at https://pqcrypta.com/http3_quic/ — the Multipath field validates a genuine second data-carrying path.
 - **WebTransport**: Native WebTransport session handling with bidirectional streams, unidirectional streams, and datagrams
 - **WebTransport SNI Certificates**: The dedicated WebTransport listener selects the per-domain certificate by SNI from the certs directory (same multi-cert resolver as the HTTPS listeners), so a single node serves WebTransport for every hosted domain with that domain's own certificate
 - **WebTransport Origin Validation**: SR-02 cross-origin enforcement — configurable `webtransport_allowed_origins` allowlist rejects browser sessions from unlisted origins with 403; non-browser clients (no Origin header) always accepted

@@ -185,7 +185,7 @@ impl Endpoint<endpoint_side::Client> {
         let socket = client_config.bind_address_config.bind_socket()?;
         let runtime = Arc::new(TokioRuntime);
 
-        let mut endpoint = quinn::Endpoint::new(endpoint_config, None, socket, runtime)?;
+        let endpoint = quinn::Endpoint::new(endpoint_config, None, socket, runtime)?;
 
         endpoint.set_default_client_config(quic_config);
 
@@ -673,7 +673,12 @@ impl SessionRequest {
     /// addresses may be mapped to IPv6.
     #[inline(always)]
     pub fn remote_address(&self) -> SocketAddr {
-        self.quic_connection.remote_address()
+        // noq multipath: use the initial path (PathId::ZERO) as the
+        // single-path equivalent (see Connection::remote_address).
+        self.quic_connection
+            .path(quinn::PathId::ZERO)
+            .and_then(|p| p.remote_address().ok())
+            .expect("connection has at least one active path")
     }
 
     /// Returns the `:authority` field of the request.

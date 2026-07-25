@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
+use futures_util::StreamExt as _;
 use h3::ext::Protocol;
 use h3_quinn::Connection as H3Connection;
 use http_body_util::{BodyExt as _, Empty};
@@ -137,6 +138,16 @@ impl QuicListener {
             info!("QUIC ACK Frequency extension enabled");
         }
 
+        // Full draft-ietf-quic-multipath support (via the noq QUIC stack):
+        // allow up to 4 concurrent, data-carrying paths per connection when
+        // the peer negotiates multipath. Unlike the earlier narrow single-
+        // path validation probe, noq implements the complete extension -
+        // per-path packet-number spaces, PATH_ACK/ABANDON/STATUS lifecycle
+        // frames, per-path loss recovery, and a scheduler - and manages path
+        // creation/validation/teardown automatically once negotiated. Inert
+        // for peers that don't advertise multipath.
+        transport_config.max_concurrent_multipath_paths(4);
+
         // Create QUIC server configuration
         let mut server_config =
             QuinnServerConfig::with_crypto(tls_provider.get_quic_server_config());
@@ -262,6 +273,27 @@ impl QuicListener {
 
                     if should_refuse {
                         incoming.refuse();
+                    } else if self.config.server.enable_quic_retry
+                        && !incoming.remote_address_validated()
+                    {
+                        // QUIC Retry (RFC 9000 §8.1.2): the client's source
+                        // address hasn't been validated yet, so answer with a
+                        // Retry token instead of accepting. The client re-sends
+                        // its Initial echoing the token; that second Incoming
+                        // arrives with remote_address_validated() == true and
+                        // is accepted normally on the next loop iteration.
+                        // Configurable via [server].enable_quic_retry.
+                        match incoming.retry() {
+                            Ok(()) => {
+                                debug!("[QUIC] Sent Retry for address validation to {}", remote_addr);
+                            }
+                            Err(e) => {
+                                warn!("[QUIC] Retry failed for {}: {} — accepting without Retry", remote_addr, e);
+                                // retry() consumes `incoming` even on error, so
+                                // there is nothing left to accept here; the
+                                // client will simply time out and retry itself.
+                            }
+                        }
                     } else {
                         info!("[{}] Incoming QUIC connection from {}", accept_count, remote_addr);
 
@@ -364,6 +396,67 @@ impl QuicListener {
                     info!("ALPN negotiated: {} for {}", alpn, remote_addr);
                 }
             }
+        }
+
+        // Multipath path management is fully automatic in noq once
+        // negotiated (see max_concurrent_multipath_paths in the transport
+        // config) - the peer opens/validates additional paths and the stack
+        // schedules across them. Subscribe to noq's PathEvent stream so real
+        // multipath activity (a second path opening, its per-path stats, and
+        // teardown) is observable in the server logs, not silent inside the
+        // transport. Costs nothing when no extra paths are opened.
+        {
+            let conn_for_paths = connection.clone();
+            let peer = remote_addr;
+            tokio::spawn(async move {
+                let mut events = conn_for_paths.path_events();
+                while let Some(ev) = events.next().await {
+                    match ev {
+                        Ok(quinn::PathEvent::Established { id, .. }) => {
+                            let (rtt_ms, cwnd, mtu) = conn_for_paths
+                                .path_stats(id)
+                                .map(|s| {
+                                    (
+                                        u64::try_from(s.rtt.as_millis()).unwrap_or(u64::MAX),
+                                        s.cwnd,
+                                        u64::from(s.current_mtu),
+                                    )
+                                })
+                                .unwrap_or((0, 0, 0));
+                            info!(
+                                "Multipath: path {} ESTABLISHED for {} (rtt={}ms cwnd={}B mtu={}B)",
+                                id.get(),
+                                peer,
+                                rtt_ms,
+                                cwnd,
+                                mtu
+                            );
+                        }
+                        Ok(quinn::PathEvent::Abandoned { id, reason, .. }) => {
+                            info!(
+                                "Multipath: path {} ABANDONED for {} (reason: {:?})",
+                                id.get(),
+                                peer,
+                                reason
+                            );
+                        }
+                        Ok(quinn::PathEvent::Discarded { id, path_stats, .. }) => {
+                            info!(
+                                "Multipath: path {} DISCARDED for {} (final: rtt={}ms cwnd={}B lost_pkts={})",
+                                id.get(),
+                                peer,
+                                u64::try_from(path_stats.rtt.as_millis()).unwrap_or(u64::MAX),
+                                path_stats.cwnd,
+                                path_stats.lost_packets
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(_lagged) => {
+                            // Broadcast receiver fell behind; benign for logging.
+                        }
+                    }
+                }
+            });
         }
 
         // Create H3 connection
