@@ -240,8 +240,7 @@ rustls = { path = "vendor/rustls-fixed/rustls" }
 # NOTE: the QUIC stack moved from the narrow-probe quinn fork to noq (see the
 # quinn/quinn-proto aliases in [dependencies]); the old quinn/quinn-proto
 # [patch.crates-io] entries were removed since nothing depends on the
-# crates.io `quinn` any more. vendor/quinn-fixed and vendor/quinn-proto-fixed
-# are retained only for history and can be deleted.
+# crates.io `quinn` any more.
 
 [lints.rust]
 # F-12: Enforce unsafe_code = deny globally. The pqc_tls.rs module carries
