@@ -156,13 +156,21 @@ impl WebTransportServer {
         // - Configures ALPN with "h3" protocol
         // - Sends SETTINGS_ENABLE_WEBTRANSPORT=1 frame
         // - Handles QUIC connection establishment
-        let config_builder = ServerConfig::builder()
+        let mut config_builder = ServerConfig::builder()
             .with_bind_socket(socket)
             .with_custom_tls_and_transport(rustls_config, transport_config)
             .keep_alive_interval(Some(Duration::from_secs(15)))
             .max_idle_timeout(Some(Duration::from_mins(2)))
             .map_err(|e| format!("Invalid idle timeout: {}", e))?
             .build();
+
+        // Advertise the same QUIC version list as the main listener: v1 (RFC 9000)
+        // + v2 (RFC 9369). Without this the WebTransport endpoint would fall back to
+        // noq's DEFAULT_SUPPORTED_VERSIONS (v1 + the obsolete draft-29..34), which
+        // both omits v2 and misleadingly advertises dead drafts in Version Negotiation.
+        config_builder
+            .quic_endpoint_config_mut()
+            .supported_versions(vec![0x0000_0001, 0x6b33_43cf]);
 
         info!("✅ Server configuration created");
         info!("🔧 ALPN Protocol: h3 (automatically configured by wtransport)");
