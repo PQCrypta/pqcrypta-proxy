@@ -312,7 +312,7 @@ impl Header {
                 number,
                 version,
             }) => {
-                w.write(u8::from(LongHeaderType::Initial) | number.tag());
+                w.write(LongHeaderType::Initial.to_byte(version == 0x6b33_43cf) | number.tag());
                 w.write(version);
                 dst_cid.encode_long(w);
                 src_cid.encode_long(w);
@@ -333,7 +333,7 @@ impl Header {
                 number,
                 version,
             } => {
-                w.write(u8::from(LongHeaderType::Standard(ty)) | number.tag());
+                w.write(LongHeaderType::Standard(ty).to_byte(version == 0x6b33_43cf) | number.tag());
                 w.write(version);
                 dst_cid.encode_long(w);
                 src_cid.encode_long(w);
@@ -350,7 +350,7 @@ impl Header {
                 ref src_cid,
                 version,
             } => {
-                w.write(u8::from(LongHeaderType::Retry));
+                w.write(LongHeaderType::Retry.to_byte(version == 0x6b33_43cf));
                 w.write(version);
                 dst_cid.encode_long(w);
                 src_cid.encode_long(w);
@@ -674,7 +674,7 @@ impl ProtectedHeader {
                 });
             }
 
-            match LongHeaderType::from_byte(first)? {
+            match LongHeaderType::from_byte(first, version == 0x6b33_43cf)? {
                 LongHeaderType::Initial => {
                     let token_len = buf.get_var()? as usize;
                     let token_start = buf.position() as usize;
@@ -871,28 +871,29 @@ pub(crate) enum LongHeaderType {
 }
 
 impl LongHeaderType {
-    fn from_byte(b: u8) -> Result<Self, PacketDecodeError> {
+    fn from_byte(b: u8, is_v2: bool) -> Result<Self, PacketDecodeError> {
         use {LongHeaderType::*, LongType::*};
         debug_assert!(b & LONG_HEADER_FORM != 0, "not a long packet");
-        Ok(match (b & 0x30) >> 4 {
-            0x0 => Initial,
-            0x1 => Standard(ZeroRtt),
-            0x2 => Standard(Handshake),
-            0x3 => Retry,
+        // QUIC v2 (RFC 9369 §3.2) renumbers the long-header packet types.
+        Ok(match ((b & 0x30) >> 4, is_v2) {
+            (0x0, false) | (0x1, true) => Initial,
+            (0x1, false) | (0x2, true) => Standard(ZeroRtt),
+            (0x2, false) | (0x3, true) => Standard(Handshake),
+            (0x3, false) | (0x0, true) => Retry,
             _ => unreachable!(),
         })
     }
-}
 
-impl From<LongHeaderType> for u8 {
-    fn from(ty: LongHeaderType) -> Self {
+    /// Encode the long-header type bits, honoring QUIC v2 (RFC 9369 §3.2) renumbering.
+    fn to_byte(self, is_v2: bool) -> u8 {
         use {LongHeaderType::*, LongType::*};
-        match ty {
-            Initial => LONG_HEADER_FORM | FIXED_BIT,
-            Standard(ZeroRtt) => LONG_HEADER_FORM | FIXED_BIT | (0x1 << 4),
-            Standard(Handshake) => LONG_HEADER_FORM | FIXED_BIT | (0x2 << 4),
-            Retry => LONG_HEADER_FORM | FIXED_BIT | (0x3 << 4),
-        }
+        let ty_bits: u8 = match (self, is_v2) {
+            (Initial, false) | (Retry, true) => 0x0,
+            (Standard(ZeroRtt), false) | (Initial, true) => 0x1,
+            (Standard(Handshake), false) | (Standard(ZeroRtt), true) => 0x2,
+            (Retry, false) | (Standard(Handshake), true) => 0x3,
+        };
+        LONG_HEADER_FORM | FIXED_BIT | (ty_bits << 4)
     }
 }
 

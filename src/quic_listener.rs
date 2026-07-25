@@ -161,11 +161,16 @@ impl QuicListener {
         }
 
         // Create endpoint. Built manually (rather than Endpoint::server) so we can
-        // override quinn's advertised QUIC version list. quinn-proto's
-        // DEFAULT_SUPPORTED_VERSIONS is v1 + draft-29..34, but this proxy only
-        // handshakes v1 — advertising those obsolete drafts in Version Negotiation
-        // is misleading (and a client that selected one would fail), so restrict the
-        // list to v1 only. quinn still adds its reserved/GREASE version automatically.
+        // override the advertised QUIC version list. noq's DEFAULT_SUPPORTED_VERSIONS
+        // is v1 + draft-29..34, but this proxy only handshakes stable versions —
+        // advertising the obsolete drafts in Version Negotiation is misleading (and a
+        // client that selected one would fail). We handshake QUIC v1 (RFC 9000) and
+        // QUIC v2 (RFC 9369): v1 is listed first as the default, v2 support is
+        // additive (the version is chosen per-connection from the client's Initial,
+        // so v1 clients are unaffected). The vendored noq fork implements v2's
+        // version-specific Initial keys (via rustls), retry integrity key, and
+        // long-header packet-type renumbering. noq still adds its reserved/GREASE
+        // version automatically.
         let socket = std::net::UdpSocket::bind(addr)?;
 
         // Explicitly size the kernel UDP socket buffers. quinn-udp enables GSO/GRO
@@ -201,7 +206,7 @@ impl QuicListener {
         let runtime = quinn::default_runtime()
             .ok_or_else(|| anyhow::anyhow!("no async runtime found for QUIC endpoint"))?;
         let mut endpoint_config = quinn::EndpointConfig::default();
-        endpoint_config.supported_versions(vec![0x0000_0001]); // QUIC v1 (RFC 9000) only
+        endpoint_config.supported_versions(vec![0x0000_0001, 0x6b33_43cf]); // QUIC v1 (RFC 9000) + v2 (RFC 9369)
         let endpoint = Endpoint::new(endpoint_config, Some(server_config), socket, runtime)?;
 
         info!("QUIC endpoint created on {}", addr);
