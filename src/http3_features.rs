@@ -67,8 +67,10 @@ impl Default for EarlyHintsConfig {
 pub struct PreloadRule {
     /// Optional hostname to restrict this rule (exact match, no www). None = all hosts.
     pub host_pattern: Option<String>,
-    /// Path pattern (prefix match)
+    /// Path pattern (prefix match, or exact when `exact` is set)
     pub path_pattern: String,
+    /// Match `path_pattern` exactly instead of as a prefix.
+    pub exact: bool,
     /// Link hints to send
     pub hints: Vec<LinkHint>,
 }
@@ -161,11 +163,11 @@ impl EarlyHintsState {
     fn build_config(config: &crate::config::Http3Config) -> EarlyHintsConfig {
         use std::collections::HashMap;
 
-        // Group preload resources by (host, path) key
-        let mut by_key: HashMap<(Option<String>, String), Vec<LinkHint>> = HashMap::new();
+        // Group preload resources by (host, path, exact) key
+        let mut by_key: HashMap<(Option<String>, String, bool), Vec<LinkHint>> = HashMap::new();
         for res in &config.preload_resources {
             by_key
-                .entry((res.host.clone(), res.path.clone()))
+                .entry((res.host.clone(), res.path.clone(), res.exact))
                 .or_default()
                 .push(LinkHint::Preload {
                     href: res.href.clone(),
@@ -175,9 +177,10 @@ impl EarlyHintsState {
         }
         let preload_rules: Vec<PreloadRule> = by_key
             .into_iter()
-            .map(|((host_pattern, path_pattern), hints)| PreloadRule {
+            .map(|((host_pattern, path_pattern, exact), hints)| PreloadRule {
                 host_pattern,
                 path_pattern,
+                exact,
                 hints,
             })
             .collect();
@@ -236,7 +239,11 @@ impl EarlyHintsState {
                 Some(h) => h == host,
                 None => true,
             };
-            let path_matches = path.starts_with(&rule.path_pattern) || rule.path_pattern == "*";
+            let path_matches = if rule.exact {
+                path == rule.path_pattern
+            } else {
+                path.starts_with(&rule.path_pattern) || rule.path_pattern == "*"
+            };
             if host_matches && path_matches {
                 for hint in &rule.hints {
                     hints.push(hint.to_link_header());

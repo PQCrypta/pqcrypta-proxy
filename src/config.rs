@@ -261,7 +261,8 @@ pub struct PreloadResourceConfig {
     /// Hostname to restrict this rule to (e.g. "stlweb.dev"). None = all hosts.
     #[serde(default)]
     pub host: Option<String>,
-    /// Path prefix that triggers this preload (e.g. "/" matches all pages)
+    /// Path that triggers this preload. By default a prefix (e.g. "/" matches
+    /// all pages); with `exact = true` it must equal the request path exactly.
     pub path: String,
     /// Resource href (e.g. "/css/style.css")
     pub href: String,
@@ -270,6 +271,11 @@ pub struct PreloadResourceConfig {
     /// Optional crossorigin attribute value
     #[serde(default)]
     pub crossorigin: Option<String>,
+    /// Match `path` exactly instead of as a prefix. Use for page-specific
+    /// assets (e.g. the homepage's CSS should only preload on "/", not on
+    /// every page whose path starts with "/").
+    #[serde(default)]
+    pub exact: bool,
 }
 
 /// HTTP/3 advanced features configuration
