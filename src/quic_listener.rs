@@ -1170,6 +1170,77 @@ impl QuicListener {
                 stream.finish().await?;
                 return Ok(());
             }
+
+            // 5. WAF inspection (path + query + headers).
+            //
+            // This step was previously missing on the HTTP/3 path while the TCP
+            // path enforced it, so every WAF rule — SQLi, XSS, scanner UAs, the
+            // lot — could be bypassed simply by connecting over QUIC. Keep this
+            // in sync with `security_middleware` in security.rs.
+            if let Some(ref waf) = security.waf_engine {
+                let query = request.uri().query().unwrap_or("").to_string();
+                let skip_bot_ua = request
+                    .headers()
+                    .get("x-health-check-bypass")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v == "1")
+                    .unwrap_or(false)
+                    || path.starts_with("/stream/downloads/");
+                let waf_req = crate::waf::WafRequest {
+                    method: request.method().as_str(),
+                    path: &path,
+                    query: &query,
+                    headers: request.headers(),
+                    body: None,
+                    skip_bot_ua_check: skip_bot_ua,
+                };
+                match waf.inspect(&waf_req) {
+                    crate::waf::WafVerdict::Block { ref rule, .. } => {
+                        warn!("WAF block: rule={} ip={} path={} (h3)", rule, ip, path);
+                        // Mirror the TCP path: repeated WAF blocks escalate to an
+                        // IP ban via the shared suspicious_patterns counter.
+                        // Pentest IPs are exempt — they send attack payloads by
+                        // design and must get a 403 without being banned mid-run.
+                        let is_pentest_bypass = {
+                            let sc = security.config.read();
+                            let ip_str = ip.to_string();
+                            sc.pentest_bypass_ips.iter().any(|p| p == &ip_str)
+                        };
+                        if !is_pentest_bypass {
+                            let mut counter = security.request_counts.entry(ip).or_default();
+                            counter.suspicious_patterns += 1;
+                            if counter.suspicious_patterns >= auto_block_threshold {
+                                drop(counter);
+                                security.block_ip(
+                                    ip,
+                                    BlockReason::TooManyErrors,
+                                    Some(std::time::Duration::from_secs(auto_block_duration_secs)),
+                                );
+                            }
+                        }
+                        metrics.requests.request_end_full(
+                            403,
+                            start_time.elapsed(),
+                            0,
+                            0,
+                            Some(&path),
+                            is_health_check,
+                        );
+                        let response = http::Response::builder()
+                            .status(http::StatusCode::FORBIDDEN)
+                            .header("server", SERVER_HEADER)
+                            .header("x-waf-block", "1")
+                            .body(())?;
+                        stream.send_response(response).await?;
+                        stream.finish().await?;
+                        return Ok(());
+                    }
+                    crate::waf::WafVerdict::Detect { ref rule, .. } => {
+                        warn!("WAF detect: rule={} ip={} path={} (h3)", rule, ip, path);
+                    }
+                    crate::waf::WafVerdict::Allow => {}
+                }
+            }
         }
 
         // Send 103 Early Hints if enabled and we have hints for this path

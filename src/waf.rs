@@ -425,6 +425,16 @@ impl WafEngine {
             }
         }
 
+        // Protocol probes (HTTP/3 checkers, uptime monitors, Alt-Svc validators)
+        // send `HEAD /` with no User-Agent and are wrongly caught by the
+        // missing-UA rule below, which made third-party HTTP/3 checkers report
+        // this server as not supporting QUIC. A HEAD on the root path returns
+        // headers only — no body, no data exposed, nothing an attacker can act
+        // on — so exempting exactly that one shape restores protocol
+        // discoverability without loosening the rule for the scanning traffic
+        // it exists to stop (which targets specific paths with GET/POST).
+        let is_root_protocol_probe = req.method.eq_ignore_ascii_case("HEAD") && req.path == "/";
+
         // Block known malicious scanner/bot user-agents before injection pattern checks.
         // Matching against UA specifically avoids false-positives from injection patterns
         // that might appear in legitimate referer or cookie headers.
@@ -432,8 +442,9 @@ impl WafEngine {
         if !req.skip_bot_ua_check && !self.bad_bot_ua_patterns.is_empty() {
             match req.headers.get("user-agent") {
                 None => {
-                    // No User-Agent header — block in strict posture
-                    if self.config.block_scanner_uas {
+                    // No User-Agent header — block in strict posture, unless
+                    // this is the root protocol probe shape (see above).
+                    if self.config.block_scanner_uas && !is_root_protocol_probe {
                         debug!("WAF blocked missing User-Agent");
                         let rule = "bad-bot-ua:missing-user-agent".to_string();
                         return if block_mode {
@@ -454,7 +465,7 @@ impl WafEngine {
                         // Also block empty User-Agent (header present but blank) —
                         // curl -H 'User-Agent:' sends Some("") not None.
                         if ua_str.trim().is_empty() {
-                            if self.config.block_scanner_uas {
+                            if self.config.block_scanner_uas && !is_root_protocol_probe {
                                 debug!("WAF blocked empty User-Agent");
                                 let rule = "bad-bot-ua:empty-user-agent".to_string();
                                 return if block_mode {
@@ -888,4 +899,77 @@ fn compile_patterns(patterns: &[&str]) -> Vec<Regex> {
                 .ok()
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    fn engine() -> WafEngine {
+        WafEngine::new(&WafConfig {
+            enabled: true,
+            block_scanner_uas: true,
+            ..Default::default()
+        })
+    }
+
+    fn req<'a>(method: &'a str, path: &'a str, headers: &'a HeaderMap) -> WafRequest<'a> {
+        WafRequest {
+            method,
+            path,
+            query: "",
+            headers,
+            body: None,
+            skip_bot_ua_check: false,
+        }
+    }
+
+    /// HTTP/3 checkers probe with `HEAD /` and no User-Agent. Blocking that
+    /// made third-party tools report this server as not supporting QUIC.
+    #[test]
+    fn head_root_without_user_agent_is_allowed() {
+        let headers = HeaderMap::new();
+        assert!(
+            matches!(
+                engine().inspect(&req("HEAD", "/", &headers)),
+                WafVerdict::Allow
+            ),
+            "HEAD / with no User-Agent must not be blocked (breaks protocol checkers)"
+        );
+    }
+
+    /// The exemption is deliberately narrow: only the root path, only HEAD.
+    #[test]
+    fn missing_user_agent_still_blocked_elsewhere() {
+        let headers = HeaderMap::new();
+        assert!(
+            matches!(
+                engine().inspect(&req("GET", "/", &headers)),
+                WafVerdict::Block { .. }
+            ),
+            "GET / with no User-Agent must still be blocked"
+        );
+        assert!(
+            matches!(
+                engine().inspect(&req("HEAD", "/admin", &headers)),
+                WafVerdict::Block { .. }
+            ),
+            "HEAD on a non-root path with no User-Agent must still be blocked"
+        );
+    }
+
+    /// The exemption must not extend to known-bad scanner user-agents.
+    #[test]
+    fn known_bad_ua_still_blocked_on_head_root() {
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", "sqlmap/1.7".parse().unwrap());
+        assert!(
+            matches!(
+                engine().inspect(&req("HEAD", "/", &headers)),
+                WafVerdict::Block { .. }
+            ),
+            "a known scanner UA must still be blocked even on HEAD /"
+        );
+    }
 }
