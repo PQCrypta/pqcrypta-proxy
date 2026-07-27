@@ -894,7 +894,7 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
             // Accept new connections
             accept_result = listener.accept() => {
                 let (stream, remote_addr) = match accept_result {
-                    Ok(result) => result,
+                    Ok((stream, addr)) => (stream, crate::security::canonical_addr(addr)),
                     Err(e) => {
                         warn!("Failed to accept TCP connection: {}", e);
                         continue;
@@ -1301,7 +1301,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
         tokio::select! {
             accept_result = listener.accept() => {
                 let (stream, remote_addr) = match accept_result {
-                    Ok(result) => result,
+                    Ok((stream, addr)) => (stream, crate::security::canonical_addr(addr)),
                     Err(e) => {
                         warn!("Failed to accept TCP connection: {}", e);
                         continue;
@@ -1716,6 +1716,7 @@ pub async fn run_tls_passthrough_server(
 
     loop {
         let (stream, client_addr) = listener.accept().await?;
+        let client_addr = crate::security::canonical_addr(client_addr);
         let config = config.clone();
 
         tokio::spawn(async move {

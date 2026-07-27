@@ -269,7 +269,7 @@ async fn handle_incoming_session(
 
     let path = session_request.path().to_string();
     let authority = session_request.authority().to_string();
-    let remote_addr = session_request.remote_address();
+    let remote_addr = crate::security::canonical_addr(session_request.remote_address());
 
     info!("📥 WebTransport session request received");
     info!("   Path: {}", path);

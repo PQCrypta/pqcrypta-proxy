@@ -252,7 +252,7 @@ impl QuicListener {
                 // Handle incoming connections
                 Some(incoming) = self.endpoint.accept() => {
                     accept_count += 1;
-                    let remote_addr = incoming.remote_address();
+                    let remote_addr = crate::security::canonical_addr(incoming.remote_address());
                     let ip = remote_addr.ip();
 
                     // Connection-level security checks: IP blocklist and GeoIP country blocking.

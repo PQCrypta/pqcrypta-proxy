@@ -13,7 +13,7 @@
 //! GeoIP blocking is an optional feature requiring MaxMind database integration
 //! (enable with `--features geoip`). Active JA3/JA4 fingerprinting lives in `fingerprint.rs`.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -57,6 +57,24 @@ fn is_trusted_ip(ip: &IpAddr) -> bool {
             // IPv4-mapped loopback (::ffff:127.0.0.1)
             v6.to_ipv4_mapped().map(|v4| v4.is_loopback()).unwrap_or(false)
         }
+    }
+}
+
+/// Canonicalize a peer socket address: unwrap IPv4-mapped IPv6
+/// (`::ffff:a.b.c.d` → `a.b.c.d`), preserving the port.
+///
+/// The listeners bind `[::]` (dual-stack), so IPv4 clients arrive as
+/// IPv4-mapped IPv6 addresses. Every IP comparison downstream — blocklists,
+/// pentest bypass, fail2ban log parsing, X-Forwarded-For, backend API key
+/// whitelists — expects the plain IPv4 form, so normalize once at the
+/// accept boundary instead of at each consumer.
+pub fn canonical_addr(addr: SocketAddr) -> SocketAddr {
+    match addr.ip() {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(IpAddr::V4(v4), addr.port()),
+            None => addr,
+        },
+        IpAddr::V4(_) => addr,
     }
 }
 
