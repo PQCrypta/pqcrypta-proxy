@@ -309,6 +309,7 @@ impl ResponseCache {
         let mut has_set_cookie = false;
         let mut has_content_encoding = false;
         let mut has_content_range = false;
+        let mut has_csp_nonce = false;
 
         for (name, value) in response_headers {
             match name.to_lowercase().as_str() {
@@ -319,8 +320,32 @@ impl ResponseCache {
                 "set-cookie" => has_set_cookie = true,
                 "content-encoding" => has_content_encoding = true,
                 "content-range" => has_content_range = true,
+                "content-security-policy" | "content-security-policy-report-only" => {
+                    if value.contains("'nonce-") {
+                        has_csp_nonce = true;
+                    }
+                }
                 _ => {}
             }
+        }
+
+        // Never cache a response carrying a CSP nonce.
+        //
+        // A nonce is the server stating that these exact script and style tags,
+        // in this exact response, are the ones permitted to run. Storing that
+        // response hands the same nonce to every subsequent visitor for the
+        // life of the entry, and a nonce known to everyone authorises everyone:
+        // an injected tag carrying it satisfies script-src, which is the one
+        // thing the nonce existed to prevent.
+        //
+        // Found on a first-party origin that emitted per-request nonces but no
+        // Cache-Control, so this cache happily pinned one nonce for its full
+        // 60-second TTL and served it to every client. The header is the
+        // reliable signal here: if the CSP names a nonce, the body is unique to
+        // one response by construction and is not ours to replay.
+        if has_csp_nonce {
+            trace!("Not caching {}: response carries a CSP nonce", key);
+            return;
         }
 
         // Never cache partial content. This cache keys on method+host+path with no
