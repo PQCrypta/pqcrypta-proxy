@@ -320,10 +320,10 @@ impl ResponseCache {
                 "set-cookie" => has_set_cookie = true,
                 "content-encoding" => has_content_encoding = true,
                 "content-range" => has_content_range = true,
-                "content-security-policy" | "content-security-policy-report-only" => {
-                    if value.contains("'nonce-") {
-                        has_csp_nonce = true;
-                    }
+                "content-security-policy" | "content-security-policy-report-only"
+                    if value.contains("'nonce-") =>
+                {
+                    has_csp_nonce = true;
                 }
                 _ => {}
             }
