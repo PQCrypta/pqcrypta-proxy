@@ -293,7 +293,34 @@ impl OcspService {
         let ocsp_url = match Self::extract_ocsp_url(&cert) {
             Ok(url) => url,
             Err(e) => {
-                warn!("OCSP: {}", e);
+                // A certificate carrying no responder URL can never be
+                // stapled, and this task re-checks hourly, so warning each
+                // time turns a permanent and entirely expected condition into
+                // recurring noise — which trains the reader to ignore real
+                // warnings. Since the CA/Browser Forum made OCSP optional,
+                // major CAs (Let's Encrypt, Google Trust Services) issue
+                // certificates with no responder at all. Say so once at info,
+                // then stay quiet until it actually changes.
+                //
+                // The read guard is scoped: parking_lot's RwLock is not
+                // reentrant and the write below would deadlock against a
+                // guard still held here.
+                let already_reported = {
+                    let cached = cached_response.read();
+                    matches!(
+                        cached.as_ref(),
+                        Some(c) if c.status == OcspStatus::NoResponder
+                    )
+                };
+
+                if already_reported {
+                    debug!("OCSP: {} (unchanged since last check)", e);
+                } else {
+                    info!(
+                        "OCSP: {} — stapling is unavailable for this certificate. Expected for CAs that retired OCSP (Let's Encrypt, Google Trust Services); revocation relies on short certificate lifetimes and CRLs instead.",
+                        e
+                    );
+                }
                 // Cache NoResponder status to prevent rapid retries (1 hour backoff)
                 *cached_response.write() = Some(CachedOcspResponse {
                     response: Vec::new(),
