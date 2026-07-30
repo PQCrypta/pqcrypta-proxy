@@ -501,6 +501,20 @@ pub struct ServerConfig {
     #[serde(default)]
     pub enable_quic_retry: bool,
 
+    /// Maximum concurrent data-carrying paths per connection
+    /// (draft-ietf-quic-multipath), served by the noq QUIC stack.
+    ///
+    /// The full extension is implemented — per-path packet-number spaces,
+    /// PATH_ACK/ABANDON/STATUS lifecycle frames, per-path loss recovery and a
+    /// scheduler — and paths are created, validated and torn down
+    /// automatically once the peer negotiates multipath. Peers that do not
+    /// advertise it are unaffected whatever this is set to.
+    ///
+    /// 1 leaves every connection single-path; 0 disables the extension so it
+    /// is never negotiated. Default: 4.
+    #[serde(default = "default_multipath_paths")]
+    pub max_concurrent_multipath_paths: u32,
+
     /// Maximum concurrent WebTransport sessions per origin (default 100).
     #[serde(default = "default_wt_max_sessions")]
     pub webtransport_max_sessions_per_origin: u32,
@@ -609,6 +623,7 @@ impl Default for ServerConfig {
             enable_quic_migration: true,
             enable_ack_frequency: true,
             enable_quic_retry: false,
+            max_concurrent_multipath_paths: 4,
             webtransport_max_sessions_per_origin: 100,
             webtransport_max_streams_per_session: 1000,
             webtransport_max_datagrams_per_sec: 500,
@@ -624,6 +639,10 @@ impl Default for ServerConfig {
 
 fn default_max_request_body_bytes() -> u64 {
     52_428_800 // 50 MiB
+}
+
+fn default_multipath_paths() -> u32 {
+    4
 }
 
 fn default_wt_max_sessions() -> u32 {

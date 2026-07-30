@@ -139,14 +139,23 @@ impl QuicListener {
         }
 
         // Full draft-ietf-quic-multipath support (via the noq QUIC stack):
-        // allow up to 4 concurrent, data-carrying paths per connection when
+        // allow this many concurrent, data-carrying paths per connection when
         // the peer negotiates multipath. Unlike the earlier narrow single-
         // path validation probe, noq implements the complete extension -
         // per-path packet-number spaces, PATH_ACK/ABANDON/STATUS lifecycle
         // frames, per-path loss recovery, and a scheduler - and manages path
         // creation/validation/teardown automatically once negotiated. Inert
         // for peers that don't advertise multipath.
-        transport_config.max_concurrent_multipath_paths(4);
+        let multipath_paths = config.server.max_concurrent_multipath_paths;
+        transport_config.max_concurrent_multipath_paths(multipath_paths);
+        if multipath_paths > 0 {
+            info!(
+                "QUIC multipath enabled: up to {} concurrent path(s) per connection",
+                multipath_paths
+            );
+        } else {
+            info!("QUIC multipath disabled by configuration (max_concurrent_multipath_paths = 0)");
+        }
 
         // Create QUIC server configuration
         let mut server_config =
