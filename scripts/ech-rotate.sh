@@ -20,12 +20,27 @@
 #   3. cp ech-rotate.service ech-rotate.timer /etc/systemd/system/
 #   4. systemctl enable --now pqcrypta-ech-rotate.timer
 #
-# Does NOT publish the resulting ECHConfigList to DNS itself — GoDaddy API
-# support for HTTPS/SVCB (TYPE65) records was not confirmed working at the
-# time this was written (see ech-config generation research notes). Until
-# that's resolved, publish scripts/ech-configs/ech-config-list.b64 to the
-# `ech=` SvcParam of pqcrypta.com's HTTPS DNS record by hand, or wire in
-# automated publishing here once GoDaddy support is verified.
+# Does NOT publish the resulting ECHConfigList to DNS itself, and on GoDaddy
+# it cannot: their DNS API has no HTTPS/SVCB record type at all. Verified
+# 2026-07-29 against api.godaddy.com/v1/domains/pqcrypta.com/records/:
+#
+#   HTTPS | SVCB | TYPE65  ->  422 INVALID_VALUE_ENUM
+#     "type not any of: A, AAAA, CAA, CNAME, MX, NS, SOA, SRV, TXT"
+#   A (control)            ->  200
+#
+# So the `ech=` SvcParam can only be edited by hand in GoDaddy's web UI —
+# which is also what corrupts commas in multi-value SvcParams (the reason
+# our alpn= lists h3 only; see public/http3-quic/DNS_HTTPS_RECORDS.md for
+# the RFC 9460 §7.1.1 `key1="\002h3\002h2"` comma-free workaround).
+#
+# This is why ech-rotate.timer is deliberately NOT installed: rotating a key
+# that cannot be published to DNS breaks ECH instead of strengthening it.
+# After each manual run, copy ech-config-list.b64 into the record by hand.
+#
+# To make rotation automatic, move DNS hosting to a provider whose API
+# supports type 65 (deSEC, Cloudflare, Route 53, Bunny, DNSimple, Gandi
+# LiveDNS) — repointing NS is enough, no domain transfer — then publish
+# ech-config-list.b64 from here and enable the timer.
 
 set -euo pipefail
 
