@@ -391,10 +391,18 @@ impl PqcTlsProvider {
     ) -> String {
         let mut groups = Vec::new();
 
-        // Add preferred KEM first if available
+        // Add preferred KEM first if available. Under require_hybrid a pure-PQC
+        // preference is skipped: the point of the setting is that every
+        // negotiated group carries both a classical and a post-quantum
+        // component, so a break of either alone is not enough.
         if let Some(kem) = preferred {
             let name = kem.openssl_name();
-            if available_kems.iter().any(|k| k.contains(name)) {
+            if config.require_hybrid && !kem.is_hybrid() {
+                warn!(
+                    "require_hybrid is set, so preferred_kem {} (pure PQC) is not offered",
+                    name
+                );
+            } else if available_kems.iter().any(|k| k.contains(name)) {
                 groups.push(name.to_string());
             }
         }
@@ -411,8 +419,19 @@ impl PqcTlsProvider {
 
         // Classical fallback: P-384 only (secp384r1, 192-bit = 100% SSL Labs score).
         // P-256 and X25519 are excluded — both 128-bit, both score 90% on SSL Labs.
-        if config.fallback_to_classical {
+        //
+        // require_hybrid wins over fallback_to_classical: offering P-384 is what
+        // lets a client with no PQC support complete a handshake, so leaving it
+        // in would make the setting meaningless. With it suppressed, such a
+        // client finds no mutually supported group and the handshake fails —
+        // which is the intended, and deliberately disruptive, behaviour.
+        if config.fallback_to_classical && !config.require_hybrid {
             groups.push("P-384".to_string());
+        } else if config.require_hybrid {
+            warn!(
+                "require_hybrid is set: no classical fallback group is offered, so \
+                 clients without hybrid PQC support cannot complete a handshake"
+            );
         }
 
         groups.join(":")

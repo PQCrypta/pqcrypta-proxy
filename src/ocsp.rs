@@ -54,6 +54,10 @@ pub struct CachedOcspResponse {
 pub struct OcspConfig {
     /// Enable OCSP stapling
     pub enabled: bool,
+    /// How long a fetched response may be cached when the responder does not
+    /// state a nextUpdate, and how long a "no responder" verdict is held before
+    /// re-checking. A responder that does supply nextUpdate always wins.
+    pub cache_duration: Duration,
     /// Refresh interval before expiration (default: 1 hour before)
     pub refresh_before_expiry: Duration,
     /// Minimum refresh interval (don't fetch more often than this)
@@ -70,6 +74,7 @@ impl Default for OcspConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            cache_duration: Duration::from_hours(1),
             refresh_before_expiry: Duration::from_hours(1), // 1 hour before expiry
             min_refresh_interval: Duration::from_mins(5),   // 5 minutes minimum
             request_timeout: Duration::from_secs(10),
@@ -234,7 +239,7 @@ impl OcspService {
                 if response.status == OcspStatus::NoResponder
                     || response.status == OcspStatus::FetchError
                 {
-                    return Duration::from_hours(1); // 1 hour
+                    return config.cache_duration;
                 }
 
                 let now = Instant::now();
@@ -326,7 +331,7 @@ impl OcspService {
                     response: Vec::new(),
                     status: OcspStatus::NoResponder,
                     fetched_at: Instant::now(),
-                    expires_at: Instant::now() + Duration::from_hours(1),
+                    expires_at: Instant::now() + config.cache_duration,
                     responder_url: String::new(),
                     next_update: None,
                 });
@@ -361,10 +366,12 @@ impl OcspService {
                 Ok((response, status, next_update)) => {
                     let now = Instant::now();
 
-                    // Calculate expiration (default to 7 days if not specified)
+                    // A responder that states nextUpdate decides its own validity;
+                    // otherwise fall back to the configured cache duration rather
+                    // than trusting an unstated response for a week.
                     let expires_at = next_update
                         .map(|d| now + d)
-                        .unwrap_or_else(|| now + Duration::from_hours(168));
+                        .unwrap_or_else(|| now + config.cache_duration);
 
                     let cached = CachedOcspResponse {
                         response,

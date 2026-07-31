@@ -3133,6 +3133,16 @@ async fn proxy_handler(
                 return (StatusCode::BAD_GATEWAY, "Backend not configured").into_response();
             };
 
+        // A route may raise or lower the backend's timeout for its own traffic —
+        // one slow endpoint (an LLM chat completion, a large PDF conversion)
+        // should not force every other route on that backend to wait as long.
+        // Applies to pool members too: the override is a property of the route,
+        // not of whichever server the pool happened to pick.
+        let backend_timeout = match route.timeout_override_ms {
+            Some(ms) => Duration::from_millis(ms),
+            None => backend_timeout,
+        };
+
         // Build backend URL based on TLS mode
         let (backend_url, use_https) = match tls_mode {
             TlsMode::Terminate => (

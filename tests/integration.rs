@@ -74,7 +74,6 @@ preferred_kem = "X25519MLKEM768"
 fallback_to_classical = true
 min_security_level = 3
 additional_kems = ["SecP256r1MLKEM768", "SecP384r1MLKEM1024"]
-enable_signatures = true
 require_hybrid = true
 verify_provider = true
 check_key_permissions = true
@@ -90,7 +89,6 @@ strict_key_permissions = false
         assert!(config.pqc.fallback_to_classical);
         assert_eq!(config.pqc.min_security_level, 3);
         assert_eq!(config.pqc.additional_kems.len(), 2);
-        assert!(config.pqc.enable_signatures);
         assert!(config.pqc.require_hybrid);
     }
 

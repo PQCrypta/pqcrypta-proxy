@@ -536,13 +536,16 @@ async fn main() -> anyhow::Result<()> {
         info!("Initializing OCSP stapling service...");
         let ocsp_config = ocsp::OcspConfig {
             enabled: config.ocsp.enabled,
+            cache_duration: std::time::Duration::from_secs(config.ocsp.cache_duration_secs),
             refresh_before_expiry: std::time::Duration::from_secs(
                 config.ocsp.refresh_before_expiry_secs,
             ),
             min_refresh_interval: std::time::Duration::from_mins(5),
             request_timeout: std::time::Duration::from_secs(config.ocsp.timeout_secs),
             max_retries: config.ocsp.max_retries,
-            retry_delay: std::time::Duration::from_secs(config.ocsp.retry_delay_ms / 1000),
+            // from_millis, not from_secs(ms / 1000): the integer division floored
+            // any sub-second delay to zero, so a 500 ms setting retried instantly.
+            retry_delay: std::time::Duration::from_millis(config.ocsp.retry_delay_ms),
         };
         let mut service = ocsp::OcspService::new(ocsp_config);
 

@@ -818,10 +818,12 @@ pub struct PqcConfig {
     #[serde(default = "default_true_pqc")]
     pub log_downgrades: bool,
 
-    /// Enable PQC signatures (ML-DSA) - requires `pqc-signatures` feature
-    #[serde(default)]
-    pub enable_signatures: bool,
-    /// Require hybrid mode (reject pure PQC or pure classical)
+    /// Require every offered key-exchange group to be hybrid (classical + PQC).
+    ///
+    /// Suppresses the pure-PQC preferred KEM and the classical P-384 fallback in
+    /// the offered group list, so a peer that supports neither a hybrid group
+    /// nor nothing at all fails the handshake outright. Default false: on a
+    /// public listener this turns away every client without PQC support.
     #[serde(default)]
     pub require_hybrid: bool,
     /// Verify OpenSSL provider integrity at startup
@@ -861,7 +863,6 @@ impl Default for PqcConfig {
             ],
             downgrade_action: default_downgrade_action(),
             log_downgrades: true,
-            enable_signatures: false,
             require_hybrid: false,
             verify_provider: true,
             check_key_permissions: true,
