@@ -34,6 +34,8 @@
 | **Load Balancing** | ✅ | 6 algorithms with session affinity and health-aware routing |
 | Circuit Breaker | ✅ | Backend health monitoring with auto-recovery |
 | **Advanced Rate Limiting** | ✅ | Multi-dimensional: IP, JA3/JA4, JWT, headers, composite keys on all paths (TCP + QUIC/HTTP3); optional Redis backend for distributed cross-instance coordination |
+| **Connection Rate Limiting** | ✅ | Per-IP cap on *new connections per second* (`connection_rate_limit`, `connections_per_second`), separate from `max_connections_per_ip` which caps concurrency — a client that opens and closes as fast as it can never trips a concurrency limit |
+| **Per-Route Security Policy** | ✅ | `[routes.security]` overrides applied before the global checks: WAF on/off and mode, rate limits, JA3 allowlist, mTLS, HMAC request signing, plus `skip_bot_blocking` for routes that serve automated clients |
 | DoS Protection | ✅ | Connection limits, request validation |
 | GeoIP Blocking | ✅ | Country-based blocking (MaxMind DB) |
 | JA3/JA4 Fingerprinting | ✅ | TLS client fingerprint detection and classification |
@@ -109,9 +111,9 @@
 | **Connection Pool** | ✅ | Per-backend connection pool with configurable max idle, max total, acquire timeout, and idle timeout |
 | **Session Affinity Modes** | ✅ | Sticky sessions via IP hash, custom header, or Set-Cookie with configurable SameSite attribute |
 | **Path Regex Routing** | ✅ | Per-route regex pattern matching with ReDoS prevention (pattern size-limited) |
-| **PQC Session Tickets** | ✅ | TLS session ticket HKDF keys wrapped with ML-KEM-1024 encapsulation (`pqc_session_tickets`) |
+| **PQC Session Tickets** | ✅ | Each TLS 1.3 ticket carries its own ML-KEM-1024 encapsulation; the resumption state is sealed with an AES-256-GCM key derived from it via HKDF-SHA384 (`pqc_session_tickets`, `session_ticket_lifetime_secs`) |
 | **TLS Key Permission Checks** | ✅ | Validates private key file permissions at startup; configurable strict mode aborts on insecure permissions |
-| **Malicious Fingerprint Blocking** | ✅ | JA3/JA4 database classification blocks known-malicious fingerprints (`block_malicious`) with configurable cache TTL |
+| **Malicious Fingerprint Blocking** | ✅ | Classification consults the operator database at `fingerprint_db_path` first, then the built-in table, matching JA3 then JA4 (`block_malicious`, `block_scanners`). Authorised `pentest_bypass_ips` are classified but never banned |
 | **Server-Timing Header** | ✅ | Per-request `Server-Timing` header with proxy latency breakdown for performance visibility |
 | **Accept-CH Header** | ✅ | `Accept-CH` client hints advertisement for adaptive content delivery |
 | **Graceful Shutdown Drain** | ✅ | Configurable drain timeout polls active connections at 100 ms intervals; exits as soon as connections reach zero |
@@ -152,7 +154,7 @@
 - **Malicious Fingerprint Blocking**: `block_malicious = true` in fingerprint config automatically blocks connections whose JA3/JA4 hash matches a known-malicious entry in the classification database; fingerprint cache with configurable TTL and background cleanup
 - **PQC Downgrade Detection**: Detects classical-only TLS negotiation when PQC is required; configurable action: block (421), log, or allow
 - **PQC + Fingerprinting Combined**: OpenSSL ML-KEM with ClientHello capture for early blocking
-- **PQC Session Tickets**: TLS session ticket HKDF keys wrapped with ML-KEM-1024 encapsulation (`pqc_session_tickets`) to protect resumed sessions against harvest-now-decrypt-later attacks
+- **PQC Session Tickets**: rustls installs no ticketer by default, so with `pqc_session_tickets = false` the proxy issues no TLS 1.3 tickets at all and resumption relies on session storage. When enabled, each ticket encapsulates to the server's ML-KEM-1024 (FIPS 204) key for a fresh per-ticket secret, derives an AES-256-GCM key from it with HKDF-SHA384, and seals the resumption state with the KEM ciphertext as associated data. The keypair rolls every `session_ticket_lifetime_secs` (default 12 h) retaining one previous generation, since the trait requires lifetime to be enforced by key rolling rather than a timestamp inside the ticket. Note the server holds both halves of the keypair: what this changes is the algorithm protecting ticket key material and that each ticket gets an independent secret — it is not a defence against reading server memory
 - **TLS 1.3 Default**: TLS 1.3 minimum on all listeners by default (`min_version = "1.3"` in `[tls]`); TLS 1.2 can be permitted via config — OpenSSL 3.5+ for TCP/TLS, rustls for QUIC/HTTP3
 - **TLS Key Permission Checks**: Private key file permissions validated at startup; `strict_key_permissions = true` aborts if permissions are too permissive
 - **0-RTT Replay Protection**: Nonce store (strict/session/none modes) — rejects replayed TLS 1.3 early-data nonces within configurable window
@@ -238,6 +240,52 @@
 - **Cross-Platform**: Linux, macOS, and Windows support
 
 ## Security
+
+### One Enforcement Path
+
+The WAF, blocklist, GeoIP check, rate limiters, header-size limit and per-route
+policy are implemented once, in `SecurityState::evaluate`, and both transports
+call it. It takes a transport-agnostic view of a request and returns a verdict;
+only the rendering differs — axum builds a `Response`, the HTTP/3 handler builds
+an `http::Response<()>`.
+
+This matters because the HTTP/3 handler previously carried its own copy of the
+checks, which omitted the WAF entirely: every rule was bypassable by connecting
+over QUIC. Two implementations of one policy drift. When changing a rule, change
+`evaluate` — a new decision variant will not compile until both renderers handle
+it. Verify parity after any change:
+
+```bash
+# both must return 403
+curl              "https://<host>/?id=1%20UNION%20SELECT%20pw%20FROM%20users"
+curl --http3-only "https://<host>/?id=1%20UNION%20SELECT%20pw%20FROM%20users"
+```
+
+### TLS Fingerprint Classification
+
+Classification consults the operator database at `fingerprint.fingerprint_db_path`
+first, then the built-in table. Entries are matched by **JA3, then JA4**.
+
+Prefer JA4 when adding a scanner. JA3 hashes the raw cipher/extension order, so a
+tool that varies its cipher list between probes produces a different JA3 every
+run — two runs of `nmap --script ssl-enum-ciphers` against this proxy produced two
+disjoint sets of 19 JA3 hashes while their JA4 values were identical. An entry
+whose `hash` field holds a JA4 string is matched the same way as a JA3 one.
+
+Collect fingerprints rather than copying them from public lists — a wrong entry
+silently blocks real visitors. The proxy logs one line per *new* fingerprint under
+the `fingerprint_observed` target, so running a single named tool and reading that
+window gives verified ground truth:
+
+```bash
+MARK=$(date -Is)
+# run exactly one tool against the proxy, then:
+journalctl -u pqcrypta-proxy --since "$MARK" | grep "New TLS fingerprint"
+```
+
+Addresses in `security.pentest_bypass_ips` are classified and logged but never
+banned by fingerprint, so adding a scanner entry cannot ban the host your
+authorised scans come from.
 
 ### Runtime Directories
 
@@ -430,13 +478,18 @@ docker run -p 80:80 -p 443:443/tcp -p 443:443/udp \
 # /etc/pqcrypta/proxy-config.toml
 
 [server]
-bind_address = "0.0.0.0"
+bind_address = "0.0.0.0"           # "[::]" for dual-stack; enable_ipv6 = false downgrades it to IPv4
 udp_port = 443
 additional_ports = [4433, 4434]
+worker_threads = 0                  # 0 = one per CPU core; read before the Tokio runtime is built
+max_concurrent_multipath_paths = 4  # draft-ietf-quic-multipath; 1 = single-path, 0 = never negotiated
 
 [tls]
 cert_path = "/etc/letsencrypt/live/example.com/fullchain.pem"
 key_path = "/etc/letsencrypt/live/example.com/privkey.pem"
+ocsp_stapling = true                # must be true AND [ocsp].enabled for stapling to run
+pqc_session_tickets = true          # without this, no TLS 1.3 tickets are issued at all
+session_ticket_lifetime_secs = 43200
 
 [http_redirect]
 enabled = true
@@ -502,6 +555,16 @@ timeout_secs = 30
 The advanced rate limiter provides multi-dimensional rate limiting inspired by Cloudflare, Envoy, HAProxy, and ML research. It solves the corporate NAT problem where many users share one gateway IP.
 
 ```toml
+# Basic layer: request rate and, separately, how fast an IP may OPEN connections.
+# max_connections_per_ip caps concurrency; a client that opens and closes as fast
+# as it can never trips a concurrency cap, which is what connection_rate_limit is for.
+[rate_limiting]
+enabled = true
+requests_per_second = 100
+burst_size = 50
+connection_rate_limit = true
+connections_per_second = 10
+
 [advanced_rate_limiting]
 enabled = true
 
@@ -658,6 +721,8 @@ custom_patterns = [
 
 The scanner-UA check also matches the default `curl/N` and `Wget/N` User-Agents, which are the expected clients for public binary-download endpoints (e.g. install scripts distributed as `curl -o file https://.../stream/downloads/...`). Paths under `/stream/downloads/` are hard-exempted from this specific check (same mechanism as the `X-Health-Check-Bypass` header) so documented `curl`/`wget` install commands aren't blocked — injection and path-traversal scanning still runs on these paths.
 
+A route can declare the same exemption rather than relying on the built-in path prefix: `skip_bot_blocking = true` on a `[[routes]]` entry turns off the scanner/bot User-Agent check for that route only, on both the TCP and HTTP/3 paths. Prefer it over adding hardcoded prefixes.
+
 Route-level WAF override:
 ```toml
 [[routes]]
@@ -670,6 +735,12 @@ backend = "api"
 waf_enabled = true
 waf_mode = "block"   # override global mode for this route
 ```
+
+Per-route policy is resolved before the security checks run, so all of it
+applies on both transports. The WAF and rate limiter sit in front of routing, so
+the security layer resolves the route itself through the same `find_route` the
+proxy uses downstream — which is what makes `[routes.security]` and
+`skip_bot_blocking` take effect at all.
 
 ### Audit Logging Configuration
 
@@ -713,8 +784,11 @@ Controls the HTTP/1.1 connection pool used for requests to backends over TCP. Al
 [connection_pool]
 idle_timeout_secs        = 90    # Close idle connections after 90 s
 max_idle_per_host        = 10    # Keep up to 10 idle connections per backend
-max_connections_per_host = 100   # Hard cap on total open connections per backend
-acquire_timeout_ms       = 5000  # Fail the request if a connection can't be acquired in 5 s
+max_connections_per_host = 100   # Limit for backends that do not set their own max_connections.
+                                 # NOT a ceiling over an explicit per-backend value — several
+                                 # backends are deliberately configured above this figure.
+acquire_timeout_ms       = 5000  # Fail the request if a connection can't be acquired in 5 s.
+                                 # Unbounded waiting turns a backend stall into a proxy-wide stall.
 ```
 
 Reducing `max_idle_per_host` lowers file-descriptor usage on backends with many idle periods. Increasing `max_connections_per_host` improves burst throughput at the cost of backend fd pressure.
