@@ -216,7 +216,29 @@ impl Default for KnownFingerprints {
 }
 
 impl KnownFingerprints {
-    /// Classify a JA3 hash
+    /// Classify from both fingerprints, trying JA3 then JA4.
+    ///
+    /// Tools that vary their cipher list between probes — nmap's
+    /// ssl-enum-ciphers is the clearest example — produce a fresh JA3 every
+    /// run while their JA4 stays constant, because JA4 sorts and summarises
+    /// where JA3 hashes raw order. Matching on JA3 alone cannot recognise
+    /// such a client twice, so entries for them are stored as JA4.
+    pub fn classify_pair(
+        &self,
+        ja3_hash: &str,
+        ja4_hash: Option<&str>,
+    ) -> (FingerprintClass, Option<String>) {
+        let by_ja3 = self.classify(ja3_hash);
+        if !matches!(by_ja3.0, FingerprintClass::Suspicious) {
+            return by_ja3;
+        }
+        match ja4_hash {
+            Some(ja4) => self.classify(ja4),
+            None => by_ja3,
+        }
+    }
+
+    /// Classify a single hash (JA3 or JA4 — the tables are keyed by string)
     pub fn classify(&self, ja3_hash: &str) -> (FingerprintClass, Option<String>) {
         if let Some(name) = self.browsers.get(ja3_hash) {
             return (FingerprintClass::Browser, Some(name.clone()));
@@ -679,7 +701,26 @@ impl FingerprintExtractor {
         let ja4_hash = fingerprint.ja4_hash;
 
         // Classify the fingerprint
-        let (classification, client_name) = self.known_fingerprints.classify(&ja3_hash);
+        // Classify against the operator-maintained database first, then the
+        // built-in table.
+        //
+        // The JSON database at fingerprint.fingerprint_db_path was loaded at
+        // startup into SecurityState::ja3_db, logged as "Loaded N JA3/JA4
+        // fingerprints" — and then read by nothing at all. Every classification
+        // came from the small hardcoded table below, so entries added to the
+        // file changed no decision whatever they said. That is why populating
+        // the file could never make block_malicious fire.
+        let (classification, client_name) = {
+            let from_file = security
+                .ja3_db
+                .classify_pair(&ja3_hash, ja4_hash.as_deref());
+            if matches!(from_file, crate::security::FingerprintClass::Suspicious) {
+                self.known_fingerprints
+                    .classify_pair(&ja3_hash, ja4_hash.as_deref())
+            } else {
+                (from_file, None)
+            }
+        };
 
         // Update cache
         let now = Instant::now();
@@ -698,6 +739,28 @@ impl FingerprintExtractor {
                 request_count: 1,
             });
 
+        // Record the first sighting of a fingerprint.
+        //
+        // The proxy computed JA3/JA4 for every connection and then kept it only
+        // in an in-memory cache, so there was no record anywhere of what had
+        // actually been seen — which is why the classification database could
+        // not be extended from real traffic and block_malicious sat armed with
+        // nothing to match. One line per NEW fingerprint (not per request) is
+        // enough to build that corpus. No User-Agent here: this runs at the TLS
+        // layer, where no HTTP request exists yet — correlate through the
+        // x-ja3-hash header the proxy injects downstream.
+        if !security.ja3_cache.contains_key(&ja3_hash) {
+            info!(
+                target: "fingerprint_observed",
+                "New TLS fingerprint: ja3={:?} ja4={:?} class={:?} client={:?} ip={}",
+                ja3_hash,
+                ja4_hash,
+                classification,
+                client_name,
+                client_ip
+            );
+        }
+
         // Update security state JA3 cache
         security.ja3_cache.insert(
             ja3_hash.clone(),
@@ -709,6 +772,33 @@ impl FingerprintExtractor {
                 request_count: 1,
             },
         );
+
+        // Authorized pentest sources are never banned by fingerprint.
+        //
+        // A fingerprint block is an auto-ban, and pentest_bypass_ips exists
+        // precisely so an engagement is not cut off mid-run — the same contract
+        // the rate limiter and auto-blocker already honour. Without this, adding
+        // a scanner fingerprint to the database would ban the very box the scans
+        // are meant to come from. Classification still happens and is still
+        // logged; only the ban is skipped.
+        let is_pentest_source = {
+            let sc = security.config.read();
+            let ip_str = client_ip.to_string();
+            sc.pentest_bypass_ips.iter().any(|p| p == &ip_str)
+        };
+        if is_pentest_source && !matches!(classification, FingerprintClass::Browser) {
+            debug!(
+                "Pentest source {} presented {:?} fingerprint {} — classified, not banned",
+                client_ip, classification, ja3_hash
+            );
+            return FingerprintResult {
+                allowed: true,
+                ja3_hash: Some(ja3_hash),
+                ja4_hash,
+                classification: Some(classification),
+                client_name,
+            };
+        }
 
         // Check if this fingerprint should be blocked (using configurable thresholds)
         let allowed = match &classification {

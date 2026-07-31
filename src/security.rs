@@ -166,6 +166,27 @@ impl Ja3Database {
             .unwrap_or(FingerprintClass::Suspicious)
     }
 
+    /// Classify a client from both of its fingerprints, preferring whichever
+    /// the database actually knows.
+    ///
+    /// JA3 alone is not sufficient for tools that vary their cipher list
+    /// between probes: nmap's ssl-enum-ciphers produced a completely different
+    /// JA3 on every run against this proxy while its JA4 stayed identical,
+    /// because JA4 sorts and summarises where JA3 hashes the raw order. A
+    /// database keyed only on JA3 therefore cannot recognise a scanner it has
+    /// already met — which is why entries for such tools have to be JA4.
+    pub fn classify_pair(&self, ja3: &str, ja4: Option<&str>) -> FingerprintClass {
+        if let Some(class) = self.entries.get(&ja3.to_lowercase()) {
+            return class.clone();
+        }
+        if let Some(ja4) = ja4 {
+            if let Some(class) = self.entries.get(&ja4.to_lowercase()) {
+                return class.clone();
+            }
+        }
+        FingerprintClass::Suspicious
+    }
+
     /// Number of entries in the database.
     pub fn len(&self) -> usize {
         self.entries.len()
