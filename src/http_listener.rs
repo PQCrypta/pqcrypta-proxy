@@ -3473,6 +3473,16 @@ async fn proxy_handler(
                             parts.headers.insert(name, val);
                         }
                     }
+                    // Strip headers the route does not want forwarded. Applied
+                    // after the overrides so an override can reinstate one
+                    // deliberately; previously routes.remove_headers was parsed
+                    // and never acted on, so a backend header listed there was
+                    // still sent to the client.
+                    for key in &route.remove_headers {
+                        if let Ok(name) = header::HeaderName::from_bytes(key.as_bytes()) {
+                            parts.headers.remove(&name);
+                        }
+                    }
                     parts.headers.remove("connection");
                     parts.headers.remove("transfer-encoding");
                     parts.headers.remove("upgrade");
@@ -3589,6 +3599,13 @@ async fn proxy_handler(
                         HeaderValue::from_str(value),
                     ) {
                         parts.headers.insert(name, val);
+                    }
+                }
+
+                // Strip headers the route does not want forwarded (see above).
+                for key in &route.remove_headers {
+                    if let Ok(name) = header::HeaderName::from_bytes(key.as_bytes()) {
+                        parts.headers.remove(&name);
                     }
                 }
 

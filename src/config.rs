@@ -465,10 +465,16 @@ pub struct ServerConfig {
     #[serde(default)]
     pub webtransport_allowed_origins: Vec<String>,
 
-    /// Maximum request body size in bytes (default 50 MiB).
-    /// Requests with Content-Length exceeding this are rejected with 413.
-    #[serde(default = "default_max_request_body_bytes")]
-    pub max_request_body_bytes: u64,
+    /// Optional override for the maximum request body size, in bytes.
+    ///
+    /// The enforced limit lives in `security.max_request_size`; this is the
+    /// server-side name for the same thing and was previously read by nothing,
+    /// so setting it did not change what was accepted. It is now an Option so
+    /// "not configured" is distinguishable from a default that would otherwise
+    /// silently lower an explicitly configured security limit — when set, it
+    /// replaces `security.max_request_size` at load time.
+    #[serde(default)]
+    pub max_request_body_bytes: Option<u64>,
 
     /// Enable QUIC connection migration (RFC 9000 §9).
     /// Allows clients to migrate to a new network path without losing the session.
@@ -652,7 +658,7 @@ impl Default for ServerConfig {
             // SR-02: Empty by default — all cross-origin sessions are rejected
             // until the operator explicitly lists allowed origins.
             webtransport_allowed_origins: Vec::new(),
-            max_request_body_bytes: 52_428_800, // 50 MiB
+            max_request_body_bytes: None,
             enable_quic_migration: true,
             enable_ack_frequency: true,
             enable_quic_retry: false,
@@ -668,10 +674,6 @@ impl Default for ServerConfig {
             normalize_paths: true,
         }
     }
-}
-
-fn default_max_request_body_bytes() -> u64 {
-    52_428_800 // 50 MiB
 }
 
 fn default_multipath_paths() -> u32 {
@@ -2114,8 +2116,10 @@ impl ConfigManager {
         let content = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("Failed to read config file {:?}: {}", path, e))?;
 
-        let config: ProxyConfig = toml::from_str(&content)
+        let mut config: ProxyConfig = toml::from_str(&content)
             .map_err(|e| anyhow::anyhow!("Failed to parse config file {:?}: {}", path, e))?;
+
+        config.apply_body_size_override();
 
         // Validate configuration
         config.validate()?;
@@ -2442,6 +2446,32 @@ fn validate_backend_address_ssrf(address: &str, allow_internal: bool) -> anyhow:
 
 impl ProxyConfig {
     /// Validate the configuration
+    /// Fold `server.max_request_body_bytes` into the limit that is actually
+    /// enforced (`security.max_request_size`).
+    ///
+    /// Two settings named for the same thing is the real defect here; only the
+    /// security one was ever read. Rather than have one silently lose, an
+    /// explicit server-side value now wins and says so, and leaving it unset
+    /// changes nothing.
+    pub fn apply_body_size_override(&mut self) {
+        if let Some(limit) = self.server.max_request_body_bytes {
+            let Ok(limit) = usize::try_from(limit) else {
+                warn!(
+                    "server.max_request_body_bytes = {} does not fit in usize on this platform — ignoring",
+                    limit
+                );
+                return;
+            };
+            if limit != self.security.max_request_size {
+                info!(
+                    "server.max_request_body_bytes = {} overrides security.max_request_size = {}",
+                    limit, self.security.max_request_size
+                );
+            }
+            self.security.max_request_size = limit;
+        }
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         // Config schema version check
         match self.version {
