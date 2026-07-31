@@ -281,6 +281,46 @@ struct BlocklistEntry {
     expires_at: Option<String>,
 }
 
+/// Outcome of the transport-independent security evaluation.
+///
+/// Rendering differs between transports — axum builds a `Response`, the HTTP/3
+/// handler builds an `http::Response<()>` and writes it to a stream — but the
+/// decision itself must not. Returning a verdict rather than a response is what
+/// lets both paths share one implementation of the rules.
+#[derive(Debug, Clone)]
+pub enum SecurityDecision {
+    /// No rule matched; continue processing.
+    Allow,
+    /// Source IP is on the blocklist.
+    Blocked(BlockedIpInfo),
+    /// Source IP resolves to a blocked country.
+    GeoBlocked,
+    /// Request rate or connection rate exceeded; `limit` is the figure that applied.
+    RateLimited { limit: u32, retry_after_secs: u64 },
+    /// Route names a JA3 allowlist this client is not on.
+    Ja3Rejected,
+    /// Header block exceeds `security.max_header_size`.
+    HeadersTooLarge { max: usize },
+    /// WAF matched in block mode. `rule` identifies which.
+    WafBlock { rule: String },
+}
+
+/// A request reduced to what the security rules actually need.
+///
+/// Deliberately transport-agnostic: no axum, no h3, no body ownership. Anything
+/// that cannot be expressed here does not belong in a shared rule.
+pub struct SecurityRequestView<'a> {
+    pub ip: IpAddr,
+    pub method: &'a str,
+    /// Lowercased path
+    pub path: &'a str,
+    pub query: &'a str,
+    pub headers: &'a HeaderMap,
+    /// Body bytes when already buffered, for WAF body inspection. None means
+    /// the caller has not buffered a body — not that the body is empty.
+    pub body: Option<&'a [u8]>,
+}
+
 /// Per-route security settings resolved for a single request.
 ///
 /// Flattened out of `RouteConfig` and `RouteSecurityPolicy` so the middleware
@@ -792,6 +832,231 @@ impl SecurityState {
     }
 
     /// Increment connection count for IP
+    /// The WAF invocation, in one place.
+    ///
+    /// Called by [`Self::evaluate`] for headers/path/query and by
+    /// [`Self::inspect_body`] once a body has been buffered. Keeping it a
+    /// single function is the point: the header pass and the body pass used to
+    /// build their own `WafRequest`, which is how the two drifted apart on
+    /// skip_bot_ua handling.
+    fn run_waf(
+        &self,
+        view: &SecurityRequestView<'_>,
+        policy: &RequestPolicy,
+        is_pentest: bool,
+    ) -> SecurityDecision {
+        let ip = view.ip;
+        let (auto_block_threshold, auto_block_duration_secs) = {
+            let c = self.config.read();
+            (c.auto_block_threshold, c.auto_block_duration_secs)
+        };
+        if let Some(waf) = self
+            .waf_engine
+            .as_ref()
+            .filter(|_| policy.waf_enabled != Some(false))
+        {
+            let skip_bot_ua = view
+                .headers
+                .get("x-health-check-bypass")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v == "1")
+                .unwrap_or(false)
+                || view.path.starts_with("/stream/downloads/")
+                || policy.skip_bot_blocking;
+
+            let waf_req = WafRequest {
+                method: view.method,
+                path: view.path,
+                query: view.query,
+                headers: view.headers,
+                body: view.body,
+                skip_bot_ua_check: skip_bot_ua,
+                mode_override: policy.waf_mode.as_deref(),
+            };
+            match waf.inspect(&waf_req) {
+                WafVerdict::Block { ref rule, .. } => {
+                    warn!("WAF block: rule={} ip={} path={}", rule, ip, view.path);
+                    if !is_pentest {
+                        let mut counter = self.request_counts.entry(ip).or_default();
+                        counter.suspicious_patterns += 1;
+                        if counter.suspicious_patterns >= auto_block_threshold {
+                            drop(counter);
+                            self.block_ip(
+                                ip,
+                                BlockReason::TooManyErrors,
+                                Some(Duration::from_secs(auto_block_duration_secs)),
+                            );
+                        }
+                    }
+                    return SecurityDecision::WafBlock { rule: rule.clone() };
+                }
+                WafVerdict::Detect { ref rule, .. } => {
+                    warn!("WAF detect: rule={} ip={} path={}", rule, ip, view.path);
+                }
+                WafVerdict::Allow => {}
+            }
+        }
+        SecurityDecision::Allow
+    }
+
+    /// WAF inspection for a request whose body has been buffered.
+    ///
+    /// Only the WAF runs: the rate limiters and blocklist already saw this
+    /// request during [`Self::evaluate`], and charging them twice for one
+    /// request would halve every configured limit.
+    pub fn inspect_body(
+        &self,
+        view: &SecurityRequestView<'_>,
+        policy: &RequestPolicy,
+        is_pentest: bool,
+    ) -> SecurityDecision {
+        self.run_waf(view, policy, is_pentest)
+    }
+
+    /// Run every transport-independent security rule against a request.
+    ///
+    /// This is the single implementation of the proxy's request-security policy.
+    /// It exists because there used to be two — the HTTP/3 handler carried its
+    /// own copy, which silently omitted the WAF entirely, so every rule could be
+    /// bypassed by connecting over QUIC. Two copies of a policy drift; this one
+    /// cannot, because both transports call it.
+    ///
+    /// Returns a verdict rather than a response so each transport can render it
+    /// in its own type. Side effects that belong to the rules themselves (adding
+    /// an IP to the blocklist, incrementing the suspicious-pattern counter) do
+    /// happen here — they are part of the decision, not part of the rendering.
+    pub fn evaluate(
+        &self,
+        view: &SecurityRequestView<'_>,
+        policy: &RequestPolicy,
+    ) -> SecurityDecision {
+        let ip = view.ip;
+
+        // Trusted sources skip everything, as they do on both paths today.
+        if self.is_trusted(&ip) {
+            return SecurityDecision::Allow;
+        }
+
+        let (auto_block_threshold, auto_block_duration_secs, max_header_size, dos_protection) = {
+            let c = self.config.read();
+            (
+                c.auto_block_threshold,
+                c.auto_block_duration_secs,
+                c.max_header_size,
+                c.dos_protection,
+            )
+        };
+
+        // Pentest sources are inspected but never rate-limited or auto-banned:
+        // they send attack payloads by design and must get a 403 without being
+        // banned mid-run.
+        let is_pentest = {
+            let c = self.config.read();
+            let ip_str = ip.to_string();
+            c.pentest_bypass_ips.iter().any(|p| p == &ip_str)
+        };
+
+        // 1. Blocklist
+        if let Some(info) = self.is_blocked(&ip) {
+            return SecurityDecision::Blocked(info);
+        }
+
+        // 2. Per-route JA3 allowlist. A request with no captured fingerprint
+        // cannot satisfy the list, so it is refused: an allowlist that fails
+        // open is not an allowlist.
+        if let Some(ref allowed) = policy.allowed_ja3 {
+            let presented = view.headers.get("x-ja3-hash").and_then(|v| v.to_str().ok());
+            if !presented.is_some_and(|h| allowed.iter().any(|a| a == h)) {
+                warn!(
+                    "JA3 allowlist rejected {} on {} (fingerprint: {})",
+                    ip,
+                    view.path,
+                    presented.unwrap_or("none captured")
+                );
+                return SecurityDecision::Ja3Rejected;
+            }
+        }
+
+        // 3. GeoIP country blocking
+        if self.is_country_blocked(&ip) {
+            warn!("GeoIP blocked request from {}", ip);
+            let duration = self
+                .config
+                .read()
+                .geoip_block_duration_secs
+                .map(Duration::from_secs);
+            self.block_ip(ip, BlockReason::GeoBlocked, duration);
+            return SecurityDecision::GeoBlocked;
+        }
+
+        // 4. Rate limits — per-route override where the route names one.
+        // 4. Rate limits — per-route override where the route names one.
+        let (rate_enabled, rate_rps, conn_rate_enabled, conn_rate_per_sec) = {
+            let rc = self.rate_config.read();
+            let over = policy.rate_limit_override.as_ref();
+            (
+                over.map_or(rc.enabled, |o| o.enabled),
+                over.map_or(rc.requests_per_second, |o| o.requests_per_second),
+                over.map_or(rc.connection_rate_limit, |o| o.connection_rate_limit),
+                over.map_or(rc.connections_per_second, |o| o.connections_per_second),
+            )
+        };
+
+        if !is_pentest {
+            if conn_rate_enabled && self.connection_rate_exceeded(ip, conn_rate_per_sec) {
+                warn!(
+                    "Connection rate limit exceeded for {} ({} conn/s)",
+                    ip, conn_rate_per_sec
+                );
+                self.block_ip(
+                    ip,
+                    BlockReason::RateLimitExceeded,
+                    Some(Duration::from_secs(auto_block_duration_secs)),
+                );
+                return SecurityDecision::RateLimited {
+                    limit: conn_rate_per_sec,
+                    retry_after_secs: 1,
+                };
+            }
+
+            if rate_enabled && self.get_ip_rate_limiter(ip).check().is_err() {
+                warn!("Rate limit exceeded for {}", ip);
+                let mut counter = self.request_counts.entry(ip).or_default();
+                counter.suspicious_patterns += 1;
+                if counter.suspicious_patterns >= auto_block_threshold {
+                    drop(counter);
+                    self.block_ip(
+                        ip,
+                        BlockReason::RateLimitExceeded,
+                        Some(Duration::from_secs(auto_block_duration_secs)),
+                    );
+                }
+                return SecurityDecision::RateLimited {
+                    limit: rate_rps,
+                    retry_after_secs: 1,
+                };
+            }
+        }
+
+        let _ = dos_protection; // concurrency counters stay with the transports
+
+        // 5. Header size
+        let header_size: usize = view
+            .headers
+            .iter()
+            .map(|(k, v)| k.as_str().len() + v.len())
+            .sum();
+        if header_size > max_header_size {
+            warn!("Headers too large from {}: {} bytes", ip, header_size);
+            return SecurityDecision::HeadersTooLarge {
+                max: max_header_size,
+            };
+        }
+
+        // 6. WAF
+        self.run_waf(view, policy, is_pentest)
+    }
+
     /// Record a new connection from `ip` and report whether it exceeds
     /// `connections_per_second`.
     ///
@@ -1156,216 +1421,64 @@ pub async fn security_middleware(
             config.auto_block_duration_secs,
         )
     };
-    let (rate_enabled, rate_rps, conn_rate_enabled, conn_rate_per_sec) = {
-        let rate_config = security.rate_config.read();
-        // A route may carry its own limits; where it does they replace the
-        // global ones for this request. Previously rate_limit_override was
-        // parsed and discarded, so a route's stricter (or looser) figure had
-        // no effect whatever it was set to.
-        let over = route_policy.rate_limit_override.as_ref();
-        (
-            over.map_or(rate_config.enabled, |o| o.enabled),
-            over.map_or(rate_config.requests_per_second, |o| o.requests_per_second),
-            over.map_or(rate_config.connection_rate_limit, |o| {
-                o.connection_rate_limit
-            }),
-            over.map_or(rate_config.connections_per_second, |o| {
-                o.connections_per_second
-            }),
-        )
-    };
+    // Rate-limit figures are read inside SecurityState::evaluate, which owns
+    // the per-route override logic; the middleware keeps no second copy.
 
     // Pre-borrow alt_svc_header for use in all early-return helpers below.
     let alt_svc = security.alt_svc_header.as_ref();
     // Extract path once here so it's available to both WAF and size checks.
     let request_path = request.uri().path().to_ascii_lowercase();
 
-    if !is_pentest_bypass {
-        // 1. Check if IP is blocked
-        if let Some(block_info) = security.is_blocked(&ip) {
-            warn!(
-                "Blocked request from {} (reason: {:?})",
-                ip, block_info.reason
-            );
-            return blocked_response(&block_info, alt_svc);
-        }
+    // Checks 1-5 (blocklist, JA3 allowlist, GeoIP, rate limits, header size,
+    // WAF) live in SecurityState::evaluate, which the HTTP/3 handler calls too.
+    //
+    // This runs for EVERY source including pentest IPs: evaluate() exempts them
+    // from the rate limiters and auto-block internally, but they are still WAF
+    // inspected and still get a 403 for a blocked attack — which is the whole
+    // contract of pentest_bypass_ips. Putting this call inside the non-pentest
+    // branch silently disabled the WAF for those addresses.
+    {
+        let view = SecurityRequestView {
+            ip,
+            method: request.method().as_str(),
+            path: &request_path,
+            query: request.uri().query().unwrap_or(""),
+            headers: request.headers(),
+            body: None,
+        };
+        let decision = security.evaluate(&view, &route_policy);
 
-        // 1b. Per-route JA3 allowlist. The fingerprint is attached upstream as
-        // x-ja3-hash by the fingerprinting acceptor; a route that names an
-        // allowlist admits only those clients. If no fingerprint was captured
-        // the request cannot satisfy the list, so it is refused rather than
-        // waved through — an allowlist that fails open is not an allowlist.
-        if let Some(ref allowed) = route_policy.allowed_ja3 {
-            let presented = headers.get("x-ja3-hash").and_then(|v| v.to_str().ok());
-            let permitted = presented.is_some_and(|h| allowed.iter().any(|a| a == h));
-            if !permitted {
-                warn!(
-                    "JA3 allowlist rejected {} on {} (fingerprint: {})",
-                    ip,
-                    request_path,
-                    presented.unwrap_or("none captured")
-                );
-                return ja3_forbidden_response(alt_svc);
-            }
-        }
-
-        // 2. GeoIP country blocking
-        if security.is_country_blocked(&ip) {
-            warn!("GeoIP blocked request from {}", ip);
-            // P2-fix: use a configurable duration instead of None (permanent).
-            // Permanent GeoIP blocks have no recourse when a database mis-classifies an IP
-            // or the IP moves between countries.  Default: 24 h (see SecurityConfig).
-            let geoip_duration = security
-                .config
-                .read()
-                .geoip_block_duration_secs
-                .map(Duration::from_secs);
-            security.block_ip(ip, BlockReason::GeoBlocked, geoip_duration);
-            return geo_blocked_response(alt_svc);
-        }
-
-        // 3. Check DoS protection - connection rate, then concurrency
-        if conn_rate_enabled && security.connection_rate_exceeded(ip, conn_rate_per_sec) {
-            warn!(
-                "Connection rate limit exceeded for {} ({} conn/s)",
-                ip, conn_rate_per_sec
-            );
-            security.block_ip(
-                ip,
-                BlockReason::RateLimitExceeded,
-                Some(Duration::from_secs(auto_block_duration_secs)),
-            );
+        if !matches!(decision, SecurityDecision::Allow) {
             let request_origin = headers
                 .get("origin")
                 .and_then(|v| v.to_str().ok())
                 .map(String::from);
-            return rate_limit_response_simple(
-                conn_rate_per_sec,
-                alt_svc,
-                request_origin.as_deref(),
-            );
+            return render_decision(&decision, alt_svc, request_origin.as_deref());
         }
 
-        if dos_protection {
+        // DoS concurrency limit — counted here because the matching decrement
+        // happens once this middleware's response is built.
+        if dos_protection && !is_pentest_bypass {
             let connections = security.increment_connections(ip);
-
             if connections > max_connections_per_ip {
                 security.decrement_connections(ip);
                 security.block_ip(
                     ip,
                     BlockReason::ConnectionLimitExceeded,
-                    Some(Duration::from_mins(1)),
+                    Some(Duration::from_secs(auto_block_duration_secs)),
                 );
-                warn!("Connection limit exceeded for {}: {}", ip, connections);
+                warn!(
+                    "Too many connections from {}: {} (limit {})",
+                    ip, connections, max_connections_per_ip
+                );
                 return too_many_connections_response(alt_svc);
             }
         }
-
-        // 4. Rate limiting
-        if rate_enabled {
-            let rate_limiter = security.get_ip_rate_limiter(ip);
-
-            if rate_limiter.check().is_err() {
-                debug!("Rate limit exceeded for {}", ip);
-
-                // Track rate limit violations
-                let mut counter = security.request_counts.entry(ip).or_default();
-                counter.suspicious_patterns += 1;
-
-                // Auto-block after repeated violations (configurable threshold)
-                if counter.suspicious_patterns >= auto_block_threshold {
-                    drop(counter);
-                    let block_duration = Duration::from_secs(auto_block_duration_secs);
-                    security.block_ip(ip, BlockReason::RateLimitExceeded, Some(block_duration));
-                }
-
-                // P1-fix: decrement the DoS connection counter that was incremented in
-                // step 3 before this early return.  Previously the counter leaked on
-                // every rate-limited request, eventually triggering DoS protection even
-                // when the client's actual concurrency was within limits.
-                if dos_protection {
-                    security.decrement_connections(ip);
-                }
-                let request_origin = headers
-                    .get("origin")
-                    .and_then(|v| v.to_str().ok())
-                    .map(String::from);
-                return rate_limit_response_simple(rate_rps, alt_svc, request_origin.as_deref());
-            }
-        }
-    } else {
-        // Pentest IP: still track DoS connection counter so cleanup runs correctly,
-        // but never rate-limit or auto-block.
-        if dos_protection {
+        // Pentest IP: still track the DoS connection counter so cleanup runs
+        // correctly, but never block on it.
+        if dos_protection && is_pentest_bypass {
             security.increment_connections(ip);
-        }
-        debug!("Pentest bypass IP {} — skipping rate-limit/auto-block", ip);
-    }
-
-    // 5. WAF inspection (path + query + headers; body scanned in chunked path below)
-    if let Some(ref waf) = security
-        .waf_engine
-        .as_ref()
-        .filter(|_| route_policy.waf_enabled != Some(false))
-    {
-        let (path, query) = {
-            let uri = request.uri();
-            (
-                uri.path().to_string(),
-                uri.query().unwrap_or("").to_string(),
-            )
-        };
-        // Skip bot UA check for health-check requests, automated internal clients,
-        // and public binary downloads — the discovery-agent download docs instruct
-        // users to fetch these via `curl`/`wget`/PowerShell, which is exactly the
-        // traffic the scanner-UA heuristic is designed to block.
-        let skip_bot_ua = request
-            .headers()
-            .get("x-health-check-bypass")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v == "1")
-            .unwrap_or(false)
-            || request_path.starts_with("/stream/downloads/")
-            || route_policy.skip_bot_blocking;
-        let waf_req = WafRequest {
-            method: request.method().as_str(),
-            path: &path,
-            query: &query,
-            headers: request.headers(),
-            body: None, // body scan happens in chunked path
-            skip_bot_ua_check: skip_bot_ua,
-            mode_override: route_policy.waf_mode.as_deref(),
-        };
-        match waf.inspect(&waf_req) {
-            WafVerdict::Block { ref rule, .. } => {
-                warn!("WAF block: rule={} ip={} path={}", rule, ip, path);
-                if dos_protection {
-                    security.decrement_connections(ip);
-                }
-                // Escalate repeated WAF blocks to IP ban using the same suspicious_patterns
-                // counter as the rate-limit path.  WAF blocks return before record_request()
-                // is called, so without this they never accumulate toward auto-block.
-                // Pentest IPs are exempt — they deliberately send attack payloads.
-                if !is_pentest_bypass {
-                    let mut counter = security.request_counts.entry(ip).or_default();
-                    counter.suspicious_patterns += 1;
-                    if counter.suspicious_patterns >= auto_block_threshold {
-                        drop(counter);
-                        let block_duration = Duration::from_secs(auto_block_duration_secs);
-                        security.block_ip(ip, BlockReason::TooManyErrors, Some(block_duration));
-                    }
-                }
-                let mut resp =
-                    (StatusCode::FORBIDDEN, "Request blocked by security policy").into_response();
-                resp.headers_mut()
-                    .insert("x-waf-block", HeaderValue::from_static("1"));
-                return resp;
-            }
-            WafVerdict::Detect { ref rule, .. } => {
-                warn!("WAF detect: rule={} ip={} path={}", rule, ip, path);
-                // Log only — continue processing
-            }
-            WafVerdict::Allow => {}
+            debug!("Pentest bypass IP {} — skipping rate-limit/auto-block", ip);
         }
     }
 
@@ -1432,11 +1545,7 @@ pub async fn security_middleware(
                 }
             }
             if !collected_bytes.is_empty() {
-                if let Some(ref waf) = security
-                    .waf_engine
-                    .as_ref()
-                    .filter(|_| waf_enabled_cl != Some(false))
-                {
+                if security.waf_engine.is_some() && waf_enabled_cl != Some(false) {
                     let waf_path = parts.uri.path().to_string();
                     let waf_query = parts.uri.query().unwrap_or("").to_string();
                     let skip_bot_ua_cl = parts
@@ -1447,17 +1556,22 @@ pub async fn security_middleware(
                         .unwrap_or(false)
                         || route_skip_bot;
                     let scan_slice_end = collected_bytes.len().min(scan_limit);
-                    let waf_req_cl = WafRequest {
+                    let body_view = SecurityRequestView {
+                        ip,
                         method: parts.method.as_str(),
                         path: &waf_path,
                         query: &waf_query,
                         headers: &parts.headers,
                         body: Some(&collected_bytes[..scan_slice_end]),
-                        skip_bot_ua_check: skip_bot_ua_cl,
-                        mode_override: waf_mode_cl.as_deref(),
                     };
-                    match waf.inspect(&waf_req_cl) {
-                        WafVerdict::Block { ref rule, .. } => {
+                    let body_policy = RequestPolicy {
+                        skip_bot_blocking: skip_bot_ua_cl,
+                        waf_mode: waf_mode_cl.clone(),
+                        waf_enabled: waf_enabled_cl,
+                        ..Default::default()
+                    };
+                    match security.inspect_body(&body_view, &body_policy, is_pentest_bypass) {
+                        SecurityDecision::WafBlock { ref rule } => {
                             warn!(
                                 "WAF body block (CL): rule={} ip={} path={}",
                                 rule, ip, waf_path
@@ -1486,13 +1600,15 @@ pub async fn security_middleware(
                                 .insert("x-waf-block", HeaderValue::from_static("1"));
                             return resp;
                         }
-                        WafVerdict::Detect { ref rule, .. } => {
+                        #[allow(unreachable_patterns)]
+                        #[allow(unreachable_patterns)]
+                        SecurityDecision::WafBlock { ref rule } if false => {
                             warn!(
                                 "WAF body detect (CL): rule={} ip={} path={}",
                                 rule, ip, waf_path
                             );
                         }
-                        WafVerdict::Allow => {}
+                        _ => {}
                     }
                 }
             }
@@ -1539,11 +1655,7 @@ pub async fn security_middleware(
         // pass supplies the buffered bytes so that body-embedded payloads
         // (SQLi, XSS, command injection, etc.) are detected.
         if !collected_bytes.is_empty() {
-            if let Some(ref waf) = security
-                .waf_engine
-                .as_ref()
-                .filter(|_| waf_enabled_cl != Some(false))
-            {
+            if security.waf_engine.is_some() && waf_enabled_cl != Some(false) {
                 let waf_path = parts.uri.path().to_string();
                 let waf_query = parts.uri.query().unwrap_or("").to_string();
                 let skip_bot_ua_body = parts
@@ -1553,17 +1665,26 @@ pub async fn security_middleware(
                     .map(|v| v == "1")
                     .unwrap_or(false)
                     || route_skip_bot;
-                let waf_req_body = WafRequest {
+                let body_view_chunked = SecurityRequestView {
+                    ip,
                     method: parts.method.as_str(),
                     path: &waf_path,
                     query: &waf_query,
                     headers: &parts.headers,
                     body: Some(collected_bytes.as_slice()),
-                    skip_bot_ua_check: skip_bot_ua_body,
-                    mode_override: waf_mode_body.as_deref(),
                 };
-                match waf.inspect(&waf_req_body) {
-                    WafVerdict::Block { ref rule, .. } => {
+                let body_policy_chunked = RequestPolicy {
+                    skip_bot_blocking: skip_bot_ua_body,
+                    waf_mode: waf_mode_body.clone(),
+                    waf_enabled: waf_enabled_cl,
+                    ..Default::default()
+                };
+                match security.inspect_body(
+                    &body_view_chunked,
+                    &body_policy_chunked,
+                    is_pentest_bypass,
+                ) {
+                    SecurityDecision::WafBlock { ref rule } => {
                         warn!("WAF body block: rule={} ip={} path={}", rule, ip, waf_path);
                         if dos_protection {
                             security.decrement_connections(ip);
@@ -1589,13 +1710,14 @@ pub async fn security_middleware(
                             .insert("x-waf-block", HeaderValue::from_static("1"));
                         return resp;
                     }
-                    WafVerdict::Detect { ref rule, .. } => {
+                    #[allow(unreachable_patterns)]
+                    SecurityDecision::WafBlock { ref rule } if false => {
                         warn!(
                             "WAF body detect (non-blocking): rule={} ip={} path={}",
                             rule, ip, waf_path
                         );
                     }
-                    WafVerdict::Allow => {}
+                    _ => {}
                 }
             }
         }
@@ -1691,6 +1813,78 @@ fn geo_blocked_response(alt_svc: &str) -> Response {
         .into_response();
     add_alt_svc(&mut response, alt_svc);
     response
+}
+
+/// Render a [`SecurityDecision`] as an axum response for the TCP path.
+///
+/// Companion to [`decision_to_h3_parts`]; the two exist because the transports
+/// build different response types, not because they apply different rules.
+fn render_decision(
+    decision: &SecurityDecision,
+    alt_svc: &str,
+    request_origin: Option<&str>,
+) -> Response {
+    match decision {
+        SecurityDecision::Allow => {
+            // Callers check for Allow before calling; treat it as a no-op 200.
+            let mut r = StatusCode::OK.into_response();
+            add_alt_svc(&mut r, alt_svc);
+            r
+        }
+        SecurityDecision::Blocked(info) => blocked_response(info, alt_svc),
+        SecurityDecision::GeoBlocked => geo_blocked_response(alt_svc),
+        SecurityDecision::RateLimited { limit, .. } => {
+            rate_limit_response_simple(*limit, alt_svc, request_origin)
+        }
+        SecurityDecision::Ja3Rejected => ja3_forbidden_response(alt_svc),
+        SecurityDecision::HeadersTooLarge { max } => headers_too_large_response(*max, alt_svc),
+        SecurityDecision::WafBlock { .. } => {
+            let mut r = (StatusCode::FORBIDDEN, "Forbidden").into_response();
+            r.headers_mut()
+                .insert("x-waf-block", HeaderValue::from_static("1"));
+            add_alt_svc(&mut r, alt_svc);
+            r
+        }
+    }
+}
+
+/// Render a [`SecurityDecision`] as an HTTP/3 status plus extra headers.
+///
+/// `None` means the request is allowed. Kept beside the decision type so a new
+/// variant cannot be added without the HTTP/3 path being updated to render it —
+/// the compiler will flag the missing arm.
+pub fn decision_to_h3_parts(
+    decision: &SecurityDecision,
+) -> Option<(StatusCode, Vec<(&'static str, String)>)> {
+    match decision {
+        SecurityDecision::Allow => None,
+        SecurityDecision::Blocked(_) | SecurityDecision::GeoBlocked => Some((
+            StatusCode::FOUND,
+            vec![(
+                "location",
+                "https://pqcrypta.com/error_pages/pqcrypt_403.html".to_string(),
+            )],
+        )),
+        SecurityDecision::RateLimited {
+            limit,
+            retry_after_secs,
+        } => Some((
+            StatusCode::TOO_MANY_REQUESTS,
+            vec![
+                ("retry-after", retry_after_secs.to_string()),
+                ("x-ratelimit-limit", limit.to_string()),
+                ("x-ratelimit-remaining", "0".to_string()),
+            ],
+        )),
+        SecurityDecision::Ja3Rejected => Some((StatusCode::FORBIDDEN, Vec::new())),
+        SecurityDecision::HeadersTooLarge { .. } => {
+            Some((StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE, Vec::new()))
+        }
+        SecurityDecision::WafBlock { .. } => Some((
+            StatusCode::FORBIDDEN,
+            vec![("x-waf-block", "1".to_string())],
+        )),
+    }
 }
 
 /// Refusal for a request that failed a route's JA3 allowlist.

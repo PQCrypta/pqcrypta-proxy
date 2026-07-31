@@ -1180,15 +1180,13 @@ impl QuicListener {
                 return Ok(());
             }
 
-            // 5. WAF inspection (path + query + headers).
+            // 5. Shared security evaluation.
             //
-            // This step was previously missing on the HTTP/3 path while the TCP
-            // path enforced it, so every WAF rule — SQLi, XSS, scanner UAs, the
-            // lot — could be bypassed simply by connecting over QUIC. Keep this
-            // in sync with `security_middleware` in security.rs.
-            // Per-route security policy, resolved the same way as on the TCP
-            // path so routes.skip_bot_blocking and [routes.security] behave
-            // identically whichever transport the client used.
+            // Every rule below is the SAME implementation the TCP path runs —
+            // SecurityState::evaluate. This handler used to carry its own copy,
+            // which omitted the WAF entirely and let every rule be bypassed over
+            // QUIC; it also never enforced GeoIP blocking or per-route policy.
+            // Only the rendering of the verdict is transport-specific.
             let h3_route_policy = {
                 let host = request
                     .headers()
@@ -1212,74 +1210,41 @@ impl QuicListener {
                     .unwrap_or_default()
             };
 
-            if let Some(ref waf) = security.waf_engine {
-                if h3_route_policy.waf_enabled != Some(false) {
-                    let query = request.uri().query().unwrap_or("").to_string();
-                    let skip_bot_ua = request
-                        .headers()
-                        .get("x-health-check-bypass")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|v| v == "1")
-                        .unwrap_or(false)
-                        || path.starts_with("/stream/downloads/")
-                        || h3_route_policy.skip_bot_blocking;
-                    let waf_req = crate::waf::WafRequest {
-                        method: request.method().as_str(),
-                        path: &path,
-                        query: &query,
-                        headers: request.headers(),
-                        body: None,
-                        skip_bot_ua_check: skip_bot_ua,
-                        mode_override: h3_route_policy.waf_mode.as_deref(),
-                    };
-                    match waf.inspect(&waf_req) {
-                        crate::waf::WafVerdict::Block { ref rule, .. } => {
-                            warn!("WAF block: rule={} ip={} path={} (h3)", rule, ip, path);
-                            // Mirror the TCP path: repeated WAF blocks escalate to an
-                            // IP ban via the shared suspicious_patterns counter.
-                            // Pentest IPs are exempt — they send attack payloads by
-                            // design and must get a 403 without being banned mid-run.
-                            let is_pentest_bypass = {
-                                let sc = security.config.read();
-                                let ip_str = ip.to_string();
-                                sc.pentest_bypass_ips.iter().any(|p| p == &ip_str)
-                            };
-                            if !is_pentest_bypass {
-                                let mut counter = security.request_counts.entry(ip).or_default();
-                                counter.suspicious_patterns += 1;
-                                if counter.suspicious_patterns >= auto_block_threshold {
-                                    drop(counter);
-                                    security.block_ip(
-                                        ip,
-                                        BlockReason::TooManyErrors,
-                                        Some(std::time::Duration::from_secs(
-                                            auto_block_duration_secs,
-                                        )),
-                                    );
-                                }
-                            }
-                            metrics.requests.request_end_full(
-                                403,
-                                start_time.elapsed(),
-                                0,
-                                0,
-                                Some(&path),
-                                is_health_check,
-                            );
-                            let response = http::Response::builder()
-                                .status(http::StatusCode::FORBIDDEN)
-                                .header("server", SERVER_HEADER)
-                                .header("x-waf-block", "1")
-                                .body(())?;
-                            stream.send_response(response).await?;
-                            stream.finish().await?;
-                            return Ok(());
-                        }
-                        crate::waf::WafVerdict::Detect { ref rule, .. } => {
-                            warn!("WAF detect: rule={} ip={} path={} (h3)", rule, ip, path);
-                        }
-                        crate::waf::WafVerdict::Allow => {}
+            {
+                let h3_query = request.uri().query().unwrap_or("").to_string();
+                let h3_method = request.method().as_str().to_string();
+                let view = crate::security::SecurityRequestView {
+                    ip,
+                    method: &h3_method,
+                    path: &path,
+                    query: &h3_query,
+                    headers: request.headers(),
+                    body: None,
+                };
+                let decision = security.evaluate(&view, &h3_route_policy);
+                if let Some((status, extra)) = crate::security::decision_to_h3_parts(&decision) {
+                    warn!(
+                        "[QUIC/H3] security decision {:?} for {} {}",
+                        decision, ip, path
+                    );
+                    metrics.requests.request_end_full(
+                        status.as_u16(),
+                        start_time.elapsed(),
+                        0,
+                        0,
+                        Some(&path),
+                        is_health_check,
+                    );
+                    let mut builder = http::Response::builder()
+                        .status(status)
+                        .header("server", SERVER_HEADER);
+                    for (k, v) in extra {
+                        builder = builder.header(k, v);
                     }
+                    let response = builder.body(())?;
+                    stream.send_response(response).await?;
+                    stream.finish().await?;
+                    return Ok(());
                 }
             }
         }
