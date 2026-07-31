@@ -199,6 +199,10 @@ pub struct SecurityState {
     pub blocked_ips: Arc<DashMap<IpAddr, BlockedIpInfo>>,
     /// Request count per IP for adaptive blocking
     pub request_counts: Arc<DashMap<IpAddr, RequestCounter>>,
+    /// New-connection timestamps per IP, for `rate_limiting.connection_rate_limit`.
+    /// Separate from `ip_connections`, which caps how many connections an IP may
+    /// hold at once: this caps how fast it may open them.
+    pub connection_rates: Arc<DashMap<IpAddr, ConnectionRateWindow>>,
     /// JA3 fingerprint cache (fingerprint -> classification)
     pub ja3_cache: Arc<DashMap<String, TlsFingerprint>>,
     /// Circuit breaker states per backend
@@ -265,6 +269,15 @@ pub enum BlockReason {
 struct BlocklistEntry {
     ip: String,
     expires_at: Option<String>,
+}
+
+/// One-second sliding window of new connections from a single IP.
+#[derive(Clone, Debug)]
+pub struct ConnectionRateWindow {
+    /// Start of the current one-second window
+    pub window_start: Instant,
+    /// Connections accepted from this IP within the window
+    pub count: u32,
 }
 
 /// Request counter for adaptive rate limiting
@@ -450,6 +463,7 @@ impl SecurityState {
         let state = Self {
             ip_rate_limiters: Arc::new(DashMap::new()),
             ip_connections: Arc::new(DashMap::new()),
+            connection_rates: Arc::new(DashMap::new()),
             blocked_ips,
             request_counts: Arc::new(DashMap::new()),
             ja3_cache: Arc::new(DashMap::new()),
@@ -749,6 +763,32 @@ impl SecurityState {
     }
 
     /// Increment connection count for IP
+    /// Record a new connection from `ip` and report whether it exceeds
+    /// `connections_per_second`.
+    ///
+    /// A one-second sliding window per IP. `max_connections_per_ip` already
+    /// caps concurrency, but an attacker that opens and closes connections as
+    /// fast as it can never trips it, so the accept rate needs its own bound.
+    pub fn connection_rate_exceeded(&self, ip: IpAddr, per_second: u32) -> bool {
+        if per_second == 0 {
+            return false;
+        }
+        let now = Instant::now();
+        let mut window = self
+            .connection_rates
+            .entry(ip)
+            .or_insert_with(|| ConnectionRateWindow {
+                window_start: now,
+                count: 0,
+            });
+        if now.duration_since(window.window_start) >= Duration::from_secs(1) {
+            window.window_start = now;
+            window.count = 0;
+        }
+        window.count += 1;
+        window.count > per_second
+    }
+
     pub fn increment_connections(&self, ip: IpAddr) -> u32 {
         let mut count = self.ip_connections.entry(ip).or_insert(0);
         *count += 1;
@@ -1055,9 +1095,14 @@ pub async fn security_middleware(
             config.auto_block_duration_secs,
         )
     };
-    let (rate_enabled, rate_rps) = {
+    let (rate_enabled, rate_rps, conn_rate_enabled, conn_rate_per_sec) = {
         let rate_config = security.rate_config.read();
-        (rate_config.enabled, rate_config.requests_per_second)
+        (
+            rate_config.enabled,
+            rate_config.requests_per_second,
+            rate_config.connection_rate_limit,
+            rate_config.connections_per_second,
+        )
     };
 
     // Pre-borrow alt_svc_header for use in all early-return helpers below.
@@ -1090,7 +1135,28 @@ pub async fn security_middleware(
             return geo_blocked_response(alt_svc);
         }
 
-        // 3. Check DoS protection - connection limits
+        // 3. Check DoS protection - connection rate, then concurrency
+        if conn_rate_enabled && security.connection_rate_exceeded(ip, conn_rate_per_sec) {
+            warn!(
+                "Connection rate limit exceeded for {} ({} conn/s)",
+                ip, conn_rate_per_sec
+            );
+            security.block_ip(
+                ip,
+                BlockReason::RateLimitExceeded,
+                Some(Duration::from_secs(auto_block_duration_secs)),
+            );
+            let request_origin = headers
+                .get("origin")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            return rate_limit_response_simple(
+                conn_rate_per_sec,
+                alt_svc,
+                request_origin.as_deref(),
+            );
+        }
+
         if dos_protection {
             let connections = security.increment_connections(ip);
 

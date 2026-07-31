@@ -48,9 +48,16 @@ pub struct BackendPool {
 impl BackendPool {
     /// Create a new backend pool
     pub fn new(config: Arc<ProxyConfig>) -> Self {
-        // Create HTTP client using configurable connection pool settings
-        let connector = hyper_util::client::legacy::connect::HttpConnector::new();
+        // Create HTTP client using configurable connection pool settings.
+        // connect_timeout comes from security.connection_timeout_secs, which
+        // previously bounded nothing: a backend that accepted TCP but never
+        // completed the connection could hold a request until the much longer
+        // per-backend response timeout expired.
+        let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
         let pool_config = &config.connection_pool;
+        connector.set_connect_timeout(Some(Duration::from_secs(
+            config.security.connection_timeout_secs,
+        )));
         let http_client = Client::builder(TokioExecutor::new())
             .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
             .pool_max_idle_per_host(pool_config.max_idle_per_host)
@@ -62,12 +69,20 @@ impl BackendPool {
             config,
         };
 
-        // Initialize limiters for each backend
+        // Initialize limiters for each backend. connection_pool.max_connections_per_host
+        // was ignored entirely; it now supplies the limit for any backend that does
+        // not set its own. It is deliberately NOT a ceiling over an explicit
+        // per-backend value — several backends here are configured above it on
+        // purpose, and silently capping them would throttle live traffic.
+        let host_cap = pool.config.connection_pool.max_connections_per_host;
         for (name, backend) in &pool.config.backends {
-            pool.limiters.insert(
-                name.clone(),
-                Arc::new(Semaphore::new(backend.max_connections as usize)),
-            );
+            let permits = if backend.max_connections > 0 {
+                backend.max_connections as usize
+            } else {
+                host_cap
+            };
+            pool.limiters
+                .insert(name.clone(), Arc::new(Semaphore::new(permits)));
         }
 
         pool
@@ -636,11 +651,23 @@ impl BackendPool {
             .map(|r| r.clone())
             .ok_or_else(|| anyhow::anyhow!("No limiter for backend: {}", backend_name))?;
 
-        limiter
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to acquire connection permit: {}", e))
+        // Bounded wait: connection_pool.acquire_timeout_ms was configured and then
+        // never used, so a saturated backend queued callers indefinitely instead
+        // of failing fast. Waiting forever behind an exhausted pool just converts
+        // a backend stall into a proxy-wide stall.
+        let wait = Duration::from_millis(self.config.connection_pool.acquire_timeout_ms);
+        match tokio::time::timeout(wait, limiter.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(e)) => Err(anyhow::anyhow!(
+                "Failed to acquire connection permit: {}",
+                e
+            )),
+            Err(_) => Err(anyhow::anyhow!(
+                "Timed out after {}ms waiting for a connection slot on backend {}",
+                wait.as_millis(),
+                backend_name
+            )),
+        }
     }
 
     /// Strip CR and LF characters from a string to prevent CRLF injection.
