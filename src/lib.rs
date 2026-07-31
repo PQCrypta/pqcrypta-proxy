@@ -85,6 +85,7 @@ pub mod metrics;
 pub mod ocsp;
 pub mod otel;
 pub mod pqc_extended;
+pub mod pqc_tickets;
 pub mod pqc_tls;
 pub mod proxy;
 pub mod quic_listener;

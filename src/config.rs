@@ -754,11 +754,22 @@ pub struct TlsConfig {
     #[serde(default = "default_zero_rtt_nonce_window")]
     pub zero_rtt_nonce_window_secs: u64,
 
-    /// Enable PQC-wrapped session tickets (experimental).
-    /// When true, session ticket HKDF keys are encapsulated with ML-KEM-1024.
-    /// Default: false.
+    /// Issue TLS 1.3 session tickets sealed with ML-KEM-1024 (FIPS 203).
+    ///
+    /// rustls installs no ticketer by default, so with this off the proxy
+    /// issues no tickets and resumption relies on rustls session storage. When
+    /// on, each ticket carries its own ML-KEM encapsulation and the resumption
+    /// state is sealed with an AES-256-GCM key derived from that encapsulation;
+    /// the keypair rolls every `session_ticket_lifetime_secs` with one
+    /// generation of overlap. Default: false.
     #[serde(default)]
     pub pqc_session_tickets: bool,
+
+    /// Ticket key lifetime in seconds; also the lifetime hint sent to clients.
+    /// Rotation is what bounds the damage a stolen ticket can do, so this is a
+    /// forward-secrecy control rather than a tuning knob. Default 43200 (12 h).
+    #[serde(default = "default_session_ticket_lifetime")]
+    pub session_ticket_lifetime_secs: u32,
 }
 
 impl Default for TlsConfig {
@@ -782,12 +793,17 @@ impl Default for TlsConfig {
             zero_rtt_replay_protection: default_zero_rtt_replay_protection(),
             zero_rtt_nonce_window_secs: default_zero_rtt_nonce_window(),
             pqc_session_tickets: false,
+            session_ticket_lifetime_secs: default_session_ticket_lifetime(),
         }
     }
 }
 
 fn default_zero_rtt_replay_protection() -> String {
     "strict".to_string()
+}
+
+fn default_session_ticket_lifetime() -> u32 {
+    43_200 // 12 hours
 }
 
 fn default_zero_rtt_nonce_window() -> u64 {
@@ -2473,21 +2489,6 @@ impl ProxyConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        // tls.pqc_session_tickets describes a feature that does not exist yet:
-        // there is no ticketer in the TLS setup at all, PQC-wrapped or
-        // otherwise. Silently accepting true would tell an operator their
-        // session tickets are ML-KEM protected when no ticket is issued at all,
-        // which is the worst of the three possible behaviours. Refuse instead,
-        // so the setting cannot lie in either direction.
-        if self.tls.pqc_session_tickets {
-            return Err(anyhow::anyhow!(
-                "tls.pqc_session_tickets = true, but ML-KEM-wrapped session tickets are \
-                 not implemented — no ticketer is installed, so nothing would be \
-                 protected. Set it false; resumption currently relies on rustls \
-                 session storage."
-            ));
-        }
-
         // Config schema version check
         match self.version {
             None => {

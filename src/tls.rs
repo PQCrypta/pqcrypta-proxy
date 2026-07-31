@@ -796,6 +796,25 @@ impl TlsProvider {
                 .with_cert_resolver(resolver)
         };
 
+        // Install the ML-KEM-1024 session ticketer when configured. rustls
+        // issues no tickets without one, so this is what makes TLS 1.3
+        // resumption available at all — pqc_session_tickets used to describe a
+        // ticketer that did not exist.
+        if tls_config.pqc_session_tickets {
+            match crate::pqc_tickets::PqcTicketer::new(tls_config.session_ticket_lifetime_secs) {
+                Ok(ticketer) => config.ticketer = Arc::new(ticketer),
+                Err(e) => {
+                    // Refuse rather than fall back to no tickets: an operator
+                    // who asked for PQC-protected resumption must not silently
+                    // get none.
+                    return Err(anyhow::anyhow!(
+                        "pqc_session_tickets is enabled but the ticketer could not start: {}",
+                        e
+                    ));
+                }
+            }
+        }
+
         // Configure ALPN protocols
         config.alpn_protocols = tls_config
             .alpn_protocols
