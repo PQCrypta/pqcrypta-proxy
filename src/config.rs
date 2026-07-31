@@ -1437,9 +1437,11 @@ pub struct FingerprintConfig {
     pub fingerprint_db_path: Option<PathBuf>,
     /// AUD-12: Automatically block connections whose JA3/JA4 fingerprint is classified
     /// as Malicious in the fingerprint database.
-    /// Default: false (advisory-only — Malicious fingerprints are logged, not blocked).
-    /// Set to true only after validating that your fingerprint database does not
-    /// produce false positives against legitimate clients.
+    /// Default: true — Malicious fingerprints are blocked, which is the point of
+    /// AUD-12. (This comment previously claimed the default was false, advisory-only;
+    /// the Default impl below has always set true, so the comment was wrong.)
+    /// Set to false to make classification advisory if your fingerprint database
+    /// produces false positives against legitimate clients.
     pub block_malicious: bool,
 
     /// Enable JA3 replay detection (same fingerprint from many IPs in short window)
