@@ -4320,6 +4320,10 @@ where
 pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 'static>(
     port: u16,
     https_port: u16,
+    // When false, plain-HTTP requests are refused instead of redirected. ACME
+    // challenges are still answered either way, so certificate renewal does not
+    // depend on this being on.
+    redirect_to_https: bool,
     acme_challenges: Option<
         Arc<
             parking_lot::RwLock<
@@ -4399,6 +4403,17 @@ pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 
                     query
                 )
             };
+
+            if !redirect_to_https {
+                // The operator has turned the redirect off. Answering with a 301
+                // anyway would make the setting meaningless, and quietly serving
+                // the request over plain HTTP would be worse — so refuse.
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "This server does not serve plain HTTP. Use HTTPS.",
+                )
+                    .into_response();
+            }
 
             Redirect::permanent(&https_url).into_response()
         }

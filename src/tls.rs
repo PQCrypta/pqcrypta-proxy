@@ -144,6 +144,14 @@ pub fn load_certified_key(
     #[cfg(all(feature = "pqc-signatures", not(feature = "fips")))]
     if let PrivateKeyDer::Pkcs8(ref k) = private_key {
         if mldsa::is_ml_dsa_87_pkcs8(k.secret_pkcs8_der()) {
+            if !ml_dsa_signing_enabled() {
+                return Err(anyhow::anyhow!(
+                    "{:?} is an ML-DSA-87 key but pqc.enable_signatures is false. \
+                     Set it true to serve post-quantum certificate signatures, or \
+                     point this host at a classical key.",
+                    key_path
+                ));
+            }
             let signing_key = Arc::new(mldsa::MlDsa87SigningKey::load(k.secret_pkcs8_der())?);
             info!(
                 "Loaded ML-DSA-87 (FIPS 204) certificate key from {:?}",
@@ -162,6 +170,25 @@ pub fn load_certified_key(
         .map_err(|e| anyhow::anyhow!("Cannot load signing key from {:?}: {}", key_path, e))?;
 
     Ok(rustls::sign::CertifiedKey::new(certs, signing_key))
+}
+
+/// Runtime switch for `pqc.enable_signatures`, set once at startup.
+///
+/// The ML-DSA path sits inside the certificate loader, which the SNI resolver
+/// calls per host without any view of the config, so the setting is published
+/// here rather than threaded through every call site. Defaults to true so a
+/// caller that never sets it (tests, tooling) keeps the compiled behaviour.
+static ML_DSA_SIGNING_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Apply `pqc.enable_signatures` before any certificate is loaded.
+pub fn set_ml_dsa_signing_enabled(enabled: bool) {
+    ML_DSA_SIGNING_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether ML-DSA-87 certificate keys may be served.
+pub fn ml_dsa_signing_enabled() -> bool {
+    ML_DSA_SIGNING_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 // ── ML-DSA-87 certificate signing (TLS signature scheme 0x0906) ──────────────

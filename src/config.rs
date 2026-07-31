@@ -603,6 +603,39 @@ pub struct ServerConfig {
     pub normalize_paths: bool,
 }
 
+impl ServerConfig {
+    /// Bind address to actually listen on.
+    ///
+    /// `enable_ipv6 = false` downgrades a dual-stack `[::]` bind to IPv4-only,
+    /// which is what the setting has always claimed to do — until now nothing
+    /// read it, so the only thing that decided address family was the literal
+    /// in `bind_address`. An explicitly non-wildcard IPv6 address is left alone
+    /// and warned about, since silently rewriting an operator's chosen address
+    /// would be worse than honouring it.
+    pub fn effective_bind_address(&self) -> String {
+        if self.enable_ipv6 {
+            return self.bind_address.clone();
+        }
+        match self.bind_address.as_str() {
+            "[::]" | "::" => {
+                tracing::info!(
+                    "enable_ipv6 = false: binding 0.0.0.0 instead of {}",
+                    self.bind_address
+                );
+                "0.0.0.0".to_string()
+            }
+            addr if addr.starts_with('[') => {
+                tracing::warn!(
+                    "enable_ipv6 = false but bind_address is {} — honouring the explicit address",
+                    addr
+                );
+                addr.to_string()
+            }
+            addr => addr.to_string(),
+        }
+    }
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -818,6 +851,17 @@ pub struct PqcConfig {
     #[serde(default = "default_true_pqc")]
     pub log_downgrades: bool,
 
+    /// Serve ML-DSA-87 (FIPS 204) certificate keys.
+    ///
+    /// When a loaded key is an ML-DSA-87 PKCS#8 key, it is signed with the
+    /// dedicated PQDSA signer (TLS signature scheme 0x0906) rather than the
+    /// provider's key loader, which cannot handle it. Setting this false makes
+    /// the proxy refuse such keys instead, so a host configured with an ML-DSA
+    /// certificate stops serving rather than silently falling back.
+    /// Requires the `pqc-signatures` build feature. Default: true.
+    #[serde(default = "default_true_pqc")]
+    pub enable_signatures: bool,
+
     /// Require every offered key-exchange group to be hybrid (classical + PQC).
     ///
     /// Suppresses the pure-PQC preferred KEM and the classical P-384 fallback in
@@ -863,6 +907,7 @@ impl Default for PqcConfig {
             ],
             downgrade_action: default_downgrade_action(),
             log_downgrades: true,
+            enable_signatures: true,
             require_hybrid: false,
             verify_provider: true,
             check_key_permissions: true,

@@ -152,8 +152,51 @@ struct Args {
     allow_insecure_backends: bool,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Entry point. The runtime is built by hand rather than by `#[tokio::main]`
+/// so `server.worker_threads` can size the pool: the attribute always takes
+/// every core, which made the setting unreachable however it was configured.
+/// 0 keeps the all-cores default.
+fn main() -> anyhow::Result<()> {
+    // The config must be read before the runtime exists, so worker_threads is
+    // known when the pool is built. Parse failures are reported by run() in the
+    // usual way; a pre-read that fails here just falls back to the default pool
+    // size and lets run() produce the real error message.
+    let worker_threads = std::env::args()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find(|w| w[0] == "--config" || w[0] == "-c")
+        .map(|w| w[1].clone())
+        .or_else(|| std::env::var("PQCRYPTA_CONFIG").ok())
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|c| toml::from_str::<toml::Value>(&c).ok())
+        .and_then(|v| {
+            v.get("server")?
+                .get("worker_threads")?
+                .as_integer()
+                .and_then(|n| usize::try_from(n).ok())
+        })
+        .unwrap_or(0);
+
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    if worker_threads > 0 {
+        builder.worker_threads(worker_threads);
+    }
+    let runtime = builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build Tokio runtime: {}", e))?;
+
+    if worker_threads > 0 {
+        tracing::debug!(
+            "Tokio runtime: {} worker threads (configured)",
+            worker_threads
+        );
+    }
+
+    runtime.block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     // SR-08: Install aws-lc-rs as the default rustls CryptoProvider.
     // This ensures the ML-KEM post-quantum key exchange offered by aws-lc-rs is
     // active for ALL TLS paths, including QUIC/HTTP3.  Previously ring was
@@ -375,6 +418,18 @@ async fn main() -> anyhow::Result<()> {
     // =========================================================================
     perform_security_checks(&config).await?;
 
+    // Publish the ML-DSA certificate-signing switch before anything loads a
+    // certificate — the SNI resolver reads it per host as keys come in.
+    pqcrypta_proxy::tls::set_ml_dsa_signing_enabled(config.pqc.enable_signatures);
+    info!(
+        "ML-DSA-87 certificate signatures: {}",
+        if config.pqc.enable_signatures {
+            "enabled"
+        } else {
+            "disabled — ML-DSA keys will be rejected"
+        }
+    );
+
     // Initialize PQC TLS provider (OpenSSL 3.5 with ML-KEM)
     info!("Initializing PQC TLS provider...");
     let pqc_provider = Arc::new(PqcTlsProvider::new(&config.pqc));
@@ -532,7 +587,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Start admin API server
     // Initialize OCSP stapling service if enabled
-    let ocsp_service: Option<Arc<ocsp::OcspService>> = if config.ocsp.enabled {
+    // Two settings gate stapling: [ocsp].enabled owns the fetch/refresh service
+    // and tls.ocsp_stapling is the TLS-side switch. Both must be on — previously
+    // tls.ocsp_stapling was read by nothing, so turning it off changed nothing.
+    if config.ocsp.enabled && !config.tls.ocsp_stapling {
+        info!("OCSP service configured but tls.ocsp_stapling = false — not stapling");
+    }
+    let ocsp_service: Option<Arc<ocsp::OcspService>> = if config.ocsp.enabled
+        && config.tls.ocsp_stapling
+    {
         info!("Initializing OCSP stapling service...");
         let ocsp_config = ocsp::OcspConfig {
             enabled: config.ocsp.enabled,
@@ -727,10 +790,12 @@ async fn main() -> anyhow::Result<()> {
         // AUD-02: Pass the allowed_domains list so the redirect server validates
         // the Host header before building the HTTPS URL.
         let redirect_allowed_domains = config.http_redirect.allowed_domains.clone();
+        let redirect_to_https = config.http_redirect.redirect_to_https;
         tokio::spawn(async move {
             if let Err(e) = run_http_redirect_server(
                 redirect_port,
                 https_port,
+                redirect_to_https,
                 challenges,
                 redirect_allowed_domains,
             )
@@ -745,7 +810,7 @@ async fn main() -> anyhow::Result<()> {
     if !config.passthrough_routes.is_empty() {
         let passthrough_addr: std::net::SocketAddr = format!(
             "{}:{}",
-            config.server.bind_address,
+            config.server.effective_bind_address(),
             config.server.udp_port // Use primary port for passthrough
         )
         .parse()?;
@@ -769,7 +834,7 @@ async fn main() -> anyhow::Result<()> {
 
     for port in all_ports.clone() {
         let bind_addr: std::net::SocketAddr =
-            format!("{}:{}", config.server.bind_address, port).parse()?;
+            format!("{}:{}", config.server.effective_bind_address(), port).parse()?;
 
         let http_cert = cert_path.clone();
         let http_key = key_path.clone();
@@ -1043,7 +1108,7 @@ async fn main() -> anyhow::Result<()> {
             // P3-fix: use the configurable webtransport_port from ServerConfig instead
             // of the previously hardcoded 4433.
             let wt_addr: std::net::SocketAddr =
-                format!("{}:{}", wt_config.server.bind_address, wt_port)
+                format!("{}:{}", wt_config.server.effective_bind_address(), wt_port)
                     .parse()
                     .expect("valid WebTransport bind address from config");
 
@@ -1265,7 +1330,8 @@ fn print_startup_summary(config: &ProxyConfig, pqc_enabled: bool) {
     info!("═══════════════════════════════════════════════════════════════");
     info!(
         "  QUIC/HTTP3:    {}:{}",
-        config.server.bind_address, config.server.udp_port
+        config.server.effective_bind_address(),
+        config.server.udp_port
     );
     info!(
         "  Admin API:     {}:{}",
