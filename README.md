@@ -537,11 +537,15 @@ blocked_ips = []
 geoip_db_path = "/var/www/html/pqcrypta-proxy/data/geoip/GeoLite2-City.mmdb"
 blocked_countries = ["CN", "RU", "KP"]
 
-[security.rate_limit]
+# Rate limits live in [rate_limiting], not under [security]; the auto-block
+# thresholds that react to them are [security] keys.
+[rate_limiting]
 requests_per_second = 100
 burst_size = 200
-auto_block_threshold = 1000
-block_duration_secs = 3600
+
+[security]
+auto_block_threshold = 10           # suspicious patterns before an IP is blocked
+auto_block_duration_secs = 300      # how long that block lasts
 max_connections_per_ip = 100
 
 [security.circuit_breaker]
@@ -567,73 +571,65 @@ connections_per_second = 10
 
 [advanced_rate_limiting]
 enabled = true
-
-# Key resolution strategy
-# Options: source_ip, xff_trusted, ja3_fingerprint, jwt_subject, composite
-key_strategy = "composite"
-
-# X-Forwarded-For trust configuration
-xff_trust_depth = 1                 # How many proxies to trust
+ipv6_subnet_bits = 64               # group /64 subnets so a single host cannot rotate addresses
 trusted_proxies = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
 
-# IPv6 subnet grouping (prevents per-host evasion)
-ipv6_prefix_length = 64
+# Key resolution: a table, not a string. The first entry that can be derived
+# from the request wins; `fallback` applies when none can.
+[advanced_rate_limiting.key_strategy]
+order = ["api_key", "jwt_subject", "ja3_fingerprint", "real_ip", "source_ip"]
+fallback = "source_ip"
+use_composite = false
 
-# Global rate limits (DDoS protection layer)
 [advanced_rate_limiting.global_limits]
 requests_per_second = 10000
 burst_size = 2000
 
-# Per-IP limits (NAT-aware via composite keys)
 [advanced_rate_limiting.global_limits.per_ip]
 requests_per_second = 100
 burst_size = 200
 requests_per_minute = 1000
 requests_per_hour = 10000
 
-# Per-JA3 fingerprint limits (NAT-friendly client identification)
-[advanced_rate_limiting.global_limits.per_ja3]
+[advanced_rate_limiting.global_limits.per_fingerprint]
 requests_per_second = 500
 burst_size = 100
 
-# Per-JWT subject limits (user-level limiting)
-[advanced_rate_limiting.global_limits.per_jwt_subject]
+[advanced_rate_limiting.global_limits.per_api_key]
 requests_per_second = 50
 burst_size = 100
 
-# Composite key limits (IP + JA3 + Path)
-[advanced_rate_limiting.global_limits.composite]
+[advanced_rate_limiting.global_limits.per_composite]
 requests_per_second = 200
 burst_size = 50
 
-# Adaptive baseline learning (ML-inspired anomaly detection)
+# Adaptive anomaly detection
 [advanced_rate_limiting.adaptive]
 enabled = true
-learning_window_secs = 3600         # 1 hour learning window
-anomaly_threshold = 3.0             # Standard deviations from mean
-block_anomalies = false             # Only log, don't block during learning
-min_samples = 100                   # Minimum samples before blocking
+baseline_window_secs = 3600         # window used to profile normal traffic
+sensitivity = 0.7                   # 0.0 = off, 1.0 = maximum
+auto_adjust = true                  # adjust limits from detected anomalies
+min_samples = 1000                  # samples required before adaptive limiting acts
+std_dev_multiplier = 3.0            # requests > mean + N*stddev counts as an anomaly
 
-# Route-specific overrides
-[[advanced_rate_limiting.route_overrides]]
-route_name = "api-route"
-per_ip_rps = 200                    # Higher limits for API route
-per_ip_burst = 400
-per_ja3_rps = 1000
+# Per-route limits are keyed by route name and carry their own [.limits] table.
+[advanced_rate_limiting.route_limits.login]
+pattern = "/api/method/login"
 
-[[advanced_rate_limiting.route_overrides]]
-route_name = "login-route"
-per_ip_rps = 10                     # Stricter limits for login
-per_ip_burst = 20
+[advanced_rate_limiting.route_limits.login.limits]
+requests_per_second = 2
+burst_size = 5
+requests_per_minute = 20
+requests_per_hour = 100
 ```
 
 **Key Features:**
 - **Composite Keys**: Combine IP + JA3 fingerprint + path for fine-grained limiting
 - **JA3/JA4 Fingerprinting**: Identify clients behind NAT by TLS handshake signature
 - **JWT Subject Extraction**: Rate limit by authenticated user, not just IP
-- **X-Forwarded-For Trust Chain**: Properly handle clients behind trusted proxies
-- **IPv6 Subnet Grouping**: Group /64 subnets to prevent per-host evasion
-- **Adaptive Baseline**: Learns normal traffic patterns and detects anomalies
+- **X-Forwarded-For Trust Chain**: `trusted_proxies` lists the hops whose XFF header is honoured when deriving the client IP
+- **IPv6 Subnet Grouping**: `ipv6_subnet_bits` groups /64 subnets to prevent per-host evasion
+- **Adaptive Baseline**: profiles normal traffic over `baseline_window_secs` and flags requests beyond `std_dev_multiplier` standard deviations
 - **Layered Limits**: Global → Route → Client hierarchy for defense in depth
 
 ### Distributed Rate Limiting (Redis)
