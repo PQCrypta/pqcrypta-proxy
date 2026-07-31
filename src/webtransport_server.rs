@@ -376,6 +376,10 @@ async fn handle_connection(
         return crate::telemetry::handle_telemetry_session(connection, remote_addr).await;
     }
 
+    // Per-session datagram budget window (see webtransport_max_datagrams_per_sec).
+    let mut dg_window_start = std::time::Instant::now();
+    let mut dg_count: u32 = 0;
+
     loop {
         tokio::select! {
             // Handle unidirectional streams (client -> server)
@@ -422,6 +426,24 @@ async fn handle_connection(
             datagram_result = connection.receive_datagram() => {
                 match datagram_result {
                     Ok(datagram) => {
+                        // server.webtransport_max_datagrams_per_sec was configured
+                        // and never enforced, so a session could flood datagrams
+                        // unbounded — each one spawning a task. Drop anything past
+                        // the per-second budget: datagrams are unreliable by
+                        // definition, so shedding is the correct response.
+                        let dg_limit = config.server.webtransport_max_datagrams_per_sec;
+                        if dg_limit > 0 {
+                            let now = std::time::Instant::now();
+                            if now.duration_since(dg_window_start) >= std::time::Duration::from_secs(1) {
+                                dg_window_start = now;
+                                dg_count = 0;
+                            }
+                            dg_count += 1;
+                            if dg_count > dg_limit {
+                                debug!("Datagram budget exceeded for {} ({}/s) — dropping", remote_addr, dg_limit);
+                                continue;
+                            }
+                        }
                         debug!("📦 Datagram received from {} ({} bytes)", remote_addr, datagram.len());
                         let conn = Arc::clone(&connection);
                         let config_clone = config.clone();

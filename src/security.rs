@@ -211,6 +211,16 @@ pub struct SecurityState {
     pub config: Arc<RwLock<SecurityConfig>>,
     /// Rate limit configuration
     pub rate_config: Arc<RwLock<RateLimitConfig>>,
+    /// Snapshot of the routing table, used only to resolve a request's route
+    /// before the security checks run.
+    ///
+    /// The WAF and rate limiter sit in front of routing, so without this they
+    /// cannot see per-route policy — which is why routes.skip_bot_blocking and
+    /// the whole [routes.security] block did nothing. Snapshotting matches how
+    /// rate_config and the security config are already held here; matching uses
+    /// ProxyConfig::find_route so the route chosen is the same one the proxy
+    /// will use downstream.
+    pub route_index: Arc<ProxyConfig>,
     /// Circuit breaker configuration
     pub circuit_breaker_config: Arc<RwLock<CircuitBreakerConfig>>,
     /// Global rate limiter (fallback)
@@ -269,6 +279,24 @@ pub enum BlockReason {
 struct BlocklistEntry {
     ip: String,
     expires_at: Option<String>,
+}
+
+/// Per-route security settings resolved for a single request.
+///
+/// Flattened out of `RouteConfig` and `RouteSecurityPolicy` so the middleware
+/// does not hold a borrow on the route table while it works.
+#[derive(Clone, Debug, Default)]
+pub struct RequestPolicy {
+    /// Route opts out of scanner/bot user-agent blocking
+    pub skip_bot_blocking: bool,
+    /// Only these JA3 hashes may reach this route
+    pub allowed_ja3: Option<Vec<String>>,
+    /// Per-route WAF on/off, overriding waf.enabled
+    pub waf_enabled: Option<bool>,
+    /// Per-route WAF mode ("block" | "detect"), overriding waf.mode
+    pub waf_mode: Option<String>,
+    /// Per-route rate limits, overriding [rate_limiting]
+    pub rate_limit_override: Option<RateLimitConfig>,
 }
 
 /// One-second sliding window of new connections from a single IP.
@@ -470,6 +498,7 @@ impl SecurityState {
             circuit_breakers: Arc::new(DashMap::new()),
             config: Arc::new(RwLock::new(config.security.clone())),
             rate_config: Arc::new(RwLock::new(config.rate_limiting.clone())),
+            route_index: Arc::new(config.clone()),
             circuit_breaker_config: Arc::new(RwLock::new(config.circuit_breaker.clone())),
             global_rate_limiter,
             #[cfg(feature = "geoip")]
@@ -1051,6 +1080,38 @@ pub async fn security_middleware(
 ) -> Response {
     let ip = client_addr.ip();
 
+    // Resolve the route before any check runs, so per-route policy can shape
+    // what follows. None means no route matched, in which case the global
+    // settings apply unchanged.
+    let route_policy = {
+        let host = headers
+            .get(hyper::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(|h| h.split(':').next().unwrap_or(h).to_ascii_lowercase());
+        let req_path = request.uri().path().to_string();
+        security
+            .route_index
+            .find_route(host.as_deref(), &req_path, false)
+            .map(|r| RequestPolicy {
+                skip_bot_blocking: r.skip_bot_blocking,
+                allowed_ja3: r.security.as_ref().and_then(|s| s.allowed_ja3.clone()),
+                waf_enabled: r.security.as_ref().and_then(|s| s.waf_enabled),
+                waf_mode: r.security.as_ref().and_then(|s| s.waf_mode.clone()),
+                rate_limit_override: r
+                    .security
+                    .as_ref()
+                    .and_then(|s| s.rate_limit_override.clone()),
+            })
+            .unwrap_or_default()
+    };
+
+    // The body-scan paths below run after `request` is consumed, so take the
+    // pieces they need while the policy is still in scope.
+    let waf_mode_cl = route_policy.waf_mode.clone();
+    let waf_enabled_cl = route_policy.waf_enabled;
+    let waf_mode_body = route_policy.waf_mode.clone();
+    let route_skip_bot = route_policy.skip_bot_blocking;
+
     // Fast path: skip all security checks for trusted IPs (loopback, or CIDRs listed in
     // security.trusted_internal_cidrs). RFC1918 ranges are no longer implicitly trusted
     // (SEC-A05) — this prevents an attacker with LAN access from bypassing rate limiting.
@@ -1097,11 +1158,20 @@ pub async fn security_middleware(
     };
     let (rate_enabled, rate_rps, conn_rate_enabled, conn_rate_per_sec) = {
         let rate_config = security.rate_config.read();
+        // A route may carry its own limits; where it does they replace the
+        // global ones for this request. Previously rate_limit_override was
+        // parsed and discarded, so a route's stricter (or looser) figure had
+        // no effect whatever it was set to.
+        let over = route_policy.rate_limit_override.as_ref();
         (
-            rate_config.enabled,
-            rate_config.requests_per_second,
-            rate_config.connection_rate_limit,
-            rate_config.connections_per_second,
+            over.map_or(rate_config.enabled, |o| o.enabled),
+            over.map_or(rate_config.requests_per_second, |o| o.requests_per_second),
+            over.map_or(rate_config.connection_rate_limit, |o| {
+                o.connection_rate_limit
+            }),
+            over.map_or(rate_config.connections_per_second, |o| {
+                o.connections_per_second
+            }),
         )
     };
 
@@ -1118,6 +1188,25 @@ pub async fn security_middleware(
                 ip, block_info.reason
             );
             return blocked_response(&block_info, alt_svc);
+        }
+
+        // 1b. Per-route JA3 allowlist. The fingerprint is attached upstream as
+        // x-ja3-hash by the fingerprinting acceptor; a route that names an
+        // allowlist admits only those clients. If no fingerprint was captured
+        // the request cannot satisfy the list, so it is refused rather than
+        // waved through — an allowlist that fails open is not an allowlist.
+        if let Some(ref allowed) = route_policy.allowed_ja3 {
+            let presented = headers.get("x-ja3-hash").and_then(|v| v.to_str().ok());
+            let permitted = presented.is_some_and(|h| allowed.iter().any(|a| a == h));
+            if !permitted {
+                warn!(
+                    "JA3 allowlist rejected {} on {} (fingerprint: {})",
+                    ip,
+                    request_path,
+                    presented.unwrap_or("none captured")
+                );
+                return ja3_forbidden_response(alt_svc);
+            }
         }
 
         // 2. GeoIP country blocking
@@ -1214,7 +1303,11 @@ pub async fn security_middleware(
     }
 
     // 5. WAF inspection (path + query + headers; body scanned in chunked path below)
-    if let Some(ref waf) = security.waf_engine {
+    if let Some(ref waf) = security
+        .waf_engine
+        .as_ref()
+        .filter(|_| route_policy.waf_enabled != Some(false))
+    {
         let (path, query) = {
             let uri = request.uri();
             (
@@ -1232,7 +1325,8 @@ pub async fn security_middleware(
             .and_then(|v| v.to_str().ok())
             .map(|v| v == "1")
             .unwrap_or(false)
-            || request_path.starts_with("/stream/downloads/");
+            || request_path.starts_with("/stream/downloads/")
+            || route_policy.skip_bot_blocking;
         let waf_req = WafRequest {
             method: request.method().as_str(),
             path: &path,
@@ -1240,6 +1334,7 @@ pub async fn security_middleware(
             headers: request.headers(),
             body: None, // body scan happens in chunked path
             skip_bot_ua_check: skip_bot_ua,
+            mode_override: route_policy.waf_mode.as_deref(),
         };
         match waf.inspect(&waf_req) {
             WafVerdict::Block { ref rule, .. } => {
@@ -1312,7 +1407,7 @@ pub async fn security_middleware(
         }
         // WAF body scan for Content-Length requests — previously skipped.
         // Buffer up to max_body_scan_bytes (65 KB) and inspect with WAF.
-        if security.waf_engine.is_some() {
+        if security.waf_engine.is_some() && route_policy.waf_enabled != Some(false) {
             let scan_limit = 65_536usize;
             let (parts, body) = request.into_parts();
             // Collect the ENTIRE body (matching the declared Content-Length) —
@@ -1337,7 +1432,11 @@ pub async fn security_middleware(
                 }
             }
             if !collected_bytes.is_empty() {
-                if let Some(ref waf) = security.waf_engine {
+                if let Some(ref waf) = security
+                    .waf_engine
+                    .as_ref()
+                    .filter(|_| waf_enabled_cl != Some(false))
+                {
                     let waf_path = parts.uri.path().to_string();
                     let waf_query = parts.uri.query().unwrap_or("").to_string();
                     let skip_bot_ua_cl = parts
@@ -1345,7 +1444,8 @@ pub async fn security_middleware(
                         .get("x-health-check-bypass")
                         .and_then(|v| v.to_str().ok())
                         .map(|v| v == "1")
-                        .unwrap_or(false);
+                        .unwrap_or(false)
+                        || route_skip_bot;
                     let scan_slice_end = collected_bytes.len().min(scan_limit);
                     let waf_req_cl = WafRequest {
                         method: parts.method.as_str(),
@@ -1354,6 +1454,7 @@ pub async fn security_middleware(
                         headers: &parts.headers,
                         body: Some(&collected_bytes[..scan_slice_end]),
                         skip_bot_ua_check: skip_bot_ua_cl,
+                        mode_override: waf_mode_cl.as_deref(),
                     };
                     match waf.inspect(&waf_req_cl) {
                         WafVerdict::Block { ref rule, .. } => {
@@ -1438,7 +1539,11 @@ pub async fn security_middleware(
         // pass supplies the buffered bytes so that body-embedded payloads
         // (SQLi, XSS, command injection, etc.) are detected.
         if !collected_bytes.is_empty() {
-            if let Some(ref waf) = security.waf_engine {
+            if let Some(ref waf) = security
+                .waf_engine
+                .as_ref()
+                .filter(|_| waf_enabled_cl != Some(false))
+            {
                 let waf_path = parts.uri.path().to_string();
                 let waf_query = parts.uri.query().unwrap_or("").to_string();
                 let skip_bot_ua_body = parts
@@ -1446,7 +1551,8 @@ pub async fn security_middleware(
                     .get("x-health-check-bypass")
                     .and_then(|v| v.to_str().ok())
                     .map(|v| v == "1")
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                    || route_skip_bot;
                 let waf_req_body = WafRequest {
                     method: parts.method.as_str(),
                     path: &waf_path,
@@ -1454,6 +1560,7 @@ pub async fn security_middleware(
                     headers: &parts.headers,
                     body: Some(collected_bytes.as_slice()),
                     skip_bot_ua_check: skip_bot_ua_body,
+                    mode_override: waf_mode_body.as_deref(),
                 };
                 match waf.inspect(&waf_req_body) {
                     WafVerdict::Block { ref rule, .. } => {
@@ -1582,6 +1689,17 @@ fn geo_blocked_response(alt_svc: &str) -> Response {
         "",
     )
         .into_response();
+    add_alt_svc(&mut response, alt_svc);
+    response
+}
+
+/// Refusal for a request that failed a route's JA3 allowlist.
+///
+/// Plain 403 rather than the redirect used for GeoIP blocks: the caller here
+/// is an automated client that named itself by TLS fingerprint, so a
+/// human-readable error page serves no one.
+fn ja3_forbidden_response(alt_svc: &str) -> Response {
+    let mut response = (StatusCode::FORBIDDEN, "Forbidden").into_response();
     add_alt_svc(&mut response, alt_svc);
     response
 }

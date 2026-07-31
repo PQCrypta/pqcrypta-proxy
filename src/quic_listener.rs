@@ -1186,68 +1186,100 @@ impl QuicListener {
             // path enforced it, so every WAF rule — SQLi, XSS, scanner UAs, the
             // lot — could be bypassed simply by connecting over QUIC. Keep this
             // in sync with `security_middleware` in security.rs.
-            if let Some(ref waf) = security.waf_engine {
-                let query = request.uri().query().unwrap_or("").to_string();
-                let skip_bot_ua = request
+            // Per-route security policy, resolved the same way as on the TCP
+            // path so routes.skip_bot_blocking and [routes.security] behave
+            // identically whichever transport the client used.
+            let h3_route_policy = {
+                let host = request
                     .headers()
-                    .get("x-health-check-bypass")
+                    .get(hyper::header::HOST)
                     .and_then(|v| v.to_str().ok())
-                    .map(|v| v == "1")
-                    .unwrap_or(false)
-                    || path.starts_with("/stream/downloads/");
-                let waf_req = crate::waf::WafRequest {
-                    method: request.method().as_str(),
-                    path: &path,
-                    query: &query,
-                    headers: request.headers(),
-                    body: None,
-                    skip_bot_ua_check: skip_bot_ua,
-                };
-                match waf.inspect(&waf_req) {
-                    crate::waf::WafVerdict::Block { ref rule, .. } => {
-                        warn!("WAF block: rule={} ip={} path={} (h3)", rule, ip, path);
-                        // Mirror the TCP path: repeated WAF blocks escalate to an
-                        // IP ban via the shared suspicious_patterns counter.
-                        // Pentest IPs are exempt — they send attack payloads by
-                        // design and must get a 403 without being banned mid-run.
-                        let is_pentest_bypass = {
-                            let sc = security.config.read();
-                            let ip_str = ip.to_string();
-                            sc.pentest_bypass_ips.iter().any(|p| p == &ip_str)
-                        };
-                        if !is_pentest_bypass {
-                            let mut counter = security.request_counts.entry(ip).or_default();
-                            counter.suspicious_patterns += 1;
-                            if counter.suspicious_patterns >= auto_block_threshold {
-                                drop(counter);
-                                security.block_ip(
-                                    ip,
-                                    BlockReason::TooManyErrors,
-                                    Some(std::time::Duration::from_secs(auto_block_duration_secs)),
-                                );
+                    .map(|h| h.split(':').next().unwrap_or(h).to_ascii_lowercase())
+                    .or_else(|| request.uri().host().map(str::to_ascii_lowercase));
+                security
+                    .route_index
+                    .find_route(host.as_deref(), &path, false)
+                    .map(|r| crate::security::RequestPolicy {
+                        skip_bot_blocking: r.skip_bot_blocking,
+                        allowed_ja3: r.security.as_ref().and_then(|s| s.allowed_ja3.clone()),
+                        waf_enabled: r.security.as_ref().and_then(|s| s.waf_enabled),
+                        waf_mode: r.security.as_ref().and_then(|s| s.waf_mode.clone()),
+                        rate_limit_override: r
+                            .security
+                            .as_ref()
+                            .and_then(|s| s.rate_limit_override.clone()),
+                    })
+                    .unwrap_or_default()
+            };
+
+            if let Some(ref waf) = security.waf_engine {
+                if h3_route_policy.waf_enabled != Some(false) {
+                    let query = request.uri().query().unwrap_or("").to_string();
+                    let skip_bot_ua = request
+                        .headers()
+                        .get("x-health-check-bypass")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|v| v == "1")
+                        .unwrap_or(false)
+                        || path.starts_with("/stream/downloads/")
+                        || h3_route_policy.skip_bot_blocking;
+                    let waf_req = crate::waf::WafRequest {
+                        method: request.method().as_str(),
+                        path: &path,
+                        query: &query,
+                        headers: request.headers(),
+                        body: None,
+                        skip_bot_ua_check: skip_bot_ua,
+                        mode_override: h3_route_policy.waf_mode.as_deref(),
+                    };
+                    match waf.inspect(&waf_req) {
+                        crate::waf::WafVerdict::Block { ref rule, .. } => {
+                            warn!("WAF block: rule={} ip={} path={} (h3)", rule, ip, path);
+                            // Mirror the TCP path: repeated WAF blocks escalate to an
+                            // IP ban via the shared suspicious_patterns counter.
+                            // Pentest IPs are exempt — they send attack payloads by
+                            // design and must get a 403 without being banned mid-run.
+                            let is_pentest_bypass = {
+                                let sc = security.config.read();
+                                let ip_str = ip.to_string();
+                                sc.pentest_bypass_ips.iter().any(|p| p == &ip_str)
+                            };
+                            if !is_pentest_bypass {
+                                let mut counter = security.request_counts.entry(ip).or_default();
+                                counter.suspicious_patterns += 1;
+                                if counter.suspicious_patterns >= auto_block_threshold {
+                                    drop(counter);
+                                    security.block_ip(
+                                        ip,
+                                        BlockReason::TooManyErrors,
+                                        Some(std::time::Duration::from_secs(
+                                            auto_block_duration_secs,
+                                        )),
+                                    );
+                                }
                             }
+                            metrics.requests.request_end_full(
+                                403,
+                                start_time.elapsed(),
+                                0,
+                                0,
+                                Some(&path),
+                                is_health_check,
+                            );
+                            let response = http::Response::builder()
+                                .status(http::StatusCode::FORBIDDEN)
+                                .header("server", SERVER_HEADER)
+                                .header("x-waf-block", "1")
+                                .body(())?;
+                            stream.send_response(response).await?;
+                            stream.finish().await?;
+                            return Ok(());
                         }
-                        metrics.requests.request_end_full(
-                            403,
-                            start_time.elapsed(),
-                            0,
-                            0,
-                            Some(&path),
-                            is_health_check,
-                        );
-                        let response = http::Response::builder()
-                            .status(http::StatusCode::FORBIDDEN)
-                            .header("server", SERVER_HEADER)
-                            .header("x-waf-block", "1")
-                            .body(())?;
-                        stream.send_response(response).await?;
-                        stream.finish().await?;
-                        return Ok(());
+                        crate::waf::WafVerdict::Detect { ref rule, .. } => {
+                            warn!("WAF detect: rule={} ip={} path={} (h3)", rule, ip, path);
+                        }
+                        crate::waf::WafVerdict::Allow => {}
                     }
-                    crate::waf::WafVerdict::Detect { ref rule, .. } => {
-                        warn!("WAF detect: rule={} ip={} path={} (h3)", rule, ip, path);
-                    }
-                    crate::waf::WafVerdict::Allow => {}
                 }
             }
         }

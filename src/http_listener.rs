@@ -303,7 +303,13 @@ pub async fn run_http_listener(
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
         metrics: state_metrics,
-        hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(300)),
+        hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(
+            // tls.zero_rtt_nonce_window_secs was configured and never read; the
+            // replay window was pinned at 300 s regardless. A shorter window
+            // means a replayed nonce is forgotten sooner, so this is a real
+            // security knob rather than a tuning one.
+            config.tls.zero_rtt_nonce_window_secs,
+        )),
         rate_limiter,
     };
 
@@ -492,7 +498,13 @@ pub async fn run_http_listener_pqc(
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
         metrics: state_metrics,
-        hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(300)),
+        hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(
+            // tls.zero_rtt_nonce_window_secs was configured and never read; the
+            // replay window was pinned at 300 s regardless. A shorter window
+            // means a replayed nonce is forgotten sooner, so this is a real
+            // security knob rather than a tuning one.
+            config.tls.zero_rtt_nonce_window_secs,
+        )),
         rate_limiter,
     };
 
@@ -768,7 +780,13 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
         metrics: state_metrics,
-        hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(300)),
+        hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(
+            // tls.zero_rtt_nonce_window_secs was configured and never read; the
+            // replay window was pinned at 300 s regardless. A shorter window
+            // means a replayed nonce is forgotten sooner, so this is a real
+            // security knob rather than a tuning one.
+            config.tls.zero_rtt_nonce_window_secs,
+        )),
         rate_limiter: rate_limiter.clone(),
     };
 
@@ -1188,7 +1206,13 @@ pub async fn run_http_listener_pqc_with_fingerprint(
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
         metrics: state_metrics,
-        hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(300)),
+        hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(
+            // tls.zero_rtt_nonce_window_secs was configured and never read; the
+            // replay window was pinned at 300 s regardless. A shorter window
+            // means a replayed nonce is forgotten sooner, so this is a real
+            // security knob rather than a tuning one.
+            config.tls.zero_rtt_nonce_window_secs,
+        )),
         rate_limiter,
     };
 

@@ -57,6 +57,10 @@ pub struct WafRequest<'a> {
     pub body: Option<&'a [u8]>,
     /// Skip bot UA pattern check (set true for routes that allow automated clients)
     pub skip_bot_ua_check: bool,
+    /// Per-route override of `waf.mode` ("block" | "detect"). None uses the
+    /// global mode. Lets one route be tuned in detect mode while the rest of
+    /// the site stays blocking.
+    pub mode_override: Option<&'a str>,
 }
 
 /// Compiled WAF engine
@@ -358,7 +362,9 @@ impl WafEngine {
 
     /// Inspect a request and return a WAF verdict.
     pub fn inspect(&self, req: &WafRequest<'_>) -> WafVerdict {
-        let block_mode = self.config.mode == "block";
+        let block_mode = req
+            .mode_override
+            .map_or(self.config.mode == "block", |m| m == "block");
 
         // Check path-only scanner/reconnaissance probe patterns first.
         // These match exclusively on req.path (not query/body) because the paths
@@ -922,6 +928,7 @@ mod tests {
             headers,
             body: None,
             skip_bot_ua_check: false,
+            mode_override: None,
         }
     }
 

@@ -2473,6 +2473,21 @@ impl ProxyConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        // tls.pqc_session_tickets describes a feature that does not exist yet:
+        // there is no ticketer in the TLS setup at all, PQC-wrapped or
+        // otherwise. Silently accepting true would tell an operator their
+        // session tickets are ML-KEM protected when no ticket is issued at all,
+        // which is the worst of the three possible behaviours. Refuse instead,
+        // so the setting cannot lie in either direction.
+        if self.tls.pqc_session_tickets {
+            return Err(anyhow::anyhow!(
+                "tls.pqc_session_tickets = true, but ML-KEM-wrapped session tickets are \
+                 not implemented — no ticketer is installed, so nothing would be \
+                 protected. Set it false; resumption currently relies on rustls \
+                 session storage."
+            ));
+        }
+
         // Config schema version check
         match self.version {
             None => {
