@@ -46,7 +46,8 @@ skip = [
     { name = "oid-registry", reason = "transitive of x509-parser chain; 0.7 and 0.8 pulled by different sub-trees" },
     # rand ecosystem — 0.8/0.9 migration still in progress across the crate graph
     { name = "rand", reason = "0.8 and 0.9 pulled by separate dependency subtrees; upstream migration ongoing" },
-    { name = "rand_chacha", reason = "version-mirrors rand; 0.3 and 0.9 pulled by rand 0.8 and 0.9 sub-trees" },
+    # rand_chacha removed: the graph converged on a single version and cargo-deny
+    # reports the skip as unnecessary.
     { name = "rand_core", reason = "version-mirrors rand; 0.6 and 0.9 pulled by rand 0.8 and 0.9 sub-trees" },
     { name = "getrandom", reason = "multiple versions due to rand/crypto crate ecosystem transition" },
     # bitflags — 1.x → 2.x migration ongoing; many crates still on 1.x
@@ -77,6 +78,16 @@ skip = [
     { name = "webpki-roots", reason = "0.26 and 1.x pulled by separate crates; update pending upstream" },
     # core-foundation — macOS SDK binding versions split across Apple platform crates
     { name = "core-foundation", reason = "macOS transitive dep; version split from separate Apple-platform crate trees" },
+    # RustCrypto ecosystem mid-migration — the older traits crates and the newer
+    # hash crates disagree on these two, and nothing here can force convergence
+    # without pinning one half to versions the other half will not accept.
+    { name = "cpufeatures", reason = "0.2 pulled by aes/polyval; 0.3 by sha1/sha2/chacha20; RustCrypto migration ongoing" },
+    { name = "crypto-common", reason = "0.1 pulled by aead/cipher/universal-hash; 0.2 by digest 0.11; RustCrypto migration ongoing" },
+    # rustls-platform-verifier — hyper-rustls 0.27 pins 0.6, the vendored noq-proto
+    # (multipath QUIC fork) pins 0.7. Resolves when hyper-rustls moves to 0.7.
+    { name = "rustls-platform-verifier", reason = "0.6 pulled by hyper-rustls 0.27; 0.7 by vendored noq-proto; awaiting hyper-rustls bump" },
+    { name = "jni", reason = "Android-only; 0.21 and 0.22 pulled by the two rustls-platform-verifier versions" },
+    { name = "jni-sys", reason = "Android-only; version-mirrors jni via rustls-platform-verifier split" },
     # windows-* — cross-compilation targets; 0.52 vs 0.x splits from indirect Windows crates
     { name = "windows-sys", reason = "multiple versions from Windows-platform crate tree; harmless on Linux" },
     { name = "windows-targets", reason = "mirrors windows-sys version split" },

@@ -17,6 +17,7 @@
 //! kind of tooling/test use, it isn't something this fork added.
 
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
@@ -109,11 +110,17 @@ fn main() {
 
     let key_path = args.out_dir.join(format!("{config_id:02x}.key"));
     fs::write(&key_path, private_key.secret_bytes()).expect("failed to write private key");
+    // Unix mode bits have no Windows equivalent; PermissionsExt::from_mode does
+    // not exist there, which broke the windows-latest build. On Windows the
+    // files inherit the directory ACL instead — the operator is responsible for
+    // the ACL on out_dir, exactly as they are for its 0700 on Unix.
+    #[cfg(unix)]
     fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
         .expect("failed to chmod private key");
 
     let ech_path = args.out_dir.join(format!("{config_id:02x}.ech"));
     fs::write(&ech_path, &entry_bytes).expect("failed to write ECHConfig entry");
+    #[cfg(unix)]
     fs::set_permissions(&ech_path, fs::Permissions::from_mode(0o644))
         .expect("failed to chmod ECHConfig entry");
 

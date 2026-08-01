@@ -24,7 +24,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      # Scoped to this crate rather than --all. There is no [workspace] section,
+      # so the vendored forks under vendor/ (noq, h3-noq, wtransport) are picked
+      # up as implicit members, and --all was checking their upstream source
+      # against our rustfmt settings. Reformatting them would make every future
+      # rebase onto upstream conflict on whitespace, for no benefit — they are
+      # tracked forks, not our code.
+      - run: cargo fmt -p pqcrypta-proxy -- --check
 
   clippy:
     name: Clippy
