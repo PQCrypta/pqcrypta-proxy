@@ -22,7 +22,7 @@ jobs:
           manifest-file: .release-please-manifest.json
 
       # After a release is created, build and upload release binaries
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: ${{ steps.release.outputs.release_created }}
 
       - uses: dtolnay/rust-toolchain@stable
