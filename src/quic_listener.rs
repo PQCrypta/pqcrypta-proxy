@@ -41,6 +41,22 @@ use crate::tls::TlsProvider;
 
 const SERVER_HEADER: &str = "pqcrypta"; // SEC-08: no version disclosure
 
+/// True when an h3 error is just the peer hanging up rather than a fault here.
+///
+/// Every one of these shapes is produced by ordinary client behaviour: a clean
+/// graceful shutdown (H3_NO_ERROR / application code 0), a browser navigating
+/// away mid-request, or an idle connection ageing out. They carry no operator
+/// signal, so they belong at debug — logged at error they drowned out real
+/// failures and kept the collector's log-analysis in a permanent error spike.
+fn is_benign_h3_close<E: std::fmt::Display>(err: &E) -> bool {
+    let msg = err.to_string();
+    msg.contains("H3_NO_ERROR")
+        || msg.contains("ApplicationClose: 0x0")
+        || msg.contains("aborted by peer")
+        || msg.contains("closed abruptly")
+        || msg.contains("Timeout")
+}
+
 /// Build Alt-Svc header value from config ports.
 /// Returns "clear" for hosts listed in `server.tcp_only_hosts` so browsers
 /// evict any cached QUIC upgrade and fall back to TCP/TLS.
@@ -875,7 +891,11 @@ impl QuicListener {
                             )
                             .await
                             {
-                                error!("HTTP/3 request error: {}", e);
+                                if is_benign_h3_close(&e) {
+                                    debug!("HTTP/3 request ended by peer: {}", e);
+                                } else {
+                                    error!("HTTP/3 request error: {}", e);
+                                }
                             }
                         });
                     }
@@ -885,7 +905,15 @@ impl QuicListener {
                     break;
                 }
                 Err(e) => {
-                    error!("HTTP/3 accept error: {}", e);
+                    // A browser navigating away closes the connection mid-accept.
+                    // That is the overwhelming majority of what lands here, and
+                    // logging it at error level made the collector's log-analysis
+                    // report continuous "error spikes" for ordinary traffic.
+                    if is_benign_h3_close(&e) {
+                        debug!("HTTP/3 connection closed by peer: {}", e);
+                    } else {
+                        error!("HTTP/3 accept error: {}", e);
+                    }
                     break;
                 }
             }

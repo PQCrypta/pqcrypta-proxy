@@ -883,7 +883,13 @@ impl SecurityState {
                 .map(|v| v == "1")
                 .unwrap_or(false)
                 || view.path.starts_with("/stream/downloads/")
-                || policy.skip_bot_blocking;
+                || policy.skip_bot_blocking
+                // pentest_bypass_ips covers the authorized red-team host plus this
+                // server's own egress and loopback. Those addresses run curl-driven
+                // self-checks that carry no browser User-Agent, so without this the
+                // bad-bot-UA rules 403'd our own monitoring — the bypass list only
+                // suppressed the auto-block counter below, never the Block verdict.
+                || is_pentest;
 
             let waf_req = WafRequest {
                 method: view.method,
