@@ -425,6 +425,30 @@ pub struct TlsProvider {
     pub resolver: Arc<MultiDomainCertResolver>,
 }
 
+/// The proxy's key exchange preference, in one place.
+///
+/// Both the live listener and the startup verification handshake call this, so the
+/// attestation cannot describe a provider that differs from the one serving traffic.
+/// Constructing them separately would let the two drift, and a banner that reports a
+/// stack nothing uses is the failure this whole mechanism exists to prevent.
+///
+/// X25519 is removed and the hybrids sorted first: clients offering only an X25519
+/// key_share get a HelloRetryRequest and fall back to secp384r1.
+pub fn build_pqc_provider() -> rustls::crypto::CryptoProvider {
+    let mut provider = rustls_post_quantum::provider();
+    provider
+        .kx_groups
+        .retain(|g| g.name() != rustls::NamedGroup::X25519);
+    provider.kx_groups.sort_by_key(|g| match g.name() {
+        rustls::NamedGroup::X25519MLKEM768 => 0u8,
+        rustls::NamedGroup::secp384r1 => 1,
+        rustls::NamedGroup::secp521r1 => 2,
+        rustls::NamedGroup::secp256r1 => 3,
+        _ => 4,
+    });
+    provider
+}
+
 impl TlsProvider {
     /// Create a new TLS provider with initial configuration
     pub fn new(tls_config: &TlsConfig, pqc_config: &PqcConfig) -> anyhow::Result<Self> {
@@ -721,8 +745,11 @@ impl TlsProvider {
         pqc_available: bool,
         resolver: Arc<MultiDomainCertResolver>,
     ) -> anyhow::Result<RustlsServerConfig> {
-        // Build the base PQC-aware crypto provider
-        let mut pq_provider = rustls_post_quantum::provider();
+        // Build the base PQC-aware crypto provider. Shared with the startup
+        // verification handshake so that what is verified is what serves — a
+        // separately-constructed provider could drift from this one and make the
+        // attestation describe a stack nothing uses.
+        let pq_provider = build_pqc_provider();
 
         // ── A+ Key Exchange ───────────────────────────────────────────────────
         // NOTE: TLS_AES_128_GCM_SHA256 is intentionally kept in rustls cipher suites.
@@ -735,17 +762,6 @@ impl TlsProvider {
         // and fall back to secp384r1 (192-bit → 100%). secp256r1 is kept as a
         // last-resort fallback since RFC 8446 mandates all TLS 1.3 implementations
         // support it.  Preferred order: X25519MLKEM768 (PQC) → secp384r1 → secp256r1.
-        pq_provider
-            .kx_groups
-            .retain(|g| g.name() != rustls::NamedGroup::X25519);
-        pq_provider.kx_groups.sort_by_key(|g| match g.name() {
-            rustls::NamedGroup::X25519MLKEM768 => 0u8,
-            rustls::NamedGroup::secp384r1 => 1,
-            rustls::NamedGroup::secp521r1 => 2,
-            rustls::NamedGroup::secp256r1 => 3,
-            _ => 4,
-        });
-
         if pqc_config.enabled && pqc_available {
             info!("Using rustls-post-quantum crypto provider with X25519MLKEM768 (PQC enabled)");
         } else {

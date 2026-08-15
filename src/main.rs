@@ -85,6 +85,7 @@ use pqcrypta_proxy::pqc_tls::{verify_pqc_support, PqcTlsProvider};
 use pqcrypta_proxy::proxy::BackendPool;
 use pqcrypta_proxy::quic_listener::QuicListener;
 use pqcrypta_proxy::rate_limiter::AdvancedRateLimiter;
+use pqcrypta_proxy::startup_verify;
 use pqcrypta_proxy::tls::TlsProvider;
 use pqcrypta_proxy::webtransport_server::WebTransportServer;
 use pqcrypta_proxy::ResponseCache;
@@ -366,6 +367,99 @@ async fn run() -> anyhow::Result<()> {
         info!("Zero-trust mode: all constraints satisfied");
     }
 
+    // ── Startup verification of the cryptographic runtime ────────────────────
+    //
+    // What follows replaces a banner that announced "POST-QUANTUM CRYPTOGRAPHY
+    // ENABLED" on the strength of shelling out to an `openssl` binary. That
+    // subprocess does not terminate this proxy's TLS — rustls does — so the claim
+    // was drawn from the wrong component and could be true while the serving stack
+    // offered no PQC at all, or false while it offered it perfectly. Measured on
+    // 2026-08-14: three hosts, three different mapped libcryptos, all three
+    // negotiating X25519MLKEM768 regardless of any of them.
+    //
+    // The handshake below uses the same provider the listener will use, so what is
+    // attested is what serves.
+    let verify_provider = Arc::new(pqcrypta_proxy::tls::build_pqc_provider());
+    let tls13_only = config.tls.min_version == "1.3";
+    let runtime = startup_verify::verify_runtime(verify_provider, tls13_only);
+
+    startup_verify::render_kx_verification(&runtime, config.pqc.required);
+
+    let sections = vec![
+        startup_verify::Section {
+            title: "TLS LISTENER",
+            rows: vec![
+                startup_verify::Row::configured(
+                    "TLS minimum",
+                    format!("TLS {}", config.tls.min_version),
+                ),
+                startup_verify::Row::observed("TLS implementation", "rustls / aws-lc-rs"),
+                startup_verify::Row::configured(
+                    "KX groups offered",
+                    runtime.offered_groups.join(", "),
+                ),
+                startup_verify::Row {
+                    name: "PQC handshake".into(),
+                    value: if runtime.succeeded() {
+                        if runtime.is_post_quantum {
+                            "PASS".into()
+                        } else {
+                            "FAILED — classical group".into()
+                        }
+                    } else {
+                        "FAILED — no handshake".into()
+                    },
+                    provenance: startup_verify::Provenance::Verified,
+                },
+                startup_verify::Row::verified(
+                    "Negotiated group",
+                    runtime.kx_group.clone().unwrap_or_else(|| "none".into()),
+                ),
+                startup_verify::Row::verified(
+                    "Negotiated suite",
+                    runtime
+                        .cipher_suite
+                        .clone()
+                        .unwrap_or_else(|| "none".into()),
+                ),
+                startup_verify::Row::observed("Verification method", "in-memory TLS 1.3 handshake"),
+            ],
+        },
+        // Sourced only from fields that exist. Every row here is CONFIGURED because
+        // none of it is exercised at this point in startup — the listeners have not
+        // bound yet. Promoting any of these to VERIFIED requires probing the live
+        // listener after bind, which is the natural next step for this mechanism and
+        // deliberately not faked in the meantime.
+        startup_verify::Section {
+            title: "QUIC / HTTP3",
+            rows: vec![
+                startup_verify::Row::configured("UDP port", config.server.udp_port.to_string()),
+                startup_verify::Row::configured("Bind address", config.server.bind_address.clone()),
+                startup_verify::Row::configured(
+                    "Max connections",
+                    config.server.max_connections.to_string(),
+                ),
+            ],
+        },
+        startup_verify::dynamic_runtime_section(&runtime),
+        startup_verify::Section {
+            title: "POLICY",
+            rows: vec![startup_verify::Row::configured(
+                "PQC required",
+                if config.pqc.required { "YES" } else { "no" },
+            )],
+        },
+    ];
+    startup_verify::render_banner(&sections);
+
+    // Fails closed, and only on evidence.
+    startup_verify::enforce_pqc_policy(&runtime, config.pqc.required)?;
+
+    // Verification runs *before* the validate-and-exit, so `--validate` answers the
+    // question an operator actually has before a deployment: not "does this file
+    // parse" but "will this host give me the security boundary I am claiming". It
+    // needs no ports and no privileges, so it can be run on a candidate host ahead of
+    // any traffic — and it fails the same way a real start would.
     if args.validate {
         info!("Configuration validation successful, exiting");
         return Ok(());
@@ -434,42 +528,6 @@ async fn run() -> anyhow::Result<()> {
     info!("Initializing PQC TLS provider...");
     let pqc_provider = Arc::new(PqcTlsProvider::new(&config.pqc));
     let pqc_status = pqc_provider.status();
-
-    if pqc_status.available {
-        info!("═══════════════════════════════════════════════════════════════");
-        info!("  🔐 POST-QUANTUM CRYPTOGRAPHY ENABLED");
-        info!("═══════════════════════════════════════════════════════════════");
-        info!("  OpenSSL:       {}", pqc_status.openssl_version);
-        info!(
-            "  Hybrid Mode:   {}",
-            if pqc_status.hybrid_mode {
-                "Yes (Classical + PQC)"
-            } else {
-                "No (Pure PQC)"
-            }
-        );
-        if let Some(kem) = &pqc_status.configured_kem {
-            info!(
-                "  Preferred KEM: {} (NIST Level {})",
-                kem.openssl_name(),
-                kem.security_level()
-            );
-        }
-        info!("  Available KEMs: {}", pqc_status.available_kems.len());
-        info!("  Groups:        {}", pqc_provider.groups_string());
-        info!("═══════════════════════════════════════════════════════════════");
-    } else if config.pqc.enabled {
-        warn!("═══════════════════════════════════════════════════════════════");
-        warn!("  ⚠️  PQC REQUESTED BUT NOT AVAILABLE");
-        warn!("═══════════════════════════════════════════════════════════════");
-        if let Some(err) = &pqc_status.error {
-            warn!("  Error: {}", err);
-        }
-        warn!("  Falling back to classical TLS 1.3");
-        warn!("═══════════════════════════════════════════════════════════════");
-    } else {
-        info!("📝 PQC disabled - using classical TLS 1.3");
-    }
 
     // Initialize TLS provider (rustls for QUIC)
     info!("Initializing TLS provider...");

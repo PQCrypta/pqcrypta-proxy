@@ -838,6 +838,18 @@ fn default_zero_rtt_safe_methods() -> Vec<String> {
 pub struct PqcConfig {
     /// Enable PQC hybrid key exchange
     pub enabled: bool,
+    /// Refuse to start unless a post-quantum key exchange is *verified* at startup.
+    ///
+    /// `enabled` asks for PQC; this insists on it. When true, the proxy performs an
+    /// in-memory TLS 1.3 handshake against its own provider during startup and exits
+    /// non-zero unless the negotiated group is a post-quantum hybrid — including when
+    /// the handshake could not be completed at all, because "we could not check" is not
+    /// grounds to claim a post-quantum boundary.
+    ///
+    /// Defaults to false so an existing deployment keeps its current behaviour on
+    /// upgrade. An operator who is selling PQC as the security property wants it true.
+    #[serde(default)]
+    pub required: bool,
     /// PQC provider: "auto", "rustls", or "openssl3.5"
     /// - "auto" (default): Use rustls for QUIC, OpenSSL when broader algorithms needed
     /// - "rustls": Pure Rust via aws-lc-rs (memory-safe, QUIC support)
@@ -911,6 +923,7 @@ impl Default for PqcConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            required: false,
             provider: "auto".to_string(), // Auto-select best available
             openssl_path: Some(PathBuf::from("/usr/local/openssl-3.5/bin/openssl")),
             openssl_lib_path: Some(PathBuf::from("/usr/local/openssl-3.5/lib64")),
