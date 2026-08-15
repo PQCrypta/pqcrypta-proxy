@@ -238,6 +238,12 @@ pub async fn run_http_listener(
     config: Arc<ProxyConfig>,
     metrics: Arc<MetricsRegistry>,
     load_balancer: Arc<LoadBalancer>,
+    // The process-wide security state, constructed once in `main`. This used to be
+    // built here, which meant every listener had its own blocklist, its own
+    // suspicious-pattern counters and its own rate buckets — a source blocked on one
+    // port began clean on the next — and the startup attestation could only ever probe
+    // a further instance that served nobody. One instance, shared.
+    security_state: SecurityState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let port = addr.port();
 
@@ -276,8 +282,8 @@ pub async fn run_http_listener(
         .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
         .build(https_connector);
 
-    // Initialize security state from config (must be created before state)
-    let security_state = SecurityState::new(&config);
+    // Security state is constructed once in main and shared across every listener and
+    // the startup attestation; see the parameter's documentation.
 
     // Initialize fingerprint extractor for JA3/JA4 tracking
     let fingerprint_extractor = Arc::new(FingerprintExtractor::new());

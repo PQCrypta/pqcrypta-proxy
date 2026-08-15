@@ -367,6 +367,13 @@ async fn run() -> anyhow::Result<()> {
         info!("Zero-trust mode: all constraints satisfied");
     }
 
+    // The process-wide security state: one blocklist, one set of suspicious-pattern
+    // counters, one set of rate buckets, shared by every listener and by the startup
+    // attestation. Each listener used to build its own, so a source blocked on one port
+    // began clean on the next, and the attestation could only ever describe an instance
+    // that served nobody.
+    let security_state = pqcrypta_proxy::security::SecurityState::new(&config);
+
     // ── Startup verification of the cryptographic runtime ────────────────────
     //
     // What follows replaces a banner that announced "POST-QUANTUM CRYPTOGRAPHY
@@ -899,6 +906,7 @@ async fn run() -> anyhow::Result<()> {
         let http_config = config.clone();
         let http_metrics = metrics_registry.clone();
         let http_lb = shared_lb.clone();
+        let http_security = security_state.clone();
         let http_resolver = std::sync::Arc::clone(&tls_provider.resolver);
 
         // Priority 1: PQC + TLS-layer fingerprinting (OpenSSL with ClientHello capture)
@@ -1013,6 +1021,7 @@ async fn run() -> anyhow::Result<()> {
                 http_config,
                 http_metrics,
                 http_lb,
+                http_security,
             )
             .await
             {
@@ -1280,19 +1289,12 @@ async fn run() -> anyhow::Result<()> {
         // blocklist entries, suspicious-pattern counters, rate buckets — lands on
         // addresses no client can ever present. A loopback probe would have been
         // useless anyway: is_trusted_ip() short-circuits evaluate() to Allow.
-        // One engine for both probes, not one each. `SecurityState::new` spawns a
-        // permanent cleanup task that reloads blocklists every minute, and a clone of
-        // the state keeps it alive after the handle is dropped — so constructing one
-        // per probe leaked two such tasks for the life of the process.
-        //
-        // This is still a separate instance from the one the listeners serve with, so
-        // what it attests is "the rules this configuration produces", not "the object
-        // currently handling traffic". Those coincide today because both are built
-        // from the same config by the same constructor; plumbing the live instance out
-        // of http_listener would close the gap and is the honest next step.
-        let probe_engine = pqcrypta_proxy::security::SecurityState::new(&config);
-        let waf = startup_verify::probe_waf(&config, &probe_engine);
-        let rate = startup_verify::probe_rate_limit(&config, &probe_engine).await;
+        // The instance the listeners are serving with, not a copy of it. What this
+        // section attests is now the object actually handling traffic — the blocklist
+        // these probes touch is the blocklist a real request is checked against.
+        let waf = startup_verify::probe_waf(&config, &security_state);
+        let (conn_rate, req_rate) =
+            startup_verify::probe_rate_limits(&config, &security_state).await;
         let mtls = startup_verify::probe_mtls(
             config.tls.require_client_cert,
             probe_addr,
@@ -1303,7 +1305,7 @@ async fn run() -> anyhow::Result<()> {
 
         startup_verify::render_banner(&[
             startup_verify::bound_listener_section(&probe, probe_addr),
-            startup_verify::enforcement_section(waf, rate, mtls),
+            startup_verify::enforcement_section(waf, conn_rate, req_rate, mtls),
         ]);
         if probe.succeeded() && !probe.is_post_quantum {
             warn!(

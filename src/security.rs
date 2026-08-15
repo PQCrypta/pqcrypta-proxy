@@ -317,13 +317,42 @@ pub enum SecurityDecision {
     /// Source IP resolves to a blocked country.
     GeoBlocked,
     /// Request rate or connection rate exceeded; `limit` is the figure that applied.
-    RateLimited { limit: u32, retry_after_secs: u64 },
+    ///
+    /// `kind` says which of the two fired. They are separate controls with separate
+    /// thresholds, and the variant used to report only the number — so a caller seeing
+    /// `limit: 10` against a config declaring `requests_per_second = 200` had no way to
+    /// know it was looking at the connection limiter. The startup attestation reported
+    /// "rate limiting enforced" for either, which was true but conflated two controls
+    /// and would have hidden one of them failing while the other worked.
+    RateLimited {
+        limit: u32,
+        retry_after_secs: u64,
+        kind: RateLimitKind,
+    },
     /// Route names a JA3 allowlist this client is not on.
     Ja3Rejected,
     /// Header block exceeds `security.max_header_size`.
     HeadersTooLarge { max: usize },
     /// WAF matched in block mode. `rule` identifies which.
     WafBlock { rule: String },
+}
+
+/// Which rate control refused a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitKind {
+    /// New connections per second from one source.
+    Connection,
+    /// Requests per second from one source.
+    Request,
+}
+
+impl RateLimitKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Connection => "connection rate",
+            Self::Request => "request rate",
+        }
+    }
 }
 
 /// A request reduced to what the security rules actually need.
@@ -1043,6 +1072,7 @@ impl SecurityState {
                 return SecurityDecision::RateLimited {
                     limit: conn_rate_per_sec,
                     retry_after_secs: 1,
+                    kind: RateLimitKind::Connection,
                 };
             }
 
@@ -1061,6 +1091,7 @@ impl SecurityState {
                 return SecurityDecision::RateLimited {
                     limit: rate_rps,
                     retry_after_secs: 1,
+                    kind: RateLimitKind::Request,
                 };
             }
         }
@@ -1895,6 +1926,7 @@ pub fn decision_to_h3_parts(
         SecurityDecision::RateLimited {
             limit,
             retry_after_secs,
+            kind: _,
         } => Some((
             StatusCode::TOO_MANY_REQUESTS,
             vec![

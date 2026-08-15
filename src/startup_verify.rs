@@ -1082,45 +1082,49 @@ pub fn probe_waf(
     }
 }
 
-/// Does the rate limiter actually deny past its threshold?
+/// A third synthetic source, so the request-limiter probe starts from a clean bucket
+/// rather than one the connection-limiter probe has already drained.
+const PROBE_SOURCE_REQRATE: std::net::IpAddr =
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 3));
+
+/// Do the rate limiters actually deny past their thresholds — both of them?
 ///
-/// Drives a synthetic key past the configured limit and reports the request number at
-/// which the limiter said no.
+/// Returns `(connection, request)`, because they are two controls and a single verdict
+/// cannot describe them.
 ///
-/// The first version of this reported "900 consecutive requests were all allowed" on a
-/// proxy where every single one had in fact been denied — ten by the WAF, because the
-/// probe sent no User-Agent, and the remaining 890 by the blocklist the WAF's
-/// auto-block had put the source on. It matched only on `RateLimited` and treated every
-/// other verdict as a pass, so it printed a FAILED that was the precise opposite of
-/// what happened. A self-test that reports a false failure in a security banner is
-/// worse than no self-test: the first person to investigate one and find nothing will
-/// discount the next.
+/// Probing only through `evaluate()` tests whichever threshold is lower and leaves the
+/// other unverified, and on this deployment it is worse than that:
+/// `connection_rate_exceeded()` increments its window on *every request*, not once per
+/// connection, so with `connections_per_second = 10` against
+/// `requests_per_second = 200` the request limiter is not merely untested — it is
+/// unreachable through that path, and the 200 an operator reads in their config never
+/// applies. Reporting a single "rate limiting: ENFORCED" would have let that stand.
 ///
-/// So: requests the WAF has no reason to refuse, and any denial by a *different*
-/// control is reported as inconclusive with the verdict named, never as "allowed".
-pub async fn probe_rate_limit(
+/// So the request limiter is exercised directly, through the same per-IP governor
+/// bucket `evaluate()` consults, on a source of its own.
+pub async fn probe_rate_limits(
     config: &crate::config::ProxyConfig,
     engine: &crate::security::SecurityState,
-) -> ProbeOutcome {
+) -> (ProbeOutcome, ProbeOutcome) {
     use crate::security::{RequestPolicy, SecurityDecision, SecurityRequestView};
 
     if !config.rate_limiting.enabled {
-        return ProbeOutcome::NotConfigured;
+        return (ProbeOutcome::NotConfigured, ProbeOutcome::NotConfigured);
     }
 
     let headers = probe_headers();
     let policy = RequestPolicy::default();
 
-    // Bounded above the configured burst so a limiter that never denies is reported
-    // rather than spun on, and so "denied late" stays distinguishable from "never".
-    let ceiling = config
+    // ── Connection limiter, through the full decision path ───────────────────
+    let conn_ceiling = config
         .rate_limiting
-        .burst_size
-        .saturating_add(config.rate_limiting.requests_per_second)
-        .saturating_add(50)
-        .clamp(10, 5000);
-
-    for attempt in 1..=ceiling {
+        .connections_per_second
+        .saturating_mul(3)
+        .clamp(10, 2000);
+    let mut connection = ProbeOutcome::NotEnforced(format!(
+        "{conn_ceiling} consecutive requests from one source were all allowed"
+    ));
+    for attempt in 1..=conn_ceiling {
         let view = SecurityRequestView {
             ip: PROBE_SOURCE_RATELIMIT,
             method: "GET",
@@ -1130,24 +1134,50 @@ pub async fn probe_rate_limit(
             body: None,
         };
         match engine.evaluate(&view, &policy) {
-            SecurityDecision::RateLimited { limit, .. } => {
-                return ProbeOutcome::Enforced(format!(
-                    "denied at request {attempt} of {ceiling} (limit {limit}/s)"
-                ))
+            SecurityDecision::RateLimited { limit, kind, .. } => {
+                connection = ProbeOutcome::Enforced(format!(
+                    "{} denied at request {attempt} (limit {limit}/s)",
+                    kind.as_str()
+                ));
+                break;
             }
             SecurityDecision::Allow => continue,
             other => {
-                return ProbeOutcome::Inconclusive(format!(
-                    "request {attempt} was denied by another control ({other:?}) before \
-                     the rate limiter could be reached"
-                ))
+                connection = ProbeOutcome::Inconclusive(format!(
+                    "request {attempt} denied by another control ({other:?})"
+                ));
+                break;
             }
         }
     }
 
-    ProbeOutcome::NotEnforced(format!(
-        "{ceiling} consecutive requests from one source were all allowed"
-    ))
+    // ── Request limiter, exercised directly ──────────────────────────────────
+    //
+    // Same per-IP governor bucket `evaluate()` checks, reached without going through
+    // the connection limiter that would otherwise answer first. Its own source, so the
+    // bucket is untouched.
+    let rps = config.rate_limiting.requests_per_second;
+    let req_ceiling = config
+        .rate_limiting
+        .burst_size
+        .saturating_add(rps)
+        .saturating_add(50)
+        .clamp(10, 5000);
+    let bucket = engine.get_ip_rate_limiter(PROBE_SOURCE_REQRATE);
+    let mut request = ProbeOutcome::NotEnforced(format!(
+        "{req_ceiling} consecutive checks against one bucket were all allowed"
+    ));
+    for attempt in 1..=req_ceiling {
+        if bucket.check().is_err() {
+            request = ProbeOutcome::Enforced(format!(
+                "request rate denied at {attempt} (limit {rps}/s, burst {})",
+                config.rate_limiting.burst_size
+            ));
+            break;
+        }
+    }
+
+    (connection, request)
 }
 
 /// Is mutual TLS actually required, or only written down?
@@ -1180,12 +1210,18 @@ pub fn probe_mtls(
 }
 
 /// Assemble the enforcement section.
-pub fn enforcement_section(waf: ProbeOutcome, rate: ProbeOutcome, mtls: ProbeOutcome) -> Section {
+pub fn enforcement_section(
+    waf: ProbeOutcome,
+    conn_rate: ProbeOutcome,
+    req_rate: ProbeOutcome,
+    mtls: ProbeOutcome,
+) -> Section {
     Section {
         title: "ENFORCEMENT (probed against TEST-NET-1 sources, no network I/O)",
         rows: vec![
             waf.row("WAF blocking"),
-            rate.row("Rate limiting"),
+            conn_rate.row("Connection rate limit"),
+            req_rate.row("Request rate limit"),
             mtls.row("mTLS"),
         ],
     }
