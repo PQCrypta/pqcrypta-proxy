@@ -352,10 +352,31 @@ pub fn render_banner(sections: &[Section]) {
                 row.value,
                 row.provenance.tag()
             );
+            // The aligned text is the message; the same facts also go out as
+            // structured fields. Under the JSON log format the table is just a string
+            // per line and `[VERIFIED]` is buried inside it, so a SIEM cannot assert
+            // on any of it — which makes an artifact whose entire purpose is to attest
+            // a security boundary unqueryable exactly where it would be relied on.
+            // Emitting both costs nothing: the human reads the message, the collector
+            // reads the fields.
             if row.provenance == Provenance::Verified && row.value.contains("FAILED") {
-                warn!("{text}");
+                warn!(
+                    attestation = true,
+                    section = %section.title,
+                    capability = %row.name,
+                    value = %row.value,
+                    provenance = %row.provenance.tag(),
+                    "{text}"
+                );
             } else {
-                info!("{text}");
+                info!(
+                    attestation = true,
+                    section = %section.title,
+                    capability = %row.name,
+                    value = %row.value,
+                    provenance = %row.provenance.tag(),
+                    "{text}"
+                );
             }
         }
         info!("{rule}");
@@ -670,5 +691,239 @@ mod tests {
             ..Default::default()
         };
         assert!(enforce_pqc_policy(&good, true).is_ok());
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Post-bind probes
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Probe the *listener that is actually bound*, not just the provider it was built
+/// from.
+///
+/// The in-memory handshake proves the crypto provider negotiates a post-quantum group.
+/// It cannot prove that the socket an operator's clients will reach was built from that
+/// provider — a listener assembled down a different code path, or handed a different
+/// config, would still pass. This closes that gap by completing a real TLS handshake
+/// over a real TCP connection to the bound port.
+///
+/// # Why this probe sends no HTTP request
+///
+/// It stops at the TLS handshake deliberately. Issuing a request would run the WAF, the
+/// rate limiter, the access log and the metrics counters against the proxy's own
+/// address, and this host runs a fail2ban jail over that access log. A startup
+/// self-test that contributes to a ban decision, consumes a rate-limit budget, or
+/// writes 4xx lines that later read as an attack is worse than no self-test. Anything
+/// that needs a request — WAF blocking, mTLS rejection, rate-limit thresholds — needs
+/// a probe identity the defences can exempt, and that exemption is a bypass primitive
+/// which has to be designed rather than improvised.
+pub fn probe_bound_listener(
+    addr: std::net::SocketAddr,
+    sni: &str,
+    provider: Arc<CryptoProvider>,
+    tls13_only: bool,
+) -> VerifiedRuntime {
+    let offered_groups = provider
+        .kx_groups
+        .iter()
+        .map(|g| format!("{:?}", g.name()))
+        .collect::<Vec<_>>();
+
+    match connect_and_read_params(addr, sni, provider, tls13_only) {
+        Ok((group, version, suite)) => VerifiedRuntime {
+            is_post_quantum: is_post_quantum(&group),
+            kx_group: Some(group),
+            tls_version: Some(version),
+            cipher_suite: Some(suite),
+            offered_groups,
+            error: None,
+        },
+        Err(e) => VerifiedRuntime {
+            offered_groups,
+            error: Some(format!("{e:#}")),
+            ..Default::default()
+        },
+    }
+}
+
+fn connect_and_read_params(
+    addr: std::net::SocketAddr,
+    sni: &str,
+    provider: Arc<CryptoProvider>,
+    tls13_only: bool,
+) -> Result<(String, String, String)> {
+    use std::io::Write;
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let versions: &[&rustls::SupportedProtocolVersion] = if tls13_only {
+        &[&rustls::version::TLS13]
+    } else {
+        &[&rustls::version::TLS12, &rustls::version::TLS13]
+    };
+
+    let config = ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(versions)
+        .context("probe client: protocol versions rejected")?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(ProbeVerifier))
+        .with_no_client_auth();
+
+    let server_name = ServerName::try_from(sni.to_string())?;
+    let mut conn = ClientConnection::new(Arc::new(config), server_name)
+        .context("probe client: connection setup")?;
+
+    // Short and absolute: this runs on the startup path, and a listener that cannot
+    // complete a loopback handshake in two seconds has already failed the test.
+    let timeout = Duration::from_secs(2);
+
+    // Retry, because `tokio::spawn` returns before the task it spawned has bound. The
+    // first version of this probe fired immediately after the listeners were spawned
+    // and reported "Connection refused" against a proxy that was in fact about to
+    // serve perfectly — a self-test that cries wolf is worse than none, because the
+    // next person to see it will start ignoring the section.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut sock = loop {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(s) => break s,
+            Err(e) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(150));
+                let _ = e;
+            }
+            Err(e) => {
+                return Err(anyhow!(
+                    "connecting to the bound listener at {addr}: {e}                      (still refusing after 5s — the listener did not come up)"
+                ))
+            }
+        }
+    };
+    sock.set_read_timeout(Some(timeout))?;
+    sock.set_write_timeout(Some(timeout))?;
+
+    while conn.is_handshaking() {
+        if conn.wants_write() {
+            conn.write_tls(&mut sock).context("probe: write")?;
+            sock.flush().ok();
+        }
+        if conn.is_handshaking() && conn.wants_read() {
+            let n = conn.read_tls(&mut sock).context("probe: read")?;
+            if n == 0 {
+                return Err(anyhow!(
+                    "listener closed the connection during the handshake"
+                ));
+            }
+            conn.process_new_packets()
+                .context("probe: handshake rejected by the listener")?;
+        }
+    }
+
+    let group = conn
+        .negotiated_key_exchange_group()
+        .map(|g| format!("{:?}", g.name()))
+        .ok_or_else(|| anyhow!("listener completed a handshake but reported no group"))?;
+    let version = conn
+        .protocol_version()
+        .map(|v| format!("{v:?}"))
+        .unwrap_or_else(|| "unknown".into());
+    let suite = conn
+        .negotiated_cipher_suite()
+        .map(|s| format!("{:?}", s.suite()))
+        .unwrap_or_else(|| "unknown".into());
+
+    // Close cleanly so the listener does not log an aborted connection for what was a
+    // successful test.
+    conn.send_close_notify();
+    if conn.wants_write() {
+        let _ = conn.write_tls(&mut sock);
+    }
+
+    Ok((group, version, suite))
+}
+
+/// Accepts any certificate, for probing this process's own listener over loopback.
+///
+/// This probe asks "what cryptographic parameters did my own socket negotiate", not
+/// "is this peer who it claims to be". Identity is not in question: the connection is
+/// to 127.0.0.1, to a port this process just bound, and nothing is sent over it. Full
+/// verification would instead make the probe fail on any host whose certificate is
+/// self-signed or issued for a name that does not resolve to loopback — turning a
+/// working PQC listener into a reported failure, which is the opposite of the point.
+///
+/// It is confined to this module, used only by [`probe_bound_listener`], and must
+/// never be reachable from configuration. If a future caller wants it for a
+/// non-loopback address, that caller is wrong.
+#[derive(Debug)]
+struct ProbeVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for ProbeVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::CryptoProvider::get_default()
+            .map(|p| p.signature_verification_algorithms.supported_schemes())
+            .unwrap_or_default()
+    }
+}
+
+/// Turn a post-bind probe result into attestation rows.
+pub fn bound_listener_section(probe: &VerifiedRuntime, addr: std::net::SocketAddr) -> Section {
+    let mut rows = vec![Row::observed("Probed endpoint", addr.to_string())];
+    match (&probe.kx_group, &probe.error) {
+        (Some(group), _) => {
+            rows.push(Row::verified("Listener reachable", "yes"));
+            rows.push(Row::verified("Listener group", group.clone()));
+            rows.push(Row {
+                name: "Listener PQC".into(),
+                value: if probe.is_post_quantum {
+                    "PASS".into()
+                } else {
+                    "FAILED — classical group".into()
+                },
+                provenance: Provenance::Verified,
+            });
+            if let Some(v) = &probe.tls_version {
+                rows.push(Row::verified("Listener TLS version", v.clone()));
+            }
+        }
+        (None, Some(err)) => {
+            rows.push(Row {
+                name: "Listener reachable".into(),
+                value: "FAILED".into(),
+                provenance: Provenance::Verified,
+            });
+            rows.push(Row::observed("Probe error", err.clone()));
+        }
+        (None, None) => rows.push(Row::observed("Listener probe", "not attempted")),
+    }
+    Section {
+        title: "BOUND TLS LISTENER (post-bind probe)",
+        rows,
     }
 }

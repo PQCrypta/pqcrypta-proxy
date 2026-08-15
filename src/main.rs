@@ -1244,6 +1244,48 @@ async fn run() -> anyhow::Result<()> {
         }
     });
 
+    // ── Post-bind attestation ────────────────────────────────────────────────
+    //
+    // The startup handshake proved the provider negotiates a post-quantum group. It
+    // could not prove that the socket clients will actually reach was built from that
+    // provider — a listener assembled down a different path would still have passed.
+    // This probes the bound port itself, over a real TCP connection, and is therefore
+    // the claim that corresponds to what a customer experiences.
+    //
+    // Failure is reported, never fatal: by this point the proxy is serving, and
+    // aborting a live listener because a self-test could not connect would turn a
+    // diagnostic into an outage. `pqc.required` has already gated startup on the
+    // provider-level verification, which is the check that can safely refuse to run.
+    {
+        // The primary HTTPS port. This was `additional_ports.first()`, which picked
+        // 4434 — a real TLS listener, but an auxiliary one, so the attestation
+        // described a port no client connects to while saying nothing about the one
+        // they all do.
+        let probe_port = config.server.udp_port;
+        let probe_addr = std::net::SocketAddr::from(([127, 0, 0, 1], probe_port));
+        let probe_sni = config
+            .routes
+            .first()
+            .and_then(|r| r.host.clone())
+            .unwrap_or_else(|| "localhost".to_string());
+        let probe = startup_verify::probe_bound_listener(
+            probe_addr,
+            &probe_sni,
+            Arc::new(pqcrypta_proxy::tls::build_pqc_provider()),
+            config.tls.min_version == "1.3",
+        );
+        startup_verify::render_banner(&[startup_verify::bound_listener_section(
+            &probe, probe_addr,
+        )]);
+        if probe.succeeded() && !probe.is_post_quantum {
+            warn!(
+                "The bound listener negotiated {} — the in-memory verification passed, \
+                 so the provider is capable and the listener is not using it.",
+                probe.kx_group.as_deref().unwrap_or("?")
+            );
+        }
+    }
+
     // Wait for shutdown signal
     info!("Press Ctrl+C to shutdown gracefully");
     tokio::select! {
