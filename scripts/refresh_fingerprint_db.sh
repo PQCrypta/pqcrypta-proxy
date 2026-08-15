@@ -28,6 +28,22 @@ CURATED_FILE="${DEST_DIR}/ja3-curated.json"
 LOG_FILE="/var/log/pqcrypta-proxy/fingerprint_db_refresh.log"
 SOURCE_URL="https://raw.githubusercontent.com/salesforce/ja3/master/lists/osx-nix-ja3.csv"
 
+# MaxMind GeoLite2 refresh. geoipupdate downloads into GEOIP_STAGE (persistent,
+# so its conditional GET makes an unchanged week free), each file is validated
+# there, and only a valid file is promoted to the live path below. The masters
+# had gone 7 months stale (2026-01-22) because nothing refreshed them at all.
+#
+# This job is the ONLY scheduler for geoipupdate: the Ubuntu package ships its
+# own `geoipupdate.timer` (Wed+Sat) and /etc/cron.d/geoipupdate, which would be a
+# second writer into the staging directory on a schedule that promotes nothing.
+# The timer was disabled on 2026-08-15; the cron.d entry self-disables under
+# systemd. If a package upgrade re-enables the timer, disable it again rather
+# than letting two owners race.
+GEOIP_DIR="/var/www/html/pqcrypta-proxy/data/geoip"
+GEOIP_STAGE="/var/lib/pqcrypta-proxy/geoip-staging"
+GEOIP_CONF="/etc/GeoIP.conf"
+GEOIP_EDITIONS="GeoLite2-City GeoLite2-ASN"
+
 # Other pqcrypta-proxy nodes: "<ssh-target>|<ssh-opts>" (see feedback_proxy_deploy_both).
 # The refresh cron only runs here, so every other node gets its data files pushed.
 # Use `-o Port=` and not `-p`: ssh reads `-p` as the port but scp reads it as
@@ -39,7 +55,16 @@ FLEET_NODES=(
     "root@74.208.108.89|-o Port=22 -i /root/.ssh/pentest_sync_rsa"
 )
 
-# Runtime data files replicated to every node: "<path>|<mode>|<owner-sensitive>".
+# Runtime data files replicated to every node:
+#   "<local path>|<mode>|<owner-sensitive>|<remote destination resolver>"
+#
+# The resolver is a command run ON the target node whose output is the
+# destination path; empty means "same path as here". It exists because api3
+# keeps the City database at /etc/pqcrypta/geoip/ via its own `geoip_db_path`,
+# so a sync that assumed the local path wrote a file that node's proxy does not
+# read — the copy would have looked successful while api3 quietly kept serving a
+# stale database forever. Resolving per node also means a future path change on
+# any node needs no edit here.
 # These are the files whose absence the proxy survives with only a WARN and a
 # silently disabled feature, which is exactly why drift here goes unnoticed:
 # the mail host was found on 2026-08-15 with none of them and no directories at
@@ -54,16 +79,85 @@ FLEET_NODES=(
 # GeoLite2-Country.mmdb is deliberately NOT here: the proxy reads City (via
 # config `geoip_db_path`) and ASN (hardcoded in speedtest.rs) and nothing reads
 # Country.
+GEOIP_PATH_RESOLVER="awk -F'\"' '/^geoip_db_path/ {print \$2}' /etc/pqcrypta/proxy-config.toml"
 FLEET_DATA_FILES=(
-    "${DEST_FILE}|600|yes"
-    "/var/www/html/pqcrypta-proxy/data/geoip/GeoLite2-City.mmdb|644|no"
-    "/var/www/html/pqcrypta-proxy/data/geoip/GeoLite2-ASN.mmdb|644|no"
+    "${DEST_FILE}|600|yes|"
+    "${GEOIP_DIR}/GeoLite2-City.mmdb|644|no|${GEOIP_PATH_RESOLVER}"
+    "${GEOIP_DIR}/GeoLite2-ASN.mmdb|644|no|"
 )
 
 mkdir -p "$(dirname "${LOG_FILE}")"
 TS=$(date '+%Y-%m-%d %H:%M:%S')
 
 log() { echo "[${TS}] $1" >> "${LOG_FILE}"; }
+
+LOCAL_RESTARTED=0
+GEOIP_CHANGED=0
+
+# Restart the local proxy at most once per run, however many databases changed.
+restart_local() {
+    [ "${LOCAL_RESTARTED}" -eq 1 ] && return
+    LOCAL_RESTARTED=1
+    systemctl restart pqcrypta-proxy 2>&1
+    if [ "$?" -eq 0 ]; then
+        log "pqcrypta-proxy restarted successfully"
+    else
+        log "WARNING: local restart failed — new data will be loaded on next restart"
+    fi
+}
+
+# A MaxMind DB ends with the metadata marker \xab\xcd\xefMaxMind.com. Checking for
+# it catches a truncated or error-page download, which would otherwise replace a
+# good database with something the proxy silently fails to load.
+valid_mmdb() {
+    [ -s "$1" ] || return 1
+    [ "$(stat -c %s "$1")" -gt 1000000 ] || return 1
+    tail -c 131072 "$1" | grep -qa $'\xab\xcd\xefMaxMind.com'
+}
+
+# Refresh the GeoLite2 masters, then promote only what validates.
+update_geoip() {
+    if ! command -v geoipupdate >/dev/null 2>&1; then
+        log "WARNING: geoipupdate not installed — GeoIP masters not refreshed (distribution still runs)"
+        return
+    fi
+    if [ ! -s "${GEOIP_CONF}" ] || grep -q "REPLACE_WITH_" "${GEOIP_CONF}"; then
+        log "WARNING: ${GEOIP_CONF} still holds placeholder credentials — GeoIP masters not refreshed (distribution still runs)"
+        return
+    fi
+
+    mkdir -p "${GEOIP_STAGE}"
+    GEOIP_OUT=$(geoipupdate -f "${GEOIP_CONF}" -d "${GEOIP_STAGE}" 2>&1)
+    if [ "$?" -ne 0 ]; then
+        log "ERROR: geoipupdate failed (${GEOIP_OUT}) — existing GeoIP masters preserved"
+        return
+    fi
+
+    for EDITION in ${GEOIP_EDITIONS}; do
+        STAGED="${GEOIP_STAGE}/${EDITION}.mmdb"
+        LIVE="${GEOIP_DIR}/${EDITION}.mmdb"
+        if [ ! -f "${STAGED}" ]; then
+            log "WARNING: ${EDITION} missing from staging after update — ${LIVE} left as is"
+            continue
+        fi
+        if ! valid_mmdb "${STAGED}"; then
+            log "ERROR: staged ${EDITION} failed validation — ${LIVE} left as is"
+            continue
+        fi
+        if [ -f "${LIVE}" ] && [ "$(sha256sum "${STAGED}" | awk '{print $1}')" = "$(sha256sum "${LIVE}" | awk '{print $1}')" ]; then
+            continue
+        fi
+        # Copy then rename: a rename within the directory is atomic, so the proxy
+        # never sees a half-written database even if it starts mid-promotion.
+        if cp "${STAGED}" "${LIVE}.tmp" && chmod 644 "${LIVE}.tmp" && mv "${LIVE}.tmp" "${LIVE}"; then
+            log "Updated ${EDITION} ($(stat -c %s "${LIVE}") bytes, built $(date -r "${LIVE}" '+%Y-%m-%d'))"
+            GEOIP_CHANGED=1
+        else
+            rm -f "${LIVE}.tmp"
+            log "ERROR: could not promote ${EDITION} into ${GEOIP_DIR}"
+        fi
+    done
+}
 
 # Replicate FLEET_DATA_FILES to every other node. Each file is compared by
 # checksum first, so an in-sync node is never copied to and never restarted, and
@@ -85,27 +179,32 @@ sync_fleet() {
         return
     fi
 
-    ALL_PATHS=""
-    ALL_DIRS=""
+    # Remote probe: resolve each file's destination on that node, create its
+    # directory, and report its checksum — one line of "<index> <path> <sum>"
+    # per file, in a single round trip.
+    PROBE=""
+    IDX=0
     for SPEC in "${SPECS[@]}"; do
         SRC="${SPEC%%|*}"
-        ALL_PATHS="${ALL_PATHS} ${SRC}"
-        case " ${ALL_DIRS} " in
-            *" $(dirname "${SRC}") "*) ;;
-            *) ALL_DIRS="${ALL_DIRS} $(dirname "${SRC}")" ;;
-        esac
+        RESOLVER="${SPEC##*|}"
+        if [ -n "${RESOLVER}" ]; then
+            PROBE="${PROBE} D=\$(${RESOLVER} 2>/dev/null); [ -z \"\$D\" ] && D=${SRC};"
+        else
+            PROBE="${PROBE} D=${SRC};"
+        fi
+        PROBE="${PROBE} mkdir -p \$(dirname \$D) 2>/dev/null; echo \"${IDX} \$D \$(sha256sum \$D 2>/dev/null | awk '{print \$1}')\";"
+        IDX=$((IDX + 1))
     done
 
     for NODE in "${FLEET_NODES[@]}"; do
         TARGET="${NODE%%|*}"
         SSH_OPTS="${NODE#*|}"
 
-        # One round trip: create any missing directories and read every checksum.
         # The trailing `:` forces a zero exit so a missing FILE is not mistaken
         # for an unreachable NODE.
         # shellcheck disable=SC2086
-        REMOTE_SUMS=$(ssh ${SSH_OPTS} -o BatchMode=yes -o ConnectTimeout=15 "${TARGET}" \
-            "mkdir -p ${ALL_DIRS} 2>/dev/null; sha256sum ${ALL_PATHS} 2>/dev/null; :" 2>/dev/null)
+        PROBE_OUT=$(ssh ${SSH_OPTS} -o BatchMode=yes -o ConnectTimeout=15 "${TARGET}" \
+            "${PROBE} :" 2>/dev/null)
         if [ "$?" -ne 0 ]; then
             log "WARNING: ${TARGET} unreachable — left on its previous data files"
             continue
@@ -113,27 +212,36 @@ sync_fleet() {
 
         CHANGED=""
         FIXUPS=""
+        IDX=0
         for SPEC in "${SPECS[@]}"; do
             SRC="${SPEC%%|*}"
             REST="${SPEC#*|}"
             MODE="${REST%%|*}"
-            OWNED="${REST##*|}"
+            REST="${REST#*|}"
+            OWNED="${REST%%|*}"
+
+            DEST=$(echo "${PROBE_OUT}" | awk -v k="${IDX}" '$1 == k { print $2 }')
+            REMOTE_SUM=$(echo "${PROBE_OUT}" | awk -v k="${IDX}" '$1 == k { print $3 }')
+            IDX=$((IDX + 1))
+            if [ -z "${DEST}" ]; then
+                log "WARNING: ${TARGET} did not resolve a destination for $(basename "${SRC}") — skipped"
+                continue
+            fi
 
             LOCAL_SUM=$(sha256sum "${SRC}" | awk '{print $1}')
-            REMOTE_SUM=$(echo "${REMOTE_SUMS}" | awk -v p="${SRC}" '$2 == p { print $1 }')
             [ "${LOCAL_SUM}" = "${REMOTE_SUM}" ] && continue
 
             # shellcheck disable=SC2086
             if ! scp -q -C ${SSH_OPTS} -o BatchMode=yes -o ConnectTimeout=15 \
-                    "${SRC}" "${TARGET}:${SRC}" 2>/dev/null; then
-                log "WARNING: could not copy $(basename "${SRC}") to ${TARGET} — node left on its previous copy"
+                    "${SRC}" "${TARGET}:${DEST}" 2>/dev/null; then
+                log "WARNING: could not copy $(basename "${SRC}") to ${TARGET}:${DEST} — node left on its previous copy"
                 continue
             fi
             CHANGED="${CHANGED} $(basename "${SRC}")"
             if [ "${OWNED}" = "yes" ]; then
-                FIXUPS="${FIXUPS} if [ -n \"\$RU\" ] && [ \"\$RU\" != root ]; then chown \$RU:\$RU ${SRC} && chmod 640 ${SRC}; else chmod ${MODE} ${SRC}; fi;"
+                FIXUPS="${FIXUPS} if [ -n \"\$RU\" ] && [ \"\$RU\" != root ]; then chown \$RU:\$RU ${DEST} && chmod 640 ${DEST}; else chmod ${MODE} ${DEST}; fi;"
             else
-                FIXUPS="${FIXUPS} chmod ${MODE} ${SRC};"
+                FIXUPS="${FIXUPS} chmod ${MODE} ${DEST};"
             fi
         done
 
@@ -158,18 +266,24 @@ sync_fleet() {
     done
 }
 
-# Every exit path goes through here, so the fleet is reconciled even when the
-# upstream fetch failed and the local database was left untouched.
+# Every exit path goes through here, so the GeoIP refresh and the fleet are
+# reconciled even when the JA3 fetch failed and the local database was left
+# untouched.
 finish() {
+    [ "${GEOIP_CHANGED}" -eq 1 ] && restart_local
     sync_fleet
     log "Refresh complete"
     exit 0
 }
 
-log "Starting JA3 fingerprint database refresh..."
+log "Starting proxy data refresh..."
 
 # Bail out cleanly on any unexpected error — never touch the live DB
 set +e
+
+# GeoIP first: it is independent of the JA3 fetch, and every JA3 failure path
+# routes through finish(), which needs the masters already updated.
+update_geoip
 
 TMP_CSV=$(mktemp /tmp/ja3_refresh_XXXXXX.csv)
 TMP_JSON=$(mktemp /tmp/ja3_refresh_XXXXXX.json)
@@ -296,7 +410,7 @@ if [ -f "${DEST_FILE}" ]; then
 fi
 
 if [ "${NEW_SUM}" = "${OLD_SUM}" ]; then
-    log "Database unchanged (${ENTRY_COUNT} entries) — no local restart needed"
+    log "JA3 database unchanged (${ENTRY_COUNT} entries)"
     finish
 fi
 
@@ -306,12 +420,6 @@ mv "${TMP_JSON}" "${DEST_FILE}"
 log "Updated JA3 database: ${ENTRY_COUNT} entries (was: $([ -n "${OLD_SUM}" ] && echo 'different' || echo 'new'))"
 
 # Reload service to pick up new DB (fast: proxy starts in < 2s)
-systemctl restart pqcrypta-proxy 2>&1
-RESTART_EXIT=$?
-if [ "${RESTART_EXIT}" -eq 0 ]; then
-    log "pqcrypta-proxy restarted successfully"
-else
-    log "WARNING: restart failed (exit ${RESTART_EXIT}) — new DB will be loaded on next restart"
-fi
+restart_local
 
 finish
