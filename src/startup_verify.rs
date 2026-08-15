@@ -927,3 +927,266 @@ pub fn bound_listener_section(probe: &VerifiedRuntime, addr: std::net::SocketAdd
         rows,
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Enforcement probes: WAF, mTLS, rate limiting
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// The source address every enforcement probe presents.
+///
+/// RFC 5737 TEST-NET-1, reserved for documentation and guaranteed never to appear as a
+/// real client. This choice is the whole safety argument for these probes, and it
+/// replaces the header-token exemption that seemed obvious at first:
+///
+/// * **No exemption exists, so no bypass primitive exists.** The rules run against the
+///   probe exactly as they run against an attacker — there is no branch in the
+///   enforcement path that a leaked token could take. A mechanism that lets a request
+///   skip the WAF is a liability forever; not needing one is free.
+/// * **Side effects land somewhere harmless.** These rules deliberately mutate state —
+///   `evaluate` adds to the blocklist and increments suspicious-pattern counters, which
+///   is part of the decision, not the rendering. Pointing that at 192.0.2.x means a
+///   blocklist entry no client can ever collide with, and a rate-limit bucket that is
+///   nobody's budget.
+/// * **It is the only address that works at all.** `is_trusted_ip()` short-circuits
+///   `evaluate()` to `Allow` for loopback, so a probe from 127.0.0.1 would sail through
+///   every rule and report "the WAF did not block" — a false failure that would have
+///   made the header-token design test precisely nothing.
+///
+/// Nothing is sent over a network for these, so there is no access-log line and no
+/// fail2ban input either.
+const PROBE_SOURCE_WAF: std::net::IpAddr =
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
+const PROBE_SOURCE_RATELIMIT: std::net::IpAddr =
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 2));
+
+/// The outcome of probing one enforcement control.
+pub enum ProbeOutcome {
+    /// The control ran and did what it is configured to do.
+    Enforced(String),
+    /// The control ran and did not enforce. This is a finding.
+    NotEnforced(String),
+    /// The control is switched off in configuration. Not a failure.
+    NotConfigured,
+    /// The probe itself could not run.
+    Inconclusive(String),
+}
+
+impl ProbeOutcome {
+    fn row(self, name: &str) -> Row {
+        match self {
+            Self::Enforced(detail) => Row::verified(name, format!("ENFORCED — {detail}")),
+            Self::NotEnforced(detail) => Row {
+                name: name.into(),
+                value: format!("FAILED — {detail}"),
+                provenance: Provenance::Verified,
+            },
+            Self::NotConfigured => Row::configured(name, "not configured"),
+            Self::Inconclusive(why) => Row::observed(name, format!("inconclusive — {why}")),
+        }
+    }
+}
+
+/// A request the WAF should have no reason to object to.
+///
+/// The first version of these probes sent an empty header map, and every request —
+/// including a bare `GET /` — came back `WafBlock`, because this WAF rejects requests
+/// with no User-Agent. That made the WAF probe pass for entirely the wrong reason: it
+/// was not detecting the attack payloads at all, it was rejecting the absence of a
+/// header, and it would have reported ENFORCED against a ruleset that could not spot a
+/// single injection.
+fn probe_headers() -> http::HeaderMap {
+    let mut h = http::HeaderMap::new();
+    h.insert(
+        http::header::USER_AGENT,
+        http::HeaderValue::from_static(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
+             Chrome/140.0 Safari/537.36",
+        ),
+    );
+    h.insert(http::header::ACCEPT, http::HeaderValue::from_static("*/*"));
+    h
+}
+
+/// Does the WAF actually block an attack, or does it block everything?
+///
+/// A probe that only sends attacks cannot tell those two apart, and this one could not:
+/// its attacks were blocked, but so was a benign request, so the "2/2 patterns blocked"
+/// it reported was evidence of nothing. The differential is the whole test — a control
+/// request that must be allowed, then attacks that must not be, with the same headers
+/// and the same source. Only the difference between the two is attributable to attack
+/// detection.
+///
+/// Returns `Inconclusive` rather than a verdict when the control is refused, because at
+/// that point the probe genuinely cannot separate a working ruleset from a blanket deny,
+/// and saying so is more useful than guessing.
+pub fn probe_waf(
+    config: &crate::config::ProxyConfig,
+    engine: &crate::security::SecurityState,
+) -> ProbeOutcome {
+    use crate::security::{RequestPolicy, SecurityDecision, SecurityRequestView};
+
+    if !config.waf.enabled {
+        return ProbeOutcome::NotConfigured;
+    }
+
+    let headers = probe_headers();
+    let policy = RequestPolicy::default();
+    let view = |path: &'static str, query: &'static str| SecurityRequestView {
+        ip: PROBE_SOURCE_WAF,
+        method: "GET",
+        path,
+        query,
+        headers: &headers,
+        body: None,
+    };
+
+    // Control first, and before any attack has had the chance to get this source
+    // blocklisted — the order matters, because an auto-block triggered by the attacks
+    // would make the control fail for a reason that has nothing to do with the control.
+    match engine.evaluate(&view("/", ""), &policy) {
+        SecurityDecision::Allow => {}
+        other => {
+            return ProbeOutcome::Inconclusive(format!(
+                "control request was refused ({other:?}) — cannot distinguish attack \
+                 detection from a blanket deny"
+            ))
+        }
+    }
+
+    let cases: &[(&str, &str, &str)] = &[
+        ("path traversal", "/../../../../etc/passwd", ""),
+        ("sql injection", "/search", "q=1%27%20OR%20%271%27%3D%271"),
+    ];
+
+    let mut blocked = Vec::new();
+    let mut allowed = Vec::new();
+    for (label, path, query) in cases {
+        match engine.evaluate(&view(path, query), &policy) {
+            SecurityDecision::Allow => allowed.push(label.to_string()),
+            SecurityDecision::WafBlock { rule } => blocked.push(format!("{label} ({rule})")),
+            other => blocked.push(format!("{label} ({other:?})")),
+        }
+    }
+
+    match (blocked.len(), allowed.len()) {
+        (n, 0) if n > 0 => {
+            ProbeOutcome::Enforced(format!("control allowed, {n}/{n} attacks blocked"))
+        }
+        (0, _) => ProbeOutcome::NotEnforced(
+            "control allowed but no attack pattern was blocked".to_string(),
+        ),
+        (b, a) => ProbeOutcome::NotEnforced(format!(
+            "blocked {b}, allowed {a} ({}) — partial coverage",
+            allowed.join(", ")
+        )),
+    }
+}
+
+/// Does the rate limiter actually deny past its threshold?
+///
+/// Drives a synthetic key past the configured limit and reports the request number at
+/// which the limiter said no.
+///
+/// The first version of this reported "900 consecutive requests were all allowed" on a
+/// proxy where every single one had in fact been denied — ten by the WAF, because the
+/// probe sent no User-Agent, and the remaining 890 by the blocklist the WAF's
+/// auto-block had put the source on. It matched only on `RateLimited` and treated every
+/// other verdict as a pass, so it printed a FAILED that was the precise opposite of
+/// what happened. A self-test that reports a false failure in a security banner is
+/// worse than no self-test: the first person to investigate one and find nothing will
+/// discount the next.
+///
+/// So: requests the WAF has no reason to refuse, and any denial by a *different*
+/// control is reported as inconclusive with the verdict named, never as "allowed".
+pub async fn probe_rate_limit(
+    config: &crate::config::ProxyConfig,
+    engine: &crate::security::SecurityState,
+) -> ProbeOutcome {
+    use crate::security::{RequestPolicy, SecurityDecision, SecurityRequestView};
+
+    if !config.rate_limiting.enabled {
+        return ProbeOutcome::NotConfigured;
+    }
+
+    let headers = probe_headers();
+    let policy = RequestPolicy::default();
+
+    // Bounded above the configured burst so a limiter that never denies is reported
+    // rather than spun on, and so "denied late" stays distinguishable from "never".
+    let ceiling = config
+        .rate_limiting
+        .burst_size
+        .saturating_add(config.rate_limiting.requests_per_second)
+        .saturating_add(50)
+        .clamp(10, 5000);
+
+    for attempt in 1..=ceiling {
+        let view = SecurityRequestView {
+            ip: PROBE_SOURCE_RATELIMIT,
+            method: "GET",
+            path: "/",
+            query: "",
+            headers: &headers,
+            body: None,
+        };
+        match engine.evaluate(&view, &policy) {
+            SecurityDecision::RateLimited { limit, .. } => {
+                return ProbeOutcome::Enforced(format!(
+                    "denied at request {attempt} of {ceiling} (limit {limit}/s)"
+                ))
+            }
+            SecurityDecision::Allow => continue,
+            other => {
+                return ProbeOutcome::Inconclusive(format!(
+                    "request {attempt} was denied by another control ({other:?}) before \
+                     the rate limiter could be reached"
+                ))
+            }
+        }
+    }
+
+    ProbeOutcome::NotEnforced(format!(
+        "{ceiling} consecutive requests from one source were all allowed"
+    ))
+}
+
+/// Is mutual TLS actually required, or only written down?
+///
+/// Reported from configuration when it is off, because "off" is a deliberate state and
+/// not a failure. When it is on, the honest test is a handshake without a client
+/// certificate against the bound listener — which is a TLS-layer rejection and involves
+/// no HTTP request, no WAF, no rate limiter and no access log.
+pub fn probe_mtls(
+    require_client_cert: bool,
+    addr: std::net::SocketAddr,
+    sni: &str,
+    provider: Arc<CryptoProvider>,
+    tls13_only: bool,
+) -> ProbeOutcome {
+    if !require_client_cert {
+        return ProbeOutcome::NotConfigured;
+    }
+    // A probe client offers no client certificate, so a listener that demands one must
+    // refuse the handshake. Success here would mean mTLS is configured and not enforced.
+    match connect_and_read_params(addr, sni, provider, tls13_only) {
+        Ok((group, _, _)) => ProbeOutcome::NotEnforced(format!(
+            "handshake completed without a client certificate (group {group})"
+        )),
+        Err(e) => ProbeOutcome::Enforced(format!(
+            "handshake without a client certificate was refused ({})",
+            e.to_string().lines().next().unwrap_or("rejected")
+        )),
+    }
+}
+
+/// Assemble the enforcement section.
+pub fn enforcement_section(waf: ProbeOutcome, rate: ProbeOutcome, mtls: ProbeOutcome) -> Section {
+    Section {
+        title: "ENFORCEMENT (probed against TEST-NET-1 sources, no network I/O)",
+        rows: vec![
+            waf.row("WAF blocking"),
+            rate.row("Rate limiting"),
+            mtls.row("mTLS"),
+        ],
+    }
+}

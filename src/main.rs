@@ -1274,9 +1274,37 @@ async fn run() -> anyhow::Result<()> {
             Arc::new(pqcrypta_proxy::tls::build_pqc_provider()),
             config.tls.min_version == "1.3",
         );
-        startup_verify::render_banner(&[startup_verify::bound_listener_section(
-            &probe, probe_addr,
-        )]);
+        // Enforcement controls. These run the real rules against RFC 5737 TEST-NET
+        // sources rather than over a socket: no exemption mechanism is introduced, so
+        // no bypass primitive exists, and the state these rules deliberately mutate —
+        // blocklist entries, suspicious-pattern counters, rate buckets — lands on
+        // addresses no client can ever present. A loopback probe would have been
+        // useless anyway: is_trusted_ip() short-circuits evaluate() to Allow.
+        // One engine for both probes, not one each. `SecurityState::new` spawns a
+        // permanent cleanup task that reloads blocklists every minute, and a clone of
+        // the state keeps it alive after the handle is dropped — so constructing one
+        // per probe leaked two such tasks for the life of the process.
+        //
+        // This is still a separate instance from the one the listeners serve with, so
+        // what it attests is "the rules this configuration produces", not "the object
+        // currently handling traffic". Those coincide today because both are built
+        // from the same config by the same constructor; plumbing the live instance out
+        // of http_listener would close the gap and is the honest next step.
+        let probe_engine = pqcrypta_proxy::security::SecurityState::new(&config);
+        let waf = startup_verify::probe_waf(&config, &probe_engine);
+        let rate = startup_verify::probe_rate_limit(&config, &probe_engine).await;
+        let mtls = startup_verify::probe_mtls(
+            config.tls.require_client_cert,
+            probe_addr,
+            &probe_sni,
+            Arc::new(pqcrypta_proxy::tls::build_pqc_provider()),
+            config.tls.min_version == "1.3",
+        );
+
+        startup_verify::render_banner(&[
+            startup_verify::bound_listener_section(&probe, probe_addr),
+            startup_verify::enforcement_section(waf, rate, mtls),
+        ]);
         if probe.succeeded() && !probe.is_post_quantum {
             warn!(
                 "The bound listener negotiated {} — the in-memory verification passed, \
