@@ -121,7 +121,10 @@ update_geoip() {
         log "WARNING: geoipupdate not installed — GeoIP masters not refreshed (distribution still runs)"
         return
     fi
-    if [ ! -s "${GEOIP_CONF}" ] || grep -q "REPLACE_WITH_" "${GEOIP_CONF}"; then
+    # Anchored to the directives: an unanchored match also hits the comment in
+    # GeoIP.conf that explains the placeholder, which silently disabled the
+    # refresh even with real credentials in place.
+    if [ ! -s "${GEOIP_CONF}" ] || grep -qE "^(AccountID|LicenseKey)[[:space:]]+REPLACE_WITH_" "${GEOIP_CONF}"; then
         log "WARNING: ${GEOIP_CONF} still holds placeholder credentials — GeoIP masters not refreshed (distribution still runs)"
         return
     fi
