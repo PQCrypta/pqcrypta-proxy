@@ -61,7 +61,7 @@
 //! - Provides hot-reload of configuration and TLS certificates
 //! - Exposes admin API for health, metrics, and management
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
@@ -119,13 +119,20 @@ struct Args {
     #[arg(long, env = "PQCRYPTA_ADMIN_PORT")]
     admin_port: Option<u16>,
 
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(long, default_value = "info", env = "PQCRYPTA_LOG_LEVEL")]
-    log_level: String,
+    /// Log level (trace, debug, info, warn, error).
+    /// Unset falls back to `[logging] level` in the config file, then "info".
+    #[arg(long, env = "PQCRYPTA_LOG_LEVEL")]
+    log_level: Option<String>,
 
-    /// Enable JSON log format
-    #[arg(long, env = "PQCRYPTA_JSON_LOGS")]
-    json_logs: bool,
+    /// Enable JSON log format (`--json-logs`, or `--json-logs=false` to force text).
+    /// Unset falls back to `[logging] format` in the config file, then text.
+    #[arg(
+        long,
+        env = "PQCRYPTA_JSON_LOGS",
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    json_logs: Option<bool>,
 
     /// Disable PQC hybrid key exchange
     #[arg(long)]
@@ -210,11 +217,35 @@ async fn run() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    // Initialize logging
-    init_logging(&args.log_level, args.json_logs)?;
+    // Initialize logging. Precedence is CLI flag / env var, then the config
+    // file's [logging] section, then the built-in default — so a node's own
+    // config governs its logging unless something explicitly overrides it.
+    // Each setting reports its own source: they resolve independently, and one
+    // label for both would claim the config governs the format when only the
+    // level came from an env var (or the reverse).
+    let (file_level, file_json) = logging_prefs_from_file(&args.config);
+    let (log_level, level_source) = match (args.log_level.clone(), file_level) {
+        (Some(level), _) => (level, "cli/env"),
+        (None, Some(level)) => (level, "config"),
+        (None, None) => ("info".to_string(), "default"),
+    };
+    let (json_logs, format_source) = match (args.json_logs, file_json) {
+        (Some(json), _) => (json, "cli/env"),
+        (None, Some(json)) => (json, "config"),
+        (None, None) => (false, "default"),
+    };
+
+    init_logging(&log_level, json_logs)?;
 
     info!("Starting PQCrypta Proxy v{}", env!("CARGO_PKG_VERSION"));
     info!("Configuration file: {:?}", args.config);
+    info!(
+        "Logging: level={} (from {}) format={} (from {})",
+        log_level,
+        level_source,
+        if json_logs { "json" } else { "text" },
+        format_source
+    );
 
     // Load configuration
     let (config_manager, mut reload_rx) = ConfigManager::new(&args.config).await?;
@@ -1397,6 +1428,50 @@ async fn run() -> anyhow::Result<()> {
 /// in `main` (after config is loaded), the global provider is replaced and all
 /// subsequent spans are exported via OTLP.  Startup spans created during config
 /// loading are silently dropped — this is acceptable.
+/// Read `[logging] level` and `format` straight from the config file, before the
+/// full configuration is loaded.
+///
+/// The tracing subscriber can only be installed once and must exist before
+/// anything logs — including the config load itself — so these two values cannot
+/// wait for the validated `Config`. Until this existed they were parsed into
+/// `LoggingConfig` and then read by nothing at all: every node's config declared
+/// `format = "json"` while three of the four logged plain text, because only the
+/// `PQCRYPTA_JSON_LOGS` env var had any effect.
+///
+/// Parse failures return `None` deliberately. There is no logger yet to report
+/// them through, and the real loader reports configuration problems properly a
+/// moment later; a malformed file must not cost us the logging we need to see
+/// that report.
+fn logging_prefs_from_file(path: &Path) -> (Option<String>, Option<bool>) {
+    #[derive(serde::Deserialize)]
+    struct LoggingSection {
+        level: Option<String>,
+        format: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Prefs {
+        logging: Option<LoggingSection>,
+    }
+
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return (None, None);
+    };
+    let Ok(prefs) = toml::from_str::<Prefs>(&text) else {
+        return (None, None);
+    };
+    let Some(logging) = prefs.logging else {
+        return (None, None);
+    };
+
+    // Anything that is not "json" is text, matching the documented two values.
+    let json = logging
+        .format
+        .as_deref()
+        .map(|format| format.eq_ignore_ascii_case("json"));
+
+    (logging.level, json)
+}
+
 fn init_logging(level: &str, json: bool) -> anyhow::Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
     // tracing_opentelemetry::layer() references the global tracer provider.
