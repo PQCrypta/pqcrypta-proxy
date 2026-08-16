@@ -62,7 +62,8 @@
 //! - Exposes admin API for health, metrics, and management
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use clap::Parser;
 use tokio::signal;
@@ -223,28 +224,28 @@ async fn run() -> anyhow::Result<()> {
     // Each setting reports its own source: they resolve independently, and one
     // label for both would claim the config governs the format when only the
     // level came from an env var (or the reverse).
-    let (file_level, file_json) = logging_prefs_from_file(&args.config);
-    let (log_level, level_source) = match (args.log_level.clone(), file_level) {
+    let prefs = logging_prefs_from_file(&args.config);
+    let (log_level, level_source) = match (args.log_level.clone(), prefs.level) {
         (Some(level), _) => (level, "cli/env"),
         (None, Some(level)) => (level, "config"),
         (None, None) => ("info".to_string(), "default"),
     };
-    let (json_logs, format_source) = match (args.json_logs, file_json) {
+    let (json_logs, format_source) = match (args.json_logs, prefs.json) {
         (Some(json), _) => (json, "cli/env"),
         (None, Some(json)) => (json, "config"),
         (None, None) => (false, "default"),
     };
-
-    init_logging(&log_level, json_logs)?;
+    let log_destination = init_logging(&log_level, json_logs, prefs.rotation)?;
 
     info!("Starting PQCrypta Proxy v{}", env!("CARGO_PKG_VERSION"));
     info!("Configuration file: {:?}", args.config);
     info!(
-        "Logging: level={} (from {}) format={} (from {})",
+        "Logging: level={} (from {}) format={} (from {}) destination={}",
         log_level,
         level_source,
         if json_logs { "json" } else { "text" },
-        format_source
+        format_source,
+        log_destination
     );
 
     // Load configuration
@@ -1428,6 +1429,35 @@ async fn run() -> anyhow::Result<()> {
 /// in `main` (after config is loaded), the global provider is replaced and all
 /// subsequent spans are exported via OTLP.  Startup spans created during config
 /// loading are silently dropped — this is acceptable.
+/// Hands the rotating writer to the fmt layer, which needs a fresh `Write` per
+/// event; the mutex guard is that per-event handle.
+#[derive(Clone)]
+struct RotatingWriterHandle(Arc<Mutex<pqcrypta_proxy::log_file::RotatingFileWriter>>);
+
+struct RotatingWriterGuard<'a>(
+    std::sync::MutexGuard<'a, pqcrypta_proxy::log_file::RotatingFileWriter>,
+);
+
+impl std::io::Write for RotatingWriterGuard<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RotatingWriterHandle {
+    type Writer = RotatingWriterGuard<'a>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        // A panic elsewhere must not silence logging, which is exactly when the
+        // logs matter most: take the data back out of a poisoned lock.
+        RotatingWriterGuard(self.0.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
 /// Read `[logging] level` and `format` straight from the config file, before the
 /// full configuration is loaded.
 ///
@@ -1442,11 +1472,15 @@ async fn run() -> anyhow::Result<()> {
 /// them through, and the real loader reports configuration problems properly a
 /// moment later; a malformed file must not cost us the logging we need to see
 /// that report.
-fn logging_prefs_from_file(path: &Path) -> (Option<String>, Option<bool>) {
+fn logging_prefs_from_file(path: &Path) -> LoggingPrefs {
     #[derive(serde::Deserialize)]
     struct LoggingSection {
         level: Option<String>,
         format: Option<String>,
+        file: Option<PathBuf>,
+        max_size_mb: Option<u64>,
+        max_backups: Option<usize>,
+        max_age_days: Option<u64>,
     }
     #[derive(serde::Deserialize)]
     struct Prefs {
@@ -1454,13 +1488,13 @@ fn logging_prefs_from_file(path: &Path) -> (Option<String>, Option<bool>) {
     }
 
     let Ok(text) = std::fs::read_to_string(path) else {
-        return (None, None);
+        return LoggingPrefs::default();
     };
     let Ok(prefs) = toml::from_str::<Prefs>(&text) else {
-        return (None, None);
+        return LoggingPrefs::default();
     };
     let Some(logging) = prefs.logging else {
-        return (None, None);
+        return LoggingPrefs::default();
     };
 
     // Anything that is not "json" is text, matching the documented two values.
@@ -1469,11 +1503,121 @@ fn logging_prefs_from_file(path: &Path) -> (Option<String>, Option<bool>) {
         .as_deref()
         .map(|format| format.eq_ignore_ascii_case("json"));
 
-    (logging.level, json)
+    // An empty path means stdout, matching the documented "empty = stdout".
+    let rotation = logging
+        .file
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| RotationConfig {
+            path,
+            max_size_bytes: logging.max_size_mb.unwrap_or(50) * 1024 * 1024,
+            max_backups: logging.max_backups.unwrap_or(3),
+            max_age_days: logging.max_age_days.unwrap_or(7),
+        });
+
+    LoggingPrefs {
+        level: logging.level,
+        json,
+        rotation,
+    }
 }
 
-fn init_logging(level: &str, json: bool) -> anyhow::Result<()> {
+/// Logging settings recovered from the config file before the subscriber exists.
+#[derive(Default)]
+struct LoggingPrefs {
+    level: Option<String>,
+    json: Option<bool>,
+    rotation: Option<RotationConfig>,
+}
+
+/// `[logging] file` plus its rotation settings, as read from the config file.
+struct RotationConfig {
+    path: PathBuf,
+    max_size_bytes: u64,
+    max_backups: usize,
+    max_age_days: u64,
+}
+
+/// Install the tracing subscriber.
+///
+/// When `rotation` is set, log records go to that file instead of stdout — the
+/// documented meaning of `[logging] file` ("empty = stdout"). A breadcrumb is
+/// printed to stderr either way, so `journalctl -u pqcrypta-proxy` still says
+/// where the logs went rather than simply falling silent.
+///
+/// If the file cannot be opened the process keeps logging to stdout. A bad log
+/// path is a reason to be noisy, never a reason to run blind.
+///
+/// Returns where records actually went, which is not always what was asked for:
+/// reporting the configured path after falling back to stdout would send anyone
+/// debugging to an empty file.
+fn init_logging(
+    level: &str,
+    json: bool,
+    rotation: Option<RotationConfig>,
+) -> anyhow::Result<String> {
+    let mut destination = "stdout".to_string();
+    let file_writer = match rotation {
+        Some(rotation) => {
+            let path = rotation.path.clone();
+            let config = pqcrypta_proxy::log_file::RotationConfig {
+                path: rotation.path,
+                max_size_bytes: rotation.max_size_bytes,
+                max_backups: rotation.max_backups,
+                max_age: (rotation.max_age_days > 0)
+                    .then(|| Duration::from_secs(rotation.max_age_days * 24 * 60 * 60)),
+            };
+            match pqcrypta_proxy::log_file::RotatingFileWriter::open(config) {
+                Ok(writer) => {
+                    eprintln!(
+                        "pqcrypta-proxy: logging to {} (rotating at {} MB, keeping {} backups)",
+                        path.display(),
+                        rotation.max_size_bytes / (1024 * 1024),
+                        rotation.max_backups
+                    );
+                    destination = path.display().to_string();
+                    Some(Arc::new(Mutex::new(writer)))
+                }
+                Err(error) => {
+                    eprintln!(
+                        "pqcrypta-proxy: cannot open log file {} ({error}) — logging to stdout",
+                        path.display()
+                    );
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+
+    // Four combinations of destination and format. Each arm builds its own
+    // layers because the subscriber type is inferred, not erased.
+    if let Some(writer) = file_writer {
+        let writer = RotatingWriterHandle(writer);
+        if json {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(fmt::layer().json().with_ansi(false).with_writer(writer))
+                .with(tracing_opentelemetry::layer())
+                .init();
+        } else {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(
+                    fmt::layer()
+                        .with_target(true)
+                        .with_thread_ids(true)
+                        // Escape codes in a file are noise, not colour.
+                        .with_ansi(false)
+                        .with_writer(writer),
+                )
+                .with(tracing_opentelemetry::layer())
+                .init();
+        }
+        return Ok(destination);
+    }
+
     // tracing_opentelemetry::layer() references the global tracer provider.
     // It is a NOOP until otel::init_otel() replaces the global provider after
     // config is loaded.  Instantiated fresh in each branch so the subscriber
@@ -1492,7 +1636,7 @@ fn init_logging(level: &str, json: bool) -> anyhow::Result<()> {
             .init();
     }
 
-    Ok(())
+    Ok(destination)
 }
 
 /// Wait for OS shutdown signal

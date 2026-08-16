@@ -1326,6 +1326,27 @@ pub struct LoggingConfig {
     /// Enable structured audit logging (default true)
     #[serde(default = "default_true")]
     pub audit_log_enabled: bool,
+    /// Rotate `file` once it reaches this size, in MB (0 = never rotate on size)
+    #[serde(default = "default_log_max_size_mb")]
+    pub max_size_mb: u64,
+    /// How many rotated files to keep alongside `file`
+    #[serde(default = "default_log_max_backups")]
+    pub max_backups: usize,
+    /// Delete rotated files older than this many days (0 = never delete on age)
+    #[serde(default = "default_log_max_age_days")]
+    pub max_age_days: u64,
+}
+
+fn default_log_max_size_mb() -> u64 {
+    50
+}
+
+fn default_log_max_backups() -> usize {
+    3
+}
+
+fn default_log_max_age_days() -> u64 {
+    7
 }
 
 impl Default for LoggingConfig {
@@ -1338,6 +1359,9 @@ impl Default for LoggingConfig {
             access_log_file: None,
             audit_log_path: None,
             audit_log_enabled: true,
+            max_size_mb: default_log_max_size_mb(),
+            max_backups: default_log_max_backups(),
+            max_age_days: default_log_max_age_days(),
         }
     }
 }

@@ -81,6 +81,7 @@ pub mod handlers;
 pub mod http3_features;
 pub mod http_listener;
 pub mod load_balancer;
+pub mod log_file;
 pub mod metrics;
 pub mod ocsp;
 pub mod otel;
