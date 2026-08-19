@@ -65,6 +65,8 @@ pub struct AdminState {
     pub audit_logger: Option<Arc<AuditLogger>>,
     /// Shared load balancer (provides canary control across all listeners)
     pub load_balancer: Option<Arc<LoadBalancer>>,
+    /// Shared security state, for live blocklist inspection and unblocking
+    pub security: Option<crate::security::SecurityState>,
 }
 
 /// Admin API server
@@ -88,6 +90,7 @@ impl AdminServer {
         metrics: Option<Arc<MetricsRegistry>>,
         audit_logger: Option<Arc<AuditLogger>>,
         load_balancer: Option<Arc<LoadBalancer>>,
+        security: Option<crate::security::SecurityState>,
     ) -> Self {
         let metrics = metrics.unwrap_or_else(|| Arc::new(MetricsRegistry::new()));
 
@@ -105,6 +108,7 @@ impl AdminServer {
             metrics,
             audit_logger,
             load_balancer,
+            security,
         });
 
         Self { config, state }
@@ -277,6 +281,8 @@ impl AdminServer {
             .route("/canary/suspend/:server_id", post(canary_suspend_handler))
             .route("/canary/resume/:server_id", post(canary_resume_handler))
             .route("/canary/weight/:server_id", post(canary_weight_handler))
+            .route("/blocklist", get(blocklist_handler))
+            .route("/blocklist/unblock/:ip", post(blocklist_unblock_handler))
             .layer(axum::middleware::from_fn_with_state(
                 auth_state,
                 auth_middleware,
@@ -1421,4 +1427,113 @@ async fn canary_weight_handler(
         )
             .into_response()
     }
+}
+
+/// One entry in the live blocklist snapshot.
+#[derive(Serialize)]
+struct BlocklistEntryView {
+    target: String,
+    reason: String,
+}
+
+/// Live blocklist response.
+#[derive(Serialize)]
+struct BlocklistResponse {
+    enabled: bool,
+    ips: Vec<BlocklistEntryView>,
+    cidrs: Vec<BlocklistEntryView>,
+    error: Option<String>,
+}
+
+/// `GET /blocklist` — what the running proxy is actually enforcing.
+///
+/// Deliberately reads in-memory state rather than the database: the two can
+/// disagree, and when they do it is the in-memory copy that decides whether a
+/// request is refused.
+async fn blocklist_handler(State(state): State<Arc<AdminState>>) -> Json<BlocklistResponse> {
+    match &state.security {
+        Some(sec) => {
+            let (ips, cidrs) = sec.blocklist_snapshot();
+            Json(BlocklistResponse {
+                enabled: true,
+                ips: ips
+                    .into_iter()
+                    .map(|(ip, reason)| BlocklistEntryView {
+                        target: ip.to_string(),
+                        reason,
+                    })
+                    .collect(),
+                cidrs: cidrs
+                    .into_iter()
+                    .map(|(net, reason)| BlocklistEntryView {
+                        target: net.to_string(),
+                        reason,
+                    })
+                    .collect(),
+                error: None,
+            })
+        }
+        None => Json(BlocklistResponse {
+            enabled: false,
+            ips: Vec::new(),
+            cidrs: Vec::new(),
+            error: Some("Security state not available".to_string()),
+        }),
+    }
+}
+
+/// Result of an unblock request.
+#[derive(Serialize)]
+struct UnblockResponse {
+    success: bool,
+    ip: String,
+    removed: usize,
+    message: String,
+}
+
+/// `POST /blocklist/unblock/:ip` — drop an IP from the live blocklist now.
+///
+/// Clearing the database row only stops the entry being re-synced; it does not
+/// release an IP the proxy has already admitted to its in-memory map. This is
+/// what makes the dashboard's unblock button take effect without a restart.
+async fn blocklist_unblock_handler(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AdminState>>,
+    Path(ip): Path<String>,
+) -> Result<Json<UnblockResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let parsed: std::net::IpAddr = ip.trim().parse().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "success": false, "error": "Invalid IP address" })),
+        )
+    })?;
+
+    let sec = state.security.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "success": false, "error": "Security state not available" })),
+        )
+    })?;
+
+    let removed = sec.unblock_ip(parsed);
+
+    if let Some(ref logger) = state.audit_logger {
+        logger.log(AuditEvent::AdminAction {
+            ip: remote_addr.ip().to_string(),
+            action: "blocklist_unblock".to_string(),
+            success: true,
+            detail: Some(format!("{parsed} ({removed} entries removed)")),
+        });
+    }
+
+    Ok(Json(UnblockResponse {
+        success: true,
+        ip: parsed.to_string(),
+        removed,
+        message: if removed > 0 {
+            format!("Removed {removed} blocklist entry/entries")
+        } else {
+            "IP was not blocked in memory".to_string()
+        },
+    }))
 }

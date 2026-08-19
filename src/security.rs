@@ -13,6 +13,7 @@
 //! GeoIP blocking is an optional feature requiring MaxMind database integration
 //! (enable with `--features geoip`). Active JA3/JA4 fingerprinting lives in `fingerprint.rs`.
 
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -757,6 +758,44 @@ impl SecurityState {
         );
     }
 
+    /// Remove an IP from the in-memory blocklist, including any CIDR entry that
+    /// covers it. Returns the number of entries dropped.
+    ///
+    /// This is the operator escape hatch behind `POST /blocklist/unblock/:ip`.
+    /// Clearing the database row alone is not enough for an IP that is already
+    /// blocked in memory: the row stops being synced, but the running proxy keeps
+    /// the entry until it expires. Removing it here takes effect immediately.
+    pub fn unblock_ip(&self, ip: IpAddr) -> usize {
+        let mut removed = 0;
+        if self.blocked_ips.remove(&ip).is_some() {
+            removed += 1;
+        }
+        let mut cidrs = self.blocked_cidrs.write();
+        let before = cidrs.len();
+        cidrs.retain(|(net, _)| !cidr_contains_ip(net, &ip));
+        removed += before - cidrs.len();
+        if removed > 0 {
+            info!("Unblocked IP {} ({} entry/entries removed)", ip, removed);
+        }
+        removed
+    }
+
+    /// Snapshot of currently blocked IPs and CIDRs, for the admin API.
+    pub fn blocklist_snapshot(&self) -> (Vec<(IpAddr, String)>, Vec<(IpNet, String)>) {
+        let ips = self
+            .blocked_ips
+            .iter()
+            .map(|e| (*e.key(), format!("{:?}", e.value().reason)))
+            .collect();
+        let cidrs = self
+            .blocked_cidrs
+            .read()
+            .iter()
+            .map(|(n, i)| (*n, format!("{:?}", i.reason)))
+            .collect();
+        (ips, cidrs)
+    }
+
     /// Reload blocklist from JSON files (synced from database).
     /// Uses the path configured in `security.blocklist_dir` (default: /var/lib/pqcrypta-proxy/blocklists).
     pub fn reload_blocklist_from_files(&self) {
@@ -819,6 +858,11 @@ impl SecurityState {
             Ok(content) => {
                 if let Ok(entries) = serde_json::from_str::<Vec<BlocklistEntry>>(&content) {
                     let mut loaded = 0;
+                    // Entries present in this sync. Used below to reconcile: a
+                    // DatabaseSync block that has disappeared from the file must be
+                    // dropped from memory, or operator unblocks never take effect.
+                    let mut present_ips: HashSet<IpAddr> = HashSet::new();
+                    let mut present_nets: HashSet<IpNet> = HashSet::new();
                     for entry in entries {
                         // Calculate expiration from the expires_at field (shared logic)
                         let expires_at = entry.expires_at.as_ref().and_then(|exp| {
@@ -855,6 +899,7 @@ impl SecurityState {
                             // The old code stripped the prefix length and only blocked the
                             // host address, ignoring the subnet entirely.
                             if let Ok(net) = entry.ip.parse::<IpNet>() {
+                                present_nets.insert(net);
                                 let mut cidrs = self.blocked_cidrs.write();
                                 if !cidrs.iter().any(|(n, _)| n == &net) {
                                     cidrs.push((net, block_info));
@@ -862,7 +907,11 @@ impl SecurityState {
                                 }
                             }
                         } else if let Ok(ip) = entry.ip.parse::<IpAddr>() {
-                            // Single-IP entry — existing behaviour
+                            // Single-IP entry — existing behaviour.
+                            // Record it as present BEFORE the contains_key short-circuit,
+                            // otherwise the reconcile below would drop the very entries
+                            // this sync just reaffirmed.
+                            present_ips.insert(ip);
                             if self.blocked_ips.contains_key(&ip) {
                                 continue;
                             }
@@ -870,8 +919,43 @@ impl SecurityState {
                             loaded += 1;
                         }
                     }
+
+                    // Reconcile: drop database-sourced blocks that are no longer in the
+                    // file. Without this the reload only ever ADDED, so clearing a row in
+                    // security_blocklist (or clicking unblock in the threat dashboard)
+                    // left the live block in place until it expired or the proxy
+                    // restarted. Only DatabaseSync entries are touched — blocks the proxy
+                    // raised itself (rate limits, WAF, config `Manual`) are not managed by
+                    // the sync file and must survive.
+                    let mut dropped = 0;
+                    self.blocked_ips.retain(|ip, info| {
+                        let stale = matches!(info.reason, BlockReason::DatabaseSync)
+                            && !present_ips.contains(ip);
+                        if stale {
+                            dropped += 1;
+                        }
+                        !stale
+                    });
+                    {
+                        let mut cidrs = self.blocked_cidrs.write();
+                        cidrs.retain(|(net, info)| {
+                            let stale = matches!(info.reason, BlockReason::DatabaseSync)
+                                && !present_nets.contains(net);
+                            if stale {
+                                dropped += 1;
+                            }
+                            !stale
+                        });
+                    }
+
                     if loaded > 0 {
                         info!("Loaded {} blocked IPs/CIDRs from database sync", loaded);
+                    }
+                    if dropped > 0 {
+                        info!(
+                            "Released {} blocked IPs/CIDRs no longer present in database sync",
+                            dropped
+                        );
                     }
                 }
             }
@@ -2138,6 +2222,99 @@ pub use geoip::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: an operator unblock must take effect on the running proxy.
+    ///
+    /// `reload_blocklist_from_files` used to only ever INSERT, so once an IP was
+    /// in the in-memory map, clearing its `security_blocklist` row (or clicking
+    /// unblock in the threat dashboard) did nothing until the entry expired or
+    /// the process restarted. On 2026-08-18 that left this platform's own web
+    /// server locked out of api.pqcrypta.com for the full 72-hour block window.
+    #[tokio::test]
+    async fn test_reload_releases_ips_removed_from_sync_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("blocked_ips.json");
+
+        let config = ProxyConfig::default();
+        let security = SecurityState::new(&config);
+        security.config.write().blocklist_dir = dir.path().to_path_buf();
+
+        let synced: IpAddr = "203.0.113.10".parse().unwrap();
+        let self_raised: IpAddr = "203.0.113.20".parse().unwrap();
+
+        // Sync file contains one IP; the proxy independently blocks another.
+        std::fs::write(&file, r#"[{"ip":"203.0.113.10","expires_at":null}]"#).unwrap();
+        security.reload_blocklist_from_files();
+        security.block_ip(self_raised, BlockReason::TooManyErrors, None);
+
+        assert!(security.is_blocked(&synced).is_some());
+        assert!(security.is_blocked(&self_raised).is_some());
+
+        // Operator clears the row → it disappears from the synced file.
+        std::fs::write(&file, "[]").unwrap();
+        security.reload_blocklist_from_files();
+
+        assert!(
+            security.is_blocked(&synced).is_none(),
+            "IP removed from the sync file must be released from memory"
+        );
+        assert!(
+            security.is_blocked(&self_raised).is_some(),
+            "a block the proxy raised itself is not managed by the sync file \
+             and must survive the reconcile"
+        );
+    }
+
+    /// A CIDR entry that leaves the sync file must be released too.
+    #[tokio::test]
+    async fn test_reload_releases_cidrs_removed_from_sync_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("blocked_ips.json");
+
+        let config = ProxyConfig::default();
+        let security = SecurityState::new(&config);
+        security.config.write().blocklist_dir = dir.path().to_path_buf();
+
+        let inside: IpAddr = "198.51.100.7".parse().unwrap();
+
+        std::fs::write(&file, r#"[{"ip":"198.51.100.0/24","expires_at":null}]"#).unwrap();
+        security.reload_blocklist_from_files();
+        assert!(security.is_blocked(&inside).is_some());
+
+        std::fs::write(&file, "[]").unwrap();
+        security.reload_blocklist_from_files();
+        assert!(
+            security.is_blocked(&inside).is_none(),
+            "CIDR removed from the sync file must be released from memory"
+        );
+    }
+
+    /// `unblock_ip` is the immediate escape hatch behind the admin route: it must
+    /// drop both a direct entry and any CIDR entry covering the address.
+    #[tokio::test]
+    async fn test_unblock_ip_removes_direct_and_cidr_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("blocked_ips.json");
+
+        let config = ProxyConfig::default();
+        let security = SecurityState::new(&config);
+        security.config.write().blocklist_dir = dir.path().to_path_buf();
+
+        let ip: IpAddr = "198.51.100.7".parse().unwrap();
+        std::fs::write(
+            &file,
+            r#"[{"ip":"198.51.100.7","expires_at":null},{"ip":"198.51.100.0/24","expires_at":null}]"#,
+        )
+        .unwrap();
+        security.reload_blocklist_from_files();
+        assert!(security.is_blocked(&ip).is_some());
+
+        assert_eq!(security.unblock_ip(ip), 2);
+        assert!(
+            security.is_blocked(&ip).is_none(),
+            "unblock must clear the covering CIDR as well as the direct entry"
+        );
+    }
 
     #[tokio::test]
     async fn test_blocked_ip_expiration() {

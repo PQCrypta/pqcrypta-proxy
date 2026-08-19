@@ -90,7 +90,6 @@ use pqcrypta_proxy::startup_verify;
 use pqcrypta_proxy::tls::TlsProvider;
 use pqcrypta_proxy::webtransport_server::WebTransportServer;
 use pqcrypta_proxy::ResponseCache;
-use pqcrypta_proxy::SecurityState;
 use pqcrypta_proxy::{
     run_http_listener, run_http_listener_with_fingerprint_and_resolver, run_http_redirect_server,
     run_tls_passthrough_server,
@@ -852,6 +851,7 @@ async fn run() -> anyhow::Result<()> {
         Some(metrics_registry.clone()),
         Some(audit_logger),
         Some(shared_lb.clone()),
+        Some(security_state.clone()),
     );
 
     let admin_handle = tokio::spawn(async move {
@@ -1072,7 +1072,11 @@ async fn run() -> anyhow::Result<()> {
     // blocked by one listener was invisible to all others (no shared blocklist,
     // rate-limiter, or connection counter).  SecurityState is #[derive(Clone)]
     // backed entirely by Arc<...> fields — cloning it shares the underlying maps.
-    let shared_quic_security = SecurityState::new(&config);
+    // Share the SAME SecurityState the HTTP listeners use, rather than building a
+    // second one. Two instances meant two independent blocklists: an IP blocked
+    // over TCP was still free to connect over HTTP/3, and an admin unblock would
+    // only ever clear one of them.
+    let shared_quic_security = security_state.clone();
 
     for port in all_ports.clone() {
         // Skip webtransport_port - it's handled by dedicated WebTransportServer
