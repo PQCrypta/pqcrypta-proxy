@@ -152,6 +152,40 @@ pub(super) enum EchStatus {
     Accepted { client_hello_inner_random: [u8; 32] },
 }
 
+/// The server-side outcome of ECH processing, as observable by the application
+/// once the handshake has progressed past the ClientHello.
+///
+/// This is [`EchStatus`] with the accepted inner hello's `random` dropped. That
+/// field is handshake machinery feeding the acceptance-confirmation derivation;
+/// it is transcript material and there is no reason to hand it out. The
+/// three-way outcome on its own is what an application can act on, and mirrors
+/// what the client side already exposes via `ClientConnection::ech_status`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EchAcceptance {
+    /// No `encrypted_client_hello` extension was present on the ClientHello.
+    NotOffered,
+    /// The extension was present but decrypted against none of the configured
+    /// keys - a stale `config_id`, a tampered payload, or a GREASE extension
+    /// from a client with no real config. Per draft-ietf-tls-esni-25 7.1 this
+    /// is not an error: the handshake continued on the ClientHelloOuter and
+    /// `retry_configs` were returned in EncryptedExtensions.
+    Rejected,
+    /// The extension decrypted and the handshake ran on the reconstructed
+    /// ClientHelloInner, so the client's real SNI never appeared in cleartext
+    /// on the wire.
+    Accepted,
+}
+
+impl From<EchStatus> for EchAcceptance {
+    fn from(status: EchStatus) -> Self {
+        match status {
+            EchStatus::NotOffered => Self::NotOffered,
+            EchStatus::Rejected => Self::Rejected,
+            EchStatus::Accepted { .. } => Self::Accepted,
+        }
+    }
+}
+
 /// Outcome of attempting to process an `encrypted_client_hello` extension on
 /// an incoming ClientHello.
 pub(crate) enum EchResolution {

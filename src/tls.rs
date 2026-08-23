@@ -446,6 +446,27 @@ pub fn build_pqc_provider() -> rustls::crypto::CryptoProvider {
         rustls::NamedGroup::secp256r1 => 3,
         _ => 4,
     });
+
+    // Prefer 256-bit AEADs, matching what the OpenSSL listener enforces for
+    // HTTP/1.1 and HTTP/2.
+    //
+    // That listener *removes* TLS_AES_128_GCM_SHA256 outright. This one cannot:
+    // RFC 9001 §5.2 fixes AES-128-GCM as the AEAD for QUIC Initial packet
+    // protection, and dropping the suite makes QuicServerConfig construction
+    // fail. So it stays available and simply loses the preference contest —
+    // rustls picks the server's first suite the client also offers, and every
+    // modern client offers all three.
+    //
+    // Without this, HTTP/2 visitors got AES-256 and HTTP/3 visitors silently got
+    // AES-128 on the same hostname: the policy was written once, on one of two
+    // listeners.
+    provider.cipher_suites.sort_by_key(|cs| match cs.suite() {
+        rustls::CipherSuite::TLS13_AES_256_GCM_SHA384 => 0u8,
+        rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => 1,
+        rustls::CipherSuite::TLS13_AES_128_GCM_SHA256 => 2,
+        _ => 3,
+    });
+
     provider
 }
 

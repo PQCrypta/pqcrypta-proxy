@@ -636,7 +636,7 @@ pub mod server {
     mod tls13;
 
     pub use builder::WantsServerCert;
-    pub use ech::{ServerEchConfig, ServerEchConfigs};
+    pub use ech::{EchAcceptance, ServerEchConfig, ServerEchConfigs};
     #[cfg(any(feature = "std", feature = "hashbrown"))]
     pub use handy::ResolvesServerCertUsingSni;
     #[cfg(any(feature = "std", feature = "hashbrown"))]

@@ -741,6 +741,22 @@ impl State<ServerConnectionData> for ExpectClientHello {
         Self: 'm,
     {
         let m = self.resolve_ech(cx, m);
+
+        // Stash the hello's wire bytes before anything consumes it. Taken after
+        // `resolve_ech` on purpose: when ECH is accepted `m` has been replaced
+        // by the reconstructed inner hello, which is the one that describes the
+        // client. Fingerprinting the outer hello would characterise the ECH
+        // padding shape shared by every ECH client, not the client itself.
+        //
+        // Skipped on a HelloRetryRequest second flight so the stored value stays
+        // the client's initial offer — the retry hello is a response to our
+        // constraint, not an independent expression of what the client supports.
+        if !self.done_retry {
+            if let MessagePayload::Handshake { encoded, .. } = &m.payload {
+                cx.data.client_hello_wire = Some(encoded.bytes().to_vec());
+            }
+        }
+
         let (client_hello, sig_schemes) = process_client_hello(&m, self.done_retry, cx)?;
         self.with_certified_key(sig_schemes, client_hello, &m, cx)
     }

@@ -14,7 +14,7 @@ categories = ["network-programming", "cryptography", "web-programming"]
 default = ["pqc", "pqc-signatures", "metrics", "admin-api", "geoip", "acme"]
 # Enable PQC hybrid key exchange via OpenSSL 3.5+ (native ML-KEM)
 # Also enables extended algorithm detection and configuration
-pqc = ["openssl", "openssl-sys", "openssl-probe"]
+pqc = ["openssl", "openssl-sys", "openssl-probe", "foreign-types"]
 # Extended PQC with ML-DSA signatures (unstable aws-lc-rs API)
 pqc-signatures = ["aws-lc-rs/unstable"]
 # Prometheus metrics endpoint
@@ -82,6 +82,9 @@ rustls-post-quantum = "0.2"
 # OpenSSL for PQC support (optional feature)
 openssl = { version = "0.10", optional = true, default-features = false }
 openssl-sys = { version = "0.9", optional = true }
+# Needed only to reach `SslRef::as_ptr` for the `SSL_get0_group_name` binding in
+# `pqc_tls`. Already in the tree via `openssl` itself, which pins the same major.
+foreign-types = { version = "0.3", optional = true }
 openssl-probe = { version = "0.1", optional = true }
 
 # aws-lc-rs for extended PQC (ML-KEM direct, ML-DSA when unstable enabled)
@@ -127,6 +130,9 @@ subtle = "2.6"
 jsonwebtoken = "9.3"
 parking_lot = "0.12"
 dashmap = "6.1"
+# Reverse/forward DNS for verified search-engine crawler checks (crawler_verify.rs).
+# Thin libc getnameinfo/getaddrinfo wrapper — blocking, so calls run in spawn_blocking.
+dns-lookup = "3.0"
 arc-swap = "1.7"
 
 # Hot reload - file watching

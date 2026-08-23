@@ -65,6 +65,15 @@ impl crypto::Session for TlsSession {
                 .inner
                 .negotiated_key_exchange_group()
                 .map(|kx| kx.name()),
+            negotiated_cipher_suite: self.inner.negotiated_cipher_suite().map(|cs| cs.suite()),
+            client_hello_wire: match self.inner {
+                Connection::Client(_) => None,
+                Connection::Server(ref session) => session.client_hello_wire().map(<[u8]>::to_vec),
+            },
+            ech_accepted: match self.inner {
+                Connection::Client(_) => None,
+                Connection::Server(ref session) => Some(session.ech_acceptance()),
+            },
         }))
     }
 
@@ -276,6 +285,27 @@ pub struct HandshakeData {
     ///
     /// `None` until the handshake has completed.
     pub negotiated_key_exchange_group: Option<rustls::NamedGroup>,
+    /// The cipher suite negotiated with the peer.
+    ///
+    /// `None` until the handshake has completed.
+    pub negotiated_cipher_suite: Option<rustls::CipherSuite>,
+    /// The client's ClientHello exactly as it arrived: handshake header then
+    /// body, with no TLS record header (QUIC has none).
+    ///
+    /// Always `None` on the client side. On the server side this is the only
+    /// plaintext copy of the hello an application can reach — over QUIC it
+    /// arrives inside encrypted Initial CRYPTO frames, so unlike a TCP listener
+    /// there is no socket to peek. Exposed for client fingerprinting (JA3/JA4),
+    /// which QUIC servers otherwise cannot do at all.
+    pub client_hello_wire: Option<Vec<u8>>,
+    /// Encrypted Client Hello outcome for this connection.
+    ///
+    /// `None` on the client side. ECH is a TLS 1.3 extension and QUIC is TLS
+    /// 1.3, so it applies over QUIC exactly as it does over TCP — the same
+    /// handshake resolves it and records the result. Without this the
+    /// application had no way to read that result back, and could only ever
+    /// report ECH as unknown on HTTP/3.
+    pub ech_accepted: Option<rustls::server::EchAcceptance>,
 }
 
 /// A QUIC-compatible TLS client configuration

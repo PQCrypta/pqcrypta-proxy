@@ -405,6 +405,35 @@ async fn run() -> anyhow::Result<()> {
     // that served nobody.
     let security_state = pqcrypta_proxy::security::SecurityState::new(&config);
 
+    // Reload the observed-fingerprint corpus and keep snapshotting it.
+    //
+    // Without this the corpus resets on every start, and this proxy restarts on
+    // config reload — so it would never accumulate one. It is evidence, not
+    // policy: nothing here bans anybody, it is what lets the public directory
+    // show live traffic next to the curated list, and what would let that list
+    // eventually be grown from something other than guesswork.
+    {
+        let loaded = security_state.load_observed_fingerprints();
+        if loaded > 0 {
+            info!("Loaded {} observed TLS fingerprints from disk", loaded);
+        }
+
+        let flush_state = security_state.clone();
+        tokio::spawn(async move {
+            // Five minutes: frequent enough that a crash loses little, rare
+            // enough that a 50k-entry corpus is not being serialised constantly.
+            let mut ticker = tokio::time::interval(Duration::from_mins(5));
+            ticker.tick().await; // the first tick fires immediately
+            loop {
+                ticker.tick().await;
+                match flush_state.flush_observed_fingerprints() {
+                    Ok(n) => tracing::debug!("Flushed {} observed TLS fingerprints", n),
+                    Err(e) => warn!("Could not flush observed fingerprints: {}", e),
+                }
+            }
+        });
+    }
+
     // ── Startup verification of the cryptographic runtime ────────────────────
     //
     // What follows replaces a banner that announced "POST-QUANTUM CRYPTOGRAPHY
@@ -965,6 +994,7 @@ async fn run() -> anyhow::Result<()> {
                     http_metrics,
                     http_lb,
                     http_sni_map,
+                    http_security.clone(),
                 )
                 .await
                 {
@@ -998,6 +1028,7 @@ async fn run() -> anyhow::Result<()> {
                     http_metrics,
                     http_lb,
                     Some(http_resolver),
+                    http_security.clone(),
                 )
                 .await
                 {
@@ -1030,6 +1061,7 @@ async fn run() -> anyhow::Result<()> {
                     http_metrics,
                     http_lb,
                     http_sni_map,
+                    http_security.clone(),
                 )
                 .await
                 {

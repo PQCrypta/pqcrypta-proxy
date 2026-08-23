@@ -574,7 +574,8 @@ impl PqcTlsProvider {
 /// Used by `http_listener::run_http_listener_pqc` for post-quantum TLS.
 #[cfg(feature = "pqc")]
 pub mod openssl_pqc {
-    use super::{PqcHandshakeInfo, PqcTlsProvider};
+    use super::{PqcHandshakeInfo, PqcKemAlgorithm, PqcTlsProvider};
+    use foreign_types::ForeignTypeRef;
     use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVersion};
     use parking_lot::RwLock;
     use std::collections::HashMap;
@@ -1025,10 +1026,47 @@ pub mod openssl_pqc {
         }
     }
 
+    unsafe extern "C" {
+        /// OpenSSL 3.2+: name of the group used for key agreement on this
+        /// connection, or NULL if key exchange has not happened yet.
+        fn SSL_get0_group_name(ssl: *const openssl_sys::SSL) -> *const std::os::raw::c_char;
+    }
+
+    /// Read the key exchange group this handshake actually negotiated.
+    ///
+    /// `SSL_get0_group_name` is not bound by the `openssl` crate, so it is
+    /// declared here directly. It has been exported since OpenSSL 3.2 and
+    /// returns a pointer to static, NUL-terminated storage owned by the
+    /// library (the `get0` in the name), so there is nothing to free.
+    ///
+    /// Returns `None` before a key exchange has happened, which is what
+    /// OpenSSL signals with a NULL return.
+    pub fn negotiated_group(ssl: &openssl::ssl::SslRef) -> Option<String> {
+        // SAFETY: `ssl.as_ptr()` is a live `SSL*` for as long as the borrow of
+        // `ssl` lasts, which covers this whole call. The returned pointer is
+        // either NULL or static storage owned by OpenSSL; we copy out of it
+        // before returning and never retain it.
+        unsafe {
+            let name = SSL_get0_group_name(ssl.as_ptr());
+            if name.is_null() {
+                return None;
+            }
+            std::ffi::CStr::from_ptr(name)
+                .to_str()
+                .ok()
+                .map(|s| s.to_string())
+        }
+    }
+
     /// Get PQC handshake info from SSL connection
     ///
     /// Call this after a TLS handshake to retrieve information about the
     /// negotiated post-quantum key exchange parameters.
+    ///
+    /// `key_exchange` and `pqc_active` are read from the connection rather than
+    /// assumed. They used to be hardcoded to `X25519MLKEM768` / `true`, which
+    /// made [`PqcConfig::check_downgrade`] structurally unable to fire on this
+    /// listener: a classical-only handshake reported itself as post-quantum.
     pub fn get_pqc_info(ssl: &openssl::ssl::SslRef) -> PqcHandshakeInfo {
         let cipher = ssl
             .current_cipher()
@@ -1037,15 +1075,21 @@ pub mod openssl_pqc {
 
         let version = ssl.version_str().to_string();
 
-        // Get negotiated group (key exchange algorithm)
-        // Note: OpenSSL 3.5 exposes this via SSL_get0_group_name
-        let group = "X25519MLKEM768".to_string(); // Default, actual detection requires FFI
+        let group = negotiated_group(ssl);
+
+        // A group we recognise as a PQC or hybrid KEM is what makes a handshake
+        // post-quantum. An unknown or absent group is not PQC — assuming
+        // otherwise is the bug this replaced.
+        let pqc_active = group
+            .as_deref()
+            .and_then(PqcKemAlgorithm::from_str)
+            .is_some();
 
         PqcHandshakeInfo {
             cipher,
             version,
-            key_exchange: group,
-            pqc_active: true, // Determined by group negotiation
+            key_exchange: group.unwrap_or_else(|| "unknown".to_string()),
+            pqc_active,
         }
     }
 }

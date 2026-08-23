@@ -156,6 +156,100 @@ pub struct FingerprintedConnection {
     /// Used by per-route internal mTLS enforcement: routes with `internal = true`
     /// default to requiring a client certificate.
     pub client_cert_present: bool,
+    /// What the handshake actually negotiated, captured once when it completes.
+    ///
+    /// Read back out by the Handshake Mirror (`/handshake/`), which reports a
+    /// visitor their own connection. Every field here is already known to the
+    /// TLS layer and thrown away today; none of it is derived from anything the
+    /// client can assert in a request.
+    pub handshake: HandshakeFacts,
+}
+
+/// The negotiated properties of one completed TLS handshake.
+///
+/// Deliberately `String`/`&'static str` rather than the rustls types: this is
+/// cloned per connection and handed to header injection, and the rustls enums
+/// would only be `format!`-ed there instead.
+#[derive(Clone, Debug, Default)]
+pub struct HandshakeFacts {
+    /// e.g. `TLSv1_3`.
+    pub tls_version: Option<String>,
+    /// e.g. `TLS13_AES_256_GCM_SHA384`.
+    pub cipher_suite: Option<String>,
+    /// The negotiated key exchange group, e.g. `X25519MLKEM768` for a hybrid
+    /// post-quantum handshake or `X25519` for a classical one. This is the
+    /// field that says whether a visitor is actually PQC-protected.
+    pub kex_group: Option<String>,
+    /// The ALPN protocol the connection settled on, e.g. `h2`.
+    pub alpn: Option<String>,
+    /// Encrypted Client Hello outcome: `not-offered`, `rejected`, or `accepted`.
+    pub ech: &'static str,
+}
+
+impl HandshakeFacts {
+    /// The headers [`inject_headers`](Self::inject_headers) owns.
+    ///
+    /// Named in one place because they have to be stripped and set as a set:
+    /// removing four of five would leave the fifth forgeable.
+    pub const HEADER_NAMES: [&'static str; 5] = [
+        "x-tls-version",
+        "x-tls-cipher",
+        "x-tls-group",
+        "x-tls-alpn",
+        "x-tls-ech",
+    ];
+
+    /// Replace any client-supplied handshake headers with what this connection
+    /// actually negotiated.
+    ///
+    /// Strip-then-set, matching the SEC-002 handling of `x-tls-early-data`: the
+    /// Handshake Mirror reports these back to the visitor as fact, so a client
+    /// that sends its own `x-tls-group: X25519MLKEM768` must not be able to
+    /// make the page claim a post-quantum handshake that never happened.
+    ///
+    /// A field the listener could not determine is left absent rather than
+    /// filled with a placeholder — "unknown" and "we didn't look" are different
+    /// answers and the mirror renders them differently.
+    pub fn inject_headers(&self, headers: &mut http::HeaderMap) {
+        for name in Self::HEADER_NAMES {
+            headers.remove(name);
+        }
+
+        let mut set = |name: &'static str, value: Option<&str>| {
+            if let Some(v) = value {
+                if let Ok(v) = http::HeaderValue::from_str(v) {
+                    headers.insert(name, v);
+                }
+            }
+        };
+
+        set("x-tls-version", self.tls_version.as_deref());
+        set("x-tls-cipher", self.cipher_suite.as_deref());
+        set("x-tls-group", self.kex_group.as_deref());
+        set("x-tls-alpn", self.alpn.as_deref());
+        set("x-tls-ech", Some(self.ech));
+    }
+
+    /// Capture from a completed server-side handshake.
+    fn from_connection(conn: &rustls::ServerConnection) -> Self {
+        Self {
+            tls_version: conn.protocol_version().map(|v| format!("{v:?}")),
+            cipher_suite: conn
+                .negotiated_cipher_suite()
+                .map(|s| format!("{:?}", s.suite())),
+            kex_group: conn
+                .negotiated_key_exchange_group()
+                .map(|g| format!("{:?}", g.name())),
+            alpn: conn
+                .alpn_protocol()
+                .map(|p| String::from_utf8_lossy(p).into_owned()),
+            ech: match conn.ech_acceptance() {
+                rustls::server::EchAcceptance::NotOffered => "not-offered",
+                rustls::server::EchAcceptance::Rejected => "rejected",
+                rustls::server::EchAcceptance::Accepted => "accepted",
+            },
+        }
+    }
 }
 
 impl Connected<&FingerprintedTlsStream<TlsStream<TcpStream>>> for FingerprintedConnection {
@@ -564,6 +658,8 @@ impl FingerprintingTlsAcceptor {
             .map(|c| matches!(c, crate::security::FingerprintClass::Browser))
             .unwrap_or(false);
 
+        let handshake = HandshakeFacts::from_connection(tls_stream.get_ref().1);
+
         let conn_info = FingerprintedConnection {
             remote_addr,
             ja3_hash: fingerprint_result.ja3_hash,
@@ -572,6 +668,7 @@ impl FingerprintingTlsAcceptor {
             is_browser,
             is_early_data: offered_early_data,
             client_cert_present,
+            handshake,
         };
 
         Ok(Some(FingerprintedTlsStream::new(tls_stream, conn_info)))
@@ -695,6 +792,88 @@ mod tests {
         );
     }
 
+    /// The full set of connection-derived headers the listeners must strip
+    /// before asserting their own values.
+    ///
+    /// `x-client-type` and `x-client-name` are the two that were missed: unlike
+    /// the rest they are inserted only when the fingerprinter has something to
+    /// say, so a conditional insert with no strip let a caller assert them.
+    /// curl sending `x-client-type: browser` reached the backend as a browser.
+    #[test]
+    fn connection_derived_headers_are_all_strippable() {
+        for name in [
+            "x-ja3-hash",
+            "x-ja4-hash",
+            "x-client-name",
+            "x-client-type",
+            "x-client-cert",
+            "x-tls-early-data",
+            "x-connection-protocol",
+            "x-pqc-enabled",
+        ] {
+            assert!(
+                http::HeaderName::from_bytes(name.as_bytes()).is_ok(),
+                "{name} must be a valid header name for the strip lists to work"
+            );
+        }
+
+        // The handshake set is stripped wholesale by inject_headers; the rest
+        // are stripped explicitly at each listener's injection site.
+        assert_eq!(HandshakeFacts::HEADER_NAMES.len(), 5);
+    }
+
+    #[test]
+    fn inject_headers_overwrites_client_supplied_values() {
+        // The whole point of strip-then-set: a caller that asserts its own
+        // handshake must not be believed. The Handshake Mirror renders these as
+        // fact, and a forged x-tls-group would make it claim a post-quantum
+        // connection that never happened.
+        let facts = HandshakeFacts {
+            tls_version: Some("TLSv1_3".to_string()),
+            cipher_suite: Some("TLS13_AES_256_GCM_SHA384".to_string()),
+            kex_group: Some("secp384r1".to_string()),
+            alpn: Some("h2".to_string()),
+            ech: "not-offered",
+        };
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-tls-group", "X25519MLKEM768".parse().unwrap());
+        headers.insert("x-tls-ech", "accepted".parse().unwrap());
+        headers.insert("x-tls-version", "TLSv9_9".parse().unwrap());
+
+        facts.inject_headers(&mut headers);
+
+        assert_eq!(headers.get("x-tls-group").unwrap(), "secp384r1");
+        assert_eq!(headers.get("x-tls-ech").unwrap(), "not-offered");
+        assert_eq!(headers.get("x-tls-version").unwrap(), "TLSv1_3");
+        // Exactly one value each, not the client's appended to ours.
+        assert_eq!(headers.get_all("x-tls-group").iter().count(), 1);
+    }
+
+    #[test]
+    fn inject_headers_removes_forged_values_it_cannot_replace() {
+        // The QUIC path cannot observe cipher suite or group. A field we have no
+        // value for must come out absent, never left holding whatever the client
+        // sent — that is the difference between "not observable" and a lie.
+        let facts = HandshakeFacts {
+            tls_version: Some("TLSv1_3".to_string()),
+            cipher_suite: None,
+            kex_group: None,
+            alpn: Some("h3".to_string()),
+            ech: "unknown",
+        };
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-tls-group", "X25519MLKEM768".parse().unwrap());
+        headers.insert("x-tls-cipher", "TLS13_AES_256_GCM_SHA384".parse().unwrap());
+
+        facts.inject_headers(&mut headers);
+
+        assert!(headers.get("x-tls-group").is_none());
+        assert!(headers.get("x-tls-cipher").is_none());
+        assert_eq!(headers.get("x-tls-alpn").unwrap(), "h3");
+    }
+
     #[test]
     fn test_fingerprinted_connection() {
         let conn = FingerprintedConnection {
@@ -705,6 +884,7 @@ mod tests {
             is_browser: true,
             is_early_data: false,
             client_cert_present: false,
+            handshake: HandshakeFacts::default(),
         };
 
         assert_eq!(conn.ja3_hash(), Some("abc123"));

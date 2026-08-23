@@ -13,13 +13,14 @@
 - **Full-Featured Proxy**: Domain-based routing, custom header injection, per-route timeouts, security headers, CORS, redirects
 - **Three TLS Modes**: Terminate, Re-encrypt, and Passthrough (SNI-based)
 - **Modern Protocols**: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebTransport
-- **Post-Quantum Ready**: Hybrid PQC key exchange (X25519MLKEM768) via OpenSSL 3.5+ with native ML-KEM; ML-DSA-87 (FIPS 204) server certificates per SNI; PQC downgrade detection
+- **Post-Quantum Ready**: Hybrid PQC key exchange (X25519MLKEM768) via OpenSSL 3.5+ with native ML-KEM; ML-DSA-87 (FIPS 204) server certificates per SNI; PQC downgrade detection reading the negotiated group off the connection
+- **Encrypted Client Hello**: Server-side ECH (draft-ietf-tls-esni-25) on TCP and QUIC, with rotating HPKE keys published in the DNS HTTPS record
 - **Zero Downtime**: Hot reload configuration and TLS certificates; environment-specific config overlay (`--env`)
 - **ACME Automation**: Automatic Let's Encrypt certificate provisioning, renewal, and Certificate Transparency log submission
 - **OCSP Stapling**: Automated OCSP response fetching and stapling
 - **Prometheus Metrics**: Comprehensive metrics for TLS, connections, requests, backends, and WAF blocks
 - **WAF**: Pattern-based request inspection for injection and traversal attacks (SQLi, XSS, path traversal, NoSQLi, SSRF, CMDi, XXE, deserialization) in detect or block mode — covers OWASP A01/A03/A08/A10 attack patterns; categories requiring architectural or supply-chain controls (A02, A04, A05, A06, A09) are handled at other layers. Scanner/reconnaissance probe paths (`.git`, `.env`, `.aws`, `wp-login.php`, terraform state, SSH keys, CI/CD files, etc.) are blocked at path level before pattern scanning, preventing automated scanner traffic from reaching backends and polluting error-rate metrics
-- **Advanced Security**: JA3/JA4 fingerprinting with replay and drift detection, circuit breaker, GeoIP blocking, DB-synced IP blocklists, WebTransport origin validation, 0-RTT replay protection
+- **Advanced Security**: JA3/JA4 fingerprinting on TCP *and* QUIC with replay and drift detection, circuit breaker, GeoIP blocking, DB-synced IP blocklists, WebTransport origin validation, 0-RTT replay protection
 - **Structured Audit Logging**: Async JSON audit log for admin actions, auth failures, WAF blocks, IP blocks, rate limit hits, PQC downgrades, config reloads
 - **Structured Access Logging**: Per-request JSON or text logs with latency, bytes, upstream, and client IP
 - **Enterprise Load Balancing**: 6 algorithms, session affinity, health-aware routing, per-backend retry policies, per-backend circuit breaker overrides, canary / percentage traffic splitting with sticky assignment and auto-rollback, traffic shadowing / mirroring
@@ -38,7 +39,7 @@
 | **Per-Route Security Policy** | ✅ | `[routes.security]` overrides applied before the global checks: WAF on/off and mode, rate limits, JA3 allowlist, mTLS, HMAC request signing, plus `skip_bot_blocking` for routes that serve automated clients |
 | DoS Protection | ✅ | Connection limits, request validation |
 | GeoIP Blocking | ✅ | Country-based blocking (MaxMind DB) |
-| JA3/JA4 Fingerprinting | ✅ | TLS client fingerprint detection and classification |
+| JA3/JA4 Fingerprinting | ✅ | TLS client fingerprint detection and classification on **every transport** — HTTP/1.1, HTTP/2 and HTTP/3. Over QUIC the ClientHello arrives inside encrypted Initial CRYPTO frames, so the vendored rustls/noq forks surface it through `HandshakeData` and it is parsed by the same extractor the TCP paths use. The JA4 transport marker is `q` over QUIC and `t` over TCP |
 | Priority Hints | ✅ | RFC 9218 response prioritization |
 | Request Coalescing | ✅ | Deduplicates identical in-flight requests |
 | Early Hints (103) | ✅ | Link headers for preload/preconnect |
@@ -62,7 +63,7 @@
 | **Audit Logger** | ✅ | Async structured JSON audit log — admin actions, auth failures, WAF events, rate limits, PQC downgrades |
 | **JA3/JA4 Replay Detection** | ✅ | Flags same fingerprint from multiple IPs within configurable window |
 | **JA3/JA4 Drift Detection** | ✅ | Flags cipher/extension composition changes on the same fingerprint hash |
-| **PQC Downgrade Detection** | ✅ | Detects classical-only TLS negotiation when PQC is required; block/log/allow action |
+| **PQC Downgrade Detection** | ✅ | Detects classical-only TLS negotiation when PQC is required; block/log/allow action. The negotiated group is read from the connection via `SSL_get0_group_name`, not assumed — it was previously hardcoded to `X25519MLKEM768`, which made the check unable to fire |
 | **Response Cache (RFC 9111)** | ✅ | Optional RFC 9111-compliant HTTP cache with Cache-Control parsing, ETag/If-None-Match, Last-Modified/If-Modified-Since, Vary header support, size-bounded DashMap store, and configurable path/host exclusions |
 | **Per-Backend Connection Pool** | ✅ | Per-host idle timeout, max idle connections, max total connections, and acquire timeout for the HTTP/1.1 backend pool |
 | **Per-Backend Retry** | ✅ | Configurable retries with exponential backoff per backend; retry on 5xx/connect-failure/timeout |
@@ -86,7 +87,7 @@
 | **TCP-Only Hosts** | ✅ | `tcp_only_hosts` in `[server]` — listed hostnames receive `Alt-Svc: clear`, evicting cached QUIC upgrades so browsers always connect via TCP/TLS |
 | **HTTP/1.1-Only Hosts** | ✅ | `http11_only_hosts` in `[server]` — listed hostnames negotiate HTTP/1.1 only (no `h2` ALPN); browsers open an independent TCP connection per `fetch()` stream instead of coalescing onto one HTTP/2 pipe, eliminating head-of-line blocking on parallel speed test streams |
 | **Admin Loopback Enforcement** | ✅ | `require_loopback = true` (default) aborts startup when admin API is bound to a non-loopback address |
-| **Shared Security State (QUIC)** | ✅ | All QUIC listeners now share one `SecurityState`; blocked IPs and rate limiters are visible across all ports |
+| **Shared Security State** | ✅ | **Every** listener — QUIC and all three TCP paths — shares one `SecurityState`. Blocked IPs, rate limiter counters, the fingerprint corpus and DB-synced blocklists are visible across all of them. The TCP listeners previously each constructed their own, so an IP blocked on one was not blocked on another and the admin API could not clear it |
 | **Audit Logger Wired** | ✅ | `AuditLogger` constructed at startup and passed to the admin server; audit events are now actually written |
 | **Cryptographically Secure Admin Token** | ✅ | Ephemeral admin tokens use `OsRng` instead of `thread_rng` |
 | **`zero_trust_mode`** | ✅ | Startup validation enforcing mTLS, no plaintext backends, no CIDR trust, and admin HMAC proof-of-possession |
@@ -132,6 +133,9 @@
 | **Fingerprint Cache TTL** | ✅ | JA3/JA4 fingerprint classification cache with configurable max-age and background cleanup |
 | **QUIC ACK Frequency** | ✅ | draft-ietf-quic-ack-frequency extension (`enable_ack_frequency`, default on) — peers may request fewer, batched ACKs, cutting ACK traffic and CPU on high-throughput connections; negotiated, so inert against clients that lack it |
 | **MASQUE / CONNECT-UDP (RFC 9298)** | ✅ | UDP proxying over HTTP/3 Extended CONNECT (`:protocol = connect-udp`); UDP payloads relayed as HTTP Datagrams (RFC 9297) bound to the request stream; disabled by default with `host:port` allowlist, per-session idle timeout, and per-connection session cap (`[masque]`) |
+| **Encrypted Client Hello (ECH)** | ✅ | Server-side ECH, draft-ietf-tls-esni-25. HPKE keypairs generated and rotated by `ech-keygen` / `ech-rotate.timer` into `/etc/pqcrypta/ech-configs`, with previous configs retained so clients holding a cached DNS record still complete. Applies on **TCP and QUIC** — ECH is a TLS 1.3 extension and QUIC is TLS 1.3, so the same handshake resolves it. The outcome (`accepted` / `rejected` / `not-offered`) is exposed to backends as `x-tls-ech` |
+| **Handshake Facts to Backends** | ✅ | `x-tls-version`, `x-tls-cipher`, `x-tls-group`, `x-tls-alpn`, `x-tls-ech` injected on all three listener paths, alongside the existing `x-ja3-hash` / `x-ja4-hash` / `x-client-name` / `x-client-type` / `x-client-cert` / `x-tls-early-data`. Every one is **stripped from the incoming request before being set**, so a caller cannot assert a handshake it did not have |
+| **Observed Fingerprint Corpus** | ✅ | Fingerprints seen in live traffic are persisted to `/var/lib/pqcrypta-proxy/fingerprints/observed.json` every 5 minutes and reloaded at startup, with the pre-hash JA3 string, per-fingerprint connection counts, and the User-Agents seen on requests carrying them. Bounded and evicted least-recently-seen. Evidence only — it never feeds classification or blocking |
 
 ## Features
 
@@ -221,7 +225,7 @@
 - **QUIC vs TCP Speed Test** (`/speedtest`): Side-by-side throughput comparison over QUIC and TCP. WebTransport path measures download/upload throughput, datagram RTT, and packet loss. The `tcp_only_hosts` + `http11_only_hosts` config options force a parallel HTTP/1.1 connection so the browser opens one TCP stream per fetch rather than coalescing onto HTTP/2 — enabling a true protocol-level comparison. TCP-speedtest responses echo the request `Origin` when it is in `webtransport_allowed_origins`, so the test works from any allowed front-end regardless of allowlist order.
 - **Pentest Suite** (`pentests/`): 32 automated black-box attack scripts across 12 phases covering WAF bypass, HTTP smuggling (HTTP/1.1 CL.TE, HTTP/2 Rapid Reset, HTTP/3, WebTransport), SSRF, timing oracles, race conditions, and AI/LLM attack surface. Use `pentest_bypass_ips` in `[security]` to skip rate-limiting and auto-block for test runner IPs while keeping the WAF active.
 - **Unified UDP Listener**: Single QuicListener handles both HTTP/3 and WebTransport
-- **Shared Security State (QUIC)**: All QUIC listeners share one security context — blocked IPs, rate limiters, and fingerprint databases are consistent across every port
+- **Shared Security State**: Every listener — QUIC and all three TCP paths — shares one security context, so blocked IPs, rate limiter counters, the fingerprint corpus and DB-synced blocklists are consistent across every port and transport, and the admin API's unblock route reaches all of them
 - **Configurable WebTransport Port**: `webtransport_port` in `[server]` controls the dedicated WebTransport server bind port (default 4433)
 - **X-Forwarded Headers**: X-Real-IP, X-Forwarded-For, X-Forwarded-Proto
 - **Hop-by-Hop Header Stripping**: HTTP/1.1 connection-specific headers stripped from backend responses at the proxy layer before any caching or forwarding — safe across HTTP/1.1, HTTP/2, HTTP/3/QUIC, and WebTransport
@@ -262,6 +266,23 @@ curl --http3-only "https://<host>/?id=1%20UNION%20SELECT%20pw%20FROM%20users"
 ```
 
 ### TLS Fingerprint Classification
+
+Fingerprints are computed on **every transport**. On TCP the listener peeks the socket
+and parses the ClientHello itself; over QUIC the hello arrives inside encrypted Initial
+CRYPTO frames, so the vendored rustls fork captures its wire bytes and the vendored noq
+fork surfaces them through `HandshakeData`. Both feed the **same** extractor — two
+parsers would mean one client classified differently depending on which port it reached,
+and a blocklist entry gathered on one silently not applying on the other.
+
+Because a QUIC client legitimately offers a different extension set (QUIC transport
+parameters in, others out), the JA4 transport marker distinguishes them: `q` over QUIC,
+`t` over TCP.
+
+Blocking on the QUIC path happens *after* the handshake rather than before it. A QUIC
+server cannot decline earlier — the hello is encrypted under keys derived during the
+handshake it would be trying to avoid — but the block still lands before any HTTP/3
+request is served.
+
 
 Classification consults the operator database at `fingerprint.fingerprint_db_path`
 first, then the built-in table. Entries are matched by **JA3, then JA4**.
@@ -625,7 +646,7 @@ requests_per_hour = 100
 
 **Key Features:**
 - **Composite Keys**: Combine IP + JA3 fingerprint + path for fine-grained limiting
-- **JA3/JA4 Fingerprinting**: Identify clients behind NAT by TLS handshake signature
+- **JA3/JA4 Fingerprinting**: Identify clients behind NAT by TLS handshake signature, on TCP and QUIC alike
 - **JWT Subject Extraction**: Rate limit by authenticated user, not just IP
 - **X-Forwarded-For Trust Chain**: `trusted_proxies` lists the hops whose XFF header is honoured when deriving the client IP
 - **IPv6 Subnet Grouping**: `ipv6_subnet_bits` groups /64 subnets to prevent per-host evasion
@@ -1513,6 +1534,35 @@ The QUIC path uses WebTransport streams natively; the TCP path uses HTTP/1.1 con
 | Session hard cap | 30 minutes |
 
 ---
+
+## Examples
+
+### `masque-client` — a MASQUE (RFC 9298) reference client
+
+```bash
+cargo run --example masque-client -- <relay:port> <target:port> <name>
+cargo run --example masque-client -- pqcrypta.com:443 1.1.1.1:53 example.com
+```
+
+Opens an HTTP/3 connection, sends an Extended CONNECT with `:protocol = connect-udp`,
+and relays one DNS query to the target resolver as an HTTP Datagram. Written to be read:
+it is the shortest complete demonstration of the CONNECT-UDP flow, including the
+quarter-stream-ID framing that RFC 9297 uses to bind a connection-global datagram back to
+its request stream.
+
+Three things it gets right that are easy to get wrong:
+
+1. **The CONNECT stream is not finished.** The stream *is* the session; closing the send
+   side tells the relay to tear the UDP socket down, and datagrams then vanish silently
+   with a 200 OK already in hand.
+2. **Both `SETTINGS_H3_DATAGRAM` and `SETTINGS_ENABLE_CONNECT_PROTOCOL` are negotiated.**
+   Separate settings; without the second, `:protocol` is not legal on the request.
+3. **Inbound datagrams are filtered by quarter stream ID.** Every datagram on the
+   connection reaches every reader.
+
+A standalone copy that builds against upstream `quinn`/`h3` rather than the vendored noq
+forks is published at <https://pqcrypta.com/masque/>, for people who want the client
+without the proxy.
 
 ## Pentest Suite
 

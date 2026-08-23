@@ -385,10 +385,40 @@ impl FingerprintExtractor {
     pub fn classify(&self, ja3_hash: &str) -> (FingerprintClass, Option<String>) {
         self.known_fingerprints.classify(ja3_hash)
     }
+}
 
-    /// Extract JA3 fingerprint from TLS ClientHello
+/// Which transport carried the ClientHello.
+///
+/// The JA4 spec's first character. Not cosmetic: the same client build over TCP
+/// and over QUIC offers a different extension set (QUIC adds transport
+/// parameters, drops others), and the marker is what keeps the two from being
+/// read as one fingerprint that keeps drifting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ja4Transport {
+    /// TLS over TCP.
+    Tcp,
+    /// TLS over QUIC.
+    Quic,
+}
+
+impl Ja4Transport {
+    fn marker(self) -> &'static str {
+        match self {
+            Self::Tcp => "t",
+            Self::Quic => "q",
+        }
+    }
+}
+
+impl FingerprintExtractor {
+    /// Extract JA3 fingerprint from a TLS record containing a ClientHello.
     ///
     /// JA3 format: SSLVersion,Ciphers,Extensions,EllipticCurves,EllipticCurvePointFormats
+    ///
+    /// Takes a record because that is what a TCP listener peeks off the socket.
+    /// For QUIC, where there is no record layer, use [`extract_ja3_quic`].
+    ///
+    /// [`extract_ja3_quic`]: Self::extract_ja3_quic
     pub fn extract_ja3(&self, client_hello: &[u8]) -> Option<Ja3Fingerprint> {
         if client_hello.len() < 43 {
             return None;
@@ -406,6 +436,34 @@ impl FingerprintExtractor {
             return None;
         };
 
+        self.extract_from_handshake(handshake, tls_version, Ja4Transport::Tcp)
+    }
+
+    /// Extract a fingerprint from a bare ClientHello handshake message.
+    ///
+    /// QUIC carries the hello in Initial CRYPTO frames with no record layer, so
+    /// the bytes start at the handshake header rather than a record header, and
+    /// there is no record version to fold into the JA3 version field.
+    ///
+    /// Deliberately the same parser as the TCP path rather than a second one.
+    /// The QUIC and TCP listeners are already separate implementations and have
+    /// drifted before; two fingerprint parsers would mean the same client could
+    /// be classified differently depending on which port it reached, and a
+    /// blocklist entry gathered on one would silently not apply on the other.
+    pub fn extract_ja3_quic(&self, handshake: &[u8]) -> Option<Ja3Fingerprint> {
+        // 0 as the record version: `ch_version.max(record_version)` below then
+        // yields the ClientHello's own version, which is the only one that
+        // exists here.
+        self.extract_from_handshake(handshake, 0, Ja4Transport::Quic)
+    }
+
+    /// Shared body of both entry points, from the handshake header onward.
+    fn extract_from_handshake(
+        &self,
+        handshake: &[u8],
+        tls_version: u16,
+        transport: Ja4Transport,
+    ) -> Option<Ja3Fingerprint> {
         // Handshake header: type(1) + length(3)
         if handshake.len() < 4 || handshake[0] != 0x01 {
             // Not a ClientHello
@@ -476,6 +534,7 @@ impl FingerprintExtractor {
         let mut sni = None;
         let mut alpn_protocols = Vec::new();
         let mut signature_algorithms = Vec::new();
+        let mut supported_versions_max: Option<u16> = None;
 
         let extensions_end = offset + extensions_len;
         while offset + 4 <= extensions_end && offset + 4 <= client_hello_data.len() {
@@ -514,6 +573,13 @@ impl FingerprintExtractor {
                         16 => {
                             // ALPN
                             alpn_protocols = parse_alpn(ext_data);
+                        }
+                        43 => {
+                            // Supported Versions. A TLS 1.3 client is required
+                            // to pin legacy_version at 0x0303 and advertise 1.3
+                            // only here, so the ClientHello version alone says
+                            // "TLS 1.2" for every modern client.
+                            supported_versions_max = parse_supported_versions(ext_data);
                         }
                         _ => {}
                     }
@@ -554,14 +620,26 @@ impl FingerprintExtractor {
         hasher.update(ja3_string.as_bytes());
         let ja3_hash = hex::encode(hasher.finalize());
 
+        // JA4 takes the highest version the client actually offered, which for
+        // any TLS 1.3 client lives in supported_versions rather than in the
+        // frozen 0x0303 legacy field. Using the legacy field labelled every
+        // modern client "12", so our JA4s could not be cross-referenced against
+        // public JA4 data and the directory decoded them as TLS 1.2.
+        //
+        // JA3 deliberately keeps `ch_version`: its spec defines the version as
+        // the ClientHello's own field, and changing it would invalidate every
+        // JA3 in the curated database.
+        let ja4_version = supported_versions_max.unwrap_or(ch_version);
+
         // Also calculate JA4 fingerprint
         let ja4_hash = self.calculate_ja4(
-            ch_version,
+            ja4_version,
             &ciphers,
             &extensions,
             &alpn_protocols,
             &signature_algorithms,
             sni.is_some(),
+            transport,
         );
 
         Some(Ja3Fingerprint {
@@ -591,6 +669,7 @@ impl FingerprintExtractor {
     ///   - 8daaf6152771 = truncated SHA256 of sorted ciphers
     ///   - _ = separator
     ///   - b186095e22b6 = truncated SHA256 of sorted extensions + signature algorithms
+    #[allow(clippy::too_many_arguments)]
     fn calculate_ja4(
         &self,
         tls_version: u16,
@@ -599,9 +678,13 @@ impl FingerprintExtractor {
         alpn: &[String],
         sig_algs: &[u16],
         has_sni: bool,
+        transport: Ja4Transport,
     ) -> Option<String> {
-        // Protocol type
-        let proto = "t"; // TLS (would be "q" for QUIC)
+        // Protocol type. This was hardcoded to "t", which meant a QUIC client
+        // produced a JA4 claiming it arrived over TCP — colliding with the TCP
+        // fingerprint of the same client build and losing the one bit that
+        // distinguishes them.
+        let proto = transport.marker();
 
         // TLS version
         let version = match tls_version {
@@ -676,7 +759,7 @@ impl FingerprintExtractor {
         ))
     }
 
-    /// Process a ClientHello and update security state
+    /// Process a ClientHello from a TLS record and update security state.
     pub fn process_client_hello(
         &self,
         client_hello: &[u8],
@@ -684,7 +767,44 @@ impl FingerprintExtractor {
         security: &SecurityState,
         config: &FingerprintConfig,
     ) -> FingerprintResult {
-        let fingerprint = match self.extract_ja3(client_hello) {
+        self.process_fingerprint(self.extract_ja3(client_hello), client_ip, security, config)
+    }
+
+    /// Process a ClientHello that arrived over QUIC.
+    ///
+    /// `handshake` is the bare handshake message the TLS stack recovered from
+    /// the Initial CRYPTO frames — there is no record layer to strip.
+    ///
+    /// Everything after extraction is the same code as the TCP path: the same
+    /// classification order, the same cache, the same pentest-bypass rule, the
+    /// same ban decision. A QUIC client must not be judged by different rules
+    /// than the identical client over TCP, and duplicating the policy here is
+    /// how that would happen.
+    pub fn process_client_hello_quic(
+        &self,
+        handshake: &[u8],
+        client_ip: IpAddr,
+        security: &SecurityState,
+        config: &FingerprintConfig,
+    ) -> FingerprintResult {
+        self.process_fingerprint(
+            self.extract_ja3_quic(handshake),
+            client_ip,
+            security,
+            config,
+        )
+    }
+
+    /// Classification, caching and blocking for an already-extracted
+    /// fingerprint. Shared by both transports.
+    fn process_fingerprint(
+        &self,
+        fingerprint: Option<Ja3Fingerprint>,
+        client_ip: IpAddr,
+        security: &SecurityState,
+        config: &FingerprintConfig,
+    ) -> FingerprintResult {
+        let fingerprint = match fingerprint {
             Some(fp) => fp,
             None => {
                 return FingerprintResult {
@@ -761,17 +881,42 @@ impl FingerprintExtractor {
             );
         }
 
-        // Update security state JA3 cache
-        security.ja3_cache.insert(
-            ja3_hash.clone(),
-            TlsFingerprint {
+        // Update security state JA3 cache.
+        //
+        // Accumulates rather than overwrites. The unconditional `insert` this
+        // replaced reset `first_seen` to now and `request_count` to 1 on every
+        // single connection, so the corpus could answer "have I ever seen this
+        // hash" and nothing else — no counts, no age, and eviction sorted on a
+        // timestamp that was always the present moment.
+        let transport = ja4_hash
+            .as_deref()
+            .and_then(|j| j.chars().next())
+            .unwrap_or('t');
+
+        security
+            .ja3_cache
+            .entry(ja3_hash.clone())
+            .and_modify(|existing| {
+                existing.last_seen = now;
+                existing.request_count = existing.request_count.saturating_add(1);
+                // Re-classification can change as the operator database grows,
+                // so take the current verdict rather than the one from first
+                // sighting.
+                existing.classification = classification.clone();
+            })
+            .or_insert_with(|| TlsFingerprint {
                 ja3_hash: ja3_hash.clone(),
                 ja4_hash: ja4_hash.clone(),
+                ja3_string: fingerprint.ja3_string.clone(),
                 classification: classification.clone(),
+                transport,
                 first_seen: now,
+                last_seen: now,
                 request_count: 1,
-            },
-        );
+                // Filled in by the HTTP layer via note_user_agent — no request
+                // exists yet at the TLS layer where this record is created.
+                user_agents: std::collections::HashMap::new(),
+            });
 
         // Authorized pentest sources are never banned by fingerprint.
         //
@@ -1088,6 +1233,19 @@ pub async fn fingerprint_middleware(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
+    // Correlate the connection's fingerprint with what this request calls
+    // itself. The TLS layer that computed the fingerprint had no HTTP request to
+    // read a User-Agent from; this is the first layer that holds both, and the
+    // pairing is what lets the directory name a client rather than list a hash.
+    if let Some(ref ja3) = ja3_hash {
+        if let Some(ua) = headers
+            .get(axum::http::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+        {
+            state.security.note_user_agent(ja3, ua);
+        }
+    }
+
     // Create fingerprint info
     let fp_info =
         FingerprintInfo::from_headers(ja3_hash.clone(), ja4_hash.clone(), &state.extractor);
@@ -1260,6 +1418,20 @@ fn parse_signature_algorithms(data: &[u8]) -> Vec<u16> {
 }
 
 /// Parse ALPN extension
+/// Highest non-GREASE version from a `supported_versions` extension.
+///
+/// ClientHello form: 1-byte list length, then 2-byte versions. GREASE values are
+/// skipped for the same reason they are everywhere else here — they are
+/// deliberate noise and including them would make the fingerprint unstable.
+fn parse_supported_versions(data: &[u8]) -> Option<u16> {
+    let list_len = *data.first()? as usize;
+    let list = data.get(1..1 + list_len)?;
+    list.chunks_exact(2)
+        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .filter(|v| !is_grease(*v))
+        .max()
+}
+
 fn parse_alpn(data: &[u8]) -> Vec<String> {
     if data.len() < 2 {
         return Vec::new();
@@ -1700,6 +1872,7 @@ mod tests {
             &["h2".to_string()],       // ALPN
             &[0x0401, 0x0403],         // Signature algorithms
             true,                      // Has SNI
+            Ja4Transport::Tcp,
         );
 
         assert!(ja4.is_some());
@@ -1714,6 +1887,60 @@ mod tests {
     }
 
     #[test]
+    fn supported_versions_beats_the_legacy_field() {
+        // TLS 1.3 clients pin legacy_version at 0x0303 and advertise 1.3 only in
+        // supported_versions, so reading the legacy field labelled every modern
+        // client "12" and made our JA4s uncomparable with public JA4 data.
+        // list length 6, then GREASE, 0x0304, 0x0303.
+        let ext = [0x06u8, 0x0a, 0x0a, 0x03, 0x04, 0x03, 0x03];
+        assert_eq!(parse_supported_versions(&ext), Some(0x0304));
+
+        // GREASE alone yields nothing to fall back on.
+        let grease_only = [0x02u8, 0x1a, 0x1a];
+        assert_eq!(parse_supported_versions(&grease_only), None);
+
+        // A truncated extension must not panic or invent a version.
+        assert_eq!(parse_supported_versions(&[0x08u8, 0x03]), None);
+        assert_eq!(parse_supported_versions(&[]), None);
+    }
+
+    #[test]
+    fn ja4_marks_quic_transport() {
+        // The marker was hardcoded to "t", so a QUIC client produced a JA4
+        // claiming TCP — colliding with the same client's TCP fingerprint and
+        // losing the one character that tells them apart.
+        let extractor = FingerprintExtractor::new();
+
+        let over_tcp = extractor
+            .calculate_ja4(
+                0x0304,
+                &[0x1301, 0x1302],
+                &[0, 43],
+                &["h3".to_string()],
+                &[0x0403],
+                true,
+                Ja4Transport::Tcp,
+            )
+            .unwrap();
+        let over_quic = extractor
+            .calculate_ja4(
+                0x0304,
+                &[0x1301, 0x1302],
+                &[0, 43],
+                &["h3".to_string()],
+                &[0x0403],
+                true,
+                Ja4Transport::Quic,
+            )
+            .unwrap();
+
+        assert!(over_tcp.starts_with('t'));
+        assert!(over_quic.starts_with('q'));
+        // Identical otherwise: only the transport differs.
+        assert_eq!(over_tcp[1..], over_quic[1..]);
+    }
+
+    #[test]
     fn test_ja4_no_sni() {
         let extractor = FingerprintExtractor::new();
 
@@ -1724,6 +1951,7 @@ mod tests {
             &[],       // No ALPN
             &[],       // No sig algs
             false,     // No SNI
+            Ja4Transport::Tcp,
         );
 
         assert!(ja4.is_some());

@@ -75,6 +75,7 @@ pub mod cache;
 pub mod compression;
 pub mod config;
 pub mod connect_udp;
+pub mod crawler_verify;
 pub mod ech_config;
 pub mod fingerprint;
 pub mod handlers;

@@ -34,6 +34,9 @@ use crate::http3_features::EarlyHintsState;
 use crate::load_balancer::{LoadBalancer, SelectionContext};
 use crate::metrics::{ConnectionProtocol, MetricsRegistry};
 use crate::otel;
+use http::HeaderValue;
+
+use crate::fingerprint::FingerprintExtractor;
 use crate::proxy::BackendPool;
 use crate::rate_limiter::{build_context_from_request, AdvancedRateLimiter, RateLimitResult};
 use crate::security::{BlockReason, SecurityState};
@@ -68,6 +71,25 @@ fn build_alt_svc_header(config: &ProxyConfig) -> String {
         .map(|p| format!("h3=\":{}\"; ma=86400", p))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The starting point for a QUIC connection's handshake facts.
+///
+/// Only the TLS version is knowable without reading `HandshakeData`: QUIC
+/// permits nothing older than TLS 1.3 (RFC 9001 §4.2). The caller fills the rest
+/// from a single `handshake_data()` read.
+///
+/// ECH starts `unknown` and is overwritten from `HandshakeData` as soon as the
+/// handshake is read. It only stays `unknown` if that read fails, which would be
+/// a real fault rather than a property of the protocol.
+fn quic_handshake_facts_empty() -> crate::tls_acceptor::HandshakeFacts {
+    crate::tls_acceptor::HandshakeFacts {
+        tls_version: Some("TLSv1_3".to_string()),
+        cipher_suite: None,
+        kex_group: None,
+        alpn: None,
+        ech: "unknown",
+    }
 }
 
 fn alt_svc_for_host(config: &ProxyConfig, host: Option<&str>) -> String {
@@ -105,6 +127,17 @@ pub struct QuicListener {
     load_balancer: Arc<LoadBalancer>,
     /// Shared response cache (HTTP/3 path)
     cache: Arc<ResponseCache>,
+    /// TLS client fingerprint extractor, shared with the TCP listeners.
+    ///
+    /// The QUIC path computed no JA3/JA4 at all: it read `x-ja3-hash` and
+    /// `x-ja4-hash` from request headers that nothing on this path ever set, so
+    /// fingerprint rate limiting, `block_malicious`/`block_scanners` and
+    /// per-route `allowed_ja3` were all inert over HTTP/3 while appearing
+    /// configured.
+    fingerprint_extractor: Arc<FingerprintExtractor>,
+    /// Fingerprint policy (blocking toggles, cache TTL) — same config the TCP
+    /// listeners read, so one setting governs both transports.
+    fingerprint_config: crate::config::FingerprintConfig,
 }
 
 impl QuicListener {
@@ -247,6 +280,9 @@ impl QuicListener {
             info!("HTTP/3 Early Hints (103) enabled");
         }
 
+        // Cloned before `config` moves into `Self`.
+        let config_for_fingerprints = config.fingerprint.clone();
+
         Ok(Self {
             endpoint,
             tls_provider,
@@ -260,6 +296,8 @@ impl QuicListener {
             advanced_rate_limiter,
             load_balancer,
             cache,
+            fingerprint_extractor: Arc::new(FingerprintExtractor::new()),
+            fingerprint_config: config_for_fingerprints,
         })
     }
 
@@ -336,6 +374,8 @@ impl QuicListener {
                         let advanced_rate_limiter = self.advanced_rate_limiter.clone();
                         let load_balancer = self.load_balancer.clone();
                         let cache = self.cache.clone();
+                        let fingerprint_extractor = self.fingerprint_extractor.clone();
+                        let fingerprint_config = self.fingerprint_config.clone();
 
                         tokio::spawn(async move {
                             metrics.connections.connection_opened(ConnectionProtocol::Http3);
@@ -350,6 +390,8 @@ impl QuicListener {
                                 advanced_rate_limiter,
                                 load_balancer,
                                 cache,
+                                fingerprint_extractor,
+                                fingerprint_config,
                             ).await {
                                 error!("Connection error from {}: {}", remote_addr, e);
                             }
@@ -408,6 +450,8 @@ impl QuicListener {
         advanced_rate_limiter: Arc<AdvancedRateLimiter>,
         load_balancer: Arc<LoadBalancer>,
         cache: Arc<ResponseCache>,
+        fingerprint_extractor: Arc<FingerprintExtractor>,
+        fingerprint_config: crate::config::FingerprintConfig,
     ) -> anyhow::Result<()> {
         // Accept connection
         let connecting = incoming.accept()?;
@@ -417,6 +461,18 @@ impl QuicListener {
 
         // Log ALPN negotiation and record TLS handshake
         metrics.tls.handshake_completed(true, false);
+
+        // Read everything the handshake exposes in one pass: ALPN, the
+        // negotiated group and cipher suite for the Handshake Mirror, and the
+        // ClientHello bytes for fingerprinting.
+        //
+        // The hello is only reachable here. Over TCP a listener peeks the socket
+        // and parses the hello itself; over QUIC it arrives inside encrypted
+        // Initial CRYPTO frames, so the TLS stack holds the only plaintext copy
+        // and the vendored rustls/noq forks hand it out through HandshakeData.
+        let mut handshake_facts = quic_handshake_facts_empty();
+        let mut client_hello: Option<Vec<u8>> = None;
+
         if let Some(handshake_data) = connection.handshake_data() {
             if let Some(crypto_data) =
                 handshake_data.downcast_ref::<quinn::crypto::rustls::HandshakeData>()
@@ -424,8 +480,65 @@ impl QuicListener {
                 if let Some(protocol) = &crypto_data.protocol {
                     let alpn = String::from_utf8_lossy(protocol);
                     info!("ALPN negotiated: {} for {}", alpn, remote_addr);
+                    handshake_facts.alpn = Some(alpn.into_owned());
+                }
+                handshake_facts.kex_group = crypto_data
+                    .negotiated_key_exchange_group
+                    .map(|g| format!("{g:?}"));
+                handshake_facts.cipher_suite = crypto_data
+                    .negotiated_cipher_suite
+                    .map(|c| format!("{c:?}"));
+                client_hello = crypto_data.client_hello_wire.clone();
+                // ECH applies over QUIC exactly as over TCP; the page reported
+                // it as "not observable over HTTP/3" only because nothing
+                // carried the result up here.
+                if let Some(ech) = crypto_data.ech_accepted {
+                    handshake_facts.ech = match ech {
+                        rustls::server::EchAcceptance::NotOffered => "not-offered",
+                        rustls::server::EchAcceptance::Rejected => "rejected",
+                        rustls::server::EchAcceptance::Accepted => "accepted",
+                    };
                 }
             }
+        }
+
+        // Fingerprint the client, applying exactly the policy the TCP path
+        // applies — same classification order, same cache, same pentest bypass,
+        // same ban decision.
+        //
+        // Unlike TCP this happens *after* the handshake rather than before it. A
+        // QUIC server cannot decline earlier: the hello is encrypted under keys
+        // derived during the handshake it would be trying to avoid. The block
+        // still lands before any HTTP/3 request is served.
+        let fingerprint = match client_hello.as_deref() {
+            Some(hello) => fingerprint_extractor.process_client_hello_quic(
+                hello,
+                remote_addr.ip(),
+                &security,
+                &fingerprint_config,
+            ),
+            None => {
+                debug!(
+                    "[QUIC] No ClientHello available for {} — not fingerprinted",
+                    remote_addr
+                );
+                crate::fingerprint::FingerprintResult {
+                    allowed: true,
+                    ja3_hash: None,
+                    ja4_hash: None,
+                    classification: None,
+                    client_name: None,
+                }
+            }
+        };
+
+        if !fingerprint.allowed {
+            warn!(
+                "[QUIC] Blocking {} on TLS fingerprint (class={:?}, ja4={:?})",
+                remote_addr, fingerprint.classification, fingerprint.ja4_hash
+            );
+            connection.close(0u32.into(), b"blocked");
+            return Ok(());
         }
 
         // Multipath path management is fully automatic in noq once
@@ -516,6 +629,8 @@ impl QuicListener {
                     advanced_rate_limiter,
                     load_balancer,
                     cache,
+                    Arc::new(handshake_facts),
+                    Arc::new(fingerprint),
                 )
                 .await?;
             }
@@ -532,6 +647,7 @@ impl QuicListener {
 
     /// Handle HTTP/3 connection with WebTransport support
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn handle_h3_connection(
         h3: &mut h3::server::Connection<H3Connection, Bytes>,
         quic_connection: QuinnConnection,
@@ -544,6 +660,8 @@ impl QuicListener {
         advanced_rate_limiter: Arc<AdvancedRateLimiter>,
         load_balancer: Arc<LoadBalancer>,
         cache: Arc<ResponseCache>,
+        handshake: Arc<crate::tls_acceptor::HandshakeFacts>,
+        fingerprint: Arc<crate::fingerprint::FingerprintResult>,
     ) -> anyhow::Result<()> {
         // Lazily created on the first CONNECT-UDP session so connections that
         // never use MASQUE pay nothing for the datagram reader task.
@@ -873,6 +991,8 @@ impl QuicListener {
                         let rl_clone = advanced_rate_limiter.clone();
                         let lb_clone = load_balancer.clone();
                         let cache_clone = cache.clone();
+                        let handshake_clone = handshake.clone();
+                        let fingerprint_clone = fingerprint.clone();
 
                         tokio::spawn(async move {
                             // Note: health check detection happens inside handle_h3_request
@@ -888,6 +1008,8 @@ impl QuicListener {
                                 rl_clone,
                                 lb_clone,
                                 cache_clone,
+                                handshake_clone,
+                                fingerprint_clone,
                             )
                             .await
                             {
@@ -926,7 +1048,7 @@ impl QuicListener {
     #[allow(clippy::too_many_arguments)]
     async fn handle_h3_request<S>(
         mut stream: h3::server::RequestStream<S, Bytes>,
-        request: http::Request<()>,
+        mut request: http::Request<()>,
         remote_addr: SocketAddr,
         config: Arc<ProxyConfig>,
         backend_pool: Arc<BackendPool>,
@@ -936,11 +1058,70 @@ impl QuicListener {
         advanced_rate_limiter: Arc<AdvancedRateLimiter>,
         load_balancer: Arc<LoadBalancer>,
         cache: Arc<ResponseCache>,
+        handshake: Arc<crate::tls_acceptor::HandshakeFacts>,
+        fingerprint: Arc<crate::fingerprint::FingerprintResult>,
     ) -> anyhow::Result<()>
     where
         S: h3::quic::BidiStream<Bytes>,
     {
         let start_time = std::time::Instant::now();
+
+        // Establish the connection-derived headers before anything reads them.
+        //
+        // This has to happen here, not at forwarding time. `security.evaluate`
+        // enforces the per-route JA3 allowlist by reading `x-ja3-hash` off this
+        // request, and on this path nothing ever set it — so the allowlist was
+        // matching whatever the *client* chose to send, which a client wanting
+        // past it would simply set to an allowed value. The TCP listeners avoid
+        // that by overwriting these headers before the router runs; this does
+        // the same.
+        //
+        // Strip first, then set: a field this path cannot observe must come out
+        // absent rather than keep the client's value.
+        {
+            let h = request.headers_mut();
+            for name in crate::tls_acceptor::HandshakeFacts::HEADER_NAMES {
+                h.remove(name);
+            }
+            for name in [
+                "x-ja3-hash",
+                "x-ja4-hash",
+                "x-client-name",
+                "x-client-type",
+                "x-client-cert",
+                "x-tls-early-data",
+                "x-connection-protocol",
+                "x-pqc-enabled",
+            ] {
+                h.remove(name);
+            }
+
+            handshake.inject_headers(h);
+            h.insert("x-connection-protocol", HeaderValue::from_static("h3"));
+
+            if let Some(ref v) = fingerprint.ja3_hash {
+                if let Ok(v) = HeaderValue::from_str(v) {
+                    h.insert("x-ja3-hash", v);
+                }
+            }
+            if let Some(ref v) = fingerprint.ja4_hash {
+                if let Ok(v) = HeaderValue::from_str(v) {
+                    h.insert("x-ja4-hash", v);
+                }
+            }
+            if let Some(ref v) = fingerprint.client_name {
+                if let Ok(v) = HeaderValue::from_str(v) {
+                    h.insert("x-client-name", v);
+                }
+            }
+            if matches!(
+                fingerprint.classification,
+                Some(crate::security::FingerprintClass::Browser)
+            ) {
+                h.insert("x-client-type", HeaderValue::from_static("browser"));
+            }
+        }
+
         let uri = request.uri();
         let path = if config.server.normalize_paths {
             uri.path().to_ascii_lowercase()
@@ -1028,6 +1209,29 @@ impl QuicListener {
             }
 
             // 2. Per-IP rate limiting.
+            //
+            // This mirrors the TCP path's exemption for forward-confirmed
+            // search-engine crawlers. The two transports run separate limiter
+            // implementations, so an exemption added on only one of them leaves
+            // the other still banning Googlebot — and modern crawlers negotiate
+            // h3 whenever it is advertised, which this proxy does.
+            let crawler_verdict = security
+                .crawler_verifier
+                .classify(ip, user_agent.as_deref());
+            let is_verified_crawler =
+                crawler_verdict == crate::crawler_verify::CrawlerVerdict::Verified;
+            let skip_auto_block = is_verified_crawler
+                || crawler_verdict == crate::crawler_verify::CrawlerVerdict::Pending;
+
+            // Correlate the connection's fingerprint with what the request calls
+            // itself. This is the only layer that has both, and it is what lets the
+            // directory name a client instead of listing an opaque hash.
+            if let Some(ref ja3) = fingerprint.ja3_hash {
+                if let Some(ref ua) = user_agent {
+                    security.note_user_agent(ja3, ua);
+                }
+            }
+
             let (rate_enabled, rate_rps) = {
                 let rc = security.rate_config.read();
                 (rc.enabled, rc.requests_per_second)
@@ -1036,13 +1240,13 @@ impl QuicListener {
                 let sc = security.config.read();
                 (sc.auto_block_threshold, sc.auto_block_duration_secs)
             };
-            if rate_enabled {
+            if rate_enabled && !is_verified_crawler {
                 let rate_limiter = security.get_ip_rate_limiter(ip);
                 if rate_limiter.check().is_err() {
                     warn!("[QUIC/H3] Rate limit exceeded for {}", ip);
                     let mut counter = security.request_counts.entry(ip).or_default();
                     counter.suspicious_patterns += 1;
-                    if counter.suspicious_patterns >= auto_block_threshold {
+                    if counter.suspicious_patterns >= auto_block_threshold && !skip_auto_block {
                         drop(counter);
                         security.block_ip(
                             ip,
@@ -1087,16 +1291,15 @@ impl QuicListener {
 
             // 3. Advanced multi-dimensional rate limiting (same logic as TCP path).
             {
-                let ja3_hash = request
-                    .headers()
-                    .get("x-ja3-hash")
-                    .and_then(|v| v.to_str().ok())
-                    .map(String::from);
-                let ja4_hash = request
-                    .headers()
-                    .get("x-ja4-hash")
-                    .and_then(|v| v.to_str().ok())
-                    .map(String::from);
+                // From the connection's own handshake, not from request
+                // headers. These used to read `x-ja3-hash` / `x-ja4-hash` off
+                // the incoming request — headers that nothing on this path ever
+                // set, so both were always None and every fingerprint-keyed
+                // rate limit rule silently matched nothing over HTTP/3. Worse,
+                // a client could set them itself and choose which bucket to be
+                // counted in.
+                let ja3_hash = fingerprint.ja3_hash.clone();
+                let ja4_hash = fingerprint.ja4_hash.clone();
                 let adv_ctx = build_context_from_request(
                     ip,
                     request.headers(),
@@ -1979,6 +2182,12 @@ impl QuicListener {
                 }
             }
         }
+
+        // The connection-derived headers were established on `request` at entry
+        // (see the top of this function) and copied verbatim by the forwarding
+        // loop above, so they arrive at the backend already authoritative.
+        // Stripping them again here would have discarded the real JA3/JA4 and
+        // re-asserted only the subset this block knew about.
 
         // Forward Host header to backend (required for virtual host routing)
         if let Some(ref host_value) = host {

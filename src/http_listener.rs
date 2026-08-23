@@ -439,6 +439,11 @@ pub async fn run_http_listener_pqc(
     metrics: Arc<MetricsRegistry>,
     load_balancer: Arc<LoadBalancer>,
     sni_map: openssl_pqc::PqcSniMap,
+    // Shared with every other listener. Each of these built its own
+    // `SecurityState` before, so a blocked IP, a rate-limit counter, an
+    // observed fingerprint or a DB-synced blocklist entry existed only on
+    // whichever listener happened to see it.
+    security_state: SecurityState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let port = addr.port();
 
@@ -478,7 +483,6 @@ pub async fn run_http_listener_pqc(
         .build(https_connector);
 
     // Initialize security state from config (must be created before state)
-    let security_state = SecurityState::new(&config);
 
     // Initialize fingerprint extractor for JA3/JA4 tracking
     let fingerprint_extractor = Arc::new(FingerprintExtractor::new());
@@ -682,6 +686,10 @@ pub async fn run_http_listener_pqc(
 ///                → Hyper HTTP/1.1 service
 ///                    → Axum router with middleware stack
 /// ```
+// Every argument is a distinct per-listener dependency with no natural
+// grouping; bundling them into a struct purely to satisfy the lint would add an
+// indirection none of the sibling listeners have.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_http_listener_with_fingerprint(
     addr: SocketAddr,
     cert_path: &str,
@@ -690,6 +698,7 @@ pub async fn run_http_listener_with_fingerprint(
     shutdown_rx: watch::Receiver<()>,
     metrics: Arc<MetricsRegistry>,
     load_balancer: Arc<LoadBalancer>,
+    security_state: SecurityState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     run_http_listener_with_fingerprint_and_resolver(
         addr,
@@ -700,6 +709,7 @@ pub async fn run_http_listener_with_fingerprint(
         metrics,
         load_balancer,
         None,
+        security_state,
     )
     .await
 }
@@ -719,6 +729,11 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
     metrics: Arc<MetricsRegistry>,
     load_balancer: Arc<LoadBalancer>,
     shared_resolver: Option<std::sync::Arc<crate::tls::MultiDomainCertResolver>>,
+    // Shared with every other listener. Each of these built its own
+    // `SecurityState` before, so a blocked IP, a rate-limit counter, an
+    // observed fingerprint or a DB-synced blocklist entry existed only on
+    // whichever listener happened to see it.
+    security_state: SecurityState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut shutdown_rx = shutdown_rx;
     let port = addr.port();
@@ -759,7 +774,6 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
         .build(https_connector);
 
     // Initialize security state from config
-    let security_state = SecurityState::new(&config);
 
     // Initialize fingerprint extractor for JA3/JA4 tracking
     let fingerprint_extractor = Arc::new(FingerprintExtractor::new());
@@ -1018,6 +1032,18 @@ async fn handle_fingerprinted_connection(
             // Strip any client-supplied x-connection-protocol header before
             // injecting the authoritative value from ALPN negotiation.
             req.headers_mut().remove("x-connection-protocol");
+            // Same for the classification headers. These are only inserted when
+            // the fingerprinter has something to say, so without an
+            // unconditional strip a caller could simply assert
+            // `x-client-type: browser` and have it survive to the backend —
+            // curl arriving labelled as a browser.
+            req.headers_mut().remove("x-client-type");
+            req.headers_mut().remove("x-client-name");
+
+            // Inject the negotiated-handshake headers the Handshake Mirror
+            // reads. Strips any client-supplied copies first (see
+            // HandshakeFacts::inject_headers).
+            ci.handshake.inject_headers(req.headers_mut());
 
             // Inject fingerprint headers for downstream middleware
             if let Some(ref hash) = ja3 {
@@ -1142,6 +1168,11 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     metrics: Arc<MetricsRegistry>,
     load_balancer: Arc<LoadBalancer>,
     sni_map: openssl_pqc::PqcSniMap,
+    // Shared with every other listener. Each of these built its own
+    // `SecurityState` before, so a blocked IP, a rate-limit counter, an
+    // observed fingerprint or a DB-synced blocklist entry existed only on
+    // whichever listener happened to see it.
+    security_state: SecurityState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut shutdown_rx = shutdown_rx;
     use openssl::ssl::SslContext;
@@ -1185,7 +1216,6 @@ pub async fn run_http_listener_pqc_with_fingerprint(
         .build(https_connector);
 
     // Initialize security state
-    let security_state = SecurityState::new(&config);
 
     // Initialize fingerprint extractor
     let fingerprint_extractor = Arc::new(FingerprintExtractor::new());
@@ -1375,6 +1405,31 @@ pub async fn run_http_listener_pqc_with_fingerprint(
 /// Handle a single PQC connection with fingerprinting
 #[cfg(feature = "pqc")]
 #[allow(clippy::too_many_arguments)]
+/// Capture what the OpenSSL PQC listener's handshake negotiated.
+///
+/// The rustls path builds the same facts in `HandshakeFacts::from_connection`;
+/// this is the OpenSSL equivalent, reading the group through the FFI binding in
+/// `pqc_tls::openssl_pqc::negotiated_group` rather than assuming it.
+///
+/// ECH is reported as `not-supported` rather than `not-offered`: this listener
+/// has no ECH keys at all, so "the client did not offer it" would be a claim
+/// this code is in no position to make.
+fn pqc_handshake_facts(ssl: &openssl::ssl::SslRef) -> crate::tls_acceptor::HandshakeFacts {
+    crate::tls_acceptor::HandshakeFacts {
+        tls_version: Some(ssl.version_str().to_string()),
+        cipher_suite: ssl.current_cipher().map(|c| c.name().to_string()),
+        kex_group: crate::pqc_tls::openssl_pqc::negotiated_group(ssl),
+        alpn: ssl
+            .selected_alpn_protocol()
+            .map(|p| String::from_utf8_lossy(p).into_owned()),
+        ech: "not-supported",
+    }
+}
+
+// Every argument is a distinct per-connection dependency with no natural
+// grouping; bundling them into a struct purely to satisfy the lint would add an
+// indirection this accept path does not otherwise need.
+#[allow(clippy::too_many_arguments)]
 async fn handle_pqc_fingerprinted_connection(
     stream: TcpStream,
     remote_addr: SocketAddr,
@@ -1504,6 +1559,7 @@ async fn handle_pqc_fingerprinted_connection(
         is_browser,
         is_early_data: false,
         client_cert_present,
+        handshake: pqc_handshake_facts(ssl_stream.ssl()),
     };
 
     // Create service that injects fingerprint headers
@@ -1523,6 +1579,18 @@ async fn handle_pqc_fingerprinted_connection(
             // Strip any client-supplied x-connection-protocol header before
             // injecting the authoritative value from ALPN negotiation.
             req.headers_mut().remove("x-connection-protocol");
+            // Same for the classification headers. These are only inserted when
+            // the fingerprinter has something to say, so without an
+            // unconditional strip a caller could simply assert
+            // `x-client-type: browser` and have it survive to the backend —
+            // curl arriving labelled as a browser.
+            req.headers_mut().remove("x-client-type");
+            req.headers_mut().remove("x-client-name");
+
+            // Inject the negotiated-handshake headers the Handshake Mirror
+            // reads. Strips any client-supplied copies first (see
+            // HandshakeFacts::inject_headers).
+            ci.handshake.inject_headers(req.headers_mut());
 
             // Inject fingerprint headers
             if let Some(ref hash) = ja3 {
@@ -1545,9 +1613,24 @@ async fn handle_pqc_fingerprinted_connection(
                     .insert("x-client-type", HeaderValue::from_static("browser"));
             }
 
-            // Add PQC indicator header
-            req.headers_mut()
-                .insert("x-pqc-enabled", HeaderValue::from_static("true"));
+            // Report whether *this handshake* was post-quantum, not whether the
+            // listener supports it. The constant `true` this replaced was wrong
+            // for every classical-only client that reached this port.
+            req.headers_mut().remove("x-pqc-enabled");
+            let pqc_negotiated = ci
+                .handshake
+                .kex_group
+                .as_deref()
+                .and_then(crate::pqc_tls::PqcKemAlgorithm::from_str)
+                .is_some();
+            req.headers_mut().insert(
+                "x-pqc-enabled",
+                if pqc_negotiated {
+                    HeaderValue::from_static("true")
+                } else {
+                    HeaderValue::from_static("false")
+                },
+            );
 
             // Tag connections where the client presented a TLS certificate so
             // proxy_handler can enforce per-route internal mTLS requirements.
@@ -2485,6 +2568,28 @@ async fn advanced_rate_limit_middleware(
                 client_addr.ip(),
                 reason
             );
+
+            // Mirror the refusal into access.log: a 403 that appears only in
+            // the journal makes every later "why did this client get a 403?"
+            // investigation start from a log that looks clean.
+            let header_str = |name: hyper::header::HeaderName| {
+                headers
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from)
+            };
+            log_access(&AccessLogEntry {
+                remote_addr: client_addr,
+                method: method.clone(),
+                path: path.clone(),
+                protocol: "HTTP/1.1".to_string(),
+                status: 403,
+                body_size: 0,
+                referer: header_str(hyper::header::REFERER),
+                user_agent: header_str(hyper::header::USER_AGENT),
+                host: header_str(hyper::header::HOST),
+                response_time_ms: 0,
+            });
 
             let mut response = (StatusCode::FORBIDDEN, "Access denied").into_response();
             // Add Alt-Svc header to advertise HTTP/3

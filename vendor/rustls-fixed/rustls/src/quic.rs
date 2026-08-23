@@ -35,7 +35,7 @@ mod connection {
         ClientExtensionsInput, ServerExtensionsInput, TransportParameters,
     };
     use crate::msgs::message::InboundPlainMessage;
-    use crate::server::{ServerConfig, ServerConnectionData};
+    use crate::server::{EchAcceptance, ServerConfig, ServerConnectionData};
     use crate::sync::Arc;
     use crate::vecbuf::ChunkVecBuffer;
 
@@ -325,6 +325,36 @@ mod connection {
         /// The server name is also used to match sessions during session resumption.
         pub fn server_name(&self) -> Option<&str> {
             self.inner.core.get_sni_str()
+        }
+
+        /// The client's ClientHello exactly as it arrived: handshake type byte,
+        /// 3-byte length, then the body. There is no TLS record header, because
+        /// a QUIC connection never has one.
+        ///
+        /// This matters more here than on the TCP side. A TCP server can peek
+        /// its own socket and parse the hello itself, which is how JA3/JA4
+        /// fingerprinting is normally implemented; over QUIC the hello arrives
+        /// inside encrypted Initial CRYPTO frames, so the TLS stack holds the
+        /// only plaintext copy and a server that cannot get it here cannot
+        /// fingerprint clients at all.
+        ///
+        /// Available once the ClientHello has been processed. If ECH was
+        /// accepted these are the *inner* hello's bytes — the hello that
+        /// actually describes the client, rather than the ECH-shaped outer one
+        /// that every ECH client looks alike in.
+        pub fn client_hello_wire(&self) -> Option<&[u8]> {
+            self.inner.core.client_hello_wire()
+        }
+
+        /// The outcome of Encrypted Client Hello processing for this connection.
+        ///
+        /// ECH is a TLS 1.3 extension and QUIC is TLS 1.3, so it applies here
+        /// exactly as it does over TCP: the same `ExpectClientHello` state
+        /// machine resolves it and records the result on the shared
+        /// `ServerConnectionData`. The only thing missing was a way to read it
+        /// back out on this connection type.
+        pub fn ech_acceptance(&self) -> EchAcceptance {
+            self.inner.core.ech_acceptance()
         }
     }
 

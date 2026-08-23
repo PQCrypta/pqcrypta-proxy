@@ -13,7 +13,7 @@
 //! GeoIP blocking is an optional feature requiring MaxMind database integration
 //! (enable with `--features geoip`). Active JA3/JA4 fingerprinting lives in `fingerprint.rs`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -37,6 +37,16 @@ const MAX_TRACKED_IPS: usize = 100_000;
 
 /// Maximum number of tracked JA3 fingerprints
 const MAX_JA3_FINGERPRINTS: usize = 50_000;
+
+/// Distinct User-Agents retained per fingerprint.
+///
+/// Three is enough to name a client and to notice when one fingerprint is worn
+/// by several very different agents (which is itself a finding). More would
+/// just be a place for a UA-randomising client to write into.
+const MAX_UA_PER_FINGERPRINT: usize = 3;
+
+/// Longest User-Agent stored. Anything longer is truncated rather than dropped.
+const MAX_UA_LEN: usize = 180;
 
 /// Check if an IP is within the unconditionally trusted loopback range.
 ///
@@ -117,7 +127,9 @@ use governor::{Quota, RateLimiter};
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::access_logger::{log_access, AccessLogEntry};
 use crate::config::{CircuitBreakerConfig, ProxyConfig, RateLimitConfig, SecurityConfig};
+use crate::crawler_verify::{CrawlerVerdict, CrawlerVerifier};
 use crate::waf::{WafEngine, WafRequest, WafVerdict};
 
 /// Entry in a JA3/JA4 fingerprint database JSON file.
@@ -262,6 +274,15 @@ pub struct SecurityState {
     /// P3-fix: previously a hardcoded constant listing ports 443/4433/4434.
     /// Now reflects the actual configured udp_port and additional_ports.
     pub alt_svc_header: Arc<str>,
+    /// Forward-confirmed reverse-DNS cache for search-engine crawlers.
+    ///
+    /// A rendering crawler fetches a document and all its subresources at once,
+    /// which the connection-rate limiter reads as a flood and answers with a
+    /// 300s ban — that is what reduced Google to ~110 requests/day and made
+    /// Search Console report 403 on healthy URLs. Verified crawlers are exempted
+    /// from the rate limiters here, the same way pentest_bypass_ips are, and for
+    /// the same reason: the limiter is aimed at abuse, not at these clients.
+    pub crawler_verifier: Arc<CrawlerVerifier>,
 }
 
 /// Information about a blocked IP
@@ -421,12 +442,221 @@ pub struct TlsFingerprint {
     pub ja3_hash: String,
     /// JA4 hash (if available)
     pub ja4_hash: Option<String>,
+    /// The pre-hash JA3 input:
+    /// `version,ciphers,extensions,curves,point_formats`.
+    ///
+    /// The extractor has always computed this and thrown it away, keeping only
+    /// the MD5. Without it a JA3 is undecodable — which is why the public
+    /// directory could show nothing at all for 160 of its 179 entries. Keeping
+    /// it costs ~200 bytes per distinct fingerprint and makes them readable.
+    pub ja3_string: String,
     /// Classification (browser, bot, scanner, etc.)
     pub classification: FingerprintClass,
+    /// Which transport carried the ClientHello: 't' (TCP) or 'q' (QUIC).
+    pub transport: char,
     /// First seen timestamp
     pub first_seen: Instant,
+    /// Most recent sighting. Drives eviction and the "last seen" the directory
+    /// reports; `first_seen` alone cannot distinguish a fingerprint seen once a
+    /// year ago from one arriving continuously.
+    pub last_seen: Instant,
     /// Request count with this fingerprint
     pub request_count: u64,
+    /// User-Agents seen on requests carrying this fingerprint, with counts.
+    ///
+    /// The fingerprint is computed at the TLS layer, where no HTTP request
+    /// exists yet — which is why the corpus could say what connected but never
+    /// what it called itself, and why almost everything in the public directory
+    /// read "unclassified". The HTTP layer has both, so it reports back here.
+    ///
+    /// Bounded at [`MAX_UA_PER_FINGERPRINT`]: a client that randomises its
+    /// User-Agent must not be able to grow this without limit.
+    pub user_agents: HashMap<String, u64>,
+}
+
+/// One observed fingerprint, in a form that survives a restart.
+///
+/// Separate from [`TlsFingerprint`] because that holds `Instant`s, which are
+/// monotonic-clock readings with no meaning across processes. Timestamps here
+/// are Unix seconds, derived at flush time.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ObservedFingerprint {
+    pub ja3_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ja4_hash: Option<String>,
+    #[serde(default)]
+    pub ja3_string: String,
+    pub classification: String,
+    #[serde(default = "default_transport")]
+    pub transport: char,
+    pub first_seen: u64,
+    pub last_seen: u64,
+    pub request_count: u64,
+    #[serde(default)]
+    pub user_agents: HashMap<String, u64>,
+}
+
+fn default_transport() -> char {
+    't'
+}
+
+impl SecurityState {
+    /// Where observed fingerprints are persisted between restarts.
+    pub const OBSERVED_PATH: &'static str = "/var/lib/pqcrypta-proxy/fingerprints/observed.json";
+
+    /// Snapshot the observed-fingerprint corpus to disk.
+    ///
+    /// Written atomically through a temp file: the public directory reads this
+    /// on a timer, and a half-written file would be a parse error served to
+    /// visitors rather than a stale-but-valid one.
+    ///
+    /// `Instant` is a monotonic reading with no meaning to another process, so
+    /// timestamps are converted to Unix seconds here by walking each elapsed
+    /// duration back from the current wall clock.
+    pub fn flush_observed_fingerprints(&self) -> std::io::Result<usize> {
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let to_unix = |i: Instant| now_unix.saturating_sub(i.elapsed().as_secs());
+
+        let records: Vec<ObservedFingerprint> = self
+            .ja3_cache
+            .iter()
+            .map(|e| {
+                let v = e.value();
+                ObservedFingerprint {
+                    ja3_hash: v.ja3_hash.clone(),
+                    ja4_hash: v.ja4_hash.clone(),
+                    ja3_string: v.ja3_string.clone(),
+                    classification: format!("{:?}", v.classification),
+                    transport: v.transport,
+                    first_seen: to_unix(v.first_seen),
+                    last_seen: to_unix(v.last_seen),
+                    request_count: v.request_count,
+                    user_agents: v.user_agents.clone(),
+                }
+            })
+            .collect();
+
+        let path = std::path::Path::new(Self::OBSERVED_PATH);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        let json = serde_json::to_vec_pretty(&records)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(&tmp, json)?;
+        // 0644: the export job feeding the public directory runs unprivileged.
+        // These are observations, not policy — this file bans nobody by itself.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))?;
+        }
+        std::fs::rename(&tmp, path)?;
+
+        Ok(records.len())
+    }
+
+    /// Record the User-Agent a request carrying this fingerprint presented.
+    ///
+    /// Called from the HTTP layer, which is the only place both facts exist at
+    /// once: the fingerprint comes off the TLS handshake, the User-Agent off the
+    /// request that followed it. Correlating them is what turns a corpus of
+    /// opaque hashes into named clients — it is how public JA4 databases are
+    /// built, and without it the directory could only ever say "unclassified".
+    ///
+    /// A no-op when the fingerprint is unknown or the header is absent, and
+    /// cheap in the common case: one `DashMap` lookup and a counter bump on an
+    /// entry that already exists.
+    pub fn note_user_agent(&self, ja3_hash: &str, user_agent: &str) {
+        if ja3_hash.is_empty() || user_agent.is_empty() {
+            return;
+        }
+
+        let Some(mut entry) = self.ja3_cache.get_mut(ja3_hash) else {
+            return;
+        };
+
+        let ua: String = user_agent.chars().take(MAX_UA_LEN).collect();
+
+        if let Some(count) = entry.user_agents.get_mut(&ua) {
+            *count = count.saturating_add(1);
+            return;
+        }
+
+        // New agent for this fingerprint. Evict the least-seen if full, so a
+        // client rotating its User-Agent cannot push out the one real name.
+        if entry.user_agents.len() >= MAX_UA_PER_FINGERPRINT {
+            if let Some(weakest) = entry
+                .user_agents
+                .iter()
+                .min_by_key(|(_, c)| **c)
+                .map(|(k, _)| k.clone())
+            {
+                // Only displace an agent seen less often than once; a
+                // one-off should not evict an established name.
+                if entry.user_agents.get(&weakest).copied().unwrap_or(0) > 1 {
+                    return;
+                }
+                entry.user_agents.remove(&weakest);
+            }
+        }
+
+        entry.user_agents.insert(ua, 1);
+    }
+
+    /// Reload the corpus written by a previous run.
+    ///
+    /// Counts and first-seen dates are the point: without this, every restart
+    /// resets the corpus to "nothing has ever been seen", and a proxy that
+    /// restarts on config reload would never accumulate one at all.
+    ///
+    /// A missing or corrupt file is not an error — first boot is the normal
+    /// case, and a bad file must not stop the proxy starting.
+    pub fn load_observed_fingerprints(&self) -> usize {
+        let Ok(bytes) = std::fs::read(Self::OBSERVED_PATH) else {
+            return 0;
+        };
+        let Ok(records) = serde_json::from_slice::<Vec<ObservedFingerprint>>(&bytes) else {
+            warn!("Observed fingerprint corpus is unreadable — starting empty");
+            return 0;
+        };
+
+        let now = Instant::now();
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Rebuild Instants by walking the wall-clock age backwards. A record
+        // stamped in the future (clock moved) collapses to "just now" rather
+        // than underflowing.
+        let to_instant = |unix: u64| {
+            now.checked_sub(Duration::from_secs(now_unix.saturating_sub(unix)))
+                .unwrap_or(now)
+        };
+
+        let mut loaded = 0;
+        for r in records {
+            self.ja3_cache.insert(
+                r.ja3_hash.clone(),
+                TlsFingerprint {
+                    ja3_hash: r.ja3_hash,
+                    ja4_hash: r.ja4_hash,
+                    ja3_string: r.ja3_string,
+                    classification: FingerprintClass::from_label(&r.classification),
+                    transport: r.transport,
+                    first_seen: to_instant(r.first_seen),
+                    last_seen: to_instant(r.last_seen),
+                    request_count: r.request_count,
+                    user_agents: r.user_agents,
+                },
+            );
+            loaded += 1;
+        }
+        loaded
+    }
 }
 
 /// Fingerprint classification
@@ -444,6 +674,24 @@ pub enum FingerprintClass {
     Scanner,
     /// API client (curl, etc.)
     ApiClient,
+}
+
+impl FingerprintClass {
+    /// Parse back the `Debug` spelling written by the flush.
+    ///
+    /// Anything unrecognised becomes `Suspicious` — the same default a
+    /// never-before-seen fingerprint gets, so a corpus written by a future
+    /// version with new variants degrades instead of being discarded.
+    fn from_label(label: &str) -> Self {
+        match label {
+            "Browser" => Self::Browser,
+            "LegitimateBot" => Self::LegitimateBot,
+            "Malicious" => Self::Malicious,
+            "Scanner" => Self::Scanner,
+            "ApiClient" => Self::ApiClient,
+            _ => Self::Suspicious,
+        }
+    }
 }
 
 /// Circuit breaker state for backend protection
@@ -586,6 +834,7 @@ impl SecurityState {
             blocked_ips,
             request_counts: Arc::new(DashMap::new()),
             ja3_cache: Arc::new(DashMap::new()),
+            crawler_verifier: Arc::new(CrawlerVerifier::new()),
             circuit_breakers: Arc::new(DashMap::new()),
             config: Arc::new(RwLock::new(config.security.clone())),
             rate_config: Arc::new(RwLock::new(config.rate_limiting.clone())),
@@ -1096,6 +1345,27 @@ impl SecurityState {
             c.pentest_bypass_ips.iter().any(|p| p == &ip_str)
         };
 
+        // Search-engine crawlers, verified by forward-confirmed reverse DNS.
+        //
+        // Verified  -> exempt from the rate limiters entirely. A render burst is
+        //              normal crawler behaviour, not abuse.
+        // Pending   -> the DNS check has not returned yet. Still rate-limited
+        //              (a 429 is retryable and crawlers honour it), but never
+        //              auto-banned, so an unproven claim cannot cost a genuine
+        //              crawler a 300s blackout on a burst it will never repeat.
+        // Rejected  -> a spoofed User-Agent. Treated as ordinary traffic.
+        //
+        // WAF, GeoIP and the blocklist all still apply: this exempts a client
+        // from volumetric limits only, never from attack inspection.
+        let crawler = self.crawler_verifier.classify(
+            ip,
+            view.headers
+                .get(hyper::header::USER_AGENT)
+                .and_then(|v| v.to_str().ok()),
+        );
+        let is_verified_crawler = crawler == CrawlerVerdict::Verified;
+        let skip_auto_block = is_verified_crawler || crawler == CrawlerVerdict::Pending;
+
         // 1. Blocklist
         if let Some(info) = self.is_blocked(&ip) {
             return SecurityDecision::Blocked(info);
@@ -1142,17 +1412,22 @@ impl SecurityState {
             )
         };
 
-        if !is_pentest {
+        if !is_pentest && !is_verified_crawler {
             if conn_rate_enabled && self.connection_rate_exceeded(ip, conn_rate_per_sec) {
                 warn!(
                     "Connection rate limit exceeded for {} ({} conn/s)",
                     ip, conn_rate_per_sec
                 );
-                self.block_ip(
-                    ip,
-                    BlockReason::RateLimitExceeded,
-                    Some(Duration::from_secs(auto_block_duration_secs)),
-                );
+                // This block fires on the first offence, with no counter to
+                // cross first — which is exactly how a single Search Console
+                // live test used to earn Google a 300s ban.
+                if !skip_auto_block {
+                    self.block_ip(
+                        ip,
+                        BlockReason::RateLimitExceeded,
+                        Some(Duration::from_secs(auto_block_duration_secs)),
+                    );
+                }
                 return SecurityDecision::RateLimited {
                     limit: conn_rate_per_sec,
                     retry_after_secs: 1,
@@ -1164,7 +1439,7 @@ impl SecurityState {
                 warn!("Rate limit exceeded for {}", ip);
                 let mut counter = self.request_counts.entry(ip).or_default();
                 counter.suspicious_patterns += 1;
-                if counter.suspicious_patterns >= auto_block_threshold {
+                if counter.suspicious_patterns >= auto_block_threshold && !skip_auto_block {
                     drop(counter);
                     self.block_ip(
                         ip,
@@ -1246,6 +1521,15 @@ impl SecurityState {
     pub fn record_request(&self, ip: IpAddr, status: StatusCode) {
         // Skip tracking for trusted IPs (loopback, or operator-configured trusted_internal_cidrs)
         if self.is_trusted(&ip) {
+            return;
+        }
+
+        // A crawler walking stale links legitimately accumulates 404s, which is
+        // precisely the shape this error-rate heuristic bans for. Verified
+        // crawlers are therefore not tracked here. The UA is not available at
+        // this call site, so this reads the verdict established earlier in the
+        // request by evaluate(); an unverified address is tracked as normal.
+        if self.crawler_verifier.cached_verdict(ip) == Some(CrawlerVerdict::Verified) {
             return;
         }
 
@@ -1445,13 +1729,18 @@ impl SecurityState {
             }
         }
 
-        // Evict oldest JA3 fingerprints if over limit
+        // Evict least-recently-seen JA3 fingerprints if over limit.
+        //
+        // Was oldest-first-seen, which threw out long-lived regulars in favour
+        // of whatever had sprayed the box most recently — backwards for a corpus
+        // meant to describe normal traffic, and it meant a burst of one-shot
+        // scanner fingerprints could evict every browser we knew about.
         let ja3_count = self.ja3_cache.len();
         if ja3_count > MAX_JA3_FINGERPRINTS {
             let mut entries: Vec<_> = self
                 .ja3_cache
                 .iter()
-                .map(|e| (e.key().clone(), e.value().first_seen))
+                .map(|e| (e.key().clone(), e.value().last_seen))
                 .collect();
             entries.sort_by_key(|(_, time)| *time);
             let to_remove = ja3_count.saturating_sub(MAX_JA3_FINGERPRINTS);
@@ -1595,20 +1884,59 @@ pub async fn security_middleware(
                 .get("origin")
                 .and_then(|v| v.to_str().ok())
                 .map(String::from);
-            return render_decision(&decision, alt_svc, request_origin.as_deref());
+            let response = render_decision(&decision, alt_svc, request_origin.as_deref());
+
+            // Security refusals used to return without ever reaching the access
+            // logger, so a blocked client saw a 403 while access.log stayed
+            // silent and only the journal recorded it. That made a Search
+            // Console "Blocked due to access forbidden (403)" impossible to
+            // reconcile against the logs. Record them like any other response.
+            let header_str = |name: hyper::header::HeaderName| {
+                headers
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from)
+            };
+            log_access(&AccessLogEntry {
+                remote_addr: client_addr,
+                method: request.method().as_str().to_string(),
+                path: request.uri().path().to_string(),
+                protocol: format!("{:?}", request.version()),
+                status: response.status().as_u16(),
+                body_size: 0,
+                referer: header_str(hyper::header::REFERER),
+                user_agent: header_str(hyper::header::USER_AGENT),
+                host: header_str(hyper::header::HOST),
+                response_time_ms: 0,
+            });
+
+            return response;
         }
 
         // DoS concurrency limit — counted here because the matching decrement
         // happens once this middleware's response is built.
+        //
+        // A verified crawler is exempt from the *ban*, not from the limit: it
+        // still gets 503'd when it exceeds the concurrency cap, but a rendering
+        // burst must not cost it a multi-minute blackout.
+        let crawler_exempt = security.crawler_verifier.classify(
+            ip,
+            headers
+                .get(hyper::header::USER_AGENT)
+                .and_then(|v| v.to_str().ok()),
+        ) == CrawlerVerdict::Verified;
+
         if dos_protection && !is_pentest_bypass {
             let connections = security.increment_connections(ip);
             if connections > max_connections_per_ip {
                 security.decrement_connections(ip);
-                security.block_ip(
-                    ip,
-                    BlockReason::ConnectionLimitExceeded,
-                    Some(Duration::from_secs(auto_block_duration_secs)),
-                );
+                if !crawler_exempt {
+                    security.block_ip(
+                        ip,
+                        BlockReason::ConnectionLimitExceeded,
+                        Some(Duration::from_secs(auto_block_duration_secs)),
+                    );
+                }
                 warn!(
                     "Too many connections from {}: {} (limit {})",
                     ip, connections, max_connections_per_ip

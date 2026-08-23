@@ -605,6 +605,7 @@ mod connection {
     use crate::common_state::{CommonState, Context, Side};
     use crate::conn::{ConnectionCommon, ConnectionCore};
     use crate::error::Error;
+    use crate::server::ech::EchAcceptance;
     use crate::server::hs;
     use crate::suites::ExtractedSecrets;
     use crate::sync::Arc;
@@ -673,6 +674,38 @@ mod connection {
         /// The server name is also used to match sessions during session resumption.
         pub fn server_name(&self) -> Option<&str> {
             self.inner.core.get_sni_str()
+        }
+
+        /// The outcome of Encrypted Client Hello processing for this connection.
+        ///
+        /// The mirror of `ClientConnection::ech_status` for the accepting side:
+        /// whether the client offered ECH, and if so whether this server could
+        /// decrypt it. Meaningful once the handshake has progressed past the
+        /// ClientHello; before that it reads as `NotOffered`, which is also the
+        /// correct answer for a server with no ECH configs loaded.
+        ///
+        /// Note that `Rejected` covers GREASE as well as a genuine failure to
+        /// decrypt - draft-ietf-tls-esni-25 deliberately makes the two
+        /// indistinguishable to the server, which is the point of GREASE.
+        pub fn ech_acceptance(&self) -> EchAcceptance {
+            self.inner.core.ech_acceptance()
+        }
+
+        /// The ClientHello this connection was opened with, as it arrived on the
+        /// wire: handshake type byte, 3-byte length, then the body. No TLS record
+        /// header, because a QUIC connection never has one.
+        ///
+        /// Available once the ClientHello has been processed. Intended for
+        /// fingerprinting (JA3/JA4) on transports where the application cannot
+        /// see the bytes for itself — over QUIC the hello arrives inside
+        /// encrypted Initial packets, so this is the only plaintext copy.
+        ///
+        /// If ECH was accepted these are the *inner* hello's bytes. That is the
+        /// hello the handshake ran on and the one that describes the client;
+        /// fingerprinting the outer one would identify the ECH shaping, not the
+        /// client behind it.
+        pub fn client_hello_wire(&self) -> Option<&[u8]> {
+            self.inner.core.client_hello_wire()
         }
 
         /// Application-controlled portion of the resumption ticket supplied by the client, if any.
@@ -1242,6 +1275,16 @@ impl ConnectionCore<ServerConnectionData> {
     pub(crate) fn get_sni_str(&self) -> Option<&str> {
         self.data.get_sni_str()
     }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn ech_acceptance(&self) -> super::ech::EchAcceptance {
+        self.data.ech_status.into()
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn client_hello_wire(&self) -> Option<&[u8]> {
+        self.data.client_hello_wire.as_deref()
+    }
 }
 
 /// State associated with a server connection.
@@ -1252,6 +1295,19 @@ pub struct ServerConnectionData {
     pub(super) resumption_data: Vec<u8>,
     pub(super) early_data: EarlyDataState,
     pub(super) ech_status: super::ech::EchStatus,
+    /// The ClientHello exactly as it arrived on the wire (handshake header
+    /// included, record layer not — QUIC has no record layer).
+    ///
+    /// Kept so the application can fingerprint the hello. On a TCP listener a
+    /// server can peek the socket and get these bytes itself; over QUIC the
+    /// hello is inside encrypted Initial CRYPTO frames and this is the only
+    /// place it exists in plaintext. Roughly 300-700 bytes, allocated once per
+    /// connection and dropped with it.
+    ///
+    /// When ECH is accepted this holds the *inner* hello — the one describing
+    /// the client's real intent — because that is what the handshake actually
+    /// ran on.
+    pub(super) client_hello_wire: Option<Vec<u8>>,
 }
 
 impl ServerConnectionData {
