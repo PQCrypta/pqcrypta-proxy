@@ -74,6 +74,7 @@ pub mod audit_logger;
 pub mod cache;
 pub mod compression;
 pub mod config;
+pub mod conformance;
 pub mod connect_udp;
 pub mod crawler_verify;
 pub mod ech_config;

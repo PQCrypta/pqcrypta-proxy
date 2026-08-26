@@ -1,0 +1,205 @@
+//! HTTP/3 and QUIC **client** conformance suite.
+//!
+//! The QUIC Interop Runner tests implementations against each other in a lab
+//! matrix. This is the other thing: a public service a client library can be
+//! pointed at to find out whether it handles the protocol's awkward corners.
+//!
+//! Offering that requires a server that will misbehave on request — emit
+//! reserved frame types, duplicate a SETTINGS identifier, reject 0-RTT, black
+//! hole the path MTU. A CDN customer cannot arrange any of it, because they do
+//! not own the implementation. We fork `noq` (QUIC) and drive HTTP/3 frames
+//! directly, so we can.
+//!
+//! # Layout
+//!
+//! - [`catalog`] — the tests, each citing the clause it exercises
+//! - [`session`] — verdicts, and the liveness probe that makes them meaningful
+//! - [`h3_frames`] — a hand-rolled HTTP/3 frame writer
+//! - [`report`] — JSON, HTML and badge output
+//!
+//! # Why HTTP/3 frames are written by hand
+//!
+//! `h3` is an unvendored crates.io dependency while `noq`/`noq-proto` are
+//! forked, so the QUIC layer is ours to bend and the HTTP/3 layer is not.
+//! Vendoring `h3` would mean tracking upstream forever for less control than
+//! writing the frames directly: a correct HTTP/3 implementation will refuse to
+//! emit a duplicate SETTINGS identifier, which is precisely what
+//! `h-duplicate-setting` needs it to do.
+//!
+//! Conformance does not need a general-purpose server. It needs specific byte
+//! sequences on specific stream types, which is a much smaller thing to build
+//! and owes nothing to anyone else's release schedule.
+
+pub mod catalog;
+pub mod h3_frames;
+pub mod report;
+pub mod session;
+
+use std::sync::Arc;
+
+use crate::config::ConformanceConfig;
+
+pub use catalog::{Class, Test, Tier};
+pub use session::{Observation, Registry, Verdict};
+
+/// Everything the listeners and handlers need to run the suite.
+pub struct Conformance {
+    pub config: ConformanceConfig,
+    pub sessions: Arc<Registry>,
+}
+
+impl std::fmt::Debug for Conformance {
+    // Hand-written because the session registry holds a DashMap of live
+    // sessions; printing their contents in a config error would be noise.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Conformance")
+            .field("host", &self.config.host)
+            .field("port_range", &self.config.port_range)
+            .field("sessions", &self.sessions.len())
+            .finish()
+    }
+}
+
+impl Conformance {
+    /// Build the shared state, or `None` when the suite is switched off.
+    ///
+    /// Returns an error rather than starting with a bad port range: a range too
+    /// small for the catalogue would silently serve only the tests that fit,
+    /// and a report missing tests without saying so is worse than no report.
+    pub fn new(config: &ConformanceConfig) -> Result<Option<Self>, String> {
+        if !config.enabled {
+            return Ok(None);
+        }
+
+        let (start, end) = config.port_range;
+        if end < start {
+            return Err(format!("conformance.port_range is inverted: {start}-{end}"));
+        }
+
+        let available = end - start + 1;
+        let needed = catalog::required_ports();
+        if available < needed {
+            return Err(format!(
+                "conformance.port_range {start}-{end} provides {available} ports but the \
+                 catalogue needs {needed}; widen the range or the suite would serve an \
+                 incomplete catalogue without saying so"
+            ));
+        }
+
+        Ok(Some(Self {
+            config: config.clone(),
+            sessions: Registry::new(config.session_ttl_secs, config.max_sessions),
+        }))
+    }
+
+    /// Ports Tier B needs to bind.
+    pub fn quic_ports(&self) -> Vec<u16> {
+        let start = self.config.port_range.0;
+        catalog::CATALOG
+            .iter()
+            .filter_map(|t| t.port_offset)
+            .map(|off| start + off)
+            .collect()
+    }
+
+    /// Whether `host` is the conformance vhost.
+    ///
+    /// Tier A only ever answers on its own hostname, so a request that lands
+    /// here by misrouting is served normally instead of being handed a
+    /// deliberately malformed response.
+    pub fn owns_host(&self, host: &str) -> bool {
+        let host = host.split(':').next().unwrap_or(host);
+        host.eq_ignore_ascii_case(&self.config.host)
+    }
+}
+
+/// Check the conformance ports do not collide with the ports serving real
+/// traffic.
+///
+/// Called at startup. An overlap would mean ordinary visitors being handed
+/// deliberately broken protocol output, so this refuses to start rather than
+/// warning.
+pub fn check_port_conflicts(
+    config: &ConformanceConfig,
+    udp_port: u16,
+    additional: &[u16],
+) -> Result<(), String> {
+    if !config.enabled {
+        return Ok(());
+    }
+    let (start, end) = config.port_range;
+    let mut live = vec![udp_port];
+    live.extend_from_slice(additional);
+    for p in live {
+        if p >= start && p <= end {
+            return Err(format!(
+                "conformance.port_range {start}-{end} contains port {p}, which serves live \
+                 traffic; conformance ports emit deliberately malformed protocol output and \
+                 must not overlap"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> ConformanceConfig {
+        ConformanceConfig {
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn disabled_yields_nothing() {
+        let c = ConformanceConfig::default();
+        assert!(Conformance::new(&c).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_range_too_small_for_the_catalogue_is_refused() {
+        let mut c = cfg();
+        c.port_range = (4460, 4461);
+        let err = Conformance::new(&c).unwrap_err();
+        assert!(err.contains("needs"), "must say how many are needed: {err}");
+    }
+
+    #[test]
+    fn an_inverted_range_is_refused() {
+        let mut c = cfg();
+        c.port_range = (4490, 4460);
+        assert!(Conformance::new(&c).is_err());
+    }
+
+    #[test]
+    fn the_default_range_fits_the_catalogue() {
+        let c = cfg();
+        let conf = Conformance::new(&c).unwrap().expect("enabled");
+        assert_eq!(conf.quic_ports().len() as u16, catalog::required_ports());
+    }
+
+    #[test]
+    fn overlapping_live_ports_is_a_startup_error() {
+        let mut c = cfg();
+        c.port_range = (440, 4489);
+        let err = check_port_conflicts(&c, 443, &[4434]).unwrap_err();
+        assert!(err.contains("443"));
+
+        c.port_range = (4460, 4489);
+        assert!(check_port_conflicts(&c, 443, &[4434]).is_ok());
+        // An additional port inside the range is caught too.
+        assert!(check_port_conflicts(&c, 443, &[4434, 4470]).is_err());
+    }
+
+    #[test]
+    fn tier_a_answers_only_on_its_own_host() {
+        let conf = Conformance::new(&cfg()).unwrap().unwrap();
+        assert!(conf.owns_host("conformance.pqcrypta.com"));
+        assert!(conf.owns_host("Conformance.PQCrypta.com"));
+        assert!(conf.owns_host("conformance.pqcrypta.com:443"));
+        assert!(!conf.owns_host("pqcrypta.com"));
+    }
+}

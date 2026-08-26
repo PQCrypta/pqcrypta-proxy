@@ -178,6 +178,9 @@ pub struct ProxyConfig {
     /// MASQUE / CONNECT-UDP proxying configuration (RFC 9298)
     #[serde(default)]
     pub masque: MasqueConfig,
+    /// HTTP/3 + QUIC client conformance suite
+    #[serde(default)]
+    pub conformance: ConformanceConfig,
 }
 
 /// Current config schema version supported by this binary
@@ -355,6 +358,7 @@ impl Default for ProxyConfig {
             cache: ResponseCacheConfig::default(),
             otel: OtelConfig::default(),
             masque: MasqueConfig::default(),
+            conformance: ConformanceConfig::default(),
         }
     }
 }
@@ -401,6 +405,71 @@ impl Default for MasqueConfig {
             allowed_targets: Vec::new(),
             session_idle_timeout_secs: 60,
             max_sessions_per_connection: 8,
+        }
+    }
+}
+
+/// HTTP/3 and QUIC **client** conformance suite.
+///
+/// Exists because we fork the QUIC stack. A conformance service has to make the
+/// server misbehave on demand — GREASE frames, reserved stream types, deliberate
+/// protocol violations — which is not something a CDN customer or cloud tenant
+/// can arrange. The client under test connects, the server emits the anomaly,
+/// and the server records whether the client tolerated it.
+///
+/// Two tiers, split by *when* the anomaly happens:
+///
+/// - **Tier A** anomalies ride on a working HTTP/3 exchange, so the client picks
+///   the test with a URL path (`/t/<test-id>`).
+/// - **Tier B** anomalies precede any request — Version Negotiation, Retry,
+///   transport parameters — so they cannot be requested in-band. Each gets its
+///   own UDP port from [`port_range`](Self::port_range), and the listener knows
+///   which test it is from its own `local_addr()`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConformanceConfig {
+    /// Master switch. Default: false — this deliberately serves malformed
+    /// protocol output and must never come up by accident on a normal vhost.
+    pub enabled: bool,
+
+    /// Hostname that serves Tier A. Requests for any other host are handled
+    /// normally, so a misrouted request cannot land on a test.
+    pub host: String,
+
+    /// Inclusive UDP port range for Tier B, one port per connection-level test.
+    /// Must not overlap `server.udp_port` or `server.additional_ports`; startup
+    /// refuses to bind if it does.
+    pub port_range: (u16, u16),
+
+    /// How long a session's verdicts are retained before expiry, in seconds.
+    /// A session is a single client's walk through the catalogue. Default: 3600.
+    pub session_ttl_secs: u64,
+
+    /// Maximum concurrent sessions. Each holds a small verdict map; the cap
+    /// exists so an unauthenticated public endpoint cannot be used to grow
+    /// memory without bound. Default: 512.
+    pub max_sessions: usize,
+
+    /// How long to wait for the liveness probe that follows every test, in
+    /// milliseconds.
+    ///
+    /// The probe is what makes a verdict meaningful: after the anomaly the
+    /// server expects one ordinary request on the same connection. Arrival
+    /// proves the client tolerated the anomaly; silence proves it did not.
+    /// Without it, "ignored correctly" and "crashed" look identical from here.
+    /// Default: 5000.
+    pub liveness_timeout_ms: u64,
+}
+
+impl Default for ConformanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: "conformance.pqcrypta.com".to_string(),
+            port_range: (4460, 4489),
+            session_ttl_secs: 3600,
+            max_sessions: 512,
+            liveness_timeout_ms: 5000,
         }
     }
 }
