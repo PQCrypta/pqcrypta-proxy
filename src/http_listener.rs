@@ -3798,8 +3798,29 @@ async fn proxy_handler(
                     .headers
                     .insert(header::SERVER, HeaderValue::from_static("pqcrypta"));
 
-                // Build response from buffered body bytes
-                let response_body = Body::from(body_bytes);
+                // Build response from buffered body bytes.
+                //
+                // RFC 9110 §9.3.2: the headers on a HEAD response are the ones a
+                // GET would have sent. These pages come off PHP-FPM chunked with
+                // no Content-Length, and Apache correctly sends none on HEAD — but
+                // `Body::from(Bytes::new())` reports an exact size of zero, so
+                // hyper synthesised `content-length: 0` and every link checker,
+                // uptime monitor, CDN probe and security scanner that uses HEAD
+                // was told the page was empty.
+                //
+                // An empty *stream* has an unknown size hint, so hyper emits
+                // whatever length headers the origin actually chose and nothing
+                // more. Only applies when the origin sent no Content-Length; when
+                // it did, that value is already correct and is passed through.
+                let head_without_length =
+                    method == Method::HEAD && !parts.headers.contains_key(header::CONTENT_LENGTH);
+                let response_body = if head_without_length {
+                    Body::from_stream(futures_util::stream::empty::<
+                        Result<bytes::Bytes, std::io::Error>,
+                    >())
+                } else {
+                    Body::from(body_bytes)
+                };
                 let response = Response::from_parts(parts, response_body);
 
                 let resp_status = response.status().as_u16();

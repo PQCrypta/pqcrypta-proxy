@@ -2052,13 +2052,17 @@ impl QuicListener {
                         }
                         response_builder = response_builder.header(k.as_str(), v.as_str());
                     }
+                    // HEAD sends no body but must report the length a GET would
+                    // have (RFC 9110 §9.3.2). Deriving the header from the
+                    // stripped body reported every cached HEAD as zero-length.
+                    let content_length = cached_body.len();
                     let body_bytes: Vec<u8> = if method == "HEAD" {
                         Vec::new()
                     } else {
                         (*cached_body).clone()
                     };
                     response_builder =
-                        response_builder.header("content-length", body_bytes.len().to_string());
+                        response_builder.header("content-length", content_length.to_string());
                     let response = response_builder.body(())?;
                     let body_size = body_bytes.len();
                     let latency = start_time.elapsed();
@@ -2365,8 +2369,13 @@ impl QuicListener {
             body: body_bytes.to_vec(),
         };
 
-        // Store response in cache (GET / HEAD only; cache.put() enforces all Cache-Control rules)
-        if (method == "GET" || method == "HEAD")
+        // Store response in cache (GET only; cache.put() enforces all Cache-Control
+        // rules). HEAD is deliberately excluded: its body is empty by definition,
+        // so the entry holds nothing worth serving, and the cache-hit arm derives
+        // `content-length` from the stored body — which reported every cached HEAD
+        // as a zero-length resource. The TCP cache middleware skips HEAD for the
+        // same reason.
+        if method == "GET"
             && cache.config.enabled
             && !cache.is_excluded_path(&path)
             && !cache.is_excluded_host(cache_host_str)
@@ -2421,9 +2430,25 @@ impl QuicListener {
             }
         }
 
-        // Add content-length from known body size (helps browsers finalize responses)
-        response_builder =
-            response_builder.header("content-length", proxy_response.body.len().to_string());
+        // Add content-length from known body size (helps browsers finalize responses).
+        //
+        // Not on HEAD: the origin returns no body there, so the buffered length is
+        // zero and synthesizing from it asserts an empty resource. RFC 9110 §9.3.2
+        // wants the header a GET would have carried — forward the origin's own
+        // value when it sent one, and otherwise send none, matching the chunked
+        // GET these backends actually serve.
+        if method == "HEAD" {
+            if let Some((_, origin_len)) = proxy_response
+                .headers
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
+            {
+                response_builder = response_builder.header("content-length", origin_len.as_str());
+            }
+        } else {
+            response_builder =
+                response_builder.header("content-length", proxy_response.body.len().to_string());
+        }
 
         // For Grafana routes: rewrite set-cookie headers from backend
         // to work around browser H3 cookie handling by adding Domain attribute

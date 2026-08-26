@@ -94,10 +94,24 @@ fn main() {
             config_id,
             kem_id: HpkeKem::DHKEM_X25519_HKDF_SHA256,
             public_key: PayloadU16::new(public_key.0),
-            symmetric_cipher_suites: vec![HpkeSymmetricCipherSuite {
-                kdf_id: HpkeKdf::HKDF_SHA256,
-                aead_id: HpkeAead::AES_128_GCM,
-            }],
+            // Advertise both AEADs the server can actually decrypt with.
+            // `ech_config::load` registers ALL_SUPPORTED_SUITES on the accepting
+            // side, so ChaCha20-Poly1305 already works there; offering only
+            // AES-128-GCM here forced it on every client, including those on
+            // hardware without AES acceleration where ChaCha20 is the faster and
+            // more constant-time choice. AES-128-GCM stays first: it is the
+            // mandatory-to-implement suite, and the ordering is the server's
+            // preference hint.
+            symmetric_cipher_suites: vec![
+                HpkeSymmetricCipherSuite {
+                    kdf_id: HpkeKdf::HKDF_SHA256,
+                    aead_id: HpkeAead::AES_128_GCM,
+                },
+                HpkeSymmetricCipherSuite {
+                    kdf_id: HpkeKdf::HKDF_SHA256,
+                    aead_id: HpkeAead::CHACHA20_POLY_1305,
+                },
+            ],
         },
         maximum_name_length: args.max_name_length,
         public_name: DnsName::try_from(args.public_name.clone())

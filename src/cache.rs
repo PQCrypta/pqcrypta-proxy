@@ -172,6 +172,33 @@ impl CacheControlDirectives {
     }
 }
 
+/// Rebuild a HEAD response without asserting a body length the origin never sent.
+///
+/// RFC 9110 §9.3.2: a HEAD response carries the header fields a GET would have.
+/// These backends serve chunked with no `Content-Length`, and correctly omit it on
+/// HEAD — but rebuilding with `Body::from(Bytes::new())` reports an exact size of
+/// zero, and hyper then synthesises `content-length: 0`, telling every link
+/// checker, uptime monitor and security scanner that probes with HEAD that the
+/// page is empty. An empty *stream* has an unknown size hint, so hyper emits only
+/// the length headers the origin actually chose.
+///
+/// When the origin did send a `Content-Length`, that value is already right and is
+/// passed straight through.
+fn head_response(parts: axum::http::response::Parts) -> Response<Body> {
+    if parts
+        .headers
+        .contains_key(axum::http::header::CONTENT_LENGTH)
+    {
+        return Response::from_parts(parts, Body::empty());
+    }
+    Response::from_parts(
+        parts,
+        Body::from_stream(futures_util::stream::empty::<
+            Result<bytes::Bytes, std::io::Error>,
+        >()),
+    )
+}
+
 // ============================================================================
 // Response cache
 // ============================================================================
@@ -576,6 +603,7 @@ pub async fn cache_middleware(
     }
 
     let cache_key = ResponseCache::build_key(method.as_str(), &host, &path_with_query);
+    let is_head = method == Method::HEAD;
 
     let if_none_match = request
         .headers()
@@ -672,6 +700,18 @@ pub async fn cache_middleware(
             // Buffer the full body (up to 100 MiB, consistent with compression middleware)
             match axum::body::to_bytes(resp_body, 100 * 1024 * 1024).await {
                 Ok(body_bytes) => {
+                    // Never store a HEAD response. Its body is empty by
+                    // definition, so the entry holds nothing worth serving, and
+                    // the Hit arm above derives `content-length` from the stored
+                    // body — which would report every cached HEAD as a
+                    // zero-length representation for the life of the entry.
+                    // The key is method-scoped, so this cannot affect GET.
+                    if is_head {
+                        parts
+                            .headers
+                            .insert("x-cache", HeaderValue::from_static("MISS"));
+                        return head_response(parts);
+                    }
                     if body_bytes.len() <= cache.config.max_body_size_bytes {
                         cache.put(&cache_key, status, &resp_headers, body_bytes.to_vec());
                     }
