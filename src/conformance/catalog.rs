@@ -257,7 +257,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Extensibility,
         tier: Tier::Http3,
         expectation: "Skip the frame using its length and read the response that follows.",
-        implemented: false,
+        implemented: true,
         port_offset: Some(14),
     },
     Test {
@@ -319,7 +319,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Correctness,
         tier: Tier::Http3,
         expectation: "Apply the encoder-stream insertions and decode the headers correctly.",
-        implemented: false,
+        implemented: true,
         port_offset: Some(20),
     },
     Test {
@@ -329,7 +329,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Correctness,
         tier: Tier::Http3,
         expectation: "Decode without error. Padding of up to 7 bits is legal, not corruption.",
-        implemented: false,
+        implemented: true,
         port_offset: Some(21),
     },
     Test {
@@ -339,7 +339,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Correctness,
         tier: Tier::Http3,
         expectation: "Handle it as an error against that one request, not the whole connection.",
-        implemented: false,
+        implemented: true,
         port_offset: Some(22),
     },
     Test {
@@ -349,7 +349,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Correctness,
         tier: Tier::Http3,
         expectation: "Deliver the trailers to the application after the body completes.",
-        implemented: false,
+        implemented: true,
         port_offset: Some(23),
     },
     Test {
@@ -359,7 +359,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Resilience,
         tier: Tier::Http3,
         expectation: "Treat 103 as informational and keep reading for the final response.",
-        implemented: false,
+        implemented: true,
         port_offset: Some(24),
     },
     Test {

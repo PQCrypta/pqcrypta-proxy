@@ -204,6 +204,168 @@ pub fn ok_response_fields(content_length: usize) -> Vec<(String, String)> {
     ]
 }
 
+/// Huffman-coded literals, precomputed.
+///
+/// A general encoder needs the whole 256-entry RFC 7541 Appendix B table, which
+/// is a lot of data to carry for two strings. These were generated from that
+/// table and the generator was checked against every worked example in RFC 7541
+/// Appendix C — `www.example.com`, `no-cache`, `custom-key`, `custom-value` —
+/// before these bytes were taken.
+///
+/// The first attempt at this table was written by hand and produced the wrong
+/// bytes for `m` among others. It looked plausible and would have made
+/// `h-qpack-huffman` fail every client on earth. Hence the vectors.
+pub mod huffman {
+    /// `200`, 3 bytes down to 2.
+    pub const STATUS_200: &[u8] = &[0x10, 0x01];
+    /// `text/plain`, 10 bytes down to 7.
+    pub const TEXT_PLAIN: &[u8] = &[0x49, 0x7c, 0xa5, 0x8a, 0xe8, 0x19, 0xaa];
+    /// `huffman-encoded`, 15 bytes down to 11.
+    pub const HUFFMAN_ENCODED: &[u8] = &[
+        0x9e, 0xd9, 0x65, 0xa4, 0x75, 0x2c, 0x5a, 0x88, 0x79, 0x0b, 0x27,
+    ];
+}
+
+/// A field section whose values are Huffman-coded.
+///
+/// Same literal-with-literal-name shape as [`qpack_literal_headers`], but with
+/// the H bit set on each value and the coded bytes in place of the plain ones.
+/// Padding of up to 7 bits is legal (RFC 7541 §5.2) and is exactly what a
+/// careless decoder trips over.
+pub fn qpack_huffman_headers(fields: &[(&str, &[u8], usize)]) -> BytesMut {
+    let mut b = BytesMut::new();
+    b.put_u8(0x00); // Required Insert Count
+    b.put_u8(0x00); // Delta Base
+
+    for (name, coded_value, _plain_len) in fields {
+        put_prefixed_int(&mut b, name.len() as u64, 3, 0b0010_0000);
+        b.put_slice(name.as_bytes());
+        // H = 1: the value that follows is Huffman-coded.
+        put_prefixed_int(&mut b, coded_value.len() as u64, 7, 0x80);
+        b.put_slice(coded_value);
+    }
+    b
+}
+
+/// An "Insert With Literal Name" instruction for the encoder stream
+/// (RFC 9204 §4.3.3).
+///
+/// Layout `01NH` then a 5-bit name length, so the flag byte is `0b0100_0000`
+/// with N and H clear.
+pub fn qpack_insert_with_literal_name(name: &str, value: &str) -> BytesMut {
+    let mut b = BytesMut::new();
+    put_prefixed_int(&mut b, name.len() as u64, 5, 0b0100_0000);
+    b.put_slice(name.as_bytes());
+    put_prefixed_int(&mut b, value.len() as u64, 7, 0x00);
+    b.put_slice(value.as_bytes());
+    b
+}
+
+/// The largest table capacity we advertise, and the entry count it implies
+/// (RFC 9204 §3.2.2: `MaxEntries = floor(capacity / 32)`).
+const QPACK_MAX_TABLE_CAPACITY: u64 = 4096;
+const QPACK_MAX_ENTRIES: u64 = QPACK_MAX_TABLE_CAPACITY / 32;
+
+/// A field section that references the dynamic table.
+///
+/// `insert_count` entries must already have been sent on the encoder stream.
+/// The Required Insert Count is encoded per RFC 9204 §4.5.1
+/// (`(count mod 2*MaxEntries) + 1`), Base equals it so Delta Base is zero, and
+/// each field line is an Indexed Field Line with T=0 — a dynamic-table
+/// reference, relative to Base.
+pub fn qpack_dynamic_headers(insert_count: u64, literal: &[(&str, &str)]) -> BytesMut {
+    let mut b = BytesMut::new();
+
+    let encoded = if insert_count == 0 {
+        0
+    } else {
+        (insert_count % (2 * QPACK_MAX_ENTRIES)) + 1
+    };
+    put_prefixed_int(&mut b, encoded, 8, 0x00);
+    // Delta Base 0, S=0: Base == Required Insert Count.
+    put_prefixed_int(&mut b, 0, 7, 0x00);
+
+    // Literals first. They carry `:status`, and RFC 9114 §4.3 requires every
+    // pseudo-header to precede the regular fields — emitting the dynamic
+    // references first put `:status` after them and made the whole section
+    // invalid, which is our error and would have been scored against the
+    // client.
+    for (name, value) in literal {
+        put_prefixed_int(&mut b, name.len() as u64, 3, 0b0010_0000);
+        b.put_slice(name.as_bytes());
+        put_prefixed_int(&mut b, value.len() as u64, 7, 0x00);
+        b.put_slice(value.as_bytes());
+    }
+
+    // Indexed Field Line, dynamic table: `1` then T=0 then a 6-bit index,
+    // relative to Base.
+    for i in 0..insert_count {
+        put_prefixed_int(&mut b, i, 6, 0b1000_0000);
+    }
+    b
+}
+
+/// Read a variable-length integer, returning the value and its width.
+///
+/// The counterpart to [`put_varint`], needed to parse the client's SETTINGS —
+/// specifically `SETTINGS_QPACK_MAX_TABLE_CAPACITY`, which governs whether the
+/// server's encoder may use the dynamic table at all.
+pub fn read_varint(b: &[u8]) -> Option<(u64, usize)> {
+    let first = *b.first()?;
+    let len = 1usize << (first >> 6);
+    if b.len() < len {
+        return None;
+    }
+    let mut v = u64::from(first & 0x3f);
+    for byte in &b[1..len] {
+        v = (v << 8) | u64::from(*byte);
+    }
+    Some((v, len))
+}
+
+/// Pull `SETTINGS_QPACK_MAX_TABLE_CAPACITY` out of a control stream's bytes.
+///
+/// Returns `None` when no SETTINGS frame has arrived yet or the setting is
+/// absent — absent means zero (RFC 9204 §5), which is the default and means the
+/// dynamic table is off limits.
+pub fn parse_qpack_capacity(control: &[u8]) -> Option<u64> {
+    // The stream begins with its type, then frames.
+    let (ty, mut off) = read_varint(control)?;
+    if ty != stream_type::CONTROL {
+        return None;
+    }
+    while off < control.len() {
+        let (frame_ty, n) = read_varint(&control[off..])?;
+        off += n;
+        let (len, n) = read_varint(&control[off..])?;
+        off += n;
+        let end = off.checked_add(usize::try_from(len).ok()?)?;
+        if end > control.len() {
+            return None;
+        }
+        if frame_ty == frame_type::SETTINGS {
+            let mut p = off;
+            while p < end {
+                let (id, a) = read_varint(&control[p..])?;
+                p += a;
+                let (value, c) = read_varint(&control[p..])?;
+                p += c;
+                if id == setting::QPACK_MAX_TABLE_CAPACITY {
+                    return Some(value);
+                }
+            }
+            return Some(0);
+        }
+        off = end;
+    }
+    None
+}
+
+/// A HEADERS frame wrapping an arbitrary, already-encoded field section.
+pub fn headers_raw(field_section: &[u8]) -> BytesMut {
+    frame(frame_type::HEADERS, field_section)
+}
+
 /// An HPACK/QPACK prefixed integer (RFC 7541 §5.1), used for QPACK's string
 /// lengths.
 ///
@@ -233,29 +395,6 @@ pub fn put_prefixed_int(buf: &mut BytesMut, value: u64, prefix_bits: u8, first_b
 mod tests {
     use super::*;
 
-    /// Read a varint back, returning the value and how many bytes it used.
-    fn read_varint(b: &[u8]) -> (u64, usize) {
-        let first = b[0];
-        match first >> 6 {
-            0 => ((first & 0x3f) as u64, 1),
-            1 => ((((first & 0x3f) as u64) << 8) | b[1] as u64, 2),
-            2 => {
-                let v = (((first & 0x3f) as u64) << 24)
-                    | ((b[1] as u64) << 16)
-                    | ((b[2] as u64) << 8)
-                    | b[3] as u64;
-                (v, 4)
-            }
-            _ => {
-                let mut v = (first & 0x3f) as u64;
-                for byte in &b[1..8] {
-                    v = (v << 8) | *byte as u64;
-                }
-                (v, 8)
-            }
-        }
-    }
-
     #[test]
     fn varints_round_trip_at_every_width() {
         // One value per encoding width, plus the boundaries either side.
@@ -270,7 +409,7 @@ mod tests {
             VARINT_MAX,
         ] {
             let encoded = varint(v);
-            let (decoded, used) = read_varint(&encoded);
+            let (decoded, used) = read_varint(&encoded).expect("valid varint");
             assert_eq!(decoded, v, "value {v} did not survive the round trip");
             assert_eq!(used, encoded.len(), "declared width disagrees for {v}");
         }
@@ -289,9 +428,9 @@ mod tests {
     #[test]
     fn a_frame_declares_its_own_length() {
         let f = frame(frame_type::DATA, b"hello");
-        let (ty, n) = read_varint(&f);
+        let (ty, n) = read_varint(&f).expect("valid varint");
         assert_eq!(ty, frame_type::DATA);
-        let (len, m) = read_varint(&f[n..]);
+        let (len, m) = read_varint(&f[n..]).expect("valid varint");
         assert_eq!(len, 5);
         assert_eq!(&f[n + m..], b"hello");
     }
@@ -317,15 +456,15 @@ mod tests {
             (setting::MAX_FIELD_SECTION_SIZE, 100),
             (setting::MAX_FIELD_SECTION_SIZE, 200),
         ]);
-        let (ty, n) = read_varint(&f);
+        let (ty, n) = read_varint(&f).expect("valid varint");
         assert_eq!(ty, frame_type::SETTINGS);
-        let (len, m) = read_varint(&f[n..]);
+        let (len, m) = read_varint(&f[n..]).expect("valid varint");
         let payload = &f[n + m..n + m + len as usize];
 
-        let (id1, a) = read_varint(payload);
-        let (v1, b) = read_varint(&payload[a..]);
-        let (id2, c) = read_varint(&payload[a + b..]);
-        let (v2, _) = read_varint(&payload[a + b + c..]);
+        let (id1, a) = read_varint(payload).expect("valid varint");
+        let (v1, b) = read_varint(&payload[a..]).expect("valid varint");
+        let (id2, c) = read_varint(&payload[a + b..]).expect("valid varint");
+        let (v2, _) = read_varint(&payload[a + b + c..]).expect("valid varint");
 
         assert_eq!(
             (id1, id2),
@@ -340,15 +479,15 @@ mod tests {
     #[test]
     fn the_default_settings_carry_an_unknown_identifier() {
         let f = settings_with_grease();
-        let (_, n) = read_varint(&f);
-        let (len, m) = read_varint(&f[n..]);
+        let (_, n) = read_varint(&f).expect("valid varint");
+        let (len, m) = read_varint(&f[n..]).expect("valid varint");
         let payload = &f[n + m..n + m + len as usize];
 
         let mut offset = 0;
         let mut saw_reserved = false;
         while offset < payload.len() {
-            let (id, a) = read_varint(&payload[offset..]);
-            let (_, b) = read_varint(&payload[offset + a..]);
+            let (id, a) = read_varint(&payload[offset..]).expect("valid varint");
+            let (_, b) = read_varint(&payload[offset + a..]).expect("valid varint");
             if id > 0x21 && (id - 0x21) % 0x1f == 0 {
                 saw_reserved = true;
             }
@@ -392,19 +531,160 @@ mod tests {
     #[test]
     fn a_reserved_stream_header_is_a_bare_varint() {
         let h = reserved_uni_stream_header(3);
-        let (ty, used) = read_varint(&h);
+        let (ty, used) = read_varint(&h).expect("valid varint");
         assert_eq!(used, h.len());
         assert_eq!((ty - 0x21) % 0x1f, 0);
     }
 
     #[test]
+    fn huffman_literals_are_shorter_than_their_plaintext() {
+        // If a "Huffman-coded" value were not actually coded, this test would
+        // still pass a naive length check — so assert the real ratio the RFC
+        // 7541 table produces for these two strings.
+        assert_eq!(huffman::TEXT_PLAIN.len(), 7, "text/plain is 10 bytes plain");
+        assert_eq!(
+            huffman::HUFFMAN_ENCODED.len(),
+            11,
+            "huffman-encoded is 15 bytes plain"
+        );
+    }
+
+    #[test]
+    fn huffman_values_set_the_h_bit() {
+        // A name short enough to fit the 3-bit length prefix, so the layout is
+        // unambiguous — "content-type" is 12 characters and overflows into a
+        // continuation byte, which is correct but makes the offsets awkward to
+        // assert.
+        let name = "ct";
+        let section = qpack_huffman_headers(&[(name, huffman::TEXT_PLAIN, 10)]);
+        // prefix(2) + name-length byte + name + value-length byte + value
+        let value_len_idx = 2 + 1 + name.len();
+        assert_eq!(
+            section[value_len_idx] & 0x80,
+            0x80,
+            "the value length byte must set H to mark it Huffman-coded"
+        );
+        assert_eq!(section[value_len_idx] & 0x7f, 7, "coded length");
+    }
+
+    #[test]
+    fn a_dynamic_field_section_encodes_the_required_insert_count() {
+        // RFC 9204 §4.5.1 with capacity 4096 → MaxEntries 128, so an insert
+        // count of 2 encodes as (2 mod 256) + 1 = 3. Encoding it as the raw
+        // count would make the client wait for an insertion that never comes.
+        let section = qpack_dynamic_headers(2, &[(":status", "200")]);
+        assert_eq!(section[0], 3, "encoded required insert count");
+        assert_eq!(section[1], 0, "delta base zero, S clear");
+        // The literals come first (pseudo-headers must precede regular fields),
+        // then one indexed field line per insertion, dynamic table (T=0).
+        let indexed: Vec<u8> = section
+            .iter()
+            .copied()
+            .filter(|b| b & 0b1100_0000 == 0b1000_0000)
+            .collect();
+        assert_eq!(indexed.len(), 2, "one indexed line per insertion");
+        assert_eq!(indexed[0] & 0b0011_1111, 0, "relative index 0");
+        assert_eq!(indexed[1] & 0b0011_1111, 1, "relative index 1");
+    }
+
+    #[test]
+    fn an_empty_dynamic_section_encodes_a_zero_insert_count() {
+        let section = qpack_dynamic_headers(0, &[(":status", "200")]);
+        assert_eq!(section[0], 0, "0 must stay 0, not become 1");
+    }
+
+    #[test]
+    fn an_encoder_insertion_uses_the_literal_name_pattern() {
+        let insert = qpack_insert_with_literal_name("x-a", "b");
+        // RFC 9204 §4.3.3: 01NH then a 5-bit name length.
+        assert_eq!(insert[0] & 0b1100_0000, 0b0100_0000);
+        assert_eq!(insert[0] & 0b0001_1111, 3, "name length in the prefix");
+        assert_eq!(&insert[1..4], b"x-a");
+    }
+
+    #[test]
+    fn varints_survive_a_write_then_read() {
+        for v in [
+            0u64,
+            63,
+            64,
+            16_383,
+            16_384,
+            1_073_741_823,
+            1_073_741_824,
+            VARINT_MAX,
+        ] {
+            let enc = varint(v);
+            assert_eq!(read_varint(&enc), Some((v, enc.len())), "value {v}");
+        }
+        assert_eq!(read_varint(&[]), None);
+        // A truncated multi-byte varint must not be read as a short one.
+        assert_eq!(read_varint(&[0x40]), None);
+    }
+
+    #[test]
+    fn qpack_capacity_is_read_from_a_control_stream() {
+        let mut stream = BytesMut::new();
+        stream.extend_from_slice(&uni_stream_header(stream_type::CONTROL));
+        stream.extend_from_slice(&settings(&[
+            (setting::MAX_FIELD_SECTION_SIZE, 16_384),
+            (setting::QPACK_MAX_TABLE_CAPACITY, 4096),
+        ]));
+        assert_eq!(parse_qpack_capacity(&stream), Some(4096));
+    }
+
+    #[test]
+    fn an_absent_capacity_reads_as_zero_not_unknown() {
+        // RFC 9204 §5: the default is zero, which forbids the dynamic table.
+        // Reporting "unknown" would tempt a caller into using it anyway.
+        let mut stream = BytesMut::new();
+        stream.extend_from_slice(&uni_stream_header(stream_type::CONTROL));
+        stream.extend_from_slice(&settings(&[(setting::MAX_FIELD_SECTION_SIZE, 16_384)]));
+        assert_eq!(parse_qpack_capacity(&stream), Some(0));
+    }
+
+    #[test]
+    fn a_non_control_stream_yields_no_capacity() {
+        let mut stream = BytesMut::new();
+        stream.extend_from_slice(&uni_stream_header(stream_type::QPACK_ENCODER));
+        assert_eq!(parse_qpack_capacity(&stream), None);
+    }
+
+    #[test]
+    fn a_truncated_control_stream_is_rejected_not_guessed() {
+        let mut stream = BytesMut::new();
+        stream.extend_from_slice(&uni_stream_header(stream_type::CONTROL));
+        let full = settings(&[(setting::QPACK_MAX_TABLE_CAPACITY, 4096)]);
+        stream.extend_from_slice(&full[..full.len() - 1]);
+        assert_eq!(parse_qpack_capacity(&stream), None);
+    }
+
+    #[test]
+    fn pseudo_headers_precede_regular_fields_in_a_dynamic_section() {
+        // RFC 9114 §4.3. Emitting the dynamic references first put `:status`
+        // after them and invalidated the section.
+        let section = qpack_dynamic_headers(2, &[(":status", "200")]);
+        let text = String::from_utf8_lossy(&section);
+        let status_at = text.find(":status").expect("status present");
+        // The indexed field lines are the 0x80-prefixed bytes; none may precede.
+        let first_indexed = section
+            .iter()
+            .position(|b| b & 0b1100_0000 == 0b1000_0000)
+            .expect("an indexed field line");
+        assert!(
+            status_at < first_indexed,
+            "pseudo-header must come before dynamic references"
+        );
+    }
+
+    #[test]
     fn goaway_carries_the_stream_id() {
         let g = goaway(12);
-        let (ty, n) = read_varint(&g);
+        let (ty, n) = read_varint(&g).expect("valid varint");
         assert_eq!(ty, frame_type::GOAWAY);
-        let (len, m) = read_varint(&g[n..]);
+        let (len, m) = read_varint(&g[n..]).expect("valid varint");
         assert_eq!(len, 1);
-        let (id, _) = read_varint(&g[n + m..]);
+        let (id, _) = read_varint(&g[n + m..]).expect("valid varint");
         assert_eq!(id, 12);
     }
 }

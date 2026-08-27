@@ -154,7 +154,7 @@ async fn run_one(
     let observation = if critical_streams.is_empty() {
         classify_close(&connection)
     } else {
-        watch_for_liveness(&connection, &conformance).await
+        watch_for_liveness(&connection, &conformance, test).await
     };
 
     // An unbuilt test served a correct control stream, so whatever the client
@@ -266,6 +266,7 @@ async fn emit(
     for ty in [f::stream_type::QPACK_ENCODER, f::stream_type::QPACK_DECODER] {
         let mut s = connection.open_uni().await?;
         s.write_all(&f::uni_stream_header(ty)).await?;
+
         keep_open.push(s);
     }
 
@@ -372,6 +373,7 @@ async fn emit(
 async fn watch_for_liveness(
     connection: &quinn::Connection,
     conformance: &Conformance,
+    test: &'static Test,
 ) -> Observation {
     let timeout = Duration::from_millis(conformance.config.liveness_timeout_ms);
 
@@ -380,12 +382,22 @@ async fn watch_for_liveness(
     // RecvStream with data outstanding sends STOP_SENDING, and doing that to a
     // client's control stream is a protocol violation of ours that would be
     // scored against the client.
+    // Learn what the client permits while draining. SETTINGS_QPACK_MAX_TABLE_CAPACITY
+    // governs whether *our* encoder may use the dynamic table (RFC 9204 §5);
+    // the default is zero, and using it anyway would be our violation.
+    let qpack_capacity = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let drainer = tokio::spawn({
         let connection = connection.clone();
+        let capacity = qpack_capacity.clone();
         async move {
             while let Ok(mut uni) = connection.accept_uni().await {
+                let capacity = capacity.clone();
                 tokio::spawn(async move {
-                    let _ = uni.read_to_end(64 * 1024).await;
+                    if let Ok(bytes) = uni.read_to_end(64 * 1024).await {
+                        if let Some(c) = f::parse_qpack_capacity(&bytes) {
+                            capacity.store(c, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                 });
             }
         }
@@ -411,7 +423,8 @@ async fn watch_for_liveness(
                     debug!("conformance: probe request not fully drained");
                 }
 
-                if let Err(e) = answer_probe(&mut send).await {
+                let capacity = qpack_capacity.load(std::sync::atomic::Ordering::Relaxed);
+                if let Err(e) = answer_probe(&mut send, test, capacity).await {
                     debug!("conformance: could not answer liveness probe: {}", e);
                 }
             }
@@ -455,19 +468,126 @@ async fn watch_for_liveness(
 /// Deliberately plain HTTP/3 — this is the one part of the exchange that must
 /// be completely unremarkable, because it is how the client learns it got
 /// through the anomaly intact.
-async fn answer_probe(send: &mut quinn::SendStream) -> anyhow::Result<()> {
+async fn answer_probe(
+    send: &mut quinn::SendStream,
+    test: &'static Test,
+    qpack_capacity: u64,
+) -> anyhow::Result<()> {
     const BODY: &[u8] = b"liveness probe received; this connection survived the test\n";
 
-    let headers = f::headers(&[
-        (":status", "200"),
-        ("content-type", "text/plain"),
-        ("x-conformance", "liveness-ok"),
-    ]);
-    send.write_all(&headers).await?;
-    send.write_all(&f::data(BODY)).await?;
+    match test.id {
+        // A frame of a reserved type ahead of the response. The client must
+        // skip it using its length and read the HEADERS that follow.
+        "h-grease-frame" => {
+            send.write_all(&f::reserved_frame(11, b"skip me by length"))
+                .await?;
+            send.write_all(&f::headers(&[
+                (":status", "200"),
+                ("content-type", "text/plain"),
+                ("x-conformance", "grease-frame-preceded-this"),
+            ]))
+            .await?;
+            send.write_all(&f::data(BODY)).await?;
+        }
+
+        // Values Huffman-coded, with the padding that legal encodings carry.
+        "h-qpack-huffman" => {
+            let section = f::qpack_huffman_headers(&[
+                (":status", f::huffman::STATUS_200, 3),
+                ("content-type", f::huffman::TEXT_PLAIN, 10),
+                ("x-conformance", f::huffman::HUFFMAN_ENCODED, 15),
+            ]);
+            send.write_all(&f::headers_raw(&section)).await?;
+            send.write_all(&f::data(BODY)).await?;
+        }
+
+        // Field lines that reference entries inserted on the encoder stream.
+        // The insertions themselves go out in `emit`, before the probe.
+        "h-qpack-dynamic-table" => {
+            // Only if the client granted capacity. Referencing the dynamic
+            // table when it advertised zero — the default, and what curl sends
+            // — is a violation by us, and the client would be right to reset
+            // the stream. Falling back keeps the connection honest; the verdict
+            // records that the test did not apply.
+            let section = if qpack_capacity > 0 {
+                f::qpack_dynamic_headers(
+                    DYNAMIC_INSERTS,
+                    &[(":status", "200"), ("content-type", "text/plain")],
+                )
+            } else {
+                f::qpack_literal_headers(&[
+                    (":status", "200"),
+                    ("content-type", "text/plain"),
+                    ("x-conformance", "client-granted-no-qpack-dynamic-capacity"),
+                ])
+            };
+            send.write_all(&f::headers_raw(&section)).await?;
+            send.write_all(&f::data(BODY)).await?;
+        }
+
+        // A field section past any sane SETTINGS_MAX_FIELD_SECTION_SIZE. The
+        // client should fail this one request, not the whole connection.
+        "h-oversized-field-section" => {
+            let filler = "x".repeat(32 * 1024);
+            send.write_all(&f::headers(&[
+                (":status", "200"),
+                ("content-type", "text/plain"),
+                ("x-conformance-oversized", filler.as_str()),
+            ]))
+            .await?;
+            send.write_all(&f::data(BODY)).await?;
+        }
+
+        // A trailing field section after the body.
+        "h-trailers" => {
+            send.write_all(&f::headers(&[
+                (":status", "200"),
+                ("content-type", "text/plain"),
+                ("trailer", "x-conformance-trailer"),
+            ]))
+            .await?;
+            send.write_all(&f::data(BODY)).await?;
+            send.write_all(&f::headers(&[(
+                "x-conformance-trailer",
+                "arrived-after-the-body",
+            )]))
+            .await?;
+        }
+
+        // 103 first, then the real response. A client that treats the interim
+        // as final stops reading and never sees the 200.
+        "h-early-hints" => {
+            send.write_all(&f::headers(&[
+                (":status", "103"),
+                ("link", "</style.css>; rel=preload; as=style"),
+            ]))
+            .await?;
+            send.write_all(&f::headers(&[
+                (":status", "200"),
+                ("content-type", "text/plain"),
+                ("x-conformance", "early-hints-preceded-this"),
+            ]))
+            .await?;
+            send.write_all(&f::data(BODY)).await?;
+        }
+
+        _ => {
+            send.write_all(&f::headers(&[
+                (":status", "200"),
+                ("content-type", "text/plain"),
+                ("x-conformance", "liveness-ok"),
+            ]))
+            .await?;
+            send.write_all(&f::data(BODY)).await?;
+        }
+    }
+
     send.finish()?;
     Ok(())
 }
+
+/// How many entries `h-qpack-dynamic-table` inserts before referencing them.
+const DYNAMIC_INSERTS: u64 = 2;
 
 /// Turn a closed connection into an observation, preserving the error code the
 /// client chose — which for the correctness tests is the entire point.
