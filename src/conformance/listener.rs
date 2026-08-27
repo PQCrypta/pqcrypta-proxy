@@ -161,6 +161,12 @@ async fn run_one(
     conformance: Arc<Conformance>,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
+    // Captured before the handshake: `Connection::remote_address` panics once
+    // the connection is established, and this is the address that finds the
+    // session anyway. Canonicalised so an IPv4-mapped IPv6 peer matches the
+    // plain IPv4 address its /session call arrived from — the two spellings
+    // have caused a lookup miss in this codebase before.
+    let peer_ip = crate::security::canonical_addr(incoming.remote_address()).ip();
     let connecting = incoming.accept()?;
     let connection = connecting.await?;
 
@@ -174,6 +180,11 @@ async fn run_one(
         })
         .and_then(|sni| session_from_sni(&sni, &conformance.config.host))
         .filter(|id| conformance.sessions.exists(id))
+        // SNI only works with a wildcard certificate for the session
+        // subdomain; without one the handshake fails before a test can run.
+        // The address that started the session is the channel that always
+        // works.
+        .or_else(|| conformance.sessions.for_source(peer_ip))
         .unwrap_or_else(|| conformance.sessions.create());
 
     // Held for the lifetime of this function, not just for the emit call.

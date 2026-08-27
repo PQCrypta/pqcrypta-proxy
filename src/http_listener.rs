@@ -227,6 +227,10 @@ pub struct HttpListenerState {
     pub hmac_nonce_store: Arc<crate::tls_acceptor::HmacNonceStore>,
     /// Rate limiter for per-route secondary rate limit checks.
     pub rate_limiter: Arc<AdvancedRateLimiter>,
+    /// Client conformance suite, when enabled. Serves its own vhost's
+    /// catalogue, sessions, reports and badge; the tests themselves live on
+    /// their own UDP ports.
+    pub conformance: Option<Arc<crate::conformance::Conformance>>,
 }
 
 /// Create and run the HTTP listener with TLS termination
@@ -300,6 +304,7 @@ pub async fn run_http_listener(
     );
 
     let state = HttpListenerState {
+        conformance: crate::conformance::shared(&config.conformance),
         config: config.clone(),
         port,
         http_client,
@@ -499,6 +504,7 @@ pub async fn run_http_listener_pqc(
     );
 
     let state = HttpListenerState {
+        conformance: crate::conformance::shared(&config.conformance),
         config: config.clone(),
         port,
         http_client,
@@ -791,6 +797,7 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
     );
 
     let state = HttpListenerState {
+        conformance: crate::conformance::shared(&config.conformance),
         config: config.clone(),
         port,
         http_client,
@@ -1233,6 +1240,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     );
 
     let state = HttpListenerState {
+        conformance: crate::conformance::shared(&config.conformance),
         config: config.clone(),
         port,
         http_client,
@@ -2779,6 +2787,25 @@ async fn proxy_handler(
         "Incoming request: {} {} {} from {}",
         method, host, path, client_addr
     );
+
+    // ── Conformance vhost — catalogue, session, report, badge ───────────────
+    //
+    // Handled in-process before route lookup, like the speedtest hosts below,
+    // so no backend is required. Only ever on its own hostname: a request that
+    // lands here by misrouting is served normally rather than being handed a
+    // page about a suite the caller never asked for.
+    if let Some(conf) = state.conformance.as_ref() {
+        if conf.owns_host(&host_str) {
+            if let Some(resp) = crate::conformance::http::route(
+                conf,
+                &method,
+                &path,
+                crate::security::canonical_addr(client_addr).ip(),
+            ) {
+                return resp;
+            }
+        }
+    }
 
     // ── TCP-only speedtest hosts — true TCP-only speedtest (no Alt-Svc, no QUIC) ─
     // Handled in-process before route lookup so no backend is required.

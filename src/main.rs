@@ -1198,24 +1198,22 @@ async fn run() -> anyhow::Result<()> {
     // [conformance] enabled = true, and it refuses to start on a port range
     // that overlaps live traffic — handing ordinary visitors malformed protocol
     // output would be a bad way to discover a config mistake.
-    match pqcrypta_proxy::conformance::Conformance::new(&config.conformance) {
-        Ok(Some(conf)) => {
-            if let Err(e) = pqcrypta_proxy::conformance::check_port_conflicts(
-                &config.conformance,
-                config.server.udp_port,
-                &config.server.additional_ports,
-            ) {
-                error!("Conformance suite not started: {}", e);
-            } else {
-                pqcrypta_proxy::conformance::listener::spawn_all(
-                    &Arc::new(conf),
-                    &tls_provider,
-                    &config.server.bind_address,
-                );
-            }
+    // The same instance the HTTP listeners hold, so a session created by a test
+    // listener is findable when its report is fetched over HTTPS.
+    if let Some(conf) = pqcrypta_proxy::conformance::shared(&config.conformance) {
+        if let Err(e) = pqcrypta_proxy::conformance::check_port_conflicts(
+            &config.conformance,
+            config.server.udp_port,
+            &config.server.additional_ports,
+        ) {
+            error!("Conformance suite not started: {}", e);
+        } else {
+            pqcrypta_proxy::conformance::listener::spawn_all(
+                &conf,
+                &tls_provider,
+                &config.server.bind_address,
+            );
         }
-        Ok(None) => {}
-        Err(e) => error!("Conformance suite misconfigured, not started: {}", e),
     }
 
     // Start dedicated WebTransport server on port 4433

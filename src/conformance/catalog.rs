@@ -26,6 +26,15 @@ pub enum Class {
     Correctness,
     /// The client must recover — retry, re-probe, migrate — rather than fail.
     Resilience,
+    /// The client must correctly process something valid but demanding —
+    /// Huffman-coded field lines, a dynamic-table reference, trailers.
+    ///
+    /// Distinct from [`Correctness`](Self::Correctness), which is about
+    /// rejecting the invalid. Conflating the two is what made this suite report
+    /// "accepted a protocol violation" for four tests that send perfectly legal
+    /// HTTP/3 — accusing a client of a fault for doing exactly what the
+    /// specification asks.
+    Interoperability,
     /// The specification permits more than one response, so both pass and the
     /// report says which was chosen.
     ///
@@ -44,6 +53,7 @@ impl Class {
             Class::Extensibility => "extensibility",
             Class::Correctness => "correctness",
             Class::Resilience => "resilience",
+            Class::Interoperability => "interoperability",
             Class::Discretionary => "discretionary",
         }
     }
@@ -323,7 +333,7 @@ pub const CATALOG: &[Test] = &[
         id: "h-qpack-dynamic-table",
         title: "Field lines referencing dynamic table insertions",
         spec: "RFC 9204 §4.3",
-        class: Class::Correctness,
+        class: Class::Interoperability,
         tier: Tier::Http3,
         expectation: "Apply the encoder-stream insertions and decode the headers correctly.",
         implemented: true,
@@ -333,7 +343,7 @@ pub const CATALOG: &[Test] = &[
         id: "h-qpack-huffman",
         title: "Huffman-coded field lines with maximal padding",
         spec: "RFC 9204 §4.1",
-        class: Class::Correctness,
+        class: Class::Interoperability,
         tier: Tier::Http3,
         expectation: "Decode without error. Padding of up to 7 bits is legal, not corruption.",
         implemented: true,
@@ -343,7 +353,7 @@ pub const CATALOG: &[Test] = &[
         id: "h-oversized-field-section",
         title: "Field section larger than the client's advertised maximum",
         spec: "RFC 9114 §4.2.2",
-        class: Class::Correctness,
+        class: Class::Interoperability,
         tier: Tier::Http3,
         expectation: "Handle it as an error against that one request, not the whole connection.",
         implemented: true,
@@ -353,7 +363,7 @@ pub const CATALOG: &[Test] = &[
         id: "h-trailers",
         title: "Trailing field section after the body",
         spec: "RFC 9114 §4.1",
-        class: Class::Correctness,
+        class: Class::Interoperability,
         tier: Tier::Http3,
         expectation: "Deliver the trailers to the application after the body completes.",
         implemented: true,

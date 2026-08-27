@@ -1,0 +1,304 @@
+/* HTTP/3 & QUIC client conformance report.
+ *
+ * Served from the conformance vhost. No inline styles or handlers anywhere —
+ * the site's CSP forbids both, and these pages are bound by it like any other.
+ *
+ * Deliberately quiet. The page's job is to make a failing test legible next to
+ * the clause it violated; anything decorative competes with that.
+ */
+
+:root {
+    --cf-ground: #f3f5f7;
+    --cf-surface: #ffffff;
+    --cf-surface-2: #e9eef2;
+    --cf-ink: #131a20;
+    --cf-ink-2: #38454f;
+    --cf-muted: #5d6a76;
+    --cf-border: #d7dee5;
+    --cf-accent: #0a6576;
+    --cf-pass: #1f6746;
+    --cf-pass-bg: #dcefe4;
+    --cf-fail: #a5252f;
+    --cf-fail-bg: #f6dfe0;
+    --cf-incon: #8a6110;
+    --cf-incon-bg: #f6ecd6;
+    --cf-notrun: #5d6a76;
+    --cf-notrun-bg: #e9eef2;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+        --cf-ground: #0d1218;
+        --cf-surface: #151d25;
+        --cf-surface-2: #1d2831;
+        --cf-ink: #dfe6ec;
+        --cf-ink-2: #b4c2cd;
+        --cf-muted: #8797a5;
+        --cf-border: #25313b;
+        --cf-accent: #46b5cb;
+        --cf-pass: #5cc191;
+        --cf-pass-bg: #12301f;
+        --cf-fail: #f0868d;
+        --cf-fail-bg: #3a1c20;
+        --cf-incon: #dfb055;
+        --cf-incon-bg: #372c15;
+        --cf-notrun: #8797a5;
+        --cf-notrun-bg: #1d2831;
+    }
+}
+
+:root[data-theme="dark"] {
+    --cf-ground: #0d1218;
+    --cf-surface: #151d25;
+    --cf-surface-2: #1d2831;
+    --cf-ink: #dfe6ec;
+    --cf-ink-2: #b4c2cd;
+    --cf-muted: #8797a5;
+    --cf-border: #25313b;
+    --cf-accent: #46b5cb;
+    --cf-pass: #5cc191;
+    --cf-pass-bg: #12301f;
+    --cf-fail: #f0868d;
+    --cf-fail-bg: #3a1c20;
+    --cf-incon: #dfb055;
+    --cf-incon-bg: #372c15;
+    --cf-notrun: #8797a5;
+    --cf-notrun-bg: #1d2831;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body.conformance-report {
+    background: var(--cf-ground);
+    color: var(--cf-ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Ubuntu, sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    margin: 0 auto;
+    padding: 40px 24px 80px;
+    max-width: 1080px;
+    -webkit-font-smoothing: antialiased;
+}
+
+.conformance-report h1 {
+    font-size: clamp(24px, 4vw, 32px);
+    font-weight: 650;
+    letter-spacing: -0.02em;
+    margin: 0 0 8px;
+    text-wrap: balance;
+}
+
+.conformance-report h2 {
+    font-size: 19px;
+    font-weight: 600;
+    margin: 36px 0 10px;
+}
+
+.conformance-report p {
+    margin: 0 0 14px;
+    max-width: 70ch;
+}
+
+.conformance-report .meta {
+    font-family: "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
+    font-size: 13px;
+    color: var(--cf-muted);
+    margin-bottom: 24px;
+}
+
+.conformance-report code {
+    font-family: "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
+    font-size: 0.88em;
+    background: var(--cf-surface-2);
+    border: 1px solid var(--cf-border);
+    border-radius: 3px;
+    padding: 0.08em 0.34em;
+}
+
+.conformance-report a {
+    color: var(--cf-accent);
+    text-underline-offset: 2px;
+}
+
+.conformance-report a:focus-visible,
+.conformance-report summary:focus-visible {
+    outline: 2px solid var(--cf-accent);
+    outline-offset: 2px;
+}
+
+.conformance-report ul {
+    max-width: 70ch;
+    padding-left: 20px;
+}
+
+.conformance-report li {
+    margin-bottom: 6px;
+}
+
+/* The runnable example. Wide, so it scrolls inside itself rather than
+   pushing the page sideways. */
+.conformance-report .ja4-rawpre {
+    background: var(--cf-surface-2);
+    border: 1px solid var(--cf-border);
+    border-radius: 4px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-size: 13px;
+    line-height: 1.55;
+}
+
+.conformance-report .ja4-rawpre code {
+    background: none;
+    border: none;
+    padding: 0;
+    white-space: pre;
+}
+
+/* Summary cards, one per class. */
+.conformance-report .summary {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: 12px;
+    margin: 24px 0 32px;
+}
+
+.conformance-report .card {
+    background: var(--cf-surface);
+    border: 1px solid var(--cf-border);
+    border-radius: 4px;
+    padding: 16px 18px;
+}
+
+.conformance-report .card h2 {
+    margin: 0 0 4px;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--cf-muted);
+}
+
+.conformance-report .rate {
+    font-size: 26px;
+    font-weight: 650;
+    margin: 0 0 2px;
+    font-variant-numeric: tabular-nums;
+}
+
+.conformance-report .counts {
+    font-size: 13px;
+    color: var(--cf-ink-2);
+    margin: 0;
+}
+
+/* Results table. Wide content scrolls in its own container. */
+.conformance-report .tablewrap,
+.conformance-report table {
+    width: 100%;
+}
+
+.conformance-report table {
+    border-collapse: collapse;
+    background: var(--cf-surface);
+    border: 1px solid var(--cf-border);
+    border-radius: 4px;
+    overflow: hidden;
+    font-size: 14px;
+}
+
+.conformance-report th {
+    text-align: left;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--cf-muted);
+    background: var(--cf-surface-2);
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--cf-border);
+    white-space: nowrap;
+}
+
+.conformance-report td {
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--cf-border);
+    color: var(--cf-ink-2);
+    vertical-align: top;
+}
+
+.conformance-report tr:last-child td {
+    border-bottom: none;
+}
+
+.conformance-report td code {
+    font-size: 12.5px;
+}
+
+.conformance-report .title {
+    color: var(--cf-ink);
+    font-weight: 500;
+}
+
+/* The expectation, shown under every row so a FAIL reads as a complete
+   sentence next to the clause it cites. */
+.conformance-report .expect {
+    color: var(--cf-muted);
+    font-size: 13px;
+}
+
+.conformance-report .chip {
+    display: inline-block;
+    font-family: "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 3px 8px;
+    border-radius: 3px;
+    white-space: nowrap;
+}
+
+.conformance-report .chip-pass {
+    background: var(--cf-pass-bg);
+    color: var(--cf-pass);
+}
+
+.conformance-report .chip-fail {
+    background: var(--cf-fail-bg);
+    color: var(--cf-fail);
+}
+
+.conformance-report .chip-inconclusive {
+    background: var(--cf-incon-bg);
+    color: var(--cf-incon);
+}
+
+.conformance-report .chip-not_run {
+    background: var(--cf-notrun-bg);
+    color: var(--cf-notrun);
+}
+
+/* A failing row earns a left edge; nothing else does. */
+.conformance-report tr.v-fail td:first-child {
+    box-shadow: inset 3px 0 0 var(--cf-fail);
+}
+
+@media (max-width: 640px) {
+    body.conformance-report {
+        padding: 24px 16px 60px;
+    }
+
+    .conformance-report table {
+        display: block;
+        overflow-x: auto;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    * {
+        animation: none !important;
+        transition: none !important;
+    }
+}

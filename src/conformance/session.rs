@@ -216,6 +216,34 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
             (Verdict::Fail, "Stalled instead of recovering.".to_string())
         }
 
+        // ── Interoperability: valid, demanding, and must be handled ──
+        (Class::Interoperability, Observation::SurvivedAndContinued) => (
+            Verdict::Pass,
+            "Decoded it and completed the request.".to_string(),
+        ),
+        (Class::Interoperability, Observation::Signalled(what)) => {
+            (Verdict::Pass, format!("Handled it: {what}."))
+        }
+        (Class::Interoperability, Observation::ClosedWith { code }) => (
+            Verdict::Fail,
+            format!(
+                "Rejected the response with error 0x{code:x}. Nothing here violates the \
+                 specification — this is valid HTTP/3 that a client is required to be able \
+                 to process."
+            ),
+        ),
+        (Class::Interoperability, Observation::ClosedSilently) => (
+            Verdict::Fail,
+            "Dropped the connection on a valid response it was required to be able to \
+             process."
+                .to_string(),
+        ),
+        (Class::Interoperability, Observation::TimedOut) => (
+            Verdict::Fail,
+            "Stalled on a valid response. Something in the decode path did not complete."
+                .to_string(),
+        ),
+
         // ── Discretionary: the specification permits either ──
         (Class::Discretionary, Observation::ClosedWith { code }) => (
             Verdict::Pass,
@@ -328,6 +356,19 @@ impl Session {
 /// All live sessions.
 pub struct Registry {
     sessions: DashMap<String, Session>,
+    /// The most recent session started from each source address.
+    ///
+    /// How a client's test connections find their session. The obvious channel
+    /// is SNI — `<session>.conformance.example` — but that needs a wildcard
+    /// certificate, and without one every connection fails TLS verification
+    /// before a single test can run. Associating by source address needs no
+    /// certificate and no cooperation from the client beyond starting the
+    /// session itself.
+    ///
+    /// Two clients behind one NAT can therefore land in the same session. That
+    /// is a real limitation and the reason SNI is still preferred when it
+    /// carries a usable id: this is the fallback, not the design.
+    by_source: DashMap<std::net::IpAddr, (String, Instant)>,
     ttl: Duration,
     max: usize,
 }
@@ -336,6 +377,7 @@ impl Registry {
     pub fn new(ttl_secs: u64, max: usize) -> Arc<Self> {
         Arc::new(Self {
             sessions: DashMap::new(),
+            by_source: DashMap::new(),
             ttl: Duration::from_secs(ttl_secs),
             max,
         })
@@ -377,9 +419,33 @@ impl Registry {
         self.sessions.contains_key(id)
     }
 
+    /// Remember that `ip` started `id`, so its test connections can find it.
+    pub fn associate(&self, ip: std::net::IpAddr, id: &str) {
+        self.by_source.insert(ip, (id.to_string(), Instant::now()));
+    }
+
+    /// The most recent live session started from `ip`.
+    ///
+    /// Expired associations are dropped rather than resurrecting a session that
+    /// has already aged out of the registry.
+    pub fn for_source(&self, ip: std::net::IpAddr) -> Option<String> {
+        let entry = self.by_source.get(&ip)?;
+        let (id, started) = entry.value();
+        if started.elapsed() >= self.ttl || !self.sessions.contains_key(id) {
+            let id = id.clone();
+            drop(entry);
+            self.by_source.remove(&ip);
+            let _ = id;
+            return None;
+        }
+        Some(id.clone())
+    }
+
     fn sweep(&self) {
         let ttl = self.ttl;
         self.sessions.retain(|_, s| s.age() < ttl);
+        self.by_source
+            .retain(|_, (_, started)| started.elapsed() < ttl);
     }
 
     pub fn len(&self) -> usize {
@@ -479,6 +545,28 @@ mod tests {
     }
 
     #[test]
+    fn valid_but_demanding_output_must_not_read_as_a_violation() {
+        // These four send legal HTTP/3 the client has to decode. Scoring them
+        // as Correctness reported "accepted a protocol violation" for doing
+        // exactly what the specification asks.
+        for id in [
+            "h-qpack-huffman",
+            "h-qpack-dynamic-table",
+            "h-trailers",
+            "h-oversized-field-section",
+        ] {
+            let t = test_of(id);
+            assert_eq!(t.class, Class::Interoperability, "{id}");
+            let (v, _) = judge(t, &Observation::SurvivedAndContinued, None);
+            assert_eq!(v, Verdict::Pass, "{id}: decoding it is the pass");
+
+            let (v, d) = judge(t, &Observation::ClosedWith { code: 0x0106 }, None);
+            assert_eq!(v, Verdict::Fail, "{id}: rejecting valid output is the fail");
+            assert!(d.contains("valid HTTP/3"), "{id}: say it was valid: {d}");
+        }
+    }
+
+    #[test]
     fn a_may_level_requirement_accepts_either_choice() {
         // RFC 9114 §7.2.4.1 says a receiver MAY reject duplicate setting
         // identifiers. Scoring this as Correctness failed curl for making a
@@ -557,6 +645,37 @@ mod tests {
         assert!(reg.len() <= 3, "cap must hold: {}", reg.len());
         // The most recent creation always survives.
         assert!(reg.exists(ids.last().unwrap()));
+    }
+
+    #[test]
+    fn a_source_address_finds_the_session_it_started() {
+        let reg = Registry::new(60, 8);
+        let ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let id = reg.create();
+        reg.associate(ip, &id);
+        assert_eq!(reg.for_source(ip).as_deref(), Some(id.as_str()));
+
+        // An address that started nothing gets nothing, rather than someone
+        // else's session.
+        let other: std::net::IpAddr = "203.0.113.8".parse().unwrap();
+        assert!(reg.for_source(other).is_none());
+    }
+
+    #[test]
+    fn an_association_to_a_vanished_session_is_dropped() {
+        let reg = Registry::new(60, 2);
+        let ip: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let first = reg.create();
+        reg.associate(ip, &first);
+        // Evict it by filling the registry past its cap.
+        for _ in 0..4 {
+            reg.create();
+        }
+        assert!(!reg.exists(&first));
+        assert!(
+            reg.for_source(ip).is_none(),
+            "must not hand back a session that no longer exists"
+        );
     }
 
     #[test]

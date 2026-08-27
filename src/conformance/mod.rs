@@ -47,6 +47,7 @@
 
 pub mod catalog;
 pub mod h3_frames;
+pub mod http;
 pub mod listener;
 pub mod report;
 pub mod session;
@@ -126,6 +127,32 @@ impl Conformance {
         let host = host.split(':').next().unwrap_or(host);
         host.eq_ignore_ascii_case(&self.config.host)
     }
+}
+
+/// The one instance for this process.
+///
+/// Shared rather than built per listener, and for the same reason `SecurityState`
+/// is: a session is created by whichever UDP test listener the client connects
+/// to and read back over HTTPS by the report handler, so separate registries
+/// would mean every report came back "no such session".
+static SHARED: std::sync::OnceLock<Option<Arc<Conformance>>> = std::sync::OnceLock::new();
+
+/// Fetch (building on first call) the process-wide conformance state.
+///
+/// Errors are logged and become `None`: a misconfigured suite must not stop the
+/// proxy serving the site. The first caller's config wins, so a hot reload does
+/// not rebuild it — the port bindings could not follow a change anyway without
+/// a restart.
+pub fn shared(config: &ConformanceConfig) -> Option<Arc<Conformance>> {
+    SHARED
+        .get_or_init(|| match Conformance::new(config) {
+            Ok(c) => c.map(Arc::new),
+            Err(e) => {
+                tracing::error!("Conformance suite misconfigured, not started: {e}");
+                None
+            }
+        })
+        .clone()
 }
 
 /// Check the conformance ports do not collide with the ports serving real
