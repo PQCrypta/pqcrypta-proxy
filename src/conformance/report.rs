@@ -290,9 +290,9 @@ mod tests {
         let r = report_with(&[
             ("h-grease-settings", Observation::SurvivedAndContinued, None),
             (
-                "h-duplicate-setting",
+                "h-missing-settings",
                 Observation::SurvivedAndContinued,
-                Some(0x0109),
+                Some(0x010a),
             ),
         ]);
         let ext = &r.by_class[Class::Extensibility.as_str()];

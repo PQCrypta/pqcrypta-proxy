@@ -111,6 +111,15 @@ pub struct Result_ {
 /// - **Resilience** — surviving is the pass, and a clean close is a partial
 ///   failure rather than a crash, but both are failures.
 pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Verdict, String) {
+    if !test.implemented {
+        return (
+            Verdict::Inconclusive,
+            "This test's anomaly is not implemented yet, so the run proves nothing about \
+             it either way."
+                .to_string(),
+        );
+    }
+
     match (test.class, obs) {
         // ── Extensibility: the client had to ignore it and keep going ──
         (Class::Extensibility, Observation::SurvivedAndContinued) => (
@@ -190,6 +199,36 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
         (Class::Resilience, Observation::TimedOut) => {
             (Verdict::Fail, "Stalled instead of recovering.".to_string())
         }
+
+        // ── Discretionary: the specification permits either ──
+        (Class::Discretionary, Observation::ClosedWith { code }) => (
+            Verdict::Pass,
+            format!(
+                "Rejected with error 0x{code:x}. The specification permits this but does \
+                 not require it; a client that ignored it would also be conformant."
+            ),
+        ),
+        (Class::Discretionary, Observation::SurvivedAndContinued) => (
+            Verdict::Pass,
+            "Tolerated it and continued. The specification permits this but does not \
+             require it; a client that rejected it would also be conformant."
+                .to_string(),
+        ),
+        (Class::Discretionary, Observation::Signalled(what)) => {
+            (Verdict::Pass, format!("Handled it: {what}."))
+        }
+        (Class::Discretionary, Observation::ClosedSilently) => (
+            Verdict::Fail,
+            "Closed without an error code. Rejecting this is permitted, but doing so \
+             silently leaves the peer unable to tell what happened."
+                .to_string(),
+        ),
+        (Class::Discretionary, Observation::TimedOut) => (
+            Verdict::Fail,
+            "Neither rejected it nor continued. Both outcomes are allowed; stalling is \
+             not one of them."
+                .to_string(),
+        ),
 
         // An extensibility test that got a specific signal is not something the
         // harness knows how to read; say so rather than inventing a verdict.
@@ -348,7 +387,7 @@ fn new_session_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conformance::catalog;
+    use crate::conformance::catalog::{self, Class, CATALOG};
 
     fn test_of(id: &str) -> &'static catalog::Test {
         catalog::find(id).expect("catalogue entry")
@@ -368,17 +407,52 @@ mod tests {
 
     #[test]
     fn a_violation_must_be_rejected_with_the_named_code() {
-        let t = test_of("h-duplicate-setting");
-        let (v, _) = judge(t, &Observation::ClosedWith { code: 0x0109 }, Some(0x0109));
+        // RFC 9114 §6.2.1 is MUST: a control stream whose first frame is not
+        // SETTINGS is H3_MISSING_SETTINGS, with no discretion.
+        let t = test_of("h-missing-settings");
+        let want = 0x010a;
+        let (v, _) = judge(t, &Observation::ClosedWith { code: want }, Some(want));
         assert_eq!(v, Verdict::Pass);
 
         // Right instinct, wrong code.
-        let (v, d) = judge(t, &Observation::ClosedWith { code: 0x0102 }, Some(0x0109));
+        let (v, d) = judge(t, &Observation::ClosedWith { code: 0x0102 }, Some(want));
         assert_eq!(v, Verdict::Fail);
-        assert!(d.contains("0x109"), "name the code that was required");
+        assert!(d.contains("0x10a"), "name the code that was required: {d}");
 
         // Accepting it is the bug being hunted.
-        let (v, _) = judge(t, &Observation::SurvivedAndContinued, Some(0x0109));
+        let (v, _) = judge(t, &Observation::SurvivedAndContinued, Some(want));
+        assert_eq!(v, Verdict::Fail);
+    }
+
+    #[test]
+    fn an_unimplemented_test_is_never_scored() {
+        // Falling through to a correct control stream must not read as the
+        // client accepting a violation that was never sent.
+        let unbuilt = CATALOG
+            .iter()
+            .find(|t| !t.implemented && t.class == Class::Correctness)
+            .expect("a correctness test is still unbuilt");
+        let (v, d) = judge(unbuilt, &Observation::SurvivedAndContinued, None);
+        assert_eq!(v, Verdict::Inconclusive);
+        assert!(d.contains("not implemented"), "say why: {d}");
+    }
+
+    #[test]
+    fn a_may_level_requirement_accepts_either_choice() {
+        // RFC 9114 §7.2.4.1 says a receiver MAY reject duplicate setting
+        // identifiers. Scoring this as Correctness failed curl for making a
+        // legal choice, which is the failure mode that would discredit the
+        // whole suite.
+        let t = test_of("h-duplicate-setting");
+        let (v, d) = judge(t, &Observation::SurvivedAndContinued, None);
+        assert_eq!(v, Verdict::Pass, "tolerating it is conformant");
+        assert!(d.contains("permits"), "say why it passed: {d}");
+
+        let (v, _) = judge(t, &Observation::ClosedWith { code: 0x0109 }, None);
+        assert_eq!(v, Verdict::Pass, "rejecting it is equally conformant");
+
+        // Stalling is not one of the permitted choices.
+        let (v, _) = judge(t, &Observation::TimedOut, None);
         assert_eq!(v, Verdict::Fail);
     }
 
@@ -386,19 +460,19 @@ mod tests {
     fn a_timeout_is_a_failure_not_an_absence() {
         // The liveness probe exists precisely so this is distinguishable from
         // a pass. A client that silently died must not read as compliant.
-        let t = test_of("h-grease-frame");
+        let t = test_of("h-grease-settings");
         let (v, _) = judge(t, &Observation::TimedOut, None);
         assert_eq!(v, Verdict::Fail);
     }
 
     #[test]
     fn resilience_rewards_recovery_however_it_is_signalled() {
-        let t = test_of("q-pmtu-blackhole");
+        let t = test_of("h-goaway");
         let (v, _) = judge(t, &Observation::SurvivedAndContinued, None);
         assert_eq!(v, Verdict::Pass);
         let (v, _) = judge(
             t,
-            &Observation::Signalled("probed down to 1200 bytes".into()),
+            &Observation::Signalled("stopped opening new requests".into()),
             None,
         );
         assert_eq!(v, Verdict::Pass);

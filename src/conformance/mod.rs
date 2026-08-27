@@ -17,6 +17,21 @@
 //! - [`h3_frames`] — a hand-rolled HTTP/3 frame writer
 //! - [`report`] — JSON, HTML and badge output
 //!
+//! # Selection: one UDP port per test
+//!
+//! Every test owns a port from the configured range, and the listener knows
+//! which test it is serving from its own `local_addr()`.
+//!
+//! Selecting by URL path was the first design, and it does not survive contact
+//! with the constraint below. Reading a path means QPACK-decoding the client's
+//! request, and `h3` exposes only `send_response`/`send_data`/`send_trailers` —
+//! no way to inject an arbitrary frame into a response it is managing. Owning
+//! the connection from its first packet avoids the decoder entirely and gives
+//! total control over SETTINGS, the control stream and the response stream.
+//!
+//! The conformance host still matters: it serves the catalogue, the reports and
+//! the badge over ordinary HTTPS. It just does not select tests.
+//!
 //! # Why HTTP/3 frames are written by hand
 //!
 //! `h3` is an unvendored crates.io dependency while `noq`/`noq-proto` are
@@ -32,6 +47,7 @@
 
 pub mod catalog;
 pub mod h3_frames;
+pub mod listener;
 pub mod report;
 pub mod session;
 
@@ -92,8 +108,8 @@ impl Conformance {
         }))
     }
 
-    /// Ports Tier B needs to bind.
-    pub fn quic_ports(&self) -> Vec<u16> {
+    /// Every port the catalogue needs bound, one per test.
+    pub fn test_ports(&self) -> Vec<u16> {
         let start = self.config.port_range.0;
         catalog::CATALOG
             .iter()
@@ -104,9 +120,8 @@ impl Conformance {
 
     /// Whether `host` is the conformance vhost.
     ///
-    /// Tier A only ever answers on its own hostname, so a request that lands
-    /// here by misrouting is served normally instead of being handed a
-    /// deliberately malformed response.
+    /// The vhost serves the catalogue, reports and badge. It does not select
+    /// tests — that is what the per-test ports are for.
     pub fn owns_host(&self, host: &str) -> bool {
         let host = host.split(':').next().unwrap_or(host);
         host.eq_ignore_ascii_case(&self.config.host)
@@ -178,7 +193,7 @@ mod tests {
     fn the_default_range_fits_the_catalogue() {
         let c = cfg();
         let conf = Conformance::new(&c).unwrap().expect("enabled");
-        assert_eq!(conf.quic_ports().len() as u16, catalog::required_ports());
+        assert_eq!(conf.test_ports().len() as u16, catalog::required_ports());
     }
 
     #[test]
@@ -195,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn tier_a_answers_only_on_its_own_host() {
+    fn the_vhost_is_matched_case_insensitively_and_without_port() {
         let conf = Conformance::new(&cfg()).unwrap().unwrap();
         assert!(conf.owns_host("conformance.pqcrypta.com"));
         assert!(conf.owns_host("Conformance.PQCrypta.com"));

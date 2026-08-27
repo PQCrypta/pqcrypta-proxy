@@ -26,6 +26,15 @@ pub enum Class {
     Correctness,
     /// The client must recover — retry, re-probe, migrate — rather than fail.
     Resilience,
+    /// The specification permits more than one response, so both pass and the
+    /// report says which was chosen.
+    ///
+    /// Exists because several requirements are MAY, not MUST — RFC 9114 §7.2.4.1
+    /// says a receiver *may* treat duplicate setting identifiers as an error.
+    /// Scoring those as Correctness would fail conformant clients for making a
+    /// legal choice, and a suite that wrongly accuses the thing it is testing is
+    /// worse than no suite: nobody trusts the failures that are real.
+    Discretionary,
 }
 
 impl Class {
@@ -35,19 +44,24 @@ impl Class {
             Class::Extensibility => "extensibility",
             Class::Correctness => "correctness",
             Class::Resilience => "resilience",
+            Class::Discretionary => "discretionary",
         }
     }
 }
 
-/// Which tier a test belongs to, which determines how a client selects it.
+/// Which protocol layer a test's anomaly lives at.
+///
+/// Not a selection mechanism — every test is selected by connecting to its own
+/// UDP port. This says where the awkwardness is, which is what a library author
+/// needs to know to find the code responsible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
-    /// The anomaly rides on a working HTTP/3 exchange, so the client selects it
-    /// with a URL path.
+    /// The anomaly is in the HTTP/3 framing: SETTINGS, the control stream,
+    /// QPACK, the response stream.
     Http3,
-    /// The anomaly precedes any request, so it cannot be named in-band. The
-    /// client selects it by connecting to a dedicated UDP port.
+    /// The anomaly is in QUIC itself: version negotiation, transport
+    /// parameters, frames, path validation.
     Quic,
 }
 
@@ -66,8 +80,22 @@ pub struct Test {
     /// What a correct client is required to do. Written as the report renders
     /// it, so a FAIL reads as a complete sentence next to the citation.
     pub expectation: &'static str,
-    /// Offset from the start of the configured port range. Tier A tests carry
-    /// `None`; Tier B tests each own one port.
+    /// Whether the anomaly is actually emitted yet.
+    ///
+    /// An unbuilt test serves a correct control stream, so a client sails
+    /// through it. For an extensibility test that reads as a pass, which is
+    /// merely premature — but for a correctness test it reads as "accepted a
+    /// violation", which is a false accusation about something we never sent.
+    /// The listener records these as inconclusive instead of judging them.
+    pub implemented: bool,
+    /// Offset from the start of the configured port range.
+    ///
+    /// Every test owns a port. Selecting by URL path was the original design,
+    /// but reading a path means QPACK-decoding the client's request, and the
+    /// `h3` crate exposes no way to inject arbitrary frames into a response it
+    /// is managing. Owning the whole connection from the first packet is both
+    /// simpler and gives total control over SETTINGS, the control stream and
+    /// the response stream.
     pub port_offset: Option<u16>,
 }
 
@@ -86,6 +114,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Extensibility,
         tier: Tier::Quic,
         expectation: "Ignore the unrecognised version, then retry the handshake using QUIC v1.",
+        implemented: false,
         port_offset: Some(0),
     },
     Test {
@@ -95,6 +124,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Correctness,
         tier: Tier::Quic,
         expectation: "Echo the Retry token in a second Initial packet and complete the handshake.",
+        implemented: false,
         port_offset: Some(1),
     },
     Test {
@@ -104,6 +134,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Extensibility,
         tier: Tier::Quic,
         expectation: "Ignore the unknown parameter and complete the handshake normally.",
+        implemented: false,
         port_offset: Some(2),
     },
     Test {
@@ -113,6 +144,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Extensibility,
         tier: Tier::Quic,
         expectation: "Ignore the frame. Closing the connection here is a failure, not caution.",
+        implemented: false,
         port_offset: Some(3),
     },
     Test {
@@ -122,6 +154,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Resilience,
         tier: Tier::Quic,
         expectation: "Adopt the new connection ID, retire the old one, and stay connected.",
+        implemented: false,
         port_offset: Some(4),
     },
     Test {
@@ -131,6 +164,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Correctness,
         tier: Tier::Quic,
         expectation: "Recognise the reset token and close the connection without erroring loudly.",
+        implemented: false,
         port_offset: Some(5),
     },
     Test {
@@ -141,6 +175,7 @@ pub const CATALOG: &[Test] = &[
         tier: Tier::Quic,
         expectation:
             "Respect the limit and announce the stall with DATA_BLOCKED / STREAM_DATA_BLOCKED.",
+        implemented: false,
         port_offset: Some(6),
     },
     Test {
@@ -150,6 +185,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Extensibility,
         tier: Tier::Quic,
         expectation: "Negotiate the extension, or ignore it. Either is correct; failing is not.",
+        implemented: false,
         port_offset: Some(7),
     },
     Test {
@@ -159,6 +195,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Correctness,
         tier: Tier::Quic,
         expectation: "Report the ECN counts back in ACK_ECN frames.",
+        implemented: false,
         port_offset: Some(8),
     },
     Test {
@@ -169,6 +206,7 @@ pub const CATALOG: &[Test] = &[
         tier: Tier::Quic,
         expectation:
             "Detect the black hole, probe down to a working size, and keep the connection.",
+        implemented: false,
         port_offset: Some(9),
     },
     Test {
@@ -178,6 +216,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Correctness,
         tier: Tier::Quic,
         expectation: "Reply with PATH_RESPONSE carrying the identical 8-byte payload.",
+        implemented: false,
         port_offset: Some(10),
     },
     Test {
@@ -187,6 +226,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Resilience,
         tier: Tier::Quic,
         expectation: "Retransmit the early data in 1-RTT. No application data may be lost.",
+        implemented: false,
         port_offset: Some(11),
     },
     Test {
@@ -196,6 +236,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Extensibility,
         tier: Tier::Quic,
         expectation: "Use the additional path, or decline it cleanly. Do not abort the connection.",
+        implemented: false,
         port_offset: Some(12),
     },
     // ── Tier A: HTTP/3 layer ──────────────────────────────────────────────
@@ -206,7 +247,8 @@ pub const CATALOG: &[Test] = &[
         class: Class::Extensibility,
         tier: Tier::Http3,
         expectation: "Ignore the unknown setting and complete the request.",
-        port_offset: None,
+        implemented: true,
+        port_offset: Some(13),
     },
     Test {
         id: "h-grease-frame",
@@ -215,7 +257,8 @@ pub const CATALOG: &[Test] = &[
         class: Class::Extensibility,
         tier: Tier::Http3,
         expectation: "Skip the frame using its length and read the response that follows.",
-        port_offset: None,
+        implemented: false,
+        port_offset: Some(14),
     },
     Test {
         id: "h-reserved-uni-stream",
@@ -224,16 +267,20 @@ pub const CATALOG: &[Test] = &[
         class: Class::Extensibility,
         tier: Tier::Http3,
         expectation: "Ignore the stream. It must not be treated as fatal.",
-        port_offset: None,
+        implemented: true,
+        port_offset: Some(15),
     },
     Test {
         id: "h-duplicate-setting",
         title: "SETTINGS containing the same identifier twice",
-        spec: "RFC 9114 §7.2.4",
-        class: Class::Correctness,
+        spec: "RFC 9114 §7.2.4.1",
+        class: Class::Discretionary,
         tier: Tier::Http3,
-        expectation: "Close the connection with H3_SETTINGS_ERROR.",
-        port_offset: None,
+        expectation: "Either reject with H3_SETTINGS_ERROR or ignore the repeat — the \
+                      specification says a receiver MAY treat this as an error, so both \
+                      are conformant.",
+        implemented: true,
+        port_offset: Some(16),
     },
     Test {
         id: "h-control-frame-unexpected",
@@ -242,7 +289,8 @@ pub const CATALOG: &[Test] = &[
         class: Class::Correctness,
         tier: Tier::Http3,
         expectation: "Close the connection with H3_FRAME_UNEXPECTED.",
-        port_offset: None,
+        implemented: true,
+        port_offset: Some(17),
     },
     Test {
         id: "h-missing-settings",
@@ -251,7 +299,8 @@ pub const CATALOG: &[Test] = &[
         class: Class::Correctness,
         tier: Tier::Http3,
         expectation: "Close the connection with H3_MISSING_SETTINGS.",
-        port_offset: None,
+        implemented: true,
+        port_offset: Some(18),
     },
     Test {
         id: "h-second-control-stream",
@@ -260,7 +309,8 @@ pub const CATALOG: &[Test] = &[
         class: Class::Correctness,
         tier: Tier::Http3,
         expectation: "Close the connection with H3_STREAM_CREATION_ERROR.",
-        port_offset: None,
+        implemented: true,
+        port_offset: Some(19),
     },
     Test {
         id: "h-qpack-dynamic-table",
@@ -269,7 +319,8 @@ pub const CATALOG: &[Test] = &[
         class: Class::Correctness,
         tier: Tier::Http3,
         expectation: "Apply the encoder-stream insertions and decode the headers correctly.",
-        port_offset: None,
+        implemented: false,
+        port_offset: Some(20),
     },
     Test {
         id: "h-qpack-huffman",
@@ -278,7 +329,8 @@ pub const CATALOG: &[Test] = &[
         class: Class::Correctness,
         tier: Tier::Http3,
         expectation: "Decode without error. Padding of up to 7 bits is legal, not corruption.",
-        port_offset: None,
+        implemented: false,
+        port_offset: Some(21),
     },
     Test {
         id: "h-oversized-field-section",
@@ -287,7 +339,8 @@ pub const CATALOG: &[Test] = &[
         class: Class::Correctness,
         tier: Tier::Http3,
         expectation: "Handle it as an error against that one request, not the whole connection.",
-        port_offset: None,
+        implemented: false,
+        port_offset: Some(22),
     },
     Test {
         id: "h-trailers",
@@ -296,7 +349,8 @@ pub const CATALOG: &[Test] = &[
         class: Class::Correctness,
         tier: Tier::Http3,
         expectation: "Deliver the trailers to the application after the body completes.",
-        port_offset: None,
+        implemented: false,
+        port_offset: Some(23),
     },
     Test {
         id: "h-early-hints",
@@ -305,7 +359,8 @@ pub const CATALOG: &[Test] = &[
         class: Class::Resilience,
         tier: Tier::Http3,
         expectation: "Treat 103 as informational and keep reading for the final response.",
-        port_offset: None,
+        implemented: false,
+        port_offset: Some(24),
     },
     Test {
         id: "h-goaway",
@@ -315,16 +370,20 @@ pub const CATALOG: &[Test] = &[
         tier: Tier::Http3,
         expectation:
             "Stop opening requests, finish those in flight, and retry idempotent ones elsewhere.",
-        port_offset: None,
+        implemented: true,
+        port_offset: Some(25),
     },
     Test {
         id: "h-max-push-id",
-        title: "Push attempted with no MAX_PUSH_ID granted",
+        title: "MAX_PUSH_ID sent by the server",
         spec: "RFC 9114 §7.2.7",
         class: Class::Correctness,
         tier: Tier::Http3,
-        expectation: "Reject with H3_ID_ERROR rather than accepting an unsolicited push.",
-        port_offset: None,
+        expectation: "Reject with H3_FRAME_UNEXPECTED. MAX_PUSH_ID travels client to \
+                      server only, so a server sending one is using a frame in a \
+                      direction the specification does not allow.",
+        implemented: true,
+        port_offset: Some(26),
     },
 ];
 
@@ -333,16 +392,15 @@ pub fn find(id: &str) -> Option<&'static Test> {
     CATALOG.iter().find(|t| t.id == id)
 }
 
-/// The Tier B test served on `port`, given the configured range start.
+/// The test served on `port`, given the configured range start.
 pub fn by_port(range_start: u16, port: u16) -> Option<&'static Test> {
     let offset = port.checked_sub(range_start)?;
-    CATALOG
-        .iter()
-        .find(|t| t.tier == Tier::Quic && t.port_offset == Some(offset))
+    CATALOG.iter().find(|t| t.port_offset == Some(offset))
 }
 
-/// How many ports Tier B needs. Startup uses this to check the configured
-/// range is wide enough rather than silently serving a truncated catalogue.
+/// How many ports the catalogue needs. Startup uses this to check the
+/// configured range is wide enough rather than silently serving a truncated
+/// catalogue.
 pub fn required_ports() -> u16 {
     CATALOG
         .iter()
@@ -365,23 +423,29 @@ mod tests {
     }
 
     #[test]
-    fn quic_tests_own_distinct_ports() {
+    fn every_test_owns_a_distinct_port() {
         let mut seen = HashSet::new();
-        for t in CATALOG.iter().filter(|t| t.tier == Tier::Quic) {
-            let off = t.port_offset.expect("a Tier B test must own a port");
+        for t in CATALOG {
+            let off = t.port_offset.expect("every test must own a port");
             assert!(seen.insert(off), "duplicate port offset on {}", t.id);
         }
     }
 
     #[test]
-    fn http3_tests_claim_no_port() {
-        for t in CATALOG.iter().filter(|t| t.tier == Tier::Http3) {
-            assert!(
-                t.port_offset.is_none(),
-                "{} is Tier A and must not reserve a port",
-                t.id
-            );
+    fn ports_are_contiguous_from_zero() {
+        // A gap would leave a bound port serving nothing, which reads as a
+        // network fault to whoever connects to it.
+        let mut offsets: Vec<u16> = CATALOG.iter().filter_map(|t| t.port_offset).collect();
+        offsets.sort_unstable();
+        for (i, off) in offsets.iter().enumerate() {
+            assert_eq!(*off, i as u16, "port offsets must run 0..n with no gaps");
         }
+    }
+
+    #[test]
+    fn both_layers_are_represented() {
+        assert!(CATALOG.iter().any(|t| t.tier == Tier::Quic));
+        assert!(CATALOG.iter().any(|t| t.tier == Tier::Http3));
     }
 
     #[test]
@@ -394,10 +458,14 @@ mod tests {
 
     #[test]
     fn port_lookup_round_trips() {
-        for t in CATALOG.iter().filter(|t| t.tier == Tier::Quic) {
+        for t in CATALOG {
             let port = 4460 + t.port_offset.unwrap();
             assert_eq!(by_port(4460, port).map(|x| x.id), Some(t.id));
         }
-        assert!(by_port(4460, 4459).is_none());
+        assert!(by_port(4460, 4459).is_none(), "below the range");
+        assert!(
+            by_port(4460, 4460 + required_ports()).is_none(),
+            "past the catalogue"
+        );
     }
 }

@@ -1191,6 +1191,33 @@ async fn run() -> anyhow::Result<()> {
         });
     }
 
+    // Start the HTTP/3 + QUIC client conformance suite.
+    //
+    // One UDP listener per test, each serving deliberately awkward-but-legal
+    // protocol output so a client library can find out how it copes. Off unless
+    // [conformance] enabled = true, and it refuses to start on a port range
+    // that overlaps live traffic — handing ordinary visitors malformed protocol
+    // output would be a bad way to discover a config mistake.
+    match pqcrypta_proxy::conformance::Conformance::new(&config.conformance) {
+        Ok(Some(conf)) => {
+            if let Err(e) = pqcrypta_proxy::conformance::check_port_conflicts(
+                &config.conformance,
+                config.server.udp_port,
+                &config.server.additional_ports,
+            ) {
+                error!("Conformance suite not started: {}", e);
+            } else {
+                pqcrypta_proxy::conformance::listener::spawn_all(
+                    &Arc::new(conf),
+                    &tls_provider,
+                    &config.server.bind_address,
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(e) => error!("Conformance suite misconfigured, not started: {}", e),
+    }
+
     // Start dedicated WebTransport server on port 4433
     // This uses wtransport crate for proper WebTransport protocol support
     {
