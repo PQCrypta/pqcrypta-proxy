@@ -86,6 +86,15 @@ pub enum Observation {
     /// PATH_RESPONSE, an ACK_ECN, a DATA_BLOCKED. Carries a short label so the
     /// report can say what was seen.
     Signalled(String),
+    /// The run completed but never put the client in the situation the test is
+    /// about — a flow-control test where the request was too small to approach
+    /// the window, say.
+    ///
+    /// Distinct from every other outcome because the alternative is a lie in
+    /// one direction or the other: scoring it as a pass credits a client for
+    /// something it was never asked to do, and scoring it as a failure accuses
+    /// it of accepting a violation that was never sent. Neither is a result.
+    NotExercised(String),
 }
 
 /// One recorded result.
@@ -117,6 +126,13 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
             "This test's anomaly is not implemented yet, so the run proves nothing about \
              it either way."
                 .to_string(),
+        );
+    }
+
+    if let Observation::NotExercised(why) = obs {
+        return (
+            Verdict::Inconclusive,
+            format!("The run did not exercise this test: {why}."),
         );
     }
 
@@ -228,6 +244,14 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
             "Neither rejected it nor continued. Both outcomes are allowed; stalling is \
              not one of them."
                 .to_string(),
+        ),
+
+        // Handled by the early return above. Repeated rather than made
+        // unreachable!() so that removing the guard degrades to the right
+        // answer instead of panicking in production.
+        (_, Observation::NotExercised(why)) => (
+            Verdict::Inconclusive,
+            format!("The run did not exercise this test: {why}."),
         ),
 
         // An extensibility test that got a specific signal is not something the
@@ -422,6 +446,23 @@ mod tests {
         // Accepting it is the bug being hunted.
         let (v, _) = judge(t, &Observation::SurvivedAndContinued, Some(want));
         assert_eq!(v, Verdict::Fail);
+    }
+
+    #[test]
+    fn a_test_that_never_ran_is_inconclusive_whatever_its_class() {
+        // A correctness test would otherwise read "accepted a violation" for a
+        // violation that was never sent, and an extensibility one would credit
+        // the client for tolerating nothing.
+        for id in ["q-flow-control", "q-path-challenge", "h-grease-settings"] {
+            let t = test_of(id);
+            let (v, d) = judge(
+                t,
+                &Observation::NotExercised("the request never approached the window".into()),
+                None,
+            );
+            assert_eq!(v, Verdict::Inconclusive, "{id}");
+            assert!(d.contains("did not exercise"), "{id}: {d}");
+        }
     }
 
     #[test]

@@ -68,6 +68,31 @@ impl TestListener {
                 .try_into()
                 .expect("30s is a valid idle timeout"),
         ));
+
+        // Per-test transport shaping. Several QUIC-layer anomalies are produced
+        // by how the endpoint is configured rather than by bytes written after
+        // the handshake, so they are set up here.
+        match test.id {
+            // Advertise windows small enough that any real request has to stop
+            // and say so. A client that ignores them is overrunning a limit it
+            // agreed to.
+            "q-flow-control" => {
+                transport.receive_window(quinn::VarInt::from_u32(1024));
+                transport.stream_receive_window(quinn::VarInt::from_u32(512));
+            }
+            // Offer the extension and see whether the peer takes it up. Either
+            // answer conforms; falling over does not.
+            "q-ack-frequency" => {
+                transport.ack_frequency_config(Some(quinn::AckFrequencyConfig::default()));
+            }
+            // Offer more than one path. Almost nothing on the public internet
+            // will accept, which is the point of measuring it.
+            "q-multipath" => {
+                transport.max_concurrent_multipath_paths(4);
+            }
+            _ => {}
+        }
+
         server_config.transport = Arc::new(transport);
 
         let socket = std::net::UdpSocket::bind(addr)
@@ -101,6 +126,22 @@ impl TestListener {
         while let Some(incoming) = self.endpoint.accept().await {
             let test = self.test;
             let conformance = self.conformance.clone();
+
+            // Source-address validation, on only for the test that measures it
+            // (RFC 9000 §8.1.2). The client re-sends its Initial echoing the
+            // token, and that second Incoming arrives already validated and is
+            // handled normally. Every other test wants an ordinary handshake so
+            // whatever the client does is attributable to the anomaly.
+            if test.id == "q-retry" && !incoming.remote_address_validated() {
+                if let Err(e) = incoming.retry() {
+                    // retry() consumes the Incoming even when it fails, so
+                    // there is nothing left to accept; the client will try
+                    // again on its own.
+                    debug!("conformance: q-retry could not send Retry: {e}");
+                }
+                continue;
+            }
+
             tokio::spawn(async move {
                 if let Err(e) = run_one(incoming, test, conformance).await {
                     // A client failing a test often means a broken connection,
@@ -156,6 +197,11 @@ async fn run_one(
     } else {
         watch_for_liveness(&connection, &conformance, test).await
     };
+
+    // Some QUIC-layer tests are judged on what the connection did rather than
+    // on whether a request arrived, so the transport's own account of it
+    // supersedes the liveness result.
+    let observation = quic_observation(&connection, test).unwrap_or(observation);
 
     // An unbuilt test served a correct control stream, so whatever the client
     // did says nothing about the anomaly — it never met one. Judging anyway
@@ -460,6 +506,91 @@ async fn watch_for_liveness(
                 None => Observation::TimedOut,
             }
         }
+    }
+}
+
+/// What the transport itself can say about a QUIC-layer test.
+///
+/// `None` means this test is judged the ordinary way, on the liveness probe.
+/// These read the connection's own frame counters, because the behaviour under
+/// test happens below HTTP entirely and the client cannot be asked about it.
+fn quic_observation(connection: &quinn::Connection, test: &'static Test) -> Option<Observation> {
+    let rx = connection.stats().frame_rx;
+
+    match test.id {
+        // Getting here at all means the client echoed the token in a second
+        // Initial: this port answers the first attempt with Retry and nothing
+        // else, so there is no other route to a completed handshake.
+        "q-retry" => Some(Observation::Signalled(
+            "echoed the Retry token and completed the handshake".to_string(),
+        )),
+
+        // The windows on this port are far too small for a real request, so a
+        // client that respects them has to say it is stuck. Announcing the
+        // stall is the required behaviour; quietly overrunning a limit it
+        // agreed to is the bug.
+        "q-flow-control" => {
+            let blocked = rx.data_blocked + rx.stream_data_blocked;
+            Some(if blocked > 0 {
+                Observation::Signalled(format!(
+                    "respected the window and announced the stall ({} DATA_BLOCKED, \
+                     {} STREAM_DATA_BLOCKED)",
+                    rx.data_blocked, rx.stream_data_blocked
+                ))
+            } else {
+                Observation::NotExercised(
+                    "the request never approached the advertised window, so no \
+                     DATA_BLOCKED was due"
+                        .to_string(),
+                )
+            })
+        }
+
+        // Either answer conforms — the extension is optional — so this reports
+        // which was chosen rather than scoring it.
+        "q-ack-frequency" => Some(Observation::Signalled(if rx.ack_frequency > 0 {
+            format!(
+                "negotiated the extension and sent {} ACK_FREQUENCY frames",
+                rx.ack_frequency
+            )
+        } else {
+            "ignored the extension, which the specification permits".to_string()
+        })),
+
+        // quinn issues NEW_CONNECTION_ID on its own; what matters is whether
+        // the client took them up and retired the old ones.
+        "q-cid-rotation" => Some(if rx.retire_connection_id > 0 {
+            Observation::Signalled(format!(
+                "rotated connection IDs and retired {} of them",
+                rx.retire_connection_id
+            ))
+        } else {
+            Observation::NotExercised(
+                "the connection was too short-lived to require a rotation".to_string(),
+            )
+        }),
+
+        // A PATH_RESPONSE echoing our challenge is the whole requirement.
+        "q-path-challenge" => Some(if rx.path_response > 0 {
+            Observation::Signalled(format!("answered with {} PATH_RESPONSE", rx.path_response))
+        } else {
+            Observation::NotExercised(
+                "no path validation was triggered, so no PATH_RESPONSE was due".to_string(),
+            )
+        }),
+
+        // Almost nothing on the public internet speaks multipath, which is
+        // precisely why it is worth measuring rather than assuming.
+        "q-multipath" => Some(Observation::Signalled(if rx.max_path_id > 0 {
+            format!(
+                "negotiated multipath ({} MAX_PATH_ID frames)",
+                rx.max_path_id
+            )
+        } else {
+            "declined the multipath offer and stayed on one path, which is conformant".to_string()
+        })),
+
+        _ => None,
     }
 }
 

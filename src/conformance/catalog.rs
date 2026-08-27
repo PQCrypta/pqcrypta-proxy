@@ -114,6 +114,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Extensibility,
         tier: Tier::Quic,
         expectation: "Ignore the unrecognised version, then retry the handshake using QUIC v1.",
+        // Not built: Needs the endpoint to reject the client's version, which EndpointConfig::supported_versions cannot express per-connection.
         implemented: false,
         port_offset: Some(0),
     },
@@ -124,7 +125,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Correctness,
         tier: Tier::Quic,
         expectation: "Echo the Retry token in a second Initial packet and complete the handshake.",
-        implemented: false,
+        implemented: true,
         port_offset: Some(1),
     },
     Test {
@@ -134,6 +135,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Extensibility,
         tier: Tier::Quic,
         expectation: "Ignore the unknown parameter and complete the handshake normally.",
+        // Not built: Needs a reserved parameter injected into noq's transport-parameter encoder.
         implemented: false,
         port_offset: Some(2),
     },
@@ -144,6 +146,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Extensibility,
         tier: Tier::Quic,
         expectation: "Ignore the frame. Closing the connection here is a failure, not caution.",
+        // Not built: Needs a reserved frame type injected into noq's 1-RTT frame writer.
         implemented: false,
         port_offset: Some(3),
     },
@@ -154,7 +157,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Resilience,
         tier: Tier::Quic,
         expectation: "Adopt the new connection ID, retire the old one, and stay connected.",
-        implemented: false,
+        implemented: true,
         port_offset: Some(4),
     },
     Test {
@@ -164,6 +167,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Correctness,
         tier: Tier::Quic,
         expectation: "Recognise the reset token and close the connection without erroring loudly.",
+        // Not built: Needs a reset token emitted for an unknown connection ID, which the public endpoint API does not expose.
         implemented: false,
         port_offset: Some(5),
     },
@@ -175,17 +179,17 @@ pub const CATALOG: &[Test] = &[
         tier: Tier::Quic,
         expectation:
             "Respect the limit and announce the stall with DATA_BLOCKED / STREAM_DATA_BLOCKED.",
-        implemented: false,
+        implemented: true,
         port_offset: Some(6),
     },
     Test {
         id: "q-ack-frequency",
         title: "ACK Frequency extension offered",
         spec: "draft-ietf-quic-ack-frequency",
-        class: Class::Extensibility,
+        class: Class::Discretionary,
         tier: Tier::Quic,
         expectation: "Negotiate the extension, or ignore it. Either is correct; failing is not.",
-        implemented: false,
+        implemented: true,
         port_offset: Some(7),
     },
     Test {
@@ -195,6 +199,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Correctness,
         tier: Tier::Quic,
         expectation: "Report the ECN counts back in ACK_ECN frames.",
+        // Not built: Needs per-packet ECT(0) marking and the peer's echoed counts, neither surfaced by ConnectionStats in this fork.
         implemented: false,
         port_offset: Some(8),
     },
@@ -206,6 +211,7 @@ pub const CATALOG: &[Test] = &[
         tier: Tier::Quic,
         expectation:
             "Detect the black hole, probe down to a working size, and keep the connection.",
+        // Not built: Needs the path to silently drop above a threshold, which is a datagram-layer concern rather than a config one.
         implemented: false,
         port_offset: Some(9),
     },
@@ -216,7 +222,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Correctness,
         tier: Tier::Quic,
         expectation: "Reply with PATH_RESPONSE carrying the identical 8-byte payload.",
-        implemented: false,
+        implemented: true,
         port_offset: Some(10),
     },
     Test {
@@ -226,6 +232,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Resilience,
         tier: Tier::Quic,
         expectation: "Retransmit the early data in 1-RTT. No application data may be lost.",
+        // Not built: Needs a resumed connection whose early data is deliberately refused.
         implemented: false,
         port_offset: Some(11),
     },
@@ -233,10 +240,10 @@ pub const CATALOG: &[Test] = &[
         id: "q-multipath",
         title: "A second path offered mid-connection",
         spec: "draft-ietf-quic-multipath",
-        class: Class::Extensibility,
+        class: Class::Discretionary,
         tier: Tier::Quic,
         expectation: "Use the additional path, or decline it cleanly. Do not abort the connection.",
-        implemented: false,
+        implemented: true,
         port_offset: Some(12),
     },
     // ── Tier A: HTTP/3 layer ──────────────────────────────────────────────
