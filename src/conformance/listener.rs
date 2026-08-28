@@ -536,10 +536,11 @@ fn quic_observation(connection: &quinn::Connection, test: &'static Test) -> Opti
             "echoed the Retry token and completed the handshake".to_string(),
         )),
 
-        // The windows on this port are far too small for a real request, so a
-        // client that respects them has to say it is stuck. Announcing the
-        // stall is the required behaviour; quietly overrunning a limit it
-        // agreed to is the bug.
+        // Respecting the window is required; announcing the stall with a
+        // BLOCKED frame is a SHOULD (§4.1), not a MUST. So a silent client is
+        // still conformant, and this reports which it did rather than scoring
+        // it — getting that wrong would fail every client that simply never
+        // filled the window.
         "q-flow-control" => {
             let blocked = rx.data_blocked + rx.stream_data_blocked;
             Some(if blocked > 0 {
@@ -549,9 +550,9 @@ fn quic_observation(connection: &quinn::Connection, test: &'static Test) -> Opti
                     rx.data_blocked, rx.stream_data_blocked
                 ))
             } else {
-                Observation::NotExercised(
-                    "the request never approached the advertised window, so no \
-                     DATA_BLOCKED was due"
+                Observation::Signalled(
+                    "respected the window without sending a BLOCKED frame, which §4.1 \
+                     permits"
                         .to_string(),
                 )
             })
@@ -886,6 +887,107 @@ mod tests {
             "conformance.pqcrypta.com"
         )
         .is_none());
+    }
+
+    /// Every `expected_code`, pinned to the RFC sentence it comes from.
+    ///
+    /// Checked against the published text on 2026-08-27, not from memory. Two
+    /// errors had already reached the catalogue by guessing — `h-duplicate-setting`
+    /// scored a MAY as a MUST, and this table's own `h-max-push-id` named
+    /// H3_ID_ERROR — and both would have failed conformant clients. If a code
+    /// changes here, re-read the clause first.
+    #[test]
+    fn every_expected_code_matches_its_rfc_clause() {
+        use f::error_code as e;
+        // (test id, required code, clause, the sentence that requires it)
+        let verified: &[(&str, u64, &str, &str)] = &[
+            (
+                "h-missing-settings",
+                e::H3_MISSING_SETTINGS,
+                "RFC 9114 §6.2.1",
+                "If the first frame of the control stream is any other frame type,                  this MUST be treated as a connection error of type H3_MISSING_SETTINGS.",
+            ),
+            (
+                "h-second-control-stream",
+                e::H3_STREAM_CREATION_ERROR,
+                "RFC 9114 §6.2.1",
+                "Only one control stream per peer is permitted; receipt of a second                  stream claiming to be a control stream MUST be treated as a connection                  error of type H3_STREAM_CREATION_ERROR.",
+            ),
+            (
+                "h-control-frame-unexpected",
+                e::H3_FRAME_UNEXPECTED,
+                "RFC 9114 §7.2.1",
+                "If a DATA frame is received on a control stream, the recipient MUST                  respond with a connection error of type H3_FRAME_UNEXPECTED.",
+            ),
+            (
+                "h-max-push-id",
+                e::H3_FRAME_UNEXPECTED,
+                "RFC 9114 §7.2.7",
+                "A server MUST NOT send a MAX_PUSH_ID frame. A client MUST treat the                  receipt of a MAX_PUSH_ID frame as a connection error of type                  H3_FRAME_UNEXPECTED.",
+            ),
+        ];
+
+        for (id, code, clause, sentence) in verified {
+            let t = catalog::find(id).expect(id);
+            assert_eq!(
+                expected_code(t),
+                Some(*code),
+                "{id}: {clause} says \"{sentence}\""
+            );
+            assert_eq!(
+                t.spec, *clause,
+                "{id} must cite the clause it was verified against"
+            );
+            assert_eq!(
+                t.class,
+                catalog::Class::Correctness,
+                "{id} requires a specific rejection, so it is a correctness test"
+            );
+        }
+
+        // Nothing else may demand a code. A test that is not Correctness has no
+        // single required rejection, and asking for one would fail a client
+        // that made a legal choice.
+        for t in catalog::CATALOG {
+            if !verified.iter().any(|(id, ..)| *id == t.id) {
+                assert!(
+                    expected_code(t).is_none(),
+                    "{} names an expected code but is not in the verified table",
+                    t.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn error_code_constants_match_rfc_9114_section_8_1() {
+        use f::error_code as e;
+        // The registry, transcribed from the published table.
+        assert_eq!(e::H3_NO_ERROR, 0x0100);
+        assert_eq!(e::H3_GENERAL_PROTOCOL_ERROR, 0x0101);
+        assert_eq!(e::H3_INTERNAL_ERROR, 0x0102);
+        assert_eq!(e::H3_STREAM_CREATION_ERROR, 0x0103);
+        assert_eq!(e::H3_CLOSED_CRITICAL_STREAM, 0x0104);
+        assert_eq!(e::H3_FRAME_UNEXPECTED, 0x0105);
+        assert_eq!(e::H3_FRAME_ERROR, 0x0106);
+        assert_eq!(e::H3_ID_ERROR, 0x0108);
+        assert_eq!(e::H3_SETTINGS_ERROR, 0x0109);
+        assert_eq!(e::H3_MISSING_SETTINGS, 0x010a);
+    }
+
+    #[test]
+    fn discretionary_tests_never_demand_a_code() {
+        // A MAY-level clause has no single right answer, so requiring one would
+        // fail a conformant client. This is how h-duplicate-setting went wrong.
+        for t in catalog::CATALOG {
+            if t.class == catalog::Class::Discretionary {
+                assert!(
+                    expected_code(t).is_none(),
+                    "{} is discretionary and must not require a code",
+                    t.id
+                );
+            }
+        }
     }
 
     #[test]

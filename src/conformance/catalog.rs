@@ -121,9 +121,11 @@ pub const CATALOG: &[Test] = &[
         id: "q-version-negotiation",
         title: "Version Negotiation offering a reserved version alongside v1",
         spec: "RFC 9000 §6",
-        class: Class::Extensibility,
+        class: Class::Correctness,
         tier: Tier::Quic,
-        expectation: "Ignore the unrecognised version, then retry the handshake using QUIC v1.",
+        expectation: "Abandon the connection attempt, or retry with a version both ends \
+                      support. §6.2 requires a client that supports only one version to \
+                      abandon it rather than persist.",
         // Not built: Needs the endpoint to reject the client's version, which EndpointConfig::supported_versions cannot express per-connection.
         implemented: false,
         port_offset: Some(0),
@@ -151,11 +153,13 @@ pub const CATALOG: &[Test] = &[
     },
     Test {
         id: "q-reserved-frame",
-        title: "Reserved frame type in a 1-RTT packet",
+        title: "Unknown frame type in a 1-RTT packet",
         spec: "RFC 9000 §12.4",
-        class: Class::Extensibility,
+        class: Class::Correctness,
         tier: Tier::Quic,
-        expectation: "Ignore the frame. Closing the connection here is a failure, not caution.",
+        expectation: "Close the connection with FRAME_ENCODING_ERROR. Unlike HTTP/3, QUIC \
+                      reserves no ignorable frame types — §12.4 makes an unknown frame a \
+                      connection error, so ignoring it is the failure here.",
         // Not built: Needs a reserved frame type injected into noq's 1-RTT frame writer.
         implemented: false,
         port_offset: Some(3),
@@ -185,10 +189,11 @@ pub const CATALOG: &[Test] = &[
         id: "q-flow-control",
         title: "Deliberately tight MAX_DATA and MAX_STREAM_DATA",
         spec: "RFC 9000 §4",
-        class: Class::Correctness,
+        class: Class::Discretionary,
         tier: Tier::Quic,
-        expectation:
-            "Respect the limit and announce the stall with DATA_BLOCKED / STREAM_DATA_BLOCKED.",
+        expectation: "Respect the limit. Announcing the stall with DATA_BLOCKED or \
+                      STREAM_DATA_BLOCKED is a SHOULD in §4.1, not a MUST, so a client that \
+                      stays silent is still conformant.",
         implemented: true,
         port_offset: Some(6),
     },
@@ -283,14 +288,16 @@ pub const CATALOG: &[Test] = &[
         spec: "RFC 9114 §6.2.3",
         class: Class::Extensibility,
         tier: Tier::Http3,
-        expectation: "Ignore the stream. It must not be treated as fatal.",
+        expectation: "Abort reading the stream or discard it — §6.2.3 permits either. \
+                      What it forbids is treating it as meaningful, or as fatal to the \
+                      connection.",
         implemented: true,
         port_offset: Some(15),
     },
     Test {
         id: "h-duplicate-setting",
         title: "SETTINGS containing the same identifier twice",
-        spec: "RFC 9114 §7.2.4.1",
+        spec: "RFC 9114 §7.2.4",
         class: Class::Discretionary,
         tier: Tier::Http3,
         expectation: "Either reject with H3_SETTINGS_ERROR or ignore the repeat — the \
@@ -302,7 +309,7 @@ pub const CATALOG: &[Test] = &[
     Test {
         id: "h-control-frame-unexpected",
         title: "A DATA frame on the control stream",
-        spec: "RFC 9114 §7.2",
+        spec: "RFC 9114 §7.2.1",
         class: Class::Correctness,
         tier: Tier::Http3,
         expectation: "Close the connection with H3_FRAME_UNEXPECTED.",
@@ -332,7 +339,7 @@ pub const CATALOG: &[Test] = &[
     Test {
         id: "h-qpack-dynamic-table",
         title: "Field lines referencing dynamic table insertions",
-        spec: "RFC 9204 §4.3",
+        spec: "RFC 9204 §4.3.3, §4.5.2",
         class: Class::Interoperability,
         tier: Tier::Http3,
         expectation: "Apply the encoder-stream insertions and decode the headers correctly.",
@@ -342,7 +349,7 @@ pub const CATALOG: &[Test] = &[
     Test {
         id: "h-qpack-huffman",
         title: "Huffman-coded field lines with maximal padding",
-        spec: "RFC 9204 §4.1",
+        spec: "RFC 9204 §4.1.2, RFC 7541 §5.2",
         class: Class::Interoperability,
         tier: Tier::Http3,
         expectation: "Decode without error. Padding of up to 7 bits is legal, not corruption.",
