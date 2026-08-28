@@ -23,7 +23,7 @@ use axum::http::{HeaderValue, Method, Request, Response, StatusCode};
 use axum::middleware::Next;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 // ============================================================================
 // Configuration
@@ -520,6 +520,100 @@ impl ResponseCache {
     pub fn stats(&self) -> (usize, usize) {
         (self.store.len(), self.size_bytes.load(Ordering::Relaxed))
     }
+
+    /// Drop every entry. Returns how many were removed.
+    pub fn purge_all(&self) -> usize {
+        let removed = self.store.len();
+        let bytes = self.size_bytes.swap(0, Ordering::Relaxed);
+        self.store.clear();
+        if removed > 0 {
+            info!("Cache purged: {removed} entries, {bytes} bytes");
+        }
+        removed
+    }
+
+    /// Drop entries whose key matches `predicate`. Returns how many were
+    /// removed.
+    ///
+    /// Keys are `METHOD|host|path_with_query` (see [`Self::build_key`]), so a
+    /// caller can select by host, by path prefix, or by exact URL without the
+    /// cache needing to know which.
+    fn purge_where<F>(&self, predicate: F) -> usize
+    where
+        F: Fn(&str) -> bool,
+    {
+        let mut removed = 0usize;
+        let mut bytes = 0usize;
+        self.store.retain(|key, entry| {
+            if predicate(key) {
+                removed += 1;
+                bytes += entry.body_size();
+                false
+            } else {
+                true
+            }
+        });
+        if bytes > 0 {
+            self.size_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        }
+        removed
+    }
+
+    /// Drop every entry for one host, whatever the method or path.
+    ///
+    /// Matched case-insensitively because [`Self::build_key`] lowercases the
+    /// host when building the key, and an operator typing `Example.com` should
+    /// not silently purge nothing.
+    pub fn purge_host(&self, host: &str) -> usize {
+        let needle = format!("|{}|", host.to_lowercase());
+        let n = self.purge_where(|key| key.contains(&needle));
+        info!("Cache purged for host {host}: {n} entries");
+        n
+    }
+
+    /// Drop every entry whose path starts with `prefix`, on any host.
+    ///
+    /// The common case after a deploy: one generated path changed and the rest
+    /// of the cache is still good.
+    pub fn purge_prefix(&self, prefix: &str) -> usize {
+        let n = self.purge_where(|key| {
+            // key is METHOD|host|path — take everything after the second bar.
+            key.splitn(3, '|')
+                .nth(2)
+                .is_some_and(|path| path.starts_with(prefix))
+        });
+        info!("Cache purged for prefix {prefix}: {n} entries");
+        n
+    }
+
+    /// Drop one host's entry for one exact path, across every method.
+    pub fn purge_url(&self, host: &str, path: &str) -> usize {
+        let needle = format!("|{}|{}", host.to_lowercase(), path);
+        let n = self.purge_where(|key| key.ends_with(&needle));
+        info!("Cache purged {host}{path}: {n} entries");
+        n
+    }
+}
+
+/// The one response cache for this process.
+///
+/// Shared rather than built per listener. There were five instances — one per
+/// HTTP listener variant and one per QUIC port — so the same URL was cached
+/// separately for h2 and h3 and for each port, and a purge would have cleared
+/// one of them while the others kept serving the old body. The cache key is
+/// `METHOD|host|path` with no port or protocol in it, so sharing is not just
+/// safe but what the key already assumed.
+static SHARED: std::sync::OnceLock<Arc<ResponseCache>> = std::sync::OnceLock::new();
+
+/// Fetch (building on first call) the process-wide response cache.
+///
+/// The first caller's config wins. Cache sizing cannot follow a hot reload
+/// anyway without discarding everything, which is the opposite of what a reload
+/// should do.
+pub fn shared(config: &ResponseCacheConfig) -> Arc<ResponseCache> {
+    SHARED
+        .get_or_init(|| Arc::new(ResponseCache::new(config.clone())))
+        .clone()
 }
 
 // ============================================================================
@@ -726,5 +820,131 @@ pub async fn cache_middleware(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod purge_tests {
+    use super::*;
+
+    fn cache() -> ResponseCache {
+        ResponseCache::new(ResponseCacheConfig {
+            enabled: true,
+            ..Default::default()
+        })
+    }
+
+    /// Seed one entry, going through `build_key` so the tests exercise the same
+    /// key shape the purge selectors parse.
+    fn seed(c: &ResponseCache, method: &str, host: &str, path: &str) {
+        c.put(
+            &ResponseCache::build_key(method, host, path),
+            200,
+            &[("cache-control".to_string(), "max-age=60".to_string())],
+            b"body".to_vec(),
+        );
+    }
+
+    fn seed_a_few(c: &ResponseCache) {
+        seed(c, "GET", "pqcrypta.com", "/robots.txt");
+        seed(c, "GET", "pqcrypta.com", "/sitemaps/sitemap.xml");
+        seed(c, "GET", "pqcrypta.com", "/sitemaps/sitemap-ja4.xml");
+        seed(c, "HEAD", "pqcrypta.com", "/robots.txt");
+        seed(c, "GET", "pqpdf.com", "/robots.txt");
+        seed(c, "GET", "pqpdf.com", "/sitemaps/sitemap.xml");
+    }
+
+    #[test]
+    fn purging_everything_empties_the_store_and_the_byte_count() {
+        let c = cache();
+        seed_a_few(&c);
+        let (before, bytes) = c.stats();
+        assert_eq!(before, 6);
+        assert!(bytes > 0);
+
+        assert_eq!(c.purge_all(), 6);
+        assert_eq!(c.stats(), (0, 0), "byte accounting must reset too");
+    }
+
+    #[test]
+    fn purging_a_host_leaves_the_others_warm() {
+        let c = cache();
+        seed_a_few(&c);
+        // Three entries for pqcrypta.com across two methods.
+        assert_eq!(c.purge_host("pqcrypta.com"), 4);
+        assert_eq!(c.stats().0, 2, "pqpdf.com must be untouched");
+    }
+
+    #[test]
+    fn a_host_purge_is_case_insensitive() {
+        // build_key lowercases the host, so an operator typing it differently
+        // would otherwise purge nothing and be told "0 entries" for a host that
+        // is plainly cached.
+        let c = cache();
+        seed_a_few(&c);
+        assert_eq!(c.purge_host("PQCrypta.COM"), 4);
+    }
+
+    #[test]
+    fn a_prefix_purge_crosses_hosts_but_respects_the_path() {
+        let c = cache();
+        seed_a_few(&c);
+        // Two sitemaps on pqcrypta.com, one on pqpdf.com.
+        assert_eq!(c.purge_prefix("/sitemaps/"), 3);
+        let (left, _) = c.stats();
+        assert_eq!(left, 3, "only the robots.txt entries remain");
+    }
+
+    #[test]
+    fn a_url_purge_takes_every_method_for_that_one_path() {
+        let c = cache();
+        seed_a_few(&c);
+        // GET and HEAD are separate keys; purging the URL must take both, or
+        // the operator fixes the page and the HEAD probe still sees the old one.
+        assert_eq!(c.purge_url("pqcrypta.com", "/robots.txt"), 2);
+        assert_eq!(c.stats().0, 4);
+    }
+
+    #[test]
+    fn a_url_purge_does_not_match_a_longer_path() {
+        let c = cache();
+        seed(&c, "GET", "pqcrypta.com", "/sitemaps/sitemap.xml");
+        seed(&c, "GET", "pqcrypta.com", "/sitemaps/sitemap-ja4.xml");
+        // Suffix matching must not let /sitemap.xml also claim
+        // /sitemap-ja4.xml, nor the reverse.
+        assert_eq!(c.purge_url("pqcrypta.com", "/sitemaps/sitemap.xml"), 1);
+        assert_eq!(c.stats().0, 1);
+    }
+
+    #[test]
+    fn purging_something_absent_removes_nothing_and_says_so() {
+        let c = cache();
+        seed_a_few(&c);
+        assert_eq!(c.purge_host("example.com"), 0);
+        assert_eq!(c.purge_url("pqcrypta.com", "/nope"), 0);
+        assert_eq!(c.purge_prefix("/nope/"), 0);
+        assert_eq!(c.stats().0, 6, "a miss must not disturb the cache");
+    }
+
+    #[test]
+    fn the_shared_cache_is_one_instance() {
+        // The whole point: five listeners previously held five caches, so a
+        // purge cleared one and the rest kept serving the old body.
+        let cfg = ResponseCacheConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let a = shared(&cfg);
+        let b = shared(&cfg);
+        assert!(Arc::ptr_eq(&a, &b));
+
+        seed(&a, "GET", "pqcrypta.com", "/robots.txt");
+        assert_eq!(
+            b.stats().0,
+            1,
+            "a write through one handle is visible in the other"
+        );
+        a.purge_all();
+        assert_eq!(b.stats().0, 0);
     }
 }

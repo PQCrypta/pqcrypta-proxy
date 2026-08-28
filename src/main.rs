@@ -89,7 +89,6 @@ use pqcrypta_proxy::rate_limiter::AdvancedRateLimiter;
 use pqcrypta_proxy::startup_verify;
 use pqcrypta_proxy::tls::TlsProvider;
 use pqcrypta_proxy::webtransport_server::WebTransportServer;
-use pqcrypta_proxy::ResponseCache;
 use pqcrypta_proxy::{
     run_http_listener, run_http_listener_with_fingerprint_and_resolver, run_http_redirect_server,
     run_tls_passthrough_server,
@@ -1142,7 +1141,7 @@ async fn run() -> anyhow::Result<()> {
         ));
         let quic_lb = shared_lb.clone();
         let quic_early_hints = early_hints_state.clone();
-        let quic_cache = Arc::new(ResponseCache::new(quic_config.cache.clone()));
+        let quic_cache = pqcrypta_proxy::cache::shared(&quic_config.cache);
         if quic_config.cache.enabled {
             info!(
                 "💾 Response cache enabled on QUIC port {} (max {}MiB, default TTL {}s)",

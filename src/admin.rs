@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use subtle::ConstantTimeEq;
 
-use axum::extract::{ConnectInfo, Path, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
@@ -283,6 +283,8 @@ impl AdminServer {
             .route("/canary/weight/:server_id", post(canary_weight_handler))
             .route("/blocklist", get(blocklist_handler))
             .route("/blocklist/unblock/:ip", post(blocklist_unblock_handler))
+            .route("/cache", get(cache_stats_handler))
+            .route("/cache/purge", post(cache_purge_handler))
             .layer(axum::middleware::from_fn_with_state(
                 auth_state,
                 auth_middleware,
@@ -1496,6 +1498,142 @@ struct UnblockResponse {
 /// Clearing the database row only stops the entry being re-synced; it does not
 /// release an IP the proxy has already admitted to its in-memory map. This is
 /// what makes the dashboard's unblock button take effect without a restart.
+/// What a purge removed.
+#[derive(Debug, Serialize)]
+struct CachePurgeResponse {
+    success: bool,
+    /// What was purged: "all", "host", "prefix" or "url".
+    scope: String,
+    /// The host / prefix / URL selected, absent for a full purge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    removed: usize,
+    /// Entries and bytes still held afterwards.
+    remaining_entries: usize,
+    remaining_bytes: usize,
+    message: String,
+}
+
+/// Current cache occupancy.
+#[derive(Debug, Serialize)]
+struct CacheStatsResponse {
+    enabled: bool,
+    entries: usize,
+    size_bytes: usize,
+    max_size_bytes: usize,
+}
+
+/// `GET /cache` — how much is held.
+async fn cache_stats_handler(State(state): State<Arc<AdminState>>) -> Json<CacheStatsResponse> {
+    let config = state.config_manager.get();
+    let cache = crate::cache::shared(&config.cache);
+    let (entries, size_bytes) = cache.stats();
+    Json(CacheStatsResponse {
+        enabled: config.cache.enabled,
+        entries,
+        size_bytes,
+        max_size_bytes: config.cache.max_size_mb * 1024 * 1024,
+    })
+}
+
+/// `POST /cache/purge` — drop cached responses.
+///
+/// Exists because a deploy that changes generated output — a sitemap, a
+/// robots.txt, a rendered page — leaves the edge serving the old body until its
+/// max-age expires, which was an hour here. Waiting an hour to see your own
+/// change is a poor way to run a site, and the alternative people reach for is
+/// restarting the proxy, which drops every live connection to fix a stale file.
+///
+/// Scope is chosen by query parameter, narrowest first:
+///
+/// ```text
+/// POST /cache/purge                          everything
+/// POST /cache/purge?host=example.com         one host
+/// POST /cache/purge?prefix=/sitemaps/        one path prefix, any host
+/// POST /cache/purge?host=x&path=/robots.txt  one exact URL
+/// ```
+///
+/// A full purge is the blunt option and is logged as such; the narrower forms
+/// exist so that fixing one file does not throw away every other host's warm
+/// cache.
+async fn cache_purge_handler(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AdminState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<CachePurgeResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let config = state.config_manager.get();
+    let cache = crate::cache::shared(&config.cache);
+
+    let host = params
+        .get("host")
+        .map(|h| h.trim())
+        .filter(|h| !h.is_empty());
+    let prefix = params
+        .get("prefix")
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty());
+    let path = params
+        .get("path")
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty());
+
+    // A path is meaningless without the host it belongs to; say so rather than
+    // silently widening the purge to every host.
+    if path.is_some() && host.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "path= selects one URL and needs host= with it; use prefix= to \
+                          purge a path across every host"
+            })),
+        ));
+    }
+
+    // Narrowest selector wins. Written as a chain rather than a tuple match so
+    // that "path without host" — already rejected above — is not a state this
+    // has to invent an answer for; a purge route is the wrong place to reach
+    // for unreachable!().
+    let (scope, target, removed) = if let (Some(h), Some(p)) = (host, path) {
+        ("url", Some(format!("{h}{p}")), cache.purge_url(h, p))
+    } else if let Some(h) = host {
+        ("host", Some(h.to_string()), cache.purge_host(h))
+    } else if let Some(pre) = prefix {
+        ("prefix", Some(pre.to_string()), cache.purge_prefix(pre))
+    } else {
+        ("all", None, cache.purge_all())
+    };
+
+    let (remaining_entries, remaining_bytes) = cache.stats();
+
+    if let Some(ref logger) = state.audit_logger {
+        logger.log(AuditEvent::AdminAction {
+            ip: remote_addr.ip().to_string(),
+            action: "cache_purge".to_string(),
+            success: true,
+            detail: Some(format!(
+                "scope={scope} target={} removed={removed}",
+                target.as_deref().unwrap_or("-")
+            )),
+        });
+    }
+
+    Ok(Json(CachePurgeResponse {
+        success: true,
+        scope: scope.to_string(),
+        target: target.clone(),
+        removed,
+        remaining_entries,
+        remaining_bytes,
+        message: match (removed, target.as_deref()) {
+            (0, Some(t)) => format!("Nothing cached for {t}"),
+            (0, None) => "Cache was already empty".to_string(),
+            (n, Some(t)) => format!("Purged {n} entries for {t}"),
+            (n, None) => format!("Purged {n} entries"),
+        },
+    }))
+}
+
 async fn blocklist_unblock_handler(
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AdminState>>,

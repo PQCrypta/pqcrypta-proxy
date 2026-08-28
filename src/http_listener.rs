@@ -51,7 +51,7 @@ use crate::tls_acceptor::FingerprintingTlsAcceptor;
 use crate::pqc_tls::{openssl_pqc, PqcTlsProvider};
 
 use crate::access_logger::{log_access, AccessLogEntry};
-use crate::cache::{cache_middleware, ResponseCache};
+use crate::cache::cache_middleware;
 use crate::compression::{compression_middleware, CompressionState};
 use crate::config::{BackendConfig, CorsConfig, ProxyConfig, ShadowConfig, TlsMode};
 use crate::fingerprint::{
@@ -332,7 +332,7 @@ pub async fn run_http_listener(
 
     // Initialize response cache (innermost layer — security headers, alt-svc, and
     // compression all run on top of it for both cache hits and cache misses)
-    let response_cache = Arc::new(ResponseCache::new(config.cache.clone()));
+    let response_cache = crate::cache::shared(&config.cache);
     if config.cache.enabled {
         info!(
             "💾 Response cache enabled (max {}MiB, default TTL {}s)",
@@ -531,7 +531,7 @@ pub async fn run_http_listener_pqc(
     let http3_features_state = Http3FeaturesState::from_proxy_config(&config.http3);
 
     // Initialize response cache
-    let response_cache = Arc::new(ResponseCache::new(config.cache.clone()));
+    let response_cache = crate::cache::shared(&config.cache);
     if config.cache.enabled {
         info!(
             "💾 Response cache enabled (max {}MiB, default TTL {}s)",
@@ -824,7 +824,7 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
     let http3_features_state = Http3FeaturesState::from_proxy_config(&config.http3);
 
     // Initialize response cache
-    let response_cache = Arc::new(ResponseCache::new(config.cache.clone()));
+    let response_cache = crate::cache::shared(&config.cache);
     if config.cache.enabled {
         info!(
             "💾 Response cache enabled (max {}MiB, default TTL {}s)",
@@ -1265,7 +1265,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     let http3_features_state = Http3FeaturesState::from_proxy_config(&config.http3);
 
     // Initialize response cache
-    let response_cache = Arc::new(ResponseCache::new(config.cache.clone()));
+    let response_cache = crate::cache::shared(&config.cache);
     if config.cache.enabled {
         info!(
             "💾 Response cache enabled (max {}MiB, default TTL {}s)",
