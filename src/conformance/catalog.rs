@@ -109,6 +109,35 @@ pub struct Test {
     pub port_offset: Option<u16>,
 }
 
+/// How each entry's requirement was checked.
+///
+/// Recorded because the two are not equally strong, and a reader deciding
+/// whether to trust a verdict deserves to know which they are looking at.
+///
+/// - **RFC text** — the clause was read as published.
+/// - **Reference implementation** — RFC 9000 is too large for the fetcher used
+///   here to return whole (it truncated around §7 every time, and on one
+///   targeted retry returned two contradictory quotes for §12.4). Those clauses
+///   were instead verified against the vendored `noq` QUIC implementation,
+///   which encodes the requirement in code and comments. Strong, but secondary.
+///
+/// | Test | Clause | Checked against |
+/// |------|--------|-----------------|
+/// | `h-*` (all fourteen) | RFC 9114, RFC 9204 | RFC text |
+/// | `q-version-negotiation` | RFC 9000 §6.2 | RFC text |
+/// | `q-zero-rtt-reject` | RFC 9001 §4.6.2 | RFC text |
+/// | `q-reserved-frame` | RFC 9000 §12.4 | reference implementation |
+/// | `q-reserved-transport-param` | RFC 9000 §18.1 | reference implementation |
+/// | `q-stateless-reset` | RFC 9000 §10.3 | reference implementation |
+/// | `q-pmtu-blackhole` | RFC 9000 §14, RFC 8899 | reference implementation |
+/// | `q-flow-control` | RFC 9000 §4.1 | RFC text |
+/// | `q-ecn` | RFC 9000 §13.4 | **neither — see below** |
+///
+/// `q-ecn` is the one entry whose requirement level is still unconfirmed. The
+/// mechanism is right (the implementation carries ECN counts back in ACK
+/// frames), but whether reporting them is a MUST was not established, so it is
+/// unbuilt and must not be scored until someone reads §13.4.
+///
 /// Every test, in report order.
 ///
 /// Three of these — `q-retry`, `q-ack-frequency` and `h-early-hints` — already
@@ -180,7 +209,9 @@ pub const CATALOG: &[Test] = &[
         spec: "RFC 9000 §10.3",
         class: Class::Correctness,
         tier: Tier::Quic,
-        expectation: "Recognise the reset token and close the connection without erroring loudly.",
+        expectation: "Recognise the token and close immediately. The packet cannot be \
+                      authenticated, so there is nothing to reply with and nothing to \
+                      report to the peer — the connection simply ends.",
         // Not built: Needs a reset token emitted for an unknown connection ID, which the public endpoint API does not expose.
         implemented: false,
         port_offset: Some(5),
@@ -221,7 +252,7 @@ pub const CATALOG: &[Test] = &[
     Test {
         id: "q-pmtu-blackhole",
         title: "Path MTU black hole above a threshold",
-        spec: "RFC 9000 §14",
+        spec: "RFC 9000 §14, RFC 8899",
         class: Class::Resilience,
         tier: Tier::Quic,
         expectation:
@@ -243,10 +274,14 @@ pub const CATALOG: &[Test] = &[
     Test {
         id: "q-zero-rtt-reject",
         title: "0-RTT rejected after the client sends early data",
-        spec: "RFC 9001 §4.6",
+        spec: "RFC 9001 §4.6.2",
         class: Class::Resilience,
         tier: Tier::Quic,
-        expectation: "Retransmit the early data in 1-RTT. No application data may be lost.",
+        expectation: "Reset the state of every stream, including application state \
+                      bound to them. Section 4.6.2 requires the reset because a rejected \
+                      0-RTT means every assumed connection characteristic may have been \
+                      wrong. It does not require retransmission, which is the \
+                      application concern, not QUIC's.",
         // Not built: Needs a resumed connection whose early data is deliberately refused.
         implemented: false,
         port_offset: Some(11),
