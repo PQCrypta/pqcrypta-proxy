@@ -48,9 +48,17 @@
 pub mod catalog;
 pub mod h3_frames;
 pub mod http;
+pub mod impairment;
 pub mod listener;
 pub mod report;
 pub mod session;
+
+/// End-to-end proof that `q-zero-rtt-reject` rejects 0-RTT.
+///
+/// Test-only: no client in reach attempts early data over HTTP/3, so the live
+/// port can only ever report that nothing was exercised. This drives it.
+#[cfg(test)]
+mod zero_rtt;
 
 use std::sync::Arc;
 
@@ -220,7 +228,10 @@ mod tests {
     fn the_default_range_fits_the_catalogue() {
         let c = cfg();
         let conf = Conformance::new(&c).unwrap().expect("enabled");
-        assert_eq!(conf.test_ports().len() as u16, catalog::required_ports());
+        assert_eq!(
+            u16::try_from(conf.test_ports().len()).expect("one port per test fits in u16"),
+            catalog::required_ports()
+        );
     }
 
     #[test]

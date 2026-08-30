@@ -1,0 +1,521 @@
+/**
+ * Quantum Apocalypse Countdown - Cutting Edge CSS Animations
+ * Advanced CSS features: @property, conic-gradient, clip-path, filters
+ */
+
+/* CSS Custom Properties for smooth animations */
+@property --angle {
+    syntax: '<angle>';
+    inherits: false;
+    initial-value: 0deg;
+}
+
+@property --glow-intensity {
+    syntax: '<number>';
+    inherits: false;
+    initial-value: 1;
+}
+
+@property --blood-flow {
+    syntax: '<percentage>';
+    inherits: false;
+    initial-value: 0%;
+}
+
+.quantum-countdown-container {
+    position: relative !important;
+    z-index: 20 !important;
+    /* Force GPU compositor layer to prevent canvas bleeding */
+    will-change: transform !important;
+    backface-visibility: hidden !important;
+    cursor: pointer !important;
+    pointer-events: all !important;
+    width: auto !important;
+    height: auto !important;
+    margin-bottom: 8px !important;
+    /* CRITICAL: Prevent cursor blend mode from affecting countdown */
+    mix-blend-mode: normal !important;
+    /* CRITICAL: Force this to be HTML context, not SVG */
+    display: block !important;
+    /* CRITICAL: Prevent browser color scheme from overriding colors */
+    color-scheme: only light !important;
+    forced-color-adjust: none !important;
+    /* Allow tooltip to render outside bounds */
+    overflow: visible !important;
+}
+
+/* Enhanced card with animated conic-gradient border */
+.quantum-countdown-card {
+    position: relative !important;
+    background: linear-gradient(145deg, rgba(20, 0, 0, 0.95), rgba(40, 0, 0, 0.9)) !important;
+    border-radius: 12px !important;
+    padding: 8px 16px !important;
+    backdrop-filter: blur(8px) saturate(1.2) !important;
+    display: flex !important;
+    gap: 12px !important;
+    align-items: center !important;
+    transform: none !important;
+    width: auto !important;
+    height: auto !important;
+    /* CRITICAL: Prevent cursor blend mode from affecting card contents */
+    mix-blend-mode: normal !important;
+}
+
+/* Animated conic-gradient border */
+.quantum-countdown-card::before {
+    content: '';
+    position: absolute;
+    inset: -2px;
+    border-radius: 12px;
+    padding: 2px;
+    background: conic-gradient(
+        from var(--angle),
+        #8b0000 0deg,
+        #cc0000 90deg,
+        #ff0000 180deg,
+        #cc0000 270deg,
+        #8b0000 360deg
+    );
+    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    mask-composite: exclude;
+    animation: borderRotate 4s linear infinite;
+    z-index: -1;
+}
+
+.quantum-countdown-card::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: 12px;
+    box-shadow:
+        0 0 20px rgba(139, 0, 0, 0.8),
+        0 4px 15px rgba(0, 0, 0, 0.9),
+        inset 0 0 15px rgba(200, 0, 0, 0.2);
+    pointer-events: none;
+    animation: pulseAmbient 3s ease-in-out infinite;
+}
+
+@keyframes borderRotate {
+    to {
+        --angle: 360deg;
+    }
+}
+
+@keyframes pulseAmbient {
+    0%, 100% {
+        box-shadow:
+            0 0 20px rgba(139, 0, 0, 0.8),
+            0 4px 15px rgba(0, 0, 0, 0.9),
+            inset 0 0 15px rgba(200, 0, 0, 0.2);
+    }
+    50% {
+        box-shadow:
+            0 0 30px rgba(200, 0, 0, 1),
+            0 6px 20px rgba(0, 0, 0, 0.95),
+            inset 0 0 25px rgba(255, 0, 0, 0.3);
+    }
+}
+
+/* Number container with clip-path animation */
+.quantum-countdown-num {
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+    gap: 3px !important;
+    min-width: 32px !important;
+    max-width: 32px !important;
+    width: 32px !important;
+    position: relative !important;
+    transform: none !important;
+}
+
+/* Blood drip pseudo-element using clip-path */
+.quantum-countdown-num::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 50%;
+    width: 2px;
+    height: 0;
+    background: linear-gradient(180deg,
+        rgba(255, 0, 0, 0) 0%,
+        rgba(255, 0, 0, 0.8) 20%,
+        rgba(200, 0, 0, 1) 60%,
+        rgba(139, 0, 0, 0.8) 100%
+    );
+    transform: translateX(-50%);
+    filter: blur(0.5px);
+    opacity: 0;
+    clip-path: polygon(
+        40% 0%, 60% 0%,
+        60% var(--blood-flow),
+        50% calc(var(--blood-flow) + 3%),
+        40% var(--blood-flow)
+    );
+    /* CRITICAL: Ensure pseudo-element never overlays text */
+    z-index: -1 !important;
+    pointer-events: none !important;
+}
+
+.quantum-countdown-num.glow::before {
+    animation: bloodDrip 0.6s ease-out;
+}
+
+@keyframes bloodDrip {
+    0% {
+        --blood-flow: 0%;
+        opacity: 0;
+        height: 0;
+    }
+    30% {
+        --blood-flow: 40%;
+        opacity: 1;
+        height: 25px;
+    }
+    60% {
+        --blood-flow: 80%;
+        opacity: 0.8;
+        height: 30px;
+    }
+    100% {
+        --blood-flow: 100%;
+        opacity: 0;
+        height: 35px;
+    }
+}
+
+/* Apocalypse number with advanced filter animations */
+/* Ultra-high specificity to prevent any CSS override */
+div.quantum-countdown-container div.quantum-countdown-card div.quantum-countdown-num div.quantum-countdown-value,
+.quantum-countdown-container .quantum-countdown-card .quantum-countdown-num .quantum-countdown-value,
+.quantum-countdown-num .quantum-countdown-value,
+.quantum-countdown-value {
+    font-family: 'Orbitron', monospace !important;
+    font-size: 1.4rem !important;
+    font-weight: 900 !important;
+    color: #ff0000 !important;
+    -webkit-text-fill-color: #ff0000 !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+    background: transparent !important;
+    background-clip: border-box !important;
+    -webkit-background-clip: border-box !important;
+    background-image: none !important;
+    mix-blend-mode: normal !important;
+    fill: none !important;
+    stroke: none !important;
+    line-height: 1 !important;
+    text-shadow:
+        0 0 8px rgba(255, 0, 0, 0.9),
+        0 0 15px rgba(200, 0, 0, 0.6),
+        0 2px 4px rgba(0, 0, 0, 0.8) !important;
+    transition: all 0.15s cubic-bezier(0.68, -0.55, 0.265, 1.55) !important;
+    filter:
+        drop-shadow(0 0 4px rgba(255, 0, 0, 0.5))
+        brightness(calc(var(--glow-intensity) * 1)) !important;
+    transform: translate3d(0, 0, 0) !important;
+    animation: none !important;
+    display: block !important;
+    width: auto !important;
+    height: auto !important;
+    will-change: contents !important;
+    backface-visibility: hidden !important;
+}
+
+/* Label with animated gradient */
+/* Ultra-high specificity to prevent any CSS override */
+.quantum-countdown-container .quantum-countdown-card .quantum-countdown-num .quantum-countdown-label,
+.quantum-countdown-num .quantum-countdown-label,
+.quantum-countdown-label {
+    font-family: 'Orbitron', monospace !important;
+    font-size: 0.5rem !important;
+    font-weight: 600 !important;
+    background: linear-gradient(90deg,
+        #8b0000,
+        #cc0000,
+        #ff0000,
+        #cc0000,
+        #8b0000
+    ) !important;
+    background-size: 200% 100% !important;
+    background-clip: text !important;
+    -webkit-background-clip: text !important;
+    -webkit-text-fill-color: transparent !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.5px !important;
+    opacity: 0.7 !important;
+    animation: gradientShift 3s ease-in-out infinite !important;
+    transform: none !important;
+    line-height: 1 !important;
+}
+
+@keyframes gradientShift {
+    0%, 100% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+}
+
+/* Advanced blood drip effect with multiple filters */
+/* Ultra-high specificity for glow state */
+div.quantum-countdown-container div.quantum-countdown-card div.quantum-countdown-num.glow div.quantum-countdown-value,
+.quantum-countdown-container .quantum-countdown-card .quantum-countdown-num.glow .quantum-countdown-value,
+.quantum-countdown-num.glow .quantum-countdown-value {
+    --glow-intensity: 1.5;
+    color: #ff3333 !important;
+    -webkit-text-fill-color: #ff3333 !important;
+    background-clip: border-box !important;
+    -webkit-background-clip: border-box !important;
+    background-image: none !important;
+    background: transparent !important;
+    fill: none !important;
+    stroke: none !important;
+    text-shadow:
+        0 0 15px rgba(255, 0, 0, 1),
+        0 0 25px rgba(255, 51, 51, 0.9),
+        0 0 35px rgba(200, 0, 0, 0.7),
+        0 4px 8px rgba(255, 0, 0, 0.8) !important;
+    transform: scale(1.12) translate3d(0, -2px, 0) !important;
+    filter:
+        drop-shadow(0 0 8px rgba(255, 0, 0, 1))
+        brightness(1.3)
+        saturate(1.5) !important;
+    animation: bloodPulse 0.15s ease-out, glitchFlicker 0.3s ease-in-out !important;
+}
+
+/* Glitch effect on number change */
+@keyframes glitchFlicker {
+    0%, 100% {
+        filter:
+            drop-shadow(0 0 8px rgba(255, 0, 0, 1))
+            brightness(1.3);
+    }
+    10% {
+        filter:
+            drop-shadow(0 0 8px rgba(255, 0, 0, 1))
+            brightness(1.5)
+            hue-rotate(5deg);
+    }
+    20% {
+        filter:
+            drop-shadow(0 0 8px rgba(255, 0, 0, 1))
+            brightness(1.2)
+            hue-rotate(-3deg);
+    }
+    30% {
+        filter:
+            drop-shadow(0 0 8px rgba(255, 0, 0, 1))
+            brightness(1.4)
+            hue-rotate(2deg);
+    }
+}
+
+/* Card pulse with backdrop-filter animation */
+.quantum-countdown-card.pulse {
+    animation: cardShake 0.15s ease-out, cardPulse 0.3s ease-out;
+    backdrop-filter: blur(12px) saturate(1.5) brightness(1.1);
+}
+
+.quantum-countdown-card.pulse::after {
+    box-shadow:
+        0 0 40px rgba(255, 0, 0, 1),
+        0 8px 30px rgba(139, 0, 0, 1),
+        inset 0 0 30px rgba(255, 0, 0, 0.5);
+    animation: shockwave 0.3s ease-out;
+}
+
+@keyframes bloodPulse {
+    0% { transform: scale(1) translateY(0); }
+    40% { transform: scale(1.15) translateY(-3px); }
+    70% { transform: scale(1.12) translateY(1px); }
+    100% { transform: scale(1.12) translateY(-2px); }
+}
+
+@keyframes cardPulse {
+    0% { transform: scale(1); }
+    50% { transform: scale(1.02); }
+    100% { transform: scale(1); }
+}
+
+@keyframes cardShake {
+    0%, 100% { transform: translateX(0); }
+    25% { transform: translateX(-1px); }
+    75% { transform: translateX(1px); }
+}
+
+@keyframes shockwave {
+    0% {
+        box-shadow:
+            0 0 20px rgba(139, 0, 0, 0.8),
+            0 4px 15px rgba(0, 0, 0, 0.9),
+            inset 0 0 15px rgba(200, 0, 0, 0.2);
+    }
+    50% {
+        box-shadow:
+            0 0 50px rgba(255, 0, 0, 1),
+            0 10px 40px rgba(139, 0, 0, 1),
+            inset 0 0 40px rgba(255, 0, 0, 0.6);
+    }
+    100% {
+        box-shadow:
+            0 0 40px rgba(255, 0, 0, 1),
+            0 8px 30px rgba(139, 0, 0, 1),
+            inset 0 0 30px rgba(255, 0, 0, 0.5);
+    }
+}
+
+/* Tooltip - Glass Electric Blue/Red */
+.tooltip-enabled {
+    position: relative;
+}
+
+.tooltip-enabled::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    top: calc(100% + 15px);
+    left: -20px;
+    transform: translateX(-10px);
+    padding: 12px 20px;
+    background: linear-gradient(135deg,
+        rgba(0, 40, 80, 0.95) 0%,
+        rgba(20, 20, 60, 0.92) 50%,
+        rgba(60, 0, 40, 0.95) 100%);
+    border: 2px solid rgba(100, 150, 255, 0.4);
+    border-radius: 12px;
+    backdrop-filter: blur(20px) saturate(180%);
+    box-shadow:
+        0 8px 32px rgba(0, 100, 255, 0.4),
+        0 4px 16px rgba(255, 0, 100, 0.3),
+        inset 0 1px 2px rgba(150, 200, 255, 0.4),
+        inset 0 -1px 2px rgba(255, 100, 150, 0.3);
+    color: #e0f0ff;
+    font-family: 'Orbitron', monospace;
+    font-size: 0.9rem;
+    font-weight: 600;
+    letter-spacing: 0.8px;
+    text-shadow:
+        0 0 12px rgba(100, 200, 255, 0.8),
+        0 0 24px rgba(255, 100, 150, 0.5),
+        0 2px 4px rgba(0, 0, 0, 0.8);
+    white-space: nowrap;
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transition: all 0.4s cubic-bezier(0.68, -0.55, 0.265, 1.55);
+    z-index: 2147483647;
+}
+
+.tooltip-enabled::before {
+    content: '';
+    position: absolute;
+    top: calc(100% + 13px);
+    left: -22px;
+    width: calc(100% + 44px);
+    height: 46px;
+    padding: 2px;
+    border-radius: 12px;
+    background: linear-gradient(135deg,
+        rgba(0, 150, 255, 0.7) 0%,
+        rgba(150, 50, 255, 0.6) 25%,
+        rgba(255, 0, 150, 0.7) 50%,
+        rgba(150, 50, 255, 0.6) 75%,
+        rgba(0, 150, 255, 0.7) 100%);
+    background-size: 200% 200%;
+    opacity: 0;
+    visibility: hidden;
+    transition: all 0.4s cubic-bezier(0.68, -0.55, 0.265, 1.55);
+    animation: gradientBorder 4s ease infinite;
+    z-index: 2147483646;
+}
+
+@keyframes gradientBorder {
+    0%, 100% {
+        background-position: 0% 50%;
+    }
+    50% {
+        background-position: 100% 50%;
+    }
+}
+
+.tooltip-enabled:hover::after {
+    opacity: 1;
+    visibility: visible;
+    transform: translateX(0);
+}
+
+.tooltip-enabled:hover::before {
+    opacity: 1;
+    visibility: visible;
+}
+
+/* Tooltip arrow */
+.tooltip-enabled:hover::after {
+    box-shadow:
+        0 8px 32px rgba(0, 100, 255, 0.35),
+        0 4px 16px rgba(255, 0, 100, 0.25),
+        inset 0 1px 2px rgba(100, 200, 255, 0.4),
+        inset 0 -1px 2px rgba(255, 50, 100, 0.3),
+        0 20px 40px rgba(0, 50, 150, 0.2);
+}
+
+/* Tooltip glow effect on hover */
+@keyframes tooltipGlow {
+    0%, 100% {
+        text-shadow:
+            0 0 10px rgba(0, 150, 255, 0.6),
+            0 0 20px rgba(255, 0, 100, 0.3);
+    }
+    50% {
+        text-shadow:
+            0 0 15px rgba(0, 200, 255, 0.8),
+            0 0 30px rgba(255, 0, 150, 0.5),
+            0 0 40px rgba(150, 0, 255, 0.3);
+    }
+}
+
+.tooltip-enabled:hover::after {
+    animation: tooltipGlow 2s ease-in-out infinite;
+}
+
+/* Responsive tooltip positioning */
+@media (max-width: 768px) {
+    .tooltip-enabled::after {
+        font-size: 0.75rem;
+        padding: 10px 16px;
+        top: calc(100% + 12px);
+        left: -10px;
+    }
+
+    .tooltip-enabled::before {
+        top: calc(100% + 10px);
+        left: -12px;
+        width: calc(100% + 24px);
+        height: 40px;
+    }
+}
+
+/* ================================================================
+   NUCLEAR OPTION: Absolute final override to prevent black text
+   This rule has maximum specificity and must be at the end of the file
+   ================================================================ */
+#quantum-countdown-container #qc-years .quantum-countdown-value,
+#quantum-countdown-container #qc-days .quantum-countdown-value,
+#quantum-countdown-container #qc-hours .quantum-countdown-value,
+#quantum-countdown-container #qc-minutes .quantum-countdown-value,
+#quantum-countdown-container #qc-seconds .quantum-countdown-value,
+#quantum-countdown-container #qc-ms .quantum-countdown-value {
+    color: #ff0000 !important;
+    -webkit-text-fill-color: #ff0000 !important;
+    background-clip: border-box !important;
+    -webkit-background-clip: border-box !important;
+    background-image: none !important;
+    background: transparent !important;
+    fill: none !important;
+    stroke: none !important;
+}
+
+#quantum-countdown-container #qc-ms.glow .quantum-countdown-value,
+#quantum-countdown-container .quantum-countdown-num.glow .quantum-countdown-value {
+    color: #ff3333 !important;
+    -webkit-text-fill-color: #ff3333 !important;
+    fill: none !important;
+    stroke: none !important;
+}

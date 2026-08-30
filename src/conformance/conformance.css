@@ -7,55 +7,26 @@
  * the clause it violated; anything decorative competes with that.
  */
 
+/* One theme, matching pqcrypta.com.
+ *
+ * These pages used to default to a light palette and follow
+ * `prefers-color-scheme`, which made the suite host look like a different
+ * product from every page that links to it. The site is dark; so is this. */
 :root {
-    --cf-ground: #f3f5f7;
-    --cf-surface: #ffffff;
-    --cf-surface-2: #e9eef2;
-    --cf-ink: #131a20;
-    --cf-ink-2: #38454f;
-    --cf-muted: #5d6a76;
-    --cf-border: #d7dee5;
-    --cf-accent: #0a6576;
-    --cf-pass: #1f6746;
-    --cf-pass-bg: #dcefe4;
-    --cf-fail: #a5252f;
-    --cf-fail-bg: #f6dfe0;
-    --cf-incon: #8a6110;
-    --cf-incon-bg: #f6ecd6;
-    --cf-notrun: #5d6a76;
-    --cf-notrun-bg: #e9eef2;
-}
-
-@media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) {
-        --cf-ground: #0d1218;
-        --cf-surface: #151d25;
-        --cf-surface-2: #1d2831;
-        --cf-ink: #dfe6ec;
-        --cf-ink-2: #b4c2cd;
-        --cf-muted: #8797a5;
-        --cf-border: #25313b;
-        --cf-accent: #46b5cb;
-        --cf-pass: #5cc191;
-        --cf-pass-bg: #12301f;
-        --cf-fail: #f0868d;
-        --cf-fail-bg: #3a1c20;
-        --cf-incon: #dfb055;
-        --cf-incon-bg: #372c15;
-        --cf-notrun: #8797a5;
-        --cf-notrun-bg: #1d2831;
-    }
-}
-
-:root[data-theme="dark"] {
-    --cf-ground: #0d1218;
-    --cf-surface: #151d25;
-    --cf-surface-2: #1d2831;
-    --cf-ink: #dfe6ec;
-    --cf-ink-2: #b4c2cd;
-    --cf-muted: #8797a5;
-    --cf-border: #25313b;
+    --cf-ground: #0b1016;
+    --cf-surface: #131b23;
+    --cf-surface-2: #1a242e;
+    --cf-ink: #e2e9ef;
+    --cf-ink-2: #b3c1cd;
+    --cf-muted: #7f8f9d;
+    --cf-border: #223039;
     --cf-accent: #46b5cb;
+    --cf-ext: #5cc191;
+    --cf-corr: #f0868d;
+    --cf-inter: #7fa9f0;
+    --cf-resil: #dfb055;
+    --cf-disc: #c39ae0;
+    --cf-incon-line: #8697a4;
     --cf-pass: #5cc191;
     --cf-pass-bg: #12301f;
     --cf-fail: #f0868d;
@@ -64,6 +35,7 @@
     --cf-incon-bg: #372c15;
     --cf-notrun: #8797a5;
     --cf-notrun-bg: #1d2831;
+    --cf-mono: 'SFMono-Regular', ui-monospace, Menlo, Consolas, 'Liberation Mono', monospace;
 }
 
 * {
@@ -76,10 +48,174 @@ body.conformance-report {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Ubuntu, sans-serif;
     font-size: 16px;
     line-height: 1.6;
-    margin: 0 auto;
-    padding: 40px 24px 80px;
-    max-width: 1080px;
+    margin: 0;
+    padding: 0;
     -webkit-font-smoothing: antialiased;
+}
+
+/* The reading column. Previously the body itself, which left no room for a
+   header or a footer above and below it. */
+.conformance-report .wrap {
+    position: relative;
+    z-index: 2;
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: 40px 24px 72px;
+}
+
+/* A ground for the prose, so running text stays legible over the animation
+   while the animation itself stays visible in the margins. */
+.conformance-report .wrap::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    background: radial-gradient(
+        ellipse 68% 52% at 38% 30%,
+        rgba(11, 16, 22, 0.86),
+        rgba(11, 16, 22, 0.6) 55%,
+        rgba(11, 16, 22, 0) 82%
+    );
+}
+
+/* ── Header ─────────────────────────────────────────────────────────── */
+
+.conformance-report .site-header {
+    position: relative;
+    z-index: 2;
+    border-bottom: 1px solid var(--cf-border);
+    background: rgba(11, 16, 22, 0.85);
+}
+
+.conformance-report .site-header .inner,
+.conformance-report .site-footer .inner {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: 22px 24px;
+}
+
+.conformance-report .brand {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+}
+
+.conformance-report .brand img {
+    width: 48px;
+    height: 48px;
+    border-radius: 8px;
+    border: 1px solid var(--cf-border);
+    flex-shrink: 0;
+}
+
+.conformance-report .brand h1 {
+    margin: 0;
+    font-size: clamp(1.35rem, 3.4vw, 1.9rem);
+    line-height: 1.15;
+    letter-spacing: -0.02em;
+    background: linear-gradient(135deg, var(--cf-accent), var(--cf-ext));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+}
+
+.conformance-report .brand .tagline {
+    margin: 3px 0 0;
+    font-size: 0.92rem;
+    color: var(--cf-muted);
+}
+
+.conformance-report .site-nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 20px;
+    margin-top: 16px;
+    font-size: 0.9rem;
+}
+
+/* ── Footer ─────────────────────────────────────────────────────────── */
+
+.conformance-report .site-footer {
+    position: relative;
+    z-index: 2;
+    border-top: 1px solid var(--cf-border);
+    background: rgba(11, 16, 22, 0.85);
+}
+
+.conformance-report .site-footer ul {
+    list-style: none;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 22px;
+    margin: 0 0 12px;
+    padding: 0;
+}
+
+.conformance-report .site-footer li {
+    margin: 0;
+}
+
+.conformance-report .site-footer .copy {
+    margin: 10px 0 0;
+    font-size: 0.85rem;
+    color: var(--cf-muted);
+}
+
+.conformance-report .site-footer .note {
+    font-size: 0.85rem;
+    color: var(--cf-muted);
+    margin: 0;
+    max-width: 70ch;
+}
+
+/* ── Summary strip ──────────────────────────────────────────────────── */
+
+.conformance-report .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 1px;
+    background: var(--cf-border);
+    border: 1px solid var(--cf-border);
+    border-radius: 5px;
+    overflow: hidden;
+    margin: 28px 0;
+}
+
+.conformance-report .stats div {
+    background: var(--cf-surface);
+    padding: 16px 18px;
+}
+
+.conformance-report .stats .v {
+    display: block;
+    font-size: 1.55rem;
+    font-weight: 650;
+    line-height: 1;
+    letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
+    color: var(--cf-accent);
+}
+
+.conformance-report .stats .k {
+    display: block;
+    margin-top: 4px;
+    font-family: var(--cf-mono);
+    font-size: 0.67rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--cf-muted);
+}
+
+@media (max-width: 640px) {
+    .conformance-report .wrap {
+        padding: 28px 16px 56px;
+    }
+
+    .conformance-report .site-header .inner,
+    .conformance-report .site-footer .inner {
+        padding: 18px 16px;
+    }
 }
 
 .conformance-report h1 {
@@ -302,3 +438,112 @@ body.conformance-report {
         transition: none !important;
     }
 }
+
+/* ── The differentiator line ────────────────────────────────────────── */
+
+.conformance-report .brand .tagline.differentiator {
+    margin-top: 8px;
+    max-width: 78ch;
+    color: var(--cf-ink-2);
+    font-size: 0.88rem;
+    line-height: 1.55;
+}
+
+/* ── Catalogue breakdown by layer and class ─────────────────────────── */
+
+.conformance-report .breakdown {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 16px;
+    margin: 8px 0 32px;
+}
+
+.conformance-report .breakdown .tier {
+    background: var(--cf-surface);
+    border: 1px solid var(--cf-border);
+    border-radius: 5px;
+    padding: 16px 18px;
+}
+
+.conformance-report .breakdown h3 {
+    margin: 0;
+    font-family: var(--cf-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--cf-accent);
+}
+
+.conformance-report .breakdown .tier-count {
+    margin: 2px 0 12px;
+    font-size: 1.5rem;
+    font-weight: 650;
+    letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
+    color: var(--cf-ink);
+}
+
+.conformance-report .breakdown dl {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 6px 12px;
+    margin: 0;
+    font-size: 0.86rem;
+}
+
+.conformance-report .breakdown dt {
+    color: var(--cf-ink-2);
+    text-transform: capitalize;
+    /* A stripe in the class colour, so the same five colours mean the same five
+       things here as they do in the catalogue table below. */
+    border-left: 3px solid var(--cf-muted);
+    padding-left: 8px;
+}
+
+.conformance-report .breakdown dd {
+    margin: 0;
+    font-variant-numeric: tabular-nums;
+    color: var(--cf-ink);
+    text-align: right;
+}
+
+.conformance-report .breakdown .cls-extensibility { border-left-color: var(--cf-ext); }
+.conformance-report .breakdown .cls-correctness { border-left-color: var(--cf-corr); }
+.conformance-report .breakdown .cls-interoperability { border-left-color: var(--cf-inter); }
+.conformance-report .breakdown .cls-resilience { border-left-color: var(--cf-resil); }
+.conformance-report .breakdown .cls-discretionary { border-left-color: var(--cf-disc); }
+
+/* ── What a result means ────────────────────────────────────────────── */
+
+.conformance-report .verdict-key {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 12px;
+    margin: 18px 0 32px;
+}
+
+.conformance-report .verdict-key .vk {
+    background: var(--cf-surface);
+    border: 1px solid var(--cf-border);
+    border-left: 3px solid var(--cf-muted);
+    border-radius: 4px;
+    padding: 14px 16px;
+}
+
+.conformance-report .verdict-key .vk strong {
+    display: block;
+    font-size: 0.95rem;
+    margin-bottom: 4px;
+}
+
+.conformance-report .verdict-key .vk span {
+    font-size: 0.88rem;
+    color: var(--cf-muted);
+}
+
+.conformance-report .verdict-key .vk-pass { border-left-color: var(--cf-pass); }
+.conformance-report .verdict-key .vk-pass strong { color: var(--cf-pass); }
+.conformance-report .verdict-key .vk-fail { border-left-color: var(--cf-fail); }
+.conformance-report .verdict-key .vk-fail strong { color: var(--cf-fail); }
+.conformance-report .verdict-key .vk-incon { border-left-color: var(--cf-incon); }
+.conformance-report .verdict-key .vk-incon strong { color: var(--cf-incon); }

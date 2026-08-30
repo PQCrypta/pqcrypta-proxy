@@ -393,6 +393,84 @@ pub struct SecurityRequestView<'a> {
     pub body: Option<&'a [u8]>,
 }
 
+/// Whether this path is one we publish *for* machines to fetch.
+///
+/// The bad-bot user-agent rules return 403 to curl, wget, python-requests, Go's
+/// HTTP client and an empty UA alike. That is a reasonable default for pages,
+/// and it leaves crawling untouched (Googlebot passes). It is the wrong answer
+/// for the handful of paths whose entire purpose is programmatic access — and
+/// our own documentation tells people to `curl` every one of these, so following
+/// the instructions on the site produced a 403.
+///
+/// Invisible from the server itself: loopback, this host's egress and api3 are
+/// all in `pentest_bypass_ips`, so a check run from any of them passes while
+/// real visitors are blocked. Verify from a node with no bypass.
+///
+/// Deliberately a list of exact paths and narrow prefixes rather than whole page
+/// directories: the aim is to unblock the published artefacts, not to switch the
+/// protection off for the pages around them.
+fn is_machine_readable_path(path: &str) -> bool {
+    // Files that exist to be read by tools, by convention.
+    const WELL_KNOWN: &[&str] = &[
+        "/robots.txt",
+        "/sitemap.xml",
+        "/llms.txt",
+        // Datasets and APIs our pages document with a curl command.
+        "/ja4/api.php", // llms.txt calls this "machine-readable, no auth, CORS open"
+        "/handshake/api.php",
+    ];
+
+    if WELL_KNOWN.contains(&path) {
+        return true;
+    }
+
+    // Sitemaps, and the .well-known tree (security.txt and friends).
+    if path.starts_with("/sitemaps/") || path.starts_with("/.well-known/") {
+        return true;
+    }
+
+    // The published post-quantum certificate chain, which /pqc/ documents
+    // fetching with curl. Extension-gated so this covers the artefacts and not
+    // the page that describes them. `view.path` arrives lowercased, so a
+    // lowercase match here is exact.
+    if path.starts_with("/pqc/")
+        && path
+            .rsplit_once('.')
+            .is_some_and(|(_, ext)| matches!(ext, "pem" | "crt" | "der" | "json"))
+    {
+        return true;
+    }
+
+    // The MASQUE reference client source, which /masque/ tells you to curl.
+    path.starts_with("/masque/client/")
+}
+
+/// Whether `host` is the conformance suite's own vhost.
+///
+/// That host is answered in-process before route lookup, so it has no route
+/// entry and cannot carry `skip_bot_blocking` the way an ordinary route can —
+/// but it is the one host on this proxy whose entire purpose is non-browser
+/// traffic. Its documented workflow is curl, its CI driver shells out to curl,
+/// and the thing under test is an HTTP/3 *client library*, so the bad-bot
+/// user-agent rules were rejecting exactly the traffic the service exists for.
+///
+/// This was invisible from the server itself: loopback and our own egress are
+/// already bypassed, so every check run from here passed while every real
+/// visitor got 403.
+///
+/// Takes the host rather than reading it from the request, because the two
+/// callers resolve it differently and only they can do it correctly — HTTP/2
+/// and HTTP/3 carry no `Host` header, only an `:authority` that hyper surfaces
+/// through the URI.
+pub fn is_conformance_host(config: &ProxyConfig, host: Option<&str>) -> bool {
+    let conf = &config.conformance;
+    conf.enabled
+        && host.is_some_and(|h| {
+            let h = h.split(':').next().unwrap_or(h);
+            h.eq_ignore_ascii_case(&conf.host)
+        })
+}
+
 /// Per-route security settings resolved for a single request.
 ///
 /// Flattened out of `RouteConfig` and `RouteSecurityPolicy` so the middleware
@@ -1245,6 +1323,7 @@ impl SecurityState {
                 .map(|v| v == "1")
                 .unwrap_or(false)
                 || view.path.starts_with("/stream/downloads/")
+                || is_machine_readable_path(view.path)
                 || policy.skip_bot_blocking
                 // pentest_bypass_ips covers the authorized red-team host plus this
                 // server's own egress and loopback. Those addresses run curl-driven
@@ -1780,11 +1859,16 @@ pub async fn security_middleware(
     // what follows. None means no route matched, in which case the global
     // settings apply unchanged.
     let route_policy = {
+        // Header first, URI authority second: HTTP/2 sends no `Host` header, so
+        // reading only the header left every h2 request looking hostless here.
         let host = headers
             .get(hyper::header::HOST)
             .and_then(|v| v.to_str().ok())
-            .map(|h| h.split(':').next().unwrap_or(h).to_ascii_lowercase());
+            .map(str::to_owned)
+            .or_else(|| request.uri().host().map(str::to_owned))
+            .map(|h| h.split(':').next().unwrap_or(&h).to_ascii_lowercase());
         let req_path = request.uri().path().to_string();
+        let on_conformance_host = is_conformance_host(&security.route_index, host.as_deref());
         security
             .route_index
             .find_route(host.as_deref(), &req_path, false)
@@ -1798,7 +1882,14 @@ pub async fn security_middleware(
                     .as_ref()
                     .and_then(|s| s.rate_limit_override.clone()),
             })
-            .unwrap_or_default()
+            .map(|mut p| {
+                p.skip_bot_blocking |= on_conformance_host;
+                p
+            })
+            .unwrap_or_else(|| RequestPolicy {
+                skip_bot_blocking: on_conformance_host,
+                ..RequestPolicy::default()
+            })
     };
 
     // The body-scan paths below run after `request` is consumed, so take the

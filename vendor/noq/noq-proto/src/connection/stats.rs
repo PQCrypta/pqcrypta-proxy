@@ -7,6 +7,32 @@ use crate::FrameType;
 
 use super::PathId;
 
+/// ECN counts most recently echoed back by the peer for a path.
+///
+/// RFC 9000 §13.4.1 requires an endpoint to feed back the ECN markings it
+/// receives "if these are accessible" — a conditional requirement, since not
+/// every platform gives an application access to the ECN field. These are the
+/// counts the peer reported in its latest ACK frame carrying them, so a
+/// zeroed set means either the peer is not reporting or the path stripped the
+/// markings before they arrived.
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EcnFeedback {
+    /// Packets the peer received marked ECT(0).
+    pub ect0: u64,
+    /// Packets the peer received marked ECT(1).
+    pub ect1: u64,
+    /// Packets the peer received marked ECN-CE, i.e. congestion experienced.
+    pub ce: u64,
+}
+
+impl EcnFeedback {
+    /// Whether the peer has reported any ECN-marked packet at all.
+    pub fn any(&self) -> bool {
+        self.ect0 > 0 || self.ect1 > 0 || self.ce > 0
+    }
+}
+
 /// Statistics about UDP datagrams transmitted or received on a connection.
 ///
 /// All QUIC packets are carried by UDP datagrams. Hence, these statistics cover all traffic
@@ -248,6 +274,13 @@ pub struct PathStats {
     pub black_holes_detected: u64,
     /// Largest UDP payload size the path currently supports.
     pub current_mtu: u16,
+    /// ECN counts the peer most recently echoed for this path.
+    pub ecn_feedback: EcnFeedback,
+    /// Whether outgoing packets on this path are still being marked ECT(0).
+    ///
+    /// Cleared when ECN validation fails, which is how a path that mangles or
+    /// strips the codepoint is told apart from a peer that is not reporting.
+    pub sending_ecn: bool,
 }
 
 /// Connection statistics.
@@ -296,6 +329,8 @@ impl std::ops::Add<PathStats> for ConnectionStats {
             lost_plpmtud_probes: _,
             black_holes_detected: _,
             current_mtu: _,
+            ecn_feedback: _,
+            sending_ecn: _,
         } = rhs;
         Self {
             udp_tx: self.udp_tx + udp_tx,
@@ -329,6 +364,8 @@ impl std::ops::AddAssign<PathStats> for ConnectionStats {
             lost_plpmtud_probes: _,
             black_holes_detected: _,
             current_mtu: _,
+            ecn_feedback: _,
+            sending_ecn: _,
         } = rhs;
         let Self {
             udp_tx,

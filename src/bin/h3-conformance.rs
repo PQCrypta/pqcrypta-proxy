@@ -399,8 +399,10 @@ fn render(report: &Report, quiet: bool, base: &str, session: &str) {
     if t.inconclusive > 0 {
         println!(
             "\nInconclusive results do not fail this run. They mean the suite never put\n\
-             your client in the situation the test is about — an anomaly not yet\n\
-             implemented, or a request too small to reach a limit."
+             your client in the situation the test is about — a request too small to\n\
+             reach a limit, a connection too short to need a connection ID rotated, or\n\
+             a client with no session ticket to resume from. Every anomaly in the\n\
+             catalogue is emitted; what varies is whether a given run reaches it."
         );
     }
 

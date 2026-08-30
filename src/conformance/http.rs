@@ -35,10 +35,147 @@ pub fn route(
         (&Method::POST, "/session") => Some(new_session(conformance, client_ip)),
         (&Method::GET, "/catalog.json") => Some(catalog_json(conformance)),
         (&Method::GET, "/css/conformance.css") => Some(stylesheet()),
+        // Page furniture. This is its own origin under `default-src 'self'`, so
+        // every asset the page references has to be served from here — it cannot
+        // borrow the site's copies across the hostname boundary.
+        (&Method::GET, "/css/bg.css") => Some(asset_css(include_str!("assets/bg.css"))),
+        (&Method::GET, "/css/cursor.css") => Some(asset_css(include_str!("assets/cursor.css"))),
+        (&Method::GET, "/js/bg.js") => Some(asset_js(include_str!("assets/bg.js"))),
+        (&Method::GET, "/js/cursor.js") => Some(asset_js(include_str!("assets/cursor.js"))),
+        (&Method::GET, "/favicon.svg") => Some(asset_bytes(
+            include_bytes!("assets/favicon.svg"),
+            "image/svg+xml",
+        )),
+        (&Method::GET, "/images/pq-crypta.jpg") => {
+            Some(asset_bytes(include_bytes!("assets/logo.jpg"), "image/jpeg"))
+        }
+        // The site navigation, served from this host at the same paths the
+        // markup references, so the shared menu works unchanged across the
+        // hostname boundary.
+        (&Method::GET, "/fun/css/menu.css") => Some(asset_css(include_str!("assets/menu.css"))),
+        (&Method::GET, "/css/quantum-countdown.css") => {
+            Some(asset_css(include_str!("assets/quantum-countdown.css")))
+        }
+        (&Method::GET, "/fun/js/menu.js") => Some(asset_js(include_str!("assets/menu.js"))),
+        (&Method::GET, "/fun/js/error-menu.js") => {
+            Some(asset_js(include_str!("assets/error-menu.js")))
+        }
+        (&Method::GET, "/fun/js/mini-countdown.js") => {
+            Some(asset_js(include_str!("assets/mini-countdown.js")))
+        }
+        (&Method::GET, "/robots.txt") => Some(robots(conformance)),
+        (&Method::GET, "/sitemap.xml") => Some(sitemap(conformance)),
         (&Method::GET, p) if p.starts_with("/report/") => Some(report_for(conformance, p)),
         (&Method::GET, p) if p.starts_with("/badge/") => Some(badge_for(conformance, p)),
         _ => None,
     }
+}
+
+/// A cacheable static asset.
+///
+/// Unlike the report pages, these never change between deploys, so they carry a
+/// long max-age rather than the `no-store` every result-bearing response needs.
+fn cacheable(mut resp: Response<Body>) -> Response<Body> {
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=86400"),
+    );
+    resp
+}
+
+fn asset_css(body: &'static str) -> Response<Body> {
+    cacheable(text(
+        StatusCode::OK,
+        "text/css; charset=utf-8",
+        body.to_string(),
+    ))
+}
+
+fn asset_js(body: &'static str) -> Response<Body> {
+    cacheable(text(
+        StatusCode::OK,
+        "application/javascript; charset=utf-8",
+        body.to_string(),
+    ))
+}
+
+fn asset_bytes(body: &'static [u8], content_type: &'static str) -> Response<Body> {
+    let mut resp = Response::new(Body::from(body));
+    resp.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    resp.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    cacheable(resp)
+}
+
+/// Crawl rules for the suite host.
+///
+/// The landing page is worth indexing; nothing else here is. A report belongs to
+/// one session and is gone within the hour, a badge is an image of that report,
+/// and `/session` is a POST that mints state — an indexed report URL would be a
+/// dead link by the time anyone followed it.
+fn robots(conformance: &Arc<Conformance>) -> Response<Body> {
+    let host = &conformance.config.host;
+    cacheable(text(
+        StatusCode::OK,
+        "text/plain; charset=utf-8",
+        format!(
+            "User-agent: *\n\
+             Allow: /$\n\
+             Disallow: /report/\n\
+             Disallow: /badge/\n\
+             Disallow: /session\n\
+             \n\
+             Sitemap: https://{host}/sitemap.xml\n"
+        ),
+    ))
+}
+
+/// One URL, because there is exactly one indexable page here.
+fn sitemap(conformance: &Arc<Conformance>) -> Response<Body> {
+    let host = &conformance.config.host;
+    cacheable(text(
+        StatusCode::OK,
+        "application/xml; charset=utf-8",
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n\
+             <url><loc>https://{host}/</loc><changefreq>weekly</changefreq>\
+             <priority>0.8</priority></url>\n\
+             </urlset>\n"
+        ),
+    ))
+}
+
+/// The Content-Security-Policy for this host's HTML pages.
+///
+/// The proxy injects a global CSP only when a response does not already carry
+/// one, so setting it here replaces the default for these pages alone.
+///
+/// It has to be a little wider than the global `default-src 'self'` because the
+/// pages carry the shared site navigation: the menu's stylesheet uses `data:`
+/// URIs for its chevron icons, and its script asks `api.pqcrypta.com` whether
+/// the visitor is signed in. Both were being refused, which the menu survived
+/// (the auth call is wrapped in a `catch`) but reported as console errors on
+/// every load. Everything else stays same-origin, and inline script and style
+/// remain forbidden.
+fn html_csp(resp: &mut Response<Body>) {
+    resp.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; \
+             img-src 'self' data:; \
+             style-src 'self'; \
+             script-src 'self'; \
+             connect-src 'self' https://api.pqcrypta.com; \
+             font-src 'self' data:; \
+             object-src 'none'; \
+             base-uri 'self'; \
+             frame-ancestors 'none'",
+        ),
+    );
 }
 
 fn text(status: StatusCode, content_type: &'static str, body: String) -> Response<Body> {
@@ -84,57 +221,328 @@ fn index(conformance: &Arc<Conformance>) -> Response<Body> {
     let start = conformance.config.port_range.0;
     let end = start + super::catalog::required_ports() - 1;
     let total = super::catalog::CATALOG.len();
-    let built = super::catalog::CATALOG
+    let quic = super::catalog::CATALOG
         .iter()
-        .filter(|t| t.implemented)
+        .filter(|t| matches!(t.tier, super::catalog::Tier::Quic))
         .count();
+    let http3 = total - quic;
+
+    // Counts per layer and class, tallied from the catalogue rather than
+    // written down, so the breakdown cannot disagree with the table below it.
+    let mut breakdown = String::new();
+    for (tier, heading) in [
+        (super::catalog::Tier::Quic, "QUIC"),
+        (super::catalog::Tier::Http3, "HTTP/3"),
+    ] {
+        let in_tier: Vec<_> = super::catalog::CATALOG
+            .iter()
+            .filter(|t| t.tier == tier)
+            .collect();
+        let mut classes: Vec<(&str, usize)> = Vec::new();
+        for t in &in_tier {
+            let name = t.class.as_str();
+            match classes.iter_mut().find(|(c, _)| *c == name) {
+                Some((_, n)) => *n += 1,
+                None => classes.push((name, 1)),
+            }
+        }
+        classes.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+
+        breakdown.push_str(&format!(
+            "<div class=\"tier\"><h3>{heading}</h3><p class=\"tier-count\">{} tests</p><dl>",
+            in_tier.len()
+        ));
+        for (class, n) in classes {
+            breakdown.push_str(&format!(
+                "<dt class=\"cls-{class}\">{class}</dt><dd>{n}</dd>"
+            ));
+        }
+        breakdown.push_str("</dl></div>");
+    }
+
+    // Every test, grouped by layer, so the page lists what it actually serves
+    // rather than a prose summary that can drift from the catalogue.
+    let mut rows = String::new();
+    for (tier, heading) in [
+        (super::catalog::Tier::Http3, "HTTP/3 layer"),
+        (super::catalog::Tier::Quic, "QUIC layer"),
+    ] {
+        rows.push_str(&format!(
+            "<h3>{heading}</h3><div class=\"tablewrap\"><table>\
+<thead><tr><th>Test</th><th>Port</th><th>Class</th><th>Specification</th></tr></thead><tbody>"
+        ));
+        for t in super::catalog::CATALOG.iter().filter(|t| t.tier == tier) {
+            let port = t
+                .port_offset
+                .map(|o| (start + o).to_string())
+                .unwrap_or_else(|| "&mdash;".to_string());
+            rows.push_str(&format!(
+                "<tr><td><code>{id}</code><span class=\"title\">{title}</span>\
+<span class=\"expect\">{expect}</span></td>\
+<td>{port}</td><td><span class=\"chip\">{class}</span></td><td>{spec}</td></tr>",
+                id = esc(t.id),
+                title = esc(t.title),
+                expect = esc(t.expectation),
+                class = esc(t.class.as_str()),
+                spec = esc(t.spec),
+            ));
+        }
+        rows.push_str("</tbody></table></div>");
+    }
+
+    // The shared site navigation, captured from the PHP include it is generated
+    // by. Its links are already absolute, so it works from this hostname without
+    // rewriting; see assets/README.md for the one that was not.
+    let menu = include_str!("assets/menu.html");
+
+    let title = "HTTP/3 &amp; QUIC Client Conformance Suite";
+    // Kept inside the site's 160-character limit for a meta description, which
+    // the first version overran by two.
+    let desc = format!(
+        "A free public conformance suite for HTTP/3 and QUIC clients: {total} tests that \
+         make the server misbehave on purpose, each citing the RFC clause it exercises."
+    );
+
+    // Taken from the clock rather than hard-coded, so the footer does not quietly
+    // go stale on 1 January.
+    let year = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| 1970 + d.as_secs() / 31_556_952)
+        .unwrap_or(1970);
 
     let body = format!(
-        "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
-<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>HTTP/3 client conformance</title>\
-<link rel=\"stylesheet\" href=\"/css/conformance.css\"></head><body class=\"conformance-report\">\
-<h1>HTTP/3 &amp; QUIC client conformance</h1>\
-<p class=\"meta\">{built} of {total} tests active on udp/{start}&ndash;{end}</p>\
-<p>This server misbehaves on purpose so your client library can find out how it \
-copes: reserved frame types, a duplicated SETTINGS identifier, a control stream \
-that opens with the wrong frame. Each test has its own UDP port. Connect, and \
-the server records what your client did.</p>\
-<h2>Running it</h2>\
-<pre class=\"ja4-rawpre\"><code># start a session\n\
-SESSION=$(curl -sX POST https://{host}/session | sed 's/.*\"id\":\"//;s/\".*//')\n\n\
-# walk the catalogue; results file under the session from this address\n\
-curl -s https://{host}/catalog.json | \\\\\n\
-  grep -o '\"port\": [0-9]*' | grep -o '[0-9]*' | while read PORT; do\n\
-    curl -s --http3-only --max-time 15 \"https://{host}:$PORT/\" -o /dev/null\n\
-  done\n\n\
-# read the result\n\
-curl -s https://{host}/report/$SESSION.json</code></pre>\
-<p>Results are filed under the session started from your address, so the test \
-connections need nothing special &mdash; just run them from the same machine \
-that asked for the session.</p>\
-<h2>What a verdict means</h2>\
-<ul>\
-<li><strong>Extensibility</strong> &mdash; your client had to ignore something \
-it did not recognise and carry on. Rejecting it is the failure; that is how \
-protocols ossify.</li>\
-<li><strong>Correctness</strong> &mdash; your client had to reject something \
-invalid, with the error code the specification names.</li>\
-<li><strong>Interoperability</strong> &mdash; the response was valid but \
-demanding &mdash; Huffman-coded fields, a dynamic-table reference, trailers \
-&mdash; and your client had to decode it.</li>\
-<li><strong>Resilience</strong> &mdash; your client had to recover rather than \
-give up.</li>\
-<li><strong>Discretionary</strong> &mdash; the specification permits more than \
-one answer. Both pass; the report says which yours chose.</li>\
-<li><strong>Inconclusive</strong> &mdash; the run never put your client in the \
-situation the test is about, so it proves nothing either way.</li>\
-</ul>\
-<p><a href=\"/catalog.json\">The catalogue</a> lists every test with the clause \
-it exercises.</p>\
-</body></html>\n"
+        r#"<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HTTP/3 &amp; QUIC Client Conformance Suite</title>
+<meta name="description" content="{desc}">
+<meta name="keywords" content="HTTP/3 conformance, QUIC conformance, h3 client testing, QUIC interop, RFC 9114, RFC 9000, RFC 9204, QPACK, GREASE, protocol conformance suite, quic-go, aioquic, ngtcp2, quiche">
+<meta name="author" content="Allan Riddel, PQ Crypta">
+<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
+<link rel="canonical" href="https://{host}/">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://{host}/">
+<meta property="og:title" content="{title}">
+<meta property="og:description" content="{desc}">
+<meta property="og:site_name" content="PQ Crypta">
+<meta property="og:image" content="https://pqcrypta.com/images/og-image.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{title}">
+<meta name="twitter:description" content="{desc}">
+<meta name="twitter:image" content="https://pqcrypta.com/images/twitter-card.jpg">
+<link rel="stylesheet" href="/fun/css/menu.css">
+<link rel="stylesheet" href="/css/quantum-countdown.css">
+<link rel="stylesheet" href="/css/conformance.css">
+<link rel="stylesheet" href="/css/bg.css">
+<link rel="stylesheet" href="/css/cursor.css">
+<script type="application/ld+json">{{"@context":"https://schema.org","@type":"SoftwareApplication","name":"PQ Crypta HTTP/3 Client Conformance Suite","url":"https://{host}/","applicationCategory":"DeveloperApplication","operatingSystem":"Any","description":"A public conformance service for HTTP/3 and QUIC client libraries. The server emits deliberately awkward but legal protocol output and records how the client under test responds.","offers":{{"@type":"Offer","price":"0","priceCurrency":"USD"}},"creator":{{"@type":"Organization","name":"PQ Crypta","url":"https://pqcrypta.com/"}}}}</script>
+</head>
+<body class="conformance-report">
+{menu}
+<div id="cf-bg-container" class="cf-bg-container" aria-hidden="true"><canvas id="cf-bg-canvas" class="cf-bg-canvas"></canvas></div>
+
+<header class="site-header"><div class="inner">
+  <div class="brand">
+    <a href="https://pqcrypta.com/"><img src="/images/pq-crypta.jpg" alt="PQ Crypta" width="48" height="48"></a>
+    <div>
+      <h1>HTTP/3 &amp; QUIC Client Conformance</h1>
+      <p class="tagline">A server that misbehaves on purpose, so your client library can find out how it copes</p>
+      <p class="tagline differentiator">Unlike an interoperability test, this one deliberately sends your
+      client protocol edge cases, illegal messages, GREASE, awkward state transitions and hostile network
+      conditions &mdash; and judges the result from the wire, not from what the client reports.</p>
+    </div>
+  </div>
+  <nav class="site-nav" aria-label="Site">
+    <a href="/">Suite</a>
+    <a href="/catalog.json">Catalogue JSON</a>
+    <a href="https://pqcrypta.com/conformance/">Documentation</a>
+    <a href="https://pqcrypta.com/conformance/matrix.php">Client matrix</a>
+    <a href="https://pqcrypta.com/pqcproxy/">The proxy</a>
+    <a href="https://pqcrypta.com/">pqcrypta.com</a>
+  </nav>
+</div></header>
+
+<main class="wrap">
+<p>This is a live service, not a description of one. Point an HTTP/3 client at any
+port below and the server will emit something awkward but legal &mdash; a reserved
+frame type, a duplicated SETTINGS identifier, a control stream that opens with the
+wrong frame, an unknown QUIC frame type, a Stateless Reset, a path-MTU black hole
+&mdash; then record what your client did about it.</p>
+
+<div class="stats">
+  <div><span class="v">{total}</span><span class="k">adversarial tests</span></div>
+  <div><span class="v">{http3}</span><span class="k">HTTP/3 layer</span></div>
+  <div><span class="v">{quic}</span><span class="k">QUIC layer</span></div>
+  <div><span class="v">{start}&ndash;{end}</span><span class="k">UDP ports</span></div>
+</div>
+
+<section class="breakdown">{breakdown}</section>
+
+<h2 id="verdict-key">What a result means</h2>
+<div class="verdict-key">
+  <div class="vk vk-pass"><strong>Pass</strong><span>The client demonstrated the behaviour the specification requires.</span></div>
+  <div class="vk vk-fail"><strong>Fail</strong><span>The client did something the specification prohibits.</span></div>
+  <div class="vk vk-incon"><strong>Inconclusive</strong><span>The run could not establish the observation &mdash; the client was never put in the situation the test is about. Never counted either way.</span></div>
+</div>
+
+<h2 id="running">Running it</h2>
+<p>Each test has its own UDP port. Results are filed under a session started from
+your address, so the test connections need nothing special &mdash; just run them
+from the machine that asked for the session.</p>
+<pre class="ja4-rawpre"><code># start a session
+SESSION=$(curl -sX POST https://{host}/session | jq -r .id)
+
+# walk the catalogue
+curl -s https://{host}/catalog.json | jq -r '.tests[].port' | while read PORT; do
+    curl -s --http3-only --max-time 15 "https://{host}:$PORT/" -o /dev/null
+  done
+
+# read the result
+curl -s https://{host}/report/$SESSION.json | jq .totals</code></pre>
+<p>Without <code>jq</code>: <code>grep -o '"port":[0-9]*' | cut -d: -f2</code> pulls the
+ports out of the catalogue. The report is also a page at
+<code>/report/&lt;session&gt;</code> and an SVG badge at
+<code>/badge/&lt;session&gt;.svg</code>.</p>
+
+<h2 id="ci">In CI</h2>
+<p><code>h3-conformance</code> does the above and exits non-zero if anything failed.
+It is a harness rather than a client: it runs a command you supply, once per test,
+so whatever <em>your</em> library connects with is what gets measured.</p>
+<pre class="ja4-rawpre"><code># drive curl
+h3-conformance
+
+# drive your own client
+h3-conformance --client 'my-client --url {{url}}'
+
+# one area, machine-readable
+h3-conformance --filter h-qpack --json</code></pre>
+<p>Exit <code>0</code> clean, <code>1</code> a test failed, <code>2</code> the suite
+was unreachable &mdash; distinct, so an outage never reads as a regression in your
+client. Inconclusive results never fail a run.</p>
+<table class="format-table"><thead><tr><th>Option</th><th>Default</th><th>What it does</th></tr></thead><tbody>
+<tr><td><code>--host</code></td><td>{host}</td><td>Which suite to run against.</td></tr>
+<tr><td><code>--client</code></td><td>curl</td><td>Command run once per test. <code>{{url}}</code> and <code>{{port}}</code> are substituted; its exit status is ignored, because a client failing a test frequently <em>should</em> exit non-zero and that is a result, not an error.</td></tr>
+<tr><td><code>--filter</code></td><td>&mdash;</td><td>Run only tests whose id contains this, e.g. <code>h-qpack</code>.</td></tr>
+<tr><td><code>--timeout</code></td><td>30s</td><td>Seconds to allow each client invocation before giving up on it.</td></tr>
+<tr><td><code>--json</code></td><td>off</td><td>Print the report as JSON instead of text.</td></tr>
+<tr><td><code>--quiet</code></td><td>off</td><td>Only print failures and the summary.</td></tr>
+</tbody></table>
+
+<h2 id="report">The report</h2>
+<p>A session collects results as you walk the ports, and is readable three ways: as
+a page at <code>/report/&lt;session&gt;</code>, as JSON at
+<code>/report/&lt;session&gt;.json</code>, and as an SVG badge at
+<code>/badge/&lt;session&gt;.svg</code>. All three are public and CORS-open, so CI
+can fetch them without a key.</p>
+<pre class="ja4-rawpre"><code>{{
+  "session": "8fbecf53c82f7c6481ecca51727c6742",
+  "catalog_size": {total},
+  "totals":   {{ "pass": 22, "fail": 0, "inconclusive": 5, "not_run": 0 }},
+  "by_class": {{ "correctness": {{ "pass": 6, "fail": 0, "inconclusive": 3 }}, ... }},
+  "results": [
+    {{ "id": "h-grease-frame", "class": "extensibility", "tier": "http3",
+      "spec": "RFC 9114 §7.2.8", "verdict": "pass",
+      "detail": "Ignored the unrecognised element and completed the follow-up request." }}
+  ]
+}}</code></pre>
+<p>Test <code>id</code>s are stable and appear in the URL, the JSON and the badge, so
+they are safe to pin a CI assertion to. Embed a badge with:</p>
+<pre class="ja4-rawpre"><code>![HTTP/3 conformance](https://{host}/badge/$SESSION.svg)</code></pre>
+<p>A badge is a picture of one run, not a live status: re-run the suite and use the
+new session to refresh it.</p>
+
+<h3>How results find their session</h3>
+<p>By default results are filed under the session started from your address, which is
+why the walk above needs nothing special. If your tests run from several machines, or
+from behind a shared address, connect with the server name
+<code>&lt;session&gt;.{host}</code> instead &mdash; the session travels in the SNI,
+and results follow it rather than the address.</p>
+<p>A session expires an hour after it was <em>created</em>, not an hour after its last
+result: activity does not extend it. Start the session at the beginning of the walk
+rather than long before, and fetch the report while the run is fresh; nothing is
+archived.</p>
+
+<h2 id="verdicts">What a verdict means</h2>
+<p><strong>The server is the judge.</strong> A library that crashes on an unknown
+frame is in no position to report on itself, so every verdict comes from what the
+server observed. Every test ends with a <strong>liveness probe</strong>: after the
+anomaly, the server expects one ordinary request on the same connection. For the
+extensibility tests that is the whole game &mdash; "ignored it" and "died on it"
+look identical on the wire until the probe arrives or does not.</p>
+<ul>
+<li><strong>Extensibility</strong> &mdash; ignore something unrecognised and carry
+on. Rejecting it is the failure; that is how protocols ossify.</li>
+<li><strong>Correctness</strong> &mdash; reject something invalid, with the error
+code the specification names. Accepting it is the bug.</li>
+<li><strong>Interoperability</strong> &mdash; the response is valid but demanding
+(Huffman-coded fields, a dynamic-table reference, trailers) and has to be decoded.</li>
+<li><strong>Resilience</strong> &mdash; recover rather than give up.</li>
+<li><strong>Discretionary</strong> &mdash; the specification permits more than one
+answer. Both pass; the report says which yours chose.</li>
+<li><strong>Inconclusive</strong> &mdash; the run never put your client in the
+situation the test is about, so it proves nothing either way and is never counted
+as a pass or a failure.</li>
+</ul>
+<p>Some tests cannot be reached by every client, and say so rather than guessing:
+0-RTT rejection needs a session ticket from an earlier connection to the same port;
+ECN reporting is required only where the ECN field is accessible, which a network
+can strip in transit; QPACK dynamic-table references need the client to have
+granted the encoder some capacity.</p>
+
+<h2 id="catalogue">The catalogue</h2>
+<p>Every test, the port it runs on, and the clause it exercises. The same data is
+available as <a href="/catalog.json">JSON</a>.</p>
+{rows}
+
+<h2 id="why">Why this exists</h2>
+<p>The <a href="https://interop.seemann.io/" rel="noopener">QUIC Interop Runner</a>
+tests implementations against each other in a lab matrix. This is the other thing:
+a public endpoint you can point a <strong>client</strong> at. Offering one requires
+a server that will misbehave on demand, which is not something a CDN customer can
+arrange &mdash; they do not own the implementation. This one runs on a forked QUIC
+and HTTP/3 stack, which is what makes the awkward cases possible.</p>
+<p>If your client scores a failure you believe is wrong,
+<a href="https://pqcrypta.com/contact/">say so</a> &mdash; a suite that accuses the
+thing it tests is worth fixing quickly.</p>
+</main>
+
+<footer class="site-footer"><div class="inner">
+  <ul>
+    <li><a href="https://pqcrypta.com/">PQ Crypta</a></li>
+    <li><a href="https://pqcrypta.com/conformance/">Documentation</a></li>
+    <li><a href="https://pqcrypta.com/conformance/matrix.php">Client matrix</a></li>
+    <li><a href="/catalog.json">Catalogue JSON</a></li>
+    <li><a href="https://pqcrypta.com/pqcproxy/">The proxy</a></li>
+    <li><a href="https://pqcrypta.com/http3-quic/">HTTP/3 scanner</a></li>
+    <li><a href="https://pqcrypta.com/ja4/">JA4 directory</a></li>
+  </ul>
+  <p class="note">Served by pqcrypta-proxy, a forked QUIC and HTTP/3 stack.
+  The forking is what makes the suite possible.</p>
+  <p class="copy">&copy; {year} Allan Riddel &mdash; PQ Crypta.
+  <a href="https://pqcrypta.com/legal/pqcryptalegal.php">Legal</a> &middot;
+  <a href="https://pqcrypta.com/legal/pqcryptaprivacy.php">Privacy</a> &middot;
+  <a href="https://pqcrypta.com/contact/">Contact</a></p>
+</div></footer>
+
+<script src="/fun/js/menu.js" defer></script>
+<script src="/fun/js/error-menu.js" defer></script>
+<script src="/fun/js/mini-countdown.js" defer></script>
+<script src="/js/bg.js" defer></script>
+<script src="/js/cursor.js" defer></script>
+</body></html>
+"#
     );
-    text(StatusCode::OK, "text/html; charset=utf-8", body)
+    let mut resp = text(StatusCode::OK, "text/html; charset=utf-8", body);
+    html_csp(&mut resp);
+    resp
+}
+
+/// Minimal HTML escaping for catalogue text going into the page.
+fn esc(v: &str) -> String {
+    v.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn new_session(conformance: &Arc<Conformance>, client_ip: std::net::IpAddr) -> Response<Body> {
@@ -204,11 +612,13 @@ fn report_for(conformance: &Arc<Conformance>, path: &str) -> Response<Body> {
             ),
         }
     } else {
-        text(
+        let mut resp = text(
             StatusCode::OK,
             "text/html; charset=utf-8",
             report::html(&built),
-        )
+        );
+        html_csp(&mut resp);
+        resp
     }
 }
 
@@ -247,9 +657,13 @@ fn not_found(json: bool) -> Response<Body> {
             "text/html; charset=utf-8",
             "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
              <title>No such session</title>\
+             <meta name=\"robots\" content=\"noindex, nofollow\">\
+             <link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\
              <link rel=\"stylesheet\" href=\"/css/conformance.css\"></head>\
-             <body class=\"conformance-report\"><h1>No such session</h1>\
-             <p>Sessions expire. <a href=\"/\">Start a new one.</a></p></body></html>\n"
+             <body class=\"conformance-report\"><div class=\"wrap\">\
+             <h1>No such session</h1>\
+             <p>Sessions expire. <a href=\"/\">Start a new one.</a></p>\
+             </div></body></html>\n"
                 .to_string(),
         )
     }

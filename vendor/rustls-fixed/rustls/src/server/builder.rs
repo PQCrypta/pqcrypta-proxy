@@ -117,6 +117,7 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
             key_log: Arc::new(NoKeyLog {}),
             enable_secret_extraction: false,
             max_early_data_size: 0,
+            refuse_early_data: false,
             send_half_rtt_data: false,
             send_tls13_tickets: 2,
             #[cfg(feature = "tls12")]

@@ -343,6 +343,18 @@ impl Endpoint {
         self.inner.state.lock().unwrap().inner.open_connections()
     }
 
+    /// How many Stateless Resets this endpoint has sent.
+    ///
+    /// A Stateless Reset is the answer to a packet bearing a connection ID the
+    /// endpoint holds no state for (RFC 9000 §10.3), so there is no connection
+    /// to observe it on and no event to receive: this counter is the only place
+    /// it is visible. Counts resets actually transmitted — the rate limit and
+    /// the anti-amplification size check both decline to send, and neither is
+    /// counted.
+    pub fn stateless_resets_sent(&self) -> u64 {
+        self.inner.state.lock().unwrap().inner.stateless_resets_sent()
+    }
+
     /// Close all of this endpoint's connections immediately and cease accepting new connections.
     ///
     /// See [`Connection::close()`] for details.

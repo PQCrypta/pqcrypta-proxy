@@ -434,6 +434,58 @@ pub struct TlsProvider {
 ///
 /// X25519 is removed and the hybrids sorted first: clients offering only an X25519
 /// key_share get a HelloRetryRequest and fall back to secp384r1.
+/// The configuration behind [`TlsProvider::build_zero_rtt_reject_config`].
+///
+/// Free-standing and taking its own resolver so the behaviour can be exercised
+/// against a throwaway certificate. A test that rebuilt this configuration
+/// itself would be testing its own copy of the logic, and the two would drift
+/// apart exactly when it mattered.
+///
+/// Offers early data and then declines it, which is the pair the conformance
+/// suite's `q-zero-rtt-reject` needs: a client only sends 0-RTT if a ticket said
+/// it could, and there is nothing to test unless that offer is then refused.
+///
+/// Two things had to be got right, and both were wrong first time.
+///
+/// **A ticketer prevents the offer.** rustls implements RFC 8446 §8.1 — 0-RTT is
+/// permitted only with *stateful* resumption, where the server keeps the session
+/// and the ticket refers to it. A ticketer means stateless resumption, and a
+/// stateless ticket can be replayed by whoever captures it, so rustls will not
+/// advertise early data beside one. It does not complain; it logs and omits the
+/// extension, and the client then simply never offers 0-RTT. Leaving `ticketer`
+/// at its default keeps rustls's server-side session store, which is the
+/// stateful half of that choice. Production makes the opposite trade for the
+/// opposite reasons: stateless resumption that survives a restart, PQC-protected
+/// tickets, and no 0-RTT at all.
+///
+/// **A HelloRetryRequest does not reject it on the connection that matters.**
+/// The first attempt here forced a retry by accepting only key-exchange groups
+/// no client key-shares speculatively, since §4.2.10 rejects early data whenever
+/// a retry is sent. It rejected nothing: clients cache the group the server
+/// chose, so the *resumed* handshake — the only one carrying 0-RTT — key-shares
+/// the right group first time and no retry happens. The refusal is now asked for
+/// directly.
+pub fn zero_rtt_reject_server_config(
+    resolver: Arc<dyn rustls::server::ResolvesServerCert>,
+) -> anyhow::Result<Arc<quinn::crypto::rustls::QuicServerConfig>> {
+    let mut config = RustlsServerConfig::builder_with_provider(Arc::new(build_pqc_provider()))
+        .with_protocol_versions(&[&TLS13])
+        .map_err(|e| anyhow::anyhow!("failed to set protocol versions: {e}"))?
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+
+    config.alpn_protocols = vec![b"h3".to_vec()];
+    // Advertised in the ticket, so a client offers early data...
+    config.max_early_data_size = u32::MAX;
+    // ...and declined every time, which is what the test is about.
+    config.refuse_early_data = true;
+
+    Ok(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(config)
+            .map_err(|e| anyhow::anyhow!("failed to build the 0-RTT QUIC config: {e}"))?,
+    ))
+}
+
 pub fn build_pqc_provider() -> rustls::crypto::CryptoProvider {
     let mut provider = rustls_post_quantum::provider();
     provider
@@ -517,6 +569,38 @@ impl TlsProvider {
     /// Get current QUIC server configuration
     pub fn get_quic_server_config(&self) -> Arc<quinn::crypto::rustls::QuicServerConfig> {
         self.server_config.load_full()
+    }
+
+    /// A QUIC server configuration that offers 0-RTT and then always refuses it.
+    ///
+    /// For the conformance suite's `q-zero-rtt-reject`, which needs a client to
+    /// genuinely attempt early data and genuinely have it rejected. Both halves
+    /// have to be arranged, and they pull in opposite directions.
+    ///
+    /// **Offering it.** A client only sends early data if a previous session
+    /// ticket said it could, and rustls issues no tickets at all without a
+    /// ticketer. The production configuration sets `max_early_data_size` to zero
+    /// unless 0-RTT is explicitly enabled — a sound default, and one that would
+    /// make this test permanently unexercisable. Here it is opened up.
+    ///
+    /// **Refusing it.** Not by rejecting the early data after the fact, but by
+    /// making acceptance impossible: the accepted key-exchange groups are cut
+    /// down to ones no client puts in its speculative first key share, so the
+    /// server must answer with a HelloRetryRequest. RFC 8446 §4.2.10 has any
+    /// 0-RTT rejected whenever a HelloRetryRequest is sent, so the rejection is
+    /// structural rather than conditional — it does not depend on getting a
+    /// decision right at the moment the early data arrives.
+    ///
+    /// The groups left in are ones every TLS 1.3 implementation supports and
+    /// almost none key-shares first, so the handshake always completes, one
+    /// round trip later than it would have.
+    ///
+    /// Not for production traffic: it costs every visitor an extra round trip
+    /// and permits early data on a proxy that does not deduplicate replays.
+    pub fn build_zero_rtt_reject_config(
+        &self,
+    ) -> anyhow::Result<Arc<quinn::crypto::rustls::QuicServerConfig>> {
+        zero_rtt_reject_server_config(self.resolver.clone())
     }
 
     /// Check if PQC is available and enabled

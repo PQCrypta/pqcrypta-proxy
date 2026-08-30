@@ -22,6 +22,7 @@ use crate::{
     TransportError, TransportErrorCode, VarInt,
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
+    coding::BufMutExt,
     config::{ServerConfig, TransportConfig},
     congestion::Controller,
     connection::{
@@ -91,7 +92,7 @@ pub(crate) use spaces::SpaceKind;
 use spaces::{OpenStatus, PacketSpace, SendableFrames, SentPacket, ThinRetransmits};
 
 mod stats;
-pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats};
+pub use stats::{ConnectionStats, EcnFeedback, FrameStats, PathStats, UdpStats};
 
 mod streams;
 #[cfg(fuzzing)]
@@ -160,6 +161,11 @@ pub struct Connection {
     endpoint_config: Arc<EndpointConfig>,
     config: Arc<TransportConfig>,
     rng: StdRng,
+    /// Whether [`TransportConfig::send_unknown_frame_type`]'s frame has gone out.
+    ///
+    /// One per connection: the peer is required to close on the first one it
+    /// sees, so a second would have nowhere to arrive.
+    sent_unknown_frame: bool,
     /// Consolidated cryptographic state
     crypto_state: CryptoState,
     /// The CID we initially chose, for use during the handshake
@@ -422,6 +428,7 @@ impl Connection {
             config,
             remote_cids: FxHashMap::from_iter([(PathId::ZERO, CidQueue::new(remote_cid))]),
             rng,
+            sent_unknown_frame: false,
             path_stats: Default::default(),
             partial_stats: ConnectionStats::default(),
             version,
@@ -2656,6 +2663,18 @@ impl Connection {
         stats.rtt = path.data.rtt.get();
         stats.cwnd = path.data.congestion.window();
         stats.current_mtu = path.data.mtud.current_mtu();
+        stats.sending_ecn = path.data.sending_ecn;
+        // The 1-RTT space carries the ECN feedback that matters to an
+        // application: the handshake spaces are discarded long before anyone
+        // reads these.
+        if let Some(space) = self.spaces[SpaceId::Data].number_spaces.get(&path_id) {
+            let ecn = space.ecn_feedback;
+            stats.ecn_feedback = EcnFeedback {
+                ect0: ecn.ect0,
+                ect1: ecn.ect1,
+                ce: ecn.ce,
+            };
+        }
         Some(stats)
     }
 
@@ -6535,6 +6554,29 @@ impl Connection {
         {
             self.streams
                 .write_stream_frames(builder, self.config.send_fairness, stats);
+        }
+
+        // A frame of unknown type, when one has been configured.
+        //
+        // Written last, after every well-formed frame, and only in a 1-RTT
+        // packet. An unknown frame type carries no length, so nothing after it
+        // can be parsed — putting it last means everything ahead of it is
+        // well-formed and the unknown type is unambiguously what the peer
+        // rejected. RFC 9000 §12.4 requires that rejection to be a connection
+        // error of type FRAME_ENCODING_ERROR.
+        if let Some(ty) = self.config.send_unknown_frame_type
+            && !self.sent_unknown_frame
+            && space_id == SpaceId::Data
+            && !is_0rtt
+            && !scheduling_info.is_abandoned
+            && scheduling_info.may_send_data
+            && builder.frame_space_remaining() >= 8
+        {
+            self.sent_unknown_frame = true;
+            builder.buf.write_var(ty);
+            // Every frame but ACK, PADDING and CONNECTION_CLOSE is
+            // ack-eliciting, and an unknown one is not one of those three.
+            builder.ack_eliciting = true;
         }
     }
 

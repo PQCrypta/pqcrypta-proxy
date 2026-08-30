@@ -50,6 +50,14 @@ pub struct Endpoint {
     allow_mtud: bool,
     /// Time at which a stateless reset was most recently sent
     last_stateless_reset: Option<Instant>,
+    /// How many Stateless Resets this endpoint has sent.
+    ///
+    /// Sending one is otherwise entirely invisible from outside: it is not a
+    /// connection event, because by definition there is no connection left to
+    /// attach it to. A caller that needs to know whether an unknown connection
+    /// ID was actually answered — a conformance suite testing RFC 9000 §10.3
+    /// behaviour, say — has nowhere else to read it from.
+    stateless_resets_sent: u64,
     /// Buffered Initial and 0-RTT messages for pending incoming connections
     incoming_buffers: Slab<IncomingBuffer>,
     all_incoming_buffers_total_bytes: u64,
@@ -77,6 +85,7 @@ impl Endpoint {
             server_config,
             allow_mtud,
             last_stateless_reset: None,
+            stateless_resets_sent: 0,
             incoming_buffers: Slab::new(),
             all_incoming_buffers_total_bytes: 0,
         }
@@ -270,6 +279,15 @@ impl Endpoint {
     }
 
     /// Builds a stateless reset packet to respond with
+    /// How many Stateless Resets this endpoint has sent.
+    ///
+    /// Counts only resets actually transmitted: the rate limit and the
+    /// anti-amplification size check both decline to send, and neither is
+    /// counted.
+    pub fn stateless_resets_sent(&self) -> u64 {
+        self.stateless_resets_sent
+    }
+
     fn stateless_reset(
         &mut self,
         now: Instant,
@@ -304,6 +322,7 @@ impl Endpoint {
 
         debug!(%dst_cid, %network_path.remote, "sending stateless reset");
         self.last_stateless_reset = Some(now);
+        self.stateless_resets_sent += 1;
         // Resets with at least this much padding can't possibly be distinguished from real packets
         const IDEAL_MIN_PADDING_LEN: usize = MIN_PADDING_LEN + MAX_CID_SIZE;
         let padding_len = if max_padding_len <= IDEAL_MIN_PADDING_LEN {

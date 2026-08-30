@@ -251,8 +251,18 @@ pub fn html(report: &Report) -> String {
         "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <title>Conformance report {}</title>\
-         <link rel=\"stylesheet\" href=\"/css/conformance.css\"></head>\
-         <body class=\"conformance-report\">{}</body></html>\n",
+         <meta name=\"robots\" content=\"noindex, nofollow\">\
+         <link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\
+         <link rel=\"stylesheet\" href=\"/css/conformance.css\">\
+         <link rel=\"stylesheet\" href=\"/css/bg.css\">\
+         <link rel=\"stylesheet\" href=\"/css/cursor.css\"></head>\
+         <body class=\"conformance-report\">\
+         <div id=\"cf-bg-container\" class=\"cf-bg-container\" aria-hidden=\"true\">\
+         <canvas id=\"cf-bg-canvas\" class=\"cf-bg-canvas\"></canvas></div>\
+         <div class=\"wrap\">{}</div>\
+         <script src=\"/js/bg.js\" defer></script>\
+         <script src=\"/js/cursor.js\" defer></script>\
+         </body></html>\n",
         esc(&report.session),
         body
     )

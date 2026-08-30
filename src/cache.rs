@@ -401,10 +401,42 @@ impl ResponseCache {
             return;
         }
 
-        // Vary: * means the response is not cacheable
-        if vary.as_deref().map(|v| v.trim() == "*").unwrap_or(false) {
-            trace!("Not caching {}: Vary: *", key);
-            return;
+        // `Vary` names the request headers the body depends on.
+        //
+        // The cache key is METHOD|host|path and nothing else, so a stored entry
+        // cannot tell apart two requests that differ only by a header. Anything
+        // the response varies on that the key does not cover therefore means one
+        // entry would answer requests that are supposed to get different bodies:
+        //
+        //   - `Vary: Cookie` or `Vary: Authorization` — one user's personalised
+        //     response handed to another. A cross-user leak, not a staleness bug.
+        //   - `Vary: Origin` — a stored `Access-Control-Allow-Origin` naming one
+        //     origin, returned to a request from a different one, telling that
+        //     origin's browser it may read the body.
+        //   - `Vary: Accept-Language`, `Accept`, `User-Agent` — simply the wrong
+        //     variant.
+        //   - `Vary: *` — varies on things not expressible as headers at all.
+        //
+        // `Accept-Encoding` is the one safe exception, and only because of where
+        // this cache sits: it is the innermost layer, inside compression, so it
+        // only ever stores identity bodies (backend-compressed responses are
+        // already refused above). The stored entry is correct for every client,
+        // and the outer layer applies the client's encoding to hits and misses
+        // alike. Move this cache outside the compression layer and that stops
+        // being true.
+        if let Some(varies_on) = vary.as_deref() {
+            let unsupported: Vec<&str> = varies_on
+                .split(',')
+                .map(str::trim)
+                .filter(|h| !h.is_empty() && !h.eq_ignore_ascii_case("accept-encoding"))
+                .collect();
+            if !unsupported.is_empty() {
+                trace!(
+                    "Not caching {key}: Vary on {unsupported:?}, which the cache key \
+                     cannot distinguish"
+                );
+                return;
+            }
         }
 
         // Determine TTL from Cache-Control
@@ -820,6 +852,88 @@ pub async fn cache_middleware(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod vary_tests {
+    use super::*;
+
+    fn cache() -> ResponseCache {
+        ResponseCache::new(ResponseCacheConfig {
+            enabled: true,
+            ..Default::default()
+        })
+    }
+
+    /// Store one response carrying `vary`, and report whether it was kept.
+    fn cached_with_vary(vary: &str) -> bool {
+        let c = cache();
+        let key = ResponseCache::build_key("GET", "pqcrypta.com", "/thing");
+        let mut headers = vec![("cache-control".to_string(), "max-age=60".to_string())];
+        if !vary.is_empty() {
+            headers.push(("vary".to_string(), vary.to_string()));
+        }
+        c.put(&key, 200, &headers, b"body".to_vec());
+        c.stats().0 > 0
+    }
+
+    #[test]
+    fn a_response_that_varies_on_nothing_is_cached() {
+        assert!(cached_with_vary(""), "the ordinary case must still cache");
+    }
+
+    #[test]
+    fn accept_encoding_is_the_one_safe_variance() {
+        // This cache sits inside the compression layer and stores only identity
+        // bodies, so one entry is correct for every client whatever encoding
+        // they asked for. Refusing these would give up most of the cache for no
+        // safety gain.
+        assert!(cached_with_vary("Accept-Encoding"));
+        assert!(cached_with_vary("accept-encoding"));
+    }
+
+    #[test]
+    fn varying_on_a_user_identifying_header_is_never_cached() {
+        // The failure this prevents is one user's personalised response being
+        // handed to another, which is a leak rather than a staleness bug — the
+        // key is METHOD|host|path and cannot tell the two requests apart.
+        assert!(!cached_with_vary("Cookie"));
+        assert!(!cached_with_vary("Authorization"));
+    }
+
+    #[test]
+    fn varying_on_origin_is_never_cached() {
+        // Routes reflecting an origin from an allowlist emit `Vary: Origin`.
+        // Caching one would return an `Access-Control-Allow-Origin` naming one
+        // origin to a request from another.
+        assert!(!cached_with_vary("Origin"));
+    }
+
+    #[test]
+    fn varying_on_a_content_negotiation_header_is_never_cached() {
+        assert!(!cached_with_vary("Accept-Language"));
+        assert!(!cached_with_vary("Accept"));
+        assert!(!cached_with_vary("User-Agent"));
+    }
+
+    #[test]
+    fn vary_star_is_never_cached() {
+        assert!(!cached_with_vary("*"));
+    }
+
+    #[test]
+    fn a_list_is_refused_when_any_member_is_unsupported() {
+        // The safe member must not excuse the unsafe one.
+        assert!(!cached_with_vary("Accept-Encoding, Cookie"));
+        assert!(!cached_with_vary("Cookie, Accept-Encoding"));
+        assert!(cached_with_vary("Accept-Encoding, accept-encoding"));
+    }
+
+    #[test]
+    fn whitespace_and_case_do_not_smuggle_a_header_past_the_check() {
+        assert!(!cached_with_vary("  cOoKiE  "));
+        assert!(cached_with_vary("  Accept-Encoding  "));
     }
 }
 

@@ -1,0 +1,54 @@
+/* Background canvas for the conformance page.
+ *
+ * The ground and its two washes are painted here rather than on <body>, so the
+ * canvas composites over them instead of being hidden behind the body's own
+ * background. Content sits above on z-index 2.
+ */
+
+.cf-bg-container {
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    background:
+        radial-gradient(ellipse at 8% 0%, rgba(70, 181, 203, 0.13), transparent 58%),
+        radial-gradient(ellipse at 94% 96%, rgba(240, 134, 141, 0.06), transparent 55%),
+        var(--cf-ground, #0b1016);
+}
+
+.cf-bg-canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+}
+
+/* Motion toggle.
+ *
+ * A control rather than a `prefers-reduced-motion` gate: the animation is the
+ * page's only illustration of what the suite does, and silently removing it for
+ * a large share of visitors leaves them a plain background and no idea anything
+ * was meant to be there. Offer the off switch instead, and remember the choice.
+ */
+.cf-motion-toggle {
+    position: fixed;
+    right: 1rem;
+    bottom: 1rem;
+    z-index: 5;
+    padding: 0.4rem 0.75rem;
+    font-family: var(--cf-mono, ui-monospace, monospace);
+    font-size: 0.7rem;
+    letter-spacing: 0.06em;
+    color: var(--cf-muted, #7f8f9d);
+    background: rgba(19, 27, 35, 0.92);
+    border: 1px solid var(--cf-border, #223039);
+    border-radius: 999px;
+    cursor: pointer;
+    transition: color 0.2s ease, border-color 0.2s ease;
+}
+
+.cf-motion-toggle:hover,
+.cf-motion-toggle:focus-visible {
+    color: var(--cf-accent, #46b5cb);
+    border-color: var(--cf-accent, #46b5cb);
+    outline: none;
+}

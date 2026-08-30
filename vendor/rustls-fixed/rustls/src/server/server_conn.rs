@@ -374,6 +374,31 @@ pub struct ServerConfig {
     /// expansion in the latter case.
     pub max_early_data_size: u32,
 
+    /// Refuse early data, while still offering it.
+    ///
+    /// A server always *may* decline 0-RTT: RFC 8446 §4.2.10 leaves acceptance
+    /// to the server, and §4.6.2 of RFC 9001 spells out what a QUIC client must
+    /// then do — reset the state of every stream, including application state
+    /// bound to them, because a rejected 0-RTT means every characteristic the
+    /// client assumed about the connection may have been wrong.
+    ///
+    /// Setting this takes the ordinary rejection path: the session is still
+    /// resumed, the ticket still advertises early data so a client still offers
+    /// it, and the offer is simply not accepted. It is not a way to disable
+    /// early data — for that, leave [`Self::max_early_data_size`] at zero, and
+    /// no client will ever send any.
+    ///
+    /// The distinction matters when the client behaviour on rejection is the
+    /// thing under test. Every other way of arranging a rejection changes
+    /// something else as well: a HelloRetryRequest rejects early data (§4.2.10)
+    /// but only on a handshake where the client's key share was unexpected,
+    /// which is precisely not the resumed handshake where 0-RTT happens, since
+    /// clients cache the group the server chose last time. Changing the ALPN or
+    /// the cipher suite also rejects it, and also changes the connection.
+    ///
+    /// Defaults to `false`.
+    pub refuse_early_data: bool,
+
     /// Whether the server should send "0.5RTT" data.  This means the server
     /// sends data after its first flight of handshake messages, without
     /// waiting for the client to complete the handshake.

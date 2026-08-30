@@ -1,0 +1,565 @@
+<div class="quantum-menu-wrapper">
+<!-- Quantum Control Panel Button -->
+<button class="quantum-control-panel-btn" id="quantumControlBtn" aria-label="Open Quantum Control Panel">
+    <span class="control-text" id="currentPageName">Navigation</span>
+    <span class="control-arrow">▼</span>
+</button>
+
+<!-- Quantum Control Panel Overlay -->
+<div class="quantum-control-overlay" id="quantumControlOverlay"></div>
+
+<!-- Quantum Control Panel -->
+<div class="quantum-control-panel" id="quantumControlPanel">
+    <div class="control-panel-header">
+        <div class="quantum-shield-container">
+            <div class="key-icon">
+                <div class="cube-3d">
+                    <div class="cube-face cube-front"></div>
+                    <div class="cube-face cube-back"></div>
+                    <div class="cube-face cube-right"></div>
+                    <div class="cube-face cube-left"></div>
+                    <div class="cube-face cube-top"></div>
+                    <div class="cube-face cube-bottom"></div>
+                </div>
+            </div>
+        </div>
+        <h2 class="panel-title">PQ CRYPTA PLATFORM</h2>
+        <button class="panel-close" id="panelCloseBtn" aria-label="Close panel">×</button>
+    </div>
+
+    <div class="control-panel-content">
+        <!-- Main Navigation -->
+        <section class="control-section">
+            <h3 class="section-title">🏠 Main</h3>
+            <div class="nav-grid">
+                <a href="https://pqcrypta.com/" class="nav-link">
+                    <span class="nav-icon">🏠</span>
+                    <span class="nav-label">Home</span>
+                </a>
+                <a href="https://pqcrypta.com/why/index.php#call-to-action" class="nav-link quantum-countdown-widget quantum-3d-card-wide tooltip-enabled" data-tooltip="Quantum Harvest: When will quantum computers decrypt today's encrypted data?">
+                    <div class="widget-header">
+                        <span class="widget-icon">⏰</span>
+                        <span class="widget-title">Q-Day Countdown</span>
+                    </div>
+                    <div class="mini-countdown-display">
+                        <div class="mini-countdown-unit">
+                            <div class="mini-countdown-value" id="mini-qc-years">3</div>
+                            <div class="mini-countdown-label">Y</div>
+                        </div>
+                        <div class="mini-countdown-unit">
+                            <div class="mini-countdown-value" id="mini-qc-days">124</div>
+                            <div class="mini-countdown-label">D</div>
+                        </div>
+                        <div class="mini-countdown-unit">
+                            <div class="mini-countdown-value" id="mini-qc-hours">09</div>
+                            <div class="mini-countdown-label">H</div>
+                        </div>
+                        <div class="mini-countdown-unit">
+                            <div class="mini-countdown-value" id="mini-qc-minutes">42</div>
+                            <div class="mini-countdown-label">M</div>
+                        </div>
+                        <div class="mini-countdown-unit">
+                            <div class="mini-countdown-value" id="mini-qc-seconds">49</div>
+                            <div class="mini-countdown-label">S</div>
+                        </div>
+                        <div class="mini-countdown-unit">
+                            <div class="mini-countdown-value" id="mini-qc-ms">397</div>
+                            <div class="mini-countdown-label">MS</div>
+                        </div>
+                    </div>
+                    <div class="widget-datetime" id="widget-datetime">
+                        <span id="widget-date"></span> <span id="widget-time"></span>
+                    </div>
+                </a>
+            </div>
+        </section>
+
+        <!-- Interactives -->
+        <section class="control-section">
+            <h3 class="section-title">🧪 Interactive Apps</h3>
+            <div class="nav-grid">
+                <a href="https://pqcrypta.com/handshake/" class="nav-link" title="See your own TLS handshake">
+                    <span class="nav-icon">🪞</span>
+                    <span class="nav-label">Handshake Mirror</span>
+                </a>
+                <a href="https://pqcrypta.com/ja4/" class="nav-link" title="JA4/JA3 Fingerprint Directory">
+                    <span class="nav-icon">🫆</span>
+                    <span class="nav-label">JA4 Directory</span>
+                </a>
+                <a href="https://pqcrypta.com/cbom/" class="nav-link" title="CycloneDX 1.6 CBOM Validator &amp; Scorer">
+                    <span class="nav-icon">📋</span>
+                    <span class="nav-label">CBOM Validator</span>
+                </a>
+                <a href="https://pqcrypta.com/share/" class="nav-link">
+                    <span class="nav-icon">🔐</span>
+                    <span class="nav-label">Encrypt &amp; Share</span>
+                </a>
+                <a href="https://pqcrypta.com/encryption/" class="nav-link">
+                    <span class="nav-icon">🔒</span>
+                    <span class="nav-label">Encryption</span>
+                </a>
+                <a href="https://pqcrypta.com/compression/" class="nav-link">
+                    <span class="nav-icon">🗜️</span>
+                    <span class="nav-label">Compression</span>
+                </a>
+                <a href="https://pqcrypta.com/pdf/" class="nav-link">
+                    <span class="nav-icon">📄</span>
+                    <span class="nav-label">PDF Tools</span>
+                </a>
+                <a href="https://pqcrypta.com/pqcchallengemode/" class="nav-link">
+                    <span class="nav-icon">🔐</span>
+                    <span class="nav-label">Challenge Mode</span>
+                </a>
+                <a href="https://pqcrypta.com/regex/" class="nav-link">
+                    <span class="nav-icon">🔍</span>
+                    <span class="nav-label">Regex Designer</span>
+                </a>
+                <a href="https://pqcrypta.com/pqc-ready/" class="nav-link">
+                    <span class="nav-icon">🔬</span>
+                    <span class="nav-label">PQC Scanner</span>
+                </a>
+                <a href="https://pqcrypta.com/http3-quic/" class="nav-link">
+                    <span class="nav-icon">⚡</span>
+                    <span class="nav-label">HTTP/3 Analyzer</span>
+                </a>
+                <a href="https://pqcrypta.com/streaming/" class="nav-link">
+                    <span class="nav-icon">🚀</span>
+                    <span class="nav-label">WebTransport Test</span>
+                </a>
+                <a href="https://pqcrypta.com/speedtest/" class="nav-link" title="QUIC-Native Speed + Latency Test">
+                    <span class="nav-icon">🌐</span>
+                    <span class="nav-label">Speed Test</span>
+                </a>
+                <a href="https://pqcrypta.com/wt-telemetry/" class="nav-link" title="WebTransport Telemetry Wall — Live QUIC Stream Isolation">
+                    <span class="nav-icon">📡</span>
+                    <span class="nav-label">Telemetry Wall</span>
+                </a>
+                <a href="https://pqcrypta.com/entropy/" class="nav-link">
+                    <span class="nav-icon">🎲</span>
+                    <span class="nav-label">Entropy</span>
+                </a>
+            </div>
+        </section>
+
+        <!-- News -->
+        <section class="control-section">
+            <h3 class="section-title">📰 News</h3>
+            <div class="nav-grid">
+                <a href="https://pqcrypta.com/news/" class="nav-link">
+                    <span class="nav-icon">📰</span>
+                    <span class="nav-label">News</span>
+                </a>
+                <!-- news widget omitted on this host: it streams from api.pqcrypta.com and proxies images through a relative PHP endpoint, neither of which exists here -->
+            </div>
+        </section>
+
+        <!-- Documents -->
+        <section class="control-section">
+            <h3 class="section-title expandable" data-section="documents">
+                <span>📚 Documents</span>
+                <span class="expand-icon">▼</span>
+            </h3>
+            <div class="nav-grid collapsible collapsed" id="documents-section">
+                <a href="https://pqcrypta.com/conformance/" class="nav-link" title="HTTP/3 &amp; QUIC client conformance suite">
+                    <span class="nav-icon">🧪</span>
+                    <span class="nav-label">H3 Conformance</span>
+                </a>
+                <a href="https://pqcrypta.com/conformance/matrix.php" class="nav-link" title="What each HTTP/3 client does when the server misbehaves">
+                    <span class="nav-icon">📊</span>
+                    <span class="nav-label">Client Matrix</span>
+                </a>
+                <a href="https://pqcrypta.com/masque/" class="nav-link active" title="Public MASQUE CONNECT-UDP Relay">
+                    <span class="nav-icon">🕳️</span>
+                    <span class="nav-label">MASQUE Relay</span>
+                </a>
+                <a href="https://pqcrypta.com/pqc-tickets/" class="nav-link" title="ML-KEM-1024 protected TLS session tickets">
+                    <span class="nav-icon">🎟️</span>
+                    <span class="nav-label">PQC Tickets</span>
+                </a>
+                <a href="https://pqcrypta.com/why/" class="nav-link">
+                    <span class="nav-icon">❓</span>
+                    <span class="nav-label">Why PQC?</span>
+                </a>
+                <a href="https://pqcrypta.com/what/" class="nav-link" title="What?">
+                    <span class="nav-icon">📋</span>
+                    <span class="nav-label">What?</span>
+                </a>
+                <a href="https://pqcrypta.com/pqcbv1/" class="nav-link" title="PQC Binary Format v1.0 RFC">
+                    <span class="nav-icon">📄</span>
+                    <span class="nav-label">PQC Binary WP</span>
+                </a>
+                <a href="https://pqcrypta.com/circuit-breaker/" class="nav-link" title="HMAC-Protected Circuit Breaker">
+                    <span class="nav-icon">⚡</span>
+                    <span class="nav-label">Circuit Breaker</span>
+                </a>
+                <a href="https://pqcrypta.com/quic-whitepaper/" class="nav-link" title="QUIC vs TCP Real-World Analysis Whitepaper">
+                    <span class="nav-icon">🌐</span>
+                    <span class="nav-label">QUIC vs TCP WP</span>
+                </a>
+                <a href="https://pqcrypta.com/multipath-whitepaper/" class="nav-link" title="Full Multipath QUIC — Client &amp; Server Implementation Whitepaper">
+                    <span class="nav-icon">🛣️</span>
+                    <span class="nav-label">Multipath QUIC WP</span>
+                </a>
+                <a href="https://pqcrypta.com/http3-whitepaper/" class="nav-link" title="Anatomy of a QUIC Connection — HTTP/3 Scanner Whitepaper">
+                    <span class="nav-icon">🔬</span>
+                    <span class="nav-label">QUIC Anatomy WP</span>
+                </a>
+                <a href="https://pqcrypta.com/http-smuggling/" class="nav-link" title="HTTP Request Smuggling Across Five Protocols">
+                    <span class="nav-icon">🕳️</span>
+                    <span class="nav-label">HTTP Smuggling</span>
+                </a>
+                <a href="https://pqcrypta.com/quic-hardening/" class="nav-link" title="QUIC / HTTP3 / WebTransport Vulnerabilities &amp; Mitigations">
+                    <span class="nav-icon">🛡️</span>
+                    <span class="nav-label">QUIC Hardening</span>
+                </a>
+                <a href="https://pqcrypta.com/traffic-analysis/" class="nav-link" title="Traffic &amp; Protocol Analysis of a Live PQC QUIC / HTTP3 Edge">
+                    <span class="nav-icon">📡</span>
+                    <span class="nav-label">Traffic Analysis</span>
+                </a>
+                <a href="https://pqcrypta.com/share-whitepaper/" class="nav-link" title="Encrypt &amp; Share — Dual-KEM Zero-Knowledge Architecture Whitepaper">
+                    <span class="nav-icon">🔐</span>
+                    <span class="nav-label">Share WP</span>
+                </a>
+                <a href="https://pqcrypta.com/benchmark/" class="nav-link" title="Live PQC Benchmark — Classical vs ML-KEM-1024 vs HQC-256">
+                    <span class="nav-icon">📊</span>
+                    <span class="nav-label">PQC Benchmark</span>
+                </a>
+                <a href="https://pqcrypta.com/benchmark-analysis/" class="nav-link" title="What 35 Post-Quantum Algorithms Actually Cost — measured analysis">
+                    <span class="nav-icon">📈</span>
+                    <span class="nav-label">Benchmark Stats</span>
+                </a>
+                <a href="https://pqcrypta.com/security-systems/" class="nav-link">
+                    <span class="nav-icon">🛡️</span>
+                    <span class="nav-label">Security</span>
+                </a>
+                <a href="https://pqcrypta.com/key-vault/" class="nav-link">
+                    <span class="nav-icon">🔐</span>
+                    <span class="nav-label">KeyVault</span>
+                </a>
+                <a href="https://pqcrypta.com/bot-threat-remediation/" class="nav-link">
+                    <span class="nav-icon">🤖</span>
+                    <span class="nav-label">Bot Remediation</span>
+                </a>
+                <a href="https://pqcrypta.com/music/music-description.php" class="nav-link" title="Quantum Chronicles">
+                    <span class="nav-icon">📖</span>
+                    <span class="nav-label">Quantum Chroni..</span>
+                </a>
+                <a href="https://pqcrypta.com/discovery/" class="nav-link" title="Discovery Agent Documentation">
+                    <span class="nav-icon">🔍</span>
+                    <span class="nav-label">Discovery Agent</span>
+                </a>
+                <a href="https://pqcrypta.com/discovery/offline/" class="nav-link" title="Air-Gap / Offline Mode">
+                    <span class="nav-icon">📴</span>
+                    <span class="nav-label">Air-Gap Mode</span>
+                </a>
+                <a href="https://pqcrypta.com/discovery/guide.php" class="nav-link" title="Discovery Agent Deployment Guide">
+                    <span class="nav-icon">📘</span>
+                    <span class="nav-label">Deployment Guide</span>
+                </a>
+                <a href="https://pqcrypta.com/pqc/" class="nav-link" title="Post-Quantum X.509 Certificate Chain">
+                    <span class="nav-icon">📜</span>
+                    <span class="nav-label">PQC Cert Chain</span>
+                </a>
+            </div>
+        </section>
+
+        <!-- PQ Crypta Proxy -->
+        <section class="control-section">
+            <h3 class="section-title">🛡️ PQ Crypta Proxy</h3>
+            <div class="nav-grid">
+                <a href="https://pqcrypta.com/pqcproxy/" class="nav-link" title="PQCrypta Proxy Documentation">
+                    <span class="nav-icon">🌐</span>
+                    <span class="nav-label">Proxy Whitepaper</span>
+                </a>
+                <a href="https://pqcrypta.com/proxy-plane/" class="nav-link" title="PQCrypta Proxy Control Plane">
+                    <span class="nav-icon">🖥️</span>
+                    <span class="nav-label">Control Plane</span>
+                </a>
+                <a href="https://github.com/PQCrypta/pqcrypta-proxy" class="nav-link" target="_blank" rel="noopener noreferrer" title="PQCrypta Proxy on GitHub">
+                    <span class="nav-icon">🐙</span>
+                    <span class="nav-label">GitHub</span>
+                </a>
+                <a href="https://pqcrypta.com/pentests/" class="nav-link" title="Red Team Pentest Suite">
+                    <span class="nav-icon">🎯</span>
+                    <span class="nav-label">Red Team Tests</span>
+                </a>
+            </div>
+        </section>
+
+        <!-- Lab Dropdown — demos, animations and the music project. Kept crawlable
+             (these pages out-earn the product pages organically) but moved below the
+             commercial groups so the panel reads as a product, not a playground. -->
+        <section class="control-section">
+            <h3 class="section-title expandable" data-section="animations">
+                <span>🎓 Lab &amp; Educational Animations</span>
+                <span class="expand-icon">▼</span>
+            </h3>
+            <div class="nav-grid collapsible collapsed" id="animations-section">
+                <a href="https://pqcrypta.com/fun/" class="nav-link">
+                    <span class="nav-icon">✨</span>
+                    <span class="nav-label">Quantum Sandbox</span>
+                </a>
+                <a href="https://pqcrypta.com/music/" class="nav-link">
+                    <span class="nav-icon">🎵</span>
+                    <span class="nav-label">Music</span>
+                </a>
+                <a href="https://pqcrypta.com/fun/cosmicfluidsimulation/" class="nav-link">
+                    <span class="nav-icon">🌌</span>
+                    <span class="nav-label">Cosmic Fluid</span>
+                </a>
+                <a href="https://pqcrypta.com/fun/dynamicquantumgrid/" class="nav-link">
+                    <span class="nav-icon">⚡</span>
+                    <span class="nav-label">Quantum Grid</span>
+                </a>
+                <a href="https://pqcrypta.com/fun/fractaltree/" class="nav-link">
+                    <span class="nav-icon">🌳</span>
+                    <span class="nav-label">Fractal Tree</span>
+                </a>
+                <a href="https://pqcrypta.com/fun/neuralnetwork/" class="nav-link">
+                    <span class="nav-icon">🤖</span>
+                    <span class="nav-label">Neural Network</span>
+                </a>
+                <a href="https://pqcrypta.com/fun/neuralchaosgrid/" class="nav-link">
+                    <span class="nav-icon">🧠</span>
+                    <span class="nav-label">Neural Chaos</span>
+                </a>
+                <a href="https://pqcrypta.com/fun/particlesystem/" class="nav-link">
+                    <span class="nav-icon">✨</span>
+                    <span class="nav-label">Particle System</span>
+                </a>
+                <a href="https://pqcrypta.com/fun/cubeanimation/" class="nav-link" title="Cube Animation">
+                    <span class="nav-icon">🧊</span>
+                    <span class="nav-label">Cube Animation</span>
+                </a>
+                <a href="https://pqcrypta.com/fun/fluidanimation/" class="nav-link" title="Fluid Animation">
+                    <span class="nav-icon">🌊</span>
+                    <span class="nav-label">Fluid Animation</span>
+                </a>
+                <a href="https://pqcrypta.com/fun/matrixrainanimation/" class="nav-link" title="Matrix Rain">
+                    <span class="nav-icon">🌧️</span>
+                    <span class="nav-label">Matrix Rain</span>
+                </a>
+                <a href="https://pqcrypta.com/fun/backgrounds/" class="nav-link" title="Animated Backgrounds">
+                    <span class="nav-icon">🖼️</span>
+                    <span class="nav-label">Backgrounds</span>
+                </a>
+                <a href="https://pqcrypta.com/mice/" class="nav-link" title="Interactive Mouse Pointers">
+                    <span class="nav-icon">🖱️</span>
+                    <span class="nav-label">Mice</span>
+                </a>
+                <a href="https://pqcrypta.com/quantum_morphic_field_explorer/" class="nav-link">
+                    <span class="nav-icon">⚛️</span>
+                    <span class="nav-label">Quantum Field</span>
+                </a>
+            </div>
+        </section>
+
+        <!-- Account -->
+        <section class="control-section">
+            <h3 class="section-title">👤 Account</h3>
+            <div class="nav-grid">
+                <a href="https://pqcrypta.com/signup.php" class="nav-link">
+                    <span class="nav-icon">📝</span>
+                    <span class="nav-label">Sign Up</span>
+                </a>
+                <a href="https://pqcrypta.com/login.php" class="nav-link">
+                    <span class="nav-icon">🔑</span>
+                    <span class="nav-label">Login</span>
+                </a>
+                <a href="https://pqcrypta.com/dashboard/" class="nav-link disabled">
+                    <span class="nav-icon">📊</span>
+                    <span class="nav-label">Dashboard</span>
+                </a>
+                <a href="https://pqcrypta.com/health/" class="nav-link">
+                    <span class="nav-icon">🩺</span>
+                    <span class="nav-label">Health Monitor</span>
+                </a>
+                <a href="https://pqcrypta.com/monitor/" class="nav-link">
+                    <span class="nav-icon">📡</span>
+                    <span class="nav-label">System Telemetry</span>
+                </a>
+                <a href="https://pqcrypta.com/auth/logout.php" class="nav-link logout-link disabled" id="logoutLink">
+                    <span class="nav-icon">🚪</span>
+                    <span class="nav-label">Logout</span>
+                </a>
+            </div>
+        </section>
+
+        <!-- Company & Legal -->
+        <section class="control-section">
+            <h3 class="section-title expandable" data-section="legal">
+                <span>🧬 Company & Legal</span>
+                <span class="expand-icon">▼</span>
+            </h3>
+            <div class="nav-grid collapsible collapsed" id="legal-section">
+                <a href="https://pqcrypta.com/contact/" class="nav-link">
+                    <span class="nav-icon">📧</span>
+                    <span class="nav-label">Contact</span>
+                </a>
+                <a href="https://pqcrypta.com/pr/" class="nav-link">
+                    <span class="nav-icon">📰</span>
+                    <span class="nav-label">Press Releases</span>
+                </a>
+                <a href="https://pqcrypta.com/legal/pqcryptaprivacy.php" class="nav-link">
+                    <span class="nav-icon">🔐</span>
+                    <span class="nav-label">Privacy</span>
+                </a>
+                <a href="https://pqcrypta.com/legal/pqcryptalegal.php" class="nav-link">
+                    <span class="nav-icon">⚖️</span>
+                    <span class="nav-label">Legal</span>
+                </a>
+            </div>
+        </section>
+
+        <!-- Utilities Section -->
+        <section class="control-section">
+            <h3 class="section-title expandable" data-section="utilities">
+                <span>🛠️ Utilities</span>
+                <span class="expand-icon">▼</span>
+            </h3>
+            <div class="action-grid-row collapsible collapsed" id="utilities-section">
+                <div class="action-item">
+                    <div class="theme-card">
+                        <label class="theme-card-label">Menu Theme</label>
+                        <select id="menuThemeSelector" class="theme-selector-compact">
+                            <option value="electric-blue">⚡ Electric Blue</option>
+                            <option value="purple-majesty">🟣 Purple Majesty</option>
+                            <option value="deep-ocean">🌊 Deep Ocean</option>
+                            <option value="emerald-matrix">🟢 Emerald Matrix</option>
+                            <option value="crimson-fire">🔥 Crimson Fire</option>
+                            <option value="arctic-ice">❄️ Arctic Ice</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="action-item">
+                    <button class="action-btn-compact action-btn-stacked" data-action="webgpu-check">
+                        <span class="action-icon">🖥️</span>
+                        <span class="action-label-wrapper">
+                            <span class="action-label-line">WebGPU</span>
+                            <span class="action-label-line">Check</span>
+                        </span>
+                    </button>
+                </div>
+                <div class="action-item">
+                    <button class="action-btn-compact action-btn-stacked" data-action="error-pages">
+                        <span class="action-icon">🚨</span>
+                        <span class="action-label-wrapper">
+                            <span class="action-label-line">Errors</span>
+                            <span class="action-label-line">Pages</span>
+                        </span>
+                    </button>
+                </div>
+            </div>
+        </section>
+
+        <!-- Security -->
+        <section class="control-section">
+            <h3 class="section-title expandable" data-section="security">
+                <span>🛡️ Security</span>
+                <span class="expand-icon">▼</span>
+            </h3>
+            <div class="nav-grid collapsible collapsed" id="security-section">
+                <a href="https://pqcrypta.com/threat-bot/" class="nav-link">
+                    <span class="nav-icon">🛡️</span>
+                    <span class="nav-label">Threat Dashboard</span>
+                </a>
+            </div>
+        </section>
+
+        <!-- Under Development -->
+        <section class="control-section">
+            <h3 class="section-title expandable" data-section="under-development">
+                <span>🚧 Under Development</span>
+                <span class="expand-icon">▼</span>
+            </h3>
+            <div class="nav-grid collapsible collapsed" id="under-development-section">
+                <!-- [DISABLED 2026-07-20: blockchain feature commented out platform-wide - only partially completed]
+                <a href="https://pqcrypta.com/blockchain/" class="nav-link">
+                    <span class="nav-icon">⛓️</span>
+                    <span class="nav-label">Blockchain</span>
+                </a>
+                -->
+                <a href="https://pqcrypta.com/analytics/" class="nav-link">
+                    <span class="nav-icon">📊</span>
+                    <span class="nav-label">Web Analytics</span>
+                </a>
+                <a href="https://pqcrypta.com/docs/" class="nav-link">
+                    <span class="nav-icon">📖</span>
+                    <span class="nav-label">Documentation</span>
+                </a>
+                <a href="https://pqcrypta.com/resume/" class="nav-link">
+                    <span class="nav-icon">🧙‍♂️</span>
+                    <span class="nav-label">Resume</span>
+                </a>
+             </div>
+        </section>
+    </div>
+</div>
+</div><!-- End .quantum-menu-wrapper -->
+<div class="error-menu-overlay" id="errorMenuOverlay"></div>
+<div class="error-pages-menu" id="errorPagesMenu">
+    <header class="error-header">
+        <button class="error-close" id="error-close-btn" aria-label="Close menu">×</button>
+        <h2 class="error-title">⟨ QUANTUM ERROR PORTAL ⟩</h2>
+        <p class="error-subtitle">Navigate the Error Dimensions</p>
+    </header>
+    <nav class="error-nav">
+        <a href="https://pqcrypta.com/error_pages/pqcrypt_400.html" class="error-menu-item" data-code="400">
+            <span class="code">400</span>
+            <div class="info">
+                <h3>Quantum Syntax Error</h3>
+                <p>Malformed Request Poetry</p>
+            </div>
+        </a>
+        <a href="https://pqcrypta.com/error_pages/pqcrypt_401.html" class="error-menu-item" data-code="401">
+            <span class="code">401</span>
+            <div class="info">
+                <h3>Quantum Lock</h3>
+                <p>Authentication Failed</p>
+            </div>
+        </a>
+        <a href="https://pqcrypta.com/error_pages/pqcrypt_403.html" class="error-menu-item" data-code="403">
+            <span class="code">403</span>
+            <div class="info">
+                <h3>Quantum Barrier</h3>
+                <p>Access Forbidden</p>
+            </div>
+        </a>
+        <a href="https://pqcrypta.com/error_pages/pqcrypt_404.html" class="error-menu-item" data-code="404">
+            <span class="code">404</span>
+            <div class="info">
+                <h3>Quantum Void</h3>
+                <p>Page Not Found</p>
+            </div>
+        </a>
+        <a href="https://pqcrypta.com/error_pages/pqcrypt_500.html" class="error-menu-item" data-code="500">
+            <span class="code">500</span>
+            <div class="info">
+                <h3>Quantum Collapse</h3>
+                <p>Server Error</p>
+            </div>
+        </a>
+        <a href="https://pqcrypta.com/error_pages/pqcrypt_502.html" class="error-menu-item" data-code="502">
+            <span class="code">502</span>
+            <div class="info">
+                <h3>Quantum Gateway</h3>
+                <p>Bad Gateway</p>
+            </div>
+        </a>
+        <a href="https://pqcrypta.com/error_pages/pqcrypt_503.html" class="error-menu-item" data-code="503">
+            <span class="code">503</span>
+            <div class="info">
+                <h3>Quantum Overload</h3>
+                <p>Service Unavailable</p>
+            </div>
+        </a>
+        <a href="https://pqcrypta.com/error_pages/pqcrypt_noreferer.html" class="error-menu-item" data-code="REF">
+            <span class="code">REF</span>
+            <div class="info">
+                <h3>Quantum Origin</h3>
+                <p>No Referer Detected</p>
+            </div>
+        </a>
+    </nav>
+</div>
+

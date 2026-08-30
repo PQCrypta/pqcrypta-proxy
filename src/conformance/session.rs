@@ -86,6 +86,12 @@ pub enum Observation {
     /// PATH_RESPONSE, an ACK_ECN, a DATA_BLOCKED. Carries a short label so the
     /// report can say what was seen.
     Signalled(String),
+    /// The client did the specific wrong thing the test was watching for, with
+    /// a sentence saying what. The counterpart to [`Observation::Signalled`],
+    /// for tests whose failure is not "accepted a violation and carried on" —
+    /// ignoring a Stateless Reset, say, where the generic wording would
+    /// misdescribe what happened.
+    Violated(String),
     /// The run completed but never put the client in the situation the test is
     /// about — a flow-control test where the request was too small to approach
     /// the window, say.
@@ -134,6 +140,36 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
             Verdict::Inconclusive,
             format!("The run did not exercise this test: {why}."),
         );
+    }
+
+    // Handled ahead of the class matrix rather than inside it: the point of this
+    // observation is that the test supplies wording the generic per-class
+    // sentence would get wrong, and that is true for every class.
+    if let Observation::Violated(what) = obs {
+        return (Verdict::Fail, format!("{what}."));
+    }
+
+    // A close that is not a defined HTTP/3 objection is a graceful shutdown,
+    // whatever the class.
+    //
+    // H3_NO_ERROR (0x100) is "no error to signal". So is any *unknown* code:
+    // RFC 9114 §8.1 requires unknown error codes to be "treated as equivalent to
+    // H3_NO_ERROR", and §9 makes the general rule explicit — implementations
+    // MUST ignore unknown values in extensible elements, error codes included.
+    //
+    // The listener already converts these before they arrive here; this states
+    // the same rule where the verdict is actually decided, so the invariant
+    // holds however the observation was produced.
+    if let Observation::ClosedWith { code } = obs {
+        if !crate::conformance::h3_frames::error_code::is_rejection(*code) {
+            return (
+                Verdict::Pass,
+                format!(
+                    "Completed the exchange and closed cleanly (0x{code:x} is not an \
+                     HTTP/3 error code, which §8.1 makes equivalent to H3_NO_ERROR)."
+                ),
+            );
+        }
     }
 
     match (test.class, obs) {
@@ -281,12 +317,21 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
             Verdict::Inconclusive,
             format!("The run did not exercise this test: {why}."),
         ),
+        (_, Observation::Violated(what)) => (Verdict::Fail, format!("{what}.")),
 
-        // An extensibility test that got a specific signal is not something the
-        // harness knows how to read; say so rather than inventing a verdict.
+        // A signal is affirmative evidence the client took the element in its
+        // stride, which is exactly what an extensibility test asks for.
+        //
+        // This was Inconclusive on the grounds that a specific signal was "not
+        // something the harness knows how to read" — true when no extensibility
+        // test produced one, and wrong as soon as one did.
+        // `q-reserved-transport-param` observes the client completing a
+        // handshake that carried a reserved transport parameter: that is the
+        // requirement of §18.1 met, reported in more detail than a bare
+        // survival, and it was being scored as though nothing had been learned.
         (Class::Extensibility, Observation::Signalled(what)) => (
-            Verdict::Inconclusive,
-            format!("Unexpected signal for an extensibility test: {what}."),
+            Verdict::Pass,
+            format!("Ignored the unrecognised element and carried on: {what}."),
         ),
     }
 }
@@ -477,7 +522,7 @@ fn new_session_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conformance::catalog::{self, Class, CATALOG};
+    use crate::conformance::catalog::{self, Class, Test, Tier};
 
     fn test_of(id: &str) -> &'static catalog::Test {
         catalog::find(id).expect("catalogue entry")
@@ -532,14 +577,65 @@ mod tests {
     }
 
     #[test]
+    fn a_graceful_shutdown_is_not_a_rejection() {
+        // RFC 9114 §8.1: H3_NO_ERROR (0x100) means "no error to signal" — it is
+        // what a client sends when it has finished, not a complaint.
+        //
+        // Scoring it as a rejection failed every client that closes its HTTP/3
+        // connection properly. It hid for a while because the first two clients
+        // measured, curl and Chromium, both close at the QUIC layer instead,
+        // where NO_ERROR was already handled. Three thin clients written later
+        // all "failed" the same seven extensibility and interoperability tests,
+        // which is what gave it away: three independent libraries do not fail
+        // identically.
+        let t = test_of("h-grease-frame");
+        for code in [
+            0x0100, // H3_NO_ERROR itself
+            0x0,    // what aioquic and quic-go send for a clean close
+            0x21,   // the first reserved GREASE error code, 0x1f*0 + 0x21
+            0x1f * 5 + 0x21,
+            0x0107, // assigned to nothing in RFC 9114
+        ] {
+            let (v, d) = judge(t, &Observation::ClosedWith { code }, None);
+            assert_ne!(
+                v,
+                Verdict::Fail,
+                "0x{code:x} is not a defined HTTP/3 error code, so §8.1 makes it \
+                 equivalent to H3_NO_ERROR — it cannot be a rejection: {d}"
+            );
+        }
+
+        // A real objection must still register as one.
+        let (v, _) = judge(t, &Observation::ClosedWith { code: 0x0105 }, None);
+        assert_eq!(
+            v,
+            Verdict::Fail,
+            "H3_FRAME_UNEXPECTED on an extensibility test is a genuine failure"
+        );
+    }
+
+    #[test]
     fn an_unimplemented_test_is_never_scored() {
         // Falling through to a correct control stream must not read as the
         // client accepting a violation that was never sent.
-        let unbuilt = CATALOG
-            .iter()
-            .find(|t| !t.implemented && t.class == Class::Correctness)
-            .expect("a correctness test is still unbuilt");
-        let (v, d) = judge(unbuilt, &Observation::SurvivedAndContinued, None);
+        //
+        // Checked against a purpose-built test rather than by hunting the
+        // catalogue for an unbuilt correctness entry: that search used to find
+        // one, and stopped finding one the moment the last correctness anomaly
+        // was built — turning a guard that still matters into a failing test.
+        // The guard has to hold for anything that might be added later, built or
+        // not, and this states exactly that.
+        let unbuilt = Test {
+            id: "test-only-unbuilt",
+            title: "An anomaly that is not emitted yet",
+            spec: "n/a",
+            class: Class::Correctness,
+            tier: Tier::Quic,
+            expectation: "Never reached: the client meets a correct server.",
+            implemented: false,
+            port_offset: None,
+        };
+        let (v, d) = judge(&unbuilt, &Observation::SurvivedAndContinued, None);
         assert_eq!(v, Verdict::Inconclusive);
         assert!(d.contains("not implemented"), "say why: {d}");
     }
@@ -605,7 +701,17 @@ mod tests {
             None,
         );
         assert_eq!(v, Verdict::Pass);
-        let (v, _) = judge(t, &Observation::ClosedWith { code: 0x2 }, None);
+        // A *defined* HTTP/3 error code, because that is what an objection is.
+        // This used to assert on 0x2, which is not an HTTP/3 error code at all —
+        // RFC 9114 §8.1 makes unknown codes equivalent to H3_NO_ERROR, so it was
+        // asserting that a clean close is a failure.
+        let (v, _) = judge(
+            t,
+            &Observation::ClosedWith {
+                code: crate::conformance::h3_frames::error_code::H3_INTERNAL_ERROR,
+            },
+            None,
+        );
         assert_eq!(v, Verdict::Fail);
     }
 
@@ -626,7 +732,7 @@ mod tests {
 
         reg.with(&id, |s| s.record(t, &Observation::TimedOut, None, 1));
         reg.with(&id, |s| {
-            s.record(t, &Observation::SurvivedAndContinued, None, 2)
+            s.record(t, &Observation::SurvivedAndContinued, None, 2);
         });
 
         let r = reg

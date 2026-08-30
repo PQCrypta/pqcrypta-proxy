@@ -1,0 +1,3721 @@
+/* PQCrypta Navigation Menu - Electric Blue Glass Theme */
+/* Uses all: initial + !important for maximum isolation */
+/* No inline styles, CSP-compliant, completely isolated from ALL page CSS */
+
+/* Hidden configuration elements (CSP compliant) */
+.config-data-hidden {
+    display: none !important;
+}
+
+/* =================================================================
+   DROPDOWN MENU - Main Navigation with COMPLETE ISOLATION
+   ================================================================= */
+
+/* Container with COMPLETE CSS reset - blocks ALL inheritance */
+.pqcrypta-nav-menu,
+.dropdown-container {
+    /* NUCLEAR OPTION: Reset ALL CSS properties to initial values */
+    all: initial;
+
+    /* Now rebuild EVERY style from scratch */
+    /* Position and layering */
+    position: absolute !important;
+    top: 10px !important;
+    right: 50px !important;
+    z-index: 10200 !important;
+
+    /* Display */
+    display: block !important;
+
+    /* Sizing */
+    width: 250px !important;
+    height: auto !important;
+
+    /* Box model */
+    margin: 0 !important;
+    padding: 10px !important;
+    box-sizing: border-box !important;
+
+    /* Visual styling - Glass Effect with Electric Blue */
+    background: rgba(0, 43, 76, 0.4) !important;
+    backdrop-filter: blur(20px) !important;
+    border: 1px solid rgba(0, 207, 255, 0.3) !important;
+    border-radius: 12px !important;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3),
+                inset 0 1px 1px rgba(230, 247, 255, 0.2) !important;
+
+    /* Typography - completely defined */
+    font-family: 'JetBrains Mono', 'Courier New', Consolas, Monaco, monospace !important;
+    font-size: 14px !important;
+    font-weight: 400 !important;
+    font-style: normal !important;
+    line-height: 1.5 !important;
+    letter-spacing: normal !important;
+    text-align: left !important;
+    text-decoration: none !important;
+    text-transform: none !important;
+    color: #E6F7FF !important;
+
+    /* Effects */
+    opacity: 1 !important;
+    visibility: visible !important;
+}
+
+/* Dropdown select element with COMPLETE isolation */
+/* ULTRA HIGH SPECIFICITY - overrides ALL page styles including inline */
+select#animation-select.dropdown-select,
+#animation-select.dropdown-select,
+.dropdown-container select#animation-select,
+.pqcrypta-nav-menu select,
+.dropdown-container .dropdown-select,
+.dropdown-select {
+    /* RESET ALL inherited CSS */
+    all: initial !important;
+
+    /* Rebuild from scratch with !important on every property */
+    /* Display and sizing */
+    display: block !important;
+    width: 100% !important;
+    height: auto !important;
+
+    /* Box model */
+    margin: 0 !important;
+    padding: 10px 35px 10px 15px !important;
+    box-sizing: border-box !important;
+
+    /* Glass Background with Electric Blue gradient */
+    background: linear-gradient(145deg, rgba(0, 43, 76, 0.6), rgba(0, 0, 0, 0.7)) !important;
+    background-color: rgba(0, 43, 76, 0.5) !important;
+    background-repeat: no-repeat !important;
+    background-position: right 10px center !important;
+    background-size: 16px !important;
+    background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%2300CFFF' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e") !important;
+    backdrop-filter: blur(15px) !important;
+    color: #E6F7FF !important;
+
+    /* Borders - Electric Blue */
+    border: 2px solid rgba(0, 207, 255, 0.4) !important;
+    border-radius: 8px !important;
+    outline: none !important;
+
+    /* Typography - fully specified */
+    font-family: 'JetBrains Mono', 'Courier New', Consolas, Monaco, monospace !important;
+    font-size: 14px !important;
+    font-weight: bold !important;
+    font-style: normal !important;
+    line-height: 1.5 !important;
+    text-align: center !important;
+    letter-spacing: 0.5px !important;
+    text-decoration: none !important;
+    text-transform: none !important;
+    vertical-align: baseline !important;
+
+    /* Interaction */
+    cursor: pointer !important;
+    user-select: none !important;
+
+    /* Visual effects - Electric Blue Glow */
+    box-shadow: 0 4px 12px rgba(0, 207, 255, 0.2),
+                inset 0 1px 1px rgba(230, 247, 255, 0.1) !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+
+    /* Remove default appearance */
+    appearance: none !important;
+    -webkit-appearance: none !important;
+    -moz-appearance: none !important;
+
+    /* Text handling */
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    white-space: nowrap !important;
+    word-wrap: normal !important;
+
+    /* Transitions */
+    transition: all 0.3s ease !important;
+}
+
+/* Focus state - Electric Blue Glow */
+.pqcrypta-nav-menu select:focus,
+select#animation-select.dropdown-select:focus,
+.dropdown-container select#animation-select:focus,
+#animation-select.dropdown-select:focus,
+.dropdown-select:focus {
+    all: initial !important;
+
+    /* Rebuild with focus styling */
+    display: block !important;
+    width: 100% !important;
+    margin: 0 !important;
+    padding: 10px 35px 10px 15px !important;
+    box-sizing: border-box !important;
+
+    background: linear-gradient(145deg, rgba(0, 43, 76, 0.7), rgba(0, 0, 0, 0.8)) !important;
+    background-color: rgba(0, 43, 76, 0.6) !important;
+    background-repeat: no-repeat !important;
+    background-position: right 10px center !important;
+    background-size: 16px !important;
+    background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%2300CFFF' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e") !important;
+    backdrop-filter: blur(15px) !important;
+    color: #E6F7FF !important;
+
+    border: 2px solid #00CFFF !important;
+    border-radius: 8px !important;
+    outline: none !important;
+
+    font-family: 'JetBrains Mono', 'Courier New', Consolas, Monaco, monospace !important;
+    font-size: 14px !important;
+    font-weight: bold !important;
+    font-style: normal !important;
+    line-height: 1.5 !important;
+    text-align: center !important;
+    letter-spacing: 0.5px !important;
+
+    cursor: pointer !important;
+    appearance: none !important;
+    -webkit-appearance: none !important;
+    -moz-appearance: none !important;
+
+    box-shadow: 0 0 0 3px rgba(0, 207, 255, 0.3),
+                0 0 20px rgba(0, 207, 255, 0.4),
+                inset 0 1px 1px rgba(230, 247, 255, 0.2) !important;
+
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    white-space: nowrap !important;
+}
+
+/* Dropdown options styling - complete reset */
+select#animation-select.dropdown-select option,
+#animation-select.dropdown-select option,
+.dropdown-container select#animation-select option,
+.pqcrypta-nav-menu select option,
+.dropdown-container .dropdown-select option,
+.dropdown-select option {
+    all: initial !important;
+
+    display: block !important;
+    padding: 10px !important;
+    margin: 0 !important;
+
+    background-color: rgba(0, 0, 0, 0.95) !important;
+    color: #E6F7FF !important;
+
+    font-family: 'JetBrains Mono', 'Courier New', Consolas, Monaco, monospace !important;
+    font-size: 14px !important;
+    font-weight: normal !important;
+    font-style: normal !important;
+    line-height: 1.5 !important;
+    text-align: left !important;
+
+    cursor: pointer !important;
+}
+
+/* Disabled options (dividers) */
+select#animation-select.dropdown-select option:disabled,
+#animation-select.dropdown-select option:disabled,
+.dropdown-container select#animation-select option:disabled,
+.pqcrypta-nav-menu select option:disabled,
+.dropdown-container .dropdown-select option:disabled,
+.dropdown-select option:disabled {
+    all: initial !important;
+
+    display: block !important;
+    padding: 5px !important;
+    margin: 0 !important;
+
+    background-color: rgba(0, 43, 76, 0.8) !important;
+    color: #00AEEF !important;
+
+    font-family: 'JetBrains Mono', 'Courier New', Consolas, Monaco, monospace !important;
+    font-size: 14px !important;
+    font-weight: bold !important;
+    font-style: normal !important;
+    line-height: 1.5 !important;
+    text-align: center !important;
+
+    cursor: default !important;
+}
+
+/* Optgroup styling */
+.pqcrypta-nav-menu select optgroup,
+.dropdown-container .dropdown-select optgroup,
+.dropdown-select optgroup {
+    all: initial;
+
+    display: block !important;
+    padding: 0 !important;
+    margin: 0 !important;
+
+    background-color: rgba(0, 43, 76, 0.9) !important;
+    color: #00CFFF !important;
+
+    font-family: 'JetBrains Mono', 'Courier New', Consolas, Monaco, monospace !important;
+    font-size: 14px !important;
+    font-weight: bold !important;
+    font-style: normal !important;
+    line-height: 1.5 !important;
+}
+
+.pqcrypta-nav-menu select optgroup option,
+.dropdown-container .dropdown-select optgroup option,
+.dropdown-select optgroup option {
+    all: initial;
+
+    display: block !important;
+    padding: 8px 15px !important;
+    margin: 0 !important;
+
+    background-color: rgba(0, 0, 0, 0.9) !important;
+    color: #00AEEF !important;
+
+    font-family: 'JetBrains Mono', 'Courier New', Consolas, Monaco, monospace !important;
+    font-size: 14px !important;
+    font-weight: normal !important;
+    font-style: normal !important;
+    line-height: 1.5 !important;
+    text-align: left !important;
+
+    cursor: pointer !important;
+}
+
+.pqcrypta-nav-menu select optgroup option:hover,
+.dropdown-container .dropdown-select optgroup option:hover,
+.dropdown-select optgroup option:hover {
+    background-color: rgba(0, 43, 76, 0.7) !important;
+}
+
+/* =================================================================
+   ERROR PAGES MENU - Quantum Portal with Electric Blue Glass
+   ================================================================= */
+
+/* Side menu panel with complete reset */
+.pqcrypta-error-menu,
+.error-pages-menu {
+    all: initial;
+
+    /* Position and layering */
+    position: fixed !important;
+    top: 0 !important;
+    /* Parked with a transform, not a negative offset.
+       `right: -350px` put a 320px-wide fixed panel 350px past the right edge,
+       which extends the document's scrollable width and lets the whole page
+       slide sideways on a phone — on every page that includes this menu. A
+       transform moves it without affecting layout, so there is nothing to
+       scroll to. Pages that worked did so only because they happened to set
+       `overflow-x: hidden` on body themselves. */
+    right: 0 !important;
+    transform: translateX(100%) !important;
+    bottom: 0 !important;
+    left: auto !important;
+    width: 320px !important;
+    height: 100vh !important;
+    z-index: 19000 !important;
+
+    /* Display */
+    display: block !important;
+
+    /* Box model */
+    margin: 0 !important;
+    padding: 0 !important;
+    box-sizing: border-box !important;
+
+    /* Glass Background with Electric Blue */
+    background: linear-gradient(135deg,
+                rgba(0, 43, 76, 0.85),
+                rgba(0, 0, 0, 0.95)) !important;
+    border-left: 2px solid rgba(0, 207, 255, 0.4) !important;
+    backdrop-filter: blur(20px) !important;
+    box-shadow: -10px 0 40px rgba(0, 207, 255, 0.2),
+                inset 1px 0 1px rgba(230, 247, 255, 0.1) !important;
+
+    /* Scrolling */
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
+
+    /* Animation */
+    transition: transform 0.35s cubic-bezier(0.25, 0.8, 0.25, 1) !important;
+
+    /* Typography */
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif !important;
+    font-size: 14px !important;
+    font-weight: 400 !important;
+    font-style: normal !important;
+    line-height: 1.5 !important;
+    color: #E6F7FF !important;
+    text-align: left !important;
+
+    /* Effects */
+    opacity: 1 !important;
+    visibility: visible !important;
+}
+
+.pqcrypta-error-menu.active,
+.error-pages-menu.active {
+    transform: translateX(0) !important;
+}
+
+/* Header section */
+.pqcrypta-error-menu .error-header,
+.error-pages-menu .error-header,
+.error-header {
+    all: initial;
+
+    display: block !important;
+    position: sticky !important;
+    top: 0 !important;
+
+    margin: 0 !important;
+    padding: 25px 20px 20px !important;
+    box-sizing: border-box !important;
+
+    background: linear-gradient(180deg,
+                rgba(0, 43, 76, 0.95),
+                rgba(0, 0, 0, 0.9)) !important;
+    border-bottom: 1px solid rgba(0, 207, 255, 0.3) !important;
+    backdrop-filter: blur(15px) !important;
+
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif !important;
+    color: #E6F7FF !important;
+
+    z-index: 1000 !important;
+}
+
+/* Close button */
+.pqcrypta-error-menu .error-close,
+.error-pages-menu .error-close,
+.error-close {
+    all: initial;
+
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+
+    position: absolute !important;
+    top: 15px !important;
+    right: 15px !important;
+
+    width: 35px !important;
+    height: 35px !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    box-sizing: border-box !important;
+
+    background: rgba(220, 20, 60, 0.8) !important;
+    color: white !important;
+    border: 1px solid rgba(0, 207, 255, 0.3) !important;
+    border-radius: 50% !important;
+
+    font-family: Arial, sans-serif !important;
+    font-size: 20px !important;
+    font-weight: bold !important;
+    line-height: 1 !important;
+    text-align: center !important;
+
+    cursor: pointer !important;
+    transition: all 0.3s ease !important;
+    box-shadow: 0 2px 8px rgba(220, 20, 60, 0.3) !important;
+}
+
+.pqcrypta-error-menu .error-close:hover,
+.error-pages-menu .error-close:hover,
+.error-close:hover {
+    background: rgba(220, 20, 60, 1) !important;
+    transform: rotate(90deg) scale(1.1) !important;
+    box-shadow: 0 4px 15px rgba(220, 20, 60, 0.5),
+                0 0 20px rgba(0, 207, 255, 0.3) !important;
+}
+
+/* Title */
+.pqcrypta-error-menu .error-title,
+.error-pages-menu .error-title,
+.error-title {
+    all: initial;
+
+    display: block !important;
+    margin: 0 0 8px 0 !important;
+    padding: 0 !important;
+
+    color: #00CFFF !important;
+    background: transparent !important;
+
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif !important;
+    font-size: 18px !important;
+    font-weight: 700 !important;
+    font-style: normal !important;
+    line-height: 1.3 !important;
+    text-align: center !important;
+    letter-spacing: 2px !important;
+    text-shadow: 0 0 15px rgba(0, 207, 255, 0.6) !important;
+}
+
+/* Subtitle */
+.pqcrypta-error-menu .error-subtitle,
+.error-pages-menu .error-subtitle,
+.error-subtitle {
+    all: initial;
+
+    display: block !important;
+    margin: 0 !important;
+    padding: 0 !important;
+
+    color: rgba(230, 247, 255, 0.8) !important;
+    background: transparent !important;
+
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif !important;
+    font-size: 13px !important;
+    font-weight: 400 !important;
+    font-style: italic !important;
+    line-height: 1.4 !important;
+    text-align: center !important;
+}
+
+/* Navigation container */
+.pqcrypta-error-menu .error-nav,
+.error-pages-menu .error-nav,
+.error-nav {
+    all: initial;
+
+    display: block !important;
+    padding: 15px 10px 25px !important;
+    margin: 0 !important;
+    box-sizing: border-box !important;
+}
+
+/* Menu items - Glass cards with Electric Blue */
+.pqcrypta-error-menu .error-menu-item,
+.error-pages-menu .error-menu-item,
+.error-menu-item {
+    all: initial;
+
+    display: flex !important;
+    align-items: center !important;
+    justify-content: flex-start !important;
+
+    padding: 18px 15px !important;
+    margin: 8px 0 !important;
+    box-sizing: border-box !important;
+
+    background: linear-gradient(135deg,
+                rgba(0, 43, 76, 0.5),
+                rgba(0, 0, 0, 0.6)) !important;
+    border: 1px solid rgba(0, 207, 255, 0.2) !important;
+    border-radius: 12px !important;
+    backdrop-filter: blur(10px) !important;
+
+    color: #E6F7FF !important;
+    text-decoration: none !important;
+
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif !important;
+
+    cursor: pointer !important;
+    transition: all 0.4s cubic-bezier(0.25, 0.8, 0.25, 1) !important;
+
+    position: relative !important;
+    overflow: hidden !important;
+
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2),
+                inset 0 1px 1px rgba(230, 247, 255, 0.1) !important;
+
+    animation: portalOpen 0.6s ease-out !important;
+}
+
+.pqcrypta-error-menu .error-menu-item::before,
+.error-pages-menu .error-menu-item::before,
+.error-menu-item::before {
+    content: '' !important;
+    position: absolute !important;
+    top: 0 !important;
+    left: -100% !important;
+    width: 100% !important;
+    height: 100% !important;
+    background: linear-gradient(90deg,
+                transparent,
+                rgba(0, 207, 255, 0.15),
+                transparent) !important;
+    transition: left 0.6s ease !important;
+}
+
+.pqcrypta-error-menu .error-menu-item:hover::before,
+.error-pages-menu .error-menu-item:hover::before,
+.error-menu-item:hover::before {
+    left: 100% !important;
+}
+
+.pqcrypta-error-menu .error-menu-item:hover,
+.error-pages-menu .error-menu-item:hover,
+.error-menu-item:hover {
+    transform: translateX(-5px) scale(1.02) !important;
+    border-color: rgba(0, 207, 255, 0.5) !important;
+    background: linear-gradient(135deg,
+                rgba(0, 43, 76, 0.7),
+                rgba(0, 0, 0, 0.8)) !important;
+    box-shadow: 0 8px 25px rgba(0, 207, 255, 0.25),
+                0 0 30px rgba(0, 207, 255, 0.15),
+                inset 0 1px 1px rgba(230, 247, 255, 0.2) !important;
+}
+
+/* Error code display */
+.pqcrypta-error-menu .error-menu-item .code,
+.error-pages-menu .error-menu-item .code,
+.error-menu-item .code {
+    all: initial;
+
+    display: block !important;
+    margin-right: 15px !important;
+    padding: 0 !important;
+
+    min-width: 50px !important;
+
+    color: #00CFFF !important;
+    background: transparent !important;
+
+    font-family: 'JetBrains Mono', 'Courier New', monospace !important;
+    font-size: 24px !important;
+    font-weight: 900 !important;
+    font-style: normal !important;
+    line-height: 1 !important;
+    text-align: center !important;
+    text-shadow: 0 0 12px rgba(0, 207, 255, 0.7) !important;
+
+    transition: all 0.3s ease !important;
+}
+
+.pqcrypta-error-menu .error-menu-item:hover .code,
+.error-pages-menu .error-menu-item:hover .code,
+.error-menu-item:hover .code {
+    transform: scale(1.1) !important;
+    text-shadow: 0 0 20px rgba(0, 207, 255, 0.9),
+                 0 0 40px rgba(0, 174, 239, 0.4) !important;
+}
+
+/* Info section */
+.pqcrypta-error-menu .error-menu-item .info,
+.error-pages-menu .error-menu-item .info,
+.error-menu-item .info {
+    all: initial;
+
+    display: block !important;
+    flex: 1 !important;
+}
+
+.pqcrypta-error-menu .error-menu-item .info h3,
+.error-pages-menu .error-menu-item .info h3,
+.error-menu-item .info h3 {
+    all: initial;
+
+    display: block !important;
+    margin: 0 0 4px 0 !important;
+    padding: 0 !important;
+
+    color: #E6F7FF !important;
+    background: transparent !important;
+
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif !important;
+    font-size: 16px !important;
+    font-weight: 600 !important;
+    font-style: normal !important;
+    line-height: 1.3 !important;
+    text-align: left !important;
+
+    transition: color 0.3s ease !important;
+}
+
+.pqcrypta-error-menu .error-menu-item .info p,
+.error-pages-menu .error-menu-item .info p,
+.error-menu-item .info p {
+    all: initial;
+
+    display: block !important;
+    margin: 0 !important;
+    padding: 0 !important;
+
+    color: rgba(230, 247, 255, 0.7) !important;
+    background: transparent !important;
+
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif !important;
+    font-size: 12px !important;
+    font-weight: 400 !important;
+    font-style: normal !important;
+    line-height: 1.4 !important;
+    text-align: left !important;
+
+    transition: color 0.3s ease !important;
+}
+
+.pqcrypta-error-menu .error-menu-item:hover .info h3,
+.error-pages-menu .error-menu-item:hover .info h3,
+.error-menu-item:hover .info h3 {
+    color: #00CFFF !important;
+}
+
+.pqcrypta-error-menu .error-menu-item:hover .info p,
+.error-pages-menu .error-menu-item:hover .info p,
+.error-menu-item:hover .info p {
+    color: rgba(230, 247, 255, 0.95) !important;
+}
+
+/* Overlay */
+.pqcrypta-error-overlay,
+.error-menu-overlay {
+    all: initial;
+
+    display: block !important;
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    width: 100vw !important;
+    height: 100vh !important;
+
+    background: rgba(0, 43, 76, 0.3) !important;
+    backdrop-filter: blur(3px) !important;
+
+    z-index: 9999 !important;
+    opacity: 0 !important;
+    visibility: hidden !important;
+
+    transition: all 0.25s ease !important;
+}
+
+.pqcrypta-error-overlay.active,
+.error-menu-overlay.active {
+    opacity: 1 !important;
+    visibility: visible !important;
+}
+
+/* =================================================================
+   ANIMATIONS
+   ================================================================= */
+
+@keyframes portalOpen {
+    0% {
+        opacity: 0;
+        transform: translateX(20px) scale(0.95);
+    }
+    100% {
+        opacity: 1;
+        transform: translateX(0) scale(1);
+    }
+}
+
+@keyframes quantumFloat {
+    0% {
+        transform: translateY(0) scale(1);
+        opacity: 0;
+    }
+    10% { opacity: 1; }
+    90% { opacity: 1; }
+    100% {
+        transform: translateY(-100px) scale(0);
+        opacity: 0;
+    }
+}
+
+/* =================================================================
+   UTILITY CLASSES
+   ================================================================= */
+
+.menu-open {
+    overflow: hidden !important;
+}
+
+.menu-item-enter {
+    opacity: 0 !important;
+    transform: translateX(50px) !important;
+}
+
+.menu-item-active {
+    opacity: 1 !important;
+    transform: translateX(0) !important;
+    transition: all 0.4s cubic-bezier(0.68, -0.55, 0.265, 1.55) !important;
+}
+
+.quantum-particle {
+    position: absolute !important;
+    width: 2px !important;
+    height: 2px !important;
+    background: #00CFFF !important;
+    border-radius: 50% !important;
+    pointer-events: none !important;
+    opacity: 0 !important;
+    z-index: 10001 !important;
+    box-shadow: 0 0 4px #00CFFF !important;
+}
+
+/* =================================================================
+   RESPONSIVE DESIGN
+   ================================================================= */
+
+@media (max-width: 768px) {
+    .pqcrypta-nav-menu,
+    .dropdown-container {
+        all: initial;
+        position: absolute !important;
+        top: 10px !important;
+        right: 10px !important;
+        width: 200px !important;
+        display: block !important;
+        padding: 10px !important;
+        box-sizing: border-box !important;
+        background: rgba(0, 43, 76, 0.4) !important;
+        backdrop-filter: blur(20px) !important;
+        border: 1px solid rgba(0, 207, 255, 0.3) !important;
+        border-radius: 12px !important;
+        font-family: 'JetBrains Mono', 'Courier New', Consolas, Monaco, monospace !important;
+        font-size: 14px !important;
+        z-index: 10200 !important;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3),
+                    inset 0 1px 1px rgba(230, 247, 255, 0.2) !important;
+    }
+
+    .pqcrypta-error-menu,
+    .error-pages-menu {
+        width: 280px !important;
+    }
+}
+
+@media (max-width: 480px) {
+    .pqcrypta-nav-menu,
+    .dropdown-container {
+        all: initial;
+        position: absolute !important;
+        top: 10px !important;
+        right: 10px !important;
+        width: 180px !important;
+        display: block !important;
+        padding: 10px !important;
+        box-sizing: border-box !important;
+        background: rgba(0, 43, 76, 0.4) !important;
+        backdrop-filter: blur(20px) !important;
+        border: 1px solid rgba(0, 207, 255, 0.3) !important;
+        border-radius: 12px !important;
+        font-family: 'JetBrains Mono', 'Courier New', Consolas, Monaco, monospace !important;
+        font-size: 12px !important;
+        z-index: 10200 !important;
+        margin: 0 !important;
+        height: auto !important;
+        font-weight: 400 !important;
+        font-style: normal !important;
+        line-height: 1.5 !important;
+        letter-spacing: normal !important;
+        text-align: left !important;
+        text-decoration: none !important;
+        text-transform: none !important;
+        color: #E6F7FF !important;
+        opacity: 1 !important;
+        visibility: visible !important;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3),
+                    inset 0 1px 1px rgba(230, 247, 255, 0.2) !important;
+    }
+
+    .pqcrypta-nav-menu select,
+    .dropdown-container .dropdown-select,
+    .dropdown-select {
+        all: initial;
+
+        display: block !important;
+        width: 100% !important;
+        height: auto !important;
+
+        margin: 0 !important;
+        padding: 8px 30px 8px 12px !important;
+        box-sizing: border-box !important;
+
+        background: linear-gradient(145deg, rgba(0, 43, 76, 0.6), rgba(0, 0, 0, 0.7)) !important;
+        background-color: rgba(0, 43, 76, 0.5) !important;
+        background-repeat: no-repeat !important;
+        background-position: right 8px center !important;
+        background-size: 14px !important;
+        background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%2300CFFF' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e") !important;
+        backdrop-filter: blur(15px) !important;
+        color: #E6F7FF !important;
+
+        border: 2px solid rgba(0, 207, 255, 0.4) !important;
+        border-radius: 8px !important;
+        outline: none !important;
+
+        font-family: 'JetBrains Mono', 'Courier New', Consolas, Monaco, monospace !important;
+        font-size: 12px !important;
+        font-weight: bold !important;
+        font-style: normal !important;
+        line-height: 1.5 !important;
+        text-align: center !important;
+        letter-spacing: 0.5px !important;
+        text-decoration: none !important;
+        text-transform: none !important;
+        vertical-align: baseline !important;
+
+        cursor: pointer !important;
+        user-select: none !important;
+
+        box-shadow: 0 4px 12px rgba(0, 207, 255, 0.2),
+                    inset 0 1px 1px rgba(230, 247, 255, 0.1) !important;
+        opacity: 1 !important;
+        visibility: visible !important;
+
+        appearance: none !important;
+        -webkit-appearance: none !important;
+        -moz-appearance: none !important;
+
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+        white-space: nowrap !important;
+        word-wrap: normal !important;
+    }
+
+    .pqcrypta-nav-menu select:focus,
+    .dropdown-container .dropdown-select:focus,
+    .dropdown-select:focus {
+        all: initial;
+
+        display: block !important;
+        width: 100% !important;
+        margin: 0 !important;
+        padding: 8px 30px 8px 12px !important;
+        box-sizing: border-box !important;
+
+        background: linear-gradient(145deg, rgba(0, 43, 76, 0.7), rgba(0, 0, 0, 0.8)) !important;
+        background-color: rgba(0, 43, 76, 0.6) !important;
+        background-repeat: no-repeat !important;
+        background-position: right 8px center !important;
+        background-size: 14px !important;
+        background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%2300CFFF' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e") !important;
+        backdrop-filter: blur(15px) !important;
+        color: #E6F7FF !important;
+
+        border: 2px solid #00CFFF !important;
+        border-radius: 8px !important;
+        outline: none !important;
+
+        font-family: 'JetBrains Mono', 'Courier New', Consolas, Monaco, monospace !important;
+        font-size: 12px !important;
+        font-weight: bold !important;
+        font-style: normal !important;
+        line-height: 1.5 !important;
+        text-align: center !important;
+        letter-spacing: 0.5px !important;
+
+        cursor: pointer !important;
+        appearance: none !important;
+        -webkit-appearance: none !important;
+        -moz-appearance: none !important;
+
+        box-shadow: 0 0 0 3px rgba(0, 207, 255, 0.3),
+                    0 0 20px rgba(0, 207, 255, 0.4),
+                    inset 0 1px 1px rgba(230, 247, 255, 0.2) !important;
+
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+        white-space: nowrap !important;
+    }
+
+    .pqcrypta-nav-menu select option,
+    .dropdown-container .dropdown-select option,
+    .dropdown-select option {
+        all: initial;
+
+        display: block !important;
+        padding: 8px !important;
+        margin: 0 !important;
+
+        background-color: rgba(0, 0, 0, 0.95) !important;
+        color: #E6F7FF !important;
+
+        font-family: 'JetBrains Mono', 'Courier New', Consolas, Monaco, monospace !important;
+        font-size: 12px !important;
+        font-weight: normal !important;
+        font-style: normal !important;
+        line-height: 1.5 !important;
+        text-align: left !important;
+
+        cursor: pointer !important;
+    }
+}
+
+/* =================================================================
+   QUANTUM CONTROL PANEL - ANIMATIONS
+   ================================================================= */
+
+@keyframes quantumPulse {
+    0%, 100% {
+        transform: scale(1);
+        filter: drop-shadow(0 0 10px var(--theme-glow-2))
+                drop-shadow(0 0 20px var(--theme-glow-1));
+    }
+    50% {
+        transform: scale(1.05);
+        filter: drop-shadow(0 0 20px var(--theme-glow-2))
+                drop-shadow(0 0 30px var(--theme-glow-1))
+                drop-shadow(0 0 40px var(--theme-glow-3));
+    }
+}
+
+@keyframes quantumGlow {
+    0%, 100% {
+        text-shadow: 0 0 20px var(--theme-glow-2),
+                     0 0 40px var(--theme-glow-1);
+    }
+    50% {
+        text-shadow: 0 0 30px var(--theme-glow-2),
+                     0 0 50px var(--theme-glow-1),
+                     0 0 70px var(--theme-glow-3);
+    }
+}
+
+@keyframes quantumShieldRotate {
+    0% {
+        transform: rotateY(0deg) rotateX(10deg);
+    }
+    50% {
+        transform: rotateY(180deg) rotateX(-10deg);
+    }
+    100% {
+        transform: rotateY(360deg) rotateX(10deg);
+    }
+}
+
+@keyframes quantumSlideInDown {
+    0% {
+        opacity: 0;
+        transform: translateY(-40px) scale(0.9);
+    }
+    50% {
+        opacity: 0.8;
+    }
+    100% {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+}
+
+@keyframes quantumFadeIn {
+    0% {
+        opacity: 0;
+    }
+    100% {
+        opacity: 1;
+    }
+}
+
+@keyframes quantumBorderGlow {
+    0%, 100% {
+        border-color: var(--theme-border-light);
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3),
+                    0 0 10px var(--theme-shadow-1),
+                    inset 0 1px 1px var(--theme-inset);
+    }
+    50% {
+        border-color: var(--theme-border);
+        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.4),
+                    0 0 20px var(--theme-shadow-1),
+                    0 0 30px var(--theme-shadow-2),
+                    inset 0 1px 2px var(--theme-inset);
+    }
+}
+
+@keyframes quantumFloat {
+    0%, 100% {
+        transform: translateY(0px);
+    }
+    50% {
+        transform: translateY(-5px);
+    }
+}
+
+@keyframes subtleEmojiPulse {
+    0%, 100% {
+        transform: scale(1);
+        filter: drop-shadow(0 0 8px var(--theme-glow-2))
+                drop-shadow(0 0 12px var(--theme-glow-1));
+    }
+    50% {
+        transform: scale(1.02);
+        filter: drop-shadow(0 0 10px var(--theme-glow-2))
+                drop-shadow(0 0 14px var(--theme-glow-1));
+    }
+}
+
+@keyframes quantumShimmer {
+    0% {
+        background-position: -200% center;
+    }
+    100% {
+        background-position: 200% center;
+    }
+}
+
+@keyframes quantumRotate {
+    0% {
+        transform: rotate(0deg);
+    }
+    100% {
+        transform: rotate(360deg);
+    }
+}
+
+@keyframes quantumPing {
+    0% {
+        transform: scale(1);
+        opacity: 1;
+    }
+    75%, 100% {
+        transform: scale(1.3);
+        opacity: 0;
+    }
+}
+
+@keyframes quantumWave {
+    0% {
+        transform: translateX(-100%);
+    }
+    100% {
+        transform: translateX(100%);
+    }
+}
+
+@keyframes quantumParticle {
+    0% {
+        opacity: 0;
+        transform: translateY(0) scale(0);
+    }
+    20% {
+        opacity: 1;
+        transform: translateY(-20px) scale(1);
+    }
+    100% {
+        opacity: 0;
+        transform: translateY(-60px) scale(0.5);
+    }
+}
+
+@keyframes quantumBackgroundPulse {
+    0%, 100% {
+        background-size: 100% 100%;
+    }
+    50% {
+        background-size: 105% 105%;
+    }
+}
+
+@keyframes quantumBreathe {
+    0%, 100% {
+        transform: scale(1);
+        opacity: 1;
+    }
+    50% {
+        transform: scale(1.02);
+        opacity: 0.95;
+    }
+}
+
+@keyframes quantumRipple {
+    0% {
+        box-shadow: 0 0 0 0 var(--theme-glow-1),
+                    0 0 0 0 var(--theme-glow-2);
+    }
+    50% {
+        box-shadow: 0 0 0 10px transparent,
+                    0 0 0 20px transparent;
+    }
+    100% {
+        box-shadow: 0 0 0 0 transparent,
+                    0 0 0 0 transparent;
+    }
+}
+
+@keyframes quantumCardEnter {
+    0% {
+        opacity: 0;
+        transform: translateY(20px) scale(0.95);
+    }
+    60% {
+        opacity: 1;
+        transform: translateY(-5px) scale(1.02);
+    }
+    100% {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+}
+
+/* =================================================================
+   QUANTUM CONTROL PANEL - Cutting-Edge Glassmorphism System
+   SCOPED: Only affects .quantum-menu-wrapper elements
+   ================================================================= */
+
+/* Quantum Menu Wrapper - Scoping container with full isolation */
+/* IMPORTANT: The quantum countdown is inside this wrapper but must maintain its own styles */
+.quantum-menu-wrapper {
+    all: initial;
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    /* Pinned to the viewport, not to the document.
+       `width: 100%` on a fixed element resolves against the initial containing
+       block, which grows with the document when anything overflows — so on a
+       page with any horizontal overflow this wrapper stretched past the screen
+       and took its `right: 10px` button with it, leaving the menu trigger cut
+       off at the edge and unreachable. `100vw` is the screen, whatever the
+       document is doing. */
+    width: 100vw !important;
+    max-width: 100vw !important;
+    height: 0 !important;
+    display: block !important;
+    z-index: 10000 !important;
+    overflow: visible !important;
+    pointer-events: none !important;
+
+    /* Defensive resets to prevent inheritance */
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+    font-size: 16px !important;
+    line-height: 1.5 !important;
+    /* NOTE: color #000 removed to prevent interference with quantum countdown */
+    background: transparent !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    border: none !important;
+    box-shadow: none !important;
+    transform: none !important;
+    animation: none !important;
+    transition: none !important;
+
+    /* Prevent conflicts with page styles */
+    text-align: left !important;
+    text-decoration: none !important;
+    text-transform: none !important;
+    letter-spacing: normal !important;
+    word-spacing: normal !important;
+    white-space: normal !important;
+    direction: ltr !important;
+    writing-mode: horizontal-tb !important;
+}
+
+/* Universal child element isolation - prevent page styles from affecting menu */
+/* IMPORTANT: Exclude quantum countdown and background animations to prevent style conflicts */
+.quantum-menu-wrapper *:not(.quantum-countdown-container):not(.quantum-countdown-container *),
+.quantum-menu-wrapper *:not(.quantum-countdown-container)::before,
+.quantum-menu-wrapper *:not(.quantum-countdown-container)::after {    
+    box-sizing: border-box !important;
+    margin: 0 !important;
+    padding: 0 !important;
+}
+
+.quantum-menu-wrapper *:not(.quantum-countdown-container):not(.quantum-countdown-container *) {
+    /* Reset all potentially conflicting properties */
+    all: unset;
+    box-sizing: border-box !important;
+}
+
+/* Allow pointer events on interactive elements only */
+.quantum-menu-wrapper .quantum-control-panel-btn {
+    pointer-events: auto !important;
+}
+
+/* CRITICAL: Overlay and panel must be completely non-interactive when closed */
+.quantum-menu-wrapper .quantum-control-overlay,
+.quantum-menu-wrapper .quantum-control-panel {
+    pointer-events: none !important;
+    visibility: hidden !important;
+    display: none !important;
+}
+
+/* Only when active should they be visible and interactive */
+.quantum-menu-wrapper .quantum-control-overlay.active,
+.quantum-menu-wrapper .quantum-control-panel.active {
+    pointer-events: auto !important;
+    visibility: visible !important;
+    display: block !important;
+}
+
+/* Quantum Particles - Animation effect */
+.quantum-menu-wrapper .quantum-particle {
+    all: initial;
+    position: fixed !important;
+    width: 6px !important;
+    height: 6px !important;
+    background: radial-gradient(circle, rgba(0, 207, 255, 0.8), rgba(0, 174, 239, 0.4)) !important;
+    border-radius: 50% !important;
+    pointer-events: none !important;
+    opacity: 0 !important;
+    transition: all 1s ease-out !important;
+    z-index: 10005 !important;
+    box-shadow: 0 0 10px rgba(0, 207, 255, 0.6) !important;
+}
+
+/* Main Control Button - Shows current page */
+.quantum-menu-wrapper .quantum-control-panel-btn {
+    all: initial;
+
+    /* Position */
+    position: absolute !important;
+    top: 10px !important;
+    right: 50px !important;
+    z-index: 10200 !important;
+
+    /* Display */
+    display: flex !important;
+    align-items: center !important;
+    gap: 12px !important;
+
+    /* Sizing */
+    min-width: 200px !important;
+    height: 50px !important;
+    padding: 0 28px !important;
+    box-sizing: border-box !important;
+
+    /* Glassmorphism Effect */
+    background: linear-gradient(135deg,
+                rgba(0, 43, 76, 0.6),
+                rgba(0, 0, 0, 0.8)) !important;
+    backdrop-filter: blur(20px) saturate(180%) !important;
+    border: 1px solid rgba(0, 207, 255, 0.4) !important;
+    border-radius: 8px !important;
+
+    /* 3D Shadow */
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4),
+                0 0 20px rgba(0, 207, 255, 0.3),
+                inset 0 1px 2px rgba(230, 247, 255, 0.2) !important;
+
+    /* Typography */
+    font-family: 'JetBrains Mono', 'Courier New', Consolas, Monaco, monospace !important;
+    color: #E6F7FF !important;
+
+    /* Interaction */
+    cursor: pointer !important;
+    transition: all 0.4s cubic-bezier(0.68, -0.55, 0.265, 1.55) !important;
+}
+
+.quantum-menu-wrapper .quantum-control-panel-btn:hover {
+    transform: translateY(-3px) scale(1.05) !important;
+    background: linear-gradient(135deg,
+                rgba(0, 43, 76, 0.8),
+                rgba(0, 0, 0, 0.9)) !important;
+    border-color: rgba(0, 207, 255, 0.7) !important;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5),
+                0 0 40px rgba(0, 207, 255, 0.5),
+                inset 0 1px 2px rgba(230, 247, 255, 0.3) !important;
+}
+
+.quantum-menu-wrapper .quantum-control-panel-btn:active {
+    transform: translateY(-1px) scale(1.02) !important;
+}
+
+.quantum-menu-wrapper .quantum-control-panel-btn .control-icon {
+    font-size: 20px !important;
+    margin-left: 8px !important;
+    animation: quantumPulse 3s ease-in-out infinite !important;
+}
+
+.quantum-menu-wrapper .quantum-control-panel-btn .control-text {
+    flex: 1 !important;
+    font-size: 14px !important;
+    font-weight: bold !important;
+    letter-spacing: 1px !important;
+    text-shadow: 0 0 10px rgba(0, 207, 255, 0.5) !important;
+    padding-left: 0.75rem !important;
+}
+
+.quantum-menu-wrapper .quantum-control-panel-btn .control-arrow {
+    font-size: 12px !important;
+    transition: transform 0.3s ease !important;
+    margin-left: auto !important;
+    margin-right: 8px !important;
+    padding-left: 8px !important;
+}
+
+.quantum-menu-wrapper .quantum-control-panel-btn.active .control-arrow {
+    transform: rotate(180deg) !important;
+}
+
+/* Overlay */
+.quantum-menu-wrapper .quantum-control-overlay {
+    all: initial;
+
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    width: 100vw !important;
+    height: 100vh !important;
+
+    background: rgba(0, 0, 0, 0.7) !important;
+    backdrop-filter: blur(8px) !important;
+
+    z-index: 10199 !important;
+
+    /* Completely hidden when not active */
+    display: none !important;
+    opacity: 0 !important;
+    visibility: hidden !important;
+    pointer-events: none !important;
+
+    transition: opacity 0.4s ease, visibility 0.4s ease !important;
+}
+
+.quantum-menu-wrapper .quantum-control-overlay.active {
+    display: block !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+    pointer-events: all !important;
+    animation: quantumFadeIn 0.3s ease-out forwards !important;
+}
+
+/* Main Control Panel */
+.quantum-menu-wrapper .quantum-control-panel {
+    all: initial;
+
+    /* Position */
+    position: fixed !important;
+    top: 70px !important;
+    right: 50px !important;
+    z-index: 10201 !important;
+
+    /* Sizing */
+    width: 480px !important;
+    max-width: 90vw !important;
+    max-height: 80vh !important;
+
+    /* Box model */
+    padding: 0 !important;
+    margin: 0 !important;
+    box-sizing: border-box !important;
+
+    /* Ultra Glassmorphism - Theme-based */
+    background: linear-gradient(135deg,
+                var(--theme-primary),
+                var(--theme-secondary),
+                var(--theme-tertiary),
+                var(--theme-dark)) !important;
+    backdrop-filter: blur(20px) saturate(150%) !important;
+    border: 2px solid var(--theme-border) !important;
+    border-radius: 8px !important;
+
+    /* 3D Shadow Stack - Theme-based Glow */
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6),
+                0 0 40px var(--theme-glow-1),
+                inset 0 1px 3px var(--theme-inset) !important;
+
+    /* Scrolling */
+    overflow: hidden !important;
+
+    /* Effects - Completely hidden when not active */
+    display: none !important;
+    opacity: 0 !important;
+    visibility: hidden !important;
+    transform: translateY(-20px) scale(0.95) translateZ(0) !important;
+    pointer-events: none !important;
+    will-change: transform, opacity !important;
+
+    /* Animation */
+    transition: opacity 0.4s cubic-bezier(0.68, -0.55, 0.265, 1.55),
+                transform 0.4s cubic-bezier(0.68, -0.55, 0.265, 1.55),
+                visibility 0.4s cubic-bezier(0.68, -0.55, 0.265, 1.55) !important;
+}
+
+.quantum-menu-wrapper .quantum-control-panel.active {
+    display: block !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+    transform: translateY(0) scale(1) !important;
+    pointer-events: all !important;
+}
+
+/* Panel Header */
+.quantum-menu-wrapper .control-panel-header {
+    all: initial;
+
+    display: flex !important;
+    align-items: center !important;
+    justify-content: space-between !important;
+
+    padding: 20px 25px !important;
+    margin: 0 !important;
+    box-sizing: border-box !important;
+
+    background: linear-gradient(180deg,
+                var(--theme-primary),
+                var(--theme-secondary),
+                var(--theme-tertiary),
+                var(--theme-dark)) !important;
+    border-bottom: 2px solid var(--theme-border) !important;
+    backdrop-filter: blur(20px) !important;
+
+    position: sticky !important;
+    top: 0 !important;
+    z-index: 100 !important;
+}
+
+.quantum-menu-wrapper .control-panel-header .panel-title {
+    all: initial;
+
+    display: block !important;
+    margin: 0 !important;
+    padding: 0 !important;
+
+    flex: 1 !important;
+    text-align: center !important;
+
+    font-family: 'JetBrains Mono', 'Courier New', monospace !important;
+    font-size: 18px !important;
+    font-weight: 700 !important;
+    letter-spacing: 3px !important;
+    line-height: 1.2 !important;
+
+    color: var(--theme-text) !important;
+    text-shadow: 0 0 20px var(--theme-glow-2),
+                 0 0 40px var(--theme-glow-1),
+                 0 0 60px var(--theme-glow-3) !important;
+
+    animation: quantumGlow 4s ease-in-out infinite !important;
+}
+
+.quantum-menu-wrapper .control-panel-header .panel-close {
+    all: initial;
+
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+
+    width: 40px !important;
+    height: 40px !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    box-sizing: border-box !important;
+
+    background: rgba(220, 20, 60, 0.8) !important;
+    border: 2px solid rgba(0, 207, 255, 0.3) !important;
+    border-radius: 50% !important;
+
+    font-family: Arial, sans-serif !important;
+    font-size: 24px !important;
+    font-weight: bold !important;
+    line-height: 1 !important;
+    color: white !important;
+
+    cursor: pointer !important;
+    transition: all 0.3s ease !important;
+
+    box-shadow: 0 4px 15px rgba(220, 20, 60, 0.4) !important;
+}
+
+.quantum-menu-wrapper .control-panel-header .panel-close:hover {
+    background: rgba(220, 20, 60, 1) !important;
+    transform: rotate(90deg) scale(1.15) !important;
+    box-shadow: 0 6px 25px rgba(220, 20, 60, 0.6),
+                0 0 30px rgba(0, 207, 255, 0.4) !important;
+    animation: quantumPulse 1s ease-in-out infinite !important;
+}
+
+/* 3D Quantum Shield Animation */
+.quantum-menu-wrapper .quantum-shield-container {
+    all: initial;
+
+    position: absolute !important;
+    left: 20px !important;
+    top: 50% !important;
+    transform: translateY(-50%) !important;
+
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+
+    perspective: 2000px !important;
+    perspective-origin: center !important;
+
+    width: 60px !important;
+    height: 60px !important;
+
+    z-index: 10 !important;
+}
+
+.quantum-menu-wrapper .quantum-shield-3d {
+    all: initial;
+
+    position: relative !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+
+    width: 50px !important;
+    height: 50px !important;
+
+    transform-style: preserve-3d !important;
+    animation: quantumShieldRotate 8s infinite ease-in-out !important;
+
+    filter: drop-shadow(0 0 20px var(--theme-glow-1))
+            drop-shadow(0 0 40px var(--theme-glow-2))
+            drop-shadow(0 0 60px var(--theme-glow-3)) !important;
+}
+
+.quantum-menu-wrapper .quantum-shield-3d .shield-icon {
+    all: initial;
+
+    position: absolute !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+
+    font-size: 48px !important;
+    line-height: 1 !important;
+
+    transform: translateZ(40px) !important;
+
+    /* Gradient text effect - Theme-based */
+    background: linear-gradient(135deg,
+                var(--theme-text) 0%,
+                var(--theme-glow-2) 50%,
+                var(--theme-glow-1) 100%) !important;
+    background-clip: text !important;
+    -webkit-background-clip: text !important;
+    -webkit-text-fill-color: transparent !important;
+
+    /* Border effect using multiple drop shadows - Theme-based */
+    filter: drop-shadow(0 2px 8px var(--theme-glow-2))
+            drop-shadow(0 0 2px var(--theme-glow-1))
+            drop-shadow(0 0 2px var(--theme-glow-2))
+            drop-shadow(0 0 3px var(--theme-glow-3)) !important;
+}
+
+.quantum-menu-wrapper .quantum-shield-container .key-icon {
+    all: initial;
+
+    position: absolute !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+
+    width: 50px !important;
+    height: 50px !important;
+
+    font-size: 24px !important;
+    line-height: 1 !important;
+
+    transform: translateZ(80px) !important;
+    transform-style: preserve-3d !important;
+
+    /* Static - no rotation */
+    animation: none !important;
+}
+
+/* 3D Rotation Animation */
+@keyframes quantumShieldRotate {
+    0% {
+        transform: rotateY(0deg) rotateX(0deg) rotateZ(0deg);
+    }
+    25% {
+        transform: rotateY(180deg) rotateX(10deg) rotateZ(5deg);
+    }
+    50% {
+        transform: rotateY(360deg) rotateX(0deg) rotateZ(0deg);
+    }
+    75% {
+        transform: rotateY(180deg) rotateX(-10deg) rotateZ(-5deg);
+    }
+    100% {
+        transform: rotateY(0deg) rotateX(0deg) rotateZ(0deg);
+    }
+}
+
+/* Key Pulse Animation */
+@keyframes keyPulse {
+    0%, 100% {
+        transform: translateZ(80px) rotate(0deg) scale(1.1);
+        filter: drop-shadow(0 0 10px rgba(255, 215, 0, 0.8))
+                drop-shadow(0 2px 4px rgba(255, 140, 0, 0.6));
+    }
+    50% {
+        transform: translateZ(100px) rotate(0deg) scale(1.3);
+        filter: drop-shadow(0 0 20px rgba(255, 215, 0, 1))
+                drop-shadow(0 4px 8px rgba(255, 140, 0, 0.8));
+    }
+}
+
+/* 3D Cube */
+.quantum-menu-wrapper .cube-3d {
+    all: initial;
+
+    position: relative !important;
+    width: 24px !important;
+    height: 24px !important;
+    transform-style: preserve-3d !important;
+    animation: cubeRotate 4s infinite linear !important;
+}
+
+.quantum-menu-wrapper .cube-face {
+    all: initial;
+
+    position: absolute !important;
+    width: 24px !important;
+    height: 24px !important;
+    background: linear-gradient(135deg,
+                var(--theme-glow-1) 0%,
+                var(--theme-glow-2) 50%,
+                var(--theme-primary) 100%) !important;
+    border: 1px solid var(--theme-border-light) !important;
+    opacity: 0.9 !important;
+    box-shadow: inset 0 0 10px rgba(255, 255, 255, 0.3),
+                0 0 15px var(--theme-glow-1) !important;
+}
+
+.quantum-menu-wrapper .cube-front {
+    transform: rotateY(0deg) translateZ(12px) !important;
+}
+
+.quantum-menu-wrapper .cube-back {
+    transform: rotateY(180deg) translateZ(12px) !important;
+}
+
+.quantum-menu-wrapper .cube-right {
+    transform: rotateY(90deg) translateZ(12px) !important;
+}
+
+.quantum-menu-wrapper .cube-left {
+    transform: rotateY(-90deg) translateZ(12px) !important;
+}
+
+.quantum-menu-wrapper .cube-top {
+    transform: rotateX(90deg) translateZ(12px) !important;
+}
+
+.quantum-menu-wrapper .cube-bottom {
+    transform: rotateX(-90deg) translateZ(12px) !important;
+}
+
+@keyframes cubeRotate {
+    0% {
+        transform: rotateX(0deg) rotateY(0deg) rotateZ(0deg);
+    }
+    100% {
+        transform: rotateX(360deg) rotateY(360deg) rotateZ(360deg);
+    }
+}
+
+/* Panel Content */
+.quantum-menu-wrapper .control-panel-content {
+    all: initial;
+
+    display: block !important;
+    padding: 20px 25px !important;
+    margin: 0 !important;
+    box-sizing: border-box !important;
+
+    max-height: calc(80vh - 80px) !important;
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
+    -webkit-overflow-scrolling: touch !important;
+
+    /* GPU acceleration for smooth scrolling */
+    transform: translateZ(0) !important;
+    will-change: scroll-position !important;
+
+    /* Custom scrollbar - Theme-based */
+    scrollbar-width: thin !important;
+    scrollbar-color: var(--theme-glow-2) var(--theme-primary) !important;
+}
+
+.quantum-menu-wrapper .control-panel-content::-webkit-scrollbar {
+    width: 8px !important;
+}
+
+.quantum-menu-wrapper .control-panel-content::-webkit-scrollbar-track {
+    background: var(--theme-primary) !important;
+    border-radius: 10px !important;
+}
+
+.quantum-menu-wrapper .control-panel-content::-webkit-scrollbar-thumb {
+    background: linear-gradient(180deg,
+                var(--theme-glow-2),
+                var(--theme-glow-1)) !important;
+    border-radius: 10px !important;
+    border: 2px solid var(--theme-primary) !important;
+}
+
+.quantum-menu-wrapper .control-panel-content::-webkit-scrollbar-thumb:hover {
+    background: var(--theme-border) !important;
+}
+
+/* Control Section */
+.quantum-menu-wrapper .control-section {
+    all: initial;
+
+    display: block !important;
+    margin: 0 auto 25px auto !important;
+    padding: 0 !important;
+    box-sizing: border-box !important;
+    max-width: 100% !important;
+
+    animation: sectionFadeIn 0.6s ease-out !important;
+}
+
+.quantum-menu-wrapper .control-section:last-child {
+    margin-bottom: 0 !important;
+}
+
+/* Section Title */
+.quantum-menu-wrapper .control-section .section-title {
+    all: initial;
+
+    display: flex !important;
+    align-items: center !important;
+    justify-content: space-between !important;
+
+    margin: 10px 10px 5px 10px !important;
+    padding: 8px 12px !important;
+    box-sizing: border-box !important;
+
+    background: linear-gradient(180deg,
+                var(--theme-primary),
+                var(--theme-secondary),
+                var(--theme-tertiary),
+                var(--theme-dark)) !important;
+    border: 1px solid var(--theme-border-light) !important;
+    border-radius: 8px !important;
+    backdrop-filter: blur(10px) !important;
+
+    font-family: 'JetBrains Mono', 'Courier New', monospace !important;
+    font-size: 13px !important;
+    font-weight: 600 !important;
+    letter-spacing: 1px !important;
+    line-height: 1.2 !important;
+
+    color: var(--theme-text) !important;
+    text-shadow: 0 0 10px var(--theme-glow-2),
+                 0 0 20px var(--theme-glow-1) !important;
+
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3),
+                0 0 15px var(--theme-shadow-1),
+                inset 0 1px 1px var(--theme-inset) !important;
+
+    animation: quantumSlideInDown 0.5s ease-out forwards,
+               quantumGlow 5s ease-in-out infinite !important;
+}
+
+.quantum-menu-wrapper .control-section .section-title.expandable {
+    cursor: pointer !important;
+    transition: all 0.3s ease !important;
+}
+
+.quantum-menu-wrapper .control-section .section-title.expandable:hover {
+    background: linear-gradient(180deg,
+                var(--theme-primary),
+                var(--theme-secondary),
+                var(--theme-tertiary),
+                var(--theme-dark)) !important;
+    border-color: var(--theme-border-hover) !important;
+    box-shadow: 0 6px 20px var(--theme-shadow-1),
+                0 0 30px var(--theme-shadow-3),
+                inset 0 1px 1px var(--theme-inset) !important;
+}
+
+.quantum-menu-wrapper .control-section .section-title .expand-icon {
+    font-size: 12px !important;
+    transition: transform 0.3s ease !important;
+}
+
+.quantum-menu-wrapper .control-section .section-title.expanded .expand-icon {
+    transform: rotate(180deg) !important;
+}
+
+/* Quick Action Grid Row - Single Row Layout */
+.quantum-menu-wrapper .action-grid-row {
+    all: initial;
+
+    display: grid !important;
+    grid-template-columns: 1fr 1fr 1fr !important;
+    gap: 10px !important;
+
+    margin: 10px !important;
+    padding: 0 !important;
+    box-sizing: border-box !important;
+}
+
+.quantum-menu-wrapper .action-item {
+    all: initial;
+
+    display: flex !important;
+    flex-direction: column !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    box-sizing: border-box !important;
+}
+
+/* Theme Card - Contains label and dropdown */
+.quantum-menu-wrapper .theme-card {
+    all: initial;
+
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 10px !important;
+    padding: 15px !important;
+    margin: 0 !important;
+    box-sizing: border-box !important;
+
+    background: linear-gradient(180deg,
+                var(--theme-primary),
+                var(--theme-secondary),
+                var(--theme-tertiary)) !important;
+    border: 2px solid var(--theme-border-light) !important;
+    border-radius: 8px !important;
+    backdrop-filter: blur(10px) !important;
+
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3),
+                0 0 15px var(--theme-shadow-1),
+                inset 0 1px 2px var(--theme-inset) !important;
+
+    animation: quantumCardEnter 0.6s ease-out forwards !important;
+}
+
+.quantum-menu-wrapper .theme-card-label {
+    all: initial;
+
+    display: block !important;
+    font-family: 'JetBrains Mono', 'Courier New', monospace !important;
+    font-size: 11px !important;
+    font-weight: 600 !important;
+    letter-spacing: 1.5px !important;
+    color: var(--theme-text) !important;
+    text-align: center !important;
+    text-transform: uppercase !important;
+    text-shadow: 0 0 8px var(--theme-glow-2) !important;
+    animation: quantumGlow 3s ease-in-out infinite !important;
+}
+
+.quantum-menu-wrapper .action-item-label {
+    all: initial;
+
+    display: block !important;
+    font-family: 'JetBrains Mono', 'Courier New', monospace !important;
+    font-size: 11px !important;
+    font-weight: 600 !important;
+    letter-spacing: 1px !important;
+    color: var(--theme-text-light) !important;
+    text-align: center !important;
+    text-transform: uppercase !important;
+    opacity: 0.9 !important;
+}
+
+/* Quick Action Grid (legacy - keep for compatibility) */
+.quantum-menu-wrapper .action-grid {
+    all: initial;
+
+    display: grid !important;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)) !important;
+    gap: 12px !important;
+
+    margin: 0 !important;
+    padding: 0 !important;
+    box-sizing: border-box !important;
+}
+
+.quantum-menu-wrapper .action-btn {
+    all: initial;
+
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+    justify-content: center !important;
+    gap: 8px !important;
+
+    padding: 18px 12px !important;
+    box-sizing: border-box !important;
+
+    background: linear-gradient(135deg,
+                var(--theme-primary),
+                var(--theme-dark)) !important;
+    border: 2px solid var(--theme-border-light) !important;
+    border-radius: 12px !important;
+    backdrop-filter: blur(10px) !important;
+
+    cursor: pointer !important;
+    transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1) !important;
+
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3),
+                0 0 10px var(--theme-shadow-1),
+                inset 0 1px 1px var(--theme-inset) !important;
+}
+
+.quantum-menu-wrapper .action-btn:hover {
+    transform: translateY(-5px) scale(1.05) !important;
+    background: linear-gradient(135deg,
+                var(--theme-secondary),
+                var(--theme-dark)) !important;
+    border-color: var(--theme-border) !important;
+    box-shadow: 0 8px 25px var(--theme-shadow-1),
+                0 0 30px var(--theme-shadow-2),
+                inset 0 1px 2px var(--theme-inset) !important;
+}
+
+.quantum-menu-wrapper .action-btn .action-icon {
+    font-size: 32px !important;
+    filter: drop-shadow(0 0 10px var(--theme-glow-2))
+            drop-shadow(0 0 15px var(--theme-glow-1)) !important;
+}
+
+.quantum-menu-wrapper .action-btn .action-label {
+    font-family: 'JetBrains Mono', 'Courier New', monospace !important;
+    font-size: 12px !important;
+    font-weight: 600 !important;
+    text-align: center !important;
+    color: var(--theme-text-light) !important;
+    line-height: 1.2 !important;
+}
+
+/* Compact Action Buttons - For Single Row Layout */
+.quantum-menu-wrapper .action-btn-compact {
+    all: initial;
+
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    gap: 6px !important;
+
+    width: 100% !important;
+    height: 96px !important;
+    padding: 14px !important;
+    box-sizing: border-box !important;
+
+    background: linear-gradient(135deg,
+                var(--theme-primary),
+                var(--theme-dark)) !important;
+    border: 2px solid var(--theme-border-light) !important;
+    border-radius: 12px !important;
+    backdrop-filter: blur(10px) !important;
+
+    cursor: pointer !important;
+    transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1) !important;
+
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3),
+                0 0 10px var(--theme-shadow-1),
+                inset 0 1px 1px var(--theme-inset) !important;
+
+    animation: quantumCardEnter 0.8s ease-out forwards !important;
+}
+
+/* Stacked variant - emoji on top, text below */
+.quantum-menu-wrapper .action-btn-compact.action-btn-stacked {
+    flex-direction: column !important;
+    gap: 8px !important;
+    padding: 16px 12px !important;
+}
+
+.quantum-menu-wrapper .action-btn-compact:hover {
+    transform: translateY(-3px) scale(1.03) !important;
+    background: linear-gradient(135deg,
+                var(--theme-secondary),
+                var(--theme-dark)) !important;
+    border-color: var(--theme-border) !important;
+    box-shadow: 0 8px 25px var(--theme-shadow-1),
+                0 0 30px var(--theme-shadow-2),
+                0 0 50px var(--theme-shadow-3),
+                inset 0 1px 2px var(--theme-inset) !important;
+}
+
+.quantum-menu-wrapper .action-btn-compact:hover .action-icon {
+    animation: quantumPulse 1.5s ease-in-out infinite !important;
+}
+
+.quantum-menu-wrapper .action-btn-compact .action-icon {
+    font-size: 24px !important;
+}
+
+.quantum-menu-wrapper .action-btn-compact.action-btn-stacked .action-icon {
+    font-size: 32px !important;
+}
+
+.quantum-menu-wrapper .action-btn-compact .action-label {
+    font-family: 'JetBrains Mono', 'Courier New', monospace !important;
+    font-size: 12px !important;
+    font-weight: 600 !important;
+    text-align: center !important;
+    color: var(--theme-text-light) !important;
+    line-height: 1.2 !important;
+    white-space: nowrap !important;
+}
+
+.quantum-menu-wrapper .action-btn-compact.action-btn-stacked .action-label {
+    font-size: 11px !important;
+}
+
+/* Two-line label wrapper */
+.quantum-menu-wrapper .action-label-wrapper {
+    all: initial;
+
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+    gap: 2px !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    box-sizing: border-box !important;
+}
+
+.quantum-menu-wrapper .action-label-line {
+    all: initial;
+
+    display: block !important;
+    font-family: 'JetBrains Mono', 'Courier New', monospace !important;
+    font-size: 12px !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.5px !important;
+    text-align: center !important;
+    color: var(--theme-text-light) !important;
+    line-height: 1.2 !important;
+    white-space: nowrap !important;
+}
+
+/* Compact Theme Selector - For Single Row Layout */
+.quantum-menu-wrapper .theme-selector-compact {
+    all: initial;
+
+    display: block !important;
+    width: 100% !important;
+    height: 42px !important;
+
+    padding: 0 35px 0 12px !important;
+    margin: 0 !important;
+    box-sizing: border-box !important;
+
+    background: rgba(0, 0, 0, 0.4) !important;
+    backdrop-filter: blur(5px) !important;
+
+    border: 2px solid var(--theme-border-light) !important;
+    border-radius: 10px !important;
+
+    font-family: 'JetBrains Mono', 'Courier New', monospace !important;
+    font-size: 12px !important;
+    font-weight: 500 !important;
+    color: var(--theme-text-light) !important;
+    line-height: 42px !important;
+
+    cursor: pointer !important;
+    transition: all 0.3s ease !important;
+
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2),
+                inset 0 1px 1px rgba(255, 255, 255, 0.1) !important;
+
+    appearance: none !important;
+    -webkit-appearance: none !important;
+    -moz-appearance: none !important;
+
+    background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23E6F7FF' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e") !important;
+    background-repeat: no-repeat !important;
+    background-position: right 8px center !important;
+    background-size: 16px !important;
+}
+
+.quantum-menu-wrapper .theme-selector-compact:hover {
+    border-color: var(--theme-border) !important;
+    background: rgba(0, 0, 0, 0.5) !important;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3),
+                0 0 15px var(--theme-shadow-1),
+                inset 0 1px 1px rgba(255, 255, 255, 0.15) !important;
+}
+
+.quantum-menu-wrapper .theme-selector-compact:focus {
+    outline: none !important;
+    border-color: var(--theme-border-hover) !important;
+    background: rgba(0, 0, 0, 0.6) !important;
+    box-shadow: 0 4px 15px var(--theme-shadow-1),
+                0 0 20px var(--theme-shadow-2),
+                inset 0 1px 1px rgba(255, 255, 255, 0.2) !important;
+}
+
+.quantum-menu-wrapper .theme-selector-compact option {
+    background: rgba(0, 0, 0, 0.95) !important;
+    color: #E6F7FF !important;
+    padding: 10px !important;
+}
+
+/* Navigation Grid */
+.quantum-menu-wrapper .nav-grid {
+    all: initial;
+
+    display: grid !important;
+    grid-template-columns: repeat(3, 1fr) !important;
+    gap: 10px !important;
+
+    margin: 10px !important;
+    padding: 0 !important;
+    box-sizing: border-box !important;
+    overflow: visible !important;
+}
+
+/* This max-height is not a size — it is the target the collapse animation runs to, and it
+   has to be a finite length because a transition to `none` does not animate. With
+   `overflow: visible` an under-sized value does not scroll or clip, it silently lets the
+   last row spill out over the section beneath: at 500px the Documents grid (19 tiles, 7
+   rows ≈ 516px) hung 16px into the next section header and ate the gap under it — and on
+   the two-column mobile layout the same grid needs ~10 rows, so it had been overflowing
+   there for far longer. Keep this comfortably above the tallest grid. */
+.quantum-menu-wrapper .nav-grid.collapsible {
+    max-height: 1200px !important;
+    opacity: 1 !important;
+    overflow: visible !important;
+    transition: all 0.4s ease !important;
+}
+
+/* Expanded state for action-grid-row (Quick Actions) */
+.quantum-menu-wrapper .action-grid-row.collapsible {
+    max-height: 1000px !important;
+    opacity: 1 !important;
+    overflow: visible !important;
+    transition: all 0.4s ease !important;
+}
+
+.quantum-menu-wrapper .nav-grid.collapsible.collapsed {
+    max-height: 0 !important;
+    opacity: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: hidden !important;
+}
+
+/* Collapsed state for action-grid-row (Quick Actions) */
+.quantum-menu-wrapper .action-grid-row.collapsible.collapsed {
+    max-height: 0 !important;
+    opacity: 0 !important;
+    margin-top: 0 !important;
+    overflow: hidden !important;
+}
+
+.quantum-menu-wrapper .nav-link {
+    all: initial;
+
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+    justify-content: center !important;
+    gap: 6px !important;
+
+    padding: 10px 8px !important;
+    box-sizing: border-box !important;
+    max-width: 130px !important;
+    width: 100% !important;
+    justify-self: center !important;
+
+    background: linear-gradient(135deg,
+                var(--theme-primary),
+                var(--theme-secondary),
+                var(--theme-tertiary),
+                var(--theme-dark)) !important;
+    border: 2px solid var(--theme-border-light) !important;
+    border-radius: 8px !important;
+    backdrop-filter: blur(8px) !important;
+
+    text-decoration: none !important;
+    cursor: pointer !important;
+
+    transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1) !important;
+
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.2),
+                0 0 10px var(--theme-shadow-1),
+                inset 0 1px 1px var(--theme-inset) !important;
+
+    position: relative !important;
+    overflow: hidden !important;
+    transform: translateZ(0) !important;
+    will-change: transform !important;
+
+    animation: quantumFadeIn 0.7s ease-out forwards !important;
+}
+
+.quantum-menu-wrapper .nav-link::before {
+    content: '' !important;
+    position: absolute !important;
+    top: 0 !important;
+    left: -100% !important;
+    width: 100% !important;
+    height: 100% !important;
+    background: linear-gradient(90deg,
+                transparent,
+                var(--theme-glow-2),
+                var(--theme-glow-1),
+                transparent) !important;
+    transition: left 0.5s ease !important;
+}
+
+.quantum-menu-wrapper .nav-link:hover::before {
+    left: 100% !important;
+}
+
+.quantum-menu-wrapper .nav-link:hover {
+    transform: translateY(-3px) scale(1.05) !important;
+    background: linear-gradient(135deg,
+                var(--theme-primary),
+                var(--theme-secondary),
+                var(--theme-tertiary),
+                var(--theme-dark)) !important;
+    border-color: var(--theme-border) !important;
+    box-shadow: 0 6px 20px var(--theme-shadow-1),
+                0 0 25px var(--theme-shadow-2),
+                0 0 35px var(--theme-shadow-3),
+                inset 0 1px 2px var(--theme-inset) !important;
+}
+
+.quantum-menu-wrapper .nav-link.active {
+    background: linear-gradient(135deg,
+                var(--theme-glow-1),
+                var(--theme-glow-2),
+                var(--theme-tertiary)) !important;
+    border-color: var(--theme-border) !important;
+    box-shadow: 0 6px 20px var(--theme-glow-1),
+                0 0 30px var(--theme-glow-2),
+                0 0 40px var(--theme-glow-3),
+                inset 0 1px 2px var(--theme-inset) !important;
+}
+
+/* Disabled state for authentication links */
+.quantum-menu-wrapper .nav-link.disabled {
+    opacity: 0.4 !important;
+    cursor: not-allowed !important;
+    pointer-events: none !important;
+    filter: grayscale(70%) !important;
+}
+
+.quantum-menu-wrapper .nav-link.disabled:hover {
+    transform: none !important;
+    background: linear-gradient(135deg,
+                rgba(0, 43, 76, 0.4),
+                rgba(0, 0, 0, 0.5)) !important;
+    border-color: rgba(0, 207, 255, 0.25) !important;
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.2),
+                inset 0 1px 1px rgba(230, 247, 255, 0.08) !important;
+}
+
+.quantum-menu-wrapper .nav-link.disabled::before {
+    display: none !important;
+}
+
+.quantum-menu-wrapper .nav-link.disabled .nav-icon {
+    filter: grayscale(100%) opacity(0.5) !important;
+}
+
+.quantum-menu-wrapper .nav-link.disabled .nav-label {
+    opacity: 0.5 !important;
+}
+
+.quantum-menu-wrapper .nav-link .nav-icon {
+    font-size: 28px !important;
+    filter: drop-shadow(0 0 8px var(--theme-glow-2))
+            drop-shadow(0 0 12px var(--theme-glow-1)) !important;
+}
+
+.quantum-menu-wrapper .nav-link.active .nav-icon {
+    filter: drop-shadow(0 0 15px var(--theme-glow-2))
+            drop-shadow(0 0 25px var(--theme-glow-1))
+            drop-shadow(0 0 35px var(--theme-glow-3)) !important;
+    animation: iconPulse 2s infinite !important;
+}
+
+.quantum-menu-wrapper .nav-link .nav-label {
+    font-family: 'JetBrains Mono', 'Courier New', monospace !important;
+    font-size: 11px !important;
+    font-weight: 600 !important;
+    text-align: center !important;
+    color: #E6F7FF !important;
+    line-height: 1.2 !important;
+}
+
+.quantum-menu-wrapper .nav-link.active .nav-label {
+    color: #00CFFF !important;
+    text-shadow: 0 0 10px rgba(0, 207, 255, 0.6) !important;
+}
+
+/* =================================================================
+   QUANTUM ANIMATIONS
+   ================================================================= */
+
+@keyframes quantumPulse {
+    0%, 100% {
+        filter: drop-shadow(0 0 5px rgba(0, 207, 255, 0.5));
+        transform: scale(1);
+    }
+    50% {
+        filter: drop-shadow(0 0 15px rgba(0, 207, 255, 0.8));
+        transform: scale(1.1);
+    }
+}
+
+@keyframes quantumGlow {
+    0%, 100% {
+        text-shadow: 0 0 20px rgba(0, 207, 255, 0.8),
+                     0 0 40px rgba(0, 174, 239, 0.4);
+    }
+    50% {
+        text-shadow: 0 0 30px rgba(0, 207, 255, 1),
+                     0 0 60px rgba(0, 174, 239, 0.6);
+    }
+}
+
+@keyframes sectionFadeIn {
+    0% {
+        opacity: 0;
+        transform: translateY(10px);
+    }
+    100% {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+@keyframes iconPulse {
+    0%, 100% {
+        filter: drop-shadow(0 0 15px rgba(0, 207, 255, 0.8));
+    }
+    50% {
+        filter: drop-shadow(0 0 25px rgba(0, 207, 255, 1));
+    }
+}
+
+/* =================================================================
+   THEME SYSTEM - CSS Custom Properties
+   ================================================================= */
+
+/* Default Theme: Electric Blue */
+.quantum-menu-wrapper {
+    --theme-primary: rgba(0, 43, 76, 0.85);
+    --theme-secondary: rgba(0, 0, 0, 0.9);
+    --theme-tertiary: rgba(0, 43, 76, 0.85);
+    --theme-dark: rgba(0, 0, 0, 0.9);
+    --theme-border: rgba(0, 207, 255, 0.5);
+    --theme-border-light: rgba(0, 207, 255, 0.25);
+    --theme-border-hover: rgba(0, 207, 255, 0.7);
+    --theme-glow-1: rgba(0, 207, 255, 0.3);
+    --theme-glow-2: rgba(0, 174, 239, 0.4);
+    --theme-glow-3: rgba(0, 207, 255, 0.2);
+    --theme-text: #00CFFF;
+    --theme-text-light: #E6F7FF;
+    --theme-shadow-1: rgba(0, 207, 255, 0.25);
+    --theme-shadow-2: rgba(0, 174, 239, 0.15);
+    --theme-shadow-3: rgba(0, 207, 255, 0.1);
+    --theme-inset: rgba(230, 247, 255, 0.2);
+}
+
+/* Purple Majesty Theme */
+.quantum-menu-wrapper[data-theme="purple-majesty"] {
+    --theme-primary: rgba(75, 0, 130, 0.4);
+    --theme-secondary: rgba(139, 0, 139, 0.3);
+    --theme-tertiary: rgba(0, 43, 76, 0.85);
+    --theme-dark: rgba(0, 0, 0, 0.9);
+    --theme-border: rgba(186, 85, 211, 0.5);
+    --theme-border-light: rgba(186, 85, 211, 0.3);
+    --theme-border-hover: rgba(186, 85, 211, 0.7);
+    --theme-glow-1: rgba(138, 43, 226, 0.4);
+    --theme-glow-2: rgba(186, 85, 211, 0.6);
+    --theme-glow-3: rgba(220, 20, 60, 0.3);
+    --theme-text: #DA70D6;
+    --theme-text-light: #E6F7FF;
+    --theme-shadow-1: rgba(138, 43, 226, 0.3);
+    --theme-shadow-2: rgba(186, 85, 211, 0.2);
+    --theme-shadow-3: rgba(220, 20, 60, 0.1);
+    --theme-inset: rgba(230, 200, 255, 0.2);
+}
+
+/* Deep Ocean Theme - Electric Blue with Purple/Red accents */
+.quantum-menu-wrapper[data-theme="deep-ocean"] {
+    --theme-primary: rgba(0, 43, 76, 0.85);
+    --theme-secondary: rgba(75, 0, 130, 0.3);
+    --theme-tertiary: rgba(0, 43, 76, 0.85);
+    --theme-dark: rgba(0, 0, 0, 0.9);
+    --theme-border: rgba(0, 207, 255, 0.5);
+    --theme-border-light: rgba(0, 207, 255, 0.3);
+    --theme-border-hover: rgba(0, 207, 255, 0.7);
+    --theme-glow-1: rgba(0, 207, 255, 0.4);
+    --theme-glow-2: rgba(138, 43, 226, 0.3);
+    --theme-glow-3: rgba(220, 20, 60, 0.2);
+    --theme-text: #00CFFF;
+    --theme-text-light: #E6F7FF;
+    --theme-shadow-1: rgba(0, 207, 255, 0.3);
+    --theme-shadow-2: rgba(138, 43, 226, 0.2);
+    --theme-shadow-3: rgba(220, 20, 60, 0.1);
+    --theme-inset: rgba(230, 247, 255, 0.2);
+}
+
+/* Emerald Matrix Theme */
+.quantum-menu-wrapper[data-theme="emerald-matrix"] {
+    --theme-primary: rgba(0, 100, 0, 0.4);
+    --theme-secondary: rgba(0, 128, 128, 0.3);
+    --theme-tertiary: rgba(0, 43, 43, 0.85);
+    --theme-dark: rgba(0, 0, 0, 0.9);
+    --theme-border: rgba(0, 255, 127, 0.5);
+    --theme-border-light: rgba(0, 255, 127, 0.3);
+    --theme-border-hover: rgba(0, 255, 127, 0.7);
+    --theme-glow-1: rgba(0, 255, 127, 0.4);
+    --theme-glow-2: rgba(0, 128, 128, 0.5);
+    --theme-glow-3: rgba(50, 205, 50, 0.3);
+    --theme-text: #00FF7F;
+    --theme-text-light: #E6FFF0;
+    --theme-shadow-1: rgba(0, 255, 127, 0.3);
+    --theme-shadow-2: rgba(0, 128, 128, 0.2);
+    --theme-shadow-3: rgba(50, 205, 50, 0.15);
+    --theme-inset: rgba(200, 255, 230, 0.2);
+}
+
+/* Crimson Fire Theme */
+.quantum-menu-wrapper[data-theme="crimson-fire"] {
+    --theme-primary: rgba(139, 0, 0, 0.4);
+    --theme-secondary: rgba(178, 34, 34, 0.3);
+    --theme-tertiary: rgba(76, 0, 0, 0.85);
+    --theme-dark: rgba(0, 0, 0, 0.9);
+    --theme-border: rgba(220, 20, 60, 0.5);
+    --theme-border-light: rgba(220, 20, 60, 0.3);
+    --theme-border-hover: rgba(220, 20, 60, 0.7);
+    --theme-glow-1: rgba(220, 20, 60, 0.5);
+    --theme-glow-2: rgba(255, 69, 0, 0.4);
+    --theme-glow-3: rgba(255, 140, 0, 0.3);
+    --theme-text: #DC143C;
+    --theme-text-light: #FFE6E6;
+    --theme-shadow-1: rgba(220, 20, 60, 0.4);
+    --theme-shadow-2: rgba(255, 69, 0, 0.25);
+    --theme-shadow-3: rgba(255, 140, 0, 0.15);
+    --theme-inset: rgba(255, 230, 230, 0.2);
+}
+
+/* Arctic Ice Theme */
+.quantum-menu-wrapper[data-theme="arctic-ice"] {
+    --theme-primary: rgba(176, 224, 230, 0.3);
+    --theme-secondary: rgba(135, 206, 235, 0.25);
+    --theme-tertiary: rgba(70, 130, 180, 0.4);
+    --theme-dark: rgba(25, 25, 112, 0.5);
+    --theme-border: rgba(175, 238, 238, 0.6);
+    --theme-border-light: rgba(175, 238, 238, 0.4);
+    --theme-border-hover: rgba(175, 238, 238, 0.8);
+    --theme-glow-1: rgba(175, 238, 238, 0.5);
+    --theme-glow-2: rgba(135, 206, 250, 0.4);
+    --theme-glow-3: rgba(230, 230, 250, 0.3);
+    --theme-text: #AFEEEE;
+    --theme-text-light: #F0FFFF;
+    --theme-shadow-1: rgba(175, 238, 238, 0.35);
+    --theme-shadow-2: rgba(135, 206, 250, 0.25);
+    --theme-shadow-3: rgba(230, 230, 250, 0.15);
+    --theme-inset: rgba(240, 255, 255, 0.25);
+}
+
+/* =================================================================
+   RESPONSIVE - QUANTUM CONTROL PANEL (SCOPED)
+   ================================================================= */
+
+@media (max-width: 768px) {
+    .quantum-menu-wrapper .quantum-control-panel-btn {
+        right: 10px !important;
+        min-width: 150px !important;
+        height: 45px !important;
+        padding: 0 15px !important;
+    }
+
+    .quantum-menu-wrapper .quantum-control-panel {
+        top: 65px !important;
+        right: 10px !important;
+        width: calc(100vw - 20px) !important;
+        max-height: 75vh !important;
+    }
+
+    .quantum-menu-wrapper .control-panel-content {
+        padding: 15px 20px !important;
+    }
+
+    .quantum-menu-wrapper .nav-grid {
+        grid-template-columns: repeat(2, 1fr) !important;
+        gap: 8px !important;
+        margin: 10px !important;
+        padding: 0 !important;
+    }
+
+    .quantum-menu-wrapper .action-grid {
+        grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)) !important;
+    }
+
+    .quantum-menu-wrapper .action-grid-row {
+        grid-template-columns: 1fr !important;
+        gap: 12px !important;
+    }
+
+    .quantum-menu-wrapper .theme-card {
+        padding: 12px !important;
+        gap: 8px !important;
+    }
+
+    .quantum-menu-wrapper .theme-card-label {
+        font-size: 10px !important;
+    }
+
+    .quantum-menu-wrapper .theme-selector-compact {
+        height: 40px !important;
+        font-size: 11px !important;
+        line-height: 40px !important;
+    }
+
+    .quantum-menu-wrapper .action-btn-compact {
+        height: 85px !important;
+        padding: 12px 8px !important;
+    }
+
+    .quantum-menu-wrapper .action-btn-compact.action-btn-stacked {
+        gap: 6px !important;
+    }
+
+    .quantum-menu-wrapper .action-btn-compact.action-btn-stacked .action-icon {
+        font-size: 28px !important;
+    }
+
+    .quantum-menu-wrapper .action-label-line {
+        font-size: 11px !important;
+    }
+
+    .quantum-menu-wrapper .action-item-label {
+        font-size: 10px !important;
+    }
+}
+
+@media (max-width: 480px) {
+    .quantum-menu-wrapper .quantum-control-panel-btn {
+        min-width: 120px !important;
+        height: 40px !important;
+        padding: 0 12px !important;
+        gap: 8px !important;
+    }
+
+    .quantum-menu-wrapper .quantum-control-panel-btn .control-text {
+        font-size: 12px !important;
+    }
+
+    .quantum-menu-wrapper .quantum-control-panel {
+        top: 55px !important;
+        width: calc(100vw - 10px) !important;
+        max-height: 70vh !important;
+    }
+
+    .quantum-menu-wrapper .control-panel-header {
+        padding: 15px 20px !important;
+    }
+
+    .quantum-menu-wrapper .control-panel-header .panel-title {
+        font-size: 14px !important;
+        letter-spacing: 1.5px !important;
+    }
+
+    /* Smaller shield on mobile */
+    .quantum-menu-wrapper .quantum-shield-container {
+        width: 40px !important;
+        height: 40px !important;
+        left: 10px !important;
+    }
+
+    .quantum-menu-wrapper .quantum-shield-3d {
+        width: 35px !important;
+        height: 35px !important;
+    }
+
+    .quantum-menu-wrapper .quantum-shield-3d .shield-icon {
+        font-size: 32px !important;
+    }
+
+    .quantum-menu-wrapper .quantum-shield-container .key-icon {
+        width: 35px !important;
+        height: 35px !important;
+    }
+
+    .quantum-menu-wrapper .cube-3d {
+        width: 18px !important;
+        height: 18px !important;
+    }
+
+    .quantum-menu-wrapper .cube-face {
+        width: 18px !important;
+        height: 18px !important;
+    }
+
+    .quantum-menu-wrapper .cube-front {
+        transform: rotateY(0deg) translateZ(9px) !important;
+    }
+
+    .quantum-menu-wrapper .cube-back {
+        transform: rotateY(180deg) translateZ(9px) !important;
+    }
+
+    .quantum-menu-wrapper .cube-right {
+        transform: rotateY(90deg) translateZ(9px) !important;
+    }
+
+    .quantum-menu-wrapper .cube-left {
+        transform: rotateY(-90deg) translateZ(9px) !important;
+    }
+
+    .quantum-menu-wrapper .cube-top {
+        transform: rotateX(90deg) translateZ(9px) !important;
+    }
+
+    .quantum-menu-wrapper .cube-bottom {
+        transform: rotateX(-90deg) translateZ(9px) !important;
+    }
+
+    .quantum-menu-wrapper .control-panel-content {
+        padding: 12px 15px !important;
+    }
+
+    .quantum-menu-wrapper .nav-grid {
+        grid-template-columns: repeat(2, 1fr) !important;
+        gap: 6px !important;
+        margin: 10px !important;
+        padding: 0 !important;
+    }
+
+    .quantum-menu-wrapper .nav-link {
+        padding: 9px 6px !important;
+    }
+
+    .quantum-menu-wrapper .nav-link .nav-icon {
+        font-size: 24px !important;
+    }
+
+    .quantum-menu-wrapper .nav-link .nav-label {
+        font-size: 10px !important;
+    }
+
+    .quantum-menu-wrapper .action-grid {
+        grid-template-columns: repeat(auto-fit, minmax(80px, 1fr)) !important;
+        gap: 8px !important;
+    }
+
+    .quantum-menu-wrapper .action-btn {
+        padding: 14px 10px !important;
+    }
+
+    .quantum-menu-wrapper .action-btn .action-icon {
+        font-size: 28px !important;
+    }
+
+    .quantum-menu-wrapper .action-btn .action-label {
+        font-size: 10px !important;
+    }
+
+    .quantum-menu-wrapper .action-grid-row {
+        grid-template-columns: 1fr !important;
+        gap: 10px !important;
+    }
+
+    .quantum-menu-wrapper .theme-card {
+        padding: 10px !important;
+        gap: 6px !important;
+    }
+
+    .quantum-menu-wrapper .theme-card-label {
+        font-size: 9px !important;
+        letter-spacing: 1px !important;
+    }
+
+    .quantum-menu-wrapper .theme-selector-compact {
+        height: 38px !important;
+        font-size: 10px !important;
+        line-height: 38px !important;
+        padding: 0 30px 0 10px !important;
+        background-position: right 6px center !important;
+        background-size: 14px !important;
+    }
+
+    .quantum-menu-wrapper .action-btn-compact {
+        height: 75px !important;
+        padding: 10px 8px !important;
+    }
+
+    .quantum-menu-wrapper .action-btn-compact.action-btn-stacked {
+        gap: 5px !important;
+    }
+
+    .quantum-menu-wrapper .action-btn-compact.action-btn-stacked .action-icon {
+        font-size: 26px !important;
+    }
+
+    .quantum-menu-wrapper .action-btn-compact .action-label {
+        font-size: 10px !important;
+    }
+
+    .quantum-menu-wrapper .action-label-line {
+        font-size: 10px !important;
+        letter-spacing: 0.3px !important;
+    }
+
+    .quantum-menu-wrapper .action-item-label {
+        font-size: 9px !important;
+    }
+
+    .quantum-menu-wrapper .action-item {
+        gap: 6px !important;
+    }
+}
+
+/* ========================================
+   QUANTUM 3D PLACEHOLDER CARDS
+   True 3D depth with X, Y, Z axis transforms
+   ======================================== */
+
+.quantum-menu-wrapper .nav-placeholder {
+    position: relative !important;
+    transform-style: preserve-3d !important;
+    perspective: 1000px !important;
+    cursor: default !important;
+    transition: none !important;
+    overflow: visible !important;
+}
+
+.quantum-menu-wrapper .quantum-3d-card {
+    background: linear-gradient(135deg,
+        rgba(138, 43, 226, 0.15) 0%,
+        rgba(75, 0, 130, 0.15) 100%) !important;
+    border: 1px solid rgba(138, 43, 226, 0.3) !important;
+    box-shadow:
+        0 4px 8px rgba(0, 0, 0, 0.3),
+        inset 0 1px 0 rgba(255, 255, 255, 0.1) !important;
+    overflow: visible !important;
+}
+
+.quantum-menu-wrapper .quantum-3d-inner {
+    position: relative !important;
+    width: 100% !important;
+    height: 100% !important;
+    transform-style: preserve-3d !important;
+    transition: transform 0.6s cubic-bezier(0.23, 1, 0.32, 1) !important;
+    overflow: visible !important;
+    transform: rotateY(0deg) rotateX(0deg) translateZ(0px) scale3d(1, 1, 1) !important;
+}
+
+.quantum-menu-wrapper .quantum-3d-card.card-tracking {
+    transition: none !important;
+}
+
+.quantum-menu-wrapper .quantum-3d-inner.card-tilted {
+    transform: rotateY(var(--tilt-x, 0deg)) rotateX(var(--tilt-y, 0deg)) translateZ(var(--tilt-z, 0px)) scale3d(1.05, 1.05, 1.05) !important;
+}
+
+.quantum-menu-wrapper .quantum-3d-card:hover .quantum-3d-inner {
+    transform: rotateY(0deg) rotateX(0deg) translateZ(20px) !important;
+}
+
+.quantum-menu-wrapper .quantum-3d-front {
+    position: relative !important;
+    width: 100% !important;
+    height: 100% !important;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+    justify-content: center !important;
+    backface-visibility: hidden !important;
+    z-index: 2 !important;
+    overflow: visible !important;
+}
+
+/* Quantum shine effect */
+.quantum-menu-wrapper .quantum-3d-shine {
+    position: absolute !important;
+    top: 0 !important;
+    left: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    background: linear-gradient(
+        45deg,
+        transparent 30%,
+        rgba(255, 255, 255, 0.1) 50%,
+        transparent 70%
+    ) !important;
+    transform: translateX(-100%) !important;
+    transition: transform 0.6s ease !important;
+    pointer-events: none !important;
+    z-index: 3 !important;
+}
+
+.quantum-menu-wrapper .quantum-3d-card:hover .quantum-3d-shine {
+    transform: translateX(100%) !important;
+}
+
+/* Particle field effect */
+.quantum-menu-wrapper .quantum-3d-card::before {
+    content: '' !important;
+    position: absolute !important;
+    top: -2px !important;
+    left: -2px !important;
+    right: -2px !important;
+    bottom: -2px !important;
+    background: linear-gradient(
+        45deg,
+        #8a2be2,
+        #4b0082,
+        #9370db,
+        #ba55d3
+    ) !important;
+    border-radius: inherit !important;
+    opacity: 0 !important;
+    z-index: -1 !important;
+    transition: opacity 0.3s ease !important;
+    filter: blur(10px) !important;
+    animation: quantum-pulse 3s ease-in-out infinite !important;
+}
+
+.quantum-menu-wrapper .quantum-3d-card:hover::before {
+    opacity: 0.6 !important;
+}
+
+/* Depth shadow effect */
+.quantum-menu-wrapper .quantum-3d-card::after {
+    content: '' !important;
+    position: absolute !important;
+    top: 50% !important;
+    left: 50% !important;
+    width: 80% !important;
+    height: 80% !important;
+    background: radial-gradient(
+        circle,
+        rgba(138, 43, 226, 0.4) 0%,
+        transparent 70%
+    ) !important;
+    transform: translate(-50%, -50%) translateZ(-50px) !important;
+    opacity: 0 !important;
+    transition: opacity 0.3s ease !important;
+    filter: blur(20px) !important;
+    z-index: -2 !important;
+    pointer-events: none !important;
+}
+
+.quantum-menu-wrapper .quantum-3d-card:hover::after {
+    opacity: 1 !important;
+}
+
+/* Icon glow for placeholders */
+.quantum-menu-wrapper .nav-placeholder .nav-icon {
+    filter: drop-shadow(0 0 8px rgba(138, 43, 226, 0.6)) !important;
+    animation: icon-float 3s ease-in-out infinite !important;
+}
+
+.quantum-menu-wrapper .nav-placeholder .nav-label {
+    opacity: 0.7 !important;
+    font-style: italic !important;
+    font-size: 11px !important;
+    text-shadow: 0 0 10px rgba(138, 43, 226, 0.5) !important;
+}
+
+/* Quantum pulse animation */
+@keyframes quantum-pulse {
+    0%, 100% {
+        transform: scale(1) !important;
+        opacity: 0.6 !important;
+    }
+    50% {
+        transform: scale(1.05) !important;
+        opacity: 0.8 !important;
+    }
+}
+
+/* Icon float animation */
+@keyframes icon-float {
+    0%, 100% {
+        transform: translateY(0px) translateZ(0px) !important;
+    }
+    50% {
+        transform: translateY(-5px) translateZ(10px) !important;
+    }
+}
+
+/* Interactive 3D tilt - will be controlled by JavaScript */
+.quantum-menu-wrapper .quantum-3d-card[data-tilt-x] .quantum-3d-inner {
+    transform: 
+        rotateY(var(--tilt-x, 0deg)) 
+        rotateX(var(--tilt-y, 0deg)) 
+        translateZ(var(--tilt-z, 0px)) !important;
+}
+
+/* Mobile optimizations */
+@media (max-width: 768px) {
+    .quantum-menu-wrapper .nav-placeholder {
+        perspective: 500px !important;
+    }
+    
+    .quantum-menu-wrapper .quantum-3d-card:hover .quantum-3d-inner {
+        transform: rotateY(0deg) rotateX(0deg) translateZ(10px) !important;
+    }
+    
+    .quantum-menu-wrapper .nav-placeholder .nav-icon {
+        animation: none !important;
+    }
+}
+
+/* Wide placeholder card - spans 2 columns */
+.quantum-menu-wrapper .quantum-3d-card-wide {
+    grid-column: span 2 !important;
+    max-width: 290px !important; /* 2 button widths (130px each) + 30px */
+    justify-self: center !important; /* Center like regular buttons */
+    width: 100% !important;
+}
+
+
+/* CSS Custom Property for rotating border animation */
+@property --angle {
+    syntax: '<angle>';
+    inherits: false;
+    initial-value: 0deg;
+}
+
+/* Mini Quantum Countdown Widget */
+.quantum-menu-wrapper .quantum-countdown-widget {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 4px !important;
+    padding: 8px !important;
+    background: linear-gradient(145deg, rgba(20, 0, 0, 0.95), rgba(40, 0, 0, 0.9)) !important;
+    border: 2px solid #8b0000 !important;
+    position: relative !important;
+    overflow: visible !important;
+    /* Prevent content from being clipped */
+    contain: none !important;
+    isolation: auto !important;
+}
+
+.quantum-menu-wrapper .quantum-countdown-widget::after {
+    content: '' !important;
+    position: absolute !important;
+    inset: 0 !important;
+    border-radius: 8px !important;
+    box-shadow:
+        0 0 15px rgba(139, 0, 0, 0.6),
+        0 2px 10px rgba(0, 0, 0, 0.7),
+        inset 0 0 10px rgba(200, 0, 0, 0.15) !important;
+    pointer-events: none !important;
+    animation: pulseAmbient 3s ease-in-out infinite !important;
+    z-index: 0 !important;
+}
+
+.quantum-menu-wrapper .widget-header {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    gap: 6px !important;
+    position: relative !important;
+    z-index: 1 !important;
+}
+
+.quantum-menu-wrapper .widget-icon {
+    font-size: 16px !important;
+    filter: drop-shadow(0 0 4px rgba(255, 0, 0, 0.6)) !important;
+}
+
+.quantum-menu-wrapper .widget-title {
+    font-family: 'Orbitron', monospace !important;
+    font-size: 0.7rem !important;
+    font-weight: 700 !important;
+    color: #ff0000 !important;
+    text-shadow: 0 0 6px rgba(255, 0, 0, 0.6) !important;
+    letter-spacing: 0.5px !important;
+}
+
+.quantum-menu-wrapper .mini-countdown-display {
+    display: flex !important;
+    justify-content: space-around !important;
+    gap: 2px !important;
+    padding: 4px 0 !important;
+    position: relative !important;
+    z-index: 1 !important;
+}
+
+.quantum-menu-wrapper .mini-countdown-unit {
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+    gap: 1px !important;
+    min-width: 20px !important;
+}
+
+.quantum-menu-wrapper .mini-countdown-value {
+    font-family: 'Orbitron', monospace !important;
+    font-size: 0.75rem !important;
+    font-weight: 900 !important;
+    color: #ff0000 !important;
+    text-shadow:
+        0 0 6px rgba(255, 0, 0, 0.8),
+        0 0 12px rgba(200, 0, 0, 0.5) !important;
+    transition: all 0.15s ease !important;
+    line-height: 1 !important;
+}
+
+.quantum-menu-wrapper .mini-countdown-value.glow {
+    color: #ff3333 !important;
+    text-shadow:
+        0 0 10px rgba(255, 0, 0, 1),
+        0 0 20px rgba(255, 51, 51, 0.8) !important;
+    transform: scale(1.1) !important;
+}
+
+.quantum-menu-wrapper .mini-countdown-label {
+    font-family: 'Orbitron', monospace !important;
+    font-size: 0.4rem !important;
+    font-weight: 600 !important;
+    background: linear-gradient(90deg,
+        #8b0000,
+        #cc0000,
+        #ff0000,
+        #cc0000,
+        #8b0000
+    ) !important;
+    background-size: 200% 100% !important;
+    background-clip: text !important;
+    -webkit-background-clip: text !important;
+    -webkit-text-fill-color: transparent !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.2px !important;
+    opacity: 0.7 !important;
+    animation: gradientShift 3s ease-in-out infinite !important;
+    line-height: 1 !important;
+}
+
+.quantum-menu-wrapper .widget-datetime {
+    display: flex !important;
+    flex-direction: row !important;
+    align-items: center !important;
+    justify-content: center !important;
+    gap: 4px !important;
+    font-family: 'Orbitron', monospace !important;
+    font-size: 0.5rem !important;
+    color: #cc0000 !important;
+    opacity: 0.8 !important;
+    padding-top: 2px !important;
+    border-top: 1px solid rgba(139, 0, 0, 0.3) !important;
+    white-space: nowrap !important;
+    position: relative !important;
+    z-index: 1 !important;
+}
+
+/* Override nav-link effects for quantum countdown widget */
+.quantum-menu-wrapper .quantum-countdown-widget::before {
+    /* Use the rotating border instead of sliding glow */
+    content: '' !important;
+    position: absolute !important;
+    inset: -2px !important;
+    border-radius: 8px !important;
+    padding: 2px !important;
+    background: conic-gradient(
+        from var(--angle, 0deg),
+        #8b0000 0deg,
+        #cc0000 90deg,
+        #ff0000 180deg,
+        #cc0000 270deg,
+        #8b0000 360deg
+    ) !important;
+    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0) !important;
+    mask-composite: exclude !important;
+    -webkit-mask-composite: xor !important;
+    animation: borderRotate 4s linear infinite !important;
+    z-index: 0 !important;
+    /* Override nav-link sliding glow completely */
+    top: -2px !important;
+    left: -2px !important;
+    right: -2px !important;
+    bottom: -2px !important;
+    width: calc(100% + 4px) !important;
+    height: calc(100% + 4px) !important;
+    transform: none !important;
+    transition: none !important;
+}
+
+.quantum-menu-wrapper .quantum-countdown-widget:hover::before {
+    /* Keep the border animation, don't slide or transform */
+    left: -2px !important;
+    top: -2px !important;
+    right: -2px !important;
+    bottom: -2px !important;
+    transform: none !important;
+}
+
+.quantum-menu-wrapper .quantum-countdown-widget:hover {
+    background: linear-gradient(145deg, rgba(20, 0, 0, 0.95), rgba(40, 0, 0, 0.9)) !important;
+    border-color: #8b0000 !important;
+    transform: translateY(-3px) scale(1.05) !important;
+    box-shadow:
+        0 6px 20px rgba(139, 0, 0, 0.6),
+        0 0 25px rgba(200, 0, 0, 0.5),
+        0 0 35px rgba(255, 0, 0, 0.4) !important;
+}
+
+.quantum-menu-wrapper .quantum-countdown-widget:hover::after {
+    box-shadow:
+        0 0 25px rgba(200, 0, 0, 0.8),
+        0 4px 15px rgba(0, 0, 0, 0.8),
+        inset 0 0 20px rgba(255, 0, 0, 0.25) !important;
+    z-index: 0 !important;
+}
+
+/* Keyframe animations for mini countdown widget */
+@keyframes borderRotate {
+    to {
+        --angle: 360deg;
+    }
+}
+
+@keyframes pulseAmbient {
+    0%, 100% {
+        box-shadow:
+            0 0 15px rgba(139, 0, 0, 0.6),
+            0 2px 10px rgba(0, 0, 0, 0.7),
+            inset 0 0 10px rgba(200, 0, 0, 0.15);
+    }
+    50% {
+        box-shadow:
+            0 0 25px rgba(200, 0, 0, 0.8),
+            0 4px 15px rgba(0, 0, 0, 0.8),
+            inset 0 0 20px rgba(255, 0, 0, 0.25);
+    }
+}
+
+@keyframes gradientShift {
+    0%, 100% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+}
+
+/* Mobile - full width */
+@media (max-width: 768px) {
+    .quantum-menu-wrapper .quantum-3d-card-wide {
+        grid-column: span 1 !important;
+    }
+}
+
+/* ========================================
+   QUANTUM SECURITY ANIMATION
+   3D rotating lock with orbiting particles
+   ======================================== */
+
+.quantum-menu-wrapper .quantum-security-animation {
+    position: relative !important;
+    width: 100% !important;
+    height: 100% !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    overflow: visible !important;
+    z-index: 10 !important;
+}
+
+.quantum-menu-wrapper .quantum-lock-container {
+    position: relative !important;
+    width: 80px !important;
+    height: 80px !important;
+    transform-style: preserve-3d !important;
+    perspective: 500px !important;
+    z-index: 100 !important;
+}
+
+/* 3D Lock Core - rotating shape */
+.quantum-menu-wrapper .quantum-lock-core {
+    position: absolute !important;
+    top: 50% !important;
+    left: 50% !important;
+    width: 40px !important;
+    height: 40px !important;
+    transform-style: preserve-3d !important;
+    transform: translate(-50%, -50%) !important;
+    animation: quantumLockRotate 3s infinite linear !important;
+}
+
+.quantum-menu-wrapper .lock-face {
+    position: absolute !important;
+    width: 40px !important;
+    height: 40px !important;
+    background: linear-gradient(135deg,
+        rgba(138, 43, 226, 0.8) 0%,
+        rgba(75, 0, 130, 0.8) 50%,
+        rgba(186, 85, 211, 0.8) 100%) !important;
+    border: 2px solid rgba(255, 255, 255, 0.3) !important;
+    border-radius: 4px !important;
+    box-shadow: 
+        0 0 20px rgba(138, 43, 226, 0.6),
+        inset 0 0 10px rgba(255, 255, 255, 0.2) !important;
+    opacity: 0.9 !important;
+}
+
+/* Lock icon overlay on front face */
+.quantum-menu-wrapper .lock-front::before {
+    content: '🔒' !important;
+    position: absolute !important;
+    top: 50% !important;
+    left: 50% !important;
+    transform: translate(-50%, -50%) !important;
+    font-size: 20px !important;
+    filter: drop-shadow(0 0 5px rgba(255, 255, 255, 0.8)) !important;
+}
+
+.quantum-menu-wrapper .lock-front {
+    transform: rotateY(0deg) translateZ(20px) !important;
+}
+
+.quantum-menu-wrapper .lock-back {
+    transform: rotateY(180deg) translateZ(20px) !important;
+}
+
+.quantum-menu-wrapper .lock-right {
+    transform: rotateY(90deg) translateZ(20px) !important;
+}
+
+.quantum-menu-wrapper .lock-left {
+    transform: rotateY(-90deg) translateZ(20px) !important;
+}
+
+.quantum-menu-wrapper .lock-top {
+    transform: rotateX(90deg) translateZ(20px) !important;
+}
+
+.quantum-menu-wrapper .lock-bottom {
+    transform: rotateX(-90deg) translateZ(20px) !important;
+}
+
+/* Quantum Orbits - 3 rings */
+.quantum-menu-wrapper .quantum-orbit {
+    position: absolute !important;
+    top: 50% !important;
+    left: 50% !important;
+    transform: translate(-50%, -50%) !important;
+    transform-style: preserve-3d !important;
+    border-radius: 50% !important;
+    z-index: 50 !important;
+}
+
+.quantum-menu-wrapper .orbit-1 {
+    width: 70px !important;
+    height: 70px !important;
+    border: 2px solid rgba(138, 43, 226, 0.5) !important;
+    animation: quantumOrbit1 2s infinite linear !important;
+}
+
+.quantum-menu-wrapper .orbit-2 {
+    width: 60px !important;
+    height: 60px !important;
+    border: 2px solid rgba(186, 85, 211, 0.5) !important;
+    animation: quantumOrbit2 2.5s infinite linear reverse !important;
+}
+
+.quantum-menu-wrapper .orbit-3 {
+    width: 50px !important;
+    height: 50px !important;
+    border: 2px solid rgba(147, 112, 219, 0.5) !important;
+    animation: quantumOrbit3 3s infinite linear !important;
+}
+
+/* Quantum Particles on orbits */
+.quantum-menu-wrapper .quantum-particle {
+    position: absolute !important;
+    width: 8px !important;
+    height: 8px !important;
+    background: radial-gradient(
+        circle,
+        rgba(255, 255, 255, 1) 0%,
+        rgba(138, 43, 226, 1) 50%,
+        transparent 100%
+    ) !important;
+    border-radius: 50% !important;
+    box-shadow:
+        0 0 15px rgba(138, 43, 226, 1),
+        0 0 30px rgba(138, 43, 226, 0.6),
+        0 0 45px rgba(138, 43, 226, 0.3) !important;
+    top: 0 !important;
+    left: 50% !important;
+    transform: translateX(-50%) !important;
+}
+
+/* Lock rotation animation */
+@keyframes quantumLockRotate {
+    0% {
+        transform: translate(-50%, -50%) rotateX(0deg) rotateY(0deg) rotateZ(0deg);
+    }
+    100% {
+        transform: translate(-50%, -50%) rotateX(360deg) rotateY(360deg) rotateZ(360deg);
+    }
+}
+
+/* Orbit rotations - different speeds and axes */
+@keyframes quantumOrbit1 {
+    0% {
+        transform: translate(-50%, -50%) rotateX(60deg) rotateZ(0deg);
+    }
+    100% {
+        transform: translate(-50%, -50%) rotateX(60deg) rotateZ(360deg);
+    }
+}
+
+@keyframes quantumOrbit2 {
+    0% {
+        transform: translate(-50%, -50%) rotateX(-45deg) rotateZ(0deg);
+    }
+    100% {
+        transform: translate(-50%, -50%) rotateX(-45deg) rotateZ(360deg);
+    }
+}
+
+@keyframes quantumOrbit3 {
+    0% {
+        transform: translate(-50%, -50%) rotateY(75deg) rotateZ(0deg);
+    }
+    100% {
+        transform: translate(-50%, -50%) rotateY(75deg) rotateZ(360deg);
+    }
+}
+
+/* Pulsing glow effect */
+.quantum-menu-wrapper .quantum-lock-core::after {
+    content: '' !important;
+    position: absolute !important;
+    top: 50% !important;
+    left: 50% !important;
+    width: 60px !important;
+    height: 60px !important;
+    transform: translate(-50%, -50%) !important;
+    background: radial-gradient(
+        circle,
+        rgba(138, 43, 226, 0.4) 0%,
+        transparent 70%
+    ) !important;
+    border-radius: 50% !important;
+    animation: quantumPulseGlow 2s ease-in-out infinite !important;
+    pointer-events: none !important;
+    z-index: -1 !important;
+}
+
+@keyframes quantumPulseGlow {
+    0%, 100% {
+        opacity: 0.5;
+        transform: translate(-50%, -50%) scale(1);
+    }
+    50% {
+        opacity: 1;
+        transform: translate(-50%, -50%) scale(1.2);
+    }
+}
+
+/* Mobile optimizations */
+@media (max-width: 768px) {
+    .quantum-menu-wrapper .quantum-lock-container {
+        width: 60px !important;
+        height: 60px !important;
+    }
+    
+    .quantum-menu-wrapper .quantum-lock-core {
+        width: 30px !important;
+        height: 30px !important;
+    }
+    
+    .quantum-menu-wrapper .lock-face {
+        width: 30px !important;
+        height: 30px !important;
+    }
+    
+    .quantum-menu-wrapper .lock-front::before {
+        font-size: 16px !important;
+    }
+    
+    .quantum-menu-wrapper .orbit-1 {
+        width: 55px !important;
+        height: 55px !important;
+    }
+    
+    .quantum-menu-wrapper .orbit-2 {
+        width: 45px !important;
+        height: 45px !important;
+    }
+    
+    .quantum-menu-wrapper .orbit-3 {
+        width: 35px !important;
+        height: 35px !important;
+    }
+}
+/* ===================================
+   REDESIGNED NEWS WIDGET - CLEAN & MODERN
+   =================================== */
+
+/* Main Widget Container - Red/Crimson theme matching Q-Day countdown */
+.quantum-menu-wrapper .quantum-news-widget {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 6px !important;
+    padding: 4px 6px !important;
+    background: linear-gradient(145deg, rgba(20, 0, 0, 0.95), rgba(40, 0, 0, 0.9)) !important;
+    border: 2px solid #8b0000 !important;
+    border-radius: 8px !important;
+    position: relative !important;
+    overflow: visible !important;
+    cursor: default !important;
+    transition: all 0.3s ease !important;
+}
+
+.quantum-menu-wrapper .quantum-news-widget::after {
+    content: '' !important;
+    position: absolute !important;
+    inset: 0 !important;
+    border-radius: 8px !important;
+    box-shadow:
+        0 0 15px rgba(139, 0, 0, 0.6),
+        0 2px 10px rgba(0, 0, 0, 0.7),
+        inset 0 0 10px rgba(200, 0, 0, 0.15) !important;
+    pointer-events: none !important;
+    animation: pulseAmbient 3s ease-in-out infinite !important;
+    z-index: 0 !important;
+}
+
+/* Hover effect - crimson glow */
+.quantum-menu-wrapper .quantum-news-widget:hover {
+    border-color: #cc0000 !important;
+    transform: translateY(-1px) !important;
+}
+
+.quantum-menu-wrapper .quantum-news-widget:hover::after {
+    box-shadow:
+        0 0 20px rgba(204, 0, 0, 0.8),
+        0 4px 15px rgba(0, 0, 0, 0.7),
+        inset 0 0 15px rgba(255, 0, 0, 0.2) !important;
+}
+
+/* Widget Header - Icon and Title with red theme */
+.quantum-menu-wrapper .quantum-news-widget .widget-header {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    gap: 6px !important;
+    padding-bottom: 6px !important;
+    border-bottom: 1px solid rgba(139, 0, 0, 0.5) !important;
+    position: relative !important;
+    z-index: 1 !important;
+}
+
+.quantum-menu-wrapper .quantum-news-widget .widget-icon {
+    font-size: 16px !important;
+    filter: drop-shadow(0 0 4px rgba(255, 0, 0, 0.6)) !important;
+}
+
+.quantum-menu-wrapper .quantum-news-widget .widget-title {
+    font-family: 'Orbitron', monospace !important;
+    font-size: 0.7rem !important;
+    font-weight: 700 !important;
+    color: #ff0000 !important;
+    text-shadow: 0 0 6px rgba(255, 0, 0, 0.6) !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.5px !important;
+}
+
+/* Directional Arrow Button */
+.quantum-menu-wrapper .news-direction-btn {
+    all: initial !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    width: 22px !important;
+    height: 22px !important;
+    border: 1px solid #8b0000 !important;
+    border-radius: 4px !important;
+    background: linear-gradient(135deg, rgba(30, 0, 0, 0.9), rgba(50, 0, 0, 0.8)) !important;
+    color: #ff3333 !important;
+    font-size: 0.75rem !important;
+    cursor: pointer !important;
+    transition: all 0.2s ease !important;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.5),
+                0 0 8px rgba(139, 0, 0, 0.3) !important;
+    font-family: monospace !important;
+    line-height: 1 !important;
+}
+
+.quantum-menu-wrapper .news-direction-btn:hover {
+    background: linear-gradient(135deg, rgba(50, 0, 0, 0.95), rgba(80, 0, 0, 0.9)) !important;
+    border-color: #cc0000 !important;
+    box-shadow: 0 3px 6px rgba(0, 0, 0, 0.6),
+                0 0 12px rgba(204, 0, 0, 0.6) !important;
+    transform: scale(1.1) !important;
+    color: #ff6666 !important;
+}
+
+.quantum-menu-wrapper .news-direction-btn:active {
+    transform: scale(0.95) !important;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.6),
+                0 0 6px rgba(139, 0, 0, 0.4) !important;
+}
+
+/* News Ticker Display Area */
+.quantum-menu-wrapper .news-ticker-display {
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: stretch !important;
+    justify-content: center !important;
+    min-height: 45px !important;
+    padding: 0 8px !important;
+    position: relative !important;
+    z-index: 1 !important;
+    width: 100% !important;
+    box-sizing: border-box !important;
+}
+
+/* Override global reset for news-ticker-display padding - more specific selector */
+.quantum-menu-wrapper .quantum-news-widget .news-ticker-display {
+    padding: 0 8px !important;
+}
+
+.quantum-menu-wrapper .news-ticker-item {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 4px !important;
+    position: relative !important;
+    z-index: 1 !important;
+    box-sizing: border-box !important;
+}
+
+/* News Ticker Link */
+.quantum-menu-wrapper .news-ticker-link {
+    text-decoration: none !important;
+    color: inherit !important;
+    display: flex !important;
+    flex-direction: row !important;
+    gap: 8px !important;
+    align-items: flex-start !important;
+    box-sizing: border-box !important;
+    transition: all 0.25s ease !important;
+}
+
+/* News Article Image */
+.quantum-menu-wrapper .news-ticker-image {
+    width: 50px !important;
+    height: 35px !important;
+    min-width: 50px !important;
+    min-height: 35px !important;
+    max-width: 50px !important;
+    max-height: 35px !important;
+    object-fit: cover !important;
+    overflow: hidden !important;
+    border-radius: 3px !important;
+    border: 1px solid #8b0000 !important;
+    box-shadow:
+        inset 1px 1px 0 rgba(255, 100, 100, 0.3),
+        inset -1px -1px 0 rgba(0, 0, 0, 0.5),
+        0 2px 4px rgba(0, 0, 0, 0.6),
+        0 0 8px rgba(139, 0, 0, 0.4) !important;
+    flex-shrink: 0 !important;
+    transition: all 0.25s ease !important;
+}
+
+.quantum-menu-wrapper .news-ticker-link:hover .news-ticker-image {
+    border-color: #cc0000 !important;
+    box-shadow:
+        inset 1px 1px 0 rgba(255, 150, 150, 0.4),
+        inset -1px -1px 0 rgba(0, 0, 0, 0.6),
+        0 3px 6px rgba(0, 0, 0, 0.7),
+        0 0 12px rgba(204, 0, 0, 0.6) !important;
+}
+
+/* News Content Container */
+.quantum-menu-wrapper .news-ticker-content {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 3px !important;
+    flex: 1 !important;
+    min-width: 0 !important;
+    overflow: hidden !important;
+}
+
+/* News Title - Clear and Readable */
+.quantum-menu-wrapper .news-ticker-title {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+    font-size: 0.65rem !important;
+    line-height: 1.35 !important;
+    font-weight: 500 !important;
+    color: #e8f8ff !important;
+    text-align: left !important;
+    letter-spacing: 0.2px !important;
+    text-shadow: 0 2px 4px rgba(0, 0, 0, 0.7) !important;
+    display: -webkit-box !important;
+    -webkit-line-clamp: 3 !important;
+    -webkit-box-orient: vertical !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    max-height: 4.05em !important;
+    word-wrap: break-word !important;
+    transition: color 0.25s ease !important;
+}
+
+/* Hover effect on title */
+.quantum-menu-wrapper .news-ticker-link:hover .news-ticker-title {
+    color: #5dade2 !important;
+}
+
+/* News Metadata (Article Date) */
+.quantum-menu-wrapper .news-ticker-meta {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+    font-size: 0.5rem !important;
+    font-weight: 400 !important;
+    color: #7ec8e3 !important;
+    text-align: left !important;
+    opacity: 0.8 !important;
+    letter-spacing: 0.2px !important;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5) !important;
+}
+
+/* Error State */
+.quantum-menu-wrapper .news-ticker-error {
+    color: #e74c3c !important;
+    font-size: 0.6rem !important;
+    text-align: center !important;
+    font-style: italic !important;
+}
+
+/* Update Time Footer */
+.quantum-menu-wrapper .news-updated {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+    font-size: 0.5rem !important;
+    color: #7ec8e3 !important;
+    text-align: center !important;
+    opacity: 0.85 !important;
+    padding-top: 4px !important;
+    border-top: 1px solid rgba(139, 0, 0, 0.3) !important;
+    position: relative !important;
+    z-index: 1 !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    gap: 6px !important;
+    letter-spacing: 0.3px !important;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5) !important;
+}
+
+.quantum-menu-wrapper .news-separator {
+    opacity: 0.5 !important;
+    color: #7ec8e3 !important;
+}
+
+.quantum-menu-wrapper #news-source {
+    font-weight: 400 !important;
+    color: #7ec8e3 !important;
+}
+
+.quantum-menu-wrapper #news-update-time {
+    color: #7ec8e3 !important;
+}
+
+/* Subtle fade animation */
+@keyframes newsTickerFade {
+    0%, 100% {
+        opacity: 1;
+    }
+    50% {
+        opacity: 0.7;
+    }
+}
+
+.quantum-menu-wrapper .news-ticker-item {
+    animation: newsTickerFade 5s ease-in-out infinite !important;
+}
+
+/* Mobile Responsive */
+@media (max-width: 480px) {
+    .quantum-menu-wrapper .news-ticker-title {
+        font-size: 0.6rem !important;
+        -webkit-line-clamp: 2 !important;
+    }
+
+    .quantum-menu-wrapper .news-ticker-source {
+        font-size: 0.52rem !important;
+    }
+
+    .quantum-menu-wrapper .quantum-news-widget .widget-title {
+        font-size: 0.65rem !important;
+    }
+}

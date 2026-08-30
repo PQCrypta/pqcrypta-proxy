@@ -52,6 +52,47 @@ pub mod error_code {
     pub const H3_ID_ERROR: u64 = 0x0108;
     pub const H3_SETTINGS_ERROR: u64 = 0x0109;
     pub const H3_MISSING_SETTINGS: u64 = 0x010a;
+    pub const H3_REQUEST_REJECTED: u64 = 0x010b;
+    pub const H3_REQUEST_CANCELLED: u64 = 0x010c;
+    pub const H3_REQUEST_INCOMPLETE: u64 = 0x010d;
+    pub const H3_MESSAGE_ERROR: u64 = 0x010e;
+    pub const H3_CONNECT_ERROR: u64 = 0x010f;
+    pub const H3_VERSION_FALLBACK: u64 = 0x0110;
+
+    /// Whether an application close code means the peer is objecting.
+    ///
+    /// Only a *defined* HTTP/3 error code other than `H3_NO_ERROR` does.
+    /// Everything else — code 0, a GREASE code from the `0x1f * N + 0x21`
+    /// space, an unassigned value — is an unknown error code, and RFC 9114 §8.1
+    /// requires those to be "treated as equivalent to H3_NO_ERROR". §9 says the
+    /// same thing more generally: "Implementations MUST ignore unknown or
+    /// unsupported values in all extensible protocol elements", and error codes
+    /// are one of the listed extension points.
+    ///
+    /// This matters because the suite reads a close as the client's verdict on
+    /// the anomaly. Treating every non-zero-ish code as a rejection accused
+    /// aioquic and quic-go of six protocol violations each — both simply close
+    /// with application code 0, which the RFC says means no error at all.
+    pub fn is_rejection(code: u64) -> bool {
+        matches!(
+            code,
+            H3_GENERAL_PROTOCOL_ERROR
+                | H3_INTERNAL_ERROR
+                | H3_STREAM_CREATION_ERROR
+                | H3_CLOSED_CRITICAL_STREAM
+                | H3_FRAME_UNEXPECTED
+                | H3_FRAME_ERROR
+                | H3_ID_ERROR
+                | H3_SETTINGS_ERROR
+                | H3_MISSING_SETTINGS
+                | H3_REQUEST_REJECTED
+                | H3_REQUEST_CANCELLED
+                | H3_REQUEST_INCOMPLETE
+                | H3_MESSAGE_ERROR
+                | H3_CONNECT_ERROR
+                | H3_VERSION_FALLBACK
+        )
+    }
 }
 
 /// Largest value a QUIC variable-length integer can carry (RFC 9000 §16).
@@ -452,19 +493,21 @@ mod tests {
     fn settings_writes_duplicates_verbatim() {
         // The whole reason this module exists: a conforming encoder would
         // refuse, and h-duplicate-setting needs it on the wire.
-        let f = settings(&[
+        let frame = settings(&[
             (setting::MAX_FIELD_SECTION_SIZE, 100),
             (setting::MAX_FIELD_SECTION_SIZE, 200),
         ]);
-        let (ty, n) = read_varint(&f).expect("valid varint");
+        let (ty, type_len) = read_varint(&frame).expect("valid varint");
         assert_eq!(ty, frame_type::SETTINGS);
-        let (len, m) = read_varint(&f[n..]).expect("valid varint");
-        let payload = &f[n + m..n + m + len as usize];
+        let (len, len_len) = read_varint(&frame[type_len..]).expect("valid varint");
+        let header = type_len + len_len;
+        let payload = &frame[header..header + usize::try_from(len).expect("frame fits in memory")];
 
-        let (id1, a) = read_varint(payload).expect("valid varint");
-        let (v1, b) = read_varint(&payload[a..]).expect("valid varint");
-        let (id2, c) = read_varint(&payload[a + b..]).expect("valid varint");
-        let (v2, _) = read_varint(&payload[a + b + c..]).expect("valid varint");
+        let (id1, id1_len) = read_varint(payload).expect("valid varint");
+        let (v1, v1_len) = read_varint(&payload[id1_len..]).expect("valid varint");
+        let after_first = id1_len + v1_len;
+        let (id2, id2_len) = read_varint(&payload[after_first..]).expect("valid varint");
+        let (v2, _) = read_varint(&payload[after_first + id2_len..]).expect("valid varint");
 
         assert_eq!(
             (id1, id2),
@@ -478,20 +521,21 @@ mod tests {
 
     #[test]
     fn the_default_settings_carry_an_unknown_identifier() {
-        let f = settings_with_grease();
-        let (_, n) = read_varint(&f).expect("valid varint");
-        let (len, m) = read_varint(&f[n..]).expect("valid varint");
-        let payload = &f[n + m..n + m + len as usize];
+        let frame = settings_with_grease();
+        let (_, type_len) = read_varint(&frame).expect("valid varint");
+        let (len, len_len) = read_varint(&frame[type_len..]).expect("valid varint");
+        let header = type_len + len_len;
+        let payload = &frame[header..header + usize::try_from(len).expect("frame fits in memory")];
 
         let mut offset = 0;
         let mut saw_reserved = false;
         while offset < payload.len() {
-            let (id, a) = read_varint(&payload[offset..]).expect("valid varint");
-            let (_, b) = read_varint(&payload[offset + a..]).expect("valid varint");
+            let (id, id_len) = read_varint(&payload[offset..]).expect("valid varint");
+            let (_, value_len) = read_varint(&payload[offset + id_len..]).expect("valid varint");
             if id > 0x21 && (id - 0x21) % 0x1f == 0 {
                 saw_reserved = true;
             }
-            offset += a + b;
+            offset += id_len + value_len;
         }
         assert!(
             saw_reserved,

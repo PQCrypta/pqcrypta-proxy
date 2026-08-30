@@ -35,6 +35,7 @@ pub struct TransportConfig {
     pub(crate) receive_window: VarInt,
     pub(crate) send_window: u64,
     pub(crate) send_fairness: bool,
+    pub(crate) send_unknown_frame_type: Option<u64>,
 
     pub(crate) packet_threshold: u32,
     pub(crate) time_threshold: f32,
@@ -165,6 +166,31 @@ impl TransportConfig {
     /// many small streams.
     pub fn send_fairness(&mut self, value: bool) -> &mut Self {
         self.send_fairness = value;
+        self
+    }
+
+    /// Emit one frame of this (unknown) type in the first 1-RTT packet.
+    ///
+    /// RFC 9000 §12.4: "An endpoint MUST treat the receipt of a frame of unknown
+    /// type as a connection error of type FRAME_ENCODING_ERROR." Unlike HTTP/3,
+    /// QUIC reserves no ignorable frame types and unknown frames carry no length,
+    /// so a receiver cannot skip one — the connection error is the only defined
+    /// outcome.
+    ///
+    /// There is consequently no legitimate production use for this: it exists so
+    /// a conformance suite can put a peer in front of the requirement and find
+    /// out whether it is honoured. The frame is written last in the packet, after
+    /// every well-formed frame, so everything ahead of it parses normally and the
+    /// unknown type is unambiguously what the peer rejected.
+    ///
+    /// Sent once, and not tracked for loss recovery: if that packet is lost the
+    /// peer never sees it, which a conformance run reads as the test not having
+    /// been exercised rather than as a pass.
+    ///
+    /// The value must not name a frame type the peer knows, or it will be parsed
+    /// rather than rejected.
+    pub fn send_unknown_frame_type(&mut self, value: Option<u64>) -> &mut Self {
+        self.send_unknown_frame_type = value;
         self
     }
 
@@ -558,6 +584,7 @@ impl Default for TransportConfig {
             receive_window: VarInt::MAX,
             send_window: (8 * STREAM_RWND).into(),
             send_fairness: true,
+            send_unknown_frame_type: None,
 
             packet_threshold: 3,
             time_threshold: 9.0 / 8.0,
@@ -609,6 +636,7 @@ impl fmt::Debug for TransportConfig {
             receive_window,
             send_window,
             send_fairness,
+            send_unknown_frame_type,
             packet_threshold,
             time_threshold,
             initial_rtt,
@@ -646,6 +674,7 @@ impl fmt::Debug for TransportConfig {
             .field("receive_window", receive_window)
             .field("send_window", send_window)
             .field("send_fairness", send_fairness)
+            .field("send_unknown_frame_type", send_unknown_frame_type)
             .field("packet_threshold", packet_threshold)
             .field("time_threshold", time_threshold)
             .field("initial_rtt", initial_rtt)

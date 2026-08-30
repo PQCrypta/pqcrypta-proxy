@@ -1,0 +1,97 @@
+/* Conformance cursor: a session, with its results trailing behind it.
+ *
+ * The head is the test currently running. The chips behind it are verdicts
+ * already recorded, in the five class colours the report uses — so the strip
+ * following the pointer is the same thing a finished run hands back.
+ */
+
+.cf-cursor {
+    position: fixed;
+    top: 0;
+    left: 0;
+    z-index: 9999;
+    pointer-events: none;
+    width: 13px;
+    height: 13px;
+    margin: -6.5px 0 0 -6.5px;
+    border: 1.5px solid var(--cf-accent, #46b5cb);
+    border-radius: 2px;
+    transition: transform 0.12s ease-out, background-color 0.12s ease-out;
+    will-change: transform;
+}
+
+/* The test in progress. */
+.cf-cursor::after {
+    content: "";
+    position: absolute;
+    inset: 3px;
+    border-radius: 1px;
+    background: var(--cf-accent, #46b5cb);
+    opacity: 0.55;
+}
+
+/* Over something you can act on, the pending test resolves. */
+.cf-cursor-active {
+    transform: scale(1.25);
+    background-color: rgba(70, 181, 203, 0.18);
+}
+
+.cf-cursor-trail {
+    position: fixed;
+    top: 0;
+    left: 0;
+    z-index: 9998;
+    pointer-events: none;
+    width: 7px;
+    height: 7px;
+    margin: -3.5px 0 0 -3.5px;
+    border-radius: 1px;
+    will-change: transform, opacity;
+}
+
+/* The five verdict classes, in report order. */
+.cf-cursor-ext { background: var(--cf-ext, #5cc191); }
+.cf-cursor-corr { background: var(--cf-corr, #f0868d); }
+.cf-cursor-inter { background: var(--cf-inter, #7fa9f0); }
+.cf-cursor-resil { background: var(--cf-resil, #dfb055); }
+.cf-cursor-disc { background: var(--cf-disc, #c39ae0); }
+
+/* Inconclusive is an outline that never fills — the one result the suite
+   records without claiming anything. */
+.cf-cursor-incon {
+    background: none;
+    border: 1px solid var(--cf-incon, #8697a4);
+}
+
+/* ── Hiding the native pointer ──────────────────────────────────────── */
+/*
+ * Gated behind a class the cursor script adds to <body> once its elements are
+ * in the DOM, never applied from CSS alone. If the script fails to load or
+ * throws, the class is never set and the real pointer stays — a page that hides
+ * the system cursor and then does not draw a replacement is unusable, and CSS
+ * has no way to know whether the replacement arrived.
+ *
+ * The universal selector is deliberate: links, buttons and resizable edges all
+ * set their own `cursor`, so hiding it on `body` alone leaves the arrow
+ * reappearing over exactly the elements people move toward.
+ */
+.cf-cursor-on,
+.cf-cursor-on * {
+    cursor: none;
+}
+
+/* Text entry keeps the real caret: a chip gives no indication of where a
+   character will land. */
+.cf-cursor-on input[type="text"],
+.cf-cursor-on input[type="search"],
+.cf-cursor-on input[type="email"],
+.cf-cursor-on textarea {
+    cursor: text;
+}
+
+@media (pointer: coarse) {
+    .cf-cursor,
+    .cf-cursor-trail {
+        display: none;
+    }
+}

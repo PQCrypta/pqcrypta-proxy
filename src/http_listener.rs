@@ -4131,6 +4131,15 @@ fn handle_cors_preflight(cors: &CorsConfig, request_origin: Option<&str>) -> Res
     } else {
         cors.allow_origin.clone()
     };
+    // `Vary: Origin` whenever the answer depends on the request's origin.
+    //
+    // Required by the Fetch standard, and load-bearing for anything in front of
+    // this: without it a cache may hand one origin the header that names
+    // another. Set only when reflecting from an allowlist — a fixed
+    // `allow_origin` is the same for every caller and needs no Vary.
+    if !cors.allow_origins.is_empty() {
+        headers.insert(header::VARY, HeaderValue::from_static("Origin"));
+    }
     if let Some(ref origin) = resolved_origin {
         if let Ok(v) = HeaderValue::from_str(origin) {
             headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
@@ -4180,6 +4189,15 @@ fn add_cors_headers(headers: &mut HeaderMap, cors: &CorsConfig, request_origin: 
     } else {
         cors.allow_origin.clone()
     };
+    // `Vary: Origin` whenever the answer depends on the request's origin.
+    //
+    // Required by the Fetch standard, and load-bearing for anything in front of
+    // this: without it a cache may hand one origin the header that names
+    // another. Set only when reflecting from an allowlist — a fixed
+    // `allow_origin` is the same for every caller and needs no Vary.
+    if !cors.allow_origins.is_empty() {
+        headers.insert(header::VARY, HeaderValue::from_static("Origin"));
+    }
     if let Some(ref origin) = resolved_origin {
         if let Ok(v) = HeaderValue::from_str(origin) {
             headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);

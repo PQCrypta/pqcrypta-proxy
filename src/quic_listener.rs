@@ -1425,11 +1425,15 @@ impl QuicListener {
                     .and_then(|v| v.to_str().ok())
                     .map(|h| h.split(':').next().unwrap_or(h).to_ascii_lowercase())
                     .or_else(|| request.uri().host().map(str::to_ascii_lowercase));
+                let on_conformance_host =
+                    crate::security::is_conformance_host(&security.route_index, host.as_deref());
                 security
                     .route_index
                     .find_route(host.as_deref(), &path, false)
                     .map(|r| crate::security::RequestPolicy {
-                        skip_bot_blocking: r.skip_bot_blocking,
+                        // The conformance vhost has no route entry, so the flag
+                        // has to be OR'd in rather than read from one.
+                        skip_bot_blocking: r.skip_bot_blocking || on_conformance_host,
                         allowed_ja3: r.security.as_ref().and_then(|s| s.allowed_ja3.clone()),
                         waf_enabled: r.security.as_ref().and_then(|s| s.waf_enabled),
                         waf_mode: r.security.as_ref().and_then(|s| s.waf_mode.clone()),
@@ -1438,7 +1442,14 @@ impl QuicListener {
                             .as_ref()
                             .and_then(|s| s.rate_limit_override.clone()),
                     })
-                    .unwrap_or_default()
+                    // No route matched — which is the conformance vhost's normal
+                    // state, since it is answered in-process and has no route
+                    // entry. `unwrap_or_default()` alone would drop the flag on
+                    // exactly the host that needs it.
+                    .unwrap_or_else(|| crate::security::RequestPolicy {
+                        skip_bot_blocking: on_conformance_host,
+                        ..crate::security::RequestPolicy::default()
+                    })
             };
 
             {
@@ -1524,6 +1535,64 @@ impl QuicListener {
                             );
                         }
                     }
+                }
+            }
+        }
+
+        // ── Conformance vhost, over HTTP/3 ────────────────────────────────────
+        //
+        // The TCP listener has served this vhost from the start; this path had
+        // never heard of it, so `https://conformance.pqcrypta.com/` answered 200
+        // over HTTP/1.1 and HTTP/2 and 404 over HTTP/3. Browsers upgrade on the
+        // Alt-Svc header, which meant the one audience most likely to open the
+        // page in the first place was the audience that could not.
+        //
+        // The instance comes from `conformance::shared`, so it is the *same*
+        // registry the TCP path uses. A second instance here would have given a
+        // session started over one transport no results from the other.
+        if let Some(conf) = crate::conformance::shared(&config.conformance) {
+            let conformance_host = request
+                .headers()
+                .get(hyper::header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .map(|h| h.split(':').next().unwrap_or(h).to_ascii_lowercase())
+                .or_else(|| request.uri().host().map(str::to_ascii_lowercase))
+                .unwrap_or_default();
+
+            if conf.owns_host(&conformance_host) {
+                if let Some(resp) = crate::conformance::http::route(
+                    &conf,
+                    request.method(),
+                    &path,
+                    crate::security::canonical_addr(remote_addr).ip(),
+                ) {
+                    let (parts, body) = resp.into_parts();
+                    let bytes = http_body_util::BodyExt::collect(body)
+                        .await
+                        .map(|c| c.to_bytes())
+                        .unwrap_or_default();
+
+                    let mut builder = http::Response::builder().status(parts.status);
+                    for (name, value) in parts.headers.iter() {
+                        builder = builder.header(name, value);
+                    }
+                    let response = builder
+                        .header("server", SERVER_HEADER)
+                        .header(
+                            "alt-svc",
+                            alt_svc_for_host(&config, Some(&conformance_host)),
+                        )
+                        .body(())?;
+
+                    stream.send_response(response).await?;
+                    // HEAD carries the headers a GET would have and no body
+                    // (RFC 9110 §9.3.2), which is also why the length above is
+                    // taken from the response rather than from what is sent.
+                    if request.method() != http::Method::HEAD && !bytes.is_empty() {
+                        stream.send_data(bytes).await?;
+                    }
+                    stream.finish().await?;
+                    return Ok(());
                 }
             }
         }
@@ -1752,6 +1821,15 @@ impl QuicListener {
                 } else {
                     cors.allow_origin.clone()
                 };
+                // `Vary: Origin` whenever the answer depends on the request's origin.
+                //
+                // Required by the Fetch standard, and load-bearing for anything in front of
+                // this: without it a cache may hand one origin the header that names
+                // another. Set only when reflecting from an allowlist — a fixed
+                // `allow_origin` is the same for every caller and needs no Vary.
+                if !cors.allow_origins.is_empty() {
+                    response_builder = response_builder.header("vary", "Origin");
+                }
                 if let Some(ref origin) = resolved_origin {
                     response_builder =
                         response_builder.header("access-control-allow-origin", origin);
@@ -2713,6 +2791,15 @@ fn add_cors_headers_to_builder(
     } else {
         cors.allow_origin.clone()
     };
+    // `Vary: Origin` whenever the answer depends on the request's origin.
+    //
+    // Required by the Fetch standard, and load-bearing for anything in front of
+    // this: without it a cache may hand one origin the header that names
+    // another. Set only when reflecting from an allowlist — a fixed
+    // `allow_origin` is the same for every caller and needs no Vary.
+    if !cors.allow_origins.is_empty() {
+        builder = builder.header("vary", "Origin");
+    }
     if let Some(ref origin) = resolved_origin {
         builder = builder.header("access-control-allow-origin", origin);
     }

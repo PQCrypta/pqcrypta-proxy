@@ -126,17 +126,22 @@ pub struct Test {
 /// | `h-*` (all fourteen) | RFC 9114, RFC 9204 | RFC text |
 /// | `q-version-negotiation` | RFC 9000 §6.2 | RFC text |
 /// | `q-zero-rtt-reject` | RFC 9001 §4.6.2 | RFC text |
-/// | `q-reserved-frame` | RFC 9000 §12.4 | reference implementation |
-/// | `q-reserved-transport-param` | RFC 9000 §18.1 | reference implementation |
-/// | `q-stateless-reset` | RFC 9000 §10.3 | reference implementation |
+/// | `q-reserved-frame` | RFC 9000 §12.4 | RFC text |
+/// | `q-reserved-transport-param` | RFC 9000 §18.1 | RFC text |
+/// | `q-stateless-reset` | RFC 9000 §10.3.1 | RFC text |
 /// | `q-pmtu-blackhole` | RFC 9000 §14, RFC 8899 | reference implementation |
 /// | `q-flow-control` | RFC 9000 §4.1 | RFC text |
-/// | `q-ecn` | RFC 9000 §13.4 | **neither — see below** |
+/// | `q-ecn` | RFC 9000 §13.4.1 | RFC text |
 ///
-/// `q-ecn` is the one entry whose requirement level is still unconfirmed. The
-/// mechanism is right (the implementation carries ECN counts back in ACK
-/// frames), but whether reporting them is a MUST was not established, so it is
-/// unbuilt and must not be scored until someone reads §13.4.
+/// `q-ecn`'s requirement level turned out to be *conditional*, which changed how
+/// it is scored. §13.4.1 says an endpoint "MUST provide feedback about ECN
+/// markings it receives, if these are accessible", and the paragraph above it
+/// explicitly permits an endpoint with no access to the ECN field to report
+/// nothing. Access is a property of the peer's platform and of the path, and
+/// neither is observable from here — a network that strips the codepoint in
+/// transit is indistinguishable, at this end, from a client that declines to
+/// report. So counts coming back score a pass and silence is inconclusive.
+/// Scoring silence as a failure would have blamed clients for their networks.
 ///
 /// Every test, in report order.
 ///
@@ -155,8 +160,7 @@ pub const CATALOG: &[Test] = &[
         expectation: "Abandon the connection attempt, or retry with a version both ends \
                       support. §6.2 requires a client that supports only one version to \
                       abandon it rather than persist.",
-        // Not built: Needs the endpoint to reject the client's version, which EndpointConfig::supported_versions cannot express per-connection.
-        implemented: false,
+        implemented: true,
         port_offset: Some(0),
     },
     Test {
@@ -176,8 +180,7 @@ pub const CATALOG: &[Test] = &[
         class: Class::Extensibility,
         tier: Tier::Quic,
         expectation: "Ignore the unknown parameter and complete the handshake normally.",
-        // Not built: Needs a reserved parameter injected into noq's transport-parameter encoder.
-        implemented: false,
+        implemented: true,
         port_offset: Some(2),
     },
     Test {
@@ -189,8 +192,7 @@ pub const CATALOG: &[Test] = &[
         expectation: "Close the connection with FRAME_ENCODING_ERROR. Unlike HTTP/3, QUIC \
                       reserves no ignorable frame types — §12.4 makes an unknown frame a \
                       connection error, so ignoring it is the failure here.",
-        // Not built: Needs a reserved frame type injected into noq's 1-RTT frame writer.
-        implemented: false,
+        implemented: true,
         port_offset: Some(3),
     },
     Test {
@@ -209,11 +211,12 @@ pub const CATALOG: &[Test] = &[
         spec: "RFC 9000 §10.3",
         class: Class::Correctness,
         tier: Tier::Quic,
-        expectation: "Recognise the token and close immediately. The packet cannot be \
-                      authenticated, so there is nothing to reply with and nothing to \
-                      report to the peer — the connection simply ends.",
-        // Not built: Needs a reset token emitted for an unknown connection ID, which the public endpoint API does not expose.
-        implemented: false,
+        expectation: "Recognise the token in the last 16 bytes of the datagram, enter the \
+                      draining period, and send no further packets on the connection. The \
+                      packet cannot be authenticated, so there is nothing to reply with \
+                      and nothing to report to the peer — continuing to send is the \
+                      failure §10.3.1 names.",
+        implemented: true,
         port_offset: Some(5),
     },
     Test {
@@ -244,9 +247,14 @@ pub const CATALOG: &[Test] = &[
         spec: "RFC 9000 §13.4",
         class: Class::Correctness,
         tier: Tier::Quic,
-        expectation: "Report the ECN counts back in ACK_ECN frames.",
-        // Not built: Needs per-packet ECT(0) marking and the peer's echoed counts, neither surfaced by ConnectionStats in this fork.
-        implemented: false,
+        expectation: "Echo the ECN counts back in ACK frames carrying an ECN section \
+                      (type 0x03). §13.4.1 makes this a conditional requirement — an \
+                      endpoint MUST report the markings it receives \"if these are \
+                      accessible\", and explicitly permits an endpoint with no access to \
+                      the ECN field to report nothing. So counts coming back is a pass, \
+                      and silence is inconclusive rather than a failure: it cannot be \
+                      told apart from a path that stripped the codepoint in transit.",
+        implemented: true,
         port_offset: Some(8),
     },
     Test {
@@ -255,10 +263,10 @@ pub const CATALOG: &[Test] = &[
         spec: "RFC 9000 §14, RFC 8899",
         class: Class::Resilience,
         tier: Tier::Quic,
-        expectation:
-            "Detect the black hole, probe down to a working size, and keep the connection.",
-        // Not built: Needs the path to silently drop above a threshold, which is a datagram-layer concern rather than a config one.
-        implemented: false,
+        expectation: "Detect the black hole, probe down to a working size, and keep the \
+                      connection. Path-MTU discovery is driven past the limit on this port, \
+                      so it engages on every connection.",
+        implemented: true,
         port_offset: Some(9),
     },
     Test {
@@ -281,9 +289,11 @@ pub const CATALOG: &[Test] = &[
                       bound to them. Section 4.6.2 requires the reset because a rejected \
                       0-RTT means every assumed connection characteristic may have been \
                       wrong. It does not require retransmission, which is the \
-                      application concern, not QUIC's.",
-        // Not built: Needs a resumed connection whose early data is deliberately refused.
-        implemented: false,
+                      application concern, not QUIC's.\n\nThis port issues tickets \
+                      that advertise early data and then declines every offer, so a \
+                      resuming client sends 0-RTT and always has it refused. The handshake \
+                      itself completes normally.",
+        implemented: true,
         port_offset: Some(11),
     },
     Test {
@@ -414,10 +424,14 @@ pub const CATALOG: &[Test] = &[
     Test {
         id: "h-early-hints",
         title: "103 Early Hints before the final response",
-        spec: "RFC 8297",
+        spec: "RFC 9110 §15.2, RFC 8297",
         class: Class::Resilience,
         tier: Tier::Http3,
-        expectation: "Treat 103 as informational and keep reading for the final response.",
+        expectation: "Treat 103 as informational and keep reading for the final response. \
+                      RFC 9110 §15.2 makes this a MUST: a client \"MUST be able to parse one \
+                      or more 1xx responses received prior to a final response, even if the \
+                      client does not expect one\". Ignoring the hints is fine — a user agent \
+                      MAY do that — but closing the connection is not.",
         implemented: true,
         port_offset: Some(24),
     },
@@ -497,7 +511,11 @@ mod tests {
         let mut offsets: Vec<u16> = CATALOG.iter().filter_map(|t| t.port_offset).collect();
         offsets.sort_unstable();
         for (i, off) in offsets.iter().enumerate() {
-            assert_eq!(*off, i as u16, "port offsets must run 0..n with no gaps");
+            assert_eq!(
+                *off,
+                u16::try_from(i).expect("catalogue is far smaller than u16::MAX"),
+                "port offsets must run 0..n with no gaps"
+            );
         }
     }
 

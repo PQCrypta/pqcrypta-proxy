@@ -603,6 +603,30 @@ impl Connection {
         conn.close(error_code, Bytes::copy_from_slice(reason), &self.0.shared);
     }
 
+    /// Abandon the connection without telling the peer.
+    ///
+    /// Where [`close()`] sends a CONNECTION_CLOSE frame and lets the peer finish
+    /// tidily, this discards the connection silently: the endpoint forgets the
+    /// connection ID while the peer still believes the connection is live. The
+    /// peer's next packet therefore arrives bearing a connection ID the endpoint
+    /// has never heard of, and RFC 9000 §10.3 has the endpoint answer it with a
+    /// Stateless Reset.
+    ///
+    /// This reproduces what a client sees when a server crashes and restarts, or
+    /// when a load balancer moves a flow to a host that holds no state for it —
+    /// the case a client can only be tested against by producing it deliberately,
+    /// since every graceful shutdown path says goodbye first.
+    ///
+    /// Locally the connection ends as [`ConnectionError::LocallyClosed`]. Streams
+    /// and futures resolve as they would for any close; nothing is transmitted.
+    ///
+    /// [`close()`]: Connection::close
+    /// [`ConnectionError::LocallyClosed`]: crate::ConnectionError::LocallyClosed
+    pub fn abandon(&self) {
+        let conn = &mut *self.0.lock_without_waking("abandon"); // conn.abandon self-wakes
+        conn.abandon(&self.0.shared);
+    }
+
     /// Wait for the handshake to be confirmed.
     ///
     /// As a server, who must be authenticated by clients,
@@ -1313,11 +1337,14 @@ impl Drop for ConnectionRef {
 
         let conn = &mut *self.lock_without_waking("drop");
 
-        if !conn.inner.is_closed() {
+        if !conn.inner.is_closed() && !conn.abandoned {
             // If the driver is alive, it's just it and us, so we'd better shut it down. If it's
             // not, we can't do any harm. If there were any streams being opened, then either
             // the connection will be closed for an unrelated reason or a fresh reference will
             // be constructed for the newly opened stream.
+            //
+            // An abandoned connection is skipped: closing it here would send the
+            // CONNECTION_CLOSE that abandoning exists to withhold.
             conn.implicit_close(&self.shared);
         }
     }
@@ -1445,6 +1472,9 @@ pub(crate) struct State {
     pub(crate) stopped: FxHashMap<StreamId, Arc<Notify>>,
     /// Always set to Some before the connection becomes drained
     pub(crate) error: Option<ConnectionError>,
+    /// Set by [`State::abandon`]: the endpoint has been told to forget this
+    /// connection, so neither Drop path may send anything to the peer.
+    abandoned: bool,
     /// Tracks paths being opened
     open_path: FxHashMap<PathId, watch::Sender<Result<(), PathError>>>,
     /// Tracks reference counts for paths.
@@ -1503,6 +1533,7 @@ impl State {
             stopped: FxHashMap::default(),
             open_path: FxHashMap::default(),
             error: None,
+            abandoned: false,
             sender,
             runtime,
             send_buffer: Vec::new(),
@@ -1817,6 +1848,33 @@ impl State {
         self.close(0u32.into(), Bytes::new(), shared);
     }
 
+    /// Drop the connection without telling the peer anything at all.
+    ///
+    /// Deliberately *not* [`State::close`]: that writes a CONNECTION_CLOSE
+    /// frame, which is the courteous ending and the opposite of what this is
+    /// for. Here the endpoint is told the connection is drained while the peer
+    /// still believes it is live, so the connection ID stops being recognised
+    /// and the peer's next packet arrives at an endpoint that has never heard
+    /// of it — answered, per RFC 9000 §10.3, with a Stateless Reset.
+    ///
+    /// This is how a server that has crashed and restarted, or lost the
+    /// connection to a load-balancer reshuffle, appears to a client. There is no
+    /// other way to produce it: every graceful path says goodbye.
+    pub(crate) fn abandon(&mut self, shared: &Shared) {
+        if self.abandoned {
+            return;
+        }
+        self.abandoned = true;
+        self.terminate(ConnectionError::LocallyClosed, shared);
+        // Removes the connection from the endpoint's CID index. Sent before the
+        // handle is dropped, so the peer meets an unknown CID while it is still
+        // sending rather than after it has given up.
+        let _ = self
+            .endpoint_events
+            .send((self.handle, EndpointEvent::drained()));
+        self.wake();
+    }
+
     pub(crate) fn check_0rtt(&self) -> Result<(), ()> {
         if self.inner.is_handshaking()
             || self.inner.accepted_0rtt()
@@ -1852,7 +1910,10 @@ impl State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        if !self.inner.is_drained() {
+        // An abandoned connection has already been reported as drained, and the
+        // endpoint has forgotten the handle; saying so twice logs a spurious
+        // "unknown connection drained" error.
+        if !self.inner.is_drained() && !self.abandoned {
             // Ensure the endpoint can tidy up
             let _ = self
                 .endpoint_events
