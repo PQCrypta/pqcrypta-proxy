@@ -390,6 +390,10 @@ wrong frame, an unknown QUIC frame type, a Stateless Reset, a path-MTU black hol
 <p>Each test has its own UDP port. Results are filed under a session started from
 your address, so the test connections need nothing special &mdash; just run them
 from the machine that asked for the session.</p>
+<p>A port per test rather than a path per test, because several anomalies are
+properties of the <em>endpoint</em> rather than of a connection: the set of QUIC
+versions offered is decided before any connection exists, so a test of it has to
+own the whole port.</p>
 <pre class="ja4-rawpre"><code># start a session
 SESSION=$(curl -sX POST https://{host}/session | jq -r .id)
 
@@ -470,6 +474,12 @@ server observed. Every test ends with a <strong>liveness probe</strong>: after t
 anomaly, the server expects one ordinary request on the same connection. For the
 extensibility tests that is the whole game &mdash; "ignored it" and "died on it"
 look identical on the wire until the probe arrives or does not.</p>
+<p>The required answer is not the same everywhere, and sometimes it is the
+opposite. Ignoring a reserved <strong>HTTP/3</strong> frame is a pass &mdash;
+reserved frame types exist to be ignored. Ignoring a reserved <strong>QUIC</strong>
+frame is a failure, because QUIC reserves no ignorable frame types and an unknown
+frame carries no length to skip it by. Two tests that look alike on the wire
+require opposite behaviour, which is why the classes exist.</p>
 <ul>
 <li><strong>Extensibility</strong> &mdash; ignore something unrecognised and carry
 on. Rejecting it is the failure; that is how protocols ossify.</li>
@@ -494,6 +504,27 @@ granted the encoder some capacity.</p>
 <p>Every test, the port it runs on, and the clause it exercises. The same data is
 available as <a href="/catalog.json">JSON</a>.</p>
 {rows}
+
+<h2 id="scope">Scope, and what this is not</h2>
+<p>Twenty-seven tests is a beginning, not coverage. QUIC and HTTP/3 together are
+enormous, and whole areas are untouched &mdash; connection migration, stream
+cancellation, QPACK blocked streams, malformed transport parameters, loss recovery
+under adverse conditions. The catalogue is chosen rather than exhaustive.</p>
+<ul>
+<li><strong>This is not a certification.</strong> Passing everything here means a
+client handled twenty-seven specific situations correctly. It does not mean the
+implementation is conformant, and nothing here should be quoted as though it did.</li>
+<li><strong>A failure is a specification violation, not a security
+vulnerability.</strong> Some may have security relevance; most are simply behaviour
+a specification prohibits. Calling every failure a vulnerability would make the
+dataset less credible and would be unfair to the implementations measured.</li>
+<li><strong>It tests clients, not servers.</strong> For the other direction, see the
+<a href="https://pqcrypta.com/http3-quic/">HTTP/3 scanner</a>.</li>
+<li><strong>The suite is itself an implementation</strong>, and subject to the same
+doubt as anything it measures. A verdict you believe is wrong is worth reporting: a
+suite that accuses the thing it tests is worse than no suite, because the real
+failures stop being believed.</li>
+</ul>
 
 <h2 id="why">Why this exists</h2>
 <p>The <a href="https://interop.seemann.io/" rel="noopener">QUIC Interop Runner</a>
