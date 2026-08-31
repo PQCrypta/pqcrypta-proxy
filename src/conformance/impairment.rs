@@ -38,6 +38,12 @@ pub struct Counters {
     pub datagrams_in: AtomicU64,
     /// Datagrams the black hole swallowed.
     pub dropped_oversize: AtomicU64,
+    /// Datagrams copied out of the second socket for `q-connection-migration`.
+    ///
+    /// The verdict needs to know whether the client was ever actually shown an
+    /// unannounced server address: if the copy never went out, a connection that
+    /// carried on proves nothing.
+    pub shadowed: AtomicU64,
     /// Datagrams the loss impairment dropped.
     ///
     /// Kept apart from `dropped_oversize` because the two answer different
@@ -76,6 +82,10 @@ impl Counters {
 
     pub fn dropped_loss(&self) -> u64 {
         self.dropped_loss.load(Ordering::Relaxed)
+    }
+
+    pub fn shadowed(&self) -> u64 {
+        self.shadowed.load(Ordering::Relaxed)
     }
 
     pub fn zero_rtt_in(&self) -> u64 {
@@ -169,6 +179,15 @@ pub struct Impairments {
     /// How long each peer's traffic flows cleanly before either impairment
     /// begins. `None` impairs from the first datagram.
     pub opens_after: Option<Duration>,
+    /// Copy this many datagrams out of a *second* socket, so they reach the
+    /// client from a server address it never sent to.
+    ///
+    /// A server cannot migrate a connection — only a client can move, and only
+    /// to a preferred address the server advertised (RFC 9000 §9.6). So packets
+    /// from an unannounced address are something a client is expected to
+    /// discard, and this is the only way to put one in front of it: the datagram
+    /// has to leave from a different port, which means a different socket.
+    pub shadow_datagrams: Option<u64>,
 }
 
 /// A socket that silently discards datagrams larger than `blackhole_above`.
@@ -200,6 +219,8 @@ pub struct ImpairedSocket {
     /// intermittently broken, and the first thing anyone does with a surprising
     /// verdict is run it again.
     loss_one_in: Option<u64>,
+    /// A second socket, and how many datagrams to duplicate out of it.
+    shadow: Option<Arc<ShadowSocket>>,
     /// Datagrams offered to the sender since the loss impairment opened.
     ///
     /// Shared with every sender this socket hands out, so the cadence is a
@@ -227,6 +248,9 @@ impl ImpairedSocket {
             blackhole_above: impairments.blackhole_above,
             clock: impairments.opens_after.map(|d| Arc::new(PeerClock::new(d))),
             loss_one_in: impairments.loss_one_in,
+            shadow: impairments
+                .shadow_datagrams
+                .and_then(|budget| ShadowSocket::bind(budget).map(Arc::new)),
             sent_while_lossy: Arc::new(AtomicU64::new(0)),
             counters,
         }
@@ -249,6 +273,7 @@ impl AsyncUdpSocket for ImpairedSocket {
             blackhole_above: self.blackhole_above,
             clock: self.clock.clone(),
             loss_one_in: self.loss_one_in,
+            shadow: self.shadow.clone(),
             sent_while_lossy: self.sent_while_lossy.clone(),
             counters: self.counters.clone(),
         })
@@ -455,6 +480,52 @@ fn compact_oversize(
     kept
 }
 
+/// A second socket on the same host, used only to reach a client from an address
+/// it never sent to.
+///
+/// Deliberately tiny in effect: it copies a fixed number of datagrams the real
+/// socket has already sent, then stops. The client should discard every one of
+/// them, and if it does, nothing about the connection changes — which is exactly
+/// the outcome that makes the test pass, and why the budget exists rather than
+/// shadowing the whole conversation.
+#[derive(Debug)]
+struct ShadowSocket {
+    socket: std::net::UdpSocket,
+    budget: u64,
+    sent: AtomicU64,
+}
+
+impl ShadowSocket {
+    /// Bind an ephemeral port on the same host. `None` if that is not possible,
+    /// which leaves the test reporting that nothing was exercised rather than
+    /// failing a client for our own missing socket.
+    fn bind(budget: u64) -> Option<Self> {
+        let socket = std::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0))
+            .or_else(|_| std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)))
+            .ok()?;
+        // Never block the sending path: a datagram that cannot go out
+        // immediately is simply not shadowed.
+        socket.set_nonblocking(true).ok()?;
+        Some(Self {
+            socket,
+            budget,
+            sent: AtomicU64::new(0),
+        })
+    }
+
+    /// Copy `datagram` to `peer` from this socket, while budget remains.
+    fn shadow(&self, datagram: &[u8], peer: SocketAddr) -> bool {
+        if self.sent.load(Ordering::Relaxed) >= self.budget {
+            return false;
+        }
+        if self.socket.send_to(datagram, peer).is_err() {
+            return false;
+        }
+        self.sent.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+}
+
 /// Whether the `nth` datagram since the impairment opened is the one to lose.
 ///
 /// Counting from one, so the first datagram after the clean window is never the
@@ -471,6 +542,7 @@ struct ImpairedSender {
     blackhole_above: Option<usize>,
     clock: Option<Arc<PeerClock>>,
     loss_one_in: Option<u64>,
+    shadow: Option<Arc<ShadowSocket>>,
     sent_while_lossy: Arc<AtomicU64>,
     counters: Arc<Counters>,
 }
@@ -529,6 +601,24 @@ impl UdpSender for ImpairedSender {
             }
         }
 
+        // A copy from the second socket, once the connection is up.
+        //
+        // Sent alongside the real datagram rather than instead of it, so the
+        // conversation is unaffected and the only new thing the client sees is
+        // the same bytes arriving from an address it never wrote to. A client
+        // that discards them — which §9.6 asks for — carries on exactly as it
+        // would have.
+        if let Some(shadow) = self.shadow.as_ref() {
+            if self
+                .clock
+                .as_ref()
+                .is_none_or(|clock| clock.is_open(transmit.destination, now))
+                && shadow.shadow(transmit.contents, transmit.destination)
+            {
+                self.counters.shadowed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
         if let Some(limit) = self.limit_for(transmit.destination, now) {
             if transmit.contents.len() > limit {
                 self.counters
@@ -553,7 +643,7 @@ impl UdpSender for ImpairedSender {
         // datagrams inside it, so a size threshold could not be applied
         // honestly — and a batch dropped for loss would take every datagram in
         // it, turning one loss in twelve into a burst of several.
-        if self.blackhole_above.is_some() || self.loss_one_in.is_some() {
+        if self.blackhole_above.is_some() || self.loss_one_in.is_some() || self.shadow.is_some() {
             NonZeroUsize::MIN
         } else {
             self.inner.max_transmit_segments()

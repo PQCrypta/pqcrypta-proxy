@@ -465,6 +465,37 @@ pub struct TlsProvider {
 /// chose, so the *resumed* handshake — the only one carrying 0-RTT — key-shares
 /// the right group first time and no retry happens. The refusal is now asked for
 /// directly.
+/// Offers early data and accepts it, for `q-zero-rtt-replay`.
+///
+/// The mirror of [`zero_rtt_reject_server_config`], and it shares that
+/// function's hard-won constraint: rustls only advertises early data beside
+/// *stateful* resumption (RFC 8446 §8.1), so the ticketer is left at its default
+/// and not replaced with the stateless one production uses. Without that, no
+/// ticket ever promises early data and no client ever offers any.
+///
+/// Accepting it is the point here. `q-zero-rtt-reject` measures what a client
+/// does when its early data is refused; this port lets the early data through so
+/// the exchange above it — a 425 (Too Early) and whatever the client does next —
+/// can happen at all.
+pub fn zero_rtt_accept_server_config(
+    resolver: Arc<dyn rustls::server::ResolvesServerCert>,
+) -> anyhow::Result<Arc<quinn::crypto::rustls::QuicServerConfig>> {
+    let mut config = RustlsServerConfig::builder_with_provider(Arc::new(build_pqc_provider()))
+        .with_protocol_versions(&[&TLS13])
+        .map_err(|e| anyhow::anyhow!("failed to set protocol versions: {e}"))?
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+
+    config.alpn_protocols = vec![b"h3".to_vec()];
+    // Advertised in the ticket, and honoured rather than declined.
+    config.max_early_data_size = u32::MAX;
+
+    Ok(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(config)
+            .map_err(|e| anyhow::anyhow!("failed to build the 0-RTT QUIC config: {e}"))?,
+    ))
+}
+
 pub fn zero_rtt_reject_server_config(
     resolver: Arc<dyn rustls::server::ResolvesServerCert>,
 ) -> anyhow::Result<Arc<quinn::crypto::rustls::QuicServerConfig>> {
@@ -601,6 +632,13 @@ impl TlsProvider {
         &self,
     ) -> anyhow::Result<Arc<quinn::crypto::rustls::QuicServerConfig>> {
         zero_rtt_reject_server_config(self.resolver.clone())
+    }
+
+    /// The accepting counterpart, for `q-zero-rtt-replay`.
+    pub fn build_zero_rtt_accept_config(
+        &self,
+    ) -> anyhow::Result<Arc<quinn::crypto::rustls::QuicServerConfig>> {
+        zero_rtt_accept_server_config(self.resolver.clone())
     }
 
     /// Check if PQC is available and enabled

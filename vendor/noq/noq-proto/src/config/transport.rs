@@ -36,6 +36,7 @@ pub struct TransportConfig {
     pub(crate) send_window: u64,
     pub(crate) send_fairness: bool,
     pub(crate) send_unknown_frame_type: Option<u64>,
+    pub(crate) send_invalid_transport_param: Option<(u64, u64)>,
 
     pub(crate) packet_threshold: u32,
     pub(crate) time_threshold: f32,
@@ -198,6 +199,26 @@ impl TransportConfig {
     /// rather than rejected.
     pub fn send_unknown_frame_type(&mut self, value: Option<u64>) -> &mut Self {
         self.send_unknown_frame_type = value;
+        self
+    }
+
+    /// Emit a transport parameter carrying a value its definition forbids.
+    ///
+    /// `(identifier, value)`. RFC 9000 §7.4: "An endpoint MUST treat receipt of a
+    /// transport parameter with an invalid value as a connection error of type
+    /// TRANSPORT_PARAMETER_ERROR." That is a MUST, unlike the SHOULD covering
+    /// duplicate parameters, which is why this sends one parameter once rather
+    /// than repeating a valid one.
+    ///
+    /// There is no legitimate production use: it exists so a conformance suite
+    /// can put a peer in front of that requirement. Pick a value the parameter's
+    /// own definition rules out — §18.2 makes an `ack_delay_exponent` above 20
+    /// invalid, for instance — or the peer will simply accept it.
+    ///
+    /// Written before the well-formed parameters, so everything after it parses
+    /// normally and the rejection is about this value alone.
+    pub fn send_invalid_transport_param(&mut self, value: Option<(u64, u64)>) -> &mut Self {
+        self.send_invalid_transport_param = value;
         self
     }
 
@@ -592,6 +613,7 @@ impl Default for TransportConfig {
             send_window: (8 * STREAM_RWND).into(),
             send_fairness: true,
             send_unknown_frame_type: None,
+            send_invalid_transport_param: None,
 
             packet_threshold: 3,
             time_threshold: 9.0 / 8.0,
@@ -644,6 +666,7 @@ impl fmt::Debug for TransportConfig {
             send_window,
             send_fairness,
             send_unknown_frame_type,
+            send_invalid_transport_param,
             packet_threshold,
             time_threshold,
             initial_rtt,
@@ -682,6 +705,7 @@ impl fmt::Debug for TransportConfig {
             .field("send_window", send_window)
             .field("send_fairness", send_fairness)
             .field("send_unknown_frame_type", send_unknown_frame_type)
+            .field("send_invalid_transport_param", send_invalid_transport_param)
             .field("packet_threshold", packet_threshold)
             .field("time_threshold", time_threshold)
             .field("initial_rtt", initial_rtt)

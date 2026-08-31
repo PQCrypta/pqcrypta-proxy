@@ -22,6 +22,9 @@ pub mod frame_type {
     pub const PUSH_PROMISE: u64 = 0x05;
     pub const GOAWAY: u64 = 0x07;
     pub const MAX_PUSH_ID: u64 = 0x0d;
+    /// PRIORITY_UPDATE for a request stream (RFC 9218 §7.2). The push-stream
+    /// variant is 0xf0701; either is forbidden from a server.
+    pub const PRIORITY_UPDATE_REQUEST: u64 = 0xf_0700;
 }
 
 /// Unidirectional stream types (RFC 9114 §6.2).
@@ -37,6 +40,10 @@ pub mod setting {
     pub const QPACK_MAX_TABLE_CAPACITY: u64 = 0x01;
     pub const MAX_FIELD_SECTION_SIZE: u64 = 0x06;
     pub const QPACK_BLOCKED_STREAMS: u64 = 0x07;
+    /// SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 9220 §3, registered by RFC 8441).
+    /// Its value MUST be 0 or 1; this is how a client learns Extended CONNECT —
+    /// and so WebTransport — is available.
+    pub const ENABLE_CONNECT_PROTOCOL: u64 = 0x08;
 }
 
 /// HTTP/3 error codes (RFC 9114 §8.1). The catalogue's correctness tests name
@@ -193,6 +200,18 @@ pub fn max_push_id(id: u64) -> BytesMut {
 /// push that was never permitted.
 pub fn cancel_push(push_id: u64) -> BytesMut {
     frame(frame_type::CANCEL_PUSH, &varint(push_id))
+}
+
+/// A PRIORITY_UPDATE frame for a request stream (RFC 9218 §7.2).
+///
+/// Payload is the Prioritized Element ID as a varint, then the Priority Field
+/// Value as ASCII structured-field text — `u=3` is a plain, valid urgency, so
+/// what a client objects to is the direction the frame travelled and not
+/// anything wrong with its contents.
+pub fn priority_update(element_id: u64, field_value: &str) -> BytesMut {
+    let mut payload = varint(element_id);
+    payload.extend_from_slice(field_value.as_bytes());
+    frame(frame_type::PRIORITY_UPDATE_REQUEST, &payload)
 }
 
 /// A DATA frame.

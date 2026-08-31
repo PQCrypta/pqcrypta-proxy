@@ -137,7 +137,9 @@ async fn drive(test_id: &'static str) -> Wire {
             .await
             .expect("the client opens a request stream");
         let _ = recv.read_to_end(4096).await;
-        answer_probe(&mut send, test, &qpack, Some(&mut emitted.encoder))
+        // No early data here: these tests are about QPACK, and the flag only
+        // decides whether the 0-RTT port answers 425.
+        answer_probe(&mut send, test, &qpack, Some(&mut emitted.encoder), false)
             .await
             .expect("answering the probe");
         let _ = send.finish();

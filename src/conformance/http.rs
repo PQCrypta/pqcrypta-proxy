@@ -515,9 +515,10 @@ available as <a href="/catalog.json">JSON</a>.</p>
 
 <h2 id="scope">Scope, and what this is not</h2>
 <p>{total} tests is a beginning, not coverage. QUIC and HTTP/3 together are
-enormous, and whole areas are untouched &mdash; connection migration, malformed
-transport parameters, extended CONNECT, prioritisation, 0-RTT replay. The
-catalogue is chosen rather than exhaustive.</p>
+enormous, and whole areas remain untouched &mdash; server push, HTTP Datagrams
+and WebTransport, a client's own migration after a NAT rebind, amplification
+limits, QPACK encoder-stream errors. The catalogue is chosen rather than
+exhaustive.</p>
 <ul>
 <li><strong>This is not a certification.</strong> Passing everything here means a
 client handled {total} specific situations correctly. It does not mean the

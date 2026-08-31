@@ -118,6 +118,8 @@ pub fn anomaly_stream(test: &Test) -> Anomaly {
         | "h-second-control-stream"
         | "h-max-push-id"
         | "h-cancel-push-unsolicited"
+        | "h-priority-update"
+        | "h-extended-connect"
         | "h-goaway"
         | "h-grease-settings"
         | "h-duplicate-setting"
@@ -132,7 +134,8 @@ pub fn anomaly_stream(test: &Test) -> Anomaly {
         | "h-oversized-field-section"
         | "h-trailers"
         | "h-early-hints"
-        | "h-response-stream-reset" => Anomaly::ResponseStream,
+        | "h-response-stream-reset"
+        | "q-zero-rtt-replay" => Anomaly::ResponseStream,
 
         _ => Anomaly::Transport,
     }
@@ -186,7 +189,7 @@ pub struct Test {
 ///
 /// | Test | Clause | Checked against |
 /// |------|--------|-----------------|
-/// | `h-*` (all nineteen) | RFC 9114, RFC 9204 | RFC text |
+/// | `h-*` (the nineteen from RFC 9114/9204) | RFC 9114, RFC 9204 | RFC text |
 /// | `q-version-negotiation` | RFC 9000 §6.2 | RFC text |
 /// | `q-zero-rtt-reject` | RFC 9001 §4.6.2 | RFC text |
 /// | `q-reserved-frame` | RFC 9000 §12.4 | RFC text |
@@ -198,6 +201,20 @@ pub struct Test {
 /// | `q-key-update` | RFC 9001 §6.2 | RFC text |
 /// | `q-stream-limit` | RFC 9000 §4.6 | RFC text |
 /// | `q-loss-recovery` | RFC 9000 §2.2, §13.3 | RFC text |
+/// | `q-connection-migration` | RFC 9000 §9.6 | RFC text |
+/// | `q-invalid-transport-param` | RFC 9000 §7.4, §18.2 | RFC text |
+/// | `q-zero-rtt-replay` | RFC 8470 §5.2 | RFC text |
+/// | `h-priority-update` | RFC 9218 §7.2 | RFC text |
+/// | `h-extended-connect` | RFC 9220 §3, RFC 8441 §3 | RFC text |
+///
+/// The five entries added on 2026-09-01 close the areas the site had been listing
+/// as untouched, and three of them changed shape while being read.
+/// `q-invalid-transport-param` was drafted around a *duplicate* parameter until
+/// §7.4 turned out to make duplicates only a SHOULD while an invalid *value* is a
+/// MUST — so the port sends one parameter, once, out of range.
+/// `q-connection-migration` is a SHOULD for the same reason and is scored as
+/// discretionary. `h-extended-connect` asks for a value RFC 8441 forbids, and
+/// neither it nor RFC 9220 names a receiver behaviour, so both answers pass.
 ///
 /// The eight entries added on 2026-08-31 were each read as published before the
 /// entry was written, and two of them changed shape as a result.
@@ -422,6 +439,64 @@ pub const CATALOG: &[Test] = &[
         implemented: true,
         port_offset: Some(29),
     },
+    Test {
+        id: "q-connection-migration",
+        title: "Datagrams arriving from a second server address",
+        spec: "RFC 9000 §9.6",
+        class: Class::Discretionary,
+        tier: Tier::Quic,
+        expectation: "Keep using the address you are already talking to. §9.6 says a \
+                      client \"SHOULD ignore packets received from a server address other \
+                      than the one it is currently using for sending packets\" — a SHOULD, \
+                      so quietly discarding them and objecting are both conformant. \
+                      Following the new address is not: nothing is listening there, and a \
+                      server may only move a client to an address it advertised as its \
+                      preferred one.",
+        implemented: true,
+        port_offset: Some(35),
+    },
+    Test {
+        id: "q-invalid-transport-param",
+        title: "Transport parameter carrying a value the specification forbids",
+        spec: "RFC 9000 §7.4, §18.2",
+        class: Class::Correctness,
+        tier: Tier::Quic,
+        expectation: "Close the connection with TRANSPORT_PARAMETER_ERROR. §18.2 makes an \
+                      ack_delay_exponent above 20 invalid, and §7.4 is a MUST: \"An \
+                      endpoint MUST treat receipt of a transport parameter with an invalid \
+                      value as a connection error of type TRANSPORT_PARAMETER_ERROR.\"\n\n\
+                      Distinct from a *duplicate* parameter, which the same clause makes \
+                      only a SHOULD — this port sends one parameter, once, with a value \
+                      outside its permitted range.\n\nThe parameter travels in the \
+                      handshake, so every client that connects here reads it. Only a \
+                      client that answers with a CONNECTION_CLOSE this endpoint can read \
+                      is scored: one that simply abandons the handshake is recorded as \
+                      inconclusive, because a close that was sent and lost looks exactly \
+                      like one that was never sent.",
+        implemented: true,
+        port_offset: Some(36),
+    },
+    Test {
+        id: "q-zero-rtt-replay",
+        title: "425 (Too Early) in answer to a request sent as early data",
+        spec: "RFC 8470 §5.2",
+        class: Class::Discretionary,
+        tier: Tier::Quic,
+        expectation: "Handle being told the request arrived too early. §5.2 says a user \
+                      agent \"SHOULD retry automatically, but any retries MUST NOT be sent \
+                      in early data\" — so retrying on the 1-RTT keys and handing the 425 \
+                      back to the caller are both conformant, and the report says which \
+                      happened. Falling over is not one of the options.\n\nThis is the \
+                      only port that *accepts* early data instead of refusing it, which is \
+                      what makes the 425 exchange possible at all. What it does not check \
+                      is §4's rule that unsafe methods must never be sent in early data: \
+                      reading the method would mean QPACK-decoding the request, which this \
+                      suite deliberately never does.\n\nReaching it needs a session \
+                      ticket from an earlier connection to this same port, so a client that \
+                      connects once has none.",
+        implemented: true,
+        port_offset: Some(37),
+    },
     // ── Tier A: HTTP/3 layer ──────────────────────────────────────────────
     Test {
         id: "h-grease-settings",
@@ -645,6 +720,42 @@ pub const CATALOG: &[Test] = &[
         implemented: true,
         port_offset: Some(34),
     },
+    Test {
+        id: "h-priority-update",
+        title: "PRIORITY_UPDATE sent by the server",
+        spec: "RFC 9218 §7.2",
+        class: Class::Discretionary,
+        tier: Tier::Http3,
+        expectation: "Reject it with H3_FRAME_UNEXPECTED, or ignore it — which is \
+                      conformant depends on whether you implement extensible priorities \
+                      at all, and that is not observable from here.\n\nA client that \
+                      does implement RFC 9218 is bound by §7.2: servers \"MUST NOT send \
+                      PRIORITY_UPDATE frames of either type\", and a client receiving one \
+                      MUST treat it as a connection error of that type. A client that does \
+                      not implement it sees frame type 0xf0700 as simply unknown, and RFC \
+                      9114 §9 requires unknown frame types to be ignored — so ignoring it \
+                      is equally correct, for a different reason.\n\nScoring this as a \
+                      failure either way would accuse one of those two clients of a \
+                      violation it did not commit, so the report says which answer was \
+                      given rather than grading it.",
+        implemented: true,
+        port_offset: Some(38),
+    },
+    Test {
+        id: "h-extended-connect",
+        title: "SETTINGS_ENABLE_CONNECT_PROTOCOL with a value outside 0 and 1",
+        spec: "RFC 9220 §3, RFC 8441 §3",
+        class: Class::Discretionary,
+        tier: Tier::Http3,
+        expectation: "Reject it or ignore it, but keep working. RFC 8441 §3 says the \
+                      value \"MUST be 0 or 1\" and RFC 9220 carries that into HTTP/3 \
+                      unchanged — yet neither names a behaviour for a receiver that sees \
+                      anything else, so both answers are conformant and stalling is not. \
+                      The setting is how a client learns Extended CONNECT is available, so \
+                      a WebTransport-capable client has real parsing behind it.",
+        implemented: true,
+        port_offset: Some(39),
+    },
 ];
 
 /// Look a test up by its stable id.
@@ -754,6 +865,11 @@ mod tests {
             ("h-cancel-push-unsolicited", 32),
             ("h-qpack-blocked-stream", 33),
             ("h-response-stream-reset", 34),
+            ("q-connection-migration", 35),
+            ("q-invalid-transport-param", 36),
+            ("q-zero-rtt-replay", 37),
+            ("h-priority-update", 38),
+            ("h-extended-connect", 39),
         ];
 
         for (id, offset) in pinned {

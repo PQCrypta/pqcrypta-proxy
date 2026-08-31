@@ -48,6 +48,28 @@ use crate::tls::TlsProvider;
 /// range, so nothing can plausibly parse it.
 const RESERVED_FRAME_TYPE: u64 = 0x2a2a;
 
+/// `ack_delay_exponent` (RFC 9000 §18.2).
+const ACK_DELAY_EXPONENT_ID: u64 = 0x0a;
+
+/// One past the ceiling §18.2 sets for it: "Values above 20 are invalid."
+///
+/// Invalid by the parameter's own definition, so a peer needs no context to know
+/// it — which is what makes the rejection a statement about §7.4 rather than
+/// about anything this endpoint negotiated.
+const INVALID_ACK_DELAY_EXPONENT: u64 = 21;
+
+/// How many datagrams `q-connection-migration` copies out of a second socket.
+const SHADOW_DATAGRAMS: u64 = 6;
+
+/// How long that test holds the response, so datagrams are still flowing once
+/// the copy window has opened.
+const SHADOW_HOLD: Duration = Duration::from_millis(900);
+
+/// How long before the copies begin. Past the handshake — a second address
+/// appearing mid-handshake is a different question from one appearing on an
+/// established connection, and §9.6 is about the latter.
+const SHADOW_OPENS_AFTER: Duration = Duration::from_millis(150);
+
 /// One datagram in this many is dropped on `q-loss-recovery`'s port.
 ///
 /// Named once because both the impairment and the sentence explaining an
@@ -81,6 +103,12 @@ impl TestListener {
             tls_provider
                 .build_zero_rtt_reject_config()
                 .with_context(|| format!("building the TLS config for {}", test.id))?
+        } else if test.id == "q-zero-rtt-replay" {
+            // The only port that lets early data through. Everything this test
+            // measures happens above it.
+            tls_provider
+                .build_zero_rtt_accept_config()
+                .with_context(|| format!("building the TLS config for {}", test.id))?
         } else {
             tls_provider.get_quic_server_config()
         };
@@ -113,6 +141,23 @@ impl TestListener {
         // A keep-alive well inside the settle window means any peer still in its
         // closing period is prompted to repeat itself while we are listening.
         transport.keep_alive_interval(Some(Duration::from_millis(250)));
+
+        // One port expects the handshake to be abandoned, so it must not wait
+        // the full idle timeout to find out.
+        //
+        // A client that refuses the parameter stops there, and if it sends no
+        // CONNECTION_CLOSE this endpoint can read, the only thing left is the
+        // timeout. At thirty seconds that verdict arrives long after the run has
+        // finished and the report has been read — which is how the test came
+        // back as never having run at all, rather than as the inconclusive it
+        // actually is.
+        if test.id == "q-invalid-transport-param" {
+            transport.max_idle_timeout(Some(
+                Duration::from_secs(5)
+                    .try_into()
+                    .expect("5s is a valid idle timeout"),
+            ));
+        }
 
         // Per-test transport shaping. Several QUIC-layer anomalies are produced
         // by how the endpoint is configured rather than by bytes written after
@@ -193,6 +238,20 @@ impl TestListener {
             "q-reserved-frame" => {
                 transport.send_unknown_frame_type(Some(RESERVED_FRAME_TYPE));
             }
+            // A parameter whose own definition rules its value out.
+            //
+            // §18.2 puts ack_delay_exponent's ceiling at 20, so 21 is invalid by
+            // the parameter's own terms rather than by anything contextual — and
+            // §7.4 makes that a MUST-level connection error. Chosen over a
+            // duplicate parameter, which the same clause makes only a SHOULD and
+            // which would therefore fail conformant clients for a legal choice,
+            // exactly as `h-duplicate-setting` once did.
+            "q-invalid-transport-param" => {
+                transport.send_invalid_transport_param(Some((
+                    ACK_DELAY_EXPONENT_ID,
+                    INVALID_ACK_DELAY_EXPONENT,
+                )));
+            }
             _ => {}
         }
 
@@ -259,15 +318,22 @@ impl TestListener {
         // while reporting on the other would be a verdict about nothing.
         let loss_one_in = (test.id == "q-loss-recovery").then_some(LOSS_CADENCE);
 
+        // A handful of datagrams from a second address, once the handshake is
+        // done. Enough that a client which follows an unannounced server address
+        // has plainly done so; few enough that one which correctly discards them
+        // is not made to work for it.
+        let shadow_datagrams = (test.id == "q-connection-migration").then_some(SHADOW_DATAGRAMS);
+
         // Open for the first four seconds, so discovery can raise the MTU to
         // 1452 on a path that genuinely carries it. Then the hole opens and
         // packets at that established size start disappearing — which is what a
         // black hole is, and what the detector looks for. The loss impairment
         // needs far less: one second is past the handshake on any path this
         // service can be reached over.
-        let opens_after = match (blackhole_above, loss_one_in) {
-            (Some(_), _) => Some(Duration::from_secs(4)),
-            (_, Some(_)) => Some(Duration::from_millis(500)),
+        let opens_after = match (blackhole_above, loss_one_in, shadow_datagrams) {
+            (Some(_), _, _) => Some(Duration::from_secs(4)),
+            (_, Some(_), _) => Some(Duration::from_millis(500)),
+            (_, _, Some(_)) => Some(SHADOW_OPENS_AFTER),
             _ => None,
         };
         let impaired = Box::new(ImpairedSocket::new(
@@ -276,6 +342,7 @@ impl TestListener {
                 blackhole_above,
                 loss_one_in,
                 opens_after,
+                shadow_datagrams,
             },
             counters.clone(),
         ));
@@ -442,7 +509,8 @@ async fn run_one(
             .and_then(|h| h.server_name)
     });
 
-    let connection = match connecting.await {
+    let mut early_data_accepted = false;
+    let connection = match accept_connection(connecting, test, &mut early_data_accepted).await {
         Ok(connection) => connection,
         Err(e) => {
             // The client closed before the handshake finished. For most tests
@@ -456,24 +524,40 @@ async fn run_one(
             // closes within a round trip and `accept()` never yields. Scored
             // here or not at all.
             let session_id = resolve_session(sni.as_deref(), peer_ip, &conformance);
-            let observation = frame_encoding_verdict(test, &e).unwrap_or_else(|| {
-                // Anything else that dies in the handshake never met the
-                // anomaly, so there is nothing to score.
-                //
-                // `q-reserved-frame` is the only test whose anomaly rides early
-                // enough to be rejected here, and it is claimed above. For the
-                // rest the anomaly is written after the connection is
-                // established, so a handshake that failed is a client that never
-                // saw one — and the generic classification would have called
-                // that a signal, which for four of the five classes is a pass.
-                // A client whose key exchange had nothing in common with ours
-                // was being credited with recovering from a 0-RTT rejection it
-                // was never sent.
-                Observation::NotExercised(format!(
-                    "the connection failed during the handshake ({e}), so the client never \
-                     reached the anomaly"
-                ))
-            });
+            let observation = frame_encoding_verdict(test, &e)
+                .or_else(|| transport_param_verdict(test, &e))
+                .unwrap_or_else(|| {
+                    // Anything else that dies in the handshake never met the
+                    // anomaly, so there is nothing to score.
+                    //
+                    // `q-reserved-frame` is the only test whose anomaly rides early
+                    // enough to be rejected here, and it is claimed above. For the
+                    // rest the anomaly is written after the connection is
+                    // established, so a handshake that failed is a client that never
+                    // saw one — and the generic classification would have called
+                    // that a signal, which for four of the five classes is a pass.
+                    // A client whose key exchange had nothing in common with ours
+                    // was being credited with recovering from a 0-RTT rejection it
+                    // was never sent.
+                    if test.id == "q-invalid-transport-param" {
+                        // This one did reach the anomaly: the parameter travels
+                        // in the handshake, so it is among the first things the
+                        // client reads. What is missing is its answer.
+                        Observation::NotExercised(format!(
+                            "the client abandoned the handshake ({e}) without a \
+                             CONNECTION_CLOSE this endpoint could read. It certainly saw \
+                             the parameter — that travels in the handshake — but §7.4 \
+                             asks for a rejection carrying TRANSPORT_PARAMETER_ERROR, and \
+                             none was observed. A close that was sent and lost cannot be \
+                             told apart from one that was never sent"
+                        ))
+                    } else {
+                        Observation::NotExercised(format!(
+                            "the connection failed during the handshake ({e}), so the \
+                             client never reached the anomaly"
+                        ))
+                    }
+                });
             let elapsed = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
             conformance.sessions.with(&session_id, |s| {
                 s.record(test, &observation, expected_code(test), elapsed);
@@ -531,6 +615,11 @@ async fn run_one(
             &mut held,
             encoder.as_mut(),
             &qpack,
+            // Not just "0-RTT was possible" — `into_0rtt` succeeds whenever the
+            // configuration offers early data, whether or not the client sent
+            // any. The wire count is the same evidence the verdict is built on,
+            // so the response and the verdict cannot disagree.
+            early_data_accepted && conformance_counters.zero_rtt_in() > 0,
         )
         .await
     };
@@ -603,6 +692,34 @@ async fn run_one(
     // waits here with the rest.
     drop(encoder);
     Ok(())
+}
+
+/// Complete the handshake, accepting early data on the one port that offers it.
+///
+/// `into_0rtt` is what actually admits 0-RTT server-side: with it, the streams a
+/// client opened in early data are delivered as soon as they arrive rather than
+/// after the handshake confirms. Without calling it, a configuration that offers
+/// early data still quietly discards the packets, and the port would be
+/// indistinguishable from the one that refuses them.
+///
+/// It hands the `Connecting` back when 0-RTT is not possible — no ticket, or a
+/// fresh client — and that is the ordinary case, so the fall-through is the
+/// normal handshake rather than an error.
+async fn accept_connection(
+    connecting: quinn::Connecting,
+    test: &'static Test,
+    early_data_accepted: &mut bool,
+) -> Result<quinn::Connection, quinn::ConnectionError> {
+    if test.id == "q-zero-rtt-replay" && test.implemented {
+        return match connecting.into_0rtt() {
+            Ok((connection, _accepted)) => {
+                *early_data_accepted = true;
+                Ok(connection)
+            }
+            Err(connecting) => connecting.await,
+        };
+    }
+    connecting.await
 }
 
 /// Vanish, and watch whether the client accepts being reset.
@@ -784,6 +901,44 @@ fn frame_encoding_verdict(test: &Test, err: &quinn::ConnectionError) -> Option<O
     }
 }
 
+/// Whether the client rejected the out-of-range parameter with the code §7.4
+/// names.
+///
+/// Kept apart from the generic close classification for the same reason
+/// [`frame_encoding_verdict`] is: this is a *transport* error code, which
+/// `expected_code` cannot express since that compares HTTP/3 application codes,
+/// and §7.4 names exactly one — so "rejected it somehow" is not the requirement.
+///
+/// The rejection arrives during the handshake, because transport parameters are
+/// read as part of it. There is no connection by then and never will be, so this
+/// is scored from the handshake failure or not at all.
+fn transport_param_verdict(test: &Test, err: &quinn::ConnectionError) -> Option<Observation> {
+    use quinn::ConnectionError as Ce;
+    use quinn_proto::TransportErrorCode as Tec;
+
+    if test.id != "q-invalid-transport-param" {
+        return None;
+    }
+    match err {
+        Ce::ConnectionClosed(c) if c.error_code == Tec::TRANSPORT_PARAMETER_ERROR => {
+            Some(Observation::Signalled(format!(
+                "closed with TRANSPORT_PARAMETER_ERROR, which is the code §7.4 requires \
+                 for a parameter carrying an invalid value (ack_delay_exponent = \
+                 {INVALID_ACK_DELAY_EXPONENT}, where §18.2 permits at most 20)"
+            )))
+        }
+        Ce::ConnectionClosed(c) => Some(Observation::Violated(format!(
+            "rejected the out-of-range parameter with {:?}, where RFC 9000 §7.4 requires \
+             TRANSPORT_PARAMETER_ERROR. The violation was detected; the code reported is \
+             wrong",
+            c.error_code
+        ))),
+        // Anything else is left to the caller, which reads a handshake that
+        // failed for another reason as the test not having been exercised.
+        _ => None,
+    }
+}
+
 /// Which session this connection's result belongs to.
 ///
 /// Shared by both arms of the handshake so a client that rejects an anomaly
@@ -948,6 +1103,37 @@ pub(super) async fn emit(
             control.write_all(&f::max_push_id(0)).await?;
         }
 
+        // A prioritisation signal travelling the wrong way.
+        //
+        // The frame itself is well formed and `u=3` is an ordinary urgency: the
+        // violation is purely that a server sent it. RFC 9218 §7.2 makes that a
+        // MUST NOT, and a client receiving one a connection error of type
+        // H3_FRAME_UNEXPECTED — the same shape as `h-max-push-id`, one frame
+        // registry apart.
+        "h-priority-update" => {
+            control.write_all(&f::settings_with_grease()).await?;
+            control
+                .write_all(&f::priority_update(PRIORITISED_REQUEST_STREAM, "u=3"))
+                .await?;
+        }
+
+        // Extended CONNECT advertised with a value the setting cannot take.
+        //
+        // RFC 8441 §3 says the value MUST be 0 or 1 and RFC 9220 carries that
+        // into HTTP/3 unchanged, but neither names what a receiver does with
+        // anything else. So this is written into an otherwise ordinary SETTINGS
+        // frame and either answer is accepted: what is being measured is that a
+        // client which parses the setting — any WebTransport-capable one does —
+        // neither stalls nor falls over.
+        "h-extended-connect" => {
+            control
+                .write_all(&f::settings(&[
+                    (f::setting::MAX_FIELD_SECTION_SIZE, 16_384),
+                    (f::setting::ENABLE_CONNECT_PROTOCOL, 2),
+                ]))
+                .await?;
+        }
+
         // CANCEL_PUSH naming a push the client never allowed.
         //
         // The frame itself is legal from a server; the identifier is not. A
@@ -1058,6 +1244,13 @@ pub(super) struct Emitted {
     pub(super) encoder: quinn::SendStream,
 }
 
+/// The request stream `h-priority-update` claims to reprioritise.
+///
+/// Stream 0 is the first client-initiated bidirectional stream, so it is the one
+/// the probe arrives on and the identifier is a plausible one rather than a
+/// second oddity for the client to trip over.
+const PRIORITISED_REQUEST_STREAM: u64 = 0;
+
 /// The push ID `h-cancel-push-unsolicited` cancels.
 ///
 /// Any value would do — no MAX_PUSH_ID was granted, so none is allowed — and a
@@ -1096,6 +1289,7 @@ async fn watch_for_liveness(
     hold: &mut Vec<quinn::SendStream>,
     encoder: Option<&mut quinn::SendStream>,
     qpack: &Arc<QpackLimits>,
+    early_data_seen: bool,
 ) -> Observation {
     let timeout = Duration::from_millis(conformance.config.liveness_timeout_ms);
 
@@ -1166,15 +1360,16 @@ async fn watch_for_liveness(
                 // entirely — whether a unidirectional stream was ever read is
                 // not observable from this end — which is why the verdict model
                 // still has to allow for not knowing.
-                if catalog::anomaly_stream(test) == catalog::Anomaly::ControlStream {
+                if let Some(hold) = probe_hold(test) {
                     tokio::select! {
-                        () = tokio::time::sleep(CONTROL_STREAM_GRACE) => {}
+                        () = tokio::time::sleep(hold) => {}
                         // Already objected: nothing to wait for.
                         _ = connection.closed() => {}
                     }
                 }
 
-                if let Err(e) = answer_probe(&mut send, test, qpack, encoder).await {
+                if let Err(e) = answer_probe(&mut send, test, qpack, encoder, early_data_seen).await
+                {
                     debug!("conformance: could not answer liveness probe: {}", e);
                 }
                 // Handed to the caller rather than dropped. `Drop for SendStream`
@@ -1244,6 +1439,24 @@ fn quic_observation(
         "q-reserved-frame" => connection
             .close_reason()
             .and_then(|e| frame_encoding_verdict(test, &e)),
+
+        // A client that got as far as an established connection accepted the
+        // parameter: the rejection §7.4 requires happens during the handshake,
+        // so reaching here at all is the failure.
+        "q-invalid-transport-param" => Some(
+            connection
+                .close_reason()
+                .and_then(|e| transport_param_verdict(test, &e))
+                .unwrap_or_else(|| {
+                    Observation::Violated(
+                        "completed the handshake carrying a transport parameter whose value \
+                         its own definition forbids. RFC 9000 §7.4 requires a connection \
+                         error of type TRANSPORT_PARAMETER_ERROR, and §18.2 puts \
+                         ack_delay_exponent's ceiling at 20"
+                            .to_string(),
+                    )
+                }),
+        ),
 
         // Getting here at all means the client echoed the token in a second
         // Initial: this port answers the first attempt with Retry and nothing
@@ -1474,6 +1687,47 @@ fn quic_observation(
             )))
         }
 
+        // Whether the client was actually shown a second address decides only
+        // whether this ran; how it reacted is the liveness result.
+        //
+        // Left to the generic path on purpose. A client that discards the
+        // stray datagrams carries on and completes the probe, and one that
+        // follows them starts writing to a socket nothing is reading, which
+        // shows up as the connection stalling. Reporting a signal here would
+        // override both.
+        "q-connection-migration" => {
+            let shadowed = counters.shadowed();
+            if shadowed > 0 {
+                return None;
+            }
+            Some(Observation::NotExercised(
+                "no datagram was copied from the second address, so the client was never \
+                 shown one. The copy begins half a second after a peer's first datagram \
+                 and needs the server to still be sending by then"
+                    .to_string(),
+            ))
+        }
+
+        // Whether any early data arrived decides only whether this ran.
+        //
+        // Counted off the wire, like `q-zero-rtt-reject`: an accepted 0-RTT
+        // packet is decrypted and disappears into the ordinary stream machinery,
+        // so there is nothing above the transport that distinguishes it from a
+        // request sent after the handshake. Without the count, a client that
+        // never had a ticket would be scored as though it had been told 425 and
+        // handled it.
+        "q-zero-rtt-replay" => {
+            if counters.zero_rtt_in() > 0 {
+                return None;
+            }
+            Some(Observation::NotExercised(
+                "the client sent no early data, so it was never answered 425. 0-RTT \
+                 needs a session ticket from an earlier connection to this same port, \
+                 and a client that connects once has none"
+                    .to_string(),
+            ))
+        }
+
         // Almost nothing on the public internet speaks multipath, which is
         // precisely why it is worth measuring rather than assuming.
         "q-multipath" => Some(Observation::Signalled(if rx.max_path_id > 0 {
@@ -1499,6 +1753,7 @@ pub(super) async fn answer_probe(
     test: &'static Test,
     qpack: &QpackLimits,
     encoder: Option<&mut quinn::SendStream>,
+    early_data_seen: bool,
 ) -> anyhow::Result<()> {
     const BODY: &[u8] = b"liveness probe received; this connection survived the test\n";
 
@@ -1776,6 +2031,45 @@ pub(super) async fn answer_probe(
             send.write_all(&f::data(BODY)).await?;
         }
 
+        // 425 (Too Early), the answer RFC 8470 defines for a request that
+        // arrived in early data.
+        //
+        // Sent whatever the request was: this port accepts 0-RTT, so anything
+        // reaching it on the first flight is by definition early data. §5.2
+        // leaves the client a choice — retry on the 1-RTT keys, or hand the
+        // status back to whoever made the request — and both are recorded as
+        // passes, so the response has to be complete and readable rather than
+        // merely a status.
+        "q-zero-rtt-replay" if early_data_seen => {
+            send.write_all(&f::headers(&[
+                (":status", "425"),
+                ("content-type", "text/plain"),
+                ("x-conformance", "too-early"),
+            ]))
+            .await?;
+            send.write_all(&f::data(
+                b"this request arrived in early data; retry it on the 1-RTT keys\n",
+            ))
+            .await?;
+        }
+
+        // No early data was accepted on this connection, so there is nothing
+        // that arrived too early and a 425 would be a lie. The client is
+        // answered normally and the verdict records that the test did not run.
+        //
+        // Sending it regardless was the first version, and it told a client
+        // which had never resumed anything to retry a request that was never
+        // early — inventing the very situation the test is supposed to observe.
+        "q-zero-rtt-replay" => {
+            send.write_all(&f::headers(&[
+                (":status", "200"),
+                ("content-type", "text/plain"),
+                ("x-conformance", "no-early-data-on-this-connection"),
+            ]))
+            .await?;
+            send.write_all(&f::data(BODY)).await?;
+        }
+
         // Headers, part of a body, then the stream is cancelled underneath it.
         //
         // The pause is what makes this a cancellation of something rather than
@@ -1850,6 +2144,29 @@ const DYNAMIC_INSERTS: u64 = 2;
 // of entries actually inserted; a mismatch is a decode failure the client would
 // be blamed for.
 const _: () = assert!(DYNAMIC_ENTRIES.len() == 2);
+
+/// How long to hold the response before releasing the client, if at all.
+///
+/// Two quite different reasons to wait, and both need the connection to still be
+/// alive a moment longer than a bare request/response would keep it.
+fn probe_hold(test: &'static Test) -> Option<Duration> {
+    if catalog::anomaly_stream(test) == catalog::Anomaly::ControlStream {
+        // Give a unidirectional stream a chance to be read before the client is
+        // free to close.
+        return Some(CONTROL_STREAM_GRACE);
+    }
+    if test.id == "q-connection-migration" {
+        // The second address is only shown to the client on datagrams this
+        // endpoint sends *after* the copy window opens, and a bare exchange is
+        // over in milliseconds — locally the window never opened at all and the
+        // test reported, correctly, that nothing had been exercised. Holding
+        // here leaves the connection running through it, and the keep-alive
+        // ensures there is traffic to copy even while nothing else is being
+        // said.
+        return Some(SHADOW_HOLD);
+    }
+    None
+}
 
 /// How long a control-stream anomaly is left in front of a client before the
 /// response is released.

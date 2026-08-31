@@ -114,6 +114,16 @@ macro_rules! make_struct {
             /// is set to `None` for `TransportParameters` received from a peer.
             pub(crate) write_order: Option<[u8; TransportParameterId::SUPPORTED.len()]>,
 
+            /// A parameter to emit carrying a value its own definition forbids.
+            ///
+            /// Conformance only, and paired with
+            /// [`TransportConfig::send_invalid_transport_param`]. RFC 9000 §7.4
+            /// makes an invalid value a MUST-level connection error of type
+            /// TRANSPORT_PARAMETER_ERROR, which is a stronger requirement than
+            /// the SHOULD that covers duplicates — so this sends one parameter,
+            /// once, out of range, and nothing else about the handshake changes.
+            pub(crate) send_invalid_param: Option<(VarInt, VarInt)>,
+
             /// The role of this peer in address discovery, if any.
             pub(crate) address_discovery_role: address_discovery::Role,
 
@@ -145,6 +155,7 @@ macro_rules! make_struct {
                     preferred_address: None,
                     grease_transport_parameter: None,
                     write_order: None,
+                    send_invalid_param: None,
                     address_discovery_role: address_discovery::Role::default(),
                     initial_max_path_id: None,
                     max_remote_nat_traversal_addresses: None,
@@ -194,6 +205,13 @@ impl TransportParameters {
                 let mut order = std::array::from_fn(|i| i as u8);
                 order.shuffle(rng);
                 order
+            }),
+            send_invalid_param: config.send_invalid_transport_param.and_then(|(id, value)| {
+                // Both halves must fit a varint or there is nothing to encode.
+                // A misconfigured pair is dropped rather than panicking a
+                // handshake: the conformance run then reports the test as
+                // unexercised, which is true, instead of taking the server down.
+                Some((VarInt::from_u64(id).ok()?, VarInt::from_u64(value).ok()?))
             }),
             address_discovery_role: config.address_discovery_role,
             initial_max_path_id: config.get_initial_max_path_id(),
@@ -327,6 +345,20 @@ impl From<UnexpectedEnd> for Error {
 impl TransportParameters {
     /// Encode `TransportParameters` into buffer
     pub fn write<W: BufMut>(&self, w: &mut W) {
+        // The deliberately invalid parameter, when one is configured.
+        //
+        // Written first, so everything after it is well formed and the peer's
+        // objection is unambiguously about this parameter rather than about
+        // whatever it failed to parse next. Transport parameters carry their own
+        // lengths, so a receiver can skip it and read the rest — which is what
+        // makes "rejected with TRANSPORT_PARAMETER_ERROR" a statement about the
+        // value and not about the encoding.
+        if let Some((id, value)) = self.send_invalid_param {
+            w.write_var(id.into_inner());
+            w.write_var(value.size() as u64);
+            w.write(value);
+        }
+
         let ids = match &self.write_order {
             Some(order) => order,
             None => &std::array::from_fn(|i| i as u8),
