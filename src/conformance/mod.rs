@@ -12,10 +12,18 @@
 //!
 //! # Layout
 //!
-//! - [`catalog`] — the tests, each citing the clause it exercises
+//! - [`catalog`] — the tests, each citing the clause it exercises, and where
+//!   each anomaly is written
+//! - [`listener`] — one QUIC listener per test: emits the anomaly and watches
 //! - [`session`] — verdicts, and the liveness probe that makes them meaningful
 //! - [`h3_frames`] — a hand-rolled HTTP/3 frame writer
+//! - [`impairment`] — a UDP socket that loses and swallows datagrams on purpose
 //! - [`report`] — JSON, HTML and badge output
+//! - [`http`] — the suite host's own pages: catalogue, reports, badge
+//!
+//! Two anomalies cannot be driven by any client within reach, so they are proven
+//! in-process instead: `zero_rtt` for refused early data, `qpack_dynamic` for the
+//! two dynamic-table tests.
 //!
 //! # Selection: one UDP port per test
 //!

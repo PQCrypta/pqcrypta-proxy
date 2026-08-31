@@ -22,9 +22,10 @@
 //!
 //! # Exit status
 //!
-//! - `0` — nothing failed. Inconclusive results do not fail a build: they mean
-//!   the run never put the client in the situation the test is about, which is
-//!   not the client's fault and must not break someone's pipeline.
+//! - `0` — nothing failed. Inconclusive results do not fail a build: the run
+//!   either never put the client in the situation the test is about, or could
+//!   not observe how it answered. Neither is the client's fault and neither
+//!   must break someone's pipeline.
 //! - `1` — at least one test failed.
 //! - `2` — the suite could not be reached, or the run could not be completed.
 //!   Deliberately distinct from a test failure, so "the service was down" never

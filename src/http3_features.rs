@@ -193,7 +193,7 @@ impl EarlyHintsState {
         }
     }
 
-    /// Create from the [http3] section of proxy-config.toml.
+    /// Create from the `[http3]` section of proxy-config.toml.
     pub fn from_http3_config(config: &crate::config::Http3Config) -> Self {
         Self {
             config: Arc::new(RwLock::new(Self::build_config(config))),
@@ -201,7 +201,7 @@ impl EarlyHintsState {
         }
     }
 
-    /// Live-reload the early-hints rules from a new [http3] config section.
+    /// Live-reload the early-hints rules from a new `[http3]` config section.
     /// Swaps the inner config in place (so every `Arc` clone held by in-flight
     /// connections sees the change) and clears the compiled-hints cache so the
     /// next request rebuilds Link headers from the new rules.

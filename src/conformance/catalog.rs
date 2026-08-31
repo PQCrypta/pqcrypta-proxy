@@ -21,8 +21,12 @@ pub enum Class {
     /// reason ossification happens.
     Extensibility,
     /// The client must reject something invalid, with the specific error code
-    /// the specification names. Failing to reject is a bug; rejecting with the
-    /// wrong code is a smaller but still real one.
+    /// the specification names. Rejecting with the wrong code is a smaller but
+    /// still real bug.
+    ///
+    /// Failing to reject is the bug being hunted, but it has to be *shown*: see
+    /// [`anomaly_stream`], which decides whether a quiet client can be said to
+    /// have accepted anything at all.
     Correctness,
     /// The client must recover — retry, re-probe, migrate — rather than fail.
     Resilience,

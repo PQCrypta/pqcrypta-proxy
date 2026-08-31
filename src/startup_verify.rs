@@ -90,7 +90,7 @@ impl VerifiedRuntime {
 ///
 /// Takes the live `ServerConfig` rather than rebuilding one, so the thing verified is
 /// the thing that serves. The certificate resolver is the only part not exercised: the
-/// client presents [`VERIFY_SNI`], for which no real certificate exists, so a throwaway
+/// client presents `VERIFY_SNI`, for which no real certificate exists, so a throwaway
 /// self-signed pair is supplied through a dedicated config that shares the caller's
 /// crypto provider and protocol versions.
 pub fn verify_runtime(provider: Arc<CryptoProvider>, tls13_only: bool) -> VerifiedRuntime {

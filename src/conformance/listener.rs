@@ -14,7 +14,7 @@
 //! 3. the server waits for the **liveness probe** — any stream the client opens
 //!    afterwards
 //! 4. what happened is recorded against the session and scored by
-//!    [`session::judge`]
+//!    [`judge`](super::session::judge)
 //!
 //! Step 3 is the load-bearing one. A client that quietly died and a client that
 //! correctly ignored the anomaly look identical up to that point.

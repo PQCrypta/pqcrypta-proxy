@@ -1065,7 +1065,7 @@ pub mod openssl_pqc {
     ///
     /// `key_exchange` and `pqc_active` are read from the connection rather than
     /// assumed. They used to be hardcoded to `X25519MLKEM768` / `true`, which
-    /// made [`PqcConfig::check_downgrade`] structurally unable to fire on this
+    /// made `PqcConfig::check_downgrade` structurally unable to fire on this
     /// listener: a classical-only handshake reported itself as post-quantum.
     pub fn get_pqc_info(ssl: &openssl::ssl::SslRef) -> PqcHandshakeInfo {
         let cipher = ssl

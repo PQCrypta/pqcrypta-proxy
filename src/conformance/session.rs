@@ -44,11 +44,19 @@ pub enum Verdict {
     Pass,
     /// The client did something the specification forbids.
     Fail,
-    /// The client connected but the test could not be driven to a conclusion —
-    /// it hung up early, or the anomaly was never reached. Deliberately distinct
-    /// from `Fail`: an inconclusive run is our problem to explain, not the
-    /// client's bug to fix, and folding the two together would produce reports
-    /// that blame clients for our own flakiness.
+    /// The client connected but no conclusion is available — it hung up early,
+    /// the anomaly was never reached, or its answer could not be observed from
+    /// this end.
+    ///
+    /// That last case is not a lesser kind of failure. A client can reject an
+    /// anomaly exactly as the specification requires and have the close go
+    /// missing, or never read the unidirectional stream the anomaly was written
+    /// to before its one request completed. Neither is distinguishable here from
+    /// a client that accepted the violation, so neither is reported as one.
+    ///
+    /// Deliberately distinct from `Fail`: an inconclusive run is our problem to
+    /// explain, not the client's bug to fix, and folding the two together would
+    /// produce reports that blame clients for what we could not see.
     Inconclusive,
     /// The client never attempted this test.
     NotRun,

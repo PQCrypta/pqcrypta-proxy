@@ -462,10 +462,13 @@ pub struct ConformanceConfig {
     /// milliseconds.
     ///
     /// The probe is what makes a verdict meaningful: after the anomaly the
-    /// server expects one ordinary request on the same connection. Arrival
-    /// proves the client tolerated the anomaly; silence proves it did not.
-    /// Without it, "ignored correctly" and "crashed" look identical from here.
-    /// Default: 5000.
+    /// server expects one ordinary request on the same connection. Without it,
+    /// "ignored correctly" and "crashed" look identical from here.
+    ///
+    /// Arrival is evidence the client got through the anomaly. Silence is not
+    /// the opposite of that: a client can reject an anomaly correctly and have
+    /// the close go missing, so a probe that never comes is judged against what
+    /// the test was measuring rather than read as acceptance. Default: 5000.
     pub liveness_timeout_ms: u64,
 }
 
@@ -1789,7 +1792,7 @@ pub struct HeadersConfig {
     pub report_to: String,
 
     /// Priority header for HTTP/3 response prioritization (RFC 9218)
-    /// Format: "u=<urgency>, i" where urgency is 0-7 and i indicates incremental
+    /// Format: `u=<urgency>, i` where urgency is 0-7 and i indicates incremental
     #[serde(default)]
     pub priority: String,
 
@@ -2200,7 +2203,7 @@ impl AffinityMode {
 /// CORS configuration for routes
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CorsConfig {
-    /// Allowed origin (e.g., "https://pqcrypta.com") — single origin, legacy
+    /// Allowed origin (e.g. `https://pqcrypta.com`) — single origin, legacy
     pub allow_origin: Option<String>,
     /// Allowed origins list — when set, the matching request origin is reflected
     #[serde(default)]

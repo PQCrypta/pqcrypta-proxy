@@ -82,7 +82,7 @@ pub struct SelectionResult {
     /// The selected backend server.
     pub server: Arc<BackendServer>,
     /// If `Some(header_value)`, the listener should append this as a `Set-Cookie`
-    /// response header (format: "PQCPROXY_CANARY=<id>; Path=/; …").
+    /// response header (format: `PQCPROXY_CANARY=<id>; Path=/; …`).
     pub set_canary_cookie: Option<String>,
 }
 

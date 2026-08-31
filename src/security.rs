@@ -485,7 +485,7 @@ pub struct RequestPolicy {
     pub waf_enabled: Option<bool>,
     /// Per-route WAF mode ("block" | "detect"), overriding waf.mode
     pub waf_mode: Option<String>,
-    /// Per-route rate limits, overriding [rate_limiting]
+    /// Per-route rate limits, overriding `[rate_limiting]`
     pub rate_limit_override: Option<RateLimitConfig>,
 }
 
@@ -547,7 +547,7 @@ pub struct TlsFingerprint {
     /// what it called itself, and why almost everything in the public directory
     /// read "unclassified". The HTTP layer has both, so it reports back here.
     ///
-    /// Bounded at [`MAX_UA_PER_FINGERPRINT`]: a client that randomises its
+    /// Bounded at `MAX_UA_PER_FINGERPRINT`: a client that randomises its
     /// User-Agent must not be able to grow this without limit.
     pub user_agents: HashMap<String, u64>,
 }

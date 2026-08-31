@@ -80,11 +80,11 @@ pub struct AcmeConfig {
 
     /// ACME directory URL (any ACME-compatible CA)
     /// Examples:
-    /// - Let's Encrypt Production: https://acme-v02.api.letsencrypt.org/directory
-    /// - Let's Encrypt Staging: https://acme-staging-v02.api.letsencrypt.org/directory
-    /// - ZeroSSL: https://acme.zerossl.com/v2/DV90
-    /// - Buypass: https://api.buypass.com/acme/directory
-    /// - Google: https://dv.acme-v02.api.pki.goog/directory
+    /// - Let's Encrypt Production: <https://acme-v02.api.letsencrypt.org/directory>
+    /// - Let's Encrypt Staging: <https://acme-staging-v02.api.letsencrypt.org/directory>
+    /// - ZeroSSL: <https://acme.zerossl.com/v2/DV90>
+    /// - Buypass: <https://api.buypass.com/acme/directory>
+    /// - Google: <https://dv.acme-v02.api.pki.goog/directory>
     #[serde(default = "default_directory_url")]
     pub directory_url: String,
 
