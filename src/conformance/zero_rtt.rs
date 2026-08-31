@@ -28,15 +28,15 @@ use std::time::Duration;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 
-use super::impairment::{Counters, ImpairedSocket};
+use super::impairment::{Counters, ImpairedSocket, Impairments};
 
 /// A certificate nobody trusts, for a server nobody else talks to.
-struct Throwaway {
-    key: Arc<rustls::sign::CertifiedKey>,
-    der: CertificateDer<'static>,
+pub(super) struct Throwaway {
+    pub(super) key: Arc<rustls::sign::CertifiedKey>,
+    pub(super) der: CertificateDer<'static>,
 }
 
-fn throwaway_cert() -> Throwaway {
+pub(super) fn throwaway_cert() -> Throwaway {
     let cert = rcgen::generate_simple_self_signed(vec!["conformance.test".to_string()])
         .expect("generating a self-signed certificate");
     let der = CertificateDer::from(cert.cert.der().to_vec());
@@ -58,7 +58,7 @@ fn throwaway_cert() -> Throwaway {
 
 /// Serves the throwaway certificate for every name.
 #[derive(Debug)]
-struct OneCert(Arc<rustls::sign::CertifiedKey>);
+pub(super) struct OneCert(pub(super) Arc<rustls::sign::CertifiedKey>);
 
 impl rustls::server::ResolvesServerCert for OneCert {
     fn resolve(
@@ -76,7 +76,10 @@ impl rustls::server::ResolvesServerCert for OneCert {
 /// that the test fails if it is ever pointed at something other than the server
 /// it started.
 #[derive(Debug)]
-struct PinnedTo(CertificateDer<'static>, Arc<rustls::crypto::CryptoProvider>);
+pub(super) struct PinnedTo(
+    pub(super) CertificateDer<'static>,
+    pub(super) Arc<rustls::crypto::CryptoProvider>,
+);
 
 impl rustls::client::danger::ServerCertVerifier for PinnedTo {
     fn verify_server_cert(
@@ -213,12 +216,13 @@ fn spawn_server(
     let socket = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("binding a loopback port");
     let runtime = quinn::default_runtime().expect("a tokio runtime is running");
+    // Unimpaired: this test is about early data being refused, and a path that
+    // dropped anything would confuse a rejection with a loss.
     let impaired = Box::new(ImpairedSocket::new(
         runtime
             .wrap_udp_socket(socket)
             .expect("wrapping the socket"),
-        None,
-        None,
+        Impairments::default(),
         counters,
     ));
     let server = quinn::Endpoint::new_with_abstract_socket(

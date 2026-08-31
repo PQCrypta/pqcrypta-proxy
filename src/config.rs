@@ -417,14 +417,15 @@ impl Default for MasqueConfig {
 /// can arrange. The client under test connects, the server emits the anomaly,
 /// and the server records whether the client tolerated it.
 ///
-/// Two tiers, split by *when* the anomaly happens:
+/// **Every test owns a UDP port** from [`port_range`](Self::port_range), and the
+/// listener knows which test it is serving from its own `local_addr()`.
 ///
-/// - **Tier A** anomalies ride on a working HTTP/3 exchange, so the client picks
-///   the test with a URL path (`/t/<test-id>`).
-/// - **Tier B** anomalies precede any request — Version Negotiation, Retry,
-///   transport parameters — so they cannot be requested in-band. Each gets its
-///   own UDP port from [`port_range`](Self::port_range), and the listener knows
-///   which test it is from its own `local_addr()`.
+/// Selecting by URL path was the original design, kept for the HTTP/3-layer
+/// tests while the QUIC-layer ones took ports of their own. It did not survive:
+/// reading a path means QPACK-decoding the client's request, and the `h3` crate
+/// exposes no way to inject an arbitrary frame into a response it is managing.
+/// Owning the connection from its first packet avoids the decoder entirely, so
+/// the split went away and every test now selects the same way.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ConformanceConfig {
@@ -432,13 +433,20 @@ pub struct ConformanceConfig {
     /// protocol output and must never come up by accident on a normal vhost.
     pub enabled: bool,
 
-    /// Hostname that serves Tier A. Requests for any other host are handled
-    /// normally, so a misrouted request cannot land on a test.
+    /// Hostname serving the catalogue, the reports and the badge. Requests for
+    /// any other host are handled normally, so a misrouted request cannot land
+    /// on a test — and this vhost does not select tests either, which is what
+    /// the per-test ports are for.
     pub host: String,
 
-    /// Inclusive UDP port range for Tier B, one port per connection-level test.
-    /// Must not overlap `server.udp_port` or `server.additional_ports`; startup
-    /// refuses to bind if it does.
+    /// Inclusive UDP port range, one port per test. Must not overlap
+    /// `server.udp_port` or `server.additional_ports`; startup refuses to bind
+    /// if it does, and refuses just as firmly if the range is too narrow for the
+    /// catalogue rather than quietly serving the tests that fit.
+    ///
+    /// Sized with headroom on purpose. Widening it later means a firewall change
+    /// on every node before the new ports are reachable, and a test nobody
+    /// outside can connect to reports nothing at all.
     pub port_range: (u16, u16),
 
     /// How long a session's verdicts are retained before expiry, in seconds.
@@ -466,7 +474,7 @@ impl Default for ConformanceConfig {
         Self {
             enabled: false,
             host: "conformance.pqcrypta.com".to_string(),
-            port_range: (4460, 4489),
+            port_range: (4460, 4499),
             session_ttl_secs: 3600,
             max_sessions: 512,
             liveness_timeout_ms: 5000,

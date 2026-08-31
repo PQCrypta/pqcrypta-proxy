@@ -75,6 +75,65 @@ pub enum Tier {
     Quic,
 }
 
+/// Which stream a test's anomaly is written to.
+///
+/// This decides what a *silent* client proves, which is the difference between a
+/// sound verdict and a false accusation.
+///
+/// A client has to read the response stream to obtain its response. So when the
+/// anomaly is there and the client delivered the response and closed cleanly, it
+/// demonstrably consumed the anomaly and carried on: that is positive evidence
+/// of acceptance, and a correctness failure.
+///
+/// The control stream is unidirectional and nothing compels a client to read it
+/// on any particular schedule. A one-shot request can complete and close before
+/// the stream is ever picked up, so "no rejection arrived" is consistent with
+/// two quite different states — the client accepted the violation, or it never
+/// saw it. Inferring failure from that is unsound, and it is exactly what made
+/// `h-max-push-id` fail one run in three against a client that rejected the
+/// frame correctly, deterministically, every time it got that far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Anomaly {
+    /// Written to the server's control stream. A client that never reads it
+    /// looks identical to one that accepted it.
+    ControlStream,
+    /// Written to the response stream, which the client must read to be served.
+    ResponseStream,
+    /// Below HTTP/3 entirely: transport parameters, frames, the path itself.
+    Transport,
+}
+
+/// Where `test` writes its anomaly.
+///
+/// Keyed by id, like the error codes are, rather than adding a field to all
+/// thirty-five entries for something only the correctness tests consult.
+pub fn anomaly_stream(test: &Test) -> Anomaly {
+    match test.id {
+        "h-missing-settings"
+        | "h-control-frame-unexpected"
+        | "h-second-control-stream"
+        | "h-max-push-id"
+        | "h-cancel-push-unsolicited"
+        | "h-goaway"
+        | "h-grease-settings"
+        | "h-duplicate-setting"
+        | "h-reserved-uni-stream" => Anomaly::ControlStream,
+
+        "h-grease-frame"
+        | "h-settings-on-request-stream"
+        | "h-data-before-headers"
+        | "h-qpack-huffman"
+        | "h-qpack-dynamic-table"
+        | "h-qpack-blocked-stream"
+        | "h-oversized-field-section"
+        | "h-trailers"
+        | "h-early-hints"
+        | "h-response-stream-reset" => Anomaly::ResponseStream,
+
+        _ => Anomaly::Transport,
+    }
+}
+
 /// One test in the catalogue.
 #[derive(Debug, Clone, Serialize)]
 pub struct Test {
@@ -123,7 +182,7 @@ pub struct Test {
 ///
 /// | Test | Clause | Checked against |
 /// |------|--------|-----------------|
-/// | `h-*` (all fourteen) | RFC 9114, RFC 9204 | RFC text |
+/// | `h-*` (all nineteen) | RFC 9114, RFC 9204 | RFC text |
 /// | `q-version-negotiation` | RFC 9000 §6.2 | RFC text |
 /// | `q-zero-rtt-reject` | RFC 9001 §4.6.2 | RFC text |
 /// | `q-reserved-frame` | RFC 9000 §12.4 | RFC text |
@@ -132,6 +191,18 @@ pub struct Test {
 /// | `q-pmtu-blackhole` | RFC 9000 §14, RFC 8899 | reference implementation |
 /// | `q-flow-control` | RFC 9000 §4.1 | RFC text |
 /// | `q-ecn` | RFC 9000 §13.4.1 | RFC text |
+/// | `q-key-update` | RFC 9001 §6.2 | RFC text |
+/// | `q-stream-limit` | RFC 9000 §4.6 | RFC text |
+/// | `q-loss-recovery` | RFC 9000 §2.2, §13.3 | RFC text |
+///
+/// The eight entries added on 2026-08-31 were each read as published before the
+/// entry was written, and two of them changed shape as a result.
+/// `h-response-stream-reset` was drafted as a resilience test — keep the
+/// connection through a stream reset — until §8 turned out to say an endpoint
+/// "MAY choose to treat a stream error as a connection error under certain
+/// circumstances", which makes closing conformant and would have failed clients
+/// for a legal choice. `q-stream-limit` separates a MUST from a SHOULD in the
+/// same clause the way `q-flow-control` does.
 ///
 /// `q-ecn`'s requirement level turned out to be *conditional*, which changed how
 /// it is scored. §13.4.1 says an endpoint "MUST provide feedback about ECN
@@ -306,6 +377,47 @@ pub const CATALOG: &[Test] = &[
         implemented: true,
         port_offset: Some(12),
     },
+    Test {
+        id: "q-key-update",
+        title: "Spontaneous 1-RTT key update",
+        spec: "RFC 9001 §6.2",
+        class: Class::Interoperability,
+        tier: Tier::Quic,
+        expectation: "Update to the next key phase and carry on. Once a packet protected \
+                      with the next phase is processed, §6.2 is a MUST — \"The endpoint \
+                      MUST update its send keys to the corresponding key phase in \
+                      response\" — so the response written after the update has to be \
+                      read with the new keys and the request completed.",
+        implemented: true,
+        port_offset: Some(27),
+    },
+    Test {
+        id: "q-stream-limit",
+        title: "Stream limits set to the minimum a request needs",
+        spec: "RFC 9000 §4.6",
+        class: Class::Discretionary,
+        tier: Tier::Quic,
+        expectation: "Stay inside the advertised limits. Respecting them is a MUST — \
+                      §4.6 says \"Endpoints MUST NOT exceed the limit set by their \
+                      peer\" — but announcing the stall with STREAMS_BLOCKED is only a \
+                      SHOULD, so a client that stays silent is still conformant.",
+        implemented: true,
+        port_offset: Some(28),
+    },
+    Test {
+        id: "q-loss-recovery",
+        title: "One datagram in twelve dropped once the path is established",
+        spec: "RFC 9000 §2.2, §13.3",
+        class: Class::Resilience,
+        tier: Tier::Quic,
+        expectation: "Reassemble the stream and deliver the whole body. §2.2 requires an \
+                      endpoint to buffer data received out of order and deliver it as an \
+                      ordered byte stream, and §13.3 has the lost data sent again in new \
+                      STREAM frames — so a response full of gaps must still arrive \
+                      complete and in order.",
+        implemented: true,
+        port_offset: Some(29),
+    },
     // ── Tier A: HTTP/3 layer ──────────────────────────────────────────────
     Test {
         id: "h-grease-settings",
@@ -458,6 +570,77 @@ pub const CATALOG: &[Test] = &[
         implemented: true,
         port_offset: Some(26),
     },
+    Test {
+        id: "h-settings-on-request-stream",
+        title: "SETTINGS frame on a request stream",
+        spec: "RFC 9114 §7.2.4",
+        class: Class::Correctness,
+        tier: Tier::Http3,
+        expectation: "Close the connection with H3_FRAME_UNEXPECTED. SETTINGS belongs to \
+                      the control stream alone: §7.2.4 says that if an endpoint receives \
+                      one on a different stream it \"MUST respond with a connection error \
+                      of type H3_FRAME_UNEXPECTED\".",
+        implemented: true,
+        port_offset: Some(30),
+    },
+    Test {
+        id: "h-data-before-headers",
+        title: "DATA frame before any HEADERS on the response stream",
+        spec: "RFC 9114 §4.1",
+        class: Class::Correctness,
+        tier: Tier::Http3,
+        expectation: "Close the connection with H3_FRAME_UNEXPECTED. A response begins \
+                      with a field section, and §4.1 makes \"receipt of an invalid \
+                      sequence of frames\" a connection error of that type — a body \
+                      arriving before the headers that describe it is exactly that.",
+        implemented: true,
+        port_offset: Some(31),
+    },
+    Test {
+        id: "h-cancel-push-unsolicited",
+        title: "CANCEL_PUSH for a push ID that was never promised",
+        spec: "RFC 9114 §7.2.3",
+        class: Class::Correctness,
+        tier: Tier::Http3,
+        expectation: "Close the connection with H3_ID_ERROR. No MAX_PUSH_ID was granted, \
+                      so every push ID is greater than currently allowed, and §7.2.3 \
+                      requires a CANCEL_PUSH referencing one to be treated as a \
+                      connection error of that type.",
+        implemented: true,
+        port_offset: Some(32),
+    },
+    Test {
+        id: "h-qpack-blocked-stream",
+        title: "Field section that blocks until the encoder stream catches up",
+        spec: "RFC 9204 §2.1.2, §2.2.1",
+        class: Class::Interoperability,
+        tier: Tier::Http3,
+        expectation: "Hold the field section, apply the insertions when they arrive on \
+                      the encoder stream, and complete the request. §2.2.1 makes a \
+                      section whose Required Insert Count exceeds the decoder's Insert \
+                      Count a blocked stream — something to be waited on, not an error.\n\n\
+                      Only run when the client advertised both a table capacity and at \
+                      least one blocked stream; §2.1.2 forbids the encoder from blocking \
+                      more streams than the decoder promised to support, so a client that \
+                      permits none cannot be tested on this.",
+        implemented: true,
+        port_offset: Some(33),
+    },
+    Test {
+        id: "h-response-stream-reset",
+        title: "Response stream reset mid-body with H3_REQUEST_CANCELLED",
+        spec: "RFC 9114 §8, §4.1",
+        class: Class::Discretionary,
+        tier: Tier::Http3,
+        expectation: "Abandon the partial response — §4.1 says a response cancelled after \
+                      a partial delivery \"SHOULD NOT be used\". Whether the connection \
+                      survives is the client's to choose: §8 lets an endpoint \"treat a \
+                      stream error as a connection error under certain circumstances\", \
+                      so keeping the connection and closing it are both conformant. \
+                      Stalling is the one wrong answer.",
+        implemented: true,
+        port_offset: Some(34),
+    },
 ];
 
 /// Look a test up by its stable id.
@@ -517,6 +700,73 @@ mod tests {
                 "port offsets must run 0..n with no gaps"
             );
         }
+    }
+
+    /// Every port that has ever been published, pinned to its offset.
+    ///
+    /// A test's port is how a client reaches it, and the catalogue, the CI
+    /// driver and every shell example on the site derive it from this offset.
+    /// Inserting a new test in the middle of the array would renumber every
+    /// port after it, silently pointing existing scripts at a different test —
+    /// so new entries take the next free offset and the array order, which is
+    /// only report order, stays grouped by layer.
+    ///
+    /// Add a line here when a test is published. Never edit one.
+    #[test]
+    fn published_port_offsets_never_change() {
+        let pinned: &[(&str, u16)] = &[
+            ("q-version-negotiation", 0),
+            ("q-retry", 1),
+            ("q-reserved-transport-param", 2),
+            ("q-reserved-frame", 3),
+            ("q-cid-rotation", 4),
+            ("q-stateless-reset", 5),
+            ("q-flow-control", 6),
+            ("q-ack-frequency", 7),
+            ("q-ecn", 8),
+            ("q-pmtu-blackhole", 9),
+            ("q-path-challenge", 10),
+            ("q-zero-rtt-reject", 11),
+            ("q-multipath", 12),
+            ("h-grease-settings", 13),
+            ("h-grease-frame", 14),
+            ("h-reserved-uni-stream", 15),
+            ("h-duplicate-setting", 16),
+            ("h-control-frame-unexpected", 17),
+            ("h-missing-settings", 18),
+            ("h-second-control-stream", 19),
+            ("h-qpack-dynamic-table", 20),
+            ("h-qpack-huffman", 21),
+            ("h-oversized-field-section", 22),
+            ("h-trailers", 23),
+            ("h-early-hints", 24),
+            ("h-goaway", 25),
+            ("h-max-push-id", 26),
+            ("q-key-update", 27),
+            ("q-stream-limit", 28),
+            ("q-loss-recovery", 29),
+            ("h-settings-on-request-stream", 30),
+            ("h-data-before-headers", 31),
+            ("h-cancel-push-unsolicited", 32),
+            ("h-qpack-blocked-stream", 33),
+            ("h-response-stream-reset", 34),
+        ];
+
+        for (id, offset) in pinned {
+            let t =
+                find(id).unwrap_or_else(|| panic!("{id} was published and must not be removed"));
+            assert_eq!(
+                t.port_offset,
+                Some(*offset),
+                "{id} was published on offset {offset}; moving it points existing \
+                 scripts at a different test"
+            );
+        }
+        assert_eq!(
+            CATALOG.len(),
+            pinned.len(),
+            "a new test must be pinned here once it is published"
+        );
     }
 
     #[test]

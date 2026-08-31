@@ -484,7 +484,9 @@ require opposite behaviour, which is why the classes exist.</p>
 <li><strong>Extensibility</strong> &mdash; ignore something unrecognised and carry
 on. Rejecting it is the failure; that is how protocols ossify.</li>
 <li><strong>Correctness</strong> &mdash; reject something invalid, with the error
-code the specification names. Accepting it is the bug.</li>
+code the specification names. Accepting it is the bug &mdash; though a failure is
+only recorded where the client demonstrably read the anomaly, never merely because
+no rejection arrived.</li>
 <li><strong>Interoperability</strong> &mdash; the response is valid but demanding
 (Huffman-coded fields, a dynamic-table reference, trailers) and has to be decoded.</li>
 <li><strong>Resilience</strong> &mdash; recover rather than give up.</li>
@@ -494,6 +496,12 @@ answer. Both pass; the report says which yours chose.</li>
 situation the test is about, so it proves nothing either way and is never counted
 as a pass or a failure.</li>
 </ul>
+<p>An anomaly written to the control stream is a case of its own. That stream is
+unidirectional and nothing obliges a client to read it on any schedule, so a
+one-shot request can finish and close before it is picked up &mdash; which is
+indistinguishable, from this end, from accepting the violation. The response is
+held back briefly to give a conformant reader its chance, and where the two still
+cannot be told apart the result is inconclusive rather than a failure.</p>
 <p>Some tests cannot be reached by every client, and say so rather than guessing:
 0-RTT rejection needs a session ticket from an earlier connection to the same port;
 ECN reporting is required only where the ECN field is accessible, which a network
@@ -506,13 +514,13 @@ available as <a href="/catalog.json">JSON</a>.</p>
 {rows}
 
 <h2 id="scope">Scope, and what this is not</h2>
-<p>Twenty-seven tests is a beginning, not coverage. QUIC and HTTP/3 together are
-enormous, and whole areas are untouched &mdash; connection migration, stream
-cancellation, QPACK blocked streams, malformed transport parameters, loss recovery
-under adverse conditions. The catalogue is chosen rather than exhaustive.</p>
+<p>{total} tests is a beginning, not coverage. QUIC and HTTP/3 together are
+enormous, and whole areas are untouched &mdash; connection migration, malformed
+transport parameters, extended CONNECT, prioritisation, 0-RTT replay. The
+catalogue is chosen rather than exhaustive.</p>
 <ul>
 <li><strong>This is not a certification.</strong> Passing everything here means a
-client handled twenty-seven specific situations correctly. It does not mean the
+client handled {total} specific situations correctly. It does not mean the
 implementation is conformant, and nothing here should be quoted as though it did.</li>
 <li><strong>A failure is a specification violation, not a security
 vulnerability.</strong> Some may have security relevance; most are simply behaviour

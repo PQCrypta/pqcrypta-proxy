@@ -81,6 +81,13 @@ struct Args {
     filter: Option<String>,
 }
 
+/// How long to let the server settle the last verdict before reading the report.
+///
+/// Comfortably longer than the two seconds the listener waits to see how a
+/// connection ended, and short enough that nobody notices it at the end of a run
+/// that takes a minute.
+const SETTLE_BEFORE_REPORT: Duration = Duration::from_secs(3);
+
 #[derive(Deserialize)]
 struct Session {
     id: String,
@@ -212,6 +219,26 @@ async fn run(args: &Args) -> i32 {
         }
         invoke_client(&args.client, &url, port, args.timeout);
     }
+
+    // ── Let the server finish deciding ──────────────────────────────────
+    //
+    // A verdict is not settled when the client exits. Several tests are judged
+    // on what happens *after* the anomaly — whether the connection goes quiet,
+    // whether a close carries an error code — and the server waits a couple of
+    // seconds for that before recording anything.
+    //
+    // The client, meanwhile, is often gone the instant it meets the anomaly.
+    // `h-response-stream-reset` ends with the server cancelling the response, so
+    // a client hangs up immediately, and it is the last entry in the catalogue:
+    // the report was being fetched while the server was still waiting to see how
+    // that connection ended, and came back `not_run` for a test that had in fact
+    // just been recorded. It showed up on some clients and not others, which is
+    // the worst shape a bug like this can take.
+    //
+    // Waiting here rather than retrying the report: the report is always
+    // available, it is the *contents* that arrive late, so there is nothing to
+    // poll for that would say "not finished yet".
+    tokio::time::sleep(SETTLE_BEFORE_REPORT).await;
 
     // ── Report ──────────────────────────────────────────────────────────
     let url = format!("{base}/report/{}.json", session.id);

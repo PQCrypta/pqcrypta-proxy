@@ -299,16 +299,20 @@ mod tests {
     fn classes_are_counted_separately() {
         let r = report_with(&[
             ("h-grease-settings", Observation::SurvivedAndContinued, None),
+            // A response-stream anomaly, so a completed request really is
+            // evidence the client read the violation and carried on. The
+            // control-stream entry this used to use is inconclusive now, and
+            // rightly: silence there proves nothing either way.
             (
-                "h-missing-settings",
+                "h-data-before-headers",
                 Observation::SurvivedAndContinued,
-                Some(0x010a),
+                Some(0x0105),
             ),
         ]);
         let ext = &r.by_class[Class::Extensibility.as_str()];
         let corr = &r.by_class[Class::Correctness.as_str()];
         assert_eq!(ext.pass, 1);
-        assert_eq!(corr.fail, 1, "accepting a violation is a correctness fail");
+        assert_eq!(corr.fail, 1, "accepting a violation it demonstrably read");
         assert_eq!(r.totals.pass, 1);
         assert_eq!(r.totals.fail, 1);
     }

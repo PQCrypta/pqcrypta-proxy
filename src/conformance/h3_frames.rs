@@ -185,6 +185,16 @@ pub fn max_push_id(id: u64) -> BytesMut {
     frame(frame_type::MAX_PUSH_ID, &varint(id))
 }
 
+/// A CANCEL_PUSH frame naming the push this refers to (RFC 9114 §7.2.3).
+///
+/// Legal in both directions, which is what makes it useful here: the violation
+/// under test is not the frame's presence but its identifier. A client that
+/// granted no MAX_PUSH_ID has allowed no push IDs at all, so any value names a
+/// push that was never permitted.
+pub fn cancel_push(push_id: u64) -> BytesMut {
+    frame(frame_type::CANCEL_PUSH, &varint(push_id))
+}
+
 /// A DATA frame.
 pub fn data(payload: &[u8]) -> BytesMut {
     frame(frame_type::DATA, payload)
@@ -364,12 +374,29 @@ pub fn read_varint(b: &[u8]) -> Option<(u64, usize)> {
     Some((v, len))
 }
 
-/// Pull `SETTINGS_QPACK_MAX_TABLE_CAPACITY` out of a control stream's bytes.
+/// What the client's SETTINGS permit our QPACK encoder to do.
 ///
-/// Returns `None` when no SETTINGS frame has arrived yet or the setting is
-/// absent — absent means zero (RFC 9204 §5), which is the default and means the
-/// dynamic table is off limits.
-pub fn parse_qpack_capacity(control: &[u8]) -> Option<u64> {
+/// Both values default to zero when the setting is absent (RFC 9204 §5), and
+/// zero in either field forbids something: no table capacity means the dynamic
+/// table is off limits entirely, and no blocked streams means a field section
+/// must never reference an insertion the decoder has not already received.
+/// Reading only the capacity was enough while nothing blocked a stream on
+/// purpose; `h-qpack-blocked-stream` needs both, because §2.1.2 makes exceeding
+/// the blocked-stream limit *our* violation, not the client's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientQpackLimits {
+    /// `SETTINGS_QPACK_MAX_TABLE_CAPACITY`.
+    pub capacity: u64,
+    /// `SETTINGS_QPACK_BLOCKED_STREAMS`.
+    pub blocked_streams: u64,
+}
+
+/// Pull the QPACK limits out of a control stream's bytes.
+///
+/// Returns `None` when no SETTINGS frame has arrived yet — which is different
+/// from a SETTINGS frame that omits them, since an omitted setting is a
+/// specified zero and an absent frame is simply not knowing.
+pub fn parse_client_qpack_limits(control: &[u8]) -> Option<ClientQpackLimits> {
     // The stream begins with its type, then frames.
     let (ty, mut off) = read_varint(control)?;
     if ty != stream_type::CONTROL {
@@ -385,17 +412,23 @@ pub fn parse_qpack_capacity(control: &[u8]) -> Option<u64> {
             return None;
         }
         if frame_ty == frame_type::SETTINGS {
+            let mut limits = ClientQpackLimits {
+                capacity: 0,
+                blocked_streams: 0,
+            };
             let mut p = off;
             while p < end {
                 let (id, a) = read_varint(&control[p..])?;
                 p += a;
                 let (value, c) = read_varint(&control[p..])?;
                 p += c;
-                if id == setting::QPACK_MAX_TABLE_CAPACITY {
-                    return Some(value);
+                match id {
+                    setting::QPACK_MAX_TABLE_CAPACITY => limits.capacity = value,
+                    setting::QPACK_BLOCKED_STREAMS => limits.blocked_streams = value,
+                    _ => {}
                 }
             }
-            return Some(0);
+            return Some(limits);
         }
         off = end;
     }
@@ -647,6 +680,43 @@ mod tests {
     }
 
     #[test]
+    fn both_qpack_limits_are_read_from_one_settings_frame() {
+        // `h-qpack-blocked-stream` may only block a stream when the client
+        // permits both a table and a blocked stream. Reading one and assuming
+        // the other would make our own §2.1.2 violation look like the client's
+        // decoding bug.
+        let mut stream = BytesMut::new();
+        stream.extend_from_slice(&uni_stream_header(stream_type::CONTROL));
+        stream.extend_from_slice(&settings(&[
+            (setting::QPACK_MAX_TABLE_CAPACITY, 4096),
+            (setting::QPACK_BLOCKED_STREAMS, 16),
+        ]));
+        let limits = parse_client_qpack_limits(&stream).expect("SETTINGS arrived");
+        assert_eq!(limits.capacity, 4096);
+        assert_eq!(limits.blocked_streams, 16);
+    }
+
+    #[test]
+    fn a_capacity_without_blocked_streams_permits_no_blocking() {
+        // The combination curl and quic-go send when the table is enabled but
+        // nothing may block: the dynamic table is usable, blocking is not.
+        let mut stream = BytesMut::new();
+        stream.extend_from_slice(&uni_stream_header(stream_type::CONTROL));
+        stream.extend_from_slice(&settings(&[(setting::QPACK_MAX_TABLE_CAPACITY, 4096)]));
+        let limits = parse_client_qpack_limits(&stream).expect("SETTINGS arrived");
+        assert_eq!(limits.capacity, 4096);
+        assert_eq!(limits.blocked_streams, 0);
+    }
+
+    #[test]
+    fn cancel_push_carries_its_push_id_as_a_varint() {
+        let f = cancel_push(3);
+        assert_eq!(f[0], u8::try_from(frame_type::CANCEL_PUSH).unwrap());
+        assert_eq!(f[1], 1, "one byte of payload");
+        assert_eq!(read_varint(&f[2..]), Some((3, 1)));
+    }
+
+    #[test]
     fn varints_survive_a_write_then_read() {
         for v in [
             0u64,
@@ -674,7 +744,9 @@ mod tests {
             (setting::MAX_FIELD_SECTION_SIZE, 16_384),
             (setting::QPACK_MAX_TABLE_CAPACITY, 4096),
         ]));
-        assert_eq!(parse_qpack_capacity(&stream), Some(4096));
+        let limits = parse_client_qpack_limits(&stream).expect("SETTINGS arrived");
+        assert_eq!(limits.capacity, 4096);
+        assert_eq!(limits.blocked_streams, 0, "absent means zero, not unknown");
     }
 
     #[test]
@@ -684,14 +756,17 @@ mod tests {
         let mut stream = BytesMut::new();
         stream.extend_from_slice(&uni_stream_header(stream_type::CONTROL));
         stream.extend_from_slice(&settings(&[(setting::MAX_FIELD_SECTION_SIZE, 16_384)]));
-        assert_eq!(parse_qpack_capacity(&stream), Some(0));
+        assert_eq!(
+            parse_client_qpack_limits(&stream).map(|l| l.capacity),
+            Some(0)
+        );
     }
 
     #[test]
     fn a_non_control_stream_yields_no_capacity() {
         let mut stream = BytesMut::new();
         stream.extend_from_slice(&uni_stream_header(stream_type::QPACK_ENCODER));
-        assert_eq!(parse_qpack_capacity(&stream), None);
+        assert_eq!(parse_client_qpack_limits(&stream), None);
     }
 
     #[test]
@@ -700,7 +775,7 @@ mod tests {
         stream.extend_from_slice(&uni_stream_header(stream_type::CONTROL));
         let full = settings(&[(setting::QPACK_MAX_TABLE_CAPACITY, 4096)]);
         stream.extend_from_slice(&full[..full.len() - 1]);
-        assert_eq!(parse_qpack_capacity(&stream), None);
+        assert_eq!(parse_client_qpack_limits(&stream), None);
     }
 
     #[test]

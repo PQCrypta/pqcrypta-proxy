@@ -38,6 +38,14 @@ pub struct Counters {
     pub datagrams_in: AtomicU64,
     /// Datagrams the black hole swallowed.
     pub dropped_oversize: AtomicU64,
+    /// Datagrams the loss impairment dropped.
+    ///
+    /// Kept apart from `dropped_oversize` because the two answer different
+    /// questions: one is a size threshold the client can dodge by sending less,
+    /// the other is unconditional. A single counter would make
+    /// `q-loss-recovery` unable to say whether anything was actually lost, and a
+    /// resilience test that cannot tell has no verdict to give.
+    pub dropped_loss: AtomicU64,
     /// Datagrams carrying at least one 0-RTT packet.
     ///
     /// Read from the wire rather than from the TLS stack, because a rejected
@@ -55,12 +63,6 @@ pub struct Counters {
     /// read. Without it that test's verdict has no session to be filed under and
     /// never reaches the client that earned it.
     pub last_peer: parking_lot::Mutex<Option<SocketAddr>>,
-    /// SETTINGS_QPACK_MAX_TABLE_CAPACITY the client advertised.
-    ///
-    /// Lives here rather than beside the connection because the verdict needs
-    /// it after the exchange, and it is learned from the client's control
-    /// stream partway through.
-    pub qpack_capacity: AtomicU64,
 }
 
 impl Counters {
@@ -72,8 +74,8 @@ impl Counters {
         self.dropped_oversize.load(Ordering::Relaxed)
     }
 
-    pub fn qpack_capacity(&self) -> u64 {
-        self.qpack_capacity.load(Ordering::Relaxed)
+    pub fn dropped_loss(&self) -> u64 {
+        self.dropped_loss.load(Ordering::Relaxed)
     }
 
     pub fn zero_rtt_in(&self) -> u64 {
@@ -151,6 +153,24 @@ impl PeerClock {
     }
 }
 
+/// What the path does to a peer's datagrams.
+///
+/// Grouped rather than passed as loose arguments because the two impairments
+/// share a clock and are easy to transpose at a call site: a socket built with
+/// the black hole's threshold in the loss field would drop 1300 datagrams in
+/// every 1300 and look, from the far end, like a dead port.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Impairments {
+    /// Datagrams larger than this vanish. `None` carries every size.
+    pub blackhole_above: Option<usize>,
+    /// One datagram in every `n` vanishes, whatever its size. `None` loses
+    /// nothing.
+    pub loss_one_in: Option<u64>,
+    /// How long each peer's traffic flows cleanly before either impairment
+    /// begins. `None` impairs from the first datagram.
+    pub opens_after: Option<Duration>,
+}
+
 /// A socket that silently discards datagrams larger than `blackhole_above`.
 ///
 /// Reported to the caller as sent. That is the point: a real black hole gives
@@ -173,25 +193,41 @@ pub struct ImpairedSocket {
     /// only then begins swallowing — which is the condition the detector is
     /// actually looking for.
     clock: Option<Arc<PeerClock>>,
+    /// One datagram in every `n` is dropped once the clock has opened.
+    ///
+    /// Deterministic rather than random: a resilience test whose severity
+    /// changes run to run cannot be told apart from a client that is
+    /// intermittently broken, and the first thing anyone does with a surprising
+    /// verdict is run it again.
+    loss_one_in: Option<u64>,
+    /// Datagrams offered to the sender since the loss impairment opened.
+    ///
+    /// Shared with every sender this socket hands out, so the cadence is a
+    /// property of the path rather than of whichever sender happened to carry a
+    /// packet.
+    sent_while_lossy: Arc<AtomicU64>,
     counters: Arc<Counters>,
 }
 
 impl ImpairedSocket {
-    /// Wrap `inner`. `blackhole_above` of `None` passes everything through.
+    /// Wrap `inner`. A default [`Impairments`] passes everything through.
     ///
-    /// `opens_after` delays the impairment for each peer separately, measured
-    /// from that peer's first datagram, giving path-MTU discovery time to settle
-    /// on a size larger than the threshold before anything starts vanishing.
+    /// `opens_after` delays both impairments for each peer separately, measured
+    /// from that peer's first datagram: path-MTU discovery needs time to settle
+    /// on a size larger than the threshold before anything starts vanishing, and
+    /// the loss impairment needs the handshake to finish before it begins, or it
+    /// would be testing handshake recovery instead of stream reassembly.
     pub fn new(
         inner: Box<dyn AsyncUdpSocket>,
-        blackhole_above: Option<usize>,
-        opens_after: Option<Duration>,
+        impairments: Impairments,
         counters: Arc<Counters>,
     ) -> Self {
         Self {
             inner,
-            blackhole_above,
-            clock: opens_after.map(|d| Arc::new(PeerClock::new(d))),
+            blackhole_above: impairments.blackhole_above,
+            clock: impairments.opens_after.map(|d| Arc::new(PeerClock::new(d))),
+            loss_one_in: impairments.loss_one_in,
+            sent_while_lossy: Arc::new(AtomicU64::new(0)),
             counters,
         }
     }
@@ -212,6 +248,8 @@ impl AsyncUdpSocket for ImpairedSocket {
             inner: self.inner.create_sender(),
             blackhole_above: self.blackhole_above,
             clock: self.clock.clone(),
+            loss_one_in: self.loss_one_in,
+            sent_while_lossy: self.sent_while_lossy.clone(),
             counters: self.counters.clone(),
         })
     }
@@ -248,18 +286,28 @@ impl AsyncUdpSocket for ImpairedSocket {
                 }
             }
 
-            if self.blackhole_above.is_none() {
-                return ready;
-            }
-
             let now = Instant::now();
             if let Some(clock) = &self.clock {
                 // Start each peer's clean window at its first datagram. This is
                 // the only place a peer becomes known, so it has to happen
-                // before any drop decision is taken for it.
+                // before any drop decision is taken for it — including a
+                // decision taken on the sending half, which never sees an
+                // inbound datagram and so can never start a clock of its own.
+                //
+                // This sits ahead of the black-hole guard below rather than
+                // inside it. While the clock existed only for the black hole the
+                // two were the same thing; a loss-impaired port has a clock and
+                // no size threshold, and returning early would leave its peers
+                // permanently unknown — `is_open` reports false for a peer it
+                // has never heard of, so nothing would ever be dropped and the
+                // test would pass every client without impairing anything.
                 for m in meta.iter().take(n) {
                     clock.note(m.addr, now);
                 }
+            }
+
+            if self.blackhole_above.is_none() {
+                return ready;
             }
 
             // Swallow oversized datagrams on the way in as well.
@@ -407,12 +455,23 @@ fn compact_oversize(
     kept
 }
 
+/// Whether the `nth` datagram since the impairment opened is the one to lose.
+///
+/// Counting from one, so the first datagram after the clean window is never the
+/// casualty: the response headers usually ride in it, and losing those on some
+/// runs and not others would make the same client pass and fail by turns.
+fn is_lost(nth: u64, one_in: u64) -> bool {
+    one_in > 0 && nth.is_multiple_of(one_in)
+}
+
 /// The sending half. Everything not dropped is passed straight through.
 #[derive(Debug)]
 struct ImpairedSender {
     inner: Pin<Box<dyn UdpSender>>,
     blackhole_above: Option<usize>,
     clock: Option<Arc<PeerClock>>,
+    loss_one_in: Option<u64>,
+    sent_while_lossy: Arc<AtomicU64>,
     counters: Arc<Counters>,
 }
 
@@ -424,6 +483,20 @@ impl ImpairedSender {
             _ => Some(limit),
         }
     }
+
+    /// The loss cadence in force for `peer`, or `None` while it is still shut.
+    ///
+    /// A cadence of zero is treated as no impairment rather than as "drop
+    /// everything": it can only arrive from a miswritten configuration, and a
+    /// port that silently swallows every datagram is indistinguishable from one
+    /// that is not running.
+    fn loss_cadence(&self, peer: SocketAddr, now: Instant) -> Option<u64> {
+        let one_in = self.loss_one_in.filter(|n| *n > 0)?;
+        match &self.clock {
+            Some(clock) if !clock.is_open(peer, now) => None,
+            _ => Some(one_in),
+        }
+    }
 }
 
 impl UdpSender for ImpairedSender {
@@ -432,7 +505,31 @@ impl UdpSender for ImpairedSender {
         transmit: &Transmit<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        if let Some(limit) = self.limit_for(transmit.destination, Instant::now()) {
+        let now = Instant::now();
+
+        // Loss first, and counted only while the impairment is open.
+        //
+        // Advancing the counter during the clean window would spend the cadence
+        // on handshake packets, so the first datagram after the window opened
+        // could be the twelfth and vanish immediately — losing the response
+        // headers on some runs and not others, which is the kind of flakiness a
+        // resilience verdict must never rest on.
+        if let Some(one_in) = self.loss_cadence(transmit.destination, now) {
+            let nth = self.sent_while_lossy.fetch_add(1, Ordering::Relaxed) + 1;
+            if is_lost(nth, one_in) {
+                self.counters.dropped_loss.fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    "conformance: dropped datagram {nth} of every {one_in} to the peer \
+                     ({} bytes)",
+                    transmit.contents.len()
+                );
+                // Reported as sent, like the black hole: a lost datagram gives
+                // its sender no signal.
+                return Poll::Ready(Ok(()));
+            }
+        }
+
+        if let Some(limit) = self.limit_for(transmit.destination, now) {
             if transmit.contents.len() > limit {
                 self.counters
                     .dropped_oversize
@@ -454,8 +551,9 @@ impl UdpSender for ImpairedSender {
         // One datagram per transmit while impaired: GSO would batch several
         // into one syscall, and the batch's length is not the length of the
         // datagrams inside it, so a size threshold could not be applied
-        // honestly.
-        if self.blackhole_above.is_some() {
+        // honestly — and a batch dropped for loss would take every datagram in
+        // it, turning one loss in twelve into a burst of several.
+        if self.blackhole_above.is_some() || self.loss_one_in.is_some() {
             NonZeroUsize::MIN
         } else {
             self.inner.max_transmit_segments()
@@ -501,6 +599,37 @@ mod tests {
             clock.is_open(peer(1), t0 + Duration::from_secs(5)),
             "open once the window has passed"
         );
+    }
+
+    #[test]
+    fn one_datagram_in_every_n_is_lost_and_the_rest_are_not() {
+        let one_in = 12;
+        let lost: Vec<u64> = (1..=36).filter(|n| is_lost(*n, one_in)).collect();
+        assert_eq!(lost, vec![12, 24, 36], "an even cadence, counted from one");
+        assert!(!is_lost(1, one_in), "the first datagram must survive");
+        assert_eq!(
+            (1..=120).filter(|n| is_lost(*n, one_in)).count(),
+            10,
+            "1 in 12 over 120 datagrams"
+        );
+    }
+
+    #[test]
+    fn a_cadence_of_zero_loses_nothing() {
+        // Only reachable from a miswritten configuration. Dropping everything
+        // would leave a port that looks dead rather than impaired, and `%` by
+        // zero would panic on the first datagram.
+        for n in 1..=10 {
+            assert!(!is_lost(n, 0));
+        }
+    }
+
+    #[test]
+    fn an_unimpaired_path_is_described_by_the_default() {
+        let i = Impairments::default();
+        assert!(i.blackhole_above.is_none());
+        assert!(i.loss_one_in.is_none());
+        assert!(i.opens_after.is_none(), "nothing to wait for");
     }
 
     #[test]

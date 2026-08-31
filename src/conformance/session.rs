@@ -74,8 +74,28 @@ impl Verdict {
 /// `h-grease-settings`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Observation {
-    /// The liveness probe arrived: the client carried on.
+    /// The liveness probe arrived and the client then closed cleanly, with no
+    /// objection to the anomaly.
+    ///
+    /// A close is something the server *saw*. Where the anomaly was in the
+    /// response the client read and delivered, that makes this evidence the
+    /// violation was accepted.
     SurvivedAndContinued,
+    /// The liveness probe arrived, and then nothing — no close, no objection,
+    /// within the window the server waits.
+    ///
+    /// Deliberately distinct from [`SurvivedAndContinued`](Self::SurvivedAndContinued),
+    /// which the two were folded into until it caused a false accusation of its
+    /// own. A client can reject an anomaly correctly and have its
+    /// CONNECTION_CLOSE lost — QUIC only re-sends one in answer to an incoming
+    /// packet (RFC 9000 §10.2.1) — and from this end that is indistinguishable
+    /// from a client that said nothing because it had nothing to say.
+    ///
+    /// For a class whose pass *is* carrying on, that distinction does not
+    /// matter: the probe completing is the evidence, and it arrived. For a
+    /// correctness test it matters entirely, because there the verdict turns on
+    /// how the connection ended and this is the case where nobody saw.
+    NoCloseObserved,
     /// The client closed the connection with this application error code.
     ClosedWith { code: u64 },
     /// The client closed without an error code, or the transport dropped.
@@ -121,10 +141,32 @@ pub struct Result_ {
 ///
 /// - **Extensibility** — surviving is the pass. Any close is a failure, however
 ///   politely it was done, because the client was required to ignore something.
-/// - **Correctness** — the *specific* error code is the pass. Surviving means
-///   the client accepted something invalid, which is the bug being hunted.
+/// - **Correctness** — the *specific* error code is the pass.
 /// - **Resilience** — surviving is the pass, and a clean close is a partial
 ///   failure rather than a crash, but both are failures.
+///
+/// # A failure needs positive evidence
+///
+/// For a correctness test it is tempting to read "no rejection arrived" as "the
+/// client accepted it". That inference is unsound, and where the anomaly went
+/// decides whether it is available at all.
+///
+/// A client must read the **response stream** to be served, so one that
+/// delivered the response and closed cleanly demonstrably consumed the anomaly
+/// and carried on. That is evidence, and it is a failure.
+///
+/// The **control stream** is unidirectional and nothing obliges a client to read
+/// it at any particular moment. A one-shot request can finish and close before
+/// the stream is picked up at all, so silence there is consistent with accepting
+/// the violation *and* with never having seen it. Those are different states and
+/// the server cannot tell them apart, so the honest verdict is inconclusive.
+///
+/// This is not hypothetical. `h-max-push-id` failed one external run in three
+/// against a client that, run directly, rejected the frame with the required
+/// code every single time: the request had simply finished before the control
+/// stream was read. A published matrix saying a named library "accepted a
+/// protocol violation" on that basis is the false accusation this suite exists
+/// to avoid.
 pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Verdict, String) {
     if !test.implemented {
         return (
@@ -160,8 +202,14 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
     // The listener already converts these before they arrive here; this states
     // the same rule where the verdict is actually decided, so the invariant
     // holds however the observation was produced.
+    //
+    // Correctness is excluded: for those the meaning of a clean close depends on
+    // whether the client can be shown to have read the anomaly at all, which is
+    // decided below rather than here.
     if let Observation::ClosedWith { code } = obs {
-        if !crate::conformance::h3_frames::error_code::is_rejection(*code) {
+        if test.class != Class::Correctness
+            && !crate::conformance::h3_frames::error_code::is_rejection(*code)
+        {
             return (
                 Verdict::Pass,
                 format!(
@@ -175,6 +223,10 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
     match (test.class, obs) {
         // ── Extensibility: the client had to ignore it and keep going ──
         (Class::Extensibility, Observation::SurvivedAndContinued) => (
+            Verdict::Pass,
+            "Ignored the unrecognised element and completed the follow-up request.".to_string(),
+        ),
+        (Class::Extensibility, Observation::NoCloseObserved) => (
             Verdict::Pass,
             "Ignored the unrecognised element and completed the follow-up request.".to_string(),
         ),
@@ -198,34 +250,103 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
         ),
 
         // ── Correctness: a specific rejection was required ──
-        (Class::Correctness, Observation::ClosedWith { code }) => match expected_code {
-            Some(want) if *code == want => (
-                Verdict::Pass,
-                format!("Rejected with the required error code 0x{want:x}."),
-            ),
-            Some(want) => (
-                Verdict::Fail,
-                format!(
-                    "Rejected, but with error 0x{code:x} where the specification requires \
-                     0x{want:x}. The violation was detected; the code reported is wrong."
+        //
+        // A rejection is always evidence, whichever stream the anomaly went to:
+        // the client can only object to something it has read.
+        (Class::Correctness, Observation::ClosedWith { code })
+            if crate::conformance::h3_frames::error_code::is_rejection(*code) =>
+        {
+            match expected_code {
+                Some(want) if *code == want => (
+                    Verdict::Pass,
+                    format!("Rejected with the required error code 0x{want:x}."),
                 ),
-            ),
-            None => (Verdict::Pass, format!("Rejected with error 0x{code:x}.")),
-        },
-        (Class::Correctness, Observation::SurvivedAndContinued) => (
-            Verdict::Fail,
-            "Accepted a protocol violation and carried on. This should have been rejected."
-                .to_string(),
-        ),
+                Some(want) => (
+                    Verdict::Fail,
+                    format!(
+                        "Rejected, but with error 0x{code:x} where the specification requires \
+                         0x{want:x}. The violation was detected; the code reported is wrong."
+                    ),
+                ),
+                // No named code means this test's requirement is a specific
+                // transport-level behaviour — echoing a PATH_RESPONSE, going
+                // quiet after a Stateless Reset — established by
+                // `quic_observation`, not by anything an HTTP/3 close can show.
+                // Reading a bare rejection as a pass would credit a client for a
+                // behaviour nobody observed, which is the same unsound step as
+                // reading silence as acceptance, pointed the other way.
+                None => (
+                    Verdict::Inconclusive,
+                    format!(
+                        "Closed with error 0x{code:x}. This test names no single required \
+                         code: what it asks for is a particular transport-level response, \
+                         and a close on its own does not show whether that happened."
+                    ),
+                ),
+            }
+        }
         (Class::Correctness, Observation::Signalled(what)) => {
             (Verdict::Pass, format!("Responded correctly: {what}."))
         }
-        (Class::Correctness, Observation::ClosedSilently) => (
-            Verdict::Fail,
-            "Closed without an error code. The violation was detected but not reported, so the \
-             peer cannot tell what went wrong."
+
+        // Nothing was observed at all, so there is nothing to reason from. This
+        // is not the control-stream case below — it applies however the anomaly
+        // was delivered, because a rejection that was sent and lost looks
+        // exactly like a rejection that was never sent.
+        (Class::Correctness, Observation::NoCloseObserved) => (
+            Verdict::Inconclusive,
+            "The client completed its request and then said nothing further before the \
+             window closed. A rejection whose CONNECTION_CLOSE was lost cannot be told \
+             apart from a client that never objected: QUIC re-sends that frame only in \
+             answer to an incoming packet, so one that goes missing is simply never seen."
                 .to_string(),
         ),
+
+        // Everything below is the *absence* of a rejection, which only means
+        // something where the client had to read the anomaly to be served.
+        (
+            Class::Correctness,
+            Observation::SurvivedAndContinued
+            | Observation::ClosedSilently
+            | Observation::ClosedWith { .. },
+        ) if catalog::anomaly_stream(test) == catalog::Anomaly::ControlStream => (
+            Verdict::Inconclusive,
+            "The client completed its request and closed without objecting, but the anomaly \
+             was written to the control stream — a unidirectional stream nothing obliges it \
+             to read on any schedule. A one-shot request can finish before that stream is \
+             picked up, so this is equally consistent with accepting the violation and with \
+             never having seen it, and neither can be told from here."
+                .to_string(),
+        ),
+        (Class::Correctness, Observation::SurvivedAndContinued) => (
+            Verdict::Fail,
+            "Accepted a protocol violation and carried on. The anomaly was in the response \
+             the client read and delivered, so it was seen; this should have been rejected."
+                .to_string(),
+        ),
+        (Class::Correctness, Observation::ClosedSilently) => (
+            Verdict::Fail,
+            "Read the response carrying the violation, then closed without an error code. \
+             The peer cannot tell what went wrong."
+                .to_string(),
+        ),
+        (Class::Correctness, Observation::ClosedWith { code }) => (
+            Verdict::Fail,
+            format!(
+                "Read the response carrying the violation and closed with 0x{code:x}, which \
+                 §8.1 makes equivalent to no error at all. This should have been rejected."
+            ),
+        ),
+        (Class::Correctness, Observation::TimedOut)
+            if catalog::anomaly_stream(test) == catalog::Anomaly::ControlStream =>
+        {
+            (
+                Verdict::Inconclusive,
+                "Nothing further arrived, and the anomaly was on the control stream, so \
+                 there is no way to tell whether the client read it."
+                    .to_string(),
+            )
+        }
         (Class::Correctness, Observation::TimedOut) => (
             Verdict::Fail,
             "Neither rejected the violation nor continued. The connection simply stalled."
@@ -234,6 +355,10 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
 
         // ── Resilience: the client had to recover ──
         (Class::Resilience, Observation::SurvivedAndContinued) => (
+            Verdict::Pass,
+            "Recovered and completed the follow-up request.".to_string(),
+        ),
+        (Class::Resilience, Observation::NoCloseObserved) => (
             Verdict::Pass,
             "Recovered and completed the follow-up request.".to_string(),
         ),
@@ -254,6 +379,10 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
 
         // ── Interoperability: valid, demanding, and must be handled ──
         (Class::Interoperability, Observation::SurvivedAndContinued) => (
+            Verdict::Pass,
+            "Decoded it and completed the request.".to_string(),
+        ),
+        (Class::Interoperability, Observation::NoCloseObserved) => (
             Verdict::Pass,
             "Decoded it and completed the request.".to_string(),
         ),
@@ -289,6 +418,12 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
             ),
         ),
         (Class::Discretionary, Observation::SurvivedAndContinued) => (
+            Verdict::Pass,
+            "Tolerated it and continued. The specification permits this but does not \
+             require it; a client that rejected it would also be conformant."
+                .to_string(),
+        ),
+        (Class::Discretionary, Observation::NoCloseObserved) => (
             Verdict::Pass,
             "Tolerated it and continued. The specification permits this but does not \
              require it; a client that rejected it would also be conformant."
@@ -554,9 +689,136 @@ mod tests {
         assert_eq!(v, Verdict::Fail);
         assert!(d.contains("0x10a"), "name the code that was required: {d}");
 
-        // Accepting it is the bug being hunted.
+        // Silence is NOT the bug being hunted. This anomaly is on the control
+        // stream, so a client that finished its request and closed without
+        // objecting may equally never have read it.
+        let (v, d) = judge(t, &Observation::SurvivedAndContinued, Some(want));
+        assert_eq!(v, Verdict::Inconclusive);
+        assert!(
+            d.contains("control stream"),
+            "say why nothing can be concluded: {d}"
+        );
+    }
+
+    /// A failure has to rest on evidence the client saw the anomaly.
+    ///
+    /// The two halves of this were one rule until an external run failed
+    /// `h-max-push-id` against a client that, driven directly, rejected the
+    /// frame with the required code six times out of six. The request had simply
+    /// completed before the control stream was read, and "no rejection arrived"
+    /// was being read as "accepted a protocol violation" — a published claim
+    /// about a named library, drawn from the absence of evidence.
+    #[test]
+    fn a_correctness_failure_needs_evidence_the_anomaly_was_read() {
+        // Response stream: the client had to read it to be served, so finishing
+        // and closing cleanly proves it saw the violation and carried on.
+        let seen = test_of("h-data-before-headers");
+        let (v, d) = judge(&seen, &Observation::SurvivedAndContinued, Some(0x0105));
+        assert_eq!(v, Verdict::Fail, "the client demonstrably read this one");
+        assert!(d.contains("response"), "say why it counts: {d}");
+
+        // Control stream: nothing obliges a client to read it before closing.
+        for id in [
+            "h-missing-settings",
+            "h-control-frame-unexpected",
+            "h-second-control-stream",
+            "h-max-push-id",
+            "h-cancel-push-unsolicited",
+        ] {
+            let t = test_of(id);
+            let (v, _) = judge(t, &Observation::SurvivedAndContinued, expected_of(t));
+            assert_eq!(
+                v,
+                Verdict::Inconclusive,
+                "{id}: silence on a control-stream anomaly proves nothing"
+            );
+            let (v, _) = judge(t, &Observation::ClosedSilently, expected_of(t));
+            assert_eq!(
+                v,
+                Verdict::Inconclusive,
+                "{id}: a clean close proves nothing"
+            );
+
+            // A rejection is always evidence, whichever stream it answers.
+            let want = expected_of(t).expect("a correctness test names its code");
+            let (v, _) = judge(t, &Observation::ClosedWith { code: want }, Some(want));
+            assert_eq!(v, Verdict::Pass, "{id}: the required code is still a pass");
+
+            // And so is the wrong one: the client objected, just badly.
+            let (v, _) = judge(t, &Observation::ClosedWith { code: 0x0101 }, Some(want));
+            assert_eq!(v, Verdict::Fail, "{id}: rejecting with the wrong code");
+        }
+    }
+
+    /// Seeing nothing is not the same as seeing a clean close.
+    ///
+    /// Both used to be one observation, and the collapse produced a false
+    /// accusation on a *response-stream* test — where the reasoning "the client
+    /// had to read this to be served" is otherwise sound. `h-data-before-headers`
+    /// was published as a failure against a client that rejects the frame with
+    /// the required code six times out of six: its CONNECTION_CLOSE had simply
+    /// gone missing, and a lost rejection looks exactly like no rejection.
+    #[test]
+    fn nothing_observed_is_never_a_correctness_failure() {
+        // Response stream, so acceptance *is* observable in principle.
+        let t = test_of("h-data-before-headers");
+        let want = crate::conformance::h3_frames::error_code::H3_FRAME_UNEXPECTED;
+
+        // Seen to close cleanly: it read the violation and did not object.
         let (v, _) = judge(t, &Observation::SurvivedAndContinued, Some(want));
         assert_eq!(v, Verdict::Fail);
+
+        // Seen to do nothing at all: no evidence either way.
+        let (v, d) = judge(t, &Observation::NoCloseObserved, Some(want));
+        assert_eq!(v, Verdict::Inconclusive);
+        assert!(d.contains("lost"), "name the reason it cannot be told: {d}");
+
+        // For the classes whose pass is carrying on, the probe completing is
+        // the evidence and silence afterwards changes nothing.
+        for (id, class) in [
+            ("h-grease-settings", Class::Extensibility),
+            ("h-trailers", Class::Interoperability),
+            ("h-goaway", Class::Resilience),
+            ("h-duplicate-setting", Class::Discretionary),
+        ] {
+            let t = test_of(id);
+            assert_eq!(t.class, class, "{id} changed class");
+            let (v, _) = judge(t, &Observation::NoCloseObserved, None);
+            assert_eq!(v, Verdict::Pass, "{id}: the follow-up request completed");
+        }
+    }
+
+    /// A pass has to be the code the clause names, not merely a rejection.
+    ///
+    /// The mirror of the rule above: reading any close as a pass credits a
+    /// client for a behaviour nobody observed. It matters most for the
+    /// transport-level correctness tests, whose real requirement — a
+    /// PATH_RESPONSE, silence after a Stateless Reset — an HTTP/3 close says
+    /// nothing about either way.
+    #[test]
+    fn a_correctness_pass_needs_the_code_the_clause_names() {
+        let t = test_of("h-max-push-id");
+        let want = crate::conformance::h3_frames::error_code::H3_FRAME_UNEXPECTED;
+
+        let (v, _) = judge(t, &Observation::ClosedWith { code: want }, Some(want));
+        assert_eq!(v, Verdict::Pass);
+
+        // A different rejection is a failure, not a pass.
+        let (v, _) = judge(t, &Observation::ClosedWith { code: 0x0109 }, Some(want));
+        assert_eq!(v, Verdict::Fail, "0x109 is not the code §7.2.7 requires");
+
+        // And where no code is named, a bare rejection settles nothing: those
+        // tests are judged on a transport behaviour a close cannot show.
+        let path = test_of("q-path-challenge");
+        assert!(expected_of(path).is_none(), "this test names no code");
+        let (v, d) = judge(path, &Observation::ClosedWith { code: 0x0101 }, None);
+        assert_eq!(v, Verdict::Inconclusive);
+        assert!(d.contains("does not show"), "say what is missing: {d}");
+    }
+
+    /// The expected code, read from the same table the listener uses.
+    fn expected_of(test: &'static catalog::Test) -> Option<u64> {
+        crate::conformance::listener::expected_code_for(test)
     }
 
     #[test]

@@ -60,6 +60,15 @@ pub mod session;
 #[cfg(test)]
 mod zero_rtt;
 
+/// End-to-end proof that the two QPACK dynamic-table tests emit what they claim.
+///
+/// Test-only, and for the same reason: every HTTP/3 client in reach advertises a
+/// QPACK table capacity of zero, so both ports can only report that nothing was
+/// exercised. One of them was writing a field section referencing insertions it
+/// never made, and no live run could have shown it.
+#[cfg(test)]
+mod qpack_dynamic;
+
 use std::sync::Arc;
 
 use crate::config::ConformanceConfig;
@@ -237,11 +246,11 @@ mod tests {
     #[test]
     fn overlapping_live_ports_is_a_startup_error() {
         let mut c = cfg();
-        c.port_range = (440, 4489);
+        c.port_range = (440, 4499);
         let err = check_port_conflicts(&c, 443, &[4434]).unwrap_err();
         assert!(err.contains("443"));
 
-        c.port_range = (4460, 4489);
+        c.port_range = (4460, 4499);
         assert!(check_port_conflicts(&c, 443, &[4434]).is_ok());
         // An additional port inside the range is caught too.
         assert!(check_port_conflicts(&c, 443, &[4434, 4470]).is_err());

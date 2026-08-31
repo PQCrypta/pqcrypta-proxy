@@ -37,7 +37,7 @@ use tracing::{debug, info, warn};
 
 use super::catalog::{self, Test, Tier};
 use super::h3_frames as f;
-use super::impairment::{Counters, ImpairedSocket};
+use super::impairment::{Counters, ImpairedSocket, Impairments};
 use super::session::Observation;
 use super::Conformance;
 use crate::tls::TlsProvider;
@@ -47,6 +47,13 @@ use crate::tls::TlsProvider;
 /// Unassigned in the IANA QUIC Frame Types registry and nowhere near an assigned
 /// range, so nothing can plausibly parse it.
 const RESERVED_FRAME_TYPE: u64 = 0x2a2a;
+
+/// One datagram in this many is dropped on `q-loss-recovery`'s port.
+///
+/// Named once because both the impairment and the sentence explaining an
+/// unexercised run quote it, and a report that describes a different rate from
+/// the one the path applied is worse than one that gives no rate at all.
+const LOSS_CADENCE: u64 = 12;
 
 /// A listener bound to one port, serving one test.
 pub struct TestListener {
@@ -89,6 +96,24 @@ impl TestListener {
                 .expect("30s is a valid idle timeout"),
         ));
 
+        // Keep a packet flowing, so a peer that has closed says so again.
+        //
+        // Every verdict here turns on how the connection ended, and the server
+        // waits a couple of seconds after the anomaly to find out. A
+        // CONNECTION_CLOSE is not retransmitted on a timer: RFC 9000 §10.2.1
+        // has a closing endpoint re-send it only *in response to* an incoming
+        // packet. So when the client's close was lost — and one in roughly a
+        // dozen was, over a real network — an idle server heard nothing more,
+        // the wait expired, and a client that had rejected the anomaly with
+        // exactly the right error code was recorded as having accepted a
+        // protocol violation and carried on.
+        //
+        // That is the false accusation this suite cannot afford, and it was
+        // invisible from the same host: on loopback the close is never lost.
+        // A keep-alive well inside the settle window means any peer still in its
+        // closing period is prompted to repeat itself while we are listening.
+        transport.keep_alive_interval(Some(Duration::from_millis(250)));
+
         // Per-test transport shaping. Several QUIC-layer anomalies are produced
         // by how the endpoint is configured rather than by bytes written after
         // the handshake, so they are set up here.
@@ -109,6 +134,22 @@ impl TestListener {
             // will accept, which is the point of measuring it.
             "q-multipath" => {
                 transport.max_concurrent_multipath_paths(4);
+            }
+            // Exactly what one HTTP/3 request needs, and not one stream more.
+            //
+            // One bidirectional stream for the request; three unidirectional
+            // for the control stream and the two QPACK streams every client
+            // opens. A client that wants a fourth — a GREASE stream, an early
+            // second request — meets the limit and has to wait for credit it
+            // will not get.
+            //
+            // Set from what the protocol requires rather than to a round
+            // number: a limit above what a request needs is never reached and
+            // measures nothing, and one below it stalls the liveness probe and
+            // fails every client for our configuration.
+            "q-stream-limit" => {
+                transport.max_concurrent_bidi_streams(1u32.into());
+                transport.max_concurrent_uni_streams(3u32.into());
             }
             // Drive path-MTU discovery hard, so the path reaches a large size
             // before the hole opens underneath it.
@@ -206,15 +247,36 @@ impl TestListener {
         // With no threshold the wrapper is transparent: nothing is dropped and
         // segmentation is left to the inner socket.
         let inner = runtime.wrap_udp_socket(socket)?;
+
+        // One datagram in twelve, once the connection is up.
+        //
+        // Enough loss that a response of any size meets several, and far short
+        // of the rate at which QUIC's own congestion response would make the
+        // transfer take longer than the test window. The clean second in front
+        // of it is what keeps this a test of stream reassembly rather than of
+        // handshake recovery: a handshake that loses packets is a different
+        // requirement in a different part of the specification, and failing one
+        // while reporting on the other would be a verdict about nothing.
+        let loss_one_in = (test.id == "q-loss-recovery").then_some(LOSS_CADENCE);
+
         // Open for the first four seconds, so discovery can raise the MTU to
         // 1452 on a path that genuinely carries it. Then the hole opens and
         // packets at that established size start disappearing — which is what a
-        // black hole is, and what the detector looks for.
-        let opens_after = blackhole_above.map(|_| Duration::from_secs(4));
+        // black hole is, and what the detector looks for. The loss impairment
+        // needs far less: one second is past the handshake on any path this
+        // service can be reached over.
+        let opens_after = match (blackhole_above, loss_one_in) {
+            (Some(_), _) => Some(Duration::from_secs(4)),
+            (_, Some(_)) => Some(Duration::from_millis(500)),
+            _ => None,
+        };
         let impaired = Box::new(ImpairedSocket::new(
             inner,
-            blackhole_above,
-            opens_after,
+            Impairments {
+                blackhole_above,
+                loss_one_in,
+                opens_after,
+            },
             counters.clone(),
         ));
         let endpoint = quinn::Endpoint::new_with_abstract_socket(
@@ -434,18 +496,31 @@ async fn run_one(
     // written but before the client had read it — so a correct client saw our
     // violation, closed the connection, and reported an error on a test it had
     // just passed.
-    let critical_streams = match emit(&connection, test).await {
-        Ok(streams) => streams,
+    let (critical_streams, mut encoder) = match emit(&connection, test).await {
+        Ok(emitted) => (emitted.keep_open, Some(emitted.encoder)),
         Err(e) => {
             debug!("conformance: {} could not emit anomaly: {}", test.id, e);
-            Vec::new()
+            (Vec::new(), None)
         }
     };
+
+    // The one anomaly that is not written to any stream.
+    //
+    // A key update is a transport event, not a frame: the next packet this
+    // endpoint sends carries the opposite key phase, and RFC 9001 §6.2 requires
+    // the client to update its own send keys in response. It goes here, after
+    // the handshake, because `force_key_update` is ignored before the connection
+    // is established — and the response the client is about to read is what
+    // proves it followed.
+    if test.id == "q-key-update" && test.implemented {
+        connection.force_key_update();
+    }
 
     // Streams that must stay open past the verdict. `Drop for SendStream`
     // finishes the stream it owns, so anything answered but not finished has to
     // be parked somewhere that outlives the wait.
     let mut held: Vec<quinn::SendStream> = Vec::new();
+    let qpack = Arc::new(QpackLimits::default());
     let observation = if critical_streams.is_empty() {
         classify_close(&connection)
     } else {
@@ -453,8 +528,9 @@ async fn run_one(
             &connection,
             &conformance,
             test,
-            &conformance_counters,
             &mut held,
+            encoder.as_mut(),
+            &qpack,
         )
         .await
     };
@@ -472,7 +548,7 @@ async fn run_one(
     // on whether a request arrived, so the transport's own account of it
     // supersedes the liveness result.
     let observation =
-        quic_observation(&connection, test, &conformance_counters).unwrap_or(observation);
+        quic_observation(&connection, test, &conformance_counters, &qpack).unwrap_or(observation);
 
     // An unbuilt test served a correct control stream, so whatever the client
     // did says nothing about the anomaly — it never met one. Judging anyway
@@ -522,6 +598,10 @@ async fn run_one(
     // our violation gets scored against them.
     drop(critical_streams);
     drop(held);
+    // The encoder stream is critical too (RFC 9204 §4.2): dropping it finishes
+    // it, and a closed QPACK encoder stream is H3_CLOSED_CRITICAL_STREAM. It
+    // waits here with the rest.
+    drop(encoder);
     Ok(())
 }
 
@@ -740,6 +820,12 @@ fn session_from_sni(sni: &str, host: &str) -> Option<String> {
 
 /// The application error code a correct client must use to reject this test's
 /// anomaly, where the specification names one.
+/// The expected code, for the verdict tests in the sibling module.
+#[cfg(test)]
+pub(super) fn expected_code_for(test: &Test) -> Option<u64> {
+    expected_code(test)
+}
+
 fn expected_code(test: &Test) -> Option<u64> {
     use f::error_code as e;
     match test.id {
@@ -747,6 +833,9 @@ fn expected_code(test: &Test) -> Option<u64> {
         "h-missing-settings" => Some(e::H3_MISSING_SETTINGS),
         "h-second-control-stream" => Some(e::H3_STREAM_CREATION_ERROR),
         "h-max-push-id" => Some(e::H3_FRAME_UNEXPECTED),
+        "h-settings-on-request-stream" => Some(e::H3_FRAME_UNEXPECTED),
+        "h-data-before-headers" => Some(e::H3_FRAME_UNEXPECTED),
+        "h-cancel-push-unsolicited" => Some(e::H3_ID_ERROR),
         _ => None,
     }
 }
@@ -758,10 +847,10 @@ fn expected_code(test: &Test) -> Option<u64> {
 /// verdict is whatever the liveness probe yields, which for an unimplemented
 /// test means "the client can talk to us" — honest, and not a claim that the
 /// anomaly was handled.
-async fn emit(
+pub(super) async fn emit(
     connection: &quinn::Connection,
     test: &'static Test,
-) -> anyhow::Result<Vec<quinn::SendStream>> {
+) -> anyhow::Result<Emitted> {
     // Streams the caller must hold for the life of the connection.
     //
     // `Drop for SendStream` calls `finish()`, so letting one fall out of scope
@@ -776,17 +865,24 @@ async fn emit(
         .write_all(&f::uni_stream_header(f::stream_type::CONTROL))
         .await?;
 
-    // QPACK encoder and decoder streams. Nothing here uses the dynamic table —
-    // every field section is literal with Required Insert Count 0 — but RFC 9204
-    // §4.2 says an endpoint SHOULD create both, and clients that wait for them
-    // before processing a field section would otherwise stall on a response and
-    // be scored as having failed a test they never saw.
-    for ty in [f::stream_type::QPACK_ENCODER, f::stream_type::QPACK_DECODER] {
-        let mut s = connection.open_uni().await?;
-        s.write_all(&f::uni_stream_header(ty)).await?;
+    // QPACK encoder and decoder streams. RFC 9204 §4.2 says an endpoint SHOULD
+    // create both, and clients that wait for them before processing a field
+    // section would otherwise stall on a response and be scored as having failed
+    // a test they never saw.
+    //
+    // The encoder is handed back rather than parked here: the two dynamic-table
+    // tests write to it after the client's SETTINGS have arrived, which is the
+    // earliest moment either is permitted to.
+    let mut encoder = connection.open_uni().await?;
+    encoder
+        .write_all(&f::uni_stream_header(f::stream_type::QPACK_ENCODER))
+        .await?;
 
-        keep_open.push(s);
-    }
+    let mut decoder = connection.open_uni().await?;
+    decoder
+        .write_all(&f::uni_stream_header(f::stream_type::QPACK_DECODER))
+        .await?;
+    keep_open.push(decoder);
 
     match test.id {
         // The client must ignore a SETTINGS identifier it does not know.
@@ -852,6 +948,19 @@ async fn emit(
             control.write_all(&f::max_push_id(0)).await?;
         }
 
+        // CANCEL_PUSH naming a push the client never allowed.
+        //
+        // The frame itself is legal from a server; the identifier is not. A
+        // client that has sent no MAX_PUSH_ID has permitted no push IDs at all,
+        // so §7.2.3's "greater than currently allowed on the connection" covers
+        // every value, and this is the smallest one that says so plainly.
+        "h-cancel-push-unsolicited" => {
+            control.write_all(&f::settings_with_grease()).await?;
+            control
+                .write_all(&f::cancel_push(UNPROMISED_PUSH_ID))
+                .await?;
+        }
+
         // Everything else gets a correct control stream. The anomaly for these
         // lives at the QUIC layer, or is not built yet; either way a client
         // meets a working server rather than an unexplained silence.
@@ -861,8 +970,100 @@ async fn emit(
     }
 
     keep_open.push(control);
-    Ok(keep_open)
+    Ok(Emitted { keep_open, encoder })
 }
+
+/// What the client's SETTINGS allow our QPACK encoder to do, on this
+/// connection.
+///
+/// Per connection, deliberately. The listener's [`Counters`] are shared by every
+/// client that ever reaches that port, so a table capacity granted by one
+/// developer's client would still be sitting there deciding another's verdict
+/// minutes later — and the two QPACK tests are judged entirely on this value.
+/// It is learned partway through, from the client's control stream, which is why
+/// it is written by the drainer and read after the exchange.
+#[derive(Debug, Default)]
+pub(super) struct QpackLimits {
+    capacity: std::sync::atomic::AtomicU64,
+    blocked_streams: std::sync::atomic::AtomicU64,
+}
+
+impl QpackLimits {
+    pub(super) fn observe(&self, limits: f::ClientQpackLimits) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.capacity.store(limits.capacity, Relaxed);
+        self.blocked_streams.store(limits.blocked_streams, Relaxed);
+    }
+
+    fn capacity(&self) -> u64 {
+        self.capacity.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn blocked_streams(&self) -> u64 {
+        self.blocked_streams
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the dynamic table may be referenced at all.
+    ///
+    /// Both halves are required. A capacity of zero forbids insertions outright
+    /// (RFC 9204 §3.2.2), and with no blocked streams permitted the encoder may
+    /// only reference entries the decoder has already acknowledged — which,
+    /// across two streams with no ordering between them, we cannot guarantee for
+    /// a section written moments after the insertions. Referencing anyway would
+    /// be our §2.1.2 violation, scored against the client.
+    fn dynamic_table_usable(&self) -> bool {
+        self.capacity() > 0 && self.blocked_streams() > 0
+    }
+
+    /// Why the dynamic table could not be used, in the words of the settings
+    /// that forbade it.
+    ///
+    /// Names the actual value rather than saying "not permitted": the two
+    /// halves are set independently and by different parts of a client's
+    /// configuration, so a developer reading an inconclusive result needs to
+    /// know which one to go and change.
+    fn why_unusable(&self) -> String {
+        match (self.capacity(), self.blocked_streams()) {
+            (0, 0) => "the client advertised SETTINGS_QPACK_MAX_TABLE_CAPACITY of 0 and \
+                       SETTINGS_QPACK_BLOCKED_STREAMS of 0, which forbid the server's \
+                       encoder from using the dynamic table at all"
+                .to_string(),
+            (0, blocked) => format!(
+                "the client advertised SETTINGS_QPACK_MAX_TABLE_CAPACITY of 0, which \
+                 forbids the server's encoder from using the dynamic table at all, \
+                 though it would have permitted {blocked} blocked stream(s)"
+            ),
+            (capacity, _) => format!(
+                "the client granted a {capacity}-byte QPACK dynamic table but \
+                 SETTINGS_QPACK_BLOCKED_STREAMS of 0, so the encoder may only reference \
+                 entries the decoder has already acknowledged — which, across two \
+                 streams with no ordering between them, cannot be guaranteed for a \
+                 section written moments after its insertions"
+            ),
+        }
+    }
+}
+
+/// The streams a test opened.
+///
+/// The encoder is named rather than left in `keep_open` because two tests write
+/// to it long after the anomaly: the dynamic table may not be touched until the
+/// client's SETTINGS say how much of it, if any, we are allowed to use, and
+/// those arrive after this function has returned.
+pub(super) struct Emitted {
+    /// Streams that must stay open for the life of the connection.
+    pub(super) keep_open: Vec<quinn::SendStream>,
+    /// The QPACK encoder stream.
+    pub(super) encoder: quinn::SendStream,
+}
+
+/// The push ID `h-cancel-push-unsolicited` cancels.
+///
+/// Any value would do — no MAX_PUSH_ID was granted, so none is allowed — and a
+/// small one keeps the frame unambiguous: this is a reference to a push that was
+/// never promised, not an overflow or a parsing accident.
+const UNPROMISED_PUSH_ID: u64 = 3;
 
 /// Wait for the client to prove it survived, then answer it.
 ///
@@ -892,8 +1093,9 @@ async fn watch_for_liveness(
     connection: &quinn::Connection,
     conformance: &Conformance,
     test: &'static Test,
-    counters: &Arc<Counters>,
     hold: &mut Vec<quinn::SendStream>,
+    encoder: Option<&mut quinn::SendStream>,
+    qpack: &Arc<QpackLimits>,
 ) -> Observation {
     let timeout = Duration::from_millis(conformance.config.liveness_timeout_ms);
 
@@ -903,24 +1105,19 @@ async fn watch_for_liveness(
     // client's control stream is a protocol violation of ours that would be
     // scored against the client.
     // Learn what the client permits while draining. SETTINGS_QPACK_MAX_TABLE_CAPACITY
-    // governs whether *our* encoder may use the dynamic table (RFC 9204 §5);
-    // the default is zero, and using it anyway would be our violation.
-    let qpack_capacity = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // and SETTINGS_QPACK_BLOCKED_STREAMS together govern whether *our* encoder
+    // may use the dynamic table (RFC 9204 §5, §2.1.2); both default to zero, and
+    // using it anyway would be our violation.
     let drainer = tokio::spawn({
         let connection = connection.clone();
-        let capacity = qpack_capacity.clone();
-        let shared = counters.clone();
+        let qpack = qpack.clone();
         async move {
             while let Ok(mut uni) = connection.accept_uni().await {
-                let capacity = capacity.clone();
-                let shared = shared.clone();
+                let qpack = qpack.clone();
                 tokio::spawn(async move {
                     if let Ok(bytes) = uni.read_to_end(64 * 1024).await {
-                        if let Some(c) = f::parse_qpack_capacity(&bytes) {
-                            capacity.store(c, std::sync::atomic::Ordering::Relaxed);
-                            shared
-                                .qpack_capacity
-                                .store(c, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(limits) = f::parse_client_qpack_limits(&bytes) {
+                            qpack.observe(limits);
                         }
                     }
                 });
@@ -951,8 +1148,33 @@ async fn watch_for_liveness(
                     debug!("conformance: probe request not fully drained");
                 }
 
-                let capacity = qpack_capacity.load(std::sync::atomic::Ordering::Relaxed);
-                if let Err(e) = answer_probe(&mut send, test, capacity).await {
+                // Give a control-stream anomaly time to be read before the
+                // response lets the client go.
+                //
+                // The anomaly was written before this request even arrived, so
+                // the bytes are already at the client — but nothing obliges it
+                // to read a unidirectional stream on any schedule, and a
+                // one-shot client that is handed its response promptly will
+                // finish and close without ever picking the stream up. The
+                // server then sees a clean close and can conclude nothing,
+                // which is the inconclusive band this narrows.
+                //
+                // Holding the response is what keeps the connection alive
+                // through that window: the client is still waiting on us, so it
+                // is still there to notice, and a conformant reader has the
+                // room to emit its rejection. It does not close the window
+                // entirely — whether a unidirectional stream was ever read is
+                // not observable from this end — which is why the verdict model
+                // still has to allow for not knowing.
+                if catalog::anomaly_stream(test) == catalog::Anomaly::ControlStream {
+                    tokio::select! {
+                        () = tokio::time::sleep(CONTROL_STREAM_GRACE) => {}
+                        // Already objected: nothing to wait for.
+                        _ = connection.closed() => {}
+                    }
+                }
+
+                if let Err(e) = answer_probe(&mut send, test, qpack, encoder).await {
                     debug!("conformance: could not answer liveness probe: {}", e);
                 }
                 // Handed to the caller rather than dropped. `Drop for SendStream`
@@ -981,7 +1203,9 @@ async fn watch_for_liveness(
                     Observation::ClosedSilently => Observation::SurvivedAndContinued,
                     other => other,
                 },
-                Err(_) => Observation::SurvivedAndContinued,
+                // The window closed with nothing seen. Not the same as a
+                // clean close, and the difference decides a correctness test.
+                Err(_) => Observation::NoCloseObserved,
             }
         }
         Ok(Err(_)) => classify_close(connection),
@@ -1006,6 +1230,7 @@ fn quic_observation(
     connection: &quinn::Connection,
     test: &'static Test,
     counters: &Counters,
+    qpack: &QpackLimits,
 ) -> Option<Observation> {
     let rx = connection.stats().frame_rx;
 
@@ -1194,16 +1419,12 @@ fn quic_observation(
         }
 
         // The client governs whether our encoder may use the dynamic table at
-        // all (RFC 9204 §3.2.3), so a client advertising zero capacity cannot
-        // be tested on it — and must not be recorded as having passed a test
-        // that never ran. That its QPACK dynamic table is off is itself the
-        // useful finding.
-        "h-qpack-dynamic-table" if counters.qpack_capacity() == 0 => {
-            Some(Observation::NotExercised(
-                "the client advertised SETTINGS_QPACK_MAX_TABLE_CAPACITY of 0, which \
-                 forbids the server's encoder from using the dynamic table at all"
-                    .to_string(),
-            ))
+        // all (RFC 9204 §3.2.3, §2.1.2), so a client that grants no capacity —
+        // or grants capacity but permits no blocked streams — cannot be tested
+        // on it, and must not be recorded as having passed a test that never
+        // ran. That its QPACK dynamic table is off is itself the useful finding.
+        "h-qpack-dynamic-table" | "h-qpack-blocked-stream" if !qpack.dynamic_table_usable() => {
+            Some(Observation::NotExercised(qpack.why_unusable()))
         }
 
         // Already sent on every connection: noq includes a reserved transport
@@ -1213,6 +1434,45 @@ fn quic_observation(
         "q-reserved-transport-param" => Some(Observation::Signalled(
             "completed a handshake carrying a reserved transport parameter".to_string(),
         )),
+
+        // Announcing the stall is a SHOULD, so only the announcement is
+        // affirmative evidence; silence is left to the liveness probe.
+        //
+        // Reporting "respected the limit" from the frame counters alone would
+        // override a client that stalled outright waiting for credit it was
+        // never going to get — the counters cannot tell that apart from a
+        // client that simply had no more streams to open, and a limit set to
+        // exactly what a request needs makes stalling a real possibility rather
+        // than a theoretical one.
+        "q-stream-limit" => (rx.streams_blocked_bidi + rx.streams_blocked_uni > 0).then(|| {
+            Observation::Signalled(format!(
+                "stayed inside the stream limits and announced the stall ({} \
+                 STREAMS_BLOCKED for bidirectional, {} for unidirectional), which §4.6 \
+                 recommends but does not require",
+                rx.streams_blocked_bidi, rx.streams_blocked_uni
+            ))
+        }),
+
+        // Whether anything was actually lost decides only whether this ran.
+        //
+        // Deliberately not a verdict of its own: the requirement is that the
+        // body arrives complete and in order, and the only evidence of that is
+        // the liveness result — a client that stalled halfway through the
+        // transfer has the same socket counters as one that finished. Returning
+        // a signal here would override that and pass both.
+        "q-loss-recovery" => {
+            let lost = counters.dropped_loss();
+            if lost > 0 {
+                return None;
+            }
+            Some(Observation::NotExercised(format!(
+                "nothing was dropped on this connection, so the client's recovery was \
+                 never called on. The impairment begins half a second after a peer's \
+                 first datagram and takes one datagram in {LOSS_CADENCE} after that; a \
+                 connection that sends fewer than {LOSS_CADENCE} datagrams in its lossy \
+                 phase can finish without meeting one"
+            )))
+        }
 
         // Almost nothing on the public internet speaks multipath, which is
         // precisely why it is worth measuring rather than assuming.
@@ -1234,10 +1494,11 @@ fn quic_observation(
 /// Deliberately plain HTTP/3 — this is the one part of the exchange that must
 /// be completely unremarkable, because it is how the client learns it got
 /// through the anomaly intact.
-async fn answer_probe(
+pub(super) async fn answer_probe(
     send: &mut quinn::SendStream,
     test: &'static Test,
-    qpack_capacity: u64,
+    qpack: &QpackLimits,
+    encoder: Option<&mut quinn::SendStream>,
 ) -> anyhow::Result<()> {
     const BODY: &[u8] = b"liveness probe received; this connection survived the test\n";
 
@@ -1268,14 +1529,37 @@ async fn answer_probe(
         }
 
         // Field lines that reference entries inserted on the encoder stream.
-        // The insertions themselves go out in `emit`, before the probe.
+        //
+        // The insertions are written here, immediately before the section that
+        // references them, and not in `emit`. They cannot go any earlier: how
+        // much of the dynamic table we are allowed is decided by the client's
+        // SETTINGS, and those arrive after the connection is up. Inserting into
+        // a table the client sized at zero is an encoder-stream error of ours
+        // (RFC 9204 §3.2.2), which is why this waits.
+        //
+        // Writing them first buys tendency, not order: the encoder stream and
+        // this one are separate streams, so either can arrive first. That is
+        // exactly why `dynamic_table_usable` also requires the client to permit
+        // a blocked stream — without one, an insertion that loses the race would
+        // make our section unanswerable and the failure would be scored against
+        // the client.
+        //
+        // They were previously written nowhere at all, while the section still
+        // claimed a Required Insert Count of two. Every client in reach
+        // advertises a capacity of zero and took the literal branch, so the
+        // reference was never emitted and the gap stayed invisible — but a
+        // client that granted a table would have been sent a section citing two
+        // insertions that did not exist, and blamed for the decode failure that
+        // followed.
         "h-qpack-dynamic-table" => {
-            // Only if the client granted capacity. Referencing the dynamic
-            // table when it advertised zero — the default, and what curl sends
-            // — is a violation by us, and the client would be right to reset
-            // the stream. Falling back keeps the connection honest; the verdict
-            // records that the test did not apply.
-            let section = if qpack_capacity > 0 {
+            let section = if qpack.dynamic_table_usable() {
+                if let Some(encoder) = encoder {
+                    for (name, value) in DYNAMIC_ENTRIES {
+                        encoder
+                            .write_all(&f::qpack_insert_with_literal_name(name, value))
+                            .await?;
+                    }
+                }
                 f::qpack_dynamic_headers(
                     DYNAMIC_INSERTS,
                     &[(":status", "200"), ("content-type", "text/plain")],
@@ -1288,6 +1572,86 @@ async fn answer_probe(
                 ])
             };
             send.write_all(&f::headers_raw(&section)).await?;
+            send.write_all(&f::data(BODY)).await?;
+        }
+
+        // The same references, deliberately sent before the insertions that
+        // satisfy them.
+        //
+        // The field section arrives with a Required Insert Count the decoder
+        // cannot yet meet, so the stream blocks (RFC 9204 §2.2.1). The
+        // insertions follow a moment later on the encoder stream, and a correct
+        // decoder resumes and completes the request. One that treats a blocked
+        // stream as a decoding failure, or simply never comes back to it, does
+        // not.
+        //
+        // The delay is what makes the block certain rather than incidental: the
+        // two streams have no ordering between them, so insertions written
+        // immediately before the section would usually — but not always —
+        // arrive first, and a test that only sometimes tests something is worse
+        // than one that says it did not run.
+        "h-qpack-blocked-stream" => {
+            if qpack.dynamic_table_usable() {
+                let section = f::qpack_dynamic_headers(
+                    DYNAMIC_INSERTS,
+                    &[(":status", "200"), ("content-type", "text/plain")],
+                );
+                send.write_all(&f::headers_raw(&section)).await?;
+                tokio::time::sleep(BLOCKED_FOR).await;
+                if let Some(encoder) = encoder {
+                    for (name, value) in DYNAMIC_ENTRIES {
+                        encoder
+                            .write_all(&f::qpack_insert_with_literal_name(name, value))
+                            .await?;
+                    }
+                }
+            } else {
+                send.write_all(&f::headers(&[
+                    (":status", "200"),
+                    ("content-type", "text/plain"),
+                    ("x-conformance", "client-permitted-no-blocked-streams"),
+                ]))
+                .await?;
+            }
+            send.write_all(&f::data(BODY)).await?;
+        }
+
+        // SETTINGS belongs to the control stream and nowhere else.
+        //
+        // A correct response follows it, so a client that ignores the violation
+        // completes the request and is recorded as having accepted it — rather
+        // than stalling on a stream that went quiet, which would be judged the
+        // same as a timeout and say nothing about the frame.
+        "h-settings-on-request-stream" => {
+            send.write_all(&f::settings(&[(
+                f::setting::MAX_FIELD_SECTION_SIZE,
+                16_384,
+            )]))
+            .await?;
+            send.write_all(&f::headers(&[
+                (":status", "200"),
+                ("content-type", "text/plain"),
+                ("x-conformance", "settings-frame-preceded-this"),
+            ]))
+            .await?;
+            send.write_all(&f::data(BODY)).await?;
+        }
+
+        // A body before the headers that describe it: an invalid sequence.
+        //
+        // Distinct from `h-grease-frame`, which also puts a frame ahead of the
+        // response. That one is a reserved type carrying a length, which §7.2.8
+        // requires a client to skip; DATA is a known type in a position §4.1
+        // forbids, and skipping it is the failure.
+        "h-data-before-headers" => {
+            send.write_all(&f::data(b"a body before any headers\n"))
+                .await?;
+            send.write_all(&f::headers(&[
+                (":status", "200"),
+                ("content-type", "text/plain"),
+                ("x-conformance", "data-frame-preceded-the-headers"),
+            ]))
+            .await?;
             send.write_all(&f::data(BODY)).await?;
         }
 
@@ -1385,6 +1749,65 @@ async fn answer_probe(
                 .await?;
         }
 
+        // A body paced so that it is still arriving when the loss begins.
+        //
+        // Sent flat out, this test measured nothing: a client on the same host
+        // took the whole body inside the clean window and the impairment never
+        // touched a single datagram, so every run came back inconclusive. The
+        // transfer has to outlast the window, and no body is large enough to do
+        // that on a loopback path — 256 KiB crosses one in about ten
+        // milliseconds — so the answer is time, not volume.
+        //
+        // Paced, the body spans several seconds on any path, and the fraction
+        // of it that meets the impairment is the same whether the client is on
+        // this host or across an ocean.
+        "q-loss-recovery" => {
+            send.write_all(&f::headers(&[
+                (":status", "200"),
+                ("content-type", "text/plain"),
+                ("x-conformance", "loss-recovery"),
+            ]))
+            .await?;
+            let chunk = vec![b'.'; LOSSY_CHUNK_BYTES];
+            for _ in 0..LOSSY_BODY_CHUNKS {
+                send.write_all(&f::data(&chunk)).await?;
+                tokio::time::sleep(LOSSY_CHUNK_GAP).await;
+            }
+            send.write_all(&f::data(BODY)).await?;
+        }
+
+        // Headers, part of a body, then the stream is cancelled underneath it.
+        //
+        // The pause is what makes this a cancellation of something rather than
+        // of nothing: RESET_STREAM abandons whatever has not left yet, so
+        // resetting immediately after the write would usually deliver no
+        // response at all, and §4.1's "cancelled after receiving a partial
+        // response" would never be the situation under test. Long enough for the
+        // headers to be on the wire, short enough to stay well inside the
+        // client's patience.
+        //
+        // Returns early: falling through to `finish()` below would complete the
+        // very stream this test exists to cut off.
+        "h-response-stream-reset" => {
+            send.write_all(&f::headers(&[
+                (":status", "200"),
+                ("content-type", "text/plain"),
+                ("x-conformance", "about-to-be-cancelled"),
+            ]))
+            .await?;
+            send.write_all(&f::data(b"the first part of a body that stops here\n"))
+                .await?;
+            tokio::time::sleep(BEFORE_RESET).await;
+            let code = quinn::VarInt::from_u64(f::error_code::H3_REQUEST_CANCELLED)
+                .expect("0x10c is inside the varint range");
+            // Fails only if the stream is already gone, which is a client that
+            // has closed — nothing left to cancel, and nothing to report.
+            if let Err(e) = send.reset(code) {
+                debug!("conformance: {} could not reset the response: {e}", test.id);
+            }
+            return Ok(());
+        }
+
         _ => {
             send.write_all(&f::headers(&[
                 (":status", "200"),
@@ -1410,15 +1833,63 @@ async fn answer_probe(
     Ok(())
 }
 
+/// The entries the two dynamic-table tests insert before referencing them.
+///
+/// Named field lines rather than filler: they arrive in the client's response
+/// headers, so anyone reading the exchange in a packet capture can see which
+/// entries the section was pointing at.
+const DYNAMIC_ENTRIES: &[(&str, &str)] = &[
+    ("x-conformance-dynamic", "first-dynamic-table-entry"),
+    ("x-conformance-dynamic-2", "second-dynamic-table-entry"),
+];
+
 /// How many entries `h-qpack-dynamic-table` inserts before referencing them.
 const DYNAMIC_INSERTS: u64 = 2;
+
+// The Required Insert Count written into the field section has to be the number
+// of entries actually inserted; a mismatch is a decode failure the client would
+// be blamed for.
+const _: () = assert!(DYNAMIC_ENTRIES.len() == 2);
+
+/// How long a control-stream anomaly is left in front of a client before the
+/// response is released.
+///
+/// The bytes reached the client before its request did; this is about giving it
+/// a moment to look at them while it still has a reason to keep the connection
+/// open. A second is far longer than reading a queued stream takes and is only
+/// spent on the tests that need it.
+const CONTROL_STREAM_GRACE: Duration = Duration::from_secs(1);
+
+/// How long `h-qpack-blocked-stream` leaves the field section blocked.
+const BLOCKED_FOR: Duration = Duration::from_millis(300);
+
+/// How long `h-response-stream-reset` lets the partial response run before
+/// cancelling it.
+const BEFORE_RESET: Duration = Duration::from_millis(300);
+
+/// The shape of `q-loss-recovery`'s body: 96 chunks of 8 KiB, 30ms apart.
+///
+/// 768 KiB over roughly three seconds. The size is not the point — the duration
+/// is. The impairment opens half a second after a peer's first datagram, so what
+/// decides whether anything is lost is how long the transfer is still running
+/// after that, and an unpaced body finishes far too soon on a fast path to meet
+/// it at all.
+///
+/// Two and a half seconds of lossy transfer is around 450 datagrams at this
+/// path's MTU, of which one in twelve — roughly forty — vanishes. Comfortably
+/// inside the ten-second grace the connection is given to close.
+const LOSSY_BODY_CHUNKS: usize = 96;
+const LOSSY_CHUNK_BYTES: usize = 8192;
+const LOSSY_CHUNK_GAP: Duration = Duration::from_millis(30);
 
 /// Turn a closed connection into an observation, preserving the error code the
 /// client chose — which for the correctness tests is the entire point.
 fn classify_close(connection: &quinn::Connection) -> Observation {
     match connection.close_reason() {
         Some(e) => classify_error(&e),
-        None => Observation::SurvivedAndContinued,
+        // Still open, or closed in a way the transport did not record: either
+        // way nothing was observed about how the client took the anomaly.
+        None => Observation::NoCloseObserved,
     }
 }
 
@@ -1545,6 +2016,15 @@ pub fn catalog_json(conformance: &Conformance) -> String {
                 "layer": match t.tier { Tier::Http3 => "http3", Tier::Quic => "quic" },
                 "expectation": t.expectation,
                 "port": t.port_offset.map(|o| start + o),
+                // Where the anomaly is written, which decides what silence from
+                // a client is allowed to prove. Published because it is the
+                // difference between a test whose failure is conclusive and one
+                // whose quiet outcome can only ever be inconclusive.
+                "anomaly": match catalog::anomaly_stream(t) {
+                    catalog::Anomaly::ControlStream => "control_stream",
+                    catalog::Anomaly::ResponseStream => "response_stream",
+                    catalog::Anomaly::Transport => "transport",
+                },
             })
         })
         .collect();
@@ -1554,6 +2034,12 @@ pub fn catalog_json(conformance: &Conformance) -> String {
         "tests": entries,
         "how": "Connect to each port in turn. To collect results under one session, \
                 use SNI <session>.<host>; obtain a session from /session.",
+        "verdicts": "A failure requires positive evidence the client read the anomaly. \
+                     Where `anomaly` is response_stream or transport the client had to \
+                     process it to be served, so completing the exchange without \
+                     objecting is a failure. Where it is control_stream, a one-shot \
+                     request can close before ever reading the stream, so silence is \
+                     inconclusive rather than a failure.",
     })
     .to_string()
 }
@@ -1634,6 +2120,26 @@ mod tests {
                 "RFC 9114 §7.2.7",
                 "A server MUST NOT send a MAX_PUSH_ID frame. A client MUST treat the                  receipt of a MAX_PUSH_ID frame as a connection error of type                  H3_FRAME_UNEXPECTED.",
             ),
+            // Read as published on 2026-08-31, along with the other four added
+            // that day.
+            (
+                "h-settings-on-request-stream",
+                e::H3_FRAME_UNEXPECTED,
+                "RFC 9114 §7.2.4",
+                "If an endpoint receives a SETTINGS frame on a different stream, the                  endpoint MUST respond with a connection error of type                  H3_FRAME_UNEXPECTED.",
+            ),
+            (
+                "h-data-before-headers",
+                e::H3_FRAME_UNEXPECTED,
+                "RFC 9114 §4.1",
+                "Receipt of an invalid sequence of frames MUST be treated as a                  connection error of type H3_FRAME_UNEXPECTED.",
+            ),
+            (
+                "h-cancel-push-unsolicited",
+                e::H3_ID_ERROR,
+                "RFC 9114 §7.2.3",
+                "If a CANCEL_PUSH frame is received that references a push ID greater                  than currently allowed on the connection, this MUST be treated as a                  connection error of type H3_ID_ERROR.",
+            ),
         ];
 
         for (id, code, clause, sentence) in verified {
@@ -1682,6 +2188,31 @@ mod tests {
         assert_eq!(e::H3_ID_ERROR, 0x0108);
         assert_eq!(e::H3_SETTINGS_ERROR, 0x0109);
         assert_eq!(e::H3_MISSING_SETTINGS, 0x010a);
+        // Sent by `h-response-stream-reset`, so it has to be the code the
+        // registry actually assigns: a stream reset carrying the wrong value
+        // would be asking the client about a different situation entirely.
+        assert_eq!(e::H3_REQUEST_CANCELLED, 0x010c);
+    }
+
+    /// A CANCEL_PUSH violation is an identifier error, not an unexpected frame.
+    ///
+    /// The distinction is the whole content of the test. CANCEL_PUSH is legal
+    /// from a server, so a client that answers H3_FRAME_UNEXPECTED has objected
+    /// to the wrong thing — and `h-max-push-id`, one entry away in this same
+    /// catalogue, is exactly the case where H3_FRAME_UNEXPECTED *is* right.
+    /// Getting these two the wrong way round is the easiest mistake here.
+    #[test]
+    fn the_two_push_tests_require_different_codes() {
+        let cancel = catalog::find("h-cancel-push-unsolicited").expect("catalogue entry");
+        let max = catalog::find("h-max-push-id").expect("catalogue entry");
+        assert_eq!(expected_code(cancel), Some(f::error_code::H3_ID_ERROR));
+        assert_eq!(expected_code(max), Some(f::error_code::H3_FRAME_UNEXPECTED));
+        assert_ne!(
+            expected_code(cancel),
+            expected_code(max),
+            "a frame in a forbidden direction and a frame naming a forbidden id are \
+             different objections"
+        );
     }
 
     #[test]
@@ -1709,6 +2240,9 @@ mod tests {
                     | "h-missing-settings"
                     | "h-second-control-stream"
                     | "h-max-push-id"
+                    | "h-settings-on-request-stream"
+                    | "h-data-before-headers"
+                    | "h-cancel-push-unsolicited"
             ) {
                 assert!(code.is_some(), "{} must name an expected code", t.id);
             }
