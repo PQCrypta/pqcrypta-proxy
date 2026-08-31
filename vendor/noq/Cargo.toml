@@ -3,6 +3,25 @@ members = ["noq", "noq-proto", "noq-udp"]
 default-members = ["noq", "noq-proto", "noq-udp"]
 resolver = "2"
 
+# The same rustls this fork is actually built against.
+#
+# `noq-proto` uses APIs that exist only in the vendored rustls — `EchAcceptance`,
+# `client_hello_wire()`, `ech_acceptance()` — which is how the proxy reads a
+# ClientHello off the wire and reports server-side ECH acceptance. The proxy's own
+# manifest patches rustls to that copy, so the crate compiles there.
+#
+# This directory is a *separate workspace*, though, and a `[patch]` in a
+# non-root manifest is ignored. Running `cargo test` from inside it therefore
+# resolved plain crates.io rustls and failed to compile the fork at all — three
+# errors about missing ECH APIs, in a crate that builds perfectly well through
+# the proxy. The tests were effectively unrunnable in place.
+#
+# Patching here too means the fork can be tested on its own terms, against the
+# dependency it is written for. Cargo ignores this section when noq is built as a
+# path dependency of the proxy, so it changes nothing about the proxy's build.
+[patch.crates-io]
+rustls = { path = "../rustls-fixed/rustls" }
+
 [workspace.package]
 version = "1.1.0"
 rust-version = "1.88"
