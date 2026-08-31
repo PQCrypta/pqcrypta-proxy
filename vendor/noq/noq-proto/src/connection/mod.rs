@@ -6564,8 +6564,23 @@ impl Connection {
         // well-formed and the unknown type is unambiguously what the peer
         // rejected. RFC 9000 §12.4 requires that rejection to be a connection
         // error of type FRAME_ENCODING_ERROR.
+        //
+        // Held back until the handshake is established, which matters more than
+        // it looks. A server's first 1-RTT packet is normally coalesced with the
+        // end of its own handshake, before it has processed the client's
+        // Finished. Put the frame there and a conforming peer rejects it and
+        // closes at once — against a connection this endpoint has not finished
+        // building, so the CONNECTION_CLOSE lands on nothing, the handshake is
+        // never completed, and the only thing the application ever learns is
+        // that the attempt timed out half a minute later. The peer did exactly
+        // what §12.4 requires and there was no way to see it.
+        //
+        // Once established there is a real connection to receive the rejection,
+        // and it arrives as a connection error carrying FRAME_ENCODING_ERROR,
+        // which is the whole observation this exists to make.
         if let Some(ty) = self.config.send_unknown_frame_type
             && !self.sent_unknown_frame
+            && self.state.is_established()
             && space_id == SpaceId::Data
             && !is_0rtt
             && !scheduling_info.is_abandoned

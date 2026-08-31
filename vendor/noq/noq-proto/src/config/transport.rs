@@ -183,9 +183,16 @@ impl TransportConfig {
     /// every well-formed frame, so everything ahead of it parses normally and the
     /// unknown type is unambiguously what the peer rejected.
     ///
-    /// Sent once, and not tracked for loss recovery: if that packet is lost the
-    /// peer never sees it, which a conformance run reads as the test not having
-    /// been exercised rather than as a pass.
+    /// Sent once, after the handshake is established, and not tracked for loss
+    /// recovery: if that packet is lost the peer never sees it, which a
+    /// conformance run reads as the test not having been exercised rather than
+    /// as a pass.
+    ///
+    /// The wait for establishment is what makes the rejection observable. Sent
+    /// any earlier it rides in the same flight as the end of the handshake, and
+    /// a peer that rejects it correctly does so against a connection that does
+    /// not exist yet — the close is dropped, the handshake never completes, and
+    /// the correct behaviour shows up as a timeout.
     ///
     /// The value must not name a frame type the peer knows, or it will be parsed
     /// rather than rejected.
