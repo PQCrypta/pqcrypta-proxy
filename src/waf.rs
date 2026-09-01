@@ -59,6 +59,10 @@ use crate::config::WafConfig;
 /// Severity of a WAF rule match
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
+    /// Below the corroboration floor: a bare indicator that is only meaningful
+    /// alongside a real attack vector (e.g. a loopback address mentioned in
+    /// prose). Several together still do not reach the block threshold.
+    Info,
     Low,
     Medium,
     High,
@@ -73,6 +77,7 @@ impl Severity {
     /// signal is never enough and two corroborating ones are.
     pub const fn score(self) -> u32 {
         match self {
+            Severity::Info => 1,
             Severity::Low => 3,
             Severity::Medium => 5,
             Severity::High => 8,
@@ -82,6 +87,7 @@ impl Severity {
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Severity::Info => "info",
             Severity::Low => "low",
             Severity::Medium => "medium",
             Severity::High => "high",
@@ -380,9 +386,9 @@ const PAYLOAD_RULES: &[RuleDef] = &[
     // Loopback in its various spellings. Individually weak — "localhost" occurs
     // in documentation, changelogs and support tickets, and blocking on it alone
     // was a standing false-positive source — so these corroborate.
-    RuleDef::payload("PQW-SSRF-010", Category::Ssrf, Severity::Low, r"127\.\d+\.\d+\.\d+"),
-    RuleDef::payload("PQW-SSRF-011", Category::Ssrf, Severity::Low, r"\[::1\]"),
-    RuleDef::payload("PQW-SSRF-012", Category::Ssrf, Severity::Low, r"(?i)localhost"),
+    RuleDef::payload("PQW-SSRF-010", Category::Ssrf, Severity::Info, r"127\.\d+\.\d+\.\d+"),
+    RuleDef::payload("PQW-SSRF-011", Category::Ssrf, Severity::Info, r"\[::1\]"),
+    RuleDef::payload("PQW-SSRF-012", Category::Ssrf, Severity::Info, r"(?i)localhost"),
     RuleDef::payload("PQW-SSRF-013", Category::Ssrf, Severity::Medium, r"(?i)0x7f0{0,4}0001"),
     RuleDef::payload("PQW-SSRF-014", Category::Ssrf, Severity::Medium, r"\b2130706433\b"),
     RuleDef::payload("PQW-SSRF-015", Category::Ssrf, Severity::Medium, r"(?i)\b0177\.0\.0\.1\b"),
@@ -2751,6 +2757,52 @@ mod tests {
 
     /// A fullwidth query that is not an attack must still pass — the fold must
     /// not turn ordinary wide-character text into a false positive.
+    /// Two bare loopback spellings in prose must not corroborate into a block:
+    /// they are Info-severity, so even together they stay under the threshold.
+    /// The regression corpus caught this — a doc string naming both `localhost`
+    /// and `127.0.0.1` was a 403.
+    #[test]
+    fn multiple_loopback_mentions_in_prose_do_not_block() {
+        let mut cfg = config();
+        cfg.ssrf = true;
+        let engine = WafEngine::new(&cfg);
+        let headers = browser_headers();
+        let v = engine.inspect(&WafRequest {
+            method: "GET",
+            path: "/docs",
+            query: "example=connect to localhost first then 127.0.0.1 and [::1]",
+            headers: &headers,
+            body: None,
+            skip_bot_ua_check: false,
+            mode_override: None,
+        });
+        assert!(
+            matches!(v, WafVerdict::Allow),
+            "bare loopback mentions must not self-corroborate into a block, got {}",
+            rule_of(&v)
+        );
+    }
+
+    /// A loopback mention DOES contribute once there is a real fetch vector:
+    /// `file://` is High, so `file:///…` next to `localhost` blocks.
+    #[test]
+    fn loopback_with_a_real_ssrf_vector_blocks() {
+        let mut cfg = config();
+        cfg.ssrf = true;
+        let engine = WafEngine::new(&cfg);
+        let headers = browser_headers();
+        let v = engine.inspect(&WafRequest {
+            method: "GET",
+            path: "/fetch",
+            query: "url=file:///etc/passwd",
+            headers: &headers,
+            body: None,
+            skip_bot_ua_check: false,
+            mode_override: None,
+        });
+        assert!(blocked(&v), "a file:// SSRF vector must block");
+    }
+
     #[test]
     fn fullwidth_non_attack_text_is_allowed() {
         let headers = browser_headers();
