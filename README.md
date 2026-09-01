@@ -732,7 +732,7 @@ sqli = true             # SQL injection patterns
 xss = true              # Cross-site scripting patterns
 path_traversal = true   # Traversal and path confusion (../, ..;/, %2e%2e, overlong UTF-8)
 nosqli = true           # NoSQL injection ($where, $gt, $regex, etc.)
-ssrf = false            # SSRF patterns (proxy hop headers always exempt)
+ssrf = true            # SSRF (metadata IPs Critical; loopback spellings Info — no FP on prose)
 cmd_injection = true    # OS command injection, ${IFS}, reverse shells
 xxe = true              # XML external entity injection
 deserialization = true  # Java/PHP/Python object injection, incl. byte signatures
@@ -1333,7 +1333,7 @@ src/
 ├── rate_limiter.rs      # Advanced multi-dimensional rate limiting; JWT HMAC verification
 ├── proxy_protocol.rs    # PROXY protocol v2 support
 ├── access_logger.rs     # Structured access log with log-injection sanitization
-├── waf.rs               # WAF engine — injection/traversal pattern detection (A01/A03/A08/A10), detect/block modes
+├── waf.rs               # WAF engine — 256-rule RegexSet with stable PQW-* IDs, anomaly scoring, multi-pass decoding, per-rule metrics (A01/A03/A06/A08/A10)
 ├── audit_logger.rs      # Async structured JSON audit logger for security events
 └── webtransport_server.rs  # WebTransport session handling; per-origin session rate limiting
 ```
