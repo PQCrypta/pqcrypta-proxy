@@ -1002,6 +1002,7 @@ mod tests {
             title: "An anomaly that is not emitted yet",
             spec: "n/a",
             class: Class::Correctness,
+            requirement: catalog::Requirement::Must,
             tier: Tier::Quic,
             expectation: "Never reached: the client meets a correct server.",
             implemented: false,

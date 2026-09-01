@@ -249,6 +249,24 @@ pub fn qpack_invalid_static_index(index: u64) -> BytesMut {
     buf
 }
 
+/// A QPACK "Insert with Name Reference" naming a static index that does not
+/// exist (RFC 9204 §4.3.2).
+///
+/// Layout `1T` then a 6-bit prefixed name index, with T=1 selecting the static
+/// table, followed by the value as a literal string. §3.1 is explicit that the
+/// same bad index means different things depending on where it arrives: on a
+/// field line it is QPACK_DECOMPRESSION_FAILED, and "if this index is received
+/// on the encoder stream, this MUST be treated as a connection error of type
+/// QPACK_ENCODER_STREAM_ERROR".
+pub fn qpack_insert_bad_name_index(index: u64, value: &str) -> BytesMut {
+    let mut buf = BytesMut::new();
+    put_prefixed_int(&mut buf, index, 6, 0b1100_0000);
+    // Value: H=0, then a 7-bit prefixed length.
+    put_prefixed_int(&mut buf, value.len() as u64, 7, 0);
+    buf.extend_from_slice(value.as_bytes());
+    buf
+}
+
 /// A PUSH_PROMISE frame (RFC 9114 §7.2.5).
 ///
 /// Push ID as a varint, then an encoded field section describing the request

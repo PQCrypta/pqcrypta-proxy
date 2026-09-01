@@ -1024,6 +1024,7 @@ fn expected_code(test: &Test) -> Option<u64> {
         "h-qpack-encoder-overflow" => Some(e::QPACK_ENCODER_STREAM_ERROR),
         "h-push-stream-unpromised" => Some(e::H3_ID_ERROR),
         "h-qpack-static-index-invalid" => Some(e::QPACK_DECOMPRESSION_FAILED),
+        "h-qpack-encoder-bad-name-index" => Some(e::QPACK_ENCODER_STREAM_ERROR),
         _ => None,
     }
 }
@@ -1258,6 +1259,15 @@ pub(super) async fn emit(
     // stream, and unlike the two dynamic-table tests it needs no permission from
     // the client: every capacity exceeds a limit of zero, which is what every
     // client in reach advertises.
+    if test.id == "h-qpack-encoder-bad-name-index" {
+        encoder
+            .write_all(&f::qpack_insert_bad_name_index(
+                INVALID_STATIC_INDEX,
+                "bad-name-reference",
+            ))
+            .await?;
+    }
+
     if test.id == "h-qpack-encoder-overflow" {
         encoder
             .write_all(&f::qpack_set_capacity(OVERSIZED_TABLE_CAPACITY))
@@ -2519,6 +2529,12 @@ pub fn catalog_json(conformance: &Conformance) -> String {
                 // a client is allowed to prove. Published because it is the
                 // difference between a test whose failure is conclusive and one
                 // whose quiet outcome can only ever be inconclusive.
+                // Published so the matrix can be filtered by how hard the
+                // clause insists, and by document, without re-deriving either
+                // from the prose.
+                "requirement": t.requirement.as_str(),
+                "requirement_label": t.requirement.label(),
+                "documents": catalog::documents(t),
                 "anomaly": match catalog::anomaly_stream(t) {
                     catalog::Anomaly::ControlStream => "control_stream",
                     catalog::Anomaly::ResponseStream => "response_stream",
@@ -2676,6 +2692,12 @@ mod tests {
                 "RFC 9204 §3.1, §4.5.2",
                 "When the decoder encounters an invalid static table index in a field                  line representation, it MUST treat this as a connection error of type                  QPACK_DECOMPRESSION_FAILED.",
             ),
+            (
+                "h-qpack-encoder-bad-name-index",
+                e::QPACK_ENCODER_STREAM_ERROR,
+                "RFC 9204 §3.1, §4.3.2",
+                "If this index is received on the encoder stream, this MUST be treated                  as a connection error of type QPACK_ENCODER_STREAM_ERROR.",
+            ),
         ];
 
         for (id, code, clause, sentence) in verified {
@@ -2789,6 +2811,7 @@ mod tests {
                     | "h-qpack-encoder-overflow"
                     | "h-push-stream-unpromised"
                     | "h-qpack-static-index-invalid"
+                    | "h-qpack-encoder-bad-name-index"
             ) {
                 assert!(code.is_some(), "{} must name an expected code", t.id);
             }

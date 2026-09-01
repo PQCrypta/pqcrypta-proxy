@@ -347,7 +347,7 @@ fn index(conformance: &Arc<Conformance>) -> Response<Body> {
     <a href="https://pqcrypta.com/"><img src="/images/pq-crypta.jpg" alt="PQ Crypta" width="48" height="48"></a>
     <div>
       <h1>HTTP/3 &amp; QUIC Client Conformance</h1>
-      <p class="tagline">A server that misbehaves on purpose, so your client library can find out how it copes</p>
+      <p class="tagline">A deliberately broken QUIC and HTTP/3 server, for testing clients</p>
       <p class="tagline differentiator">Unlike an interoperability test, this one deliberately sends your
       client protocol edge cases, illegal messages, GREASE, awkward state transitions and hostile network
       conditions &mdash; and judges the result from the wire, not from what the client reports.</p>
@@ -364,6 +364,8 @@ fn index(conformance: &Arc<Conformance>) -> Response<Body> {
 </div></header>
 
 <main class="wrap">
+<p class="thesis">We do not ask your client whether it handled the protocol
+correctly. We watch what it actually did on the wire.</p>
 <p>This is a live service, not a description of one. Point an HTTP/3 client at any
 port below and the server will emit something awkward but legal &mdash; a reserved
 frame type, a duplicated SETTINGS identifier, a control stream that opens with the

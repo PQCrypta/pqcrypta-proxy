@@ -547,3 +547,14 @@ body.conformance-report {
 .conformance-report .verdict-key .vk-fail strong { color: var(--cf-fail); }
 .conformance-report .verdict-key .vk-incon { border-left-color: var(--cf-incon); }
 .conformance-report .verdict-key .vk-incon strong { color: var(--cf-incon); }
+
+/* The thesis, first thing in the page body: the one sentence that separates
+   this from every other HTTP/3 testing tool. */
+.thesis {
+    font-size: 1.15rem;
+    line-height: 1.5;
+    font-weight: 600;
+    padding-left: 0.9rem;
+    border-left: 3px solid currentColor;
+    margin: 0 0 1.1rem;
+}

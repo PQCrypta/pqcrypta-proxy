@@ -79,6 +79,53 @@ pub enum Tier {
     Quic,
 }
 
+/// The requirement level of the clause a test exercises, as it binds the client.
+///
+/// A separate axis from [`Class`], and deliberately so. The class says what kind
+/// of correctness is being measured; this says how hard the specification
+/// insists. They do not move together: `h-duplicate-setting` is discretionary
+/// *because* its clause is a MAY, but `q-stream-limit` is discretionary while
+/// resting on a MUST NOT, because what the test can observe is the SHOULD-level
+/// announcement rather than the prohibition itself.
+///
+/// Published in the catalogue so a reader can ask for every MUST across both
+/// protocols, or see at a glance that a failure they are looking at rests on a
+/// SHOULD and is a matter of judgement rather than a violation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Requirement {
+    /// The clause requires the behaviour.
+    Must,
+    /// The clause forbids the behaviour.
+    MustNot,
+    /// The clause recommends it; a client may reasonably do otherwise.
+    Should,
+    /// The clause permits it; more than one answer is conformant.
+    May,
+}
+
+impl Requirement {
+    /// Stable name, used in JSON and in the matrix filters.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Requirement::Must => "must",
+            Requirement::MustNot => "must_not",
+            Requirement::Should => "should",
+            Requirement::May => "may",
+        }
+    }
+
+    /// How it is written in a specification.
+    pub fn label(self) -> &'static str {
+        match self {
+            Requirement::Must => "MUST",
+            Requirement::MustNot => "MUST NOT",
+            Requirement::Should => "SHOULD",
+            Requirement::May => "MAY",
+        }
+    }
+}
+
 /// Which stream a test's anomaly is written to.
 ///
 /// This decides what a *silent* client proves, which is the difference between a
@@ -129,6 +176,7 @@ pub fn anomaly_stream(test: &Test) -> Anomaly {
         // A push stream is a server-opened unidirectional stream like any other:
         // nothing obliges a client to read it before its own request completes.
         | "h-push-stream-unpromised"
+        | "h-qpack-encoder-bad-name-index"
         | "h-goaway"
         | "h-grease-settings"
         | "h-duplicate-setting"
@@ -163,6 +211,8 @@ pub struct Test {
     pub spec: &'static str,
     pub class: Class,
     pub tier: Tier,
+    /// How hard the cited clause insists, as it binds the client.
+    pub requirement: Requirement,
     /// What a correct client is required to do. Written as the report renders
     /// it, so a FAIL reads as a complete sentence next to the citation.
     pub expectation: &'static str,
@@ -223,6 +273,7 @@ pub struct Test {
 /// | `h-push-stream-unpromised` | RFC 9114 §6.2.2 | RFC text |
 /// | `h-qpack-static-index-invalid` | RFC 9204 §3.1 | RFC text |
 /// | `q-packet-reordering` | RFC 9000 §2.2 | RFC text |
+/// | `h-qpack-encoder-bad-name-index` | RFC 9204 §3.1 | RFC text |
 ///
 /// The five entries added on 2026-09-01 close the areas the site had been listing
 /// as untouched, and three of them changed shape while being read.
@@ -265,6 +316,7 @@ pub const CATALOG: &[Test] = &[
         title: "Version Negotiation offering a reserved version alongside v1",
         spec: "RFC 9000 §6",
         class: Class::Correctness,
+        requirement: Requirement::Must,
         tier: Tier::Quic,
         expectation: "Abandon the connection attempt, or retry with a version both ends \
                       support. §6.2 requires a client that supports only one version to \
@@ -277,6 +329,7 @@ pub const CATALOG: &[Test] = &[
         title: "Retry packet for source-address validation",
         spec: "RFC 9000 §8.1.2",
         class: Class::Correctness,
+        requirement: Requirement::Must,
         tier: Tier::Quic,
         expectation: "Echo the Retry token in a second Initial packet and complete the handshake.",
         implemented: true,
@@ -287,6 +340,7 @@ pub const CATALOG: &[Test] = &[
         title: "Reserved transport parameter (31·N+27)",
         spec: "RFC 9000 §18.1",
         class: Class::Extensibility,
+        requirement: Requirement::Must,
         tier: Tier::Quic,
         expectation: "Ignore the unknown parameter and complete the handshake normally.",
         implemented: true,
@@ -297,6 +351,7 @@ pub const CATALOG: &[Test] = &[
         title: "Unknown frame type in a 1-RTT packet",
         spec: "RFC 9000 §12.4",
         class: Class::Correctness,
+        requirement: Requirement::Must,
         tier: Tier::Quic,
         expectation: "Close the connection with FRAME_ENCODING_ERROR. Unlike HTTP/3, QUIC \
                       reserves no ignorable frame types — §12.4 makes an unknown frame a \
@@ -309,6 +364,7 @@ pub const CATALOG: &[Test] = &[
         title: "NEW_CONNECTION_ID followed by RETIRE_CONNECTION_ID",
         spec: "RFC 9000 §5.1",
         class: Class::Resilience,
+        requirement: Requirement::Must,
         tier: Tier::Quic,
         expectation: "Adopt the new connection ID, retire the old one, and stay connected.",
         implemented: true,
@@ -319,6 +375,7 @@ pub const CATALOG: &[Test] = &[
         title: "Stateless reset",
         spec: "RFC 9000 §10.3",
         class: Class::Correctness,
+        requirement: Requirement::Must,
         tier: Tier::Quic,
         expectation: "Recognise the token in the last 16 bytes of the datagram, enter the \
                       draining period, and send no further packets on the connection. The \
@@ -333,6 +390,7 @@ pub const CATALOG: &[Test] = &[
         title: "Deliberately tight MAX_DATA and MAX_STREAM_DATA",
         spec: "RFC 9000 §4",
         class: Class::Discretionary,
+        requirement: Requirement::Should,
         tier: Tier::Quic,
         expectation: "Respect the limit. Announcing the stall with DATA_BLOCKED or \
                       STREAM_DATA_BLOCKED is a SHOULD in §4.1, not a MUST, so a client that \
@@ -345,6 +403,7 @@ pub const CATALOG: &[Test] = &[
         title: "ACK Frequency extension offered",
         spec: "draft-ietf-quic-ack-frequency",
         class: Class::Discretionary,
+        requirement: Requirement::May,
         tier: Tier::Quic,
         expectation: "Negotiate the extension, or ignore it. Either is correct; failing is not.",
         implemented: true,
@@ -355,6 +414,7 @@ pub const CATALOG: &[Test] = &[
         title: "Packets marked ECT(0)",
         spec: "RFC 9000 §13.4",
         class: Class::Correctness,
+        requirement: Requirement::Must,
         tier: Tier::Quic,
         expectation: "Echo the ECN counts back in ACK frames carrying an ECN section \
                       (type 0x03). §13.4.1 makes this a conditional requirement — an \
@@ -371,6 +431,7 @@ pub const CATALOG: &[Test] = &[
         title: "Path MTU black hole above a threshold",
         spec: "RFC 9000 §14, RFC 8899",
         class: Class::Resilience,
+        requirement: Requirement::Should,
         tier: Tier::Quic,
         expectation: "Detect the black hole, probe down to a working size, and keep the \
                       connection. Path-MTU discovery is driven past the limit on this port, \
@@ -383,6 +444,7 @@ pub const CATALOG: &[Test] = &[
         title: "Server-initiated PATH_CHALLENGE",
         spec: "RFC 9000 §8.2",
         class: Class::Correctness,
+        requirement: Requirement::Must,
         tier: Tier::Quic,
         expectation: "Reply with PATH_RESPONSE carrying the identical 8-byte payload.",
         implemented: true,
@@ -393,6 +455,7 @@ pub const CATALOG: &[Test] = &[
         title: "0-RTT rejected after the client sends early data",
         spec: "RFC 9001 §4.6.2",
         class: Class::Resilience,
+        requirement: Requirement::Must,
         tier: Tier::Quic,
         expectation: "Reset the state of every stream, including application state \
                       bound to them. Section 4.6.2 requires the reset because a rejected \
@@ -410,6 +473,7 @@ pub const CATALOG: &[Test] = &[
         title: "A second path offered mid-connection",
         spec: "draft-ietf-quic-multipath",
         class: Class::Discretionary,
+        requirement: Requirement::May,
         tier: Tier::Quic,
         expectation: "Use the additional path, or decline it cleanly. Do not abort the connection.",
         implemented: true,
@@ -420,6 +484,7 @@ pub const CATALOG: &[Test] = &[
         title: "Spontaneous 1-RTT key update",
         spec: "RFC 9001 §6.2",
         class: Class::Interoperability,
+        requirement: Requirement::Must,
         tier: Tier::Quic,
         expectation: "Update to the next key phase and carry on. Once a packet protected \
                       with the next phase is processed, §6.2 is a MUST — \"The endpoint \
@@ -434,6 +499,7 @@ pub const CATALOG: &[Test] = &[
         title: "Stream limits set to the minimum a request needs",
         spec: "RFC 9000 §4.6",
         class: Class::Discretionary,
+        requirement: Requirement::MustNot,
         tier: Tier::Quic,
         expectation: "Stay inside the advertised limits. Respecting them is a MUST — \
                       §4.6 says \"Endpoints MUST NOT exceed the limit set by their \
@@ -447,6 +513,7 @@ pub const CATALOG: &[Test] = &[
         title: "One datagram in twelve dropped once the path is established",
         spec: "RFC 9000 §2.2, §13.3",
         class: Class::Resilience,
+        requirement: Requirement::Must,
         tier: Tier::Quic,
         expectation: "Reassemble the stream and deliver the whole body. §2.2 requires an \
                       endpoint to buffer data received out of order and deliver it as an \
@@ -461,6 +528,7 @@ pub const CATALOG: &[Test] = &[
         title: "Datagrams arriving from a second server address",
         spec: "RFC 9000 §9.6",
         class: Class::Discretionary,
+        requirement: Requirement::Should,
         tier: Tier::Quic,
         expectation: "Keep using the address you are already talking to. §9.6 says a \
                       client \"SHOULD ignore packets received from a server address other \
@@ -477,6 +545,7 @@ pub const CATALOG: &[Test] = &[
         title: "Transport parameter carrying a value the specification forbids",
         spec: "RFC 9000 §7.4, §18.2",
         class: Class::Correctness,
+        requirement: Requirement::Must,
         tier: Tier::Quic,
         expectation: "Close the connection with TRANSPORT_PARAMETER_ERROR. §18.2 makes an \
                       ack_delay_exponent above 20 invalid, and §7.4 is a MUST: \"An \
@@ -498,6 +567,7 @@ pub const CATALOG: &[Test] = &[
         title: "425 (Too Early) in answer to a request sent as early data",
         spec: "RFC 8470 §5.2",
         class: Class::Discretionary,
+        requirement: Requirement::Should,
         tier: Tier::Quic,
         expectation: "Handle being told the request arrived too early. §5.2 says a user \
                       agent \"SHOULD retry automatically, but any retries MUST NOT be sent \
@@ -520,6 +590,7 @@ pub const CATALOG: &[Test] = &[
         title: "Reserved SETTINGS identifier (0x1f·N+0x21)",
         spec: "RFC 9114 §7.2.4.1",
         class: Class::Extensibility,
+        requirement: Requirement::Must,
         tier: Tier::Http3,
         expectation: "Ignore the unknown setting and complete the request.",
         implemented: true,
@@ -530,6 +601,7 @@ pub const CATALOG: &[Test] = &[
         title: "Reserved frame type on the response stream",
         spec: "RFC 9114 §7.2.8",
         class: Class::Extensibility,
+        requirement: Requirement::Must,
         tier: Tier::Http3,
         expectation: "Skip the frame using its length and read the response that follows.",
         implemented: true,
@@ -540,6 +612,7 @@ pub const CATALOG: &[Test] = &[
         title: "Unidirectional stream with a reserved stream type",
         spec: "RFC 9114 §6.2.3",
         class: Class::Extensibility,
+        requirement: Requirement::Must,
         tier: Tier::Http3,
         expectation: "Abort reading the stream or discard it — §6.2.3 permits either. \
                       What it forbids is treating it as meaningful, or as fatal to the \
@@ -552,6 +625,7 @@ pub const CATALOG: &[Test] = &[
         title: "SETTINGS containing the same identifier twice",
         spec: "RFC 9114 §7.2.4",
         class: Class::Discretionary,
+        requirement: Requirement::May,
         tier: Tier::Http3,
         expectation: "Either reject with H3_SETTINGS_ERROR or ignore the repeat — the \
                       specification says a receiver MAY treat this as an error, so both \
@@ -564,6 +638,7 @@ pub const CATALOG: &[Test] = &[
         title: "A DATA frame on the control stream",
         spec: "RFC 9114 §7.2.1",
         class: Class::Correctness,
+        requirement: Requirement::Must,
         tier: Tier::Http3,
         expectation: "Close the connection with H3_FRAME_UNEXPECTED.",
         implemented: true,
@@ -574,6 +649,7 @@ pub const CATALOG: &[Test] = &[
         title: "Control stream whose first frame is not SETTINGS",
         spec: "RFC 9114 §6.2.1",
         class: Class::Correctness,
+        requirement: Requirement::Must,
         tier: Tier::Http3,
         expectation: "Close the connection with H3_MISSING_SETTINGS.",
         implemented: true,
@@ -584,6 +660,7 @@ pub const CATALOG: &[Test] = &[
         title: "A second control stream opened by the server",
         spec: "RFC 9114 §6.2.1",
         class: Class::Correctness,
+        requirement: Requirement::Must,
         tier: Tier::Http3,
         expectation: "Close the connection with H3_STREAM_CREATION_ERROR.",
         implemented: true,
@@ -594,6 +671,7 @@ pub const CATALOG: &[Test] = &[
         title: "Field lines referencing dynamic table insertions",
         spec: "RFC 9204 §4.3.3, §4.5.2",
         class: Class::Interoperability,
+        requirement: Requirement::Must,
         tier: Tier::Http3,
         expectation: "Apply the encoder-stream insertions and decode the headers correctly.",
         implemented: true,
@@ -604,6 +682,7 @@ pub const CATALOG: &[Test] = &[
         title: "Huffman-coded field lines with maximal padding",
         spec: "RFC 9204 §4.1.2, RFC 7541 §5.2",
         class: Class::Interoperability,
+        requirement: Requirement::Must,
         tier: Tier::Http3,
         expectation: "Decode without error. Padding of up to 7 bits is legal, not corruption.",
         implemented: true,
@@ -614,6 +693,7 @@ pub const CATALOG: &[Test] = &[
         title: "Field section larger than the client's advertised maximum",
         spec: "RFC 9114 §4.2.2",
         class: Class::Interoperability,
+        requirement: Requirement::Must,
         tier: Tier::Http3,
         expectation: "Handle it as an error against that one request, not the whole connection.",
         implemented: true,
@@ -624,6 +704,7 @@ pub const CATALOG: &[Test] = &[
         title: "Trailing field section after the body",
         spec: "RFC 9114 §4.1",
         class: Class::Interoperability,
+        requirement: Requirement::Must,
         tier: Tier::Http3,
         expectation: "Deliver the trailers to the application after the body completes.",
         implemented: true,
@@ -634,6 +715,7 @@ pub const CATALOG: &[Test] = &[
         title: "103 Early Hints before the final response",
         spec: "RFC 9110 §15.2, RFC 8297",
         class: Class::Resilience,
+        requirement: Requirement::Must,
         tier: Tier::Http3,
         expectation: "Treat 103 as informational and keep reading for the final response. \
                       RFC 9110 §15.2 makes this a MUST: a client \"MUST be able to parse one \
@@ -648,6 +730,7 @@ pub const CATALOG: &[Test] = &[
         title: "GOAWAY sent mid-connection",
         spec: "RFC 9114 §5.2",
         class: Class::Resilience,
+        requirement: Requirement::Should,
         tier: Tier::Http3,
         expectation:
             "Stop opening requests, finish those in flight, and retry idempotent ones elsewhere.",
@@ -659,6 +742,7 @@ pub const CATALOG: &[Test] = &[
         title: "MAX_PUSH_ID sent by the server",
         spec: "RFC 9114 §7.2.7",
         class: Class::Correctness,
+        requirement: Requirement::MustNot,
         tier: Tier::Http3,
         expectation: "Reject with H3_FRAME_UNEXPECTED. MAX_PUSH_ID travels client to \
                       server only, so a server sending one is using a frame in a \
@@ -671,6 +755,7 @@ pub const CATALOG: &[Test] = &[
         title: "SETTINGS frame on a request stream",
         spec: "RFC 9114 §7.2.4",
         class: Class::Correctness,
+        requirement: Requirement::Must,
         tier: Tier::Http3,
         expectation: "Close the connection with H3_FRAME_UNEXPECTED. SETTINGS belongs to \
                       the control stream alone: §7.2.4 says that if an endpoint receives \
@@ -684,6 +769,7 @@ pub const CATALOG: &[Test] = &[
         title: "DATA frame before any HEADERS on the response stream",
         spec: "RFC 9114 §4.1",
         class: Class::Correctness,
+        requirement: Requirement::Must,
         tier: Tier::Http3,
         expectation: "Close the connection with H3_FRAME_UNEXPECTED. A response begins \
                       with a field section, and §4.1 makes \"receipt of an invalid \
@@ -697,6 +783,7 @@ pub const CATALOG: &[Test] = &[
         title: "CANCEL_PUSH for a push ID that was never promised",
         spec: "RFC 9114 §7.2.3",
         class: Class::Correctness,
+        requirement: Requirement::Must,
         tier: Tier::Http3,
         expectation: "Close the connection with H3_ID_ERROR. No MAX_PUSH_ID was granted, \
                       so every push ID is greater than currently allowed, and §7.2.3 \
@@ -710,6 +797,7 @@ pub const CATALOG: &[Test] = &[
         title: "Field section that blocks until the encoder stream catches up",
         spec: "RFC 9204 §2.1.2, §2.2.1",
         class: Class::Interoperability,
+        requirement: Requirement::Must,
         tier: Tier::Http3,
         expectation: "Hold the field section, apply the insertions when they arrive on \
                       the encoder stream, and complete the request. §2.2.1 makes a \
@@ -727,6 +815,7 @@ pub const CATALOG: &[Test] = &[
         title: "Response stream reset mid-body with H3_REQUEST_CANCELLED",
         spec: "RFC 9114 §8, §4.1",
         class: Class::Discretionary,
+        requirement: Requirement::May,
         tier: Tier::Http3,
         expectation: "Abandon the partial response — §4.1 says a response cancelled after \
                       a partial delivery \"SHOULD NOT be used\". Whether the connection \
@@ -742,6 +831,7 @@ pub const CATALOG: &[Test] = &[
         title: "PRIORITY_UPDATE sent by the server",
         spec: "RFC 9218 §7.2",
         class: Class::Discretionary,
+        requirement: Requirement::MustNot,
         tier: Tier::Http3,
         expectation: "Reject it with H3_FRAME_UNEXPECTED, or ignore it — which is \
                       conformant depends on whether you implement extensible priorities \
@@ -763,6 +853,7 @@ pub const CATALOG: &[Test] = &[
         title: "SETTINGS_ENABLE_CONNECT_PROTOCOL with a value outside 0 and 1",
         spec: "RFC 9220 §3, RFC 8441 §3",
         class: Class::Discretionary,
+        requirement: Requirement::Must,
         tier: Tier::Http3,
         expectation: "Reject it or ignore it, but keep working. RFC 8441 §3 says the \
                       value \"MUST be 0 or 1\" and RFC 9220 carries that into HTTP/3 \
@@ -778,6 +869,7 @@ pub const CATALOG: &[Test] = &[
         title: "PUSH_PROMISE for a push the client never allowed",
         spec: "RFC 9114 §7.2.5, §4.6",
         class: Class::Correctness,
+        requirement: Requirement::Must,
         tier: Tier::Http3,
         expectation: "Close the connection with H3_ID_ERROR. §7.2.7 leaves the maximum \
                       push ID unset until the client sends MAX_PUSH_ID, so a server \
@@ -794,6 +886,7 @@ pub const CATALOG: &[Test] = &[
         title: "SETTINGS_H3_DATAGRAM with a value that is neither 0 nor 1",
         spec: "RFC 9297 §2.1.1",
         class: Class::Correctness,
+        requirement: Requirement::Must,
         tier: Tier::Http3,
         expectation: "Close the connection with H3_SETTINGS_ERROR. Unusually for a \
                       setting, RFC 9297 pins down the invalid-value case rather than \
@@ -811,6 +904,7 @@ pub const CATALOG: &[Test] = &[
         title: "Encoder stream setting a dynamic table capacity above the client's limit",
         spec: "RFC 9204 §4.3.1, §6",
         class: Class::Correctness,
+        requirement: Requirement::Must,
         tier: Tier::Http3,
         expectation: "Close the connection with QPACK_ENCODER_STREAM_ERROR (0x201). §4.3.1 \
                       says the new capacity \"MUST be lower than or equal to the limit\" \
@@ -828,6 +922,7 @@ pub const CATALOG: &[Test] = &[
         title: "A second GOAWAY naming a larger identifier than the first",
         spec: "RFC 9114 §5.2",
         class: Class::Correctness,
+        requirement: Requirement::Must,
         tier: Tier::Http3,
         expectation: "Close the connection with H3_ID_ERROR. §5.2 permits multiple GOAWAY \
                       frames but requires the identifier in each to be no greater than any \
@@ -844,6 +939,7 @@ pub const CATALOG: &[Test] = &[
         title: "Push stream opened for a push nobody allowed",
         spec: "RFC 9114 §6.2.2",
         class: Class::Correctness,
+        requirement: Requirement::Must,
         tier: Tier::Http3,
         expectation: "Close the connection with H3_ID_ERROR. §6.2.2 does not require the \
                       push to have been promised first — the stream alone is enough: a \
@@ -861,6 +957,7 @@ pub const CATALOG: &[Test] = &[
         title: "Field line indexing a static table entry that does not exist",
         spec: "RFC 9204 §3.1, §4.5.2",
         class: Class::Correctness,
+        requirement: Requirement::Must,
         tier: Tier::Http3,
         expectation: "Close the connection with QPACK_DECOMPRESSION_FAILED (0x200). The \
                       static table has 99 entries, so index 200 refers to nothing, and \
@@ -877,6 +974,7 @@ pub const CATALOG: &[Test] = &[
         title: "Datagrams delivered out of order",
         spec: "RFC 9000 §2.2",
         class: Class::Resilience,
+        requirement: Requirement::Must,
         tier: Tier::Quic,
         expectation: "Put the stream back in order and deliver the whole body. §2.2 \
                       requires an endpoint to be \"able to deliver stream data to an \
@@ -890,7 +988,74 @@ pub const CATALOG: &[Test] = &[
         implemented: true,
         port_offset: Some(46),
     },
+    Test {
+        id: "h-qpack-encoder-bad-name-index",
+        title: "Encoder instruction naming a static index that does not exist",
+        spec: "RFC 9204 §3.1, §4.3.2",
+        class: Class::Correctness,
+        requirement: Requirement::Must,
+        tier: Tier::Http3,
+        expectation: "Close the connection with QPACK_ENCODER_STREAM_ERROR (0x201). The \
+                      same bad index means different things depending on where it arrives, \
+                      and §3.1 says both: on a field line it is \
+                      QPACK_DECOMPRESSION_FAILED, and \"if this index is received on the \
+                      encoder stream, this MUST be treated as a connection error of type \
+                      QPACK_ENCODER_STREAM_ERROR\".\n\nPaired deliberately with the \
+                      field-line version on the neighbouring port: a client that answers \
+                      both with the same code has collapsed a distinction the \
+                      specification draws twice in one paragraph.",
+        implemented: true,
+        port_offset: Some(47),
+    },
 ];
+
+/// The documents a test cites, in the order they appear.
+///
+/// Parsed from `spec` rather than stored separately: the citation is written
+/// once, and two fields that could disagree about which document a test comes
+/// from would eventually do exactly that. A test may cite more than one — the
+/// path-MTU test rests on RFC 9000 and RFC 8899 together.
+///
+/// Not every entry cites an RFC. Two rest on IETF drafts, because the extensions
+/// they exercise have not been published as RFCs, and a filter that offered only
+/// RFCs would quietly hide them.
+pub fn documents(test: &Test) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let bytes = test.spec.as_bytes();
+    let mut i = 0usize;
+    while let Some(at) = test.spec[i..].find("RFC ") {
+        let start = i + at + "RFC ".len();
+        let digits: String = bytes[start..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .map(|b| *b as char)
+            .collect();
+        i = start + digits.len().max(1);
+        if digits.is_empty() {
+            continue;
+        }
+        let name = format!("RFC {digits}");
+        if !found.contains(&name) {
+            found.push(name);
+        }
+    }
+
+    if found.is_empty() {
+        // A draft, or anything else cited by name. Take it up to the first
+        // separator so "draft-ietf-quic-multipath §5" still groups with its
+        // siblings.
+        let name = test
+            .spec
+            .split([',', ' '])
+            .next()
+            .unwrap_or(test.spec)
+            .trim();
+        if !name.is_empty() {
+            found.push(name.to_string());
+        }
+    }
+    found
+}
 
 /// Look a test up by its stable id.
 pub fn find(id: &str) -> Option<&'static Test> {
@@ -1011,6 +1176,7 @@ mod tests {
             ("h-push-stream-unpromised", 44),
             ("h-qpack-static-index-invalid", 45),
             ("q-packet-reordering", 46),
+            ("h-qpack-encoder-bad-name-index", 47),
         ];
 
         for (id, offset) in pinned {
@@ -1051,6 +1217,59 @@ mod tests {
                  stream or the response stream; falling through to Transport makes silence \
                  look like acceptance",
                 t.id
+            );
+        }
+    }
+
+    #[test]
+    fn every_test_names_the_document_it_comes_from() {
+        for t in CATALOG {
+            let cited = documents(t);
+            assert!(
+                !cited.is_empty(),
+                "{} cites nothing that can be parsed out of {:?}",
+                t.id,
+                t.spec
+            );
+        }
+        // A test citing two documents keeps both, in order.
+        let mtu = find("q-pmtu-blackhole").expect("catalogue entry");
+        assert_eq!(documents(mtu), vec!["RFC 9000", "RFC 8899"]);
+        // And a repeated citation is not listed twice.
+        let reorder = find("q-packet-reordering").expect("catalogue entry");
+        assert_eq!(documents(reorder), vec!["RFC 9000"]);
+        // Drafts are named too, or the filter would hide the extensions.
+        let multipath = find("q-multipath").expect("catalogue entry");
+        assert_eq!(documents(multipath), vec!["draft-ietf-quic-multipath"]);
+    }
+
+    /// Requirement level and class are independent axes.
+    ///
+    /// Worth pinning, because it is tempting to assume discretionary means MAY.
+    /// It does not: `q-stream-limit` is discretionary and rests on a MUST NOT,
+    /// since the prohibition is not what the test can observe — the SHOULD-level
+    /// announcement is.
+    #[test]
+    fn requirement_level_is_not_the_class() {
+        let stream_limit = find("q-stream-limit").expect("catalogue entry");
+        assert_eq!(stream_limit.class, Class::Discretionary);
+        assert_eq!(stream_limit.requirement, Requirement::MustNot);
+
+        let duplicate = find("h-duplicate-setting").expect("catalogue entry");
+        assert_eq!(duplicate.class, Class::Discretionary);
+        assert_eq!(duplicate.requirement, Requirement::May);
+
+        // Every level is represented, or the filters would have empty buckets.
+        for level in [
+            Requirement::Must,
+            Requirement::MustNot,
+            Requirement::Should,
+            Requirement::May,
+        ] {
+            assert!(
+                CATALOG.iter().any(|t| t.requirement == level),
+                "no test carries {}",
+                level.label()
             );
         }
     }
