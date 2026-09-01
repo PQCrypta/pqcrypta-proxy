@@ -515,10 +515,14 @@ available as <a href="/catalog.json">JSON</a>.</p>
 
 <h2 id="scope">Scope, and what this is not</h2>
 <p>{total} tests is a beginning, not coverage. QUIC and HTTP/3 together are
-enormous, and whole areas remain untouched &mdash; server push, HTTP Datagrams
-and WebTransport, a client's own migration after a NAT rebind, amplification
-limits, QPACK encoder-stream errors. The catalogue is chosen rather than
-exhaustive.</p>
+enormous, and whole areas remain untouched &mdash; push streams themselves as
+opposed to the promise, QPACK decoder-stream errors, WebTransport session
+handling beyond the setting that gates it, and packet reordering. The catalogue
+is chosen rather than exhaustive.</p>
+<p>Two gaps are permanent. A client's own migration after a NAT rebind cannot be
+provoked from here: only the client, or its network, can change the address it
+sends from. And the amplification limit is a requirement on <em>servers</em>, so
+there is nothing about it to ask of the thing under test.</p>
 <ul>
 <li><strong>This is not a certification.</strong> Passing everything here means a
 client handled {total} specific situations correctly. It does not mean the

@@ -40,6 +40,12 @@ pub mod setting {
     pub const QPACK_MAX_TABLE_CAPACITY: u64 = 0x01;
     pub const MAX_FIELD_SECTION_SIZE: u64 = 0x06;
     pub const QPACK_BLOCKED_STREAMS: u64 = 0x07;
+    /// SETTINGS_H3_DATAGRAM (RFC 9297 §2.1.1).
+    ///
+    /// Its value MUST be 0 or 1, and a receiver seeing anything else MUST
+    /// terminate the connection with H3_SETTINGS_ERROR — one of the few settings
+    /// whose invalid-value handling the specification pins down.
+    pub const H3_DATAGRAM: u64 = 0x33;
     /// SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 9220 §3, registered by RFC 8441).
     /// Its value MUST be 0 or 1; this is how a client learns Extended CONNECT —
     /// and so WebTransport — is available.
@@ -66,6 +72,15 @@ pub mod error_code {
     pub const H3_CONNECT_ERROR: u64 = 0x010f;
     pub const H3_VERSION_FALLBACK: u64 = 0x0110;
 
+    // QPACK's error codes (RFC 9204 §6) share the HTTP/3 application error
+    // space. They belong here for the same reason the H3_* codes do: a client
+    // that closes with one is objecting, and a suite that did not recognise
+    // them would read a QPACK rejection as "no error to signal" and score it as
+    // though the client had accepted the instruction.
+    pub const QPACK_DECOMPRESSION_FAILED: u64 = 0x0200;
+    pub const QPACK_ENCODER_STREAM_ERROR: u64 = 0x0201;
+    pub const QPACK_DECODER_STREAM_ERROR: u64 = 0x0202;
+
     /// Whether an application close code means the peer is objecting.
     ///
     /// Only a *defined* HTTP/3 error code other than `H3_NO_ERROR` does.
@@ -83,7 +98,10 @@ pub mod error_code {
     pub fn is_rejection(code: u64) -> bool {
         matches!(
             code,
-            H3_GENERAL_PROTOCOL_ERROR
+            QPACK_DECOMPRESSION_FAILED
+                | QPACK_ENCODER_STREAM_ERROR
+                | QPACK_DECODER_STREAM_ERROR
+                | H3_GENERAL_PROTOCOL_ERROR
                 | H3_INTERNAL_ERROR
                 | H3_STREAM_CREATION_ERROR
                 | H3_CLOSED_CRITICAL_STREAM
@@ -200,6 +218,30 @@ pub fn max_push_id(id: u64) -> BytesMut {
 /// push that was never permitted.
 pub fn cancel_push(push_id: u64) -> BytesMut {
     frame(frame_type::CANCEL_PUSH, &varint(push_id))
+}
+
+/// A PUSH_PROMISE frame (RFC 9114 §7.2.5).
+///
+/// Push ID as a varint, then an encoded field section describing the request
+/// being promised. The field section is an ordinary literal encoding — what a
+/// client objects to is the push ID, since the maximum is unset until it sends
+/// MAX_PUSH_ID and so every value exceeds what it has advertised.
+pub fn push_promise(push_id: u64, fields: &[(&str, &str)]) -> BytesMut {
+    let mut payload = varint(push_id);
+    payload.extend_from_slice(&qpack_literal_headers(fields));
+    frame(frame_type::PUSH_PROMISE, &payload)
+}
+
+/// A QPACK "Set Dynamic Table Capacity" instruction (RFC 9204 §4.3.1).
+///
+/// Pattern `001` followed by the capacity as a 5-bit prefixed integer. §4.3.1
+/// requires the new capacity to be no larger than the limit the decoder
+/// advertised in SETTINGS_QPACK_MAX_TABLE_CAPACITY, and makes exceeding it a
+/// connection error of type QPACK_ENCODER_STREAM_ERROR.
+pub fn qpack_set_capacity(capacity: u64) -> BytesMut {
+    let mut buf = BytesMut::new();
+    put_prefixed_int(&mut buf, capacity, 5, 0b0010_0000);
+    buf
 }
 
 /// A PRIORITY_UPDATE frame for a request stream (RFC 9218 §7.2).

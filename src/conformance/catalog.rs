@@ -120,6 +120,12 @@ pub fn anomaly_stream(test: &Test) -> Anomaly {
         | "h-cancel-push-unsolicited"
         | "h-priority-update"
         | "h-extended-connect"
+        | "h-push-promise-unsolicited"
+        | "h-datagram-setting-invalid"
+        | "h-goaway-increasing"
+        // The QPACK encoder stream is unidirectional too, and nothing obliges a
+        // client to read it on any schedule either.
+        | "h-qpack-encoder-overflow"
         | "h-goaway"
         | "h-grease-settings"
         | "h-duplicate-setting"
@@ -206,6 +212,10 @@ pub struct Test {
 /// | `q-zero-rtt-replay` | RFC 8470 §5.2 | RFC text |
 /// | `h-priority-update` | RFC 9218 §7.2 | RFC text |
 /// | `h-extended-connect` | RFC 9220 §3, RFC 8441 §3 | RFC text |
+/// | `h-push-promise-unsolicited` | RFC 9114 §7.2.5 | RFC text |
+/// | `h-datagram-setting-invalid` | RFC 9297 §2.1.1 | RFC text |
+/// | `h-qpack-encoder-overflow` | RFC 9204 §4.3.1, §6 | RFC text |
+/// | `h-goaway-increasing` | RFC 9114 §5.2 | RFC text |
 ///
 /// The five entries added on 2026-09-01 close the areas the site had been listing
 /// as untouched, and three of them changed shape while being read.
@@ -756,6 +766,72 @@ pub const CATALOG: &[Test] = &[
         implemented: true,
         port_offset: Some(39),
     },
+    Test {
+        id: "h-push-promise-unsolicited",
+        title: "PUSH_PROMISE for a push the client never allowed",
+        spec: "RFC 9114 §7.2.5, §4.6",
+        class: Class::Correctness,
+        tier: Tier::Http3,
+        expectation: "Close the connection with H3_ID_ERROR. §7.2.7 leaves the maximum \
+                      push ID unset until the client sends MAX_PUSH_ID, so a server \
+                      \"cannot push until it receives a MAX_PUSH_ID frame\" and every push \
+                      ID is larger than the client has advertised. §7.2.5 is explicit \
+                      about the answer: a client \"MUST treat receipt of a PUSH_PROMISE \
+                      frame that contains a larger push ID than the client has advertised \
+                      as a connection error of H3_ID_ERROR\".",
+        implemented: true,
+        port_offset: Some(40),
+    },
+    Test {
+        id: "h-datagram-setting-invalid",
+        title: "SETTINGS_H3_DATAGRAM with a value that is neither 0 nor 1",
+        spec: "RFC 9297 §2.1.1",
+        class: Class::Correctness,
+        tier: Tier::Http3,
+        expectation: "Close the connection with H3_SETTINGS_ERROR. Unusually for a \
+                      setting, RFC 9297 pins down the invalid-value case rather than \
+                      leaving it open: the value \"MUST be either 0 or 1\", and if one \
+                      \"is received with a value that is neither 0 nor 1, the receiver \
+                      MUST terminate the connection with error H3_SETTINGS_ERROR\".\n\n\
+                      This is the setting that gates HTTP Datagrams and so WebTransport, \
+                      which means a client that implements either has real parsing behind \
+                      it rather than an ignored identifier.",
+        implemented: true,
+        port_offset: Some(41),
+    },
+    Test {
+        id: "h-qpack-encoder-overflow",
+        title: "Encoder stream setting a dynamic table capacity above the client's limit",
+        spec: "RFC 9204 §4.3.1, §6",
+        class: Class::Correctness,
+        tier: Tier::Http3,
+        expectation: "Close the connection with QPACK_ENCODER_STREAM_ERROR (0x201). §4.3.1 \
+                      says the new capacity \"MUST be lower than or equal to the limit\" \
+                      the decoder advertised, and that a decoder \"MUST treat a new \
+                      dynamic table capacity value that exceeds this limit as a connection \
+                      error of type QPACK_ENCODER_STREAM_ERROR\".\n\nUnlike the other \
+                      two dynamic-table tests, this one runs against every client: they \
+                      all advertise a capacity of zero, and any capacity at all exceeds a \
+                      limit of zero.",
+        implemented: true,
+        port_offset: Some(42),
+    },
+    Test {
+        id: "h-goaway-increasing",
+        title: "A second GOAWAY naming a larger identifier than the first",
+        spec: "RFC 9114 §5.2",
+        class: Class::Correctness,
+        tier: Tier::Http3,
+        expectation: "Close the connection with H3_ID_ERROR. §5.2 permits multiple GOAWAY \
+                      frames but requires the identifier in each to be no greater than any \
+                      previously sent, because the identifier is a promise about what will \
+                      still be processed and raising it takes that promise back. \
+                      \"Receiving a GOAWAY containing a larger identifier than previously \
+                      received MUST be treated as a connection error of type \
+                      H3_ID_ERROR.\"",
+        implemented: true,
+        port_offset: Some(43),
+    },
 ];
 
 /// Look a test up by its stable id.
@@ -870,6 +946,10 @@ mod tests {
             ("q-zero-rtt-replay", 37),
             ("h-priority-update", 38),
             ("h-extended-connect", 39),
+            ("h-push-promise-unsolicited", 40),
+            ("h-datagram-setting-invalid", 41),
+            ("h-qpack-encoder-overflow", 42),
+            ("h-goaway-increasing", 43),
         ];
 
         for (id, offset) in pinned {

@@ -991,6 +991,10 @@ fn expected_code(test: &Test) -> Option<u64> {
         "h-settings-on-request-stream" => Some(e::H3_FRAME_UNEXPECTED),
         "h-data-before-headers" => Some(e::H3_FRAME_UNEXPECTED),
         "h-cancel-push-unsolicited" => Some(e::H3_ID_ERROR),
+        "h-push-promise-unsolicited" => Some(e::H3_ID_ERROR),
+        "h-goaway-increasing" => Some(e::H3_ID_ERROR),
+        "h-datagram-setting-invalid" => Some(e::H3_SETTINGS_ERROR),
+        "h-qpack-encoder-overflow" => Some(e::QPACK_ENCODER_STREAM_ERROR),
         _ => None,
     }
 }
@@ -1103,6 +1107,51 @@ pub(super) async fn emit(
             control.write_all(&f::max_push_id(0)).await?;
         }
 
+        // A push nobody permitted.
+        //
+        // The maximum push ID is unset until the client sends MAX_PUSH_ID
+        // (§7.2.7), and no client under test sends one, so push ID 0 is already
+        // larger than what has been advertised. The promised request is an
+        // ordinary GET so the field section decodes cleanly and the only thing
+        // left to object to is the push itself.
+        "h-push-promise-unsolicited" => {
+            control.write_all(&f::settings_with_grease()).await?;
+            control
+                .write_all(&f::push_promise(
+                    UNPROMISED_PUSH_ID_ZERO,
+                    &[
+                        (":method", "GET"),
+                        (":scheme", "https"),
+                        (":authority", "conformance.pqcrypta.com"),
+                        (":path", "/pushed"),
+                    ],
+                ))
+                .await?;
+        }
+
+        // The one setting whose invalid-value handling the specification pins
+        // down, rather than leaving to the receiver.
+        "h-datagram-setting-invalid" => {
+            control
+                .write_all(&f::settings(&[
+                    (f::setting::MAX_FIELD_SECTION_SIZE, 16_384),
+                    (f::setting::H3_DATAGRAM, 2),
+                ]))
+                .await?;
+        }
+
+        // Two GOAWAYs, the second reaching further than the first.
+        //
+        // The identifier is a promise about what will still be processed, so
+        // raising it takes that promise back — which is why §5.2 allows several
+        // GOAWAYs but not an increasing one. The first is a legitimate frame;
+        // only the second is the violation.
+        "h-goaway-increasing" => {
+            control.write_all(&f::settings_with_grease()).await?;
+            control.write_all(&f::goaway(0)).await?;
+            control.write_all(&f::goaway(GOAWAY_INCREASED_TO)).await?;
+        }
+
         // A prioritisation signal travelling the wrong way.
         //
         // The frame itself is well formed and `u=3` is an ordinary urgency: the
@@ -1153,6 +1202,16 @@ pub(super) async fn emit(
         _ => {
             control.write_all(&f::settings_with_grease()).await?;
         }
+    }
+
+    // One test's anomaly belongs on the encoder stream rather than the control
+    // stream, and unlike the two dynamic-table tests it needs no permission from
+    // the client: every capacity exceeds a limit of zero, which is what every
+    // client in reach advertises.
+    if test.id == "h-qpack-encoder-overflow" {
+        encoder
+            .write_all(&f::qpack_set_capacity(OVERSIZED_TABLE_CAPACITY))
+            .await?;
     }
 
     keep_open.push(control);
@@ -1243,6 +1302,23 @@ pub(super) struct Emitted {
     /// The QPACK encoder stream.
     pub(super) encoder: quinn::SendStream,
 }
+
+/// The push `h-push-promise-unsolicited` promises.
+///
+/// Zero, because the maximum push ID is unset until a client sends MAX_PUSH_ID
+/// and none does: the smallest possible value already exceeds what was
+/// advertised, which keeps the violation about the promise rather than about an
+/// implausible identifier.
+const UNPROMISED_PUSH_ID_ZERO: u64 = 0;
+
+/// The identifier `h-goaway-increasing` raises its second GOAWAY to.
+const GOAWAY_INCREASED_TO: u64 = 16;
+
+/// The dynamic table capacity `h-qpack-encoder-overflow` asks for.
+///
+/// Any non-zero value exceeds the limit every client in reach advertises, and a
+/// round number makes the instruction obvious in a packet capture.
+const OVERSIZED_TABLE_CAPACITY: u64 = 4096;
 
 /// The request stream `h-priority-update` claims to reprioritise.
 ///
@@ -2245,7 +2321,7 @@ fn classify_error(err: &quinn::ConnectionError) -> Observation {
         // rather than flattening it to "silently", which reads as though the
         // client said nothing at all.
         Ce::TransportError(e) => {
-            Observation::Signalled(format!("closed at the QUIC layer: {}", e.code))
+            Observation::ObjectedAtTransport(format!("closed at the QUIC layer: {}", e.code))
         }
         // The common case in practice. curl/ngtcp2 rejects an HTTP/3 violation
         // by closing at the transport layer rather than with an application
@@ -2261,7 +2337,7 @@ fn classify_error(err: &quinn::ConnectionError) -> Observation {
             if close.error_code == quinn_proto::TransportErrorCode::NO_ERROR {
                 Observation::ClosedSilently
             } else {
-                Observation::Signalled(format!(
+                Observation::ObjectedAtTransport(format!(
                     "rejected at the QUIC layer with {:?}",
                     close.error_code
                 ))
@@ -2457,6 +2533,31 @@ mod tests {
                 "RFC 9114 §7.2.3",
                 "If a CANCEL_PUSH frame is received that references a push ID greater                  than currently allowed on the connection, this MUST be treated as a                  connection error of type H3_ID_ERROR.",
             ),
+            // Read as published on 2026-09-01.
+            (
+                "h-push-promise-unsolicited",
+                e::H3_ID_ERROR,
+                "RFC 9114 §7.2.5, §4.6",
+                "A client MUST treat receipt of a PUSH_PROMISE frame that contains a                  larger push ID than the client has advertised as a connection error of                  H3_ID_ERROR.",
+            ),
+            (
+                "h-goaway-increasing",
+                e::H3_ID_ERROR,
+                "RFC 9114 §5.2",
+                "Receiving a GOAWAY containing a larger identifier than previously                  received MUST be treated as a connection error of type H3_ID_ERROR.",
+            ),
+            (
+                "h-datagram-setting-invalid",
+                e::H3_SETTINGS_ERROR,
+                "RFC 9297 §2.1.1",
+                "If the SETTINGS_H3_DATAGRAM setting is received with a value that is                  neither 0 nor 1, the receiver MUST terminate the connection with error                  H3_SETTINGS_ERROR.",
+            ),
+            (
+                "h-qpack-encoder-overflow",
+                e::QPACK_ENCODER_STREAM_ERROR,
+                "RFC 9204 §4.3.1, §6",
+                "The decoder MUST treat a new dynamic table capacity value that exceeds                  this limit as a connection error of type QPACK_ENCODER_STREAM_ERROR.",
+            ),
         ];
 
         for (id, code, clause, sentence) in verified {
@@ -2505,6 +2606,10 @@ mod tests {
         assert_eq!(e::H3_ID_ERROR, 0x0108);
         assert_eq!(e::H3_SETTINGS_ERROR, 0x0109);
         assert_eq!(e::H3_MISSING_SETTINGS, 0x010a);
+        // QPACK's codes share the same application error space (RFC 9204 §6).
+        assert_eq!(e::QPACK_DECOMPRESSION_FAILED, 0x0200);
+        assert_eq!(e::QPACK_ENCODER_STREAM_ERROR, 0x0201);
+        assert_eq!(e::QPACK_DECODER_STREAM_ERROR, 0x0202);
         // Sent by `h-response-stream-reset`, so it has to be the code the
         // registry actually assigns: a stream reset carrying the wrong value
         // would be asking the client about a different situation entirely.
@@ -2560,6 +2665,10 @@ mod tests {
                     | "h-settings-on-request-stream"
                     | "h-data-before-headers"
                     | "h-cancel-push-unsolicited"
+                    | "h-push-promise-unsolicited"
+                    | "h-goaway-increasing"
+                    | "h-datagram-setting-invalid"
+                    | "h-qpack-encoder-overflow"
             ) {
                 assert!(code.is_some(), "{} must name an expected code", t.id);
             }

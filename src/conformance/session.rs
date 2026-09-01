@@ -110,6 +110,21 @@ pub enum Observation {
     ClosedSilently,
     /// Nothing happened before the liveness timeout expired.
     TimedOut,
+    /// The client objected, but at the QUIC layer, so no HTTP/3 error code was
+    /// carried.
+    ///
+    /// Separate from [`Signalled`](Self::Signalled), which a test raises when it
+    /// has seen the specific thing it was watching for. This is the opposite: an
+    /// objection whose *content* could not be read. curl/ngtcp2 rejects HTTP/3
+    /// violations this way — H3_MISSING_SETTINGS arrives as a transport
+    /// INTERNAL_ERROR — so for a test whose requirement is a named code, the one
+    /// thing being asked about is exactly what did not arrive.
+    ///
+    /// It used to be folded into `Signalled`, which made it a pass: the report
+    /// said "Responded correctly" about a code it had never seen, while a client
+    /// that did send an HTTP/3 code and got it slightly wrong was failed. The
+    /// stricter client scored worse than the one that said less.
+    ObjectedAtTransport(String),
     /// The client did something specific the test was watching for — a
     /// PATH_RESPONSE, an ACK_ECN, a DATA_BLOCKED. Carries a short label so the
     /// report can say what was seen.
@@ -245,6 +260,13 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
                  ignored — rejecting an unknown extension is what causes protocol ossification."
             ),
         ),
+        (Class::Extensibility, Observation::ObjectedAtTransport(what)) => (
+            Verdict::Fail,
+            format!(
+                "Closed the connection ({what}). The element was required to be ignored — \
+                 rejecting an unknown extension is what causes protocol ossification."
+            ),
+        ),
         (Class::Extensibility, Observation::ClosedSilently) => (
             Verdict::Fail,
             "Dropped the connection without an error code instead of ignoring the element."
@@ -296,6 +318,29 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
         (Class::Correctness, Observation::Signalled(what)) => {
             (Verdict::Pass, format!("Responded correctly: {what}."))
         }
+
+        // An objection with nothing in it to check.
+        //
+        // The client rejected something, which is the right instinct, but the
+        // requirement here is a particular error code and a QUIC-layer close
+        // carries none. Calling that a pass would credit it for the one thing
+        // that was not observed; calling it a failure would accuse it of
+        // accepting a violation it plainly rejected. Neither is available.
+        (Class::Correctness, Observation::ObjectedAtTransport(what)) => (
+            Verdict::Inconclusive,
+            match expected_code {
+                Some(want) => format!(
+                    "Objected, but at the QUIC layer ({what}), so the HTTP/3 error code \
+                     could not be read. §8.1 carries an HTTP/3 connection error in an \
+                     application close, and this test asks for 0x{want:x} specifically — \
+                     whether that was the client's reasoning is not observable from here."
+                ),
+                None => format!(
+                    "Objected, but at the QUIC layer ({what}), which does not show whether \
+                     the specific behaviour this test asks for occurred."
+                ),
+            },
+        ),
 
         // Nothing was observed at all, so there is nothing to reason from. This
         // is not the control-stream case below — it applies however the anomaly
@@ -377,6 +422,10 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
             Verdict::Fail,
             format!("Gave up with error 0x{code:x} instead of recovering."),
         ),
+        (Class::Resilience, Observation::ObjectedAtTransport(what)) => (
+            Verdict::Fail,
+            format!("Gave up ({what}) instead of recovering."),
+        ),
         (Class::Resilience, Observation::ClosedSilently) => (
             Verdict::Fail,
             "Dropped the connection instead of recovering.".to_string(),
@@ -403,6 +452,13 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
                 "Rejected the response with error 0x{code:x}. Nothing here violates the \
                  specification — this is valid HTTP/3 that a client is required to be able \
                  to process."
+            ),
+        ),
+        (Class::Interoperability, Observation::ObjectedAtTransport(what)) => (
+            Verdict::Fail,
+            format!(
+                "Rejected the response ({what}). Nothing here violates the specification — \
+                 this is valid HTTP/3 that a client is required to be able to process."
             ),
         ),
         (Class::Interoperability, Observation::ClosedSilently) => (
@@ -440,6 +496,13 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
         (Class::Discretionary, Observation::Signalled(what)) => {
             (Verdict::Pass, format!("Handled it: {what}."))
         }
+        (Class::Discretionary, Observation::ObjectedAtTransport(what)) => (
+            Verdict::Pass,
+            format!(
+                "Rejected it ({what}). The specification permits this but does not require \
+                 it; a client that ignored it would also be conformant."
+            ),
+        ),
         (Class::Discretionary, Observation::ClosedSilently) => (
             Verdict::Fail,
             "Closed without an error code. Rejecting this is permitted, but doing so \
@@ -794,6 +857,45 @@ mod tests {
             let (v, _) = judge(t, &Observation::NoCloseObserved, None);
             assert_eq!(v, Verdict::Pass, "{id}: the follow-up request completed");
         }
+    }
+
+    /// An objection with no readable code is not a pass for a named-code test.
+    ///
+    /// curl/ngtcp2 rejects HTTP/3 violations by closing at the QUIC layer, so
+    /// H3_MISSING_SETTINGS arrives as a transport INTERNAL_ERROR and the code the
+    /// clause names is never on the wire. Scoring that "Responded correctly" gave
+    /// the quietest client the best score in the published matrix, while clients
+    /// that did send an HTTP/3 code and got it wrong were failed.
+    #[test]
+    fn objecting_without_a_readable_code_settles_nothing() {
+        let t = test_of("h-missing-settings");
+        let want = crate::conformance::h3_frames::error_code::H3_MISSING_SETTINGS;
+        let at_transport = Observation::ObjectedAtTransport(
+            "rejected at the QUIC layer with INTERNAL_ERROR".into(),
+        );
+
+        let (v, d) = judge(t, &at_transport, Some(want));
+        assert_eq!(v, Verdict::Inconclusive, "the required code was never seen");
+        assert!(d.contains("0x10a"), "name the code it was asked for: {d}");
+
+        // The real thing still passes, and a wrong code still fails.
+        assert_eq!(
+            judge(t, &Observation::ClosedWith { code: want }, Some(want)).0,
+            Verdict::Pass
+        );
+        assert_eq!(
+            judge(t, &Observation::ClosedWith { code: 0x0102 }, Some(want)).0,
+            Verdict::Fail
+        );
+
+        // For the classes whose requirement is to *not* object, closing at the
+        // transport layer is as much a failure as closing with a code.
+        let ext = test_of("h-grease-settings");
+        assert_eq!(judge(ext, &at_transport, None).0, Verdict::Fail);
+
+        // And where either answer is permitted, it remains a pass.
+        let disc = test_of("h-duplicate-setting");
+        assert_eq!(judge(disc, &at_transport, None).0, Verdict::Pass);
     }
 
     /// A pass has to be the code the clause names, not merely a rejection.

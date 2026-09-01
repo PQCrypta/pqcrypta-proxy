@@ -254,11 +254,11 @@ mod tests {
     #[test]
     fn overlapping_live_ports_is_a_startup_error() {
         let mut c = cfg();
-        c.port_range = (440, 4499);
+        c.port_range = (440, 4600);
         let err = check_port_conflicts(&c, 443, &[4434]).unwrap_err();
         assert!(err.contains("443"));
 
-        c.port_range = (4460, 4499);
+        c.port_range = (4460, 4600);
         assert!(check_port_conflicts(&c, 443, &[4434]).is_ok());
         // An additional port inside the range is caught too.
         assert!(check_port_conflicts(&c, 443, &[4434, 4470]).is_err());

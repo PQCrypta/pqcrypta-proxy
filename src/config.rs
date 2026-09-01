@@ -477,7 +477,7 @@ impl Default for ConformanceConfig {
         Self {
             enabled: false,
             host: "conformance.pqcrypta.com".to_string(),
-            port_range: (4460, 4499),
+            port_range: (4460, 4600),
             session_ttl_secs: 3600,
             max_sessions: 512,
             liveness_timeout_ms: 5000,
