@@ -520,11 +520,15 @@ available as <a href="/catalog.json">JSON</a>.</p>
 enormous, and the catalogue is chosen rather than exhaustive. What is missing
 divides into two different things, and collapsing them into one list of "not done
 yet" would overstate what this suite can ever become.</p>
-<p><strong>Testable, and not yet written.</strong> A genuine backlog: version
-negotiation between two versions both ends support; ECN congestion marking, where
-a CE codepoint should come back in the counts rather than only ECT(0); repeated
-key updates; Retry with a token that does not validate; MAX_STREAMS credit issued
-mid-connection.</p>
+<p><strong>Testable, and not yet written.</strong> Shorter than it was: ECN
+congestion marking, repeated key updates and mid-connection MAX_STREAMS credit
+have since been built. What is left is a Retry packet a client ought to discard —
+§17.2.5.2 has a client ignore any Retry after the first — and similar
+single-clause cases. Compatible version negotiation is not counted here: §6.2
+does not say what a client does when the offered version is one it supports, only
+that "how to perform version negotiation is left as future work". RFC 9368
+supplies that work, so the test becomes possible once the stack implements
+<code>version_information</code>, and not before.</p>
 <p><strong>Outside what this vantage point can establish.</strong> Not a backlog.
 A server watching a client cannot legitimately provoke or observe these, so a
 test claiming to cover them would be reporting on something other than what it

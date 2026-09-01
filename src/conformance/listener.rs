@@ -58,6 +58,28 @@ const ACK_DELAY_EXPONENT_ID: u64 = 0x0a;
 /// about anything this endpoint negotiated.
 const INVALID_ACK_DELAY_EXPONENT: u64 = 21;
 
+/// How long `q-key-update-repeated` waits before updating a second time.
+///
+/// Long enough for the first phase to be acknowledged, which is what makes the
+/// second update legal rather than ignored.
+const SECOND_KEY_UPDATE_AFTER: Duration = Duration::from_millis(600);
+
+/// How long `q-max-streams-credit` withholds the credit for a request.
+///
+/// Comfortably inside the liveness window, so a client that waits still has time
+/// to open its request and be answered.
+const STREAM_CREDIT_AFTER: Duration = Duration::from_millis(700);
+
+/// How many ECT markings in every this-many become CE on `q-ecn-congestion`.
+///
+/// Every one of them. A cadence of four marked nothing at all: ECN validation
+/// fails on many paths (§13.4.2) and this stack then stops marking ECT, so only
+/// two or three datagrams ever carry a codepoint to rewrite and a count of four
+/// is never reached. A congested router marks everything that passes, which is
+/// both realistic and the only way to be sure the client is shown one before the
+/// marking stops.
+const CE_CADENCE: u64 = 1;
+
 /// One datagram in this many is held back and released late on
 /// `q-packet-reordering`'s port.
 const REORDER_CADENCE: u64 = 6;
@@ -198,6 +220,13 @@ impl TestListener {
             // fails every client for our configuration.
             "q-stream-limit" => {
                 transport.max_concurrent_bidi_streams(1u32.into());
+                transport.max_concurrent_uni_streams(3u32.into());
+            }
+            // No request may be opened at first. The credit arrives once the
+            // connection is up, and the whole test is whether the client waits
+            // for it rather than opening anyway.
+            "q-max-streams-credit" => {
+                transport.max_concurrent_bidi_streams(0u32.into());
                 transport.max_concurrent_uni_streams(3u32.into());
             }
             // Drive path-MTU discovery hard, so the path reaches a large size
@@ -342,6 +371,9 @@ impl TestListener {
         // frequent that the stream is more out of order than in.
         let reorder_one_in = (test.id == "q-packet-reordering").then_some(REORDER_CADENCE);
 
+        // Every ECT marking becomes CE, for as long as there are any.
+        let mark_ce_one_in = (test.id == "q-ecn-congestion").then_some(CE_CADENCE);
+
         // Open for the first four seconds, so discovery can raise the MTU to
         // 1452 on a path that genuinely carries it. Then the hole opens and
         // packets at that established size start disappearing — which is what a
@@ -368,6 +400,7 @@ impl TestListener {
                 blackhole_above,
                 loss_one_in,
                 opens_after,
+                mark_ce_one_in,
                 reorder_one_in,
                 shadow_datagrams,
             },
@@ -627,6 +660,35 @@ async fn run_one(
         connection.force_key_update();
     }
 
+    // Two updates, spaced so the second is legal.
+    //
+    // §6.1 forbids initiating another update before the previous phase has been
+    // acknowledged, and the stack enforces that by ignoring a redundant call —
+    // so the second one has to wait for a round trip rather than follow
+    // immediately, or it would silently never happen and the test would be the
+    // single-update one under another name.
+    if test.id == "q-key-update-repeated" && test.implemented {
+        connection.force_key_update();
+        let again = connection.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(SECOND_KEY_UPDATE_AFTER).await;
+            again.force_key_update();
+        });
+    }
+
+    // The stream credit this port withheld at the handshake.
+    //
+    // Issued from a task rather than inline: the client cannot open its request
+    // until this lands, so the code that waits for the request has to already be
+    // running when it does.
+    if test.id == "q-max-streams-credit" && test.implemented {
+        let granting = connection.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(STREAM_CREDIT_AFTER).await;
+            granting.set_max_concurrent_bi_streams(quinn::VarInt::from_u32(1));
+        });
+    }
+
     // Streams that must stay open past the verdict. `Drop for SendStream`
     // finishes the stream it owns, so anything answered but not finished has to
     // be parked somewhere that outlives the wait.
@@ -665,6 +727,28 @@ async fn run_one(
     // supersedes the liveness result.
     let observation =
         quic_observation(&connection, test, &conformance_counters, &qpack).unwrap_or(observation);
+
+    // A client that declined to wait for stream credit has not failed anything.
+    //
+    // This port withholds the credit a request needs and issues it a moment
+    // later. Waiting is what §4.6 expects, but nothing obliges a one-shot client
+    // to sit on a connection it cannot use yet — and the catalogue entry says so.
+    // Left to the generic path, giving up reads as a discretionary test that
+    // stalled, which is scored as a failure.
+    let observation = if test.id == "q-max-streams-credit"
+        && matches!(
+            observation,
+            Observation::TimedOut | Observation::ClosedSilently
+        ) {
+        Observation::NotExercised(format!(
+            "the client did not wait for the credit. This port grants no bidirectional \
+             stream until {}ms in, and declining to wait that long is not a violation of \
+             anything — it simply leaves the limit untested",
+            STREAM_CREDIT_AFTER.as_millis()
+        ))
+    } else {
+        observation
+    };
 
     // An unbuilt test served a correct control stream, so whatever the client
     // did says nothing about the anomaly — it never met one. Judging anyway
@@ -1734,6 +1818,71 @@ fn quic_observation(
                 ),
             })
         }
+
+        // Whether the client can see a congestion signal at all.
+        //
+        // Read from the same ECN feedback as the ECT(0) test, and scored the same
+        // conditional way: counts coming back is the only conclusion available,
+        // and silence cannot be told apart from a peer with no access to the
+        // field or a path that rewrote the codepoint.
+        "q-ecn-congestion" => {
+            let marked = counters.marked_ce();
+            let path = connection.path_stats(quinn_proto::PathId::ZERO);
+            Some(match path {
+                _ if marked == 0 => Observation::NotExercised(
+                    "no datagram was marked CE, so the client was never shown a congestion \
+                     signal. The marking begins shortly after a peer's first datagram and \
+                     rewrites one ECT codepoint in four after that"
+                        .to_string(),
+                ),
+                Some(p) if p.ecn_feedback.ce > 0 => Observation::Signalled(format!(
+                    "reported the congestion back: {} ECN-CE among {} ECT(0) and {} \
+                     ECT(1), after {marked} datagram(s) were marked",
+                    p.ecn_feedback.ce, p.ecn_feedback.ect0, p.ecn_feedback.ect1
+                )),
+                Some(p) if p.ecn_feedback.any() => Observation::NotExercised(format!(
+                    "ECN counts came back but none of them were CE ({} ECT(0), {} ECT(1)), \
+                     though {marked} datagram(s) were marked. A path that rewrote the \
+                     codepoint in transit cannot be told apart from a client that does not \
+                     distinguish CE",
+                    p.ecn_feedback.ect0, p.ecn_feedback.ect1
+                )),
+                Some(_) => Observation::NotExercised(
+                    "no ECN counts came back at all. §13.4.1 requires reporting only where \
+                     the ECN field is accessible, and a path that stripped the codepoint \
+                     cannot be told apart from a client that does not report"
+                        .to_string(),
+                ),
+                None => Observation::NotExercised(
+                    "the path had already been discarded before its ECN counts could be read"
+                        .to_string(),
+                ),
+            })
+        }
+
+        // Waiting for credit is the pass; announcing the wait is a bonus.
+        //
+        // Left to the liveness result when the client did open its request:
+        // the probe arriving after the credit is the evidence, and it is the
+        // generic path that records it. Only the case where nothing arrived
+        // needs saying in this test's own words.
+        // Announcing the block is affirmative evidence the client waited
+        // properly, and §4.6 recommends exactly that.
+        //
+        // The first version also checked `frame_rx.stream` for a request having
+        // arrived, which is wrong: that counts STREAM frames of every kind, and
+        // a client's own control and QPACK streams are made of them. It was
+        // therefore true on every connection, the arm never fired, and a client
+        // that announced the block and then declined to wait was handed to the
+        // generic path and failed for closing quietly — the exact outcome this
+        // entry's expectation says is not a failure.
+        "q-max-streams-credit" => (rx.streams_blocked_bidi > 0).then(|| {
+            Observation::Signalled(format!(
+                "announced the block with {} STREAMS_BLOCKED rather than opening a \
+                 stream it had no credit for, which is what §4.6 recommends",
+                rx.streams_blocked_bidi
+            ))
+        }),
 
         // The path carries 1452 bytes for four seconds, then starts swallowing
         // anything over 1300. A client that notices and drops back to a working

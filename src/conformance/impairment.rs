@@ -25,7 +25,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use quinn::udp::{RecvMeta, Transmit};
+use quinn::udp::{EcnCodepoint, RecvMeta, Transmit};
 
 use super::h3_frames::read_varint;
 use quinn::{AsyncUdpSocket, UdpSender};
@@ -38,6 +38,8 @@ pub struct Counters {
     pub datagrams_in: AtomicU64,
     /// Datagrams the black hole swallowed.
     pub dropped_oversize: AtomicU64,
+    /// Datagrams whose ECT marking was rewritten to CE.
+    pub marked_ce: AtomicU64,
     /// Datagrams held back and released after a later one, for
     /// `q-packet-reordering`.
     ///
@@ -97,6 +99,10 @@ impl Counters {
 
     pub fn reordered(&self) -> u64 {
         self.reordered.load(Ordering::Relaxed)
+    }
+
+    pub fn marked_ce(&self) -> u64 {
+        self.marked_ce.load(Ordering::Relaxed)
     }
 
     pub fn zero_rtt_in(&self) -> u64 {
@@ -190,6 +196,13 @@ pub struct Impairments {
     /// How long each peer's traffic flows cleanly before either impairment
     /// begins. `None` impairs from the first datagram.
     pub opens_after: Option<Duration>,
+    /// Rewrite one ECT marking in every `n` to CE, as a congested router would.
+    ///
+    /// Only an already-ECT-marked datagram is touched. A router does not invent
+    /// ECN capability on a packet that never claimed it, and neither does this:
+    /// marking CE on an unmarked datagram would be a path doing something no
+    /// path does, and the client would be right to ignore it.
+    pub mark_ce_one_in: Option<u64>,
     /// Hold one datagram in every `n` and release it after the next, so it
     /// arrives out of order.
     ///
@@ -240,6 +253,10 @@ pub struct ImpairedSocket {
     loss_one_in: Option<u64>,
     /// A second socket, and how many datagrams to duplicate out of it.
     shadow: Option<Arc<ShadowSocket>>,
+    /// Rewrite one ECT marking in every `n` to CE.
+    mark_ce_one_in: Option<u64>,
+    /// Datagrams offered while CE marking is open.
+    ce_seen: Arc<AtomicU64>,
     /// Hold one datagram in every `n` and send it after the following one.
     reorder_one_in: Option<u64>,
     /// The datagram currently being held back, if any.
@@ -279,6 +296,8 @@ impl ImpairedSocket {
             shadow: impairments
                 .shadow_datagrams
                 .and_then(|budget| ShadowSocket::bind(budget).map(Arc::new)),
+            mark_ce_one_in: impairments.mark_ce_one_in,
+            ce_seen: Arc::new(AtomicU64::new(0)),
             reorder_one_in: impairments.reorder_one_in,
             reorder_held: Arc::new(parking_lot::Mutex::new(None)),
             reorder_seen: Arc::new(AtomicU64::new(0)),
@@ -305,6 +324,8 @@ impl AsyncUdpSocket for ImpairedSocket {
             clock: self.clock.clone(),
             loss_one_in: self.loss_one_in,
             shadow: self.shadow.clone(),
+            mark_ce_one_in: self.mark_ce_one_in,
+            ce_seen: self.ce_seen.clone(),
             reorder_one_in: self.reorder_one_in,
             reorder_held: self.reorder_held.clone(),
             reorder_seen: self.reorder_seen.clone(),
@@ -585,6 +606,8 @@ struct ImpairedSender {
     clock: Option<Arc<PeerClock>>,
     loss_one_in: Option<u64>,
     shadow: Option<Arc<ShadowSocket>>,
+    mark_ce_one_in: Option<u64>,
+    ce_seen: Arc<AtomicU64>,
     reorder_one_in: Option<u64>,
     reorder_held: Arc<parking_lot::Mutex<Option<(Vec<u8>, SocketAddr)>>>,
     reorder_seen: Arc<AtomicU64>,
@@ -609,6 +632,15 @@ impl ImpairedSender {
     /// that is not running.
     fn loss_cadence(&self, peer: SocketAddr, now: Instant) -> Option<u64> {
         let one_in = self.loss_one_in.filter(|n| *n > 0)?;
+        match &self.clock {
+            Some(clock) if !clock.is_open(peer, now) => None,
+            _ => Some(one_in),
+        }
+    }
+
+    /// The CE-marking cadence in force for `peer`, or `None` while it is shut.
+    fn ce_cadence(&self, peer: SocketAddr, now: Instant) -> Option<u64> {
+        let one_in = self.mark_ce_one_in.filter(|n| *n > 0)?;
         match &self.clock {
             Some(clock) if !clock.is_open(peer, now) => None,
             _ => Some(one_in),
@@ -654,6 +686,31 @@ impl UdpSender for ImpairedSender {
                 return Poll::Ready(Ok(()));
             }
         }
+
+        // Congestion marking: turn an ECT codepoint into CE.
+        //
+        // What a congested router does, and the only way to ask a client whether
+        // it can see the signal at all. The datagram is otherwise untouched and
+        // still goes out — this rewrites one header field, it does not drop or
+        // delay anything — so it is decided first and the result carried into
+        // whatever follows.
+        let mut marked = None;
+        if let Some(one_in) = self.ce_cadence(transmit.destination, now) {
+            if matches!(transmit.ecn, Some(EcnCodepoint::Ect0 | EcnCodepoint::Ect1)) {
+                let nth = self.ce_seen.fetch_add(1, Ordering::Relaxed) + 1;
+                if is_multiple_of(nth, one_in) {
+                    self.counters.marked_ce.fetch_add(1, Ordering::Relaxed);
+                    marked = Some(Transmit {
+                        destination: transmit.destination,
+                        ecn: Some(EcnCodepoint::Ce),
+                        contents: transmit.contents,
+                        segment_size: transmit.segment_size,
+                        src_ip: transmit.src_ip,
+                    });
+                }
+            }
+        }
+        let transmit = marked.as_ref().unwrap_or(transmit);
 
         // Reordering: hold one datagram back, then send it after the next.
         //

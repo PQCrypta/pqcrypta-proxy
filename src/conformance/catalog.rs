@@ -274,6 +274,9 @@ pub struct Test {
 /// | `h-qpack-static-index-invalid` | RFC 9204 §3.1 | RFC text |
 /// | `q-packet-reordering` | RFC 9000 §2.2 | RFC text |
 /// | `h-qpack-encoder-bad-name-index` | RFC 9204 §3.1 | RFC text |
+/// | `q-ecn-congestion` | RFC 9000 §13.4.1 | RFC text |
+/// | `q-key-update-repeated` | RFC 9001 §6.1 | RFC text |
+/// | `q-max-streams-credit` | RFC 9000 §4.6 | RFC text |
 ///
 /// The five entries added on 2026-09-01 close the areas the site had been listing
 /// as untouched, and three of them changed shape while being read.
@@ -583,6 +586,65 @@ pub const CATALOG: &[Test] = &[
                       connects once has none.",
         implemented: true,
         port_offset: Some(37),
+    },
+    Test {
+        id: "q-ecn-congestion",
+        title: "Path marking packets CE, not just ECT(0)",
+        spec: "RFC 9000 §13.4",
+        class: Class::Correctness,
+        requirement: Requirement::Must,
+        tier: Tier::Quic,
+        expectation: "Report the CE count back in the ECN section of an ACK. §13.4.1 makes \
+                      this the same conditional requirement as reporting ECT(0) — an \
+                      endpoint MUST provide feedback about the markings it receives \"if \
+                      these are accessible\" — and CE is the marking that matters, since \
+                      it is how a path says it is congested.\n\nDistinct from the ECT(0) \
+                      test on the neighbouring port: that one asks whether a client reports \
+                      markings at all, and this asks whether it distinguishes the one that \
+                      means something. A client that echoes ECT(0) counts faithfully and \
+                      never reports a CE has a congestion signal it cannot see.\n\n\
+                      Silence is inconclusive, not a failure, for the same reason: the ECN \
+                      field may be inaccessible to the peer, and a path that rewrites the \
+                      codepoint in transit is indistinguishable from here.",
+        implemented: true,
+        port_offset: Some(48),
+    },
+    Test {
+        id: "q-key-update-repeated",
+        title: "A second key update after the first is acknowledged",
+        spec: "RFC 9001 §6.1, §6.5",
+        class: Class::Interoperability,
+        requirement: Requirement::Must,
+        tier: Tier::Quic,
+        expectation: "Follow both updates and carry on. §6.1 lets an endpoint update again \
+                      once the previous phase has been acknowledged, so a long-lived \
+                      connection changes keys repeatedly and a client has to track the \
+                      phase rather than assume one change.\n\nDistinct from the single \
+                      update on the neighbouring port. An implementation that hardcodes the \
+                      first transition — treating key phase as a one-way flag rather than a \
+                      bit that alternates — passes that test and fails here, which is \
+                      precisely the bug worth finding.",
+        implemented: true,
+        port_offset: Some(49),
+    },
+    Test {
+        id: "q-max-streams-credit",
+        title: "No stream credit at first, then MAX_STREAMS mid-connection",
+        spec: "RFC 9000 §4.6",
+        class: Class::Discretionary,
+        requirement: Requirement::MustNot,
+        tier: Tier::Quic,
+        expectation: "Wait for the credit, then open the request. This port grants no \
+                      bidirectional streams in its transport parameters and issues \
+                      MAX_STREAMS a moment later. §4.6 is unambiguous that a client may not \
+                      jump the gun — \"Endpoints MUST NOT exceed the limit set by their \
+                      peer\" — and announcing the wait with STREAMS_BLOCKED is a SHOULD, so \
+                      a client that waits quietly is equally conformant.\n\nGiving up \
+                      rather than waiting is not scored as a failure: nothing obliges a \
+                      one-shot client to sit on a connection it cannot use yet, and the \
+                      report says which it did.",
+        implemented: true,
+        port_offset: Some(50),
     },
     // ── Tier A: HTTP/3 layer ──────────────────────────────────────────────
     Test {
@@ -1177,6 +1239,9 @@ mod tests {
             ("h-qpack-static-index-invalid", 45),
             ("q-packet-reordering", 46),
             ("h-qpack-encoder-bad-name-index", 47),
+            ("q-ecn-congestion", 48),
+            ("q-key-update-repeated", 49),
+            ("q-max-streams-credit", 50),
         ];
 
         for (id, offset) in pinned {
