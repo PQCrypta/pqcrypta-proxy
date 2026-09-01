@@ -1222,6 +1222,7 @@ async fn run() -> anyhow::Result<()> {
     {
         let wt_config = config.clone();
         let wt_backend_pool = Arc::new(BackendPool::new(config.clone()));
+        let wt_security = security_state.clone();
         // The WebTransport server uses a single cert (no SNI).  Resolution order:
         //   1. Explicit webtransport_cert_path / webtransport_key_path from config.
         //   2. Auto-detect: look for api.<primary-domain>.crt in the certs directory.
@@ -1279,7 +1280,7 @@ async fn run() -> anyhow::Result<()> {
                 .await
             {
                 Ok(server) => {
-                    let server = server.with_metrics(wt_metrics);
+                    let server = server.with_metrics(wt_metrics).with_security(wt_security);
                     info!("✅ WebTransport server ready on {}", server.local_addr());
                     if let Err(e) = server.run().await {
                         error!("WebTransport server error: {}", e);

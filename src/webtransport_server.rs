@@ -32,6 +32,15 @@ pub struct WebTransportServer {
     metrics: Option<Arc<MetricsRegistry>>,
     /// Per-origin active session counter (origin string → count)
     origin_session_counts: Arc<DashMap<String, Arc<AtomicU32>>>,
+    /// Shared security state for WAF inspection of proxied payloads.
+    ///
+    /// WebTransport stream and datagram payloads are forwarded to the same
+    /// backends (/encrypt, /decrypt, …) as HTTP requests, so without this they
+    /// are an uninspected path to those backends — the exact transport
+    /// divergence the shared security layer exists to prevent, just one
+    /// transport further out than HTTP/3. `None` leaves inspection off (the WAF
+    /// is opt-in), matching the HTTP paths.
+    security: Option<crate::security::SecurityState>,
 }
 
 impl WebTransportServer {
@@ -195,6 +204,7 @@ impl WebTransportServer {
             backend_pool,
             metrics: None,
             origin_session_counts: Arc::new(DashMap::new()),
+            security: None,
         })
     }
 
@@ -202,6 +212,14 @@ impl WebTransportServer {
     #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<MetricsRegistry>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Attach shared security state so proxied WebTransport payloads are
+    /// WAF-inspected before reaching a backend.
+    #[must_use]
+    pub fn with_security(mut self, security: crate::security::SecurityState) -> Self {
+        self.security = Some(security);
         self
     }
 
@@ -216,6 +234,7 @@ impl WebTransportServer {
         let backend_pool = self.backend_pool.clone();
         let metrics = self.metrics.clone();
         let origin_counts = Arc::clone(&self.origin_session_counts);
+        let security = self.security.clone();
 
         info!("🌐 WebTransport server listening on {}", self.addr);
         info!("🔗 Ready to accept WebTransport connections");
@@ -232,6 +251,7 @@ impl WebTransportServer {
             let backend_clone = backend_pool.clone();
             let session_metrics = metrics.clone();
             let counts_clone = Arc::clone(&origin_counts);
+            let security_clone = security.clone();
             tokio::spawn(async move {
                 if let Some(ref m) = session_metrics {
                     m.connections
@@ -242,6 +262,7 @@ impl WebTransportServer {
                     config_clone,
                     backend_clone,
                     counts_clone,
+                    security_clone,
                 )
                 .await
                 {
@@ -261,6 +282,7 @@ async fn handle_incoming_session(
     config: Arc<ProxyConfig>,
     backend_pool: Arc<BackendPool>,
     origin_session_counts: Arc<DashMap<String, Arc<AtomicU32>>>,
+    security: Option<crate::security::SecurityState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("📨 Processing incoming WebTransport session...");
     info!("📍 Remote address: {}", incoming_session.remote_address());
@@ -347,7 +369,15 @@ async fn handle_incoming_session(
     info!("✅ WebTransport connection established: {}", remote_addr);
 
     // Handle the connection; decrement counter when it closes
-    let result = handle_connection(connection, remote_addr, path, config, backend_pool).await;
+    let result = handle_connection(
+        connection,
+        remote_addr,
+        path,
+        config,
+        backend_pool,
+        security,
+    )
+    .await;
     counter.fetch_sub(1, Ordering::Relaxed);
     result
 }
@@ -359,6 +389,7 @@ async fn handle_connection(
     path: String,
     config: Arc<ProxyConfig>,
     backend_pool: Arc<BackendPool>,
+    security: Option<crate::security::SecurityState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!(
         "🔄 Handling WebTransport connection from {} (path: {})",
@@ -391,9 +422,11 @@ async fn handle_connection(
                         let conn = Arc::clone(&connection);
                         let config_clone = config.clone();
                         let backend_clone = backend_pool.clone();
+                        let security_clone = security.clone();
                         let path_clone = path.clone();
                         tokio::spawn(handle_uni_stream(
-                            recv_stream, remote_addr, conn, path_clone, config_clone, backend_clone
+                            recv_stream, remote_addr, conn, path_clone, config_clone, backend_clone,
+                            security_clone,
                         ));
                     }
                     Err(e) => {
@@ -411,9 +444,11 @@ async fn handle_connection(
                         let conn = Arc::clone(&connection);
                         let config_clone = config.clone();
                         let backend_clone = backend_pool.clone();
+                        let security_clone = security.clone();
                         let path_clone = path.clone();
                         tokio::spawn(handle_bi_stream(
-                            send_stream, recv_stream, remote_addr, conn, path_clone, config_clone, backend_clone
+                            send_stream, recv_stream, remote_addr, conn, path_clone, config_clone,
+                            backend_clone, security_clone,
                         ));
                     }
                     Err(e) => {
@@ -449,9 +484,11 @@ async fn handle_connection(
                         let conn = Arc::clone(&connection);
                         let config_clone = config.clone();
                         let backend_clone = backend_pool.clone();
+                        let security_clone = security.clone();
                         let path_clone = path.clone();
                         tokio::spawn(handle_datagram(
-                            datagram.to_vec(), remote_addr, conn, path_clone, config_clone, backend_clone
+                            datagram.to_vec(), remote_addr, conn, path_clone, config_clone,
+                            backend_clone, security_clone,
                         ));
                     }
                     Err(e) => {
@@ -475,6 +512,7 @@ async fn handle_uni_stream(
     path: String,
     config: Arc<ProxyConfig>,
     backend_pool: Arc<BackendPool>,
+    security: Option<crate::security::SecurityState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Apply timeout for request reading
     let timeout_duration = Duration::from_secs(30);
@@ -513,7 +551,16 @@ async fn handle_uni_stream(
     );
 
     // Process and proxy the request
-    match proxy_request(&buffer, &path, remote_addr, &config, &backend_pool).await {
+    match proxy_request(
+        &buffer,
+        &path,
+        remote_addr,
+        &config,
+        &backend_pool,
+        &security,
+    )
+    .await
+    {
         Ok(response) => {
             debug!("✅ Processed unidirectional request from {}", remote_addr);
             debug!("   Response: {} bytes", response.len());
@@ -527,6 +574,7 @@ async fn handle_uni_stream(
 }
 
 /// Handle bidirectional stream
+#[allow(clippy::too_many_arguments)] // WT handler: transport + routing + security
 async fn handle_bi_stream(
     mut send_stream: wtransport::stream::SendStream,
     mut recv_stream: wtransport::stream::RecvStream,
@@ -535,6 +583,7 @@ async fn handle_bi_stream(
     path: String,
     config: Arc<ProxyConfig>,
     backend_pool: Arc<BackendPool>,
+    security: Option<crate::security::SecurityState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Apply timeout for request reading
     let timeout_duration = Duration::from_secs(30);
@@ -592,7 +641,16 @@ async fn handle_bi_stream(
     );
 
     // Process and proxy the request
-    match proxy_request(&buffer, &path, remote_addr, &config, &backend_pool).await {
+    match proxy_request(
+        &buffer,
+        &path,
+        remote_addr,
+        &config,
+        &backend_pool,
+        &security,
+    )
+    .await
+    {
         Ok(response) => {
             debug!(
                 "📤 Sending response to {} ({} bytes)",
@@ -624,6 +682,7 @@ async fn handle_bi_stream(
 }
 
 /// Handle datagram
+#[allow(clippy::too_many_arguments)] // WT handler: transport + routing + security
 async fn handle_datagram(
     datagram: Vec<u8>,
     remote_addr: SocketAddr,
@@ -631,6 +690,7 @@ async fn handle_datagram(
     path: String,
     config: Arc<ProxyConfig>,
     backend_pool: Arc<BackendPool>,
+    security: Option<crate::security::SecurityState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Check datagram size limit (datagrams should be small, typically < 64KB)
     let max_datagram_size = 65535; // Max UDP datagram size
@@ -661,7 +721,14 @@ async fn handle_datagram(
     let timeout_duration = Duration::from_secs(30);
     let proxy_result = tokio::time::timeout(
         timeout_duration,
-        proxy_request(&datagram, &path, remote_addr, &config, &backend_pool),
+        proxy_request(
+            &datagram,
+            &path,
+            remote_addr,
+            &config,
+            &backend_pool,
+            &security,
+        ),
     )
     .await;
 
@@ -708,7 +775,52 @@ async fn proxy_request(
     remote_addr: SocketAddr,
     config: &Arc<ProxyConfig>,
     backend_pool: &Arc<BackendPool>,
+    security: &Option<crate::security::SecurityState>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    // WAF inspection. A WebTransport stream/datagram payload is proxied to the
+    // same backends (/encrypt, /decrypt, …) as an HTTP request, so it is an
+    // attack surface on those backends and must clear the same WAF the HTTP and
+    // HTTP/3 paths run. The payload is treated as the request body; there are no
+    // HTTP headers on a WT frame, so a minimal header map is synthesised. When
+    // no security state is attached (WAF disabled) this is a no-op.
+    if let Some(sec) = security {
+        if sec.waf_engine.is_some() {
+            let ip = crate::security::canonical_addr(remote_addr).ip();
+            let is_pentest = {
+                let ip_str = ip.to_string();
+                sec.config
+                    .read()
+                    .pentest_bypass_ips
+                    .iter()
+                    .any(|p| p == &ip_str)
+            };
+            let headers = axum::http::HeaderMap::new();
+            let view = crate::security::SecurityRequestView {
+                ip,
+                method: "POST",
+                path,
+                query: "",
+                headers: &headers,
+                body: Some(data),
+            };
+            let policy = crate::security::RequestPolicy::default();
+            if let crate::security::SecurityDecision::WafBlock { rule } =
+                sec.inspect_body(&view, &policy, is_pentest)
+            {
+                warn!(
+                    "[WebTransport] WAF block: rule={} ip={} path={}",
+                    rule, ip, path
+                );
+                let body = json!({
+                    "success": false,
+                    "error": "Request blocked by security policy",
+                    "webtransport": true,
+                });
+                return Ok(serde_json::to_vec(&body)?);
+            }
+        }
+    }
+
     // Try to parse as JSON
     if let Ok(request_str) = std::str::from_utf8(data) {
         if let Ok(request) = serde_json::from_str::<serde_json::Value>(request_str) {
