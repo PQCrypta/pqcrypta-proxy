@@ -2332,6 +2332,7 @@ pub struct CorsConfig {
 
 impl ConfigManager {
     /// Create a new configuration manager and load initial config
+    #[allow(clippy::unused_async_trait_impl)] // public async API; callers .await it
     pub async fn new(
         config_path: impl AsRef<Path>,
     ) -> anyhow::Result<(Self, mpsc::Receiver<ConfigReloadEvent>)> {

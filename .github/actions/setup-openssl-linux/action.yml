@@ -1,0 +1,48 @@
+name: Setup OpenSSL 3.5 (Linux)
+description: >
+  Build and cache OpenSSL 3.5.x on a Linux runner and export the env the openssl
+  crate reads. ubuntu-latest ships OpenSSL 3.0, but the `pqc` feature links
+  symbols added in 3.2+ (e.g. SSL_get0_group_name) and needs 3.5 for native
+  ML-KEM — the same OpenSSL production runs. macOS/Windows CI already install a
+  recent OpenSSL via brew/vcpkg; this is the Linux equivalent.
+
+inputs:
+  version:
+    description: OpenSSL version to build
+    default: "3.5.5"
+
+runs:
+  using: composite
+  steps:
+    - name: Cache OpenSSL ${{ inputs.version }}
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ~/openssl-${{ inputs.version }}
+        key: openssl-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}-v1
+
+    - name: Build OpenSSL ${{ inputs.version }} (cache miss)
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euxo pipefail
+        V="${{ inputs.version }}"
+        cd "$(mktemp -d)"
+        curl -fsSL "https://github.com/openssl/openssl/releases/download/openssl-${V}/openssl-${V}.tar.gz" -o openssl.tar.gz
+        tar xf openssl.tar.gz
+        cd "openssl-${V}"
+        ./Configure --prefix="$HOME/openssl-${V}" --libdir=lib linux-x86_64 no-docs shared
+        make -j"$(nproc)"
+        make install_sw
+
+    - name: Export OpenSSL environment
+      shell: bash
+      run: |
+        P="$HOME/openssl-${{ inputs.version }}"
+        {
+          echo "OPENSSL_DIR=$P"
+          echo "OPENSSL_LIB_DIR=$P/lib"
+          echo "OPENSSL_INCLUDE_DIR=$P/include"
+          echo "PKG_CONFIG_PATH=$P/lib/pkgconfig"
+          echo "LD_LIBRARY_PATH=$P/lib:${LD_LIBRARY_PATH:-}"
+        } >> "$GITHUB_ENV"

@@ -1426,7 +1426,9 @@ fn parse_signature_algorithms(data: &[u8]) -> Vec<u16> {
 fn parse_supported_versions(data: &[u8]) -> Option<u16> {
     let list_len = *data.first()? as usize;
     let list = data.get(1..1 + list_len)?;
-    list.chunks_exact(2)
+    list.as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_be_bytes([c[0], c[1]]))
         .filter(|v| !is_grease(*v))
         .max()

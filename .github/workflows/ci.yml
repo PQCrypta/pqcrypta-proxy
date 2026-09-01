@@ -72,6 +72,10 @@ jobs:
         with:
           key: ${{ matrix.os }}
 
+      - name: Setup OpenSSL 3.5 (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        uses: ./.github/actions/setup-openssl-linux
+
       # Install OpenSSL on Windows using vcpkg for reliable paths
       - name: Install OpenSSL (Windows)
         if: matrix.os == 'windows-latest'
@@ -129,6 +133,10 @@ jobs:
           echo "OPENSSL_LIB_DIR=$OPENSSL_PREFIX/lib" >> $GITHUB_ENV
           echo "OPENSSL_INCLUDE_DIR=$OPENSSL_PREFIX/include" >> $GITHUB_ENV
 
+      - name: Setup OpenSSL 3.5 (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        uses: ./.github/actions/setup-openssl-linux
+
       # Run tests - use default features on macOS (pqc-signatures requires Go for FIPS)
       - name: Run unit tests (Linux)
         if: matrix.os == 'ubuntu-latest'
@@ -152,6 +160,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Setup OpenSSL 3.5 (Linux)
+        uses: ./.github/actions/setup-openssl-linux
 
       # Generate self-signed certificates for testing
       - name: Generate test certificates

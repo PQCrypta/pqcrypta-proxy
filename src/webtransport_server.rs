@@ -39,6 +39,7 @@ impl WebTransportServer {
     ///
     /// ALPN Protocol: "h3" (HTTP/3) is automatically configured by wtransport crate
     /// The crate handles SETTINGS_ENABLE_WEBTRANSPORT frame automatically
+    #[allow(clippy::unused_async_trait_impl)] // public async API; callers .await it
     pub async fn new(
         addr: SocketAddr,
         cert_path: &str,

@@ -47,6 +47,7 @@ impl WebTransportHandler {
     /// Note: The actual WebTransport stream handling is done by the dedicated
     /// WebTransportServer (webtransport_server.rs) which uses the wtransport crate.
     /// This method is for HTTP/3 layer WebTransport handling via h3/quinn.
+    #[allow(clippy::unused_async_trait_impl)] // public async API; callers .await it
     pub async fn handle_session(&self) -> anyhow::Result<()> {
         info!(
             "WebTransport session handler started for client {}",

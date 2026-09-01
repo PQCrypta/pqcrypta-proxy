@@ -143,6 +143,7 @@ pub struct QuicListener {
 impl QuicListener {
     /// Create a new QUIC listener
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::unused_async_trait_impl)] // public async API; callers .await it
     pub async fn new(
         config: Arc<ProxyConfig>,
         tls_provider: Arc<TlsProvider>,
