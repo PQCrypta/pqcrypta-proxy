@@ -58,6 +58,10 @@ const ACK_DELAY_EXPONENT_ID: u64 = 0x0a;
 /// about anything this endpoint negotiated.
 const INVALID_ACK_DELAY_EXPONENT: u64 = 21;
 
+/// One datagram in this many is held back and released late on
+/// `q-packet-reordering`'s port.
+const REORDER_CADENCE: u64 = 6;
+
 /// How many datagrams `q-connection-migration` copies out of a second socket.
 const SHADOW_DATAGRAMS: u64 = 6;
 
@@ -238,6 +242,15 @@ impl TestListener {
             "q-reserved-frame" => {
                 transport.send_unknown_frame_type(Some(RESERVED_FRAME_TYPE));
             }
+            // Ask the path-validation question rather than waiting for it.
+            //
+            // A PATH_CHALLENGE is otherwise sent only while validating a path,
+            // and a connection that never moves never validates one — so this
+            // test spent its whole life reporting that no path validation had
+            // been triggered.
+            "q-path-challenge" => {
+                transport.send_path_challenge(true);
+            }
             // A parameter whose own definition rules its value out.
             //
             // §18.2 puts ack_delay_exponent's ceiling at 20, so 21 is invalid by
@@ -324,16 +337,29 @@ impl TestListener {
         // is not made to work for it.
         let shadow_datagrams = (test.id == "q-connection-migration").then_some(SHADOW_DATAGRAMS);
 
+        // One datagram in six arrives behind the one that followed it. Frequent
+        // enough that any response of a few packets meets several, and never so
+        // frequent that the stream is more out of order than in.
+        let reorder_one_in = (test.id == "q-packet-reordering").then_some(REORDER_CADENCE);
+
         // Open for the first four seconds, so discovery can raise the MTU to
         // 1452 on a path that genuinely carries it. Then the hole opens and
         // packets at that established size start disappearing — which is what a
         // black hole is, and what the detector looks for. The loss impairment
         // needs far less: one second is past the handshake on any path this
         // service can be reached over.
-        let opens_after = match (blackhole_above, loss_one_in, shadow_datagrams) {
-            (Some(_), _, _) => Some(Duration::from_secs(4)),
-            (_, Some(_), _) => Some(Duration::from_millis(500)),
-            (_, _, Some(_)) => Some(SHADOW_OPENS_AFTER),
+        let opens_after = match (
+            blackhole_above,
+            loss_one_in,
+            shadow_datagrams,
+            reorder_one_in,
+        ) {
+            (Some(_), _, _, _) => Some(Duration::from_secs(4)),
+            (_, Some(_), _, _) => Some(Duration::from_millis(500)),
+            (_, _, Some(_), _) => Some(SHADOW_OPENS_AFTER),
+            // Past the handshake, which has its own ordering requirements and is
+            // not what §2.2 is about.
+            (_, _, _, Some(_)) => Some(Duration::from_millis(200)),
             _ => None,
         };
         let impaired = Box::new(ImpairedSocket::new(
@@ -342,6 +368,7 @@ impl TestListener {
                 blackhole_above,
                 loss_one_in,
                 opens_after,
+                reorder_one_in,
                 shadow_datagrams,
             },
             counters.clone(),
@@ -995,6 +1022,8 @@ fn expected_code(test: &Test) -> Option<u64> {
         "h-goaway-increasing" => Some(e::H3_ID_ERROR),
         "h-datagram-setting-invalid" => Some(e::H3_SETTINGS_ERROR),
         "h-qpack-encoder-overflow" => Some(e::QPACK_ENCODER_STREAM_ERROR),
+        "h-push-stream-unpromised" => Some(e::H3_ID_ERROR),
+        "h-qpack-static-index-invalid" => Some(e::QPACK_DECOMPRESSION_FAILED),
         _ => None,
     }
 }
@@ -1105,6 +1134,27 @@ pub(super) async fn emit(
         "h-max-push-id" => {
             control.write_all(&f::settings_with_grease()).await?;
             control.write_all(&f::max_push_id(0)).await?;
+        }
+
+        // A push stream for a push nobody allowed.
+        //
+        // §6.2.2 does not require the push to have been promised: the stream on
+        // its own is the violation when no MAX_PUSH_ID has been sent, and none
+        // is. Held open like the other critical streams — the objection under
+        // test is that the stream exists, not that it was closed.
+        "h-push-stream-unpromised" => {
+            control.write_all(&f::settings_with_grease()).await?;
+            let mut push = connection.open_uni().await?;
+            push.write_all(&f::push_stream_header(UNPROMISED_PUSH_ID_ZERO))
+                .await?;
+            push.write_all(&f::headers(&[
+                (":status", "200"),
+                ("content-type", "text/plain"),
+            ]))
+            .await?;
+            push.write_all(&f::data(b"a push nobody asked for\n"))
+                .await?;
+            keep_open.push(push);
         }
 
         // A push nobody permitted.
@@ -1313,6 +1363,12 @@ const UNPROMISED_PUSH_ID_ZERO: u64 = 0;
 
 /// The identifier `h-goaway-increasing` raises its second GOAWAY to.
 const GOAWAY_INCREASED_TO: u64 = 16;
+
+/// The static table index `h-qpack-static-index-invalid` references.
+///
+/// The table has 99 entries, so anything from 99 up is invalid; 200 is well
+/// clear of the boundary and cannot be mistaken for an off-by-one.
+const INVALID_STATIC_INDEX: u64 = 200;
 
 /// The dynamic table capacity `h-qpack-encoder-overflow` asks for.
 ///
@@ -1763,6 +1819,20 @@ fn quic_observation(
             )))
         }
 
+        // Whether anything actually arrived out of order decides only whether
+        // this ran; putting the stream back together is the liveness result.
+        "q-packet-reordering" => {
+            if counters.reordered() > 0 {
+                return None;
+            }
+            Some(Observation::NotExercised(
+                "no datagram was delivered out of order, so the client's reassembly was \
+                 never called on. The impairment begins shortly after a peer's first \
+                 datagram and holds one in six after that"
+                    .to_string(),
+            ))
+        }
+
         // Whether the client was actually shown a second address decides only
         // whether this ran; how it reacted is the liveness result.
         //
@@ -1986,6 +2056,21 @@ pub(super) async fn answer_probe(
             send.write_all(&f::data(BODY)).await?;
         }
 
+        // A field line pointing at a static entry that does not exist.
+        //
+        // The static table has 99 entries and this asks for 200, which §3.1
+        // makes a decoding failure rather than an unknown-but-ignorable value.
+        // No SETTINGS grant it — the static table is always there and always the
+        // same size — so unlike the dynamic-table tests this reaches every
+        // client.
+        "h-qpack-static-index-invalid" => {
+            send.write_all(&f::headers_raw(&f::qpack_invalid_static_index(
+                INVALID_STATIC_INDEX,
+            )))
+            .await?;
+            send.write_all(&f::data(BODY)).await?;
+        }
+
         // A field section past any sane SETTINGS_MAX_FIELD_SECTION_SIZE. The
         // client should fail this one request, not the whole connection.
         "h-oversized-field-section" => {
@@ -2078,6 +2163,27 @@ pub(super) async fn answer_probe(
             .await?;
             send.write_all(&f::data(b"the rest of this body will never arrive\n"))
                 .await?;
+        }
+
+        // Enough datagrams for the reordering to bite, sent briskly.
+        //
+        // Reassembly is about a stream that arrives in the wrong order, so what
+        // matters is that the body spans many packets — not that it takes a long
+        // time. A short pause every few chunks keeps the impairment's window
+        // open across the whole transfer without dragging the run out.
+        "q-packet-reordering" => {
+            send.write_all(&f::headers(&[
+                (":status", "200"),
+                ("content-type", "text/plain"),
+                ("x-conformance", "reordered"),
+            ]))
+            .await?;
+            let chunk = vec![b'#'; 8192];
+            for _ in 0..48 {
+                send.write_all(&f::data(&chunk)).await?;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            send.write_all(&f::data(BODY)).await?;
         }
 
         // A body paced so that it is still arriving when the loss begins.
@@ -2558,6 +2664,18 @@ mod tests {
                 "RFC 9204 §4.3.1, §6",
                 "The decoder MUST treat a new dynamic table capacity value that exceeds                  this limit as a connection error of type QPACK_ENCODER_STREAM_ERROR.",
             ),
+            (
+                "h-push-stream-unpromised",
+                e::H3_ID_ERROR,
+                "RFC 9114 §6.2.2",
+                "A client MUST treat receipt of a push stream as a connection error of                  type H3_ID_ERROR when no MAX_PUSH_ID frame has been sent or when the                  stream references a push ID that is greater than the maximum push ID.",
+            ),
+            (
+                "h-qpack-static-index-invalid",
+                e::QPACK_DECOMPRESSION_FAILED,
+                "RFC 9204 §3.1, §4.5.2",
+                "When the decoder encounters an invalid static table index in a field                  line representation, it MUST treat this as a connection error of type                  QPACK_DECOMPRESSION_FAILED.",
+            ),
         ];
 
         for (id, code, clause, sentence) in verified {
@@ -2669,6 +2787,8 @@ mod tests {
                     | "h-goaway-increasing"
                     | "h-datagram-setting-invalid"
                     | "h-qpack-encoder-overflow"
+                    | "h-push-stream-unpromised"
+                    | "h-qpack-static-index-invalid"
             ) {
                 assert!(code.is_some(), "{} must name an expected code", t.id);
             }

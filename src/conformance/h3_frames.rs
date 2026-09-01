@@ -220,6 +220,35 @@ pub fn cancel_push(push_id: u64) -> BytesMut {
     frame(frame_type::CANCEL_PUSH, &varint(push_id))
 }
 
+/// The header of a server push stream (RFC 9114 §6.2.2): stream type then push ID.
+///
+/// §6.2.2 requires a client to treat a push stream as H3_ID_ERROR "when no
+/// MAX_PUSH_ID frame has been sent", which is every client here — so the push ID
+/// itself needs to be nothing more exotic than zero.
+pub fn push_stream_header(push_id: u64) -> BytesMut {
+    let mut buf = uni_stream_header(stream_type::PUSH);
+    buf.extend_from_slice(&varint(push_id));
+    buf
+}
+
+/// A field section whose single field line indexes a static entry that does not
+/// exist (RFC 9204 §4.5.2).
+///
+/// Layout `1T` then a 6-bit prefixed index, with T=1 selecting the static table.
+/// The static table has 99 entries, so anything from 99 up is invalid and §3.1
+/// requires the decoder to treat it as QPACK_DECOMPRESSION_FAILED.
+///
+/// Needs no permission from the client, unlike the dynamic-table tests: the
+/// static table is always present and always the same size.
+pub fn qpack_invalid_static_index(index: u64) -> BytesMut {
+    let mut buf = BytesMut::new();
+    // Required Insert Count 0, Delta Base 0 — nothing dynamic is referenced.
+    buf.put_u8(0);
+    buf.put_u8(0);
+    put_prefixed_int(&mut buf, index, 6, 0b1100_0000);
+    buf
+}
+
 /// A PUSH_PROMISE frame (RFC 9114 §7.2.5).
 ///
 /// Push ID as a varint, then an encoded field section describing the request

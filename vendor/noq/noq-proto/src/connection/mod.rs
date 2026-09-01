@@ -166,6 +166,8 @@ pub struct Connection {
     /// One per connection: the peer is required to close on the first one it
     /// sees, so a second would have nowhere to arrive.
     sent_unknown_frame: bool,
+    /// Whether [`TransportConfig::send_path_challenge`]'s frame has gone out.
+    sent_path_challenge: bool,
     /// Consolidated cryptographic state
     crypto_state: CryptoState,
     /// The CID we initially chose, for use during the handshake
@@ -429,6 +431,7 @@ impl Connection {
             remote_cids: FxHashMap::from_iter([(PathId::ZERO, CidQueue::new(remote_cid))]),
             rng,
             sent_unknown_frame: false,
+            sent_path_challenge: false,
             path_stats: Default::default(),
             partial_stats: ConnectionStats::default(),
             version,
@@ -6554,6 +6557,34 @@ impl Connection {
         {
             self.streams
                 .write_stream_frames(builder, self.config.send_fairness, stats);
+        }
+
+        // A PATH_CHALLENGE on demand, when one has been configured.
+        //
+        // Written for the conformance suite, which otherwise has no way to ask
+        // the question: this stack sends PATH_CHALLENGE only while validating a
+        // path, and a connection that never moves never validates one. A test
+        // that waited for that to happen naturally reported, correctly and
+        // forever, that no path validation had been triggered — it looked like a
+        // test of §8.2 and measured nothing at all.
+        //
+        // Established-only, for the same reason as the unknown frame below: the
+        // reply has to arrive at a connection that exists. The payload is random
+        // so the echo cannot be anything but an echo, and it is sent once,
+        // untracked for loss — if that packet goes missing the run reports the
+        // test as unexercised rather than blaming the peer for a reply it was
+        // never asked for.
+        if self.config.send_path_challenge
+            && !self.sent_path_challenge
+            && self.state.is_established()
+            && space_id == SpaceId::Data
+            && !is_0rtt
+            && !scheduling_info.is_abandoned
+            && builder.frame_space_remaining() >= frame::PathChallenge::SIZE_BOUND
+        {
+            self.sent_path_challenge = true;
+            let token = self.rng.random();
+            builder.write_frame(frame::PathChallenge(token), stats);
         }
 
         // A frame of unknown type, when one has been configured.

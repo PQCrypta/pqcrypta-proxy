@@ -126,6 +126,9 @@ pub fn anomaly_stream(test: &Test) -> Anomaly {
         // The QPACK encoder stream is unidirectional too, and nothing obliges a
         // client to read it on any schedule either.
         | "h-qpack-encoder-overflow"
+        // A push stream is a server-opened unidirectional stream like any other:
+        // nothing obliges a client to read it before its own request completes.
+        | "h-push-stream-unpromised"
         | "h-goaway"
         | "h-grease-settings"
         | "h-duplicate-setting"
@@ -141,7 +144,8 @@ pub fn anomaly_stream(test: &Test) -> Anomaly {
         | "h-trailers"
         | "h-early-hints"
         | "h-response-stream-reset"
-        | "q-zero-rtt-replay" => Anomaly::ResponseStream,
+        | "q-zero-rtt-replay"
+        | "h-qpack-static-index-invalid" => Anomaly::ResponseStream,
 
         _ => Anomaly::Transport,
     }
@@ -216,6 +220,9 @@ pub struct Test {
 /// | `h-datagram-setting-invalid` | RFC 9297 §2.1.1 | RFC text |
 /// | `h-qpack-encoder-overflow` | RFC 9204 §4.3.1, §6 | RFC text |
 /// | `h-goaway-increasing` | RFC 9114 §5.2 | RFC text |
+/// | `h-push-stream-unpromised` | RFC 9114 §6.2.2 | RFC text |
+/// | `h-qpack-static-index-invalid` | RFC 9204 §3.1 | RFC text |
+/// | `q-packet-reordering` | RFC 9000 §2.2 | RFC text |
 ///
 /// The five entries added on 2026-09-01 close the areas the site had been listing
 /// as untouched, and three of them changed shape while being read.
@@ -832,6 +839,57 @@ pub const CATALOG: &[Test] = &[
         implemented: true,
         port_offset: Some(43),
     },
+    Test {
+        id: "h-push-stream-unpromised",
+        title: "Push stream opened for a push nobody allowed",
+        spec: "RFC 9114 §6.2.2",
+        class: Class::Correctness,
+        tier: Tier::Http3,
+        expectation: "Close the connection with H3_ID_ERROR. §6.2.2 does not require the \
+                      push to have been promised first — the stream alone is enough: a \
+                      client \"MUST treat receipt of a push stream as a connection error \
+                      of type H3_ID_ERROR when no MAX_PUSH_ID frame has been sent\", and \
+                      no client under test sends one.\n\nDistinct from the PUSH_PROMISE \
+                      test, which puts the same violation in a frame on the control \
+                      stream. This one opens the push stream itself, which a client has to \
+                      recognise by its stream type before any frame inside it is read.",
+        implemented: true,
+        port_offset: Some(44),
+    },
+    Test {
+        id: "h-qpack-static-index-invalid",
+        title: "Field line indexing a static table entry that does not exist",
+        spec: "RFC 9204 §3.1, §4.5.2",
+        class: Class::Correctness,
+        tier: Tier::Http3,
+        expectation: "Close the connection with QPACK_DECOMPRESSION_FAILED (0x200). The \
+                      static table has 99 entries, so index 200 refers to nothing, and \
+                      §3.1 is explicit: \"When the decoder encounters an invalid static \
+                      table index in a field line representation, it MUST treat this as a \
+                      connection error of type QPACK_DECOMPRESSION_FAILED.\"\n\nThe \
+                      static table needs no permission and never changes size, so unlike \
+                      the dynamic-table tests this one applies to every client.",
+        implemented: true,
+        port_offset: Some(45),
+    },
+    Test {
+        id: "q-packet-reordering",
+        title: "Datagrams delivered out of order",
+        spec: "RFC 9000 §2.2",
+        class: Class::Resilience,
+        tier: Tier::Quic,
+        expectation: "Put the stream back in order and deliver the whole body. §2.2 \
+                      requires an endpoint to be \"able to deliver stream data to an \
+                      application as an ordered byte stream\", and says plainly that doing \
+                      so \"requires that an endpoint buffer any data that is received out \
+                      of order\".\n\nDistinct from the loss test, which needs \
+                      retransmission before the gap can be filled. Nothing is lost here: \
+                      every byte arrives, some of it early, and a client that assumes \
+                      arrival order is delivery order will produce a corrupt body or stall \
+                      waiting for data it already has.",
+        implemented: true,
+        port_offset: Some(46),
+    },
 ];
 
 /// Look a test up by its stable id.
@@ -950,6 +1008,9 @@ mod tests {
             ("h-datagram-setting-invalid", 41),
             ("h-qpack-encoder-overflow", 42),
             ("h-goaway-increasing", 43),
+            ("h-push-stream-unpromised", 44),
+            ("h-qpack-static-index-invalid", 45),
+            ("q-packet-reordering", 46),
         ];
 
         for (id, offset) in pinned {
@@ -967,6 +1028,31 @@ mod tests {
             pinned.len(),
             "a new test must be pinned here once it is published"
         );
+    }
+
+    /// Every HTTP/3 test says which stream its anomaly went to.
+    ///
+    /// The fallback arm is `Transport`, which the verdict model treats as an
+    /// anomaly the client had to process to be served — so a missing entry does
+    /// not fail loudly, it quietly turns "the client stayed silent" into "the
+    /// client accepted a violation". `h-push-stream-unpromised` was added
+    /// without one and was published as a failure against a client that had
+    /// simply not read the stream.
+    #[test]
+    fn every_http3_test_declares_where_its_anomaly_is_written() {
+        for t in CATALOG {
+            if t.tier != Tier::Http3 {
+                continue;
+            }
+            assert_ne!(
+                anomaly_stream(t),
+                Anomaly::Transport,
+                "{} is an HTTP/3 test and must say whether its anomaly is on the control \
+                 stream or the response stream; falling through to Transport makes silence \
+                 look like acceptance",
+                t.id
+            );
+        }
     }
 
     #[test]

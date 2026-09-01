@@ -515,10 +515,10 @@ available as <a href="/catalog.json">JSON</a>.</p>
 
 <h2 id="scope">Scope, and what this is not</h2>
 <p>{total} tests is a beginning, not coverage. QUIC and HTTP/3 together are
-enormous, and whole areas remain untouched &mdash; push streams themselves as
-opposed to the promise, QPACK decoder-stream errors, WebTransport session
-handling beyond the setting that gates it, and packet reordering. The catalogue
-is chosen rather than exhaustive.</p>
+enormous, and areas remain untouched &mdash; WebTransport session handling beyond
+the setting that gates it, QPACK decoder-stream errors, CONNECT tunnelling, and
+version negotiation between two versions both ends support. The catalogue is
+chosen rather than exhaustive.</p>
 <p>Two gaps are permanent. A client's own migration after a NAT rebind cannot be
 provoked from here: only the client, or its network, can change the address it
 sends from. And the amplification limit is a requirement on <em>servers</em>, so

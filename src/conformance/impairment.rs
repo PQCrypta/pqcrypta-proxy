@@ -38,6 +38,13 @@ pub struct Counters {
     pub datagrams_in: AtomicU64,
     /// Datagrams the black hole swallowed.
     pub dropped_oversize: AtomicU64,
+    /// Datagrams held back and released after a later one, for
+    /// `q-packet-reordering`.
+    ///
+    /// Counted because the verdict has to know whether anything was actually
+    /// delivered out of order: a connection that carried on proves nothing if
+    /// its datagrams all arrived in the order they were sent.
+    pub reordered: AtomicU64,
     /// Datagrams copied out of the second socket for `q-connection-migration`.
     ///
     /// The verdict needs to know whether the client was ever actually shown an
@@ -86,6 +93,10 @@ impl Counters {
 
     pub fn shadowed(&self) -> u64 {
         self.shadowed.load(Ordering::Relaxed)
+    }
+
+    pub fn reordered(&self) -> u64 {
+        self.reordered.load(Ordering::Relaxed)
     }
 
     pub fn zero_rtt_in(&self) -> u64 {
@@ -179,6 +190,14 @@ pub struct Impairments {
     /// How long each peer's traffic flows cleanly before either impairment
     /// begins. `None` impairs from the first datagram.
     pub opens_after: Option<Duration>,
+    /// Hold one datagram in every `n` and release it after the next, so it
+    /// arrives out of order.
+    ///
+    /// Nothing is lost: every byte is delivered, some of it late. That is the
+    /// distinction from the loss impairment, and it is the point — reassembly
+    /// and retransmission are different requirements, and a client can satisfy
+    /// one without the other.
+    pub reorder_one_in: Option<u64>,
     /// Copy this many datagrams out of a *second* socket, so they reach the
     /// client from a server address it never sent to.
     ///
@@ -221,6 +240,15 @@ pub struct ImpairedSocket {
     loss_one_in: Option<u64>,
     /// A second socket, and how many datagrams to duplicate out of it.
     shadow: Option<Arc<ShadowSocket>>,
+    /// Hold one datagram in every `n` and send it after the following one.
+    reorder_one_in: Option<u64>,
+    /// The datagram currently being held back, if any.
+    ///
+    /// Shared across senders so a held datagram is released by whichever sender
+    /// carries the next one, rather than stranded in the one that took it.
+    reorder_held: Arc<parking_lot::Mutex<Option<(Vec<u8>, SocketAddr)>>>,
+    /// Datagrams offered while reordering is open.
+    reorder_seen: Arc<AtomicU64>,
     /// Datagrams offered to the sender since the loss impairment opened.
     ///
     /// Shared with every sender this socket hands out, so the cadence is a
@@ -251,6 +279,9 @@ impl ImpairedSocket {
             shadow: impairments
                 .shadow_datagrams
                 .and_then(|budget| ShadowSocket::bind(budget).map(Arc::new)),
+            reorder_one_in: impairments.reorder_one_in,
+            reorder_held: Arc::new(parking_lot::Mutex::new(None)),
+            reorder_seen: Arc::new(AtomicU64::new(0)),
             sent_while_lossy: Arc::new(AtomicU64::new(0)),
             counters,
         }
@@ -274,6 +305,9 @@ impl AsyncUdpSocket for ImpairedSocket {
             clock: self.clock.clone(),
             loss_one_in: self.loss_one_in,
             shadow: self.shadow.clone(),
+            reorder_one_in: self.reorder_one_in,
+            reorder_held: self.reorder_held.clone(),
+            reorder_seen: self.reorder_seen.clone(),
             sent_while_lossy: self.sent_while_lossy.clone(),
             counters: self.counters.clone(),
         })
@@ -532,6 +566,14 @@ impl ShadowSocket {
 /// casualty: the response headers usually ride in it, and losing those on some
 /// runs and not others would make the same client pass and fail by turns.
 fn is_lost(nth: u64, one_in: u64) -> bool {
+    is_multiple_of(nth, one_in)
+}
+
+/// Whether the `nth` datagram falls on a cadence of one in `one_in`.
+///
+/// Zero means no impairment rather than "every datagram": a cadence of zero can
+/// only come from a miswritten configuration, and `%` by zero would panic.
+fn is_multiple_of(nth: u64, one_in: u64) -> bool {
     one_in > 0 && nth.is_multiple_of(one_in)
 }
 
@@ -543,6 +585,9 @@ struct ImpairedSender {
     clock: Option<Arc<PeerClock>>,
     loss_one_in: Option<u64>,
     shadow: Option<Arc<ShadowSocket>>,
+    reorder_one_in: Option<u64>,
+    reorder_held: Arc<parking_lot::Mutex<Option<(Vec<u8>, SocketAddr)>>>,
+    reorder_seen: Arc<AtomicU64>,
     sent_while_lossy: Arc<AtomicU64>,
     counters: Arc<Counters>,
 }
@@ -564,6 +609,15 @@ impl ImpairedSender {
     /// that is not running.
     fn loss_cadence(&self, peer: SocketAddr, now: Instant) -> Option<u64> {
         let one_in = self.loss_one_in.filter(|n| *n > 0)?;
+        match &self.clock {
+            Some(clock) if !clock.is_open(peer, now) => None,
+            _ => Some(one_in),
+        }
+    }
+
+    /// The reordering cadence in force for `peer`, or `None` while it is shut.
+    fn reorder_cadence(&self, peer: SocketAddr, now: Instant) -> Option<u64> {
+        let one_in = self.reorder_one_in.filter(|n| *n > 0)?;
         match &self.clock {
             Some(clock) if !clock.is_open(peer, now) => None,
             _ => Some(one_in),
@@ -597,6 +651,55 @@ impl UdpSender for ImpairedSender {
                 );
                 // Reported as sent, like the black hole: a lost datagram gives
                 // its sender no signal.
+                return Poll::Ready(Ok(()));
+            }
+        }
+
+        // Reordering: hold one datagram back, then send it after the next.
+        //
+        // Nothing is dropped. The held datagram goes out immediately behind the
+        // one that overtook it, so the peer receives every byte with exactly one
+        // pair out of order — which is what a reassembly buffer is for, and what
+        // a client that assumes arrival order is delivery order gets wrong.
+        //
+        // The release happens before this datagram is sent, in the opposite
+        // order: current first, then the one being held.
+        if let Some(one_in) = self.reorder_cadence(transmit.destination, now) {
+            let held = self.reorder_held.lock().take();
+            if let Some((bytes, dest)) = held {
+                // Send the newer datagram first — that is the overtaking.
+                match self.inner.as_mut().poll_send(transmit, cx) {
+                    Poll::Ready(Ok(())) => {}
+                    other => {
+                        // Could not send; put the held one back so it is not
+                        // lost, and let the caller retry.
+                        *self.reorder_held.lock() = Some((bytes, dest));
+                        return other;
+                    }
+                }
+                let late = Transmit {
+                    destination: dest,
+                    ecn: None,
+                    contents: &bytes,
+                    segment_size: None,
+                    src_ip: None,
+                };
+                if self.inner.as_mut().poll_send(&late, cx).is_ready() {
+                    self.counters.reordered.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    // The socket is full. Keep it rather than drop it: this
+                    // impairment reorders, it does not lose.
+                    *self.reorder_held.lock() = Some((bytes, dest));
+                }
+                return Poll::Ready(Ok(()));
+            }
+
+            let nth = self.reorder_seen.fetch_add(1, Ordering::Relaxed) + 1;
+            if is_multiple_of(nth, one_in) {
+                // Reported as sent. It has not been lost — the next datagram
+                // out will carry it along behind itself.
+                *self.reorder_held.lock() =
+                    Some((transmit.contents.to_vec(), transmit.destination));
                 return Poll::Ready(Ok(()));
             }
         }

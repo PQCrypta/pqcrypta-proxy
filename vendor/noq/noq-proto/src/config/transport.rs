@@ -37,6 +37,7 @@ pub struct TransportConfig {
     pub(crate) send_fairness: bool,
     pub(crate) send_unknown_frame_type: Option<u64>,
     pub(crate) send_invalid_transport_param: Option<(u64, u64)>,
+    pub(crate) send_path_challenge: bool,
 
     pub(crate) packet_threshold: u32,
     pub(crate) time_threshold: f32,
@@ -219,6 +220,22 @@ impl TransportConfig {
     /// normally and the rejection is about this value alone.
     pub fn send_invalid_transport_param(&mut self, value: Option<(u64, u64)>) -> &mut Self {
         self.send_invalid_transport_param = value;
+        self
+    }
+
+    /// Send one PATH_CHALLENGE once the handshake is established.
+    ///
+    /// RFC 9000 §8.2 requires a peer to answer with PATH_RESPONSE echoing the
+    /// eight-byte payload, and this is the only way to ask: a PATH_CHALLENGE is
+    /// otherwise sent solely while validating a path, and a connection that
+    /// never moves never validates one. A conformance test waiting for that
+    /// reported, indefinitely, that no path validation had been triggered.
+    ///
+    /// Not path validation itself — nothing here depends on the answer, and no
+    /// path is marked valid or invalid by it. It exists so the requirement can
+    /// be observed.
+    pub fn send_path_challenge(&mut self, value: bool) -> &mut Self {
+        self.send_path_challenge = value;
         self
     }
 
@@ -614,6 +631,7 @@ impl Default for TransportConfig {
             send_fairness: true,
             send_unknown_frame_type: None,
             send_invalid_transport_param: None,
+            send_path_challenge: false,
 
             packet_threshold: 3,
             time_threshold: 9.0 / 8.0,
@@ -667,6 +685,7 @@ impl fmt::Debug for TransportConfig {
             send_fairness,
             send_unknown_frame_type,
             send_invalid_transport_param,
+            send_path_challenge,
             packet_threshold,
             time_threshold,
             initial_rtt,
@@ -706,6 +725,7 @@ impl fmt::Debug for TransportConfig {
             .field("send_fairness", send_fairness)
             .field("send_unknown_frame_type", send_unknown_frame_type)
             .field("send_invalid_transport_param", send_invalid_transport_param)
+            .field("send_path_challenge", send_path_challenge)
             .field("packet_threshold", packet_threshold)
             .field("time_threshold", time_threshold)
             .field("initial_rtt", initial_rtt)
