@@ -1,0 +1,88 @@
+name: Post-deploy WAF regression gate
+
+# Runs the security regression corpus against the LIVE deployment after a
+# release, and on demand, and fails if the deploy regressed the WAF or started
+# blocking legitimate traffic. See pentests/regression/README.md.
+#
+# Why this cannot use a GitHub-hosted runner as the test source:
+#   A 403 is only a WAF verdict if the source IP is exempt in all four defence
+#   layers (pentest_bypass_ips, the DatabaseSync blocklist, the honeypot's
+#   security_whitelist, fail2ban). A GitHub-hosted runner is a random cloud IP in
+#   none of them, so it would self-ban and every probe would 403 regardless — a
+#   meaningless pass. Instead the runner is only a CONDUCTOR: it SSHes to the
+#   control host, which runs the integrity check locally (it needs DB, fail2ban
+#   and config access) and drives the bypass-listed tester (api3) over SSH. The
+#   experiment runs from the authorized vantage; the runner just triggers it.
+#
+# Prerequisites (repo secrets):
+#   CONTROL_SSH_KEY   private key with access to the control host
+#   CONTROL_SSH_HOST  control host (user@host), e.g. deploy@66.179.95.51
+#   CONTROL_SSH_PORT  optional, default 22
+# The control host must already hold this repo's pentests/ tree and the tester
+# SSH key (it does — that is where deploys are driven from).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Target URL to test"
+        default: "https://pqcrypta.com"
+        required: false
+
+concurrency:
+  group: post-deploy-regression
+  cancel-in-progress: false
+
+jobs:
+  regression-gate:
+    name: WAF regression gate (live)
+    runs-on: ubuntu-latest
+    # Skip cleanly on forks / PRs that lack the deployment secrets, so this
+    # never blocks contributors who cannot reach the fleet.
+    if: ${{ github.repository == 'PQCrypta/pqcrypta-proxy' }}
+    steps:
+      - name: Guard — require deployment secrets
+        id: guard
+        env:
+          KEY: ${{ secrets.CONTROL_SSH_KEY }}
+          HOST: ${{ secrets.CONTROL_SSH_HOST }}
+        run: |
+          if [ -z "$KEY" ] || [ -z "$HOST" ]; then
+            echo "Deployment secrets absent — this run cannot reach the fleet."
+            echo "run_gate=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_gate=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up SSH to the control host
+        if: steps.guard.outputs.run_gate == 'true'
+        env:
+          KEY: ${{ secrets.CONTROL_SSH_KEY }}
+          HOST: ${{ secrets.CONTROL_SSH_HOST }}
+          PORT: ${{ secrets.CONTROL_SSH_PORT }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/control_key
+          chmod 600 ~/.ssh/control_key
+          PORT="${PORT:-22}"
+          HOSTNAME="${HOST#*@}"
+          ssh-keyscan -p "$PORT" "$HOSTNAME" >> ~/.ssh/known_hosts 2>/dev/null || true
+          echo "CONTROL_PORT=$PORT" >> "$GITHUB_ENV"
+
+      - name: Run the post-deploy regression gate on the control host
+        if: steps.guard.outputs.run_gate == 'true'
+        env:
+          HOST: ${{ secrets.CONTROL_SSH_HOST }}
+          TARGET: ${{ github.event.inputs.target || 'https://pqcrypta.com' }}
+        run: |
+          # The gate script, the integrity checker and the corpus already live
+          # on the control host (it is the deploy host). Invoke it there; its
+          # exit code is the gate.
+          ssh -i ~/.ssh/control_key -p "$CONTROL_PORT" "$HOST" \
+            "TARGET='$TARGET' /var/www/html/pqcrypta-proxy/pentests/regression/postdeploy_gate.sh"
+
+      - name: Note when skipped
+        if: steps.guard.outputs.run_gate != 'true'
+        run: echo "::notice::Post-deploy regression gate skipped — deployment secrets not configured."
