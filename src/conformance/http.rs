@@ -517,14 +517,25 @@ available as <a href="/catalog.json">JSON</a>.</p>
 
 <h2 id="scope">Scope, and what this is not</h2>
 <p>{total} tests is a beginning, not coverage. QUIC and HTTP/3 together are
-enormous, and areas remain untouched &mdash; WebTransport session handling beyond
-the setting that gates it, QPACK decoder-stream errors, CONNECT tunnelling, and
-version negotiation between two versions both ends support. The catalogue is
-chosen rather than exhaustive.</p>
-<p>Two gaps are permanent. A client's own migration after a NAT rebind cannot be
-provoked from here: only the client, or its network, can change the address it
-sends from. And the amplification limit is a requirement on <em>servers</em>, so
-there is nothing about it to ask of the thing under test.</p>
+enormous, and the catalogue is chosen rather than exhaustive. What is missing
+divides into two different things, and collapsing them into one list of "not done
+yet" would overstate what this suite can ever become.</p>
+<p><strong>Testable, and not yet written.</strong> A genuine backlog: version
+negotiation between two versions both ends support; ECN congestion marking, where
+a CE codepoint should come back in the counts rather than only ECT(0); repeated
+key updates; Retry with a token that does not validate; MAX_STREAMS credit issued
+mid-connection.</p>
+<p><strong>Outside what this vantage point can establish.</strong> Not a backlog.
+A server watching a client cannot legitimately provoke or observe these, so a
+test claiming to cover them would be reporting on something other than what it
+says. QPACK <em>decoder</em>-stream errors, because that stream is the client's
+output and nothing here can make it emit a malformed instruction. WebTransport
+session handling, because Extended CONNECT is client-initiated and a generic
+HTTP/3 client never opens a session. A client's own migration after a NAT rebind,
+because only the client or its network can change the address it sends from — the
+server can send a PATH_CHALLENGE, and does, but that is a different question. And
+the amplification limit, which is a requirement on servers, so there is nothing
+about it to ask of the thing under test.</p>
 <ul>
 <li><strong>This is not a certification.</strong> Passing everything here means a
 client handled {total} specific situations correctly. It does not mean the
