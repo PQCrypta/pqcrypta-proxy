@@ -585,6 +585,79 @@ auto_block_duration_secs = 300     # Block duration (seconds)
 # =============================
 # TLS Fingerprint Detection (JA3/JA4)
 # =============================
+# =============================================================================
+# Web Application Firewall
+# =============================================================================
+[waf]
+# Enable WAF — injection, traversal, inclusion, scanner probes, request anomalies
+enabled = true
+# "block" rejects the request with 403; "detect" logs only (for tuning)
+mode = "block"
+# Anomaly score at which a request is blocked. Severities contribute
+# Low 3, Medium 5, High 8, Critical 10. At 5 any single Medium-or-higher rule
+# blocks on its own, while two Low-severity signals must agree. Raise it on a
+# route that produces false positives; lower it to act on single weak signals.
+anomaly_threshold = 5
+# OWASP A03: SQL injection pattern matching
+sqli = true
+# OWASP A03: Cross-site scripting pattern matching
+xss = true
+# OWASP A01/A05: Path traversal and path confusion (../, ..;/, overlong UTF-8)
+path_traversal = true
+# OWASP A03: NoSQL injection detection ($where, $gt operator abuse, etc.)
+nosqli = true
+# OWASP A10: SSRF detection — off, high false-positive rate for URL fields
+ssrf = false
+# OWASP A03: OS command injection (shell metacharacters, ${IFS}, reverse shells)
+cmd_injection = true
+# OWASP A08: XML external entity injection
+xxe = true
+# OWASP A08: insecure deserialization (Java/PHP/Python, incl. byte signatures)
+deserialization = true
+# OWASP A06: JNDI/Log4Shell and expression-language injection (OGNL, SpEL)
+jndi = true
+# OWASP A03: server-side template injection (Jinja, Twig, ERB)
+ssti = true
+# Local/remote file inclusion via URL stream wrappers (php://, expect://, phar://)
+file_inclusion = true
+# CRLF injection / HTTP response splitting. Applied to URL and headers only —
+# request bodies use CRLF line endings legitimately.
+crlf_injection = true
+# JavaScript prototype pollution (__proto__, constructor.prototype)
+proto_pollution = true
+# GraphQL schema introspection — off, legitimate for a public schema
+graphql = false
+# Structural anomalies: request smuggling (CL+TE, conflicting Content-Length),
+# control characters in headers, diagnostic methods, malformed Host
+request_anomaly = true
+# Block known scanner/reconnaissance probe paths (.git, .env, wp-login, etc.)
+scanner_probe = true
+# Block known malicious scanner/bot user-agents (sqlmap, nikto, masscan, curl, etc.)
+block_scanner_uas = true
+# Scan request bodies, decoding JSON string escapes
+scan_json_body = true
+# Maximum body bytes to scan (64KB — covers all form submissions)
+max_body_scan_bytes = 65536
+# Scan every request header except content negotiation, cache validators,
+# client hints and credentials
+scan_all_headers = true
+# Maximum bytes of any single header value to scan
+max_header_scan_bytes = 8192
+# Header count above which a request is flagged as anomalous
+max_header_count = 80
+# Percent-decode passes before matching. One pass is a bypass: %253Cscript%253E
+# decodes once to %3Cscript%3E, matches nothing, and the origin decodes it again.
+max_decode_passes = 3
+# Custom extra regex patterns — empty, built-in ruleset covers OWASP Top 10
+custom_patterns = []
+
+# Per-path rule exclusions, for tuning a false positive without switching a
+# category off site-wide. `path` is a regex; name rule identifiers in `rules`
+# and/or whole categories in `categories`.
+# [[waf.exclusions]]
+# path = "^/regex/"
+# categories = ["xss"]
+
 [fingerprint]
 # Enable TLS fingerprint detection
 enabled = true

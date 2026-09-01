@@ -128,6 +128,7 @@ use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::access_logger::{log_access, AccessLogEntry};
+use crate::audit_logger::AuditLogger;
 use crate::config::{CircuitBreakerConfig, ProxyConfig, RateLimitConfig, SecurityConfig};
 use crate::crawler_verify::{CrawlerVerdict, CrawlerVerifier};
 use crate::waf::{WafEngine, WafRequest, WafVerdict};
@@ -266,6 +267,14 @@ pub struct SecurityState {
     pub ja3_db: Arc<Ja3Database>,
     /// WAF engine (None if WAF disabled)
     pub waf_engine: Option<Arc<WafEngine>>,
+    /// Structured audit logger, when one is configured.
+    ///
+    /// `AuditLogger` has carried `log_waf_block`/`log_waf_detect` — and the
+    /// README has documented `waf_block`/`waf_detect` event categories — since
+    /// audit logging was added, but nothing ever called them: the WAF verdict
+    /// reached `warn!` and stopped there, so the one security control most
+    /// worth an audit trail produced none.
+    pub audit_logger: Option<Arc<AuditLogger>>,
     /// CIDR ranges from database-synced blocklist files.
     /// P2-fix: single-IP parsing previously ignored subnet notation; CIDRs now stored
     /// separately and checked in is_blocked() via cidr_contains_ip().
@@ -923,6 +932,7 @@ impl SecurityState {
             geoip_db,
             ja3_db: Arc::new(ja3_db),
             waf_engine,
+            audit_logger: None,
             blocked_cidrs: Arc::new(RwLock::new(Vec::new())),
             alt_svc_header,
         };
@@ -1300,6 +1310,17 @@ impl SecurityState {
     /// single function is the point: the header pass and the body pass used to
     /// build their own `WafRequest`, which is how the two drifted apart on
     /// skip_bot_ua handling.
+    /// Attach an audit logger.
+    ///
+    /// A builder rather than a `new` parameter so the five existing
+    /// construction sites — and any future one that has no logger to hand —
+    /// stay unchanged.
+    #[must_use]
+    pub fn with_audit_logger(mut self, logger: Arc<AuditLogger>) -> Self {
+        self.audit_logger = Some(logger);
+        self
+    }
+
     fn run_waf(
         &self,
         view: &SecurityRequestView<'_>,
@@ -1342,8 +1363,24 @@ impl SecurityState {
                 mode_override: policy.waf_mode.as_deref(),
             };
             match waf.inspect(&waf_req) {
-                WafVerdict::Block { ref rule, .. } => {
-                    warn!("WAF block: rule={} ip={} path={}", rule, ip, view.path);
+                WafVerdict::Block {
+                    ref rule,
+                    severity,
+                    score,
+                    matched,
+                } => {
+                    warn!(
+                        "WAF block: rule={} severity={} score={} rules_matched={} ip={} path={}",
+                        rule,
+                        severity.as_str(),
+                        score,
+                        matched,
+                        ip,
+                        view.path
+                    );
+                    if let Some(audit) = &self.audit_logger {
+                        audit.log_waf_block(ip, rule.clone(), view.path);
+                    }
                     if !is_pentest {
                         let mut counter = self.request_counts.entry(ip).or_default();
                         counter.suspicious_patterns += 1;
@@ -1358,8 +1395,24 @@ impl SecurityState {
                     }
                     return SecurityDecision::WafBlock { rule: rule.clone() };
                 }
-                WafVerdict::Detect { ref rule, .. } => {
-                    warn!("WAF detect: rule={} ip={} path={}", rule, ip, view.path);
+                WafVerdict::Detect {
+                    ref rule,
+                    severity,
+                    score,
+                    matched,
+                } => {
+                    warn!(
+                        "WAF detect: rule={} severity={} score={} rules_matched={} ip={} path={}",
+                        rule,
+                        severity.as_str(),
+                        score,
+                        matched,
+                        ip,
+                        view.path
+                    );
+                    if let Some(audit) = &self.audit_logger {
+                        audit.log_waf_detect(ip, rule.clone(), view.path);
+                    }
                 }
                 WafVerdict::Allow => {}
             }

@@ -725,18 +725,90 @@ Request arrives on any path
 [waf]
 enabled = true
 mode = "block"          # "detect" logs only; "block" returns 403
+anomaly_threshold = 5   # score at which a request is blocked
+
+# Detection categories
 sqli = true             # SQL injection patterns
 xss = true              # Cross-site scripting patterns
-path_traversal = true   # Directory traversal (../, %2e%2e, null bytes)
+path_traversal = true   # Traversal and path confusion (../, ..;/, %2e%2e, overlong UTF-8)
 nosqli = true           # NoSQL injection ($where, $gt, $regex, etc.)
-ssrf = false            # SSRF patterns for path/query/body (X-Forwarded-For always exempt — proxy hops add loopback IPs legitimately)
-scan_json_body = true   # Scan request bodies
+ssrf = false            # SSRF patterns (proxy hop headers always exempt)
+cmd_injection = true    # OS command injection, ${IFS}, reverse shells
+xxe = true              # XML external entity injection
+deserialization = true  # Java/PHP/Python object injection, incl. byte signatures
+jndi = true             # JNDI/Log4Shell, OGNL, SpEL expression injection
+ssti = true             # Server-side template injection (Jinja, Twig, ERB)
+file_inclusion = true   # php://, expect://, phar://, data:// stream wrappers
+crlf_injection = true   # Response splitting (URL and headers only)
+proto_pollution = true  # __proto__, constructor.prototype
+graphql = false         # Schema introspection — off, legitimate for public schemas
+request_anomaly = true  # Request smuggling, header injection, diagnostic methods
+scanner_probe = true    # Reconnaissance probe paths (.git, .env, wp-login, …)
+block_scanner_uas = true
+
+# Inspection surface
+scan_json_body = true         # Scan bodies, decoding JSON string escapes
 max_body_scan_bytes = 65536   # Max bytes of body to scan (default 64 KB)
-block_scanner_uas = true      # Block known security scanner User-Agents (sqlmap, nikto, nmap, masscan, burp, etc.) — default true
+scan_all_headers = true       # Every header except negotiation/cache/hints/credentials
+max_header_scan_bytes = 8192  # Max bytes of any single header value
+max_header_count = 80         # Header count above which a request is anomalous
+max_decode_passes = 3         # Percent-decode passes before matching
+
 custom_patterns = [
     "(?i)\\bmy-banned-keyword\\b",
 ]
 ```
+
+**Anomaly scoring.** A rule match contributes its severity's score — Low 3,
+Medium 5, High 8, Critical 10 — and the request is blocked once the total
+reaches `anomaly_threshold`. At the default of 5 any single Medium-or-higher
+rule blocks on its own, while two Low-severity signals must agree. Low is where
+genuinely ambiguous patterns live: `localhost` in a URL parameter, a bare
+`exec(`, a backtick pair. Raise the threshold to demand more corroboration,
+lower it to act on single weak signals. A match below the threshold is still
+counted in the per-rule metrics, so a rule can be evaluated before it is trusted
+to block.
+
+**Rule identifiers.** Every rule has a stable identifier of the form
+`PQW-<CATEGORY>-<NNN>`, and verdicts are reported as `category:identifier` —
+`bad-bot-ua:PQW-BOT-001`, `sqli:PQW-SQLI-011`. Identifiers are stable across
+pattern edits and across category toggles: switching a category off keeps its
+rules' metric series in place rather than renumbering everything after them.
+
+**Decoding.** Inputs are matched raw and in every decoded form: percent-decoding
+is applied repeatedly to a fixpoint (`max_decode_passes`), plus form decoding
+(`+` → space), HTML character references (`&#x3c;`), and JSON string escapes
+(`\u003c`). A rule that matches several decoded forms of the same input counts
+once. Bodies are decoded lossily and are always inspected, whether or not they
+are valid UTF-8; binary bodies are additionally matched against byte signatures
+(Java serialisation header, Python pickle opcodes) that no textual decoding
+could preserve.
+
+**Request anomalies.** `request_anomaly` covers what no regex can express:
+conflicting `Content-Length` headers and `Content-Length` beside
+`Transfer-Encoding` (request smuggling), transfer codings other than `chunked`,
+control characters in header values, `TRACE`/`TRACK`/`DEBUG`, excessive header
+counts, and a `Host` containing a path, space or userinfo marker.
+
+**Per-path exclusions.** Tune a false positive without switching a category off
+site-wide:
+
+```toml
+[[waf.exclusions]]
+path = "^/regex/"          # regex matched against the request path
+categories = ["xss"]       # whole categories to suppress
+
+[[waf.exclusions]]
+path = "^/api/graphql"
+rules = ["PQW-NOSQL-001"]  # or individual rule identifiers
+```
+
+**Metrics.** The Prometheus endpoint exports `pqcrypta_waf_requests_total`,
+`pqcrypta_waf_allowed_total`, `pqcrypta_waf_blocked_total`,
+`pqcrypta_waf_detected_total`, and `pqcrypta_waf_rule_hits_total` labelled by
+`rule`, `category` and `severity`. Only rules that have actually matched are
+emitted, so the series count tracks the traffic this node sees rather than the
+full rule table.
 
 `block_scanner_uas` matches against a built-in regex set covering common attack tools. It operates independently from path/payload pattern matching — a request can be blocked purely by its User-Agent even if the body is clean. Disable per-route via `waf_mode = "detect"` if you need to allow scanner tools from specific paths (e.g., an internal security tooling endpoint).
 

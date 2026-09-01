@@ -402,7 +402,13 @@ async fn run() -> anyhow::Result<()> {
     // attestation. Each listener used to build its own, so a source blocked on one port
     // began clean on the next, and the attestation could only ever describe an instance
     // that served nobody.
-    let security_state = pqcrypta_proxy::security::SecurityState::new(&config);
+    // Built here rather than at the admin server below because the security
+    // state needs it: WAF verdicts are audit events, and the logger has to
+    // exist before the state that emits them.
+    let audit_logger = Arc::new(AuditLogger::new(&config.logging));
+
+    let security_state = pqcrypta_proxy::security::SecurityState::new(&config)
+        .with_audit_logger(audit_logger.clone());
 
     // Reload the observed-fingerprint corpus and keep snapshotting it.
     //
@@ -845,10 +851,6 @@ async fn run() -> anyhow::Result<()> {
         acme_challenges = None;
         None
     };
-
-    // P2-fix: Construct the audit logger and pass it to the admin server.
-    // Previously this was always None which silently disabled audit logging.
-    let audit_logger = Arc::new(AuditLogger::new(&config.logging));
 
     // Create shared load balancer so admin API and all HTTP listeners share state
     // (canary suspend/resume, weight changes via admin are reflected in live routing)

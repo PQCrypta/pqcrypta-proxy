@@ -215,6 +215,98 @@ pub struct WafConfig {
     /// Block known malicious scanner/bot user-agents (sqlmap, nikto, masscan, etc.)
     #[serde(default = "default_true")]
     pub block_scanner_uas: bool,
+    /// OWASP A03: OS command injection detection
+    #[serde(default = "default_true")]
+    pub cmd_injection: bool,
+    /// OWASP A08: XML external entity detection
+    #[serde(default = "default_true")]
+    pub xxe: bool,
+    /// OWASP A08: insecure deserialization detection (Java/PHP/Python)
+    #[serde(default = "default_true")]
+    pub deserialization: bool,
+    /// OWASP A06: JNDI/Log4Shell and expression-language injection
+    #[serde(default = "default_true")]
+    pub jndi: bool,
+    /// OWASP A03: server-side template injection
+    #[serde(default = "default_true")]
+    pub ssti: bool,
+    /// Local/remote file inclusion via URL stream wrappers (php://, expect://)
+    #[serde(default = "default_true")]
+    pub file_inclusion: bool,
+    /// CRLF injection / HTTP response splitting
+    #[serde(default = "default_true")]
+    pub crlf_injection: bool,
+    /// JavaScript prototype pollution
+    #[serde(default = "default_true")]
+    pub proto_pollution: bool,
+    /// GraphQL schema introspection (default false — legitimate for public schemas)
+    #[serde(default)]
+    pub graphql: bool,
+    /// Structural request anomalies: request smuggling, header injection,
+    /// diagnostic methods, malformed Host
+    #[serde(default = "default_true")]
+    pub request_anomaly: bool,
+    /// Anomaly score at which a request is blocked (default 5).
+    ///
+    /// Severities contribute Low 2, Medium 5, High 8, Critical 10. At the
+    /// default, any single Medium-or-higher rule blocks on its own while two
+    /// Low-severity signals must agree. Raise it to require more corroboration
+    /// on a route that produces false positives; lower it to act on single weak
+    /// signals.
+    #[serde(default = "default_anomaly_threshold")]
+    pub anomaly_threshold: u32,
+    /// How many times to percent-decode an input before matching (default 3).
+    ///
+    /// One pass is a bypass: `%253Cscript%253E` decodes once to
+    /// `%3Cscript%3E`, matches nothing, and is decoded again by the origin.
+    #[serde(default = "default_max_decode_passes")]
+    pub max_decode_passes: usize,
+    /// Scan all request headers rather than a fixed short list (default true).
+    /// Content negotiation, cache validators, client hints and credentials are
+    /// always skipped.
+    #[serde(default = "default_true")]
+    pub scan_all_headers: bool,
+    /// Maximum bytes of any single header value to scan (default 8192)
+    #[serde(default = "default_max_header_scan_bytes")]
+    pub max_header_scan_bytes: usize,
+    /// Header count above which a request is flagged as anomalous (default 80)
+    #[serde(default = "default_max_header_count")]
+    pub max_header_count: usize,
+    /// Per-path rule exclusions for false-positive tuning
+    #[serde(default)]
+    pub exclusions: Vec<WafExclusion>,
+}
+
+/// Suppress specific WAF rules or categories on paths matching a regex.
+///
+/// Tuning used to mean switching a whole category off globally: a single
+/// false positive on one endpoint cost the protection everywhere.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WafExclusion {
+    /// Regex matched against the request path
+    pub path: String,
+    /// Rule identifiers to suppress, e.g. "PQW-NOSQL-001"
+    #[serde(default)]
+    pub rules: Vec<String>,
+    /// Whole categories to suppress, e.g. "nosqli"
+    #[serde(default)]
+    pub categories: Vec<String>,
+}
+
+const fn default_anomaly_threshold() -> u32 {
+    5
+}
+
+const fn default_max_decode_passes() -> usize {
+    3
+}
+
+const fn default_max_header_scan_bytes() -> usize {
+    8192
+}
+
+const fn default_max_header_count() -> usize {
+    80
 }
 
 impl Default for WafConfig {
@@ -232,6 +324,22 @@ impl Default for WafConfig {
             custom_patterns: Vec::new(),
             scanner_probe: true,
             block_scanner_uas: true,
+            cmd_injection: true,
+            xxe: true,
+            deserialization: true,
+            jndi: true,
+            ssti: true,
+            file_inclusion: true,
+            crlf_injection: true,
+            proto_pollution: true,
+            graphql: false,
+            request_anomaly: true,
+            anomaly_threshold: default_anomaly_threshold(),
+            max_decode_passes: default_max_decode_passes(),
+            scan_all_headers: true,
+            max_header_scan_bytes: default_max_header_scan_bytes(),
+            max_header_count: default_max_header_count(),
+            exclusions: Vec::new(),
         }
     }
 }

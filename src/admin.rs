@@ -655,6 +655,45 @@ async fn metrics_handler(State(state): State<Arc<AdminState>>) -> String {
         );
     }
 
+    // WAF counters. The engine holds its own atomics because SecurityState is
+    // built from config and has no metrics handle; this is where they surface.
+    if let Some(waf) = state.security.as_ref().and_then(|s| s.waf_engine.as_ref()) {
+        let stats = waf.stats();
+
+        output.push_str("\n# HELP pqcrypta_waf_requests_total Requests inspected by the WAF\n");
+        output.push_str("# TYPE pqcrypta_waf_requests_total counter\n");
+        let _ = writeln!(output, "pqcrypta_waf_requests_total {}", stats.inspected);
+
+        output.push_str("# HELP pqcrypta_waf_allowed_total Requests the WAF allowed\n");
+        output.push_str("# TYPE pqcrypta_waf_allowed_total counter\n");
+        let _ = writeln!(output, "pqcrypta_waf_allowed_total {}", stats.allowed);
+
+        output.push_str("# HELP pqcrypta_waf_blocked_total Requests the WAF blocked (403)\n");
+        output.push_str("# TYPE pqcrypta_waf_blocked_total counter\n");
+        let _ = writeln!(output, "pqcrypta_waf_blocked_total {}", stats.blocked);
+
+        output.push_str(
+            "# HELP pqcrypta_waf_detected_total Requests that scored over threshold in detect mode\n",
+        );
+        output.push_str("# TYPE pqcrypta_waf_detected_total counter\n");
+        let _ = writeln!(output, "pqcrypta_waf_detected_total {}", stats.detected);
+
+        // Per-rule hits. Only rules that have matched are emitted, so the series
+        // count tracks what the site actually sees rather than the ~250-rule
+        // table. A rule counts here even when its request was ultimately
+        // allowed — that is what makes the counters usable for tuning a
+        // threshold rather than only for counting 403s.
+        output.push_str("# HELP pqcrypta_waf_rule_hits_total Matches per WAF rule\n");
+        output.push_str("# TYPE pqcrypta_waf_rule_hits_total counter\n");
+        for rule in &stats.rules {
+            let _ = writeln!(
+                output,
+                "pqcrypta_waf_rule_hits_total{{rule=\"{}\",category=\"{}\",severity=\"{}\"}} {}",
+                rule.id, rule.category, rule.severity, rule.hits
+            );
+        }
+    }
+
     output
 }
 
