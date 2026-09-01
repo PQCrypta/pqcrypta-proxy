@@ -785,6 +785,20 @@ are valid UTF-8; binary bodies are additionally matched against byte signatures
 (Java serialisation header, Python pickle opcodes) that no textual decoding
 could preserve.
 
+**Transport parity.** The WAF runs identically over HTTP/1.1, HTTP/2 and
+HTTP/3 — the QUIC/h3 handler and the TCP handler both call the one
+`SecurityState::evaluate` (and `inspect_body` once the body is buffered), so
+path, query, header and **body** inspection are the same on every transport. A
+regression corpus is run over both `--transport auto` (h1/h2) and
+`--transport h3` to prove that parity, not assume it.
+
+**Compressed bodies.** A `Content-Encoding: gzip|deflate|br|zstd` request body
+is decompressed (bounded by `max_decompressed_body_bytes`, so a decompression
+bomb cannot exhaust memory) and the decompressed form is scanned — otherwise a
+compressed payload is entropy to the pattern engine and passes. The raw
+compressed bytes are never text-scanned (they trip binary-ish rules), only
+matched against the binary deserialization signatures.
+
 **Request anomalies.** `request_anomaly` covers what no regex can express:
 conflicting `Content-Length` headers and `Content-Length` beside
 `Transfer-Encoding` (request smuggling), transfer codings other than `chunked`,

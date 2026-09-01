@@ -1373,6 +1373,57 @@ impl WafEngine {
 /// [`push_pattern`], so the only remaining failure is the set exceeding the
 /// compiled-program size limit; the limit is raised well past what this ruleset
 /// needs, and a failure is loud rather than silent.
+/// Decompress a request body far enough to inspect it, capped at `max_out`
+/// bytes so a compression bomb cannot exhaust memory.
+///
+/// Returns `None` for an unrecognised or `identity` encoding, or when
+/// decompression fails (malformed stream) — the caller then relies on the raw
+/// scan. Only the first token of a comma-separated `Content-Encoding` list is
+/// honoured, which is what matters for the common single-encoding case; a
+/// multi-layer encoding falls through to the raw scan rather than being
+/// recursively unwrapped.
+fn decompress_bounded(body: &[u8], encoding: &str, max_out: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    let enc = encoding
+        .split(',')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+
+    // A bounded reader over the input, decoded by the matching decoder, read
+    // through a `take(max_out)` limiter so output can never exceed the cap.
+    let mut out = Vec::new();
+    let limit = max_out as u64;
+    let result = match enc.as_str() {
+        "gzip" | "x-gzip" => flate2::read::GzDecoder::new(body)
+            .take(limit)
+            .read_to_end(&mut out),
+        "deflate" | "x-deflate" => flate2::read::ZlibDecoder::new(body)
+            .take(limit)
+            .read_to_end(&mut out),
+        "br" => brotli::Decompressor::new(body, 4096)
+            .take(limit)
+            .read_to_end(&mut out),
+        "zstd" => match zstd::stream::read::Decoder::new(body) {
+            Ok(d) => d.take(limit).read_to_end(&mut out),
+            Err(e) => Err(e),
+        },
+        _ => return None, // identity / unknown — nothing to do
+    };
+
+    match result {
+        // A clean EOF, or a stream that filled the cap (which read_to_end sees
+        // as EOF on the limited reader): inspect what we have either way.
+        Ok(_) => Some(out),
+        // Truncated/corrupt stream: keep whatever decoded before the error, so a
+        // deliberately-broken tail cannot hide a payload in the good prefix.
+        Err(_) if !out.is_empty() => Some(out),
+        Err(_) => None,
+    }
+}
+
 fn build_set(patterns: &[&str], scope: &str) -> RegexSet {
     RegexSetBuilder::new(patterns)
         .size_limit(32 * 1024 * 1024)
@@ -1518,7 +1569,11 @@ impl WafEngine {
         // --- Body -------------------------------------------------------------
         if a.score < threshold {
             if let Some(body) = req.body {
-                self.scan_body(&mut a, body, &excluded, threshold);
+                let content_encoding = req
+                    .headers
+                    .get("content-encoding")
+                    .and_then(|v| v.to_str().ok());
+                self.scan_body(&mut a, body, content_encoding, &excluded, threshold);
             }
         }
 
@@ -1751,35 +1806,88 @@ impl WafEngine {
         &self,
         a: &mut Assessment,
         body: &[u8],
+        content_encoding: Option<&str>,
         excluded: &[&CompiledExclusion],
         threshold: u32,
     ) {
         if body.is_empty() {
             return;
         }
-        let limited = &body[..body.len().min(self.config.max_body_scan_bytes)];
 
-        // Byte signatures run against the raw bytes: a Java serialised object is
-        // binary, so its `\xac\xed\x00\x05` header cannot survive any textual
-        // decoding and the regex rule for it could never fire.
-        if self.config.deserialization {
-            for (n, (_, _, needle)) in BYTE_SIGNATURES.iter().enumerate() {
-                let idx = self.byte_sig_base + n;
-                if self.is_excluded(excluded, idx) {
-                    continue;
-                }
-                if limited.windows(needle.len()).any(|w| w == *needle) {
-                    debug!("WAF body byte signature {}", self.rules[idx].id);
-                    if self.record(a, idx, threshold) {
-                        return;
-                    }
+        // If the body is compression-encoded, decompress first and treat the
+        // decompressed bytes as the thing to inspect as text. Scanning the raw
+        // compressed bytes as text is not just useless (a gzipped `<script>` is
+        // entropy) — it is a false-positive source: a DEFLATE stream contains
+        // stray NULs and control bytes that trip binary-ish rules such as the
+        // null-byte traversal rule. So: byte-signatures always run on the raw
+        // bytes (they look for exact binary headers, unaffected by entropy),
+        // but the text scan runs on the decompressed form when there is one,
+        // and on the raw form otherwise.
+        let decompressed = content_encoding
+            .filter(|_| self.config.decode_compressed_body)
+            .and_then(|enc| {
+                decompress_bounded(body, enc, self.config.max_decompressed_body_bytes)
+                    .filter(|d| !d.is_empty() && d.as_slice() != body)
+            });
+
+        // 1. Binary signatures on the raw bytes (Java/pickle headers).
+        if self.scan_body_signatures(a, body, excluded, threshold) {
+            return;
+        }
+
+        // 2. Text scan — on the decompressed body if we have one, else the raw.
+        let text_target: &[u8] = decompressed.as_deref().unwrap_or(body);
+        if let Some(enc) = content_encoding {
+            if decompressed.is_some() {
+                debug!(
+                    "WAF scanning decompressed body ({} bytes, enc={})",
+                    text_target.len(),
+                    enc
+                );
+            }
+        }
+        self.scan_body_text(a, text_target, excluded, threshold);
+    }
+
+    /// Binary signature scan (exact byte headers) on a raw body slice.
+    fn scan_body_signatures(
+        &self,
+        a: &mut Assessment,
+        body: &[u8],
+        excluded: &[&CompiledExclusion],
+        threshold: u32,
+    ) -> bool {
+        if !self.config.deserialization {
+            return false;
+        }
+        let limited = &body[..body.len().min(self.config.max_body_scan_bytes)];
+        for (n, (_, _, needle)) in BYTE_SIGNATURES.iter().enumerate() {
+            let idx = self.byte_sig_base + n;
+            if self.is_excluded(excluded, idx) {
+                continue;
+            }
+            if limited.windows(needle.len()).any(|w| w == *needle) {
+                debug!("WAF body byte signature {}", self.rules[idx].id);
+                if self.record(a, idx, threshold) {
+                    return true;
                 }
             }
         }
+        false
+    }
 
+    /// Text (regex) scan on a raw-or-decompressed body slice.
+    fn scan_body_text(
+        &self,
+        a: &mut Assessment,
+        body: &[u8],
+        excluded: &[&CompiledExclusion],
+        threshold: u32,
+    ) {
         if !self.config.scan_json_body {
             return;
         }
+        let limited = &body[..body.len().min(self.config.max_body_scan_bytes)];
         let text = String::from_utf8_lossy(limited);
         if self.scan_payload(
             a,
@@ -2753,6 +2861,125 @@ mod tests {
         assert_eq!(percent_u_decode("plain"), "plain");
         assert_eq!(fold_fullwidth("\u{ff1c}script\u{ff1e}"), "<script>");
         assert_eq!(fold_fullwidth("ascii"), "ascii");
+    }
+
+    /// A gzip'd request body carrying an attack must be decompressed and
+    /// blocked. Compressed, the raw bytes are entropy and match nothing — the
+    /// bypass this closes.
+    #[test]
+    fn gzip_encoded_body_attack_is_decompressed_and_blocked() {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(br#"{"q":"<script>alert(1)</script>"}"#)
+            .unwrap();
+        let gz = enc.finish().unwrap();
+
+        let mut headers = browser_headers();
+        headers.insert("content-encoding", "gzip".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+        let v = engine().inspect(&WafRequest {
+            method: "POST",
+            path: "/api/x",
+            query: "",
+            headers: &headers,
+            body: Some(&gz),
+            skip_bot_ua_check: false,
+            mode_override: None,
+        });
+        assert!(
+            blocked(&v),
+            "gzip'd XSS body must be decompressed and blocked"
+        );
+        assert!(
+            rule_of(&v).starts_with("xss:"),
+            "must block via an XSS rule (proof of decompression), not raw-stream byte noise; got {}",
+            rule_of(&v)
+        );
+    }
+
+    /// deflate (zlib) encoding path.
+    #[test]
+    fn deflate_encoded_body_attack_is_blocked() {
+        use std::io::Write;
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(b"id=1' OR 1=1--").unwrap();
+        let z = enc.finish().unwrap();
+        let mut headers = browser_headers();
+        headers.insert("content-encoding", "deflate".parse().unwrap());
+        let v = engine().inspect(&WafRequest {
+            method: "POST",
+            path: "/api/x",
+            query: "",
+            headers: &headers,
+            body: Some(&z),
+            skip_bot_ua_check: false,
+            mode_override: None,
+        });
+        assert!(blocked(&v), "deflate'd SQLi body must be blocked");
+    }
+
+    /// A benign gzip'd body must still pass once decompressed — decompression
+    /// must not turn ordinary compressed traffic into a false positive.
+    #[test]
+    fn gzip_encoded_benign_body_is_allowed() {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(br#"{"name":"alice","tier":2,"note":"hello world"}"#)
+            .unwrap();
+        let gz = enc.finish().unwrap();
+        let mut headers = browser_headers();
+        headers.insert("content-encoding", "gzip".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+        let v = engine().inspect(&WafRequest {
+            method: "POST",
+            path: "/api/x",
+            query: "",
+            headers: &headers,
+            body: Some(&gz),
+            skip_bot_ua_check: false,
+            mode_override: None,
+        });
+        assert!(
+            matches!(v, WafVerdict::Allow),
+            "benign gzip body must pass, got {}",
+            rule_of(&v)
+        );
+    }
+
+    /// A compression bomb must not exhaust memory: decompression is capped, and
+    /// whatever fits in the cap is still scanned (so a payload in the first
+    /// megabyte is caught, and a bomb is truncated rather than expanded whole).
+    #[test]
+    fn decompression_is_bounded() {
+        // 8 MiB of 'A' compresses tiny; cap the scan at 64 KiB.
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&vec![b'A'; 8 * 1024 * 1024]).unwrap();
+        let gz = enc.finish().unwrap();
+        let out = decompress_bounded(&gz, "gzip", 64 * 1024);
+        let out = out.expect("bounded decode should return the capped prefix");
+        assert!(
+            out.len() <= 64 * 1024,
+            "output must be capped, got {}",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn decompress_bounded_handles_gzip_cli_output() {
+        // Bytes identical to what the `gzip` CLI emits (has FNAME=0, OS byte).
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(br#"{"name":"alice"}"#).unwrap();
+        let gz = enc.finish().unwrap();
+        let out = decompress_bounded(&gz, "gzip", 1024).expect("gzip must decode");
+        assert_eq!(out, br#"{"name":"alice"}"#);
+    }
+
+    #[test]
+    fn decompress_bounded_rejects_unknown_encoding() {
+        assert!(decompress_bounded(b"whatever", "identity", 1024).is_none());
+        assert!(decompress_bounded(b"whatever", "", 1024).is_none());
     }
 
     /// A fullwidth query that is not an attack must still pass — the fold must

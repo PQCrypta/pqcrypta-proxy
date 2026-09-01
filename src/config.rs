@@ -275,6 +275,17 @@ pub struct WafConfig {
     /// Per-path rule exclusions for false-positive tuning
     #[serde(default)]
     pub exclusions: Vec<WafExclusion>,
+    /// Decompress Content-Encoding'd request bodies before scanning them.
+    ///
+    /// Without this a gzip/br/zstd/deflate request body is inspected compressed
+    /// — pure entropy to the pattern engine — so a compressed `<script>` or
+    /// `' OR 1=1` reaches the origin unmatched.
+    #[serde(default = "default_true")]
+    pub decode_compressed_body: bool,
+    /// Cap on decompressed body bytes inspected (default 1 MiB), so a
+    /// compression bomb cannot exhaust memory during inspection.
+    #[serde(default = "default_max_decompressed_body_bytes")]
+    pub max_decompressed_body_bytes: usize,
 }
 
 /// Suppress specific WAF rules or categories on paths matching a regex.
@@ -309,6 +320,10 @@ const fn default_max_header_count() -> usize {
     80
 }
 
+const fn default_max_decompressed_body_bytes() -> usize {
+    1024 * 1024
+}
+
 impl Default for WafConfig {
     fn default() -> Self {
         Self {
@@ -340,6 +355,8 @@ impl Default for WafConfig {
             max_header_scan_bytes: default_max_header_scan_bytes(),
             max_header_count: default_max_header_count(),
             exclusions: Vec::new(),
+            decode_compressed_body: true,
+            max_decompressed_body_bytes: default_max_decompressed_body_bytes(),
         }
     }
 }

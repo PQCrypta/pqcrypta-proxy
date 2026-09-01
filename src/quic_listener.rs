@@ -2067,6 +2067,92 @@ impl QuicListener {
             }
         }
 
+        // WAF body inspection over HTTP/3.
+        //
+        // The header/path/query pass ran through `security.evaluate()` above
+        // with `body: None` — the request body is only available here, once it
+        // has been read. The TCP listener buffers and inspects the body the same
+        // way; without this, a body-borne attack (SQLi/XXE/prototype pollution
+        // in a POST body) was blocked over TCP but sailed through over QUIC,
+        // exactly the transport divergence this proxy exists not to have. The
+        // engine truncates to `max_body_scan_bytes` internally, so the whole
+        // buffered body is passed by reference.
+        if !body.is_empty() && security.waf_engine.is_some() {
+            let is_pentest = {
+                let ip_str = ip.to_string();
+                security
+                    .config
+                    .read()
+                    .pentest_bypass_ips
+                    .iter()
+                    .any(|p| p == &ip_str)
+            };
+            let body_query = request.uri().query().unwrap_or("").to_string();
+            // Re-resolve the per-route policy here: the one built for the header
+            // pass lives in a block that has since closed. Same idiom, so body
+            // inspection honours the same per-route waf_mode / waf_enabled.
+            let body_route_policy = {
+                let bhost = request
+                    .headers()
+                    .get(hyper::header::HOST)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|h| h.split(':').next().unwrap_or(h).to_ascii_lowercase())
+                    .or_else(|| request.uri().host().map(str::to_ascii_lowercase));
+                let on_conf =
+                    crate::security::is_conformance_host(&security.route_index, bhost.as_deref());
+                security
+                    .route_index
+                    .find_route(bhost.as_deref(), &path, false)
+                    .map(|r| crate::security::RequestPolicy {
+                        skip_bot_blocking: r.skip_bot_blocking || on_conf,
+                        allowed_ja3: r.security.as_ref().and_then(|s| s.allowed_ja3.clone()),
+                        waf_enabled: r.security.as_ref().and_then(|s| s.waf_enabled),
+                        waf_mode: r.security.as_ref().and_then(|s| s.waf_mode.clone()),
+                        rate_limit_override: r
+                            .security
+                            .as_ref()
+                            .and_then(|s| s.rate_limit_override.clone()),
+                    })
+                    .unwrap_or_else(|| crate::security::RequestPolicy {
+                        skip_bot_blocking: on_conf,
+                        ..crate::security::RequestPolicy::default()
+                    })
+            };
+            let body_view = crate::security::SecurityRequestView {
+                ip,
+                method: &method,
+                path: &path,
+                query: &body_query,
+                headers: request.headers(),
+                body: Some(&body),
+            };
+            let decision = security.inspect_body(&body_view, &body_route_policy, is_pentest);
+            if let Some((status, extra)) = crate::security::decision_to_h3_parts(&decision) {
+                warn!(
+                    "[QUIC/H3] WAF body decision {:?} for {} {}",
+                    decision, ip, path
+                );
+                metrics.requests.request_end_full(
+                    status.as_u16(),
+                    start_time.elapsed(),
+                    body.len() as u64,
+                    0,
+                    Some(&path),
+                    is_health_check,
+                );
+                let mut builder = http::Response::builder()
+                    .status(status)
+                    .header("server", SERVER_HEADER);
+                for (k, v) in extra {
+                    builder = builder.header(k, v);
+                }
+                let response = builder.body(())?;
+                stream.send_response(response).await?;
+                stream.finish().await?;
+                return Ok(());
+            }
+        }
+
         // --- Response cache lookup (GET / HEAD only, HTTP/3 path) ---
         // Range requests bypass the cache entirely: the cache stores whole responses
         // and must hand range requests to the backend so they get a correct 206 with

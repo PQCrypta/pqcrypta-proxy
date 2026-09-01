@@ -650,6 +650,12 @@ max_header_count = 80
 # Percent-decode passes before matching. One pass is a bypass: %253Cscript%253E
 # decodes once to %3Cscript%3E, matches nothing, and the origin decodes it again.
 max_decode_passes = 3
+# Decompress Content-Encoding'd request bodies (gzip/deflate/br/zstd) before
+# scanning. Without this a compressed payload is inspected as entropy and a
+# gzipped <script> reaches the origin unmatched. Bounded to avoid decompression bombs.
+decode_compressed_body = true
+# Cap on decompressed body bytes inspected (1 MiB).
+max_decompressed_body_bytes = 1048576
 # Custom extra regex patterns — empty, built-in ruleset covers OWASP Top 10
 custom_patterns = []
 
