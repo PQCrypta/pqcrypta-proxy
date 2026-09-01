@@ -785,12 +785,15 @@ are valid UTF-8; binary bodies are additionally matched against byte signatures
 (Java serialisation header, Python pickle opcodes) that no textual decoding
 could preserve.
 
-**Transport parity.** The WAF runs identically over HTTP/1.1, HTTP/2 and
-HTTP/3 — the QUIC/h3 handler and the TCP handler both call the one
+**Transport parity.** The WAF runs identically over HTTP/1.1, HTTP/2, HTTP/3
+and WebTransport. The TCP and QUIC/h3 handlers both call the one
 `SecurityState::evaluate` (and `inspect_body` once the body is buffered), so
-path, query, header and **body** inspection are the same on every transport. A
+path, query, header and **body** inspection are the same on every transport; a
 regression corpus is run over both `--transport auto` (h1/h2) and
-`--transport h3` to prove that parity, not assume it.
+`--transport h3` to prove that parity, not assume it. WebTransport stream and
+datagram payloads are proxied to the same backends as HTTP requests, so they run
+through the same `inspect_body` before reaching a backend — a WebTransport
+session is not an uninspected path to `/encrypt` and friends.
 
 **Compressed bodies.** A `Content-Encoding: gzip|deflate|br|zstd` request body
 is decompressed (bounded by `max_decompressed_body_bytes`, so a decompression
@@ -1347,7 +1350,7 @@ src/
 ├── rate_limiter.rs      # Advanced multi-dimensional rate limiting; JWT HMAC verification
 ├── proxy_protocol.rs    # PROXY protocol v2 support
 ├── access_logger.rs     # Structured access log with log-injection sanitization
-├── waf.rs               # WAF engine — 256-rule RegexSet with stable PQW-* IDs, anomaly scoring, multi-pass decoding, per-rule metrics (A01/A03/A06/A08/A10)
+├── waf.rs               # WAF engine — 256-rule RegexSet, PQW-* IDs, anomaly scoring, multi-pass decoding, per-rule metrics; enforced on TCP, HTTP/3 and WebTransport (A01/A03/A06/A08/A10)
 ├── audit_logger.rs      # Async structured JSON audit logger for security events
 └── webtransport_server.rs  # WebTransport session handling; per-origin session rate limiting
 ```
@@ -1826,6 +1829,20 @@ When tracing is active, every access-log line includes a `trace_id=<hex>` field 
 Spans are batched and exported asynchronously via OTLP HTTP/JSON (no protobuf dependency — uses the existing `reqwest` client). The global tracer provider is a NOOP until `init_otel()` is called after config loads, so startup spans are silently dropped; all request-handling spans are fully exported. On graceful shutdown, the batch queue is flushed before the process exits.
 
 ## Deployment
+
+### Fleet deploy (build-verified)
+
+`scripts/deploy.sh` builds the release binary, records its sha256, deploys to
+every proxy node, and verifies each node is running that exact hash with the
+service active. It always builds first: `cargo test` and `cargo clippy` do not
+produce the release binary, so copying `target/release/pqcrypta-proxy` after
+only those can ship a stale build — this script closes that gap.
+
+```bash
+scripts/deploy.sh              # build + deploy all nodes + verify hashes
+scripts/deploy.sh --local-only # this node only
+scripts/deploy.sh --gate       # also run the post-deploy WAF regression gate
+```
 
 ### Systemd (Linux)
 
