@@ -419,6 +419,11 @@ const PAYLOAD_RULES: &[RuleDef] = &[
         r"(?i)\|\s*(base64|xxd|od|openssl)\b"),
     RuleDef::payload("PQW-CMD-014", Category::CmdInjection, Severity::Critical,
         r"(?i)\b(bash|sh)\s+-i\s+>&\s*/dev/(tcp|udp)/"),
+    // A command-substitution wrapper around a recognised command is
+    // unambiguous — `$(id)`, `` `whoami` ``, `${cat}` — unlike the bare
+    // substitution syntax above, which appears in shell docs and stays Low.
+    RuleDef::payload("PQW-CMD-015", Category::CmdInjection, Severity::High,
+        r"(?i)[$`]\{?\(?\s*(id|whoami|uname|hostname|pwd|cat|ls|dir|env|set|ps|netstat|ifconfig|ip|curl|wget|nc|ncat|bash|sh|zsh|python[0-9]?|perl|ruby|php|powershell)\b"),
 
     // ---------------------------------------------------------------------
     // A08 — XXE
@@ -489,6 +494,16 @@ const PAYLOAD_RULES: &[RuleDef] = &[
         r"(?i)\{%\s*(import|include|extends|set|for|if|with|debug)\b"),
     RuleDef::payload("PQW-SSTI-005", Category::Ssti, Severity::High,
         r"(?i)<%=?\s*(system|exec|require|eval|Runtime|ProcessBuilder)\b"),
+    // PHP-family template engines (Smarty, Twig, Blade) — {php}...{/php},
+    // {$smarty.*}, Twig {{dump()}}, Smarty/Blade block tags {if}...{/if}.
+    RuleDef::payload("PQW-SSTI-006", Category::Ssti, Severity::Critical,
+        r"(?i)\{\s*/?\s*php\s*\}"),
+    RuleDef::payload("PQW-SSTI-007", Category::Ssti, Severity::High,
+        r"(?i)\{\$smarty\.(version|template|current_dir|ldelim|rdelim|now|const|config|session|server|get|post|cookies|request|capture)\b"),
+    RuleDef::payload("PQW-SSTI-008", Category::Ssti, Severity::High,
+        r"(?i)\{\{\s*(dump|include|source|attribute|constant|max|min|range|block|template_from_string)\s*\("),
+    RuleDef::payload("PQW-SSTI-009", Category::Ssti, Severity::Medium,
+        r"(?i)\{\s*/(if|foreach|section|for|while|block|literal|capture|strip)\s*\}"),
 
     // ---------------------------------------------------------------------
     // Local / remote file inclusion via URL stream wrappers
@@ -953,6 +968,61 @@ fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
 ///
 /// The raw form is always first; the rest are added only when they differ, so a
 /// header with no encoding at all costs exactly one scan.
+/// Decode IIS-style `%uXXXX` escapes.
+///
+/// Non-standard, but IIS and a handful of application stacks accept it, so a
+/// payload written `%u003cscript%u003e` reaches such a backend as `<script>`
+/// while surviving ordinary percent-decoding untouched (`%u` is not valid
+/// percent-encoding, so the earlier pass leaves it alone).
+fn percent_u_decode(input: &str) -> String {
+    if !input.contains("%u") && !input.contains("%U") {
+        return input.to_string();
+    }
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if (bytes[i] == b'%')
+            && i + 5 < bytes.len()
+            && (bytes[i + 1] | 0x20) == b'u'
+            && bytes[i + 2..i + 6].iter().all(u8::is_ascii_hexdigit)
+        {
+            if let Some(c) = u32::from_str_radix(&input[i + 2..i + 6], 16)
+                .ok()
+                .and_then(char::from_u32)
+            {
+                out.push(c);
+                i += 6;
+                continue;
+            }
+        }
+        let ch = input[i..].chars().next().unwrap_or('\u{fffd}');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Fold Unicode fullwidth Latin forms to their ASCII equivalents.
+///
+/// Fullwidth Latin (U+FF01..U+FF5E) renders like ASCII and several backends
+/// normalise it before use, so a fullwidth `<script>` is `<script>` to them.
+/// Folding it here lets the ASCII rules match without every rule having to
+/// enumerate the fullwidth codepoints.
+fn fold_fullwidth(input: &str) -> String {
+    if input.is_ascii() {
+        return input.to_string();
+    }
+    input
+        .chars()
+        .map(|c| match c {
+            '\u{ff01}'..='\u{ff5e}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+            '\u{3000}' => ' ', // ideographic space
+            _ => c,
+        })
+        .collect()
+}
+
 fn decode_variants(raw: &str, max_passes: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(4);
     out.push(raw.to_string());
@@ -974,6 +1044,12 @@ fn decode_variants(raw: &str, max_passes: usize) -> Vec<String> {
     }
     add(html_entity_decode(&pct), &mut out);
     add(json_unescape(&pct), &mut out);
+    if pct.contains('%') {
+        add(percent_u_decode(&pct), &mut out);
+    }
+    if !pct.is_ascii() {
+        add(fold_fullwidth(&pct), &mut out);
+    }
 
     out
 }
@@ -2583,5 +2659,115 @@ mod tests {
             assert!(t.len() <= max || max > s.len());
             assert!(s.starts_with(t));
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Gaps closed after the black-box pentest run
+    // ------------------------------------------------------------------
+
+    /// `$(id)` in a parameter passed inspection because bare `$(...)` is Low
+    /// (it appears in shell docs). A substitution wrapping a known command is
+    /// not ambiguous and must block.
+    #[test]
+    fn command_substitution_of_a_known_command_is_blocked() {
+        let headers = browser_headers();
+        for q in ["cmd=$(id)", "cmd=`whoami`", "x=${cat}", "y=$( uname -a )"] {
+            let v = engine().inspect(&WafRequest {
+                method: "GET",
+                path: "/run",
+                query: q,
+                headers: &headers,
+                body: None,
+                skip_bot_ua_check: false,
+                mode_override: None,
+            });
+            assert!(blocked(&v), "command substitution {q:?} must block");
+        }
+    }
+
+    /// PHP/Smarty/Twig template injection the Jinja-oriented rules missed.
+    #[test]
+    fn php_family_template_injection_is_blocked() {
+        let headers = browser_headers();
+        for q in [
+            "t={php}echo 7*7;{/php}",
+            "t={$smarty.version}",
+            "t={{dump(app)}}",
+            "t={/if}",
+        ] {
+            let v = engine().inspect(&WafRequest {
+                method: "GET",
+                path: "/tpl",
+                query: q,
+                headers: &headers,
+                body: None,
+                skip_bot_ua_check: false,
+                mode_override: None,
+            });
+            assert!(blocked(&v), "PHP-family SSTI {q:?} must block");
+        }
+    }
+
+    /// Fullwidth `<script>` (U+FF1C/FF1E) is folded to ASCII before matching.
+    #[test]
+    fn fullwidth_xss_is_folded_and_blocked() {
+        let headers = browser_headers();
+        // %EF%BC%9C = U+FF1C, %EF%BC%9E = U+FF1E.
+        let v = engine().inspect(&WafRequest {
+            method: "GET",
+            path: "/s",
+            query: "q=%EF%BC%9Cscript%EF%BC%9Ealert(1)%EF%BC%9C/script%EF%BC%9E",
+            headers: &headers,
+            body: None,
+            skip_bot_ua_check: false,
+            mode_override: None,
+        });
+        assert!(blocked(&v), "fullwidth-encoded XSS must block");
+    }
+
+    /// IIS-style `%uXXXX` escapes are decoded before matching.
+    #[test]
+    fn percent_u_encoded_xss_is_blocked() {
+        let headers = browser_headers();
+        let v = engine().inspect(&WafRequest {
+            method: "GET",
+            path: "/s",
+            query: "q=%u003cscript%u003ealert(1)%u003c/script%u003e",
+            headers: &headers,
+            body: None,
+            skip_bot_ua_check: false,
+            mode_override: None,
+        });
+        assert!(blocked(&v), "%u-encoded XSS must block");
+    }
+
+    #[test]
+    fn decoder_units_for_new_forms() {
+        assert_eq!(percent_u_decode("%u003cb%u003e"), "<b>");
+        assert_eq!(percent_u_decode("plain"), "plain");
+        assert_eq!(fold_fullwidth("\u{ff1c}script\u{ff1e}"), "<script>");
+        assert_eq!(fold_fullwidth("ascii"), "ascii");
+    }
+
+    /// A fullwidth query that is not an attack must still pass — the fold must
+    /// not turn ordinary wide-character text into a false positive.
+    #[test]
+    fn fullwidth_non_attack_text_is_allowed() {
+        let headers = browser_headers();
+        let v = engine().inspect(&WafRequest {
+            method: "GET",
+            path: "/s",
+            // Fullwidth "ABC123" — folds to ASCII "ABC123", matches no rule.
+            query: "q=%EF%BC%A1%EF%BC%A2%EF%BC%A3",
+            headers: &headers,
+            body: None,
+            skip_bot_ua_check: false,
+            mode_override: None,
+        });
+        assert!(
+            matches!(v, WafVerdict::Allow),
+            "benign fullwidth text must pass, got {}",
+            rule_of(&v)
+        );
     }
 }

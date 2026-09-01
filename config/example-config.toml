@@ -606,8 +606,10 @@ xss = true
 path_traversal = true
 # OWASP A03: NoSQL injection detection ($where, $gt operator abuse, etc.)
 nosqli = true
-# OWASP A10: SSRF detection — off, high false-positive rate for URL fields
-ssrf = false
+# OWASP A10: SSRF detection. Safe to enable since the scoring rework: metadata
+# IPs are Critical while loopback spellings (localhost, 127.x) are Low and need
+# corroboration, so a URL field mentioning localhost no longer 403s on its own.
+ssrf = true
 # OWASP A03: OS command injection (shell metacharacters, ${IFS}, reverse shells)
 cmd_injection = true
 # OWASP A08: XML external entity injection

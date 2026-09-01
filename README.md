@@ -777,8 +777,9 @@ rules' metric series in place rather than renumbering everything after them.
 
 **Decoding.** Inputs are matched raw and in every decoded form: percent-decoding
 is applied repeatedly to a fixpoint (`max_decode_passes`), plus form decoding
-(`+` → space), HTML character references (`&#x3c;`), and JSON string escapes
-(`\u003c`). A rule that matches several decoded forms of the same input counts
+(`+` → space), HTML character references (`&#x3c;`), JSON string escapes
+(`\u003c`), IIS-style `%uXXXX` escapes, and Unicode fullwidth folding
+(`\uff1cscript\uff1e` → `<script>`). A rule that matches several decoded forms of the same input counts
 once. Bodies are decoded lossily and are always inspected, whether or not they
 are valid UTF-8; binary bodies are additionally matched against byte signatures
 (Java serialisation header, Python pickle opcodes) that no textual decoding
