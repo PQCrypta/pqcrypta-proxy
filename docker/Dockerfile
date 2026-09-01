@@ -23,7 +23,10 @@
 #         defaultMode: 0400
 
 # Stage 1: Build
-FROM rust:1-bookworm AS builder
+# Trixie (Debian 13) ships OpenSSL 3.5.x; the `pqc` feature links 3.2+ symbols
+# (SSL_get0_group_name) and needs 3.5 for native ML-KEM, so bookworm's 3.0 will
+# not link. This matches the OpenSSL 3.5 that production runs.
+FROM rust:1-trixie AS builder
 
 WORKDIR /build
 
@@ -52,7 +55,7 @@ COPY tests ./tests
 RUN cargo build --release --locked
 
 # Stage 2: Runtime
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 # Install runtime dependencies
 # AUD-08: curl is required by the HEALTHCHECK instruction below.

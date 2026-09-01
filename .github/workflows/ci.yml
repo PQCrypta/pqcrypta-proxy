@@ -161,9 +161,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Setup OpenSSL 3.5 (Linux)
-        uses: ./.github/actions/setup-openssl-linux
-
       # Generate self-signed certificates for testing
       - name: Generate test certificates
         run: |
@@ -205,6 +202,12 @@ jobs:
           path_prefix = "/"
           backend = "echo"
           EOF
+
+      # Build/link needs OpenSSL 3.5 (native ML-KEM + SSL_get0_group_name); placed
+      # AFTER cert generation so the system openssl CLI above is not perturbed by
+      # LD_LIBRARY_PATH pointing at the freshly-built libs.
+      - name: Setup OpenSSL 3.5 (Linux)
+        uses: ./.github/actions/setup-openssl-linux
 
       # Run integration tests
       - name: Run integration tests
