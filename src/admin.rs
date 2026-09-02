@@ -55,11 +55,11 @@ pub struct AdminState {
     pub shutdown_tx: mpsc::Sender<()>,
     /// Server start time
     pub start_time: Instant,
-    /// Connection counter (legacy)
-    pub connection_count: Arc<RwLock<u64>>,
-    /// Request counter (legacy)
-    pub request_count: Arc<RwLock<u64>>,
-    /// Comprehensive metrics registry
+    /// Comprehensive metrics registry — the single source of connection and
+    /// request counts.  Two `RwLock<u64>` "legacy" counters used to live here
+    /// and were read by three health endpoints, but nothing in the codebase
+    /// ever incremented them, so every health response reported zero traffic on
+    /// a busy proxy.  The registry beside them had the real numbers all along.
     pub metrics: Arc<MetricsRegistry>,
     /// Structured audit logger for security-relevant events
     pub audit_logger: Option<Arc<AuditLogger>>,
@@ -103,8 +103,6 @@ impl AdminServer {
             rate_limiter,
             shutdown_tx,
             start_time: Instant::now(),
-            connection_count: Arc::new(RwLock::new(0)),
-            request_count: Arc::new(RwLock::new(0)),
             metrics,
             audit_logger,
             load_balancer,
@@ -114,8 +112,18 @@ impl AdminServer {
         Self { config, state }
     }
 
-    /// Run the admin HTTP server
-    pub async fn run(self) -> anyhow::Result<()> {
+    /// Run the admin HTTP server until `shutdown` resolves.
+    ///
+    /// The shutdown future is mandatory rather than optional: `axum::serve`
+    /// without `with_graceful_shutdown` never returns, so a caller that awaits
+    /// the server task can never make progress past it.  That is precisely the
+    /// bug this signature exists to make unrepresentable — every restart used
+    /// to stall in `stop-sigterm` until systemd sent SIGKILL, which killed
+    /// in-flight connections and skipped the connection-drain loop entirely.
+    pub async fn run(
+        self,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> anyhow::Result<()> {
         if !self.config.enabled {
             info!("Admin API disabled");
             return Ok(());
@@ -303,6 +311,10 @@ impl AdminServer {
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+            info!("Admin API shutting down");
+        })
         .await
         .map_err(|e| anyhow::anyhow!("Admin server error: {e}"))
     }
@@ -621,12 +633,14 @@ async fn health_handler(State(state): State<Arc<AdminState>>) -> Json<HealthResp
         });
     }
 
+    let snapshot = state.metrics.snapshot();
+
     Json(HealthResponse {
         status: "healthy".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_seconds: uptime,
-        connections: *state.connection_count.read(),
-        requests: *state.request_count.read(),
+        connections: snapshot.connections.active,
+        requests: snapshot.requests.total,
         backends,
     })
 }
@@ -1204,6 +1218,7 @@ struct QuicHealthResponse {
     port: u16,
     migration_enabled: bool,
     connections: u64,
+    http3_connections_total: u64,
 }
 
 /// WebTransport health response
@@ -1219,13 +1234,24 @@ struct WebTransportHealthResponse {
 /// QUIC protocol health endpoint (protected — requires auth)
 async fn health_quic_handler(State(state): State<Arc<AdminState>>) -> Json<QuicHealthResponse> {
     let config = state.config_manager.get();
-    let connections = *state.connection_count.read();
+    let snapshot = state.metrics.snapshot();
+
+    // "ok" used to be unconditional, which made this endpoint incapable of
+    // reporting the one thing it exists to report.  A listener that has been up
+    // long enough to be scraped and has never completed a QUIC handshake is not
+    // healthy, whatever the process state says.
+    let status = if snapshot.connections.http3 > 0 || state.start_time.elapsed().as_secs() < 60 {
+        "ok"
+    } else {
+        "degraded"
+    };
 
     Json(QuicHealthResponse {
-        status: "ok".to_string(),
+        status: status.to_string(),
         port: config.server.udp_port,
         migration_enabled: config.server.enable_quic_migration,
-        connections,
+        connections: snapshot.connections.active,
+        http3_connections_total: snapshot.connections.http3,
     })
 }
 
@@ -1234,11 +1260,21 @@ async fn health_webtransport_handler(
     State(state): State<Arc<AdminState>>,
 ) -> Json<WebTransportHealthResponse> {
     let config = state.config_manager.get();
-    let connections = *state.connection_count.read();
+    let snapshot = state.metrics.snapshot();
+
+    // WebTransport is only reachable when it is in the negotiated ALPN set;
+    // reporting "ok" for a listener that cannot accept a session is worse than
+    // reporting nothing, because it silences the alert that would catch it.
+    let advertised = config
+        .tls
+        .alpn_protocols
+        .iter()
+        .any(|p| p == "webtransport" || p == "h3");
+    let status = if advertised { "ok" } else { "unavailable" };
 
     Json(WebTransportHealthResponse {
-        status: "ok".to_string(),
-        active_connections: connections,
+        status: status.to_string(),
+        active_connections: snapshot.connections.webtransport,
         allowed_origins: config.server.webtransport_allowed_origins.clone(),
         max_sessions_per_origin: config.server.webtransport_max_sessions_per_origin,
         max_streams_per_session: config.server.webtransport_max_streams_per_session,

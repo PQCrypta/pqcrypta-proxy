@@ -915,6 +915,16 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
         // early data offered in ClientHello and tag the connection accordingly.
         config.tls.enable_0rtt,
     );
+    // The acceptor defaulted to mode "strict" with a 60 s window regardless of
+    // what the operator configured, so `tls.zero_rtt_replay_protection` and
+    // `tls.zero_rtt_nonce_window_secs` were validated at startup and then
+    // discarded.  Selecting "none" or "session" silently still got "strict",
+    // and — worse for anyone who trusted the knob — shortening the window did
+    // nothing.  Feed the acceptor the real values.
+    acceptor_builder = acceptor_builder.with_zero_rtt_protection(
+        &config.tls.zero_rtt_replay_protection,
+        config.tls.zero_rtt_nonce_window_secs,
+    );
     if let Some(h11_cfg) = http11_only_config {
         acceptor_builder = acceptor_builder
             .with_http11_only_acceptor(h11_cfg, config.server.http11_only_hosts.clone());
@@ -3051,6 +3061,27 @@ async fn proxy_handler(
                 route.name, method, path
             );
             return StatusCode::TOO_EARLY.into_response();
+        }
+
+        // L-5: `tls.zero_rtt_safe_methods` documents which methods may ride on
+        // early data and defaults to GET/HEAD, but nothing read it — a route
+        // with `allow_0rtt = true` forwarded a replayable POST just as happily
+        // as a GET.  The per-route flag says *whether* early data is allowed at
+        // all; this says *what* may travel on it, and both have to hold.
+        if is_early_data {
+            let safe = state
+                .config
+                .tls
+                .zero_rtt_safe_methods
+                .iter()
+                .any(|m| m.eq_ignore_ascii_case(method.as_str()));
+            if !safe {
+                debug!(
+                    "Rejecting 0-RTT early-data request on route {:?}: method {} is not in                      tls.zero_rtt_safe_methods",
+                    route.name, method
+                );
+                return StatusCode::TOO_EARLY.into_response();
+            }
         }
 
         // Enforce per-route HTTP/1.1 restriction (RFC 7231 §6.5.15).

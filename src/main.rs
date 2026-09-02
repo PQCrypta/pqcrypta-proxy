@@ -624,9 +624,16 @@ async fn run() -> anyhow::Result<()> {
         config.backends.len()
     );
 
-    // Create shutdown channels
-    let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
-    let (_admin_shutdown_tx, _admin_shutdown_rx) = mpsc::channel::<()>(1);
+    // Create shutdown channels.
+    //
+    // `shutdown_tx` runs admin → main: POST /shutdown sends on it and the
+    // select! below receives.  The receiver used to be bound as `_shutdown_rx`
+    // and never polled, so the documented admin shutdown endpoint returned 200
+    // and shut nothing down.
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
+    // `admin_shutdown_tx` runs the other way, main → admin, so the admin
+    // listener stops accepting and drains when the process is going down.
+    let (admin_shutdown_tx, mut admin_shutdown_rx) = mpsc::channel::<()>(1);
 
     // Start configuration file watching
     if args.watch_config {
@@ -885,7 +892,12 @@ async fn run() -> anyhow::Result<()> {
     );
 
     let admin_handle = tokio::spawn(async move {
-        if let Err(e) = admin_server.run().await {
+        if let Err(e) = admin_server
+            .run(async move {
+                let _ = admin_shutdown_rx.recv().await;
+            })
+            .await
+        {
             error!("Admin server error: {}", e);
         }
     });
@@ -1420,6 +1432,9 @@ async fn run() -> anyhow::Result<()> {
         _ = shutdown_signal() => {
             info!("Received shutdown signal, initiating graceful shutdown...");
         }
+        _ = shutdown_rx.recv() => {
+            info!("Received admin API shutdown request, initiating graceful shutdown...");
+        }
     }
 
     // Graceful shutdown
@@ -1430,7 +1445,7 @@ async fn run() -> anyhow::Result<()> {
 
     // Send shutdown signal to admin server
     // Intentionally ignored: receiver may already be gone during shutdown
-    let _ = shutdown_tx.send(()).await;
+    let _ = admin_shutdown_tx.send(()).await;
 
     // Send shutdown signals to HTTP fingerprinting listeners
     // Intentionally ignored: receivers may already be gone during shutdown
@@ -1443,11 +1458,6 @@ async fn run() -> anyhow::Result<()> {
     // Intentionally ignored: receivers may already be gone during shutdown
     for quic_shutdown_tx in quic_shutdown_senders {
         let _ = quic_shutdown_tx.send(()).await;
-    }
-
-    // Wait for admin server to stop
-    if let Err(e) = admin_handle.await {
-        warn!("Admin server task error during shutdown: {}", e);
     }
 
     // AUD-11 / SEC-A06: Poll active connections and exit as soon as they reach
@@ -1474,6 +1484,24 @@ async fn run() -> anyhow::Result<()> {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // Wait for the admin server to finish draining — inside the same budget,
+    // not on top of it.  `graceful_shutdown_timeout_secs` is the number an
+    // operator sizes their unit's TimeoutStopSec against, so the whole shutdown
+    // has to fit within it or the supervisor SIGKILLs the process mid-drain and
+    // the budget means nothing.  Whatever the connection drain did not spend is
+    // what the admin listener gets, with a floor so it is never zero.
+    let admin_budget = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .max(std::time::Duration::from_secs(1));
+    match tokio::time::timeout(admin_budget, admin_handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("Admin server task error during shutdown: {}", e),
+        Err(_) => warn!(
+            "Admin server did not drain within {:?} — proceeding with shutdown",
+            admin_budget
+        ),
     }
 
     // Flush and shut down OTEL before process exit so buffered spans are exported
@@ -1975,7 +2003,7 @@ async fn perform_security_checks(config: &ProxyConfig) -> anyhow::Result<()> {
     // =========================================================================
     if config.pqc.enabled {
         // Quick PQC support verification
-        match verify_pqc_support() {
+        match verify_pqc_support(&config.pqc) {
             Ok(status) => {
                 info!(
                     "  ✅ PQC Support: OpenSSL {} with {} KEMs",

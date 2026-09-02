@@ -430,8 +430,21 @@ impl QuicListener {
             }
         }
 
-        // Graceful shutdown: wait for existing connections to drain
-        info!("Waiting for existing connections to close...");
+        // Graceful shutdown: tell peers we are going away, then wait for the
+        // connections to finish.
+        //
+        // `wait_idle()` on its own waits for connections to close *by
+        // themselves*, and an idle HTTP/3 connection from a browser does not:
+        // it sits there until its own idle timeout, which outlives any
+        // shutdown budget.  So every restart drained for the full
+        // `graceful_shutdown_timeout_secs` and then gave up with connections
+        // still counted active.  `close()` sends CONNECTION_CLOSE to each open
+        // connection first (QUIC's equivalent of HTTP/2 GOAWAY), so peers
+        // reconnect to the new process immediately instead of waiting to be
+        // cut off.
+        info!("Closing QUIC connections and waiting for them to drain...");
+        self.endpoint
+            .close(quinn::VarInt::from_u32(0), b"server shutting down");
         self.endpoint.wait_idle().await;
 
         info!("QUIC listener stopped");
@@ -1801,6 +1814,62 @@ impl QuicListener {
                 return Ok(());
             }
         };
+
+        // Per-route rate limits, applied after route matching exactly as the TCP
+        // path does.  This check did not exist here at all, so every
+        // `[advanced_rate_limiting.route_limits.*]` block was enforced over
+        // HTTP/1.1 and HTTP/2 and skipped over HTTP/3 — a login endpoint pinned
+        // to 2 rps was served at the global per-IP rate to any client willing to
+        // negotiate h3, which browsers do by default off the Alt-Svc header.
+        // The two listeners are separate implementations; a control added to one
+        // is not a control until it is added to both.
+        if let Some(ref route_name) = route.name {
+            if config
+                .advanced_rate_limiting
+                .route_limits
+                .contains_key(route_name.as_str())
+            {
+                let route_ctx = build_context_from_request(
+                    ip,
+                    request.headers(),
+                    &path,
+                    &method,
+                    fingerprint.ja3_hash.clone(),
+                    fingerprint.ja4_hash.clone(),
+                    Some(route_name.clone()),
+                );
+                if let RateLimitResult::Limited {
+                    retry_after_ms,
+                    limit,
+                    ..
+                } = advanced_rate_limiter.check(&route_ctx).await
+                {
+                    warn!(
+                        "HTTP/3 per-route rate limit exceeded for {} on route {}",
+                        ip, route_name
+                    );
+                    let response = http::Response::builder()
+                        .status(http::StatusCode::TOO_MANY_REQUESTS)
+                        .header("server", SERVER_HEADER)
+                        .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
+                        .header("retry-after", (retry_after_ms / 1000).to_string())
+                        .header("x-ratelimit-limit", limit.to_string())
+                        .header("x-ratelimit-remaining", "0")
+                        .body(())?;
+                    stream.send_response(response).await?;
+                    stream.finish().await?;
+                    metrics.requests.request_end_full(
+                        429,
+                        start_time.elapsed(),
+                        0,
+                        0,
+                        Some(&path),
+                        is_health_check,
+                    );
+                    return Ok(());
+                }
+            }
+        }
 
         // Handle CORS preflight OPTIONS requests using route.cors
         if request.method() == http::Method::OPTIONS {

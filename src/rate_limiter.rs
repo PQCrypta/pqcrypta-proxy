@@ -1533,6 +1533,29 @@ impl AdvancedRateLimiter {
 
             // Resolve key + limits; clone what we need for the async phase.
             let (key, limits) = self.resolve_key_and_limits(ctx, &config);
+
+            // `route_limits.<route>.exempt_keys` names the key values that this
+            // route does not rate-limit — a health-check API key, a monitoring
+            // agent's fingerprint, an internal caller's IP.  The field was
+            // parsed and stored and read by nothing, so every listed key was
+            // limited exactly like an anonymous one.  Compare against the
+            // resolved key's value, which is what the operator writes in the
+            // list, rather than the internal `type:value` string.
+            if let Some(route_name) = &ctx.route_name {
+                if let Some(route_limits) = config.route_limits.get(route_name) {
+                    let bare = key
+                        .value
+                        .split_once('#')
+                        .map_or(key.value.as_str(), |(_, v)| v);
+                    if route_limits.exempt_keys.iter().any(|k| k == bare) {
+                        return RateLimitResult::Allowed {
+                            remaining: u32::MAX,
+                            limit: u32::MAX,
+                        };
+                    }
+                }
+            }
+
             Some(SyncData {
                 key_string: key.to_key_string(),
                 limits,
@@ -1736,17 +1759,33 @@ impl AdvancedRateLimiter {
         ctx: &RateLimitContext,
         config: &AdvancedRateLimitConfig,
     ) -> (RateLimitKey, PerKeyLimits) {
-        // Check for route-specific overrides first
+        // Check for route-specific overrides first.
+        //
+        // `key_override` used to be the only way a route's limits took effect:
+        // without one this fell straight through to the waterfall, which
+        // resolved the ordinary per-IP key AND the ordinary per-IP limits, so a
+        // route configured at 2 rps was served at the global 1000 rps.  A
+        // `[route_limits.*]` block with no `key_override` is the common shape —
+        // it is how you say "this endpoint is stricter than the rest" — so it
+        // has to work on its own.
+        //
+        // The key is namespaced with the route name either way.  Sharing the
+        // unprefixed per-IP key would put the route's traffic in the same
+        // bucket as everything else from that address, which both double-counts
+        // ordinary requests and lets other traffic exhaust the route's budget.
         if let Some(route_name) = &ctx.route_name {
             if let Some(route_limits) = config.route_limits.get(route_name) {
-                if let Some(ref key_override) = route_limits.key_override {
-                    if let Some(value) = self.extract_key_value(key_override, ctx, config) {
-                        return (
-                            RateLimitKey::new(key_override.clone(), value),
-                            route_limits.limits.clone(),
-                        );
-                    }
-                }
+                let key_type = route_limits
+                    .key_override
+                    .clone()
+                    .unwrap_or_else(|| config.key_strategy.fallback.clone());
+                let value = self
+                    .extract_key_value(&key_type, ctx, config)
+                    .unwrap_or_else(|| ctx.source_ip.to_string());
+                return (
+                    RateLimitKey::new(key_type, format!("{route_name}#{value}")),
+                    route_limits.limits.clone(),
+                );
             }
         }
 
@@ -1782,6 +1821,24 @@ impl AdvancedRateLimiter {
                         RateLimitKey::composite(components),
                         composite.limits.clone(),
                     );
+                }
+            }
+        }
+
+        // `fingerprint_limiting.prefer_over_ip` exists for NAT: behind one
+        // public address a TLS fingerprint separates clients that an IP cannot.
+        // It was declared, defaulted and documented, and then never read — so
+        // any deployment whose `key_strategy.order` listed an IP key first
+        // (the common shape) rate-limited an entire NAT as a single client.
+        // Honour it by trying the fingerprint keys ahead of the waterfall.
+        if config.fingerprint_limiting.enabled && config.fingerprint_limiting.prefer_over_ip {
+            for key_type in [
+                RateLimitKeyType::Ja3Fingerprint,
+                RateLimitKeyType::Ja4Fingerprint,
+            ] {
+                if let Some(value) = self.extract_key_value(&key_type, ctx, config) {
+                    let limits = self.get_limits_for_key(&key_type, &value, config);
+                    return (RateLimitKey::new(key_type, value), limits);
                 }
             }
         }
@@ -2026,11 +2083,22 @@ impl AdvancedRateLimiter {
         value: &str,
         config: &AdvancedRateLimitConfig,
     ) -> PerKeyLimits {
-        // Check for fingerprint-specific limits
+        // Check for fingerprint-specific limits.
+        //
+        // Two knobs used to be inert here.  `fingerprint_limiting.enabled` was
+        // never consulted, so turning the subsystem off left its limits fully
+        // in force; and `global_limits.per_fingerprint` — a complete limit
+        // block sat alongside per_ip/per_api_key/per_composite — was read by
+        // nothing at all, so an operator who tuned it got `unknown_limits`
+        // regardless.  `per_fingerprint` is now the base for a fingerprint key,
+        // which `fingerprint_limiting` refines when it is switched on.
         if matches!(
             key_type,
             RateLimitKeyType::Ja3Fingerprint | RateLimitKeyType::Ja4Fingerprint
         ) {
+            if !config.fingerprint_limiting.enabled {
+                return config.global_limits.per_fingerprint.clone();
+            }
             if let Some(limits) = config.fingerprint_limiting.trusted_fingerprints.get(value) {
                 return limits.clone();
             }
@@ -2414,6 +2482,180 @@ mod tests {
 
         // Some requests should be rate limited
         assert!(limited_count > 0);
+    }
+
+    /// `route_limits.<route>.exempt_keys` was parsed and never read, so a key
+    /// an operator had explicitly exempted was rate-limited like any other.
+    #[tokio::test]
+    async fn exempt_keys_bypass_the_route_limit() {
+        let mut config = AdvancedRateLimitConfig::default();
+        config.route_limits.insert(
+            "health".to_string(),
+            RouteLimits {
+                pattern: "/health".to_string(),
+                limits: PerKeyLimits {
+                    requests_per_second: 1,
+                    burst_size: 1,
+                    requests_per_minute: None,
+                    requests_per_hour: None,
+                },
+                key_override: None,
+                exempt_keys: vec!["10.9.9.9".to_string()],
+            },
+        );
+        let limiter = AdvancedRateLimiter::new(config);
+
+        let ctx = |ip| RateLimitContext {
+            source_ip: IpAddr::V4(ip),
+            headers: HashMap::new(),
+            path: "/health".to_string(),
+            method: "GET".to_string(),
+            query_params: HashMap::new(),
+            cookies: HashMap::new(),
+            ja3_hash: None,
+            ja4_hash: None,
+            route_name: Some("health".to_string()),
+        };
+
+        // The exempt monitoring agent is never limited, however hard it polls.
+        let exempt = ctx(Ipv4Addr::new(10, 9, 9, 9));
+        for _ in 0..50 {
+            assert!(matches!(
+                limiter.check(&exempt).await,
+                RateLimitResult::Allowed { .. }
+            ));
+        }
+
+        // A caller that is not on the list still hits the 1 rps route limit.
+        let other = ctx(Ipv4Addr::new(10, 9, 9, 10));
+        let mut limited = 0;
+        for _ in 0..50 {
+            if matches!(limiter.check(&other).await, RateLimitResult::Limited { .. }) {
+                limited += 1;
+            }
+        }
+        assert!(limited > 0, "non-exempt key should still be limited");
+    }
+
+    /// A `[route_limits.*]` block with no `key_override` used to fall straight
+    /// through to the global per-IP limits, so the stricter number an operator
+    /// wrote for a login endpoint was never applied.
+    #[tokio::test]
+    async fn route_limits_apply_without_a_key_override() {
+        let mut config = AdvancedRateLimitConfig::default();
+        config.route_limits.insert(
+            "login".to_string(),
+            RouteLimits {
+                pattern: "/api/method/login".to_string(),
+                limits: PerKeyLimits {
+                    requests_per_second: 2,
+                    burst_size: 2,
+                    requests_per_minute: None,
+                    requests_per_hour: None,
+                },
+                key_override: None,
+                exempt_keys: Vec::new(),
+            },
+        );
+        let limiter = AdvancedRateLimiter::new(config);
+
+        let ctx = RateLimitContext {
+            source_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 4)),
+            headers: HashMap::new(),
+            path: "/api/method/login".to_string(),
+            method: "POST".to_string(),
+            query_params: HashMap::new(),
+            cookies: HashMap::new(),
+            ja3_hash: None,
+            ja4_hash: None,
+            route_name: Some("login".to_string()),
+        };
+
+        let mut limited = 0;
+        for _ in 0..40 {
+            if matches!(limiter.check(&ctx).await, RateLimitResult::Limited { .. }) {
+                limited += 1;
+            }
+        }
+        assert!(
+            limited > 0,
+            "a 2 rps route limit must bite well inside 40 requests"
+        );
+
+        // The route bucket is namespaced, so the same IP on a route with no
+        // limits block is unaffected by what it spent above.
+        let elsewhere = RateLimitContext {
+            route_name: None,
+            path: "/".to_string(),
+            ..ctx.clone()
+        };
+        assert!(matches!(
+            limiter.check(&elsewhere).await,
+            RateLimitResult::Allowed { .. }
+        ));
+    }
+
+    /// `fingerprint_limiting.prefer_over_ip` is the NAT knob: it must beat an
+    /// IP-first `key_strategy.order`, which is the configuration shape that
+    /// makes it worth having.  It was never read.
+    #[tokio::test]
+    async fn prefer_over_ip_puts_the_fingerprint_ahead_of_an_ip_first_order() {
+        let mut config = AdvancedRateLimitConfig::default();
+        config.key_strategy.order = vec![RateLimitKeyType::SourceIp];
+        config.fingerprint_limiting.enabled = true;
+        config.fingerprint_limiting.prefer_over_ip = true;
+        let limiter = AdvancedRateLimiter::new(config.clone());
+
+        let ctx = RateLimitContext {
+            source_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+            headers: HashMap::new(),
+            path: "/".to_string(),
+            method: "GET".to_string(),
+            query_params: HashMap::new(),
+            cookies: HashMap::new(),
+            ja3_hash: Some("cd08e31494f9531f560d64c695473da9".to_string()),
+            ja4_hash: None,
+            route_name: None,
+        };
+
+        let (key, _) = limiter.resolve_key_and_limits(&ctx, &config);
+        assert_eq!(key.key_type, RateLimitKeyType::Ja3Fingerprint);
+
+        // With the knob off, the configured IP-first order wins again.
+        let mut ip_first = config;
+        ip_first.fingerprint_limiting.prefer_over_ip = false;
+        let (key, _) = limiter.resolve_key_and_limits(&ctx, &ip_first);
+        assert_eq!(key.key_type, RateLimitKeyType::SourceIp);
+    }
+
+    /// `global_limits.per_fingerprint` was a fully-populated limit block that
+    /// nothing read, and `fingerprint_limiting.enabled = false` did not turn
+    /// fingerprint limiting off.  Switching the subsystem off now falls back to
+    /// the global block instead of silently keeping `unknown_limits`.
+    #[tokio::test]
+    async fn disabling_fingerprint_limiting_falls_back_to_the_global_block() {
+        let mut config = AdvancedRateLimitConfig::default();
+        config.global_limits.per_fingerprint = PerKeyLimits {
+            requests_per_second: 4242,
+            burst_size: 99,
+            requests_per_minute: None,
+            requests_per_hour: None,
+        };
+        config.fingerprint_limiting.unknown_limits = PerKeyLimits {
+            requests_per_second: 7,
+            burst_size: 7,
+            requests_per_minute: None,
+            requests_per_hour: None,
+        };
+        let limiter = AdvancedRateLimiter::new(config.clone());
+
+        config.fingerprint_limiting.enabled = true;
+        let on = limiter.get_limits_for_key(&RateLimitKeyType::Ja3Fingerprint, "abc", &config);
+        assert_eq!(on.requests_per_second, 7);
+
+        config.fingerprint_limiting.enabled = false;
+        let off = limiter.get_limits_for_key(&RateLimitKeyType::Ja3Fingerprint, "abc", &config);
+        assert_eq!(off.requests_per_second, 4242);
     }
 
     #[tokio::test]

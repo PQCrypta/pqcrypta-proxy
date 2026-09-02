@@ -1156,21 +1156,25 @@ impl PqcTlsProvider {
     }
 }
 
-/// Verify that the system supports PQC TLS
+/// Verify that the operator's configured OpenSSL supports PQC TLS.
 ///
-/// This function creates a temporary PQC provider and checks if the system
-/// has OpenSSL 3.5+ with ML-KEM support available.
+/// Takes the live `[pqc]` config rather than `PqcConfig::default()`.  With the
+/// default it probed the compiled-in `/usr/local/openssl-3.5/lib64` no matter
+/// what `openssl_lib_path` said, so any host that installed OpenSSL 3.5
+/// somewhere else logged "PQC not available, falling back to classical TLS" at
+/// every startup while the listeners — which do read the config — negotiated
+/// ML-KEM perfectly well.  A startup check that reports on a path the server
+/// never uses is worse than no check: it trains operators to ignore it.
 ///
 /// # Example
 /// ```ignore
-/// match verify_pqc_support() {
+/// match verify_pqc_support(&config.pqc) {
 ///     Ok(status) => println!("PQC supported: {:?}", status.available_kems),
 ///     Err(e) => println!("PQC not available: {}", e),
 /// }
 /// ```
-pub fn verify_pqc_support() -> Result<PqcStatus, String> {
-    let config = PqcConfig::default();
-    let provider = PqcTlsProvider::new(&config);
+pub fn verify_pqc_support(config: &PqcConfig) -> Result<PqcStatus, String> {
+    let provider = PqcTlsProvider::new(config);
     let status = provider.status();
 
     if status.available {
