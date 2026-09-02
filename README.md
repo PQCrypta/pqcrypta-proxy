@@ -632,8 +632,8 @@ burst_size = 50
 [advanced_rate_limiting.adaptive]
 enabled = true
 baseline_window_secs = 3600         # window used to profile normal traffic
-sensitivity = 0.7                   # 0.0 = off, 1.0 = maximum
-auto_adjust = true                  # adjust limits from detected anomalies
+sensitivity = 0.7                   # 0.0 = laxest, 1.0 = strictest; 0.7 == raw multiplier
+auto_adjust = true                  # tighten each key's limits toward its own baseline
 min_samples = 1000                  # samples required before adaptive limiting acts
 std_dev_multiplier = 3.0            # requests > mean + N*stddev counts as an anomaly
 
@@ -656,6 +656,36 @@ requests_per_hour = 100
 - **IPv6 Subnet Grouping**: `ipv6_subnet_bits` groups /64 subnets to prevent per-host evasion
 - **Adaptive Baseline**: profiles normal traffic over `baseline_window_secs` and flags requests beyond `std_dev_multiplier` standard deviations
 - **Layered Limits**: Global → Route → Client hierarchy for defense in depth
+
+#### Adaptive: `sensitivity` and `auto_adjust`
+
+A request is anomalous once its rate exceeds `mean + k * stddev` for its key.
+`std_dev_multiplier` is the raw `k`; **`sensitivity`** is the same control
+expressed the way an operator thinks about it, and the two compose rather than
+compete. The scale is **anchored at the default 0.7**, which yields exactly
+`std_dev_multiplier` — so a deployment that leaves `sensitivity` alone behaves
+identically to one that had never heard of it:
+
+| `sensitivity` | effective `k` at the 3.0 default | effect |
+|---|---|---|
+| 0.0 | 10.0 | only gross outliers |
+| 0.7 | 3.0 | the default, unchanged |
+| 1.0 | 0.25 | floored — maximum sensitivity still needs a real deviation |
+
+**`auto_adjust`** tightens each key's `requests_per_minute` and
+`requests_per_hour` toward that key's own learned threshold. The configured
+limits are necessarily sized for the busiest plausible caller, so without it
+every quiet key carries the loudest key's headroom: an account that normally
+makes 5 requests a minute may make 3,000 before anything objects, which is all
+the room a credential-stuffing run needs.
+
+Adjustment is **one-directional and bounded**. The configured limit is a ceiling
+that is never exceeded and `burst_size` is the floor, so a nearly-idle key
+cannot be tightened into limiting its own first legitimate burst. Nothing
+happens at all until the key's baseline reaches `min_samples` — a new key is not
+throttled for being new. The per-second token bucket is deliberately untouched:
+its quota is fixed when the bucket is built, and per-second bursts are what
+`burst_size` and the anomaly detector already answer.
 
 ### Distributed Rate Limiting (Redis)
 

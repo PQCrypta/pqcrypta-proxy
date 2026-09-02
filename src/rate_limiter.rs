@@ -519,11 +519,33 @@ pub struct AdaptiveConfig {
     #[serde(default = "default_baseline_window")]
     pub baseline_window_secs: u64,
 
-    /// Anomaly detection sensitivity (0.0 - 1.0)
+    /// Anomaly detection sensitivity, 0.0 (laxest) to 1.0 (strictest).
+    ///
+    /// Scales `std_dev_multiplier`, which is the raw statistical knob: a
+    /// request is anomalous once its rate exceeds `mean + multiplier * stddev`.
+    /// Sensitivity is the same control expressed the way an operator thinks
+    /// about it — turn it up to catch more, down to catch less — so the two
+    /// compose rather than compete.
+    ///
+    /// The scale is anchored at the default 0.7, which yields exactly
+    /// `std_dev_multiplier` and so reproduces the behaviour of every existing
+    /// deployment unchanged.  See `effective_std_dev_multiplier`.
     #[serde(default = "default_sensitivity")]
     pub sensitivity: f64,
 
-    /// Auto-adjust limits based on traffic patterns
+    /// Tighten each key's minute and hour limits toward its own learned
+    /// baseline.
+    ///
+    /// The configured limits are sized for the busiest plausible caller, so
+    /// every quiet key carries the loudest key's headroom: an account that
+    /// normally makes 5 requests a minute can make 3,000 before anything
+    /// objects, which is all the room a credential-stuffing run needs.  With
+    /// this on, once a key has enough samples its standing limits move down to
+    /// its observed normal plus the anomaly margin.
+    ///
+    /// Adjustment is one-directional: the configured limit is a ceiling that is
+    /// never exceeded, and `burst_size` is the floor, so a nearly-idle key
+    /// cannot be tightened into limiting its own first legitimate burst.
     #[serde(default)]
     pub auto_adjust: bool,
 
@@ -538,6 +560,34 @@ pub struct AdaptiveConfig {
 
 fn default_baseline_window() -> u64 {
     3600 // 1 hour
+}
+
+/// The sensitivity value at which the scale is anchored.  At this value
+/// `effective_std_dev_multiplier` returns `std_dev_multiplier` untouched.
+const ANCHOR_SENSITIVITY: f64 = 0.7;
+
+/// Maximum sensitivity still requires a real deviation from the mean.  Without
+/// a floor, `sensitivity = 1.0` collapses the threshold onto the mean itself,
+/// and roughly half of all samples sit above their own mean.
+const MIN_STD_DEV_MULTIPLIER: f64 = 0.25;
+
+/// Fold `sensitivity` into `std_dev_multiplier` to get the multiplier the
+/// baseline actually uses.
+///
+/// `sensitivity` was declared, defaulted, documented and read by nothing, so
+/// the only thing that moved the anomaly threshold was the raw statistical
+/// multiplier.  The mapping is linear and anchored at the default sensitivity,
+/// so a deployment that never touched either knob sees no change at all:
+///
+/// | sensitivity | factor | multiplier at the 3.0 default |
+/// |-------------|--------|-------------------------------|
+/// | 0.0         | 3.33   | 10.0  — only gross outliers   |
+/// | 0.7         | 1.00   | 3.0   — today's behaviour     |
+/// | 1.0         | 0.00   | 0.25  — floored, see above    |
+fn effective_std_dev_multiplier(config: &AdaptiveConfig) -> f64 {
+    let sensitivity = config.sensitivity.clamp(0.0, 1.0);
+    let factor = (1.0 - sensitivity) / (1.0 - ANCHOR_SENSITIVITY);
+    (config.std_dev_multiplier * factor).max(MIN_STD_DEV_MULTIPLIER)
 }
 
 fn default_sensitivity() -> f64 {
@@ -1080,15 +1130,25 @@ impl AdaptiveBaseline {
         samples.retain(|(t, _)| *t > cutoff);
     }
 
-    /// Check if value is anomalous
+    /// Whether enough samples have been seen for the mean to mean anything.
+    pub fn is_established(&self) -> bool {
+        self.count.load(Ordering::Relaxed) >= self.min_samples
+    }
+
+    /// The rate above which a sample counts as anomalous: `mean + k * stddev`,
+    /// where `k` already has `sensitivity` folded in.
+    ///
+    /// Exposed separately from `is_anomaly` because `auto_adjust` needs the
+    /// number itself, not the verdict — the same threshold that flags a spike
+    /// is the right resting place for the key's standing limits.  Returns
+    /// `None` until the baseline is established.
     // Prometheus gauge values are f64; precision loss on large counter values is acceptable.
     #[allow(clippy::cast_precision_loss)]
-    pub fn is_anomaly(&self, value: u64) -> bool {
-        let count = self.count.load(Ordering::Relaxed);
-        if count < self.min_samples {
-            return false; // Not enough data for baseline
+    pub fn threshold(&self) -> Option<f64> {
+        if !self.is_established() {
+            return None;
         }
-
+        let count = self.count.load(Ordering::Relaxed);
         let sum = self.sum.load(Ordering::Relaxed) as f64;
         let sum_sq = self.sum_squared.load(Ordering::Relaxed) as f64;
         let n = count as f64;
@@ -1099,9 +1159,17 @@ impl AdaptiveBaseline {
         let variance = mean.mul_add(-mean, sum_sq / n);
         let std_dev = variance.sqrt();
 
-        let threshold = self.std_dev_multiplier.mul_add(std_dev, mean);
+        Some(self.std_dev_multiplier.mul_add(std_dev, mean))
+    }
 
-        value as f64 > threshold
+    /// Check if value is anomalous
+    // Prometheus gauge values are f64; precision loss on large counter values is acceptable.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn is_anomaly(&self, value: u64) -> bool {
+        match self.threshold() {
+            Some(threshold) => value as f64 > threshold,
+            None => false, // Not enough data for baseline
+        }
     }
 
     /// Get current mean
@@ -1192,7 +1260,7 @@ impl RateLimitBucket {
                 Some(Arc::new(AdaptiveBaseline::new(
                     config.baseline_window_secs,
                     config.min_samples,
-                    config.std_dev_multiplier,
+                    effective_std_dev_multiplier(config),
                 )))
             } else {
                 None
@@ -1212,8 +1280,56 @@ impl RateLimitBucket {
         }
     }
 
+    /// The limits this bucket actually enforces, after `auto_adjust`.
+    ///
+    /// Returns `limits` untouched unless auto-adjustment is on AND this key's
+    /// baseline has reached `min_samples`.  Once established, the standing
+    /// minute/hour ceilings move down to
+    /// the key's own anomaly threshold, bounded by `burst_size` below and the
+    /// operator's configured value above.  The per-second token bucket is not
+    /// touched: `governor`'s quota is fixed when the bucket is built, and
+    /// per-second bursts are what `burst_size` and the anomaly detector already
+    /// answer.
+    fn effective_limits(&self, limits: &PerKeyLimits, adaptive: &AdaptiveConfig) -> PerKeyLimits {
+        if !adaptive.auto_adjust {
+            return limits.clone();
+        }
+        let Some(ref baseline) = self.baseline else {
+            return limits.clone();
+        };
+        // `threshold()` is None until the baseline reaches `min_samples`.  An
+        // unestablished baseline has a meaningless mean, and tightening on it
+        // would throttle a key for being new.
+        let Some(threshold) = baseline.threshold() else {
+            return limits.clone();
+        };
+
+        // The baseline records per-minute counts, so its threshold is already
+        // in the units `requests_per_minute` is expressed in.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let per_minute = threshold.ceil().clamp(0.0, f64::from(u32::MAX)) as u32;
+        let per_minute = per_minute.max(limits.burst_size);
+
+        PerKeyLimits {
+            requests_per_second: limits.requests_per_second,
+            burst_size: limits.burst_size,
+            requests_per_minute: limits
+                .requests_per_minute
+                .map(|configured| per_minute.min(configured)),
+            requests_per_hour: limits.requests_per_hour.map(|configured| {
+                per_minute
+                    .saturating_mul(60)
+                    .max(limits.burst_size)
+                    .min(configured)
+            }),
+        }
+    }
+
     /// Check if request is allowed
-    pub fn check(&self, limits: &PerKeyLimits) -> RateLimitResult {
+    pub fn check(&self, limits: &PerKeyLimits, adaptive: &AdaptiveConfig) -> RateLimitResult {
+        let adjusted = self.effective_limits(limits, adaptive);
+        let limits = &adjusted;
+
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         *self.last_request.write() = Instant::now();
 
@@ -1422,7 +1538,7 @@ impl AdvancedRateLimiter {
         // Extract adaptive config values before moving config
         let adaptive_baseline_window = config.adaptive.baseline_window_secs;
         let adaptive_min_samples = config.adaptive.min_samples;
-        let adaptive_std_dev_multiplier = config.adaptive.std_dev_multiplier;
+        let adaptive_std_dev_multiplier = effective_std_dev_multiplier(&config.adaptive);
 
         // Stash the Redis config before consuming `config`.
         let redis_cfg = config.redis.clone();
@@ -1699,7 +1815,7 @@ impl AdvancedRateLimiter {
         adaptive_cfg: &AdaptiveConfig,
     ) -> RateLimitResult {
         let bucket = self.get_or_create_bucket(key_string, limits, adaptive_cfg);
-        bucket.check(limits)
+        bucket.check(limits, adaptive_cfg)
     }
 
     fn get_or_create_bucket(
@@ -2482,6 +2598,190 @@ mod tests {
 
         // Some requests should be rate limited
         assert!(limited_count > 0);
+    }
+
+    /// `sensitivity` was declared, defaulted, documented and read by nothing.
+    /// The mapping must be monotonic, must be anchored at the default so no
+    /// existing deployment changes behaviour, and must never collapse the
+    /// threshold onto the mean.
+    #[test]
+    fn sensitivity_scales_the_std_dev_multiplier_around_the_default() {
+        let at = |sensitivity: f64| {
+            effective_std_dev_multiplier(&AdaptiveConfig {
+                sensitivity,
+                std_dev_multiplier: 3.0,
+                ..AdaptiveConfig::default()
+            })
+        };
+
+        // Anchored: the default sensitivity is exactly today's behaviour.
+        assert!((at(0.7) - 3.0).abs() < 1e-9);
+
+        // Monotonic: more sensitive means a lower bar to clear.
+        assert!(at(0.0) > at(0.35));
+        assert!(at(0.35) > at(0.7));
+        assert!(at(0.7) > at(0.9));
+
+        // Floored, so maximum sensitivity still needs a real deviation.
+        assert!((at(1.0) - MIN_STD_DEV_MULTIPLIER).abs() < 1e-9);
+
+        // Out-of-range input is clamped rather than producing a negative
+        // multiplier, which would flag every sample below the mean.
+        assert!(at(4.2) >= MIN_STD_DEV_MULTIPLIER);
+        assert!((at(-1.0) - at(0.0)).abs() < 1e-9);
+    }
+
+    /// A more sensitive setting must actually flag a spike that a laxer one
+    /// lets through — the mapping is only worth having if it reaches the
+    /// verdict.
+    #[test]
+    fn sensitivity_changes_what_counts_as_an_anomaly() {
+        let build = |sensitivity: f64| {
+            let cfg = AdaptiveConfig {
+                enabled: true,
+                sensitivity,
+                std_dev_multiplier: 3.0,
+                min_samples: 10,
+                ..AdaptiveConfig::default()
+            };
+            let baseline =
+                AdaptiveBaseline::new(3600, cfg.min_samples, effective_std_dev_multiplier(&cfg));
+            // A steady 100/min with a little jitter.
+            for i in 0..40 {
+                baseline.record(if i % 2 == 0 { 98 } else { 102 });
+            }
+            baseline
+        };
+
+        // The samples give mean 100, stddev 2.  Sensitivity 0.95 maps to a
+        // multiplier of 0.5 (threshold 101); sensitivity 0.1 maps to 9.0
+        // (threshold 118).  110 sits between them, so it separates the two.
+        let sensitive = build(0.95);
+        let lax = build(0.1);
+        assert!((sensitive.threshold().unwrap() - 101.0).abs() < 1e-6);
+        assert!((lax.threshold().unwrap() - 118.0).abs() < 1e-6);
+
+        assert!(
+            sensitive.is_anomaly(110),
+            "a high sensitivity should flag a modest excursion"
+        );
+        assert!(
+            !lax.is_anomaly(110),
+            "a low sensitivity should let the same excursion pass"
+        );
+
+        // Both agree on a gross outlier and on ordinary traffic.
+        assert!(sensitive.is_anomaly(5000) && lax.is_anomaly(5000));
+        assert!(!sensitive.is_anomaly(99) && !lax.is_anomaly(99));
+    }
+
+    /// `auto_adjust` was declared and read by nothing, so a key that normally
+    /// makes a handful of requests a minute kept the whole configured budget.
+    #[test]
+    fn auto_adjust_tightens_a_quiet_key_toward_its_own_baseline() {
+        let limits = PerKeyLimits {
+            requests_per_second: 100,
+            burst_size: 10,
+            requests_per_minute: Some(3000),
+            requests_per_hour: Some(100_000),
+        };
+        let adaptive = AdaptiveConfig {
+            enabled: true,
+            auto_adjust: true,
+            min_samples: 10,
+            ..AdaptiveConfig::default()
+        };
+        let bucket = RateLimitBucket::new(&limits, Some(&adaptive));
+        let baseline = bucket.baseline.as_ref().expect("adaptive is enabled");
+
+        // Before the baseline is established, nothing is touched — a new key
+        // must not be throttled for being new.
+        assert_eq!(
+            bucket
+                .effective_limits(&limits, &adaptive)
+                .requests_per_minute,
+            Some(3000)
+        );
+
+        // This key's normal is ~20 requests/minute.
+        for i in 0..40 {
+            baseline.record(if i % 2 == 0 { 19 } else { 21 });
+        }
+
+        let adjusted = bucket.effective_limits(&limits, &adaptive);
+        let per_minute = adjusted.requests_per_minute.expect("still set");
+        assert!(
+            per_minute < 3000,
+            "an established quiet baseline must tighten the configured ceiling, got {per_minute}"
+        );
+        assert!(
+            per_minute >= limits.burst_size,
+            "must never tighten below burst_size, got {per_minute}"
+        );
+        assert!(
+            adjusted.requests_per_hour.unwrap() <= 100_000,
+            "the configured value stays a hard ceiling"
+        );
+
+        // The per-second quota is deliberately untouched.
+        assert_eq!(adjusted.requests_per_second, 100);
+        assert_eq!(adjusted.burst_size, 10);
+    }
+
+    /// Auto-adjustment is one-directional: a busy key whose baseline sits above
+    /// the configured ceiling must not be handed a bigger budget than the
+    /// operator wrote.
+    #[test]
+    fn auto_adjust_never_raises_a_limit_above_the_configured_value() {
+        let limits = PerKeyLimits {
+            requests_per_second: 100,
+            burst_size: 10,
+            requests_per_minute: Some(50),
+            requests_per_hour: Some(1000),
+        };
+        let adaptive = AdaptiveConfig {
+            enabled: true,
+            auto_adjust: true,
+            min_samples: 10,
+            ..AdaptiveConfig::default()
+        };
+        let bucket = RateLimitBucket::new(&limits, Some(&adaptive));
+        let baseline = bucket.baseline.as_ref().expect("adaptive is enabled");
+
+        // A baseline far above the configured minute ceiling.
+        for _ in 0..40 {
+            baseline.record(5000);
+        }
+
+        let adjusted = bucket.effective_limits(&limits, &adaptive);
+        assert_eq!(adjusted.requests_per_minute, Some(50));
+        assert_eq!(adjusted.requests_per_hour, Some(1000));
+    }
+
+    /// With `auto_adjust` off, the configured limits pass through untouched
+    /// however much baseline has accumulated.
+    #[test]
+    fn auto_adjust_off_leaves_limits_alone() {
+        let limits = PerKeyLimits {
+            requests_per_second: 100,
+            burst_size: 10,
+            requests_per_minute: Some(3000),
+            requests_per_hour: Some(100_000),
+        };
+        let adaptive = AdaptiveConfig {
+            enabled: true,
+            auto_adjust: false,
+            min_samples: 10,
+            ..AdaptiveConfig::default()
+        };
+        let bucket = RateLimitBucket::new(&limits, Some(&adaptive));
+        for _ in 0..40 {
+            bucket.baseline.as_ref().unwrap().record(20);
+        }
+
+        let adjusted = bucket.effective_limits(&limits, &adaptive);
+        assert_eq!(adjusted.requests_per_minute, Some(3000));
+        assert_eq!(adjusted.requests_per_hour, Some(100_000));
     }
 
     /// `route_limits.<route>.exempt_keys` was parsed and never read, so a key
