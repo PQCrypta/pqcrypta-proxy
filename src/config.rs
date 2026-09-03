@@ -2492,49 +2492,78 @@ impl ConfigManager {
         Ok(())
     }
 
-    /// Start watching configuration file for changes
+    /// Start watching the configuration file and the TLS cert/key for changes
     ///
-    /// Watches the config file's PARENT DIRECTORY rather than the file itself.
-    /// inotify follows the inode, and almost every way of saving a file —
-    /// `sed -i`, vim, most editors, any write-temp-then-rename — replaces the
-    /// inode. Watching the file directly therefore works exactly once and then
-    /// goes permanently deaf, with no error and no log line. Watching the
-    /// directory and filtering by filename survives a rename-over.
+    /// Watches PARENT DIRECTORIES, never the files themselves. inotify follows
+    /// the inode, and almost every way of replacing a file — `sed -i`, vim, most
+    /// editors, certbot's renew-then-rename, any write-temp-then-rename — swaps
+    /// it. Watching a file directly therefore fires exactly once and then goes
+    /// permanently deaf, with no error and no log line. Measured over three
+    /// consecutive `sed -i` edits: file watch [1, 0, 0], directory watch
+    /// [3, 3, 3]. Watching the directory and filtering by path survives it.
     pub fn start_watching(&self) -> anyhow::Result<()> {
         let config_path = self.config_path.clone();
         let reload_tx = self.reload_tx.clone();
         let config = Arc::clone(&self.config.load_full());
 
         // Canonicalise so events (which carry absolute paths) compare equal even
-        // when the process was given a relative --config.
-        let watch_target = config_path
-            .canonicalize()
-            .unwrap_or_else(|_| config_path.clone());
-        let config_dir = watch_target
-            .parent()
-            .map(|p| p.to_path_buf())
-            .ok_or_else(|| anyhow::anyhow!("config path has no parent directory: {:?}", watch_target))?;
+        // when the process was given a relative --config. A path that does not
+        // exist yet cannot be canonicalised; fall back to it as given, so a cert
+        // that appears later is still recognised.
+        let canon = |p: &Path| -> PathBuf { p.canonicalize().unwrap_or_else(|_| p.to_path_buf()) };
 
-        // Create file watcher
-        let event_target = watch_target.clone();
+        let config_file = canon(&config_path);
+        let cert_file = canon(&config.tls.cert_path);
+        let key_file = canon(&config.tls.key_path);
+
+        // Directories to watch, deduplicated — cert and key usually share one,
+        // and may well be the config directory too. Watching the same path twice
+        // would just deliver every event twice.
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        let add_dir = |p: &Path, dirs: &mut Vec<PathBuf>| {
+            if let Some(d) = p.parent() {
+                if d.as_os_str().is_empty() || !d.is_dir() {
+                    return;
+                }
+                let d = canon(d);
+                if !dirs.contains(&d) {
+                    dirs.push(d);
+                }
+            }
+        };
+        add_dir(&config_file, &mut dirs);
+        add_dir(&cert_file, &mut dirs);
+        add_dir(&key_file, &mut dirs);
+        if dirs.is_empty() {
+            anyhow::bail!("no watchable directory for config {:?}", config_file);
+        }
+
+        let ev_config = config_file.clone();
+        let ev_cert = cert_file.clone();
+        let ev_key = key_file.clone();
+
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             match res {
                 Ok(event) => {
-                    // The directory watch also reports siblings (editor swap files,
-                    // .bak copies), so only act on the config file itself.
-                    if !event.paths.iter().any(|p| p == &event_target) {
+                    if !(event.kind.is_modify() || event.kind.is_create()) {
                         return;
                     }
-                    if event.kind.is_modify() || event.kind.is_create() {
-                        debug!("Config file change detected: {:?}", event);
+                    // A directory watch also reports siblings — editor swap files,
+                    // .bak copies, certbot's staging files — so dispatch strictly
+                    // on which watched path the event names.
+                    let hit_config = event.paths.iter().any(|p| p == &ev_config);
+                    let hit_tls = event
+                        .paths
+                        .iter()
+                        .any(|p| p == &ev_cert || p == &ev_key);
 
-                        // Reload configuration
+                    if hit_config {
+                        debug!("Config file change detected: {:?}", event);
                         match Self::load_config(&config_path) {
                             Ok(new_config) => {
                                 let new_config = Arc::new(new_config);
                                 info!("Configuration hot-reloaded");
-
-                                // Send reload event (blocking send for non-async context)
+                                // blocking send: this closure is not async
                                 let _ = reload_tx
                                     .blocking_send(ConfigReloadEvent::ConfigReloaded(new_config));
                             }
@@ -2545,6 +2574,16 @@ impl ConfigManager {
                             }
                         }
                     }
+
+                    if hit_tls {
+                        // Previously a cert change fell through to the config
+                        // branch, which re-read the TOML and never re-read the
+                        // certificate off disk — so the watcher could not
+                        // actually reload a renewed cert. Emit the event that
+                        // main.rs and quic_listener.rs already handle.
+                        info!("TLS certificate or key changed on disk");
+                        let _ = reload_tx.blocking_send(ConfigReloadEvent::TlsCertsReloaded);
+                    }
                 }
                 Err(e) => {
                     warn!("Config file watch error: {}", e);
@@ -2552,20 +2591,14 @@ impl ConfigManager {
             }
         })?;
 
-        // Watch the directory, not the file — see the note on this function.
-        watcher.watch(&config_dir, RecursiveMode::NonRecursive)?;
-        info!("Watching config directory {:?} for {:?}", config_dir, watch_target);
-
-        // Also watch TLS certificate files for changes
-        let tls_config = &config.tls;
-        if tls_config.cert_path.exists() {
-            watcher.watch(&tls_config.cert_path, RecursiveMode::NonRecursive)?;
-            info!("Watching TLS cert: {:?}", tls_config.cert_path);
+        for d in &dirs {
+            watcher.watch(d, RecursiveMode::NonRecursive)?;
+            info!("Watching directory {:?}", d);
         }
-        if tls_config.key_path.exists() {
-            watcher.watch(&tls_config.key_path, RecursiveMode::NonRecursive)?;
-            info!("Watching TLS key: {:?}", tls_config.key_path);
-        }
+        info!(
+            "Config watch target {:?}; TLS watch targets {:?} and {:?}",
+            config_file, cert_file, key_file
+        );
 
         *self.watcher.write() = Some(watcher);
         info!("Configuration file watching enabled");
