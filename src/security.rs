@@ -1473,8 +1473,7 @@ impl SecurityState {
         // banned mid-run.
         let is_pentest = {
             let c = self.config.read();
-            let ip_str = ip.to_string();
-            c.pentest_bypass_ips.iter().any(|p| p == &ip_str)
+            crate::config::ip_list_contains(&c.pentest_bypass_ips, &ip)
         };
 
         // Search-engine crawlers, verified by forward-confirmed reverse DNS.
@@ -1697,8 +1696,7 @@ impl SecurityState {
         // burst of 4xx from a bypass address — still earned an auto-ban here.
         {
             let c = self.config.read();
-            let ip_str = ip.to_string();
-            if c.pentest_bypass_ips.iter().any(|p| p == &ip_str) {
+            if crate::config::ip_list_contains(&c.pentest_bypass_ips, &ip) {
                 return;
             }
         }
@@ -2011,8 +2009,7 @@ pub async fn security_middleware(
     // Pentest IPs get proper 403 for blocked attacks without being banned mid-run.
     let is_pentest_bypass = {
         let config = security.config.read();
-        let ip_str = ip.to_string();
-        config.pentest_bypass_ips.iter().any(|p| p == &ip_str)
+        crate::config::ip_list_contains(&config.pentest_bypass_ips, &ip)
     };
 
     // Read config values without cloning the entire struct - just read what we need
@@ -2732,6 +2729,43 @@ pub use geoip::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: the bypass list must match ADDRESSES, not their spelling.
+    ///
+    /// Every call site compared `ip.to_string()` against the raw config strings.
+    /// `to_string()` emits the canonical compressed form, so any other valid
+    /// spelling of the same IPv6 address silently failed to match. Found on
+    /// 2026-09-03: this platform's bypass entry was its IPv4 address, the box
+    /// egressed over IPv6, and the exemption never applied to a single request.
+    #[tokio::test]
+    async fn test_ip_list_matches_any_spelling_of_the_same_address() {
+        use crate::config::ip_list_contains;
+
+        let list = vec![
+            "2607:f1c0:f064:5800:0:0:0:1".to_string(), // uncompressed
+            "203.0.113.5".to_string(),
+            "  198.51.100.9  ".to_string(),            // operator whitespace
+            "not-an-ip".to_string(),                   // must not panic
+        ];
+
+        let compressed: IpAddr = "2607:f1c0:f064:5800::1".parse().unwrap();
+        let upper: IpAddr = "2607:F1C0:F064:5800::1".parse().unwrap();
+        assert!(
+            ip_list_contains(&list, &compressed),
+            "compressed IPv6 must match an uncompressed list entry"
+        );
+        assert!(
+            ip_list_contains(&list, &upper),
+            "IPv6 spelling is case-insensitive; matching must be too"
+        );
+        assert!(ip_list_contains(&list, &"203.0.113.5".parse().unwrap()));
+        assert!(
+            ip_list_contains(&list, &"198.51.100.9".parse().unwrap()),
+            "a padded entry must still match"
+        );
+        assert!(!ip_list_contains(&list, &"203.0.113.6".parse().unwrap()));
+        assert!(!ip_list_contains(&list, &"::1".parse().unwrap()));
+    }
 
     /// Regression: `pentest_bypass_ips` must survive the error-rate heuristic.
     ///

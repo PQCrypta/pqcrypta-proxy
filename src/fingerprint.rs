@@ -928,8 +928,7 @@ impl FingerprintExtractor {
         // logged; only the ban is skipped.
         let is_pentest_source = {
             let sc = security.config.read();
-            let ip_str = client_ip.to_string();
-            sc.pentest_bypass_ips.iter().any(|p| p == &ip_str)
+            crate::config::ip_list_contains(&sc.pentest_bypass_ips, &client_ip)
         };
         if is_pentest_source && !matches!(classification, FingerprintClass::Browser) {
             debug!(

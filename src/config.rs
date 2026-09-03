@@ -3290,3 +3290,21 @@ stream_to_method = "POST"
         assert_eq!(config.routes.len(), 1);
     }
 }
+
+/// Does `ip` appear in a `pentest_bypass_ips`-style list?
+///
+/// Compares PARSED addresses, not strings. `IpAddr::to_string()` emits the
+/// canonical compressed form, so a string comparison silently fails for every
+/// other valid spelling of the same IPv6 address — `2607:f1c0:f064:5800:0:0:0:1`
+/// and `2607:F1C0:F064:5800::1` are the same host but neither matches
+/// `2607:f1c0:f064:5800::1`. An operator editing this list by hand should not
+/// have to guess Rust's formatting to make a bypass take effect.
+pub fn ip_list_contains(list: &[String], ip: &std::net::IpAddr) -> bool {
+    list.iter().any(|entry| {
+        entry
+            .trim()
+            .parse::<std::net::IpAddr>()
+            .map(|parsed| &parsed == ip)
+            .unwrap_or(false)
+    })
+}

@@ -786,14 +786,8 @@ async fn proxy_request(
     if let Some(sec) = security {
         if sec.waf_engine.is_some() {
             let ip = crate::security::canonical_addr(remote_addr).ip();
-            let is_pentest = {
-                let ip_str = ip.to_string();
-                sec.config
-                    .read()
-                    .pentest_bypass_ips
-                    .iter()
-                    .any(|p| p == &ip_str)
-            };
+            let is_pentest =
+                crate::config::ip_list_contains(&sec.config.read().pentest_bypass_ips, &ip);
             let headers = axum::http::HeaderMap::new();
             let view = crate::security::SecurityRequestView {
                 ip,

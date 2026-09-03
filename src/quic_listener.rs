@@ -2147,15 +2147,8 @@ impl QuicListener {
         // engine truncates to `max_body_scan_bytes` internally, so the whole
         // buffered body is passed by reference.
         if !body.is_empty() && security.waf_engine.is_some() {
-            let is_pentest = {
-                let ip_str = ip.to_string();
-                security
-                    .config
-                    .read()
-                    .pentest_bypass_ips
-                    .iter()
-                    .any(|p| p == &ip_str)
-            };
+            let is_pentest =
+                crate::config::ip_list_contains(&security.config.read().pentest_bypass_ips, &ip);
             let body_query = request.uri().query().unwrap_or("").to_string();
             // Re-resolve the per-route policy here: the one built for the header
             // pass lives in a block that has since closed. Same idiom, so body
