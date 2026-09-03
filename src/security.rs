@@ -1499,8 +1499,25 @@ impl SecurityState {
         let skip_auto_block = is_verified_crawler || crawler == CrawlerVerdict::Pending;
 
         // 1. Blocklist
+        //
+        // A pentest source must not be denied by an *automatic* block: the
+        // contract above is that it gets inspected and refused per-request, never
+        // banned mid-run. Without this, any auto-ban already on the list (or one
+        // added by a path that predates the bypass) locked the address out for
+        // the whole block duration despite the bypass. A deliberate operator
+        // block still stands — Manual, DatabaseSync and GeoBlocked are decisions,
+        // not heuristics.
         if let Some(info) = self.is_blocked(&ip) {
-            return SecurityDecision::Blocked(info);
+            let automatic = matches!(
+                info.reason,
+                BlockReason::RateLimitExceeded
+                    | BlockReason::ConnectionLimitExceeded
+                    | BlockReason::TooManyErrors
+                    | BlockReason::SuspiciousFingerprint
+            );
+            if !(automatic && is_pentest) {
+                return SecurityDecision::Blocked(info);
+            }
         }
 
         // 2. Per-route JA3 allowlist. A request with no captured fingerprint
@@ -1657,12 +1674,33 @@ impl SecurityState {
         }
 
         // A crawler walking stale links legitimately accumulates 404s, which is
-        // precisely the shape this error-rate heuristic bans for. Verified
-        // crawlers are therefore not tracked here. The UA is not available at
-        // this call site, so this reads the verdict established earlier in the
-        // request by evaluate(); an unverified address is tracked as normal.
-        if self.crawler_verifier.cached_verdict(ip) == Some(CrawlerVerdict::Verified) {
+        // precisely the shape this error-rate heuristic bans for. The UA is not
+        // available at this call site, so this reads the verdict established
+        // earlier in the request by evaluate(); an unverified address is tracked
+        // as normal.
+        //
+        // Pending counts as exempt here, matching evaluate()'s `skip_auto_block`.
+        // evaluate() deliberately never auto-bans a Pending crawler — an unproven
+        // claim must not cost a genuine crawler a blackout on a burst it will
+        // never repeat — and this path bans on exactly the same evidence, so
+        // exempting only Verified here reopened the hole from the other side.
+        if matches!(
+            self.crawler_verifier.cached_verdict(ip),
+            Some(CrawlerVerdict::Verified | CrawlerVerdict::Pending)
+        ) {
             return;
+        }
+
+        // Pentest sources send attack payloads by design and are documented as
+        // "inspected but never rate-limited or auto-banned" (see evaluate()).
+        // evaluate() honours that; this path did not, so a red-team run — or any
+        // burst of 4xx from a bypass address — still earned an auto-ban here.
+        {
+            let c = self.config.read();
+            let ip_str = ip.to_string();
+            if c.pentest_bypass_ips.iter().any(|p| p == &ip_str) {
+                return;
+            }
         }
 
         // Read config values
@@ -2694,6 +2732,48 @@ pub use geoip::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: `pentest_bypass_ips` must survive the error-rate heuristic.
+    ///
+    /// `record_request` auto-blocks on a burst of 4xx. It exempted trusted IPs
+    /// and Verified crawlers, but not pentest sources — even though `evaluate`
+    /// documents them as "inspected but never rate-limited or auto-banned" — and
+    /// not Pending crawlers, which `evaluate` also refuses to auto-ban. A red-team
+    /// run, or any bypass address collecting 403s, banned itself for the whole
+    /// auto_block_duration. Hit on 2026-09-03 while load-testing a proposal site:
+    /// the platform's own egress IP was in pentest_bypass_ips and still got a
+    /// 403 "Access denied - IP blocked".
+    #[tokio::test]
+    async fn test_pentest_bypass_survives_error_rate_autoblock() {
+        let mut config = ProxyConfig::default();
+        config.security.pentest_bypass_ips = vec!["203.0.113.77".to_string()];
+        // Make the heuristic trivially easy to trip.
+        config.security.error_4xx_threshold = 1;
+        config.security.min_requests_for_error_check = 1;
+        config.security.error_rate_threshold = 0.1;
+        config.security.auto_block_threshold = 1;
+
+        let security = SecurityState::new(&config);
+
+        let bypass: IpAddr = "203.0.113.77".parse().unwrap();
+        let ordinary: IpAddr = "203.0.113.78".parse().unwrap();
+
+        for _ in 0..20 {
+            security.record_request(bypass, StatusCode::FORBIDDEN);
+            security.record_request(ordinary, StatusCode::FORBIDDEN);
+        }
+
+        assert!(
+            security.is_blocked(&bypass).is_none(),
+            "a pentest_bypass_ips address must never be auto-banned by the \
+             error-rate heuristic"
+        );
+        assert!(
+            security.is_blocked(&ordinary).is_some(),
+            "an ordinary address with the same 4xx burst must still be blocked, \
+             or the test proves nothing"
+        );
+    }
 
     /// Regression: an operator unblock must take effect on the running proxy.
     ///
