@@ -2493,15 +2493,38 @@ impl ConfigManager {
     }
 
     /// Start watching configuration file for changes
+    ///
+    /// Watches the config file's PARENT DIRECTORY rather than the file itself.
+    /// inotify follows the inode, and almost every way of saving a file —
+    /// `sed -i`, vim, most editors, any write-temp-then-rename — replaces the
+    /// inode. Watching the file directly therefore works exactly once and then
+    /// goes permanently deaf, with no error and no log line. Watching the
+    /// directory and filtering by filename survives a rename-over.
     pub fn start_watching(&self) -> anyhow::Result<()> {
         let config_path = self.config_path.clone();
         let reload_tx = self.reload_tx.clone();
         let config = Arc::clone(&self.config.load_full());
 
+        // Canonicalise so events (which carry absolute paths) compare equal even
+        // when the process was given a relative --config.
+        let watch_target = config_path
+            .canonicalize()
+            .unwrap_or_else(|_| config_path.clone());
+        let config_dir = watch_target
+            .parent()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| anyhow::anyhow!("config path has no parent directory: {:?}", watch_target))?;
+
         // Create file watcher
+        let event_target = watch_target.clone();
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             match res {
                 Ok(event) => {
+                    // The directory watch also reports siblings (editor swap files,
+                    // .bak copies), so only act on the config file itself.
+                    if !event.paths.iter().any(|p| p == &event_target) {
+                        return;
+                    }
                     if event.kind.is_modify() || event.kind.is_create() {
                         debug!("Config file change detected: {:?}", event);
 
@@ -2529,8 +2552,9 @@ impl ConfigManager {
             }
         })?;
 
-        // Watch the configuration file
-        watcher.watch(&self.config_path, RecursiveMode::NonRecursive)?;
+        // Watch the directory, not the file — see the note on this function.
+        watcher.watch(&config_dir, RecursiveMode::NonRecursive)?;
+        info!("Watching config directory {:?} for {:?}", config_dir, watch_target);
 
         // Also watch TLS certificate files for changes
         let tls_config = &config.tls;
