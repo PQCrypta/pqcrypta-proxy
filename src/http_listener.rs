@@ -217,7 +217,15 @@ pub struct HttpListenerState {
     /// upstream — see pqcrypta-api's connection handling), this trades a bit of
     /// per-request handshake overhead for reliability. Cheap on loopback backends.
     pub direct_client: Client<HttpConnector, Body>,
-    pub security: SecurityState,
+    /// Behind an `Arc` because axum clones the whole `State<T>` for every
+    /// request, and `SecurityState` holds 19 `Arc` fields — so cloning it by
+    /// value cost 19 atomic increments and 19 decrements per request, on cache
+    /// lines shared by every worker thread. A profile under load attributed
+    /// **32 % of all CPU** to exactly that: 16.7 % in `drop_glue::<SecurityState>`
+    /// and 15.7 % in its `clone`. One `Arc` makes it one increment and one
+    /// decrement. Every other field here was already `Arc` for this reason;
+    /// this one was the exception.
+    pub security: Arc<SecurityState>,
     /// Fingerprint extractor for TLS client identification
     pub fingerprint: Arc<FingerprintExtractor>,
     pub load_balancer: Arc<LoadBalancer>,
@@ -320,7 +328,7 @@ pub async fn run_http_listener(
         http_client,
         https_client,
         direct_client,
-        security: security_state.clone(),
+        security: Arc::new(security_state.clone()),
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
         metrics: state_metrics,
@@ -530,7 +538,7 @@ pub async fn run_http_listener_pqc(
         http_client,
         https_client,
         direct_client,
-        security: security_state.clone(),
+        security: Arc::new(security_state.clone()),
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
         metrics: state_metrics,
@@ -833,7 +841,7 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
         http_client,
         https_client,
         direct_client,
-        security: security_state.clone(),
+        security: Arc::new(security_state.clone()),
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
         metrics: state_metrics,
@@ -1296,7 +1304,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
         http_client,
         https_client,
         direct_client,
-        security: security_state.clone(),
+        security: Arc::new(security_state.clone()),
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
         metrics: state_metrics,
