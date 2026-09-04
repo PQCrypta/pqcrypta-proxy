@@ -207,8 +207,12 @@ async fn send_proxy_v2_header(
 pub struct HttpListenerState {
     pub config: Arc<ProxyConfig>,
     pub port: u16,
-    pub http_client: Client<HttpConnector, Body>,
-    pub https_client: Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>,
+    // Behind `Arc` for the same reason as `security`: axum clones the state per
+    // request, and hyper's `Client::clone` copies its config, its HTTP/1 and
+    // HTTP/2 builders and its connector — real struct copies, not refcounts.
+    // Three of them per request came to 7.4 % of CPU in the profile.
+    pub http_client: Arc<Client<HttpConnector, Body>>,
+    pub https_client: Arc<Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>>,
     /// Dedicated client with connection pooling disabled (`pool_max_idle_per_host(0)`)
     /// — used instead of `http_client` when `BackendConfig::disable_pooling` is set.
     /// Every request opens a fresh connection rather than reusing a pooled one;
@@ -216,7 +220,7 @@ pub struct HttpListenerState {
     /// reset on a *reused* pooled connection (root cause not yet isolated further
     /// upstream — see pqcrypta-api's connection handling), this trades a bit of
     /// per-request handshake overhead for reliability. Cheap on loopback backends.
-    pub direct_client: Client<HttpConnector, Body>,
+    pub direct_client: Arc<Client<HttpConnector, Body>>,
     /// Behind an `Arc` because axum clones the whole `State<T>` for every
     /// request, and `SecurityState` holds 19 `Arc` fields — so cloning it by
     /// value cost 19 atomic increments and 19 decrements per request, on cache
@@ -325,9 +329,9 @@ pub async fn run_http_listener(
         conformance: crate::conformance::shared(&config.conformance),
         config: config.clone(),
         port,
-        http_client,
-        https_client,
-        direct_client,
+        http_client: Arc::new(http_client),
+        https_client: Arc::new(https_client),
+        direct_client: Arc::new(direct_client),
         security: Arc::new(security_state.clone()),
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
@@ -535,9 +539,9 @@ pub async fn run_http_listener_pqc(
         conformance: crate::conformance::shared(&config.conformance),
         config: config.clone(),
         port,
-        http_client,
-        https_client,
-        direct_client,
+        http_client: Arc::new(http_client),
+        https_client: Arc::new(https_client),
+        direct_client: Arc::new(direct_client),
         security: Arc::new(security_state.clone()),
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
@@ -838,9 +842,9 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
         conformance: crate::conformance::shared(&config.conformance),
         config: config.clone(),
         port,
-        http_client,
-        https_client,
-        direct_client,
+        http_client: Arc::new(http_client),
+        https_client: Arc::new(https_client),
+        direct_client: Arc::new(direct_client),
         security: Arc::new(security_state.clone()),
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
@@ -1301,9 +1305,9 @@ pub async fn run_http_listener_pqc_with_fingerprint(
         conformance: crate::conformance::shared(&config.conformance),
         config: config.clone(),
         port,
-        http_client,
-        https_client,
-        direct_client,
+        http_client: Arc::new(http_client),
+        https_client: Arc::new(https_client),
+        direct_client: Arc::new(direct_client),
         security: Arc::new(security_state.clone()),
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
@@ -3583,8 +3587,8 @@ async fn proxy_handler(
                         client_addr,
                         state.port,
                         &route.add_headers,
-                        state.http_client.clone(),
-                        state.https_client.clone(),
+                        (*state.http_client).clone(),
+                        (*state.https_client).clone(),
                     );
                 } else {
                     warn!(
