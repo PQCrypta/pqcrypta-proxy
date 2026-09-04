@@ -346,6 +346,12 @@ pub async fn run_http_listener(
         rate_limiter,
     };
 
+    // axum clones `State<T>` for the handler and again for every middleware
+    // layer that takes it, so the struct was being copied field-by-field several
+    // times per request. One `Arc` makes each of those a refcount bump; field
+    // access is unchanged through `Deref`.
+    let state = Arc::new(state);
+
     // Initialize compression state
     let compression_state = CompressionState::default();
 
@@ -555,6 +561,12 @@ pub async fn run_http_listener_pqc(
         )),
         rate_limiter,
     };
+
+    // axum clones `State<T>` for the handler and again for every middleware
+    // layer that takes it, so the struct was being copied field-by-field several
+    // times per request. One `Arc` makes each of those a refcount bump; field
+    // access is unchanged through `Deref`.
+    let state = Arc::new(state);
 
     // Initialize compression state
     let compression_state = CompressionState::default();
@@ -858,6 +870,12 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
         )),
         rate_limiter: rate_limiter.clone(),
     };
+
+    // axum clones `State<T>` for the handler and again for every middleware
+    // layer that takes it, so the struct was being copied field-by-field several
+    // times per request. One `Arc` makes each of those a refcount bump; field
+    // access is unchanged through `Deref`.
+    let state = Arc::new(state);
 
     // Initialize compression state
     let compression_state = CompressionState::default();
@@ -1321,6 +1339,12 @@ pub async fn run_http_listener_pqc_with_fingerprint(
         )),
         rate_limiter,
     };
+
+    // axum clones `State<T>` for the handler and again for every middleware
+    // layer that takes it, so the struct was being copied field-by-field several
+    // times per request. One `Arc` makes each of those a refcount bump; field
+    // access is unchanged through `Deref`.
+    let state = Arc::new(state);
 
     // Initialize middleware states
     let compression_state = CompressionState::default();
@@ -2163,7 +2187,7 @@ async fn trace_context_middleware(request: Request<Body>, next: Next) -> Respons
 ///   - ALL requests to tcp.pqcrypta.com (dedicated TCP-only speedtest origin;
 ///     never advertises QUIC so Chrome always connects with TCP/TLS)
 async fn alt_svc_middleware(
-    State(state): State<HttpListenerState>,
+    State(state): State<Arc<HttpListenerState>>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
@@ -2302,7 +2326,7 @@ async fn alt_svc_middleware(
 
 /// Middleware to add security headers to all responses
 async fn security_headers_middleware(
-    State(state): State<HttpListenerState>,
+    State(state): State<Arc<HttpListenerState>>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
@@ -2787,7 +2811,7 @@ async fn tcp_upload_cors_preflight() -> Response {
 
 /// Main proxy handler - routes requests to appropriate backends
 async fn proxy_handler(
-    State(state): State<HttpListenerState>,
+    State(state): State<Arc<HttpListenerState>>,
     Host(host): Host,
     ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
     mut req: Request<Body>,
