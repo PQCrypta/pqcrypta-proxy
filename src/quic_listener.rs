@@ -525,12 +525,28 @@ impl QuicListener {
         // derived during the handshake it would be trying to avoid. The block
         // still lands before any HTTP/3 request is served.
         let fingerprint = match client_hello.as_deref() {
-            Some(hello) => fingerprint_extractor.process_client_hello_quic(
-                hello,
-                remote_addr.ip(),
-                &security,
-                &fingerprint_config,
-            ),
+            // `fingerprint.enabled = false` has to mean the same thing on both
+            // transports. The TCP listeners gate their whole fingerprint stage on
+            // it; this path did not, so an operator who turned fingerprinting off
+            // still had QUIC connections classified and banned — a security policy
+            // that applied over HTTP/3 and not over HTTP/1.1 or HTTP/2, with
+            // nothing in the configuration saying so. Found when a load generator
+            // was blocked as Suspicious on a run with the feature explicitly
+            // disabled.
+            Some(hello) if fingerprint_config.enabled => fingerprint_extractor
+                .process_client_hello_quic(
+                    hello,
+                    remote_addr.ip(),
+                    &security,
+                    &fingerprint_config,
+                ),
+            Some(_) => crate::fingerprint::FingerprintResult {
+                allowed: true,
+                ja3_hash: None,
+                ja4_hash: None,
+                classification: None,
+                client_name: None,
+            },
             None => {
                 debug!(
                     "[QUIC] No ClientHello available for {} — not fingerprinted",
