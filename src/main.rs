@@ -159,11 +159,63 @@ struct Args {
     allow_insecure_backends: bool,
 }
 
+/// Raise `RLIMIT_NOFILE`'s soft limit to the hard limit.
+///
+/// A proxy is a file-descriptor multiplier: every client connection costs one
+/// descriptor and the backend connection serving it costs another, so a default
+/// soft limit of 1024 caps the process at roughly 500 concurrent connections
+/// regardless of `server.max_connections`. Past that, `accept()` and backend
+/// connects fail with `EMFILE` and the proxy answers 5xx while looking perfectly
+/// healthy — nothing has crashed, the CPU is idle, and the configuration says it
+/// should be fine.
+///
+/// This was measured, not theorised: benchmarking against HAProxy on a shell with
+/// the stock 1024 limit, HTTP/2 at 1000 concurrent streams returned **100 % 5xx**
+/// (100,829 of 100,829 requests) and HTTP/3 stopped serving mid-run. HAProxy on the
+/// same shell did not, because it raises its own limit from `maxconn` at startup.
+/// A systemd unit with `LimitNOFILE=` set has always masked this — which is why it
+/// survived to be found by a benchmark rather than by production.
+///
+/// Only the soft limit is touched, and only upward, which needs no privilege: the
+/// hard limit is the administrator's ceiling and is left alone. Failure is not
+/// fatal — an operator who has deliberately lowered the hard limit gets a warning
+/// and the limit they chose.
+#[cfg(unix)]
+fn raise_fd_limit() {
+    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+
+    let Ok((soft, hard)) = getrlimit(Resource::RLIMIT_NOFILE) else {
+        eprintln!("warning: could not read RLIMIT_NOFILE; leaving the descriptor limit alone");
+        return;
+    };
+
+    if soft >= hard {
+        return; // already at the ceiling; nothing to raise
+    }
+
+    match setrlimit(Resource::RLIMIT_NOFILE, hard, hard) {
+        Ok(()) => eprintln!("file descriptor limit raised: {soft} -> {hard}"),
+        Err(e) => eprintln!(
+            "warning: could not raise RLIMIT_NOFILE from {soft} to {hard} ({e}); \
+             concurrent connections are capped near {} and excess requests will fail with 5xx",
+            soft / 2
+        ),
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_fd_limit() {
+    // Windows has no RLIMIT_NOFILE; the CRT handle limit is not adjustable this way.
+}
+
 /// Entry point. The runtime is built by hand rather than by `#[tokio::main]`
 /// so `server.worker_threads` can size the pool: the attribute always takes
 /// every core, which made the setting unreachable however it was configured.
 /// 0 keeps the all-cores default.
 fn main() -> anyhow::Result<()> {
+    // Raise the file-descriptor limit before anything opens a socket.
+    raise_fd_limit();
+
     // The config must be read before the runtime exists, so worker_threads is
     // known when the pool is built. Parse failures are reported by run() in the
     // usual way; a pre-read that fails here just falls back to the default pool

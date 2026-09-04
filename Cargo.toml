@@ -203,7 +203,7 @@ windows-service-rs = { version = "0.7", package = "windows-service", optional = 
 tempfile = "3.14"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["signal", "user"] }
+nix = { version = "0.29", features = ["signal", "user", "resource"] }
 # Unix socket support for PHP-FPM backends (not available on Windows)
 hyperlocal = "0.9"
 # Signal handling (uses Unix-specific signal iterators)
