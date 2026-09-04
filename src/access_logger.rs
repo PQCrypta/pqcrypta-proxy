@@ -26,16 +26,24 @@ pub fn sanitize_log_field(s: &str) -> String {
 
 /// Access log entry with request and response details
 #[derive(Debug, Clone)]
-pub struct AccessLogEntry {
+/// One access-log record, borrowing every string it reports.
+///
+/// It used to own them, which meant each of the eleven call sites allocated a
+/// method, a path, a host, a referer, a user-agent and — from a string literal —
+/// a protocol, on every request. The logger only ever reads them as `&str`, and
+/// `log_access` does nothing at all when access logging is disabled, so on a
+/// proxy with the access log off that was six allocations per request thrown
+/// away without being looked at.
+pub struct AccessLogEntry<'a> {
     pub remote_addr: SocketAddr,
-    pub method: String,
-    pub path: String,
-    pub protocol: String,
+    pub method: &'a str,
+    pub path: &'a str,
+    pub protocol: &'a str,
     pub status: u16,
     pub body_size: usize,
-    pub referer: Option<String>,
-    pub user_agent: Option<String>,
-    pub host: Option<String>,
+    pub referer: Option<&'a str>,
+    pub user_agent: Option<&'a str>,
+    pub host: Option<&'a str>,
     pub response_time_ms: u64,
 }
 
@@ -78,7 +86,7 @@ impl AccessLogger {
     }
 
     /// Log an access entry
-    pub fn log(&self, entry: &AccessLogEntry) {
+    pub fn log(&self, entry: &AccessLogEntry<'_>) {
         if !self.enabled {
             return;
         }
@@ -87,23 +95,20 @@ impl AccessLogger {
         // $remote_addr - - [$time_local] "$request" $status $body_bytes_sent "$referer" "$user_agent"
         let timestamp = Local::now().format("%d/%b/%Y:%H:%M:%S %z");
         // M-1: Sanitize all user-controlled fields to prevent log injection
-        let safe_path = sanitize_log_field(&entry.path);
-        let safe_method = sanitize_log_field(&entry.method);
-        let safe_protocol = sanitize_log_field(&entry.protocol);
+        let safe_path = sanitize_log_field(entry.path);
+        let safe_method = sanitize_log_field(entry.method);
+        let safe_protocol = sanitize_log_field(entry.protocol);
         let request = format!("{} {} {}", safe_method, safe_path, safe_protocol);
         let referer = entry
             .referer
-            .as_deref()
             .map(sanitize_log_field)
             .unwrap_or_else(|| "-".to_string());
         let user_agent = entry
             .user_agent
-            .as_deref()
             .map(sanitize_log_field)
             .unwrap_or_else(|| "-".to_string());
         let host = entry
             .host
-            .as_deref()
             .map(sanitize_log_field)
             .unwrap_or_else(|| "-".to_string());
 
@@ -199,7 +204,7 @@ pub fn get_access_logger() -> Option<&'static AccessLogger> {
 }
 
 /// Log an access entry using the global logger
-pub fn log_access(entry: &AccessLogEntry) {
+pub fn log_access(entry: &AccessLogEntry<'_>) {
     if let Some(logger) = get_access_logger() {
         logger.log(entry);
     }

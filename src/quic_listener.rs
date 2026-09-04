@@ -1790,14 +1790,14 @@ impl QuicListener {
                 // Log 404 response
                 log_access(&AccessLogEntry {
                     remote_addr,
-                    method: method.clone(),
-                    path: path.clone(),
-                    protocol: "HTTP/3".to_string(),
+                    method: &method,
+                    path: &path,
+                    protocol: "HTTP/3",
                     status: 404,
                     body_size: 0,
-                    referer: referer.clone(),
-                    user_agent: user_agent.clone(),
-                    host: host.clone(),
+                    referer: referer.as_deref(),
+                    user_agent: user_agent.as_deref(),
+                    host: host.as_deref(),
                     response_time_ms: start_time
                         .elapsed()
                         .as_millis()
@@ -2326,14 +2326,14 @@ impl QuicListener {
                     );
                     log_access(&AccessLogEntry {
                         remote_addr,
-                        method,
-                        path,
-                        protocol: "HTTP/3".to_string(),
+                        method: &method,
+                        path: &path,
+                        protocol: "HTTP/3",
                         status,
                         body_size,
-                        referer,
-                        user_agent,
-                        host,
+                        referer: referer.as_deref(),
+                        user_agent: user_agent.as_deref(),
+                        host: host.as_deref(),
                         response_time_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
                     });
                     return Ok(());
@@ -2378,14 +2378,14 @@ impl QuicListener {
                     );
                     log_access(&AccessLogEntry {
                         remote_addr,
-                        method,
-                        path,
-                        protocol: "HTTP/3".to_string(),
+                        method: &method,
+                        path: &path,
+                        protocol: "HTTP/3",
                         status: 304,
                         body_size: 0,
-                        referer,
-                        user_agent,
-                        host,
+                        referer: referer.as_deref(),
+                        user_agent: user_agent.as_deref(),
+                        host: host.as_deref(),
                         response_time_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
                     });
                     return Ok(());
@@ -2585,14 +2585,14 @@ impl QuicListener {
             );
             log_access(&AccessLogEntry {
                 remote_addr,
-                method,
-                path,
-                protocol: "HTTP/3".to_string(),
+                method: &method,
+                path: &path,
+                protocol: "HTTP/3",
                 status: stream_status,
                 body_size: 0,
-                referer,
-                user_agent,
-                host,
+                referer: referer.as_deref(),
+                user_agent: user_agent.as_deref(),
+                host: host.as_deref(),
                 response_time_ms: start_time
                     .elapsed()
                     .as_millis()
@@ -2829,14 +2829,14 @@ impl QuicListener {
         // Log successful response
         log_access(&AccessLogEntry {
             remote_addr,
-            method,
-            path,
-            protocol: "HTTP/3".to_string(),
+            method: &method,
+            path: &path,
+            protocol: "HTTP/3",
             status: response_status,
             body_size,
-            referer,
-            user_agent,
-            host,
+            referer: referer.as_deref(),
+            user_agent: user_agent.as_deref(),
+            host: host.as_deref(),
             response_time_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
         });
 

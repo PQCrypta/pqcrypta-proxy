@@ -2666,17 +2666,13 @@ async fn advanced_rate_limit_middleware(
             // Mirror the refusal into access.log: a 403 that appears only in
             // the journal makes every later "why did this client get a 403?"
             // investigation start from a log that looks clean.
-            let header_str = |name: hyper::header::HeaderName| {
-                headers
-                    .get(name)
-                    .and_then(|v| v.to_str().ok())
-                    .map(String::from)
-            };
+            let header_str =
+                |name: hyper::header::HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
             log_access(&AccessLogEntry {
                 remote_addr: client_addr,
-                method: method.clone(),
-                path: path.clone(),
-                protocol: "HTTP/1.1".to_string(),
+                method: &method,
+                path: &path,
+                protocol: "HTTP/1.1",
                 status: 403,
                 body_size: 0,
                 referer: header_str(hyper::header::REFERER),
@@ -3674,14 +3670,14 @@ async fn proxy_handler(
                 // Log backend timeout
                 log_access(&AccessLogEntry {
                     remote_addr: client_addr,
-                    method: method_str,
-                    path,
-                    protocol: "HTTP/1.1".to_string(),
+                    method: &method_str,
+                    path: &path,
+                    protocol: "HTTP/1.1",
                     status: 504,
                     body_size: 0,
-                    referer,
-                    user_agent,
-                    host: Some(host_str),
+                    referer: referer.as_deref(),
+                    user_agent: user_agent.as_deref(),
+                    host: Some(&host_str),
                     response_time_ms: request_start
                         .elapsed()
                         .as_millis()
@@ -3777,14 +3773,14 @@ async fn proxy_handler(
                     );
                     log_access(&AccessLogEntry {
                         remote_addr: client_addr,
-                        method: method_str,
-                        path,
-                        protocol: "HTTP/1.1".to_string(),
+                        method: &method_str,
+                        path: &path,
+                        protocol: "HTTP/1.1",
                         status: resp_status,
                         body_size: 0,
-                        referer,
-                        user_agent,
-                        host: Some(host_str),
+                        referer: referer.as_deref(),
+                        user_agent: user_agent.as_deref(),
+                        host: Some(&host_str),
                         response_time_ms: request_start
                             .elapsed()
                             .as_millis()
@@ -3978,14 +3974,14 @@ async fn proxy_handler(
                 // Log successful response
                 log_access(&AccessLogEntry {
                     remote_addr: client_addr,
-                    method: method_str,
-                    path,
-                    protocol: "HTTP/1.1".to_string(),
+                    method: &method_str,
+                    path: &path,
+                    protocol: "HTTP/1.1",
                     status: resp_status,
                     body_size: 0, // Can't know body size for streaming response
-                    referer,
-                    user_agent,
-                    host: Some(host_str),
+                    referer: referer.as_deref(),
+                    user_agent: user_agent.as_deref(),
+                    host: Some(&host_str),
                     response_time_ms: request_start
                         .elapsed()
                         .as_millis()
@@ -4031,14 +4027,14 @@ async fn proxy_handler(
                 // Log backend error
                 log_access(&AccessLogEntry {
                     remote_addr: client_addr,
-                    method: method_str,
-                    path,
-                    protocol: "HTTP/1.1".to_string(),
+                    method: &method_str,
+                    path: &path,
+                    protocol: "HTTP/1.1",
                     status: 502,
                     body_size: 0,
-                    referer,
-                    user_agent,
-                    host: Some(host_str),
+                    referer: referer.as_deref(),
+                    user_agent: user_agent.as_deref(),
+                    host: Some(&host_str),
                     response_time_ms: request_start
                         .elapsed()
                         .as_millis()
@@ -4066,14 +4062,14 @@ async fn proxy_handler(
         // Log 404
         log_access(&AccessLogEntry {
             remote_addr: client_addr,
-            method: method_str,
-            path,
-            protocol: "HTTP/1.1".to_string(),
+            method: &method_str,
+            path: &path,
+            protocol: "HTTP/1.1",
             status: 404,
             body_size: 0,
-            referer,
-            user_agent,
-            host: Some(host_str),
+            referer: referer.as_deref(),
+            user_agent: user_agent.as_deref(),
+            host: Some(&host_str),
             response_time_ms: request_start
                 .elapsed()
                 .as_millis()

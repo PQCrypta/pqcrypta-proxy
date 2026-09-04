@@ -2070,17 +2070,25 @@ pub async fn security_middleware(
             // silent and only the journal recorded it. That made a Search
             // Console "Blocked due to access forbidden (403)" impossible to
             // reconcile against the logs. Record them like any other response.
-            let header_str = |name: hyper::header::HeaderName| {
-                headers
-                    .get(name)
-                    .and_then(|v| v.to_str().ok())
-                    .map(String::from)
+            // Borrowed, not allocated: AccessLogEntry holds `&str` now, and this
+            // path runs on every blocked request.
+            let header_str =
+                |name: hyper::header::HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
+            // `Version` has no `as_str`, so map the few variants rather than
+            // format! into a String that the logger only reads back.
+            let protocol = match request.version() {
+                hyper::Version::HTTP_09 => "HTTP/0.9",
+                hyper::Version::HTTP_10 => "HTTP/1.0",
+                hyper::Version::HTTP_11 => "HTTP/1.1",
+                hyper::Version::HTTP_2 => "HTTP/2.0",
+                hyper::Version::HTTP_3 => "HTTP/3.0",
+                _ => "HTTP/1.1",
             };
             log_access(&AccessLogEntry {
                 remote_addr: client_addr,
-                method: request.method().as_str().to_string(),
-                path: request.uri().path().to_string(),
-                protocol: format!("{:?}", request.version()),
+                method: request.method().as_str(),
+                path: request.uri().path(),
+                protocol,
                 status: response.status().as_u16(),
                 body_size: 0,
                 referer: header_str(hyper::header::REFERER),
