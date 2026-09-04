@@ -231,6 +231,16 @@ opt-level = 3
 [profile.release.build-override]
 # Empty override to ensure main profile settings apply
 
+# Identical to release except that symbols survive, so `perf` can attribute
+# cycles to functions. Profiling a stripped binary tells you only that the CPU
+# was busy, which is already known. Same opt-level, same LTO, same
+# codegen-units, so what is measured is what ships — a profile of a
+# differently-optimised build is a profile of a different program.
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
+
 [profile.bench]
 debug = true
 

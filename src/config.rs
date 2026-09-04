@@ -1294,6 +1294,16 @@ pub struct RouteConfig {
     pub path_exact: Option<String>,
     /// Path regex pattern
     pub path_regex: Option<String>,
+    /// `path_regex` compiled, built once on first use and reused thereafter.
+    ///
+    /// It used to be compiled from source inside `route_matches`, which runs on
+    /// every request against every route — so a request hitting a config with
+    /// nine regex routes paid nine regex *compilations*, an operation orders of
+    /// magnitude dearer than the match it exists to perform. Not serialised and
+    /// not part of the config surface: it is derived state, and `#[serde(skip)]`
+    /// gives it its `Default` on load and on reload.
+    #[serde(skip)]
+    compiled_path_regex: std::sync::OnceLock<Option<regex::Regex>>,
     /// Enable WebTransport for this route
     #[serde(default)]
     pub webtransport: bool,
@@ -2757,6 +2767,19 @@ fn validate_backend_address_ssrf(address: &str, allow_internal: bool) -> anyhow:
     Ok(())
 }
 
+/// `haystack.starts_with(prefix)`, ASCII-case-insensitively, without allocating.
+fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
+    haystack.len() >= prefix.len()
+        && haystack.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
+/// `haystack.ends_with(suffix)`, ASCII-case-insensitively, without allocating.
+fn ends_with_ignore_ascii_case(haystack: &str, suffix: &str) -> bool {
+    haystack.len() >= suffix.len()
+        && haystack.as_bytes()[haystack.len() - suffix.len()..]
+            .eq_ignore_ascii_case(suffix.as_bytes())
+}
+
 impl ProxyConfig {
     /// Validate the configuration
     /// Fold `server.max_request_body_bytes` into the limit that is actually
@@ -3166,15 +3189,15 @@ impl ProxyConfig {
         path: &str,
         is_webtransport: bool,
     ) -> Option<&RouteConfig> {
-        // Sort routes by priority and find first match
-        let mut matching_routes: Vec<_> = self
-            .routes
+        // Lowest priority wins. This used to collect every match into a Vec and
+        // sort it, allocating on a path that runs for every request on every
+        // transport; a single min pass gives the same answer with no allocation.
+        // `min_by_key` keeps the *first* of equal keys, which is the same route
+        // a stable sort would have put first.
+        self.routes
             .iter()
             .filter(|r| self.route_matches(r, host, path, is_webtransport))
-            .collect();
-
-        matching_routes.sort_by_key(|r| r.priority);
-        matching_routes.first().copied()
+            .min_by_key(|r| r.priority)
     }
 
     /// Check if a route matches the request
@@ -3191,8 +3214,6 @@ impl ProxyConfig {
             return false;
         }
 
-        let path_lower = path.to_ascii_lowercase();
-
         // Check host pattern (case-insensitive)
         if let Some(ref pattern) = route.host {
             if let Some(h) = host {
@@ -3206,30 +3227,29 @@ impl ProxyConfig {
 
         // Check path - exact match takes priority (case-insensitive)
         if let Some(ref exact) = route.path_exact {
-            if path_lower != exact.to_ascii_lowercase() {
-                return false;
-            }
-            return true;
+            return path.eq_ignore_ascii_case(exact);
         }
 
-        // Check path regex (already validated during config load)
-        // Use case-insensitive matching
+        // Check path regex. Compiled once into the route's OnceLock and reused;
+        // it was previously rebuilt from source here, on every request, for
+        // every route carrying one. The regex is built case-insensitive, so it
+        // matches the raw path and needs no lowercased copy of it.
         if let Some(ref regex_str) = route.path_regex {
-            if let Ok(re) = regex::RegexBuilder::new(regex_str)
-                .case_insensitive(true)
-                .size_limit(1024 * 1024)
-                .build()
-            {
-                if !re.is_match(&path_lower) {
-                    return false;
-                }
-                return true;
-            }
+            let compiled = route.compiled_path_regex.get_or_init(|| {
+                regex::RegexBuilder::new(regex_str)
+                    .case_insensitive(true)
+                    .size_limit(1024 * 1024)
+                    .build()
+                    .ok()
+            });
+            // A pattern that will not compile matches nothing, rather than being
+            // silently skipped so the route matches everything after it.
+            return compiled.as_ref().is_some_and(|re| re.is_match(path));
         }
 
         // Check path prefix (case-insensitive)
         if let Some(ref prefix) = route.path_prefix {
-            if !path_lower.starts_with(&prefix.to_ascii_lowercase()) {
+            if !starts_with_ignore_ascii_case(path, prefix) {
                 return false;
             }
         }
@@ -3240,15 +3260,12 @@ impl ProxyConfig {
     /// Check if host matches pattern (supports wildcards)
     /// Case-insensitive comparison
     fn host_matches(&self, pattern: &str, host: &str) -> bool {
-        let pattern_lower = pattern.to_ascii_lowercase();
-        let host_lower = host.to_ascii_lowercase();
-        if pattern_lower.starts_with("*.") {
-            // Wildcard subdomain match
-            let suffix = &pattern_lower[1..];
-            host_lower.ends_with(suffix) || host_lower == pattern_lower[2..]
+        if let Some(rest) = pattern.strip_prefix("*.") {
+            // Wildcard subdomain: `*.example.com` matches `api.example.com` and
+            // the apex `example.com` itself.
+            ends_with_ignore_ascii_case(host, &pattern[1..]) || host.eq_ignore_ascii_case(rest)
         } else {
-            // Exact match
-            pattern_lower == host_lower
+            pattern.eq_ignore_ascii_case(host)
         }
     }
 
@@ -3269,6 +3286,100 @@ mod tests {
         assert!(config.server.udp_port > 0);
         assert!(config.admin.port > 0);
         assert!(config.pqc.enabled);
+    }
+
+    /// Build a route carrying just the matching fields under test.
+    fn route(
+        host: Option<&str>,
+        prefix: Option<&str>,
+        exact: Option<&str>,
+        rx: Option<&str>,
+        priority: i32,
+    ) -> RouteConfig {
+        let mut r: RouteConfig = serde_json::from_str(r#"{"backend":"b"}"#).expect("minimal route");
+        r.host = host.map(String::from);
+        r.path_prefix = prefix.map(String::from);
+        r.path_exact = exact.map(String::from);
+        r.path_regex = rx.map(String::from);
+        r.priority = priority;
+        r
+    }
+
+    fn config_with(routes: Vec<RouteConfig>) -> ProxyConfig {
+        let mut c = ProxyConfig::default();
+        c.routes = routes;
+        c
+    }
+
+    #[test]
+    fn path_prefix_matches_case_insensitively_without_allocating() {
+        let c = config_with(vec![route(None, Some("/API"), None, None, 1)]);
+        assert!(c.find_route(None, "/api/v1/thing", false).is_some());
+        assert!(c.find_route(None, "/ApI/v1", false).is_some());
+        assert!(c.find_route(None, "/other", false).is_none());
+    }
+
+    #[test]
+    fn path_exact_matches_only_the_exact_path() {
+        let c = config_with(vec![route(None, None, Some("/Health"), None, 1)]);
+        assert!(c.find_route(None, "/health", false).is_some());
+        assert!(c.find_route(None, "/HEALTH", false).is_some());
+        assert!(
+            c.find_route(None, "/health/sub", false).is_none(),
+            "exact must not match a longer path"
+        );
+    }
+
+    #[test]
+    fn path_regex_matches_and_is_compiled_once() {
+        let c = config_with(vec![route(None, None, None, Some(r"\.(woff2?|ttf)$"), 1)]);
+        assert!(c.find_route(None, "/fonts/a.woff2", false).is_some());
+        assert!(
+            c.find_route(None, "/fonts/A.TTF", false).is_some(),
+            "case-insensitive"
+        );
+        assert!(c.find_route(None, "/fonts/a.png", false).is_none());
+
+        // The compiled regex is cached on the route rather than rebuilt: after a
+        // match the slot is populated, which is what makes repeat requests cheap.
+        assert!(
+            c.routes[0].compiled_path_regex.get().is_some(),
+            "regex should be compiled and cached after first use"
+        );
+    }
+
+    #[test]
+    fn an_uncompilable_regex_matches_nothing_rather_than_everything() {
+        // Unbalanced bracket: it cannot compile. The route must then match no
+        // path at all, never fall through to matching every path.
+        let c = config_with(vec![route(None, None, None, Some("[unclosed"), 1)]);
+        assert!(c.find_route(None, "/anything", false).is_none());
+    }
+
+    #[test]
+    fn lowest_priority_wins_and_ties_keep_declaration_order() {
+        let c = config_with(vec![
+            route(None, Some("/"), None, None, 10),
+            route(None, Some("/api"), None, None, 2),
+            route(None, Some("/api"), None, None, 2),
+        ]);
+        let hit = c
+            .find_route(None, "/api/x", false)
+            .expect("a route matches");
+        assert_eq!(hit.priority, 2);
+        // Ties resolve to the first declared, as a stable sort would have.
+        assert!(std::ptr::eq(hit, &c.routes[1]));
+    }
+
+    #[test]
+    fn wildcard_host_matches_subdomain_and_apex() {
+        let c = config_with(vec![route(Some("*.example.com"), Some("/"), None, None, 1)]);
+        assert!(c.find_route(Some("api.example.com"), "/x", false).is_some());
+        assert!(
+            c.find_route(Some("EXAMPLE.COM"), "/x", false).is_some(),
+            "apex, any case"
+        );
+        assert!(c.find_route(Some("example.org"), "/x", false).is_none());
     }
 
     #[test]

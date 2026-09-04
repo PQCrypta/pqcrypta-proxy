@@ -534,12 +534,7 @@ impl QuicListener {
             // was blocked as Suspicious on a run with the feature explicitly
             // disabled.
             Some(hello) if fingerprint_config.enabled => fingerprint_extractor
-                .process_client_hello_quic(
-                    hello,
-                    remote_addr.ip(),
-                    &security,
-                    &fingerprint_config,
-                ),
+                .process_client_hello_quic(hello, remote_addr.ip(), &security, &fingerprint_config),
             Some(_) => crate::fingerprint::FingerprintResult {
                 allowed: true,
                 ja3_hash: None,
