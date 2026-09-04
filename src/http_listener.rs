@@ -3259,6 +3259,12 @@ async fn proxy_handler(
                     host: host.clone(),
                     canary_cookie,
                     canary_header,
+                    query: uri.query().map(String::from),
+                    hash_header: pool.hash_header_name().and_then(|h| {
+                        headers
+                            .get(h)
+                            .and_then(|v| v.to_str().ok().map(String::from))
+                    }),
                 };
 
                 // Select backend from pool

@@ -16,7 +16,6 @@
 /// on long-running instances with many unique clients.
 const SESSION_TTL: Duration = Duration::from_hours(1); // 1 hour
 
-use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -70,6 +69,15 @@ pub struct SelectionContext {
     /// Value of the canary sticky header from the request (e.g. "X-Canary-Group: true").
     /// Present when the pool's canary.sticky_header matches a header in the request.
     pub canary_header: Option<String>,
+    /// Raw query string without the leading `?`, for `url_param` hashing.
+    pub query: Option<String>,
+    /// Value of the header named by the pool's `header:<name>` algorithm.
+    ///
+    /// Extracted by the listener rather than handed the whole header map, the same
+    /// way `affinity_header` already is: the pool knows which single header its
+    /// algorithm needs (`BackendPool::hash_header_name`), so cloning the rest of
+    /// them into every selection would be waste.
+    pub hash_header: Option<String>,
 }
 
 /// Result of `BackendPool::select()`.
@@ -460,6 +468,10 @@ pub struct BackendPool {
     pub servers: RwLock<Vec<Arc<BackendServer>>>,
     /// Load balancing algorithm
     algorithm: Box<dyn LoadBalancingAlgorithm>,
+    /// Request header the algorithm hashes on, when it is `header:<name>`.
+    /// The listener reads this to extract that one header into the selection
+    /// context rather than cloning the whole header map per request.
+    hash_header_name: Option<String>,
     /// Session affinity mode
     pub affinity: AffinityMode,
     /// Custom affinity header name
@@ -504,6 +516,11 @@ impl BackendPool {
     /// Create pool from configuration
     pub fn from_config(config: &BackendPoolConfig, _lb_config: &LoadBalancerConfig) -> Self {
         let algorithm = Self::create_algorithm(&config.algorithm);
+        let hash_header_name = config
+            .algorithm
+            .strip_prefix("header:")
+            .filter(|n| !n.is_empty())
+            .map(String::from);
 
         let servers: Vec<Arc<BackendServer>> = config
             .servers
@@ -539,20 +556,75 @@ impl BackendPool {
             ip_sessions: DashMap::new(),
             header_sessions: DashMap::new(),
             rr_counter: AtomicU64::new(0),
+            hash_header_name,
             wrr_state: RwLock::new(WeightedRoundRobinState::default()),
             canary_config: config.canary.clone(),
             canary_sessions: DashMap::new(),
         }
     }
 
+    /// Every algorithm name this build accepts.
+    ///
+    /// `url_param` and `header` take an argument after a colon
+    /// (`url_param:sessionid`, `header:X-Tenant`), so they are listed here by
+    /// prefix and matched separately.
+    pub const ALGORITHMS: &'static [&'static str] = &[
+        "least_connections",
+        "round_robin",
+        "weighted_round_robin",
+        "random",
+        "ip_hash",
+        "least_response_time",
+        "uri_hash",
+        "url_param:<name>",
+        "header:<name>",
+        "first_available",
+        "power_of_two_choices",
+    ];
+
+    /// Whether `name` is an algorithm this build implements.
+    ///
+    /// Used by config validation so a typo is refused at load rather than
+    /// silently becoming `least_connections` — an operator who asked for
+    /// `ip_hash` and got round-robin behaviour has no way to notice.
+    pub fn is_known_algorithm(name: &str) -> bool {
+        matches!(
+            name,
+            "least_connections"
+                | "round_robin"
+                | "weighted_round_robin"
+                | "random"
+                | "ip_hash"
+                | "least_response_time"
+                | "uri_hash"
+                | "first_available"
+                | "power_of_two_choices"
+        ) || name
+            .split_once(':')
+            .is_some_and(|(kind, arg)| matches!(kind, "url_param" | "header") && !arg.is_empty())
+    }
+
     /// Create algorithm by name
     fn create_algorithm(name: &str) -> Box<dyn LoadBalancingAlgorithm> {
+        if let Some((kind, arg)) = name.split_once(':') {
+            if !arg.is_empty() {
+                match kind {
+                    "url_param" => return Box::new(UrlParamHashAlgorithm::new(arg)),
+                    "header" => return Box::new(HeaderHashAlgorithm::new(arg)),
+                    _ => {}
+                }
+            }
+        }
+
         match name {
             "round_robin" => Box::new(RoundRobinAlgorithm),
             "weighted_round_robin" => Box::new(WeightedRoundRobinAlgorithm),
             "random" => Box::new(RandomAlgorithm),
             "ip_hash" => Box::new(IpHashAlgorithm),
             "least_response_time" => Box::new(LeastResponseTimeAlgorithm),
+            "uri_hash" => Box::new(UriHashAlgorithm),
+            "first_available" => Box::new(FirstAvailableAlgorithm),
+            "power_of_two_choices" => Box::new(PowerOfTwoChoicesAlgorithm),
             _ => Box::new(LeastConnectionsAlgorithm), // Default: least_connections
         }
     }
@@ -856,6 +928,14 @@ impl BackendPool {
         self.algorithm.name()
     }
 
+    /// The single request header this pool's algorithm hashes on, if any.
+    ///
+    /// `None` for every algorithm except `header:<name>`, so the listeners pay
+    /// nothing for this on the common path.
+    pub fn hash_header_name(&self) -> Option<&str> {
+        self.hash_header_name.as_deref()
+    }
+
     /// Suspend a canary server by its ID.  Returns true if found and suspended.
     pub fn suspend_canary_server(&self, server_id: &str) -> bool {
         let servers = self.servers.read();
@@ -1027,6 +1107,100 @@ pub struct PoolStats {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// Hashing for the hash-based algorithms
+// ═══════════════════════════════════════════════════════════════
+
+/// FNV-1a, 64-bit.
+///
+/// `DefaultHasher` is deterministic in the standard library as it stands, but it is
+/// documented as making no stability guarantee across releases — and the entire
+/// promise of a hash algorithm is that a given key keeps landing on the same
+/// backend. A toolchain bump silently re-homing every session is not a risk worth
+/// carrying for a hasher that fits in five lines.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    bytes
+        .iter()
+        .fold(OFFSET, |h, b| (h ^ u64::from(*b)).wrapping_mul(PRIME))
+}
+
+/// Final avalanche mix (the MurmurHash3 64-bit finalizer).
+///
+/// FNV-1a alone is not good enough here, and the rendezvous test caught it. The
+/// last thing hashed is the server id, and ids in a pool differ only in their
+/// final bytes — `127.0.0.1:9000` through `9004`. FNV-1a ends on
+/// `(h ^ byte).wrapping_mul(PRIME)`, so two such ids differ by roughly
+/// `small_delta * PRIME`, and since `PRIME` is about 2^40 that leaves the top
+/// ~21 bits identical across every server in the pool. Those are exactly the bits
+/// `rendezvous_score` leans on, so the ordering was decided by correlated low bits
+/// and one backend took half the keyspace instead of a fifth.
+///
+/// This spreads every input bit across all 64 output bits, which is what the
+/// construction assumes it is being handed.
+const fn mix64(mut x: u64) -> u64 {
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    x ^= x >> 33;
+    x
+}
+
+/// Score one server for a key under weighted rendezvous hashing.
+///
+/// Maps the hash into `(0, 1)` and takes `-weight / ln(u)`. That is the standard
+/// weighted-rendezvous construction: the maximum over servers is distributed in
+/// proportion to weight, and the ordering for a given key is independent of which
+/// other servers happen to be present.
+fn rendezvous_score(key: &[u8], server: &BackendServer) -> f64 {
+    let mut buf = Vec::with_capacity(key.len() + server.id.len() + 1);
+    buf.extend_from_slice(key);
+    buf.push(0xff); // domain separator, so ("ab","c") and ("a","bc") differ
+    buf.extend_from_slice(server.id.as_bytes());
+
+    // Never exactly 0 or 1, so the logarithm stays finite.
+    #[allow(clippy::cast_precision_loss)]
+    let u = (mix64(fnv1a(&buf)) as f64 + 0.5) / (u64::MAX as f64 + 1.0);
+    let weight = f64::from(server.effective_weight().max(1));
+    -weight / u.ln()
+}
+
+/// Pick a server for `key` by weighted rendezvous ("highest random weight") hashing.
+///
+/// The obvious way to write a hash algorithm is `hash(key) % healthy.len()`, and it
+/// fails in the one case it exists for: when a backend goes unhealthy the modulus
+/// changes and very nearly every key moves, so the affinity the algorithm promises
+/// evaporates exactly when the pool is degraded and affinity matters most.
+///
+/// Rendezvous scores every server independently and takes the maximum, so losing a
+/// server moves only the keys that were on it — the other `n - 1` servers keep
+/// theirs. That is the property `ip_hash`, `uri_hash`, `url_param` and `header`
+/// hashing are all bought for, and it costs an O(n) scan of a pool that is
+/// realistically a handful of entries.
+fn rendezvous_select(servers: &[Arc<BackendServer>], key: &[u8]) -> Option<Arc<BackendServer>> {
+    servers
+        .iter()
+        .max_by(|a, b| {
+            rendezvous_score(key, a)
+                .partial_cmp(&rendezvous_score(key, b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .cloned()
+}
+
+/// Extract one parameter's value from a raw query string.
+///
+/// Returns `None` when the parameter is absent, which the callers treat as "fall
+/// back to round-robin" rather than hashing every such request onto one backend.
+fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == name).then_some(v)
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Algorithm Implementations
 // ═══════════════════════════════════════════════════════════════
 
@@ -1146,13 +1320,9 @@ impl LoadBalancingAlgorithm for IpHashAlgorithm {
             return None;
         }
 
-        // Hash client IP to server index
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        ctx.client_ip.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        let idx = usize::try_from(hash).unwrap_or(usize::MAX) % healthy_servers.len();
-        Some(healthy_servers[idx].clone())
+        // Rendezvous rather than `hash % len`: a backend going unhealthy must move
+        // only the clients that were on it, not re-home the entire pool.
+        rendezvous_select(&healthy_servers, ctx.client_ip.to_string().as_bytes())
     }
 
     fn name(&self) -> &'static str {
@@ -1183,6 +1353,209 @@ impl LoadBalancingAlgorithm for LeastResponseTimeAlgorithm {
         // Update EMA in server (already done in BackendServer::record_result)
         // This hook allows for algorithm-specific tracking if needed
         let _ = (server, response_time);
+    }
+}
+
+/// URI hash — affinity by request path (HAProxy `uri`).
+///
+/// Sends every request for a given path to the same backend, which is what makes
+/// a tier of caching backends useful: each one ends up owning a disjoint slice of
+/// the URL space instead of all of them caching everything.
+///
+/// The query string is deliberately excluded. `?v=` cache-busters and analytics
+/// parameters would otherwise scatter one resource across the whole pool, which is
+/// the opposite of the point.
+pub struct UriHashAlgorithm;
+
+impl LoadBalancingAlgorithm for UriHashAlgorithm {
+    fn select(&self, pool: &BackendPool, ctx: &SelectionContext) -> Option<Arc<BackendServer>> {
+        let healthy = pool.get_healthy_servers();
+        if healthy.is_empty() {
+            return None;
+        }
+        rendezvous_select(&healthy, ctx.path.as_bytes())
+    }
+
+    fn name(&self) -> &'static str {
+        "uri_hash"
+    }
+}
+
+/// URL parameter hash — affinity by one query parameter (HAProxy `url_param`).
+///
+/// Configured as `url_param:<name>`. Used to pin a session to a backend when the
+/// session identifier travels in the URL rather than a cookie.
+///
+/// A request that does not carry the parameter falls back to round-robin. Hashing
+/// the empty string instead would pile every parameterless request — health checks,
+/// crawlers, the front page — onto one backend.
+pub struct UrlParamHashAlgorithm {
+    param: String,
+}
+
+impl UrlParamHashAlgorithm {
+    pub fn new(param: impl Into<String>) -> Self {
+        Self {
+            param: param.into(),
+        }
+    }
+}
+
+impl LoadBalancingAlgorithm for UrlParamHashAlgorithm {
+    fn select(&self, pool: &BackendPool, ctx: &SelectionContext) -> Option<Arc<BackendServer>> {
+        let healthy = pool.get_healthy_servers();
+        if healthy.is_empty() {
+            return None;
+        }
+
+        match ctx
+            .query
+            .as_deref()
+            .and_then(|q| query_param(q, &self.param))
+        {
+            Some(value) => rendezvous_select(&healthy, value.as_bytes()),
+            None => {
+                let idx = usize::try_from(pool.rr_counter.fetch_add(1, Ordering::Relaxed))
+                    .unwrap_or(usize::MAX);
+                Some(healthy[idx % healthy.len()].clone())
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "url_param_hash"
+    }
+}
+
+/// Header hash — affinity by one request header (HAProxy `hdr(<name>)`).
+///
+/// Configured as `header:<name>`. The listener extracts the named header into
+/// `SelectionContext::hash_header`, so a tenant identifier, an API key or a
+/// device ID can pin traffic to a backend without a cookie.
+///
+/// As with `url_param`, a request missing the header falls back to round-robin
+/// rather than collapsing onto a single server.
+pub struct HeaderHashAlgorithm {
+    header: String,
+}
+
+impl HeaderHashAlgorithm {
+    pub fn new(header: impl Into<String>) -> Self {
+        Self {
+            header: header.into(),
+        }
+    }
+
+    /// The header this instance needs the listener to extract.
+    pub fn header_name(&self) -> &str {
+        &self.header
+    }
+}
+
+impl LoadBalancingAlgorithm for HeaderHashAlgorithm {
+    fn select(&self, pool: &BackendPool, ctx: &SelectionContext) -> Option<Arc<BackendServer>> {
+        let healthy = pool.get_healthy_servers();
+        if healthy.is_empty() {
+            return None;
+        }
+
+        match ctx.hash_header.as_deref() {
+            Some(value) if !value.is_empty() => rendezvous_select(&healthy, value.as_bytes()),
+            _ => {
+                let idx = usize::try_from(pool.rr_counter.fetch_add(1, Ordering::Relaxed))
+                    .unwrap_or(usize::MAX);
+                Some(healthy[idx % healthy.len()].clone())
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "header_hash"
+    }
+}
+
+/// First available — fill servers in declared order (HAProxy `first`).
+///
+/// Saturates the first server up to its `max_connections` before touching the
+/// second, and so on. The opposite of spreading load, and deliberately so: it is
+/// how you keep spare capacity genuinely idle, so it can be powered down, scaled
+/// in, or simply left cold as headroom.
+///
+/// A server with no connection limit would absorb everything and starve the rest,
+/// so an unlimited server is treated as last in line rather than first.
+pub struct FirstAvailableAlgorithm;
+
+impl LoadBalancingAlgorithm for FirstAvailableAlgorithm {
+    fn select(&self, pool: &BackendPool, _ctx: &SelectionContext) -> Option<Arc<BackendServer>> {
+        let healthy = pool.get_healthy_servers();
+        if healthy.is_empty() {
+            return None;
+        }
+
+        healthy
+            .iter()
+            .find(|s| {
+                s.max_connections > 0
+                    && s.active_connections.load(Ordering::Relaxed) < s.max_connections
+            })
+            .or_else(|| {
+                // Everything with a limit is full, or nothing declares one: fall back
+                // to the least loaded so the pool still serves rather than 503s.
+                healthy
+                    .iter()
+                    .min_by_key(|s| s.active_connections.load(Ordering::Relaxed))
+            })
+            .cloned()
+    }
+
+    fn name(&self) -> &'static str {
+        "first_available"
+    }
+}
+
+/// Power of two choices — sample two at random, take the less loaded.
+///
+/// Envoy's default and NGINX's `random two least_conn`. It gets within a constant
+/// factor of true least-connections while avoiding both of that algorithm's
+/// problems: the O(n) scan on every request, and the herd effect where several
+/// workers observe the same idle backend simultaneously and all pile onto it.
+///
+/// Weight is honoured by comparing load per unit of weight, so a server with twice
+/// the weight is picked until it carries twice the connections.
+pub struct PowerOfTwoChoicesAlgorithm;
+
+impl LoadBalancingAlgorithm for PowerOfTwoChoicesAlgorithm {
+    fn select(&self, pool: &BackendPool, _ctx: &SelectionContext) -> Option<Arc<BackendServer>> {
+        let healthy = pool.get_healthy_servers();
+        match healthy.len() {
+            0 => return None,
+            1 => return Some(healthy[0].clone()),
+            _ => {}
+        }
+
+        let mut rng = rand::thread_rng();
+        let a = rng.gen_range(0..healthy.len());
+        // Draw the second from the remaining n-1 and shift, so the two are always
+        // distinct without looping until they differ.
+        let mut b = rng.gen_range(0..healthy.len() - 1);
+        if b >= a {
+            b += 1;
+        }
+
+        let load = |s: &Arc<BackendServer>| {
+            f64::from(s.active_connections.load(Ordering::Relaxed))
+                / f64::from(s.effective_weight().max(1))
+        };
+
+        Some(if load(&healthy[a]) <= load(&healthy[b]) {
+            healthy[a].clone()
+        } else {
+            healthy[b].clone()
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "power_of_two_choices"
     }
 }
 
@@ -1475,7 +1848,204 @@ mod tests {
             host: "localhost".to_string(),
             canary_cookie: None,
             canary_header: None,
+            query: None,
+            hash_header: None,
         }
+    }
+
+    /// Build a pool of `n` servers, all healthy, for the hash tests.
+    fn hash_pool(algorithm: &str, n: usize) -> BackendPool {
+        let servers: Vec<PoolServerConfig> = (0..n)
+            .map(|i| PoolServerConfig {
+                address: format!("127.0.0.1:{}", 9000 + i),
+                weight: 100,
+                priority: 1,
+                max_connections: 100,
+                timeout_ms: 30000,
+                tls_mode: TlsMode::Terminate,
+                tls_cert: None,
+                tls_skip_verify: false,
+                tls_sni: None,
+                cb_failure_threshold: None,
+                cb_half_open_delay_secs: None,
+                cb_success_threshold: None,
+                canary: false,
+                canary_weight_percent: 0,
+            })
+            .collect();
+        let cfg = make_pool_config(algorithm, servers, None);
+        BackendPool::from_config(&cfg, &LoadBalancerConfig::default())
+    }
+
+    #[test]
+    fn uri_hash_is_stable_for_the_same_path() {
+        let pool = hash_pool("uri_hash", 5);
+        let mut ctx = default_ctx();
+        ctx.path = "/assets/app.js".to_string();
+
+        let first = pool.select(&ctx).unwrap().server.id.clone();
+        for _ in 0..50 {
+            assert_eq!(pool.select(&ctx).unwrap().server.id, first);
+        }
+    }
+
+    #[test]
+    fn uri_hash_spreads_distinct_paths() {
+        let pool = hash_pool("uri_hash", 5);
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..200 {
+            let mut ctx = default_ctx();
+            ctx.path = format!("/page/{i}");
+            seen.insert(pool.select(&ctx).unwrap().server.id.clone());
+        }
+        assert_eq!(
+            seen.len(),
+            5,
+            "every backend should own part of the URL space"
+        );
+    }
+
+    #[test]
+    fn url_param_hash_pins_by_parameter_and_ignores_the_rest() {
+        let pool = hash_pool("url_param:sid", 4);
+
+        let mut a = default_ctx();
+        a.query = Some("page=1&sid=abc123&t=99".to_string());
+        let mut b = default_ctx();
+        b.query = Some("sid=abc123".to_string());
+
+        assert_eq!(
+            pool.select(&a).unwrap().server.id,
+            pool.select(&b).unwrap().server.id,
+            "same sid must pin to the same backend regardless of other parameters"
+        );
+    }
+
+    #[test]
+    fn url_param_hash_without_the_parameter_does_not_collapse_onto_one_backend() {
+        let pool = hash_pool("url_param:sid", 4);
+        let ctx = default_ctx(); // no query at all
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..40 {
+            seen.insert(pool.select(&ctx).unwrap().server.id.clone());
+        }
+        assert_eq!(
+            seen.len(),
+            4,
+            "requests without the parameter must round-robin, not pile onto one server"
+        );
+    }
+
+    #[test]
+    fn header_hash_pins_by_header_value() {
+        let pool = hash_pool("header:X-Tenant", 4);
+        assert_eq!(pool.hash_header_name(), Some("X-Tenant"));
+
+        let mut ctx = default_ctx();
+        ctx.hash_header = Some("tenant-42".to_string());
+        let first = pool.select(&ctx).unwrap().server.id.clone();
+        for _ in 0..25 {
+            assert_eq!(pool.select(&ctx).unwrap().server.id, first);
+        }
+    }
+
+    #[test]
+    fn first_available_fills_in_order_then_moves_on() {
+        let pool = hash_pool("first_available", 3);
+        let servers = pool.servers.read().clone();
+
+        // Nothing loaded: the first server takes it.
+        let first_id = servers[0].id.clone();
+        assert_eq!(pool.select(&default_ctx()).unwrap().server.id, first_id);
+
+        // Saturate it; selection must move to the second, not spread.
+        servers[0]
+            .active_connections
+            .store(servers[0].max_connections, Ordering::Relaxed);
+        assert_eq!(
+            pool.select(&default_ctx()).unwrap().server.id,
+            servers[1].id
+        );
+    }
+
+    #[test]
+    fn power_of_two_choices_never_returns_the_most_loaded_of_a_pair() {
+        // With two servers the sample is the whole pool, so the lighter one must
+        // win every single time — this is the property, not a tendency.
+        let pool = hash_pool("power_of_two_choices", 2);
+        let servers = pool.servers.read().clone();
+        servers[0].active_connections.store(50, Ordering::Relaxed);
+        servers[1].active_connections.store(1, Ordering::Relaxed);
+
+        for _ in 0..100 {
+            assert_eq!(
+                pool.select(&default_ctx()).unwrap().server.id,
+                servers[1].id
+            );
+        }
+    }
+
+    #[test]
+    fn rendezvous_moves_only_the_departed_servers_keys() {
+        // The property modulo hashing does not have, and the reason these
+        // algorithms use rendezvous: losing one backend of five must re-home
+        // roughly a fifth of the keyspace, not nearly all of it.
+        let five = hash_pool("uri_hash", 5);
+        let all = five.servers.read().clone();
+
+        let keys: Vec<String> = (0..2000).map(|i| format!("/k/{i}")).collect();
+        let before: Vec<String> = keys
+            .iter()
+            .map(|k| {
+                let mut c = default_ctx();
+                c.path = k.clone();
+                five.select(&c).unwrap().server.id.clone()
+            })
+            .collect();
+
+        // Drop the last server and re-run the same keys against the survivors.
+        let survivors: Vec<Arc<BackendServer>> = all[..4].to_vec();
+        let departed = &all[4].id;
+
+        let mut moved = 0usize;
+        let mut moved_off_survivor = 0usize;
+        for (k, was) in keys.iter().zip(&before) {
+            let now = rendezvous_select(&survivors, k.as_bytes())
+                .unwrap()
+                .id
+                .clone();
+            if now != *was {
+                moved += 1;
+                if was != departed {
+                    moved_off_survivor += 1;
+                }
+            }
+        }
+
+        assert_eq!(
+            moved_off_survivor, 0,
+            "a key on a surviving backend must not move; {moved_off_survivor} did"
+        );
+        assert!(
+            moved < keys.len() / 3,
+            "only the departed server's share should move, got {moved} of {}",
+            keys.len()
+        );
+    }
+
+    #[test]
+    fn unknown_algorithm_names_are_rejected_not_silently_defaulted() {
+        assert!(BackendPool::is_known_algorithm("least_connections"));
+        assert!(BackendPool::is_known_algorithm("power_of_two_choices"));
+        assert!(BackendPool::is_known_algorithm("url_param:sid"));
+        assert!(BackendPool::is_known_algorithm("header:X-Tenant"));
+
+        // HAProxy muscle memory, a stray space, and a parameterised form with no
+        // parameter — each would previously have become least_connections in silence.
+        assert!(!BackendPool::is_known_algorithm("leastconn"));
+        assert!(!BackendPool::is_known_algorithm("ip_hash "));
+        assert!(!BackendPool::is_known_algorithm("url_param:"));
+        assert!(!BackendPool::is_known_algorithm("header:"));
     }
 
     #[test]

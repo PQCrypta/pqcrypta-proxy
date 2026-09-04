@@ -2007,6 +2007,13 @@ impl QuicListener {
                     host: host.clone().unwrap_or_default(),
                     canary_cookie: canary_cookie_val,
                     canary_header: canary_header_val,
+                    query: request.uri().query().map(String::from),
+                    hash_header: pool.hash_header_name().and_then(|h| {
+                        request
+                            .headers()
+                            .get(h)
+                            .and_then(|v| v.to_str().ok().map(String::from))
+                    }),
                 };
 
                 match pool.select(&ctx) {

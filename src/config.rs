@@ -2552,10 +2552,7 @@ impl ConfigManager {
                     // .bak copies, certbot's staging files — so dispatch strictly
                     // on which watched path the event names.
                     let hit_config = event.paths.iter().any(|p| p == &ev_config);
-                    let hit_tls = event
-                        .paths
-                        .iter()
-                        .any(|p| p == &ev_cert || p == &ev_key);
+                    let hit_tls = event.paths.iter().any(|p| p == &ev_cert || p == &ev_key);
 
                     if hit_config {
                         debug!("Config file change detected: {:?}", event);
@@ -2803,6 +2800,38 @@ impl ProxyConfig {
                 ));
             }
             Some(_) => {}
+        }
+
+        // An unknown load balancing algorithm used to fall through to
+        // `least_connections` in silence. An operator who wrote `ip_hash ` with a
+        // stray space, or `leastconn` from HAProxy muscle memory, would get
+        // round-robin-ish behaviour and no way to discover it — sticky sessions
+        // simply would not stick. Refuse it at load instead.
+        {
+            let mut bad: Vec<String> = Vec::new();
+            if !crate::load_balancer::BackendPool::is_known_algorithm(
+                &self.load_balancer.default_algorithm,
+            ) {
+                bad.push(format!(
+                    "load_balancer.default_algorithm = {:?}",
+                    self.load_balancer.default_algorithm
+                ));
+            }
+            for (pool_name, pool) in &self.backend_pools {
+                if !crate::load_balancer::BackendPool::is_known_algorithm(&pool.algorithm) {
+                    bad.push(format!(
+                        "backend_pools[{pool_name:?}].algorithm = {:?}",
+                        pool.algorithm
+                    ));
+                }
+            }
+            if !bad.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "Unknown load balancing algorithm: {}. Supported: {}.",
+                    bad.join(", "),
+                    crate::load_balancer::BackendPool::ALGORITHMS.join(", ")
+                ));
+            }
         }
 
         // Config conflict: mTLS required but no CA cert

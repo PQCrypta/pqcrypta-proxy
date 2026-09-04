@@ -2744,8 +2744,8 @@ mod tests {
         let list = vec![
             "2607:f1c0:f064:5800:0:0:0:1".to_string(), // uncompressed
             "203.0.113.5".to_string(),
-            "  198.51.100.9  ".to_string(),            // operator whitespace
-            "not-an-ip".to_string(),                   // must not panic
+            "  198.51.100.9  ".to_string(), // operator whitespace
+            "not-an-ip".to_string(),        // must not panic
         ];
 
         let compressed: IpAddr = "2607:f1c0:f064:5800::1".parse().unwrap();
