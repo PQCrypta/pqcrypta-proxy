@@ -1,0 +1,111 @@
+# pqcrypta-proxy benchmark configuration.
+#
+# Matched to the HAProxy config: same certificate, same backend, 4 workers,
+# TLS 1.3 only. Every security feature that HAProxy has no equivalent for is
+# OFF for the like-for-like run — WAF, fingerprinting, rate limiting, audit
+# logging. A second run turns them back on, because that is the configuration
+# anyone actually deploys and the cost of it is a fair thing to publish.
+version = 1
+
+[server]
+bind_address = "127.0.0.1"
+udp_port = 18444
+worker_threads = 4
+max_connections = 60000
+enable_ipv6 = false
+graceful_shutdown_timeout_secs = 1
+# The extension is negotiated, so leaving it on cannot disadvantage HAProxy —
+# but multipath is off so both sides run a plain single-path QUIC connection.
+max_concurrent_multipath_paths = 1
+enable_ack_frequency = true
+enable_quic_retry = false
+enable_quic_migration = true
+# This box already runs a production pqcrypta-proxy node. The bench instance must
+# not touch its ports: WebTransport off its default 4433, and the port-80 HTTP
+# redirect server disabled outright (see [http_redirect]).
+webtransport_port = 18445
+
+[tls]
+cert_path = "/root/bench/certs/bench.local.crt"
+key_path  = "/root/bench/certs/bench.local.key"
+min_version = "1.3"
+alpn_protocols = ["h3", "h2", "http/1.1"]
+ocsp_stapling = false
+enable_0rtt = false
+pqc_session_tickets = false
+
+[pqc]
+# Classical for the like-for-like run. The PQC handshake cost is measured
+# separately, against HAProxy also configured for X25519MLKEM768, so that
+# number is a comparison rather than a penalty applied to one side only.
+enabled = false
+
+[backends.static]
+name = "static"
+type = "http1"
+address = "127.0.0.1:18080"
+tls = false
+timeout_ms = 30000
+max_connections = 20000
+
+[[routes]]
+name = "all"
+host = "bench.local"
+path_prefix = "/"
+backend = "static"
+
+[waf]
+enabled = false
+
+[fingerprint]
+enabled = false
+
+[rate_limiting]
+enabled = false
+
+[advanced_rate_limiting]
+enabled = false
+
+[security]
+dos_protection = false
+
+[logging]
+level = "error"
+access_log = false
+audit_log_enabled = false
+
+[admin]
+enabled = false
+
+[ocsp]
+enabled = false
+
+[acme]
+enabled = false
+
+[cache]
+enabled = false
+
+[otel]
+enabled = false
+
+[conformance]
+enabled = false
+
+[masque]
+enabled = false
+
+[http_redirect]
+# Off: the default binds port 80, which the production node on this box owns.
+enabled = false
+
+[connection_pool]
+# Matched to what production actually runs, and comparable to HAProxy's
+# maxconn 20000 on the same backend. Leaving this at the built-in default of 10
+# idle connections per host meant that at concurrency 100 most requests opened a
+# fresh backend TCP connection while HAProxy reused freely — which is a
+# difference between two configs, not between two proxies.
+idle_timeout_secs = 90
+max_idle_per_host = 500
+max_connections_per_host = 20000
+acquire_timeout_ms = 5000
