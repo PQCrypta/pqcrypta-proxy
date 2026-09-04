@@ -202,6 +202,14 @@ windows-service-rs = { version = "0.7", package = "windows-service", optional = 
 # Temporary files (cross-platform)
 tempfile = "3.14"
 
+# Global allocator. A profile of the HTTP/3 path put 15 % of all cycles in
+# glibc malloc/realloc/free — the largest single addressable component, ahead of
+# the QUIC stack at 10.5 % and well ahead of our own code at 1.5 %. A proxy
+# allocates constantly and across threads (buffers per packet, per frame, per
+# header), which is precisely the workload glibc's arena allocator handles worst
+# and a thread-caching allocator handles best.
+mimalloc = { version = "0.1", default-features = false }
+
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "user", "resource"] }
 # Unix socket support for PHP-FPM backends (not available on Windows)
@@ -238,7 +246,11 @@ opt-level = 3
 # differently-optimised build is a profile of a different program.
 [profile.profiling]
 inherits = "release"
-debug = true
+# Line tables only, not full DWARF. `debug = true` alongside thin LTO needs more
+# memory than this host has — it was OOM-killed twice — and perf only needs
+# enough to attribute samples to function names. Everything else matches release
+# so the profile describes the binary that actually ships.
+debug = 1
 strip = false
 
 [profile.bench]

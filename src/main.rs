@@ -212,6 +212,17 @@ fn raise_fd_limit() {
 /// so `server.worker_threads` can size the pool: the attribute always takes
 /// every core, which made the setting unreachable however it was configured.
 /// 0 keeps the all-cores default.
+/// Global allocator.
+///
+/// Profiling under HTTP/3 load attributed 15 % of all cycles to glibc
+/// malloc/realloc/free — more than the QUIC stack (10.5 %) and ten times our own
+/// code (1.5 %). A proxy allocates small buffers constantly and frees them on
+/// whichever worker thread happens to finish the work, which is the pattern
+/// glibc's per-arena design serves worst. mimalloc keeps a per-thread free list
+/// and handles cross-thread frees without contending on an arena lock.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> anyhow::Result<()> {
     // Raise the file-descriptor limit before anything opens a socket.
     raise_fd_limit();
