@@ -3275,6 +3275,24 @@ impl ProxyConfig {
     }
 }
 
+/// Does `ip` appear in a `pentest_bypass_ips`-style list?
+///
+/// Compares PARSED addresses, not strings. `IpAddr::to_string()` emits the
+/// canonical compressed form, so a string comparison silently fails for every
+/// other valid spelling of the same IPv6 address — `2607:f1c0:f064:5800:0:0:0:1`
+/// and `2607:F1C0:F064:5800::1` are the same host but neither matches
+/// `2607:f1c0:f064:5800::1`. An operator editing this list by hand should not
+/// have to guess Rust's formatting to make a bypass take effect.
+pub fn ip_list_contains(list: &[String], ip: &std::net::IpAddr) -> bool {
+    list.iter().any(|entry| {
+        entry
+            .trim()
+            .parse::<std::net::IpAddr>()
+            .map(|parsed| &parsed == ip)
+            .unwrap_or(false)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3306,9 +3324,10 @@ mod tests {
     }
 
     fn config_with(routes: Vec<RouteConfig>) -> ProxyConfig {
-        let mut c = ProxyConfig::default();
-        c.routes = routes;
-        c
+        ProxyConfig {
+            routes,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -3368,7 +3387,7 @@ mod tests {
             .expect("a route matches");
         assert_eq!(hit.priority, 2);
         // Ties resolve to the first declared, as a stable sort would have.
-        assert!(std::ptr::eq(hit, &c.routes[1]));
+        assert!(std::ptr::eq(hit, std::ptr::from_ref(&c.routes[1])));
     }
 
     #[test]
@@ -3429,22 +3448,4 @@ stream_to_method = "POST"
         assert_eq!(config.backends.len(), 1);
         assert_eq!(config.routes.len(), 1);
     }
-}
-
-/// Does `ip` appear in a `pentest_bypass_ips`-style list?
-///
-/// Compares PARSED addresses, not strings. `IpAddr::to_string()` emits the
-/// canonical compressed form, so a string comparison silently fails for every
-/// other valid spelling of the same IPv6 address — `2607:f1c0:f064:5800:0:0:0:1`
-/// and `2607:F1C0:F064:5800::1` are the same host but neither matches
-/// `2607:f1c0:f064:5800::1`. An operator editing this list by hand should not
-/// have to guess Rust's formatting to make a bypass take effect.
-pub fn ip_list_contains(list: &[String], ip: &std::net::IpAddr) -> bool {
-    list.iter().any(|entry| {
-        entry
-            .trim()
-            .parse::<std::net::IpAddr>()
-            .map(|parsed| &parsed == ip)
-            .unwrap_or(false)
-    })
 }

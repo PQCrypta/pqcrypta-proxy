@@ -17,19 +17,22 @@
 //!   hardware acceleration, and broader algorithm choices
 //! - **rustls-post-quantum** (fallback): Pure Rust implementation with X25519MLKEM768 hybrid
 
+use std::convert::Infallible;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use bytes;
 
 use axum::{
     body::Body,
-    extract::{ConnectInfo, Host, State},
+    extract::{ConnectInfo, FromRequestParts, Host, State},
     http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
-    routing::{any, post},
     Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
@@ -245,6 +248,228 @@ pub struct HttpListenerState {
     pub conformance: Option<Arc<crate::conformance::Conformance>>,
 }
 
+// ============================================================================
+// Request dispatch
+// ============================================================================
+// Every request used to go through an `axum::Router`. A Router matches the path
+// and then hands the caller a *clone* of the matched endpoint, and that clone is
+// not a refcount bump: `Route` wraps a `BoxCloneService`, so cloning it heap-
+// allocates, and the `MethodRouter` behind a named route is boxed again. An
+// HTTP/2 profile put 4.21% in `Route::clone`, 1.07% in `BoxedIntoRoute::clone`
+// and 1.03% in `MethodRouter` drop glue — 6.3% of CPU rebuilding a routing table
+// that has exactly one named entry in it.
+//
+// `ProxyDispatch` is that table written out longhand: one path comparison, then
+// the proxy handler. Cloning it is an `Arc` bump. The middleware stack around it
+// is unchanged, and so is what the client sees — including the 405 that axum's
+// `MethodRouter` returned for a method the named route does not register.
+
+/// The one path that is not proxied.
+const TCP_UPLOAD_PATH: &str = "/speedtest/tcp-upload-stream";
+
+/// The router replacement: the speedtest upload endpoint, or the proxy.
+#[derive(Clone)]
+struct ProxyDispatch {
+    state: Arc<HttpListenerState>,
+}
+
+impl tower::Service<Request<Body>> for ProxyDispatch {
+    type Response = Response;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Response, Infallible>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut TaskContext<'_>) -> Poll<Result<(), Infallible>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: Request<Body>) -> Self::Future {
+        let state = self.state.clone();
+        Box::pin(async move { Ok(dispatch(state, req).await) })
+    }
+}
+
+/// Route one request. `Host` and `ConnectInfo` were extractor arguments while
+/// this went through the Router; they are run by hand here so `proxy_handler`
+/// keeps its signature.
+async fn dispatch(state: Arc<HttpListenerState>, req: Request<Body>) -> Response {
+    if req.uri().path() == TCP_UPLOAD_PATH {
+        return match *req.method() {
+            Method::POST => tcp_upload_measure_handler(req.into_body()).await,
+            Method::OPTIONS => tcp_upload_cors_preflight().await,
+            _ => (
+                StatusCode::METHOD_NOT_ALLOWED,
+                [(header::ALLOW, "POST,OPTIONS")],
+            )
+                .into_response(),
+        };
+    }
+
+    let (mut parts, body) = req.into_parts();
+    let host = match Host::from_request_parts(&mut parts, &()).await {
+        Ok(host) => host,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let connect_info = match ConnectInfo::<SocketAddr>::from_request_parts(&mut parts, &()).await {
+        Ok(info) => info,
+        Err(rejection) => return rejection.into_response(),
+    };
+
+    proxy_handler(
+        State(state),
+        host,
+        connect_info,
+        Request::from_parts(parts, body),
+    )
+    .await
+}
+
+/// Static dispatch for the optional fingerprint layer.
+///
+/// `tower::util::Either` maps both branches onto `BoxError`, which would break
+/// the `Error = Infallible` bound the surrounding axum layers require, and
+/// boxing a branch would put back the per-request allocation this module exists
+/// to remove. Both branches are `from_fn` services, and `FromFn::Future` is the
+/// same non-generic type either way, so the enum needs no future of its own.
+#[derive(Clone)]
+enum MaybeFingerprint<A, B> {
+    With(A),
+    Without(B),
+}
+
+impl<A, B> tower::Service<Request<Body>> for MaybeFingerprint<A, B>
+where
+    A: tower::Service<Request<Body>, Response = Response, Error = Infallible>,
+    B: tower::Service<Request<Body>, Response = Response, Error = Infallible, Future = A::Future>,
+{
+    type Response = Response;
+    type Error = Infallible;
+    type Future = A::Future;
+
+    fn poll_ready(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), Infallible>> {
+        match self {
+            Self::With(svc) => svc.poll_ready(cx),
+            Self::Without(svc) => svc.poll_ready(cx),
+        }
+    }
+
+    fn call(&mut self, req: Request<Body>) -> Self::Future {
+        match self {
+            Self::With(svc) => svc.call(req),
+            Self::Without(svc) => svc.call(req),
+        }
+    }
+}
+
+/// Adapts the server's body type to `axum::body::Body`.
+///
+/// `Router` did this conversion at its own boundary. The `from_fn` middleware
+/// stack only speaks `Request<Body>`, so hyper's `Incoming` has to be converted
+/// before it reaches the outermost layer.
+#[derive(Clone)]
+struct BodyShim<S>(S);
+
+impl<S, B> tower::Service<Request<B>> for BodyShim<S>
+where
+    S: tower::Service<Request<Body>>,
+    B: hyper::body::Body<Data = bytes::Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+        self.0.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<B>) -> Self::Future {
+        let (parts, body) = req.into_parts();
+        self.0.call(Request::from_parts(parts, Body::new(body)))
+    }
+}
+
+/// Apply one layer, pinning the extractor-tuple type parameter that a bare
+/// `Layer::layer` call leaves ambiguous — `Router::layer` carries the same
+/// `L::Service: Service<_>` bound for the same reason.
+fn wrap<L, I>(layer: L, inner: I) -> L::Service
+where
+    L: tower::Layer<I>,
+    L::Service: tower::Service<Request<Body>, Response = Response, Error = Infallible>,
+{
+    layer.layer(inner)
+}
+
+/// Build the request-handling stack: the same middleware, in the same
+/// outside-to-inside order the `Router` applied it, around `ProxyDispatch`.
+///
+/// Order (outside to inside): trace context -> advanced rate limit ->
+/// fingerprint -> security -> http3 features -> compression -> Alt-Svc ->
+/// security headers -> cache -> dispatch.
+#[allow(clippy::too_many_arguments)]
+fn build_proxy_service(
+    state: Arc<HttpListenerState>,
+    response_cache: Arc<crate::cache::ResponseCache>,
+    compression_state: CompressionState,
+    http3_features_state: Http3FeaturesState,
+    security_state: Arc<SecurityState>,
+    fingerprint_state: Option<FingerprintMiddlewareState>,
+    rl_state: (Arc<AdvancedRateLimiter>, Arc<MetricsRegistry>),
+) -> impl tower::Service<
+    Request<Body>,
+    Response = Response,
+    Error = Infallible,
+    Future = axum::middleware::future::FromFnResponseFuture,
+> + Clone
+       + Send
+       + 'static {
+    // Cache is innermost: it stores pre-compression bodies, so every outer layer
+    // applies to hits and misses alike.
+    let svc = wrap(
+        middleware::from_fn_with_state(response_cache, cache_middleware),
+        ProxyDispatch {
+            state: state.clone(),
+        },
+    );
+    let svc = wrap(
+        middleware::from_fn_with_state(state.clone(), security_headers_middleware),
+        svc,
+    );
+    let svc = wrap(
+        middleware::from_fn_with_state(state, alt_svc_middleware),
+        svc,
+    );
+    let svc = wrap(
+        middleware::from_fn_with_state(compression_state, compression_middleware),
+        svc,
+    );
+    let svc = wrap(
+        middleware::from_fn_with_state(http3_features_state, http3_features_middleware),
+        svc,
+    );
+    // Arc: axum clones the layer's state per request, and this one holds 19 Arcs
+    // of its own.
+    let svc = wrap(
+        middleware::from_fn_with_state(security_state, security_middleware),
+        svc,
+    );
+
+    let svc = match fingerprint_state {
+        Some(fp_state) => MaybeFingerprint::With(wrap(
+            middleware::from_fn_with_state(fp_state, fingerprint_middleware),
+            svc,
+        )),
+        None => MaybeFingerprint::Without(svc),
+    };
+
+    let svc = wrap(
+        middleware::from_fn_with_state(rl_state, advanced_rate_limit_middleware),
+        svc,
+    );
+    // Trace context is the absolute outermost layer so the trace ID is available
+    // to every inner middleware and to the access logger.
+    wrap(middleware::from_fn(trace_context_middleware), svc)
+}
+
 /// Create and run the HTTP listener with TLS termination
 #[allow(clippy::similar_names)]
 pub async fn run_http_listener(
@@ -370,6 +595,7 @@ pub async fn run_http_listener(
 
     // Initialize fingerprint middleware state (if enabled)
     let fingerprint_state = if config.fingerprint.enabled {
+        info!("🔍 TLS fingerprinting middleware enabled");
         Some(FingerprintMiddlewareState::new(
             fingerprint_extractor,
             security_state.clone(),
@@ -379,68 +605,15 @@ pub async fn run_http_listener(
         None
     };
 
-    // Build router with full middleware stack
-    // Order (outside to inside): advanced_rate_limit -> fingerprint -> security -> http3 -> compression -> alt_svc -> security_headers -> cache -> handler
-    let app = Router::new()
-        .route(
-            "/speedtest/tcp-upload-stream",
-            post(tcp_upload_measure_handler).options(tcp_upload_cors_preflight),
-        )
-        .fallback(any(proxy_handler))
-        // Cache (innermost — stores pre-compression bodies; outer layers apply to hits+misses)
-        .layer(middleware::from_fn_with_state(
-            response_cache,
-            cache_middleware,
-        ))
-        // Response headers (runs after cache — applied to both hits and misses)
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            security_headers_middleware,
-        ))
-        // Alt-Svc header
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            alt_svc_middleware,
-        ))
-        // Response compression
-        .layer(middleware::from_fn_with_state(
-            compression_state,
-            compression_middleware,
-        ))
-        // HTTP/3 features (Priority hints, Request coalescing)
-        .layer(middleware::from_fn_with_state(
-            http3_features_state,
-            http3_features_middleware,
-        ))
-        // Security middleware (basic IP checks, circuit breaker)
-        .layer(middleware::from_fn_with_state(
-            // Arc: axum clones the layer's state per request, and this one holds
-            // 19 Arcs of its own.
-            Arc::new(security_state),
-            security_middleware,
-        ));
-
-    // Conditionally add fingerprint middleware (if enabled)
-    let app = if let Some(fp_state) = fingerprint_state {
-        info!("🔍 TLS fingerprinting middleware enabled");
-        app.layer(middleware::from_fn_with_state(
-            fp_state,
-            fingerprint_middleware,
-        ))
-    } else {
-        app
-    };
-
-    // Add rate limiting and trace context extraction (outermost layers)
-    let app = app
-        .layer(middleware::from_fn_with_state(
-            rl_state,
-            advanced_rate_limit_middleware,
-        ))
-        // Trace context extraction is the absolute outermost layer so the trace
-        // ID is available to all inner middleware and the access logger.
-        .layer(middleware::from_fn(trace_context_middleware))
-        .with_state(state);
+    let app = build_proxy_service(
+        state.clone(),
+        response_cache,
+        compression_state,
+        http3_features_state,
+        Arc::new(security_state),
+        fingerprint_state,
+        rl_state,
+    );
 
     // Build TLS config using the per-domain SNI resolver (no single cert required)
     let rustls_server_config = build_rustls_server_config(cert_path, key_path).map_err(|e| {
@@ -455,7 +628,14 @@ pub async fn run_http_listener(
 
     // Run HTTPS server
     axum_server::bind_rustls(addr, tls_config)
-        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+        // Spelled out: `ServiceExt` is generic over the request type, and
+        // hyper hands `axum_server` an `Incoming` body that only `BodyShim`
+        // converts.
+        .serve(
+            axum::ServiceExt::<Request<hyper::body::Incoming>>::into_make_service_with_connect_info::<
+                SocketAddr,
+            >(BodyShim(app)),
+        )
         .await?;
 
     Ok(())
@@ -587,6 +767,7 @@ pub async fn run_http_listener_pqc(
 
     // Initialize fingerprint middleware state (if enabled)
     let fingerprint_state = if config.fingerprint.enabled {
+        info!("🔍 TLS fingerprinting middleware enabled (PQC mode)");
         Some(FingerprintMiddlewareState::new(
             fingerprint_extractor,
             security_state.clone(),
@@ -596,60 +777,15 @@ pub async fn run_http_listener_pqc(
         None
     };
 
-    // Build router with full middleware stack
-    // Order (outside to inside): advanced_rate_limit -> fingerprint -> security -> http3 -> compression -> alt_svc -> security_headers -> cache -> handler
-    let app = Router::new()
-        .route(
-            "/speedtest/tcp-upload-stream",
-            post(tcp_upload_measure_handler).options(tcp_upload_cors_preflight),
-        )
-        .fallback(any(proxy_handler))
-        .layer(middleware::from_fn_with_state(
-            response_cache,
-            cache_middleware,
-        ))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            security_headers_middleware,
-        ))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            alt_svc_middleware,
-        ))
-        .layer(middleware::from_fn_with_state(
-            compression_state,
-            compression_middleware,
-        ))
-        .layer(middleware::from_fn_with_state(
-            http3_features_state,
-            http3_features_middleware,
-        ))
-        .layer(middleware::from_fn_with_state(
-            // Arc: axum clones the layer's state per request, and this one holds
-            // 19 Arcs of its own.
-            Arc::new(security_state),
-            security_middleware,
-        ));
-
-    // Conditionally add fingerprint middleware (if enabled)
-    let app = if let Some(fp_state) = fingerprint_state {
-        info!("🔍 TLS fingerprinting middleware enabled (PQC mode)");
-        app.layer(middleware::from_fn_with_state(
-            fp_state,
-            fingerprint_middleware,
-        ))
-    } else {
-        app
-    };
-
-    // Add rate limiting and trace context extraction (outermost layers)
-    let app = app
-        .layer(middleware::from_fn_with_state(
-            rl_state,
-            advanced_rate_limit_middleware,
-        ))
-        .layer(middleware::from_fn(trace_context_middleware))
-        .with_state(state);
+    let app = build_proxy_service(
+        state.clone(),
+        response_cache,
+        compression_state,
+        http3_features_state,
+        Arc::new(security_state),
+        fingerprint_state,
+        rl_state,
+    );
 
     // =========================================================================
     // OpenSSL 3.5+ PQC TLS Backend
@@ -708,7 +844,14 @@ pub async fn run_http_listener_pqc(
 
     // Run HTTPS server with OpenSSL 3.5+ (PQC-enabled with native ML-KEM)
     axum_server::bind_openssl(addr, openssl_config)
-        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+        // Spelled out: `ServiceExt` is generic over the request type, and
+        // hyper hands `axum_server` an `Incoming` body that only `BodyShim`
+        // converts.
+        .serve(
+            axum::ServiceExt::<Request<hyper::body::Incoming>>::into_make_service_with_connect_info::<
+                SocketAddr,
+            >(BodyShim(app)),
+        )
         .await?;
 
     Ok(())
@@ -903,49 +1046,15 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
         Arc::new(config.fingerprint.clone()),
     );
 
-    // Build router with full middleware stack
-    let app = Router::new()
-        .route(
-            "/speedtest/tcp-upload-stream",
-            post(tcp_upload_measure_handler).options(tcp_upload_cors_preflight),
-        )
-        .fallback(any(proxy_handler))
-        .layer(middleware::from_fn_with_state(
-            response_cache,
-            cache_middleware,
-        ))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            security_headers_middleware,
-        ))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            alt_svc_middleware,
-        ))
-        .layer(middleware::from_fn_with_state(
-            compression_state,
-            compression_middleware,
-        ))
-        .layer(middleware::from_fn_with_state(
-            http3_features_state,
-            http3_features_middleware,
-        ))
-        .layer(middleware::from_fn_with_state(
-            // Arc: axum clones the layer's state per request, and this one holds
-            // 19 Arcs of its own.
-            Arc::new(security_state.clone()),
-            security_middleware,
-        ))
-        .layer(middleware::from_fn_with_state(
-            fingerprint_state,
-            fingerprint_middleware,
-        ))
-        .layer(middleware::from_fn_with_state(
-            rl_state,
-            advanced_rate_limit_middleware,
-        ))
-        .layer(middleware::from_fn(trace_context_middleware))
-        .with_state(state);
+    let app = build_proxy_service(
+        state.clone(),
+        response_cache,
+        compression_state,
+        http3_features_state,
+        Arc::new(security_state.clone()),
+        Some(fingerprint_state),
+        rl_state,
+    );
 
     // Build rustls server config (h2 + http/1.1).
     // Use the shared resolver when provided so ACME-issued certs are hot-reloaded
@@ -1046,13 +1155,19 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
 }
 
 /// Handle a single connection with fingerprinting
-async fn handle_fingerprinted_connection(
+async fn handle_fingerprinted_connection<S>(
     stream: TcpStream,
     remote_addr: SocketAddr,
     acceptor: Arc<FingerprintingTlsAcceptor>,
-    app: Router,
+    app: S,
     metrics: Arc<MetricsRegistry>,
-) {
+) where
+    S: tower::Service<Request<Body>, Response = Response, Error = Infallible>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send,
+{
     trace!("New TCP connection from {}", remote_addr);
 
     // Accept TLS connection with fingerprint capture
@@ -1371,50 +1486,15 @@ pub async fn run_http_listener_pqc_with_fingerprint(
         Arc::new(config.fingerprint.clone()),
     );
 
-    // Build router with full middleware stack
-    // Order (outside to inside): advanced_rate_limit -> fingerprint -> security -> http3 -> compression -> alt_svc -> security_headers -> cache -> handler
-    let app = Router::new()
-        .route(
-            "/speedtest/tcp-upload-stream",
-            post(tcp_upload_measure_handler).options(tcp_upload_cors_preflight),
-        )
-        .fallback(any(proxy_handler))
-        .layer(middleware::from_fn_with_state(
-            response_cache,
-            cache_middleware,
-        ))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            security_headers_middleware,
-        ))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            alt_svc_middleware,
-        ))
-        .layer(middleware::from_fn_with_state(
-            compression_state,
-            compression_middleware,
-        ))
-        .layer(middleware::from_fn_with_state(
-            http3_features_state,
-            http3_features_middleware,
-        ))
-        .layer(middleware::from_fn_with_state(
-            // Arc: axum clones the layer's state per request, and this one holds
-            // 19 Arcs of its own.
-            Arc::new(security_state.clone()),
-            security_middleware,
-        ))
-        .layer(middleware::from_fn_with_state(
-            fingerprint_state,
-            fingerprint_middleware,
-        ))
-        .layer(middleware::from_fn_with_state(
-            rl_state,
-            advanced_rate_limit_middleware,
-        ))
-        .layer(middleware::from_fn(trace_context_middleware))
-        .with_state(state);
+    let app = build_proxy_service(
+        state.clone(),
+        response_cache,
+        compression_state,
+        http3_features_state,
+        Arc::new(security_state.clone()),
+        Some(fingerprint_state),
+        rl_state,
+    );
 
     // Create OpenSSL PQC acceptor with SNI multi-domain support.
     // The `sni_map` was pre-built by the caller and is shared with the ACME
@@ -1532,16 +1612,22 @@ fn pqc_handshake_facts(ssl: &openssl::ssl::SslRef) -> crate::tls_acceptor::Hands
 // grouping; bundling them into a struct purely to satisfy the lint would add an
 // indirection this accept path does not otherwise need.
 #[allow(clippy::too_many_arguments)]
-async fn handle_pqc_fingerprinted_connection(
+async fn handle_pqc_fingerprinted_connection<S>(
     stream: TcpStream,
     remote_addr: SocketAddr,
     ssl_context: Arc<openssl::ssl::SslContext>,
     fingerprint_extractor: Arc<FingerprintExtractor>,
     security_state: SecurityState,
     fingerprint_config: crate::config::FingerprintConfig,
-    app: Router,
+    app: S,
     metrics: Arc<MetricsRegistry>,
-) {
+) where
+    S: tower::Service<Request<Body>, Response = Response, Error = Infallible>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send,
+{
     use openssl::ssl::Ssl;
     use tokio_openssl::SslStream;
 
