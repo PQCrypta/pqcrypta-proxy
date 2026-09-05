@@ -414,7 +414,9 @@ pub async fn run_http_listener(
         ))
         // Security middleware (basic IP checks, circuit breaker)
         .layer(middleware::from_fn_with_state(
-            security_state,
+            // Arc: axum clones the layer's state per request, and this one holds
+            // 19 Arcs of its own.
+            Arc::new(security_state),
             security_middleware,
         ));
 
@@ -623,7 +625,9 @@ pub async fn run_http_listener_pqc(
             http3_features_middleware,
         ))
         .layer(middleware::from_fn_with_state(
-            security_state,
+            // Arc: axum clones the layer's state per request, and this one holds
+            // 19 Arcs of its own.
+            Arc::new(security_state),
             security_middleware,
         ));
 
@@ -927,7 +931,9 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
             http3_features_middleware,
         ))
         .layer(middleware::from_fn_with_state(
-            security_state.clone(),
+            // Arc: axum clones the layer's state per request, and this one holds
+            // 19 Arcs of its own.
+            Arc::new(security_state.clone()),
             security_middleware,
         ))
         .layer(middleware::from_fn_with_state(
@@ -1394,7 +1400,9 @@ pub async fn run_http_listener_pqc_with_fingerprint(
             http3_features_middleware,
         ))
         .layer(middleware::from_fn_with_state(
-            security_state.clone(),
+            // Arc: axum clones the layer's state per request, and this one holds
+            // 19 Arcs of its own.
+            Arc::new(security_state.clone()),
             security_middleware,
         ))
         .layer(middleware::from_fn_with_state(

@@ -1936,7 +1936,13 @@ impl SecurityState {
 
 /// Security middleware for rate limiting, IP blocking, and request validation
 pub async fn security_middleware(
-    State(security): State<SecurityState>,
+    // `Arc`, not the struct. Axum clones the middleware's state for every
+    // request, and `SecurityState` holds 19 `Arc` fields — so by value this was
+    // 19 atomic increments in and 19 decrements out, per request, on cache lines
+    // every worker touches. The same defect was fixed in `HttpListenerState`
+    // earlier and it survived here, in the middleware's own state parameter: a
+    // profile still showed 3.4 % of CPU in this clone and its drop afterwards.
+    State(security): State<Arc<SecurityState>>,
     ConnectInfo(client_addr): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     mut request: Request<Body>,
