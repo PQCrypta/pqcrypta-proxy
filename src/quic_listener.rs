@@ -6,6 +6,7 @@
 //! This listener handles QUIC/HTTP3 connections (h3/quinn stack) and runs alongside
 //! `WebTransportServer` (wtransport stack), which handles the dedicated WebTransport port.
 
+use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -119,8 +120,14 @@ pub struct QuicListener {
     early_hints_state: Arc<EarlyHintsState>,
     /// Metrics registry for recording request/connection stats
     metrics: Arc<MetricsRegistry>,
-    /// Security state for IP blocking, GeoIP country blocking, and rate limiting
-    security: SecurityState,
+    /// Security state for IP blocking, GeoIP country blocking, and rate limiting.
+    ///
+    /// `Arc`, not an owned clone: this is handed to every connection task and
+    /// every request within it, and `SecurityState` holds 17 `Arc`s of its own —
+    /// so an owned copy is ~19 atomic increments on the way in and as many
+    /// decrements on the way out, per request. The TCP path was fixed for this;
+    /// the QUIC path kept the copy.
+    security: Arc<SecurityState>,
     /// Advanced multi-dimensional rate limiter (shared with TCP listeners)
     advanced_rate_limiter: Arc<AdvancedRateLimiter>,
     /// Shared load balancer for canary routing and pool-based selection
@@ -150,7 +157,7 @@ impl QuicListener {
         shutdown_rx: mpsc::Receiver<()>,
         reload_rx: mpsc::Receiver<ConfigReloadEvent>,
         metrics: Arc<MetricsRegistry>,
-        security: SecurityState,
+        security: Arc<SecurityState>,
         advanced_rate_limiter: Arc<AdvancedRateLimiter>,
         load_balancer: Arc<LoadBalancer>,
         cache: Arc<ResponseCache>,
@@ -459,7 +466,7 @@ impl QuicListener {
         config: Arc<ProxyConfig>,
         backend_pool: Arc<BackendPool>,
         early_hints_state: Arc<EarlyHintsState>,
-        security: SecurityState,
+        security: Arc<SecurityState>,
         metrics: Arc<MetricsRegistry>,
         advanced_rate_limiter: Arc<AdvancedRateLimiter>,
         load_balancer: Arc<LoadBalancer>,
@@ -680,7 +687,7 @@ impl QuicListener {
         config: Arc<ProxyConfig>,
         backend_pool: Arc<BackendPool>,
         early_hints_state: Arc<EarlyHintsState>,
-        security: SecurityState,
+        security: Arc<SecurityState>,
         metrics: Arc<MetricsRegistry>,
         advanced_rate_limiter: Arc<AdvancedRateLimiter>,
         load_balancer: Arc<LoadBalancer>,
@@ -1078,7 +1085,7 @@ impl QuicListener {
         config: Arc<ProxyConfig>,
         backend_pool: Arc<BackendPool>,
         early_hints_state: Arc<EarlyHintsState>,
-        security: SecurityState,
+        security: Arc<SecurityState>,
         metrics: Arc<MetricsRegistry>,
         advanced_rate_limiter: Arc<AdvancedRateLimiter>,
         load_balancer: Arc<LoadBalancer>,
@@ -1148,35 +1155,54 @@ impl QuicListener {
         }
 
         let uri = request.uri();
-        let path = if config.server.normalize_paths {
-            uri.path().to_ascii_lowercase()
+        // `Cow`: the common request has no query and no path normalisation, and
+        // then neither of these allocates at all. Before, every request built a
+        // `path` String, an (often empty) `query` String, and a third String
+        // concatenating them.
+        let path: Cow<'_, str> = if config.server.normalize_paths {
+            Cow::Owned(uri.path().to_ascii_lowercase())
         } else {
-            uri.path().to_string()
+            Cow::Borrowed(uri.path())
         };
-        let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
-        let path_with_query = format!("{}{}", path, query);
-        let method = request.method().to_string();
-        // In HTTP/3, host comes from :authority pseudo-header (in URI) or fallback to host header
-        let host = uri
+        let path_with_query: Cow<'_, str> = match uri.query() {
+            Some(q) => Cow::Owned(format!("{path}?{q}")),
+            None => match &path {
+                Cow::Borrowed(p) => Cow::Borrowed(p),
+                Cow::Owned(p) => Cow::Borrowed(p.as_str()),
+            },
+        };
+        // Borrowed, not owned. `request` is `Request<()>` — the body lives on
+        // `stream` — and nothing below mutates it, so these all outlive their
+        // uses. Every one of them was an allocation on the hot path.
+        let method = request.method().as_str();
+        // In HTTP/3, host comes from :authority pseudo-header (in URI) or fallback
+        // to host header. An authority host is almost always already lowercase,
+        // so only pay for the copy when it actually needs changing.
+        let host: Option<Cow<'_, str>> = uri
             .authority()
-            .map(|a| a.host().to_ascii_lowercase())
+            .map(|a| {
+                let h = a.host();
+                if h.bytes().any(|b| b.is_ascii_uppercase()) {
+                    Cow::Owned(h.to_ascii_lowercase())
+                } else {
+                    Cow::Borrowed(h)
+                }
+            })
             .or_else(|| {
                 request
                     .headers()
                     .get("host")
                     .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string())
+                    .map(Cow::Borrowed)
             });
         let user_agent = request
             .headers()
             .get("user-agent")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+            .and_then(|v| v.to_str().ok());
         let referer = request
             .headers()
             .get("referer")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+            .and_then(|v| v.to_str().ok());
         let is_health_check = request
             .headers()
             .get("x-health-check-bypass")
@@ -1240,9 +1266,7 @@ impl QuicListener {
             // implementations, so an exemption added on only one of them leaves
             // the other still banning Googlebot — and modern crawlers negotiate
             // h3 whenever it is advertised, which this proxy does.
-            let crawler_verdict = security
-                .crawler_verifier
-                .classify(ip, user_agent.as_deref());
+            let crawler_verdict = security.crawler_verifier.classify(ip, user_agent);
             let is_verified_crawler =
                 crawler_verdict == crate::crawler_verify::CrawlerVerdict::Verified;
             let skip_auto_block = is_verified_crawler
@@ -1252,7 +1276,7 @@ impl QuicListener {
             // itself. This is the only layer that has both, and it is what lets the
             // directory name a client instead of listing an opaque hash.
             if let Some(ref ja3) = fingerprint.ja3_hash {
-                if let Some(ref ua) = user_agent {
+                if let Some(ua) = user_agent {
                     security.note_user_agent(ja3, ua);
                 }
             }
@@ -1329,7 +1353,7 @@ impl QuicListener {
                     ip,
                     request.headers(),
                     &path,
-                    &method,
+                    method,
                     ja3_hash,
                     ja4_hash,
                     None,
@@ -1478,13 +1502,11 @@ impl QuicListener {
             };
 
             {
-                let h3_query = request.uri().query().unwrap_or("").to_string();
-                let h3_method = request.method().as_str().to_string();
                 let view = crate::security::SecurityRequestView {
                     ip,
-                    method: &h3_method,
+                    method,
                     path: &path,
-                    query: &h3_query,
+                    query: request.uri().query().unwrap_or(""),
                     headers: request.headers(),
                     body: None,
                 };
@@ -1790,13 +1812,13 @@ impl QuicListener {
                 // Log 404 response
                 log_access(&AccessLogEntry {
                     remote_addr,
-                    method: &method,
+                    method,
                     path: &path,
                     protocol: "HTTP/3",
                     status: 404,
                     body_size: 0,
-                    referer: referer.as_deref(),
-                    user_agent: user_agent.as_deref(),
+                    referer,
+                    user_agent,
                     host: host.as_deref(),
                     response_time_ms: start_time
                         .elapsed()
@@ -1844,7 +1866,7 @@ impl QuicListener {
                     ip,
                     request.headers(),
                     &path,
-                    &method,
+                    method,
                     fingerprint.ja3_hash.clone(),
                     fingerprint.ja4_hash.clone(),
                     Some(route_name.clone()),
@@ -2014,8 +2036,8 @@ impl QuicListener {
                     client_ip: remote_addr.ip(),
                     session_cookie: session_cookie_val,
                     affinity_header: None,
-                    path: path.clone(),
-                    host: host.clone().unwrap_or_default(),
+                    path: path.clone().into_owned(),
+                    host: host.clone().map(Cow::into_owned).unwrap_or_default(),
                     canary_cookie: canary_cookie_val,
                     canary_header: canary_header_val,
                     query: request.uri().query().map(String::from),
@@ -2200,7 +2222,7 @@ impl QuicListener {
             };
             let body_view = crate::security::SecurityRequestView {
                 ip,
-                method: &method,
+                method,
                 path: &path,
                 query: &body_query,
                 headers: request.headers(),
@@ -2246,7 +2268,7 @@ impl QuicListener {
             && !cache.is_excluded_host(cache_host_str)
         {
             let host_str = cache_host_str;
-            let cache_key = ResponseCache::build_key(&method, host_str, &path_with_query);
+            let cache_key = ResponseCache::build_key(method, host_str, &path_with_query);
             let if_none_match = request
                 .headers()
                 .get("if-none-match")
@@ -2326,13 +2348,13 @@ impl QuicListener {
                     );
                     log_access(&AccessLogEntry {
                         remote_addr,
-                        method: &method,
+                        method,
                         path: &path,
                         protocol: "HTTP/3",
                         status,
                         body_size,
-                        referer: referer.as_deref(),
-                        user_agent: user_agent.as_deref(),
+                        referer,
+                        user_agent,
                         host: host.as_deref(),
                         response_time_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
                     });
@@ -2378,13 +2400,13 @@ impl QuicListener {
                     );
                     log_access(&AccessLogEntry {
                         remote_addr,
-                        method: &method,
+                        method,
                         path: &path,
                         protocol: "HTTP/3",
                         status: 304,
                         body_size: 0,
-                        referer: referer.as_deref(),
-                        user_agent: user_agent.as_deref(),
+                        referer,
+                        user_agent,
                         host: host.as_deref(),
                         response_time_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
                     });
@@ -2440,7 +2462,7 @@ impl QuicListener {
 
         // Forward Host header to backend (required for virtual host routing)
         if let Some(ref host_value) = host {
-            headers.insert("Host".to_string(), host_value.clone());
+            headers.insert("Host".to_string(), host_value.clone().into_owned());
         }
 
         // Extract distributed trace context from the incoming QUIC/HTTP3 request
@@ -2474,8 +2496,12 @@ impl QuicListener {
                             shadow_cfg.shadow_header_value.clone(),
                         );
                         let shadow_body = body.clone();
-                        let shadow_method = method.clone();
-                        let shadow_path = path_with_query.clone();
+                        // Owned here and nowhere else: the spawned task is
+                        // `'static`, and shadowing is off by default, so the
+                        // allocation belongs on this branch rather than on every
+                        // request.
+                        let shadow_method = method.to_owned();
+                        let shadow_path = path_with_query.clone().into_owned();
                         let shadow_bp = backend_pool.clone();
                         let shadow_timeout_ms = shadow_cfg.timeout_ms;
                         let shadow_log = shadow_cfg.log_responses;
@@ -2585,13 +2611,13 @@ impl QuicListener {
             );
             log_access(&AccessLogEntry {
                 remote_addr,
-                method: &method,
+                method,
                 path: &path,
                 protocol: "HTTP/3",
                 status: stream_status,
                 body_size: 0,
-                referer: referer.as_deref(),
-                user_agent: user_agent.as_deref(),
+                referer,
+                user_agent,
                 host: host.as_deref(),
                 response_time_ms: start_time
                     .elapsed()
@@ -2626,7 +2652,7 @@ impl QuicListener {
             && !cache.is_excluded_host(cache_host_str)
         {
             let host_str = cache_host_str;
-            let cache_key = ResponseCache::build_key(&method, host_str, &path_with_query);
+            let cache_key = ResponseCache::build_key(method, host_str, &path_with_query);
             cache.put(
                 &cache_key,
                 proxy_response.status,
@@ -2829,13 +2855,13 @@ impl QuicListener {
         // Log successful response
         log_access(&AccessLogEntry {
             remote_addr,
-            method: &method,
+            method,
             path: &path,
             protocol: "HTTP/3",
             status: response_status,
             body_size,
-            referer: referer.as_deref(),
-            user_agent: user_agent.as_deref(),
+            referer,
+            user_agent,
             host: host.as_deref(),
             response_time_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
         });

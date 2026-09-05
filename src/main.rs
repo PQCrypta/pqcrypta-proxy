@@ -1184,7 +1184,10 @@ async fn run() -> anyhow::Result<()> {
     // second one. Two instances meant two independent blocklists: an IP blocked
     // over TCP was still free to connect over HTTP/3, and an admin unblock would
     // only ever clear one of them.
-    let shared_quic_security = security_state.clone();
+    // Arc once here rather than an owned clone per listener: `QuicListener` hands
+    // this to every connection task and every request, and the struct holds 17
+    // `Arc`s of its own.
+    let shared_quic_security = std::sync::Arc::new(security_state.clone());
 
     for port in all_ports.clone() {
         // Skip webtransport_port - it's handled by dedicated WebTransportServer
