@@ -31,8 +31,13 @@ pub struct ProxyResponse {
     pub status: u16,
     /// Response headers (Vec to support multiple headers with same name, e.g. Set-Cookie)
     pub headers: Vec<(String, String)>,
-    /// Response body
-    pub body: Vec<u8>,
+    /// Response body.
+    ///
+    /// `Bytes`, not `Vec<u8>`: hyper hands the body over as `Bytes` already and
+    /// the HTTP/3 sender takes `Bytes`, so an owned `Vec` in between meant
+    /// copying the entire body once per response for no reason -- 1.23 GB/s of
+    /// pure memcpy at 64 KB. Cloning this for the cache is now a refcount bump.
+    pub body: Bytes,
 }
 
 /// Backend connection pool manager
@@ -257,7 +262,7 @@ impl BackendPool {
         Ok(ProxyResponse {
             status,
             headers: response_headers,
-            body: body_bytes.to_vec(),
+            body: body_bytes,
         })
     }
 

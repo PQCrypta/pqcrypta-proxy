@@ -2323,10 +2323,12 @@ impl QuicListener {
                     // have (RFC 9110 §9.3.2). Deriving the header from the
                     // stripped body reported every cached HEAD as zero-length.
                     let content_length = cached_body.len();
-                    let body_bytes: Vec<u8> = if method == "HEAD" {
-                        Vec::new()
+                    // Refcount bump, not a copy: serving a cache hit used to
+                    // clone the whole body out of the entry.
+                    let body_bytes: Bytes = if method == "HEAD" {
+                        Bytes::new()
                     } else {
-                        (*cached_body).clone()
+                        cached_body.clone()
                     };
                     response_builder =
                         response_builder.header("content-length", content_length.to_string());
@@ -2335,7 +2337,7 @@ impl QuicListener {
                     let latency = start_time.elapsed();
                     stream.send_response(response).await?;
                     if !body_bytes.is_empty() {
-                        stream.send_data(Bytes::from(body_bytes)).await?;
+                        stream.send_data(body_bytes).await?;
                     }
                     stream.finish().await?;
                     metrics.requests.request_end_full(
@@ -2637,7 +2639,7 @@ impl QuicListener {
         let proxy_response = crate::proxy::ProxyResponse {
             status: stream_status,
             headers: stream_headers,
-            body: body_bytes.to_vec(),
+            body: body_bytes,
         };
 
         // Store response in cache (GET only; cache.put() enforces all Cache-Control
@@ -2838,7 +2840,7 @@ impl QuicListener {
         let response_status = proxy_response.status;
 
         stream.send_response(response).await?;
-        stream.send_data(Bytes::from(proxy_response.body)).await?;
+        stream.send_data(proxy_response.body).await?;
         stream.finish().await?;
 
         // Record metrics

@@ -21,6 +21,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderValue, Method, Request, Response, StatusCode};
 use axum::middleware::Next;
+use bytes::Bytes;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, trace};
@@ -84,8 +85,10 @@ struct CacheEntry {
     status: u16,
     /// Response headers forwarded from the backend
     headers: Vec<(String, String)>,
-    /// Response body bytes (uncompressed; compression is handled by outer middleware)
-    body: Arc<Vec<u8>>,
+    /// Response body bytes (uncompressed; compression is handled by outer middleware).
+    /// `Bytes` rather than `Arc<Vec<u8>>` so serving a hit clones a refcount
+    /// instead of copying the whole body.
+    body: Bytes,
     /// ETag header value from backend (for If-None-Match comparison)
     etag: Option<String>,
     /// Last-Modified header value from backend (for If-Modified-Since comparison)
@@ -118,7 +121,7 @@ pub enum CacheLookup {
     Hit {
         status: u16,
         headers: Vec<(String, String)>,
-        body: Arc<Vec<u8>>,
+        body: Bytes,
         /// Seconds elapsed since the entry was stored (for the `Age` header)
         age_secs: u64,
     },
@@ -305,20 +308,14 @@ impl ResponseCache {
         CacheLookup::Hit {
             status: entry.status,
             headers: entry.headers.clone(),
-            body: Arc::clone(&entry.body),
+            body: entry.body.clone(),
             age_secs,
         }
     }
 
     /// Store a backend response.  Respects Cache-Control directives, size limits,
     /// and the `no_cache_set_cookie` configuration flag.
-    pub fn put(
-        &self,
-        key: &str,
-        status: u16,
-        response_headers: &[(String, String)],
-        body: Vec<u8>,
-    ) {
+    pub fn put(&self, key: &str, status: u16, response_headers: &[(String, String)], body: Bytes) {
         if !self.config.enabled {
             return;
         }
@@ -491,7 +488,7 @@ impl ResponseCache {
         let new_entry = CacheEntry {
             status,
             headers: response_headers.to_vec(),
-            body: Arc::new(body),
+            body,
             etag,
             last_modified,
             cache_control: cache_control_val,
@@ -772,7 +769,7 @@ pub async fn cache_middleware(
             let resp_body = if method == Method::HEAD {
                 Body::empty()
             } else {
-                Body::from((*body).clone())
+                Body::from(body)
             };
 
             builder
@@ -839,7 +836,7 @@ pub async fn cache_middleware(
                         return head_response(parts);
                     }
                     if body_bytes.len() <= cache.config.max_body_size_bytes {
-                        cache.put(&cache_key, status, &resp_headers, body_bytes.to_vec());
+                        cache.put(&cache_key, status, &resp_headers, body_bytes.clone());
                     }
                     parts
                         .headers
@@ -874,7 +871,7 @@ mod vary_tests {
         if !vary.is_empty() {
             headers.push(("vary".to_string(), vary.to_string()));
         }
-        c.put(&key, 200, &headers, b"body".to_vec());
+        c.put(&key, 200, &headers, Bytes::from_static(b"body"));
         c.stats().0 > 0
     }
 
@@ -955,7 +952,7 @@ mod purge_tests {
             &ResponseCache::build_key(method, host, path),
             200,
             &[("cache-control".to_string(), "max-age=60".to_string())],
-            b"body".to_vec(),
+            Bytes::from_static(b"body"),
         );
     }
 
