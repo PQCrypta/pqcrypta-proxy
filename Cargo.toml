@@ -265,6 +265,13 @@ debug = true
 # handshake pipeline. See vendor/rustls-fixed/rustls/src/server/ech.rs.
 [patch.crates-io]
 rustls = { path = "vendor/rustls-fixed/rustls" }
+# h3: forked to fix the QPACK string encoder. Upstream always sets the Huffman
+# bit and never checks whether Huffman actually shrinks the value, copies the
+# input before encoding, grows the output a byte at a time, and copies it out a
+# byte at a time. `hpack_encode` was the hottest single symbol in the HTTP/3
+# profile at 4.88% -- more than the entire QUIC stack. Patched here rather than
+# in the dependency graph so `h3-noq` gets the same fork.
+h3 = { path = "vendor/h3" }
 # NOTE: the QUIC stack moved from the narrow-probe quinn fork to noq (see the
 # quinn/quinn-proto aliases in [dependencies]); the old quinn/quinn-proto
 # [patch.crates-io] entries were removed since nothing depends on the
