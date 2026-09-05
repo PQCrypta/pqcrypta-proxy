@@ -6,6 +6,7 @@
 //! This listener handles QUIC/HTTP3 connections (h3/quinn stack) and runs alongside
 //! `WebTransportServer` (wtransport stack), which handles the dedicated WebTransport port.
 
+use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -35,7 +36,6 @@ use crate::http3_features::EarlyHintsState;
 use crate::load_balancer::{LoadBalancer, SelectionContext};
 use crate::metrics::{ConnectionProtocol, MetricsRegistry};
 use crate::otel;
-use http::HeaderValue;
 
 use crate::fingerprint::FingerprintExtractor;
 use crate::proxy::BackendPool;
@@ -2419,15 +2419,31 @@ impl QuicListener {
             }
         }
 
-        // Build headers map - start with route-specific headers
-        let mut headers = route.add_headers.clone();
+        // Build the header map the backend will receive.
+        //
+        // A `HeaderMap`, not a `HashMap<String, String>`: this used to allocate
+        // two Strings per header on the way in and the forwarding code then
+        // re-parsed and re-validated every name to rebuild a `HeaderMap` from
+        // them. Cloning a `HeaderName` is cheap and a `HeaderValue` is
+        // `Bytes`-backed, so carrying the real type costs no allocations at all.
+        let mut headers = HeaderMap::with_capacity(request.headers().len() + 8);
+        for (name, value) in &route.add_headers {
+            if let (Ok(n), Ok(v)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                headers.insert(n, v);
+            }
+        }
 
         // Forward original request headers (excluding hop-by-hop headers)
-        for (name, value) in request.headers().iter() {
-            let name_lower = name.as_str().to_lowercase();
-            // Skip hop-by-hop headers and pseudo-headers
-            if !matches!(
-                name_lower.as_str(),
+        let mut cookie_parts: Vec<&str> = Vec::new();
+        for (name, value) in request.headers() {
+            // `HeaderName` is always lowercase, so this compares without
+            // allocating the lowercased copy the old loop built per header.
+            let name_str = name.as_str();
+            if matches!(
+                name_str,
                 "host"
                     | "connection"
                     | "transfer-encoding"
@@ -2437,22 +2453,25 @@ impl QuicListener {
                     | "proxy-authorization"
                     | "te"
                     | "trailer"
-            ) && !name_lower.starts_with(':')
+            ) || name_str.starts_with(':')
             {
-                if let Ok(value_str) = value.to_str() {
-                    if name_lower == "cookie" {
-                        // HTTP/3 splits Cookie across multiple header fields (RFC 9114 §4.2.1).
-                        // Combine them with "; " so the HTTP/1.1 backend sees one Cookie header.
-                        headers
-                            .entry("cookie".to_string())
-                            .and_modify(|existing| {
-                                *existing = format!("{}; {}", existing, value_str);
-                            })
-                            .or_insert_with(|| value_str.to_string());
-                    } else {
-                        headers.insert(name.as_str().to_string(), value_str.to_string());
-                    }
+                continue;
+            }
+            if name_str == "cookie" {
+                // HTTP/3 splits Cookie across multiple header fields
+                // (RFC 9114 §4.2.1); collect them and join once below so the
+                // HTTP/1.1 backend sees a single Cookie header.
+                if let Ok(v) = value.to_str() {
+                    cookie_parts.push(v);
                 }
+            } else {
+                headers.insert(name.clone(), value.clone());
+            }
+        }
+        if !cookie_parts.is_empty() {
+            let joined = cookie_parts.join("; ");
+            if let Ok(v) = HeaderValue::from_str(&joined) {
+                headers.insert(header::COOKIE, v);
             }
         }
 
@@ -2464,26 +2483,36 @@ impl QuicListener {
 
         // Forward Host header to backend (required for virtual host routing)
         if let Some(ref host_value) = host {
-            headers.insert("Host".to_string(), host_value.clone().into_owned());
+            if let Ok(v) = HeaderValue::from_str(host_value) {
+                headers.insert(header::HOST, v);
+            }
         }
 
         // Extract distributed trace context from the incoming QUIC/HTTP3 request
         // headers and stitch this request into the caller's trace.  The current
         // span becomes a child of the caller's span; proxy.rs then injects the
         // new child span context into the upstream backend request.
-        otel::set_parent_from_map(&tracing::Span::current(), &headers);
+        otel::set_parent_from_headers(&tracing::Span::current(), &headers);
 
-        // Forward X-Forwarded headers
-        headers.insert("X-Forwarded-Proto".to_string(), "https".to_string());
-        headers.insert("X-Forwarded-For".to_string(), remote_addr.ip().to_string());
-        headers.insert("X-Real-IP".to_string(), remote_addr.ip().to_string());
+        // Forward X-Forwarded headers. The IP is formatted once and shared.
+        headers.insert(
+            HeaderName::from_static("x-forwarded-proto"),
+            HeaderValue::from_static("https"),
+        );
+        let client_ip = remote_addr.ip().to_string();
+        if let Ok(ip_value) = HeaderValue::from_str(&client_ip) {
+            headers.insert(HeaderName::from_static("x-forwarded-for"), ip_value.clone());
+            headers.insert(HeaderName::from_static("x-real-ip"), ip_value.clone());
 
-        if route.forward_client_identity {
-            let header_name = route
-                .client_identity_header
-                .as_deref()
-                .unwrap_or("X-Client-IP");
-            headers.insert(header_name.to_string(), remote_addr.ip().to_string());
+            if route.forward_client_identity {
+                let header_name = route
+                    .client_identity_header
+                    .as_deref()
+                    .unwrap_or("x-client-ip");
+                if let Ok(n) = HeaderName::from_bytes(header_name.as_bytes()) {
+                    headers.insert(n, ip_value);
+                }
+            }
         }
 
         // Traffic shadowing: fire-and-forget async copy to shadow backend (if configured)
@@ -2492,7 +2521,19 @@ impl QuicListener {
                 let roll: u8 = rand::random::<u8>() % 100;
                 if roll < shadow_cfg.percent.min(100) {
                     if let Some(shadow_backend) = config.get_backend(&shadow_cfg.backend).cloned() {
-                        let mut shadow_headers = headers.clone();
+                        // The shadow path still takes the older
+                        // `HashMap<String, String>` interface. Converting here
+                        // rather than upstream keeps the per-request path on
+                        // `HeaderMap`: shadowing is off by default, so this
+                        // allocation belongs on this branch.
+                        let mut shadow_headers: std::collections::HashMap<String, String> = headers
+                            .iter()
+                            .filter_map(|(n, v)| {
+                                v.to_str()
+                                    .ok()
+                                    .map(|v| (n.as_str().to_string(), v.to_string()))
+                            })
+                            .collect();
                         shadow_headers.insert(
                             shadow_cfg.shadow_header.clone(),
                             shadow_cfg.shadow_header_value.clone(),
@@ -2546,28 +2587,33 @@ impl QuicListener {
         // Proxy to backend (include query string in path).
         // Use the streaming path for all requests: inspect content-type from response
         // headers to decide whether to pump chunks (SSE) or buffer (everything else).
+        // `Bytes::from(Vec)` takes ownership without copying; the clone handed
+        // to the forwarder below is then a refcount bump.
+        let request_body = Bytes::from(body);
+        let request_body_len = request_body.len() as u64;
+
         let (stream_status, stream_headers, stream_body) = backend_pool
-            .proxy_http_stream(
+            .proxy_stream(
                 &backend,
-                request.method().as_str(),
+                request.method(),
                 &path_with_query,
                 headers,
-                &body,
+                request_body.clone(),
             )
             .await?;
 
-        let is_sse = stream_headers.iter().any(|(k, v)| {
-            k.eq_ignore_ascii_case("content-type") && v.contains("text/event-stream")
-        });
+        let is_sse = stream_headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("text/event-stream"));
 
         // SSE fast path: send headers immediately, then pump body frames as they arrive.
         if is_sse {
-            let mut sse_builder = http::Response::builder()
-                .status(http::StatusCode::from_u16(stream_status).unwrap_or(http::StatusCode::OK));
+            let mut sse_builder = http::Response::builder().status(stream_status);
             for (name, value) in &stream_headers {
-                let lower = name.to_ascii_lowercase();
-                // Skip content-length (SSE has no fixed length) and hop-by-hop headers
-                if lower == "content-length" || lower == "transfer-encoding" {
+                // Skip content-length (SSE has no fixed length) and hop-by-hop
+                // headers. `HeaderName` is already lowercase, so no copy here.
+                if name == header::CONTENT_LENGTH || name == header::TRANSFER_ENCODING {
                     continue;
                 }
                 sse_builder = sse_builder.header(name, value);
@@ -2604,9 +2650,9 @@ impl QuicListener {
             stream.finish().await?;
 
             metrics.requests.request_end_full(
-                stream_status,
+                stream_status.as_u16(),
                 start_time.elapsed(),
-                body.len() as u64,
+                request_body_len,
                 0,
                 Some(&path),
                 is_health_check,
@@ -2616,7 +2662,7 @@ impl QuicListener {
                 method,
                 path: &path,
                 protocol: "HTTP/3",
-                status: stream_status,
+                status: stream_status.as_u16(),
                 body_size: 0,
                 referer,
                 user_agent,
@@ -2637,7 +2683,7 @@ impl QuicListener {
             .map_err(|e| anyhow::anyhow!("Failed to read response body: {}", e))?
             .to_bytes();
         let proxy_response = crate::proxy::ProxyResponse {
-            status: stream_status,
+            status: stream_status.as_u16(),
             headers: stream_headers,
             body: body_bytes,
         };
@@ -2655,10 +2701,22 @@ impl QuicListener {
         {
             let host_str = cache_host_str;
             let cache_key = ResponseCache::build_key(method, host_str, &path_with_query);
+            // The cache stores `Vec<(String, String)>`; converting here rather
+            // than upstream keeps the forwarding path on `HeaderMap`, and this
+            // runs only for cacheable GETs rather than every request.
+            let cache_headers: Vec<(String, String)> = proxy_response
+                .headers
+                .iter()
+                .filter_map(|(n, v)| {
+                    v.to_str()
+                        .ok()
+                        .map(|v| (n.as_str().to_string(), v.to_string()))
+                })
+                .collect();
             cache.put(
                 &cache_key,
                 proxy_response.status,
-                &proxy_response.headers,
+                &cache_headers,
                 proxy_response.body.clone(),
             );
         }
@@ -2673,13 +2731,15 @@ impl QuicListener {
         // Note: set-cookie for /grafana is handled separately below with Domain rewriting
         let is_grafana = path.starts_with("/grafana");
         for (name, value) in &proxy_response.headers {
-            let lower_name = name.to_lowercase();
+            // `HeaderName` is already lowercase; the old loop allocated a
+            // lowercased String per response header to learn that.
+            let lower_name = name.as_str();
             // Skip set-cookie for Grafana routes (handled below with Domain attribute)
             if is_grafana && lower_name == "set-cookie" {
                 continue;
             }
             if matches!(
-                lower_name.as_str(),
+                lower_name,
                 "content-type"
                     | "cache-control"
                     | "etag"
@@ -2711,12 +2771,8 @@ impl QuicListener {
         // value when it sent one, and otherwise send none, matching the chunked
         // GET these backends actually serve.
         if method == "HEAD" {
-            if let Some((_, origin_len)) = proxy_response
-                .headers
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
-            {
-                response_builder = response_builder.header("content-length", origin_len.as_str());
+            if let Some(origin_len) = proxy_response.headers.get(header::CONTENT_LENGTH) {
+                response_builder = response_builder.header(header::CONTENT_LENGTH, origin_len);
             }
         } else {
             response_builder =
@@ -2729,16 +2785,15 @@ impl QuicListener {
             // Remove set-cookie from whitelist-forwarded headers (already added above)
             // and re-add with explicit Domain to help browser cookie storage
             let mut has_cookies = false;
-            for (name, value) in &proxy_response.headers {
-                if name.to_lowercase() == "set-cookie" {
-                    has_cookies = true;
-                    // Add Domain=pqcrypta.com to help browser store cookie
-                    let with_domain = if !value.contains("Domain=") {
-                        format!("{}; Domain=pqcrypta.com", value)
-                    } else {
-                        value.clone()
-                    };
-                    response_builder = response_builder.header("set-cookie", with_domain.as_str());
+            for value in proxy_response.headers.get_all(header::SET_COOKIE) {
+                let Ok(cookie) = value.to_str() else { continue };
+                has_cookies = true;
+                // Add Domain=pqcrypta.com to help browser store cookie
+                if cookie.contains("Domain=") {
+                    response_builder = response_builder.header(header::SET_COOKIE, value);
+                } else {
+                    response_builder = response_builder
+                        .header(header::SET_COOKIE, format!("{cookie}; Domain=pqcrypta.com"));
                 }
             }
             if has_cookies {
@@ -2848,7 +2903,7 @@ impl QuicListener {
         metrics.requests.request_end_full(
             response_status,
             latency,
-            body.len() as u64,
+            request_body_len,
             body_size as u64,
             Some(&path),
             is_health_check,

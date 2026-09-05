@@ -13,7 +13,8 @@ use std::time::Duration;
 use bytes::{Buf, Bytes};
 use dashmap::DashMap;
 use http_body_util::{BodyExt, Full};
-use hyper::{Method, Request};
+use hyper::header::HeaderMap;
+use hyper::{Method, Request, StatusCode};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -25,12 +26,31 @@ use crate::config::{BackendConfig, BackendType, ProxyConfig};
 use crate::otel;
 
 /// Response from backend proxy
+/// Hop-by-hop headers, forbidden over HTTP/2 and HTTP/3 (RFC 9113 §8.2.2,
+/// RFC 9114 §4.2). Was declared inline in each forwarding function.
+const HOP_BY_HOP: &[&str] = &[
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "upgrade",
+    "te",
+    "trailer",
+    "proxy-authenticate",
+    "proxy-authorization",
+];
+
 #[derive(Debug)]
 pub struct ProxyResponse {
     /// HTTP status code
     pub status: u16,
-    /// Response headers (Vec to support multiple headers with same name, e.g. Set-Cookie)
-    pub headers: Vec<(String, String)>,
+    /// Response headers.
+    ///
+    /// `HeaderMap` rather than `Vec<(String, String)>`: it already supports
+    /// repeated names (`Set-Cookie`), which was the reason for the Vec, and it
+    /// is what both hyper and the HTTP/3 sender speak — so carrying it avoids
+    /// three String allocations per header in each direction.
+    pub headers: HeaderMap,
     /// Response body.
     ///
     /// `Bytes`, not `Vec<u8>`: hyper hands the body over as `Bytes` already and
@@ -222,32 +242,15 @@ impl BackendPool {
         // Strip HTTP/1.1 hop-by-hop headers — these are connection-specific and forbidden
         // in HTTP/2 and HTTP/3 (RFC 9113 §8.2.2, RFC 9114 §4.2). Forwarding them over
         // QUIC/HTTP3 causes ERR_QUIC_PROTOCOL_ERROR in browsers.
-        const HOP_BY_HOP: &[&str] = &[
-            "transfer-encoding",
-            "connection",
-            "keep-alive",
-            "proxy-connection",
-            "upgrade",
-            "te",
-            "trailer",
-            "proxy-authenticate",
-            "proxy-authorization",
-        ];
         let status = response.status().as_u16();
-        let mut response_headers = Vec::new();
-        for (name, value) in response.headers() {
-            let name_lower = name.as_str().to_ascii_lowercase();
-            if HOP_BY_HOP.contains(&name_lower.as_str()) {
-                continue;
-            }
-            if let Ok(v) = value.to_str() {
-                response_headers.push((name.to_string(), v.to_string()));
-            }
+        let (parts, body_part) = response.into_parts();
+        let mut response_headers = parts.headers;
+        for name in HOP_BY_HOP {
+            response_headers.remove(*name);
         }
 
         // Read response body
-        let body_bytes = response
-            .into_body()
+        let body_bytes = body_part
             .collect()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read response body: {}", e))?
@@ -266,36 +269,41 @@ impl BackendPool {
         })
     }
 
-    /// Proxy request to HTTP backend and return response parts + raw streaming body.
-    /// Used for SSE / chunked responses where buffering the full body is undesirable.
-    /// The caller is responsible for draining the body.
-    pub async fn proxy_http_stream(
+    /// Forward a request to a backend, carrying `HeaderMap` and `Bytes` through
+    /// untouched.
+    ///
+    /// The older `proxy_http_stream` takes `HashMap<String, String>` headers and
+    /// a `&[u8]` body, which forces the caller to dismantle a perfectly good
+    /// `HeaderMap` into owned Strings, then forces this function to rebuild one —
+    /// `Request::builder().header(k, v)` re-parses and re-validates every header
+    /// name — and copies the body. The response then went the same way in
+    /// reverse, three String allocations per header into a `Vec<(String, String)>`.
+    /// Four conversions per request, all of them round trips to the same value.
+    ///
+    /// Here the caller's `HeaderMap` becomes the request's `HeaderMap` by move,
+    /// the body is a `Bytes` clone (a refcount bump), and the response's
+    /// `HeaderMap` is returned as-is with only the hop-by-hop entries removed.
+    pub async fn proxy_stream(
         &self,
         backend: &BackendConfig,
-        method: &str,
+        method: &Method,
         path: &str,
-        headers: HashMap<String, String>,
-        body: &[u8],
-    ) -> anyhow::Result<(u16, Vec<(String, String)>, hyper::body::Incoming)> {
+        mut headers: HeaderMap,
+        body: Bytes,
+    ) -> anyhow::Result<(StatusCode, HeaderMap, hyper::body::Incoming)> {
         let _permit = self.acquire_permit(&backend.name).await?;
 
-        let mut headers = headers;
-        otel::inject_current_context_into_map(&mut headers);
+        otel::inject_current_context_into_headers(&mut headers);
 
-        let uri = if backend.tls {
-            format!("https://{}{}", backend.address, path)
-        } else {
-            format!("http://{}{}", backend.address, path)
-        };
+        let scheme = if backend.tls { "https" } else { "http" };
+        let uri = format!("{}://{}{}", scheme, backend.address, path);
 
-        let method_parsed = method.parse::<Method>()?;
-        let mut req_builder = Request::builder().method(method_parsed).uri(&uri);
-        for (k, v) in &headers {
-            req_builder = req_builder.header(k, v);
-        }
-        let request = req_builder
-            .body(Full::new(Bytes::copy_from_slice(body)))
-            .map_err(|e| anyhow::anyhow!("Failed to build request: {}", e))?;
+        let mut request = Request::new(Full::new(body));
+        *request.method_mut() = method.clone();
+        *request.uri_mut() = uri
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid backend URI {uri}: {e}"))?;
+        *request.headers_mut() = headers;
 
         let timeout = Duration::from_millis(backend.timeout_ms);
         let response = tokio::time::timeout(timeout, self.http_client.request(request))
@@ -303,30 +311,16 @@ impl BackendPool {
             .map_err(|_| anyhow::anyhow!("Backend stream request timeout"))?
             .map_err(|e| anyhow::anyhow!("Backend stream request failed: {}", e))?;
 
-        const HOP_BY_HOP: &[&str] = &[
-            "transfer-encoding",
-            "connection",
-            "keep-alive",
-            "proxy-connection",
-            "upgrade",
-            "te",
-            "trailer",
-            "proxy-authenticate",
-            "proxy-authorization",
-        ];
-        let status = response.status().as_u16();
-        let mut response_headers = Vec::new();
-        for (name, value) in response.headers() {
-            let lower = name.as_str().to_ascii_lowercase();
-            if HOP_BY_HOP.contains(&lower.as_str()) {
-                continue;
-            }
-            if let Ok(v) = value.to_str() {
-                response_headers.push((name.to_string(), v.to_string()));
-            }
+        let status = response.status();
+        let (parts, body_part) = response.into_parts();
+        let mut response_headers = parts.headers;
+        // Connection-specific headers are forbidden over HTTP/2 and HTTP/3
+        // (RFC 9113 §8.2.2, RFC 9114 §4.2); forwarding them makes browsers fail
+        // the response with a protocol error.
+        for name in HOP_BY_HOP {
+            response_headers.remove(*name);
         }
 
-        let (_, body_part) = response.into_parts();
         Ok((status, response_headers, body_part))
     }
 
