@@ -2441,168 +2441,149 @@ pub async fn security_middleware(
     response
 }
 
-/// Generate blocked IP response
-fn blocked_response(info: &BlockedIpInfo, alt_svc: &str) -> Response {
-    // P1-fix: `duration_since` panics (in debug) / saturates (in release) when the
-    // reference instant is in the past — a TOCTOU race between is_blocked() and here.
-    // `saturating_duration_since` returns zero for expired blocks without panicking.
-    let retry_after = info
-        .expires_at
-        .map(|e| e.saturating_duration_since(Instant::now()).as_secs())
-        .unwrap_or(3600);
+/// Origins allowed to read a security refusal cross-origin.
+///
+/// Without these headers a 429 or 403 reaches the browser as an opaque CORS
+/// error, so the page cannot see the status and retries blindly instead of
+/// backing off. The HTTP/3 handler kept its own copy of this list; one list
+/// means the two transports cannot disagree about who may read a refusal.
+const CORS_REFUSAL_ORIGINS: &[&str] = &["https://pqcrypta.com", "https://www.pqcrypta.com"];
 
-    let mut response = (StatusCode::FORBIDDEN, "Access denied - IP blocked").into_response();
-
-    response.headers_mut().insert(
-        "Retry-After",
-        HeaderValue::from_str(&retry_after.to_string()).unwrap_or(HeaderValue::from_static("3600")),
-    );
-    add_alt_svc(&mut response, alt_svc);
-
-    response
+/// The CORS headers a refusal needs so `request_origin` may read it, or empty
+/// when that origin is not on the allowlist.
+///
+/// Exposed because the advanced rate limiter renders its own 429s on both
+/// transports and must consult the same allowlist as [`decision_rendering`].
+pub fn cors_refusal_headers(request_origin: Option<&str>) -> Vec<(&'static str, String)> {
+    let origin = request_origin.unwrap_or("");
+    if CORS_REFUSAL_ORIGINS.contains(&origin) {
+        vec![
+            ("access-control-allow-origin", origin.to_string()),
+            ("access-control-allow-credentials", "true".to_string()),
+            ("vary", "Origin".to_string()),
+        ]
+    } else {
+        Vec::new()
+    }
 }
 
-/// Generate GeoIP blocked response — redirects to the styled 403 error page.
-/// The error page path is exempt from security checks so the redirect always resolves.
-fn geo_blocked_response(alt_svc: &str) -> Response {
-    let mut response = (
-        StatusCode::FOUND,
-        [(
-            "Location",
-            "https://pqcrypta.com/error_pages/pqcrypt_403.html",
-        )],
-        "",
-    )
-        .into_response();
-    add_alt_svc(&mut response, alt_svc);
-    response
+/// How a [`SecurityDecision`] appears on the wire.
+pub struct DecisionRendering {
+    pub status: StatusCode,
+    pub headers: Vec<(&'static str, String)>,
+    /// Body text, for transports that send one. HTTP/3 refusals are
+    /// header-only and ignore this.
+    pub body: String,
+}
+
+/// Render a [`SecurityDecision`], or `None` when the request is allowed.
+///
+/// Both transports render from this one function. They previously kept a
+/// renderer each, and the two had drifted: a `Blocked` verdict meant 403 plus
+/// `Retry-After` on TCP but a 302 redirect over HTTP/3, and a `RateLimited`
+/// verdict lost its CORS headers over HTTP/3 — so a browser on h3 saw an opaque
+/// failure where the same client on h2 saw a 429 it could back off from.
+///
+/// `request_origin` is the request's `Origin` header, which decides whether the
+/// refusal may be read cross-origin.
+///
+/// Matching exhaustively is deliberate: a new [`SecurityDecision`] variant
+/// cannot be added without the compiler demanding a rendering for it.
+pub fn decision_rendering(
+    decision: &SecurityDecision,
+    request_origin: Option<&str>,
+) -> Option<DecisionRendering> {
+    match decision {
+        SecurityDecision::Allow => None,
+
+        SecurityDecision::Blocked(info) => {
+            // P1-fix: `saturating_duration_since` rather than `duration_since`,
+            // which panics in debug (and saturates in release) when the block
+            // expires in the race between `is_blocked()` and here.
+            let retry_after = info
+                .expires_at
+                .map(|e| e.saturating_duration_since(Instant::now()).as_secs())
+                .unwrap_or(3600);
+            Some(DecisionRendering {
+                status: StatusCode::FORBIDDEN,
+                headers: vec![("retry-after", retry_after.to_string())],
+                body: "Access denied - IP blocked".to_string(),
+            })
+        }
+
+        // Redirected rather than refused: a geo-blocked visitor is a person, and
+        // the styled error page explains the block. The page itself is exempt
+        // from security checks so the redirect always resolves.
+        SecurityDecision::GeoBlocked => Some(DecisionRendering {
+            status: StatusCode::FOUND,
+            headers: vec![(
+                "location",
+                "https://pqcrypta.com/error_pages/pqcrypt_403.html".to_string(),
+            )],
+            body: String::new(),
+        }),
+
+        SecurityDecision::RateLimited {
+            limit,
+            retry_after_secs,
+            kind: _,
+        } => {
+            let mut headers = vec![
+                ("retry-after", retry_after_secs.to_string()),
+                ("x-ratelimit-limit", limit.to_string()),
+                ("x-ratelimit-remaining", "0".to_string()),
+            ];
+            headers.extend(cors_refusal_headers(request_origin));
+            Some(DecisionRendering {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                headers,
+                body: "Rate limit exceeded".to_string(),
+            })
+        }
+
+        // Plain 403 rather than the redirect used for GeoIP blocks: the caller
+        // here is an automated client that named itself by TLS fingerprint, so a
+        // human-readable error page serves no one.
+        SecurityDecision::Ja3Rejected => Some(DecisionRendering {
+            status: StatusCode::FORBIDDEN,
+            headers: Vec::new(),
+            body: "Forbidden".to_string(),
+        }),
+
+        SecurityDecision::HeadersTooLarge { max } => Some(DecisionRendering {
+            status: StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            headers: Vec::new(),
+            body: format!("Headers exceed maximum size of {} bytes", max),
+        }),
+
+        SecurityDecision::WafBlock { .. } => Some(DecisionRendering {
+            status: StatusCode::FORBIDDEN,
+            headers: vec![("x-waf-block", "1".to_string())],
+            body: "Forbidden".to_string(),
+        }),
+    }
 }
 
 /// Render a [`SecurityDecision`] as an axum response for the TCP path.
-///
-/// Companion to [`decision_to_h3_parts`]; the two exist because the transports
-/// build different response types, not because they apply different rules.
 fn render_decision(
     decision: &SecurityDecision,
     alt_svc: &str,
     request_origin: Option<&str>,
 ) -> Response {
-    match decision {
-        SecurityDecision::Allow => {
-            // Callers check for Allow before calling; treat it as a no-op 200.
-            let mut r = StatusCode::OK.into_response();
-            add_alt_svc(&mut r, alt_svc);
-            r
-        }
-        SecurityDecision::Blocked(info) => blocked_response(info, alt_svc),
-        SecurityDecision::GeoBlocked => geo_blocked_response(alt_svc),
-        SecurityDecision::RateLimited { limit, .. } => {
-            rate_limit_response_simple(*limit, alt_svc, request_origin)
-        }
-        SecurityDecision::Ja3Rejected => ja3_forbidden_response(alt_svc),
-        SecurityDecision::HeadersTooLarge { max } => headers_too_large_response(*max, alt_svc),
-        SecurityDecision::WafBlock { .. } => {
-            let mut r = (StatusCode::FORBIDDEN, "Forbidden").into_response();
-            r.headers_mut()
-                .insert("x-waf-block", HeaderValue::from_static("1"));
-            add_alt_svc(&mut r, alt_svc);
-            r
+    let Some(rendering) = decision_rendering(decision, request_origin) else {
+        // Callers check for Allow before calling; treat it as a no-op 200.
+        let mut r = StatusCode::OK.into_response();
+        add_alt_svc(&mut r, alt_svc);
+        return r;
+    };
+
+    let mut response = (rendering.status, rendering.body).into_response();
+    for (name, value) in rendering.headers {
+        if let Ok(v) = HeaderValue::from_str(&value) {
+            response.headers_mut().insert(name, v);
         }
     }
-}
-
-/// Render a [`SecurityDecision`] as an HTTP/3 status plus extra headers.
-///
-/// `None` means the request is allowed. Kept beside the decision type so a new
-/// variant cannot be added without the HTTP/3 path being updated to render it —
-/// the compiler will flag the missing arm.
-pub fn decision_to_h3_parts(
-    decision: &SecurityDecision,
-) -> Option<(StatusCode, Vec<(&'static str, String)>)> {
-    match decision {
-        SecurityDecision::Allow => None,
-        SecurityDecision::Blocked(_) | SecurityDecision::GeoBlocked => Some((
-            StatusCode::FOUND,
-            vec![(
-                "location",
-                "https://pqcrypta.com/error_pages/pqcrypt_403.html".to_string(),
-            )],
-        )),
-        SecurityDecision::RateLimited {
-            limit,
-            retry_after_secs,
-            kind: _,
-        } => Some((
-            StatusCode::TOO_MANY_REQUESTS,
-            vec![
-                ("retry-after", retry_after_secs.to_string()),
-                ("x-ratelimit-limit", limit.to_string()),
-                ("x-ratelimit-remaining", "0".to_string()),
-            ],
-        )),
-        SecurityDecision::Ja3Rejected => Some((StatusCode::FORBIDDEN, Vec::new())),
-        SecurityDecision::HeadersTooLarge { .. } => {
-            Some((StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE, Vec::new()))
-        }
-        SecurityDecision::WafBlock { .. } => Some((
-            StatusCode::FORBIDDEN,
-            vec![("x-waf-block", "1".to_string())],
-        )),
-    }
-}
-
-/// Refusal for a request that failed a route's JA3 allowlist.
-///
-/// Plain 403 rather than the redirect used for GeoIP blocks: the caller here
-/// is an automated client that named itself by TLS fingerprint, so a
-/// human-readable error page serves no one.
-fn ja3_forbidden_response(alt_svc: &str) -> Response {
-    let mut response = (StatusCode::FORBIDDEN, "Forbidden").into_response();
     add_alt_svc(&mut response, alt_svc);
-    response
-}
-
-/// Generate rate limit exceeded response with just the RPS value
-fn rate_limit_response_simple(
-    requests_per_second: u32,
-    alt_svc: &str,
-    request_origin: Option<&str>,
-) -> Response {
-    let mut response = (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
-
-    // Add standard rate limit headers
-    response
-        .headers_mut()
-        .insert("Retry-After", HeaderValue::from_static("1"));
-    response.headers_mut().insert(
-        "X-RateLimit-Limit",
-        HeaderValue::from_str(&requests_per_second.to_string())
-            .unwrap_or(HeaderValue::from_static("100")),
-    );
-    response
-        .headers_mut()
-        .insert("X-RateLimit-Remaining", HeaderValue::from_static("0"));
-
-    // CORS headers on 429 so browsers see the status code instead of a CORS error
-    const ALLOWED_ORIGINS: &[&str] = &["https://pqcrypta.com", "https://www.pqcrypta.com"];
-    let origin = request_origin.unwrap_or("");
-    if ALLOWED_ORIGINS.contains(&origin) {
-        if let Ok(v) = HeaderValue::from_str(origin) {
-            response
-                .headers_mut()
-                .insert("access-control-allow-origin", v);
-        }
-        response.headers_mut().insert(
-            "access-control-allow-credentials",
-            HeaderValue::from_static("true"),
-        );
-        response
-            .headers_mut()
-            .insert("vary", HeaderValue::from_static("Origin"));
-    }
-
-    add_alt_svc(&mut response, alt_svc);
-
     response
 }
 
@@ -3047,5 +3028,128 @@ mod tests {
             !is_trusted_ip(&private2),
             "RFC1918 must NOT be unconditionally trusted (SEC-A05)"
         );
+    }
+}
+
+#[cfg(test)]
+mod decision_rendering_tests {
+    use super::*;
+
+    fn all_decisions() -> Vec<SecurityDecision> {
+        vec![
+            SecurityDecision::Allow,
+            SecurityDecision::Blocked(BlockedIpInfo {
+                reason: BlockReason::RateLimitExceeded,
+                blocked_at: Instant::now(),
+                expires_at: Some(Instant::now() + Duration::from_secs(300)),
+                block_count: 1,
+            }),
+            SecurityDecision::GeoBlocked,
+            SecurityDecision::RateLimited {
+                limit: 100,
+                retry_after_secs: 1,
+                kind: RateLimitKind::Request,
+            },
+            SecurityDecision::Ja3Rejected,
+            SecurityDecision::HeadersTooLarge { max: 8192 },
+            SecurityDecision::WafBlock {
+                rule: "PQW-000".to_string(),
+            },
+        ]
+    }
+
+    /// Both transports render from `decision_rendering`, so the status a verdict
+    /// carries cannot depend on how the client connected.
+    ///
+    /// This is the invariant the HTTP/3 handler used to violate: `Blocked` meant
+    /// 403 with a `Retry-After` on TCP but a 302 redirect over h3, which the h3
+    /// path then masked by open-coding its own blocklist check ahead of
+    /// `evaluate`.
+    #[test]
+    fn tcp_and_h3_agree_on_status_for_every_decision() {
+        for decision in all_decisions() {
+            let tcp = render_decision(&decision, "", None);
+            let h3 = decision_rendering(&decision, None);
+
+            match h3 {
+                None => {
+                    assert!(
+                        matches!(decision, SecurityDecision::Allow),
+                        "only Allow may render as nothing: {decision:?}"
+                    );
+                    assert_eq!(tcp.status(), StatusCode::OK, "{decision:?}");
+                }
+                Some(rendering) => assert_eq!(
+                    tcp.status(),
+                    rendering.status,
+                    "transports disagree on status for {decision:?}"
+                ),
+            }
+        }
+    }
+
+    /// A refused request must carry the same headers on both transports, or a
+    /// browser on h3 sees an opaque failure where the same client on h2 sees a
+    /// status it can act on.
+    #[test]
+    fn tcp_and_h3_agree_on_headers_for_every_decision() {
+        for decision in all_decisions() {
+            let Some(rendering) = decision_rendering(&decision, None) else {
+                continue;
+            };
+            let tcp = render_decision(&decision, "", None);
+            for (name, value) in rendering.headers {
+                let actual = tcp
+                    .headers()
+                    .get(name)
+                    .unwrap_or_else(|| panic!("TCP dropped `{name}` for {decision:?}"));
+                assert_eq!(actual, value.as_str(), "`{name}` differs for {decision:?}");
+            }
+        }
+    }
+
+    /// A blocked IP is refused outright, not redirected: the caller is being
+    /// denied, and a 302 to an error page reads as success to a non-browser.
+    #[test]
+    fn a_blocked_ip_is_refused_with_a_retry_after() {
+        let decision = SecurityDecision::Blocked(BlockedIpInfo {
+            reason: BlockReason::Manual,
+            blocked_at: Instant::now(),
+            expires_at: Some(Instant::now() + Duration::from_secs(300)),
+            block_count: 1,
+        });
+        let rendering = decision_rendering(&decision, None).expect("a block renders");
+        assert_eq!(rendering.status, StatusCode::FORBIDDEN);
+        let retry = rendering
+            .headers
+            .iter()
+            .find(|(k, _)| *k == "retry-after")
+            .map(|(_, v)| v.parse::<u64>().expect("numeric retry-after"))
+            .expect("a block carries retry-after");
+        assert!(retry > 0 && retry <= 300, "retry-after was {retry}");
+    }
+
+    /// The CORS allowlist is consulted for rate-limit refusals on both
+    /// transports; an origin that is not on it gets no CORS headers at all.
+    #[test]
+    fn rate_limit_refusals_carry_cors_only_for_allowed_origins() {
+        let decision = SecurityDecision::RateLimited {
+            limit: 100,
+            retry_after_secs: 1,
+            kind: RateLimitKind::Request,
+        };
+
+        let allowed = decision_rendering(&decision, Some("https://pqcrypta.com")).unwrap();
+        assert!(allowed
+            .headers
+            .iter()
+            .any(|(k, v)| *k == "access-control-allow-origin" && v == "https://pqcrypta.com"));
+        assert!(allowed.headers.iter().any(|(k, _)| *k == "vary"));
+
+        let stranger = decision_rendering(&decision, Some("https://evil.example")).unwrap();
+        assert!(!stranger
+            .headers
+            .iter()
+            .any(|(k, _)| k.starts_with("access-control-")));
     }
 }

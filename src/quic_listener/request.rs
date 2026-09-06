@@ -20,7 +20,7 @@ use crate::metrics::MetricsRegistry;
 use crate::otel;
 use crate::proxy::BackendPool;
 use crate::rate_limiter::{build_context_from_request, AdvancedRateLimiter, RateLimitResult};
-use crate::security::{BlockReason, SecurityState};
+use crate::security::SecurityState;
 
 use super::cors::add_cors_headers_to_builder;
 use super::{alt_svc_for_host, resolve_route_policy, QuicListener, SERVER_HEADER};
@@ -170,9 +170,10 @@ impl QuicListener {
             method, path, host, remote_addr
         );
 
-        // Per-request security checks: mirrors security_middleware applied on the TCP path.
-        // Connection-level blocking (IP blocklist + GeoIP) is enforced at accept time, but
-        // the blocklist may grow while a connection is live, so we re-check here.
+        // Per-request security checks, run from the same `SecurityState` the TCP
+        // path uses. Connection-level blocking is enforced at accept time, but the
+        // blocklist may grow while a connection is live, so `evaluate` re-checks it
+        // per request.
         let ip = remote_addr.ip();
         // Cache for `resolve_route_policy`. The header-pass WAF evaluation and
         // the body-pass inspection both need the same per-route policy, and the
@@ -182,54 +183,6 @@ impl QuicListener {
         let mut route_policy: Option<crate::security::RequestPolicy> = None;
 
         if !security.is_trusted(&ip) {
-            // 1. Re-check IP blocklist (IP may have been blocked after connection was accepted).
-            if let Some(block_info) = security.is_blocked(&ip) {
-                warn!(
-                    "[QUIC/H3] Blocked request from {} (reason: {:?})",
-                    ip, block_info.reason
-                );
-                metrics.requests.request_end_full(
-                    403,
-                    start_time.elapsed(),
-                    0,
-                    0,
-                    Some(&path),
-                    is_health_check,
-                );
-                let retry_after = block_info
-                    .expires_at
-                    .map(|e| {
-                        let now = std::time::Instant::now();
-                        if e > now {
-                            e.duration_since(now).as_secs()
-                        } else {
-                            0
-                        }
-                    })
-                    .unwrap_or(3600);
-                let response = http::Response::builder()
-                    .status(http::StatusCode::FORBIDDEN)
-                    .header("retry-after", retry_after.to_string())
-                    .header("server", SERVER_HEADER)
-                    .body(())?;
-                stream.send_response(response).await?;
-                stream.finish().await?;
-                return Ok(());
-            }
-
-            // 2. Per-IP rate limiting.
-            //
-            // This mirrors the TCP path's exemption for forward-confirmed
-            // search-engine crawlers. The two transports run separate limiter
-            // implementations, so an exemption added on only one of them leaves
-            // the other still banning Googlebot — and modern crawlers negotiate
-            // h3 whenever it is advertised, which this proxy does.
-            let crawler_verdict = security.crawler_verifier.classify(ip, user_agent);
-            let is_verified_crawler =
-                crawler_verdict == crate::crawler_verify::CrawlerVerdict::Verified;
-            let skip_auto_block = is_verified_crawler
-                || crawler_verdict == crate::crawler_verify::CrawlerVerdict::Pending;
-
             // Correlate the connection's fingerprint with what the request calls
             // itself. This is the only layer that has both, and it is what lets the
             // directory name a client instead of listing an opaque hash.
@@ -239,64 +192,16 @@ impl QuicListener {
                 }
             }
 
-            let (rate_enabled, rate_rps) = {
-                let rc = security.rate_config.read();
-                (rc.enabled, rc.requests_per_second)
-            };
-            let (auto_block_threshold, auto_block_duration_secs) = {
-                let sc = security.config.read();
-                (sc.auto_block_threshold, sc.auto_block_duration_secs)
-            };
-            if rate_enabled && !is_verified_crawler {
-                let rate_limiter = security.get_ip_rate_limiter(ip);
-                if rate_limiter.check().is_err() {
-                    warn!("[QUIC/H3] Rate limit exceeded for {}", ip);
-                    let mut counter = security.request_counts.entry(ip).or_default();
-                    counter.suspicious_patterns += 1;
-                    if counter.suspicious_patterns >= auto_block_threshold && !skip_auto_block {
-                        drop(counter);
-                        security.block_ip(
-                            ip,
-                            BlockReason::RateLimitExceeded,
-                            Some(Duration::from_secs(auto_block_duration_secs)),
-                        );
-                    }
-                    metrics.requests.request_end_full(
-                        429,
-                        start_time.elapsed(),
-                        0,
-                        0,
-                        Some(&path),
-                        is_health_check,
-                    );
-                    // CORS headers on 429 so browsers see the status code
-                    const CORS_ORIGINS: &[&str] =
-                        &["https://pqcrypta.com", "https://www.pqcrypta.com"];
-                    let req_origin = request
-                        .headers()
-                        .get("origin")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
-                    let mut builder = http::Response::builder()
-                        .status(http::StatusCode::TOO_MANY_REQUESTS)
-                        .header("retry-after", "1")
-                        .header("x-ratelimit-limit", rate_rps.to_string())
-                        .header("x-ratelimit-remaining", "0")
-                        .header("server", SERVER_HEADER);
-                    if CORS_ORIGINS.contains(&req_origin) {
-                        builder = builder
-                            .header("access-control-allow-origin", req_origin)
-                            .header("access-control-allow-credentials", "true")
-                            .header("vary", "Origin");
-                    }
-                    let response = builder.body(())?;
-                    stream.send_response(response).await?;
-                    stream.finish().await?;
-                    return Ok(());
-                }
-            }
-
-            // 3. Advanced multi-dimensional rate limiting (same logic as TCP path).
+            // 1. Advanced multi-dimensional rate limiting.
+            //
+            // The only limiter that is genuinely this path's own work: it is a
+            // separate subsystem from the per-IP limiter and `evaluate` does not
+            // call it. The blocklist, the per-IP rate limit (with its crawler
+            // exemption and auto-block) and the header-size check used to be
+            // open-coded here as well, immediately before the `evaluate` call
+            // below re-ran every one of them — so an h3 request was charged
+            // *two* tokens against the per-IP limiter, giving HTTP/3 clients
+            // half the configured request rate of the same client on TCP.
             {
                 // From the connection's own handshake, not from request
                 // headers. These used to read `x-ja3-hash` / `x-ja4-hash` off
@@ -336,13 +241,12 @@ impl QuicListener {
                             is_health_check,
                         );
                         // CORS headers on 429 so browsers see the status code
-                        const CORS_ORIGINS_ADV: &[&str] =
-                            &["https://pqcrypta.com", "https://www.pqcrypta.com"];
+                        // rather than an opaque CORS failure. The allowlist is
+                        // the one `security` renders its own refusals from.
                         let req_origin_adv = request
                             .headers()
                             .get("origin")
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("");
+                            .and_then(|v| v.to_str().ok());
                         let retry_secs = (retry_after_ms / 1000).max(1);
                         let mut builder_adv = http::Response::builder()
                             .status(http::StatusCode::TOO_MANY_REQUESTS)
@@ -354,11 +258,8 @@ impl QuicListener {
                                 format!("{:?}", reason).to_ascii_lowercase(),
                             )
                             .header("server", SERVER_HEADER);
-                        if CORS_ORIGINS_ADV.contains(&req_origin_adv) {
-                            builder_adv = builder_adv
-                                .header("access-control-allow-origin", req_origin_adv)
-                                .header("access-control-allow-credentials", "true")
-                                .header("vary", "Origin");
+                        for (k, v) in crate::security::cors_refusal_headers(req_origin_adv) {
+                            builder_adv = builder_adv.header(k, v);
                         }
                         let response = builder_adv.body(())?;
                         stream.send_response(response).await?;
@@ -389,36 +290,7 @@ impl QuicListener {
                 }
             }
 
-            // 4. Header size validation.
-            let max_header_size = security.config.read().max_header_size;
-            let header_size: usize = request
-                .headers()
-                .iter()
-                .map(|(k, v)| k.as_str().len() + v.len())
-                .sum();
-            if header_size > max_header_size {
-                warn!(
-                    "[QUIC/H3] Headers too large from {}: {} bytes",
-                    ip, header_size
-                );
-                metrics.requests.request_end_full(
-                    431,
-                    start_time.elapsed(),
-                    0,
-                    0,
-                    Some(&path),
-                    is_health_check,
-                );
-                let response = http::Response::builder()
-                    .status(http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE)
-                    .header("server", SERVER_HEADER)
-                    .body(())?;
-                stream.send_response(response).await?;
-                stream.finish().await?;
-                return Ok(());
-            }
-
-            // 5. Shared security evaluation.
+            // 2. Shared security evaluation.
             //
             // Every rule below is the SAME implementation the TCP path runs —
             // SecurityState::evaluate. This handler used to carry its own copy,
@@ -441,13 +313,19 @@ impl QuicListener {
                     body: None,
                 };
                 let decision = security.evaluate(&view, &h3_route_policy);
-                if let Some((status, extra)) = crate::security::decision_to_h3_parts(&decision) {
+                let request_origin = request
+                    .headers()
+                    .get("origin")
+                    .and_then(|v| v.to_str().ok());
+                if let Some(rendering) =
+                    crate::security::decision_rendering(&decision, request_origin)
+                {
                     warn!(
                         "[QUIC/H3] security decision {:?} for {} {}",
                         decision, ip, path
                     );
                     metrics.requests.request_end_full(
-                        status.as_u16(),
+                        rendering.status.as_u16(),
                         start_time.elapsed(),
                         0,
                         0,
@@ -455,9 +333,9 @@ impl QuicListener {
                         is_health_check,
                     );
                     let mut builder = http::Response::builder()
-                        .status(status)
+                        .status(rendering.status)
                         .header("server", SERVER_HEADER);
-                    for (k, v) in extra {
+                    for (k, v) in rendering.headers {
                         builder = builder.header(k, v);
                     }
                     let response = builder.body(())?;
@@ -1137,13 +1015,17 @@ impl QuicListener {
                 body: Some(&body),
             };
             let decision = security.inspect_body(&body_view, &body_route_policy, is_pentest);
-            if let Some((status, extra)) = crate::security::decision_to_h3_parts(&decision) {
+            let body_origin = request
+                .headers()
+                .get("origin")
+                .and_then(|v| v.to_str().ok());
+            if let Some(rendering) = crate::security::decision_rendering(&decision, body_origin) {
                 warn!(
                     "[QUIC/H3] WAF body decision {:?} for {} {}",
                     decision, ip, path
                 );
                 metrics.requests.request_end_full(
-                    status.as_u16(),
+                    rendering.status.as_u16(),
                     start_time.elapsed(),
                     body.len() as u64,
                     0,
@@ -1151,9 +1033,9 @@ impl QuicListener {
                     is_health_check,
                 );
                 let mut builder = http::Response::builder()
-                    .status(status)
+                    .status(rendering.status)
                     .header("server", SERVER_HEADER);
-                for (k, v) in extra {
+                for (k, v) in rendering.headers {
                     builder = builder.header(k, v);
                 }
                 let response = builder.body(())?;
