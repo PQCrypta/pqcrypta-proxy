@@ -158,6 +158,52 @@ pub struct QuicListener {
 ///
 /// Deliberately excludes `alt-svc`, which varies by host, and `server-timing`,
 /// which carries the elapsed time of the request.
+/// Resolve the per-route security policy for a request.
+///
+/// This was inlined twice in `handle_h3_request` -- once for the header-pass WAF
+/// evaluation and again for the body-pass inspection, because the first lived in
+/// a block that had since closed. Each copy re-derived the host, called
+/// `is_conformance_host`, ran `find_route` (an O(routes) scan -- one route in a
+/// test config, sixty on the live edge, nine of them carrying regexes) and
+/// cloned every policy field. Extracted so the caller can resolve it once.
+fn resolve_route_policy(
+    security: &SecurityState,
+    request: &http::Request<()>,
+    path: &str,
+) -> crate::security::RequestPolicy {
+    let host = request
+        .headers()
+        .get(hyper::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|h| h.split(':').next().unwrap_or(h).to_ascii_lowercase())
+        .or_else(|| request.uri().host().map(str::to_ascii_lowercase));
+    let on_conformance_host =
+        crate::security::is_conformance_host(&security.route_index, host.as_deref());
+    security
+        .route_index
+        .find_route(host.as_deref(), path, false)
+        .map(|r| crate::security::RequestPolicy {
+            // The conformance vhost has no route entry, so the flag has to be
+            // OR'd in rather than read from one.
+            skip_bot_blocking: r.skip_bot_blocking || on_conformance_host,
+            allowed_ja3: r.security.as_ref().and_then(|s| s.allowed_ja3.clone()),
+            waf_enabled: r.security.as_ref().and_then(|s| s.waf_enabled),
+            waf_mode: r.security.as_ref().and_then(|s| s.waf_mode.clone()),
+            rate_limit_override: r
+                .security
+                .as_ref()
+                .and_then(|s| s.rate_limit_override.clone()),
+        })
+        // No route matched — which is the conformance vhost's normal state,
+        // since it is answered in-process and has no route entry.
+        // `unwrap_or_default()` alone would drop the flag on exactly the host
+        // that needs it.
+        .unwrap_or_else(|| crate::security::RequestPolicy {
+            skip_bot_blocking: on_conformance_host,
+            ..crate::security::RequestPolicy::default()
+        })
+}
+
 fn build_static_response_headers(config: &ProxyConfig) -> HeaderMap {
     let mut h = HeaderMap::with_capacity(16);
     let mut put = |name: &'static str, value: &str| {
@@ -1287,6 +1333,13 @@ impl QuicListener {
         // Connection-level blocking (IP blocklist + GeoIP) is enforced at accept time, but
         // the blocklist may grow while a connection is live, so we re-check here.
         let ip = remote_addr.ip();
+        // Cache for `resolve_route_policy`. The header-pass WAF evaluation and
+        // the body-pass inspection both need the same per-route policy, and the
+        // body pass used to rebuild it from scratch — repeating the host
+        // derivation, an O(routes) `find_route` scan and a clone of every policy
+        // field. Resolved lazily so a request that reaches neither pays nothing.
+        let mut route_policy: Option<crate::security::RequestPolicy> = None;
+
         if !security.is_trusted(&ip) {
             // 1. Re-check IP blocklist (IP may have been blocked after connection was accepted).
             if let Some(block_info) = security.is_blocked(&ip) {
@@ -1531,39 +1584,11 @@ impl QuicListener {
             // which omitted the WAF entirely and let every rule be bypassed over
             // QUIC; it also never enforced GeoIP blocking or per-route policy.
             // Only the rendering of the verdict is transport-specific.
-            let h3_route_policy = {
-                let host = request
-                    .headers()
-                    .get(hyper::header::HOST)
-                    .and_then(|v| v.to_str().ok())
-                    .map(|h| h.split(':').next().unwrap_or(h).to_ascii_lowercase())
-                    .or_else(|| request.uri().host().map(str::to_ascii_lowercase));
-                let on_conformance_host =
-                    crate::security::is_conformance_host(&security.route_index, host.as_deref());
-                security
-                    .route_index
-                    .find_route(host.as_deref(), &path, false)
-                    .map(|r| crate::security::RequestPolicy {
-                        // The conformance vhost has no route entry, so the flag
-                        // has to be OR'd in rather than read from one.
-                        skip_bot_blocking: r.skip_bot_blocking || on_conformance_host,
-                        allowed_ja3: r.security.as_ref().and_then(|s| s.allowed_ja3.clone()),
-                        waf_enabled: r.security.as_ref().and_then(|s| s.waf_enabled),
-                        waf_mode: r.security.as_ref().and_then(|s| s.waf_mode.clone()),
-                        rate_limit_override: r
-                            .security
-                            .as_ref()
-                            .and_then(|s| s.rate_limit_override.clone()),
-                    })
-                    // No route matched — which is the conformance vhost's normal
-                    // state, since it is answered in-process and has no route
-                    // entry. `unwrap_or_default()` alone would drop the flag on
-                    // exactly the host that needs it.
-                    .unwrap_or_else(|| crate::security::RequestPolicy {
-                        skip_bot_blocking: on_conformance_host,
-                        ..crate::security::RequestPolicy::default()
-                    })
-            };
+            // Resolved at most once per request: the body-pass WAF inspection
+            // below reuses this instead of repeating the host derivation, the
+            // route scan and the policy-field clones.
+            let h3_route_policy = route_policy
+                .get_or_insert_with(|| resolve_route_policy(&security, &request, &path));
 
             {
                 let view = crate::security::SecurityRequestView {
@@ -2257,33 +2282,11 @@ impl QuicListener {
             // Re-resolve the per-route policy here: the one built for the header
             // pass lives in a block that has since closed. Same idiom, so body
             // inspection honours the same per-route waf_mode / waf_enabled.
-            let body_route_policy = {
-                let bhost = request
-                    .headers()
-                    .get(hyper::header::HOST)
-                    .and_then(|v| v.to_str().ok())
-                    .map(|h| h.split(':').next().unwrap_or(h).to_ascii_lowercase())
-                    .or_else(|| request.uri().host().map(str::to_ascii_lowercase));
-                let on_conf =
-                    crate::security::is_conformance_host(&security.route_index, bhost.as_deref());
-                security
-                    .route_index
-                    .find_route(bhost.as_deref(), &path, false)
-                    .map(|r| crate::security::RequestPolicy {
-                        skip_bot_blocking: r.skip_bot_blocking || on_conf,
-                        allowed_ja3: r.security.as_ref().and_then(|s| s.allowed_ja3.clone()),
-                        waf_enabled: r.security.as_ref().and_then(|s| s.waf_enabled),
-                        waf_mode: r.security.as_ref().and_then(|s| s.waf_mode.clone()),
-                        rate_limit_override: r
-                            .security
-                            .as_ref()
-                            .and_then(|s| s.rate_limit_override.clone()),
-                    })
-                    .unwrap_or_else(|| crate::security::RequestPolicy {
-                        skip_bot_blocking: on_conf,
-                        ..crate::security::RequestPolicy::default()
-                    })
-            };
+            // Same policy the header pass used. It used to be rebuilt here
+            // because that one was scoped to a block that had closed; it is now
+            // resolved once per request and shared.
+            let body_route_policy = route_policy
+                .get_or_insert_with(|| resolve_route_policy(&security, &request, &path));
             let body_view = crate::security::SecurityRequestView {
                 ip,
                 method,
