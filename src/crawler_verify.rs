@@ -111,11 +111,34 @@ static CRAWLERS: &[CrawlerSpec] = &[
 ];
 
 /// Match a User-Agent against the known crawler families.
+/// Case-insensitive substring search that does not allocate.
+///
+/// `str::contains` is case-sensitive, so matching a lowercase token meant
+/// lowercasing the whole User-Agent first -- a heap allocation on every request,
+/// for a scan that almost always finds nothing. The tokens in `CRAWLERS` are all
+/// lowercase ASCII, so comparing each window with `eq_ignore_ascii_case` gives
+/// the same answer with no allocation.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+    if n.is_empty() {
+        return true;
+    }
+    if h.len() < n.len() {
+        return false;
+    }
+    // Compare on the first byte before the full window: most windows differ
+    // there, and this keeps the common miss to one comparison per position.
+    let first = n[0];
+    h.windows(n.len())
+        .any(|w| (w[0] | 0x20) == first && w.eq_ignore_ascii_case(n))
+}
+
 fn spec_for_user_agent(user_agent: &str) -> Option<&'static CrawlerSpec> {
-    let ua = user_agent.to_ascii_lowercase();
-    CRAWLERS
-        .iter()
-        .find(|spec| spec.ua_tokens.iter().any(|token| ua.contains(token)))
+    CRAWLERS.iter().find(|spec| {
+        spec.ua_tokens
+            .iter()
+            .any(|token| contains_ignore_ascii_case(user_agent, token))
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -341,6 +364,42 @@ fn verify_reverse_dns(ip: IpAddr, allowed_suffixes: &[&str]) -> CrawlerVerdict {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn user_agent_matching_is_case_insensitive_without_allocating() {
+        // The lowercase path this replaced used `to_ascii_lowercase()` on every
+        // request; these assert the hand-rolled search agrees with it.
+        assert!(spec_for_user_agent("Mozilla/5.0 (compatible; Googlebot/2.1)").is_some());
+        assert!(spec_for_user_agent("mozilla/5.0 (compatible; googlebot/2.1)").is_some());
+        assert!(spec_for_user_agent("MOZILLA/5.0 (COMPATIBLE; GOOGLEBOT/2.1)").is_some());
+        assert!(spec_for_user_agent("BingBot/2.0").is_some());
+        assert!(spec_for_user_agent("bInGbOt/2.0").is_some());
+
+        assert!(spec_for_user_agent("").is_none());
+        assert!(spec_for_user_agent("curl/8.5.0").is_none());
+        assert!(spec_for_user_agent("h2load nghttp2/1.64.0").is_none());
+        // A token that is a prefix of nothing present must not match.
+        assert!(spec_for_user_agent("googlebo").is_none());
+    }
+
+    #[test]
+    fn contains_ignore_ascii_case_matches_the_lowercasing_it_replaced() {
+        for (hay, needle) in [
+            ("Googlebot", "googlebot"),
+            ("xxGOOGLEBOTxx", "googlebot"),
+            ("aaa", "aaa"),
+            ("aab", "aaa"),
+            ("", "x"),
+            ("short", "muchlongerneedle"),
+            ("AbC", ""),
+        ] {
+            assert_eq!(
+                contains_ignore_ascii_case(hay, needle),
+                hay.to_ascii_lowercase().contains(needle),
+                "{hay:?} contains {needle:?}"
+            );
+        }
+    }
+
     use super::*;
     use std::net::Ipv4Addr;
 
