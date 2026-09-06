@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
+use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt as _;
 use h3::ext::Protocol;
 use h3_quinn::Connection as H3Connection;
@@ -698,8 +699,26 @@ impl QuicListener {
         // Lazily created on the first CONNECT-UDP session so connections that
         // never use MASQUE pay nothing for the datagram reader task.
         let mut datagram_router: Option<Arc<DatagramRouter>> = None;
+
+        // Ordinary requests are polled here rather than each getting its own
+        // `tokio::spawn`. A spawn heap-allocates a task and puts it through the
+        // scheduler for every request; `FuturesUnordered` polls them all
+        // concurrently on this connection's existing task and allocates nothing.
+        // The one change in behaviour is that a single connection's streams now
+        // share one worker instead of being spread across all of them -- which
+        // is the right trade for the many-connections-few-streams shape real
+        // traffic has, and the reason CONNECT, WebTransport and WebSocket
+        // upgrades below still spawn: those are long-lived and must not occupy
+        // this loop.
+        let mut inflight = FuturesUnordered::new();
+
         loop {
-            match h3.accept().await {
+            let accepted = tokio::select! {
+                biased;
+                a = h3.accept() => a,
+                Some(()) = inflight.next(), if !inflight.is_empty() => continue,
+            };
+            match accepted {
                 Ok(Some(resolver)) => {
                     // Resolve the request
                     let (request, stream) = match resolver.resolve_request().await {
@@ -1026,7 +1045,7 @@ impl QuicListener {
                         let handshake_clone = handshake.clone();
                         let fingerprint_clone = fingerprint.clone();
 
-                        tokio::spawn(async move {
+                        inflight.push(async move {
                             // Note: health check detection happens inside handle_h3_request
                             if let Err(e) = Self::handle_h3_request(
                                 stream,
@@ -1072,6 +1091,11 @@ impl QuicListener {
                 }
             }
         }
+
+        // Finish what is already in flight. A spawned task outlived this loop on
+        // its own; a future in this queue is dropped with it, which would cancel
+        // requests mid-response and skip their metrics and access-log entries.
+        while inflight.next().await.is_some() {}
 
         Ok(())
     }
