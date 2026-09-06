@@ -96,13 +96,7 @@ serde_json = "1.0"
 toml = "0.8"
 
 # Logging and tracing
-# `release_max_level_debug` makes every `trace!` and `trace_span!` a compile-time
-# no-op in release builds. The QUIC stack creates a tracing span and emits a
-# trace event *per frame of every packet* in `process_payload`, which is the
-# hottest symbol in the whole profile at 10.3%. Production runs at `info`, so
-# none of it is ever recorded. DEBUG is deliberately kept: the config offers it
-# as an operator level and removing it would lose a real capability.
-tracing = { version = "0.1", features = ["release_max_level_debug"] }
+tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 
