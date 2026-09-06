@@ -25,7 +25,7 @@ use quinn::{
 };
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::access_logger::{log_access, AccessLogEntry};
 use crate::cache::{CacheLookup, ResponseCache};
@@ -2676,16 +2676,35 @@ impl QuicListener {
             return Ok(());
         }
 
-        // Non-SSE: buffer the body we already started receiving.
-        let body_bytes = stream_body
-            .collect()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read response body: {}", e))?
-            .to_bytes();
-        let proxy_response = crate::proxy::ProxyResponse {
-            status: stream_status.as_u16(),
-            headers: stream_headers,
-            body: body_bytes,
+        // Only the cache needs the whole body in hand. Everything else can be
+        // forwarded frame by frame as the backend produces it, which is what the
+        // origin is already doing.
+        //
+        // Buffering was costing three things at once: `Collected::to_bytes()`
+        // allocates and copies whenever a body arrives in more than one frame,
+        // the full body stays resident until the last byte arrives (a hundred
+        // concurrent 64 KB responses is 6.4 MB of live buffer), and nothing
+        // reaches the client until the origin has finished.
+        //
+        // HEAD is buffered too, but its body is empty by definition, so that
+        // costs nothing and keeps the length logic below in one place.
+        let will_cache = method == "GET"
+            && cache.config.enabled
+            && !cache.is_excluded_path(&path)
+            && !cache.is_excluded_host(cache_host_str);
+
+        let mut streaming_body: Option<hyper::body::Incoming> = None;
+        let buffered: Option<Bytes> = if will_cache || method == "HEAD" {
+            Some(
+                stream_body
+                    .collect()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to read response body: {}", e))?
+                    .to_bytes(),
+            )
+        } else {
+            streaming_body = Some(stream_body);
+            None
         };
 
         // Store response in cache (GET only; cache.put() enforces all Cache-Control
@@ -2694,18 +2713,12 @@ impl QuicListener {
         // `content-length` from the stored body — which reported every cached HEAD
         // as a zero-length resource. The TCP cache middleware skips HEAD for the
         // same reason.
-        if method == "GET"
-            && cache.config.enabled
-            && !cache.is_excluded_path(&path)
-            && !cache.is_excluded_host(cache_host_str)
-        {
-            let host_str = cache_host_str;
-            let cache_key = ResponseCache::build_key(method, host_str, &path_with_query);
+        if will_cache {
+            let cache_key = ResponseCache::build_key(method, cache_host_str, &path_with_query);
             // The cache stores `Vec<(String, String)>`; converting here rather
             // than upstream keeps the forwarding path on `HeaderMap`, and this
             // runs only for cacheable GETs rather than every request.
-            let cache_headers: Vec<(String, String)> = proxy_response
-                .headers
+            let cache_headers: Vec<(String, String)> = stream_headers
                 .iter()
                 .filter_map(|(n, v)| {
                     v.to_str()
@@ -2715,22 +2728,20 @@ impl QuicListener {
                 .collect();
             cache.put(
                 &cache_key,
-                proxy_response.status,
+                stream_status.as_u16(),
                 &cache_headers,
-                proxy_response.body.clone(),
+                buffered.clone().unwrap_or_default(),
             );
         }
 
         // Build HTTP/3 response with headers from backend
-        let mut response_builder = http::Response::builder().status(
-            http::StatusCode::from_u16(proxy_response.status).unwrap_or(http::StatusCode::OK),
-        );
+        let mut response_builder = http::Response::builder().status(stream_status);
 
         // Forward selected headers from backend (including CORS if backend sets them)
         // Note: x-content-type-options excluded from whitelist since proxy adds its own
         // Note: set-cookie for /grafana is handled separately below with Domain rewriting
         let is_grafana = path.starts_with("/grafana");
-        for (name, value) in &proxy_response.headers {
+        for (name, value) in &stream_headers {
             // `HeaderName` is already lowercase; the old loop allocated a
             // lowercased String per response header to learn that.
             let lower_name = name.as_str();
@@ -2771,12 +2782,16 @@ impl QuicListener {
         // value when it sent one, and otherwise send none, matching the chunked
         // GET these backends actually serve.
         if method == "HEAD" {
-            if let Some(origin_len) = proxy_response.headers.get(header::CONTENT_LENGTH) {
+            if let Some(origin_len) = stream_headers.get(header::CONTENT_LENGTH) {
                 response_builder = response_builder.header(header::CONTENT_LENGTH, origin_len);
             }
-        } else {
-            response_builder =
-                response_builder.header("content-length", proxy_response.body.len().to_string());
+        } else if let Some(ref b) = buffered {
+            response_builder = response_builder.header(header::CONTENT_LENGTH, b.len());
+        } else if let Some(origin_len) = stream_headers.get(header::CONTENT_LENGTH) {
+            // Streaming: the length is not known until the last frame, so forward
+            // the origin's own value. When it sent none the response is chunked
+            // and HTTP/3 needs no length at all.
+            response_builder = response_builder.header(header::CONTENT_LENGTH, origin_len);
         }
 
         // For Grafana routes: rewrite set-cookie headers from backend
@@ -2785,7 +2800,7 @@ impl QuicListener {
             // Remove set-cookie from whitelist-forwarded headers (already added above)
             // and re-add with explicit Domain to help browser cookie storage
             let mut has_cookies = false;
-            for value in proxy_response.headers.get_all(header::SET_COOKIE) {
+            for value in stream_headers.get_all(header::SET_COOKIE) {
                 let Ok(cookie) = value.to_str() else { continue };
                 has_cookies = true;
                 // Add Domain=pqcrypta.com to help browser store cookie
@@ -2891,11 +2906,41 @@ impl QuicListener {
         }
 
         let response = response_builder.body(())?;
-        let body_size = proxy_response.body.len();
-        let response_status = proxy_response.status;
+        let response_status = stream_status.as_u16();
 
         stream.send_response(response).await?;
-        stream.send_data(proxy_response.body).await?;
+
+        // Buffered only when the cache needed the whole body; otherwise each
+        // frame goes out as the backend produces it.
+        let body_size = match buffered {
+            Some(body) => {
+                let len = body.len();
+                if !body.is_empty() {
+                    stream.send_data(body).await?;
+                }
+                len
+            }
+            None => {
+                let mut sent = 0usize;
+                let mut frames = 0usize;
+                let mut body = streaming_body
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("streaming body already consumed"))?;
+                while let Some(frame_result) = body.frame().await {
+                    let frame = frame_result
+                        .map_err(|e| anyhow::anyhow!("Backend body stream failed: {}", e))?;
+                    if let Some(data) = frame.data_ref() {
+                        if !data.is_empty() {
+                            sent += data.len();
+                            frames += 1;
+                            stream.send_data(data.clone()).await?;
+                        }
+                    }
+                }
+                trace!("HTTP/3 streamed {sent} bytes to client in {frames} frames");
+                sent
+            }
+        };
         stream.finish().await?;
 
         // Record metrics
