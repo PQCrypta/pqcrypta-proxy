@@ -274,15 +274,24 @@ impl QuicListener {
         transport_config
             .max_concurrent_bidi_streams(config.server.max_streams_per_connection.into());
         transport_config
-            .max_concurrent_uni_streams(config.server.max_streams_per_connection.into());
+            .max_concurrent_uni_streams(config.server.max_uni_streams_per_connection.into());
         transport_config.keep_alive_interval(Some(Duration::from_secs(
             config.server.keepalive_interval_secs,
         )));
-        // Match WebTransport server flow-control windows so HTTP/3 upload streams
-        // achieve the same per-stream throughput as WebTransport streams.
-        // Quinn defaults (~256 KB) cause 5 Mbps/stream; 8 MB raises that to ~100+ Mbps.
-        transport_config.receive_window(VarInt::from_u32(16 * 1024 * 1024)); // 16 MB connection
-        transport_config.stream_receive_window(VarInt::from_u32(8 * 1024 * 1024)); // 8 MB per stream
+        // Flow-control windows. These are the INITIAL credit a peer gets; the
+        // receiver extends it with MAX_STREAM_DATA as it consumes, so these figures
+        // cap neither transfer size nor eventual throughput — they set how much a
+        // peer may send before waiting for us once.
+        //
+        // The previous 8 MB per stream / 16 MB per connection was set to match the
+        // WebTransport server and beat quinn's ~256 KB default. 2 MB still clears
+        // any realistic path: a stream window sustains window/RTT, so 2 MB is
+        // ~533 Mbps at 30 ms and ~160 Mbps at 100 ms, far above what an HTTP upload
+        // to this proxy needs. What the old figure bought instead was a much larger
+        // advertised memory commitment per connection, multiplied by every stream a
+        // peer chose to open.
+        transport_config.receive_window(VarInt::from_u32(8 * 1024 * 1024)); // 8 MB connection
+        transport_config.stream_receive_window(VarInt::from_u32(2 * 1024 * 1024)); // 2 MB per stream
         transport_config.max_idle_timeout(Some(
             Duration::from_secs(config.server.max_idle_timeout_secs)
                 .try_into()

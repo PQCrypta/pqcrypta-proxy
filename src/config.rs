@@ -637,8 +637,19 @@ pub struct ServerConfig {
     pub additional_ports: Vec<u16>,
     /// Maximum concurrent connections
     pub max_connections: u32,
-    /// Maximum concurrent streams per connection
+    /// Maximum concurrent BIDIRECTIONAL streams per connection (HTTP/3 requests).
     pub max_streams_per_connection: u32,
+    /// Maximum concurrent UNIDIRECTIONAL streams per connection.
+    ///
+    /// Split out from `max_streams_per_connection`, which drove both directions.
+    /// HTTP/3 needs exactly three unidirectional streams — the control stream and
+    /// the two QPACK streams — and a WebTransport session opens a handful more.
+    /// Advertising the bidirectional figure here told every peer it could open a
+    /// thousand, each with its own per-stream receive window and stream state, for
+    /// a capability nothing uses. HAProxy advertises 3 here; 100 leaves generous
+    /// WebTransport headroom while dropping the advertised ceiling tenfold.
+    #[serde(default = "default_max_uni_streams")]
+    pub max_uni_streams_per_connection: u32,
     /// Keep-alive interval in seconds
     pub keepalive_interval_secs: u64,
     /// Maximum idle timeout in seconds
@@ -855,6 +866,7 @@ impl Default for ServerConfig {
             additional_ports: vec![4433, 4434],
             max_connections: 10000,
             max_streams_per_connection: 1000,
+            max_uni_streams_per_connection: default_max_uni_streams(),
             keepalive_interval_secs: 15,
             max_idle_timeout_secs: 120,
             enable_ipv6: true,
@@ -879,6 +891,10 @@ impl Default for ServerConfig {
             normalize_paths: true,
         }
     }
+}
+
+fn default_max_uni_streams() -> u32 {
+    100
 }
 
 fn default_multipath_paths() -> u32 {
