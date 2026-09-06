@@ -124,7 +124,6 @@ pub struct HttpListenerState {
     /// Metrics registry for request tracking
     pub metrics: Arc<MetricsRegistry>,
     /// Nonce store for per-route HMAC replay protection (shared across all routes).
-    pub hmac_nonce_store: Arc<crate::tls_acceptor::HmacNonceStore>,
     /// Rate limiter for per-route secondary rate limit checks.
     pub rate_limiter: Arc<AdvancedRateLimiter>,
     /// Client conformance suite, when enabled. Serves its own vhost's
@@ -446,13 +445,6 @@ pub async fn run_http_listener(
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
         metrics: state_metrics,
-        hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(
-            // tls.zero_rtt_nonce_window_secs was configured and never read; the
-            // replay window was pinned at 300 s regardless. A shorter window
-            // means a replayed nonce is forgotten sooner, so this is a real
-            // security knob rather than a tuning one.
-            config.tls.zero_rtt_nonce_window_secs,
-        )),
         rate_limiter,
     };
 
@@ -619,13 +611,6 @@ pub async fn run_http_listener_pqc(
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
         metrics: state_metrics,
-        hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(
-            // tls.zero_rtt_nonce_window_secs was configured and never read; the
-            // replay window was pinned at 300 s regardless. A shorter window
-            // means a replayed nonce is forgotten sooner, so this is a real
-            // security knob rather than a tuning one.
-            config.tls.zero_rtt_nonce_window_secs,
-        )),
         rate_limiter,
     };
 
@@ -893,13 +878,6 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
         metrics: state_metrics,
-        hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(
-            // tls.zero_rtt_nonce_window_secs was configured and never read; the
-            // replay window was pinned at 300 s regardless. A shorter window
-            // means a replayed nonce is forgotten sooner, so this is a real
-            // security knob rather than a tuning one.
-            config.tls.zero_rtt_nonce_window_secs,
-        )),
         rate_limiter: rate_limiter.clone(),
     };
 
@@ -1336,13 +1314,6 @@ pub async fn run_http_listener_pqc_with_fingerprint(
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
         metrics: state_metrics,
-        hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(
-            // tls.zero_rtt_nonce_window_secs was configured and never read; the
-            // replay window was pinned at 300 s regardless. A shorter window
-            // means a replayed nonce is forgotten sooner, so this is a real
-            // security knob rather than a tuning one.
-            config.tls.zero_rtt_nonce_window_secs,
-        )),
         rate_limiter,
     };
 
@@ -2040,25 +2011,14 @@ async fn proxy_handler(
             }
         }
 
-        // Handle redirect routes
-        if let Some(ref redirect_to) = route.redirect {
-            let new_path = if let Some(ref prefix) = route.path_prefix {
-                // Replace prefix with redirect target, keeping the rest (case-insensitive)
-                let prefix_lower = prefix.to_ascii_lowercase();
-                let suffix = if path.starts_with(&prefix_lower) {
-                    &path[prefix_lower.len()..]
-                } else {
-                    ""
-                };
-                format!("{}{}{}", redirect_to, suffix, query)
-            } else {
-                format!("{}{}", redirect_to, query)
-            };
-
-            if route.redirect_permanent {
-                return Redirect::permanent(&new_path).into_response();
+        // Handle redirect routes. Shared with the HTTP/3 path, which had no
+        // redirect handling at all and answered 502 for these.
+        if let Some((target, permanent)) = crate::route_gate::redirect_target(route, &path, &query)
+        {
+            if permanent {
+                return Redirect::permanent(&target).into_response();
             }
-            return Redirect::temporary(&new_path).into_response();
+            return Redirect::temporary(&target).into_response();
         }
 
         // Handle OPTIONS preflight for CORS
@@ -2069,176 +2029,45 @@ async fn proxy_handler(
             }
         }
 
-        // SEC-002: Enforce per-route 0-RTT (early data) policy (RFC 8470).
-        // x-tls-early-data is set exclusively by the accept loop after stripping
-        // any client-supplied copy, so it cannot be forged by external callers.
-        // Routes with `allow_0rtt = false` (the default) must not receive early
-        // data requests because they can be replayed by a network attacker.
-        let is_early_data = headers
-            .get("x-tls-early-data")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v == "1")
-            .unwrap_or(false);
-
-        if is_early_data && !route.allow_0rtt {
-            // RFC 8470: 425 Too Early — the server is unwilling to risk
-            // processing a request that might be replayed.
-            debug!(
-                "Rejecting 0-RTT early-data request on route {:?} (allow_0rtt = false): {} {}",
-                route.name, method, path
-            );
-            return StatusCode::TOO_EARLY.into_response();
-        }
-
-        // L-5: `tls.zero_rtt_safe_methods` documents which methods may ride on
-        // early data and defaults to GET/HEAD, but nothing read it — a route
-        // with `allow_0rtt = true` forwarded a replayable POST just as happily
-        // as a GET.  The per-route flag says *whether* early data is allowed at
-        // all; this says *what* may travel on it, and both have to hold.
-        if is_early_data {
-            let safe = state
-                .config
-                .tls
-                .zero_rtt_safe_methods
-                .iter()
-                .any(|m| m.eq_ignore_ascii_case(method.as_str()));
-            if !safe {
-                debug!(
-                    "Rejecting 0-RTT early-data request on route {:?}: method {} is not in                      tls.zero_rtt_safe_methods",
-                    route.name, method
-                );
-                return StatusCode::TOO_EARLY.into_response();
-            }
-        }
-
-        // Enforce per-route HTTP/1.1 restriction (RFC 7231 §6.5.15).
-        // x-connection-protocol is set exclusively by the accept loop after stripping
-        // any client-supplied copy, so it cannot be forged by external callers.
-        // Routes with allow_http11 = false (the default) require HTTP/2 or HTTP/3.
-        let is_http1 = headers
-            .get("x-connection-protocol")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v == "h1")
-            .unwrap_or(false);
-
-        // WebSocket upgrades are always HTTP/1.1 — bypass the allow_http11 gate when
-        // the route explicitly enables WebSocket passthrough.
+        // A WebSocket upgrade is always HTTP/1.1, so it bypasses the HTTP/1.1
+        // gate below and later selects the tunnel path instead of a plain proxy.
         let ws_passthrough = is_ws_upgrade && route.supports_websocket;
-        if is_http1 && !route.allow_http11 && !ws_passthrough {
-            debug!(
-                "Rejecting HTTP/1.1 request on route {:?} (allow_http11 = false): {} {}",
-                route.name, method, path
-            );
-            let mut resp = StatusCode::UPGRADE_REQUIRED.into_response();
-            if let Ok(v) = HeaderValue::from_str("h2, h3") {
-                resp.headers_mut().insert("upgrade", v);
-            }
-            return resp;
-        }
 
-        // Internal route mTLS enforcement.
-        // x-client-cert is set exclusively by the TLS accept loop (stripped from any
-        // client-supplied copy) so it cannot be forged by external callers.
-        if route.internal {
-            let mtls_required = route
-                .security
-                .as_ref()
-                .and_then(|s| s.mtls_required)
-                .unwrap_or(true); // default true when internal = true
-
-            if mtls_required {
-                let client_cert_present = headers
-                    .get("x-client-cert")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|v| v == "1")
-                    .unwrap_or(false);
-                if !client_cert_present {
-                    warn!(
-                        "Internal route {:?} rejected request from {}: no client certificate",
-                        route.name,
-                        client_addr.ip()
-                    );
-                    return StatusCode::UNAUTHORIZED.into_response();
-                }
-            }
-        }
-
-        // Per-route HMAC proof-of-possession.
-        // Signature = HMAC-SHA256(METHOD\nPATH_AND_QUERY\nTIMESTAMP[\nNONCE], secret).
-        // X-Request-Nonce, when present, is bound into the signature and checked for
-        // uniqueness within the window (full replay prevention).
-        if let Some(ref secret) = route
-            .security
-            .as_ref()
-            .and_then(|s| s.hmac_secret.as_ref())
-            .cloned()
+        // Per-route gates: 0-RTT policy, the HTTP/1.1 restriction, internal-route
+        // mTLS and HMAC proof-of-possession. Every one of these is the SAME
+        // implementation the HTTP/3 path now runs — they used to live only here,
+        // so a route protected by `mtls_required` or an `hmac_secret` was open
+        // over HTTP/3. See `crate::route_gate`.
         {
-            use hmac::{Hmac, KeyInit, Mac};
-            use sha2::Sha256;
-
-            let sig = headers
-                .get("x-request-signature")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            let ts = headers
-                .get("x-request-timestamp")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            let nonce_val = headers.get("x-request-nonce").and_then(|v| v.to_str().ok());
-
-            let ts_u: u64 = ts.parse().unwrap_or(0);
-            let now_ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            if now_ts.abs_diff(ts_u) > 300 {
-                warn!(
-                    "Route {:?} HMAC timestamp out of 300s window from {}",
-                    route.name,
-                    client_addr.ip()
-                );
-                return StatusCode::UNAUTHORIZED.into_response();
-            }
-
-            // Sign full path + query string to prevent query-parameter mutation attacks.
             let path_and_query = uri
                 .path_and_query()
                 .map(|pq| pq.as_str())
                 .unwrap_or_else(|| uri.path());
-
-            let message = match nonce_val {
-                Some(n) => format!("{}\n{}\n{}\n{}", method.as_str(), path_and_query, ts, n),
-                None => format!("{}\n{}\n{}", method.as_str(), path_and_query, ts),
+            let gate_cx = crate::route_gate::GateContext {
+                route,
+                method: method.as_str(),
+                path_and_query,
+                path: &path,
+                headers: &headers,
+                client_ip: client_addr.ip(),
+                is_websocket_upgrade: is_ws_upgrade,
+                zero_rtt_safe_methods: &state.config.tls.zero_rtt_safe_methods,
+                hmac_nonce_store: crate::route_gate::shared_nonce_store(
+                    state.config.tls.zero_rtt_nonce_window_secs,
+                ),
             };
-
-            type HmacSha256 = Hmac<Sha256>;
-            let mut mac =
-                HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key size");
-            mac.update(message.as_bytes());
-            let expected = hex::encode(mac.finalize().into_bytes());
-
-            use subtle::ConstantTimeEq;
-            let valid: bool = sig.as_bytes().ct_eq(expected.as_bytes()).into();
-            if !valid {
-                warn!(
-                    "Route {:?} HMAC signature invalid from {}",
-                    route.name,
-                    client_addr.ip()
-                );
-                return StatusCode::UNAUTHORIZED.into_response();
-            }
-
-            // Nonce deduplication: reject replays within the 300s window.
-            // Run after signature validation to avoid polluting the store on bad sigs.
-            if let Some(n) = nonce_val {
-                if state.hmac_nonce_store.check_and_insert(n) {
-                    warn!(
-                        "Route {:?} HMAC nonce replay detected from {}",
-                        route.name,
-                        client_addr.ip()
-                    );
-                    return StatusCode::UNAUTHORIZED.into_response();
+            if let crate::route_gate::GateOutcome::Refuse {
+                status,
+                headers: extra,
+            } = crate::route_gate::evaluate(&gate_cx)
+            {
+                let mut resp = status.into_response();
+                for (k, v) in extra {
+                    if let Ok(val) = HeaderValue::from_str(&v) {
+                        resp.headers_mut().insert(k, val);
+                    }
                 }
+                return resp;
             }
         }
 

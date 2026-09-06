@@ -712,6 +712,44 @@ impl QuicListener {
             }
         }
 
+        // Redirect routes, before the CORS preflight below so a preflight to an
+        // authenticated route is still answered — the order the TCP path uses.
+        // This path had no redirect handling at all, so the six SEO redirects in
+        // production answered 308 over TCP and 502 over HTTP/3.
+        {
+            let query = request
+                .uri()
+                .query()
+                .map(|q| format!("?{}", q))
+                .unwrap_or_default();
+            if let Some((target, permanent)) =
+                crate::route_gate::redirect_target(route, &path, &query)
+            {
+                let status = if permanent {
+                    http::StatusCode::PERMANENT_REDIRECT
+                } else {
+                    http::StatusCode::TEMPORARY_REDIRECT
+                };
+                let response = http::Response::builder()
+                    .status(status)
+                    .header("location", &target)
+                    .header("server", SERVER_HEADER)
+                    .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
+                    .body(())?;
+                stream.send_response(response).await?;
+                stream.finish().await?;
+                metrics.requests.request_end_full(
+                    status.as_u16(),
+                    start_time.elapsed(),
+                    0,
+                    0,
+                    Some(&path),
+                    is_health_check,
+                );
+                return Ok(());
+            }
+        }
+
         // Handle CORS preflight OPTIONS requests using route.cors
         if request.method() == http::Method::OPTIONS {
             if let Some(ref cors) = route.cors {
@@ -786,6 +824,53 @@ impl QuicListener {
                 return Ok(());
             }
             // If no CORS config, fall through to normal handling / backend
+        }
+
+        // Per-route gates: 0-RTT policy, the HTTP/1.1 restriction, internal-route
+        // mTLS and HMAC proof-of-possession. The SAME implementation the TCP path
+        // runs. None of these existed on this path: a route protected by
+        // `mtls_required` or an `hmac_secret` was enforced over HTTP/1.1 and
+        // HTTP/2 and wide open over HTTP/3.
+        {
+            let gate_cx = crate::route_gate::GateContext {
+                route,
+                method,
+                path_and_query: &path_with_query,
+                path: &path,
+                headers: request.headers(),
+                client_ip: ip,
+                // Only consulted by the HTTP/1.1 gate, which cannot fire here:
+                // this path always sets `x-connection-protocol: h3`.
+                is_websocket_upgrade: false,
+                zero_rtt_safe_methods: &config.tls.zero_rtt_safe_methods,
+                hmac_nonce_store: crate::route_gate::shared_nonce_store(
+                    config.tls.zero_rtt_nonce_window_secs,
+                ),
+            };
+            if let crate::route_gate::GateOutcome::Refuse {
+                status,
+                headers: extra,
+            } = crate::route_gate::evaluate(&gate_cx)
+            {
+                let mut builder = http::Response::builder()
+                    .status(status)
+                    .header("server", SERVER_HEADER)
+                    .header("alt-svc", alt_svc_for_host(&config, host.as_deref()));
+                for (k, v) in extra {
+                    builder = builder.header(k, v);
+                }
+                stream.send_response(builder.body(())?).await?;
+                stream.finish().await?;
+                metrics.requests.request_end_full(
+                    status.as_u16(),
+                    start_time.elapsed(),
+                    0,
+                    0,
+                    Some(&path),
+                    is_health_check,
+                );
+                return Ok(());
+            }
         }
 
         // Pool-aware backend selection: supports canary routing and load balancing.

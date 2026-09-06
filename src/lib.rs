@@ -93,6 +93,7 @@ pub mod pqc_tls;
 pub mod proxy;
 pub mod quic_listener;
 pub mod rate_limiter; // Must be before config (config imports from it)
+pub mod route_gate;
 pub mod security;
 pub mod speedtest;
 pub mod startup_verify;
