@@ -147,6 +147,62 @@ pub struct QuicListener {
     fingerprint_config: crate::config::FingerprintConfig,
 }
 
+/// Response headers that are identical on every response until the config is
+/// reloaded.
+///
+/// These were rebuilt per response from config `String`s: fifteen header-name
+/// parses and, because `HeaderValue::from_str` copies into `Bytes`, fifteen heap
+/// allocations for values that never change. Built once per connection instead,
+/// after which applying them is a `HeaderName` clone (cheap) and a `HeaderValue`
+/// clone (a refcount bump).
+///
+/// Deliberately excludes `alt-svc`, which varies by host, and `server-timing`,
+/// which carries the elapsed time of the request.
+fn build_static_response_headers(config: &ProxyConfig) -> HeaderMap {
+    let mut h = HeaderMap::with_capacity(16);
+    let mut put = |name: &'static str, value: &str| {
+        if let Ok(v) = HeaderValue::from_str(value) {
+            h.append(HeaderName::from_static(name), v);
+        }
+    };
+    put("server", SERVER_HEADER);
+    if !config.headers.accept_ch.is_empty() {
+        put("accept-ch", &config.headers.accept_ch);
+    }
+    if !config.headers.nel.is_empty() {
+        put("nel", &config.headers.nel);
+    }
+    if !config.headers.report_to.is_empty() {
+        put("report-to", &config.headers.report_to);
+    }
+    if !config.headers.priority.is_empty() {
+        put("priority", &config.headers.priority);
+    }
+    put("strict-transport-security", &config.headers.hsts);
+    put("x-frame-options", &config.headers.x_frame_options);
+    put(
+        "x-content-type-options",
+        &config.headers.x_content_type_options,
+    );
+    put("referrer-policy", &config.headers.referrer_policy);
+    put("permissions-policy", &config.headers.permissions_policy);
+    put(
+        "cross-origin-opener-policy",
+        &config.headers.cross_origin_opener_policy,
+    );
+    put(
+        "cross-origin-embedder-policy",
+        &config.headers.cross_origin_embedder_policy,
+    );
+    put(
+        "cross-origin-resource-policy",
+        &config.headers.cross_origin_resource_policy,
+    );
+    put("x-quantum-resistant", &config.headers.x_quantum_resistant);
+    put("x-security-level", &config.headers.x_security_level);
+    h
+}
+
 impl QuicListener {
     /// Create a new QUIC listener
     #[allow(clippy::too_many_arguments)]
@@ -698,6 +754,11 @@ impl QuicListener {
         // Lazily created on the first CONNECT-UDP session so connections that
         // never use MASQUE pay nothing for the datagram reader task.
         let mut datagram_router: Option<Arc<DatagramRouter>> = None;
+
+        // Built once for the connection rather than once per response; see
+        // `build_static_response_headers`.
+        let static_headers = Arc::new(build_static_response_headers(&config));
+
         loop {
             match h3.accept().await {
                 Ok(Some(resolver)) => {
@@ -1025,6 +1086,7 @@ impl QuicListener {
                         let cache_clone = cache.clone();
                         let handshake_clone = handshake.clone();
                         let fingerprint_clone = fingerprint.clone();
+                        let static_headers_clone = static_headers.clone();
 
                         tokio::spawn(async move {
                             // Note: health check detection happens inside handle_h3_request
@@ -1042,6 +1104,7 @@ impl QuicListener {
                                 cache_clone,
                                 handshake_clone,
                                 fingerprint_clone,
+                                static_headers_clone,
                             )
                             .await
                             {
@@ -1092,6 +1155,7 @@ impl QuicListener {
         cache: Arc<ResponseCache>,
         handshake: Arc<crate::tls_acceptor::HandshakeFacts>,
         fingerprint: Arc<crate::fingerprint::FingerprintResult>,
+        static_headers: Arc<HeaderMap>,
     ) -> anyhow::Result<()>
     where
         S: h3::quic::BidiStream<Bytes>,
@@ -2829,14 +2893,18 @@ impl QuicListener {
         response_builder =
             response_builder.header("alt-svc", alt_svc_for_host(&config, host.as_deref()));
 
-        // Add Server header for branding (hide backend identity)
-        response_builder = response_builder.header("server", SERVER_HEADER);
+        // Server, Client-Hints, reporting and security headers: all fifteen are
+        // fixed until the config reloads, so they are built once per connection
+        // and applied here by cloning. See `build_static_response_headers`.
+        if let Some(h) = response_builder.headers_mut() {
+            h.reserve(static_headers.len());
+            for (name, value) in static_headers.iter() {
+                h.append(name.clone(), value.clone());
+            }
+        }
 
-        // ═══════════════════════════════════════════════════════════════
-        // HTTP/3 Performance & Monitoring Headers
-        // ═══════════════════════════════════════════════════════════════
-
-        // Server-Timing header - Performance metrics for DevTools
+        // Server-Timing carries this request's elapsed time, so it cannot be
+        // part of that set.
         if config.headers.server_timing_enabled {
             let processing_time = start_time.elapsed();
             let server_timing = format!(
@@ -2845,51 +2913,6 @@ impl QuicListener {
             );
             response_builder = response_builder.header("server-timing", server_timing);
         }
-
-        // Accept-CH header - Client Hints for adaptive content
-        if !config.headers.accept_ch.is_empty() {
-            response_builder = response_builder.header("accept-ch", &config.headers.accept_ch);
-        }
-
-        // NEL header - Network Error Logging
-        if !config.headers.nel.is_empty() {
-            response_builder = response_builder.header("nel", &config.headers.nel);
-        }
-
-        // Report-To header - Reporting API endpoint
-        if !config.headers.report_to.is_empty() {
-            response_builder = response_builder.header("report-to", &config.headers.report_to);
-        }
-
-        // Priority header (RFC 9218) - HTTP/3 response prioritization
-        if !config.headers.priority.is_empty() {
-            response_builder = response_builder.header("priority", &config.headers.priority);
-        }
-
-        // Security headers
-        response_builder = response_builder
-            .header("strict-transport-security", &config.headers.hsts)
-            .header("x-frame-options", &config.headers.x_frame_options)
-            .header(
-                "x-content-type-options",
-                &config.headers.x_content_type_options,
-            )
-            .header("referrer-policy", &config.headers.referrer_policy)
-            .header("permissions-policy", &config.headers.permissions_policy)
-            .header(
-                "cross-origin-opener-policy",
-                &config.headers.cross_origin_opener_policy,
-            )
-            .header(
-                "cross-origin-embedder-policy",
-                &config.headers.cross_origin_embedder_policy,
-            )
-            .header(
-                "cross-origin-resource-policy",
-                &config.headers.cross_origin_resource_policy,
-            )
-            .header("x-quantum-resistant", &config.headers.x_quantum_resistant)
-            .header("x-security-level", &config.headers.x_security_level);
 
         // Add CORS headers from route.cors (proxy-level CORS) if configured
         if let Some(ref cors) = route.cors {
