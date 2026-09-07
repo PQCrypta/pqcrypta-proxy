@@ -1683,8 +1683,14 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub allow_internal_backends: bool,
     /// Duration in seconds for GeoIP-based IP blocks.
-    /// `None` means permanent (old behaviour); `Some(n)` expires the block after n seconds.
-    /// Default: Some(86400) — 24 h, giving operators recourse for mis-classified IPs.
+    ///
+    /// `0` means the block never expires. TOML has no null and this field carries
+    /// a serde default, so omitting it cannot express "permanent" — zero is the
+    /// only spelling available. Any other `n` expires the block after n seconds.
+    /// Default: 86400 — 24 h, giving operators recourse for mis-classified IPs.
+    ///
+    /// Note this is global, not per-country: it applies to every entry in
+    /// `blocked_countries`.
     #[serde(default = "default_geoip_block_duration_secs")]
     pub geoip_block_duration_secs: Option<u64>,
     /// Enable zero-trust mode. At startup, enforces:

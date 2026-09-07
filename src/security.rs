@@ -1538,10 +1538,19 @@ impl SecurityState {
         // 3. GeoIP country blocking
         if self.is_country_blocked(&ip) {
             warn!("GeoIP blocked request from {}", ip);
+            // `geoip_block_duration_secs = 0` means the block never expires.
+            //
+            // TOML has no null, and the field carries a serde default, so
+            // omitting it cannot express "permanent" — zero is the only value
+            // available to say it. It also had to stop meaning what it used to:
+            // `Some(0)` became `Instant::now() + 0`, a block that had already
+            // expired before it was written, so an operator asking for the
+            // strongest setting got no block at all.
             let duration = self
                 .config
                 .read()
                 .geoip_block_duration_secs
+                .filter(|secs| *secs > 0)
                 .map(Duration::from_secs);
             self.block_ip(ip, BlockReason::GeoBlocked, duration);
             return SecurityDecision::GeoBlocked;
@@ -3106,6 +3115,25 @@ mod decision_rendering_tests {
                 assert_eq!(actual, value.as_str(), "`{name}` differs for {decision:?}");
             }
         }
+    }
+
+    /// `geoip_block_duration_secs = 0` means the block never expires.
+    ///
+    /// Zero is the only way TOML can say "permanent" for this field, and it used
+    /// to mean the opposite: `Instant::now() + 0` is a block that expired before
+    /// it was written, so the strongest-looking setting produced no block at all.
+    #[test]
+    fn a_zero_geoip_block_duration_means_permanent() {
+        fn effective(secs: Option<u64>) -> Option<Duration> {
+            secs.filter(|s| *s > 0).map(Duration::from_secs)
+        }
+        assert_eq!(effective(Some(0)), None, "0 must mean no expiry");
+        assert_eq!(effective(None), None, "absent must mean no expiry");
+        assert_eq!(
+            effective(Some(86400)),
+            Some(Duration::from_hours(24)),
+            "a real duration must still expire"
+        );
     }
 
     /// A blocked IP is refused outright, not redirected: the caller is being
