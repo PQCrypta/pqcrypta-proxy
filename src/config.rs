@@ -1601,13 +1601,18 @@ impl Default for LoggingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RateLimitConfig {
-    /// Enable rate limiting
+    /// Enable rate limiting.
+    ///
+    /// The master switch for this whole section: `false` turns off the request
+    /// limiter *and* the connection limiter below. It did not always — the
+    /// connection limiter was gated only on its own flag, which defaults to
+    /// true, so disabling the section left it banning clients for 300s.
     pub enabled: bool,
     /// Requests per second per IP
     pub requests_per_second: u32,
     /// Burst size
     pub burst_size: u32,
-    /// Enable connection rate limiting
+    /// Enable connection rate limiting. Only consulted when `enabled` is true.
     pub connection_rate_limit: bool,
     /// New connections per second per IP
     pub connections_per_second: u32,

@@ -1570,7 +1570,20 @@ impl SecurityState {
         };
 
         if !is_pentest && !is_verified_crawler {
-            if conn_rate_enabled && self.connection_rate_exceeded(ip, conn_rate_per_sec) {
+            // `enabled` is the section's master switch, so it has to gate the
+            // connection limiter too. It did not: `connection_rate_limit`
+            // defaults to true at 10 conn/s, so `[rate_limiting] enabled = false`
+            // turned off request rate limiting and left connection rate limiting
+            // running — and that limiter blocks for 300s on the first offence.
+            // An operator who disabled the section still had clients banned by it.
+            // Invisible over loopback, where is_trusted() short-circuits all of
+            // this; found by benchmarking from a non-loopback address, where a
+            // load generator with the whole section disabled was banned inside a
+            // second and every subsequent request answered 403.
+            if rate_enabled
+                && conn_rate_enabled
+                && self.connection_rate_exceeded(ip, conn_rate_per_sec)
+            {
                 warn!(
                     "Connection rate limit exceeded for {} ({} conn/s)",
                     ip, conn_rate_per_sec
@@ -2810,6 +2823,72 @@ mod tests {
             security.is_blocked(&ordinary).is_some(),
             "an ordinary address with the same 4xx burst must still be blocked, \
              or the test proves nothing"
+        );
+    }
+
+    /// Regression: `[rate_limiting] enabled = false` must disable the whole
+    /// section, connection rate limiting included.
+    ///
+    /// It did not. The connection limiter was gated only on its own
+    /// `connection_rate_limit` flag, which defaults to `true` at 10 conn/s, and
+    /// it blocks for `auto_block_duration_secs` on the *first* offence with no
+    /// counter to cross. So an operator who turned the section off still had
+    /// clients banned for five minutes by the half of it that ignored the switch.
+    ///
+    /// Invisible over loopback, because `is_trusted()` short-circuits the entire
+    /// per-request security block before any of this runs. Found on 2026-09-07
+    /// by benchmarking from a non-loopback address with every security feature
+    /// disabled: the load generator was banned inside a second and 100% of
+    /// 820,380 requests came back 4xx.
+    #[tokio::test]
+    async fn test_rate_limiting_disabled_also_disables_connection_limiter() {
+        let headers = HeaderMap::new();
+        let policy = RequestPolicy::default();
+        // Not loopback: loopback is unconditionally trusted and would skip
+        // everything under test, which is exactly why this went unnoticed.
+        let ip: IpAddr = "203.0.113.42".parse().unwrap();
+        let view = SecurityRequestView {
+            ip,
+            method: "GET",
+            path: "/",
+            query: "",
+            headers: &headers,
+            body: None,
+        };
+
+        let mut config = ProxyConfig::default();
+        config.rate_limiting.enabled = false;
+        // Left at its default of true, which is the whole point: an operator
+        // disabling the section does not go on to disable each field inside it.
+        assert!(config.rate_limiting.connection_rate_limit);
+        let security = SecurityState::new(&config);
+
+        // Far past connections_per_second (10) in one window.
+        for _ in 0..50 {
+            let decision = security.evaluate(&view, &policy);
+            assert!(
+                matches!(decision, SecurityDecision::Allow),
+                "with the section disabled every request must be allowed, got {decision:?}"
+            );
+        }
+        assert!(
+            security.is_blocked(&ip).is_none(),
+            "a disabled [rate_limiting] section must not ban anyone"
+        );
+
+        // And the limiter must still work when the section is on, or the fix
+        // above would be indistinguishable from deleting the feature.
+        let mut on = ProxyConfig::default();
+        on.rate_limiting.enabled = true;
+        on.rate_limiting.connection_rate_limit = true;
+        on.rate_limiting.connections_per_second = 10;
+        let security = SecurityState::new(&on);
+        for _ in 0..50 {
+            let _ = security.evaluate(&view, &policy);
+        }
+        assert!(
+            security.is_blocked(&ip).is_some(),
+            "with the section enabled the connection limiter must still fire"
         );
     }
 
