@@ -19,6 +19,9 @@ pqc = ["openssl", "openssl-sys", "openssl-probe", "foreign-types"]
 pqc-signatures = ["aws-lc-rs/unstable"]
 # Prometheus metrics endpoint
 metrics = ["prometheus"]
+# Count allocations, for answering "how many per request" rather than inferring
+# it from a profile's allocator share. Diagnostic only; never in a release build.
+count-allocs = []
 # Admin HTTP API for health, reload, shutdown
 admin-api = ["tower-http"]
 # ACME certificate automation (works with any ACME CA: Let's Encrypt, ZeroSSL, Buypass, etc.)

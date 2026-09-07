@@ -220,12 +220,75 @@ fn raise_fd_limit() {
 /// whichever worker thread happens to finish the work, which is the pattern
 /// glibc's per-arena design serves worst. mimalloc keeps a per-thread free list
 /// and handles cross-thread frees without contending on an arena lock.
+/// Counts allocations so the per-request allocation count can be measured
+/// rather than inferred from a profile's allocator share.
+///
+/// A profile says what fraction of CPU the allocator used; it does not say how
+/// many allocations that was, and the two lead to different work. Enable with
+/// `--features count-allocs` and read the counters off the admin/metrics path or
+/// a SIGUSR-triggered dump. Off by default and compiled out entirely, so the
+/// shipping binary pays nothing.
+#[cfg(feature = "count-allocs")]
+#[allow(unsafe_code)] // GlobalAlloc is an unsafe trait; this module is diagnostic
+                      // only and is compiled out of every release build.
+mod alloc_counter {
+    use std::alloc::{GlobalAlloc, Layout};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static ALLOCS: AtomicU64 = AtomicU64::new(0);
+    pub static BYTES: AtomicU64 = AtomicU64::new(0);
+
+    pub struct Counting(pub mimalloc::MiMalloc);
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            unsafe { self.0.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { self.0.dealloc(ptr, layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
+            unsafe { self.0.realloc(ptr, layout, new_size) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            unsafe { self.0.alloc_zeroed(layout) }
+        }
+    }
+}
+
+#[cfg(feature = "count-allocs")]
+#[global_allocator]
+static GLOBAL: alloc_counter::Counting = alloc_counter::Counting(mimalloc::MiMalloc);
+
+#[cfg(not(feature = "count-allocs"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> anyhow::Result<()> {
     // Raise the file-descriptor limit before anything opens a socket.
     raise_fd_limit();
+
+    // Allocation counter readout. Two samples across a load window, divided by
+    // the requests served in it, gives allocations per request — the number a
+    // profile's allocator share cannot supply.
+    #[cfg(feature = "count-allocs")]
+    std::thread::spawn(|| {
+        use std::sync::atomic::Ordering;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            eprintln!(
+                "ALLOCS {} BYTES {}",
+                alloc_counter::ALLOCS.load(Ordering::Relaxed),
+                alloc_counter::BYTES.load(Ordering::Relaxed)
+            );
+        }
+    });
 
     // The config must be read before the runtime exists, so worker_threads is
     // known when the pool is built. Parse failures are reported by run() in the

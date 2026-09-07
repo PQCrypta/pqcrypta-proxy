@@ -762,6 +762,7 @@ impl fmt::Debug for TransportConfig {
             .field("mtu_discovery_config", mtu_discovery_config)
             .field("pad_to_mtu", pad_to_mtu)
             .field("ack_frequency_config", ack_frequency_config)
+            .field("local_ack_eliciting_threshold", local_ack_eliciting_threshold)
             .field(
                 "max_outgoing_bytes_per_second",
                 max_outgoing_bytes_per_second,
