@@ -343,15 +343,16 @@ impl Connection {
         let connection_side = ConnectionSide::from(side_args);
         let side = connection_side.side();
         let mut rng = StdRng::from_seed(rng_seed);
-        let mut initial_space = PacketSpace::new(now, SpaceId::Initial, &mut rng);
-        let mut handshake_space = PacketSpace::new(now, SpaceId::Handshake, &mut rng);
+        let ack_threshold = config.local_ack_eliciting_threshold;
+        let mut initial_space = PacketSpace::new(now, SpaceId::Initial, &mut rng, ack_threshold);
+        let mut handshake_space = PacketSpace::new(now, SpaceId::Handshake, &mut rng, ack_threshold);
         #[cfg(test)]
         let mut data_space = match config.deterministic_packet_numbers {
-            true => PacketSpace::new_deterministic(now, SpaceId::Data),
-            false => PacketSpace::new(now, SpaceId::Data, &mut rng),
+            true => PacketSpace::new_deterministic(now, SpaceId::Data, ack_threshold),
+            false => PacketSpace::new(now, SpaceId::Data, &mut rng, ack_threshold),
         };
         #[cfg(not(test))]
-        let mut data_space = PacketSpace::new(now, SpaceId::Data, &mut rng);
+        let mut data_space = PacketSpace::new(now, SpaceId::Data, &mut rng, ack_threshold);
 
         // The spaces for PathId::ZERO do not need the PathEvent::Established event.
         initial_space.for_path(PathId::ZERO).open_status = OpenStatus::Informed;
@@ -988,7 +989,12 @@ impl Connection {
 
         let path = vacant_entry.insert(PathState { data, prev: None });
 
-        let mut pn_space = spaces::PacketNumberSpace::new(now, SpaceId::Data, &mut self.rng);
+        let mut pn_space = spaces::PacketNumberSpace::new(
+            now,
+            SpaceId::Data,
+            &mut self.rng,
+            self.config.local_ack_eliciting_threshold,
+        );
         if let Some(pn) = pn {
             pn_space.dedup.insert(pn);
         }
@@ -4624,7 +4630,12 @@ impl Connection {
                     .for_path(path_id)
                     .next_packet_number;
                 self.spaces[SpaceId::Initial] = {
-                    let mut space = PacketSpace::new(now, SpaceId::Initial, &mut self.rng);
+                    let mut space = PacketSpace::new(
+                        now,
+                        SpaceId::Initial,
+                        &mut self.rng,
+                        self.config.local_ack_eliciting_threshold,
+                    );
                     space.for_path(path_id).next_packet_number = next_pn;
                     space.pending.crypto.push_back(frame::Crypto {
                         offset: 0,
