@@ -29,8 +29,8 @@ enable_quic_migration = true
 webtransport_port = 18445
 
 [tls]
-cert_path = "/root/bench/certs/bench.local.crt"
-key_path  = "/root/bench/certs/bench.local.key"
+cert_path = "/root/bench/certs/bench-sec.local.crt"
+key_path  = "/root/bench/certs/bench-sec.local.key"
 min_version = "1.3"
 alpn_protocols = ["h3", "h2", "http/1.1"]
 ocsp_stapling = false
@@ -56,6 +56,11 @@ name = "all"
 host = "bench-sec.local"
 path_prefix = "/"
 backend = "static"
+# Both arms must handle protocols identically or the comparison includes the
+# route gate. The gate is enforced only on the fingerprinting accept loop, so
+# without this the security-on arm answers 426 to every HTTP/1.1 request while
+# the security-off arm serves them.
+allow_http11 = true
 
 [waf]
 enabled = true
@@ -64,7 +69,18 @@ scan_json_body = true
 [fingerprint]
 enabled = true
 tls_layer_capture = true
-block_scanners = true
+# Classification, replay detection and drift detection all still run — that work
+# is exactly what this arm is pricing. What is lifted is the ability to ban:
+# h2load's JA3 classifies as Suspicious, and the default threshold of 100
+# requests per minute bans a load generator inside the warm-up.
+block_scanners = false
+block_malicious = false
+suspicious_rate_threshold = 4000000000
+suspicious_rate_window_secs = 1
+suspicious_block_duration_secs = 1
+malicious_block_duration_secs = 1
+replay_detection = true
+drift_detection = true
 [rate_limiting]
 enabled = true
 # Far above the offered load: the cost under test is evaluating a request, and a

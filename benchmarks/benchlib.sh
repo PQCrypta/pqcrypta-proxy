@@ -76,7 +76,12 @@ bench_spawn_proxy() {  # $1=binary $2=config $3...=extra args
 bench_stop_proxies() {
     local p
     for p in $(ss -lntupH 2>/dev/null | grep -E ":1844[3-5]" | grep -oP 'pid=\K[0-9]+' | sort -u); do
-        if tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -qE "/root/bench/conf/"; then
+        # Basenames, not the directory: a hand-typed relative --config path
+        # slipped through a directory match and left a proxy holding the cores.
+        # These names exist only in this harness -- the production node on this
+        # box runs /etc/pqcrypta/proxy-config.toml and never matches.
+        if tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null \
+            | grep -qE "pqc-bench|pqc-sec|pqc-streams|pqc-noackfreq|conf/haproxy"; then
             kill "$p" 2>/dev/null
         fi
     done

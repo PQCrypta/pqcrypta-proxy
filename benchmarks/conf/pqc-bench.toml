@@ -56,6 +56,11 @@ name = "all"
 host = "bench.local"
 path_prefix = "/"
 backend = "static"
+# The HTTP/1.1 column measures a route that permits HTTP/1.1. This used to be
+# implicit: the per-route gate read a header the plain accept loop never set, so
+# it was inert here and h1 was served regardless. Now that the gate reads the
+# request version, the route has to say what it always meant.
+allow_http11 = true
 
 [waf]
 enabled = false
