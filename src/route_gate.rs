@@ -16,12 +16,18 @@
 //! and 502 over HTTP/3 — the browsers most likely to be on h3 are exactly the
 //! ones that follow the `Alt-Svc` this proxy advertises.
 //!
-//! Nothing here needs to know which transport it is on. Both listeners
-//! establish the connection-derived headers (`x-tls-early-data`,
-//! `x-connection-protocol`, `x-client-cert`) before any of this reads them, and
-//! both strip any client-supplied copy first, so these values cannot be forged.
-//! On HTTP/3 that means early data reads as absent and the protocol reads as
-//! `h3`, so the 0-RTT and HTTP/1.1 gates correctly never fire there.
+//! Nothing here needs to know which transport it is on. The connection-derived
+//! headers (`x-tls-early-data`, `x-client-cert`) are established by the accept
+//! loop, which strips any client-supplied copy first, so they cannot be forged.
+//!
+//! The protocol is **not** one of them. It arrives as [`GateContext::is_http11`],
+//! read from the request's own version, because relying on an injected header
+//! meant relying on all three TCP accept loops to inject it — and the plain
+//! Rustls one, used whenever `fingerprint.tls_layer_capture` is off, never did.
+//! That made the HTTP/1.1 gate fail open on that listener: a route with
+//! `allow_http11 = false` served HTTP/1.1 whenever fingerprinting was disabled.
+//! A gate that depends on cooperation from every code path that can reach it is
+//! a gate that is off wherever someone forgot.
 
 use std::net::IpAddr;
 use std::sync::OnceLock;
@@ -76,6 +82,17 @@ pub struct GateContext<'a> {
     pub path: &'a str,
     pub headers: &'a HeaderMap,
     pub client_ip: IpAddr,
+    /// Whether this request arrived over HTTP/1.1.
+    ///
+    /// Taken from the request's own version, not from a header. It used to be
+    /// read from `x-connection-protocol`, which each accept loop was expected to
+    /// inject — and the plain Rustls listener, the one used whenever
+    /// `fingerprint.tls_layer_capture` is off, never did. The HTTP/1.1 gate
+    /// therefore failed **open** on that listener: a route with
+    /// `allow_http11 = false` accepted HTTP/1.1 whenever fingerprinting happened
+    /// to be disabled, which is a security decision silently contingent on an
+    /// unrelated performance switch.
+    pub is_http11: bool,
     /// A WebSocket upgrade is always HTTP/1.1, so it bypasses the HTTP/1.1 gate
     /// when the route opts into WebSocket passthrough.
     pub is_websocket_upgrade: bool,
@@ -180,12 +197,9 @@ fn zero_rtt_gate(cx: &GateContext<'_>) -> Option<GateOutcome> {
 /// any client-supplied copy. Routes with `allow_http11 = false` (the default)
 /// require HTTP/2 or HTTP/3.
 fn http11_gate(cx: &GateContext<'_>) -> Option<GateOutcome> {
-    let is_http1 = cx
-        .headers
-        .get("x-connection-protocol")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v == "h1")
-        .unwrap_or(false);
+    // From the request's own version. Reading `x-connection-protocol` here meant
+    // trusting every accept loop to inject it, and one of the three did not.
+    let is_http1 = cx.is_http11;
 
     // A WebSocket upgrade is always HTTP/1.1 — bypass the gate when the route
     // explicitly enables WebSocket passthrough.
@@ -341,6 +355,17 @@ mod tests {
         method: &'a str,
         safe: &'a [String],
     ) -> GateContext<'a> {
+        ctx_proto(r, h, store, method, safe, false)
+    }
+
+    fn ctx_proto<'a>(
+        r: &'a RouteConfig,
+        h: &'a HeaderMap,
+        store: &'a HmacNonceStore,
+        method: &'a str,
+        safe: &'a [String],
+        is_http11: bool,
+    ) -> GateContext<'a> {
         GateContext {
             route: r,
             method,
@@ -348,6 +373,7 @@ mod tests {
             path: "/x",
             headers: h,
             client_ip: "203.0.113.9".parse().unwrap(),
+            is_http11,
             is_websocket_upgrade: false,
             zero_rtt_safe_methods: safe,
             hmac_nonce_store: store,
@@ -447,20 +473,58 @@ mod tests {
         assert!(status_of(&evaluate(&ctx(&r, &h, &store, "GET", &safe))).is_none());
     }
 
-    /// HTTP/3 never sets `x-connection-protocol: h1`, so the HTTP/1.1 gate must
-    /// not fire there even on a route that forbids HTTP/1.1.
+    /// The HTTP/1.1 gate fires on HTTP/1.1 and not on anything else, and it reads
+    /// the connection's real protocol rather than a header.
     #[test]
-    fn the_http11_gate_does_not_fire_on_h3() {
+    fn the_http11_gate_fires_only_on_http11() {
         let r = route(); // allow_http11 defaults false
-        let mut h = HeaderMap::new();
-        h.insert("x-connection-protocol", HeaderValue::from_static("h3"));
+        let h = HeaderMap::new();
         let store = HmacNonceStore::new(300);
         let safe: Vec<String> = vec![];
-        assert!(status_of(&evaluate(&ctx(&r, &h, &store, "GET", &safe))).is_none());
 
-        h.insert("x-connection-protocol", HeaderValue::from_static("h1"));
+        assert!(
+            status_of(&evaluate(&ctx_proto(&r, &h, &store, "GET", &safe, false))).is_none(),
+            "HTTP/2 and HTTP/3 must pass a route that forbids HTTP/1.1"
+        );
         assert_eq!(
-            status_of(&evaluate(&ctx(&r, &h, &store, "GET", &safe))),
+            status_of(&evaluate(&ctx_proto(&r, &h, &store, "GET", &safe, true))),
+            Some(StatusCode::UPGRADE_REQUIRED)
+        );
+    }
+
+    /// Regression: the gate must not be satisfiable, or defeatable, by a header.
+    ///
+    /// It used to read `x-connection-protocol`, which each accept loop was
+    /// expected to inject. The plain Rustls listener — the one used whenever
+    /// `fingerprint.tls_layer_capture` is off — never injected it, so the gate
+    /// failed **open** there and a route with `allow_http11 = false` served
+    /// HTTP/1.1 whenever fingerprinting happened to be disabled. Found on
+    /// 2026-09-07: the same config answered 200 to an HTTP/1.1 request with
+    /// fingerprinting off and 426 with it on.
+    #[test]
+    fn the_http11_gate_ignores_the_connection_protocol_header() {
+        let r = route(); // allow_http11 defaults false
+        let store = HmacNonceStore::new(300);
+        let safe: Vec<String> = vec![];
+
+        // A real HTTP/1.1 request is refused even with no header to say so —
+        // this is the case the plain listener used to let through.
+        let empty = HeaderMap::new();
+        assert_eq!(
+            status_of(&evaluate(&ctx_proto(
+                &r, &empty, &store, "GET", &safe, true
+            ))),
+            Some(StatusCode::UPGRADE_REQUIRED),
+            "the gate must not depend on an accept loop injecting a header"
+        );
+
+        // And a client asserting h3 cannot talk its way out of it.
+        let mut spoofed = HeaderMap::new();
+        spoofed.insert("x-connection-protocol", HeaderValue::from_static("h3"));
+        assert_eq!(
+            status_of(&evaluate(&ctx_proto(
+                &r, &spoofed, &store, "GET", &safe, true
+            ))),
             Some(StatusCode::UPGRADE_REQUIRED)
         );
     }

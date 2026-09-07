@@ -1741,6 +1741,10 @@ async fn proxy_handler(
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
+    // The connection's real protocol, for the per-route HTTP/1.1 gate. Read here
+    // rather than from `x-connection-protocol`: only two of the three TCP accept
+    // loops injected that header, so the gate was inert on the third.
+    let is_http11 = req.version() == http::Version::HTTP_11;
     let is_ws_upgrade = headers
         .get("upgrade")
         .and_then(|v| v.to_str().ok())
@@ -2050,6 +2054,7 @@ async fn proxy_handler(
                 path: &path,
                 headers: &headers,
                 client_ip: client_addr.ip(),
+                is_http11,
                 is_websocket_upgrade: is_ws_upgrade,
                 zero_rtt_safe_methods: &state.config.tls.zero_rtt_safe_methods,
                 hmac_nonce_store: crate::route_gate::shared_nonce_store(

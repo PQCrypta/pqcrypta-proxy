@@ -873,8 +873,8 @@ impl QuicListener {
                 path: &path,
                 headers: request.headers(),
                 client_ip: ip,
-                // Only consulted by the HTTP/1.1 gate, which cannot fire here:
-                // this path always sets `x-connection-protocol: h3`.
+                // HTTP/3 by construction, so the HTTP/1.1 gate never fires here.
+                is_http11: false,
                 is_websocket_upgrade: false,
                 zero_rtt_safe_methods: &config.tls.zero_rtt_safe_methods,
                 hmac_nonce_store: crate::route_gate::shared_nonce_store(
