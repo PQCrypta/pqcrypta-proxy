@@ -25,6 +25,45 @@ use crate::security::SecurityState;
 use super::cors::add_cors_headers_to_builder;
 use super::{alt_svc_for_host, resolve_route_policy, QuicListener, SERVER_HEADER};
 
+/// Take whatever the client already sent, so the receive side closes cleanly.
+///
+/// Used by the in-process responders that write their own body and so cannot
+/// use [`respond_and_finish`]. Same reason: finishing a bidirectional stream
+/// whose receive side is still open makes h3 reset it, and the client throws
+/// away a response it already has.
+async fn drain_request<S>(stream: &mut h3::server::RequestStream<S, Bytes>)
+where
+    S: h3::quic::BidiStream<Bytes>,
+{
+    while let Ok(Some(_)) = stream.recv_data().await {}
+}
+
+/// Send a body-less response and close the stream cleanly.
+///
+/// The drain is the point. An early return answers without ever reading the
+/// request body, which leaves the receive side of the bidirectional stream open;
+/// finishing and dropping it there makes h3 reset the stream, and the client
+/// discards a response it had already received in full. Over HTTP/3 that made
+/// every early return unusable — `curl -L` could not follow a 308 redirect and
+/// reported `stream 0 reset by server` on a WAF 403, while the same verdicts on
+/// TCP were fine. Proxied responses were never affected because forwarding
+/// reads the request body first.
+async fn respond_and_finish<S>(
+    stream: &mut h3::server::RequestStream<S, Bytes>,
+    response: http::Response<()>,
+) -> anyhow::Result<()>
+where
+    S: h3::quic::BidiStream<Bytes>,
+{
+    stream.send_response(response).await?;
+    // Whatever the client already sent, take it: a GET usually has nothing and
+    // this returns immediately. Errors are ignored because a client that has
+    // already gone away is not a failure of this response.
+    while let Ok(Some(_)) = stream.recv_data().await {}
+    stream.finish().await?;
+    Ok(())
+}
+
 impl QuicListener {
     /// Handle a single HTTP/3 request
     #[allow(clippy::too_many_arguments)]
@@ -262,8 +301,7 @@ impl QuicListener {
                             builder_adv = builder_adv.header(k, v);
                         }
                         let response = builder_adv.body(())?;
-                        stream.send_response(response).await?;
-                        stream.finish().await?;
+                        respond_and_finish(&mut stream, response).await?;
                         return Ok(());
                     }
                     RateLimitResult::Blocked { reason } => {
@@ -283,8 +321,7 @@ impl QuicListener {
                             .status(http::StatusCode::FORBIDDEN)
                             .header("server", SERVER_HEADER)
                             .body(())?;
-                        stream.send_response(response).await?;
-                        stream.finish().await?;
+                        respond_and_finish(&mut stream, response).await?;
                         return Ok(());
                     }
                 }
@@ -339,8 +376,7 @@ impl QuicListener {
                         builder = builder.header(k, v);
                     }
                     let response = builder.body(())?;
-                    stream.send_response(response).await?;
-                    stream.finish().await?;
+                    respond_and_finish(&mut stream, response).await?;
                     return Ok(());
                 }
             }
@@ -446,6 +482,7 @@ impl QuicListener {
                     if request.method() != http::Method::HEAD && !bytes.is_empty() {
                         stream.send_data(bytes).await?;
                     }
+                    drain_request(&mut stream).await;
                     stream.finish().await?;
                     return Ok(());
                 }
@@ -591,6 +628,7 @@ impl QuicListener {
                 .body(())?;
             stream.send_response(response).await?;
             stream.send_data(json_bytes).await?;
+            drain_request(&mut stream).await;
             stream.finish().await?;
 
             metrics.requests.request_end_full(
@@ -650,8 +688,7 @@ impl QuicListener {
                     .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
                     .body(())?;
 
-                stream.send_response(response).await?;
-                stream.finish().await?;
+                respond_and_finish(&mut stream, response).await?;
                 return Ok(());
             }
         };
@@ -697,8 +734,7 @@ impl QuicListener {
                         .header("x-ratelimit-limit", limit.to_string())
                         .header("x-ratelimit-remaining", "0")
                         .body(())?;
-                    stream.send_response(response).await?;
-                    stream.finish().await?;
+                    respond_and_finish(&mut stream, response).await?;
                     metrics.requests.request_end_full(
                         429,
                         start_time.elapsed(),
@@ -736,8 +772,7 @@ impl QuicListener {
                     .header("server", SERVER_HEADER)
                     .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
                     .body(())?;
-                stream.send_response(response).await?;
-                stream.finish().await?;
+                respond_and_finish(&mut stream, response).await?;
                 metrics.requests.request_end_full(
                     status.as_u16(),
                     start_time.elapsed(),
@@ -811,8 +846,7 @@ impl QuicListener {
                 }
 
                 let response = response_builder.body(())?;
-                stream.send_response(response).await?;
-                stream.finish().await?;
+                respond_and_finish(&mut stream, response).await?;
                 metrics.requests.request_end_full(
                     200,
                     start_time.elapsed(),
@@ -859,8 +893,7 @@ impl QuicListener {
                 for (k, v) in extra {
                     builder = builder.header(k, v);
                 }
-                stream.send_response(builder.body(())?).await?;
-                stream.finish().await?;
+                respond_and_finish(&mut stream, builder.body(())?).await?;
                 metrics.requests.request_end_full(
                     status.as_u16(),
                     start_time.elapsed(),
@@ -984,8 +1017,7 @@ impl QuicListener {
                             .status(http::StatusCode::SERVICE_UNAVAILABLE)
                             .header("server", SERVER_HEADER)
                             .body(())?;
-                        stream.send_response(response).await?;
-                        stream.finish().await?;
+                        respond_and_finish(&mut stream, response).await?;
                         return Ok(());
                     }
                 }
@@ -1006,8 +1038,7 @@ impl QuicListener {
                             .status(http::StatusCode::BAD_GATEWAY)
                             .header("server", SERVER_HEADER)
                             .body(())?;
-                        stream.send_response(response).await?;
-                        stream.finish().await?;
+                        respond_and_finish(&mut stream, response).await?;
                         return Ok(());
                     }
                 }
@@ -1040,8 +1071,7 @@ impl QuicListener {
                             .status(http::StatusCode::PAYLOAD_TOO_LARGE)
                             .body(())?;
 
-                        stream.send_response(response).await?;
-                        stream.finish().await?;
+                        respond_and_finish(&mut stream, response).await?;
                         return Ok(());
                     }
                 }
@@ -1124,8 +1154,7 @@ impl QuicListener {
                     builder = builder.header(k, v);
                 }
                 let response = builder.body(())?;
-                stream.send_response(response).await?;
-                stream.finish().await?;
+                respond_and_finish(&mut stream, response).await?;
                 return Ok(());
             }
         }
@@ -1265,8 +1294,7 @@ impl QuicListener {
                     }
                     let response = response_builder.body(())?;
                     let latency = start_time.elapsed();
-                    stream.send_response(response).await?;
-                    stream.finish().await?;
+                    respond_and_finish(&mut stream, response).await?;
                     metrics.requests.request_end_full(
                         304,
                         latency,
