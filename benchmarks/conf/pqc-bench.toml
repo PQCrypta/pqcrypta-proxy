@@ -10,7 +10,10 @@ version = 1
 [server]
 bind_address = "127.0.0.1"
 udp_port = 18444
-worker_threads = 4
+# One physical core each (CPUs 4-5 are SMT siblings), two workers each, matched
+# to HAProxy nbthread 2. The backend needs two physical cores of its own: on one
+# it saturated and became the ceiling in ten of HAProxy's eighteen cells.
+worker_threads = 2
 max_connections = 60000
 enable_ipv6 = false
 graceful_shutdown_timeout_secs = 1

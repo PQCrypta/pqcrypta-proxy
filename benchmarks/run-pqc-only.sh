@@ -47,7 +47,7 @@ parse() {
 }
 
 stop_bench_proxies
-setsid taskset -c 2-5 /root/bench/pqcrypta-proxy --config "${CFG:-/root/bench/conf/pqc-bench-features.toml}" </dev/null >>"$OUT/pqc2.log" 2>&1 &
+setsid taskset -c "$BENCH_PROXY_CPUS" /root/bench/pqcrypta-proxy --config "${CFG:-/root/bench/conf/pqc-bench-features.toml}" </dev/null >>"$OUT/pqc2.log" 2>&1 &
 sleep 6
 
 echo "proxy,protocol,body,conns,streams,rep,req_per_s,throughput,succeeded,failed,mean_latency,http_2xx" > "$OUT/results-pqc2.csv"
@@ -61,8 +61,12 @@ for alpn in "http/1.1" h2 h3; do
       [ "$alpn" = "h3" ] && extra=(--alpn-list=h3)
       for rep in $(seq 1 "$REPS"); do
         raw="$OUT/raw2/pqc_${alpn//\//-}_${body}_c${conns}_r${rep}.txt"
-        taskset -c 6-11 timeout $((DUR + 30)) "$H2LOAD" "${extra[@]}" \
-            -c "$conns" -m "$streams" --duration="$DUR" --warm-up-time=2 \
+        # h2load defaults to -t 1; see run-bench.sh. Both arms must use the same
+        # generator or the features-cost figure compares two different rigs.
+        threads=${GEN_THREADS:-6}
+        [ "$threads" -gt "$conns" ] && threads=$conns
+        taskset -c "$BENCH_GEN_CPUS" timeout $((DUR + 30)) "$H2LOAD" "${extra[@]}" \
+            -c "$conns" -m "$streams" -t "$threads" --duration="$DUR" --warm-up-time=2 \
             "https://bench.local:18444/$body" > "$raw" 2>/dev/null
         read -r rps bps ok fail lat ok2xx < <(parse < "$raw")
         echo "pqc,$alpn,$body,$conns,$streams,$rep,$rps,$bps,$ok,$fail,$lat,$ok2xx" >> "$OUT/results-pqc2.csv"

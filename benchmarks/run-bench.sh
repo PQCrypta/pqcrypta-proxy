@@ -13,6 +13,9 @@ set -uo pipefail
 . /root/bench/benchlib.sh
 bench_guard_init
 
+# HAProxy re-pins itself from cpu-map, so the config has to match the layout.
+HAPROXY_CFG=${HAPROXY_CFG:-/root/bench/conf/haproxy.cfg}
+
 # Both proxies get the same descriptor limit, and it is the one production runs
 # under (the systemd unit sets LimitNOFILE=65535). The first pass inherited the
 # shell default of 1024, which caps a proxy near 500 concurrent connections
@@ -29,19 +32,22 @@ DUR=${DUR:-10}
 start_proxy() {  # $1 = haproxy|pqc
   stop_proxies
   if [ "$1" = haproxy ]; then
-    setsid taskset -c 2-5 haproxy -f /root/bench/conf/haproxy.cfg -db </dev/null >>"$OUT/haproxy.log" 2>&1 &
+    setsid taskset -c "$BENCH_PROXY_CPUS" haproxy -f "$HAPROXY_CFG" -db </dev/null >>"$OUT/haproxy.log" 2>&1 9>&- &
   else
-    setsid taskset -c 2-5 /root/bench/pqcrypta-proxy --config /root/bench/conf/pqc-bench.toml </dev/null >>"$OUT/pqc.log" 2>&1 &
+    setsid taskset -c "$BENCH_PROXY_CPUS" /root/bench/pqcrypta-proxy --config /root/bench/conf/pqc-bench.toml </dev/null >>"$OUT/pqc.log" 2>&1 9>&- &
   fi
   sleep 5
+  local pid
+  pid=$(ss -lntupH 2>/dev/null | grep -E ":1844[34]" | grep -oP 'pid=\K[0-9]+' | head -1)
+  [ -n "$pid" ] || { echo "FATAL: no proxy listening after start" >&2; exit 1; }
+  bench_assert_pinning "$pid" "$BENCH_PROXY_CPUS" || exit 1
 }
 
 stop_proxies() {
-  pkill -f "haproxy -f /root/bench/conf/haproxy.cfg" 2>/dev/null
-  local pids
+  local pids p
   pids=$(ss -lntupH 2>/dev/null | grep -E ":1844[3-5]" | grep -oP 'pid=\K[0-9]+' | sort -u)
   for p in $pids; do
-    tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -qE "pqc-bench.toml|bench/conf/haproxy.cfg" && kill "$p" 2>/dev/null
+    tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -qE "bench/conf/pqc-bench|bench/conf/haproxy" && kill "$p" 2>/dev/null
   done
   sleep 2
 }
@@ -54,8 +60,15 @@ one_run() {  # $1=port $2=alpn $3=path $4=conns $5=streams
   [ "$alpn" = "h2" ]  && extra=(--alpn-list=h2)
   [ "$alpn" = "h3" ]  && extra=(--alpn-list=h3)
 
-  taskset -c 6-11 timeout $((DUR + 30)) "$H2LOAD" "${extra[@]}" \
-      -c "$conns" -m "$streams" --duration="$DUR" --warm-up-time=2 \
+  # THREADS: h2load defaults to -t 1. Pinned to six cores it used one, and over
+  # HTTP/3 that single core hit 99% against HAProxy while the server idled --
+  # so the h3 column was measuring the generator, not the proxy. h2load requires
+  # threads <= clients, so clamp to conns for the low-concurrency cells.
+  local threads=${GEN_THREADS:-6}
+  [ "$threads" -gt "$conns" ] && threads=$conns
+
+  taskset -c "$BENCH_GEN_CPUS" timeout $((DUR + 30)) "$H2LOAD" "${extra[@]}" \
+      -c "$conns" -m "$streams" -t "$threads" --duration="$DUR" --warm-up-time=2 \
       "https://bench.local:${port}${path}" 2>/dev/null
 }
 

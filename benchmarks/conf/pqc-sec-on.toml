@@ -8,7 +8,7 @@
 version = 1
 
 [server]
-bind_address = "127.0.0.1"
+bind_address = "10.99.0.1"
 udp_port = 18444
 # One physical core each (CPUs 4-5 are SMT siblings), two workers each, matched
 # to HAProxy nbthread 2. The backend needs two physical cores of its own: on one
@@ -53,25 +53,49 @@ max_connections = 20000
 
 [[routes]]
 name = "all"
-host = "bench.local"
+host = "bench-sec.local"
 path_prefix = "/"
 backend = "static"
 
 [waf]
-enabled = false
-
+enabled = true
+mode = "block"
+scan_json_body = true
 [fingerprint]
-enabled = false
-
+enabled = true
+tls_layer_capture = true
+block_scanners = true
 [rate_limiting]
-enabled = false
-
+enabled = true
+# Far above the offered load: the cost under test is evaluating a request, and a
+# run that trips the limiter measures the rejection path instead.
+requests_per_second = 4000000
+burst_size = 2000000
+connection_rate_limit = true
+connections_per_second = 1000000
 [advanced_rate_limiting]
-enabled = false
+enabled = true
 
+[advanced_rate_limiting.global_limits]
+requests_per_second = 4000000
+burst_size = 2000000
+
+[advanced_rate_limiting.global_limits.per_ip]
+requests_per_second = 4000000
+burst_size = 2000000
+requests_per_minute = 240000000
+requests_per_hour = 4000000000
+
+[advanced_rate_limiting.global_limits.per_fingerprint]
+requests_per_second = 4000000
+burst_size = 2000000
+requests_per_minute = 240000000
+requests_per_hour = 4000000000
 [security]
-dos_protection = false
-
+dos_protection = true
+# The generator is one IP holding a hundred connections; the default cap of 100
+# sits exactly on that edge.
+max_connections_per_ip = 60000
 [logging]
 level = "error"
 access_log = false
@@ -112,3 +136,21 @@ idle_timeout_secs = 90
 max_idle_per_host = 500
 max_connections_per_host = 20000
 acquire_timeout_ms = 5000
+
+[http3]
+# OFF for the like-for-like run. These default to on, and each is per-request
+# work HAProxy is not doing: coalescing takes a DashMap lookup and possible
+# subscriber registration on every GET, early hints builds and writes a 103
+# before the real response, priority hints parses and emits a Priority header.
+# They are real features and the default is defensible — but a run that leaves
+# them on while HAProxy does plain proxying is not the like-for-like comparison
+# it claims to be. conf/pqc-bench-features.toml keeps them on for the second
+# arm, which is the number anyone actually deploying this should read.
+early_hints_enabled = false
+priority_hints_enabled = false
+coalescing_enabled = false
+preconnect_origins = []
+
+[headers]
+# Same reasoning: Server-Timing instruments every request and emits a header.
+server_timing_enabled = false

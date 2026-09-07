@@ -50,9 +50,9 @@ for proxy in haproxy pqc; do
   port=18443; [ "$proxy" = pqc ] && port=18444
   stop_bench_proxies
   if [ "$proxy" = haproxy ]; then
-    setsid taskset -c 2-5 haproxy -f /root/bench/conf/haproxy.cfg -db </dev/null >/dev/null 2>&1 &
+    setsid taskset -c "$BENCH_PROXY_CPUS" haproxy -f "${HAPROXY_CFG:-/root/bench/conf/haproxy.cfg}" -db </dev/null >/dev/null 2>&1 &
   else
-    setsid taskset -c 2-5 /root/bench/pqcrypta-proxy --config /root/bench/conf/pqc-bench.toml </dev/null >/dev/null 2>&1 &
+    setsid taskset -c "$BENCH_PROXY_CPUS" /root/bench/pqcrypta-proxy --config /root/bench/conf/pqc-bench.toml </dev/null >/dev/null 2>&1 &
   fi
   sleep 6
 
@@ -65,7 +65,7 @@ for proxy in haproxy pqc; do
     fi
     for rep in $(seq 1 "$REPS"); do
       raw="$OUT/${proxy}_${curve}_r${rep}.txt"
-      taskset -c 6-11 timeout 90 "$H2LOAD" --h1 --groups="$curve" \
+      taskset -c "$BENCH_GEN_CPUS" timeout 90 "$H2LOAD" --h1 --groups="$curve" \
           -c "$CONNS" -n "$CONNS" -m 1 "https://bench.local:${port}/empty" \
           > "$raw" 2>/dev/null
       # "time for connect:  min  max  mean  sd  +/- sd" — mean is field 4.
