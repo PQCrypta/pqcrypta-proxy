@@ -3,9 +3,13 @@
 // cast_precision_loss, wildcard_imports) have been removed from this allow-list
 // and are now enforced crate-wide.  Any remaining suppressions below apply only
 // to style/pedantic lints that do not have security implications.
-#![deny(dead_code)]
-#![deny(unused_variables)]
-#![deny(unused_imports)]
+// These three are relaxed only for the measurement-only `bench-no-middleware`
+// build, which removes the middleware chain and so leaves its functions, imports
+// and the `MaybeFingerprint::With` variant unreferenced. Every shipping build —
+// anything without that feature — keeps all four denies in force.
+#![cfg_attr(not(feature = "bench-no-middleware"), deny(dead_code))]
+#![cfg_attr(not(feature = "bench-no-middleware"), deny(unused_variables))]
+#![cfg_attr(not(feature = "bench-no-middleware"), deny(unused_imports))]
 #![deny(unused_mut)]
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::missing_errors_doc)]

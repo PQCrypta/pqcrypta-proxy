@@ -22,6 +22,10 @@ metrics = ["prometheus"]
 # Count allocations, for answering "how many per request" rather than inferring
 # it from a profile's allocator share. Diagnostic only; never in a release build.
 count-allocs = []
+# MEASUREMENT ONLY: collapse the middleware chain to nothing, to price the
+# layering. Produces a binary with no security evaluator and no rate limiting.
+# Never ship it.
+bench-no-middleware = []
 # Admin HTTP API for health, reload, shutdown
 admin-api = ["tower-http"]
 # ACME certificate automation (works with any ACME CA: Let's Encrypt, ZeroSSL, Buypass, etc.)

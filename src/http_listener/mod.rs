@@ -306,49 +306,75 @@ fn build_proxy_service(
 > + Clone
        + Send
        + 'static {
-    // Cache is innermost: it stores pre-compression bodies, so every outer layer
-    // applies to hits and misses alike.
-    let svc = wrap(
-        middleware::from_fn_with_state(response_cache, cache_middleware),
-        ProxyDispatch {
+    // MEASUREMENT ONLY: collapse the chain so the cost of the layering itself — a
+    // boxed future and a clone per layer per request — can be measured instead of
+    // inferred from a profile's share. NOT deployable: it removes the security
+    // evaluator, both rate limiters, the response cache, and every response header
+    // the chain adds. Never built by scripts/deploy.sh.
+    #[cfg(feature = "bench-no-middleware")]
+    let svc = {
+        let _ = (
+            &response_cache,
+            &compression_state,
+            &http3_features_state,
+            &security_state,
+            &fingerprint_state,
+            &rl_state,
+        );
+        // The `With` variant is never constructed here, so name a type for it.
+        MaybeFingerprint::<ProxyDispatch, ProxyDispatch>::Without(ProxyDispatch {
             state: state.clone(),
-        },
-    );
-    let svc = wrap(
-        middleware::from_fn_with_state(state.clone(), security_headers_middleware),
-        svc,
-    );
-    let svc = wrap(
-        middleware::from_fn_with_state(state, alt_svc_middleware),
-        svc,
-    );
-    let svc = wrap(
-        middleware::from_fn_with_state(compression_state, compression_middleware),
-        svc,
-    );
-    let svc = wrap(
-        middleware::from_fn_with_state(http3_features_state, http3_features_middleware),
-        svc,
-    );
-    // Arc: axum clones the layer's state per request, and this one holds 19 Arcs
-    // of its own.
-    let svc = wrap(
-        middleware::from_fn_with_state(security_state, security_middleware),
-        svc,
-    );
-
-    let svc = match fingerprint_state {
-        Some(fp_state) => MaybeFingerprint::With(wrap(
-            middleware::from_fn_with_state(fp_state, fingerprint_middleware),
-            svc,
-        )),
-        None => MaybeFingerprint::Without(svc),
+        })
     };
 
-    let svc = wrap(
-        middleware::from_fn_with_state(rl_state, advanced_rate_limit_middleware),
-        svc,
-    );
+    #[cfg(not(feature = "bench-no-middleware"))]
+    let svc = {
+        // Cache is innermost: it stores pre-compression bodies, so every outer layer
+        // applies to hits and misses alike.
+        let svc = wrap(
+            middleware::from_fn_with_state(response_cache, cache_middleware),
+            ProxyDispatch {
+                state: state.clone(),
+            },
+        );
+        let svc = wrap(
+            middleware::from_fn_with_state(state.clone(), security_headers_middleware),
+            svc,
+        );
+        let svc = wrap(
+            middleware::from_fn_with_state(state, alt_svc_middleware),
+            svc,
+        );
+        let svc = wrap(
+            middleware::from_fn_with_state(compression_state, compression_middleware),
+            svc,
+        );
+        let svc = wrap(
+            middleware::from_fn_with_state(http3_features_state, http3_features_middleware),
+            svc,
+        );
+        // Arc: axum clones the layer's state per request, and this one holds 19 Arcs
+        // of its own.
+        let svc = wrap(
+            middleware::from_fn_with_state(security_state, security_middleware),
+            svc,
+        );
+
+        let svc = match fingerprint_state {
+            Some(fp_state) => MaybeFingerprint::With(wrap(
+                middleware::from_fn_with_state(fp_state, fingerprint_middleware),
+                svc,
+            )),
+            None => MaybeFingerprint::Without(svc),
+        };
+
+        let svc = wrap(
+            middleware::from_fn_with_state(rl_state, advanced_rate_limit_middleware),
+            svc,
+        );
+        svc
+    };
+
     // Trace context is the absolute outermost layer so the trace ID is available
     // to every inner middleware and to the access logger.
     wrap(middleware::from_fn(trace_context_middleware), svc)
