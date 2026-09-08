@@ -32,6 +32,14 @@ use super::HttpListenerState;
 ///
 /// When OTEL is disabled (default NOOP provider) this middleware is a no-op.
 pub(super) async fn trace_context_middleware(request: Request<Body>, next: Next) -> Response {
+    // MEASUREMENT ONLY: the layer stays in the chain and pays every bit of the
+    // plumbing — the boxed future, the per-request clone, the `Next` indirection —
+    // but does none of its own work. Subtracting this from the full build gives
+    // the work; subtracting the no-chain build from this gives the plumbing.
+    #[cfg(feature = "bench-null-middleware")]
+    {
+        return next.run(request).await;
+    }
     use tracing::Instrument;
 
     let span = tracing::info_span!(
@@ -67,6 +75,14 @@ pub(super) async fn alt_svc_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    // MEASUREMENT ONLY: the layer stays in the chain and pays every bit of the
+    // plumbing — the boxed future, the per-request clone, the `Next` indirection —
+    // but does none of its own work. Subtracting this from the full build gives
+    // the work; subtracting the no-chain build from this gives the plumbing.
+    #[cfg(feature = "bench-null-middleware")]
+    {
+        return next.run(request).await;
+    }
     // HTTP/2 uses the :authority pseudo-header which hyper surfaces via URI,
     // not the Host header. Fall back to URI host so both HTTP/1.1 and HTTP/2
     // requests are checked correctly.
@@ -206,6 +222,14 @@ pub(super) async fn security_headers_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    // MEASUREMENT ONLY: the layer stays in the chain and pays every bit of the
+    // plumbing — the boxed future, the per-request clone, the `Next` indirection —
+    // but does none of its own work. Subtracting this from the full build gives
+    // the work; subtracting the no-chain build from this gives the plumbing.
+    #[cfg(feature = "bench-null-middleware")]
+    {
+        return next.run(request).await;
+    }
     // Track request timing for Server-Timing header
     let start_time = std::time::Instant::now();
 
@@ -407,6 +431,14 @@ pub(super) async fn advanced_rate_limit_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    // MEASUREMENT ONLY: the layer stays in the chain and pays every bit of the
+    // plumbing — the boxed future, the per-request clone, the `Next` indirection —
+    // but does none of its own work. Subtracting this from the full build gives
+    // the work; subtracting the no-chain build from this gives the plumbing.
+    #[cfg(feature = "bench-null-middleware")]
+    {
+        return next.run(request).await;
+    }
     let method = request.method().as_str().to_string();
     let path = request.uri().path().to_ascii_lowercase();
 

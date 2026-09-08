@@ -26,6 +26,11 @@ count-allocs = []
 # layering. Produces a binary with no security evaluator and no rate limiting.
 # Never ship it.
 bench-no-middleware = []
+# MEASUREMENT ONLY: keep all eight layers in the chain, paying the boxed future,
+# the per-request clone and the `Next` indirection, but make each do no work.
+# Isolates the plumbing from the work. Produces a binary with no security
+# evaluator and no rate limiting. Never ship it.
+bench-null-middleware = []
 # Admin HTTP API for health, reload, shutdown
 admin-api = ["tower-http"]
 # ACME certificate automation (works with any ACME CA: Let's Encrypt, ZeroSSL, Buypass, etc.)

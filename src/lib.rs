@@ -7,10 +7,34 @@
 // build, which removes the middleware chain and so leaves its functions, imports
 // and the `MaybeFingerprint::With` variant unreferenced. Every shipping build —
 // anything without that feature — keeps all four denies in force.
-#![cfg_attr(not(feature = "bench-no-middleware"), deny(dead_code))]
-#![cfg_attr(not(feature = "bench-no-middleware"), deny(unused_variables))]
-#![cfg_attr(not(feature = "bench-no-middleware"), deny(unused_imports))]
-#![deny(unused_mut)]
+#![cfg_attr(
+    all(
+        not(feature = "bench-no-middleware"),
+        not(feature = "bench-null-middleware")
+    ),
+    deny(dead_code)
+)]
+#![cfg_attr(
+    all(
+        not(feature = "bench-no-middleware"),
+        not(feature = "bench-null-middleware")
+    ),
+    deny(unused_variables)
+)]
+#![cfg_attr(
+    all(
+        not(feature = "bench-no-middleware"),
+        not(feature = "bench-null-middleware")
+    ),
+    deny(unused_imports)
+)]
+#![cfg_attr(
+    all(
+        not(feature = "bench-no-middleware"),
+        not(feature = "bench-null-middleware")
+    ),
+    deny(unused_mut)
+)]
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_panics_doc)]

@@ -243,6 +243,14 @@ pub async fn compression_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    // MEASUREMENT ONLY: the layer stays in the chain and pays every bit of the
+    // plumbing — the boxed future, the per-request clone, the `Next` indirection —
+    // but does none of its own work. Subtracting this from the full build gives
+    // the work; subtracting the no-chain build from this gives the plumbing.
+    #[cfg(feature = "bench-null-middleware")]
+    {
+        return next.run(request).await;
+    }
     let config = &state.config;
 
     if !config.enabled {
