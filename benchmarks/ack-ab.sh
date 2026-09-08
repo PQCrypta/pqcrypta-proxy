@@ -23,7 +23,7 @@ H2LOAD=/opt/h3bench/bin/h2load
 A=${A:-/root/bench/pqcrypta-proxy}
 B=${B:-/root/bench/pqc-ackthresh0}
 ROUNDS=${ROUNDS:-3}
-DUR=${DUR:-8}
+DUR=${DUR:-$BENCH_DUR}
 
 cell() {  # $1=bin $2=streams -> "rps lat cpu"
   bench_stop_proxies
@@ -33,7 +33,7 @@ cell() {  # $1=bin $2=streams -> "rps lat cpu"
   [ -n "$pid" ] || { echo "- - -"; return; }
   c0=$(awk '{print $14+$15}' "/proc/$pid/stat"); t0=$(date +%s.%N)
   out=$(taskset -c "$BENCH_GEN_CPUS" timeout 60 "$H2LOAD" --alpn-list=h3 \
-        -c 10 -m "$2" -t 6 --duration="$DUR" --warm-up-time=2 \
+        -c 10 -m "$2" -t 6 --duration="$DUR" --warm-up-time="${WU:-$BENCH_WARMUP}" \
         "https://bench.local:18444/empty" 2>/dev/null)
   t1=$(date +%s.%N); c1=$(awk '{print $14+$15}' "/proc/$pid/stat")
   bench_stop_proxies

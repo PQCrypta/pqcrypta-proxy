@@ -20,7 +20,7 @@ H2LOAD=/opt/h3bench/bin/h2load
 A=${A:-/root/bench/pqc-mw-A}
 B=${B:-/root/bench/pqc-mw-B}
 ROUNDS=${ROUNDS:-4}
-DUR=${DUR:-10}
+DUR=${DUR:-$BENCH_DUR}
 
 hdr_bytes() {  # response header size, so the confound is quantified not assumed
   curl -sk -o /dev/null -D - "https://bench.local:18444/${BODY:-1k}" 2>/dev/null | wc -c
@@ -35,7 +35,7 @@ cell() {  # $1=bin -> "rps cpu hdrbytes"
   hb=$(hdr_bytes)
   c0=$(awk '{print $14+$15}' "/proc/$pid/stat"); t0=$(date +%s.%N)
   out=$(taskset -c "$BENCH_GEN_CPUS" timeout 60 "$H2LOAD" --h1 -c 10 -m 1 -t 6 \
-        --duration="$DUR" --warm-up-time=2 "https://bench.local:18444/${BODY:-1k}" 2>/dev/null)
+        --duration="$DUR" --warm-up-time="${WU:-$BENCH_WARMUP}" "https://bench.local:18444/${BODY:-1k}" 2>/dev/null)
   t1=$(date +%s.%N); c1=$(awk '{print $14+$15}' "/proc/$pid/stat")
   bench_stop_proxies
   echo "$out" | awk -v a="$c0" -v b="$c1" -v s="$t0" -v e="$t1" -v h="$hb" '

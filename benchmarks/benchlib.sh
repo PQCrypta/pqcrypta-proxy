@@ -37,6 +37,15 @@ bench_require_fds() {
 # actually hit are the generator's and the backend's, and both must stay several
 # times clear of whatever the proxy can drive -- a clipped generator or backend
 # understates whichever proxy is faster, which is the direction that flatters us.
+# ── 0b. How long to measure ──────────────────────────────────────────────
+# A 10s cell has cv ~14% here; 60s with a 15s warm-up has cv ~8%, and takes
+# HAProxy from ~7% to 1.4%. The short window measures a transient — the 10s
+# distribution is bimodal, mostly ~18k with jumps to ~25k, and the mode persists
+# for a whole 30s run. Anything that needs to resolve better than ~15% has to use
+# the long window; a full matrix pass then costs ~2 hours instead of ~22 minutes.
+BENCH_DUR=${BENCH_DUR:-60}
+BENCH_WARMUP=${BENCH_WARMUP:-15}
+
 BENCH_PROXY_CPUS=${BENCH_PROXY_CPUS:-4-5}
 BENCH_GEN_CPUS=${BENCH_GEN_CPUS:-6-11}
 
@@ -66,7 +75,32 @@ bench_spawn_proxy() {  # $1=binary $2=config $3...=extra args
     # on an unrecognised argument, which reads as "proxy did not start".
     setsid taskset -c "$BENCH_PROXY_CPUS" "$bin" --config "$cfg" "$@" \
         </dev/null >/dev/null 2>&1 9>&- &
-    sleep 6
+
+    # Assert that the process now listening is the one just started. Without
+    # this, a failed bind leaves the PREVIOUS binary serving and the run measures
+    # it under the new binary's name.
+    local waited=0 pid cmd
+    while :; do
+        pid=$(ss -lntupH 2>/dev/null | grep -E ":1844[3-5]" \
+              | grep -oP 'pid=\K[0-9]+' | sort -u | head -1)
+        if [ -n "$pid" ]; then
+            cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+            case "$cmd" in
+                *"$bin"*) break ;;
+                *)
+                    echo "FATAL: :1844x is served by '$cmd', not '$bin'" >&2
+                    echo "       a stale proxy survived; the run would measure the wrong binary" >&2
+                    exit 1
+                    ;;
+            esac
+        fi
+        waited=$((waited + 1))
+        if [ "$waited" -gt 20 ]; then
+            echo "FATAL: $bin never bound :1844x" >&2
+            exit 1
+        fi
+        sleep 1
+    done
 }
 
 # ── 4. Kill only what this harness started ───────────────────────────────
@@ -90,7 +124,27 @@ bench_stop_proxies() {
     for h in $(ps -eo pid,cmd --no-headers | awk '/\/opt\/h3bench\/bin\/h2load/ {print $1}'); do
         kill -9 "$h" 2>/dev/null
     done
-    sleep 2
+
+    # Wait for the socket to actually go, rather than sleeping and hoping. A
+    # fixed sleep was long enough for 10s cells and not for 60s ones, and the
+    # symptom was the NEXT proxy failing to bind while the old one kept serving —
+    # so every arm of an A/B measured the first binary and the comparison read
+    # 1.00x. Escalate to SIGKILL, then fail loudly rather than measure a lie.
+    local waited=0
+    while ss -lntupH 2>/dev/null | grep -qE ":1844[3-5]"; do
+        waited=$((waited + 1))
+        if [ "$waited" -eq 10 ]; then
+            for p in $(ss -lntupH 2>/dev/null | grep -E ":1844[3-5]" \
+                       | grep -oP 'pid=\K[0-9]+' | sort -u); do
+                kill -9 "$p" 2>/dev/null
+            done
+        fi
+        if [ "$waited" -gt 20 ]; then
+            echo "FATAL: :1844x still bound after 20s; refusing to start another proxy" >&2
+            exit 1
+        fi
+        sleep 1
+    done
 }
 
 # ── 5. A generated config must not silently lose sections ────────────────

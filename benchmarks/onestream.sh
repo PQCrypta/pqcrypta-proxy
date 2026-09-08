@@ -12,7 +12,7 @@ cell() {  # $1=label $2=port $3=alpn
   pid=$(ss -lntupH 2>/dev/null | grep ":$2" | grep -oP 'pid=\K[0-9]+' | head -1)
   c0=$(awk '{print $14+$15}' "/proc/$pid/stat"); t0=$(date +%s.%N)
   out=$(taskset -c "$BENCH_GEN_CPUS" timeout 40 "$H2LOAD" $3 -c 10 -m 1 -t 6 \
-        --duration=10 --warm-up-time=2 "https://bench.local:$2/1k" 2>/dev/null)
+        --duration=10 --warm-up-time="${WU:-$BENCH_WARMUP}" "https://bench.local:$2/1k" 2>/dev/null)
   t1=$(date +%s.%N); c1=$(awk '{print $14+$15}' "/proc/$pid/stat")
   echo "$out" | awk -v l="$1" -v a="$c0" -v b="$c1" -v s="$t0" -v e="$t1" '
     /^finished in/ { rps=$4 }
@@ -24,6 +24,8 @@ bench_stop_proxies
 setsid taskset -c "$BENCH_PROXY_CPUS" haproxy -f /root/bench/conf/haproxy.cfg -db </dev/null >/dev/null 2>&1 9>&- &
 sleep 5
 cell "HAProxy, HTTP/3" 18443 --alpn-list=h3
+cell "HAProxy, HTTP/2" 18443 --alpn-list=h2
+cell "HAProxy, HTTP/1.1" 18443 --h1
 bench_stop_proxies
 
 bench_spawn_proxy /root/bench/pqcrypta-proxy /root/bench/conf/pqc-bench.toml
