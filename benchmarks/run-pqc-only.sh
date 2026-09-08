@@ -22,10 +22,17 @@ bench_guard_init
 export LD_LIBRARY_PATH=/opt/h3bench/lib
 H2LOAD=/opt/h3bench/bin/h2load
 OUT=/root/bench/out
+
+# Output path. Defaults to a timestamped name so no two runs share a file:
+# a fixed name is truncated by the next run, and anything copying it in the
+# meantime saves a partial file over the good one. Pass RESULTS explicitly to
+# put it where you want it.
+RESULTS=${RESULTS:-$OUT/results-pqc2-$(date +%Y%m%d_%H%M%S).csv}
 mkdir -p "$OUT/raw2"
 
 REPS=${REPS:-3}
-DUR=${DUR:-8}
+DUR=${DUR:-$BENCH_DUR}
+WU_PAD=${WU:-$BENCH_WARMUP}
 
 stop_bench_proxies() {
   local pids
@@ -50,7 +57,7 @@ stop_bench_proxies
 setsid taskset -c "$BENCH_PROXY_CPUS" /root/bench/pqcrypta-proxy --config "${CFG:-/root/bench/conf/pqc-bench-features.toml}" </dev/null >>"$OUT/pqc2.log" 2>&1 &
 sleep 6
 
-echo "proxy,protocol,body,conns,streams,rep,req_per_s,throughput,succeeded,failed,mean_latency,http_2xx" > "$OUT/results-pqc2.csv"
+echo "proxy,protocol,body,conns,streams,rep,req_per_s,throughput,succeeded,failed,mean_latency,http_2xx" > "$RESULTS"
 
 for alpn in "http/1.1" h2 h3; do
   for body in empty 1k 64k; do
@@ -65,11 +72,11 @@ for alpn in "http/1.1" h2 h3; do
         # generator or the features-cost figure compares two different rigs.
         threads=${GEN_THREADS:-6}
         [ "$threads" -gt "$conns" ] && threads=$conns
-        taskset -c "$BENCH_GEN_CPUS" timeout $((DUR + 30)) "$H2LOAD" "${extra[@]}" \
-            -c "$conns" -m "$streams" -t "$threads" --duration="$DUR" --warm-up-time=2 \
+        taskset -c "$BENCH_GEN_CPUS" timeout $((DUR + WU_PAD + 40)) "$H2LOAD" "${extra[@]}" \
+            -c "$conns" -m "$streams" -t "$threads" --duration="$DUR" --warm-up-time="${WU:-$BENCH_WARMUP}" \
             "https://bench.local:18444/$body" > "$raw" 2>/dev/null
         read -r rps bps ok fail lat ok2xx < <(parse < "$raw")
-        echo "pqc,$alpn,$body,$conns,$streams,$rep,$rps,$bps,$ok,$fail,$lat,$ok2xx" >> "$OUT/results-pqc2.csv"
+        echo "pqc,$alpn,$body,$conns,$streams,$rep,$rps,$bps,$ok,$fail,$lat,$ok2xx" >> "$RESULTS"
         printf "  pqc2 %-8s %-5s c=%-4s r%s  %11s req/s  %10s  lat=%-9s 2xx=%-8s fail=%s\n" \
           "$alpn" "$body" "$conns" "$rep" "$rps" "$bps" "$lat" "$ok2xx" "$fail"
       done
@@ -78,4 +85,19 @@ for alpn in "http/1.1" h2 h3; do
 done
 
 stop_bench_proxies
-echo "=== done: $OUT/results-pqc2.csv ==="
+# Row count, asserted rather than assumed. A short file means the run died, or
+# something truncated it — analysing one silently produces a plausible table from
+# half the data. chmod is not a guard here: this runs as root, and root ignores
+# the permission bits.
+expected=$((3 * 3 * 2 * REPS))
+got=$(( $(grep -c . "$RESULTS") - 1 ))
+if [ "$got" -ne "$expected" ]; then
+    echo "FATAL: $RESULTS has $got rows, expected $expected" >&2
+    echo "       the run did not finish, or the file was overwritten" >&2
+    exit 1
+fi
+echo "rows: $got (as expected)"
+
+# A hint to anyone reading, not a guard — see above.
+chmod 444 "$RESULTS" 2>/dev/null
+echo "=== done: $RESULTS ==="

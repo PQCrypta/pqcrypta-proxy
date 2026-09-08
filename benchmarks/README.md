@@ -193,6 +193,22 @@ sample must never invent — `ressample.py` matches the backend by its config
    asserts that the process listening is the binary it just started and aborts
    naming both if not.
 
+10. **No run writes a shared, reusable path.** Every runner took its output file
+    name as a constant — `out/results.csv`, `out/results-pqc2.csv` — and the
+    caller copied it somewhere durable afterwards. That leaves a window: the next
+    run truncates the fixed name, and anything copying it in the meantime saves a
+    partial file *over* the good one. It happened twice in one session to the same
+    file, and both times the data survived only because the runner's log happened
+    to contain every cell.
+
+    Output paths are now a parameter (`RESULTS`, `RESULTS_DIR`) with a timestamped
+    default, so two runs cannot collide and there is no live file worth copying;
+    the callers write straight into the results directory and copy nothing. Each
+    runner then **asserts its own row count** and fails if the file is short,
+    because a truncated CSV analyses cleanly and produces a plausible table from
+    half the data. Note that `chmod 444` on a finished file is a hint and not a
+    guard: this harness runs as root, and root ignores the permission bits.
+
 ## Measurement-only builds
 
 Three cargo features exist to answer questions a profile cannot. None is ever

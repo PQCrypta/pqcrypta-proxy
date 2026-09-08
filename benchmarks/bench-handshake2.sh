@@ -21,6 +21,11 @@ bench_guard_init
 export LD_LIBRARY_PATH=/opt/h3bench/lib
 H2LOAD=/opt/h3bench/bin/h2load
 OUT=/root/bench/out/handshake
+
+# Output path, timestamped by default: a fixed name is a file the next run
+# truncates, and a caller copying it mid-run saves a partial over the good one.
+RESULTS=${RESULTS:-$OUT/results-$(date +%Y%m%d_%H%M%S).csv}
+mkdir -p "$(dirname "$RESULTS")"
 mkdir -p "$OUT"
 
 CONNS=${CONNS:-200}
@@ -44,7 +49,7 @@ negotiated() {  # $1=port $2=curve
     | sed -E 's/.*group: *//; s/Peer Temp Key: *//'
 }
 
-echo "proxy,curve,rep,mean_connect_us,handshakes_per_sec,negotiated" > "$OUT/results.csv"
+echo "proxy,curve,rep,mean_connect_us,handshakes_per_sec,negotiated" > "$RESULTS"
 
 for proxy in haproxy pqc; do
   port=18443; [ "$proxy" = pqc ] && port=18444
@@ -60,7 +65,7 @@ for proxy in haproxy pqc; do
     grp=$(negotiated "$port" "$curve")
     if [ -z "$grp" ]; then
       printf "  %-8s %-16s NOT NEGOTIABLE — skipped\n" "$proxy" "$curve"
-      echo "$proxy,$curve,-,-,-,not-negotiable" >> "$OUT/results.csv"
+      echo "$proxy,$curve,-,-,-,not-negotiable" >> "$RESULTS"
       continue
     fi
     for rep in $(seq 1 "$REPS"); do
@@ -77,7 +82,7 @@ for proxy in haproxy pqc; do
           else if (v ~ /s$/)  { sub(/s$/,"",v);  us=v*1000000 }
           printf "%.0f %.0f\n", us, (us>0 ? 1000000/us : 0)
         }' "$raw")
-      echo "$proxy,$curve,$rep,${conn_us:-0},${hps:-0},$grp" >> "$OUT/results.csv"
+      echo "$proxy,$curve,$rep,${conn_us:-0},${hps:-0},$grp" >> "$RESULTS"
       printf "  %-8s %-16s r%s  connect=%6s us  =%7s handshakes/s/conn   negotiated=%s\n" \
         "$proxy" "$curve" "$rep" "${conn_us:-?}" "${hps:-?}" "$grp"
     done
@@ -85,4 +90,5 @@ for proxy in haproxy pqc; do
 done
 
 stop_bench_proxies
-echo "=== $OUT/results.csv ==="
+chmod 444 "$RESULTS" 2>/dev/null
+echo "=== $RESULTS ==="

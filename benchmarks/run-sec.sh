@@ -22,6 +22,11 @@ bench_guard_init
 export LD_LIBRARY_PATH=/opt/h3bench/lib
 H2LOAD=/opt/h3bench/bin/h2load
 OUT=/root/bench/out
+
+# Where the two arms land. Timestamped by default for the same reason as the
+# other runners: a fixed name is a file the next run will truncate.
+RESULTS_DIR=${RESULTS_DIR:-$OUT/sec-$(date +%Y%m%d_%H%M%S)}
+mkdir -p "$RESULTS_DIR"
 BIN=${BIN:-/root/bench/pqcrypta-proxy}
 
 # A browser UA, because waf.block_scanner_uas is on and correctly rejects a
@@ -29,7 +34,8 @@ BIN=${BIN:-/root/bench/pqcrypta-proxy}
 # it costs; the request simply is not one it should reject.
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 REPS=${REPS:-3}
-DUR=${DUR:-10}
+DUR=${DUR:-$BENCH_DUR}
+WU_PAD=${WU:-$BENCH_WARMUP}
 
 # Preflight: prove the security path is live in one arm and not the other before
 # spending an hour measuring the difference between them. An arm that silently
@@ -89,7 +95,7 @@ preflight /root/bench/conf/pqc-sec-on.toml  403
 
 for arm in off on; do
   cfg=/root/bench/conf/pqc-sec-$arm.toml
-  csv="$OUT/results-sec-$arm.csv"
+  csv="$RESULTS_DIR/results-sec-$arm.csv"
   mkdir -p "$OUT/raw-sec-$arm"
   bench_stop_proxies
   bench_spawn_proxy "$BIN" "$cfg"
@@ -105,9 +111,9 @@ for arm in off on; do
           threads=${GEN_THREADS:-6}
           [ "$threads" -gt "$conns" ] && threads=$conns
           raw="$OUT/raw-sec-$arm/pqc_${alpn//\//-}_${body}_c${conns}_r${rep}.txt"
-          taskset -c "$BENCH_GEN_CPUS" timeout $((DUR + 30)) "$H2LOAD" "${extra[@]}" \
+          taskset -c "$BENCH_GEN_CPUS" timeout $((DUR + WU_PAD + 40)) "$H2LOAD" "${extra[@]}" \
               -H "user-agent: $UA" \
-              -c "$conns" -m "$streams" -t "$threads" --duration="$DUR" --warm-up-time=2 \
+              -c "$conns" -m "$streams" -t "$threads" --duration="$DUR" --warm-up-time="${WU:-$BENCH_WARMUP}" \
               "https://bench-sec.local:18444/$body" > "$raw" 2>/dev/null
           read -r rps bps ok fail lat ok2xx c4xx < <(parse < "$raw")
           echo "pqc,$alpn,$body,$conns,$streams,$rep,$rps,$bps,$ok,$fail,$lat,$ok2xx,$c4xx" >> "$csv"
@@ -118,5 +124,6 @@ for arm in off on; do
     done
   done
   bench_stop_proxies
+  chmod 444 "$csv" 2>/dev/null
   echo "=== done: $csv ==="
 done

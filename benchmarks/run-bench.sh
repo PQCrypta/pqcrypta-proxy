@@ -24,10 +24,17 @@ HAPROXY_CFG=${HAPROXY_CFG:-/root/bench/conf/haproxy.cfg}
 export LD_LIBRARY_PATH=/opt/h3bench/lib
 H2LOAD=/opt/h3bench/bin/h2load
 OUT=/root/bench/out
+
+# Output path. Defaults to a timestamped name so no two runs share a file:
+# a fixed name is truncated by the next run, and anything copying it in the
+# meantime saves a partial file over the good one. Pass RESULTS explicitly to
+# put it where you want it.
+RESULTS=${RESULTS:-$OUT/results-$(date +%Y%m%d_%H%M%S).csv}
 mkdir -p "$OUT/raw"
 
 REPS=${REPS:-3}
-DUR=${DUR:-10}
+DUR=${DUR:-$BENCH_DUR}
+WU_PAD=${WU:-$BENCH_WARMUP}
 
 start_proxy() {  # $1 = haproxy|pqc
   stop_proxies
@@ -67,8 +74,8 @@ one_run() {  # $1=port $2=alpn $3=path $4=conns $5=streams
   local threads=${GEN_THREADS:-6}
   [ "$threads" -gt "$conns" ] && threads=$conns
 
-  taskset -c "$BENCH_GEN_CPUS" timeout $((DUR + 30)) "$H2LOAD" "${extra[@]}" \
-      -c "$conns" -m "$streams" -t "$threads" --duration="$DUR" --warm-up-time=2 \
+  taskset -c "$BENCH_GEN_CPUS" timeout $((DUR + WU_PAD + 40)) "$H2LOAD" "${extra[@]}" \
+      -c "$conns" -m "$streams" -t "$threads" --duration="$DUR" --warm-up-time="${WU:-$BENCH_WARMUP}" \
       "https://bench.local:${port}${path}" 2>/dev/null
 }
 
@@ -87,7 +94,7 @@ parse() {  # stdin = h2load output
   '
 }
 
-echo "proxy,protocol,body,conns,streams,rep,req_per_s,throughput,succeeded,failed,mean_latency,http_2xx" > "$OUT/results.csv"
+echo "proxy,protocol,body,conns,streams,rep,req_per_s,throughput,succeeded,failed,mean_latency,http_2xx" > "$RESULTS"
 
 for proxy in haproxy pqc; do
   port=18443; [ "$proxy" = pqc ] && port=18444
@@ -103,7 +110,7 @@ for proxy in haproxy pqc; do
           raw="$OUT/raw/${proxy}_${alpn//\//-}_${body}_c${conns}_r${rep}.txt"
           one_run "$port" "$alpn" "/$body" "$conns" "$streams" > "$raw"
           read -r rps bps ok fail lat ok2xx < <(parse < "$raw")
-          echo "$proxy,$alpn,$body,$conns,$streams,$rep,$rps,$bps,$ok,$fail,$lat,$ok2xx" >> "$OUT/results.csv"
+          echo "$proxy,$alpn,$body,$conns,$streams,$rep,$rps,$bps,$ok,$fail,$lat,$ok2xx" >> "$RESULTS"
           printf "  %-7s %-8s %-5s c=%-4s r%s  %11s req/s  %10s  lat=%-9s 2xx=%-8s fail=%s\n" \
             "$proxy" "$alpn" "$body" "$conns" "$rep" "$rps" "$bps" "$lat" "$ok2xx" "$fail"
         done
@@ -114,4 +121,19 @@ for proxy in haproxy pqc; do
 done
 
 echo
-echo "=== raw CSV at $OUT/results.csv ==="
+# Row count, asserted rather than assumed. A short file means the run died, or
+# something truncated it — analysing one silently produces a plausible table from
+# half the data. chmod is not a guard here: this runs as root, and root ignores
+# the permission bits.
+expected=$((2 * 3 * 3 * 2 * REPS))
+got=$(( $(grep -c . "$RESULTS") - 1 ))
+if [ "$got" -ne "$expected" ]; then
+    echo "FATAL: $RESULTS has $got rows, expected $expected" >&2
+    echo "       the run did not finish, or the file was overwritten" >&2
+    exit 1
+fi
+echo "rows: $got (as expected)"
+
+# A hint to anyone reading, not a guard — see above.
+chmod 444 "$RESULTS" 2>/dev/null
+echo "=== raw CSV at $RESULTS ==="

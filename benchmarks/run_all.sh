@@ -20,27 +20,22 @@ SAMPLER=$!
 trap 'kill $SAMPLER 2>/dev/null' EXIT
 
 echo "########## backend ceiling  $(date -Is)"
-REPS=3 DUR=10 ./bench-backend.sh 2>&1
-cp "$OUT/backend-ceiling.csv" "$RES/" 2>/dev/null
+RESULTS="$RES/backend-ceiling.csv" REPS=3 ./bench-backend.sh 2>&1
 
 for run in 1 2; do
   echo "########## full matrix run $run  $(date -Is)"
-  REPS=3 DUR=10 ./run-bench.sh 2>&1
-  cp "$OUT/results.csv" "$RES/results-run$run.csv"
+  RESULTS="$RES/results-run$run.csv" REPS=3 ./run-bench.sh 2>&1
 done
 
 for run in 1 2; do
   echo "########## as-deployed run $run  $(date -Is)"
-  REPS=3 DUR=10 ./run-pqc-only.sh 2>&1
-  cp "$OUT/results-pqc2.csv" "$RES/results-depl$run.csv"
+  RESULTS="$RES/results-depl$run.csv" REPS=3 ./run-pqc-only.sh 2>&1
 done
 
 echo "########## security arms  $(date -Is)"
-REPS=3 DUR=10 ./run-sec.sh 2>&1
-cp "$OUT/results-sec-off.csv" "$OUT/results-sec-on.csv" "$RES/" 2>/dev/null
+RESULTS_DIR="$RES" REPS=3 ./run-sec.sh 2>&1
 
 echo "########## handshake  $(date -Is)"
-CONNS=200 REPS=3 ./bench-handshake2.sh 2>&1
-cp "$OUT/handshake/results.csv" "$RES/handshake.csv" 2>/dev/null
+RESULTS="$RES/handshake.csv" CONNS=200 REPS=3 ./bench-handshake2.sh 2>&1
 
 echo "########## done $(date -Is)  -> $RES"
