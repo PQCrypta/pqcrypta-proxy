@@ -36,6 +36,12 @@ pub async fn run_tls_passthrough_server(
     loop {
         let (stream, client_addr) = listener.accept().await?;
         let client_addr = crate::security::canonical_addr(client_addr);
+
+        // Passthrough shovels bytes in both directions, so Nagle here just adds
+        // a delayed-ACK wait to whatever the tunnelled protocol does.
+        if let Err(e) = stream.set_nodelay(true) {
+            warn!("Failed to set TCP_NODELAY on {}: {}", client_addr, e);
+        }
         let config = config.clone();
 
         tokio::spawn(async move {
@@ -99,6 +105,10 @@ async fn handle_passthrough_connection(
     .await
     .map_err(|_| "Backend connection timeout")?
     .map_err(|e| format!("Backend connection failed: {}", e))?;
+
+    if let Err(e) = backend_stream.set_nodelay(true) {
+        warn!("Failed to set TCP_NODELAY on {}: {}", route.backend, e);
+    }
 
     // Send PROXY protocol v2 header if enabled (before stream split)
     if route.proxy_protocol {

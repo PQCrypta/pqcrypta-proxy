@@ -296,6 +296,26 @@ impl<S: AsyncWrite> AsyncWrite for FingerprintedTlsStream<S> {
         self.project().inner.poll_write(cx, buf)
     }
 
+    // Both of these must be forwarded, not left to the trait defaults.
+    // `AsyncWrite::poll_write_vectored` defaults to writing only the first
+    // buffer and `is_write_vectored` defaults to `false`, so a wrapper that
+    // omits them tells hyper the transport cannot do vectored I/O. hyper then
+    // writes an HTTP/2 HEADERS frame and its DATA frame as two separate
+    // segments instead of one, and with Nagle enabled on the accepted socket
+    // the small second write is held until the peer's delayed-ACK timer fires:
+    // a flat 40 ms added to every response on the fingerprinting path.
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.project().inner.poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.project().inner.poll_flush(cx)
     }

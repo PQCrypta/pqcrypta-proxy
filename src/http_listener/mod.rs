@@ -35,7 +35,8 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     Router,
 };
-use axum_server::tls_rustls::RustlsConfig;
+use axum_server::accept::NoDelayAcceptor;
+use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
 use hyper::upgrade::OnUpgrade;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
@@ -530,7 +531,10 @@ pub async fn run_http_listener(
     // SEC-A04: Hardcoded backend addresses removed from logs to prevent topology disclosure.
 
     // Run HTTPS server
-    axum_server::bind_rustls(addr, tls_config)
+    // Spelled out rather than `bind_rustls`, which composes the same acceptor
+    // over `DefaultAcceptor` and so leaves Nagle on every accepted socket.
+    axum_server::bind(addr)
+        .acceptor(RustlsAcceptor::new(tls_config).acceptor(NoDelayAcceptor))
         // Spelled out: `ServiceExt` is generic over the request type, and
         // hyper hands `axum_server` an `Incoming` body that only `BodyShim`
         // converts.
@@ -692,7 +696,7 @@ pub async fn run_http_listener_pqc(
     // - SecP384r1MLKEM1024 (higher security)
     // - X448MLKEM1024 (maximum security)
     // =========================================================================
-    use axum_server::tls_openssl::OpenSSLConfig;
+    use axum_server::tls_openssl::{OpenSSLAcceptor, OpenSSLConfig};
 
     // Create OpenSSL SSL acceptor with PQC hybrid key exchange + SNI multi-domain support.
     // `sni_map` is shared with the ACME handler so hot-reload works without restart.
@@ -739,7 +743,9 @@ pub async fn run_http_listener_pqc(
     // SEC-A04: Hardcoded backend addresses removed from logs to prevent topology disclosure.
 
     // Run HTTPS server with OpenSSL 3.5+ (PQC-enabled with native ML-KEM)
-    axum_server::bind_openssl(addr, openssl_config)
+    // Spelled out rather than `bind_openssl`, for the reason above.
+    axum_server::bind(addr)
+        .acceptor(OpenSSLAcceptor::new(openssl_config).acceptor(NoDelayAcceptor))
         // Spelled out: `ServiceExt` is generic over the request type, and
         // hyper hands `axum_server` an `Incoming` body that only `BodyShim`
         // converts.
@@ -1019,6 +1025,16 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
                         continue;
                     }
                 };
+
+                // Nagle has to go on a client-facing socket. A proxy writes a
+                // response and then waits, so a small write left buffered waits
+                // out the peer's delayed-ACK timer -- 40 ms, on every response
+                // whose last segment is short. `axum_server` covers the
+                // listeners it owns via `NoDelayAcceptor`; this accept loop is
+                // ours, so it has to do it here.
+                if let Err(e) = stream.set_nodelay(true) {
+                    warn!("Failed to set TCP_NODELAY on {}: {}", remote_addr, e);
+                }
 
                 // Clone resources for the spawned task
                 let acceptor = fingerprinting_acceptor.clone();
@@ -1431,6 +1447,16 @@ pub async fn run_http_listener_pqc_with_fingerprint(
                         continue;
                     }
                 };
+
+                // Nagle has to go on a client-facing socket. A proxy writes a
+                // response and then waits, so a small write left buffered waits
+                // out the peer's delayed-ACK timer -- 40 ms, on every response
+                // whose last segment is short. `axum_server` covers the
+                // listeners it owns via `NoDelayAcceptor`; this accept loop is
+                // ours, so it has to do it here.
+                if let Err(e) = stream.set_nodelay(true) {
+                    warn!("Failed to set TCP_NODELAY on {}: {}", remote_addr, e);
+                }
 
                 // Clone resources for spawned task
                 let ssl_ctx = ssl_context.clone();
