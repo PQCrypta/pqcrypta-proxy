@@ -28,9 +28,9 @@ of it and the same threaded generator:
 
 | body | c=10 | c=100 |
 |---|---|---|
-| empty | 268k req/s | 380k req/s |
-| 1 KB | 164k req/s | 277k req/s |
-| 64 KB | 57k req/s (3.5 GB/s) | 138k req/s (8.4 GB/s) |
+| empty | 240k req/s | 378k req/s |
+| 1 KB | 195k req/s | 278k req/s |
+| 64 KB | 55k req/s (3.3 GB/s) | 132k req/s (8.1 GB/s) |
 
 Re-measure this whenever the layout changes, and read it against what the
 proxies posted. It is not a formality: see guard 6.
@@ -56,7 +56,13 @@ pair is a figure about four HTTP/3 extras; label it that way.
   raised far above the offered load on purpose: the cost under test is
   *evaluating* a request, and a run that trips the limiter measures the
   rejection path instead. `run-sec.sh` refuses to start unless a SQLi probe
-  returns 403 on the on-arm and 200 on the off-arm.
+  returns 403 on the on-arm and 200 on the off-arm, a plain GET returns 200 on
+  both, **and** a five-second burst at a hundred connections returns zero 4xx on
+  both. That last check exists because two full arms were measured and thrown
+  away after a preflight of one request passed and the run then tripped a ban it
+  could never have reached — the connection rate limiter the first time, the
+  fingerprint suspicious-rate threshold the second. A guard that tests a
+  different workload from the one it guards is not a guard.
 
 Set up the interface once:
 
@@ -78,6 +84,9 @@ echo '10.99.0.1 bench-sec.local' >> /etc/hosts
 ./bench-routes.sh       # one config, one cell — for A/B on a code change
 ./bench-handshake2.sh   # TLS handshake cost, classical vs X25519MLKEM768
 ./repeat.sh A B 5       # interleaved A/B of two binaries
+./onestream.sh          # one in-flight stream per connection, all protocols
+./mw3.sh                # middleware arms, counterbalanced
+./spread-confirm.sh     # coefficient of variation, both proxies
 python3 pagefigs2.py out/res-<stamp>    # every figure the page publishes
 ```
 
@@ -153,6 +162,57 @@ reading them together:
 A filter that stops matching reports "idle", which is the one answer a resource
 sample must never invent — `ressample.py` matches the backend by its config
 *directory*, having once silently stopped matching when the filename changed.
+
+8. **A cell must be long enough to reach steady state.** Ten seconds is not.
+   Coefficient of variation over repeats of one unchanged cell: **~14 % at 10 s,
+   ~14 % at 30 s, ~5–8 % at 60 s** with a 15-second warm-up — and HAProxy's goes
+   from ~7 % to **1.4 %**. The short window measures a transient: the 10-second
+   distribution is bimodal, mostly ~18k req/s with jumps to ~25k, and the mode
+   persists for a whole 30-second run. It is a harness fix rather than a thumb on
+   the scale precisely because it improves HAProxy too — a duration that
+   stabilised only our own numbers would be the opposite. It also appears to
+   understate us: one 64 KB cell moves 18.0k → 19.9k req/s on the longer window.
+   `BENCH_DUR` / `BENCH_WARMUP` default to 60/15. Ruled out before landing on it:
+   the per-cell proxy restart (one instance serving every cell still spreads
+   1.40×) and tokio work-stealing/SMT (one worker pinned to one hyperthread only
+   moves cv 14.1 % → 10.3 %).
+
+   The cost is time. A full matrix pass is 108 measurements at 75 s, so ~2.5
+   hours, and two passes plus a backend ceiling is most of a day. Anything that
+   needs to resolve better than ~15 % has to pay it.
+
+9. **The proxy under test must be the one actually listening.**
+   `bench_stop_proxies` used to kill and sleep two seconds. At 60-second cells the
+   old proxy holds its socket longer than that, the next one fails to bind, and
+   **the old one keeps serving** — so every arm of an A/B measures the first
+   binary and the comparison reads 1.00×. That is the worst failure mode
+   available: it does not error, it agrees with you. Caught only because all three
+   arms of a three-way reported identical response-header bytes, which is possible
+   only if they were one process. The stop now waits for the socket to go,
+   escalates to `SIGKILL` at 10 s and aborts at 20 s; `bench_spawn_proxy` then
+   asserts that the process listening is the binary it just started and aborts
+   naming both if not.
+
+## Measurement-only builds
+
+Three cargo features exist to answer questions a profile cannot. None is ever
+built by `scripts/deploy.sh`, and each produces a binary that must not ship.
+
+- `count-allocs` — wraps the global allocator with counters. A profile gives the
+  allocator's *share* of CPU; this gives the *number*, and the two lead to
+  different work. Measured: **292 allocations and ~62 KB per request** to serve a
+  1 KB response, which cross-checks against the profile's 14.5 % allocator share.
+- `bench-no-middleware` — collapses the eight-layer chain to one pass-through
+  layer. Measured: the chain costs **26.5 µs/request at 64 KB (1.33×, rank
+  64/64)**, roughly twice our deficit to HAProxy at that body size.
+- `bench-null-middleware` — keeps every layer, and its boxed future and
+  per-request clone, but makes each do no work. Intended to split that 26.5 µs
+  into work and plumbing. **It does not resolve**: two runs gave 23.0/5.2 and
+  9.9/16.2 µs, inverting which half dominates.
+
+Measure the middleware arms at **64 KB**. Collapsing the chain also drops the 848
+response-header bytes those layers add, which is 40 % of a 1 KB response and 1 %
+of a 64 KB one; at 1 KB that confound alone reads as 1.50×.
 
 ## Measuring a code change
 
