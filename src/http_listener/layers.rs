@@ -199,19 +199,17 @@ pub(super) async fn alt_svc_middleware(
         response
             .headers_mut()
             .insert("alt-svc", HeaderValue::from_static("clear"));
-    } else {
-        let alt_svc_value = build_alt_svc_header(state.port, &state.config.server.additional_ports);
-        if let Ok(value) = HeaderValue::from_str(&alt_svc_value) {
-            response.headers_mut().insert("alt-svc", value);
-        }
+    } else if let Some(value) = state.alt_svc_value.clone() {
+        // Precomputed at startup: this value is a function of the listener port
+        // and the configured additional ports, neither of which changes while
+        // the listener runs. Cloning a `HeaderValue` bumps a refcount.
+        response.headers_mut().insert("alt-svc", value);
     }
 
     // Add WebTransport port header
-    response.headers_mut().insert(
-        "x-webtransport-port",
-        HeaderValue::from_str(&state.port.to_string())
-            .unwrap_or_else(|_| HeaderValue::from_static("443")),
-    );
+    response
+        .headers_mut()
+        .insert("x-webtransport-port", state.webtransport_port_value.clone());
 
     response
 }

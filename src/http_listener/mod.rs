@@ -96,6 +96,21 @@ use websocket::handle_websocket_tunnel;
 pub struct HttpListenerState {
     pub config: Arc<ProxyConfig>,
     pub port: u16,
+    /// `alt-svc` and `x-webtransport-port`, built once at startup.
+    ///
+    /// Both are a function of `port` and `config.server.additional_ports`, so
+    /// they cannot change while the listener is alive — but they were being
+    /// rebuilt on every single response: a `Vec`, one `format!` per advertised
+    /// port, a `join`, and then a `HeaderValue::from_str` to parse the result
+    /// back, plus a second `to_string` + parse for the port header. Cloning a
+    /// `HeaderValue` is a refcount bump on its backing `Bytes`, so holding the
+    /// finished values costs nothing per request.
+    ///
+    /// Note this is deliberately NOT `SecurityState::alt_svc_header`, which is
+    /// built from `config.server.udp_port`; this one advertises `port`, the
+    /// port this listener actually terminates.
+    pub alt_svc_value: Option<HeaderValue>,
+    pub webtransport_port_value: HeaderValue,
     // Behind `Arc` for the same reason as `security`: axum clones the state per
     // request, and hyper's `Client::clone` copies its config, its HTTP/1 and
     // HTTP/2 builders and its connector — real struct copies, not refcounts.
@@ -493,6 +508,13 @@ pub async fn run_http_listener(
         conformance: crate::conformance::shared(&config.conformance),
         config: config.clone(),
         port,
+        alt_svc_value: HeaderValue::from_str(&layers::build_alt_svc_header(
+            port,
+            &config.server.additional_ports,
+        ))
+        .ok(),
+        webtransport_port_value: HeaderValue::from_str(&port.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("443")),
         http_client: Arc::new(http_client),
         https_client: Arc::new(https_client),
         direct_client: Arc::new(direct_client),
@@ -665,6 +687,13 @@ pub async fn run_http_listener_pqc(
         conformance: crate::conformance::shared(&config.conformance),
         config: config.clone(),
         port,
+        alt_svc_value: HeaderValue::from_str(&layers::build_alt_svc_header(
+            port,
+            &config.server.additional_ports,
+        ))
+        .ok(),
+        webtransport_port_value: HeaderValue::from_str(&port.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("443")),
         http_client: Arc::new(http_client),
         https_client: Arc::new(https_client),
         direct_client: Arc::new(direct_client),
@@ -937,6 +966,13 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
         conformance: crate::conformance::shared(&config.conformance),
         config: config.clone(),
         port,
+        alt_svc_value: HeaderValue::from_str(&layers::build_alt_svc_header(
+            port,
+            &config.server.additional_ports,
+        ))
+        .ok(),
+        webtransport_port_value: HeaderValue::from_str(&port.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("443")),
         http_client: Arc::new(http_client),
         https_client: Arc::new(https_client),
         direct_client: Arc::new(direct_client),
@@ -1388,6 +1424,13 @@ pub async fn run_http_listener_pqc_with_fingerprint(
         conformance: crate::conformance::shared(&config.conformance),
         config: config.clone(),
         port,
+        alt_svc_value: HeaderValue::from_str(&layers::build_alt_svc_header(
+            port,
+            &config.server.additional_ports,
+        ))
+        .ok(),
+        webtransport_port_value: HeaderValue::from_str(&port.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("443")),
         http_client: Arc::new(http_client),
         https_client: Arc::new(https_client),
         direct_client: Arc::new(direct_client),
