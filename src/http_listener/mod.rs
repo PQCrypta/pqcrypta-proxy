@@ -35,7 +35,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     Router,
 };
-use axum_server::accept::NoDelayAcceptor;
+use axum_server::accept::Accept;
 use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
 use hyper::upgrade::OnUpgrade;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -176,6 +176,31 @@ impl tower::Service<Request<Body>> for ProxyDispatch {
 /// Route one request. `Host` and `ConnectInfo` were extractor arguments while
 /// this went through the Router; they are run by hand here so `proxy_handler`
 /// keeps its signature.
+/// An `axum_server` acceptor that applies `TCP_NODELAY` when the configuration
+/// asks for it.
+///
+/// `axum_server` ships `DefaultAcceptor` (never sets it) and `NoDelayAcceptor`
+/// (always sets it) as two distinct types, which would make the choice a branch
+/// over two different `Server` types at every call site. One type carrying the
+/// flag keeps that to a value.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ConfigurableNoDelay(pub(crate) bool);
+
+impl<S> Accept<tokio::net::TcpStream, S> for ConfigurableNoDelay {
+    type Stream = tokio::net::TcpStream;
+    type Service = S;
+    type Future = std::future::Ready<std::io::Result<(Self::Stream, Self::Service)>>;
+
+    fn accept(&self, stream: Self::Stream, service: S) -> Self::Future {
+        if self.0 {
+            if let Err(e) = stream.set_nodelay(true) {
+                warn!("Failed to set TCP_NODELAY on an accepted socket: {}", e);
+            }
+        }
+        std::future::ready(Ok((stream, service)))
+    }
+}
+
 async fn dispatch(state: Arc<HttpListenerState>, req: Request<Body>) -> Response {
     if req.uri().path() == TCP_UPLOAD_PATH {
         return match *req.method() {
@@ -397,6 +422,9 @@ pub async fn run_http_listener(
     // a further instance that served nobody. One instance, shared.
     security_state: SecurityState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Read once here: `config` is moved into builders further down in
+    // several of these functions.
+    let nodelay = config.server.tcp_nodelay;
     let port = addr.port();
 
     info!(
@@ -534,7 +562,7 @@ pub async fn run_http_listener(
     // Spelled out rather than `bind_rustls`, which composes the same acceptor
     // over `DefaultAcceptor` and so leaves Nagle on every accepted socket.
     axum_server::bind(addr)
-        .acceptor(RustlsAcceptor::new(tls_config).acceptor(NoDelayAcceptor))
+        .acceptor(RustlsAcceptor::new(tls_config).acceptor(ConfigurableNoDelay(nodelay)))
         // Spelled out: `ServiceExt` is generic over the request type, and
         // hyper hands `axum_server` an `Incoming` body that only `BodyShim`
         // converts.
@@ -567,6 +595,9 @@ pub async fn run_http_listener_pqc(
     // whichever listener happened to see it.
     security_state: SecurityState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Read once here: `config` is moved into builders further down in
+    // several of these functions.
+    let nodelay = config.server.tcp_nodelay;
     let port = addr.port();
 
     info!(
@@ -745,7 +776,7 @@ pub async fn run_http_listener_pqc(
     // Run HTTPS server with OpenSSL 3.5+ (PQC-enabled with native ML-KEM)
     // Spelled out rather than `bind_openssl`, for the reason above.
     axum_server::bind(addr)
-        .acceptor(OpenSSLAcceptor::new(openssl_config).acceptor(NoDelayAcceptor))
+        .acceptor(OpenSSLAcceptor::new(openssl_config).acceptor(ConfigurableNoDelay(nodelay)))
         // Spelled out: `ServiceExt` is generic over the request type, and
         // hyper hands `axum_server` an `Incoming` body that only `BodyShim`
         // converts.
@@ -834,6 +865,9 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
     // whichever listener happened to see it.
     security_state: SecurityState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Read once here: `config` is moved into builders further down in
+    // several of these functions.
+    let nodelay = config.server.tcp_nodelay;
     let mut shutdown_rx = shutdown_rx;
     let port = addr.port();
 
@@ -1032,8 +1066,10 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
                 // whose last segment is short. `axum_server` covers the
                 // listeners it owns via `NoDelayAcceptor`; this accept loop is
                 // ours, so it has to do it here.
-                if let Err(e) = stream.set_nodelay(true) {
-                    warn!("Failed to set TCP_NODELAY on {}: {}", remote_addr, e);
+                if nodelay {
+                    if let Err(e) = stream.set_nodelay(true) {
+                        warn!("Failed to set TCP_NODELAY on {}: {}", remote_addr, e);
+                    }
                 }
 
                 // Clone resources for the spawned task
@@ -1277,6 +1313,9 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     // whichever listener happened to see it.
     security_state: SecurityState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Read once here: `config` is moved into builders further down in
+    // several of these functions.
+    let nodelay = config.server.tcp_nodelay;
     let mut shutdown_rx = shutdown_rx;
     use openssl::ssl::SslContext;
 
@@ -1454,8 +1493,10 @@ pub async fn run_http_listener_pqc_with_fingerprint(
                 // whose last segment is short. `axum_server` covers the
                 // listeners it owns via `NoDelayAcceptor`; this accept loop is
                 // ours, so it has to do it here.
-                if let Err(e) = stream.set_nodelay(true) {
-                    warn!("Failed to set TCP_NODELAY on {}: {}", remote_addr, e);
+                if nodelay {
+                    if let Err(e) = stream.set_nodelay(true) {
+                        warn!("Failed to set TCP_NODELAY on {}: {}", remote_addr, e);
+                    }
                 }
 
                 // Clone resources for spawned task

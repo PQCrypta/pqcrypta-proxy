@@ -730,6 +730,24 @@ pub struct ServerConfig {
     #[serde(default = "default_ack_eliciting_threshold")]
     pub ack_eliciting_threshold: u64,
 
+    /// Set `TCP_NODELAY` on accepted client-facing sockets (default: true).
+    ///
+    /// With Nagle left on, the kernel refuses to put a short segment on the
+    /// wire while earlier data is unacknowledged. A proxy writes a response and
+    /// then waits, so the peer has nothing to piggyback an acknowledgement on
+    /// and its delayed-ACK timer — 40 ms on Linux — has to expire first. That
+    /// was measured here as a flat 41.7 ms on every HTTP/2 request at a 1 KB
+    /// body, and 41.9 ms at 64 KB with a single stream in flight.
+    ///
+    /// Disabling this restores Nagle's coalescing. Whether that buys measurable
+    /// throughput on large bodies is being measured and is NOT yet established
+    /// — a pooled matrix suggested it at 64 KB, inside the run-to-run spread,
+    /// which is a hypothesis rather than a result. The default stays `true`
+    /// regardless: a 40 ms per-request stall is not a trade worth making for
+    /// anything interactive.
+    #[serde(default = "default_tcp_nodelay")]
+    pub tcp_nodelay: bool,
+
     /// Enable QUIC Retry for explicit address validation (RFC 9000 §8.1.2).
     ///
     /// When enabled, a new connection whose source address has not yet been
@@ -901,6 +919,7 @@ impl Default for ServerConfig {
             enable_quic_migration: true,
             enable_ack_frequency: true,
             ack_eliciting_threshold: default_ack_eliciting_threshold(),
+            tcp_nodelay: default_tcp_nodelay(),
             enable_quic_retry: false,
             max_concurrent_multipath_paths: 4,
             webtransport_max_sessions_per_origin: 100,
@@ -924,6 +943,11 @@ fn default_max_uni_streams() -> u32 {
 /// [`ServerConfig::ack_eliciting_threshold`] for the measurement behind this.
 fn default_ack_eliciting_threshold() -> u64 {
     0
+}
+
+/// Nagle off on accepted sockets. See [`ServerConfig::tcp_nodelay`].
+fn default_tcp_nodelay() -> bool {
+    true
 }
 
 fn default_multipath_paths() -> u32 {

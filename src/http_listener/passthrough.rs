@@ -39,8 +39,10 @@ pub async fn run_tls_passthrough_server(
 
         // Passthrough shovels bytes in both directions, so Nagle here just adds
         // a delayed-ACK wait to whatever the tunnelled protocol does.
-        if let Err(e) = stream.set_nodelay(true) {
-            warn!("Failed to set TCP_NODELAY on {}: {}", client_addr, e);
+        if config.server.tcp_nodelay {
+            if let Err(e) = stream.set_nodelay(true) {
+                warn!("Failed to set TCP_NODELAY on {}: {}", client_addr, e);
+            }
         }
         let config = config.clone();
 
