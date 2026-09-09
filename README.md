@@ -1249,6 +1249,13 @@ x_quantum_resistant = "ML-KEM-1024, ML-DSA-87, X25519MLKEM768"
 x_security_level = "Post-Quantum Ready"
 ```
 
+This set is applied identically on HTTP/1.1, HTTP/2 and HTTP/3, and on cache hits
+as well as origin responses — the TCP listener applies it in an Axum layer, the
+HTTP/3 listener in `apply_response_policy_headers`. `content_security_policy` is
+the one header the origin can override: a CSP sent by the backend (typically one
+carrying per-request script nonces) is forwarded untouched, and the configured
+policy is injected only when the backend sent none.
+
 ### CORS Configuration
 
 ```toml
