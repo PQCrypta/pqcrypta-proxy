@@ -3262,7 +3262,12 @@ pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 
     );
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app.into_make_service()).await?;
+    // Unconditionally, unlike the proxy listeners' `server.tcp_nodelay`: this
+    // server answers redirects and ACME challenges, so there is never a stream
+    // for Nagle to coalesce and its only possible effect is a delayed-ACK wait.
+    axum::serve(listener, app.into_make_service())
+        .tcp_nodelay(true)
+        .await?;
 
     Ok(())
 }

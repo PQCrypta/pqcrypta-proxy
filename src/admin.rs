@@ -307,10 +307,13 @@ impl AdminServer {
         info!("Admin API listening on {}", addr);
         let listener = TcpListener::bind(addr).await?;
 
+        // Unconditionally: the admin API returns small JSON documents, so Nagle
+        // has nothing to coalesce here and can only add a delayed-ACK wait.
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .tcp_nodelay(true)
         .with_graceful_shutdown(async move {
             shutdown.await;
             info!("Admin API shutting down");
