@@ -1,6 +1,6 @@
 //! Response compression middleware
 //!
-//! Provides cutting-edge compression features:
+//! Provides:
 //! - Brotli compression (best ratio, 95%+ browser support)
 //! - Zstandard compression (fastest, gaining adoption)
 //! - Gzip compression (fallback for older clients)

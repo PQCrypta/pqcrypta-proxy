@@ -824,8 +824,7 @@ pub async fn run_http_listener_pqc(
 // ============================================================================
 // This implementation captures ClientHello before TLS handshake, extracts
 // JA3/JA4 fingerprints, and blocks malicious clients before they can waste
-// resources on a full handshake. This is the architecture used by Envoy,
-// HAProxy, and other enterprise proxies.
+// resources on a full handshake. Envoy and HAProxy use the same architecture.
 
 /// Run HTTP listener with custom TLS accept loop and full fingerprinting
 ///

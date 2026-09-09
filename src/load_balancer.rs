@@ -1,6 +1,6 @@
 //! Load balancer module for backend pool management
 //!
-//! Provides cutting-edge load balancing with:
+//! Provides:
 //! - Multiple algorithms (least_connections, round_robin, weighted, random, ip_hash, least_response_time)
 //! - Health-aware routing (skip unhealthy backends)
 //! - Session affinity (cookie-based and IP-based sticky sessions)

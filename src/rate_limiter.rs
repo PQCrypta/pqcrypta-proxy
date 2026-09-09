@@ -1,6 +1,6 @@
 //! Advanced Multi-Dimensional Rate Limiting Module
 //!
-//! Cutting-edge rate limiting inspired by industry leaders:
+//! Multi-dimensional rate limiting, with the approach of each borrowed from:
 //! - Cloudflare: Composite keys, NAT-aware, JA3 fingerprinting
 //! - Envoy: Hierarchical descriptors, external rate limit service
 //! - HAProxy: Multiple stick tables, layered rate limits

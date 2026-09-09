@@ -565,7 +565,7 @@ impl PqcTlsProvider {
 // Use this backend when you need:
 // - Maximum PQC algorithm flexibility
 // - Hardware-accelerated cryptography
-// - Compatibility with enterprise PKI systems
+// - Compatibility with internal PKI systems
 // ============================================================================
 
 /// OpenSSL SSL context configuration for PQC

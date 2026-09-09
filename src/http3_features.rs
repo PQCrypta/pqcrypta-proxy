@@ -1,6 +1,6 @@
 //! HTTP/3 Advanced Features Module
 //!
-//! Implements cutting-edge HTTP/3 features:
+//! Implements these HTTP/3 features:
 //! - **Early Hints (103)**: Preload critical resources before final response
 //! - **Priority Hints**: Extensible Priorities (RFC 9218) for resource scheduling
 //! - **Request Coalescing**: Deduplicate identical in-flight requests

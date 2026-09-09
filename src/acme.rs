@@ -6,7 +6,7 @@
 //! - ZeroSSL
 //! - Buypass
 //! - Google Trust Services
-//! - Private/Enterprise ACME servers
+//! - Private and internally hosted ACME servers
 //!
 //! Features:
 //! - HTTP-01 challenge support
