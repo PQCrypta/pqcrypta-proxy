@@ -4,6 +4,47 @@ The rig behind the throughput and handshake figures published at
 <https://pqcrypta.com/proxy-comparison/>. It is here so the numbers can be
 re-run rather than taken on trust.
 
+## Measuring an optimisation: use `instr-ab.sh`, not req/s
+
+**Throughput on this rig has a run-to-run cv of 21–27 %.** Measured six ways
+(2026-09-09): fresh process each run, same process throughout, per-second
+sampling, CPU steal, hardware counters. What it is *not*: the clock
+(cycles/second is flat to 0.3 %), our code doing more work (instructions per
+request is flat to 0.5 %), CPU steal (exactly zero), TLB or huge pages
+(3.7 dTLB misses per packet), or SMT sharing (splitting the two workers onto
+separate physical cores made it *slower* and only slightly steadier). It is
+**IPC**: on an identical instruction stream, the CPU retires instructions
+1.6× slower in the slow mode (1.08 → 0.66) and holds that mode for tens of
+seconds. The machine's speed varies; the work does not.
+
+So measure the work:
+
+| metric | cv over 6 fresh runs |
+|---|---|
+| req/s | **27.0 %** |
+| instructions per request | **0.30 %** |
+
+```sh
+./instr-ab.sh <binA> <binB> [rounds] [config]
+```
+
+Counts instructions retired by the proxy process over the *same* window the
+generator is measuring, and reports instructions per request for each binary.
+A 1 % change is visible in four rounds (~5 minutes); ~0.5 % needs about ten.
+Compare that with req/s, which needs two pooled 108-cell passes — most of a
+day — to resolve 5 %.
+
+Two things this does not replace. It measures instructions, so a change that
+trades instructions for cache behaviour or syscalls will not show up correctly
+— check `perf stat` for cycles and cache-misses too. And the published
+comparison against HAProxy is still req/s, because that is what an operator
+gets; this is the development feedback loop, not the headline.
+
+**Align the windows.** `perf` must not start until the generator's warm-up is
+over. Charging warm-up and idle instructions against measured requests took the
+cv from 0.30 % to 3.98 % — still far better than req/s, but with a trend in it
+that reads like a real effect.
+
 ## Layout
 
 Everything runs on one machine with CPU pinning — a WAN path measures the link,
