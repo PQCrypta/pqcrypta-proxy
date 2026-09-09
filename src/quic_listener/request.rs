@@ -1236,6 +1236,16 @@ impl QuicListener {
                     };
                     response_builder =
                         response_builder.header("content-length", content_length.to_string());
+                    // A cache hit replays the stored origin headers and nothing
+                    // else, so without this it answered with none of the security
+                    // headers a miss gets — including CSP.
+                    response_builder = super::apply_response_policy_headers(
+                        response_builder,
+                        &config,
+                        &static_headers,
+                        host.as_deref(),
+                        &path,
+                    );
                     let response = response_builder.body(())?;
                     let body_size = body_bytes.len();
                     let latency = start_time.elapsed();
@@ -1664,6 +1674,16 @@ impl QuicListener {
                     | "accept-ranges"
                     | "content-disposition"
                     | "vary"
+                    // The origin's CSP carries this response's script nonces, so
+                    // it must survive the hop. Dropping it left every HTTP/3
+                    // response with no CSP at all — see
+                    // `apply_response_policy_headers`, which supplies the
+                    // configured fallback only when the origin sent none.
+                    | "content-security-policy"
+                    | "content-security-policy-report-only"
+                    // RFC 9110 6.6.1: an origin with a clock should send Date.
+                    // Only the TCP path had one, via hyper.
+                    | "date"
                     | "set-cookie"
                     | "location"
                     | "access-control-allow-origin"
@@ -1732,15 +1752,17 @@ impl QuicListener {
         response_builder =
             response_builder.header("alt-svc", alt_svc_for_host(&config, host.as_deref()));
 
-        // Server, Client-Hints, reporting and security headers: all fifteen are
-        // fixed until the config reloads, so they are built once per connection
-        // and applied here by cloning. See `build_static_response_headers`.
-        if let Some(h) = response_builder.headers_mut() {
-            h.reserve(static_headers.len());
-            for (name, value) in static_headers.iter() {
-                h.append(name.clone(), value.clone());
-            }
-        }
+        // Server, Client-Hints, reporting and security headers: the fixed ones
+        // are built once per connection and applied here by cloning (see
+        // `build_static_response_headers`); CSP depends on the request and on
+        // whether the origin set its own, so it is decided here.
+        response_builder = super::apply_response_policy_headers(
+            response_builder,
+            &config,
+            &static_headers,
+            host.as_deref(),
+            &path,
+        );
 
         // Server-Timing carries this request's elapsed time, so it cannot be
         // part of that set.

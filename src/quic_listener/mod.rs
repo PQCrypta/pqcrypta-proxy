@@ -6,7 +6,7 @@
 //! This listener handles QUIC/HTTP3 connections (h3/quinn stack) and runs alongside
 //! `WebTransportServer` (wtransport stack), which handles the dedicated WebTransport port.
 
-use http::header::{HeaderMap, HeaderName, HeaderValue};
+use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -245,7 +245,78 @@ fn build_static_response_headers(config: &ProxyConfig) -> HeaderMap {
     );
     put("x-quantum-resistant", &config.headers.x_quantum_resistant);
     put("x-security-level", &config.headers.x_security_level);
+    put(
+        "x-permitted-cross-domain-policies",
+        &config.headers.x_permitted_cross_domain_policies,
+    );
+    put("x-download-options", &config.headers.x_download_options);
+    put(
+        "x-dns-prefetch-control",
+        &config.headers.x_dns_prefetch_control,
+    );
     h
+}
+
+/// Apply the per-connection static header set and the policy headers that
+/// depend on the request itself.
+///
+/// The TCP listener's `security_headers_middleware` is an axum layer, so it
+/// never ran for HTTP/3 — and this path's own static set omitted the one header
+/// that matters most. Every HTTP/3 response left here **without a
+/// Content-Security-Policy**: the backend's nonce-bearing CSP is not on the
+/// forwarding allowlist, and nothing injected the configured one. Since the DNS
+/// HTTPS record advertises `alpn="h3"`, a browser's *first* connection is QUIC,
+/// so the strict CSP the site is built around was absent for exactly the
+/// visitors most likely to arrive on it.
+///
+/// Order matters: a CSP already on the builder came from the origin (it carries
+/// the per-request nonces) and always wins over the configured fallback.
+pub(super) fn apply_response_policy_headers(
+    mut builder: http::response::Builder,
+    config: &ProxyConfig,
+    static_headers: &HeaderMap,
+    host: Option<&str>,
+    path: &str,
+) -> http::response::Builder {
+    // The Outlook add-in surface is framed cross-origin by Office: it must not
+    // get X-Frame-Options: DENY, and it needs its own CSP. Same three config
+    // knobs the TCP path reads, so the two transports agree.
+    let hc = &config.headers;
+    let is_outlook_addin = !hc.addin_csp.is_empty()
+        && !hc.addin_path_prefix.is_empty()
+        && path.starts_with(&hc.addin_path_prefix)
+        && host.is_some_and(|h| {
+            let h = h.split(':').next().unwrap_or(h);
+            hc.addin_hosts.iter().any(|a| a.eq_ignore_ascii_case(h))
+        });
+
+    if let Some(h) = builder.headers_mut() {
+        h.reserve(static_headers.len());
+        for (name, value) in static_headers.iter() {
+            if is_outlook_addin && name == header::X_FRAME_OPTIONS {
+                continue;
+            }
+            h.append(name.clone(), value.clone());
+        }
+    }
+
+    let has_csp = builder
+        .headers_ref()
+        .is_some_and(|h| h.contains_key(header::CONTENT_SECURITY_POLICY));
+    if !has_csp {
+        let csp = if is_outlook_addin {
+            hc.addin_csp.as_str()
+        } else {
+            hc.content_security_policy.as_str()
+        };
+        if !csp.is_empty() {
+            if let Ok(v) = HeaderValue::from_str(csp) {
+                builder = builder.header(header::CONTENT_SECURITY_POLICY, v);
+            }
+        }
+    }
+
+    builder
 }
 
 impl QuicListener {

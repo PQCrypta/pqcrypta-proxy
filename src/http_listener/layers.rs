@@ -352,9 +352,15 @@ pub(super) async fn security_headers_middleware(
 
     // Server-Timing header (RFC 6797) - Performance metrics
     // Format: metric;dur=<ms>;desc="description"
+    //
+    // No `quic` metric here: this layer only ever runs on the TCP listener, so
+    // the connection carrying the response is TLS-over-TCP. It used to name
+    // "QUIC v1" on every HTTP/1.1 and HTTP/2 response, describing a transport
+    // that was not in use — and the desc differed from the HTTP/3 path's, so the
+    // same page reported two different proxies depending on how it was fetched.
     if config.server_timing_enabled {
         let server_timing = format!(
-            "proxy;dur={:.2};desc=\"PQCProxy Processing\", quic;desc=\"QUIC v1\"",
+            "proxy;dur={:.2};desc=\"PQ Crypta Processing\"",
             processing_time.as_secs_f64() * 1000.0
         );
         if let Ok(v) = HeaderValue::from_str(&server_timing) {

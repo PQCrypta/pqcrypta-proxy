@@ -52,11 +52,29 @@ async fn get(url: &str) -> anyhow::Result<u16> {
 
     // Resolve here rather than letting the endpoint do it, so a DNS failure is
     // reported as a DNS failure instead of a connection one.
-    let addr = tokio::net::lookup_host((host, port))
+    //
+    // Every address, not just the first: a UDP socket is bound to one family, and
+    // quinn rejects a remote from the other one outright ("invalid remote
+    // address"). Taking `next()` alone meant any dual-stack host whose AAAA came
+    // back first (haproxy.com does) failed before a packet was ever sent, which
+    // reads as a broken origin rather than a client that never tried.
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
         .await
         .with_context(|| format!("resolving {host}:{port}"))?
-        .next()
+        .collect();
+    let addr = *addrs
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or_else(|| addrs.first())
         .ok_or_else(|| anyhow!("{host}:{port} resolved to nothing"))?;
+    // Bind the family the chosen address actually needs.
+    let bind: std::net::SocketAddr = if addr.is_ipv4() {
+        "0.0.0.0:0"
+            .parse()
+            .expect("INADDR_ANY:0 is a valid address")
+    } else {
+        "[::]:0".parse().expect("in6addr_any:0 is a valid address")
+    };
 
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -75,12 +93,7 @@ async fn get(url: &str) -> anyhow::Result<u16> {
             .map_err(|e| anyhow!("building the QUIC client config: {e}"))?,
     ));
 
-    let endpoint = quinn::Endpoint::client(
-        "0.0.0.0:0"
-            .parse()
-            .expect("INADDR_ANY:0 is always a valid socket address"),
-    )
-    .context("binding a client socket")?;
+    let endpoint = quinn::Endpoint::client(bind).context("binding a client socket")?;
     endpoint.set_default_client_config(client_config);
 
     let connection = endpoint
