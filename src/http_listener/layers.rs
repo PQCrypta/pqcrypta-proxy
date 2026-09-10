@@ -424,16 +424,37 @@ pub(super) async fn security_headers_middleware(
 ///
 /// The QUIC counterpart is `quic_listener::build_alt_svc_header_over_quic`, which
 /// excludes the connection in use rather than listing it.
-pub(super) fn build_alt_svc_header(port: u16, additional_ports: &[u16]) -> String {
-    let mut seen = vec![port];
-    let mut parts = vec![format!("h3=\":{port}\"; ma=86400")];
-    for p in additional_ports {
-        if seen.contains(p) {
+/// As above, but with `server.alt_svc_ports` applied when the operator has set it.
+///
+/// The override replaces the derived list outright rather than filtering it: a port
+/// that is bound but unreachable is not in the derived list by mistake, it is there
+/// because the proxy really did bind it. Only the operator knows it is filtered
+/// upstream or handed to WebTransport, so the operator's list wins whole.
+pub(super) fn build_alt_svc_header_with_override(
+    port: u16,
+    additional_ports: &[u16],
+    alt_svc_ports: Option<&[u16]>,
+) -> String {
+    let mut seen: Vec<u16> = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
+
+    let advertised: Vec<u16> = match alt_svc_ports {
+        Some(explicit) => explicit.to_vec(),
+        None => {
+            let mut v = vec![port];
+            v.extend_from_slice(additional_ports);
+            v
+        }
+    };
+
+    for p in advertised {
+        if seen.contains(&p) {
             continue;
         }
-        seen.push(*p);
+        seen.push(p);
         parts.push(format!("h3=\":{p}\"; ma=86400"));
     }
+
     parts.join(", ")
 }
 
@@ -619,14 +640,14 @@ pub(super) async fn advanced_rate_limit_middleware(
 
 #[cfg(test)]
 mod alt_svc_tcp_tests {
-    use super::build_alt_svc_header;
+    use super::build_alt_svc_header_with_override;
 
     /// Every node binds 4434 as both its listener port and an additional port, so
     /// the :4434 listener used to state the same alternative twice.
     #[test]
     fn does_not_repeat_a_port_listed_twice() {
         assert_eq!(
-            build_alt_svc_header(4434, &[4433, 4434]),
+            build_alt_svc_header_with_override(4434, &[4433, 4434], None),
             "h3=\":4434\"; ma=86400, h3=\":4433\"; ma=86400"
         );
     }
@@ -634,7 +655,7 @@ mod alt_svc_tcp_tests {
     #[test]
     fn lists_every_distinct_h3_port() {
         assert_eq!(
-            build_alt_svc_header(443, &[4434]),
+            build_alt_svc_header_with_override(443, &[4434], None),
             "h3=\":443\"; ma=86400, h3=\":4434\"; ma=86400"
         );
     }
@@ -643,6 +664,31 @@ mod alt_svc_tcp_tests {
     /// genuine alternative to a TCP connection on 443.
     #[test]
     fn includes_its_own_port_because_tcp_is_a_different_transport() {
-        assert!(build_alt_svc_header(443, &[]).contains("h3=\":443\""));
+        assert!(build_alt_svc_header_with_override(443, &[], None).contains("h3=\":443\""));
+    }
+
+    /// The mail host case: it binds UDP 443 and the provider filters it upstream, so
+    /// the port it is listening on is exactly the one it must not advertise.
+    #[test]
+    fn override_replaces_the_derived_list_including_the_listener_port() {
+        assert_eq!(
+            build_alt_svc_header_with_override(443, &[4433, 4434], Some(&[4434])),
+            "h3=\":4434\"; ma=86400"
+        );
+    }
+
+    /// A node that serves no HTTP/3 at all should say so by saying nothing, rather
+    /// than pointing browsers at a port that can only time out.
+    #[test]
+    fn empty_override_advertises_no_http3() {
+        assert_eq!(build_alt_svc_header_with_override(4433, &[], Some(&[])), "");
+    }
+
+    #[test]
+    fn absent_override_keeps_the_derived_behaviour() {
+        assert_eq!(
+            build_alt_svc_header_with_override(443, &[4434], None),
+            build_alt_svc_header_with_override(443, &[4434], None)
+        );
     }
 }

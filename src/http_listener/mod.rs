@@ -508,9 +508,10 @@ pub async fn run_http_listener(
         conformance: crate::conformance::shared(&config.conformance),
         config: config.clone(),
         port,
-        alt_svc_value: HeaderValue::from_str(&layers::build_alt_svc_header(
+        alt_svc_value: HeaderValue::from_str(&layers::build_alt_svc_header_with_override(
             port,
             &config.server.additional_ports,
+            config.server.alt_svc_ports.as_deref(),
         ))
         .ok(),
         webtransport_port_value: HeaderValue::from_str(&port.to_string())
@@ -687,9 +688,10 @@ pub async fn run_http_listener_pqc(
         conformance: crate::conformance::shared(&config.conformance),
         config: config.clone(),
         port,
-        alt_svc_value: HeaderValue::from_str(&layers::build_alt_svc_header(
+        alt_svc_value: HeaderValue::from_str(&layers::build_alt_svc_header_with_override(
             port,
             &config.server.additional_ports,
+            config.server.alt_svc_ports.as_deref(),
         ))
         .ok(),
         webtransport_port_value: HeaderValue::from_str(&port.to_string())
@@ -965,9 +967,10 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
         conformance: crate::conformance::shared(&config.conformance),
         config: config.clone(),
         port,
-        alt_svc_value: HeaderValue::from_str(&layers::build_alt_svc_header(
+        alt_svc_value: HeaderValue::from_str(&layers::build_alt_svc_header_with_override(
             port,
             &config.server.additional_ports,
+            config.server.alt_svc_ports.as_deref(),
         ))
         .ok(),
         webtransport_port_value: HeaderValue::from_str(&port.to_string())
@@ -1423,9 +1426,10 @@ pub async fn run_http_listener_pqc_with_fingerprint(
         conformance: crate::conformance::shared(&config.conformance),
         config: config.clone(),
         port,
-        alt_svc_value: HeaderValue::from_str(&layers::build_alt_svc_header(
+        alt_svc_value: HeaderValue::from_str(&layers::build_alt_svc_header_with_override(
             port,
             &config.server.additional_ports,
+            config.server.alt_svc_ports.as_deref(),
         ))
         .ok(),
         webtransport_port_value: HeaderValue::from_str(&port.to_string())

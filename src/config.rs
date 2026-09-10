@@ -635,6 +635,28 @@ pub struct ServerConfig {
     /// Additional ports for WebTransport (e.g., [4433, 4434])
     #[serde(default)]
     pub additional_ports: Vec<u16>,
+    /// The UDP ports to advertise in Alt-Svc, when that is not simply every port
+    /// the proxy binds.
+    ///
+    /// Binding a UDP port is not the same as serving HTTP/3 on it, and only the
+    /// operator knows the difference:
+    ///
+    ///   * on the mail host, inbound UDP/443 is filtered by the provider and never
+    ///     reaches the machine — the proxy binds it, logs a clean QUIC start, and no
+    ///     datagram ever arrives
+    ///   * on the Midwest speedtest node, UDP/4433 is deliberately the WebTransport
+    ///     endpoint, so a plain HTTP/3 request there is answered by the WebTransport
+    ///     server and gets no response headers
+    ///
+    /// In both cases the derived value advertised HTTP/3 on a port a browser cannot
+    /// use, which costs every visitor a QUIC attempt that can only time out before
+    /// it falls back to TCP. Set this to the ports that actually answer.
+    ///
+    /// `None` keeps the derived behaviour (this listener's port plus
+    /// `additional_ports`); an empty list advertises no HTTP/3 at all, which is the
+    /// truthful value for a node that serves none.
+    #[serde(default)]
+    pub alt_svc_ports: Option<Vec<u16>>,
     /// Maximum concurrent connections
     pub max_connections: u32,
     /// Maximum concurrent BIDIRECTIONAL streams per connection (HTTP/3 requests).
@@ -904,6 +926,7 @@ impl Default for ServerConfig {
             bind_address: "0.0.0.0".to_string(),
             udp_port: 443,
             additional_ports: vec![4433, 4434],
+            alt_svc_ports: None,
             max_connections: 10000,
             max_streams_per_connection: 1000,
             max_uni_streams_per_connection: default_max_uni_streams(),

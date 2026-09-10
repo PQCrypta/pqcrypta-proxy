@@ -90,12 +90,21 @@ fn build_alt_svc_header_over_quic(config: &ProxyConfig) -> String {
     // h3:P can always reach h2:P.
     let mut parts = vec![format!("h2=\":{current}\"; ma=86400")];
 
+    // `server.alt_svc_ports`, when the operator has set it, is the list of ports
+    // that actually serve HTTP/3 — a bound port is not necessarily a reachable one.
+    // The current connection is still excluded: it is proven reachable, being in
+    // use, but it is not an alternative to itself.
+    let advertised: Vec<u16> = match config.server.alt_svc_ports.as_deref() {
+        Some(explicit) => explicit.to_vec(),
+        None => config.server.additional_ports.clone(),
+    };
+
     let mut seen = vec![current];
-    for p in &config.server.additional_ports {
-        if seen.contains(p) {
+    for p in advertised {
+        if seen.contains(&p) {
             continue;
         }
-        seen.push(*p);
+        seen.push(p);
         parts.push(format!("h3=\":{p}\"; ma=86400"));
     }
 
@@ -1471,6 +1480,31 @@ mod alt_svc_tests {
         let v = build_alt_svc_header_over_quic(&c);
         assert_eq!(v.matches("h3=\":4434\"").count(), 1, "{v}");
         assert!(!v.contains("h3=\":443\""), "{v}");
+    }
+
+    /// The Midwest speedtest node: UDP 4433 is the WebTransport endpoint, so a plain
+    /// HTTP/3 request there is answered by the WebTransport server and never gets
+    /// response headers. With a real h3 port on 4434, only that one is advertised.
+    #[test]
+    fn override_names_only_the_ports_that_serve_http3() {
+        let mut c = config_with(4434, vec![4433, 4434], vec![]);
+        c.server.alt_svc_ports = Some(vec![4434]);
+        let v = build_alt_svc_header_over_quic(&c);
+        // 4434 is this connection, so it drops out even though the override lists it.
+        assert_eq!(v, "h2=\":4434\"; ma=86400");
+        assert!(
+            !v.contains("h3=\":4433\""),
+            "4433 serves WebTransport, not h3: {v}"
+        );
+    }
+
+    /// A node with no HTTP/3 at all still names its TCP alternative — that is real
+    /// and reachable — but no h3 port.
+    #[test]
+    fn empty_override_still_names_the_tcp_alternative() {
+        let mut c = config_with(4433, vec![], vec![]);
+        c.server.alt_svc_ports = Some(vec![]);
+        assert_eq!(build_alt_svc_header_over_quic(&c), "h2=\":4433\"; ma=86400");
     }
 
     /// Unchanged behaviour: a TCP-only host still gets the eviction token, which is
