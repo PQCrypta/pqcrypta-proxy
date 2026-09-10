@@ -45,6 +45,7 @@
 | Early Hints (103) | ✅ | Link headers for preload/preconnect |
 | Compression | ✅ | Brotli/gzip/deflate/zstd |
 | Security Headers | ✅ | HSTS, CSP, CORS, Alt-Svc; CORS headers injected on 429 rate-limit responses so browsers surface the status code instead of a misleading CORS error |
+| Alt-Svc by transport | ✅ | RFC 7838: Alt-Svc names alternatives *to the connection it arrives on*. Over TCP the proxy advertises `h3` on every configured UDP port; over QUIC it advertises `h2` on the same port plus any *other* h3 port, never the connection in use |
 | PQC TLS | ✅ | X25519MLKEM768 hybrid key exchange (NIST Level 3) + ML-DSA-87 server certificates (NIST Level 5, FIPS 204) |
 | Background Cleanup | ✅ | Auto-cleanup of expired entries |
 | **ACME Automation** | ✅ | Let's Encrypt HTTP-01/DNS-01; one individual cert per domain with atomic writes and immediate hot-reload |
