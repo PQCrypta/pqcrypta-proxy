@@ -413,10 +413,26 @@ pub(super) async fn security_headers_middleware(
 // - Adaptive baseline learning with anomaly detection
 
 /// Build Alt-Svc header value for HTTP/3 advertisement.
+/// The Alt-Svc value for a response being sent **over TCP**: every UDP port that
+/// serves HTTP/3, which is how a browser discovers HTTP/3 in the first place.
+///
+/// De-duplicated. A listener's own port is frequently also listed in
+/// `additional_ports` — every node here binds 4434 both ways — and the earlier
+/// version emitted it once from each, so the :4434 listener advertised
+/// `h3=":4434"; ma=86400, h3=":4434"; ma=86400`. Harmless to a parser, but it is the
+/// same alternative stated twice, and it was visible on the live edge.
+///
+/// The QUIC counterpart is `quic_listener::build_alt_svc_header_over_quic`, which
+/// excludes the connection in use rather than listing it.
 pub(super) fn build_alt_svc_header(port: u16, additional_ports: &[u16]) -> String {
-    let mut parts = vec![format!("h3=\":{}\"; ma=86400", port)];
+    let mut seen = vec![port];
+    let mut parts = vec![format!("h3=\":{port}\"; ma=86400")];
     for p in additional_ports {
-        parts.push(format!("h3=\":{}\"; ma=86400", p));
+        if seen.contains(p) {
+            continue;
+        }
+        seen.push(*p);
+        parts.push(format!("h3=\":{p}\"; ma=86400"));
     }
     parts.join(", ")
 }
@@ -598,5 +614,35 @@ pub(super) async fn advanced_rate_limit_middleware(
             add_alt_svc_to_response(&mut response, alt_svc);
             response
         }
+    }
+}
+
+#[cfg(test)]
+mod alt_svc_tcp_tests {
+    use super::build_alt_svc_header;
+
+    /// Every node binds 4434 as both its listener port and an additional port, so
+    /// the :4434 listener used to state the same alternative twice.
+    #[test]
+    fn does_not_repeat_a_port_listed_twice() {
+        assert_eq!(
+            build_alt_svc_header(4434, &[4433, 4434]),
+            "h3=\":4434\"; ma=86400, h3=\":4433\"; ma=86400"
+        );
+    }
+
+    #[test]
+    fn lists_every_distinct_h3_port() {
+        assert_eq!(
+            build_alt_svc_header(443, &[4434]),
+            "h3=\":443\"; ma=86400, h3=\":4434\"; ma=86400"
+        );
+    }
+
+    /// Unlike the QUIC side, the TCP value DOES include its own port: h3 on 443 is a
+    /// genuine alternative to a TCP connection on 443.
+    #[test]
+    fn includes_its_own_port_because_tcp_is_a_different_transport() {
+        assert!(build_alt_svc_header(443, &[]).contains("h3=\":443\""));
     }
 }
