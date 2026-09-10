@@ -1370,8 +1370,10 @@ src/
 ├── config.rs            # Configuration parsing, schema versioning, conflict validation, env overlay
 ├── load_balancer.rs     # Load balancing algorithms, pools, session affinity, per-backend CB overrides
 ├── proxy.rs             # Backend pool, request routing, per-backend retry with exponential backoff
-├── http_listener.rs     # HTTP/1.1 + HTTP/2 listener with PQC TLS
-├── quic_listener.rs     # QUIC/HTTP/3 listener; configurable connection migration
+├── http_listener/       # HTTP/1.1 + HTTP/2 listener with PQC TLS; layers (security
+│                       # headers, Alt-Svc, rate limit), TLS config, PROXY v2, passthrough
+├── quic_listener/       # QUIC/HTTP/3 listener; configurable connection migration;
+│                       # request.rs holds the h3 request pipeline and response policy headers
 ├── security.rs          # Rate limiting, DoS, GeoIP, circuit breaker, WAF hook, body size limit
 ├── fingerprint.rs       # JA3/JA4 TLS fingerprint extraction, replay cache, drift detector
 ├── tls_acceptor.rs      # Custom TLS acceptor with fingerprint capture; 0-RTT nonce store
