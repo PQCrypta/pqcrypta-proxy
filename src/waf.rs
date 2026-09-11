@@ -1382,6 +1382,116 @@ impl WafEngine {
 /// honoured, which is what matters for the common single-encoding case; a
 /// multi-layer encoding falls through to the raw scan rather than being
 /// recursively unwrapped.
+/// Find the first occurrence of `needle` in `hay`.
+fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Pull the boundary token out of a `multipart/*` Content-Type value.
+fn multipart_boundary(content_type: &str) -> Option<String> {
+    let ct = content_type.trim();
+    if ct.len() < 10 || !ct[..10].eq_ignore_ascii_case("multipart/") {
+        return None;
+    }
+    for param in ct.split(';').skip(1) {
+        if let Some((k, v)) = param.split_once('=') {
+            if k.trim().eq_ignore_ascii_case("boundary") {
+                let v = v.trim().trim_matches('"');
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Whether a part's declared media type is text worth running regex rules over.
+fn is_text_media_type(ct: &str) -> bool {
+    let base = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    base.starts_with("text/")
+        || base.ends_with("+json")
+        || base.ends_with("+xml")
+        || matches!(
+            base.as_str(),
+            "application/json"
+                | "application/xml"
+                | "application/javascript"
+                | "application/x-javascript"
+                | "application/ecmascript"
+                | "application/x-www-form-urlencoded"
+                | "application/graphql"
+        )
+}
+
+/// Build the scannable view of a `multipart/form-data` body.
+///
+/// A file part's payload is opaque bytes to this proxy: a PDF, a DOCX, a JPEG.
+/// Running text injection rules over it matches on coincidence, not intent —
+/// a DEFLATE stream inside a DOCX trips the shell-metacharacter and JNDI
+/// patterns, and any 0x00 trips the null-byte traversal rule. Those are the
+/// same false positives already called out for compressed bodies above.
+///
+/// What stays in scope: every part's headers — the field name and the filename
+/// are attacker-controlled text and a real injection vector — plus the payload
+/// of ordinary form fields and of file parts that declare a text media type.
+/// Byte-signature detection is unaffected; it runs on the raw body separately.
+fn multipart_text_view(body: &[u8], boundary: &str) -> Vec<u8> {
+    let delim_owned = format!("--{}", boundary);
+    let delim = delim_owned.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(body.len().min(8192));
+
+    let mut rest = match find_sub(body, delim) {
+        Some(i) => &body[i + delim.len()..],
+        None => return out,
+    };
+
+    loop {
+        let (part, next) = match find_sub(rest, delim) {
+            Some(i) => (&rest[..i], &rest[i + delim.len()..]),
+            None => (rest, &rest[rest.len()..]),
+        };
+
+        let (headers, payload) = match find_sub(part, b"\r\n\r\n") {
+            Some(i) => (&part[..i], &part[i + 4..]),
+            None => match find_sub(part, b"\n\n") {
+                Some(i) => (&part[..i], &part[i + 2..]),
+                None => (part, &part[part.len()..]),
+            },
+        };
+
+        out.extend_from_slice(headers);
+        out.push(b'\n');
+
+        let head = String::from_utf8_lossy(headers);
+        let mut is_file = false;
+        let mut part_ct: Option<String> = None;
+        for line in head.lines() {
+            let lower = line.trim().to_ascii_lowercase();
+            if lower.starts_with("content-disposition:") && lower.contains("filename=") {
+                is_file = true;
+            }
+            if let Some(v) = lower.strip_prefix("content-type:") {
+                part_ct = Some(v.trim().to_string());
+            }
+        }
+
+        if !is_file || part_ct.as_deref().map(is_text_media_type).unwrap_or(false) {
+            out.extend_from_slice(payload);
+            out.push(b'\n');
+        }
+
+        if next.is_empty() || next.starts_with(b"--") {
+            break;
+        }
+        rest = next;
+    }
+    out
+}
+
 fn decompress_bounded(body: &[u8], encoding: &str, max_out: usize) -> Option<Vec<u8>> {
     use std::io::Read;
 
@@ -1573,7 +1683,18 @@ impl WafEngine {
                     .headers
                     .get("content-encoding")
                     .and_then(|v| v.to_str().ok());
-                self.scan_body(&mut a, body, content_encoding, &excluded, threshold);
+                let content_type = req
+                    .headers
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok());
+                self.scan_body(
+                    &mut a,
+                    body,
+                    content_encoding,
+                    content_type,
+                    &excluded,
+                    threshold,
+                );
             }
         }
 
@@ -1807,6 +1928,7 @@ impl WafEngine {
         a: &mut Assessment,
         body: &[u8],
         content_encoding: Option<&str>,
+        content_type: Option<&str>,
         excluded: &[&CompiledExclusion],
         threshold: u32,
     ) {
@@ -1846,6 +1968,16 @@ impl WafEngine {
                 );
             }
         }
+        // A multipart body is not one text document: the file parts are opaque
+        // binary. Narrow the text scan to the parts that actually carry text.
+        let multipart_view = content_type
+            .and_then(multipart_boundary)
+            .map(|b| multipart_text_view(text_target, &b));
+        if multipart_view.is_some() {
+            debug!("WAF scanning multipart text parts only");
+        }
+        let text_target: &[u8] = multipart_view.as_deref().unwrap_or(text_target);
+
         self.scan_body_text(a, text_target, excluded, threshold);
     }
 
@@ -3048,5 +3180,154 @@ mod tests {
             "benign fullwidth text must pass, got {}",
             rule_of(&v)
         );
+    }
+
+    // ── multipart/form-data: only the text-bearing parts are regex-scanned ──
+
+    fn multipart_headers() -> HeaderMap {
+        let mut h = browser_headers();
+        h.insert(
+            "content-type",
+            "multipart/form-data; boundary=----pqBoundary42".parse().unwrap(),
+        );
+        h
+    }
+
+    fn multipart_body(parts: &[(&str, Option<&str>, &str, &[u8])]) -> Vec<u8> {
+        let mut b: Vec<u8> = Vec::new();
+        for (name, filename, ctype, payload) in parts {
+            b.extend_from_slice(b"------pqBoundary42\r\n");
+            match filename {
+                Some(f) => b.extend_from_slice(
+                    format!(
+                        "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
+                        name, f
+                    )
+                    .as_bytes(),
+                ),
+                None => b.extend_from_slice(
+                    format!("Content-Disposition: form-data; name=\"{}\"\r\n", name).as_bytes(),
+                ),
+            }
+            if !ctype.is_empty() {
+                b.extend_from_slice(format!("Content-Type: {}\r\n", ctype).as_bytes());
+            }
+            b.extend_from_slice(b"\r\n");
+            b.extend_from_slice(payload);
+            b.extend_from_slice(b"\r\n");
+        }
+        b.extend_from_slice(b"------pqBoundary42--\r\n");
+        b
+    }
+
+    /// The regression this exists for: an uploaded PDF/DOCX is opaque bytes, and
+    /// matching shell, JNDI and null-byte-traversal patterns against them blocked
+    /// roughly a third of real uploads.
+    #[test]
+    fn multipart_binary_file_part_is_not_text_scanned() {
+        let headers = multipart_headers();
+        // Byte soup of the kind a DEFLATE stream inside a DOCX produces: a NUL
+        // (null-byte traversal), shell metacharacters, and a JNDI lookup.
+        let mut payload: Vec<u8> = vec![0x00, 0xba, 0x26, 0x80, 0xae, 0x00];
+        payload.extend_from_slice(b"; cat /etc/passwd | sh ${jndi:ldap://x/a}");
+        payload.extend_from_slice(&[0x00, 0xff, 0xfe]);
+        let body = multipart_body(&[(
+            "file",
+            Some("report.pdf"),
+            "application/pdf",
+            payload.as_slice(),
+        )]);
+        let v = engine().inspect(&WafRequest {
+            method: "POST",
+            path: "/api.php",
+            query: "",
+            headers: &headers,
+            body: Some(&body),
+            skip_bot_ua_check: false,
+            mode_override: None,
+        });
+        assert!(
+            !blocked(&v),
+            "a binary file part must not be regex-scanned, got {}",
+            rule_of(&v)
+        );
+    }
+
+    /// Narrowing the scan must not blind the WAF to ordinary form fields.
+    #[test]
+    fn multipart_text_field_is_still_scanned() {
+        let headers = multipart_headers();
+        let body = multipart_body(&[
+            ("operation", None, "", b"'; DROP TABLE users--"),
+            ("file", Some("a.pdf"), "application/pdf", &[0x00, 0x01, 0x02]),
+        ]);
+        let v = engine().inspect(&WafRequest {
+            method: "POST",
+            path: "/api.php",
+            query: "",
+            headers: &headers,
+            body: Some(&body),
+            skip_bot_ua_check: false,
+            mode_override: None,
+        });
+        assert!(blocked(&v), "injection in a text field must still block");
+    }
+
+    /// The filename is attacker-controlled and stays in scope.
+    #[test]
+    fn multipart_malicious_filename_is_still_scanned() {
+        let headers = multipart_headers();
+        let body = multipart_body(&[(
+            "file",
+            Some("../../../../etc/passwd"),
+            "application/pdf",
+            &[0x25, 0x50, 0x44, 0x46],
+        )]);
+        let v = engine().inspect(&WafRequest {
+            method: "POST",
+            path: "/api.php",
+            query: "",
+            headers: &headers,
+            body: Some(&body),
+            skip_bot_ua_check: false,
+            mode_override: None,
+        });
+        assert!(blocked(&v), "a traversal filename must still block");
+    }
+
+    /// A file part that declares a text type is still worth scanning.
+    #[test]
+    fn multipart_text_file_part_is_still_scanned() {
+        let headers = multipart_headers();
+        let body = multipart_body(&[(
+            "file",
+            Some("payload.html"),
+            "text/html",
+            b"<script>alert(1)</script>",
+        )]);
+        let v = engine().inspect(&WafRequest {
+            method: "POST",
+            path: "/api.php",
+            query: "",
+            headers: &headers,
+            body: Some(&body),
+            skip_bot_ua_check: false,
+            mode_override: None,
+        });
+        assert!(blocked(&v), "a text/* file part must still be scanned");
+    }
+
+    #[test]
+    fn multipart_boundary_is_parsed() {
+        assert_eq!(
+            multipart_boundary("multipart/form-data; boundary=----abc").as_deref(),
+            Some("----abc")
+        );
+        assert_eq!(
+            multipart_boundary("MULTIPART/FORM-DATA; BOUNDARY=\"q1\"").as_deref(),
+            Some("q1")
+        );
+        assert_eq!(multipart_boundary("application/json"), None);
+        assert_eq!(multipart_boundary("multipart/form-data"), None);
     }
 }
