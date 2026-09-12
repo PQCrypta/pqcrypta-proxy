@@ -454,7 +454,15 @@ setting_identifiers! {
     // https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-8.2
     H3_SETTING_ENABLE_DATAGRAM_CHROME_SPECIFIC= 0xFFD277,
 
-    WEBTRANSPORT_MAX_SESSIONS = 0x2b603743,
+    // draft-ietf-webtrans-http3-09 §8.2 registers this as 0xc671706a. This fork
+    // carried 0x2b603743 — ENABLE_WEBTRANSPORT's codepoint plus one, which is
+    // not a value any draft assigns. The effect was invisible from the server
+    // side and total from the client's: a conforming peer looking for
+    // 0xc671706a saw nothing, and the registered default for absent is 0,
+    // meaning "not willing to receive any WebTransport sessions". The proxy was
+    // computing a session limit, serialising it, and putting it somewhere no
+    // client reads.
+    WEBTRANSPORT_MAX_SESSIONS = 0xc671706a,
 }
 
 const SETTINGS_LEN: usize = 8;

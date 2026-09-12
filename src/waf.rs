@@ -1411,7 +1411,12 @@ fn multipart_boundary(content_type: &str) -> Option<String> {
 
 /// Whether a part's declared media type is text worth running regex rules over.
 fn is_text_media_type(ct: &str) -> bool {
-    let base = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let base = ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     base.starts_with("text/")
         || base.ends_with("+json")
         || base.ends_with("+xml")
@@ -3188,7 +3193,9 @@ mod tests {
         let mut h = browser_headers();
         h.insert(
             "content-type",
-            "multipart/form-data; boundary=----pqBoundary42".parse().unwrap(),
+            "multipart/form-data; boundary=----pqBoundary42"
+                .parse()
+                .unwrap(),
         );
         h
     }
@@ -3259,7 +3266,12 @@ mod tests {
         let headers = multipart_headers();
         let body = multipart_body(&[
             ("operation", None, "", b"'; DROP TABLE users--"),
-            ("file", Some("a.pdf"), "application/pdf", &[0x00, 0x01, 0x02]),
+            (
+                "file",
+                Some("a.pdf"),
+                "application/pdf",
+                &[0x00, 0x01, 0x02],
+            ),
         ]);
         let v = engine().inspect(&WafRequest {
             method: "POST",

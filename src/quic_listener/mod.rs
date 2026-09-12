@@ -874,13 +874,20 @@ impl QuicListener {
         // Create H3 connection
         let h3_conn = H3Connection::new(connection.clone());
 
-        // Try to establish HTTP/3 connection with WebTransport support enabled
-        // This advertises SETTINGS_ENABLE_WEBTRANSPORT=1 to clients
+        // Advertises SETTINGS_ENABLE_WEBTRANSPORT=1 and
+        // SETTINGS_WEBTRANSPORT_MAX_SESSIONS (draft-ietf-webtrans-http3-09 §8.2).
+        //
+        // The advertised limit is the limit actually enforced. It was hardcoded
+        // to 1000 while `webtransport_max_sessions_per_origin` — the value
+        // `handle_webtransport_session` refuses connections against — defaults
+        // to 100. A client was told it could open ten times what it would be
+        // given, which is worse than saying nothing: the setting exists so a
+        // peer can size its own behaviour, and a wrong number is acted upon.
         match h3::server::builder()
             .enable_webtransport(true)
             .enable_extended_connect(true)
             .enable_datagram(true)
-            .max_webtransport_sessions(1000)
+            .max_webtransport_sessions(config.server.webtransport_max_sessions_per_origin as u64)
             .build(h3_conn)
             .await
         {
