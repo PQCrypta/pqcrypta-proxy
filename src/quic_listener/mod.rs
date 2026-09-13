@@ -1087,6 +1087,27 @@ impl QuicListener {
 
                         let wt_metrics = metrics.clone();
                         tokio::spawn(async move {
+                            // The CONNECT stream IS the session. Hold it for the
+                            // session's lifetime by moving it in here.
+                            //
+                            // It used to stay behind as a local and go out of
+                            // scope at the end of this match arm. h3's
+                            // RequestStream finishes and resets on drop, so the
+                            // server sent FIN and STOP_SENDING on stream 0
+                            // immediately after answering 200 — tearing down the
+                            // session it had just accepted.
+                            //
+                            // Invisible from here: the accept path logged success
+                            // and nothing logged the drop. Chrome's netlog named
+                            // it — STOP_SENDING_FRAME_RECEIVED, then a 5-byte FIN
+                            // on stream 0, then ERR_QUIC_PROTOCOL_ERROR, against a
+                            // :4433 control that reached
+                            // QUIC_SESSION_WEBTRANSPORT_SESSION_READY instead.
+                            //
+                            // Tolerant clients hid it. aioquic and the wtransport
+                            // crate both treat a finished CONNECT stream as a
+                            // usable session and reported the endpoint working.
+                            let mut session_stream = stream;
                             debug!(
                                 "WebTransport session active for {} on path {}",
                                 remote_addr, path
@@ -1094,12 +1115,30 @@ impl QuicListener {
                             if let Err(e) = handler.handle_session().await {
                                 error!("WebTransport session error for {}: {}", remote_addr, e);
                             }
+
+                            // Holding the stream in a binding was not enough:
+                            // `handle_session` logs twice and returns Ok(()) at
+                            // once, despite saying it "remains active until
+                            // client disconnects", so the task ended in
+                            // microseconds and the drop still finished the
+                            // stream. Chrome saw the same FIN and STOP_SENDING
+                            // as before the change.
+                            //
+                            // Reading is what actually waits. The CONNECT stream
+                            // stays open for the life of a WebTransport session,
+                            // so this resolves when the peer closes or resets it
+                            // — the session ending is the thing being awaited,
+                            // not a timer.
+                            loop {
+                                match session_stream.recv_data().await {
+                                    Ok(Some(_)) => continue,
+                                    _ => break,
+                                }
+                            }
+
+                            debug!("WebTransport session ended for {}", remote_addr);
                             wt_metrics.connections.connection_closed();
                         });
-
-                        // NOTE: Stream is intentionally NOT finished here
-                        // The WebTransport session keeps it open for bidirectional communication
-                        // The session will be closed when the client disconnects or on error
                     } else if is_connect_udp {
                         // RFC 9298: CONNECT-UDP. Relay UDP datagrams between the
                         // client and an allowlisted target host:port.
