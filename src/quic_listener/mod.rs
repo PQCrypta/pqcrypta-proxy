@@ -1035,11 +1035,26 @@ impl QuicListener {
                             continue;
                         }
 
-                        // Send 200 OK to accept the WebTransport session
-                        // IMPORTANT: Do NOT finish the stream - WebTransport sessions keep it open
+                        // Send 200 OK to accept the WebTransport session.
+                        // IMPORTANT: Do NOT finish the stream - WebTransport sessions keep it open.
+                        //
+                        // No `sec-webtransport-http3-draft` header. That pair was
+                        // draft-02's version handshake: the client sent
+                        // `Sec-Webtransport-Http3-Draft02: 1` and the server
+                        // echoed `draft02`. Every draft since removed it, and
+                        // Chrome has not sent the request half for years — so
+                        // answering with the echo announces a version the peer
+                        // never asked for.
+                        //
+                        // It was the entire difference. Replaying Chrome's exact
+                        // CONNECT with an independent stack, :443 answered
+                        // `200` + this header and :4433 answered a bare `200`;
+                        // Chrome accepts :4433 and rejects :443. The SETTINGS
+                        // were already correct on both — ENABLE_CONNECT_PROTOCOL,
+                        // H3_DATAGRAM and WEBTRANSPORT_MAX_SESSIONS=100 all
+                        // present and read back by an outside client.
                         let response = http::Response::builder()
                             .status(http::StatusCode::OK)
-                            .header("sec-webtransport-http3-draft", "draft02")
                             .body(())?;
 
                         // Respond on the stream first
