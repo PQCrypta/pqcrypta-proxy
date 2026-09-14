@@ -55,6 +55,20 @@ FLEET_NODES=(
     "root@74.208.108.89|-o Port=22 -i /root/.ssh/pentest_sync_rsa"
 )
 
+# Which tracked config each node's live file should match. Keyed by the same
+# target string as FLEET_NODES so the two lists cannot drift apart silently.
+declare -A FLEET_CONFIG_DIR=(
+    ["root@10.10.0.2"]="remotellm"
+    ["root@209.46.123.222"]="mail"
+    ["root@74.208.108.89"]="api3"
+)
+CONFIG_REPO="/var/www/html/pqcrypta-configs/pqcrypta/nodes"
+LIVE_CONFIG="/etc/pqcrypta/proxy-config.toml"
+# The placeholder the repo commits in place of a real admin token. Deliberately
+# 24 characters — under the 32 the proxy demands — so a config copied from the
+# repo fails to start rather than running with a guessable token.
+TOKEN_PLACEHOLDER='auth_token = "REPLACE_WITH_ADMIN_TOKEN"  # live value lives only in /etc/pqcrypta/proxy-config.toml (0640) — never commit a real token'
+
 # Runtime data files replicated to every node:
 #   "<local path>|<mode>|<owner-sensitive>|<remote destination resolver>"
 #
@@ -269,12 +283,86 @@ sync_fleet() {
     done
 }
 
+# Report proxy configs that have drifted from what is tracked in
+# pqcrypta-configs.
+#
+# Detection only: it refreshes the working copy and says what moved, and never
+# commits. These files are public and carry a redacted admin token, so a machine
+# that both edits and publishes them is one sed away from leaking one — and an
+# unreviewed config commit is worth less than a loud diff someone reads.
+#
+# The reason this exists: the tracked copy was found 474 lines behind the
+# running node, still naming the obsolete x25519_kyber768 KEM. A rebuild from
+# the repo would have deployed it. Nothing was watching, so nothing said so.
+check_config_drift() {
+    [ -d "${CONFIG_REPO}" ] || { log "config drift: ${CONFIG_REPO} missing, skipped"; return; }
+    local DRIFTED=0
+
+    for NODE in "local" "${FLEET_NODES[@]}"; do
+        local TARGET NAME TMP
+        if [ "${NODE}" = "local" ]; then
+            TARGET="local"; NAME="local"
+        else
+            TARGET="${NODE%%|*}"
+            NAME="${FLEET_CONFIG_DIR[${TARGET}]:-}"
+            [ -n "${NAME}" ] || { log "config drift: no tracked dir for ${TARGET}, skipped"; continue; }
+        fi
+
+        local TRACKED="${CONFIG_REPO}/${NAME}/proxy-config.toml"
+        [ -f "${TRACKED}" ] || { log "config drift: ${NAME} not tracked yet"; DRIFTED=1; continue; }
+
+        TMP=$(mktemp /tmp/cfgdrift_XXXXXX.toml)
+        if [ "${NODE}" = "local" ]; then
+            cp "${LIVE_CONFIG}" "${TMP}" 2>/dev/null
+        else
+            # shellcheck disable=SC2086
+            ssh ${NODE#*|} -o ConnectTimeout=10 -o BatchMode=yes "${TARGET}" \
+                "cat ${LIVE_CONFIG}" > "${TMP}" 2>/dev/null
+        fi
+        if [ ! -s "${TMP}" ]; then
+            log "config drift: could not read ${NAME} config — node unreachable?"
+            rm -f "${TMP}"; continue
+        fi
+
+        # Redact before anything compares or copies. Done with the whole line so
+        # a token containing regex metacharacters cannot survive a partial match.
+        sed -i "s|^auth_token[[:space:]]*=.*|${TOKEN_PLACEHOLDER}|" "${TMP}"
+
+        # Refuse to touch the repo if a token somehow survived. Cheap, and the
+        # one failure here is unrecoverable once pushed.
+        # "A token line exists AND it is not the placeholder". Both halves are
+        # needed. Piping into `grep -qv` looks equivalent and is not: on empty
+        # input `grep -qv` exits 0 here, so a node with no [admin] section —
+        # remotellm — would have aborted on every run and never synced. An
+        # earlier version also paired that with a grep -E carrying a PCRE
+        # lookahead, a dialect it does not support, which could never match and
+        # only made the guard look thorough.
+        if grep -qE '^auth_token' "${TMP}" \
+           && ! grep -qE '^auth_token[[:space:]]*=[[:space:]]*"REPLACE_WITH_ADMIN_TOKEN"' "${TMP}"; then
+            log "config drift: ABORT on ${NAME} — redaction did not take, repo untouched"
+            rm -f "${TMP}"; DRIFTED=1; continue
+        fi
+
+        local N
+        N=$(diff "${TRACKED}" "${TMP}" 2>/dev/null | grep -c '^[<>]')
+        if [ "${N}" -gt 0 ]; then
+            cp "${TMP}" "${TRACKED}"
+            log "config drift: ${NAME} moved ${N} lines — working copy refreshed, review and commit"
+            DRIFTED=1
+        fi
+        rm -f "${TMP}"
+    done
+
+    [ "${DRIFTED}" -eq 0 ] && log "config drift: all four nodes match what is tracked"
+}
+
 # Every exit path goes through here, so the GeoIP refresh and the fleet are
 # reconciled even when the JA3 fetch failed and the local database was left
 # untouched.
 finish() {
     [ "${GEOIP_CHANGED}" -eq 1 ] && restart_local
     sync_fleet
+    check_config_drift
     log "Refresh complete"
     exit 0
 }
