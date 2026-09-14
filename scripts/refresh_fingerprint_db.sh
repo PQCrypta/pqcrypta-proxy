@@ -353,7 +353,73 @@ check_config_drift() {
         rm -f "${TMP}"
     done
 
+    check_apache_drift || DRIFTED=1
+
     [ "${DRIFTED}" -eq 0 ] && log "config drift: all four nodes match what is tracked"
+}
+
+# Apache vhosts on this node, tracked beside the proxy config.
+#
+# They were untracked until 2026-09-14, which meant a security-relevant edit
+# there was unreviewable and could drift the same way the proxy config once sat
+# 474 lines behind its node. The edit that prompted this was a deny rule for
+# backup files: `index.php.backup-logo-...` had been answering 200 with the raw
+# PHP source of the page.
+#
+# Copied from sites-ENABLED, dereferenced, so the tracked set records which
+# vhosts are live as well as what they contain. No redaction step: these carry
+# certificate *paths*, never key material, and that is asserted below rather
+# than assumed — a vhost that ever gains a secret must not reach this public
+# repo.
+check_apache_drift() {
+    local DIR="${CONFIG_REPO}/local/apache"
+    local SRC="/etc/apache2/sites-enabled"
+    [ -d "${SRC}" ] || return 0
+    [ -d "${DIR}" ] || { log "apache drift: ${DIR} not tracked yet"; return 1; }
+
+    local DRIFTED=0 F NAME TMP
+    for F in "${SRC}"/*.conf; do
+        [ -e "${F}" ] || continue
+        NAME=$(basename "${F}")
+        TMP=$(mktemp /tmp/apadrift_XXXXXX.conf)
+        cp "$(readlink -f "${F}")" "${TMP}" 2>/dev/null
+
+        # Fail closed if a vhost ever starts carrying key material or an inline
+        # credential. The repo is public with secret scanning on every push; an
+        # unreviewed copy is worth less than a loud refusal.
+        if grep -qiE 'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|SetEnv[[:space:]]+[A-Za-z_]*(KEY|SECRET|PASS)[A-Za-z_]*[[:space:]]+[^[:space:]]|RequestHeader[[:space:]]+set[[:space:]]+Authorization' "${TMP}"; then
+            log "apache drift: ABORT on ${NAME} — looks like it carries a secret, repo untouched"
+            rm -f "${TMP}"; DRIFTED=1; continue
+        fi
+
+        if [ ! -f "${DIR}/${NAME}" ]; then
+            cp "${TMP}" "${DIR}/${NAME}"
+            log "apache drift: ${NAME} was not tracked — working copy added, review and commit"
+            DRIFTED=1
+        else
+            local N
+            N=$(diff "${DIR}/${NAME}" "${TMP}" 2>/dev/null | grep -c '^[<>]')
+            if [ "${N}" -gt 0 ]; then
+                cp "${TMP}" "${DIR}/${NAME}"
+                log "apache drift: ${NAME} moved ${N} lines — working copy refreshed, review and commit"
+                DRIFTED=1
+            fi
+        fi
+        rm -f "${TMP}"
+    done
+
+    # A vhost that was disabled or deleted should stop being tracked.
+    for F in "${DIR}"/*.conf; do
+        [ -e "${F}" ] || continue
+        NAME=$(basename "${F}")
+        if [ ! -e "${SRC}/${NAME}" ]; then
+            log "apache drift: ${NAME} is tracked but no longer enabled — remove it from the repo"
+            DRIFTED=1
+        fi
+    done
+
+    [ "${DRIFTED}" -eq 0 ] && log "apache drift: all vhosts match what is tracked"
+    return "${DRIFTED}"
 }
 
 # Every exit path goes through here, so the GeoIP refresh and the fleet are
