@@ -2113,13 +2113,15 @@ async fn perform_security_checks(config: &ProxyConfig) -> anyhow::Result<()> {
                 info!("  ✅ OpenSSL provider: VERIFIED");
             }
             Err(e) => {
-                if config.pqc.fallback_to_classical {
+                if config.pqc.require_pqc_provider {
+                    error!("  ❌ OpenSSL provider verification failed: {}", e);
+                    error!("     pqc.require_pqc_provider is set: refusing to start rather");
+                    error!("     than serve classical-only crypto under a PQC configuration");
+                    has_errors = true;
+                } else {
                     warn!("  ⚠️  OpenSSL provider check failed: {}", e);
                     warn!("     Will fall back to classical TLS (rustls)");
                     has_warnings = true;
-                } else {
-                    error!("  ❌ OpenSSL provider verification failed: {}", e);
-                    has_errors = true;
                 }
             }
         }

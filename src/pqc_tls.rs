@@ -238,10 +238,10 @@ impl PqcTlsProvider {
                 status.available = false;
                 status.error = Some(e.clone());
 
-                if config.fallback_to_classical {
-                    warn!("PQC not available, falling back to classical TLS: {}", e);
-                } else {
+                if config.require_pqc_provider {
                     error!("PQC required but not available: {}", e);
+                } else {
+                    warn!("PQC not available, falling back to classical TLS: {}", e);
                 }
             }
         }
@@ -427,10 +427,21 @@ impl PqcTlsProvider {
         // which is the intended, and deliberately disruptive, behaviour.
         if config.fallback_to_classical && !config.require_hybrid {
             groups.push("P-384".to_string());
-        } else if config.require_hybrid {
+        } else {
+            // Warn whichever setting caused it. `require_hybrid` used to warn and
+            // `fallback_to_classical = false` did not, so the more obscure of the
+            // two routes to a client lockout was the silent one — and an operator
+            // reading "fallback to classical" as a startup safety valve would have
+            // cut off every non-ML-KEM client without a line in the log.
+            let cause = if config.require_hybrid {
+                "require_hybrid is set"
+            } else {
+                "fallback_to_classical is off"
+            };
             warn!(
-                "require_hybrid is set: no classical fallback group is offered, so \
-                 clients without hybrid PQC support cannot complete a handshake"
+                "{}: no classical key-exchange group is offered, so clients without \
+                 hybrid PQC support cannot complete a handshake at all",
+                cause
             );
         }
 

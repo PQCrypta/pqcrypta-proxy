@@ -1158,8 +1158,26 @@ pub struct PqcConfig {
     pub openssl_lib_path: Option<PathBuf>,
     /// Preferred KEM algorithm for key exchange
     pub preferred_kem: String,
-    /// Fallback to classical if PQC fails
+    /// Offer a classical key-exchange group (P-384) alongside the hybrid PQC
+    /// groups, so a client with no ML-KEM support can still complete a
+    /// handshake. This is a CLIENT COMPATIBILITY switch, not a statement about
+    /// our own posture: with it off, such clients cannot connect at all.
+    ///
+    /// Measured on this deployment before the split: system curl built against
+    /// quictls 3.1.4 has no ML-KEM and reaches the site over P-384, as do
+    /// third-party monitoring and several crawlers. Turning this off is a live
+    /// lockout, which is why it no longer also governs startup strictness —
+    /// see `require_pqc_provider`.
     pub fallback_to_classical: bool,
+    /// Refuse to start when PQC is enabled but its provider cannot be used,
+    /// instead of degrading to a classical-only listener with a warning.
+    ///
+    /// Split out of `fallback_to_classical`, which conflated two unrelated
+    /// decisions: what we offer CLIENTS, and what we do when our OWN crypto is
+    /// broken. An operator wanting to fail closed on the second had to accept a
+    /// client lockout as the price, so in practice nobody did.
+    #[serde(default = "default_require_pqc_provider")]
+    pub require_pqc_provider: bool,
     /// Minimum security level (1-5, corresponding to NIST levels)
     /// - 1: 128-bit (ML-KEM-512)
     /// - 3: 192-bit (X25519MLKEM768, ML-KEM-768) - recommended
@@ -1228,6 +1246,7 @@ impl Default for PqcConfig {
             // Provides NIST Level 3 security with classical fallback
             preferred_kem: "X25519MLKEM768".to_string(),
             fallback_to_classical: true,
+            require_pqc_provider: default_require_pqc_provider(),
             min_security_level: 3,
             additional_kems: vec![
                 "SecP256r1MLKEM768".to_string(),
@@ -1242,6 +1261,14 @@ impl Default for PqcConfig {
             strict_key_permissions: false,
         }
     }
+}
+
+/// Fail closed by default. `pqc.enabled` already gates this, so it only fires
+/// where an operator asked for PQC and the provider is broken — a state that
+/// should stop a deployment rather than quietly serve classical crypto under a
+/// configuration that claims otherwise.
+fn default_require_pqc_provider() -> bool {
+    true
 }
 
 fn default_downgrade_action() -> String {

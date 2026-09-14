@@ -164,7 +164,7 @@
 - **PQC Downgrade Detection**: Detects classical-only TLS negotiation when PQC is required; configurable action: block (421), log, or allow
 - **PQC + Fingerprinting Combined**: OpenSSL ML-KEM with ClientHello capture for early blocking
 - **PQC Session Tickets**: rustls installs no ticketer by default, so with `pqc_session_tickets = false` the proxy issues no TLS 1.3 tickets at all and resumption relies on session storage. When enabled, each ticket encapsulates to the server's ML-KEM-1024 (FIPS 204) key for a fresh per-ticket secret, derives an AES-256-GCM key from it with HKDF-SHA384, and seals the resumption state with the KEM ciphertext as associated data. The keypair rolls every `session_ticket_lifetime_secs` (default 12 h) retaining one previous generation, since the trait requires lifetime to be enforced by key rolling rather than a timestamp inside the ticket. Note the server holds both halves of the keypair: what this changes is the algorithm protecting ticket key material and that each ticket gets an independent secret — it is not a defence against reading server memory
-- **TLS 1.3 Default**: TLS 1.3 minimum on all listeners by default (`min_version = "1.3"` in `[tls]`); TLS 1.2 can be permitted via config — OpenSSL 3.5+ for TCP/TLS, rustls for QUIC/HTTP3
+- **TLS 1.3 Default**: TLS 1.3 minimum on all listeners by default (`min_version = "1.3"` in `[tls]`), which is what this deployment runs. TLS 1.2 can be permitted via config for compatibility, but that is a departure from the default posture rather than an equivalent choice — OpenSSL 3.5+ for TCP/TLS, rustls for QUIC/HTTP3
 - **TLS Key Permission Checks**: Private key file permissions validated at startup; `strict_key_permissions = true` aborts if permissions are too permissive
 - **0-RTT Replay Protection**: Nonce store (strict/session/none modes) — rejects replayed TLS 1.3 early-data nonces within configurable window
 - **QUIC Retry (source-address validation)**: Optional RFC 9000 §8.1.2 Retry — a new, unvalidated connection is answered with a Retry token the client must echo before the handshake proceeds, hardening against spoofed-source amplification/DDoS at the cost of one extra round trip per new connection. Configurable via `enable_quic_retry` in `[server]` (default off, in which case RFC 9000's implicit 3× anti-amplification validation is used instead — no per-connection latency).
@@ -1439,10 +1439,19 @@ provider = "openssl3.5"
 openssl_path = "/usr/local/openssl-pq/bin/openssl"
 openssl_lib_path = "/usr/local/openssl-pq/lib64"
 preferred_kem = "X25519MLKEM768"
-fallback_to_classical = true
+fallback_to_classical = true   # offer P-384 so non-ML-KEM clients can connect
+require_pqc_provider = true    # refuse to start if our own PQC provider is broken
 ```
 
-> **Important**: `openssl_path` must point to an OpenSSL 3.5+ binary built with ML-KEM support. The proxy checks this path at startup to determine whether the PQC TCP listener is available. If the path is wrong or the binary is missing, the proxy silently falls back to a standard rustls listener that accepts TLS 1.2 and does not negotiate X25519MLKEM768. Always verify the path exists before deploying.
+These two were one flag until they were split, and the split matters because they answer different questions.
+
+`fallback_to_classical` is **client compatibility**: whether a classical group (P-384, 192-bit) is offered alongside the hybrid PQC groups. X25519 and P-256 are refused regardless. With it off, a client with no ML-KEM support cannot complete a handshake at all — on this deployment that measurably includes curl built against quictls, third-party uptime monitoring and several crawlers, all of which reach the site today over P-384. It is a live lockout, not a posture setting. `require_hybrid = true` states the same lockout deliberately.
+
+`require_pqc_provider` is **our own posture**: what happens when PQC is enabled and its provider cannot be used. It defaults to refusing to start. Previously the only way to fail closed here was to turn off `fallback_to_classical`, which also cut off every non-PQC client — so the safe choice carried a price nobody wanted to pay, and the unsafe one was the default.
+
+Whichever setting removes the classical group, the proxy now logs a warning saying so. It used to warn for `require_hybrid` and stay silent for `fallback_to_classical = false`, so the more obscure route to a client lockout was also the quieter one.
+
+> **Important**: `openssl_path` must point to an OpenSSL 3.5+ binary built with ML-KEM support. The proxy checks this path at startup to decide whether the PQC TCP listener is available. With `require_pqc_provider = true` (the default) a wrong or missing path stops startup; with it false the proxy falls back to a standard rustls listener that accepts TLS 1.2 and does not negotiate X25519MLKEM768. Verify the path before deploying either way.
 
 ## ACME Certificate Automation
 

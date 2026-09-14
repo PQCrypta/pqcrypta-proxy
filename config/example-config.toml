@@ -282,7 +282,28 @@ openssl_lib_path = "/usr/local/openssl-3.5/lib64"
 preferred_kem = "X25519MLKEM768"
 
 # Fallback to classical TLS if PQC is unavailable
+# Offer a classical key-exchange group (P-384) alongside the hybrid PQC groups.
+#
+# This is a CLIENT COMPATIBILITY switch, not a statement about our posture. With
+# it off, a client with no ML-KEM support cannot handshake at all — measured on
+# this deployment, that includes curl built against quictls, third-party uptime
+# monitoring and several crawlers, all of which reach the site today over P-384.
+# X25519 and P-256 are already refused; P-384 is 192-bit.
+#
+# It no longer governs what happens when our OWN crypto is broken. See
+# require_pqc_provider below.
 fallback_to_classical = true
+
+# Refuse to start when PQC is enabled but its provider cannot be used, rather
+# than degrading to a classical-only listener with a warning in the log.
+#
+# Split out of fallback_to_classical, which conflated two unrelated decisions —
+# what we offer clients, and what we do when our own crypto is broken. Failing
+# closed on the second used to cost a client lockout, so in practice nobody did
+# it. Gated by pqc.enabled, so this only fires where PQC was asked for and is
+# broken, which should stop a deployment rather than quietly serve classical
+# crypto under a configuration claiming otherwise.
+require_pqc_provider = true
 
 # Minimum security level (NIST levels 1-5)
 # 1 = 128-bit, 3 = 192-bit (recommended), 5 = 256-bit
