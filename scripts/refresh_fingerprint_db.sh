@@ -354,8 +354,44 @@ check_config_drift() {
     done
 
     check_apache_drift || DRIFTED=1
+    check_app_config_drift || DRIFTED=1
 
     [ "${DRIFTED}" -eq 0 ] && log "config drift: all four nodes match what is tracked"
+}
+
+# The app's config.php, tracked redacted beside the rest.
+#
+# It is gitignored in the app repo because it holds live credentials, so without
+# this nothing watches it: the 2026-09-15 CSP fix — which stopped it overwriting
+# every page's Content-Security-Policy and un-broke the speedtest server picker —
+# existed only on disk, and a restore from git would have reverted it silently.
+#
+# Delegates the redaction to scripts/sync_app_config.sh in the configs repo,
+# which is fail-closed: it refuses to write if any live value survives. If that
+# script aborts, this reports drift rather than swallowing it, because an
+# un-refreshed copy is exactly the state this exists to catch.
+check_app_config_drift() {
+    local SYNC="${CONFIG_REPO}/../../scripts/sync_app_config.sh"
+    local TRACKED="${CONFIG_REPO}/../../php/config.php.redacted"
+    [ -x "${SYNC}" ] || { log "app config drift: ${SYNC} missing, skipped"; return 0; }
+
+    local BEFORE=""
+    [ -f "${TRACKED}" ] && BEFORE=$(sha256sum "${TRACKED}" | cut -d' ' -f1)
+
+    if ! "${SYNC}" >/dev/null 2>&1; then
+        log "app config drift: sync_app_config.sh ABORTED — live config not published, investigate"
+        return 1
+    fi
+
+    local AFTER
+    AFTER=$(sha256sum "${TRACKED}" 2>/dev/null | cut -d' ' -f1)
+    if [ "${BEFORE}" != "${AFTER}" ]; then
+        log "app config drift: config.php moved — redacted copy refreshed, review and commit"
+        return 1
+    fi
+
+    log "app config drift: config.php matches what is tracked"
+    return 0
 }
 
 # Apache vhosts on this node, tracked beside the proxy config.
