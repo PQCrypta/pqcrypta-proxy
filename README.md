@@ -13,7 +13,7 @@
 - **Full-Featured Proxy**: Domain-based routing, custom header injection, per-route timeouts, security headers, CORS, redirects
 - **Three TLS Modes**: Terminate, Re-encrypt, and Passthrough (SNI-based)
 - **Modern Protocols**: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebTransport
-- **Post-Quantum Ready**: Hybrid PQC key exchange (X25519MLKEM768) via OpenSSL 3.5+ with native ML-KEM; ML-DSA-87 (FIPS 204) server certificates per SNI; PQC downgrade detection reading the negotiated group off the connection
+- **Post-Quantum Ready**: Hybrid PQC key exchange (X25519MLKEM768) via OpenSSL 3.5+ with native ML-KEM; RFC 8879 certificate compression to claw back the handshake bytes ML-KEM adds; ML-DSA-87 (FIPS 204) server certificates per SNI; PQC downgrade detection reading the negotiated group off the connection
 - **Encrypted Client Hello**: Server-side ECH (draft-ietf-tls-esni-25) on TCP and QUIC, with rotating HPKE keys published in the DNS HTTPS record
 - **Zero Downtime**: Hot reload configuration and TLS certificates; environment-specific config overlay (`--env`)
 - **ACME Automation**: Automatic Let's Encrypt certificate provisioning, renewal, and Certificate Transparency log submission
@@ -104,6 +104,7 @@
 | **Hot Reload** | ✅ | Configuration and TLS certificates reloaded at runtime without dropping connections or restarting |
 | **Log Rotation (SIGHUP)** | ✅ | `SIGHUP` reopens all log file handles in-place; compatible with logrotate `postrotate` — no restart required |
 | **TLS 1.3 Default** | ✅ | TLS 1.3 minimum by default on all listeners (`min_version = "1.3"`); configurable to allow TLS 1.2 via `min_version` in `[tls]` |
+| **Certificate Compression (RFC 8879)** | ✅ | The certificate chain is sent compressed to any client that offers `compress_certificate`. Measured on pqcrypta.com: 3,435 bytes to 2,376 with zlib (1.45:1), about 1&nbsp;KB off every full handshake — which roughly offsets what the X25519MLKEM768 key share adds. Both TLS stacks are covered, and they need different treatment: on the OpenSSL TCP listener it takes `SSL_CTX_set1_cert_comp_preference` **and** `SSL_CTX_compress_certs` (the preference alone reports success and changes nothing on the wire), while rustls on QUIC/HTTP-3 needs only its `brotli`/`zlib` crate features. zlib on TCP because these OpenSSL builds carry `-DZLIB` and nothing else; brotli and zlib on the QUIC side |
 | **Server Identity Concealment** | ✅ | Server header suppressed and replaced with configurable custom branding |
 | **JWT Rate Limiting** | ✅ | Per-subject rate limiting with HMAC-SHA256 signature verification; unsigned `sub` claims rejected; non-HMAC algorithms blocked |
 | **Log Injection Prevention** | ✅ | Newlines and control characters stripped from all user-controlled fields before writing to access and audit logs |
