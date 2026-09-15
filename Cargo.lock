@@ -3206,6 +3206,8 @@ name = "rustls"
 version = "0.23.36"
 dependencies = [
  "aws-lc-rs",
+ "brotli 8.0.2",
+ "brotli-decompressor 5.0.0",
  "log",
  "once_cell",
  "ring",
@@ -3213,6 +3215,7 @@ dependencies = [
  "rustls-webpki",
  "subtle",
  "zeroize",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -5047,6 +5050,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40990edd51aae2c2b6907af74ffb635029d5788228222c4bb811e9351c0caad3"
 
 [[package]]
 name = "zmij"

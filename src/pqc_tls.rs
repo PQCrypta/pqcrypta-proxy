@@ -677,6 +677,70 @@ pub mod openssl_pqc {
     ///
     /// This configures OpenSSL 3.5+ with ML-KEM hybrid groups for post-quantum
     /// key exchange while maintaining backward compatibility with classical TLS.
+    /// Enable RFC 8879 certificate compression on the TCP listener.
+    ///
+    /// OpenSSL will *receive* a compressed chain by default but never *sends* one
+    /// unless a preference list is set — a stock 3.5.5 `s_server` answers a client
+    /// offering zlib with a plain Certificate, which is exactly what this proxy was
+    /// doing. The rustls side (QUIC/HTTP-3) needs no equivalent: there the crate
+    /// features alone populate `ServerConfig::cert_compressors`.
+    ///
+    /// Raw FFI because neither the `openssl` nor the `openssl-sys` crate binds this
+    /// call, though libssl exports it.
+    ///
+    /// Only zlib is offered. The three OpenSSL builds here report `-DZLIB` and
+    /// nothing else, so naming brotli or zstd would advertise algorithms the
+    /// library cannot produce. Clients overwhelmingly offer zlib anyway — OpenSSL's
+    /// own s_client offers zlib alone, and Facebook, the one origin in a sample of
+    /// six found compressing at all, answers with it.
+    ///
+    /// Worth ~1.1 KB per full handshake here: the chain is 3,411 bytes over four
+    /// certs and zlib takes it to about 2,356.
+    fn enable_cert_compression(ctx: *mut openssl_sys::SSL_CTX) {
+        // int SSL_CTX_set1_cert_comp_preference(SSL_CTX *ctx, int *algs, size_t len);
+        unsafe extern "C" {
+            fn SSL_CTX_set1_cert_comp_preference(
+                ctx: *mut openssl_sys::SSL_CTX,
+                algs: *mut std::os::raw::c_int,
+                len: usize,
+            ) -> std::os::raw::c_int;
+            // int SSL_CTX_compress_certs(SSL_CTX *ctx, int alg);
+            fn SSL_CTX_compress_certs(
+                ctx: *mut openssl_sys::SSL_CTX,
+                alg: std::os::raw::c_int,
+            ) -> std::os::raw::c_int;
+        }
+
+        const TLSEXT_COMP_CERT_ZLIB: std::os::raw::c_int = 1;
+        let mut algs = [TLSEXT_COMP_CERT_ZLIB];
+
+        // Safety: `ctx` is the live SSL_CTX owned by the builder, and `algs` is a
+        // stack array that OpenSSL copies out of (set1_ semantics) before returning.
+        let rc = unsafe { SSL_CTX_set1_cert_comp_preference(ctx, algs.as_mut_ptr(), algs.len()) };
+
+        // Setting the preference alone is not enough on OpenSSL 3.5: the chain
+        // must also be compressed into the context. Verified the hard way — with
+        // only the preference set, and the call reporting success, pqcrypta.com
+        // went on answering a zlib-offering client with a plain 3,435-byte
+        // Certificate. Safe to call here: the certificate is loaded before this
+        // point at every call site.
+        let compressed = unsafe { SSL_CTX_compress_certs(ctx, TLSEXT_COMP_CERT_ZLIB) };
+
+        if rc == 1 && compressed == 1 {
+            tracing::info!("TLS certificate compression enabled (RFC 8879, zlib)");
+        } else if rc == 1 {
+            tracing::warn!(
+                "TLS certificate compression preference set but SSL_CTX_compress_certs returned \
+                 {compressed}; chains will be sent uncompressed"
+            );
+        } else {
+            // Not fatal: an uncompressed chain is correct, just larger.
+            tracing::warn!(
+            "TLS certificate compression unavailable (SSL_CTX_set1_cert_comp_preference returned {rc});              chains will be sent uncompressed"
+        );
+        }
+    }
+
     pub fn create_pqc_acceptor(
         cert_path: &Path,
         key_path: &Path,
@@ -831,6 +895,7 @@ pub mod openssl_pqc {
             .set_private_key_file(default_key_path, SslFiletype::PEM)
             .map_err(|e| format!("Failed to load default private key: {}", e))?;
         apply_pqc_groups(&mut builder, pqc_provider);
+        enable_cert_compression(builder.as_ptr());
         builder
             .set_alpn_protos(b"\x02h2\x08http/1.1")
             .map_err(|e| format!("Failed to set ALPN protos: {}", e))?;
@@ -900,6 +965,7 @@ pub mod openssl_pqc {
             .set_private_key_file(key_path, SslFiletype::PEM)
             .map_err(|e| format!("Failed to load key {:?}: {}", key_path, e))?;
         apply_pqc_groups(&mut builder, pqc_provider);
+        enable_cert_compression(builder.as_ptr());
         builder
             .set_alpn_protos(b"\x02h2\x08http/1.1")
             .map_err(|e| format!("Failed to set ALPN: {}", e))?;
@@ -957,6 +1023,7 @@ pub mod openssl_pqc {
             .set_private_key_file(key_path, SslFiletype::PEM)
             .map_err(|e| format!("Failed to load key {:?}: {}", key_path, e))?;
         apply_pqc_groups(&mut builder, pqc_provider);
+        enable_cert_compression(builder.as_ptr());
         // HTTP/1.1 only — no h2 advertised
         builder
             .set_alpn_protos(b"\x08http/1.1")

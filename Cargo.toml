@@ -81,7 +81,18 @@ bytes = "1.9"
 
 # TLS with PQC support via aws-lc-rs (has ML-KEM)
 # prefer-post-quantum feature enables X25519MLKEM768 as preferred key exchange
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "prefer-post-quantum"] }
+# `brotli` and `zlib` switch on RFC 8879 certificate compression. rustls picks
+# the compressors up from the crate features on its own — ServerConfig's
+# cert_compressors defaults to compress::default_cert_compressors() — so no
+# wiring is needed beyond this line.
+#
+# Worth it here more than on most servers: the chain is 3,411 bytes over four
+# certs (the Let's Encrypt cross-signed ECDSA path, none of it redundant), and
+# brotli takes it to 2,257 — 1,154 bytes off a handshake that is already
+# carrying an ~1.1 KB ML-KEM key share for X25519MLKEM768. Both algorithms are
+# listed because the client picks: brotli compresses better, zlib is what some
+# clients offer alone.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "prefer-post-quantum", "brotli", "zlib"] }
 rustls-pemfile = "2.2"
 rustls-pki-types = { version = "1.9", features = ["alloc"] }
 rustls-native-certs = "0.8"
