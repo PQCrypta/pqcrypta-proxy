@@ -21,7 +21,12 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+
+/// Body returned when no route matches. Named so the access log can report its
+/// length without the literal drifting from the response.
+const NO_ROUTE_BODY: &str = "Not Found";
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
@@ -409,11 +414,10 @@ fn build_proxy_service(
             None => MaybeFingerprint::Without(svc),
         };
 
-        let svc = wrap(
+        wrap(
             middleware::from_fn_with_state(rl_state, advanced_rate_limit_middleware),
             svc,
-        );
-        svc
+        )
     };
 
     // Trace context is the absolute outermost layer so the trace ID is available
@@ -1884,6 +1888,10 @@ async fn proxy_handler(
     // rather than from `x-connection-protocol`: only two of the three TCP accept
     // loops injected that header, so the gate was inert on the third.
     let is_http11 = req.version() == http::Version::HTTP_11;
+    // The protocol actually negotiated, for the access log. Every call site
+    // below used to write a literal "HTTP/1.1", so h2 traffic was recorded as
+    // h1 and the log could not tell the two apart.
+    let protocol_str = crate::access_logger::protocol_name(req.version());
     let is_ws_upgrade = headers
         .get("upgrade")
         .and_then(|v| v.to_str().ok())
@@ -2595,14 +2603,17 @@ async fn proxy_handler(
                     is_health_check,
                 );
 
+                let timeout_body =
+                    format!("Backend timeout after {}ms", backend_timeout.as_millis());
+
                 // Log backend timeout
                 log_access(&AccessLogEntry {
                     remote_addr: client_addr,
                     method: &method_str,
                     path: &path,
-                    protocol: "HTTP/1.1",
+                    protocol: protocol_str,
                     status: 504,
-                    body_size: 0,
+                    body_size: timeout_body.len(),
                     referer: referer.as_deref(),
                     user_agent: user_agent.as_deref(),
                     host: Some(&host_str),
@@ -2613,11 +2624,7 @@ async fn proxy_handler(
                         .unwrap_or(u64::MAX),
                 });
 
-                (
-                    StatusCode::GATEWAY_TIMEOUT,
-                    format!("Backend timeout after {}ms", backend_timeout.as_millis()),
-                )
-                    .into_response()
+                (StatusCode::GATEWAY_TIMEOUT, timeout_body).into_response()
             }
             Ok(Ok(backend_response)) => {
                 let response_time = request_start.elapsed();
@@ -2699,23 +2706,46 @@ async fn proxy_handler(
                         Some(&path),
                         is_health_check,
                     );
-                    log_access(&AccessLogEntry {
-                        remote_addr: client_addr,
-                        method: &method_str,
-                        path: &path,
-                        protocol: "HTTP/1.1",
-                        status: resp_status,
-                        body_size: 0,
-                        referer: referer.as_deref(),
-                        user_agent: user_agent.as_deref(),
-                        host: Some(&host_str),
-                        response_time_ms: request_start
-                            .elapsed()
-                            .as_millis()
-                            .try_into()
-                            .unwrap_or(u64::MAX),
-                    });
-                    return Response::from_parts(parts, Body::new(incoming_body));
+                    // This branch forwards the body without buffering it, so there is
+                    // no length to log yet. Hold the line open and write it when the
+                    // stream ends — or when the client disconnects mid-stream, which
+                    // the guard's Drop covers.
+                    let (guard, counter) = crate::access_logger::StreamedBodyLogger::new(
+                        crate::access_logger::DeferredAccessLog {
+                            remote_addr: client_addr,
+                            method: method_str.clone(),
+                            path: path.clone(),
+                            protocol: protocol_str,
+                            status: resp_status,
+                            referer: referer.clone(),
+                            user_agent: user_agent.clone(),
+                            host: Some(host_str.clone()),
+                            started: request_start,
+                        },
+                    );
+                    let counted = futures_util::StreamExt::filter_map(
+                        futures_util::StreamExt::map(
+                            http_body_util::BodyStream::new(Body::new(incoming_body)),
+                            move |frame| {
+                                // `guard` is owned by this closure, so it is dropped
+                                // with the stream and logs exactly once.
+                                let _logger = &guard;
+                                match frame {
+                                    Ok(f) => match f.into_data() {
+                                        Ok(data) => {
+                                            counter.fetch_add(data.len(), Ordering::Relaxed);
+                                            Some(Ok(data))
+                                        }
+                                        // Trailers carry no body bytes.
+                                        Err(_) => None,
+                                    },
+                                    Err(e) => Some(Err(e)),
+                                }
+                            },
+                        ),
+                        |item| async move { item },
+                    );
+                    return Response::from_parts(parts, Body::from_stream(counted));
                 }
 
                 // Buffer the response body BEFORE releasing the backend connection.
@@ -2878,6 +2908,16 @@ async fn proxy_handler(
                 // it did, that value is already correct and is passed through.
                 let head_without_length =
                     method == Method::HEAD && !parts.headers.contains_key(header::CONTENT_LENGTH);
+                // The body was buffered above, so its size is known here; the note
+                // that used to sit on the log call ("Can't know body size for
+                // streaming response") described a different branch — the
+                // passthrough one, which now counts its bytes as they go.
+                // Read before the move, and zero for a bodyless HEAD.
+                let body_len = if head_without_length {
+                    0
+                } else {
+                    body_bytes.len()
+                };
                 let response_body = if head_without_length {
                     Body::from_stream(futures_util::stream::empty::<
                         Result<bytes::Bytes, std::io::Error>,
@@ -2904,9 +2944,9 @@ async fn proxy_handler(
                     remote_addr: client_addr,
                     method: &method_str,
                     path: &path,
-                    protocol: "HTTP/1.1",
+                    protocol: protocol_str,
                     status: resp_status,
-                    body_size: 0, // Can't know body size for streaming response
+                    body_size: body_len,
                     referer: referer.as_deref(),
                     user_agent: user_agent.as_deref(),
                     host: Some(&host_str),
@@ -2952,14 +2992,16 @@ async fn proxy_handler(
                     is_health_check,
                 );
 
+                let error_body = format!("Backend error: {}", e);
+
                 // Log backend error
                 log_access(&AccessLogEntry {
                     remote_addr: client_addr,
                     method: &method_str,
                     path: &path,
-                    protocol: "HTTP/1.1",
+                    protocol: protocol_str,
                     status: 502,
-                    body_size: 0,
+                    body_size: error_body.len(),
                     referer: referer.as_deref(),
                     user_agent: user_agent.as_deref(),
                     host: Some(&host_str),
@@ -2970,7 +3012,7 @@ async fn proxy_handler(
                         .unwrap_or(u64::MAX),
                 });
 
-                (StatusCode::BAD_GATEWAY, format!("Backend error: {}", e)).into_response()
+                (StatusCode::BAD_GATEWAY, error_body).into_response()
             }
         }
     } else {
@@ -2992,9 +3034,9 @@ async fn proxy_handler(
             remote_addr: client_addr,
             method: &method_str,
             path: &path,
-            protocol: "HTTP/1.1",
+            protocol: protocol_str,
             status: 404,
-            body_size: 0,
+            body_size: NO_ROUTE_BODY.len(),
             referer: referer.as_deref(),
             user_agent: user_agent.as_deref(),
             host: Some(&host_str),
@@ -3005,7 +3047,7 @@ async fn proxy_handler(
                 .unwrap_or(u64::MAX),
         });
 
-        (StatusCode::NOT_FOUND, "Not Found").into_response()
+        (StatusCode::NOT_FOUND, NO_ROUTE_BODY).into_response()
     }
 }
 

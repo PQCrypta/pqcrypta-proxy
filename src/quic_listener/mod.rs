@@ -1129,12 +1129,7 @@ impl QuicListener {
                             // so this resolves when the peer closes or resets it
                             // — the session ending is the thing being awaited,
                             // not a timer.
-                            loop {
-                                match session_stream.recv_data().await {
-                                    Ok(Some(_)) => continue,
-                                    _ => break,
-                                }
-                            }
+                            while let Ok(Some(_)) = session_stream.recv_data().await {}
 
                             debug!("WebTransport session ended for {}", remote_addr);
                             wt_metrics.connections.connection_closed();

@@ -662,6 +662,7 @@ impl QuicListener {
                     path: &path,
                     protocol: "HTTP/3",
                     status: 404,
+                    // The 404 below is built with `.body(())` — genuinely no body.
                     body_size: 0,
                     referer,
                     user_agent,
@@ -1319,6 +1320,7 @@ impl QuicListener {
                         path: &path,
                         protocol: "HTTP/3",
                         status: 304,
+                        // RFC 9110 §15.4.5: a 304 carries no body.
                         body_size: 0,
                         referer,
                         user_agent,
@@ -1548,11 +1550,16 @@ impl QuicListener {
             stream.send_response(sse_builder.body(())?).await?;
 
             let mut body_stream = stream_body;
+            // Counted as it is written: this loop is the only place these bytes
+            // pass through, so the access log can report what was actually sent
+            // instead of the 0 a streamed response used to record.
+            let mut sse_bytes = 0usize;
             while let Some(frame_result) = body_stream.frame().await {
                 match frame_result {
                     Ok(frame) => {
                         if let Some(data) = frame.data_ref() {
                             if !data.is_empty() {
+                                sse_bytes += data.len();
                                 stream.send_data(data.clone()).await?;
                             }
                         }
@@ -1576,7 +1583,7 @@ impl QuicListener {
                 path: &path,
                 protocol: "HTTP/3",
                 status: stream_status.as_u16(),
-                body_size: 0,
+                body_size: sse_bytes,
                 referer,
                 user_agent,
                 host: host.as_deref(),

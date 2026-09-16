@@ -8,6 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::{debug, error, info};
 
@@ -207,5 +208,147 @@ pub fn get_access_logger() -> Option<&'static AccessLogger> {
 pub fn log_access(entry: &AccessLogEntry<'_>) {
     if let Some(logger) = get_access_logger() {
         logger.log(entry);
+    }
+}
+
+/// The token that belongs in the request line for a given HTTP version.
+///
+/// Every TCP call site used to hardcode `"HTTP/1.1"`, so an h2 request was
+/// logged as h1 and the log could not answer "which protocol did this client
+/// use?" — the one question a mixed h1/h2/h3 edge gets asked most.
+pub fn protocol_name(version: http::Version) -> &'static str {
+    match version {
+        http::Version::HTTP_09 => "HTTP/0.9",
+        http::Version::HTTP_10 => "HTTP/1.0",
+        http::Version::HTTP_11 => "HTTP/1.1",
+        http::Version::HTTP_2 => "HTTP/2.0",
+        http::Version::HTTP_3 => "HTTP/3.0",
+        _ => "HTTP/1.1",
+    }
+}
+
+/// Bytes a fully-built response will send, read from the length it declares.
+///
+/// For the short refusal bodies the security layers produce, `into_response()`
+/// has already set `content-length`, so this is exact. Returns 0 when no length
+/// is declared, which for those responses means there is no body.
+pub fn declared_body_size(headers: &http::HeaderMap) -> usize {
+    headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+/// An access-log line held open while a streaming body is still being written.
+///
+/// A passthrough stream (SSE, and anything else the proxy forwards without
+/// buffering) has no size at the moment the response head is built. Logging
+/// there is why `$body_bytes_sent` read 0 on those requests. This owns its
+/// fields so the line can be written when the body actually ends.
+pub struct DeferredAccessLog {
+    pub remote_addr: SocketAddr,
+    pub method: String,
+    pub path: String,
+    pub protocol: &'static str,
+    pub status: u16,
+    pub referer: Option<String>,
+    pub user_agent: Option<String>,
+    pub host: Option<String>,
+    pub started: std::time::Instant,
+}
+
+impl DeferredAccessLog {
+    /// Write the line, now that the body has ended and its size is known.
+    pub fn finish(self, body_size: usize) {
+        log_access(&AccessLogEntry {
+            remote_addr: self.remote_addr,
+            method: &self.method,
+            path: &self.path,
+            protocol: self.protocol,
+            status: self.status,
+            body_size,
+            referer: self.referer.as_deref(),
+            user_agent: self.user_agent.as_deref(),
+            host: self.host.as_deref(),
+            response_time_ms: self
+                .started
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        });
+    }
+}
+
+/// Writes a [`DeferredAccessLog`] when the body it is attached to is dropped.
+///
+/// Drop rather than end-of-stream on purpose: a client that disconnects halfway
+/// through an event stream still gets a log line, carrying the bytes it actually
+/// received, which is what nginx records and what makes an aborted stream
+/// visible at all.
+pub struct StreamedBodyLogger {
+    entry: Option<DeferredAccessLog>,
+    counter: Arc<AtomicUsize>,
+}
+
+impl StreamedBodyLogger {
+    pub fn new(entry: DeferredAccessLog) -> (Self, Arc<AtomicUsize>) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                entry: Some(entry),
+                counter: Arc::clone(&counter),
+            },
+            counter,
+        )
+    }
+}
+
+impl Drop for StreamedBodyLogger {
+    fn drop(&mut self) {
+        if let Some(entry) = self.entry.take() {
+            entry.finish(self.counter.load(Ordering::Relaxed));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every TCP call site once wrote a literal "HTTP/1.1", so an h2 request was
+    /// indistinguishable from an h1 one in the log.
+    #[test]
+    fn protocol_name_reports_the_version_it_was_given() {
+        assert_eq!(protocol_name(http::Version::HTTP_11), "HTTP/1.1");
+        assert_eq!(protocol_name(http::Version::HTTP_2), "HTTP/2.0");
+        assert_eq!(protocol_name(http::Version::HTTP_3), "HTTP/3.0");
+        assert_eq!(protocol_name(http::Version::HTTP_10), "HTTP/1.0");
+    }
+
+    #[test]
+    fn declared_body_size_reads_content_length() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::CONTENT_LENGTH, "2376".parse().unwrap());
+        assert_eq!(declared_body_size(&headers), 2376);
+    }
+
+    /// No declared length means no body on these refusal responses — not an
+    /// unknown length, so 0 is the honest answer rather than a placeholder.
+    #[test]
+    fn declared_body_size_is_zero_without_a_length() {
+        assert_eq!(declared_body_size(&http::HeaderMap::new()), 0);
+    }
+
+    /// A malformed content-length must not panic the logger.
+    #[test]
+    fn declared_body_size_ignores_a_length_it_cannot_parse() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            "not-a-number".parse().unwrap(),
+        );
+        assert_eq!(declared_body_size(&headers), 0);
     }
 }

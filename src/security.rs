@@ -2110,23 +2110,14 @@ pub async fn security_middleware(
             // path runs on every blocked request.
             let header_str =
                 |name: hyper::header::HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
-            // `Version` has no `as_str`, so map the few variants rather than
-            // format! into a String that the logger only reads back.
-            let protocol = match request.version() {
-                hyper::Version::HTTP_09 => "HTTP/0.9",
-                hyper::Version::HTTP_10 => "HTTP/1.0",
-                hyper::Version::HTTP_11 => "HTTP/1.1",
-                hyper::Version::HTTP_2 => "HTTP/2.0",
-                hyper::Version::HTTP_3 => "HTTP/3.0",
-                _ => "HTTP/1.1",
-            };
+            let protocol = crate::access_logger::protocol_name(request.version());
             log_access(&AccessLogEntry {
                 remote_addr: client_addr,
                 method: request.method().as_str(),
                 path: request.uri().path(),
                 protocol,
                 status: response.status().as_u16(),
-                body_size: 0,
+                body_size: crate::access_logger::declared_body_size(response.headers()),
                 referer: header_str(hyper::header::REFERER),
                 user_agent: header_str(hyper::header::USER_AGENT),
                 host: header_str(hyper::header::HOST),

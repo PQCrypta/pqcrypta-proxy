@@ -23,6 +23,9 @@ use crate::rate_limiter::{
 
 use super::HttpListenerState;
 
+/// Body of the WAF refusal. Named so the logged length cannot drift from it.
+const ACCESS_DENIED_BODY: &str = "Access denied";
+
 /// Middleware that extracts the incoming distributed trace context and makes it
 /// the parent of the current request span.
 ///
@@ -481,6 +484,7 @@ pub(super) async fn advanced_rate_limit_middleware(
         return next.run(request).await;
     }
     let method = request.method().as_str().to_string();
+    let protocol_str = crate::access_logger::protocol_name(request.version());
     let path = request.uri().path().to_ascii_lowercase();
 
     // Pre-build Alt-Svc header for error responses (ports 443, 4433, 4434)
@@ -621,16 +625,16 @@ pub(super) async fn advanced_rate_limit_middleware(
                 remote_addr: client_addr,
                 method: &method,
                 path: &path,
-                protocol: "HTTP/1.1",
+                protocol: protocol_str,
                 status: 403,
-                body_size: 0,
+                body_size: ACCESS_DENIED_BODY.len(),
                 referer: header_str(hyper::header::REFERER),
                 user_agent: header_str(hyper::header::USER_AGENT),
                 host: header_str(hyper::header::HOST),
                 response_time_ms: 0,
             });
 
-            let mut response = (StatusCode::FORBIDDEN, "Access denied").into_response();
+            let mut response = (StatusCode::FORBIDDEN, ACCESS_DENIED_BODY).into_response();
             // Add Alt-Svc header to advertise HTTP/3
             add_alt_svc_to_response(&mut response, alt_svc);
             response
