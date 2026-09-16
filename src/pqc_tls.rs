@@ -691,11 +691,13 @@ pub mod openssl_pqc {
     /// Only zlib is offered. The three OpenSSL builds here report `-DZLIB` and
     /// nothing else, so naming brotli or zstd would advertise algorithms the
     /// library cannot produce. Clients overwhelmingly offer zlib anyway — OpenSSL's
-    /// own s_client offers zlib alone, and Facebook, the one origin in a sample of
-    /// six found compressing at all, answers with it.
+    /// own s_client offers zlib alone, and Facebook, the one of four large external
+    /// origins sampled that compresses at all, answers with it.
     ///
-    /// Worth ~1.1 KB per full handshake here: the chain is 3,411 bytes over four
-    /// certs and zlib takes it to about 2,356.
+    /// Worth exactly 1,051 bytes per full handshake here, measured over seven
+    /// connections each way with `-no_rx_cert_comp`: the Certificate message is
+    /// 3,435 bytes and the CompressedCertificate that replaces it is 2,384. The
+    /// chain itself is 3,411 bytes over four certs, which zlib takes to 2,356.
     fn enable_cert_compression(ctx: *mut openssl_sys::SSL_CTX) {
         // int SSL_CTX_set1_cert_comp_preference(SSL_CTX *ctx, int *algs, size_t len);
         unsafe extern "C" {
