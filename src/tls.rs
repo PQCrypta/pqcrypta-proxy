@@ -487,6 +487,7 @@ pub fn zero_rtt_accept_server_config(
         .with_cert_resolver(resolver);
 
     config.alpn_protocols = vec![b"h3".to_vec()];
+    crate::cert_compression::apply(&mut config);
     // Advertised in the ticket, and honoured rather than declined.
     config.max_early_data_size = u32::MAX;
 
@@ -506,6 +507,7 @@ pub fn zero_rtt_reject_server_config(
         .with_cert_resolver(resolver);
 
     config.alpn_protocols = vec![b"h3".to_vec()];
+    crate::cert_compression::apply(&mut config);
     // Advertised in the ticket, so a client offers early data...
     config.max_early_data_size = u32::MAX;
     // ...and declined every time, which is what the test is about.
@@ -987,6 +989,7 @@ impl TlsProvider {
         // by ech-keygen/ech-rotate.timer). Absent -> normal non-ECH TLS,
         // exactly as before this existed.
         config.ech = crate::ech_config::load();
+        crate::cert_compression::apply(&mut config);
 
         // Configure 0-RTT (early data)
         // L-5: 0-RTT is a replay-attack risk. The proxy forwards early data to

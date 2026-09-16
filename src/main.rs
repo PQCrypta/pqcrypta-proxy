@@ -689,6 +689,10 @@ async fn run() -> anyhow::Result<()> {
         None
     };
 
+    // Fixed before any TLS context is built, since both stacks bake the answer
+    // into the context rather than consulting it per handshake.
+    pqcrypta_proxy::cert_compression::init(&config.tls.certificate_compression);
+
     let config = Arc::new(config);
 
     // =========================================================================

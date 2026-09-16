@@ -699,6 +699,13 @@ pub mod openssl_pqc {
     /// 3,435 bytes and the CompressedCertificate that replaces it is 2,384. The
     /// chain itself is 3,411 bytes over four certs, which zlib takes to 2,356.
     fn enable_cert_compression(ctx: *mut openssl_sys::SSL_CTX) {
+        // `tls.certificate_compression = "off"` leaves the context alone, which is
+        // all that is needed here: OpenSSL sends an uncompressed chain unless
+        // asked, so not asking is the off switch.
+        if !crate::cert_compression::enabled() {
+            return;
+        }
+
         // int SSL_CTX_set1_cert_comp_preference(SSL_CTX *ctx, int *algs, size_t len);
         unsafe extern "C" {
             fn SSL_CTX_set1_cert_comp_preference(

@@ -57,6 +57,7 @@ pub(super) fn build_rustls_server_config(
     // Set ALPN protocols for HTTP/2 and HTTP/1.1 negotiation
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     config.ech = crate::ech_config::load();
+    crate::cert_compression::apply(&mut config);
 
     Ok(config)
 }
@@ -89,6 +90,7 @@ pub(super) fn build_rustls_server_config_http11_only(
     // HTTP/1.1 only — browser cannot coalesce streams onto a single TCP pipe
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     config.ech = crate::ech_config::load();
+    crate::cert_compression::apply(&mut config);
 
     Ok(config)
 }
@@ -104,6 +106,7 @@ pub(super) fn build_rustls_server_config_with_resolver(
         .with_cert_resolver(resolver);
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     config.ech = crate::ech_config::load();
+    crate::cert_compression::apply(&mut config);
     Ok(config)
 }
 
@@ -116,5 +119,6 @@ pub(super) fn build_rustls_server_config_http11_only_with_resolver(
         .with_cert_resolver(resolver);
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     config.ech = crate::ech_config::load();
+    crate::cert_compression::apply(&mut config);
     Ok(config)
 }

@@ -100,6 +100,7 @@ pub mod acme;
 pub mod admin;
 pub mod audit_logger;
 pub mod cache;
+pub mod cert_compression;
 pub mod compression;
 pub mod config;
 pub mod conformance;

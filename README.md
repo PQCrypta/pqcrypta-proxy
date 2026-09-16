@@ -118,6 +118,7 @@
 | **Connection Pool** | ✅ | Per-backend connection pool with configurable max idle, max total, acquire timeout, and idle timeout |
 | **Session Affinity Modes** | ✅ | Sticky sessions via IP hash, custom header, or Set-Cookie with configurable SameSite attribute |
 | **Path Regex Routing** | ✅ | Per-route regex pattern matching with ReDoS prevention (pattern size-limited) |
+| **Certificate Compression** | ✅ | RFC 8879 on both stacks: zlib over TCP via OpenSSL's `SSL_CTX_compress_certs`, brotli or zlib over QUIC/HTTP-3 where rustls builds the list from crate features. `certificate_compression = "auto" \| "off"` in `[tls]`, default `auto`. Worth 1,051 bytes off every full handshake on a four-certificate Let's Encrypt chain |
 | **PQC Session Tickets** | ✅ | Each TLS 1.3 ticket carries its own ML-KEM-1024 encapsulation; the resumption state is sealed with an AES-256-GCM key derived from it via HKDF-SHA384 (`pqc_session_tickets`, `session_ticket_lifetime_secs`) |
 | **TLS Key Permission Checks** | ✅ | Validates private key file permissions at startup; configurable strict mode aborts on insecure permissions |
 | **Malicious Fingerprint Blocking** | ✅ | Classification consults the operator database at `fingerprint_db_path` first, then the built-in table, matching JA3 then JA4 (`block_malicious`, `block_scanners`). Authorised `pentest_bypass_ips` are classified but never banned |
@@ -165,6 +166,7 @@
 - **PQC Downgrade Detection**: Detects classical-only TLS negotiation when PQC is required; configurable action: block (421), log, or allow
 - **PQC + Fingerprinting Combined**: OpenSSL ML-KEM with ClientHello capture for early blocking
 - **PQC Session Tickets**: rustls installs no ticketer by default, so with `pqc_session_tickets = false` the proxy issues no TLS 1.3 tickets at all and resumption relies on session storage. When enabled, each ticket encapsulates to the server's ML-KEM-1024 (FIPS 204) key for a fresh per-ticket secret, derives an AES-256-GCM key from it with HKDF-SHA384, and seals the resumption state with the KEM ciphertext as associated data. The keypair rolls every `session_ticket_lifetime_secs` (default 12 h) retaining one previous generation, since the trait requires lifetime to be enforced by key rolling rather than a timestamp inside the ticket. Note the server holds both halves of the keypair: what this changes is the algorithm protecting ticket key material and that each ticket gets an independent secret — it is not a defence against reading server memory
+- **Certificate Compression**: RFC 8879, on by default (`certificate_compression = "auto"` in `[tls]`; `"off"` disables it on both stacks). The two stacks enable it in completely different ways — OpenSSL sends an uncompressed chain unless the application calls **both** `SSL_CTX_set1_cert_comp_preference` *and* `SSL_CTX_compress_certs`, neither of which the `openssl` or `openssl-sys` crates bind, while rustls needs no call at all and populates `cert_compressors` from the `brotli` and `zlib` crate features. Only zlib is offered over TCP, because these OpenSSL builds report `-DZLIB` and nothing else and advertising an algorithm the library cannot produce is worse than offering one fewer. Measured on this deployment: the Certificate message is 3,435 bytes and the `CompressedCertificate` replacing it is 2,384, a saving of exactly 1,051 bytes per full handshake — most of what the X25519MLKEM768 key share adds. The setting is read once at startup because both stacks bake it into the TLS context, so changing it needs a restart rather than a config reload
 - **TLS 1.3 Default**: TLS 1.3 minimum on all listeners by default (`min_version = "1.3"` in `[tls]`), which is what this deployment runs. TLS 1.2 can be permitted via config for compatibility, but that is a departure from the default posture rather than an equivalent choice — OpenSSL 3.5+ for TCP/TLS, rustls for QUIC/HTTP3
 - **TLS Key Permission Checks**: Private key file permissions validated at startup; `strict_key_permissions = true` aborts if permissions are too permissive
 - **0-RTT Replay Protection**: Nonce store (strict/session/none modes) — rejects replayed TLS 1.3 early-data nonces within configurable window
@@ -517,6 +519,7 @@ key_path = "/etc/letsencrypt/live/example.com/privkey.pem"
 ocsp_stapling = true                # must be true AND [ocsp].enabled for stapling to run
 pqc_session_tickets = true          # without this, no TLS 1.3 tickets are issued at all
 session_ticket_lifetime_secs = 43200
+certificate_compression = "auto"    # RFC 8879; "auto" (default) or "off"; restart to apply
 
 [http_redirect]
 enabled = true
