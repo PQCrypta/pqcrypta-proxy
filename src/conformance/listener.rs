@@ -181,12 +181,14 @@ impl TestListener {
                 // 0x2A2A, one of the RFC 8701 reserved values, chosen from the
                 // middle of the range rather than the ends so a client that
                 // special-cases a boundary is not accidentally let through.
-                // Withdrawn: a GREASE value in the ServerHello key_share is a
-                // group the client did not offer, so rejecting it is correct
-                // under §4.1.3 and the test as built accused every conformant
-                // client. See the catalogue entry. The impairment variant stays
-                // in the fork for when the honest version is built.
-                "t-grease-group" => None,
+                // Rebuilt where the value is legal: the server's
+                // supported_groups in EncryptedExtensions, not the ServerHello
+                // key_share. The first version put it in the key_share, which
+                // §4.1.3 makes illegal whatever the value is, and so accused
+                // every conformant client of a failure. See the catalogue entry.
+                "t-grease-group" => Some(rustls::server::KeyShareImpairment::GreaseGroup(
+                    GREASE_NAMED_GROUP,
+                )),
                 _ => None,
             };
             tls_provider
@@ -1910,6 +1912,13 @@ const GOAWAY_AFTER_REQUEST: &str = "h-goaway";
 /// between them in RFC 9000 §2.1) says precisely "this one is being handled and
 /// nothing after it is".
 const GOAWAY_NEXT_REQUEST_STEP: u64 = 4;
+
+/// The RFC 8701 reserved group `t-grease-group` advertises.
+///
+/// 0x2A2A, taken from the middle of the reserved range rather than either end,
+/// so a client that special-cases a boundary value is not let through by
+/// accident.
+const GREASE_NAMED_GROUP: u16 = 0x2A2A;
 
 /// The push `h-push-promise-unsolicited` promises.
 ///

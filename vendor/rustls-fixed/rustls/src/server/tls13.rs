@@ -552,8 +552,12 @@ mod client_hello {
                 }
                 KeyShareEntry::new(ckx.group, payload)
             }
-            Some(KeyShareImpairment::GreaseGroup(code)) => {
-                KeyShareEntry::new(NamedGroup::Unknown(code), ckx.pub_key)
+            // Deliberately untouched: this impairment acts on the server's
+            // `supported_groups` in EncryptedExtensions, not on the key_share.
+            // A GREASE value here would be a group the client never offered,
+            // which §4.1.3 makes illegal and every correct client rejects.
+            Some(KeyShareImpairment::GreaseGroup(_)) => {
+                KeyShareEntry::new(ckx.group, ckx.pub_key)
             }
         };
 
@@ -788,6 +792,37 @@ mod client_hello {
                     retry_configs: ech_configs.retry_configs(),
                 },
             );
+        }
+
+        // The conformance suite's `t-grease-group`, and the only thing in this
+        // function that a serving deployment never reaches: `None` everywhere
+        // but on that port.
+        //
+        // §4.2.7 invites a server to advertise everything it supports here,
+        // "regardless of whether they are currently supported by the client",
+        // so a reserved RFC 8701 codepoint among the real groups is legal and
+        // must be ignored until the handshake completes.
+        if let Some(KeyShareImpairment::GreaseGroup(code)) = config.key_share_impairment {
+            let mut groups: Vec<NamedGroup> = config
+                .provider
+                .kx_groups
+                .iter()
+                .map(|g| g.name())
+                .collect();
+            // Second rather than first: a client that reads only the head of
+            // the list should still see a real group there, so what is measured
+            // is tolerance of the unknown value and not a failure to find
+            // anything usable.
+            groups.insert(1.min(groups.len()), NamedGroup::Unknown(code));
+            // Said out loud so a pass on this port is never vacuous: a client
+            // that "tolerated" an extension nobody sent would look identical to
+            // one that handled it.
+            debug!(
+                "conformance: advertising GREASE group {:#06x} in supported_groups ({} groups)",
+                code,
+                groups.len()
+            );
+            ep.extensions.named_groups = Some(groups);
         }
 
         let ee = HandshakeMessagePayload(HandshakePayload::EncryptedExtensions(ep.extensions));

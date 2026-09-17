@@ -553,11 +553,27 @@ pub enum KeyShareImpairment {
     /// it is named with, which is precisely the clause's subject.
     ShareLengthMismatch,
 
-    /// Advertise a GREASE group alongside the real one.
+    /// Advertise a GREASE group alongside the real ones, in the server's
+    /// `supported_groups` in EncryptedExtensions.
     ///
     /// RFC 8701 reserves these code points precisely so that an endpoint
     /// meeting one learns to tolerate a future real group sharing the same
     /// shape. A client that rejects it is the reason protocols ossify.
+    ///
+    /// **Where it goes is the whole test.** Put in the ServerHello `key_share`,
+    /// as this was first built, it is not an extensibility test at all: RFC 8446
+    /// §4.1.3 makes a key_share naming any group the client did not offer
+    /// illegal whatever the value is, so every conformant client correctly
+    /// aborts and a test demanding tolerance scores all of them as failures.
+    /// That version was withdrawn before it judged anyone.
+    ///
+    /// §4.2.7 is the place where it is unambiguously legal: "servers are
+    /// permitted to send the 'supported_groups' extension to the client", and a
+    /// client "MUST NOT act upon any information found in 'supported_groups'
+    /// prior to successful completion of the handshake". So the handshake must
+    /// complete, and a client that aborts over a codepoint it was told not to
+    /// act on has ossified against groups that do not exist yet -- which is
+    /// precisely what GREASE exists to catch.
     GreaseGroup(u16),
 }
 

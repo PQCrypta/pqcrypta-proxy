@@ -1276,26 +1276,30 @@ pub const CATALOG: &[Test] = &[
         class: Class::Extensibility,
         requirement: Requirement::Must,
         tier: Tier::Tls,
-        expectation: "Ignore the unrecognised group and carry on. RFC 8701 reserves these \
-                      values precisely so that an endpoint meeting one learns to tolerate \
-                      a future real group sharing the same shape.\n\nWITHDRAWN before it \
-                      ever judged a client, and the reason is worth keeping. It was first \
-                      built by naming a GREASE value in the ServerHello key_share -- which \
-                      is not an extensibility test at all. A key_share naming any group \
-                      the client did not offer is illegal under RFC 8446 §4.1.3 whatever \
-                      the value is, so every conformant client correctly answered \
-                      illegal_parameter, and as an Extensibility test demanding tolerance \
-                      that scored every one of them as a failure. neqo caught it on first \
-                      contact.\n\nThat is the exact false accusation this suite exists to \
-                      avoid, and it would also have duplicated t-group-not-offered, which \
-                      already measures that rejection properly.\n\nThe honest version \
-                      puts the GREASE value where a client genuinely must ignore it -- \
-                      server supported_groups in EncryptedExtensions, RFC 8446 §4.2.7 -- \
-                      which rustls does not currently emit at all, so it needs an \
-                      extension the codec does not yet carry. Held at unimplemented rather \
-                      than deleted so the port and the id stay stable and the mistake stays \
-                      on the record.",
-        implemented: false,
+        expectation: "Ignore the unrecognised group and complete the handshake. RFC 8701 \
+                      reserves these values precisely so that an endpoint meeting one \
+                      learns to tolerate a future real group sharing the same shape.\n\n\
+                      The value goes in the server's supported_groups in \
+                      EncryptedExtensions, second in a list of real groups. RFC 8446 §4.2.7 \
+                      permits a server to send that list — \"regardless of whether they are \
+                      currently supported by the client\" — and requires that a client \
+                      \"MUST NOT act upon any information found in supported_groups prior \
+                      to successful completion of the handshake\". So the handshake must \
+                      complete, and a client that aborts over a codepoint it was told not \
+                      to act on has ossified against groups that do not exist yet.\n\n\
+                      WHERE the value goes is the whole test, and getting it wrong the \
+                      first time is on the record deliberately. It was built by naming a \
+                      GREASE value in the ServerHello key_share, which is not an \
+                      extensibility test at all: §4.1.3 makes a key_share naming any group \
+                      the client did not offer illegal whatever the value is, so every \
+                      conformant client correctly answered illegal_parameter — and an \
+                      Extensibility test demanding tolerance scored all of them as \
+                      failures. neqo caught it on first contact. It also duplicated \
+                      t-group-not-offered, which measures that rejection properly.\n\n\
+                      The honest version needed an extension rustls had no reason to send, \
+                      so the fork's ServerExtensions gained a named_groups field. The port \
+                      and the id never moved while it was unimplemented.",
+        implemented: true,
         port_offset: Some(56),
     },
 ];

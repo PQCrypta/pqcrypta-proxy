@@ -1137,6 +1137,21 @@ extension_struct! {
         ExtensionType::ECPointFormats =>
             pub(crate) ec_point_formats: Option<SupportedEcPointFormats>,
 
+        /// Groups this server supports, sent in EncryptedExtensions (RFC8446)
+        ///
+        /// §4.2.7 permits this from TLS 1.3 onward: "servers are permitted to
+        /// send the 'supported_groups' extension to the client", which a client
+        /// "MUST NOT act upon ... prior to successful completion of the
+        /// handshake" but may use afterwards to choose a better key_share next
+        /// time.
+        ///
+        /// rustls has never needed to send it. The field exists for the
+        /// conformance suite's `t-grease-group`, which puts an RFC 8701 value
+        /// here -- the one place in a server's output where a reserved group
+        /// codepoint is unambiguously legal and must simply be ignored.
+        ExtensionType::EllipticCurves =>
+            pub(crate) named_groups: Option<Vec<NamedGroup>>,
+
         /// Server name indication acknowledgement (RFC6066)
         ExtensionType::ServerName =>
             pub(crate) server_name_ack: Option<()>,
@@ -1204,6 +1219,7 @@ impl ServerExtensions<'_> {
     fn into_owned(self) -> ServerExtensions<'static> {
         let Self {
             ec_point_formats,
+            named_groups,
             server_name_ack,
             session_ticket_ack,
             renegotiation_info,
@@ -1223,6 +1239,7 @@ impl ServerExtensions<'_> {
         } = self;
         ServerExtensions {
             ec_point_formats,
+            named_groups,
             server_name_ack,
             session_ticket_ack,
             renegotiation_info,
