@@ -577,6 +577,7 @@ pub fn build_single_group_provider(
 pub fn single_group_server_config(
     resolver: Arc<dyn rustls::server::ResolvesServerCert>,
     group: rustls::NamedGroup,
+    impairment: Option<rustls::server::KeyShareImpairment>,
 ) -> anyhow::Result<Arc<quinn::crypto::rustls::QuicServerConfig>> {
     let provider = build_single_group_provider(group)?;
     let mut config = RustlsServerConfig::builder_with_provider(Arc::new(provider))
@@ -587,6 +588,10 @@ pub fn single_group_server_config(
 
     config.alpn_protocols = vec![b"h3".to_vec()];
     crate::cert_compression::apply(&mut config);
+    // Only ever `Some` on a conformance port. `vendor/rustls-fixed` treats
+    // `None` as ordinary conformant behaviour and never reaches the damaging
+    // branch, so nothing here changes what a serving listener emits.
+    config.key_share_impairment = impairment;
 
     Ok(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(config).map_err(|e| {
@@ -727,8 +732,9 @@ impl TlsProvider {
     pub fn build_single_group_config(
         &self,
         group: rustls::NamedGroup,
+        impairment: Option<rustls::server::KeyShareImpairment>,
     ) -> anyhow::Result<Arc<quinn::crypto::rustls::QuicServerConfig>> {
-        single_group_server_config(self.resolver.clone(), group)
+        single_group_server_config(self.resolver.clone(), group, impairment)
     }
 
     /// Check if PQC is available and enabled

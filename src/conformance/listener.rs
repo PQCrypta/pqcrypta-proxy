@@ -152,8 +152,33 @@ impl TestListener {
                 "t-classical-only" => rustls::NamedGroup::X25519,
                 _ => rustls::NamedGroup::X25519MLKEM768,
             };
+            // Three ports go further than choosing a group: they emit a
+            // ServerHello key_share a correct implementation has no code path
+            // to produce. That lives in `vendor/rustls-fixed` because it cannot
+            // be reached by configuration, which is the whole reason these
+            // three were catalogued as unbuilt until the fork gained a hook.
+            let impairment = match test.id {
+                // secp384r1 is in the provider and is emphatically not what the
+                // client offered to a port that will negotiate only the hybrid.
+                "t-group-not-offered" => Some(rustls::server::KeyShareImpairment::GroupNotOffered(
+                    rustls::NamedGroup::secp384r1,
+                )),
+                "t-corrupt-hybrid-share" => {
+                    Some(rustls::server::KeyShareImpairment::CorruptHybridPqHalf)
+                }
+                // 0x2A2A, one of the RFC 8701 reserved values, chosen from the
+                // middle of the range rather than the ends so a client that
+                // special-cases a boundary is not accidentally let through.
+                // Withdrawn: a GREASE value in the ServerHello key_share is a
+                // group the client did not offer, so rejecting it is correct
+                // under §4.1.3 and the test as built accused every conformant
+                // client. See the catalogue entry. The impairment variant stays
+                // in the fork for when the honest version is built.
+                "t-grease-group" => None,
+                _ => None,
+            };
             tls_provider
-                .build_single_group_config(group)
+                .build_single_group_config(group, impairment)
                 .with_context(|| format!("building the TLS config for {}", test.id))?
         } else {
             tls_provider.get_quic_server_config()
@@ -619,7 +644,14 @@ async fn run_one(
                     // A client whose key exchange had nothing in common with ours
                     // was being credited with recovering from a 0-RTT rejection it
                     // was never sent.
-                    if test.id == "q-invalid-transport-param" {
+                    if matches!(test.tier, Tier::Tls) {
+                        // On this tier the handshake IS the anomaly, so a
+                        // handshake that failed is a result rather than a
+                        // non-event. Saying "the client never reached the
+                        // anomaly" here would be false: it reached it, and this
+                        // is what it did about it.
+                        tls_handshake_observation(test, &e)
+                    } else if test.id == "q-invalid-transport-param" {
                         // This one did reach the anomaly: the parameter travels
                         // in the handshake, so it is among the first things the
                         // client reads. What is missing is its answer.
@@ -825,6 +857,172 @@ async fn run_one(
     Ok(())
 }
 
+/// Why a TLS-tier handshake ended, read from the connection error rather than
+/// from its wording.
+///
+/// The first version matched on the error's `Display` string, looking for
+/// "error 47", and two things were wrong with that.
+///
+/// The string does not say who spoke: our own rustls refusing a client that
+/// offered no group we will negotiate renders as "the cryptographic handshake
+/// failed: error 40", the same shape as a peer's alert and the opposite
+/// meaning — the client never even saw the anomaly.
+///
+/// And 47 is not the only right answer. RFC 9001 §4.8 lets a QUIC endpoint
+/// replace any alert with a generic one, so reading anything else as a refusal
+/// to obey RFC 8446 §4.1.3 would fail a client for taking a permission it was
+/// given in writing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TlsAbort {
+    /// The peer converted a TLS alert into a CRYPTO_ERROR close, per RFC 9001
+    /// §4.8. Carries the AlertDescription.
+    Alert(u8),
+    /// This server refused: the client offered no key exchange group the port
+    /// will negotiate, so the ServerHello carrying the anomaly was never sent.
+    NoGroupsInCommon,
+    /// The handshake stopped and nothing arrived to say why.
+    Silent,
+    /// Something else ended it.
+    Other,
+}
+
+/// Classify a failed TLS-tier handshake.
+fn classify_tls_abort(e: &quinn::ConnectionError) -> TlsAbort {
+    match e {
+        // A close the peer sent. RFC 9001 §4.8 maps a TLS alert to
+        // 0x0100 | AlertDescription, so anything in that range is the client
+        // telling us which alert its TLS stack raised.
+        quinn::ConnectionError::ConnectionClosed(close) => {
+            let code = u64::from(close.error_code);
+            match code {
+                0x0100..=0x01ff => TlsAbort::Alert((code & 0xff) as u8),
+                _ => TlsAbort::Other,
+            }
+        }
+        // Raised on this side, not received. `NoKxGroupsInCommon` is rustls
+        // saying the ClientHello offered nothing this port will negotiate,
+        // which happens before any anomaly is emitted.
+        quinn::ConnectionError::TransportError(err) => {
+            if err.reason.contains("NoKxGroupsInCommon") {
+                TlsAbort::NoGroupsInCommon
+            } else {
+                TlsAbort::Other
+            }
+        }
+        quinn::ConnectionError::TimedOut => TlsAbort::Silent,
+        _ => TlsAbort::Other,
+    }
+}
+
+/// What a failed handshake on the TLS tier says about the client.
+///
+/// # Why a generic alert passes
+///
+/// RFC 9001 §4.8 is explicit that QUIC "permits the use of a generic code in
+/// place of a specific error code ... this includes replacing any alert with a
+/// generic alert, such as handshake_failure", and that an endpoint MAY do so to
+/// avoid exposing confidential information. Demanding `illegal_parameter`
+/// specifically would therefore fail a client for taking a permission the
+/// document hands it in writing — the exact false accusation this suite exists
+/// to avoid. What §4.1.3 of RFC 8446 requires is the *abort*; the alert value
+/// is reported rather than judged.
+fn tls_handshake_observation(test: &'static Test, e: &quinn::ConnectionError) -> Observation {
+    let abort = classify_tls_abort(e);
+
+    // Common to every port here: a client that offered no group this port will
+    // negotiate never received the ServerHello the test is about.
+    //
+    // `t-classical-only` is the exception, because there that refusal is the
+    // measurement rather than a miss.
+    if abort == TlsAbort::NoGroupsInCommon && test.id != "t-classical-only" {
+        return Observation::NotExercised(
+            "the client offered no key exchange group this port will negotiate, so the \
+             ServerHello this test is about was never sent. Against a hybrid-only port that \
+             means no post-quantum key share was offered at all -- which is a fact about the \
+             client, not a gap in the run"
+                .to_string(),
+        );
+    }
+
+    match test.id {
+        // ── §4.1.3: a key_share naming a group the client never offered ──
+        //
+        // The abort is the requirement. Any CRYPTO_ERROR close is evidence of
+        // one, whichever alert it names.
+        "t-group-not-offered" => match abort {
+            TlsAbort::Alert(47) => Observation::Signalled(
+                "aborted with illegal_parameter (alert 47) over a key_share naming a group it \
+                 never offered, which is exactly what RFC 8446 §4.1.3 requires"
+                    .to_string(),
+            ),
+            TlsAbort::Alert(code) => Observation::Signalled(format!(
+                "aborted the handshake with TLS alert {code} (CRYPTO_ERROR 0x{:x}) rather than \
+                 illegal_parameter. §4.1.3 requires the abort, and RFC 9001 §4.8 expressly \
+                 permits replacing any alert with a generic one over QUIC, so the code is \
+                 reported and not judged",
+                0x0100 | u64::from(code)
+            )),
+            // No CONNECTION_CLOSE arrived. The handshake certainly did not
+            // complete, so the client did not accept the group -- but a close
+            // that was never sent cannot be told from one that was lost, and
+            // "stopped talking" cannot be told from "stalled". The requirement
+            // is met either way; the manner of it is not observable.
+            TlsAbort::Silent => Observation::Ambiguous(
+                "The handshake did not complete, so the group was not accepted, but nothing \
+                 arrived to say the client rejected it deliberately. RFC 9001 §4.8 carries a \
+                 TLS alert in a CONNECTION_CLOSE and none was seen; a close that was never \
+                 sent and one that was lost look the same from here"
+                    .to_string(),
+            ),
+            _ => Observation::Ambiguous(format!(
+                "The handshake ended ({e}) without a CONNECTION_CLOSE carrying a TLS alert, so \
+                 the client did not accept the group but nothing shows how it refused"
+            )),
+        },
+
+        // ── The hybrid share whose ML-KEM half is corrupt ──
+        //
+        // Any failure passes here, and only completion fails. The dangerous
+        // outcome is the one that *succeeds*: a client that finishes against a
+        // corrupt ML-KEM half has used the intact classical half alone and
+        // downgraded itself to exactly the security level the hybrid exists to
+        // avoid. That case is caught where a completed connection reaches the
+        // ordinary response path.
+        //
+        // Silence is a pass rather than nothing observed, and deliberately: the
+        // client's key schedule has diverged from ours, so it cannot encrypt
+        // anything we can read at the handshake level. Not answering is the
+        // only answer available to it.
+        "t-corrupt-hybrid-share" => match abort {
+            TlsAbort::Alert(code) => Observation::Signalled(format!(
+                "rejected the handshake with TLS alert {code}. The shared secret is both \
+                 halves through the key schedule, so a corrupt ML-KEM half must break it -- \
+                 and this client did not fall back to the intact X25519 half"
+            )),
+            _ => Observation::Signalled(format!(
+                "did not complete the handshake ({e}). The shared secret is both halves \
+                 through the key schedule, so a corrupt ML-KEM half must break it -- and this \
+                 client did not fall back to the intact X25519 half"
+            )),
+        },
+
+        // A client that will not negotiate with a classical-only server has
+        // taken a post-quantum floor, which is exactly the choice this
+        // discretionary test exists to observe. Scoring it "did not exercise"
+        // would discard the answer at the moment it was given.
+        "t-classical-only" if abort == TlsAbort::NoGroupsInCommon => Observation::Signalled(
+            "declined to negotiate when only the classical X25519 was offered, which is a \
+             deliberate post-quantum floor. No RFC requires this and none forbids it"
+                .to_string(),
+        ),
+
+        _ => Observation::NotExercised(format!(
+            "the handshake failed ({e}) for a reason other than the key exchange this port \
+             constrains"
+        )),
+    }
+}
+
 /// Complete the handshake, accepting early data on the one port that offers it.
 ///
 /// `into_0rtt` is what actually admits 0-RTT server-side: with it, the streams a
@@ -850,6 +1048,32 @@ async fn accept_connection(
             Err(connecting) => connecting.await,
         };
     }
+
+    // The TLS tier is given its own, much shorter deadline.
+    //
+    // On every other tier the handshake is scenery and the anomaly comes after
+    // it, so a handshake that never finishes is simply a connection that failed.
+    // Here the handshake *is* the test, and the client's answer to two of these
+    // ports is to stop talking: it cannot encrypt anything the server can read
+    // once its key schedule has diverged, so silence is the only answer
+    // available to it.
+    //
+    // Left to the transport's idle timeout, that silence takes 30 seconds to
+    // become a verdict — and the runner has fetched the report and moved on by
+    // then. Both new TLS tests came back `not_run` for quinn on the first
+    // seven-client run for exactly this reason: the verdicts were recorded
+    // correctly, just after anybody was still reading.
+    //
+    // Five seconds is two orders of magnitude more than a handshake on this path
+    // takes and still well inside the runner's window.
+    if matches!(test.tier, Tier::Tls) {
+        const TLS_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
+        return match tokio::time::timeout(TLS_HANDSHAKE_DEADLINE, connecting).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(quinn::ConnectionError::TimedOut),
+        };
+    }
+
     connecting.await
 }
 
@@ -2011,12 +2235,14 @@ fn quic_observation(
             if counters.initials_in() > 1 {
                 return None;
             }
-            Some(Observation::NotExercised(
-                format!(
-                    "the client's first flight fitted in {} Initial packet(s), so a                      ClientHello too large for one was never sent. That usually means it                      did not offer a post-quantum key share: an ML-KEM-768 share is 1,216                      bytes and cannot fit beside the rest of a ClientHello inside the                      1,200-byte Initial minimum",
-                    counters.initials_in()
-                ),
-            ))
+            Some(Observation::NotExercised(format!(
+                "the client's first flight fitted in {} Initial packet(s), so a ClientHello \
+                     too large for one was never sent. That usually means it did not \
+                     offer a post-quantum key share: an ML-KEM-768 share is 1,216 \
+                     bytes and cannot fit beside the rest of a ClientHello inside the \
+                     1,200-byte Initial minimum",
+                counters.initials_in()
+            )))
         }
 
         // Whether anything actually arrived out of order decides only whether
@@ -2805,25 +3031,30 @@ mod tests {
                 "h-missing-settings",
                 e::H3_MISSING_SETTINGS,
                 "RFC 9114 §6.2.1",
-                "If the first frame of the control stream is any other frame type,                  this MUST be treated as a connection error of type H3_MISSING_SETTINGS.",
+                "If the first frame of the control stream is any other frame type, this MUST \
+                 be treated as a connection error of type H3_MISSING_SETTINGS.",
             ),
             (
                 "h-second-control-stream",
                 e::H3_STREAM_CREATION_ERROR,
                 "RFC 9114 §6.2.1",
-                "Only one control stream per peer is permitted; receipt of a second                  stream claiming to be a control stream MUST be treated as a connection                  error of type H3_STREAM_CREATION_ERROR.",
+                "Only one control stream per peer is permitted; receipt of a second stream \
+                 claiming to be a control stream MUST be treated as a connection error of type \
+                 H3_STREAM_CREATION_ERROR.",
             ),
             (
                 "h-control-frame-unexpected",
                 e::H3_FRAME_UNEXPECTED,
                 "RFC 9114 §7.2.1",
-                "If a DATA frame is received on a control stream, the recipient MUST                  respond with a connection error of type H3_FRAME_UNEXPECTED.",
+                "If a DATA frame is received on a control stream, the recipient MUST respond \
+                 with a connection error of type H3_FRAME_UNEXPECTED.",
             ),
             (
                 "h-max-push-id",
                 e::H3_FRAME_UNEXPECTED,
                 "RFC 9114 §7.2.7",
-                "A server MUST NOT send a MAX_PUSH_ID frame. A client MUST treat the                  receipt of a MAX_PUSH_ID frame as a connection error of type                  H3_FRAME_UNEXPECTED.",
+                "A server MUST NOT send a MAX_PUSH_ID frame. A client MUST treat the receipt \
+                 of a MAX_PUSH_ID frame as a connection error of type H3_FRAME_UNEXPECTED.",
             ),
             // Read as published on 2026-08-31, along with the other four added
             // that day.
@@ -2831,62 +3062,76 @@ mod tests {
                 "h-settings-on-request-stream",
                 e::H3_FRAME_UNEXPECTED,
                 "RFC 9114 §7.2.4",
-                "If an endpoint receives a SETTINGS frame on a different stream, the                  endpoint MUST respond with a connection error of type                  H3_FRAME_UNEXPECTED.",
+                "If an endpoint receives a SETTINGS frame on a different stream, the endpoint \
+                 MUST respond with a connection error of type H3_FRAME_UNEXPECTED.",
             ),
             (
                 "h-data-before-headers",
                 e::H3_FRAME_UNEXPECTED,
                 "RFC 9114 §4.1",
-                "Receipt of an invalid sequence of frames MUST be treated as a                  connection error of type H3_FRAME_UNEXPECTED.",
+                "Receipt of an invalid sequence of frames MUST be treated as a connection \
+                 error of type H3_FRAME_UNEXPECTED.",
             ),
             (
                 "h-cancel-push-unsolicited",
                 e::H3_ID_ERROR,
                 "RFC 9114 §7.2.3",
-                "If a CANCEL_PUSH frame is received that references a push ID greater                  than currently allowed on the connection, this MUST be treated as a                  connection error of type H3_ID_ERROR.",
+                "If a CANCEL_PUSH frame is received that references a push ID greater than \
+                 currently allowed on the connection, this MUST be treated as a connection \
+                 error of type H3_ID_ERROR.",
             ),
             // Read as published on 2026-09-01.
             (
                 "h-push-promise-unsolicited",
                 e::H3_ID_ERROR,
                 "RFC 9114 §7.2.5, §4.6",
-                "A client MUST treat receipt of a PUSH_PROMISE frame that contains a                  larger push ID than the client has advertised as a connection error of                  H3_ID_ERROR.",
+                "A client MUST treat receipt of a PUSH_PROMISE frame that contains a larger \
+                 push ID than the client has advertised as a connection error of H3_ID_ERROR.",
             ),
             (
                 "h-goaway-increasing",
                 e::H3_ID_ERROR,
                 "RFC 9114 §5.2",
-                "Receiving a GOAWAY containing a larger identifier than previously                  received MUST be treated as a connection error of type H3_ID_ERROR.",
+                "Receiving a GOAWAY containing a larger identifier than previously received \
+                 MUST be treated as a connection error of type H3_ID_ERROR.",
             ),
             (
                 "h-datagram-setting-invalid",
                 e::H3_SETTINGS_ERROR,
                 "RFC 9297 §2.1.1",
-                "If the SETTINGS_H3_DATAGRAM setting is received with a value that is                  neither 0 nor 1, the receiver MUST terminate the connection with error                  H3_SETTINGS_ERROR.",
+                "If the SETTINGS_H3_DATAGRAM setting is received with a value that is neither \
+                 0 nor 1, the receiver MUST terminate the connection with error \
+                 H3_SETTINGS_ERROR.",
             ),
             (
                 "h-qpack-encoder-overflow",
                 e::QPACK_ENCODER_STREAM_ERROR,
                 "RFC 9204 §4.3.1, §6",
-                "The decoder MUST treat a new dynamic table capacity value that exceeds                  this limit as a connection error of type QPACK_ENCODER_STREAM_ERROR.",
+                "The decoder MUST treat a new dynamic table capacity value that exceeds this \
+                 limit as a connection error of type QPACK_ENCODER_STREAM_ERROR.",
             ),
             (
                 "h-push-stream-unpromised",
                 e::H3_ID_ERROR,
                 "RFC 9114 §6.2.2",
-                "A client MUST treat receipt of a push stream as a connection error of                  type H3_ID_ERROR when no MAX_PUSH_ID frame has been sent or when the                  stream references a push ID that is greater than the maximum push ID.",
+                "A client MUST treat receipt of a push stream as a connection error of type \
+                 H3_ID_ERROR when no MAX_PUSH_ID frame has been sent or when the stream \
+                 references a push ID that is greater than the maximum push ID.",
             ),
             (
                 "h-qpack-static-index-invalid",
                 e::QPACK_DECOMPRESSION_FAILED,
                 "RFC 9204 §3.1, §4.5.2",
-                "When the decoder encounters an invalid static table index in a field                  line representation, it MUST treat this as a connection error of type                  QPACK_DECOMPRESSION_FAILED.",
+                "When the decoder encounters an invalid static table index in a field line \
+                 representation, it MUST treat this as a connection error of type \
+                 QPACK_DECOMPRESSION_FAILED.",
             ),
             (
                 "h-qpack-encoder-bad-name-index",
                 e::QPACK_ENCODER_STREAM_ERROR,
                 "RFC 9204 §3.1, §4.3.2",
-                "If this index is received on the encoder stream, this MUST be treated                  as a connection error of type QPACK_ENCODER_STREAM_ERROR.",
+                "If this index is received on the encoder stream, this MUST be treated as a \
+                 connection error of type QPACK_ENCODER_STREAM_ERROR.",
             ),
         ];
 

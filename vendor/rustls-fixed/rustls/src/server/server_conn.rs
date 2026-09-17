@@ -480,6 +480,61 @@ pub struct ServerConfig {
     ///
     /// [RFC8779]: https://datatracker.ietf.org/doc/rfc8879/
     pub cert_decompressors: Vec<&'static dyn compress::CertDecompressor>,
+
+    /// Deliberately damage the server's TLS 1.3 key share.
+    ///
+    /// **This exists to make the server misbehave on purpose and has no
+    /// legitimate use in a serving deployment.** It backs the TLS tier of a
+    /// public HTTP/3 client-conformance suite, where the point is to emit the
+    /// specific illegal thing a correct implementation would never produce and
+    /// then observe what the client does about it.
+    ///
+    /// `None`, the default, is ordinary conformant behaviour, and every code
+    /// path below is a no-op unless it is set.
+    pub key_share_impairment: Option<KeyShareImpairment>,
+}
+
+/// How to damage the server's `key_share` in ServerHello.
+///
+/// Each variant names the client-side requirement it is there to exercise.
+/// None of them can be produced by configuration, which is why they live here
+/// rather than in the conformance crate: a correct TLS implementation has no
+/// code path that emits any of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KeyShareImpairment {
+    /// Name a group the client did not offer.
+    ///
+    /// RFC 8446 §4.1.3: if the selected group was not offered, the client MUST
+    /// abort with `illegal_parameter`. Accepting it would let a server steer a
+    /// client onto a group the client deliberately excluded.
+    ///
+    /// The payload is left as generated, so the only thing wrong is the name.
+    GroupNotOffered(NamedGroup),
+
+    /// Corrupt the ML-KEM half of a hybrid share and leave the X25519 half
+    /// intact.
+    ///
+    /// draft-ietf-tls-hybrid-design §3.2: the shared secret is the
+    /// concatenation of both components through the key schedule, so damaging
+    /// either half must fail the handshake at Finished verification.
+    ///
+    /// What is under test is the failure *mode*, not the failure. A client that
+    /// falls back to the classical half alone has silently downgraded itself to
+    /// the security level the hybrid exists to avoid — and would do so against
+    /// an attacker able to corrupt one half at will.
+    ///
+    /// For X25519MLKEM768 the server share is the 1,088-byte ML-KEM-768
+    /// ciphertext followed by the 32-byte X25519 key, so this flips bits in the
+    /// leading bytes and leaves the trailing 32 untouched.
+    CorruptHybridPqHalf,
+
+    /// Advertise a GREASE group alongside the real one.
+    ///
+    /// RFC 8701 reserves these code points precisely so that an endpoint
+    /// meeting one learns to tolerate a future real group sharing the same
+    /// shape. A client that rejects it is the reason protocols ossify.
+    GreaseGroup(u16),
 }
 
 impl ServerConfig {

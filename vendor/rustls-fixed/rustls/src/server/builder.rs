@@ -126,6 +126,8 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
             cert_compressors: compress::default_cert_compressors().to_vec(),
             cert_compression_cache: Arc::new(compress::CompressionCache::default()),
             cert_decompressors: compress::default_cert_decompressors().to_vec(),
+            // Conformant by default; only the conformance suite ever sets this.
+            key_share_impairment: None,
         }
     }
 }

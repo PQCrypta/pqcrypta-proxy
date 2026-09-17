@@ -26,7 +26,7 @@ use crate::msgs::handshake::{
 };
 use crate::msgs::message::{Message, MessagePayload};
 use crate::msgs::persist;
-use crate::server::ServerConfig;
+use crate::server::{KeyShareImpairment, ServerConfig};
 use crate::suites::PartiallyExtractedSecrets;
 use crate::sync::Arc;
 use crate::tls13::key_schedule::{
@@ -506,8 +506,41 @@ mod client_hello {
             })?;
         cx.common.kx_state.complete();
 
+        // Deliberate damage, for the conformance suite's TLS tier. `None` --
+        // every serving deployment -- leaves the share exactly as generated.
+        let impaired_share = match config.key_share_impairment {
+            None => KeyShareEntry::new(ckx.group, ckx.pub_key),
+            Some(KeyShareImpairment::GroupNotOffered(group)) => {
+                // Payload untouched: the only thing wrong is the name, so a
+                // client that aborts can only be aborting over §4.1.3 and not
+                // over a malformed share it could not parse.
+                KeyShareEntry::new(group, ckx.pub_key)
+            }
+            Some(KeyShareImpairment::CorruptHybridPqHalf) => {
+                // For X25519MLKEM768 the server share is the 1,088-byte ML-KEM
+                // ciphertext followed by the 32-byte X25519 key. Flip a bit
+                // early in the ciphertext and leave the classical tail intact,
+                // so a client that still completes has used the classical half
+                // alone -- which is the finding.
+                //
+                // A single bit, not a scribble: ML-KEM decapsulation never
+                // fails, it returns an implicit-rejection secret, so the
+                // handshake must die at Finished verification rather than at a
+                // decode error. Damaging the length or the structure would test
+                // the parser instead.
+                let mut payload = ckx.pub_key.clone();
+                if payload.len() > 32 {
+                    payload[0] ^= 0x01;
+                }
+                KeyShareEntry::new(ckx.group, payload)
+            }
+            Some(KeyShareImpairment::GreaseGroup(code)) => {
+                KeyShareEntry::new(NamedGroup::Unknown(code), ckx.pub_key)
+            }
+        };
+
         let extensions = Box::new(ServerExtensions {
-            key_share: Some(KeyShareEntry::new(ckx.group, ckx.pub_key)),
+            key_share: Some(impaired_share),
             selected_version: Some(ProtocolVersion::TLSv1_3),
             preshared_key: chosen_psk_idx.map(|idx| idx as u16),
             ..Default::default()

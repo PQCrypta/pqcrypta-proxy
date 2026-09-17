@@ -135,6 +135,16 @@ pub enum Observation {
     /// ignoring a Stateless Reset, say, where the generic wording would
     /// misdescribe what happened.
     Violated(String),
+    /// The client did something, and what it means cannot be established from
+    /// here. Carries the sentence saying why, because the reason is the result.
+    ///
+    /// The counterpart to [`Observation::Violated`], for the case where the
+    /// generic per-class wording would resolve an ambiguity the run did not.
+    /// Distinct from [`NotExercised`](Self::NotExercised): the client *was* put
+    /// in the situation the test is about — it simply answered in a way that
+    /// admits more than one reading, and a suite that guesses between them is
+    /// worse than one that says so.
+    Ambiguous(String),
     /// The run completed but never put the client in the situation the test is
     /// about — a flow-control test where the request was too small to approach
     /// the window, say.
@@ -241,6 +251,42 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
                 ),
             );
         }
+    }
+
+    // ── The TLS tier reasons from the handshake, not from a response ──
+    //
+    // Every correctness arm below is written for an anomaly delivered over
+    // HTTP/3, where the absence of an objection is genuinely ambiguous: the
+    // client may have accepted the violation, or it may never have read it.
+    //
+    // On this tier it cannot be ambiguous. The anomaly is in the ServerHello,
+    // so a client that established a connection at all has read it and carried
+    // on regardless — and that is the dangerous outcome rather than a quiet
+    // one. A client that completes against a corrupted ML-KEM half has used the
+    // intact X25519 half alone and downgraded itself to exactly the security
+    // level the hybrid exists to avoid.
+    //
+    // A client that rejected the handshake never reaches here: the listener
+    // turns a failed TLS handshake into a `Signalled` observation, which the
+    // correctness arms below already read as a pass.
+    if test.tier == catalog::Tier::Tls
+        && test.class == Class::Correctness
+        && matches!(
+            obs,
+            Observation::SurvivedAndContinued
+                | Observation::NoCloseObserved
+                | Observation::ClosedSilently
+                | Observation::ClosedWith { .. }
+        )
+    {
+        return (
+            Verdict::Fail,
+            "Completed the handshake against a ServerHello the specification requires it to \
+             reject, then served the request over it. The anomaly is in the key exchange, so \
+             a connection that was established at all is evidence the client read it and \
+             accepted it."
+                .to_string(),
+        );
     }
 
     match (test.class, obs) {
@@ -524,6 +570,12 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
             format!("The run did not exercise this test: {why}."),
         ),
         (_, Observation::Violated(what)) => (Verdict::Fail, format!("{what}.")),
+
+        // Same reasoning, pointed at the other outcome: the test has
+        // established that nothing can be concluded here, and it says why in
+        // its own words rather than through a per-class sentence written for a
+        // case where something could.
+        (_, Observation::Ambiguous(what)) => (Verdict::Inconclusive, format!("{what}.")),
 
         // A signal is affirmative evidence the client took the element in its
         // stride, which is exactly what an extensibility test asks for.
@@ -1011,6 +1063,39 @@ mod tests {
         let (v, d) = judge(&unbuilt, &Observation::SurvivedAndContinued, None);
         assert_eq!(v, Verdict::Inconclusive);
         assert!(d.contains("not implemented"), "say why: {d}");
+    }
+
+    #[test]
+    fn a_completed_tls_handshake_is_acceptance_and_not_ambiguity() {
+        // On the HTTP/3 tier, a client that says nothing may simply never have
+        // read the anomaly, so several observations are scored inconclusive. On
+        // the TLS tier there is no such doubt: the anomaly is the ServerHello,
+        // and a connection that was established at all carries it.
+        //
+        // Silence must therefore be a failure here and an inconclusive there,
+        // from the same observation — which is precisely the pair a single
+        // shared rule would get wrong.
+        for id in ["t-group-not-offered", "t-corrupt-hybrid-share"] {
+            let t = test_of(id);
+            assert_eq!(t.tier, Tier::Tls, "{id}");
+            assert_eq!(t.class, Class::Correctness, "{id}");
+
+            for obs in [
+                Observation::SurvivedAndContinued,
+                Observation::NoCloseObserved,
+                Observation::ClosedSilently,
+                Observation::ClosedWith { code: 0x0100 },
+            ] {
+                let (v, d) = judge(t, &obs, None);
+                assert_eq!(v, Verdict::Fail, "{id} on {obs:?}");
+                assert!(d.contains("key exchange"), "{id}: say where it was: {d}");
+            }
+
+            // The rejection still passes, and is what the listener reports when
+            // the handshake dies.
+            let (v, _) = judge(t, &Observation::Signalled("aborted".to_string()), None);
+            assert_eq!(v, Verdict::Pass, "{id}: rejecting it is the pass");
+        }
     }
 
     #[test]

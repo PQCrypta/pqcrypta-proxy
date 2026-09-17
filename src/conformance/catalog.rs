@@ -1108,10 +1108,16 @@ pub const CATALOG: &[Test] = &[
                       requires it to answer with a second ClientHello carrying a share \
                       for the named group. A client that does not offer the group at all \
                       must abandon the attempt cleanly rather than stall — that is a \
-                      correct outcome for a client without post-quantum support and is \
-                      reported as such, not as a fault.\n\nThis is the round trip that \
-                      breaks first in a real migration, because it is the one that never \
-                      happens until a server somewhere stops offering the classical group.",
+                      correct outcome for a client without post-quantum support.\n\nA \
+                      client that cannot negotiate the group at all never establishes a \
+                      connection, so the server records no verdict and the result is \
+                      `not run` rather than a pass or a failure. On this tier that reads \
+                      as \"no post-quantum key exchange\", which is itself the finding: \
+                      every other tier reaches `not run` only when the runner skipped \
+                      something. curl/ngtcp2 1.11.0 lands here.\n\nThis is the round \
+                      trip that breaks first in a real migration, because it is the one \
+                      that never happens until a server somewhere stops offering the \
+                      classical group.",
         implemented: true,
         port_offset: Some(51),
     },
@@ -1156,18 +1162,26 @@ pub const CATALOG: &[Test] = &[
     Test {
         id: "t-group-not-offered",
         title: "Server selects a key exchange group the client never offered",
-        spec: "RFC 8446 §4.1.3, §4.2.8",
+        spec: "RFC 8446 §4.1.3, §4.2.8, RFC 9001 §4.8",
         class: Class::Correctness,
         requirement: Requirement::Must,
         tier: Tier::Tls,
         expectation: "Abort with illegal_parameter. §4.1.3 is explicit that if the \
                       selected group was not offered, the client MUST abort — accepting \
                       it would let a server steer a client onto a group it deliberately \
-                      excluded.\n\nNot yet emitted: it needs the selected group \
-                      substituted in the ServerHello key_share after the group is chosen, \
-                      inside vendor/rustls-fixed, which the single-group configuration \
-                      used by the other TLS ports cannot express.",
-        implemented: false,
+                      excluded.\n\nThe port names secp384r1 in its ServerHello against a \
+                      client that offered only the hybrid, and leaves the payload exactly \
+                      as generated: the only thing wrong is the name, so a client that \
+                      aborts can only be aborting over §4.1.3 and not over a share it \
+                      could not parse.\n\nWhat is judged is the abort, not the alert \
+                      value. RFC 9001 §4.8 lets a QUIC endpoint replace any alert with a \
+                      generic one — handshake_failure in place of illegal_parameter — \
+                      expressly so that a client need not say what it objected to, so the \
+                      code a client chooses is reported here and not scored. A handshake \
+                      that ends without any CONNECTION_CLOSE is inconclusive rather than a \
+                      failure: the group was certainly not accepted, but a close that was \
+                      never sent cannot be told from one that was lost.",
+        implemented: true,
         port_offset: Some(54),
     },
     Test {
@@ -1184,25 +1198,44 @@ pub const CATALOG: &[Test] = &[
                       the failure: a client that falls back to the classical half alone \
                       has silently downgraded itself to exactly the security level the \
                       hybrid exists to avoid, and would do so against an attacker who can \
-                      corrupt one half at will.\n\nNot yet emitted: needs the ML-KEM \
-                      component of the server share rewritten after encapsulation, inside \
-                      vendor/rustls-fixed.",
-        implemented: false,
+                      corrupt one half at will.\n\nThe server share for X25519MLKEM768 is \
+                      the 1,088-byte ML-KEM ciphertext followed by the 32-byte X25519 key. \
+                      One bit is flipped early in the ciphertext and the classical tail is \
+                      left untouched, so a client that still completes has used the \
+                      classical half alone. A single bit rather than a scribble on \
+                      purpose: ML-KEM decapsulation never fails, it returns an \
+                      implicit-rejection secret, so the handshake has to die at Finished \
+                      verification rather than at a decode error — damaging the length or \
+                      the structure would test the parser instead.",
+        implemented: true,
         port_offset: Some(55),
     },
     Test {
         id: "t-grease-group",
-        title: "GREASE named group in supported_groups and the HRR",
-        spec: "RFC 8701 §3.1, RFC 8446 §4.1.4",
+        title: "GREASE named group a client must tolerate",
+        spec: "RFC 8701 §4, RFC 8446 §4.2.7",
         class: Class::Extensibility,
         requirement: Requirement::Must,
         tier: Tier::Tls,
-        expectation: "Ignore the unknown group and carry on. RFC 8701 reserves these \
+        expectation: "Ignore the unrecognised group and carry on. RFC 8701 reserves these \
                       values precisely so that an endpoint meeting one learns to tolerate \
-                      a future real group with the same code point.\n\nNot yet emitted: \
-                      needs a reserved value injected into the server's group list inside \
-                      vendor/rustls-fixed, which will not encode a NamedGroup it has no \
-                      variant for.",
+                      a future real group sharing the same shape.\n\nWITHDRAWN before it \
+                      ever judged a client, and the reason is worth keeping. It was first \
+                      built by naming a GREASE value in the ServerHello key_share -- which \
+                      is not an extensibility test at all. A key_share naming any group \
+                      the client did not offer is illegal under RFC 8446 §4.1.3 whatever \
+                      the value is, so every conformant client correctly answered \
+                      illegal_parameter, and as an Extensibility test demanding tolerance \
+                      that scored every one of them as a failure. neqo caught it on first \
+                      contact.\n\nThat is the exact false accusation this suite exists to \
+                      avoid, and it would also have duplicated t-group-not-offered, which \
+                      already measures that rejection properly.\n\nThe honest version \
+                      puts the GREASE value where a client genuinely must ignore it -- \
+                      server supported_groups in EncryptedExtensions, RFC 8446 §4.2.7 -- \
+                      which rustls does not currently emit at all, so it needs an \
+                      extension the codec does not yet carry. Held at unimplemented rather \
+                      than deleted so the port and the id stay stable and the mistake stays \
+                      on the record.",
         implemented: false,
         port_offset: Some(56),
     },

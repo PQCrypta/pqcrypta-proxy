@@ -97,6 +97,39 @@ where
     /// [`recv_data()`]: #method.recv_data
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_response(&mut self) -> Result<Response<()>, StreamError> {
+        // Interim responses are skipped rather than returned.
+        //
+        // RFC 9110 §15.2 requires a client to be able to parse one or more 1xx
+        // responses received prior to a final response, and RFC 8297 makes 103
+        // Early Hints a thing a server may send before any of the work behind
+        // the real response has finished. This read exactly one HEADERS frame
+        // and called it the response, so a 103 was returned to the caller as if
+        // it were final and the actual response that followed was an
+        // unexpected second HEADERS -- reported as H3_FRAME_UNEXPECTED, which
+        // is a connection error raised against a server doing nothing wrong.
+        //
+        // Measured, not theorised: this is `h-early-hints` in our own
+        // conformance suite, which our own client failed while we were
+        // publishing other implementations' failures on the same test.
+        //
+        // Skipping rather than surfacing them is the minimal correct fix and
+        // not the complete one: a caller that wants the hints (to start a
+        // preload, which is the entire point of 103) still cannot reach them.
+        // That needs an API change, so it is deliberately not smuggled in here.
+        //
+        // 101 is not special-cased because HTTP/3 has no protocol upgrade:
+        // RFC 9114 §4.4 removes it, and Extended CONNECT replaces it.
+        loop {
+            let resp = self.recv_one_response().await?;
+            if !resp.status().is_informational() {
+                return Ok(resp);
+            }
+        }
+    }
+
+    /// One HEADERS frame, decoded into a response, interim or final.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    async fn recv_one_response(&mut self) -> Result<Response<()>, StreamError> {
         let mut frame = future::poll_fn(|cx| self.inner.stream.poll_next(cx))
             .await
             .map_err(|e| self.handle_frame_stream_error_on_request_stream(e))?

@@ -745,8 +745,9 @@ pub mod openssl_pqc {
         } else {
             // Not fatal: an uncompressed chain is correct, just larger.
             tracing::warn!(
-            "TLS certificate compression unavailable (SSL_CTX_set1_cert_comp_preference returned {rc});              chains will be sent uncompressed"
-        );
+                "TLS certificate compression unavailable (SSL_CTX_set1_cert_comp_preference \
+             returned {rc}); chains will be sent uncompressed"
+            );
         }
     }
 

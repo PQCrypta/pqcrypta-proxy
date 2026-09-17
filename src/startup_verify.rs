@@ -792,7 +792,8 @@ fn connect_and_read_params(
             }
             Err(e) => {
                 return Err(anyhow!(
-                    "connecting to the bound listener at {addr}: {e}                      (still refusing after 5s — the listener did not come up)"
+                    "connecting to the bound listener at {addr}: {e} (still refusing after 5s \
+                     — the listener did not come up)"
                 ))
             }
         }
