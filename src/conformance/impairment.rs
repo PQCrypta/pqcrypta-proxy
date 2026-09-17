@@ -53,6 +53,17 @@ pub struct Counters {
     /// unannounced server address: if the copy never went out, a connection that
     /// carried on proves nothing.
     pub shadowed: AtomicU64,
+    /// Client datagrams that carried a QUIC Initial packet.
+    ///
+    /// The evidence for `t-hybrid-large-hello`. An ML-KEM-768 key share is 1,216
+    /// bytes, which takes a ClientHello past the 1,200-byte minimum RFC 9000
+    /// §14.1 sets for an Initial datagram, so the first flight has to be split
+    /// across more than one of them. Counting them is the only way to know the
+    /// client was actually put in that situation: if its ClientHello fit in one
+    /// packet after all, the connection completing proves nothing about how it
+    /// handles one that does not, and the test must say so rather than take
+    /// credit for it.
+    pub initials_in: AtomicU64,
     /// Datagrams the loss impairment dropped.
     ///
     /// Kept apart from `dropped_oversize` because the two answer different
@@ -83,6 +94,10 @@ pub struct Counters {
 impl Counters {
     pub fn datagrams_in(&self) -> u64 {
         self.datagrams_in.load(Ordering::Relaxed)
+    }
+
+    pub fn initials_in(&self) -> u64 {
+        self.initials_in.load(Ordering::Relaxed)
     }
 
     pub fn dropped_oversize(&self) -> u64 {
@@ -363,6 +378,9 @@ impl AsyncUdpSocket for ImpairedSocket {
                     if carries_zero_rtt(dgram) {
                         self.counters.zero_rtt_in.fetch_add(1, Ordering::Relaxed);
                     }
+                    if carries_initial(dgram) {
+                        self.counters.initials_in.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
 
@@ -446,18 +464,28 @@ impl AsyncUdpSocket for ImpairedSocket {
 /// Conservative by construction: anything it cannot parse ends the walk, so the
 /// answer is only ever "a 0-RTT packet was definitely here".
 fn carries_zero_rtt(dgram: &[u8]) -> bool {
-    walk_for_zero_rtt(dgram).unwrap_or(false)
+    walk_for_packet_type(dgram, 0x1).unwrap_or(false)
+}
+
+/// Whether this datagram carries a QUIC Initial packet.
+///
+/// Same walk as the 0-RTT check and for the same reason: the answer is only
+/// ever "one was definitely here". A datagram this cannot parse is not counted,
+/// which can undercount but cannot invent an Initial that was not sent — and an
+/// undercount makes `t-hybrid-large-hello` report itself unexercised rather than
+/// claim a client handled something it was never shown.
+fn carries_initial(dgram: &[u8]) -> bool {
+    walk_for_packet_type(dgram, 0x0).unwrap_or(false)
 }
 
 /// The walk itself. `None` means "could not parse any further", which the caller
 /// reads as "not found" — the answer is only ever "a 0-RTT packet was definitely
 /// here".
-fn walk_for_zero_rtt(mut dgram: &[u8]) -> Option<bool> {
+fn walk_for_packet_type(mut dgram: &[u8], wanted: u8) -> Option<bool> {
     /// QUIC v1. A different version is a different packet layout, and guessing
     /// at one is how a parser starts inventing results.
     const V1: u32 = 1;
     const INITIAL: u8 = 0x0;
-    const ZERO_RTT: u8 = 0x1;
     const RETRY: u8 = 0x3;
 
     loop {
@@ -479,7 +507,7 @@ fn walk_for_zero_rtt(mut dgram: &[u8]) -> Option<bool> {
         }
 
         let packet_type = (first & 0x30) >> 4;
-        if packet_type == ZERO_RTT {
+        if packet_type == wanted {
             return Some(true);
         }
 

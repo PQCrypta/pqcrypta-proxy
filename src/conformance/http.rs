@@ -225,7 +225,11 @@ fn index(conformance: &Arc<Conformance>) -> Response<Body> {
         .iter()
         .filter(|t| matches!(t.tier, super::catalog::Tier::Quic))
         .count();
-    let http3 = total - quic;
+    let tls = super::catalog::CATALOG
+        .iter()
+        .filter(|t| matches!(t.tier, super::catalog::Tier::Tls))
+        .count();
+    let http3 = total - quic - tls;
 
     // Counts per layer and class, tallied from the catalogue rather than
     // written down, so the breakdown cannot disagree with the table below it.
@@ -233,6 +237,7 @@ fn index(conformance: &Arc<Conformance>) -> Response<Body> {
     for (tier, heading) in [
         (super::catalog::Tier::Quic, "QUIC"),
         (super::catalog::Tier::Http3, "HTTP/3"),
+        (super::catalog::Tier::Tls, "TLS"),
     ] {
         let in_tier: Vec<_> = super::catalog::CATALOG
             .iter()
@@ -266,6 +271,7 @@ fn index(conformance: &Arc<Conformance>) -> Response<Body> {
     for (tier, heading) in [
         (super::catalog::Tier::Http3, "HTTP/3 layer"),
         (super::catalog::Tier::Quic, "QUIC layer"),
+        (super::catalog::Tier::Tls, "TLS layer"),
     ] {
         rows.push_str(&format!(
             "<h3>{heading}</h3><div class=\"tablewrap\"><table>\
@@ -376,6 +382,7 @@ wrong frame, an unknown QUIC frame type, a Stateless Reset, a path-MTU black hol
   <div><span class="v">{total}</span><span class="k">adversarial tests</span></div>
   <div><span class="v">{http3}</span><span class="k">HTTP/3 layer</span></div>
   <div><span class="v">{quic}</span><span class="k">QUIC layer</span></div>
+  <div><span class="v">{tls}</span><span class="k">TLS layer</span></div>
   <div><span class="v">{start}&ndash;{end}</span><span class="k">UDP ports</span></div>
 </div>
 

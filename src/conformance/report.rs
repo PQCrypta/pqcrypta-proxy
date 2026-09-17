@@ -102,6 +102,7 @@ pub fn build(session_id: &str, results: &[Result_], generated_at: String) -> Rep
             tier: match test.tier {
                 catalog::Tier::Http3 => "http3",
                 catalog::Tier::Quic => "quic",
+                catalog::Tier::Tls => "tls",
             },
             expectation: test.expectation,
             verdict: r.verdict.as_str(),

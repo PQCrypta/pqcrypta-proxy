@@ -77,6 +77,20 @@ pub enum Tier {
     /// The anomaly is in QUIC itself: version negotiation, transport
     /// parameters, frames, path validation.
     Quic,
+    /// The anomaly is in the TLS 1.3 handshake carried inside QUIC: which key
+    /// exchange group the server will negotiate, and what the client does when
+    /// that is not the one it hoped for.
+    ///
+    /// Added last and it is the layer this company is named after. The first
+    /// fifty-one tests covered QUIC and HTTP/3 and said nothing about the
+    /// handshake underneath them, during the migration that makes client
+    /// behaviour there matter more than it ever has.
+    ///
+    /// These ports do not emit malformed bytes. They are configured to
+    /// negotiate exactly one group, which is a legal server configuration and
+    /// not a violation of anything — but it forces a path production never
+    /// does, and what a client does on that path is the measurement.
+    Tls,
 }
 
 /// The requirement level of the clause a test exercises, as it binds the client.
@@ -1069,6 +1083,129 @@ pub const CATALOG: &[Test] = &[
         implemented: true,
         port_offset: Some(47),
     },
+    // ---------------------------------------------------------------- TLS tier
+    //
+    // The first fifty-one tests cover QUIC and HTTP/3 and say nothing about the
+    // TLS 1.3 handshake underneath them. That is the layer the post-quantum
+    // migration is actually happening in, and the layer where client bugs are
+    // currently being found in the wild.
+    //
+    // These ports emit no malformed bytes. Each negotiates exactly one key
+    // exchange group, which is a legal configuration and not a violation of
+    // anything, and the measurement is what the client does when the group it
+    // hoped for is not on offer. That distinction matters for how a failure
+    // here should be read: a client that cannot complete one of these has a
+    // real interoperability problem, not a tolerance problem.
+    Test {
+        id: "t-hybrid-only",
+        title: "Server negotiates only the post-quantum hybrid X25519MLKEM768",
+        spec: "RFC 8446 §4.1.4, draft-ietf-tls-hybrid-design",
+        class: Class::Interoperability,
+        requirement: Requirement::Must,
+        tier: Tier::Tls,
+        expectation: "Complete the handshake. A client whose first key share was \
+                      classical must recover through HelloRetryRequest, which §4.1.4 \
+                      requires it to answer with a second ClientHello carrying a share \
+                      for the named group. A client that does not offer the group at all \
+                      must abandon the attempt cleanly rather than stall — that is a \
+                      correct outcome for a client without post-quantum support and is \
+                      reported as such, not as a fault.\n\nThis is the round trip that \
+                      breaks first in a real migration, because it is the one that never \
+                      happens until a server somewhere stops offering the classical group.",
+        implemented: true,
+        port_offset: Some(51),
+    },
+    Test {
+        id: "t-classical-only",
+        title: "Server negotiates only classical X25519 against a hybrid offer",
+        spec: "RFC 8446 §4.1.1, draft-ietf-tls-hybrid-design §5",
+        class: Class::Discretionary,
+        requirement: Requirement::May,
+        tier: Tier::Tls,
+        expectation: "Either outcome is conformant and the report says which was taken. \
+                      A client that proceeds has chosen availability: the connection is \
+                      classically secure and it accepted that. A client that refuses has \
+                      chosen a post-quantum floor, which is a policy some deployments \
+                      now require and no RFC yet mandates.\n\nNo grade is attached, \
+                      because attaching one would invent a requirement. What is worth \
+                      knowing is that the answer is a deliberate choice rather than an \
+                      accident, and today most clients cannot express it either way.",
+        implemented: true,
+        port_offset: Some(52),
+    },
+    Test {
+        id: "t-hybrid-large-hello",
+        title: "Hybrid key share large enough to split the Initial across packets",
+        spec: "RFC 9000 §8.1, §14.1, RFC 9001 §4.4",
+        class: Class::Resilience,
+        requirement: Requirement::Must,
+        tier: Tier::Tls,
+        expectation: "Complete the handshake with a ClientHello that does not fit one \
+                      QUIC Initial packet. An ML-KEM-768 key share is 1,216 bytes, which \
+                      pushes a ClientHello past the 1,200-byte floor RFC 9000 §14.1 sets \
+                      for an Initial, so the flight must be spread over more than one \
+                      packet and every one of them padded to the full size.\n\nThis is \
+                      the concrete reason post-quantum TLS deployments fail in the field, \
+                      and it interacts with the §8.1 anti-amplification limit: the server \
+                      may not send more than three times what it has received, so a \
+                      client that under-pads its Initials can stall the handshake without \
+                      either side doing anything invalid.",
+        implemented: true,
+        port_offset: Some(53),
+    },
+    Test {
+        id: "t-group-not-offered",
+        title: "Server selects a key exchange group the client never offered",
+        spec: "RFC 8446 §4.1.3, §4.2.8",
+        class: Class::Correctness,
+        requirement: Requirement::Must,
+        tier: Tier::Tls,
+        expectation: "Abort with illegal_parameter. §4.1.3 is explicit that if the \
+                      selected group was not offered, the client MUST abort — accepting \
+                      it would let a server steer a client onto a group it deliberately \
+                      excluded.\n\nNot yet emitted: it needs the selected group \
+                      substituted in the ServerHello key_share after the group is chosen, \
+                      inside vendor/rustls-fixed, which the single-group configuration \
+                      used by the other TLS ports cannot express.",
+        implemented: false,
+        port_offset: Some(54),
+    },
+    Test {
+        id: "t-corrupt-hybrid-share",
+        title: "Hybrid key share with an intact X25519 half and a corrupt ML-KEM half",
+        spec: "draft-ietf-tls-hybrid-design §3.2, RFC 8446 §4.1.3",
+        class: Class::Correctness,
+        requirement: Requirement::Must,
+        tier: Tier::Tls,
+        expectation: "Fail the handshake. The hybrid secret is the concatenation of both \
+                      shares fed through the key schedule, so corrupting either half must \
+                      produce a transcript mismatch and a failed Finished \
+                      verification.\n\nWhat is being looked for is the failure mode, not \
+                      the failure: a client that falls back to the classical half alone \
+                      has silently downgraded itself to exactly the security level the \
+                      hybrid exists to avoid, and would do so against an attacker who can \
+                      corrupt one half at will.\n\nNot yet emitted: needs the ML-KEM \
+                      component of the server share rewritten after encapsulation, inside \
+                      vendor/rustls-fixed.",
+        implemented: false,
+        port_offset: Some(55),
+    },
+    Test {
+        id: "t-grease-group",
+        title: "GREASE named group in supported_groups and the HRR",
+        spec: "RFC 8701 §3.1, RFC 8446 §4.1.4",
+        class: Class::Extensibility,
+        requirement: Requirement::Must,
+        tier: Tier::Tls,
+        expectation: "Ignore the unknown group and carry on. RFC 8701 reserves these \
+                      values precisely so that an endpoint meeting one learns to tolerate \
+                      a future real group with the same code point.\n\nNot yet emitted: \
+                      needs a reserved value injected into the server's group list inside \
+                      vendor/rustls-fixed, which will not encode a NamedGroup it has no \
+                      variant for.",
+        implemented: false,
+        port_offset: Some(56),
+    },
 ];
 
 /// The documents a test cites, in the order they appear.
@@ -1242,6 +1379,13 @@ mod tests {
             ("q-ecn-congestion", 48),
             ("q-key-update-repeated", 49),
             ("q-max-streams-credit", 50),
+            // TLS tier, published 2026-09-17.
+            ("t-hybrid-only", 51),
+            ("t-classical-only", 52),
+            ("t-hybrid-large-hello", 53),
+            ("t-group-not-offered", 54),
+            ("t-corrupt-hybrid-share", 55),
+            ("t-grease-group", 56),
         ];
 
         for (id, offset) in pinned {

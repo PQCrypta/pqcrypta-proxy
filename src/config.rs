@@ -1840,6 +1840,25 @@ pub struct SecurityConfig {
     /// Remove these entries after the pentest engagement ends.
     #[serde(default)]
     pub pentest_bypass_ips: Vec<String>,
+    /// How many distinct TLS fingerprints the observed corpus retains.
+    ///
+    /// This began as a memory-exhaustion guard at a hardcoded 50,000 and is now
+    /// the size limit on a published dataset: `observed.json` is what
+    /// `/ja4/` serves, and that is the most-crawled path on the site by a
+    /// factor of eight. The corpus reached exactly 50,000 entries, which means
+    /// it had been evicting its long tail — least-recently-seen first, so the
+    /// rare fingerprints a directory exists to record are precisely the ones
+    /// that go.
+    ///
+    /// Still bounded, because it is still fed by anyone who can open a
+    /// connection. At roughly 500 bytes an entry the default costs ~125 MB
+    /// resident and ~125 MB on disk.
+    #[serde(default = "default_max_tracked_fingerprints")]
+    pub max_tracked_fingerprints: usize,
+}
+
+fn default_max_tracked_fingerprints() -> usize {
+    250_000
 }
 
 fn default_geoip_block_duration_secs() -> Option<u64> {
@@ -1866,6 +1885,7 @@ impl Default for SecurityConfig {
             min_requests_for_error_check: 200, // Need 200+ requests before error check
             error_rate_threshold: 0.7, // 70% error rate triggers suspicious
             error_window_secs: 60,    // 1 minute sliding window
+            max_tracked_fingerprints: default_max_tracked_fingerprints(),
             trusted_internal_cidrs: Vec::new(),
             blocklist_dir: PathBuf::from("/var/lib/pqcrypta-proxy/blocklists"),
             allow_internal_backends: false,

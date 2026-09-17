@@ -35,8 +35,13 @@ use dashmap::DashMap;
 /// When exceeded, oldest entries are evicted
 const MAX_TRACKED_IPS: usize = 100_000;
 
-/// Maximum number of tracked JA3 fingerprints
-const MAX_JA3_FINGERPRINTS: usize = 50_000;
+/// Fallback corpus ceiling, used only if the configured value is zero.
+///
+/// The real limit is `security.max_tracked_fingerprints`. This was a hardcoded
+/// 50,000 until 2026-09-17, by which time the corpus was sitting at exactly
+/// that number: it had been evicting its long tail for an unknown period, and
+/// the long tail is what a fingerprint directory is for.
+const FALLBACK_MAX_JA3_FINGERPRINTS: usize = 250_000;
 
 /// Distinct User-Agents retained per fingerprint.
 ///
@@ -1925,15 +1930,34 @@ impl SecurityState {
         // of whatever had sprayed the box most recently — backwards for a corpus
         // meant to describe normal traffic, and it meant a burst of one-shot
         // scanner fingerprints could evict every browser we knew about.
+        //
+        // Logged at warn when it fires. Evicting from a published corpus is a
+        // data-loss event, not routine housekeeping: the previous ceiling was
+        // reached silently and the only evidence was the file size sitting on a
+        // round number.
+        let max_fingerprints = {
+            let c = self.config.read();
+            if c.max_tracked_fingerprints == 0 {
+                FALLBACK_MAX_JA3_FINGERPRINTS
+            } else {
+                c.max_tracked_fingerprints
+            }
+        };
         let ja3_count = self.ja3_cache.len();
-        if ja3_count > MAX_JA3_FINGERPRINTS {
+        if ja3_count > max_fingerprints {
             let mut entries: Vec<_> = self
                 .ja3_cache
                 .iter()
                 .map(|e| (e.key().clone(), e.value().last_seen))
                 .collect();
             entries.sort_by_key(|(_, time)| *time);
-            let to_remove = ja3_count.saturating_sub(MAX_JA3_FINGERPRINTS);
+            let to_remove = ja3_count.saturating_sub(max_fingerprints);
+            warn!(
+                "observed fingerprint corpus at ceiling: {} entries, limit {}, \
+                 evicting {} least-recently-seen. Raise \
+                 security.max_tracked_fingerprints to keep them.",
+                ja3_count, max_fingerprints, to_remove
+            );
             for (hash, _) in entries.into_iter().take(to_remove) {
                 self.ja3_cache.remove(&hash);
             }

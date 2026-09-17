@@ -135,6 +135,26 @@ impl TestListener {
             tls_provider
                 .build_zero_rtt_accept_config()
                 .with_context(|| format!("building the TLS config for {}", test.id))?
+        } else if matches!(test.tier, Tier::Tls) {
+            // The TLS tier's whole anomaly is which group the server will
+            // negotiate. Nothing malformed is emitted; the port simply refuses
+            // to speak anything else, and what the client does about that is
+            // the measurement.
+            //
+            // `t-hybrid-large-hello` shares the hybrid-only configuration with
+            // `t-hybrid-only` deliberately. The two differ in what is judged,
+            // not in what is served: one asks whether the handshake completed,
+            // the other asks how the client packetised a ClientHello too large
+            // for a single Initial. Serving them on one port would force a
+            // client to be graded twice on one connection, and the suite's own
+            // rule is one anomaly per port.
+            let group = match test.id {
+                "t-classical-only" => rustls::NamedGroup::X25519,
+                _ => rustls::NamedGroup::X25519MLKEM768,
+            };
+            tls_provider
+                .build_single_group_config(group)
+                .with_context(|| format!("building the TLS config for {}", test.id))?
         } else {
             tls_provider.get_quic_server_config()
         };
@@ -1978,6 +1998,27 @@ fn quic_observation(
             )))
         }
 
+        // Whether the ClientHello actually needed more than one Initial packet
+        // decides only whether this ran; completing the handshake is the
+        // liveness result.
+        //
+        // A client that negotiated the hybrid in a single Initial was never put
+        // in the situation this test is about, and crediting it would be
+        // claiming it handles a split first flight on the evidence of a flight
+        // that was not split. Two is the threshold rather than one because
+        // every handshake sends at least one Initial.
+        "t-hybrid-large-hello" => {
+            if counters.initials_in() > 1 {
+                return None;
+            }
+            Some(Observation::NotExercised(
+                format!(
+                    "the client's first flight fitted in {} Initial packet(s), so a                      ClientHello too large for one was never sent. That usually means it                      did not offer a post-quantum key share: an ML-KEM-768 share is 1,216                      bytes and cannot fit beside the rest of a ClientHello inside the                      1,200-byte Initial minimum",
+                    counters.initials_in()
+                ),
+            ))
+        }
+
         // Whether anything actually arrived out of order decides only whether
         // this ran; putting the stream back together is the liveness result.
         "q-packet-reordering" => {
@@ -2671,7 +2712,7 @@ pub fn catalog_json(conformance: &Conformance) -> String {
                 "title": t.title,
                 "spec": t.spec,
                 "class": t.class.as_str(),
-                "layer": match t.tier { Tier::Http3 => "http3", Tier::Quic => "quic" },
+                "layer": match t.tier { Tier::Http3 => "http3", Tier::Quic => "quic", Tier::Tls => "tls" },
                 "expectation": t.expectation,
                 "port": t.port_offset.map(|o| start + o),
                 // Where the anomaly is written, which decides what silence from

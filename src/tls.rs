@@ -519,6 +519,82 @@ pub fn zero_rtt_reject_server_config(
     ))
 }
 
+/// A provider offering exactly one key-exchange group.
+///
+/// This is how the TLS tier of the conformance suite emits its anomalies. A
+/// server that will negotiate only one group is not misbehaving — it is a
+/// perfectly legal configuration — but it forces the client down a path that
+/// production never does, and what the client does there is the measurement.
+///
+/// Two of them matter during the migration:
+///
+/// * **hybrid only.** A client that offered only classical groups must recover
+///   through HelloRetryRequest, which costs it an extra round trip and is the
+///   part of post-quantum deployment that breaks first. A client that never
+///   listed the group at all cannot recover and must abandon cleanly rather
+///   than hang.
+/// * **classical only.** The mirror: a client that offered a hybrid is answered
+///   with X25519. Whether it proceeds or refuses is a policy decision the RFCs
+///   leave open, so the suite reports which was taken rather than grading it.
+///
+/// The cipher-suite preference is left exactly as `build_pqc_provider` sets it,
+/// so the only variable between the production path and a test port is the
+/// group. A test that changed two things at once would not measure either.
+pub fn build_single_group_provider(
+    group: rustls::NamedGroup,
+) -> anyhow::Result<rustls::crypto::CryptoProvider> {
+    // Built from the unmodified post-quantum provider, not from
+    // `build_pqc_provider`, which removes X25519 outright: that is the edge's
+    // production policy, and inheriting it here left `t-classical-only` with an
+    // empty group list. The port then refused to bind at all -- correctly, by
+    // the guard below, but it meant the one test about classical downgrade was
+    // the one test that could not run.
+    //
+    // The cipher-suite preference IS inherited, deliberately, so the only thing
+    // that differs between a test port and production is the group.
+    let mut provider = rustls_post_quantum::provider();
+    prefer_256_bit_aeads(&mut provider);
+    provider.kx_groups.retain(|g| g.name() == group);
+    if provider.kx_groups.is_empty() {
+        // Every caller names a group the post-quantum provider is expected to
+        // carry. An empty list would build a server that can complete no
+        // handshake at all, and every client would then "fail" a test that was
+        // never emitted — the precise false accusation this suite exists to
+        // avoid.
+        anyhow::bail!(
+            "the crypto provider does not carry {:?}; refusing to build a server with no key exchange",
+            group
+        );
+    }
+    Ok(provider)
+}
+
+/// A QUIC server config that will negotiate only `group`.
+///
+/// Used by the TLS tier's listeners. Shares the edge's own certificate
+/// resolver, so a client meets the same certificate chain it would in
+/// production and the only thing under test is the key exchange.
+pub fn single_group_server_config(
+    resolver: Arc<dyn rustls::server::ResolvesServerCert>,
+    group: rustls::NamedGroup,
+) -> anyhow::Result<Arc<quinn::crypto::rustls::QuicServerConfig>> {
+    let provider = build_single_group_provider(group)?;
+    let mut config = RustlsServerConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&TLS13])
+        .map_err(|e| anyhow::anyhow!("failed to set protocol versions: {e}"))?
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+
+    config.alpn_protocols = vec![b"h3".to_vec()];
+    crate::cert_compression::apply(&mut config);
+
+    Ok(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(config).map_err(|e| {
+            anyhow::anyhow!("failed to build the single-group QUIC config for {group:?}: {e}")
+        })?,
+    ))
+}
+
 pub fn build_pqc_provider() -> rustls::crypto::CryptoProvider {
     let mut provider = rustls_post_quantum::provider();
     provider
@@ -532,27 +608,31 @@ pub fn build_pqc_provider() -> rustls::crypto::CryptoProvider {
         _ => 4,
     });
 
-    // Prefer 256-bit AEADs, matching what the OpenSSL listener enforces for
-    // HTTP/1.1 and HTTP/2.
-    //
-    // That listener *removes* TLS_AES_128_GCM_SHA256 outright. This one cannot:
-    // RFC 9001 §5.2 fixes AES-128-GCM as the AEAD for QUIC Initial packet
-    // protection, and dropping the suite makes QuicServerConfig construction
-    // fail. So it stays available and simply loses the preference contest —
-    // rustls picks the server's first suite the client also offers, and every
-    // modern client offers all three.
-    //
-    // Without this, HTTP/2 visitors got AES-256 and HTTP/3 visitors silently got
-    // AES-128 on the same hostname: the policy was written once, on one of two
-    // listeners.
+    prefer_256_bit_aeads(&mut provider);
+
+    provider
+}
+
+/// Order 256-bit AEADs ahead of AES-128, matching what the OpenSSL listener
+/// enforces for HTTP/1.1 and HTTP/2.
+///
+/// That listener *removes* TLS_AES_128_GCM_SHA256 outright. This cannot: RFC
+/// 9001 §5.2 fixes AES-128-GCM as the AEAD for QUIC Initial packet protection,
+/// and dropping the suite makes QuicServerConfig construction fail. So it stays
+/// available and simply loses the preference contest — rustls picks the
+/// server's first suite the client also offers, and every modern client offers
+/// all three.
+///
+/// Without this, HTTP/2 visitors got AES-256 and HTTP/3 visitors silently got
+/// AES-128 on the same hostname: the policy was written once, on one of two
+/// listeners.
+fn prefer_256_bit_aeads(provider: &mut rustls::crypto::CryptoProvider) {
     provider.cipher_suites.sort_by_key(|cs| match cs.suite() {
         rustls::CipherSuite::TLS13_AES_256_GCM_SHA384 => 0u8,
         rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => 1,
         rustls::CipherSuite::TLS13_AES_128_GCM_SHA256 => 2,
         _ => 3,
     });
-
-    provider
 }
 
 impl TlsProvider {
@@ -641,6 +721,14 @@ impl TlsProvider {
         &self,
     ) -> anyhow::Result<Arc<quinn::crypto::rustls::QuicServerConfig>> {
         zero_rtt_accept_server_config(self.resolver.clone())
+    }
+
+    /// A config that will negotiate only `group`, for the TLS conformance tier.
+    pub fn build_single_group_config(
+        &self,
+        group: rustls::NamedGroup,
+    ) -> anyhow::Result<Arc<quinn::crypto::rustls::QuicServerConfig>> {
+        single_group_server_config(self.resolver.clone(), group)
     }
 
     /// Check if PQC is available and enabled
