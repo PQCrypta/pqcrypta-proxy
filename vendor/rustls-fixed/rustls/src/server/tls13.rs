@@ -37,6 +37,14 @@ use crate::tls13::{
 };
 use crate::{ConnectionTrafficSecrets, compress, rand, verify};
 
+/// The X25519 half of a hybrid server share, in bytes.
+///
+/// RFC 8446 §4.2.8.2 fixes an X25519 public value at 32 bytes, and
+/// draft-kwiatkowski-tls-ecdhe-mlkem §3.1.2 puts it at the tail of the
+/// X25519MLKEM768 server share, after the 1,088-byte ML-KEM ciphertext.
+/// Used only by [`KeyShareImpairment::ShareLengthMismatch`], which removes it.
+const X25519_SHARE_LEN: usize = 32;
+
 mod client_hello {
     use super::*;
     use crate::compress::CertCompressor;
@@ -531,6 +539,16 @@ mod client_hello {
                 let mut payload = ckx.pub_key.clone();
                 if payload.len() > 32 {
                     payload[0] ^= 0x01;
+                }
+                KeyShareEntry::new(ckx.group, payload)
+            }
+            Some(KeyShareImpairment::ShareLengthMismatch) => {
+                // Drop the 32-byte classical tail: 1,120 bytes become 1,088
+                // under a group whose share is fixed at 1,120. The ML-KEM
+                // ciphertext is left whole so the only defect is the length.
+                let mut payload = ckx.pub_key.clone();
+                if payload.len() > X25519_SHARE_LEN {
+                    payload.truncate(payload.len() - X25519_SHARE_LEN);
                 }
                 KeyShareEntry::new(ckx.group, payload)
             }

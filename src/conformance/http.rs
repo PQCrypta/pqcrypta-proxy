@@ -663,7 +663,16 @@ fn report_for(conformance: &Arc<Conformance>, path: &str) -> Response<Body> {
     let Some(id) = session_id(path, "/report/", ".json") else {
         return not_found(wants_json);
     };
-    let Some(results) = conformance.sessions.with(&id, |s| s.results()) else {
+    // Reading the JSON report is how a driver says it is finished: there is no
+    // other goodbye, and `Registry::associate` needs to know the difference
+    // between a run that ended and one still being driven. The HTML form is
+    // deliberately not counted -- see `Session::mark_reported`.
+    let Some(results) = conformance.sessions.with(&id, |s| {
+        if wants_json {
+            s.mark_reported();
+        }
+        s.results()
+    }) else {
         return not_found(wants_json);
     };
 

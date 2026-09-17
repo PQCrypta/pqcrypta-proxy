@@ -166,6 +166,11 @@ impl TestListener {
                 "t-corrupt-hybrid-share" => {
                     Some(rustls::server::KeyShareImpairment::CorruptHybridPqHalf)
                 }
+                // 1,088 bytes where the group fixes the server share at 1,120:
+                // the ML-KEM ciphertext whole and the X25519 tail removed.
+                "t-hybrid-share-length" => {
+                    Some(rustls::server::KeyShareImpairment::ShareLengthMismatch)
+                }
                 // 0x2A2A, one of the RFC 8701 reserved values, chosen from the
                 // middle of the range rather than the ends so a client that
                 // special-cases a boundary is not accidentally let through.
@@ -1010,6 +1015,48 @@ fn tls_handshake_observation(test: &'static Test, e: &quinn::ConnectionError) ->
                 "did not complete the handshake ({e}). The shared secret is both halves \
                  through the key schedule, so a corrupt ML-KEM half must break it -- and this \
                  client did not fall back to the intact X25519 half"
+            )),
+        },
+
+        // ── §3.1.2: a share whose length does not match its group ──
+        //
+        // Judged exactly as `t-group-not-offered` is, and for the same reason:
+        // the draft names illegal_parameter, RFC 9001 §4.8 lets a QUIC endpoint
+        // replace it, so the abort is the requirement and the code is reported.
+        //
+        // The distinction worth drawing here is that failing is not by itself
+        // evidence of the check. No client can complete this handshake -- the
+        // shared secret needs the half we removed -- so a client that never
+        // looks at the length still fails, just later and over something else.
+        // An alert naming illegal_parameter is the one outcome that shows the
+        // length was checked where the draft asks for it; anything else is an
+        // abort we can confirm but cannot attribute, and it is reported that
+        // way rather than being counted as proof.
+        "t-hybrid-share-length" => match abort {
+            TlsAbort::Alert(47) => Observation::Signalled(
+                "aborted with illegal_parameter (alert 47) over a server share of the wrong \
+                 length for X25519MLKEM768, which is the check §3.1.2 asks the client to make \
+                 and the code it names"
+                    .to_string(),
+            ),
+            TlsAbort::Alert(code) => Observation::Signalled(format!(
+                "aborted the handshake with TLS alert {code} rather than illegal_parameter. \
+                 §3.1.2 requires the abort and RFC 9001 §4.8 permits replacing the alert over \
+                 QUIC, so the code is reported and not judged -- though note that a truncated \
+                 share also breaks the key schedule, so this abort does not on its own show \
+                 the length was what the client objected to"
+            )),
+            TlsAbort::Silent => Observation::Ambiguous(
+                "The handshake did not complete, which it could not have done with half the \
+                 shared secret missing, but nothing arrived to say the client rejected the \
+                 length deliberately. A close that was never sent and one that was lost look \
+                 the same from here"
+                    .to_string(),
+            ),
+            _ => Observation::Ambiguous(format!(
+                "The handshake ended ({e}) without a CONNECTION_CLOSE carrying a TLS alert. \
+                 The share was certainly not used, but nothing shows whether its length was \
+                 what the client objected to"
             )),
         },
 
@@ -3305,6 +3352,111 @@ mod tests {
                     "{} names an expected code but is not in the verified table",
                     t.id
                 );
+            }
+        }
+    }
+
+    /// The same rule for the two codes `expected_code` cannot express.
+    ///
+    /// `expected_code` compares HTTP/3 application codes. Two tests are decided
+    /// on a *transport* code instead, in their own verdict functions, and so sat
+    /// outside the table above -- which meant the sibling of the mistake that
+    /// table exists to prevent could still be made in `frame_encoding_verdict`
+    /// or `transport_param_verdict` and nothing would catch it.
+    ///
+    /// This drives the functions rather than reading a map, so it pins the
+    /// behaviour and not just the constant: the required code has to be accepted
+    /// as an objection, and a plausible wrong one has to be reported as a
+    /// violation naming the right code. Sentences re-read from the published
+    /// text on 2026-09-17.
+    #[test]
+    fn every_transport_code_matches_its_rfc_clause() {
+        use quinn_proto::TransportErrorCode as Tec;
+
+        fn closed_with(code: Tec) -> quinn::ConnectionError {
+            quinn::ConnectionError::ConnectionClosed(quinn_proto::ConnectionClose {
+                error_code: code,
+                frame_type: quinn_proto::MaybeFrame::None,
+                reason: bytes::Bytes::new(),
+            })
+        }
+
+        // (test id, clause, the sentence requiring it, the code it names, a
+        //  wrong-but-plausible code a client might send instead)
+        let verified: &[(
+            &str,
+            &str,
+            &str,
+            Tec,
+            Tec,
+            fn(&Test, &quinn::ConnectionError) -> Option<Observation>,
+        )] = &[
+            (
+                "q-reserved-frame",
+                "RFC 9000 §12.4",
+                "An endpoint MUST treat the receipt of a frame of unknown type as a \
+                 connection error of type FRAME_ENCODING_ERROR.",
+                Tec::FRAME_ENCODING_ERROR,
+                Tec::PROTOCOL_VIOLATION,
+                frame_encoding_verdict,
+            ),
+            (
+                "q-invalid-transport-param",
+                "RFC 9000 §7.4",
+                // Two sentences, because the violation and the code live in
+                // different sections: §18.2 "ack_delay_exponent ... Values above
+                // 20 are invalid." is what makes the parameter we send illegal,
+                // and §7.4 is what says how a client must answer it.
+                "An endpoint MUST treat receipt of a transport parameter with an invalid \
+                 value as a connection error of type TRANSPORT_PARAMETER_ERROR.",
+                Tec::TRANSPORT_PARAMETER_ERROR,
+                Tec::INTERNAL_ERROR,
+                transport_param_verdict,
+            ),
+        ];
+
+        for (id, clause, sentence, required, wrong, verdict) in verified {
+            let t = catalog::find(id).expect(id);
+            // `contains`, not equality: a test may cite more than one clause,
+            // and `q-invalid-transport-param` rightly cites two -- §18.2 is
+            // what makes ack_delay_exponent = 32 invalid, §7.4 is what names
+            // the code to reject it with. What must hold is that the clause
+            // naming the code is among them.
+            assert!(
+                t.spec.contains(clause),
+                "{id} cites \"{}\" but was verified against {clause}",
+                t.spec
+            );
+            assert_eq!(
+                t.class,
+                catalog::Class::Correctness,
+                "{id} requires a specific rejection, so it is a correctness test"
+            );
+            assert!(
+                matches!(
+                    verdict(t, &closed_with(*required)),
+                    Some(Observation::Signalled(_))
+                ),
+                "{id}: {clause} says \"{sentence}\", so that code must read as an objection"
+            );
+            assert!(
+                matches!(
+                    verdict(t, &closed_with(*wrong)),
+                    Some(Observation::Violated(_))
+                ),
+                "{id}: a rejection carrying the wrong code is still a violation of {clause}"
+            );
+            // And the functions must keep to their own test: one catalogue-wide
+            // matcher answering for everything would judge tests nobody verified.
+            for other in catalog::CATALOG {
+                if other.id != *id {
+                    assert!(
+                        verdict(other, &closed_with(*required)).is_none(),
+                        "{} answered for {}, which it was not verified against",
+                        id,
+                        other.id
+                    );
+                }
             }
         }
     }

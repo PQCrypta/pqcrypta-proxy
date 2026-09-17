@@ -82,12 +82,23 @@ struct Args {
     filter: Option<String>,
 }
 
-/// How long to let the server settle the last verdict before reading the report.
+/// How long to keep asking for a verdict that has not landed yet.
 ///
-/// Comfortably longer than the two seconds the listener waits to see how a
-/// connection ended, and short enough that nobody notices it at the end of a run
-/// that takes a minute.
-const SETTLE_BEFORE_REPORT: Duration = Duration::from_secs(3);
+/// This replaced a flat three-second sleep, which was too short for one class of
+/// test and guessed for every other. A TLS-tier client whose key exchange fails
+/// has no handshake keys and so cannot encrypt a `CONNECTION_CLOSE` at all: the
+/// server learns how that connection ended only when its own handshake timeout
+/// expires, several seconds after the client process is gone.
+///
+/// Sitting under the old sleep, that arrived as `not_run` for a test that had
+/// just been driven -- a false statement about our own coverage on a page whose
+/// claim is measurement, and invisible in a full run because a later test's
+/// traffic covered the gap. It showed up only with `--filter`, which is how it
+/// was found.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(20);
+
+/// How often to re-read the report while a verdict is still outstanding.
+const SETTLE_POLL: Duration = Duration::from_millis(500);
 
 #[derive(Deserialize)]
 struct Session {
@@ -137,6 +148,64 @@ struct ResultRow {
     verdict: String,
     detail: String,
     expectation: String,
+}
+
+/// Read the report, waiting while a test we drove still has no verdict.
+///
+/// `driven` is what this invocation actually ran, so a `not_run` among those is
+/// a verdict in flight rather than a test nobody attempted -- the distinction
+/// the old fixed sleep could not make. Everything outside `driven` is left
+/// alone: with `--filter`, most of the catalogue is legitimately not run.
+///
+/// Returns the raw body so the JSON form prints exactly what the server sent.
+async fn collect_report(
+    http: &reqwest::Client,
+    url: &str,
+    driven: &std::collections::BTreeSet<&str>,
+    deadline: tokio::time::Instant,
+    quiet: bool,
+) -> Result<String, i32> {
+    loop {
+        let body = match http.get(url).send().await {
+            Ok(r) => match r.text().await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("could not read the report: {e}");
+                    return Err(exit::UNREACHABLE);
+                }
+            },
+            Err(e) => {
+                eprintln!("could not fetch the report: {e}");
+                return Err(exit::UNREACHABLE);
+            }
+        };
+
+        // Counted from the body each time rather than from a parsed copy kept
+        // across iterations, so a malformed report fails in one place: the
+        // caller's own parse.
+        let outstanding = serde_json::from_str::<Report>(&body).map_or(0, |r| {
+            r.results
+                .iter()
+                .filter(|row| row.verdict == "not_run" && driven.contains(row.id.as_str()))
+                .count()
+        });
+
+        if outstanding == 0 || tokio::time::Instant::now() >= deadline {
+            if outstanding > 0 && !quiet {
+                // Said out loud rather than published in silence: a `not_run`
+                // that outlives the deadline is a verdict we stopped waiting
+                // for, and it must not read as "this client was never driven".
+                eprintln!(
+                    "warning: {outstanding} test(s) still had no verdict after {}s; \
+                     they are reported as not run",
+                    SETTLE_DEADLINE.as_secs()
+                );
+            }
+            return Ok(body);
+        }
+
+        tokio::time::sleep(SETTLE_POLL).await;
+    }
 }
 
 /// Exit codes, named so the meanings are not scattered as literals.
@@ -225,36 +294,26 @@ async fn run(args: &Args) -> i32 {
     //
     // A verdict is not settled when the client exits. Several tests are judged
     // on what happens *after* the anomaly — whether the connection goes quiet,
-    // whether a close carries an error code — and the server waits a couple of
-    // seconds for that before recording anything.
+    // whether a close carries an error code — and the server waits before
+    // recording anything. The client, meanwhile, is often gone the instant it
+    // meets the anomaly.
     //
-    // The client, meanwhile, is often gone the instant it meets the anomaly.
-    // `h-response-stream-reset` ends with the server cancelling the response, so
-    // a client hangs up immediately, and it is the last entry in the catalogue:
-    // the report was being fetched while the server was still waiting to see how
-    // that connection ended, and came back `not_run` for a test that had in fact
-    // just been recorded. It showed up on some clients and not others, which is
-    // the worst shape a bug like this can take.
+    // This used to be a flat sleep, on the reasoning that the report is always
+    // available and only its contents arrive late, so there is nothing to poll
+    // for. That was wrong: there is. Every test in `selected` was driven, so any
+    // of them still reading `not_run` is a verdict in flight, and that is a
+    // condition worth waiting on rather than a duration worth guessing.
     //
-    // Waiting here rather than retrying the report: the report is always
-    // available, it is the *contents* that arrive late, so there is nothing to
-    // poll for that would say "not finished yet".
-    tokio::time::sleep(SETTLE_BEFORE_REPORT).await;
-
-    // ── Report ──────────────────────────────────────────────────────────
+    // So: read the report, and while something we drove has no verdict, read it
+    // again until the deadline. A run where everything lands promptly now waits
+    // for one round trip instead of three seconds.
     let url = format!("{base}/report/{}.json", session.id);
-    let body = match http.get(&url).send().await {
-        Ok(r) => match r.text().await {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("could not read the report: {e}");
-                return exit::UNREACHABLE;
-            }
-        },
-        Err(e) => {
-            eprintln!("could not fetch the report: {e}");
-            return exit::UNREACHABLE;
-        }
+    let driven: std::collections::BTreeSet<&str> = selected.iter().map(|t| t.id.as_str()).collect();
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
+
+    let body = match collect_report(&http, &url, &driven, deadline, args.json).await {
+        Ok(body) => body,
+        Err(code) => return code,
     };
 
     if args.json {

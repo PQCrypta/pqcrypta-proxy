@@ -529,6 +529,30 @@ pub enum KeyShareImpairment {
     /// leading bytes and leaves the trailing 32 untouched.
     CorruptHybridPqHalf,
 
+    /// Send a hybrid share whose length does not match the group named
+    /// alongside it.
+    ///
+    /// draft-kwiatkowski-tls-ecdhe-mlkem §3.1.2 fixes the X25519MLKEM768 server
+    /// share at 1,120 bytes — 1,088 for the ML-KEM ciphertext and 32 for the
+    /// X25519 key — and says in as many words: "For all groups, the client MUST
+    /// check if the ciphertext length matches the selected group, and abort with
+    /// an illegal_parameter alert if it fails."
+    ///
+    /// The classical tail is dropped, leaving the ML-KEM ciphertext whole. Both
+    /// halves are needed for the shared secret, so a client that does not check
+    /// the length cannot derive the same keys either way; what separates them is
+    /// *where* it fails. Checking the length rejects this at the ServerHello,
+    /// with a code that says what was wrong. Not checking it carries a truncated
+    /// share into decapsulation and fails later and less clearly — which is why
+    /// the draft asks for the check rather than leaving the key schedule to
+    /// notice.
+    ///
+    /// Truncation rather than padding, because a longer share could be read as a
+    /// framing error in the extension itself. This one parses cleanly as an
+    /// opaque vector: the only thing wrong with it is its length for the group
+    /// it is named with, which is precisely the clause's subject.
+    ShareLengthMismatch,
+
     /// Advertise a GREASE group alongside the real one.
     ///
     /// RFC 8701 reserves these code points precisely so that an endpoint

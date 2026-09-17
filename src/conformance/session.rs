@@ -599,6 +599,16 @@ pub struct Session {
     pub id: String,
     created: Instant,
     results: HashMap<&'static str, Result_>,
+    /// Whether this session's machine-readable report has been collected.
+    ///
+    /// The driver reads `/report/<id>.json` once, at the end, after it has
+    /// driven every test it intends to. That read is the only signal this
+    /// endpoint gets that a run is over -- there is no goodbye -- and it is what
+    /// separates the two ways a session loses its source-address association:
+    /// the ordinary one, where the next run starts after this one finished, and
+    /// the damaging one in [`Registry::associate`], where a run still being
+    /// driven has its connections taken.
+    reported: bool,
 }
 
 impl Session {
@@ -607,7 +617,17 @@ impl Session {
             id,
             created: Instant::now(),
             results: HashMap::new(),
+            reported: false,
         }
+    }
+
+    /// Note that the results have been collected, so this run is over.
+    ///
+    /// Only the JSON form counts. A person opening the HTML report in a browser
+    /// while a run is going is a reader, not a driver, and must not quietly
+    /// disarm the collision warning for the run they are watching.
+    pub fn mark_reported(&mut self) {
+        self.reported = true;
     }
 
     /// Record an outcome. A test re-run within the same session overwrites its
@@ -756,9 +776,19 @@ impl Registry {
     /// session has already recorded.
     ///
     /// `None` in every ordinary case: no previous association, the same session
-    /// re-associating, an expired one, a session that has since been swept, or
-    /// one that recorded nothing — a client that opened a session and never ran
-    /// a test loses nothing by being displaced.
+    /// re-associating, an expired one, a session that has since been swept, one
+    /// that recorded nothing — a client that opened a session and never ran a
+    /// test loses nothing by being displaced — and, most importantly, one whose
+    /// report has already been collected.
+    ///
+    /// That last condition is what makes this warning worth reading. Without it
+    /// the check fired on every ordinary sequential run: the association lives
+    /// for `session_ttl_secs`, an hour in the shipped configuration, so a matrix
+    /// run driving seven clients one after another would have logged six
+    /// collisions and every one of them would have been a lie. A warning that
+    /// appears on every healthy run teaches the reader to skip it, which is
+    /// worse than no warning at all -- the first version of this guard had that
+    /// defect and it was caught by running the thing it was written to protect.
     fn displaced_by(&self, ip: std::net::IpAddr, id: &str) -> Option<(String, usize)> {
         // Read and drop the guard before the caller inserts: holding one on
         // `by_source` across that insert would deadlock the map against itself.
@@ -770,8 +800,8 @@ impl Registry {
             }
             prev_id.clone()
         };
-        let recorded = self.with(&prev_id, |s| s.results.len())?;
-        (recorded > 0).then_some((prev_id, recorded))
+        let (recorded, reported) = self.with(&prev_id, |s| (s.results.len(), s.reported))?;
+        (recorded > 0 && !reported).then_some((prev_id, recorded))
     }
 
     /// The most recent live session started from `ip`.
@@ -1325,6 +1355,47 @@ mod tests {
         // because refusing it would break the ordinary case.
         reg.associate(ip, &second);
         assert_eq!(reg.for_source(ip).as_deref(), Some(second.as_str()));
+    }
+
+    /// A run that finished is not a collision, however much it recorded.
+    ///
+    /// The first version of this guard warned whenever the displaced session had
+    /// any results at all, which made it fire on every ordinary sequential run:
+    /// the association survives for the session TTL -- an hour as shipped -- so a
+    /// matrix driving seven clients in turn produced six warnings, each of them
+    /// false. It was caught by reading the log of the thing the guard exists to
+    /// protect.
+    ///
+    /// Collecting the JSON report is the signal that a run is over, so what is
+    /// warned about now is a session displaced *before* anyone came for its
+    /// results.
+    #[test]
+    fn a_finished_run_is_not_reported_as_a_collision() {
+        let reg = Registry::new(60, 64);
+        let ip: std::net::IpAddr = "203.0.113.12".parse().unwrap();
+        let first = reg.create();
+        reg.associate(ip, &first);
+
+        let t = test_of("h-grease-settings");
+        reg.with(&first, |s| {
+            s.record(t, &Observation::SurvivedAndContinued, None, 1);
+        });
+
+        // Still being driven: displacing it now is the real thing.
+        let second = reg.create();
+        assert_eq!(reg.displaced_by(ip, &second), Some((first.clone(), 1)));
+
+        // Its driver collects the report, which is how a run ends here.
+        reg.with(&first, Session::mark_reported);
+
+        // The next client in the same matrix run now displaces it in silence,
+        // which is what an ordinary sequential run looks like.
+        let third = reg.create();
+        assert_eq!(
+            reg.displaced_by(ip, &third),
+            None,
+            "a run whose results were collected has nothing left to contaminate"
+        );
     }
 
     #[test]

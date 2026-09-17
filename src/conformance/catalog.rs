@@ -1216,6 +1216,33 @@ pub const CATALOG: &[Test] = &[
         port_offset: Some(55),
     },
     Test {
+        id: "t-hybrid-share-length",
+        title: "Hybrid key share whose length does not match the group named with it",
+        spec: "draft-kwiatkowski-tls-ecdhe-mlkem §3.1.2, RFC 8446 §6.2, RFC 9001 §4.8",
+        class: Class::Correctness,
+        requirement: Requirement::Must,
+        tier: Tier::Tls,
+        expectation: "Abort rather than proceed. §3.1.2 is explicit: \"For all groups, the \
+                      client MUST check if the ciphertext length matches the selected group, \
+                      and abort with an illegal_parameter alert if it fails.\"\n\nThe port \
+                      sends 1,088 bytes where X25519MLKEM768 fixes the server share at 1,120 \
+                      — the ML-KEM ciphertext whole and the 32-byte X25519 tail removed. It \
+                      parses cleanly as an opaque vector, so the only thing wrong with it is \
+                      its length for the group it is named with.\n\nNeither outcome lets a \
+                      client derive our keys, because the shared secret needs both halves. \
+                      What separates them is where it notices: a client that checks the \
+                      length rejects this at the ServerHello, while one that does not carries \
+                      a truncated share into decapsulation and fails later and less \
+                      clearly.\n\nWhat is judged is the abort, not the alert value. RFC 9001 \
+                      §4.8 lets a QUIC endpoint replace any alert with a generic one, so the \
+                      code a client chooses is reported and not scored — and a handshake that \
+                      ends with no CONNECTION_CLOSE at all is inconclusive rather than a \
+                      failure, because a close that was never sent cannot be told from one \
+                      that was lost.",
+        implemented: true,
+        port_offset: Some(57),
+    },
+    Test {
         id: "t-grease-group",
         title: "GREASE named group a client must tolerate",
         spec: "RFC 8701 §4, RFC 8446 §4.2.7",
@@ -1424,6 +1451,7 @@ mod tests {
             ("t-group-not-offered", 54),
             ("t-corrupt-hybrid-share", 55),
             ("t-grease-group", 56),
+            ("t-hybrid-share-length", 57),
         ];
 
         for (id, offset) in pinned {
