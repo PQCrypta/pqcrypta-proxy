@@ -1334,6 +1334,35 @@ impl QuicListener {
             }
         }
 
+        // RFC 9114 §4.2: HTTP/3 has no Transfer-Encoding. A request carrying one
+        // MUST be treated as malformed, not silently repaired — the header used
+        // to be dropped and the request forwarded, which is what an attacker
+        // probing for a TE/CL desync is counting on. Rejecting the stream is the
+        // enforcement the security pages claim, mirroring how the h2 path fails a
+        // TE-bearing request. `te` is a request header a client legitimately
+        // sends over h2/h3 to negotiate trailers, so only `transfer-encoding`
+        // makes a request malformed here.
+        if request
+            .headers()
+            .contains_key(http::header::TRANSFER_ENCODING)
+        {
+            metrics.requests.request_end_full(
+                400,
+                start_time.elapsed(),
+                0,
+                0,
+                Some(&path),
+                is_health_check,
+            );
+            let response = http::Response::builder()
+                .status(http::StatusCode::BAD_REQUEST)
+                .header("server", SERVER_HEADER)
+                .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
+                .body(())?;
+            respond_and_finish(&mut stream, response).await?;
+            return Ok(());
+        }
+
         // Build the header map the backend will receive.
         //
         // A `HeaderMap`, not a `HashMap<String, String>`: this used to allocate
