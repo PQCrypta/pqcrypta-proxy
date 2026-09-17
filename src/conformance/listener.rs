@@ -692,11 +692,15 @@ async fn run_one(
     // written but before the client had read it — so a correct client saw our
     // violation, closed the connection, and reported an error on a test it had
     // just passed.
-    let (critical_streams, mut encoder) = match emit(&connection, test).await {
-        Ok(emitted) => (emitted.keep_open, Some(emitted.encoder)),
+    let (critical_streams, mut encoder, mut late_control) = match emit(&connection, test).await {
+        Ok(emitted) => (
+            emitted.keep_open,
+            Some(emitted.encoder),
+            emitted.late_control,
+        ),
         Err(e) => {
             debug!("conformance: {} could not emit anomaly: {}", test.id, e);
-            (Vec::new(), None)
+            (Vec::new(), None, None)
         }
     };
 
@@ -754,7 +758,10 @@ async fn run_one(
             &conformance,
             test,
             &mut held,
-            encoder.as_mut(),
+            ServerStreams {
+                encoder: encoder.as_mut(),
+                late_control: late_control.as_mut(),
+            },
             &qpack,
             // Not just "0-RTT was possible" — `into_0rtt` succeeds whenever the
             // configuration offers early data, whether or not the client sent
@@ -1454,9 +1461,13 @@ pub(super) async fn emit(
         }
 
         // GOAWAY mid-connection: stop starting new requests, finish the rest.
+        //
+        // Only the SETTINGS go out here. The GOAWAY itself is written later,
+        // from `watch_for_liveness`, once the client's request is actually in
+        // flight -- see `late_control` below for why sending it now measured
+        // the wrong thing.
         "h-goaway" => {
             control.write_all(&f::settings_with_grease()).await?;
-            control.write_all(&f::goaway(0)).await?;
         }
 
         // Push with no MAX_PUSH_ID granted is an H3_ID_ERROR.
@@ -1602,8 +1613,21 @@ pub(super) async fn emit(
             .await?;
     }
 
-    keep_open.push(control);
-    Ok(Emitted { keep_open, encoder })
+    // `h-goaway` is the one test whose frame must arrive *after* the client's
+    // request, so its control stream is handed back named rather than parked
+    // with the rest. Everything else has already written what it came to write.
+    let late_control = if test.id == GOAWAY_AFTER_REQUEST {
+        Some(control)
+    } else {
+        keep_open.push(control);
+        None
+    };
+
+    Ok(Emitted {
+        keep_open,
+        encoder,
+        late_control,
+    })
 }
 
 /// What the client's SETTINGS allow our QPACK encoder to do, on this
@@ -1689,7 +1713,57 @@ pub(super) struct Emitted {
     pub(super) keep_open: Vec<quinn::SendStream>,
     /// The QPACK encoder stream.
     pub(super) encoder: quinn::SendStream,
+    /// The control stream, for the one test that writes to it after the
+    /// client's request rather than before it.
+    ///
+    /// `None` for every other test, whose control stream is in `keep_open`
+    /// with nothing left to say.
+    pub(super) late_control: Option<quinn::SendStream>,
 }
+
+/// The server-side streams `watch_for_liveness` may still write to.
+///
+/// One parameter rather than two because they travel together and mean the same
+/// thing: streams this endpoint opened, kept past `emit`, because the moment
+/// they are allowed to be written is after the client's request rather than
+/// before it.
+pub(super) struct ServerStreams<'a> {
+    /// The QPACK encoder stream, writable only once the client's SETTINGS say
+    /// how much of the dynamic table, if any, we may use.
+    pub(super) encoder: Option<&'a mut quinn::SendStream>,
+    /// The control stream `h-goaway` writes its frame on, once there is a
+    /// request in flight for that frame to be about.
+    pub(super) late_control: Option<&'a mut quinn::SendStream>,
+}
+
+/// The test whose GOAWAY is deliberately held back until a request is in
+/// flight.
+///
+/// Sent at connection setup, as it was until 2026-09-17, the frame races the
+/// client's first request -- and RFC 9114 §5.2 makes losing that race a
+/// *correct* client's problem, not ours: a client that reads GOAWAY before it
+/// has sent anything MUST NOT open a request on that connection, so the right
+/// answer is to close and go elsewhere. The suite recorded that as "dropped the
+/// connection instead of recovering" and published a failure.
+///
+/// It fired once, against Chromium, in the 2026-09-17T20:03Z run and did not
+/// reproduce in three consecutive re-runs afterwards. An upstream report had
+/// already been drafted on it. A verdict decided by which of two packets won a
+/// race is the exact thing `MEASUREMENT_METHODOLOGY.md` forbids.
+///
+/// So the frame now goes out once the request stream has been accepted, naming
+/// an identifier above it: the in-flight request is inside the promise, and
+/// what the test measures is whether the client finishes it -- which is what
+/// the catalogue entry has claimed all along.
+const GOAWAY_AFTER_REQUEST: &str = "h-goaway";
+
+/// How far above the in-flight request `h-goaway`'s identifier sits.
+///
+/// §5.2's identifier names the first request that will *not* be processed, so
+/// pointing it at the next client-initiated bidirectional stream (+4, the step
+/// between them in RFC 9000 §2.1) says precisely "this one is being handled and
+/// nothing after it is".
+const GOAWAY_NEXT_REQUEST_STEP: u64 = 4;
 
 /// The push `h-push-promise-unsolicited` promises.
 ///
@@ -1757,10 +1831,14 @@ async fn watch_for_liveness(
     conformance: &Conformance,
     test: &'static Test,
     hold: &mut Vec<quinn::SendStream>,
-    encoder: Option<&mut quinn::SendStream>,
+    ours: ServerStreams<'_>,
     qpack: &Arc<QpackLimits>,
     early_data_seen: bool,
 ) -> Observation {
+    let ServerStreams {
+        encoder,
+        late_control,
+    } = ours;
     let timeout = Duration::from_millis(conformance.config.liveness_timeout_ms);
 
     // Drain the client's unidirectional streams for the life of this
@@ -1792,7 +1870,16 @@ async fn watch_for_liveness(
     let probe = tokio::time::timeout(timeout, connection.accept_bi()).await;
     drainer.abort();
 
-    match probe {
+    // Whether the frame `late_control` exists for actually went out.
+    //
+    // It is written under the client's request, so a client that never opened
+    // one was never shown the anomaly at all -- and the branches below would
+    // otherwise read its silence as a failure to recover from something it was
+    // never sent.
+    let mut deferred_written = false;
+    let deferred = late_control.is_some();
+
+    let observation = match probe {
         Ok(Ok(stream)) => {
             {
                 let (mut send, mut recv) = stream;
@@ -1810,6 +1897,41 @@ async fn watch_for_liveness(
                 .await;
                 if !matches!(drained, Ok(Ok(_))) {
                     debug!("conformance: probe request not fully drained");
+                }
+
+                // The one frame that is written here rather than in `emit`.
+                //
+                // `h-goaway` is about a server draining under a request that is
+                // already running, and that is only true once the request has
+                // arrived. Written at connection setup it raced the request
+                // instead, and a client that read it first was right to close
+                // -- §5.2 forbids opening a request after GOAWAY -- but the
+                // suite scored the close as a failure to recover.
+                //
+                // The identifier names the *next* request stream, so the one
+                // being answered below is inside the promise: finish this,
+                // start nothing further. That is the sentence the catalogue
+                // entry has always claimed to be testing.
+                if let Some(control) = late_control {
+                    let in_flight: u64 = send.id().into();
+                    let result = control
+                        .write_all(&f::goaway(in_flight + GOAWAY_NEXT_REQUEST_STEP))
+                        .await;
+                    match result {
+                        Ok(()) => {
+                            deferred_written = true;
+                            debug!(
+                                "conformance: {} sent GOAWAY({}) under request stream {}",
+                                test.id,
+                                in_flight + GOAWAY_NEXT_REQUEST_STEP,
+                                in_flight
+                            );
+                        }
+                        // Not a client failure: the connection went away before
+                        // the anomaly could be written, so the test was never
+                        // put to it. The liveness result that follows says so.
+                        Err(e) => debug!("conformance: {} could not send GOAWAY: {}", test.id, e),
+                    }
                 }
 
                 // Give a control-stream anomaly time to be read before the
@@ -1883,7 +2005,25 @@ async fn watch_for_liveness(
                 None => Observation::TimedOut,
             }
         }
+    };
+
+    // Nothing was shown, so nothing is concluded.
+    //
+    // `h-goaway` writes its frame under a request in flight. A client that
+    // opened no request never saw it, and the observation above would report
+    // that as a client which dropped the connection instead of recovering --
+    // the same false accusation the deferral was introduced to remove, moved
+    // one step along.
+    if deferred && !deferred_written {
+        return Observation::NotExercised(
+            "the client opened no request, and this test's frame is written under a \
+             request in flight rather than at connection setup, so the anomaly was \
+             never sent"
+                .to_string(),
+        );
     }
+
+    observation
 }
 
 /// What the transport itself can say about a QUIC-layer test.
@@ -2779,10 +2919,12 @@ fn probe_hold(test: &'static Test) -> Option<Duration> {
 /// How long a control-stream anomaly is left in front of a client before the
 /// response is released.
 ///
-/// The bytes reached the client before its request did; this is about giving it
-/// a moment to look at them while it still has a reason to keep the connection
-/// open. A second is far longer than reading a queued stream takes and is only
-/// spent on the tests that need it.
+/// For every test but one the bytes reached the client before its request did;
+/// this is about giving it a moment to look at them while it still has a reason
+/// to keep the connection open. A second is far longer than reading a queued
+/// stream takes and is only spent on the tests that need it. `h-goaway` writes
+/// its frame at the start of this window rather than before it, and the window
+/// is what gives the client room to act on it.
 const CONTROL_STREAM_GRACE: Duration = Duration::from_secs(1);
 
 /// How long `h-qpack-blocked-stream` leaves the field section blocked.

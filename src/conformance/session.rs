@@ -723,8 +723,55 @@ impl Registry {
     }
 
     /// Remember that `ip` started `id`, so its test connections can find it.
+    ///
+    /// Last writer wins, and the displaced session keeps running: its client
+    /// carries on making connections, and every one of them is now recorded
+    /// against whoever associated most recently. Nothing fails, nothing is
+    /// logged by the transport, and both reports come back looking plausible.
+    ///
+    /// That is not hypothetical. Two matrix runs were started from this host
+    /// twenty seconds apart on 2026-09-17, and the second one's `POST /session`
+    /// silently took the first one's in-flight client mid-run. The only reason
+    /// it was caught is that a human happened to be watching both.
+    ///
+    /// So a collision is now said out loud. It cannot be *prevented* here --
+    /// the second caller is entitled to a session, and refusing it would break
+    /// the ordinary case of a developer starting a fresh run after an abandoned
+    /// one -- but a run whose results are suspect should be visible in the log
+    /// at the moment it happens, rather than inferred from a strange row a week
+    /// later.
     pub fn associate(&self, ip: std::net::IpAddr, id: &str) {
+        if let Some((prev_id, recorded)) = self.displaced_by(ip, id) {
+            tracing::warn!(
+                "conformance: session {id} claimed {ip}, which session {prev_id} was already \
+                 using after {recorded} recorded result(s). Both runs now share one \
+                 association and the later one takes every connection: treat both reports as \
+                 contaminated"
+            );
+        }
         self.by_source.insert(ip, (id.to_string(), Instant::now()));
+    }
+
+    /// The live session `id` is about to take `ip` from, and how much that
+    /// session has already recorded.
+    ///
+    /// `None` in every ordinary case: no previous association, the same session
+    /// re-associating, an expired one, a session that has since been swept, or
+    /// one that recorded nothing — a client that opened a session and never ran
+    /// a test loses nothing by being displaced.
+    fn displaced_by(&self, ip: std::net::IpAddr, id: &str) -> Option<(String, usize)> {
+        // Read and drop the guard before the caller inserts: holding one on
+        // `by_source` across that insert would deadlock the map against itself.
+        let prev_id = {
+            let entry = self.by_source.get(&ip)?;
+            let (prev_id, since) = entry.value();
+            if prev_id == id || since.elapsed() >= self.ttl {
+                return None;
+            }
+            prev_id.clone()
+        };
+        let recorded = self.with(&prev_id, |s| s.results.len())?;
+        (recorded > 0).then_some((prev_id, recorded))
     }
 
     /// The most recent live session started from `ip`.
@@ -1240,6 +1287,44 @@ mod tests {
             reg.for_source(ip).is_none(),
             "must not hand back a session that no longer exists"
         );
+    }
+
+    #[test]
+    fn a_second_run_from_one_address_is_reported_as_a_collision() {
+        // Two matrix runs from this host, twenty seconds apart, and the second
+        // one's session silently took the first one's in-flight client. The
+        // association cannot refuse the newcomer -- a developer restarting
+        // after an abandoned run is the ordinary case and looks identical --
+        // so what it owes is a loud record of the moment it happened.
+        let reg = Registry::new(60, 64);
+        let ip: std::net::IpAddr = "203.0.113.11".parse().unwrap();
+        let first = reg.create();
+        reg.associate(ip, &first);
+
+        // Nothing recorded yet: displacing this loses nothing, and warning
+        // about it would cry wolf at every re-run.
+        let second = reg.create();
+        assert_eq!(reg.displaced_by(ip, &second), None);
+
+        // Re-associating the same session is not a collision either.
+        reg.associate(ip, &first);
+        assert_eq!(reg.displaced_by(ip, &first), None);
+
+        // A run in progress, though, is exactly the case worth shouting about.
+        let t = test_of("h-grease-settings");
+        reg.with(&first, |s| {
+            s.record(t, &Observation::SurvivedAndContinued, None, 1);
+        });
+        assert_eq!(
+            reg.displaced_by(ip, &second),
+            Some((first, 1)),
+            "a live run with results must be named when it is displaced"
+        );
+
+        // And the displacement itself still happens: the later session wins,
+        // because refusing it would break the ordinary case.
+        reg.associate(ip, &second);
+        assert_eq!(reg.for_source(ip).as_deref(), Some(second.as_str()));
     }
 
     #[test]

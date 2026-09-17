@@ -809,7 +809,12 @@ pub const CATALOG: &[Test] = &[
         requirement: Requirement::Should,
         tier: Tier::Http3,
         expectation:
-            "Stop opening requests, finish those in flight, and retry idempotent ones elsewhere.",
+            "Stop opening requests, finish those in flight, and retry idempotent ones elsewhere. \
+             The GOAWAY is written once the client's request is running and names the stream \
+             after it, so §5.2 puts that request inside the range the server promises to \
+             process: finishing it is the behaviour under test. Sent before the request \
+             instead, the correct answer would be to close and reconnect, and the test would \
+             be measuring a race rather than recovery.",
         implemented: true,
         port_offset: Some(25),
     },
