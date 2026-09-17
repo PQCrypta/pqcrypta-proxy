@@ -135,6 +135,13 @@ impl TestListener {
             tls_provider
                 .build_zero_rtt_accept_config()
                 .with_context(|| format!("building the TLS config for {}", test.id))?
+        } else if test.id == "t-cert-compression-pq" {
+            // The one TLS-tier port whose subject is the certificate rather
+            // than the key exchange: an ML-DSA-87 chain, sent compressed when
+            // the client offers a codec we share.
+            tls_provider
+                .build_pq_chain_config()
+                .with_context(|| format!("building the TLS config for {}", test.id))?
         } else if matches!(test.tier, Tier::Tls) {
             // The TLS tier's whole anomaly is which group the server will
             // negotiate. Nothing malformed is emitted; the port simply refuses
@@ -792,6 +799,32 @@ async fn run_one(
     let observation =
         quic_observation(&connection, test, &conformance_counters, &qpack).unwrap_or(observation);
 
+    // A completed handshake on the post-quantum chain port deserves its own
+    // sentence rather than the generic discretionary one.
+    //
+    // "Tolerated it and continued" is true of a client that ignored a GREASE
+    // codepoint; it is a poor description of one that decompressed 55 KB of
+    // ML-DSA-87 certificates and verified a signature scheme standardised this
+    // decade. The distinction matters because this row is the certificate-side
+    // answer to the question the TLS tier exists to ask, and today almost
+    // nothing reaches it.
+    let observation = if test.id == "t-cert-compression-pq"
+        && matches!(
+            observation,
+            Observation::SurvivedAndContinued | Observation::NoCloseObserved
+        ) {
+        Observation::Signalled(
+            "completed the handshake against an ML-DSA-87 chain: the compressed certificate \
+             message was decompressed, the chain parsed, and a post-quantum signature verified. \
+             Note that a client run with certificate verification disabled reaches this point \
+             without trusting anything, so what this shows is that the chain was processed, not \
+             that it was trusted"
+                .to_string(),
+        )
+    } else {
+        observation
+    };
+
     // A client that declined to wait for stream credit has not failed anything.
     //
     // This port withholds the credit a request needs and issues it a moment
@@ -892,6 +925,13 @@ enum TlsAbort {
     /// This server refused: the client offered no key exchange group the port
     /// will negotiate, so the ServerHello carrying the anomaly was never sent.
     NoGroupsInCommon,
+    /// This server refused for the other reason: the client's
+    /// `signature_algorithms` named nothing our certificate can be verified
+    /// with, so the chain was never sent either.
+    ///
+    /// Only reachable on the post-quantum chain port. Every other port serves
+    /// an ECDSA certificate that every client in existence can verify.
+    NoSignatureSchemesInCommon,
     /// The handshake stopped and nothing arrived to say why.
     Silent,
     /// Something else ended it.
@@ -915,7 +955,9 @@ fn classify_tls_abort(e: &quinn::ConnectionError) -> TlsAbort {
         // saying the ClientHello offered nothing this port will negotiate,
         // which happens before any anomaly is emitted.
         quinn::ConnectionError::TransportError(err) => {
-            if err.reason.contains("NoKxGroupsInCommon") {
+            if err.reason.contains("NoSignatureSchemesInCommon") {
+                TlsAbort::NoSignatureSchemesInCommon
+            } else if err.reason.contains("NoKxGroupsInCommon") {
                 TlsAbort::NoGroupsInCommon
             } else {
                 TlsAbort::Other
@@ -1057,6 +1099,63 @@ fn tls_handshake_observation(test: &'static Test, e: &quinn::ConnectionError) ->
                 "The handshake ended ({e}) without a CONNECTION_CLOSE carrying a TLS alert. \
                  The share was certainly not used, but nothing shows whether its length was \
                  what the client objected to"
+            )),
+        },
+
+        // ── The post-quantum chain ──
+        //
+        // Graded not at all, and the alert is the entire measurement. A client
+        // that rejects our private CA has already decompressed 55 KB of
+        // ML-DSA-87 certificates to find out who signed them, which is the
+        // capability under test; one that cannot parse the chain says so with a
+        // different code entirely.
+        //
+        // Alert numbers from RFC 8446 §6.2: 42 bad_certificate, 43
+        // unsupported_certificate, 45 certificate_expired, 46
+        // certificate_unknown, 48 unknown_ca, 50 decode_error.
+        "t-cert-compression-pq" => match abort {
+            // The chain never left this endpoint, so nothing about the client's
+            // handling of it was observed. This is a fact about the client and
+            // not a gap in the run -- and the most common answer today, which is
+            // itself the finding: a certificate signed with ML-DSA-87 cannot be
+            // offered to a client whose signature_algorithms does not name it.
+            TlsAbort::NoSignatureSchemesInCommon => Observation::NotExercised(
+                "the client's signature_algorithms named nothing that can verify an ML-DSA-87 \
+                 chain, so this endpoint refused before sending one. Post-quantum certificates \
+                 are not reachable for this client at all, which is a fact about it rather \
+                 than a gap in the run"
+                    .to_string(),
+            ),
+            TlsAbort::Alert(code @ (42 | 46 | 48)) => Observation::Signalled(format!(
+                "decompressed and parsed the 55 KB ML-DSA-87 chain, then rejected it on trust \
+                 (alert {code}). That is the right answer to a private CA, and reaching it \
+                 means the certificate message itself was handled"
+            )),
+            TlsAbort::Alert(code @ 43) => Observation::Signalled(format!(
+                "parsed the chain and rejected it as unsupported (alert {code}), which reads \
+                 as ML-DSA-87 being a signature algorithm this client does not implement -- a \
+                 fact about its algorithm support rather than about the compressed chain"
+            )),
+            TlsAbort::Alert(code @ 50) => Observation::Signalled(format!(
+                "could not decode the certificate message (alert {code}). The chain is the \
+                 only thing unusual about this port, so this is the compressed 55 KB of it \
+                 rather than anything about trust -- the outcome a post-quantum deployment \
+                 needs to know about"
+            )),
+            TlsAbort::Alert(code) => Observation::Signalled(format!(
+                "aborted over the certificate with TLS alert {code}. Reported rather than \
+                 graded: RFC 8879 §4 lets a receiver cap the decompressed size and abort, and \
+                 no document requires ML-DSA support of anyone"
+            )),
+            TlsAbort::Silent => Observation::Ambiguous(
+                "The handshake did not complete and nothing arrived to say why. The chain was \
+                 certainly not accepted, but a client that could not parse it and one whose \
+                 close was lost look the same from here"
+                    .to_string(),
+            ),
+            _ => Observation::Ambiguous(format!(
+                "The handshake ended ({e}) without a CONNECTION_CLOSE carrying a TLS alert, so \
+                 nothing shows how far into the chain the client got"
             )),
         },
 

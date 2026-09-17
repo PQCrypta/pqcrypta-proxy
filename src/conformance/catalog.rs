@@ -1243,6 +1243,33 @@ pub const CATALOG: &[Test] = &[
         port_offset: Some(57),
     },
     Test {
+        id: "t-cert-compression-pq",
+        title: "Post-quantum certificate chain, compressed per RFC 8879",
+        spec: "RFC 8879 §4, RFC 8446 §4.4.2",
+        class: Class::Discretionary,
+        requirement: Requirement::May,
+        tier: Tier::Tls,
+        expectation: "Decompress and parse a 55 KB ML-DSA-87 chain, then judge it on its \
+                      merits. Nothing here is graded: RFC 8879 is optional, no RFC requires \
+                      support for ML-DSA certificates, and §4 expressly lets a receiver cap \
+                      the decompressed size and abort. What the port reports is which of \
+                      those a client does.\n\nThe chain is deliberately issued by a private \
+                      CA nobody trusts, and that is what makes the measurement work rather \
+                      than spoiling it. A client that rejects it for its *trust anchor* — \
+                      unknown_ca, or bad_certificate — has already decompressed a 55 KB \
+                      certificate message, parsed ML-DSA-87 structures it may never have seen \
+                      and got as far as chain building. That is the whole capability under \
+                      test, and the rejection that follows is correct behaviour, not a \
+                      failure.\n\nA client that cannot get that far answers differently: \
+                      decode_error or a record-size abort says the compressed chain itself \
+                      defeated it, which is the outcome the post-quantum migration needs to \
+                      know about. Certificate sizes are the half of that migration nobody can \
+                      configure their way out of — ML-DSA-87 signatures are 4,627 bytes each \
+                      and every chain carries several.",
+        implemented: true,
+        port_offset: Some(58),
+    },
+    Test {
         id: "t-grease-group",
         title: "GREASE named group a client must tolerate",
         spec: "RFC 8701 §4, RFC 8446 §4.2.7",
@@ -1452,6 +1479,7 @@ mod tests {
             ("t-corrupt-hybrid-share", 55),
             ("t-grease-group", 56),
             ("t-hybrid-share-length", 57),
+            ("t-cert-compression-pq", 58),
         ];
 
         for (id, offset) in pinned {

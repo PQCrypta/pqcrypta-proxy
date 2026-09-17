@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use anyhow::Context as _;
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 use rustls::crypto::CryptoProvider;
@@ -600,6 +601,62 @@ pub fn single_group_server_config(
     ))
 }
 
+/// Where the deployed ML-DSA-87 chain lives.
+///
+/// The same files [`crate::tls`]'s integration test loads, and the chain
+/// `/pqc/` publishes: a private CA, so nothing outside this box trusts it,
+/// which is deliberate — see the `t-cert-compression-pq` catalogue entry for
+/// why being *untrusted* is what makes the measurement work.
+const PQ_CHAIN: &str = "/etc/pqcrypta/pqc-certs/fullchain.pem";
+const PQ_CHAIN_KEY: &str = "/etc/pqcrypta/pqc-certs/server.key";
+
+/// A config that serves the post-quantum certificate chain, for the one
+/// conformance port whose subject is the certificate rather than the key
+/// exchange.
+///
+/// Ordinary key exchange, ordinary ALPN, ordinary everything else: what differs
+/// is a 55 KB ML-DSA-87 chain in place of the 5 KB ECDSA one, sent compressed
+/// under RFC 8879 when the client offers a codec this build also has.
+///
+/// Fails loudly when the chain is missing rather than falling back to the
+/// ordinary resolver. A port that silently served the classical chain would
+/// report every client as handling a post-quantum one.
+pub fn pq_chain_server_config() -> anyhow::Result<Arc<quinn::crypto::rustls::QuicServerConfig>> {
+    let key = load_certified_key(Path::new(PQ_CHAIN), Path::new(PQ_CHAIN_KEY))
+        .with_context(|| format!("loading the post-quantum chain from {PQ_CHAIN}"))?;
+
+    let mut config = RustlsServerConfig::builder_with_provider(Arc::new(build_pqc_provider()))
+        .with_protocol_versions(&[&TLS13])
+        .map_err(|e| anyhow::anyhow!("failed to set protocol versions: {e}"))?
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(SingleChain(Arc::new(key))));
+
+    config.alpn_protocols = vec![b"h3".to_vec()];
+    crate::cert_compression::apply(&mut config);
+
+    Ok(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(config)
+            .map_err(|e| anyhow::anyhow!("failed to build the post-quantum QUIC config: {e}"))?,
+    ))
+}
+
+/// One chain for every name, because this port is about the chain.
+///
+/// The SNI resolver would answer with whatever certificate matches the name the
+/// client sent, which on a conformance port is the ordinary one — the opposite
+/// of what this test needs.
+#[derive(Debug)]
+struct SingleChain(Arc<rustls::sign::CertifiedKey>);
+
+impl rustls::server::ResolvesServerCert for SingleChain {
+    fn resolve(
+        &self,
+        _hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(self.0.clone())
+    }
+}
+
 pub fn build_pqc_provider() -> rustls::crypto::CryptoProvider {
     let mut provider = rustls_post_quantum::provider();
     provider
@@ -735,6 +792,14 @@ impl TlsProvider {
         impairment: Option<rustls::server::KeyShareImpairment>,
     ) -> anyhow::Result<Arc<quinn::crypto::rustls::QuicServerConfig>> {
         single_group_server_config(self.resolver.clone(), group, impairment)
+    }
+
+    /// A config serving the post-quantum certificate chain, for
+    /// `t-cert-compression-pq`.
+    pub fn build_pq_chain_config(
+        &self,
+    ) -> anyhow::Result<Arc<quinn::crypto::rustls::QuicServerConfig>> {
+        pq_chain_server_config()
     }
 
     /// Check if PQC is available and enabled
