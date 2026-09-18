@@ -1249,14 +1249,14 @@ pub const CATALOG: &[Test] = &[
         class: Class::Discretionary,
         requirement: Requirement::May,
         tier: Tier::Tls,
-        expectation: "Decompress and parse a 55 KB ML-DSA-87 chain, then judge it on its \
+        expectation: "Decompress and parse a 40 KB ML-DSA-87 chain, then judge it on its \
                       merits. Nothing here is graded: RFC 8879 is optional, no RFC requires \
                       support for ML-DSA certificates, and §4 expressly lets a receiver cap \
                       the decompressed size and abort. What the port reports is which of \
                       those a client does.\n\nThe chain is deliberately issued by a private \
                       CA nobody trusts, and that is what makes the measurement work rather \
                       than spoiling it. A client that rejects it for its *trust anchor* — \
-                      unknown_ca, or bad_certificate — has already decompressed a 55 KB \
+                      unknown_ca, or bad_certificate — has already decompressed a 40 KB \
                       certificate message, parsed ML-DSA-87 structures it may never have seen \
                       and got as far as chain building. That is the whole capability under \
                       test, and the rejection that follows is correct behaviour, not a \

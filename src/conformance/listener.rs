@@ -870,7 +870,7 @@ async fn run_one(
     // sentence rather than the generic discretionary one.
     //
     // "Tolerated it and continued" is true of a client that ignored a GREASE
-    // codepoint; it is a poor description of one that decompressed 55 KB of
+    // codepoint; it is a poor description of one that decompressed 40 KB of
     // ML-DSA-87 certificates and verified a signature scheme standardised this
     // decade. The distinction matters because this row is the certificate-side
     // answer to the question the TLS tier exists to ask, and today almost
@@ -1172,7 +1172,7 @@ fn tls_handshake_observation(test: &'static Test, e: &quinn::ConnectionError) ->
         // ── The post-quantum chain ──
         //
         // Graded not at all, and the alert is the entire measurement. A client
-        // that rejects our private CA has already decompressed 55 KB of
+        // that rejects our private CA has already decompressed 40 KB of
         // ML-DSA-87 certificates to find out who signed them, which is the
         // capability under test; one that cannot parse the chain says so with a
         // different code entirely.
@@ -1194,7 +1194,7 @@ fn tls_handshake_observation(test: &'static Test, e: &quinn::ConnectionError) ->
                     .to_string(),
             ),
             TlsAbort::Alert(code @ (42 | 46 | 48)) => Observation::Signalled(format!(
-                "decompressed and parsed the 55 KB ML-DSA-87 chain, then rejected it on trust \
+                "decompressed and parsed the 40 KB ML-DSA-87 chain, then rejected it on trust \
                  (alert {code}). That is the right answer to a private CA, and reaching it \
                  means the certificate message itself was handled"
             )),
@@ -1205,7 +1205,7 @@ fn tls_handshake_observation(test: &'static Test, e: &quinn::ConnectionError) ->
             )),
             TlsAbort::Alert(code @ 50) => Observation::Signalled(format!(
                 "could not decode the certificate message (alert {code}). The chain is the \
-                 only thing unusual about this port, so this is the compressed 55 KB of it \
+                 only thing unusual about this port, so this is the compressed 40 KB of it \
                  rather than anything about trust -- the outcome a post-quantum deployment \
                  needs to know about"
             )),

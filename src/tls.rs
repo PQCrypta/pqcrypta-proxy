@@ -615,7 +615,7 @@ const PQ_CHAIN_KEY: &str = "/etc/pqcrypta/pqc-certs/server.key";
 /// exchange.
 ///
 /// Ordinary key exchange, ordinary ALPN, ordinary everything else: what differs
-/// is a 55 KB ML-DSA-87 chain in place of the 5 KB ECDSA one, sent compressed
+/// is a 40 KB ML-DSA-87 chain in place of the 5 KB ECDSA one, sent compressed
 /// under RFC 8879 when the client offers a codec this build also has.
 ///
 /// Fails loudly when the chain is missing rather than falling back to the
