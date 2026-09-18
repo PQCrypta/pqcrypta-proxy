@@ -287,7 +287,23 @@ async fn run(args: &Args) -> i32 {
                 test.title
             );
         }
-        invoke_client(&args.client, &url, port, args.timeout);
+        // The 0-RTT ports need a connection that has something to resume.
+        //
+        // Early data is only possible with a session ticket from an earlier
+        // connection to the same port, and the driver makes exactly one
+        // connection per test -- so in the 2026-09-18 run these two tests were
+        // inconclusive for eleven of twelve clients with "the client sent no
+        // early data". True, and not the client's doing: it was never given a
+        // ticket to send any with.
+        //
+        // The wrapper is told to resume rather than the driver making the
+        // extra connection itself, because only the wrapper knows the flags
+        // its client wants (`--session-file`, `-0`, a resumption token) and
+        // whether that client can do this at all. A wrapper that ignores the
+        // variable behaves exactly as before, which is the honest outcome for
+        // curl and Chromium -- neither offers early data over HTTP/3.
+        let resume = test.id.starts_with("q-zero-rtt");
+        invoke_client(&args.client, &url, port, args.timeout, resume);
     }
 
     // ── Let the server finish deciding ──────────────────────────────────
@@ -351,7 +367,7 @@ async fn run(args: &Args) -> i32 {
     reason = "{url} and {port} are literal placeholders in a user-supplied template, \
               substituted by replace(); they are not format arguments"
 )]
-fn invoke_client(template: &str, url: &str, port: u16, timeout_secs: u64) {
+fn invoke_client(template: &str, url: &str, port: u16, timeout_secs: u64, resume: bool) {
     let rendered = template
         .replace("{url}", url)
         .replace("{port}", &port.to_string());
@@ -365,12 +381,16 @@ fn invoke_client(template: &str, url: &str, port: u16, timeout_secs: u64) {
         return;
     };
 
-    let mut child = match Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(rest)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::null());
+    // Always set, never unset, so a wrapper reading it sees "0" rather than a
+    // variable that is sometimes absent -- inherited environments have caused
+    // enough confusion in this runner already.
+    command.env("H3_CONFORMANCE_RESUME", if resume { "1" } else { "0" });
+    let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("  could not run {program}: {e}");
