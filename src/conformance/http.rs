@@ -392,7 +392,7 @@ wrong frame, an unknown QUIC frame type, a Stateless Reset, a path-MTU black hol
 <div class="verdict-key">
   <div class="vk vk-pass"><strong>Pass</strong><span>The client demonstrated the behaviour the specification requires.</span></div>
   <div class="vk vk-fail"><strong>Fail</strong><span>The client did something the specification prohibits.</span></div>
-  <div class="vk vk-incon"><strong>Inconclusive</strong><span>The run could not establish the observation &mdash; the client was never put in the situation the test is about. Never counted either way.</span></div>
+  <div class="vk vk-incon"><strong>Inconclusive</strong><span>The run did not establish what your client does here &mdash; either it was never put in the situation, or its answer admits more than one reading. Not a failure, and never counted as one.</span></div>
 </div>
 
 <h2 id="running">Running it</h2>
