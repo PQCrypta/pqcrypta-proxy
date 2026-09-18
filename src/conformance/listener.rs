@@ -655,9 +655,36 @@ async fn run_one(
             // No SNI to resolve with: the ClientHello never got far enough to
             // hand one over, so the source address is all there is.
             let session_id = resolve_session(None, peer_ip, &conformance);
-            let observation = Observation::NotExercised(format!(
-                "the endpoint refused the connection before a handshake existed ({e}). On                  this tier that is what a client offering no key exchange group this port                  will negotiate looks like -- a fact about the client, not a gap in the run"
-            ));
+            // Only the TLS tier can explain a pre-handshake refusal, because
+            // only there does the endpoint constrain the handshake. Every
+            // TLS-tier port negotiates exactly one key exchange group, so a
+            // client offering none of it is refused here and that refusal *is*
+            // the measurement.
+            //
+            // On the QUIC and HTTP/3 tiers the same code path fires for an
+            // unrelated reason and nothing about key exchange is known. Saying
+            // otherwise is not a harmless extra sentence: in the 2026-09-18 run
+            // it reached 28 HTTP/3 cells and one QUIC cell, where the tier does
+            // not constrain the handshake at all. Twenty-nine of those thirty
+            // were xquic, whose four TLS-tier passes show it negotiates the
+            // group perfectly well -- so the sentence told a reader the exact
+            // opposite of what the TLS tier had measured about the same client
+            // in the same run. An instrument that invents a cause is worse than
+            // one that reports none, because the invented one is actionable.
+            let observation = Observation::NotExercised(match test.tier {
+                Tier::Tls => format!(
+                    "the endpoint refused the connection before a handshake existed ({e}). \
+                     Every port on this tier negotiates exactly one key exchange group, so \
+                     this is what a client offering none of it looks like from here -- a fact \
+                     about the client, not a gap in the run"
+                ),
+                Tier::Quic | Tier::Http3 => format!(
+                    "the endpoint refused the connection before a handshake existed ({e}), so \
+                     the client never reached the anomaly. What the refusal was about is not \
+                     recorded here: this tier does not constrain the handshake, and the error \
+                     is the transport's own"
+                ),
+            });
             conformance.sessions.with(&session_id, |sess| {
                 sess.record(
                     test,
