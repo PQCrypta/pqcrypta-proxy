@@ -607,6 +607,26 @@ async fn run_one(
     endpoint: quinn::Endpoint,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
+
+    // What the port had counted before this client arrived.
+    //
+    // `Counters` belongs to the listener, not the connection: it is created once
+    // per port at start-up and lives as long as the process. `zero_rtt_in()` is
+    // therefore cumulative, so the first client ever to send early data on this
+    // port set it above zero permanently -- and every client after it was then
+    // judged as though it had sent early data too.
+    //
+    // That is a verdict decided by what somebody else did, which is the same
+    // defect as two runs sharing a session and a GOAWAY that raced the request.
+    // It was visible in the data: a matrix run taken after a proxy restart
+    // recorded ten clients as `inconclusive` on this test where the run before
+    // it -- against a process that had been up for hours -- recorded nine passes.
+    // The nine were the artefact; the ten are the truth.
+    //
+    // Baselined here rather than after `accept()`, because 0-RTT packets arrive
+    // *during* the handshake: by the time there is a `Connection` they have
+    // already been counted.
+    let zero_rtt_before = conformance_counters.zero_rtt_in();
     // Captured before the handshake: `Connection::remote_address` panics once
     // the connection is established, and this is the address that finds the
     // session anyway. Canonicalised so an IPv4-mapped IPv6 peer matches the
@@ -781,7 +801,7 @@ async fn run_one(
             // configuration offers early data, whether or not the client sent
             // any. The wire count is the same evidence the verdict is built on,
             // so the response and the verdict cannot disagree.
-            early_data_accepted && conformance_counters.zero_rtt_in() > 0,
+            early_data_accepted && conformance_counters.zero_rtt_in() > zero_rtt_before,
         )
         .await
     };
@@ -798,8 +818,14 @@ async fn run_one(
     // Some QUIC-layer tests are judged on what the connection did rather than
     // on whether a request arrived, so the transport's own account of it
     // supersedes the liveness result.
-    let observation =
-        quic_observation(&connection, test, &conformance_counters, &qpack).unwrap_or(observation);
+    let observation = quic_observation(
+        &connection,
+        test,
+        &conformance_counters,
+        zero_rtt_before,
+        &qpack,
+    )
+    .unwrap_or(observation);
 
     // A completed handshake on the post-quantum chain port deserves its own
     // sentence rather than the generic discretionary one.
@@ -2190,6 +2216,9 @@ fn quic_observation(
     connection: &quinn::Connection,
     test: &'static Test,
     counters: &Counters,
+    // What the port had counted before this connection: `Counters` is
+    // per-listener and cumulative, so only the delta belongs to this client.
+    zero_rtt_before: u64,
     qpack: &QpackLimits,
 ) -> Option<Observation> {
     let rx = connection.stats().frame_rx;
@@ -2296,7 +2325,7 @@ fn quic_observation(
         // require retransmission — that is the application's concern, not
         // QUIC's — so the test is whether the client comes back and completes
         // the request on the 1-RTT keys, not how it got there.
-        "q-zero-rtt-reject" => Some(if counters.zero_rtt_in() > 0 {
+        "q-zero-rtt-reject" => Some(if counters.zero_rtt_in() > zero_rtt_before {
             // Whatever the liveness result was, it was reached after a genuine
             // rejection. Left to the generic path, which scores a completed
             // follow-up request as recovery and a stall or a give-up as failure.
@@ -2584,7 +2613,8 @@ fn quic_observation(
         // never had a ticket would be scored as though it had been told 425 and
         // handled it.
         "q-zero-rtt-replay" => {
-            if counters.zero_rtt_in() > 0 {
+            // The delta, not the total: see `zero_rtt_before` in `run_one`.
+            if counters.zero_rtt_in() > zero_rtt_before {
                 return None;
             }
             Some(Observation::NotExercised(
