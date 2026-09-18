@@ -633,7 +633,46 @@ async fn run_one(
     // plain IPv4 address its /session call arrived from — the two spellings
     // have caused a lookup miss in this codebase before.
     let peer_ip = crate::security::canonical_addr(incoming.remote_address()).ip();
-    let mut connecting = incoming.accept()?;
+
+    // A refusal here used to leave no trace, and the report said the opposite of
+    // what happened.
+    //
+    // `?` propagated the error out of `run_one` before anything was recorded, so
+    // the session held no result for this test and the report fell back to
+    // `not_run` -- rendered as "Not attempted". The client had been attempted.
+    // It connected, the endpoint refused it, and the one page whose whole claim
+    // is measurement reported that as never having tried.
+    //
+    // It is not a rare path: every TLS-tier port negotiates exactly one key
+    // exchange group, so the three clients in the matrix that offer no
+    // post-quantum key share -- curl, aioquic and .NET/msquic -- are refused by
+    // all six of them. Nineteen of the twenty cells reading "Not attempted" in
+    // the 2026-09-18 run were this, and the reason behind them is the most
+    // interesting thing the TLS tier measures.
+    let mut connecting = match incoming.accept() {
+        Ok(connecting) => connecting,
+        Err(e) => {
+            // No SNI to resolve with: the ClientHello never got far enough to
+            // hand one over, so the source address is all there is.
+            let session_id = resolve_session(None, peer_ip, &conformance);
+            let observation = Observation::NotExercised(format!(
+                "the endpoint refused the connection before a handshake existed ({e}). On                  this tier that is what a client offering no key exchange group this port                  will negotiate looks like -- a fact about the client, not a gap in the run"
+            ));
+            conformance.sessions.with(&session_id, |sess| {
+                sess.record(
+                    test,
+                    &observation,
+                    expected_code(test),
+                    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                );
+            });
+            info!(
+                "conformance: {} session={} refused before the handshake: {}",
+                test.id, session_id, e
+            );
+            return Ok(());
+        }
+    };
 
     // Read the SNI before awaiting the handshake, not after.
     //
