@@ -87,6 +87,12 @@ mod qpack_dynamic;
 #[cfg(test)]
 mod read_proof;
 
+/// Whether lsquic can handshake against the suite's smallest flow-control
+/// windows, which is the one thing that separates a client finding from a
+/// coincidence of which port the stall was noticed on.
+#[cfg(test)]
+mod lsquic_windows;
+
 use std::sync::Arc;
 
 use crate::config::ConformanceConfig;
