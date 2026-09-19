@@ -942,84 +942,25 @@ async fn run_one(
     // Only when the probe itself cannot be put -- the stream is gone, or the
     // client's window is too large to fill for the price -- does the verdict
     // stay inconclusive, and then it says which.
-    let observation = if catalog::anomaly_stream(test) == catalog::Anomaly::ControlStream
-        && test.class == catalog::Class::Correctness
-        && matches!(
-            observation,
-            Observation::SurvivedAndContinued
-                | Observation::ClosedSilently
-                | Observation::ClosedWith { .. }
-        ) {
-        // The read-proof is not wired to verdicts, and this is the honest end
-        // of two attempts rather than a pause between them.
-        //
-        // When it fires, it is right: credit extended on this stream proves
-        // the client consumed data on this stream. The defect is not in the
-        // verdicts it produces, it is in *which cells get one*. Both designs
-        // needed the client's consumption to approach the window it
-        // advertised -- the first by overrunning it, the second by waiting for
-        // the grant that only nearness provokes -- so how often the probe
-        // decides is a function of the client's buffer and nothing else.
-        // Measured twice, across twelve clients:
-        //
-        //   overrun probe:  100% decided at 64 KB, 45% at 512 KB, skipped >4 MB
-        //   credit probe:   100% decided at 64 KB, 54% at 512 KB, 0% at 1 GB
-        //
-        // Removing the ceiling fixed the skips and moved nothing else. The
-        // second design was the first one's dependency in a cheaper wrapper.
-        //
-        // Correct-but-biased coverage is worse than none in a comparative
-        // matrix. picoquic collected eleven real verdicts and curl zero, on
-        // the same tests, for no reason but a buffer eight thousand times
-        // smaller -- and a reader comparing their failure counts would have
-        // read that difference as behaviour. A uniform inconclusive is
-        // comparable across clients; a partial one that correlates with an
-        // unrelated variable is not.
-        //
-        // So these cells say what is true: from a server, for a client that
-        // completes its request and closes without objecting, whether it read
-        // a unidirectional stream is not observable. That was the suite's
-        // position before any of this was built, and two measured failures
-        // have not moved it.
-        //
-        // `read_proof` is still computed and still logged, because the log is
-        // what proved this and is what would show it changing. It just does
-        // not decide anything. `conformance::read_proof` keeps the tests: both
-        // directions fire, and credit on another stream is not mistaken for a
-        // read. The mechanism is sound; its reach is not.
-        let _ = &read_proof;
-        #[allow(unreachable_code)]
-        match None::<bool> {
-            Some(true) => Observation::Violated(
-                    "Read the control stream and carried on without objecting. It extended flow-control credit on that stream after the frame was written, which a receiver only does once its application has consumed the data -- so the violation was seen and accepted"
-                    .to_string(),
-            ),
-            // Not `Unsupported`, and the distinction matters.
-            //
-            // `Unsupported` is reserved for a client that *said* it does not
-            // do something -- a SETTINGS value, a supported_groups list, an
-            // outright refusal. This is the harness inferring from an absence:
-            // the window stayed full, so nothing was consumed. That is a sound
-            // measurement and it is still not a declaration, and letting
-            // inference in under the same label would turn `unsupported` into
-            // a better-looking `inconclusive` within a month.
-            //
-            // So it stays inconclusive, and it is ours to fix rather than the
-            // client's: nothing obliges a one-shot client to read the control
-            // stream, which means a suite that puts its anomaly there and
-            // hopes has chosen a delivery the test cannot rely on. The fix is
-            // on our side -- hold the response until the stream is consumed --
-            // and until then this cell is a line on our bug list with a
-            // measured cause rather than a guess.
-            Some(false) => Observation::NotExercised(
-                    "the client never read the control stream during its request. Measured, not assumed: the flow-control window on that stream filled and stayed full for the whole probe while the connection was otherwise healthy, and a receiver only extends that window once its application has consumed what it has. So the anomaly was written and never reached the client -- which makes this a delivery this suite cannot rely on, rather than anything about the client"
-                    .to_string(),
-            ),
-            None => observation,
-        }
-    } else {
-        observation
-    };
+    // The control-stream read-proof does not decide anything, and the call
+    // site is gone rather than neutered.
+    //
+    // It was left in place behind `match None::<bool>` with an
+    // `#[allow(unreachable_code)]`, which is dead code wearing the shape of
+    // live code — in the one subsystem this suite spent a day proving
+    // unreliable. Someone reading it in six months sees a probe that appears
+    // wired.
+    //
+    // What is worth keeping is kept elsewhere: `control_stream_was_read`
+    // still runs and still logs, because the log is what established the
+    // limit and is what would show the vantage point changing, and
+    // `conformance::read_proof` keeps the three tests that prove the
+    // mechanism sound in both directions. Its *reach* is what fails — the
+    // probe decides only for clients whose advertised window is small enough
+    // that reading forces a credit grant, so the cells it answered sorted by
+    // buffer size. That is recorded on /conformance/ as a limit of this
+    // vantage point, not as a gap to close.
+    let _ = read_proof;
 
     // Some QUIC-layer tests are judged on what the connection did rather than
     // on whether a request arrived, so the transport's own account of it

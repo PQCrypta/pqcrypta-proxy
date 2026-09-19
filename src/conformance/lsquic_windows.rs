@@ -145,7 +145,7 @@ async fn arm(
 /// able to prevent a handshake — but the two fail differently if one of them
 /// can. Run as four arms, all before any is read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "shells out to /opt/h3-clients/lsquic-get; fleet host only"]
+#[ignore = "drives the real lsquic binary at /opt/h3-clients: fleet host only, and not fixable in CI — it records a finding rather than guarding one"]
 async fn which_window_stops_lsquic() {
     let _ = rustls::crypto::CryptoProvider::install_default(crate::tls::build_pqc_provider());
     const N: usize = 5;
@@ -174,7 +174,7 @@ async fn which_window_stops_lsquic() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "shells out to /opt/h3-clients/lsquic-get; fleet host only"]
+#[ignore = "drives the real lsquic binary at /opt/h3-clients: fleet host only, and not fixable in CI — it records a finding rather than guarding one"]
 async fn lsquic_against_tight_and_default_windows() {
     let _ = rustls::crypto::CryptoProvider::install_default(crate::tls::build_pqc_provider());
     const ATTEMPTS: usize = 4;
