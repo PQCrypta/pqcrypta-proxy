@@ -694,6 +694,51 @@ impl Session {
         elapsed_ms: u64,
     ) {
         let (verdict, detail) = judge(test, obs, expected_code);
+
+        // A connection that did not exercise the test must not overwrite one
+        // that did.
+        //
+        // One test can be answered by more than one connection. The 0-RTT
+        // ports are driven by a wrapper that connects twice — once to be
+        // issued a session ticket, once to resume with it and offer early
+        // data — and only the second is the measurement. The first, by
+        // construction, sends no early data.
+        //
+        // This used to be a plain insert, so the verdict belonged to whichever
+        // connection finished last rather than to whichever exercised the
+        // test. Measured on `q-zero-rtt-replay` with ngtcp2:
+        //
+        //   13:24:39  peer :50932  elapsed     0ms  ObjectedAtTransport(...)
+        //   13:24:47  peer :38030  elapsed 20003ms  NotExercised("no early data")
+        //
+        // The resume answered correctly and immediately; the priming
+        // connection, started twenty seconds earlier and outliving the resume
+        // server-side, landed afterwards and replaced a real verdict with
+        // "the client sent no early data". It looked like a regime effect —
+        // the same cell passed when run alone and failed in a full catalogue
+        // — because the priming connection only outlives the resume when the
+        // run is busy enough to make it slow.
+        //
+        // So `NotExercised` is the one observation that never overwrites. It
+        // means "this connection did not put the client in the situation",
+        // which is not a reason to discard a connection that did.
+        if matches!(obs, Observation::NotExercised(_)) {
+            if let Some(existing) = self.results.get(test.id) {
+                if existing.verdict != Verdict::Inconclusive {
+                    // Logged because it is otherwise invisible: without this
+                    // line the only trace of a discarded overwrite is a
+                    // verdict that quietly does not change.
+                    tracing::info!(
+                        "conformance: {} keeping {:?} from the connection that exercised it, \
+                         rather than a later one that did not",
+                        test.id,
+                        existing.verdict
+                    );
+                    return;
+                }
+            }
+        }
+
         self.results.insert(
             test.id,
             Result_ {
@@ -911,6 +956,69 @@ fn new_session_id() -> String {
 mod tests {
     use super::*;
     use crate::conformance::catalog::{self, Class, Test, Tier};
+
+    #[test]
+    fn a_connection_that_did_not_exercise_the_test_does_not_overwrite_one_that_did() {
+        // The 0-RTT wrapper connects twice: once to be issued a ticket, once
+        // to resume and offer early data. Only the second measures anything,
+        // and the first can finish afterwards — measured at 20 seconds after,
+        // because its server-side connection outlived the resume entirely.
+        let t = catalog::find("q-zero-rtt-replay").expect("the test exists");
+        let mut sess = Session::new("overwrite-test".into());
+
+        // The resume answers, immediately and correctly.
+        sess.record(
+            t,
+            &Observation::ObjectedAtTransport("rejected at the QUIC layer".into()),
+            None,
+            0,
+        );
+        let after_resume = sess.results.get(t.id).expect("recorded").verdict;
+        assert_ne!(
+            after_resume,
+            Verdict::Inconclusive,
+            "the resume produced a verdict"
+        );
+
+        // The priming connection lands twenty seconds later with nothing.
+        sess.record(
+            t,
+            &Observation::NotExercised("the client sent no early data".into()),
+            None,
+            20_003,
+        );
+        assert_eq!(
+            sess.results.get(t.id).expect("still recorded").verdict,
+            after_resume,
+            "a connection that exercised nothing must not replace one that did"
+        );
+    }
+
+    #[test]
+    fn a_later_connection_may_still_improve_an_inconclusive_result() {
+        // The rule is one-directional: `NotExercised` never overwrites, but
+        // anything may replace an inconclusive, or a test that genuinely goes
+        // unexercised could never be corrected by a later connection that
+        // reached it.
+        let t = catalog::find("q-zero-rtt-replay").expect("the test exists");
+        let mut sess = Session::new("improve-test".into());
+        sess.record(t, &Observation::NotExercised("nothing yet".into()), None, 1);
+        assert_eq!(
+            sess.results.get(t.id).unwrap().verdict,
+            Verdict::Inconclusive
+        );
+        sess.record(
+            t,
+            &Observation::ObjectedAtTransport("rejected at the QUIC layer".into()),
+            None,
+            2,
+        );
+        assert_ne!(
+            sess.results.get(t.id).unwrap().verdict,
+            Verdict::Inconclusive,
+            "a connection that reached the anomaly must be able to replace an inconclusive"
+        );
+    }
 
     fn test_of(id: &str) -> &'static catalog::Test {
         catalog::find(id).expect("catalogue entry")

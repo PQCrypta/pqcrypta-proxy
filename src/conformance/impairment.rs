@@ -61,6 +61,22 @@ pub struct PeerCounters {
     pub dropped_loss: AtomicU64,
     pub zero_rtt_in: AtomicU64,
     pub version_negotiations_out: AtomicU64,
+    /// Whether a connection has already taken a view of this entry.
+    ///
+    /// Decides whether a view baselines at zero or at the current values, and
+    /// the distinction is not cosmetic. A connection's first datagram is what
+    /// *creates* this entry, and for the 0-RTT tests that datagram is the
+    /// whole measurement: early data is coalesced behind the Initial that
+    /// produces the `Incoming`, so it is counted before `run_one` exists to
+    /// take a baseline. Baselining at the current values there discards the
+    /// only 0-RTT packet the client sends, and the suite reports that a
+    /// client which did offer early data did not — measured, on the wire,
+    /// with ngtcp2.
+    ///
+    /// So the first view of an entry starts from zero, which is exactly the
+    /// count that entry was created with. A second view means a second
+    /// connection from the same address, and that one baselines normally.
+    viewed: std::sync::atomic::AtomicBool,
 }
 
 /// What the socket counted while a test ran.
@@ -260,7 +276,13 @@ impl Counters {
     /// it, it is cross-client contamination, which is the bug this split
     /// exists to remove.
     pub fn view_for(&self, addr: SocketAddr) -> PeerView {
-        PeerView::new(self.peer(addr))
+        let peer = self.peer(addr);
+        // First connection on this entry: the entry is this connection's, so
+        // its counts start at zero and nothing that arrived before `run_one`
+        // is lost. A later one baselines, which bounds what a reused address
+        // can inherit.
+        let first = !peer.viewed.swap(true, std::sync::atomic::Ordering::Relaxed);
+        PeerView::new(peer, first)
     }
 }
 
@@ -291,7 +313,21 @@ pub struct PeerView {
 }
 
 impl PeerView {
-    fn new(counters: Arc<PeerCounters>) -> Self {
+    fn new(counters: Arc<PeerCounters>, from_zero: bool) -> Self {
+        if from_zero {
+            return Self {
+                zero_rtt_in: 0,
+                version_negotiations_out: 0,
+                initials_in: 0,
+                marked_ce: 0,
+                dropped_loss: 0,
+                dropped_oversize: 0,
+                reordered: 0,
+                shadowed: 0,
+                datagrams_in: 0,
+                counters,
+            };
+        }
         Self {
             zero_rtt_in: counters.zero_rtt_in.load(Ordering::Relaxed),
             version_negotiations_out: counters.version_negotiations_out.load(Ordering::Relaxed),
@@ -1509,6 +1545,38 @@ mod peer_counter_tests {
             view.initials_in() <= 1,
             "a client whose hello fits in one Initial must not inherit an earlier client's split"
         );
+    }
+
+    /// A connection keeps what arrived before `run_one` could baseline.
+    ///
+    /// The regression this guards is measured, not imagined: 0-RTT is
+    /// coalesced behind the Initial that produces the `Incoming`, so the only
+    /// early-data packet ngtcp2 sends is counted before there is a connection
+    /// to attribute it to. Baselining at the current values discarded it, and
+    /// the suite reported that a client which did offer early data did not.
+    #[test]
+    fn the_first_view_keeps_what_created_the_entry() {
+        let counters = Counters::default();
+        let peer = addr(50004);
+
+        // The connection's first datagram: an Initial with 0-RTT coalesced
+        // behind it, counted by the socket before `run_one` runs.
+        counters
+            .peer(peer)
+            .initials_in
+            .fetch_add(1, Ordering::Relaxed);
+        counters
+            .peer(peer)
+            .zero_rtt_in
+            .fetch_add(1, Ordering::Relaxed);
+
+        let view = counters.view_for(peer);
+        assert_eq!(
+            view.zero_rtt_in(),
+            1,
+            "early data that arrived with the Initial belongs to this connection"
+        );
+        assert_eq!(view.initials_in(), 1);
     }
 
     /// Two connections from the same address do not share a count.
