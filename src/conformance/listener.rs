@@ -2311,16 +2311,33 @@ async fn watch_for_liveness(
             // So settle: wait for the client to close, and let the reason
             // decide. Silence means it really did carry on.
             let settle = Duration::from_secs(2);
-            match tokio::time::timeout(settle, connection.closed()).await {
-                Ok(_) => match classify_close(connection, &conformance.close_elicitation).await {
-                    // A clean close after a completed request is exactly what a
-                    // client that handled the anomaly does.
-                    Observation::ClosedSilently => Observation::SurvivedAndContinued,
-                    other => other,
-                },
-                // The window closed with nothing seen. Not the same as a
-                // clean close, and the difference decides a correctness test.
-                Err(_) => Observation::NoCloseObserved,
+            // Both arms go through `classify_close`, including the one where
+            // the settle window expired with nothing seen.
+            //
+            // That arm used to return `NoCloseObserved` outright, which is the
+            // one conclusion in this function that must not be drawn without
+            // asking: a client that rejected the anomaly and whose single
+            // CONNECTION_CLOSE was lost looks exactly like a client that
+            // carried on, and RFC 9000 §10.2.1 says the only way to tell is to
+            // send it a packet. The elicitation probe existed for precisely
+            // that case and was wired into every arm except it -- the three it
+            // did reach all arrive with `close_reason()` already `Some`, where
+            // it can never fire. Counting the probe is what exposed this: a
+            // full matrix run attempted it zero times.
+            //
+            // `close_reason()` is `None` here, so `classify_close` sends the
+            // PING and waits. A client that really did close answers with the
+            // close it already sent; a live one stays connected and the
+            // observation is `NoCloseObserved` exactly as before, 400ms later.
+            let _ = tokio::time::timeout(settle, connection.closed()).await;
+            match classify_close(connection, &conformance.close_elicitation).await {
+                // A clean close after a completed request is exactly what a
+                // client that handled the anomaly does -- and that is as true
+                // of a close we had to ask for as of one that arrived on its
+                // own. Whether the settle window saw it decides nothing here;
+                // only whether the client closed, and how.
+                Observation::ClosedSilently => Observation::SurvivedAndContinued,
+                other => other,
             }
         }
         Ok(Err(_)) => classify_close(connection, &conformance.close_elicitation).await,
