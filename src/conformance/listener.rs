@@ -883,7 +883,10 @@ async fn run_one(
     let mut probe_control = probe_control;
 
     let (observation, read_proof) = if critical_streams.is_empty() {
-        (classify_close(&connection).await, None)
+        (
+            classify_close(&connection, &conformance.close_elicitation).await,
+            None,
+        )
     } else {
         tokio::join!(
             watch_for_liveness(
@@ -2309,7 +2312,7 @@ async fn watch_for_liveness(
             // decide. Silence means it really did carry on.
             let settle = Duration::from_secs(2);
             match tokio::time::timeout(settle, connection.closed()).await {
-                Ok(_) => match classify_close(connection).await {
+                Ok(_) => match classify_close(connection, &conformance.close_elicitation).await {
                     // A clean close after a completed request is exactly what a
                     // client that handled the anomaly does.
                     Observation::ClosedSilently => Observation::SurvivedAndContinued,
@@ -2320,13 +2323,13 @@ async fn watch_for_liveness(
                 Err(_) => Observation::NoCloseObserved,
             }
         }
-        Ok(Err(_)) => classify_close(connection).await,
+        Ok(Err(_)) => classify_close(connection, &conformance.close_elicitation).await,
         Err(_) => {
             // Nothing arrived in time. If the peer had closed we would have
             // seen an error above, so distinguish a real stall from a close
             // that raced the timeout.
             match connection.close_reason() {
-                Some(_) => classify_close(connection).await,
+                Some(_) => classify_close(connection, &conformance.close_elicitation).await,
                 None => Observation::TimedOut,
             }
         }
@@ -3461,7 +3464,10 @@ const CLOSE_ELICIT_WAIT: Duration = Duration::from_millis(400);
 
 /// Turn a closed connection into an observation, preserving the error code the
 /// client chose — which for the correctness tests is the entire point.
-async fn classify_close(connection: &quinn::Connection) -> Observation {
+async fn classify_close(
+    connection: &quinn::Connection,
+    elicitation: &crate::conformance::CloseElicitation,
+) -> Observation {
     if let Some(e) = connection.close_reason() {
         return classify_error(&e);
     }
@@ -3481,10 +3487,17 @@ async fn classify_close(connection: &quinn::Connection) -> Observation {
     // is unchanged. Worth 14 cells of the 2026-09-18 matrix, and worth more
     // than that to the principle: an inconclusive verdict should mean the
     // instrument has something to fix, and this one did.
+    //
+    // Counted, both halves. This probe is what decides a correctness test when
+    // the first close went missing, so how often it works is a published
+    // property of the instrument rather than something the suite asserts about
+    // itself -- see `/conformance/` for the rate the last run measured.
+    elicitation.attempt();
     connection.ping();
     let deadline = tokio::time::Instant::now() + CLOSE_ELICIT_WAIT;
     loop {
         if let Some(e) = connection.close_reason() {
+            elicitation.answer();
             return classify_error(&e);
         }
         if tokio::time::Instant::now() >= deadline {

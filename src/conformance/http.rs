@@ -34,6 +34,7 @@ pub fn route(
         (&Method::GET, "/" | "/index.html") => Some(index(conformance)),
         (&Method::POST, "/session") => Some(new_session(conformance, client_ip)),
         (&Method::GET, "/catalog.json") => Some(catalog_json(conformance)),
+        (&Method::GET, "/instrument.json") => Some(instrument_json(conformance)),
         (&Method::GET, "/css/conformance.css") => Some(stylesheet()),
         // Page furniture. This is its own origin under `default-src 'self'`, so
         // every asset the page references has to be served from here — it cannot
@@ -654,6 +655,22 @@ fn catalog_json(conformance: &Arc<Conformance>) -> Response<Body> {
     )
 }
 
+/// What the instrument knows about itself.
+///
+/// Only the close-elicitation counters so far. They are process-wide and
+/// monotonic, so a caller wanting the figure for one run reads this before and
+/// after and subtracts -- which is what `run-matrix.sh` does, and why nothing
+/// here resets them. A single absolute number would silently fold in every
+/// other connection the suite served in between.
+fn instrument_json(conformance: &Arc<Conformance>) -> Response<Body> {
+    let (attempted, answered) = conformance.close_elicitation.read();
+    text(
+        StatusCode::OK,
+        "application/json; charset=utf-8",
+        format!("{{\"close_elicitation\":{{\"attempted\":{attempted},\"answered\":{answered}}}}}"),
+    )
+}
+
 fn report_for(conformance: &Arc<Conformance>, path: &str) -> Response<Body> {
     // Case-sensitive on purpose: these paths come from links we emit, and a
     // request for `.JSON` is somebody probing, not a caller we need to serve.
@@ -852,6 +869,7 @@ mod tests {
         assert!(route(&c, &Method::GET, "/", ip).is_some());
         assert!(route(&c, &Method::POST, "/session", ip).is_some());
         assert!(route(&c, &Method::GET, "/catalog.json", ip).is_some());
+        assert!(route(&c, &Method::GET, "/instrument.json", ip).is_some());
         assert!(route(&c, &Method::GET, "/css/conformance.css", ip).is_some());
         // Anything else falls through to normal routing.
         assert!(route(&c, &Method::GET, "/favicon.ico", ip).is_none());

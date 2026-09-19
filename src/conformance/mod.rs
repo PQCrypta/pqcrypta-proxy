@@ -100,10 +100,54 @@ use crate::config::ConformanceConfig;
 pub use catalog::{Class, Test, Tier};
 pub use session::{Observation, Registry, Verdict};
 
+/// How often the suite has to ask a client for its close, and how often asking
+/// works.
+///
+/// RFC 9000 §10.2.1: an endpoint in the closing state re-sends its
+/// CONNECTION_CLOSE in answer to an incoming packet, and only then. So a client
+/// that rejected an anomaly correctly and whose one close was lost is, from
+/// here, indistinguishable from a client that never objected -- unless the
+/// server sends something. `classify_close` sends a PING and waits.
+///
+/// That is the instrument deciding what a correctness test saw, so how well it
+/// works is not an implementation detail: an elicitation rate near zero would
+/// mean most of the correctness tier rests on a guess. It is counted rather
+/// than asserted, published from the run rather than from a note, and the two
+/// numbers are process-wide on purpose -- it is a property of the method, not
+/// of any one session.
+#[derive(Debug, Default)]
+pub struct CloseElicitation {
+    /// Connections that closed with no reason recorded, so a PING was sent.
+    pub attempted: std::sync::atomic::AtomicU64,
+    /// Of those, the ones that answered with a close before the wait expired.
+    pub answered: std::sync::atomic::AtomicU64,
+}
+
+impl CloseElicitation {
+    pub fn attempt(&self) {
+        self.attempted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn answer(&self) {
+        self.answered
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `(attempted, answered)` as of now.
+    pub fn read(&self) -> (u64, u64) {
+        (
+            self.attempted.load(std::sync::atomic::Ordering::Relaxed),
+            self.answered.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
+
 /// Everything the listeners and handlers need to run the suite.
 pub struct Conformance {
     pub config: ConformanceConfig,
     pub sessions: Arc<Registry>,
+    pub close_elicitation: Arc<CloseElicitation>,
 }
 
 impl std::fmt::Debug for Conformance {
@@ -147,6 +191,7 @@ impl Conformance {
         Ok(Some(Self {
             config: config.clone(),
             sessions: Registry::new(config.session_ttl_secs, config.max_sessions),
+            close_elicitation: Arc::new(CloseElicitation::default()),
         }))
     }
 
