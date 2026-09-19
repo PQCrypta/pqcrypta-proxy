@@ -77,6 +77,16 @@ mod zero_rtt;
 #[cfg(test)]
 mod qpack_dynamic;
 
+/// Proof that the control-stream read-proof answers in both directions.
+///
+/// Test-only for the reason the module explains: no client in the fleet
+/// declines to read its control stream, so across 708 live verdicts the probe
+/// reported "read" every time and "not read" never. The negative branch has
+/// to be built rather than waited for, or the claim that the probe
+/// distinguishes the two rests on evidence from one direction only.
+#[cfg(test)]
+mod read_proof;
+
 use std::sync::Arc;
 
 use crate::config::ConformanceConfig;

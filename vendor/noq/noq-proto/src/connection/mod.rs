@@ -2687,6 +2687,21 @@ impl Connection {
         Some(stats)
     }
 
+    /// The peer's `initial_max_stream_data_uni`, in bytes.
+    ///
+    /// How much this endpoint may write on any one unidirectional stream it
+    /// opens before the peer has to extend credit. Exposed because that
+    /// threshold is the difference between guessing and knowing: writing past
+    /// it only succeeds if the peer sent MAX_STREAM_DATA, and a peer only does
+    /// that when its application has consumed the data. It is the one
+    /// standards-defined signal that a unidirectional stream was *read* rather
+    /// than merely delivered.
+    ///
+    /// Zero until the handshake has supplied the peer's parameters.
+    pub fn peer_initial_max_stream_data_uni(&self) -> u64 {
+        self.peer_params.initial_max_stream_data_uni.into_inner()
+    }
+
     /// Ping the remote endpoint
     ///
     /// Causes an ACK-eliciting packet to be transmitted on the connection.

@@ -386,6 +386,32 @@ impl<'a> SendStream<'a> {
 
         Ok(stream.as_ref().map(|s| s.priority).unwrap_or_default())
     }
+
+    /// The peer's current flow-control limit for **this stream**, in bytes.
+    ///
+    /// Rises only when a MAX_STREAM_DATA frame naming this stream arrives, and
+    /// a peer sends one of those only when its application has consumed data
+    /// on this stream. That makes it the one signal available to a sender that
+    /// separates "delivered" from "read", for one specific stream.
+    ///
+    /// The conformance suite needs exactly that, and the per-stream part is
+    /// not incidental. `FrameStats::max_stream_data` counts MAX_STREAM_DATA
+    /// frames for the whole connection, so it also rises when the peer reads
+    /// the *response* on a different stream -- credit granted for reasons that
+    /// have nothing to do with the stream under test. Polling that counter
+    /// would be fast and wrong.
+    ///
+    /// # Panics
+    /// - when applied to a receive stream
+    pub fn peer_max_data(&self) -> Result<u64, ClosedStream> {
+        let stream = self
+            .state
+            .send
+            .get(&self.id)
+            .ok_or(ClosedStream { _private: () })?;
+
+        Ok(stream.as_ref().map(|s| s.max_data).unwrap_or_default())
+    }
 }
 
 /// A queue of streams with pending outgoing data, sorted by priority

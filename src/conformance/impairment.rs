@@ -144,6 +144,100 @@ impl Counters {
     pub fn last_peer(&self) -> Option<SocketAddr> {
         *self.last_peer.lock()
     }
+
+    /// What this port had counted when a connection began.
+    ///
+    /// Take one of these at the top of every connection and read the counters
+    /// through it. See [`Since`] for why that is not optional.
+    pub fn since_now(self: &Arc<Self>) -> Since {
+        Since {
+            counters: Arc::clone(self),
+            zero_rtt_in: self.zero_rtt_in(),
+            version_negotiations_out: self.version_negotiations_out(),
+            initials_in: self.initials_in(),
+            marked_ce: self.marked_ce(),
+            dropped_loss: self.dropped_loss(),
+            dropped_oversize: self.dropped_oversize(),
+            reordered: self.reordered(),
+            shadowed: self.shadowed(),
+            datagrams_in: self.datagrams_in(),
+        }
+    }
+}
+
+/// The counters as *this connection* moved them.
+///
+/// `Counters` belongs to the listener. It is created once per port at start-up
+/// and never reset, so every field is the running total for every client that
+/// has ever connected to that port. Reading one directly and comparing it
+/// against a constant -- `> 0`, `== 0`, `> 1` -- asks "has this ever happened
+/// here", and then answers a question about the client in front of you with
+/// it.
+///
+/// That is not a hypothetical. It shipped twice. `zero_rtt_in` was the first:
+/// the first client ever to send early data on a port set the flag
+/// permanently, and every client after it was judged as though it had too.
+/// That was found, fixed with a hand-rolled baseline, and documented at the
+/// call site -- and then on 2026-09-19 `version_negotiations_out` was added
+/// with `> 0` ten lines below the comment explaining why not to. A run
+/// reported that ten of twelve clients lose their 0-RTT to a version GREASE;
+/// one does, and it had poisoned the port for the nine that followed.
+///
+/// Auditing the rest of the file after that found six more: `initials_in > 1`
+/// deciding `t-hybrid-large-hello` (which feeds the post-quantum results),
+/// `marked_ce == 0`, `dropped_loss > 0`, `reordered > 0`, `shadowed > 0` and
+/// `dropped_oversize`. Seven instances of one shape, and the shape is
+/// "shared mutable port state read as though it described one client".
+///
+/// So the absolute reads are no longer reachable from the verdict path. A
+/// verdict takes one of these instead of a `&Counters`, and every accessor on
+/// it returns the delta. Getting it wrong now requires deliberately reaching
+/// past this type, which is a different and much more visible mistake than
+/// forgetting a subtraction.
+pub struct Since {
+    counters: Arc<Counters>,
+    zero_rtt_in: u64,
+    version_negotiations_out: u64,
+    initials_in: u64,
+    marked_ce: u64,
+    dropped_loss: u64,
+    dropped_oversize: u64,
+    reordered: u64,
+    shadowed: u64,
+    datagrams_in: u64,
+}
+
+macro_rules! since_delta {
+    ($($name:ident),+ $(,)?) => {
+        impl Since {
+            $(
+                /// How far this counter moved during this connection.
+                pub fn $name(&self) -> u64 {
+                    self.counters.$name().saturating_sub(self.$name)
+                }
+            )+
+        }
+    };
+}
+
+since_delta!(
+    zero_rtt_in,
+    version_negotiations_out,
+    initials_in,
+    marked_ce,
+    dropped_loss,
+    dropped_oversize,
+    reordered,
+    shadowed,
+    datagrams_in,
+);
+
+impl Since {
+    /// The port's own counters, for the few places that genuinely want a
+    /// lifetime total rather than this connection's share.
+    pub fn port_total(&self) -> &Counters {
+        &self.counters
+    }
 }
 
 /// How long a peer's traffic flows cleanly before the black hole opens under it.
@@ -1173,5 +1267,72 @@ mod tests {
                 _ => false,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod since_tests {
+    use super::*;
+
+    /// A baseline taken after other clients have used the port reports zero
+    /// for them and only this connection's share afterwards.
+    ///
+    /// The regression this guards is not hypothetical: it shipped seven times.
+    /// A cumulative per-port counter read as an absolute made the first client
+    /// to do something decide the verdict for every client after it, and the
+    /// symptom was a run reporting that ten of twelve implementations lose
+    /// their 0-RTT to a version GREASE when one of them does.
+    #[test]
+    fn a_baseline_hides_what_earlier_clients_did() {
+        let counters = Arc::new(Counters::default());
+
+        // Nine earlier clients on this port.
+        for _ in 0..9 {
+            counters
+                .version_negotiations_out
+                .fetch_add(1, Ordering::Relaxed);
+            counters.zero_rtt_in.fetch_add(3, Ordering::Relaxed);
+            counters.initials_in.fetch_add(2, Ordering::Relaxed);
+        }
+
+        let since = counters.since_now();
+        assert_eq!(
+            since.version_negotiations_out(),
+            0,
+            "nine earlier GREASEs are not this client's"
+        );
+        assert_eq!(since.zero_rtt_in(), 0);
+        assert_eq!(since.initials_in(), 0);
+
+        // This client sends one Initial and no early data.
+        counters.initials_in.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(since.initials_in(), 1, "only this connection's Initials");
+        assert_eq!(
+            since.zero_rtt_in(),
+            0,
+            "it sent none, whatever the port total says"
+        );
+        assert_eq!(
+            counters.initials_in(),
+            19,
+            "the port total is still there for anything that genuinely wants it"
+        );
+    }
+
+    /// `t-hybrid-large-hello` asks whether *this* ClientHello needed more than
+    /// one Initial. Before `Since`, two earlier clients on the port were
+    /// enough to answer yes for everybody -- and that test feeds the
+    /// post-quantum results.
+    #[test]
+    fn a_split_client_hello_is_this_clients_or_nobodys() {
+        let counters = Arc::new(Counters::default());
+        counters.initials_in.fetch_add(2, Ordering::Relaxed); // an earlier client split its hello
+
+        let since = counters.since_now();
+        counters.initials_in.fetch_add(1, Ordering::Relaxed); // ours fits in one
+        assert!(
+            since.initials_in() <= 1,
+            "a client whose hello fits in one Initial must not inherit an earlier client's split"
+        );
     }
 }

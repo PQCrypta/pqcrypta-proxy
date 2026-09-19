@@ -603,6 +603,52 @@ impl Connection {
         conn.close(error_code, Bytes::copy_from_slice(reason), &self.0.shared);
     }
 
+    /// Send an ack-eliciting PING, and make the peer say something.
+    ///
+    /// `quinn-proto` has had `Connection::ping` all along; the high-level API
+    /// never surfaced it, because for ordinary use the keep-alive timer covers
+    /// the same ground.
+    ///
+    /// The conformance suite needs it for a case the timer does not reach.
+    /// RFC 9000 §10.2.1 has a closing endpoint retransmit its CONNECTION_CLOSE
+    /// *in response to an incoming packet* and not otherwise — so a client that
+    /// rejected an anomaly exactly as the specification requires, and whose
+    /// single close was lost, is from the server's side indistinguishable from
+    /// a client that never objected at all. The suite reported both as
+    /// `NoCloseObserved`, which is 14 cells of "we could not tell" in the
+    /// 2026-09-18 matrix.
+    ///
+    /// One PING resolves it: a client in closing state answers with the close
+    /// it already sent, and a client that never closed stays quiet. The
+    /// ambiguity was never in the protocol, only in not having asked.
+    ///
+    /// Carries no application semantics, which is why it is a PING and not a
+    /// stream or a datagram — anything visible to HTTP/3 would risk changing
+    /// the behaviour being measured.
+    pub fn ping(&self) {
+        let conn = &mut *self.0.lock_and_wake("ping");
+        conn.inner.ping();
+    }
+
+    /// How many bytes we may write on a unidirectional stream before the peer
+    /// must extend credit.
+    ///
+    /// The conformance suite uses this to tell "the client read our control
+    /// stream and accepted the violation on it" from "the client never read
+    /// the stream at all" — two outcomes that look identical if you only watch
+    /// for a close, and which were reported together as inconclusive for 41
+    /// cells of the 2026-09-18 matrix. Writing past this limit succeeds only
+    /// if the peer sent MAX_STREAM_DATA, and a peer sends that only once its
+    /// application has consumed what it already has.
+    ///
+    /// Zero before the handshake completes.
+    pub fn peer_initial_max_stream_data_uni(&self) -> u64 {
+        self.0
+            .lock_without_waking("peer_initial_max_stream_data_uni")
+            .inner
+            .peer_initial_max_stream_data_uni()
+    }
+
     /// Abandon the connection without telling the peer.
     ///
     /// Where [`close()`] sends a CONNECTION_CLOSE frame and lets the peer finish

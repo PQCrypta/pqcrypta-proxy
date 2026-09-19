@@ -460,11 +460,15 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
         ) if catalog::anomaly_stream(test) == catalog::Anomaly::ControlStream => (
             Verdict::Inconclusive,
             "The client completed its request and closed without objecting, and the anomaly \
-             was on the control stream. Whether it read that stream is decided by filling \
-             its flow-control window and seeing if credit is extended; reaching this \
-             sentence means the probe could not be put — the stream was already gone, or \
-             the client's window was too large to fill for the price. Those are the only \
-             two cases left, and both are ours to fix."
+             was on the control stream — a unidirectional stream nothing obliges it to read \
+             on any schedule. Whether it read that stream is not observable from a server \
+             for a client configured like this one. The only thing a reader emits that \
+             distinguishes reading from receiving is a flow-control credit grant, and a \
+             receiver grants credit only as its consumption approaches the window it \
+             advertised; a client advertising a large window reads everything we send, \
+             comes nowhere near its limit, and says nothing. Measured, not assumed — and \
+             not a gap this suite is working on closing, but a limit of watching from this \
+             end."
                 .to_string(),
         ),
         (Class::Correctness, Observation::SurvivedAndContinued) => (

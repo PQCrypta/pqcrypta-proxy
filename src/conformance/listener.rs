@@ -37,7 +37,7 @@ use tracing::{debug, info, warn};
 
 use super::catalog::{self, Test, Tier};
 use super::h3_frames as f;
-use super::impairment::{Counters, ImpairedSocket, Impairments};
+use super::impairment::{Counters, ImpairedSocket, Impairments, Since};
 use super::session::Observation;
 use super::Conformance;
 use crate::tls::TlsProvider;
@@ -610,23 +610,21 @@ async fn run_one(
 
     // What the port had counted before this client arrived.
     //
-    // `Counters` belongs to the listener, not the connection: it is created once
-    // per port at start-up and lives as long as the process. `zero_rtt_in()` is
-    // therefore cumulative, so the first client ever to send early data on this
-    // port set it above zero permanently -- and every client after it was then
-    // judged as though it had sent early data too.
+    // `Counters` belongs to the listener, not the connection: created once per
+    // port at start-up and never reset. Read directly, every field is the
+    // running total for every client that has ever connected there, and
+    // comparing one against a constant answers "has this ever happened here"
+    // while appearing to answer "did this client do it".
     //
-    // That is a verdict decided by what somebody else did, which is the same
-    // defect as two runs sharing a session and a GOAWAY that raced the request.
-    // It was visible in the data: a matrix run taken after a proxy restart
-    // recorded ten clients as `inconclusive` on this test where the run before
-    // it -- against a process that had been up for hours -- recorded nine passes.
-    // The nine were the artefact; the ten are the truth.
+    // Baselined before `accept()` rather than after, because 0-RTT and Initial
+    // packets are counted on the way in: by the time there is a `Connection`
+    // they are already in the totals.
     //
-    // Baselined here rather than after `accept()`, because 0-RTT packets arrive
-    // *during* the handshake: by the time there is a `Connection` they have
-    // already been counted.
-    let zero_rtt_before = conformance_counters.zero_rtt_in();
+    // Everything downstream reads deltas through this handle and cannot reach
+    // the absolute values. `Since` in impairment.rs carries the list of seven
+    // verdicts that got this wrong before it existed -- including the one that
+    // decided `t-hybrid-large-hello`, which feeds the post-quantum results.
+    let since = conformance_counters.since_now();
     // Captured before the handshake: `Connection::remote_address` panics once
     // the connection is established, and this is the address that finds the
     // session anyway. Canonicalised so an IPv4-mapped IPv6 peer matches the
@@ -904,7 +902,7 @@ async fn run_one(
                 // configuration offers early data, whether or not the client sent
                 // any. The wire count is the same evidence the verdict is built on,
                 // so the response and the verdict cannot disagree.
-                early_data_accepted && conformance_counters.zero_rtt_in() > zero_rtt_before,
+                early_data_accepted && since.zero_rtt_in() > 0,
             ),
             async {
                 match probe_control.as_mut() {
@@ -950,7 +948,46 @@ async fn run_one(
                 | Observation::ClosedSilently
                 | Observation::ClosedWith { .. }
         ) {
-        match read_proof {
+        // The read-proof is not wired to verdicts, and this is the honest end
+        // of two attempts rather than a pause between them.
+        //
+        // When it fires, it is right: credit extended on this stream proves
+        // the client consumed data on this stream. The defect is not in the
+        // verdicts it produces, it is in *which cells get one*. Both designs
+        // needed the client's consumption to approach the window it
+        // advertised -- the first by overrunning it, the second by waiting for
+        // the grant that only nearness provokes -- so how often the probe
+        // decides is a function of the client's buffer and nothing else.
+        // Measured twice, across twelve clients:
+        //
+        //   overrun probe:  100% decided at 64 KB, 45% at 512 KB, skipped >4 MB
+        //   credit probe:   100% decided at 64 KB, 54% at 512 KB, 0% at 1 GB
+        //
+        // Removing the ceiling fixed the skips and moved nothing else. The
+        // second design was the first one's dependency in a cheaper wrapper.
+        //
+        // Correct-but-biased coverage is worse than none in a comparative
+        // matrix. picoquic collected eleven real verdicts and curl zero, on
+        // the same tests, for no reason but a buffer eight thousand times
+        // smaller -- and a reader comparing their failure counts would have
+        // read that difference as behaviour. A uniform inconclusive is
+        // comparable across clients; a partial one that correlates with an
+        // unrelated variable is not.
+        //
+        // So these cells say what is true: from a server, for a client that
+        // completes its request and closes without objecting, whether it read
+        // a unidirectional stream is not observable. That was the suite's
+        // position before any of this was built, and two measured failures
+        // have not moved it.
+        //
+        // `read_proof` is still computed and still logged, because the log is
+        // what proved this and is what would show it changing. It just does
+        // not decide anything. `conformance::read_proof` keeps the tests: both
+        // directions fire, and credit on another stream is not mistaken for a
+        // read. The mechanism is sound; its reach is not.
+        let _ = &read_proof;
+        #[allow(unreachable_code)]
+        match None::<bool> {
             Some(true) => Observation::Violated(
                     "Read the control stream and carried on without objecting. It extended flow-control credit on that stream after the frame was written, which a receiver only does once its application has consumed the data -- so the violation was seen and accepted"
                     .to_string(),
@@ -985,14 +1022,7 @@ async fn run_one(
     // Some QUIC-layer tests are judged on what the connection did rather than
     // on whether a request arrived, so the transport's own account of it
     // supersedes the liveness result.
-    let observation = quic_observation(
-        &connection,
-        test,
-        &conformance_counters,
-        zero_rtt_before,
-        &qpack,
-    )
-    .unwrap_or(observation);
+    let observation = quic_observation(&connection, test, &since, &qpack).unwrap_or(observation);
 
     // A completed handshake on the post-quantum chain port deserves its own
     // sentence rather than the generic discretionary one.
@@ -2381,10 +2411,9 @@ async fn watch_for_liveness(
 fn quic_observation(
     connection: &quinn::Connection,
     test: &'static Test,
-    counters: &Counters,
-    // What the port had counted before this connection: `Counters` is
-    // per-listener and cumulative, so only the delta belongs to this client.
-    zero_rtt_before: u64,
+    // Deltas for this connection alone. A `&Counters` here is what let one
+    // client's traffic decide another client's verdict, seven times over.
+    counters: &Since,
     qpack: &QpackLimits,
 ) -> Option<Observation> {
     let rx = connection.stats().frame_rx;
@@ -2491,7 +2520,7 @@ fn quic_observation(
         // require retransmission — that is the application's concern, not
         // QUIC's — so the test is whether the client comes back and completes
         // the request on the 1-RTT keys, not how it got there.
-        "q-zero-rtt-reject" => Some(if counters.zero_rtt_in() > zero_rtt_before {
+        "q-zero-rtt-reject" => Some(if counters.zero_rtt_in() > 0 {
             // Whatever the liveness result was, it was reached after a genuine
             // rejection. Left to the generic path, which scores a completed
             // follow-up request as recovery and a stall or a give-up as failure.
@@ -2775,7 +2804,7 @@ fn quic_observation(
         // handled it.
         "q-zero-rtt-replay" => {
             // The delta, not the total: see `zero_rtt_before` in `run_one`.
-            if counters.zero_rtt_in() > zero_rtt_before {
+            if counters.zero_rtt_in() > 0 {
                 return None;
             }
             Some(no_early_data(counters, "it was never answered 425"))
@@ -3307,7 +3336,7 @@ const LOSSY_CHUNK_GAP: Duration = Duration::from_millis(30);
 ///     case that is a fact about the client.
 ///
 /// Reported as `Unsupported` only in the third: there the client has answered.
-fn no_early_data(counters: &Counters, what_was_missed: &str) -> Observation {
+fn no_early_data(counters: &Since, what_was_missed: &str) -> Observation {
     if counters.version_negotiations_out() > 0 {
         return Observation::NotExercised(format!(
             "the client sent no early data, so {what_was_missed}. It offered a GREASE QUIC \
@@ -3338,15 +3367,6 @@ fn no_early_data(counters: &Counters, what_was_missed: &str) -> Observation {
     ))
 }
 
-/// The most we will write to prove a control stream was read.
-///
-/// The probe has to exceed the client's `initial_max_stream_data_uni` to force
-/// a MAX_STREAM_DATA, so its cost is that limit, not a number we pick. A few
-/// clients advertise windows in the tens of megabytes; pushing that much down
-/// a control stream to settle one verdict is a bad trade, so above this the
-/// probe is skipped and the result stays inconclusive and says why.
-const READ_PROOF_CEILING: u64 = 4 * 1024 * 1024;
-
 /// How long the client has to extend credit once the window is full.
 const READ_PROOF_WAIT: Duration = Duration::from_millis(1_500);
 
@@ -3373,7 +3393,7 @@ const READ_PROOF_WAIT: Duration = Duration::from_millis(1_500);
 /// inconclusive cells in the 2026-09-18 matrix — the single largest reason in
 /// the grid, and stated as though it were a fact of nature. It was not. It was
 /// the consequence of never asking.
-async fn control_stream_was_read(
+pub(super) async fn control_stream_was_read(
     test_id: &str,
     connection: &quinn::Connection,
     control: &mut quinn::SendStream,
@@ -3389,11 +3409,19 @@ async fn control_stream_was_read(
     // would be a property of this harness wearing the costume of a finding.
     // The per-client windows have to be comparable and the skips have to be
     // countable, so both go in the log.
-    if limit == 0 || limit > READ_PROOF_CEILING {
-        info!(
-            "conformance: {} read-proof skipped (peer initial_max_stream_data_uni = {} bytes, ceiling {})",
-            test_id, limit, READ_PROOF_CEILING
-        );
+    // The ceiling is gone, and deliberately.
+    //
+    // It existed because the old probe had to write the whole window, so a
+    // client advertising 1 GB -- curl does -- would have cost a gigabyte to
+    // measure. Skipping those clients made the probe's reach a property of a
+    // constant in this file: curl and Chromium were never probed at all, on
+    // any cell, in the 2026-09-19 02:20Z run.
+    //
+    // Watching this stream's own credit removes the reason for it. The probe
+    // now ends at the first grant, so a large window costs no more than a
+    // small one, and every client is measured on the same terms.
+    if limit == 0 {
+        info!("conformance: {test_id} read-proof skipped (peer window not yet known)");
         return None;
     }
     info!(
@@ -3401,40 +3429,76 @@ async fn control_stream_was_read(
         test_id, limit
     );
 
-    // Everything already written on this stream counts against the same
-    // window, so overshooting the whole limit is certain to cross it whatever
-    // the test sent.
+    // Watch this stream's own credit, and stop the moment it moves.
+    //
+    // The first version proved a read by overrunning the window: write
+    // `limit + 2` frames and see whether `write_all` completed. That is
+    // unambiguous and it made the probe's cost the client's choice, because
+    // the amount to write *is* the window the client advertised. Measured
+    // across twelve clients in the 2026-09-19 02:20Z run, the success rate was
+    // a monotonic function of that window and nothing else -- 100% at 64 KB,
+    // 45% at 512 KB, 9-36% around 1 MB, skipped above 4 MB. Small-buffer
+    // clients finished before they could close; large-buffer clients lost a
+    // race to their own close timer. Every verdict in that column was a buffer
+    // size wearing a behaviour's clothes.
+    //
+    // A MAX_STREAM_DATA naming *this* stream is the same evidence for a
+    // fraction of the work: a peer sends one only when its application has
+    // consumed data here. Not `FrameStats::max_stream_data`, which counts them
+    // for the whole connection and therefore also rises when the client reads
+    // the response on another stream -- fast, and wrong.
+    let baseline = match control.peer_max_data() {
+        Ok(v) => v,
+        Err(_) => {
+            info!("conformance: {test_id} read-proof skipped (stream already closed)");
+            return None;
+        }
+    };
+
     let payload = vec![0u8; 4096];
     let frame = f::reserved_frame(0x1f, &payload);
-    let writes = (limit / frame.len() as u64) + 2;
+    let mut written = 0u64;
 
     let probe = async {
-        for _ in 0..writes {
-            control.write_all(&frame).await?;
+        loop {
+            if control.peer_max_data().unwrap_or(baseline) > baseline {
+                return Ok::<bool, quinn::WriteError>(true);
+            }
+            // Keep filling, because a receiver only grants more once it has
+            // consumed enough to be worth granting. Bounded by the window:
+            // past that, `write_all` blocks and the polling below is what
+            // makes progress.
+            tokio::select! {
+                res = control.write_all(&frame) => {
+                    res?;
+                    written += frame.len() as u64;
+                }
+                () = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+            if control.peer_max_data().unwrap_or(baseline) > baseline {
+                return Ok(true);
+            }
         }
-        Ok::<(), quinn::WriteError>(())
     };
 
     let outcome = tokio::time::timeout(READ_PROOF_WAIT, probe).await;
     let (verdict, why) = match &outcome {
-        // Wrote past the window, so credit was extended, so the client read.
-        Ok(Ok(())) => (Some(true), "credit extended past the window".to_string()),
+        Ok(Ok(true)) => (
+            Some(true),
+            "peer extended credit on this stream".to_string(),
+        ),
+        Ok(Ok(false)) => (None, "probe ended without a decision".to_string()),
         // The stream died under us: the client is gone and nothing is proven.
         Ok(Err(e)) => (None, format!("stream ended under the probe: {e}")),
-        // The window filled and stayed full for the whole wait. The client is
-        // still there — it just is not reading this stream.
+        // Still connected, still not granting credit on this stream.
         Err(_) => (
             Some(false),
-            "window stayed full for the whole wait".to_string(),
+            "no credit granted on this stream for the whole wait".to_string(),
         ),
     };
     info!(
-        "conformance: {} read-proof result={:?} window={} wrote={} why={}",
-        test_id,
-        verdict,
-        limit,
-        writes * frame.len() as u64,
-        why
+        "conformance: {test_id} read-proof result={verdict:?} window={limit} wrote={written} \
+         why={why}"
     );
     verdict
 }

@@ -238,6 +238,30 @@ impl SendStream {
         conn.inner.send_stream(self.stream).priority()
     }
 
+    /// The peer's current flow-control limit for this stream, in bytes.
+    ///
+    /// Moves only when the peer sends MAX_STREAM_DATA naming this stream,
+    /// which it does only once its application has consumed data here. For a
+    /// sender that is the one available proof that a stream was *read* and not
+    /// merely delivered.
+    ///
+    /// The conformance suite reads it to decide whether a client processed the
+    /// control stream an anomaly was written to. Its first attempt proved the
+    /// same thing by overrunning the window and seeing whether the write
+    /// completed -- unambiguous, and ruinously dependent on how large a window
+    /// the client advertised. Measured across twelve clients, the probe's
+    /// success rate was a monotonic function of that window and nothing else:
+    /// 100% at 64 KB, 45% at 512 KB, 9-36% around 1 MB, and skipped entirely
+    /// above 4 MB. It was measuring buffer sizes and reporting them as
+    /// behaviour.
+    ///
+    /// Watching this value instead ends the measurement at the first grant, so
+    /// what the probe costs no longer depends on anything the client chose.
+    pub fn peer_max_data(&self) -> Result<u64, ClosedStream> {
+        let mut conn = self.conn.lock_without_waking("SendStream::peer_max_data");
+        conn.inner.send_stream(self.stream).peer_max_data()
+    }
+
     /// Completes when the peer stops the stream or reads the stream to completion
     ///
     /// Yields `Some` with the stop error code if the peer stops the stream. Yields `None` if the
