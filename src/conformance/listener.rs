@@ -671,20 +671,24 @@ async fn run_one(
             // opposite of what the TLS tier had measured about the same client
             // in the same run. An instrument that invents a cause is worse than
             // one that reports none, because the invented one is actionable.
-            let observation = Observation::NotExercised(match test.tier {
-                Tier::Tls => format!(
-                    "the endpoint refused the connection before a handshake existed ({e}). \
-                     Every port on this tier negotiates exactly one key exchange group, so \
-                     this is what a client offering none of it looks like from here -- a fact \
-                     about the client, not a gap in the run"
-                ),
-                Tier::Quic | Tier::Http3 => format!(
+            let observation = match test.tier {
+                // A definite answer, and the one this tier exists to get. Every
+                // TLS port negotiates exactly one group, so a refusal here is
+                // the client saying it does not have that group.
+                Tier::Tls => Observation::Unsupported(format!(
+                    "The client offers no key exchange group this port will negotiate, so it \
+                     was refused before a handshake existed ({e}). That is a capability this \
+                     client does not have, rather than something the run failed to measure"
+                )),
+                // Nothing is known here, and that is our problem rather than
+                // the client's.
+                Tier::Quic | Tier::Http3 => Observation::NotExercised(format!(
                     "the endpoint refused the connection before a handshake existed ({e}), so \
                      the client never reached the anomaly. What the refusal was about is not \
                      recorded here: this tier does not constrain the handshake, and the error \
                      is the transport's own"
-                ),
-            });
+                )),
+            };
             conformance.sessions.with(&session_id, |sess| {
                 sess.record(
                     test,
@@ -792,17 +796,19 @@ async fn run_one(
     // written but before the client had read it — so a correct client saw our
     // violation, closed the connection, and reported an error on a test it had
     // just passed.
-    let (critical_streams, mut encoder, mut late_control) = match emit(&connection, test).await {
-        Ok(emitted) => (
-            emitted.keep_open,
-            Some(emitted.encoder),
-            emitted.late_control,
-        ),
-        Err(e) => {
-            debug!("conformance: {} could not emit anomaly: {}", test.id, e);
-            (Vec::new(), None, None)
-        }
-    };
+    let (critical_streams, mut encoder, mut control, control_is_late) =
+        match emit(&connection, test).await {
+            Ok(emitted) => (
+                emitted.keep_open,
+                Some(emitted.encoder),
+                Some(emitted.control),
+                emitted.control_is_late,
+            ),
+            Err(e) => {
+                debug!("conformance: {} could not emit anomaly: {}", test.id, e);
+                (Vec::new(), None, None, false)
+            }
+        };
 
     // The one anomaly that is not written to any stream.
     //
@@ -850,26 +856,63 @@ async fn run_one(
     // be parked somewhere that outlives the wait.
     let mut held: Vec<quinn::SendStream> = Vec::new();
     let qpack = Arc::new(QpackLimits::default());
-    let observation = if critical_streams.is_empty() {
-        classify_close(&connection)
+
+    // The read-proof has to run *while the client is still there*.
+    //
+    // The first version of it ran after the exchange had settled, which is
+    // exactly too late: for every observation it was meant to resolve the
+    // client had already completed its request and closed, so the first write
+    // hit a dead connection and the probe reported "could not be put" every
+    // single time. It was a correct idea wired into the wrong moment, and the
+    // only way to see that was to run it -- the code compiled, the tests
+    // passed, and the verdicts were unchanged.
+    //
+    // Filling the window concurrently with the client's own request is the
+    // right moment: the padding is a reserved frame type the client must skip
+    // (RFC 9114 §7.2.8), it travels on the control stream rather than the
+    // request, and it is only started for the tests whose verdict actually
+    // turns on whether that stream was read.
+    let probe_control = if !control_is_late
+        && catalog::anomaly_stream(test) == catalog::Anomaly::ControlStream
+        && test.class == catalog::Class::Correctness
+    {
+        control.take()
     } else {
-        watch_for_liveness(
-            &connection,
-            &conformance,
-            test,
-            &mut held,
-            ServerStreams {
-                encoder: encoder.as_mut(),
-                late_control: late_control.as_mut(),
-            },
-            &qpack,
-            // Not just "0-RTT was possible" — `into_0rtt` succeeds whenever the
-            // configuration offers early data, whether or not the client sent
-            // any. The wire count is the same evidence the verdict is built on,
-            // so the response and the verdict cannot disagree.
-            early_data_accepted && conformance_counters.zero_rtt_in() > zero_rtt_before,
+        None
+    };
+    let mut probe_control = probe_control;
+
+    let (observation, read_proof) = if critical_streams.is_empty() {
+        (classify_close(&connection).await, None)
+    } else {
+        tokio::join!(
+            watch_for_liveness(
+                &connection,
+                &conformance,
+                test,
+                &mut held,
+                ServerStreams {
+                    encoder: encoder.as_mut(),
+                    late_control: if control_is_late {
+                        control.as_mut()
+                    } else {
+                        None
+                    },
+                },
+                &qpack,
+                // Not just "0-RTT was possible" — `into_0rtt` succeeds whenever the
+                // configuration offers early data, whether or not the client sent
+                // any. The wire count is the same evidence the verdict is built on,
+                // so the response and the verdict cannot disagree.
+                early_data_accepted && conformance_counters.zero_rtt_in() > zero_rtt_before,
+            ),
+            async {
+                match probe_control.as_mut() {
+                    Some(stream) => control_stream_was_read(test.id, &connection, stream).await,
+                    None => None,
+                }
+            }
         )
-        .await
     };
 
     // The stateless-reset test only begins once the client is established and
@@ -877,6 +920,64 @@ async fn run_one(
     // vanishing mid-conversation, which needs a conversation first.
     let observation = if test.id == "q-stateless-reset" && test.implemented {
         abandon_and_watch(&connection, &endpoint, &conformance_counters, &mut held).await
+    } else {
+        observation
+    };
+
+    // Ask whether the control stream was ever read, rather than reporting that
+    // we cannot know.
+    //
+    // This is the single largest source of inconclusive verdicts in the suite:
+    // the client completed its request and closed without objecting, the
+    // anomaly was on a unidirectional stream nothing obliges it to read on any
+    // schedule, and those two facts together were treated as unanswerable. The
+    // flow-control probe answers them. Both outcomes are results:
+    //
+    //   read it and said nothing -> it saw the violation and accepted it, which
+    //                               is the failure the test is looking for
+    //   never read it            -> the anomaly did not reach this client, which
+    //                               is a fact about how it handles control
+    //                               streams and not a hole in the run
+    //
+    // Only when the probe itself cannot be put -- the stream is gone, or the
+    // client's window is too large to fill for the price -- does the verdict
+    // stay inconclusive, and then it says which.
+    let observation = if catalog::anomaly_stream(test) == catalog::Anomaly::ControlStream
+        && test.class == catalog::Class::Correctness
+        && matches!(
+            observation,
+            Observation::SurvivedAndContinued
+                | Observation::ClosedSilently
+                | Observation::ClosedWith { .. }
+        ) {
+        match read_proof {
+            Some(true) => Observation::Violated(
+                    "Read the control stream and carried on without objecting. It extended flow-control credit on that stream after the frame was written, which a receiver only does once its application has consumed the data -- so the violation was seen and accepted"
+                    .to_string(),
+            ),
+            // Not `Unsupported`, and the distinction matters.
+            //
+            // `Unsupported` is reserved for a client that *said* it does not
+            // do something -- a SETTINGS value, a supported_groups list, an
+            // outright refusal. This is the harness inferring from an absence:
+            // the window stayed full, so nothing was consumed. That is a sound
+            // measurement and it is still not a declaration, and letting
+            // inference in under the same label would turn `unsupported` into
+            // a better-looking `inconclusive` within a month.
+            //
+            // So it stays inconclusive, and it is ours to fix rather than the
+            // client's: nothing obliges a one-shot client to read the control
+            // stream, which means a suite that puts its anomaly there and
+            // hopes has chosen a delivery the test cannot rely on. The fix is
+            // on our side -- hold the response until the stream is consumed --
+            // and until then this cell is a line on our bug list with a
+            // measured cause rather than a guess.
+            Some(false) => Observation::NotExercised(
+                    "the client never read the control stream during its request. Measured, not assumed: the flow-control window on that stream filled and stayed full for the whole probe while the connection was otherwise healthy, and a receiver only extends that window once its application has consumed what it has. So the anomaly was written and never reached the client -- which makes this a delivery this suite cannot rely on, rather than anything about the client"
+                    .to_string(),
+            ),
+            None => observation,
+        }
     } else {
         observation
     };
@@ -1083,11 +1184,10 @@ fn tls_handshake_observation(test: &'static Test, e: &quinn::ConnectionError) ->
     // `t-classical-only` is the exception, because there that refusal is the
     // measurement rather than a miss.
     if abort == TlsAbort::NoGroupsInCommon && test.id != "t-classical-only" {
-        return Observation::NotExercised(
-            "the client offered no key exchange group this port will negotiate, so the \
+        return Observation::Unsupported(
+            "The client offered no key exchange group this port will negotiate, so the \
              ServerHello this test is about was never sent. Against a hybrid-only port that \
-             means no post-quantum key share was offered at all -- which is a fact about the \
-             client, not a gap in the run"
+             means it offered no post-quantum key share at all"
                 .to_string(),
         );
     }
@@ -1213,11 +1313,10 @@ fn tls_handshake_observation(test: &'static Test, e: &quinn::ConnectionError) ->
             // not a gap in the run -- and the most common answer today, which is
             // itself the finding: a certificate signed with ML-DSA-87 cannot be
             // offered to a client whose signature_algorithms does not name it.
-            TlsAbort::NoSignatureSchemesInCommon => Observation::NotExercised(
-                "the client's signature_algorithms named nothing that can verify an ML-DSA-87 \
+            TlsAbort::NoSignatureSchemesInCommon => Observation::Unsupported(
+                "The client's signature_algorithms named nothing that can verify an ML-DSA-87 \
                  chain, so this endpoint refused before sending one. Post-quantum certificates \
-                 are not reachable for this client at all, which is a fact about it rather \
-                 than a gap in the run"
+                 are not reachable for this client at all"
                     .to_string(),
             ),
             TlsAbort::Alert(code @ (42 | 46 | 48)) => Observation::Signalled(format!(
@@ -1856,17 +1955,11 @@ pub(super) async fn emit(
     // `h-goaway` is the one test whose frame must arrive *after* the client's
     // request, so its control stream is handed back named rather than parked
     // with the rest. Everything else has already written what it came to write.
-    let late_control = if test.id == GOAWAY_AFTER_REQUEST {
-        Some(control)
-    } else {
-        keep_open.push(control);
-        None
-    };
-
     Ok(Emitted {
         keep_open,
         encoder,
-        late_control,
+        control,
+        control_is_late: test.id == GOAWAY_AFTER_REQUEST,
     })
 }
 
@@ -1953,12 +2046,19 @@ pub(super) struct Emitted {
     pub(super) keep_open: Vec<quinn::SendStream>,
     /// The QPACK encoder stream.
     pub(super) encoder: quinn::SendStream,
-    /// The control stream, for the one test that writes to it after the
-    /// client's request rather than before it.
+    /// The control stream.
     ///
-    /// `None` for every other test, whose control stream is in `keep_open`
-    /// with nothing left to say.
-    pub(super) late_control: Option<quinn::SendStream>,
+    /// Named rather than parked in `keep_open` for two reasons now. The first
+    /// is `h-goaway`, which writes to it after the client's request rather
+    /// than before. The second is the read-proof: where a test's anomaly went
+    /// out on this stream and the client then said nothing, the only way to
+    /// tell "read it and accepted the violation" from "never read it" is to
+    /// write past the client's flow-control limit on this exact stream and see
+    /// whether credit is extended. Both need a handle that outlives `emit`.
+    pub(super) control: quinn::SendStream,
+    /// Whether `control` still has its frame to write, which is `h-goaway`
+    /// and nothing else.
+    pub(super) control_is_late: bool,
 }
 
 /// The server-side streams `watch_for_liveness` may still write to.
@@ -2231,7 +2331,7 @@ async fn watch_for_liveness(
             // decide. Silence means it really did carry on.
             let settle = Duration::from_secs(2);
             match tokio::time::timeout(settle, connection.closed()).await {
-                Ok(_) => match classify_close(connection) {
+                Ok(_) => match classify_close(connection).await {
                     // A clean close after a completed request is exactly what a
                     // client that handled the anomaly does.
                     Observation::ClosedSilently => Observation::SurvivedAndContinued,
@@ -2242,13 +2342,13 @@ async fn watch_for_liveness(
                 Err(_) => Observation::NoCloseObserved,
             }
         }
-        Ok(Err(_)) => classify_close(connection),
+        Ok(Err(_)) => classify_close(connection).await,
         Err(_) => {
             // Nothing arrived in time. If the peer had closed we would have
             // seen an error above, so distinguish a real stall from a close
             // that raced the timeout.
             match connection.close_reason() {
-                Some(_) => classify_close(connection),
+                Some(_) => classify_close(connection).await,
                 None => Observation::TimedOut,
             }
         }
@@ -2397,12 +2497,7 @@ fn quic_observation(
             // follow-up request as recovery and a stall or a give-up as failure.
             return None;
         } else {
-            Observation::NotExercised(
-                "the client sent no early data, so nothing was rejected. 0-RTT needs a \
-                 session ticket from an earlier connection to this same port, and a \
-                 client that connects once has none"
-                    .to_string(),
-            )
+            no_early_data(counters, "nothing was rejected")
         }),
 
         // Every packet this endpoint sends is marked ECT(0), so a client with
@@ -2562,7 +2657,7 @@ fn quic_observation(
         // on it, and must not be recorded as having passed a test that never
         // ran. That its QPACK dynamic table is off is itself the useful finding.
         "h-qpack-dynamic-table" | "h-qpack-blocked-stream" if !qpack.dynamic_table_usable() => {
-            Some(Observation::NotExercised(qpack.why_unusable()))
+            Some(Observation::Unsupported(qpack.why_unusable()))
         }
 
         // Already sent on every connection: noq includes a reserved transport
@@ -2683,12 +2778,7 @@ fn quic_observation(
             if counters.zero_rtt_in() > zero_rtt_before {
                 return None;
             }
-            Some(Observation::NotExercised(
-                "the client sent no early data, so it was never answered 425. 0-RTT \
-                 needs a session ticket from an earlier connection to this same port, \
-                 and a client that connects once has none"
-                    .to_string(),
-            ))
+            Some(no_early_data(counters, "it was never answered 425"))
         }
 
         // Almost nothing on the public internet speaks multipath, which is
@@ -3200,15 +3290,199 @@ const LOSSY_BODY_CHUNKS: usize = 96;
 const LOSSY_CHUNK_BYTES: usize = 8192;
 const LOSSY_CHUNK_GAP: Duration = Duration::from_millis(30);
 
+/// Why no early data arrived, said accurately.
+///
+/// Three different things reached the same sentence before this existed, and
+/// only one of them was about the client:
+///
+///   * the client was never given a ticket to resume from -- the driver made
+///     one connection per test until 2026-09-19, and 22 cells said "a client
+///     that connects once has none" because that was literally true;
+///   * the client GREASEs its QUIC version, is answered with Version
+///     Negotiation as RFC 8999 §6 requires, and does not re-offer early data
+///     on the retry. Measured on the wire, this is exactly what Cloudflare
+///     quiche does: its 0-RTT rides in a 0xbabababa first flight and never
+///     comes back. It tried, and its own probe cost it the attempt;
+///   * the client had every opportunity and did not take it, which is the one
+///     case that is a fact about the client.
+///
+/// Reported as `Unsupported` only in the third: there the client has answered.
+fn no_early_data(counters: &Counters, what_was_missed: &str) -> Observation {
+    if counters.version_negotiations_out() > 0 {
+        return Observation::NotExercised(format!(
+            "the client sent no early data, so {what_was_missed}. It offered a GREASE QUIC \
+             version first, which this endpoint answered with Version Negotiation (RFC 8999 \
+             §6), and it did not re-offer early data on the v1 retry -- so the 0-RTT it \
+             intended never reached the wire. That is worth knowing about the client, but it \
+             is not this test"
+        ));
+    }
+    // Also inference from an absence, and held to the same bar as the
+    // control-stream case above.
+    //
+    // A client that was primed and sends no early data has probably declined
+    // 0-RTT -- but "probably" is the word doing the work. The driver primes,
+    // so a ticket was issued; whether *this* client resumed with it is not
+    // visible from here, and a client that silently failed to store the ticket
+    // is indistinguishable from one that stored it and chose not to use it.
+    // Calling that `Unsupported` would put a declaration in the client's mouth.
+    //
+    // Promoting it needs one more fact: whether the handshake resumed. rustls
+    // knows, and the fork could surface it the way `peer_initial_max_stream_data_uni`
+    // was surfaced. Until it does, this is inconclusive and the reason says so.
+    Observation::NotExercised(format!(
+        "the client sent no early data, so {what_was_missed}. A session was issued for it to \
+         resume from, so the opportunity existed -- but whether this client resumed the \
+         session at all is not observable from this end, and a client that failed to store \
+         the ticket looks exactly like one that stored it and chose not to offer early data"
+    ))
+}
+
+/// The most we will write to prove a control stream was read.
+///
+/// The probe has to exceed the client's `initial_max_stream_data_uni` to force
+/// a MAX_STREAM_DATA, so its cost is that limit, not a number we pick. A few
+/// clients advertise windows in the tens of megabytes; pushing that much down
+/// a control stream to settle one verdict is a bad trade, so above this the
+/// probe is skipped and the result stays inconclusive and says why.
+const READ_PROOF_CEILING: u64 = 4 * 1024 * 1024;
+
+/// How long the client has to extend credit once the window is full.
+const READ_PROOF_WAIT: Duration = Duration::from_millis(1_500);
+
+/// Did the client actually read our control stream?
+///
+/// Returns `Some(true)` if it demonstrably did, `Some(false)` if it
+/// demonstrably did not, and `None` if the question could not be put.
+///
+/// The one signal in QUIC that distinguishes *delivered* from *read* is flow
+/// control. A receiver extends a stream's window with MAX_STREAM_DATA when its
+/// application consumes data (RFC 9000 §4.1); it has no reason to do so
+/// otherwise. So filling the window and writing one byte more asks the
+/// question directly: the write completes only if credit arrived, and credit
+/// arrives only if the client read.
+///
+/// The padding is a reserved frame type, which RFC 9114 §7.2.8 requires
+/// clients to skip using its length, so the probe adds nothing the client is
+/// entitled to object to. It runs only after the test's own exchange has
+/// settled and only when the verdict would otherwise be inconclusive, so it
+/// cannot colour what it is measuring.
+///
+/// Why this exists: "the client completed its request and closed without
+/// objecting, but the anomaly was on the control stream" was 41 of the 199
+/// inconclusive cells in the 2026-09-18 matrix — the single largest reason in
+/// the grid, and stated as though it were a fact of nature. It was not. It was
+/// the consequence of never asking.
+async fn control_stream_was_read(
+    test_id: &str,
+    connection: &quinn::Connection,
+    control: &mut quinn::SendStream,
+) -> Option<bool> {
+    let limit = connection.peer_initial_max_stream_data_uni();
+
+    // Logged for every connection, reached or skipped, because the first
+    // question anyone should ask of this probe is whether it ran at all.
+    //
+    // If the window a client advertises decides whether it gets probed, then
+    // a client with a small window collects real verdicts while one with a
+    // large window keeps its inconclusives -- and the difference between them
+    // would be a property of this harness wearing the costume of a finding.
+    // The per-client windows have to be comparable and the skips have to be
+    // countable, so both go in the log.
+    if limit == 0 || limit > READ_PROOF_CEILING {
+        info!(
+            "conformance: {} read-proof skipped (peer initial_max_stream_data_uni = {} bytes, ceiling {})",
+            test_id, limit, READ_PROOF_CEILING
+        );
+        return None;
+    }
+    info!(
+        "conformance: {} read-proof starting (peer window {} bytes)",
+        test_id, limit
+    );
+
+    // Everything already written on this stream counts against the same
+    // window, so overshooting the whole limit is certain to cross it whatever
+    // the test sent.
+    let payload = vec![0u8; 4096];
+    let frame = f::reserved_frame(0x1f, &payload);
+    let writes = (limit / frame.len() as u64) + 2;
+
+    let probe = async {
+        for _ in 0..writes {
+            control.write_all(&frame).await?;
+        }
+        Ok::<(), quinn::WriteError>(())
+    };
+
+    let outcome = tokio::time::timeout(READ_PROOF_WAIT, probe).await;
+    let (verdict, why) = match &outcome {
+        // Wrote past the window, so credit was extended, so the client read.
+        Ok(Ok(())) => (Some(true), "credit extended past the window".to_string()),
+        // The stream died under us: the client is gone and nothing is proven.
+        Ok(Err(e)) => (None, format!("stream ended under the probe: {e}")),
+        // The window filled and stayed full for the whole wait. The client is
+        // still there — it just is not reading this stream.
+        Err(_) => (
+            Some(false),
+            "window stayed full for the whole wait".to_string(),
+        ),
+    };
+    info!(
+        "conformance: {} read-proof result={:?} window={} wrote={} why={}",
+        test_id,
+        verdict,
+        limit,
+        writes * frame.len() as u64,
+        why
+    );
+    verdict
+}
+
+/// How long to wait for a close that a PING should have shaken loose.
+///
+/// One round trip plus slack. These clients are on the same host or a few
+/// milliseconds away; a peer in closing state answers immediately or not at
+/// all, and waiting longer only delays the run.
+const CLOSE_ELICIT_WAIT: Duration = Duration::from_millis(400);
+
 /// Turn a closed connection into an observation, preserving the error code the
 /// client chose — which for the correctness tests is the entire point.
-fn classify_close(connection: &quinn::Connection) -> Observation {
-    match connection.close_reason() {
-        Some(e) => classify_error(&e),
-        // Still open, or closed in a way the transport did not record: either
-        // way nothing was observed about how the client took the anomaly.
-        None => Observation::NoCloseObserved,
+async fn classify_close(connection: &quinn::Connection) -> Observation {
+    if let Some(e) = connection.close_reason() {
+        return classify_error(&e);
     }
+
+    // Nothing recorded — so ask, rather than reporting that we could not tell.
+    //
+    // RFC 9000 §10.2.1: an endpoint in the closing state re-sends its
+    // CONNECTION_CLOSE in answer to an incoming packet, and only then. A
+    // client that rejected the anomaly correctly and whose one close was lost
+    // therefore looks exactly like a client that never objected. The suite
+    // documented that indistinguishability in `Observation::NoCloseObserved`
+    // for months and treated it as a fact of nature; it is not. It is the
+    // consequence of never having sent anything after the anomaly.
+    //
+    // One PING settles it. A peer in closing state answers with the close it
+    // already sent; a peer that never closed stays quiet and the observation
+    // is unchanged. Worth 14 cells of the 2026-09-18 matrix, and worth more
+    // than that to the principle: an inconclusive verdict should mean the
+    // instrument has something to fix, and this one did.
+    connection.ping();
+    let deadline = tokio::time::Instant::now() + CLOSE_ELICIT_WAIT;
+    loop {
+        if let Some(e) = connection.close_reason() {
+            return classify_error(&e);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Asked, and still nothing. Now the silence is evidence rather than an
+    // absence of it: this peer is not in closing state.
+    Observation::NoCloseObserved
 }
 
 /// The same classification, from an error rather than from a live connection.

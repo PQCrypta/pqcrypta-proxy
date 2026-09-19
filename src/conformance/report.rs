@@ -21,6 +21,10 @@ use super::session::{Result_, Verdict};
 pub struct ClassSummary {
     pub pass: usize,
     pub fail: usize,
+    /// The client said it does not do this. A finding, not a gap.
+    pub unsupported: usize,
+    /// The suite failed to measure. Every one of these is a line on our own
+    /// bug list, not a property of the client.
     pub inconclusive: usize,
     pub not_run: usize,
 }
@@ -89,6 +93,7 @@ pub fn build(session_id: &str, results: &[Result_], generated_at: String) -> Rep
             match r.verdict {
                 Verdict::Pass => bucket.pass += 1,
                 Verdict::Fail => bucket.fail += 1,
+                Verdict::Unsupported => bucket.unsupported += 1,
                 Verdict::Inconclusive => bucket.inconclusive += 1,
                 Verdict::NotRun => bucket.not_run += 1,
             }

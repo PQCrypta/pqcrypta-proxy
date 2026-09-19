@@ -57,7 +57,33 @@ pub enum Verdict {
     /// Deliberately distinct from `Fail`: an inconclusive run is our problem to
     /// explain, not the client's bug to fix, and folding the two together would
     /// produce reports that blame clients for what we could not see.
+    ///
+    /// It is also deliberately distinct from [`Unsupported`](Self::Unsupported),
+    /// and that split was overdue. Until it existed this variant carried both
+    /// "we failed to measure" and "the client told us it does not do this",
+    /// which are opposites: one is a defect in the instrument and the other is
+    /// the finding. In the 2026-09-18 matrix 63 of 199 inconclusive cells were
+    /// the second kind -- a client advertising `SETTINGS_QPACK_MAX_TABLE_CAPACITY:
+    /// 0`, or offering no key exchange group a port would negotiate -- and
+    /// filing those under "no conclusion available" made a definite capability
+    /// gap read as a gap in our own measurement.
+    ///
+    /// The bar is now: if this verdict appears, the suite has something to fix.
     Inconclusive,
+    /// The client is definitively not capable of what the test is about, and
+    /// said so itself.
+    ///
+    /// Not a failure and not a gap: an answer. A client that advertises a QPACK
+    /// dynamic table capacity of zero has stated it will not use the dynamic
+    /// table, and a client refused for offering no key exchange group this port
+    /// negotiates has stated it cannot do that group. Both are facts about the
+    /// client, established by the run, and both are the kind of thing someone
+    /// reads this matrix to find out.
+    ///
+    /// Excluded from the pass rate for the same reason `Inconclusive` is --
+    /// the client was never judged against the clause -- but reported as a
+    /// result rather than as an absence of one.
+    Unsupported,
     /// The client never attempted this test.
     NotRun,
 }
@@ -68,6 +94,7 @@ impl Verdict {
             Verdict::Pass => "pass",
             Verdict::Fail => "fail",
             Verdict::Inconclusive => "inconclusive",
+            Verdict::Unsupported => "unsupported",
             Verdict::NotRun => "not_run",
         }
     }
@@ -153,7 +180,24 @@ pub enum Observation {
     /// one direction or the other: scoring it as a pass credits a client for
     /// something it was never asked to do, and scoring it as a failure accuses
     /// it of accepting a violation that was never sent. Neither is a result.
+    ///
+    /// Reserved, since 2026-09-19, for cases where *the run* fell short. Where
+    /// the client itself closed the door -- it advertised that it will not use
+    /// the feature, or offered nothing the port can negotiate -- the outcome is
+    /// [`Unsupported`](Self::Unsupported), which is a finding rather than a
+    /// hole. Every remaining `NotExercised` is a line on the suite's own bug
+    /// list.
     NotExercised(String),
+    /// The client stated, by its own configuration or its own refusal, that it
+    /// does not do the thing the test is about.
+    ///
+    /// The distinction from [`NotExercised`](Self::NotExercised) is who fell
+    /// short. "The request was too small to approach the window" is the run
+    /// failing to set up the situation. "The client advertised a QPACK dynamic
+    /// table capacity of zero, which forbids the server's encoder from using
+    /// the table at all" is the client answering the question before it was
+    /// asked -- and that answer is exactly what a reader wants.
+    Unsupported(String),
 }
 
 /// One recorded result.
@@ -208,6 +252,10 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
              it either way."
                 .to_string(),
         );
+    }
+
+    if let Observation::Unsupported(why) = obs {
+        return (Verdict::Unsupported, format!("{why}."));
     }
 
     if let Observation::NotExercised(why) = obs {
@@ -394,10 +442,11 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
         // exactly like a rejection that was never sent.
         (Class::Correctness, Observation::NoCloseObserved) => (
             Verdict::Inconclusive,
-            "The client completed its request and then said nothing further before the \
-             window closed. A rejection whose CONNECTION_CLOSE was lost cannot be told \
-             apart from a client that never objected: QUIC re-sends that frame only in \
-             answer to an incoming packet, so one that goes missing is simply never seen."
+            "The client completed its request, said nothing further, and did not answer a \
+             PING with a close. A peer in closing state re-sends its CONNECTION_CLOSE when \
+             a packet arrives (RFC 9000 §10.2.1), so the PING rules out a rejection whose \
+             close was simply lost — but it cannot show what the client did instead, and \
+             this is the residue the suite has not yet found a way to read."
                 .to_string(),
         ),
 
@@ -410,11 +459,12 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
             | Observation::ClosedWith { .. },
         ) if catalog::anomaly_stream(test) == catalog::Anomaly::ControlStream => (
             Verdict::Inconclusive,
-            "The client completed its request and closed without objecting, but the anomaly \
-             was written to the control stream — a unidirectional stream nothing obliges it \
-             to read on any schedule. A one-shot request can finish before that stream is \
-             picked up, so this is equally consistent with accepting the violation and with \
-             never having seen it, and neither can be told from here."
+            "The client completed its request and closed without objecting, and the anomaly \
+             was on the control stream. Whether it read that stream is decided by filling \
+             its flow-control window and seeing if credit is extended; reaching this \
+             sentence means the probe could not be put — the stream was already gone, or \
+             the client's window was too large to fill for the price. Those are the only \
+             two cases left, and both are ours to fix."
                 .to_string(),
         ),
         (Class::Correctness, Observation::SurvivedAndContinued) => (
@@ -569,6 +619,7 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
             Verdict::Inconclusive,
             format!("The run did not exercise this test: {why}."),
         ),
+        (_, Observation::Unsupported(why)) => (Verdict::Unsupported, format!("{why}.")),
         (_, Observation::Violated(what)) => (Verdict::Fail, format!("{what}.")),
 
         // Same reasoning, pointed at the other outcome: the test has

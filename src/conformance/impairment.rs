@@ -82,6 +82,19 @@ pub struct Counters {
     /// tried, and scoring the second as though it were the first would pass
     /// every client that has no session ticket.
     pub zero_rtt_in: AtomicU64,
+    /// Version Negotiation packets this endpoint sent.
+    ///
+    /// Counted because it is the missing half of the 0-RTT verdict. A client
+    /// that GREASEs its QUIC version -- quiche puts 0xbabababa in a
+    /// speculative first flight -- is answered with Version Negotiation, as
+    /// RFC 8999 §6 requires, and then starts again on v1. Measured on the
+    /// wire, quiche coalesces its early data into that GREASE flight and does
+    /// not re-offer it on the retry, so not one 0-RTT packet reaches us.
+    ///
+    /// Without this counter the suite reported that as "the client sent no
+    /// early data", which is true of the wire and quite wrong about the
+    /// client: it tried, and its own version probe cost it the attempt.
+    pub version_negotiations_out: AtomicU64,
     /// The address the most recent datagram came from.
     ///
     /// `q-version-negotiation` is judged from the socket alone — no connection
@@ -122,6 +135,10 @@ impl Counters {
 
     pub fn zero_rtt_in(&self) -> u64 {
         self.zero_rtt_in.load(Ordering::Relaxed)
+    }
+
+    pub fn version_negotiations_out(&self) -> u64 {
+        self.version_negotiations_out.load(Ordering::Relaxed)
     }
 
     pub fn last_peer(&self) -> Option<SocketAddr> {
@@ -692,6 +709,20 @@ impl UdpSender for ImpairedSender {
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
         let now = Instant::now();
+
+        // A Version Negotiation packet carries version 0 (RFC 8999 §6), and it
+        // is the one long-header packet whose type bits mean nothing. Counting
+        // it here rather than inferring it later, because by the time a
+        // verdict is being written the packet is long gone.
+        if let Some(contents) = transmit.contents.get(..5) {
+            if contents[0] & 0x80 != 0
+                && u32::from_be_bytes([contents[1], contents[2], contents[3], contents[4]]) == 0
+            {
+                self.counters
+                    .version_negotiations_out
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
 
         // Loss first, and counted only while the impairment is open.
         //
