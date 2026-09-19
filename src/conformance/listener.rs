@@ -982,7 +982,9 @@ async fn run_one(
     let observation = if test.id == "t-cert-compression-pq"
         && matches!(
             observation,
-            Observation::SurvivedAndContinued | Observation::NoCloseObserved
+            Observation::SurvivedAndContinued
+                | Observation::NoCloseObserved
+                | Observation::PeerUnreachable
         ) {
         Observation::Signalled(
             "completed the handshake against an ML-DSA-87 chain: the compressed certificate \
@@ -3550,9 +3552,14 @@ async fn classify_close(
     // counters say which of the two the run was.
     if connection.stats().frame_rx.acks > acks_before {
         elicitation.acknowledge();
+        return Observation::NoCloseObserved;
     }
 
-    Observation::NoCloseObserved
+    // Nothing came back at all, so the silence is not the peer's -- it may not
+    // be there. Reporting this as `NoCloseObserved` would have the correctness
+    // tier say a PING ruled out a lost rejection, which a PING that reached
+    // nobody does not.
+    Observation::PeerUnreachable
 }
 
 /// The same classification, from an error rather than from a live connection.

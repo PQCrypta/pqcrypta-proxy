@@ -131,6 +131,23 @@ pub enum Observation {
     /// correctness test it matters entirely, because there the verdict turns on
     /// how the connection ended and this is the case where nobody saw.
     NoCloseObserved,
+    /// The probe itself drew nothing: no close, and no acknowledgement either.
+    ///
+    /// [`NoCloseObserved`](Self::NoCloseObserved) means the server asked and a
+    /// live peer declined to say anything. This means the server asked and
+    /// cannot show anyone was listening. The two used to be one variant, and
+    /// the difference is not cosmetic: 42 of 93 probes in the 2026-09-19
+    /// matrix fell here, and for all of them the report claimed a PING had
+    /// "ruled out a rejection whose close was lost". A PING that reached
+    /// nobody rules out nothing, so that was a false statement about the
+    /// evidence in nearly half the cases it was made.
+    ///
+    /// It is folded back into a pass wherever the pass was earned before the
+    /// probe ran -- the follow-up request completing is what those classes
+    /// measure, and it had already completed. Only the correctness tier turns
+    /// on how the connection ended, and there this is the case where the
+    /// instrument cannot show it was heard.
+    PeerUnreachable,
     /// The client closed the connection with this application error code.
     ClosedWith { code: u64 },
     /// The client closed without an error code, or the transport dropped.
@@ -323,6 +340,7 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
             obs,
             Observation::SurvivedAndContinued
                 | Observation::NoCloseObserved
+                | Observation::PeerUnreachable
                 | Observation::ClosedSilently
                 | Observation::ClosedWith { .. }
         )
@@ -344,6 +362,14 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
             "Ignored the unrecognised element and completed the follow-up request.".to_string(),
         ),
         (Class::Extensibility, Observation::NoCloseObserved) => (
+            Verdict::Pass,
+            "Ignored the unrecognised element and completed the follow-up request.".to_string(),
+        ),
+        // The pass was earned by the follow-up request, which completed before
+        // the probe ran. Whether the client was still listening afterwards
+        // does not bear on it, so the verdict is the same and the sentence
+        // claims nothing about the probe.
+        (Class::Extensibility, Observation::PeerUnreachable) => (
             Verdict::Pass,
             "Ignored the unrecognised element and completed the follow-up request.".to_string(),
         ),
@@ -442,11 +468,21 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
         // exactly like a rejection that was never sent.
         (Class::Correctness, Observation::NoCloseObserved) => (
             Verdict::Inconclusive,
-            "The client completed its request, said nothing further, and did not answer a \
-             PING with a close. A peer in closing state re-sends its CONNECTION_CLOSE when \
-             a packet arrives (RFC 9000 §10.2.1), so the PING rules out a rejection whose \
-             close was simply lost — but it cannot show what the client did instead, and \
-             this is the residue the suite has not yet found a way to read."
+            "The client completed its request, said nothing further, and answered a PING \
+             without closing. A peer in closing state re-sends its CONNECTION_CLOSE when a \
+             packet arrives (RFC 9000 §10.2.1), and this one acknowledged the packet and \
+             sent no close, so it was still there and had not rejected the anomaly. What it \
+             did instead is the residue the suite has not yet found a way to read."
+                .to_string(),
+        ),
+        (Class::Correctness, Observation::PeerUnreachable) => (
+            Verdict::Inconclusive,
+            "The client completed its request and then answered nothing at all — neither a \
+             close nor an acknowledgement of the PING sent to elicit one. So this says less \
+             than the case above it: the server cannot show the question was even received, \
+             and a client that exited without closing looks from here exactly like one that \
+             read the anomaly and carried on. Reported separately rather than as silence \
+             from a live peer, which is a stronger claim than the run supports."
                 .to_string(),
         ),
 
@@ -513,6 +549,10 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
             Verdict::Pass,
             "Recovered and completed the follow-up request.".to_string(),
         ),
+        (Class::Resilience, Observation::PeerUnreachable) => (
+            Verdict::Pass,
+            "Recovered and completed the follow-up request.".to_string(),
+        ),
         (Class::Resilience, Observation::Signalled(what)) => {
             (Verdict::Pass, format!("Recovered: {what}."))
         }
@@ -538,6 +578,10 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
             "Decoded it and completed the request.".to_string(),
         ),
         (Class::Interoperability, Observation::NoCloseObserved) => (
+            Verdict::Pass,
+            "Decoded it and completed the request.".to_string(),
+        ),
+        (Class::Interoperability, Observation::PeerUnreachable) => (
             Verdict::Pass,
             "Decoded it and completed the request.".to_string(),
         ),
@@ -586,6 +630,12 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
                 .to_string(),
         ),
         (Class::Discretionary, Observation::NoCloseObserved) => (
+            Verdict::Pass,
+            "Tolerated it and continued. The specification permits this but does not \
+             require it; a client that rejected it would also be conformant."
+                .to_string(),
+        ),
+        (Class::Discretionary, Observation::PeerUnreachable) => (
             Verdict::Pass,
             "Tolerated it and continued. The specification permits this but does not \
              require it; a client that rejected it would also be conformant."
@@ -1129,13 +1179,35 @@ mod tests {
         let (v, _) = judge(t, &Observation::SurvivedAndContinued, Some(want));
         assert_eq!(v, Verdict::Fail);
 
-        // Seen to do nothing at all: no evidence either way.
+        // A live peer that said nothing: no evidence either way, and the
+        // report may say the peer was there, because the probe was answered.
         let (v, d) = judge(t, &Observation::NoCloseObserved, Some(want));
         assert_eq!(v, Verdict::Inconclusive);
-        assert!(d.contains("lost"), "name the reason it cannot be told: {d}");
+        assert!(
+            d.contains("acknowledged the packet"),
+            "say what the probe established: {d}"
+        );
+
+        // A peer that answered nothing at all. Also inconclusive, but for a
+        // weaker reason, and the report must not borrow the stronger one: a
+        // PING that drew no acknowledgement rules nothing out. This assertion
+        // is the guard -- the two texts were one sentence until 2026-09-19,
+        // and it claimed a lost rejection had been ruled out in 42 of the 93
+        // cases it was printed in.
+        let (v, d) = judge(t, &Observation::PeerUnreachable, Some(want));
+        assert_eq!(v, Verdict::Inconclusive);
+        assert!(
+            d.contains("neither a close nor an acknowledgement"),
+            "say that nothing came back: {d}"
+        );
+        assert!(
+            !d.contains("rules out"),
+            "an unanswered probe rules nothing out: {d}"
+        );
 
         // For the classes whose pass is carrying on, the probe completing is
-        // the evidence and silence afterwards changes nothing.
+        // the evidence and what happens afterwards changes nothing -- whether
+        // the peer went quiet or went away.
         for (id, class) in [
             ("h-grease-settings", Class::Extensibility),
             ("h-trailers", Class::Interoperability),
@@ -1144,8 +1216,14 @@ mod tests {
         ] {
             let t = test_of(id);
             assert_eq!(t.class, class, "{id} changed class");
-            let (v, _) = judge(t, &Observation::NoCloseObserved, None);
-            assert_eq!(v, Verdict::Pass, "{id}: the follow-up request completed");
+            for obs in [Observation::NoCloseObserved, Observation::PeerUnreachable] {
+                let (v, _) = judge(t, &obs, None);
+                assert_eq!(
+                    v,
+                    Verdict::Pass,
+                    "{id}/{obs:?}: the follow-up request completed"
+                );
+            }
         }
     }
 
