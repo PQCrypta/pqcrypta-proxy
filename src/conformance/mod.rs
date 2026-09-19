@@ -121,6 +121,18 @@ pub struct CloseElicitation {
     pub attempted: std::sync::atomic::AtomicU64,
     /// Of those, the ones that answered with a close before the wait expired.
     pub answered: std::sync::atomic::AtomicU64,
+    /// Of those, the ones where the peer acknowledged the probe at the
+    /// transport layer without producing a close.
+    ///
+    /// This is what separates the two readings of a zero answer rate. A peer
+    /// that ACKs the PING and sends no close is demonstrably alive and simply
+    /// not in closing state, so `NoCloseObserved` is the right answer and the
+    /// probe did its job by proving it. A probe that draws neither a close nor
+    /// an ACK reached nobody, and a zero answer rate would mean the instrument
+    /// is broken rather than the conclusion sound. Without this counter the
+    /// two are indistinguishable, which is the same mistake the probe itself
+    /// was introduced to stop making.
+    pub acknowledged: std::sync::atomic::AtomicU64,
 }
 
 impl CloseElicitation {
@@ -134,11 +146,17 @@ impl CloseElicitation {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// `(attempted, answered)` as of now.
-    pub fn read(&self) -> (u64, u64) {
+    pub fn acknowledge(&self) {
+        self.acknowledged
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `(attempted, answered, acknowledged)` as of now.
+    pub fn read(&self) -> (u64, u64, u64) {
         (
             self.attempted.load(std::sync::atomic::Ordering::Relaxed),
             self.answered.load(std::sync::atomic::Ordering::Relaxed),
+            self.acknowledged.load(std::sync::atomic::Ordering::Relaxed),
         )
     }
 }

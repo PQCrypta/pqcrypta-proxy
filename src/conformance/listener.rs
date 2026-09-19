@@ -3501,15 +3501,30 @@ async fn classify_close(
     //
     // One PING settles it. A peer in closing state answers with the close it
     // already sent; a peer that never closed stays quiet and the observation
-    // is unchanged. Worth 14 cells of the 2026-09-18 matrix, and worth more
-    // than that to the principle: an inconclusive verdict should mean the
-    // instrument has something to fix, and this one did.
+    // is unchanged.
+    //
+    // This comment used to claim the probe was worth 14 cells of the
+    // 2026-09-18 matrix. It was not, and could not have been: until
+    // 2026-09-19 the probe was reachable only from call sites that already
+    // had a `close_reason()`, so it never ran. The counters below were added
+    // to check that claim and measured zero attempts across a full matrix.
+    // The figure had been read off a log from the targeted experiments, which
+    // are a different population, and written up as a property of the suite.
+    //
+    // What it is actually worth, now that it runs where the conclusion is
+    // drawn: the answer rate is zero and the acknowledgement rate is total.
+    // Every peer that reaches this point ACKs the PING and sends no close, so
+    // it is alive and `NoCloseObserved` below is correct -- which is the
+    // point. The probe's value here is not that it changes the answer but
+    // that it earns it, and the counters are published so the day it stops
+    // earning it is visible rather than silent.
     //
     // Counted, both halves. This probe is what decides a correctness test when
     // the first close went missing, so how often it works is a published
     // property of the instrument rather than something the suite asserts about
     // itself -- see `/conformance/` for the rate the last run measured.
     elicitation.attempt();
+    let acks_before = connection.stats().frame_rx.acks;
     connection.ping();
     let deadline = tokio::time::Instant::now() + CLOSE_ELICIT_WAIT;
     loop {
@@ -3525,6 +3540,18 @@ async fn classify_close(
 
     // Asked, and still nothing. Now the silence is evidence rather than an
     // absence of it: this peer is not in closing state.
+    //
+    // Provided the question arrived. A PING that drew neither a close nor an
+    // acknowledgement reached nobody, and reading that as "the client did not
+    // object" would be the very inference this probe exists to replace. So the
+    // ACK is counted separately: a peer that acknowledges and sends no close
+    // is demonstrably alive, and the observation below is a measurement. A
+    // peer that acknowledges nothing leaves it a guess, and the published
+    // counters say which of the two the run was.
+    if connection.stats().frame_rx.acks > acks_before {
+        elicitation.acknowledge();
+    }
+
     Observation::NoCloseObserved
 }
 

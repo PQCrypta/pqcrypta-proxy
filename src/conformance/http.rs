@@ -663,11 +663,18 @@ fn catalog_json(conformance: &Arc<Conformance>) -> Response<Body> {
 /// here resets them. A single absolute number would silently fold in every
 /// other connection the suite served in between.
 fn instrument_json(conformance: &Arc<Conformance>) -> Response<Body> {
-    let (attempted, answered) = conformance.close_elicitation.read();
+    let (attempted, answered, acknowledged) = conformance.close_elicitation.read();
+    let body = serde_json::json!({
+        "close_elicitation": {
+            "attempted": attempted,
+            "answered": answered,
+            "acknowledged": acknowledged,
+        }
+    });
     text(
         StatusCode::OK,
         "application/json; charset=utf-8",
-        format!("{{\"close_elicitation\":{{\"attempted\":{attempted},\"answered\":{answered}}}}}"),
+        body.to_string(),
     )
 }
 
