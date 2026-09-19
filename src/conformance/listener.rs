@@ -37,7 +37,7 @@ use tracing::{debug, info, warn};
 
 use super::catalog::{self, Test, Tier};
 use super::h3_frames as f;
-use super::impairment::{Counters, ImpairedSocket, Impairments, Since};
+use super::impairment::{Counters, ImpairedSocket, Impairments, PeerView};
 use super::session::Observation;
 use super::Conformance;
 use crate::tls::TlsProvider;
@@ -608,29 +608,31 @@ async fn run_one(
 ) -> anyhow::Result<()> {
     let started = Instant::now();
 
-    // What the port had counted before this client arrived.
-    //
-    // `Counters` belongs to the listener, not the connection: created once per
-    // port at start-up and never reset. Read directly, every field is the
-    // running total for every client that has ever connected there, and
-    // comparing one against a constant answers "has this ever happened here"
-    // while appearing to answer "did this client do it".
-    //
-    // Baselined before `accept()` rather than after, because 0-RTT and Initial
-    // packets are counted on the way in: by the time there is a `Connection`
-    // they are already in the totals.
-    //
-    // Everything downstream reads deltas through this handle and cannot reach
-    // the absolute values. `Since` in impairment.rs carries the list of seven
-    // verdicts that got this wrong before it existed -- including the one that
-    // decided `t-hybrid-large-hello`, which feeds the post-quantum results.
-    let since = conformance_counters.since_now();
     // Captured before the handshake: `Connection::remote_address` panics once
     // the connection is established, and this is the address that finds the
     // session anyway. Canonicalised so an IPv4-mapped IPv6 peer matches the
     // plain IPv4 address its /session call arrived from — the two spellings
     // have caused a lookup miss in this codebase before.
-    let peer_ip = crate::security::canonical_addr(incoming.remote_address()).ip();
+    let peer_addr = incoming.remote_address();
+    let peer_ip = crate::security::canonical_addr(peer_addr).ip();
+
+    // This connection's counters, and the only ones any verdict can reach.
+    //
+    // `Counters` belongs to the listener — one per port, created at start-up
+    // and never reset — so read directly, every field is the running total
+    // for every client that has ever connected there. Seven verdicts once did
+    // read them that way, and the symptom was one client's behaviour reported
+    // as nine other clients'.
+    //
+    // Taken before `accept()`, because 0-RTT and Initial packets are counted
+    // on the way in and are already recorded by the time a `Connection`
+    // exists. The view carries a baseline as well as the per-peer split: the
+    // split is what stops another client's traffic being read at all, and the
+    // baseline is what bounds the damage if two connections ever do share an
+    // address — unusual for this runner, where each client is a fresh process
+    // with a fresh ephemeral port, but the suite is public and a CI harness
+    // behind NAT would do it.
+    let since = conformance_counters.view_for(peer_addr);
 
     // A refusal here used to leave no trace, and the report said the opposite of
     // what happened.
@@ -917,7 +919,7 @@ async fn run_one(
     // talking, so it runs here rather than in `emit`: the anomaly is the server
     // vanishing mid-conversation, which needs a conversation first.
     let observation = if test.id == "q-stateless-reset" && test.implemented {
-        abandon_and_watch(&connection, &endpoint, &conformance_counters, &mut held).await
+        abandon_and_watch(&connection, &endpoint, &since, &mut held).await
     } else {
         observation
     };
@@ -1475,7 +1477,12 @@ async fn accept_connection(
 async fn abandon_and_watch(
     connection: &quinn::Connection,
     endpoint: &quinn::Endpoint,
-    counters: &Counters,
+    // Per-connection like every other verdict. The connection is abandoned
+    // partway through, but the peer does not change, so its own datagram
+    // count is the right thing to watch — and the wrong thing is the port
+    // aggregate, where another client arriving during the eight-second wait
+    // would look like this one still talking.
+    counters: &PeerView,
     held: &mut [quinn::SendStream],
 ) -> Observation {
     /// How long the body is allowed to flow before the connection is abandoned.
@@ -2411,9 +2418,10 @@ async fn watch_for_liveness(
 fn quic_observation(
     connection: &quinn::Connection,
     test: &'static Test,
-    // Deltas for this connection alone. A `&Counters` here is what let one
-    // client's traffic decide another client's verdict, seven times over.
-    counters: &Since,
+    // This peer's counters and nothing else. A `&Counters` here is what let
+    // one client's traffic decide another client's verdict, seven times over,
+    // and there is no route from this type to the port aggregate.
+    counters: &PeerView,
     qpack: &QpackLimits,
 ) -> Option<Observation> {
     let rx = connection.stats().frame_rx;
@@ -3336,7 +3344,7 @@ const LOSSY_CHUNK_GAP: Duration = Duration::from_millis(30);
 ///     case that is a fact about the client.
 ///
 /// Reported as `Unsupported` only in the third: there the client has answered.
-fn no_early_data(counters: &Since, what_was_missed: &str) -> Observation {
+fn no_early_data(counters: &PeerView, what_was_missed: &str) -> Observation {
     if counters.version_negotiations_out() > 0 {
         return Observation::NotExercised(format!(
             "the client sent no early data, so {what_was_missed}. It offered a GREASE QUIC \

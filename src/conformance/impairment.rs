@@ -29,7 +29,39 @@ use quinn::udp::{EcnCodepoint, RecvMeta, Transmit};
 
 use super::h3_frames::read_varint;
 use quinn::{AsyncUdpSocket, UdpSender};
-use tracing::debug;
+use tracing::{debug, warn};
+
+/// One peer's share of what the socket counted.
+///
+/// The fields mirror the numeric ones on [`Counters`], and they exist because
+/// `Counters` belongs to the *listener* — one per port, never reset — so every
+/// field there is the running total for every client that has ever connected.
+/// A verdict about one client must not be able to read a number another
+/// client moved.
+///
+/// That was not theoretical. It shipped seven times, and the symptom was a run
+/// reporting that ten of twelve implementations lose their 0-RTT to a version
+/// GREASE when exactly one of them does. A baseline handle over the shared
+/// counters closed that by
+/// subtracting a baseline — correct arithmetic over the wrong state. It still
+/// read a number every connection on the port was writing to, so the next
+/// defect from that root would have been an interleaving rather than a stale
+/// read, and no subtraction fixes that.
+///
+/// So the state is split at the source: every datagram is attributed to the
+/// peer it came from or went to, and a verdict reads only that peer's counts.
+#[derive(Debug, Default)]
+pub struct PeerCounters {
+    pub datagrams_in: AtomicU64,
+    pub dropped_oversize: AtomicU64,
+    pub marked_ce: AtomicU64,
+    pub reordered: AtomicU64,
+    pub shadowed: AtomicU64,
+    pub initials_in: AtomicU64,
+    pub dropped_loss: AtomicU64,
+    pub zero_rtt_in: AtomicU64,
+    pub version_negotiations_out: AtomicU64,
+}
 
 /// What the socket counted while a test ran.
 #[derive(Debug, Default)]
@@ -102,6 +134,16 @@ pub struct Counters {
     /// read. Without it that test's verdict has no session to be filed under and
     /// never reaches the client that earned it.
     pub last_peer: parking_lot::Mutex<Option<SocketAddr>>,
+    /// The same counts, split by peer. See [`PeerCounters`].
+    ///
+    /// Entries carry their last touch rather than their first, and are dropped
+    /// only once untouched for [`PEER_MEMORY`]. Every datagram to or from a
+    /// peer touches its entry, so a connection that is still being measured
+    /// cannot be evicted — which matters more here than for the impairment
+    /// clock next door. Losing a clock entry restarts a timing window and is
+    /// mildly wrong; losing a counter entry restarts a delta at zero and a
+    /// verdict reads a partial count as a whole one.
+    peers: DashMap<SocketAddr, (Arc<PeerCounters>, Instant)>,
 }
 
 impl Counters {
@@ -145,57 +187,98 @@ impl Counters {
         *self.last_peer.lock()
     }
 
-    /// What this port had counted when a connection began.
+    /// This peer's counters, creating the entry if it is new.
     ///
-    /// Take one of these at the top of every connection and read the counters
-    /// through it. See [`Since`] for why that is not optional.
-    pub fn since_now(self: &Arc<Self>) -> Since {
-        Since {
-            counters: Arc::clone(self),
-            zero_rtt_in: self.zero_rtt_in(),
-            version_negotiations_out: self.version_negotiations_out(),
-            initials_in: self.initials_in(),
-            marked_ce: self.marked_ce(),
-            dropped_loss: self.dropped_loss(),
-            dropped_oversize: self.dropped_oversize(),
-            reordered: self.reordered(),
-            shadowed: self.shadowed(),
-            datagrams_in: self.datagrams_in(),
+    /// Touches the entry, which is what keeps a live connection from being
+    /// evicted: every datagram either way comes through here.
+    pub fn peer(&self, addr: SocketAddr) -> Arc<PeerCounters> {
+        let now = Instant::now();
+        if self.peers.len() >= MAX_TRACKED_PEERS {
+            self.prune(now);
         }
+        let mut entry = self
+            .peers
+            .entry(addr)
+            .or_insert_with(|| (Arc::new(PeerCounters::default()), now));
+        entry.1 = now;
+        Arc::clone(&entry.0)
+    }
+
+    /// Drop what can be dropped, oldest first, protecting anything live.
+    ///
+    /// Age alone is not enough. Retaining only entries younger than
+    /// [`PEER_MEMORY`] frees nothing when every entry is younger than that,
+    /// which is exactly the case under a burst — a scan opening a thousand
+    /// source ports inside a minute leaves the map unbounded, and a
+    /// constructed test caught it doing precisely that at 2,049 entries.
+    ///
+    /// So age first, then oldest-first down to the bound, and never an entry
+    /// touched within [`ACTIVE_GRACE`]. Every datagram to or from a peer
+    /// touches its entry and these tests settle in seconds, so a connection
+    /// still being measured is inside that grace by construction. Losing its
+    /// entry would restart a delta at zero and let a verdict read a partial
+    /// count as a whole one, which is the one outcome worth growing the map
+    /// to avoid: if the bound cannot be met without evicting live peers, it
+    /// is not met, and the log says so.
+    fn prune(&self, now: Instant) {
+        self.peers
+            .retain(|_, (_, touched)| now.duration_since(*touched) < PEER_MEMORY);
+        if self.peers.len() < MAX_TRACKED_PEERS {
+            return;
+        }
+        // Past the ceiling, age stops protecting anything. Below it, an
+        // active peer is untouchable.
+        let over_ceiling = self.peers.len() >= HARD_PEER_CEILING;
+        let mut ages: Vec<(SocketAddr, Instant)> = self
+            .peers
+            .iter()
+            .map(|e| (*e.key(), e.value().1))
+            .filter(|(_, t)| over_ceiling || now.duration_since(*t) >= ACTIVE_GRACE)
+            .collect();
+        ages.sort_by_key(|(_, t)| *t);
+        let excess = self.peers.len().saturating_sub(MAX_TRACKED_PEERS / 2);
+        for (addr, _) in ages.into_iter().take(excess) {
+            self.peers.remove(&addr);
+        }
+        if over_ceiling {
+            warn!(
+                "conformance: {} peers on one port inside a minute — evicting active \
+                 entries to stay bounded, so a verdict in flight may be short its counts",
+                self.peers.len()
+            );
+        }
+    }
+
+    /// A verdict's view of one connection: this peer's counts, from where they
+    /// stood when the connection began.
+    ///
+    /// The baseline is not redundant with the per-peer split. Two connections
+    /// sharing an address is unusual for this runner — each client is a fresh
+    /// process with a fresh ephemeral port — but the suite is public, and a CI
+    /// harness behind NAT or a client binding a fixed source port would do it.
+    /// With the baseline, overlap degrades to a bounded stale count; without
+    /// it, it is cross-client contamination, which is the bug this split
+    /// exists to remove.
+    pub fn view_for(&self, addr: SocketAddr) -> PeerView {
+        PeerView::new(self.peer(addr))
     }
 }
 
-/// The counters as *this connection* moved them.
+/// One connection's counts, and the only counter type a verdict can reach.
 ///
-/// `Counters` belongs to the listener. It is created once per port at start-up
-/// and never reset, so every field is the running total for every client that
-/// has ever connected to that port. Reading one directly and comparing it
-/// against a constant -- `> 0`, `== 0`, `> 1` -- asks "has this ever happened
-/// here", and then answers a question about the client in front of you with
-/// it.
+/// The handle this replaces subtracted a baseline from a number the whole
+/// port was writing to — correct arithmetic over shared state. This reads a
+/// number only one peer writes to, and subtracts a baseline as well. The
+/// difference that matters is not the arithmetic: it is that there is no way
+/// from here to the port aggregate, so a verdict cannot read another
+/// connection's traffic even by mistake.
 ///
-/// That is not a hypothetical. It shipped twice. `zero_rtt_in` was the first:
-/// the first client ever to send early data on a port set the flag
-/// permanently, and every client after it was judged as though it had too.
-/// That was found, fixed with a hand-rolled baseline, and documented at the
-/// call site -- and then on 2026-09-19 `version_negotiations_out` was added
-/// with `> 0` ten lines below the comment explaining why not to. A run
-/// reported that ten of twelve clients lose their 0-RTT to a version GREASE;
-/// one does, and it had poisoned the port for the nine that followed.
-///
-/// Auditing the rest of the file after that found six more: `initials_in > 1`
-/// deciding `t-hybrid-large-hello` (which feeds the post-quantum results),
-/// `marked_ce == 0`, `dropped_loss > 0`, `reordered > 0`, `shadowed > 0` and
-/// `dropped_oversize`. Seven instances of one shape, and the shape is
-/// "shared mutable port state read as though it described one client".
-///
-/// So the absolute reads are no longer reachable from the verdict path. A
-/// verdict takes one of these instead of a `&Counters`, and every accessor on
-/// it returns the delta. Getting it wrong now requires deliberately reaching
-/// past this type, which is a different and much more visible mistake than
-/// forgetting a subtraction.
-pub struct Since {
-    counters: Arc<Counters>,
+/// `watch_version_negotiation` still takes `&Counters`, and that is the one
+/// legitimate exception: no connection is ever established on that port —
+/// the stack answers the Initial and discards it without surfacing an
+/// `Incoming` — so there is no per-connection state for it to read.
+pub struct PeerView {
+    counters: Arc<PeerCounters>,
     zero_rtt_in: u64,
     version_negotiations_out: u64,
     initials_in: u64,
@@ -207,20 +290,37 @@ pub struct Since {
     datagrams_in: u64,
 }
 
-macro_rules! since_delta {
+impl PeerView {
+    fn new(counters: Arc<PeerCounters>) -> Self {
+        Self {
+            zero_rtt_in: counters.zero_rtt_in.load(Ordering::Relaxed),
+            version_negotiations_out: counters.version_negotiations_out.load(Ordering::Relaxed),
+            initials_in: counters.initials_in.load(Ordering::Relaxed),
+            marked_ce: counters.marked_ce.load(Ordering::Relaxed),
+            dropped_loss: counters.dropped_loss.load(Ordering::Relaxed),
+            dropped_oversize: counters.dropped_oversize.load(Ordering::Relaxed),
+            reordered: counters.reordered.load(Ordering::Relaxed),
+            shadowed: counters.shadowed.load(Ordering::Relaxed),
+            datagrams_in: counters.datagrams_in.load(Ordering::Relaxed),
+            counters,
+        }
+    }
+}
+
+macro_rules! peer_delta {
     ($($name:ident),+ $(,)?) => {
-        impl Since {
+        impl PeerView {
             $(
-                /// How far this counter moved during this connection.
+                /// How far this peer's counter moved during this connection.
                 pub fn $name(&self) -> u64 {
-                    self.counters.$name().saturating_sub(self.$name)
+                    self.counters.$name.load(Ordering::Relaxed).saturating_sub(self.$name)
                 }
             )+
         }
     };
 }
 
-since_delta!(
+peer_delta!(
     zero_rtt_in,
     version_negotiations_out,
     initials_in,
@@ -231,14 +331,6 @@ since_delta!(
     shadowed,
     datagrams_in,
 );
-
-impl Since {
-    /// The port's own counters, for the few places that genuinely want a
-    /// lifetime total rather than this connection's share.
-    pub fn port_total(&self) -> &Counters {
-        &self.counters
-    }
-}
 
 /// How long a peer's traffic flows cleanly before the black hole opens under it.
 ///
@@ -269,6 +361,27 @@ impl std::fmt::Debug for PeerClock {
 /// Peers tracked before stale entries are cleared. A conformance port sees one
 /// client at a time; this is headroom, not a working set.
 const MAX_TRACKED_PEERS: usize = 1024;
+
+/// How recently a peer must have been seen to count as still being measured.
+///
+/// Longer than any test takes to settle and longer than the liveness window,
+/// so an entry inside this is one a verdict may still be reading. Nothing in
+/// it is ever evicted.
+const ACTIVE_GRACE: Duration = Duration::from_secs(60);
+
+/// The point at which bounded memory beats a precise verdict.
+///
+/// Below this, a peer touched inside [`ACTIVE_GRACE`] is never evicted, so a
+/// connection being measured cannot lose its count. That protection has no
+/// bound of its own: under a scan opening thousands of source ports a second,
+/// every entry is recent and nothing is evictable. A constructed test found
+/// the map at 2,049 entries and climbing.
+///
+/// So there is a ceiling, and past it the oldest go regardless. A port that
+/// has seen four thousand peers inside a minute is being scanned, not
+/// measured, and the verdict that might be spoiled belongs to a connection
+/// competing with a flood. Losing it is the better failure.
+const HARD_PEER_CEILING: usize = MAX_TRACKED_PEERS * 4;
 
 /// How long a peer is remembered. Comfortably longer than the 30-second idle
 /// timeout these connections run with, so no live peer is ever forgotten and
@@ -473,6 +586,16 @@ impl AsyncUdpSocket for ImpairedSocket {
             self.counters
                 .datagrams_in
                 .fetch_add(n as u64, Ordering::Relaxed);
+            // Per datagram rather than per batch: a `recvmmsg` batch can carry
+            // datagrams from more than one peer, and crediting the whole batch
+            // to the first sender would reintroduce exactly the cross-client
+            // contamination this split removes.
+            for m in meta.iter().take(n) {
+                self.counters
+                    .peer(m.addr)
+                    .datagrams_in
+                    .fetch_add(1, Ordering::Relaxed);
+            }
 
             if let Some(m) = meta.first().filter(|_| n > 0) {
                 *self.counters.last_peer.lock() = Some(m.addr);
@@ -486,11 +609,17 @@ impl AsyncUdpSocket for ImpairedSocket {
             // observe. On the wire it is plainly labelled.
             for (buf, m) in bufs.iter().zip(meta.iter()).take(n) {
                 if let Some(dgram) = buf.get(..m.len) {
+                    // Both totals move together: the port aggregate for the
+                    // one reader that has no connection to speak of, and this
+                    // peer's own for every verdict.
+                    let peer = self.counters.peer(m.addr);
                     if carries_zero_rtt(dgram) {
                         self.counters.zero_rtt_in.fetch_add(1, Ordering::Relaxed);
+                        peer.zero_rtt_in.fetch_add(1, Ordering::Relaxed);
                     }
                     if carries_initial(dgram) {
                         self.counters.initials_in.fetch_add(1, Ordering::Relaxed);
+                        peer.initials_in.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -534,6 +663,15 @@ impl AsyncUdpSocket for ImpairedSocket {
                 self.counters
                     .dropped_oversize
                     .fetch_add(dropped as u64, Ordering::Relaxed);
+                // `compact_oversize` has already removed the dropped entries,
+                // so the addresses are gone by here; the peer is the one this
+                // socket is talking to.
+                if let Some(m) = meta.first() {
+                    self.counters
+                        .peer(m.addr)
+                        .dropped_oversize
+                        .fetch_add(dropped as u64, Ordering::Relaxed);
+                }
                 debug!("conformance: black hole swallowed {dropped} inbound datagram(s)");
             }
             if kept == 0 && n > 0 {
@@ -815,6 +953,10 @@ impl UdpSender for ImpairedSender {
                 self.counters
                     .version_negotiations_out
                     .fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .peer(transmit.destination)
+                    .version_negotiations_out
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -829,6 +971,10 @@ impl UdpSender for ImpairedSender {
             let nth = self.sent_while_lossy.fetch_add(1, Ordering::Relaxed) + 1;
             if is_lost(nth, one_in) {
                 self.counters.dropped_loss.fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .peer(transmit.destination)
+                    .dropped_loss
+                    .fetch_add(1, Ordering::Relaxed);
                 debug!(
                     "conformance: dropped datagram {nth} of every {one_in} to the peer \
                      ({} bytes)",
@@ -853,6 +999,10 @@ impl UdpSender for ImpairedSender {
                 let nth = self.ce_seen.fetch_add(1, Ordering::Relaxed) + 1;
                 if is_multiple_of(nth, one_in) {
                     self.counters.marked_ce.fetch_add(1, Ordering::Relaxed);
+                    self.counters
+                        .peer(transmit.destination)
+                        .marked_ce
+                        .fetch_add(1, Ordering::Relaxed);
                     marked = Some(Transmit {
                         destination: transmit.destination,
                         ecn: Some(EcnCodepoint::Ce),
@@ -896,6 +1046,10 @@ impl UdpSender for ImpairedSender {
                 };
                 if self.inner.as_mut().poll_send(&late, cx).is_ready() {
                     self.counters.reordered.fetch_add(1, Ordering::Relaxed);
+                    self.counters
+                        .peer(transmit.destination)
+                        .reordered
+                        .fetch_add(1, Ordering::Relaxed);
                 } else {
                     // The socket is full. Keep it rather than drop it: this
                     // impairment reorders, it does not lose.
@@ -929,6 +1083,10 @@ impl UdpSender for ImpairedSender {
                 && shadow.shadow(transmit.contents, transmit.destination)
             {
                 self.counters.shadowed.fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .peer(transmit.destination)
+                    .shadowed
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -1271,23 +1429,31 @@ mod tests {
 }
 
 #[cfg(test)]
-mod since_tests {
+mod peer_counter_tests {
     use super::*;
 
-    /// A baseline taken after other clients have used the port reports zero
-    /// for them and only this connection's share afterwards.
-    ///
-    /// The regression this guards is not hypothetical: it shipped seven times.
-    /// A cumulative per-port counter read as an absolute made the first client
-    /// to do something decide the verdict for every client after it, and the
-    /// symptom was a run reporting that ten of twelve implementations lose
-    /// their 0-RTT to a version GREASE when one of them does.
-    #[test]
-    fn a_baseline_hides_what_earlier_clients_did() {
-        let counters = Arc::new(Counters::default());
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
 
-        // Nine earlier clients on this port.
-        for _ in 0..9 {
+    /// One client's traffic must not be visible to another's verdict.
+    ///
+    /// The regression is not hypothetical: it shipped seven times. Reading a
+    /// cumulative per-port counter as though it described one connection made
+    /// the first client to do something decide the verdict for every client
+    /// after it, and the symptom was a run reporting that ten of twelve
+    /// implementations lose their 0-RTT to a version GREASE when one does.
+    #[test]
+    fn a_peer_sees_only_its_own_traffic() {
+        let counters = Counters::default();
+
+        // Nine earlier clients, each on its own ephemeral port.
+        for p in 40000..40009 {
+            let peer = counters.peer(addr(p));
+            peer.version_negotiations_out
+                .fetch_add(1, Ordering::Relaxed);
+            peer.zero_rtt_in.fetch_add(3, Ordering::Relaxed);
+            peer.initials_in.fetch_add(2, Ordering::Relaxed);
             counters
                 .version_negotiations_out
                 .fetch_add(1, Ordering::Relaxed);
@@ -1295,44 +1461,137 @@ mod since_tests {
             counters.initials_in.fetch_add(2, Ordering::Relaxed);
         }
 
-        let since = counters.since_now();
+        let ours = addr(50000);
+        let view = counters.view_for(ours);
         assert_eq!(
-            since.version_negotiations_out(),
+            view.version_negotiations_out(),
             0,
-            "nine earlier GREASEs are not this client's"
+            "nine earlier GREASEs are not ours"
         );
-        assert_eq!(since.zero_rtt_in(), 0);
-        assert_eq!(since.initials_in(), 0);
+        assert_eq!(view.zero_rtt_in(), 0);
+        assert_eq!(view.initials_in(), 0);
 
-        // This client sends one Initial and no early data.
-        counters.initials_in.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(since.initials_in(), 1, "only this connection's Initials");
+        counters
+            .peer(ours)
+            .initials_in
+            .fetch_add(1, Ordering::Relaxed);
+        assert_eq!(view.initials_in(), 1, "only this connection's Initials");
         assert_eq!(
-            since.zero_rtt_in(),
+            view.zero_rtt_in(),
             0,
             "it sent none, whatever the port total says"
         );
         assert_eq!(
             counters.initials_in(),
-            19,
-            "the port total is still there for anything that genuinely wants it"
+            18,
+            "the port aggregate is still there for the one reader with no connection"
         );
     }
 
     /// `t-hybrid-large-hello` asks whether *this* ClientHello needed more than
-    /// one Initial. Before `Since`, two earlier clients on the port were
-    /// enough to answer yes for everybody -- and that test feeds the
-    /// post-quantum results.
+    /// one Initial, and it feeds the post-quantum results. Two earlier clients
+    /// on the port used to be enough to answer yes for everybody.
     #[test]
     fn a_split_client_hello_is_this_clients_or_nobodys() {
-        let counters = Arc::new(Counters::default());
-        counters.initials_in.fetch_add(2, Ordering::Relaxed); // an earlier client split its hello
+        let counters = Counters::default();
+        counters
+            .peer(addr(40001))
+            .initials_in
+            .fetch_add(2, Ordering::Relaxed);
 
-        let since = counters.since_now();
-        counters.initials_in.fetch_add(1, Ordering::Relaxed); // ours fits in one
+        let ours = addr(50001);
+        let view = counters.view_for(ours);
+        counters
+            .peer(ours)
+            .initials_in
+            .fetch_add(1, Ordering::Relaxed);
         assert!(
-            since.initials_in() <= 1,
+            view.initials_in() <= 1,
             "a client whose hello fits in one Initial must not inherit an earlier client's split"
+        );
+    }
+
+    /// Two connections from the same address do not share a count.
+    ///
+    /// Each client here is a fresh process with a fresh ephemeral port, so
+    /// this should not arise — but the suite is public, and a CI harness
+    /// behind NAT or a client binding a fixed source port would do it. The
+    /// baseline inside the view is what makes that degrade to a bounded stale
+    /// count rather than to the contamination the split exists to remove.
+    #[test]
+    fn a_reused_address_does_not_inherit_the_previous_connections_count() {
+        let counters = Counters::default();
+        let same = addr(50002);
+
+        let first = counters.view_for(same);
+        counters
+            .peer(same)
+            .zero_rtt_in
+            .fetch_add(5, Ordering::Relaxed);
+        assert_eq!(first.zero_rtt_in(), 5);
+
+        // A second connection from the same address takes a fresh view.
+        let second = counters.view_for(same);
+        assert_eq!(
+            second.zero_rtt_in(),
+            0,
+            "the previous connection's early data is not ours"
+        );
+        counters
+            .peer(same)
+            .zero_rtt_in
+            .fetch_add(1, Ordering::Relaxed);
+        assert_eq!(second.zero_rtt_in(), 1);
+    }
+
+    /// Eviction must not be able to drop a peer that is still being measured.
+    ///
+    /// Constructed rather than reasoned about, because "the map is big enough"
+    /// is the assumption that bites when something opens a thousand
+    /// connections. The impairment clock next door tolerates losing an entry —
+    /// its timing window restarts, mildly wrong. Losing a *counter* entry
+    /// restarts a delta at zero and a verdict reads a partial count as a whole
+    /// one, which is a quiet wrong answer.
+    ///
+    /// Entries are keyed on last touch and every datagram touches, so a live
+    /// peer is safe by construction. This drives the map well past its bound
+    /// with a live peer in it and checks the count survives.
+    #[test]
+    fn eviction_cannot_drop_a_peer_still_being_measured() {
+        let counters = Counters::default();
+        let live = addr(50003);
+
+        let view = counters.view_for(live);
+        counters
+            .peer(live)
+            .datagrams_in
+            .fetch_add(7, Ordering::Relaxed);
+
+        // Far more peers than the bound, interleaved with traffic on the live
+        // one exactly as a real connection would be.
+        for p in 0..(MAX_TRACKED_PEERS as u32 * 2) {
+            let port = 10000u32.wrapping_add(p) as u16;
+            counters
+                .peer(addr(port))
+                .datagrams_in
+                .fetch_add(1, Ordering::Relaxed);
+            if p % 8 == 0 {
+                counters
+                    .peer(live)
+                    .datagrams_in
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        assert!(
+            view.datagrams_in() >= 7,
+            "a peer touched throughout must keep its count across pruning, got {}",
+            view.datagrams_in()
+        );
+        assert!(
+            counters.peers.len() <= HARD_PEER_CEILING,
+            "the map must stay bounded even when every entry is active, got {}",
+            counters.peers.len()
         );
     }
 }
