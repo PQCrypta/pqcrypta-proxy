@@ -461,14 +461,12 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
             Verdict::Inconclusive,
             "The client completed its request and closed without objecting, and the anomaly \
              was on the control stream — a unidirectional stream nothing obliges it to read \
-             on any schedule. Whether it read that stream is not observable from a server \
-             for a client configured like this one. The only thing a reader emits that \
-             distinguishes reading from receiving is a flow-control credit grant, and a \
-             receiver grants credit only as its consumption approaches the window it \
-             advertised; a client advertising a large window reads everything we send, \
-             comes nowhere near its limit, and says nothing. Measured, not assumed — and \
-             not a gap this suite is working on closing, but a limit of watching from this \
-             end."
+             on any schedule. Accepting the violation and never reaching the stream look \
+             the same from here. The one signal that separates reading from receiving is a \
+             flow-control credit grant, and a receiver grants credit only as its \
+             consumption approaches the window it advertised, so a client with a large \
+             window reads everything sent and says nothing. Not a judgement withheld — a \
+             distinction this vantage point cannot draw for this client."
                 .to_string(),
         ),
         (Class::Correctness, Observation::SurvivedAndContinued) => (
