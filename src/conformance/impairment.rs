@@ -57,6 +57,7 @@ pub struct PeerCounters {
     pub marked_ce: AtomicU64,
     pub reordered: AtomicU64,
     pub shadowed: AtomicU64,
+    pub shadow_failed: AtomicU64,
     pub initials_in: AtomicU64,
     pub dropped_loss: AtomicU64,
     pub zero_rtt_in: AtomicU64,
@@ -101,6 +102,9 @@ pub struct Counters {
     /// unannounced server address: if the copy never went out, a connection that
     /// carried on proves nothing.
     pub shadowed: AtomicU64,
+    /// Copies that could not be sent at all, which is our failure and not the
+    /// client's. Separated because for a year the two were the same zero.
+    pub shadow_failed: AtomicU64,
     /// Client datagrams that carried a QUIC Initial packet.
     ///
     /// The evidence for `t-hybrid-large-hello`. An ML-KEM-768 key share is 1,216
@@ -181,6 +185,10 @@ impl Counters {
 
     pub fn shadowed(&self) -> u64 {
         self.shadowed.load(Ordering::Relaxed)
+    }
+
+    pub fn shadow_failed(&self) -> u64 {
+        self.shadow_failed.load(Ordering::Relaxed)
     }
 
     pub fn reordered(&self) -> u64 {
@@ -309,6 +317,7 @@ pub struct PeerView {
     dropped_oversize: u64,
     reordered: u64,
     shadowed: u64,
+    shadow_failed: u64,
     datagrams_in: u64,
 }
 
@@ -324,6 +333,7 @@ impl PeerView {
                 dropped_oversize: 0,
                 reordered: 0,
                 shadowed: 0,
+                shadow_failed: 0,
                 datagrams_in: 0,
                 counters,
             };
@@ -337,6 +347,7 @@ impl PeerView {
             dropped_oversize: counters.dropped_oversize.load(Ordering::Relaxed),
             reordered: counters.reordered.load(Ordering::Relaxed),
             shadowed: counters.shadowed.load(Ordering::Relaxed),
+            shadow_failed: counters.shadow_failed.load(Ordering::Relaxed),
             datagrams_in: counters.datagrams_in.load(Ordering::Relaxed),
             counters,
         }
@@ -365,6 +376,7 @@ peer_delta!(
     dropped_oversize,
     reordered,
     shadowed,
+    shadow_failed,
     datagrams_in,
 );
 
@@ -858,39 +870,93 @@ fn compact_oversize(
 /// shadowing the whole conversation.
 #[derive(Debug)]
 struct ShadowSocket {
-    socket: std::net::UdpSocket,
+    /// One socket per address family, because a datagram cannot cross them.
+    ///
+    /// This bound a single socket on `::` and sent to whatever address the
+    /// connection was using. Every client in the fleet connects over IPv4, so
+    /// every copy failed with EAFNOSUPPORT -- and `send_to(..).is_err()`
+    /// returned `false`, which is also what "budget exhausted" returns, so the
+    /// failure was indistinguishable from the feature working. The test then
+    /// reported that the client had never been shown a second address, which
+    /// was true and entirely our doing: `q-connection-migration` was
+    /// unexercisable for all twelve clients and said so as though it were
+    /// their run.
+    ///
+    /// Two sockets rather than one dual-stack socket with v4-mapped addresses:
+    /// `IPV6_V6ONLY` defaults to 0 here but is a system setting, and a test
+    /// that silently stops working when a sysctl changes is how this happened.
+    v4: Option<std::net::UdpSocket>,
+    v6: Option<std::net::UdpSocket>,
+    /// How many copies each peer is shown. Enforced per peer by the caller
+    /// against `Counters`, never by a counter inside this struct.
+    ///
+    /// It was `sent: AtomicU64` here, one tally for the whole listener, which
+    /// is bound once at start-up and serves every client for the life of the
+    /// process. The first connection to arrive consumed the entire budget and
+    /// every connection after it was shown nothing -- the same bug class as
+    /// the per-port counters this suite already had to close once: shared
+    /// mutable state whose scope does not match what it describes. It was
+    /// invisible while the address-family fault meant no copy ever left the
+    /// socket, and surfaced the moment that was fixed.
     budget: u64,
-    sent: AtomicU64,
+    /// Copies that could not be sent. Surfaced, never swallowed.
+    failed: AtomicU64,
 }
 
 impl ShadowSocket {
-    /// Bind an ephemeral port on the same host. `None` if that is not possible,
+    /// Bind an ephemeral port per family. `None` only if neither can be bound,
     /// which leaves the test reporting that nothing was exercised rather than
     /// failing a client for our own missing socket.
     fn bind(budget: u64) -> Option<Self> {
-        let socket = std::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0))
-            .or_else(|_| std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)))
-            .ok()?;
-        // Never block the sending path: a datagram that cannot go out
-        // immediately is simply not shadowed.
-        socket.set_nonblocking(true).ok()?;
+        fn ephemeral(addr: std::net::IpAddr) -> Option<std::net::UdpSocket> {
+            let socket = std::net::UdpSocket::bind((addr, 0)).ok()?;
+            // Never block the sending path: a datagram that cannot go out
+            // immediately is simply not shadowed.
+            socket.set_nonblocking(true).ok()?;
+            Some(socket)
+        }
+        let v4 = ephemeral(std::net::Ipv4Addr::UNSPECIFIED.into());
+        let v6 = ephemeral(std::net::Ipv6Addr::UNSPECIFIED.into());
+        if v4.is_none() && v6.is_none() {
+            return None;
+        }
         Some(Self {
-            socket,
+            v4,
+            v6,
             budget,
-            sent: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
         })
     }
 
-    /// Copy `datagram` to `peer` from this socket, while budget remains.
+    /// Copy `datagram` to `peer` from the socket of `peer`'s family.
+    ///
+    /// The budget is the caller's to enforce, per peer. See `budget`.
     fn shadow(&self, datagram: &[u8], peer: SocketAddr) -> bool {
-        if self.sent.load(Ordering::Relaxed) >= self.budget {
+        let socket = match peer {
+            SocketAddr::V4(_) => self.v4.as_ref(),
+            SocketAddr::V6(_) => self.v6.as_ref(),
+        };
+        let Some(socket) = socket else {
+            self.failed.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        if let Err(e) = socket.send_to(datagram, peer) {
+            // Counted and named. The version that swallowed this made the
+            // test report a client behaviour it had never had the chance to
+            // exhibit.
+            self.failed.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                "conformance: could not copy a datagram from the shadow address to {}: {}",
+                peer,
+                e
+            );
             return false;
         }
-        if self.socket.send_to(datagram, peer).is_err() {
-            return false;
-        }
-        self.sent.fetch_add(1, Ordering::Relaxed);
         true
+    }
+
+    fn failures(&self) -> u64 {
+        self.failed.load(Ordering::Relaxed)
     }
 }
 
@@ -1116,13 +1182,17 @@ impl UdpSender for ImpairedSender {
                 .clock
                 .as_ref()
                 .is_none_or(|clock| clock.is_open(transmit.destination, now))
-                && shadow.shadow(transmit.contents, transmit.destination)
             {
-                self.counters.shadowed.fetch_add(1, Ordering::Relaxed);
-                self.counters
-                    .peer(transmit.destination)
-                    .shadowed
-                    .fetch_add(1, Ordering::Relaxed);
+                let peer = self.counters.peer(transmit.destination);
+                let shown = peer.shadowed.load(Ordering::Relaxed);
+                let before = shadow.failures();
+                if shown < shadow.budget && shadow.shadow(transmit.contents, transmit.destination) {
+                    self.counters.shadowed.fetch_add(1, Ordering::Relaxed);
+                    peer.shadowed.fetch_add(1, Ordering::Relaxed);
+                } else if shadow.failures() > before {
+                    self.counters.shadow_failed.fetch_add(1, Ordering::Relaxed);
+                    peer.shadow_failed.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
 
@@ -1660,6 +1730,90 @@ mod peer_counter_tests {
             counters.peers.len() <= HARD_PEER_CEILING,
             "the map must stay bounded even when every entry is active, got {}",
             counters.peers.len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod shadow_socket_tests {
+    use super::*;
+
+    /// A copy must go out from a socket of the peer's own address family.
+    ///
+    /// This bound one socket on `::` and sent to whatever address the
+    /// connection used. Every client in the fleet connects over IPv4, so every
+    /// copy failed with EAFNOSUPPORT, and `send_to(..).is_err()` returned the
+    /// same `false` as "nothing to do" -- so `q-connection-migration` reported
+    /// that twelve clients had never been shown a second address, which was
+    /// true and entirely ours. The failure counter exists so that can never
+    /// again be silent, and this asserts the send itself.
+    #[test]
+    fn a_copy_reaches_a_peer_of_either_family() {
+        let shadow = ShadowSocket::bind(6).expect("bind an ephemeral port");
+
+        // Real receivers, so a send that the kernel refuses is a real failure
+        // rather than an unroutable address being tolerated.
+        let v4 = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        assert!(
+            shadow.shadow(b"copy", v4.local_addr().unwrap()),
+            "a v4 peer must be served from the v4 socket"
+        );
+
+        if let Ok(v6) = std::net::UdpSocket::bind((std::net::Ipv6Addr::LOCALHOST, 0)) {
+            assert!(
+                shadow.shadow(b"copy", v6.local_addr().unwrap()),
+                "a v6 peer must be served from the v6 socket"
+            );
+        }
+
+        assert_eq!(shadow.failures(), 0, "no send should have failed");
+    }
+
+    /// A send that cannot go out is counted, not discarded.
+    #[test]
+    fn a_failed_copy_is_counted() {
+        let shadow = ShadowSocket {
+            v4: None,
+            v6: None,
+            budget: 6,
+            failed: AtomicU64::new(0),
+        };
+        let dest: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        assert!(!shadow.shadow(b"copy", dest));
+        assert_eq!(
+            shadow.failures(),
+            1,
+            "a copy with nowhere to go is our failure and must be visible"
+        );
+    }
+
+    /// The budget belongs to a peer, not to the listener.
+    ///
+    /// `ShadowSocket` is built once per test port and serves every client for
+    /// the life of the process. While the tally lived here, the first
+    /// connection consumed all six copies and every later one was shown
+    /// nothing -- so the test worked once per restart and reported the other
+    /// runs as clients that had never been offered a second address.
+    #[test]
+    fn the_budget_is_counted_per_peer() {
+        let counters = Counters::default();
+        let a: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:1001".parse().unwrap();
+        let budget = 6;
+
+        for _ in 0..budget {
+            counters.peer(a).shadowed.fetch_add(1, Ordering::Relaxed);
+        }
+
+        assert_eq!(
+            counters.peer(a).shadowed.load(Ordering::Relaxed),
+            budget,
+            "the first peer has had its allowance"
+        );
+        assert_eq!(
+            counters.peer(b).shadowed.load(Ordering::Relaxed),
+            0,
+            "and the next peer starts from zero rather than inheriting it"
         );
     }
 }

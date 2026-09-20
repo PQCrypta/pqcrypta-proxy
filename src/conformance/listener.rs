@@ -2757,10 +2757,26 @@ fn quic_observation(
             if shadowed > 0 {
                 return None;
             }
+            // Our failure and the client's are different sentences.
+            //
+            // They were the same one until 2026-09-19, and it was the wrong
+            // one: the shadow socket bound `::` and every client connects over
+            // IPv4, so every copy failed with EAFNOSUPPORT and the error was
+            // discarded. The report told twelve clients they had not been
+            // shown a second address, which was true, and ours.
+            let failed = counters.shadow_failed();
+            if failed > 0 {
+                return Some(Observation::NotExercised(format!(
+                    "this endpoint could not send from its second address at all: \
+                     {failed} copy attempt(s) failed. That is a fault in the harness, \
+                     not a property of the client, and nothing about this client's \
+                     handling of §9.6 should be read from it"
+                )));
+            }
             Some(Observation::NotExercised(
                 "no datagram was copied from the second address, so the client was never \
-                 shown one. The copy begins half a second after a peer's first datagram \
-                 and needs the server to still be sending by then"
+                 shown one. The copy opens shortly after a peer's first datagram and \
+                 needs the server to still be sending by then"
                     .to_string(),
             ))
         }
