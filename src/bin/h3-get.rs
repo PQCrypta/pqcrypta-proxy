@@ -88,6 +88,21 @@ async fn get(url: &str) -> anyhow::Result<u16> {
     .with_no_client_auth();
     crypto.alpn_protocols = vec![b"h3".to_vec()];
 
+    // The suite's two 0-RTT ports need a resumed connection carrying early
+    // data, and the driver runs this binary once per test -- so the pair is
+    // made here, in one process, with an in-memory ticket store. On disk it
+    // would need a serialisation format nobody else reads; in memory it is a
+    // field.
+    //
+    // Without this the self-test client offered no early data at all and both
+    // 0-RTT cells reported that the run had not exercised them. Ours to fix,
+    // and it is the client we ship.
+    let resuming = std::env::var("H3_CONFORMANCE_RESUME").as_deref() == Ok("1");
+    if resuming {
+        // Storing a ticket is not the same as offering early data with it.
+        crypto.enable_early_data = true;
+    }
+
     let client_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
             .map_err(|e| anyhow!("building the QUIC client config: {e}"))?,
@@ -96,11 +111,31 @@ async fn get(url: &str) -> anyhow::Result<u16> {
     let endpoint = quinn::Endpoint::client(bind).context("binding a client socket")?;
     endpoint.set_default_client_config(client_config);
 
-    let connection = endpoint
+    if resuming {
+        // One connection purely to be issued a ticket. Its failure is not this
+        // run's failure: without a ticket the connection below is an ordinary
+        // one and the suite reports honestly that no early data was offered.
+        if let Ok(connecting) = endpoint.connect(addr, host) {
+            if let Ok(priming) = connecting.await {
+                // The ticket arrives after the handshake, not with it, so the
+                // connection has to outlive the handshake to receive one.
+                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                priming.close(0u32.into(), b"primed");
+            }
+        }
+    }
+
+    let connecting = endpoint
         .connect(addr, host)
-        .context("starting the connection")?
-        .await
-        .context("completing the handshake")?;
+        .context("starting the connection")?;
+
+    // `into_0rtt` is what actually puts the request in the first flight. A
+    // resumed handshake that waits for completion sends its request in 1-RTT
+    // like any other, which is indistinguishable from never having resumed.
+    let connection = match connecting.into_0rtt() {
+        Ok((connection, _accepted)) => connection,
+        Err(connecting) => connecting.await.context("completing the handshake")?,
+    };
 
     let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(connection))
         .await
