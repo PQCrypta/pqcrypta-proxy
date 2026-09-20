@@ -39,6 +39,15 @@ pub struct Settings {
     pub(crate) enable_extended_connect: bool,
     /// Enable HTTP Datagrams, see https://datatracker.ietf.org/doc/rfc9297/ for details
     pub(crate) enable_datagram: bool,
+    /// The dynamic table size this endpoint will accept, in bytes.
+    ///
+    /// Zero means the encoder may not use the dynamic table at all, which is
+    /// what this was fixed at: the table was implemented and unreachable, so
+    /// advertising anything else would have been a claim we could not honour.
+    pub(crate) qpack_max_table_capacity: u64,
+    /// How many streams this endpoint will allow to be blocked on a dynamic
+    /// table insert it has not yet received.
+    pub(crate) qpack_blocked_streams: u64,
     /// The maximum number of concurrent streams that can be opened by the peer.
     pub(crate) max_webtransport_sessions: u64,
 }
@@ -57,6 +66,12 @@ impl From<&frame::Settings> for Settings {
             max_webtransport_sessions: settings
                 .get(frame::SettingId::WEBTRANSPORT_MAX_SESSIONS)
                 .unwrap_or(defaults.max_webtransport_sessions),
+            qpack_max_table_capacity: settings
+                .get(frame::SettingId::QPACK_MAX_TABLE_CAPACITY)
+                .unwrap_or(defaults.qpack_max_table_capacity),
+            qpack_blocked_streams: settings
+                .get(frame::SettingId::QPACK_MAX_BLOCKED_STREAMS)
+                .unwrap_or(defaults.qpack_blocked_streams),
             enable_datagram: settings
                 .get(frame::SettingId::H3_DATAGRAM)
                 .map(|value| value != 0)
@@ -85,6 +100,8 @@ impl TryFrom<Config> for frame::Settings {
                     enable_extended_connect,
                     enable_datagram,
                     max_webtransport_sessions,
+                    qpack_max_table_capacity,
+                    qpack_blocked_streams,
                 },
         } = value;
 
@@ -126,6 +143,14 @@ impl TryFrom<Config> for frame::Settings {
         )?;
         settings.insert(frame::SettingId::H3_DATAGRAM, enable_datagram as u64)?;
         settings.insert(
+            frame::SettingId::QPACK_MAX_TABLE_CAPACITY,
+            qpack_max_table_capacity,
+        )?;
+        settings.insert(
+            frame::SettingId::QPACK_MAX_BLOCKED_STREAMS,
+            qpack_blocked_streams,
+        )?;
+        settings.insert(
             frame::SettingId::WEBTRANSPORT_MAX_SESSIONS,
             max_webtransport_sessions,
         )?;
@@ -141,6 +166,8 @@ impl Default for Settings {
             enable_webtransport: false,
             enable_extended_connect: false,
             enable_datagram: false,
+            qpack_max_table_capacity: 0,
+            qpack_blocked_streams: 0,
             max_webtransport_sessions: 0,
         }
     }

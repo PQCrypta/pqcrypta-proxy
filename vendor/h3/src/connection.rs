@@ -81,16 +81,6 @@ where
     control_send: C::SendStream,
     control_recv: Option<FrameStream<C::RecvStream, B>>,
     qpack_streams: QpackStreams<C, B>,
-    /// The QPACK decoder, and with it the dynamic table.
-    ///
-    /// The table has been implemented in `qpack::dynamic` all along and was
-    /// never connected: `encoder_recv` was accepted, stored, and never polled,
-    /// so `on_encoder_recv` was called nowhere outside the qpack module. Our
-    /// own conformance suite showed the cost as four cells on one root cause
-    /// -- two `unsupported`, because a client that cannot use the table must
-    /// advertise a capacity of zero, and two `inconclusive`, because a stream
-    /// nobody reads draws no objection and grants no flow-control credit.
-    qpack_decoder: qpack::Decoder,
     /// Buffers incoming uni/recv streams which have yet to be claimed.
     ///
     /// This is opposed to discarding them by returning in `poll_accept_recv`, which may cause them to be missed by something else polling.
@@ -317,7 +307,6 @@ where
             control_send: control_send,
             control_recv: None,
             qpack_streams,
-            qpack_decoder: qpack::Decoder::default(),
             handled_connection_error: None,
             pending_recv_streams: Vec::with_capacity(3),
             got_peer_settings: false,
@@ -588,7 +577,10 @@ where
                 else {
                     return Poll::Pending;
                 };
-                self.qpack_decoder
+                self.shared
+                    .qpack_decoder
+                    .lock()
+                    .expect("the QPACK decoder lock is never held across a panic")
                     .on_encoder_recv(encoder.buf_mut(), &mut out)
             };
             if let Err(e) = applied {
@@ -613,10 +605,22 @@ where
             // reached would be speculative. It becomes required the moment
             // the advertised capacity is non-zero, which is the next step and
             // is deliberately not this one.
-            debug_assert!(
-                out.is_empty(),
-                "the dynamic table grew while advertising zero capacity"
-            );
+            if !out.is_empty() {
+                //= https://www.rfc-editor.org/rfc/rfc9204#section-4.4.3
+                //# The Insert Count Increment instruction ... informs the
+                //# encoder of the total number of dynamic table insertions
+                //# ... the decoder has received.
+                //
+                // Without this the encoder cannot tell what has been applied
+                // and can never evict, so a table we advertise but never
+                // acknowledge is worse than one we decline.
+                if let Some(send) = self.qpack_streams.decoder_send.as_mut() {
+                    // Queued rather than awaited: this is a poll function,
+                    // and the instruction is a few bytes that the transport
+                    // will flush with everything else.
+                    let _ = send.send_data(WriteBuf::<B>::from_raw(&out));
+                }
+            }
         }
     }
 

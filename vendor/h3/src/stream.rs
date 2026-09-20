@@ -85,6 +85,32 @@ where
     }
 }
 
+impl<B> WriteBuf<B>
+where
+    B: Buf,
+{
+    /// A few bytes that are already encoded, copied into the inline buffer.
+    ///
+    /// For QPACK decoder instructions -- Section Acknowledgement, Insert
+    /// Count Increment, Stream Cancellation -- which are at most a handful of
+    /// bytes each. There was no way to put raw bytes on a stream: every
+    /// constructor here takes a typed thing, so the decoder stream could be
+    /// opened and never written to.
+    pub(crate) fn from_raw(bytes: &[u8]) -> Self {
+        let mut this = Self {
+            buf: [0; WRITE_BUF_ENCODE_SIZE],
+            len: 0,
+            pos: 0,
+            frame: None,
+        };
+        let n = bytes.len().min(WRITE_BUF_ENCODE_SIZE);
+        debug_assert_eq!(n, bytes.len(), "raw write larger than the inline buffer");
+        this.buf[..n].copy_from_slice(&bytes[..n]);
+        this.len = n;
+        this
+    }
+}
+
 impl<B> From<StreamType> for WriteBuf<B>
 where
     B: Buf,

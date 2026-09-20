@@ -97,6 +97,22 @@ impl Builder {
         self
     }
 
+    /// Offer the server a QPACK dynamic table of this size, in bytes.
+    ///
+    /// Zero, the default, tells the encoder it may not use the table at all.
+    /// Anything else is a promise this endpoint can keep only because the
+    /// encoder stream is now read and applied.
+    pub fn qpack_max_table_capacity(&mut self, bytes: u64) -> &mut Self {
+        self.config.settings.qpack_max_table_capacity = bytes;
+        self
+    }
+
+    /// How many streams may be blocked awaiting a dynamic table insert.
+    pub fn qpack_blocked_streams(&mut self, streams: u64) -> &mut Self {
+        self.config.settings.qpack_blocked_streams = streams;
+        self
+    }
+
     /// Indicates that the client supports HTTP/3 datagrams
     ///
     /// See: <https://www.rfc-editor.org/rfc/rfc9297#section-2.1.1>

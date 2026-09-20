@@ -202,7 +202,18 @@ async fn get(url: &str) -> anyhow::Result<u16> {
         },
     };
 
-    let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(connection))
+    // Offer the server a QPACK dynamic table.
+    //
+    // Advertising zero is what made h-qpack-dynamic-table and
+    // h-qpack-blocked-stream read `unsupported` against our own client: the
+    // table is implemented, and until the encoder stream was read and applied
+    // there was no way to honour a non-zero value. 4 KiB and 16 blocked
+    // streams are ordinary figures -- Chromium and Firefox are in the same
+    // range -- and the point is to exercise the path, not to win at it.
+    let (mut driver, mut send_request) = h3::client::builder()
+        .qpack_max_table_capacity(4096)
+        .qpack_blocked_streams(16)
+        .build(h3_quinn::Connection::new(connection))
         .await
         .map_err(|e| anyhow!("opening the HTTP/3 connection: {e}"))?;
 

@@ -465,7 +465,18 @@ setting_identifiers! {
     WEBTRANSPORT_MAX_SESSIONS = 0xc671706a,
 }
 
-const SETTINGS_LEN: usize = 8;
+/// How many settings one SETTINGS frame can carry.
+///
+/// Was 8, which is exactly what the sender emitted once the two QPACK
+/// settings were added: the ninth `insert` returned `Exceeded`, the whole
+/// frame failed to build, and the connection sent its defaults instead. The
+/// symptom was a client advertising a dynamic table capacity of zero while
+/// its own configuration said 4096, with nothing in the log to say why --
+/// `Settings::try_from` fails, and the call site turns that into an internal
+/// error whose own comment says it should be impossible.
+///
+/// Room to spare rather than exactly enough, for the same reason.
+const SETTINGS_LEN: usize = 12;
 
 #[derive(Debug, PartialEq)]
 pub struct Settings {

@@ -83,6 +83,14 @@ pub struct Decoder {
     table: DynamicTable,
 }
 
+impl std::fmt::Debug for Decoder {
+    // Hand-written: the dynamic table holds field values, which are header
+    // contents and have no business in a log line.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Decoder").finish_non_exhaustive()
+    }
+}
+
 impl Decoder {
     // Decode field lines received on Request of Push stream.
     // https://www.rfc-editor.org/rfc/rfc9204.html#name-field-line-representations

@@ -2303,10 +2303,38 @@ async fn watch_for_liveness(
             while let Ok(mut uni) = connection.accept_uni().await {
                 let qpack = qpack.clone();
                 tokio::spawn(async move {
-                    if let Ok(bytes) = uni.read_to_end(64 * 1024).await {
-                        if let Some(limits) = f::parse_client_qpack_limits(&bytes) {
-                            qpack.observe(limits);
+                    // Read as it arrives, and parse as soon as the SETTINGS
+                    // frame is whole.
+                    //
+                    // This was `read_to_end`, which on a *control* stream does
+                    // not return until the connection is over -- a control
+                    // stream stays open for its whole life (§6.2.1 makes
+                    // closing one an error). So the client's QPACK limits were
+                    // observed, if at all, long after the response that
+                    // depended on them had been written.
+                    //
+                    // All twelve clients reported "advertised 0 and 0",
+                    // Chromium and Firefox among them, and both
+                    // h-qpack-dynamic-table and h-qpack-blocked-stream were
+                    // `unsupported` across the board on the strength of a
+                    // measurement that never happened. 24 cells.
+                    let mut buf = Vec::with_capacity(4096);
+                    while buf.len() < 64 * 1024 {
+                        match uni.read_chunk(4096).await {
+                            Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
+                            // End of stream, or the stream failed: whatever is
+                            // here is all there will be.
+                            Ok(None) | Err(_) => break,
                         }
+                        if let Some(limits) = f::parse_client_qpack_limits(&buf) {
+                            qpack.observe(limits);
+                            return;
+                        }
+                    }
+                    // A last attempt on whatever arrived before the stream
+                    // ended, so a client that closes promptly is still read.
+                    if let Some(limits) = f::parse_client_qpack_limits(&buf) {
+                        qpack.observe(limits);
                     }
                 });
             }

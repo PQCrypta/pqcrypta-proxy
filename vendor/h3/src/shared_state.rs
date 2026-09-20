@@ -2,7 +2,7 @@
 
 use std::{
     borrow::Cow,
-    sync::{atomic::AtomicBool, OnceLock},
+    sync::{atomic::AtomicBool, Mutex, OnceLock},
 };
 
 use futures_util::task::AtomicWaker;
@@ -30,6 +30,14 @@ pub struct SharedState {
     /// (H3_FRAME_UNEXPECTED). Both were answered H3_FRAME_UNEXPECTED, and our
     /// own conformance suite failed us for the first.
     is_client: AtomicBool,
+    /// The QPACK decoder, and with it the dynamic table.
+    ///
+    /// Shared because two places need the same one: the connection, which
+    /// applies encoder instructions as they arrive, and each request stream,
+    /// which decodes field sections that may reference what those
+    /// instructions inserted. A copy in each would decode against a table
+    /// that had not seen the inserts.
+    pub(crate) qpack_decoder: Mutex<crate::qpack::Decoder>,
 }
 
 impl SharedState {
@@ -53,6 +61,7 @@ impl Default for SharedState {
             closing: AtomicBool::new(false),
             waker: AtomicWaker::new(),
             is_client: AtomicBool::new(false),
+            qpack_decoder: Mutex::new(crate::qpack::Decoder::default()),
         }
     }
 }
