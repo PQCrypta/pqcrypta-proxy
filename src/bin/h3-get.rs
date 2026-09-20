@@ -79,6 +79,32 @@ async fn get(url: &str) -> anyhow::Result<u16> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
+    // Our own post-quantum root, so `t-cert-compression-pq` can be verified
+    // rather than waved through.
+    //
+    // That port serves an ML-DSA-87 chain issued by a CA of ours, which no
+    // public root store carries. The clients that pass this test today do so
+    // with certificate verification disabled -- the suite says as much in the
+    // verdict -- and matching them by turning verification off here would
+    // make our own client the least rigorous in the fleet at the one test
+    // about certificates. Trusting the issuer keeps the chain, the signature
+    // and the compression all genuinely checked.
+    //
+    // Missing file is not fatal: away from this host the test is unreachable
+    // anyway, and every other port uses the public roots above.
+    const PQ_ROOT: &str = "/etc/pqcrypta/pqc-certs/root_ca.crt";
+    match std::fs::read(PQ_ROOT) {
+        Ok(pem) => {
+            let mut rd = std::io::BufReader::new(std::io::Cursor::new(pem));
+            for cert in rustls_pemfile::certs(&mut rd).flatten() {
+                if let Err(e) = roots.add(cert) {
+                    eprintln!("h3-get: ignoring {PQ_ROOT}: {e}");
+                }
+            }
+        }
+        Err(e) => eprintln!("h3-get: {PQ_ROOT} not readable ({e}); public roots only"),
+    }
+
     let mut crypto = rustls::ClientConfig::builder_with_provider(Arc::new(
         pqcrypta_proxy::tls::build_pqc_provider(),
     ))

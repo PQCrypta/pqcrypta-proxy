@@ -176,8 +176,10 @@ static SUPPORTED_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms
         webpki_algs::RSA_PKCS1_2048_8192_SHA256_ABSENT_PARAMS,
         webpki_algs::RSA_PKCS1_2048_8192_SHA384_ABSENT_PARAMS,
         webpki_algs::RSA_PKCS1_2048_8192_SHA512_ABSENT_PARAMS,
+        ML_DSA_87_VERIFY,
     ],
     mapping: &[
+        (SignatureScheme::ML_DSA_87, &[ML_DSA_87_VERIFY]),
         // Note: for TLS1.2 the curve is not fixed by SignatureScheme. For TLS1.3 it is.
         (
             SignatureScheme::ECDSA_NISTP384_SHA384,
@@ -345,3 +347,50 @@ mod tests {
         );
     }
 }
+
+/// ML-DSA-87 (FIPS 204) certificate verification.
+///
+/// rustls knows the `ML_DSA_87` signature scheme codepoint and aws-lc-rs ships
+/// the verification algorithm, but nothing joined them -- so a client built on
+/// this provider advertised no `signature_algorithms` entry that could verify
+/// an ML-DSA-87 chain, and a server offering one was refused before the
+/// certificate was sent. Our own conformance suite recorded that against our
+/// own client as `t-cert-compression-pq: unsupported`, which for a
+/// post-quantum stack is the wrong answer to be giving.
+///
+/// The signing half already exists outside this crate, built on the same
+/// `PqdsaKeyPair`. This is the half that was missing.
+#[derive(Debug)]
+struct MlDsa87Verify;
+
+/// DER of the AlgorithmIdentifier contents for id-ml-dsa-87
+/// (OID 2.16.840.1.101.3.4.3.19), parameters absent.
+const ML_DSA_87_ALG_ID: &[u8] = &[
+    0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x13,
+];
+
+impl pki_types::SignatureVerificationAlgorithm for MlDsa87Verify {
+    fn public_key_alg_id(&self) -> pki_types::AlgorithmIdentifier {
+        pki_types::AlgorithmIdentifier::from_slice(ML_DSA_87_ALG_ID)
+    }
+
+    fn signature_alg_id(&self) -> pki_types::AlgorithmIdentifier {
+        pki_types::AlgorithmIdentifier::from_slice(ML_DSA_87_ALG_ID)
+    }
+
+    fn verify_signature(
+        &self,
+        public_key: &[u8],
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<(), pki_types::InvalidSignature> {
+        aws_lc_rs::signature::UnparsedPublicKey::new(
+            &aws_lc_rs::unstable::signature::ML_DSA_87,
+            public_key,
+        )
+        .verify(message, signature)
+        .map_err(|_| pki_types::InvalidSignature)
+    }
+}
+
+static ML_DSA_87_VERIFY: &dyn pki_types::SignatureVerificationAlgorithm = &MlDsa87Verify;
