@@ -84,6 +84,17 @@ const CE_CADENCE: u64 = 1;
 /// `q-packet-reordering`'s port.
 const REORDER_CADENCE: u64 = 6;
 
+/// How long a connection ID lives on `q-cid-rotation`'s port before the server
+/// asks for it back.
+///
+/// Short enough that a single request outlives it, long enough to be past the
+/// handshake on any path this service can be reached over.
+const CID_LIFETIME: Duration = Duration::from_millis(300);
+
+/// How long that test holds the response open, so the expiry lands inside the
+/// connection rather than after the client has gone.
+const CID_ROTATION_HOLD: Duration = Duration::from_millis(900);
+
 /// How many datagrams `q-connection-migration` copies out of a second socket.
 const SHADOW_DATAGRAMS: u64 = 6;
 
@@ -377,6 +388,28 @@ impl TestListener {
             endpoint_config.supported_versions(vec![0x1a2a_3a4a]);
         } else {
             endpoint_config.supported_versions(vec![0x0000_0001, 0x6b33_43cf]);
+        }
+
+        // Make the rotation happen instead of waiting to see whether it does.
+        //
+        // §5.1.2 obliges a client to retire a connection ID when the server
+        // issues NEW_CONNECTION_ID with a higher `retire_prior_to`, and quinn
+        // issues one when a CID reaches the end of its lifetime. The default
+        // lifetime is unbounded, so nothing ever expired and the port was
+        // measuring whether a one-request connection happened to outlive a
+        // rotation it was never going to be asked for -- eleven of twelve
+        // clients reported "the connection was too short-lived", which was our
+        // description of a rotation we never asked for.
+        //
+        // A short lifetime plus the hold in `probe_hold` puts the request
+        // squarely after the expiry, so the client is asked and the answer is
+        // its own.
+        if test.id == "q-cid-rotation" {
+            endpoint_config.cid_generator(Arc::new(|| {
+                let mut gen = quinn_proto::RandomConnectionIdGenerator::new(8);
+                gen.set_lifetime(CID_LIFETIME);
+                Box::new(gen)
+            }));
         }
 
         // A path that silently swallows anything large, for the black-hole test.
@@ -1826,19 +1859,23 @@ pub(super) async fn emit(
         // larger than what has been advertised. The promised request is an
         // ordinary GET so the field section decodes cleanly and the only thing
         // left to object to is the push itself.
+        // The frame goes on the response stream, not here.
+        //
+        // It was written to the control stream, where §7.2.5 has a different
+        // and more specific answer: "If a PUSH_PROMISE frame is received on
+        // the control stream, the client MUST respond with a connection error
+        // of type H3_FRAME_UNEXPECTED." So the port asked one question and the
+        // catalogue graded the other, and seven independent implementations --
+        // quinn, aioquic, chromium, quiche, neqo, ngtcp2, lsquic, xquic -- were
+        // failed for answering 0x105 correctly. When every implementation
+        // disagrees with the suite, the suite is what needs reading again.
+        //
+        // Placement is the whole test, exactly as it was for t-grease-group.
+        // On a response stream PUSH_PROMISE is a legal frame in a legal place,
+        // so the only thing left to object to is the push ID -- which is what
+        // the title says this measures.
         "h-push-promise-unsolicited" => {
             control.write_all(&f::settings_with_grease()).await?;
-            control
-                .write_all(&f::push_promise(
-                    UNPROMISED_PUSH_ID_ZERO,
-                    &[
-                        (":method", "GET"),
-                        (":scheme", "https"),
-                        (":authority", "conformance.pqcrypta.com"),
-                        (":path", "/pushed"),
-                    ],
-                ))
-                .await?;
         }
 
         // The one setting whose invalid-value handling the specification pins
@@ -2467,7 +2504,12 @@ fn quic_observation(
             ))
         } else {
             Observation::NotExercised(
-                "the connection was too short-lived to require a rotation".to_string(),
+                "this endpoint asked for a rotation and none came back. The connection \
+                 ID issued at the handshake expires part-way through the exchange and \
+                 NEW_CONNECTION_ID carries a higher retire_prior_to, so §5.1.2 obliges \
+                 a RETIRE_CONNECTION_ID -- but a client that closed before the expiry \
+                 was never asked"
+                    .to_string(),
             )
         }),
 
@@ -3021,6 +3063,30 @@ pub(super) async fn answer_probe(
         // response. That one is a reserved type carrying a length, which §7.2.8
         // requires a client to skip; DATA is a known type in a position §4.1
         // forbids, and skipping it is the failure.
+        // PUSH_PROMISE where the frame itself is allowed, so the push ID is
+        // the only thing wrong with it. §7.2.7 leaves the maximum push ID
+        // unset until the client sends MAX_PUSH_ID and none of them do, so
+        // push ID 0 is already larger than anything advertised.
+        "h-push-promise-unsolicited" => {
+            send.write_all(&f::headers(&[
+                (":status", "200"),
+                ("content-type", "text/plain"),
+                ("x-conformance", "push-promise-unsolicited"),
+            ]))
+            .await?;
+            send.write_all(&f::push_promise(
+                UNPROMISED_PUSH_ID_ZERO,
+                &[
+                    (":method", "GET"),
+                    (":scheme", "https"),
+                    (":authority", "conformance.pqcrypta.com"),
+                    (":path", "/pushed"),
+                ],
+            ))
+            .await?;
+            send.write_all(&f::data(BODY)).await?;
+        }
+
         "h-data-before-headers" => {
             send.write_all(&f::data(b"a body before any headers\n"))
                 .await?;
@@ -3313,6 +3379,10 @@ fn probe_hold(test: &'static Test) -> Option<Duration> {
         // Give a unidirectional stream a chance to be read before the client is
         // free to close.
         return Some(CONTROL_STREAM_GRACE);
+    }
+    if test.id == "q-cid-rotation" {
+        // The CID expires 300ms in; a bare request is over long before that.
+        return Some(CID_ROTATION_HOLD);
     }
     if test.id == "q-connection-migration" {
         // The second address is only shown to the client on datagrams this

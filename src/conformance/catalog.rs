@@ -181,7 +181,6 @@ pub fn anomaly_stream(test: &Test) -> Anomaly {
         | "h-cancel-push-unsolicited"
         | "h-priority-update"
         | "h-extended-connect"
-        | "h-push-promise-unsolicited"
         | "h-datagram-setting-invalid"
         | "h-goaway-increasing"
         // The QPACK encoder stream is unidirectional too, and nothing obliges a
@@ -207,7 +206,11 @@ pub fn anomaly_stream(test: &Test) -> Anomaly {
         | "h-early-hints"
         | "h-response-stream-reset"
         | "q-zero-rtt-replay"
-        | "h-qpack-static-index-invalid" => Anomaly::ResponseStream,
+        | "h-qpack-static-index-invalid"
+        // Moved here from the control stream on 2026-09-20: on the control
+        // stream §7.2.5 answers H3_FRAME_UNEXPECTED whatever the push ID, so
+        // the port was asking a different question from the one graded.
+        | "h-push-promise-unsolicited" => Anomaly::ResponseStream,
 
         _ => Anomaly::Transport,
     }
@@ -967,7 +970,15 @@ pub const CATALOG: &[Test] = &[
         expectation: "Close the connection with H3_ID_ERROR. §7.2.7 leaves the maximum \
                       push ID unset until the client sends MAX_PUSH_ID, so a server \
                       \"cannot push until it receives a MAX_PUSH_ID frame\" and every push \
-                      ID is larger than the client has advertised. §7.2.5 is explicit \
+                      ID is larger than the client has advertised.\n\nWHERE the frame goes \
+                      is the whole test. It was written to the control stream, where \
+                      §7.2.5 gives a different and more specific answer -- a PUSH_PROMISE \
+                      there is H3_FRAME_UNEXPECTED whatever its push ID -- so the port \
+                      asked one question and this entry graded the other. Seven \
+                      independent implementations answered 0x105 correctly and were \
+                      failed for it, until 2026-09-20. It now arrives on the response \
+                      stream, where the frame is legal and its push ID is the only thing \
+                      left to object to. §7.2.5 is explicit \
                       about the answer: a client \"MUST treat receipt of a PUSH_PROMISE \
                       frame that contains a larger push ID than the client has advertised \
                       as a connection error of H3_ID_ERROR\".",

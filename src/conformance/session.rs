@@ -439,27 +439,49 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
             (Verdict::Pass, format!("Responded correctly: {what}."))
         }
 
-        // An objection with nothing in it to check.
+        // An objection carrying no HTTP/3 error code.
         //
-        // The client rejected something, which is the right instinct, but the
-        // requirement here is a particular error code and a QUIC-layer close
-        // carries none. Calling that a pass would credit it for the one thing
-        // that was not observed; calling it a failure would accuse it of
-        // accepting a violation it plainly rejected. Neither is available.
+        // This read inconclusive on the grounds that a QUIC-layer close carries
+        // no code, so calling it a failure would accuse a client of accepting a
+        // violation it plainly rejected. That was a false choice. A failure here
+        // does not say the client accepted anything -- it says the client did
+        // not signal the way §8.1 requires, which is the same thing the arm
+        // above says to a client that rejects with the wrong HTTP/3 code and
+        // scores Fail for it. A close carrying no code at all is further from
+        // the requirement than one carrying the wrong code, and it was being
+        // scored more gently.
+        //
+        // What it cost: curl closes every one of these at the transport layer
+        // with INTERNAL_ERROR -- "the endpoint encountered an internal error",
+        // §20.1 -- and names an HTTP/3 error code nowhere in the catalogue, in
+        // any test. Fifteen cells, every one unscored, which is most of why
+        // that column read 0 fail and 20 inconclusive. The suite could not
+        // score it because it never spoke the language the tests read, and
+        // reported its own silence as an open question.
+        //
+        // Only where a code was named. Where the requirement is a transport-
+        // level behaviour instead, a close still shows nothing either way and
+        // the result stays inconclusive.
+        (Class::Correctness, Observation::ObjectedAtTransport(what)) if expected_code.is_some() => {
+            let want = expected_code.expect("guarded above");
+            (
+                Verdict::Fail,
+                format!(
+                    "Objected at the QUIC layer ({what}) instead of signalling the HTTP/3 \
+                     error. The violation was detected and rejected, which is the right \
+                     instinct; §8.1 requires an HTTP/3 connection error to be carried in \
+                     an application close, and this test names 0x{want:x}. A transport \
+                     close carries no HTTP/3 code at all, so a peer has no way to learn \
+                     what was wrong."
+                ),
+            )
+        }
         (Class::Correctness, Observation::ObjectedAtTransport(what)) => (
             Verdict::Inconclusive,
-            match expected_code {
-                Some(want) => format!(
-                    "Objected, but at the QUIC layer ({what}), so the HTTP/3 error code \
-                     could not be read. §8.1 carries an HTTP/3 connection error in an \
-                     application close, and this test asks for 0x{want:x} specifically — \
-                     whether that was the client's reasoning is not observable from here."
-                ),
-                None => format!(
-                    "Objected, but at the QUIC layer ({what}), which does not show whether \
-                     the specific behaviour this test asks for occurred."
-                ),
-            },
+            format!(
+                "Objected, but at the QUIC layer ({what}), which does not show whether \
+                 the specific behaviour this test asks for occurred."
+            ),
         ),
 
         // Nothing was observed at all, so there is nothing to reason from. This
@@ -1227,13 +1249,19 @@ mod tests {
         }
     }
 
-    /// An objection with no readable code is not a pass for a named-code test.
+    /// An objection with no readable code does not meet a named-code clause.
     ///
     /// curl/ngtcp2 rejects HTTP/3 violations by closing at the QUIC layer, so
     /// H3_MISSING_SETTINGS arrives as a transport INTERNAL_ERROR and the code the
     /// clause names is never on the wire. Scoring that "Responded correctly" gave
     /// the quietest client the best score in the published matrix, while clients
     /// that did send an HTTP/3 code and got it wrong were failed.
+    ///
+    /// It was then inconclusive for a year, which was the same mistake in a
+    /// softer form: a close carrying no code at all is further from the clause
+    /// than one carrying the wrong code, and the wrong code has always been a
+    /// failure. The two are asserted together here so they cannot drift apart
+    /// again.
     #[test]
     fn objecting_without_a_readable_code_settles_nothing() {
         let t = test_of("h-missing-settings");
@@ -1243,8 +1271,25 @@ mod tests {
         );
 
         let (v, d) = judge(t, &at_transport, Some(want));
-        assert_eq!(v, Verdict::Inconclusive, "the required code was never seen");
+        assert_eq!(
+            v,
+            Verdict::Fail,
+            "the clause names a code and none was sent"
+        );
         assert!(d.contains("0x10a"), "name the code it was asked for: {d}");
+        assert!(
+            d.contains("detected and rejected"),
+            "credit the rejection while failing the signalling: {d}"
+        );
+
+        // Where the requirement is a transport-level behaviour rather than a
+        // code, a close still shows nothing either way.
+        let transport_behaviour = test_of("q-stateless-reset");
+        assert_eq!(
+            judge(transport_behaviour, &at_transport, None).0,
+            Verdict::Inconclusive,
+            "no code was named, so there is nothing for this close to have missed"
+        );
 
         // The real thing still passes, and a wrong code still fails.
         assert_eq!(

@@ -144,10 +144,28 @@ where
             })?;
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
-        //= type=TODO
         //# A client MUST treat
         //# receipt of a PUSH_PROMISE frame that contains a larger push ID than
         //# the client has advertised as a connection error of H3_ID_ERROR.
+
+        // This client advertises no push ID at all: it never sends MAX_PUSH_ID,
+        // and §7.2.7 leaves the maximum unset until it does, so a server
+        // "cannot push until it receives a MAX_PUSH_ID frame". Every push ID
+        // that arrives is therefore larger than the client has advertised, and
+        // the clause above applies unconditionally.
+        //
+        // It was marked TODO and fell through to the "first response frame is
+        // not headers" arm below, which answers H3_FRAME_UNEXPECTED. That is
+        // the right instinct with the wrong code, and our own conformance
+        // suite failed us for it.
+        if matches!(frame, Frame::PushPromise(_)) {
+            return Err(
+                self.handle_connection_error_on_stream(InternalConnectionError::new(
+                    Code::H3_ID_ERROR,
+                    "PUSH_PROMISE received when no MAX_PUSH_ID has been sent".to_string(),
+                )),
+            );
+        }
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
         //= type=TODO

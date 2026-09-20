@@ -123,6 +123,10 @@ impl Builder {
     {
         let open = quic.opener();
         let shared = SharedState::default();
+        // The shared request-stream code needs to know which end it is on:
+        // PUSH_PROMISE on a response stream is an ID error for a client and an
+        // unexpected frame for a server.
+        shared.set_is_client();
 
         let conn_state = Arc::new(shared);
 

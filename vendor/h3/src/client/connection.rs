@@ -445,6 +445,28 @@ where
                     info!("Server initiated graceful shutdown, last: StreamId({})", id);
                 }
 
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
+                //# If a CANCEL_PUSH frame is received that references a push ID
+                //# greater than currently allowed on the connection, this MUST be
+                //# treated as a connection error of type H3_ID_ERROR.
+                //
+                // This client sends no MAX_PUSH_ID, so nothing is currently
+                // allowed and every referenced push ID is greater than it.
+                // Without this arm the frame fell to the catch-all below and
+                // was answered H3_FRAME_UNEXPECTED -- a rejection with the
+                // wrong code, which our own conformance suite failed us for.
+                Ok(Frame::CancelPush(id)) => {
+                    return Poll::Ready(self.inner.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_ID_ERROR,
+                            format!(
+                                "CANCEL_PUSH for push ID {} when no MAX_PUSH_ID has been sent",
+                                id
+                            ),
+                        ),
+                    ));
+                }
+
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
                 //# If a PUSH_PROMISE frame is received on the control stream, the client
                 //# MUST respond with a connection error of type H3_FRAME_UNEXPECTED.

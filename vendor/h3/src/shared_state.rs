@@ -20,6 +20,29 @@ pub struct SharedState {
     closing: AtomicBool,
     /// Waker for the connection
     waker: AtomicWaker,
+    /// Whether this endpoint is the client.
+    ///
+    /// A handful of frames are legal in one direction and not the other, and
+    /// the shared request-stream code cannot tell which end it is on without
+    /// this. PUSH_PROMISE is the case that needed it: on a client's response
+    /// stream it is a legal frame whose push ID may be wrong (§7.2.5,
+    /// H3_ID_ERROR), and on a server it should never arrive at all
+    /// (H3_FRAME_UNEXPECTED). Both were answered H3_FRAME_UNEXPECTED, and our
+    /// own conformance suite failed us for the first.
+    is_client: AtomicBool,
+}
+
+impl SharedState {
+    /// Mark this state as belonging to a client endpoint.
+    pub(crate) fn set_is_client(&self) {
+        self.is_client
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether this endpoint is the client.
+    pub(crate) fn is_client(&self) -> bool {
+        self.is_client.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl Default for SharedState {
@@ -29,6 +52,7 @@ impl Default for SharedState {
             connection_error: OnceLock::new(),
             closing: AtomicBool::new(false),
             waker: AtomicWaker::new(),
+            is_client: AtomicBool::new(false),
         }
     }
 }

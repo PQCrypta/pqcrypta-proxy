@@ -869,6 +869,29 @@ where
                     return Poll::Ready(Ok(None));
                 }
                 Ok(Some(Frame::Data { .. })) => (),
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
+                //# A client MUST treat
+                //# receipt of a PUSH_PROMISE frame that contains a larger push ID than
+                //# the client has advertised as a connection error of H3_ID_ERROR.
+                //
+                // On a client's response stream PUSH_PROMISE is where it
+                // belongs, so the frame is not what is wrong -- the push ID
+                // is. This client sends no MAX_PUSH_ID, so §7.2.7 leaves the
+                // maximum unset and every push ID exceeds it.
+                //
+                // It fell to the catch-all below and was answered
+                // H3_FRAME_UNEXPECTED, which is the right code for the *other*
+                // reading of this frame and the wrong one here. On a server it
+                // really should never arrive, so the catch-all still applies
+                // there.
+                Ok(Some(Frame::PushPromise(_))) if self.conn_state.is_client() => {
+                    return Poll::Ready(Err(self.handle_connection_error_on_stream(
+                        InternalConnectionError::new(
+                            Code::H3_ID_ERROR,
+                            "PUSH_PROMISE received when no MAX_PUSH_ID has been sent".to_string(),
+                        ),
+                    )));
+                }
                 Ok(Some(other_frame)) => {
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
                     //# Receipt of an invalid sequence of frames MUST be treated as a

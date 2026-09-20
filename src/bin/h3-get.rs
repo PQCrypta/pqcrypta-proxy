@@ -141,6 +141,21 @@ async fn get(url: &str) -> anyhow::Result<u16> {
         .await
         .map_err(|e| anyhow!("opening the HTTP/3 connection: {e}"))?;
 
+    // Everything from here can fail by deciding the *server* is at fault, and
+    // that decision has to reach the wire.
+    //
+    // It did not. On any error this returned straight out of `get`, `main`
+    // printed it and the process exited -- dropping the endpoint, which does
+    // not flush a CONNECTION_CLOSE. So the client detected the violation,
+    // chose the right HTTP/3 error code, and threw it away before sending it.
+    // From the server the connection simply went quiet, which is
+    // indistinguishable from a client that never objected: h-data-before-
+    // headers and h-settings-on-request-stream both reported our own client
+    // as inconclusive for a rejection it had already made.
+    //
+    // `exchange` holds the fallible part; the drain below runs whichever way
+    // it ends.
+
     // The driver owns the control stream and the connection-level frames, which
     // is exactly where most of this suite's anomalies arrive. It has to keep
     // running for the whole request.
@@ -149,6 +164,26 @@ async fn get(url: &str) -> anyhow::Result<u16> {
             async move { futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await },
         );
 
+    let outcome = exchange(&mut send_request, &uri).await;
+
+    // Let the driver finish what it started, whether that is a clean close or
+    // the connection error it just raised, and then wait for the datagram to
+    // actually leave. Bounded: a client that hangs here would be worse than
+    // one that closes silently.
+    drop(send_request);
+    let _ = tokio::time::timeout(DRAIN, driving).await;
+    let _ = tokio::time::timeout(DRAIN, endpoint.wait_idle()).await;
+
+    outcome
+}
+
+/// How long to let a decided close reach the wire before giving up on it.
+const DRAIN: Duration = Duration::from_secs(2);
+
+async fn exchange(
+    send_request: &mut h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>,
+    uri: &http::Uri,
+) -> anyhow::Result<u16> {
     let request = http::Request::builder()
         .method(http::Method::GET)
         .uri(uri.clone())
@@ -182,9 +217,6 @@ async fn get(url: &str) -> anyhow::Result<u16> {
     }
     // Trailers too, for the same reason.
     let _ = stream.recv_trailers().await;
-
-    drop(send_request);
-    let _ = driving.await;
 
     Ok(response.status().as_u16())
 }
