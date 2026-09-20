@@ -2319,22 +2319,42 @@ async fn watch_for_liveness(
                     // `unsupported` across the board on the strength of a
                     // measurement that never happened. 24 cells.
                     let mut buf = Vec::with_capacity(4096);
-                    while buf.len() < 64 * 1024 {
+                    let mut observed = false;
+                    loop {
                         match uni.read_chunk(4096).await {
-                            Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
+                            Ok(Some(chunk)) => {
+                                if buf.len() < 64 * 1024 {
+                                    buf.extend_from_slice(&chunk);
+                                }
+                            }
                             // End of stream, or the stream failed: whatever is
                             // here is all there will be.
                             Ok(None) | Err(_) => break,
                         }
+                        if !observed {
+                            if let Some(limits) = f::parse_client_qpack_limits(&buf) {
+                                qpack.observe(limits);
+                                observed = true;
+                            }
+                        }
+                        // Reading continues past the parse, and that is the
+                        // whole point of the loop shape.
+                        //
+                        // The first version returned as soon as the limits
+                        // were known, which dropped the `RecvStream` -- and
+                        // dropping one makes quinn send STOP_SENDING. On a
+                        // client's *control* stream that is
+                        // H3_CLOSED_CRITICAL_STREAM, and the clients said so:
+                        // msquic went from 34 passes to 12, chromium and
+                        // xquic each lost eight, all of them correctly
+                        // rejecting with 0x104. The stream has to be drained
+                        // for the life of the connection whether or not it
+                        // has told us anything yet.
+                    }
+                    if !observed {
                         if let Some(limits) = f::parse_client_qpack_limits(&buf) {
                             qpack.observe(limits);
-                            return;
                         }
-                    }
-                    // A last attempt on whatever arrived before the stream
-                    // ended, so a client that closes promptly is still read.
-                    if let Some(limits) = f::parse_client_qpack_limits(&buf) {
-                        qpack.observe(limits);
                     }
                 });
             }
