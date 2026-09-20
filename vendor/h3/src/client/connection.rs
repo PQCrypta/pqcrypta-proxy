@@ -395,6 +395,15 @@ where
     /// Maintain the connection state until it is closed
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<ConnectionError> {
+        // Drain the peer's QPACK encoder stream.
+        //
+        // Client side only for now: the same machinery would serve the server
+        // half, but that half runs the live proxy and this is the first time
+        // these instructions have been processed at all. One end at a time.
+        if let Poll::Ready(err) = self.inner.poll_qpack_encoder(cx) {
+            return Poll::Ready(err);
+        }
+
         while let Poll::Ready(result) = self.inner.poll_control(cx) {
             match result {
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2

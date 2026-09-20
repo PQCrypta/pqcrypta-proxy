@@ -81,6 +81,16 @@ where
     control_send: C::SendStream,
     control_recv: Option<FrameStream<C::RecvStream, B>>,
     qpack_streams: QpackStreams<C, B>,
+    /// The QPACK decoder, and with it the dynamic table.
+    ///
+    /// The table has been implemented in `qpack::dynamic` all along and was
+    /// never connected: `encoder_recv` was accepted, stored, and never polled,
+    /// so `on_encoder_recv` was called nowhere outside the qpack module. Our
+    /// own conformance suite showed the cost as four cells on one root cause
+    /// -- two `unsupported`, because a client that cannot use the table must
+    /// advertise a capacity of zero, and two `inconclusive`, because a stream
+    /// nobody reads draws no objection and grants no flow-control credit.
+    qpack_decoder: qpack::Decoder,
     /// Buffers incoming uni/recv streams which have yet to be claimed.
     ///
     /// This is opposed to discarding them by returning in `poll_accept_recv`, which may cause them to be missed by something else polling.
@@ -307,6 +317,7 @@ where
             control_send: control_send,
             control_recv: None,
             qpack_streams,
+            qpack_decoder: qpack::Decoder::default(),
             handled_connection_error: None,
             pending_recv_streams: Vec::with_capacity(3),
             got_peer_settings: false,
@@ -529,6 +540,86 @@ where
 
     /// Waits for the control stream to be received and reads subsequent frames.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    /// Read whatever the peer has put on the QPACK encoder stream.
+    ///
+    /// RFC 9204 §4.2: encoder instructions are processed as they arrive. Two
+    /// things follow from actually doing it. An instruction that cannot be
+    /// applied is QPACK_ENCODER_STREAM_ERROR (§2.2.3), which is the verdict
+    /// two of our own conformance cells were waiting for; and consuming the
+    /// bytes is what extends flow-control credit, which is the only signal a
+    /// server has that the stream was read at all.
+    pub(crate) fn poll_qpack_encoder(&mut self, cx: &mut Context<'_>) -> Poll<ConnectionError> {
+        if self.qpack_streams.encoder_recv.is_none() {
+            return Poll::Pending;
+        }
+        loop {
+            let Some(AcceptedRecvStream::Encoder(encoder)) =
+                self.qpack_streams.encoder_recv.as_mut()
+            else {
+                return Poll::Pending;
+            };
+            match ready!(encoder.poll_read(cx)) {
+                Ok(true) => {
+                    //= https://www.rfc-editor.org/rfc/rfc9204#section-4.2
+                    //# Closure of either unidirectional stream type MUST be treated as a
+                    //# connection error of type H3_CLOSED_CRITICAL_STREAM.
+                    return Poll::Ready(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_CLOSED_CRITICAL_STREAM,
+                            "the peer closed its QPACK encoder stream".to_string(),
+                        ),
+                    ));
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    return Poll::Ready(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_CLOSED_CRITICAL_STREAM,
+                            format!("the QPACK encoder stream failed: {e}"),
+                        ),
+                    ));
+                }
+            }
+
+            let mut out = BytesMut::new();
+            let applied = {
+                let Some(AcceptedRecvStream::Encoder(encoder)) =
+                    self.qpack_streams.encoder_recv.as_mut()
+                else {
+                    return Poll::Pending;
+                };
+                self.qpack_decoder
+                    .on_encoder_recv(encoder.buf_mut(), &mut out)
+            };
+            if let Err(e) = applied {
+                //= https://www.rfc-editor.org/rfc/rfc9204#section-2.2.3
+                //# An endpoint that receives an invalid encoder instruction MUST treat
+                //# it as a connection error of type QPACK_ENCODER_STREAM_ERROR.
+                return Poll::Ready(self.handle_connection_error(
+                    InternalConnectionError::new(
+                        Code::QPACK_ENCODER_STREAM_ERROR,
+                        format!("invalid QPACK encoder instruction: {e:?}"),
+                    ),
+                ));
+            }
+            // Acknowledgements belong on the decoder stream, and are not sent
+            // yet.
+            //
+            // `on_encoder_recv` produces an Insert Count Increment only when
+            // the table actually grew, and this endpoint advertises a
+            // capacity of zero, so nothing can be inserted and `out` stays
+            // empty. Writing it needs a `WriteBuf` bound the generic `B` does
+            // not carry here, and adding one to feed a branch that cannot be
+            // reached would be speculative. It becomes required the moment
+            // the advertised capacity is non-zero, which is the next step and
+            // is deliberately not this one.
+            debug_assert!(
+                out.is_empty(),
+                "the dynamic table grew while advertising zero capacity"
+            );
+        }
+    }
+
     pub fn poll_control(
         &mut self,
         cx: &mut Context<'_>,

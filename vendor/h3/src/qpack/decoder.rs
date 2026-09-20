@@ -78,6 +78,7 @@ pub struct Decoded {
     pub mem_size: u64,
 }
 
+#[derive(Default)]
 pub struct Decoder {
     table: DynamicTable,
 }
