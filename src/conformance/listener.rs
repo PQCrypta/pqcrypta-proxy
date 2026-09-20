@@ -829,17 +829,18 @@ async fn run_one(
     // written but before the client had read it — so a correct client saw our
     // violation, closed the connection, and reported an error on a test it had
     // just passed.
-    let (critical_streams, mut encoder, mut control, control_is_late) =
+    let (critical_streams, mut encoder, mut control, mut probe_target, control_is_late) =
         match emit(&connection, test).await {
             Ok(emitted) => (
                 emitted.keep_open,
                 Some(emitted.encoder),
                 Some(emitted.control),
+                emitted.probe_target,
                 emitted.control_is_late,
             ),
             Err(e) => {
                 debug!("conformance: {} could not emit anomaly: {}", test.id, e);
-                (Vec::new(), None, None, false)
+                (Vec::new(), None, None, None, false)
             }
         };
 
@@ -905,15 +906,31 @@ async fn run_one(
     // (RFC 9114 §7.2.8), it travels on the control stream rather than the
     // request, and it is only started for the tests whose verdict actually
     // turns on whether that stream was read.
-    let probe_control = if !control_is_late
-        && catalog::anomaly_stream(test) == catalog::Anomaly::ControlStream
-        && test.class == catalog::Class::Correctness
-    {
-        control.take()
-    } else {
+    //
+    // Whichever stream carries the anomaly, and only that one. The control
+    // stream for the tests written to it; the anomaly's own stream for a push
+    // stream or the QPACK encoder stream. Credit on one says nothing about
+    // the other, which is the mistake this replaces.
+    let mut probe_control = if test.class != catalog::Class::Correctness {
         None
+    } else {
+        match catalog::anomaly_stream(test) {
+            catalog::Anomaly::ControlStream if !control_is_late => control.take(),
+            // Only where the padding is legal on the stream it pads.
+            //
+            // The proof works by writing a reserved HTTP/3 frame type, which
+            // §7.2.8 requires a client to skip -- true on the control stream
+            // and on a push stream, both of which carry HTTP/3 frames. The
+            // QPACK encoder stream does not: its bytes are encoder
+            // instructions and there is no no-op among them, so padding it
+            // would be our own protocol violation and any rejection it drew
+            // would be a verdict about the probe. The two encoder-stream
+            // tests therefore stay inconclusive, honestly, rather than being
+            // resolved by a stimulus that breaks the thing it measures.
+            catalog::Anomaly::OtherUniStream => probe_target.take(),
+            _ => None,
+        }
     };
-    let mut probe_control = probe_control;
 
     let (observation, read_proof) = if critical_streams.is_empty() {
         (
@@ -1783,6 +1800,9 @@ pub(super) async fn emit(
     // and a correct client would close the connection over it, failing a test it
     // had actually handled properly.
     let mut keep_open = Vec::new();
+    // The anomaly's own stream, where that is a unidirectional stream other
+    // than the control stream. See `Emitted::probe_target`.
+    let mut probe_target: Option<quinn::SendStream> = None;
 
     let mut control = connection.open_uni().await?;
     control
@@ -1894,7 +1914,9 @@ pub(super) async fn emit(
             .await?;
             push.write_all(&f::data(b"a push nobody asked for\n"))
                 .await?;
-            keep_open.push(push);
+            // Handed to the read proof rather than parked: this is the stream
+            // whose consumption the verdict turns on.
+            probe_target = Some(push);
         }
 
         // A push nobody permitted.
@@ -2024,6 +2046,7 @@ pub(super) async fn emit(
         keep_open,
         encoder,
         control,
+        probe_target,
         control_is_late: test.id == GOAWAY_AFTER_REQUEST,
     })
 }
@@ -2121,6 +2144,16 @@ pub(super) struct Emitted {
     /// write past the client's flow-control limit on this exact stream and see
     /// whether credit is extended. Both need a handle that outlives `emit`.
     pub(super) control: quinn::SendStream,
+    /// The stream this test's anomaly was written to, when that is a
+    /// server-opened unidirectional stream other than the control stream.
+    ///
+    /// The read proof has to watch the stream whose bytes are in question. It
+    /// watched the control stream for these too, because they were all filed
+    /// under one `Anomaly` variant, and concluded that a client which had
+    /// drained our control stream must also have consumed a push stream it may
+    /// never have looked at. Three of our own client's cells were failed on
+    /// that.
+    pub(super) probe_target: Option<quinn::SendStream>,
     /// Whether `control` still has its frame to write, which is `h-goaway`
     /// and nothing else.
     pub(super) control_is_late: bool,
@@ -3433,7 +3466,7 @@ const _: () = assert!(DYNAMIC_ENTRIES.len() == 2);
 /// Two quite different reasons to wait, and both need the connection to still be
 /// alive a moment longer than a bare request/response would keep it.
 fn probe_hold(test: &'static Test) -> Option<Duration> {
-    if catalog::anomaly_stream(test) == catalog::Anomaly::ControlStream {
+    if catalog::anomaly_may_be_unread(test) {
         // Give a unidirectional stream a chance to be read before the client is
         // free to close.
         return Some(CONTROL_STREAM_GRACE);
@@ -3906,6 +3939,7 @@ pub fn catalog_json(conformance: &Conformance) -> String {
                 "documents": catalog::documents(t),
                 "anomaly": match catalog::anomaly_stream(t) {
                     catalog::Anomaly::ControlStream => "control_stream",
+                    catalog::Anomaly::OtherUniStream => "other_uni_stream",
                     catalog::Anomaly::ResponseStream => "response_stream",
                     catalog::Anomaly::Transport => "transport",
                 },

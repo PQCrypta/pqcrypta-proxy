@@ -566,7 +566,7 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
             Observation::SurvivedAndContinued
             | Observation::ClosedSilently
             | Observation::ClosedWith { .. },
-        ) if catalog::anomaly_stream(test) == catalog::Anomaly::ControlStream => (
+        ) if catalog::anomaly_may_be_unread(test) => (
             Verdict::Inconclusive,
             "The client completed its request and closed without objecting, and the anomaly \
              was on the control stream — a unidirectional stream nothing obliges it to read \
@@ -597,16 +597,12 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
                  §8.1 makes equivalent to no error at all. This should have been rejected."
             ),
         ),
-        (Class::Correctness, Observation::TimedOut)
-            if catalog::anomaly_stream(test) == catalog::Anomaly::ControlStream =>
-        {
-            (
-                Verdict::Inconclusive,
-                "Nothing further arrived, and the anomaly was on the control stream, so \
+        (Class::Correctness, Observation::TimedOut) if catalog::anomaly_may_be_unread(test) => (
+            Verdict::Inconclusive,
+            "Nothing further arrived, and the anomaly was on the control stream, so \
                  there is no way to tell whether the client read it."
-                    .to_string(),
-            )
-        }
+                .to_string(),
+        ),
         (Class::Correctness, Observation::TimedOut) => (
             Verdict::Fail,
             "Neither rejected the violation nor continued. The connection simply stalled."

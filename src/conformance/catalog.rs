@@ -162,10 +162,34 @@ pub enum Anomaly {
     /// Written to the server's control stream. A client that never reads it
     /// looks identical to one that accepted it.
     ControlStream,
+    /// A server-opened unidirectional stream that is not the control stream:
+    /// the QPACK encoder stream, a push stream, a reserved type.
+    ///
+    /// Judged exactly as `ControlStream` is -- nothing obliges a client to
+    /// read either on any schedule -- but kept apart because the read proof
+    /// measures credit on the control stream, and that says nothing about
+    /// whether a different stream was consumed.
+    OtherUniStream,
     /// Written to the response stream, which the client must read to be served.
     ResponseStream,
     /// Below HTTP/3 entirely: transport parameters, frames, the path itself.
     Transport,
+}
+
+/// Whether `test`'s anomaly rides a server-opened unidirectional stream.
+///
+/// The control stream and the others are judged alike: nothing obliges a
+/// client to read either on any schedule, so silence proves nothing. They are
+/// separate variants only because the read proof measures credit on the
+/// control stream, and that is evidence about the control stream and nothing
+/// else. Use this wherever the question is "could the client have missed it",
+/// and match `Anomaly::ControlStream` exactly wherever the answer comes from
+/// that stream's own credit.
+pub fn anomaly_may_be_unread(test: &Test) -> bool {
+    matches!(
+        anomaly_stream(test),
+        Anomaly::ControlStream | Anomaly::OtherUniStream
+    )
 }
 
 /// Where `test` writes its anomaly.
@@ -183,17 +207,31 @@ pub fn anomaly_stream(test: &Test) -> Anomaly {
         | "h-extended-connect"
         | "h-datagram-setting-invalid"
         | "h-goaway-increasing"
-        // The QPACK encoder stream is unidirectional too, and nothing obliges a
-        // client to read it on any schedule either.
-        | "h-qpack-encoder-overflow"
-        // A push stream is a server-opened unidirectional stream like any other:
-        // nothing obliges a client to read it before its own request completes.
-        | "h-push-stream-unpromised"
-        | "h-qpack-encoder-bad-name-index"
         | "h-goaway"
         | "h-grease-settings"
-        | "h-duplicate-setting"
-        | "h-reserved-uni-stream" => Anomaly::ControlStream,
+        | "h-duplicate-setting" => Anomaly::ControlStream,
+
+        // Server-opened unidirectional streams that are *not* the control
+        // stream: the QPACK encoder stream, a push stream, a reserved type.
+        //
+        // These share the control stream's problem -- nothing obliges a client
+        // to read a unidirectional stream on any schedule -- and for a year
+        // that was the only thing about them that mattered, so they were filed
+        // under `ControlStream` and the distinction cost nothing.
+        //
+        // It costs something now. The read proof watches credit on the control
+        // stream specifically, and credit there says nothing about whether the
+        // client read a *different* stream. Reading them as one made the proof
+        // conclude that a client which had drained our control stream must
+        // also have consumed a push stream it may never have looked at, and
+        // three of our own client's cells were failed on exactly that. Same
+        // error the proof's own comment warns about one level down, where
+        // connection-wide MAX_STREAM_DATA is rejected in favour of per-stream:
+        // the signal has to belong to the thing being claimed.
+        "h-qpack-encoder-overflow"
+        | "h-push-stream-unpromised"
+        | "h-qpack-encoder-bad-name-index"
+        | "h-reserved-uni-stream" => Anomaly::OtherUniStream,
 
         "h-grease-frame"
         | "h-settings-on-request-stream"

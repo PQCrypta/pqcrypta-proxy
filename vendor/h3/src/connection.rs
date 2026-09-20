@@ -464,6 +464,29 @@ where
                         )));
                     }
                 }
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.6
+                //# If a client receives a push stream with a Push ID that it has not
+                //# allowed, it MUST treat this as a connection error of type
+                //# H3_ID_ERROR.
+                //
+                // This client sends no MAX_PUSH_ID, and §7.2.7 leaves the
+                // maximum unset until it does -- a server "cannot push until
+                // it receives a MAX_PUSH_ID frame" -- so no push ID has ever
+                // been allowed and every push stream qualifies.
+                //
+                // The variant existed and had no arm, so it fell to the `_`
+                // at the bottom of this match and the stream was discarded in
+                // silence. Our own conformance suite scored that as accepting
+                // the violation, which is what it was.
+                //
+                // Clients only: a server receiving one of these is a
+                // different fault, and the catch-all still covers it.
+                AcceptedRecvStream::Push(_) if self.shared.is_client() => {
+                    return Err(self.handle_connection_error(InternalConnectionError::new(
+                        Code::H3_ID_ERROR,
+                        "received a push stream when no MAX_PUSH_ID has been sent".to_string(),
+                    )));
+                }
                 AcceptedRecvStream::WebTransportUni(id, s)
                     if self.config.settings.enable_webtransport =>
                 {
@@ -586,6 +609,40 @@ where
             Ok(Some(Frame::Settings(settings))) => {
                 if !self.got_peer_settings {
                     // Received settings frame
+
+                    //= https://www.rfc-editor.org/rfc/rfc9297#section-2.1.1
+                    //# An endpoint that receives the SETTINGS_H3_DATAGRAM parameter with
+                    //# a value other than 0 or 1 MUST terminate the connection with error
+                    //# H3_SETTINGS_ERROR.
+
+                    //= https://www.rfc-editor.org/rfc/rfc9220#section-3
+                    //# A value other than 0 or 1 in the SETTINGS_ENABLE_CONNECT_PROTOCOL
+                    //# parameter MUST be treated as a connection error of type
+                    //# H3_SETTINGS_ERROR.
+                    //
+                    // These were read as `value != 0`, so any non-zero value was
+                    // taken as "enabled" and nothing was rejected. Our own
+                    // conformance suite scored that as accepting a protocol
+                    // violation, and it was right to.
+                    for id in [
+                        frame::SettingId::H3_DATAGRAM,
+                        frame::SettingId::ENABLE_WEBTRANSPORT,
+                        frame::SettingId::ENABLE_CONNECT_PROTOCOL,
+                    ] {
+                        if let Some(value) = settings.get(id) {
+                            if value > 1 {
+                                return Poll::Ready(Err(self.handle_connection_error(
+                                    InternalConnectionError::new(
+                                        Code::H3_SETTINGS_ERROR,
+                                        format!(
+                                            "setting {id:?} carries {value}, which is \
+                                             neither 0 nor 1"
+                                        ),
+                                    ),
+                                )));
+                            }
+                        }
+                    }
 
                     self.got_peer_settings = true;
                     self.set_settings((&settings).into());
