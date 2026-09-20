@@ -987,16 +987,36 @@ async fn run_one(
     // unreliable. Someone reading it in six months sees a probe that appears
     // wired.
     //
-    // What is worth keeping is kept elsewhere: `control_stream_was_read`
-    // still runs and still logs, because the log is what established the
-    // limit and is what would show the vantage point changing, and
-    // `conformance::read_proof` keeps the three tests that prove the
-    // mechanism sound in both directions. Its *reach* is what fails — the
-    // probe decides only for clients whose advertised window is small enough
-    // that reading forces a credit grant, so the cells it answered sorted by
-    // buffer size. That is recorded on /conformance/ as a limit of this
-    // vantage point, not as a gap to close.
-    let _ = read_proof;
+    // The probe decides again, and this time the reach was measured first.
+    //
+    // It was withdrawn because the version of it that wrote the client's whole
+    // advertised window answered only for clients with small buffers -- 100%
+    // at 64 KB, 9% around 1 MB, skipped entirely above 4 MB -- so the cells it
+    // resolved sorted by buffer size rather than by behaviour. The rewrite
+    // watches this stream's own credit and stops at the first grant, which
+    // costs the same whatever the window, and the reach was measured across
+    // six clients before rewiring it: msquic 10/10, picoquic 10/10, quic-go
+    // 4/10, aioquic 4/10, chromium 3/35, curl 0/10. curl's are all "connection
+    // lost" -- it closes before the probe can be put, which is a different
+    // limit from the one that was withdrawn and is not buffer size.
+    //
+    // Only `Some(true)` is acted on. A grant is positive evidence that the
+    // bytes were consumed; its absence is still the old ambiguity and is left
+    // as inconclusive, so nothing is failed for a probe that merely did not
+    // land.
+    let observation = match (&observation, read_proof) {
+        (
+            Observation::SurvivedAndContinued
+            | Observation::ClosedSilently
+            | Observation::NoCloseObserved
+            | Observation::PeerUnreachable
+            | Observation::TimedOut,
+            Some(true),
+        ) if catalog::anomaly_stream(test) == catalog::Anomaly::ControlStream => {
+            Observation::ReadThenSilent("extended flow-control credit on it".to_string())
+        }
+        _ => observation,
+    };
 
     // Some QUIC-layer tests are judged on what the connection did rather than
     // on whether a request arrived, so the transport's own account of it

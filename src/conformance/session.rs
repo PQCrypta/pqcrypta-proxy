@@ -148,6 +148,27 @@ pub enum Observation {
     /// on how the connection ended, and there this is the case where the
     /// instrument cannot show it was heard.
     PeerUnreachable,
+    /// The client granted flow-control credit on the control stream after the
+    /// anomaly went out, and then did not object to it.
+    ///
+    /// A receiver sends MAX_STREAM_DATA only once its application has consumed
+    /// what was already sent, so a grant on *this* stream is the one signal
+    /// that separates reading from receiving. With it, "completed the request
+    /// and said nothing" stops being unanswerable: the client read the
+    /// violation and accepted it.
+    ///
+    /// The probe behind this was withdrawn once, for a good reason that no
+    /// longer holds. The version that was withdrawn proved a read by writing
+    /// the client's whole advertised window, so whether a cell got a verdict
+    /// was decided by the client's buffer size -- 100% at 64 KB, 9% around
+    /// 1 MB, skipped above 4 MB -- and the column sorted by buffer size
+    /// wearing a behaviour's clothes. The current one watches this stream's
+    /// own credit and stops at the first grant, so a large window costs no
+    /// more than a small one. Measured before rewiring it: msquic 10/10,
+    /// picoquic 10/10, quic-go and aioquic 4/10, chromium 3/35, curl 0/10 --
+    /// and curl's are all "connection lost", which is curl closing too fast
+    /// rather than a window it was too expensive to fill.
+    ReadThenSilent(String),
     /// The client closed the connection with this application error code.
     ClosedWith { code: u64 },
     /// The client closed without an error code, or the transport dropped.
@@ -505,6 +526,36 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
              and a client that exited without closing looks from here exactly like one that \
              read the anomaly and carried on. Reported separately rather than as silence \
              from a live peer, which is a stronger claim than the run supports."
+                .to_string(),
+        ),
+
+        // Proven to have read it, and said nothing.
+        //
+        // This is the control-stream case with the evidence that used to be
+        // missing, so it is judged as the response-stream case is: the client
+        // saw the violation and carried on.
+        (Class::Correctness, Observation::ReadThenSilent(how)) => (
+            Verdict::Fail,
+            format!(
+                "Accepted a protocol violation and carried on. The anomaly was on the \
+                 control stream, and this client {how} -- a receiver extends credit on a \
+                 stream only once its application has consumed what was already there, so \
+                 the bytes were read rather than merely delivered. This should have been \
+                 rejected."
+            ),
+        ),
+        // For the classes whose pass is carrying on, proving the read changes
+        // nothing: carrying on was already the requirement.
+        (
+            Class::Extensibility
+            | Class::Resilience
+            | Class::Interoperability
+            | Class::Discretionary,
+            Observation::ReadThenSilent(_),
+        ) => (
+            Verdict::Pass,
+            "Read the element on the control stream and carried on, which is what this \
+             test asks for."
                 .to_string(),
         ),
 
