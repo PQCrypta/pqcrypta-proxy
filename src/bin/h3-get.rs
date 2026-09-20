@@ -202,17 +202,25 @@ async fn get(url: &str) -> anyhow::Result<u16> {
         },
     };
 
-    // Offer the server a QPACK dynamic table.
+    // Offer the server a QPACK dynamic table, and no blocked streams.
     //
-    // Advertising zero is what made h-qpack-dynamic-table and
-    // h-qpack-blocked-stream read `unsupported` against our own client: the
-    // table is implemented, and until the encoder stream was read and applied
-    // there was no way to honour a non-zero value. 4 KiB and 16 blocked
-    // streams are ordinary figures -- Chromium and Firefox are in the same
-    // range -- and the point is to exercise the path, not to win at it.
+    // The table is honest now: the encoder stream is read and applied, and
+    // field sections decode against the same decoder that applied them.
+    //
+    // Blocked streams are not, and saying 16 was an overclaim that the suite
+    // caught within one run. A blocked stream is one whose field section
+    // references an insert the decoder has not received yet, and handling it
+    // means parking the section until the encoder stream catches up. This
+    // decoder does not park: `decode_header` returns MissingRefs and the
+    // connection fails with QPACK_DECOMPRESSION_FAILED. Advertising zero is
+    // what a decoder without that machinery is required to say -- the encoder
+    // then may not reference an insert we have not acknowledged, so the
+    // situation never arises.
+    //
+    // h-qpack-blocked-stream therefore reads `unsupported`, which is true.
     let (mut driver, mut send_request) = h3::client::builder()
         .qpack_max_table_capacity(4096)
-        .qpack_blocked_streams(16)
+        .qpack_blocked_streams(0)
         .build(h3_quinn::Connection::new(connection))
         .await
         .map_err(|e| anyhow!("opening the HTTP/3 connection: {e}"))?;

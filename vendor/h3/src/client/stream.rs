@@ -175,7 +175,29 @@ where
         //# H3_GENERAL_PROTOCOL_ERROR.
 
         let decoded = if let Frame::Headers(ref mut encoded) = frame {
-            match qpack::decode_stateless(encoded, self.inner.max_field_section_size) {
+            // Decode against the connection's dynamic table, not statelessly.
+            //
+            // `decode_stateless` cannot resolve a reference into the dynamic
+            // table, so using it while advertising a non-zero
+            // SETTINGS_QPACK_MAX_TABLE_CAPACITY is claiming a capability and
+            // then failing to honour it: the moment a server took us up on
+            // it, every response carrying a dynamic reference came back
+            // QPACK_DECOMPRESSION_FAILED. Our own conformance suite caught
+            // exactly that -- h-qpack-dynamic-table went from `unsupported`
+            // to `fail` the run after the capacity was advertised, which is
+            // the right complaint about a client that says it has a table and
+            // cannot read one.
+            //
+            // The decoder is the one on SharedState, so the inserts applied
+            // from the encoder stream are the same ones resolved here.
+            let decoded = self
+                .inner
+                .conn_state
+                .qpack_decoder
+                .lock()
+                .expect("the QPACK decoder lock is never held across a panic")
+                .decode_header(encoded);
+            match decoded {
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
                 //# An HTTP/3 implementation MAY impose a limit on the maximum size of
                 //# the message header it will accept on an individual HTTP message.
