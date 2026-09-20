@@ -146,7 +146,34 @@ async fn get(url: &str) -> anyhow::Result<u16> {
     // like any other, which is indistinguishable from never having resumed.
     let (connection, zero_rtt) = match connecting.into_0rtt() {
         Ok((connection, accepted)) => (connection, Some(accepted)),
-        Err(connecting) => (connecting.await.context("completing the handshake")?, None),
+        Err(connecting) => match connecting.await {
+            Ok(connection) => (connection, None),
+            // A failed handshake still has something to say, and ours does
+            // not manage to say it.
+            //
+            // RFC 9001 §4.8 carries a TLS alert in a CONNECTION_CLOSE. On
+            // t-group-not-offered this client detects the fault and names the
+            // alert -- "error 47: peer misbehaved: WrongGroupForKeyShare" --
+            // and on q-invalid-transport-param it names the parameter. The
+            // server sees neither, and reports both as a handshake that
+            // stopped with nothing said, which is indistinguishable from a
+            // client that objected to nothing. Nine of the twelve clients do
+            // produce a readable close on those same ports, so the server is
+            // reading them; we are not sending one.
+            //
+            // The drain below is here because it is the same shape as the
+            // fault on the request path, where exiting before the datagram
+            // left was exactly the problem. It did not fix this one: the
+            // cells are unchanged with it. So the close is not merely
+            // unflushed, it is not being produced, and that is in the noq
+            // fork rather than in this file. Left in place because it costs
+            // nothing and the next person should not have to rule it out
+            // again; the open question is recorded rather than guessed at.
+            Err(e) => {
+                let _ = tokio::time::timeout(DRAIN, endpoint.wait_idle()).await;
+                return Err(anyhow::Error::new(e).context("completing the handshake"));
+            }
+        },
     };
 
     let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(connection))
