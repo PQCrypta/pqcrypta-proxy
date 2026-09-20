@@ -1574,22 +1574,47 @@ async fn abandon_and_watch(
         ));
     }
 
+    // Let whatever was already in flight land before the clock starts.
+    //
+    // A Stateless Reset cannot stop packets the peer has already put on the
+    // wire, and §10.3.1 asks a client to go quiet once it *recognises* the
+    // token -- not retroactively. Counting from the instant the reset was
+    // sent charged every one of those crossing packets to the client, which
+    // made the verdict turn on how much it happened to have in flight at that
+    // moment. Across three runs of the same binaries it flipped
+    // picoquic/q-stateless-reset pass -> fail -> pass and
+    // xquic/q-stateless-reset the same way, and a cell that changes its claim
+    // between identical runs is not a result.
+    //
+    // The grace is generous next to the round-trip times here, and it does
+    // not weaken the test: a client that has not recognised the token keeps
+    // retransmitting for the whole silence window that follows, which is
+    // longer than any reasonable PTO on this path.
+    const CROSSING: Duration = Duration::from_millis(500);
+    tokio::time::sleep(CROSSING).await;
+    let settled = counters.datagrams_in();
+
     tokio::time::sleep(SILENCE).await;
-    let after = counters.datagrams_in() - at_reset;
+    let after = counters.datagrams_in() - settled;
+    let crossing = settled - at_reset;
 
     if after == 0 {
         Observation::Signalled(format!(
             "was sent a Stateless Reset and went quiet — nothing further arrived in the {} \
-             seconds that followed, which is the draining period §10.3.1 requires",
+             seconds that followed, which is the draining period §10.3.1 requires \
+             ({crossing} datagram(s) were already in flight when the reset went out and are \
+             not counted against it)",
             SILENCE.as_secs()
         ))
     } else {
         Observation::Violated(format!(
             "kept sending after the Stateless Reset: {after} more datagram(s) arrived in \
-             the following {} seconds. RFC 9000 §10.3.1 requires a client that recognises \
-             the token to enter the draining period and send nothing further, so this \
+             the following {} seconds, after a {}ms grace for packets already in flight \
+             ({crossing} of those). RFC 9000 §10.3.1 requires a client that recognises the \
+             token to enter the draining period and send nothing further, so this \
              connection is wedged against an endpoint that has forgotten it",
-            SILENCE.as_secs()
+            SILENCE.as_secs(),
+            CROSSING.as_millis()
         ))
     }
 }
