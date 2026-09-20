@@ -925,18 +925,10 @@ async fn run_one(
     } else {
         match catalog::anomaly_stream(test) {
             catalog::Anomaly::ControlStream if !control_is_late => control.take(),
-            // Only where the padding is legal on the stream it pads.
-            //
-            // The proof works by writing a reserved HTTP/3 frame type, which
-            // §7.2.8 requires a client to skip -- true on the control stream
-            // and on a push stream, both of which carry HTTP/3 frames. The
-            // QPACK encoder stream does not: its bytes are encoder
-            // instructions and there is no no-op among them, so padding it
-            // would be our own protocol violation and any rejection it drew
-            // would be a verdict about the probe. The two encoder-stream
-            // tests therefore stay inconclusive, honestly, rather than being
-            // resolved by a stimulus that breaks the thing it measures.
-            catalog::Anomaly::OtherUniStream => probe_target.take(),
+            // The push test hands its stream over; the two QPACK tests write
+            // to the encoder stream, which `emit` returns by name. Each is
+            // padded with something legal on it -- see `fill` in the probe.
+            catalog::Anomaly::OtherUniStream => probe_target.take().or_else(|| encoder.take()),
             _ => None,
         }
     };
@@ -3589,6 +3581,12 @@ fn no_early_data(counters: &PeerView, what_was_missed: &str) -> Observation {
     ))
 }
 
+/// How much padding the read proof writes at a time.
+///
+/// Chosen for the number of writes, not the bytes: the fill has to finish
+/// inside the client's own connection, and each write can cost a poll tick.
+const PROBE_CHUNK: usize = 64 * 1024;
+
 /// How long the client has to extend credit once the window is full.
 const READ_PROOF_WAIT: Duration = Duration::from_millis(1_500);
 
@@ -3677,8 +3675,40 @@ pub(super) async fn control_stream_was_read(
         }
     };
 
-    let payload = vec![0u8; 4096];
-    let frame = f::reserved_frame(0x1f, &payload);
+    // Padding the stream is allowed to carry.
+    //
+    // A reserved HTTP/3 frame type is the right filler on a stream made of
+    // HTTP/3 frames -- §7.2.8 requires a client to skip it -- and it is
+    // meaningless on the QPACK encoder stream, whose bytes are encoder
+    // instructions. That looked like the end of it, and the two
+    // encoder-stream tests were left inconclusive on the grounds that no
+    // legal filler exists there.
+    //
+    // One does. RFC 9204 §4.3.1's Set Dynamic Table Capacity is a complete,
+    // legal encoder instruction, a decoder must process it, and repeating it
+    // with the same value changes nothing: capacity 0 is valid and is what
+    // this endpoint already advertises. So the encoder stream can be filled
+    // as legally as the control stream, and its tests can be answered rather
+    // than written off.
+    let frame = if matches!(
+        test_id,
+        "h-qpack-encoder-overflow" | "h-qpack-encoder-bad-name-index"
+    ) {
+        // 64 KiB of one-byte instructions. The size is about how many
+        // writes the fill takes, not about the bytes: at 4 KiB a 1.25 MB
+        // window needs ~300 writes and the polling loop can spend a 10ms
+        // tick on each, so the probe was still filling when the client
+        // finished and went away -- measured at 1,249,280 of 1,250,000
+        // bytes written before "connection lost". Twenty writes instead of
+        // three hundred.
+        let mut buf = bytes::BytesMut::with_capacity(PROBE_CHUNK);
+        for _ in 0..PROBE_CHUNK {
+            buf.extend_from_slice(&f::qpack_set_capacity(0));
+        }
+        buf
+    } else {
+        f::reserved_frame(0x1f, &vec![0u8; PROBE_CHUNK])
+    };
     let mut written = 0u64;
 
     let probe = async {
