@@ -428,6 +428,15 @@ impl TestListener {
         let blackhole_above = (test.id == "q-pmtu-blackhole").then_some(1300);
         let counters = Arc::new(Counters::default());
 
+        // Load this port's remembered ECN path evidence, and give it somewhere
+        // to write its own. Only the two ECN ports mark ECT, so only they can
+        // ever prove or need it.
+        if matches!(test.id, "q-ecn" | "q-ecn-congestion") {
+            counters.ecn_evidence.remember_at(
+                std::path::Path::new(super::impairment::ECN_EVIDENCE_DIR).join(test.id),
+            );
+        }
+
         // Every port gets the counting socket, impaired or not.
         //
         // It used to be wrapped only for the two tests that need an impairment,

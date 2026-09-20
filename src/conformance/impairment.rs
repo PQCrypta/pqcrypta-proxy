@@ -81,6 +81,80 @@ pub struct PeerCounters {
     viewed: std::sync::atomic::AtomicBool,
 }
 
+/// Where a port's ECN path evidence is kept between restarts.
+///
+/// "This port's path carries ECT" is a fact about the network between this
+/// host and the clients that reach it, and it does not stop being true because
+/// the proxy restarted. Keeping it only in memory meant the first matrix run
+/// after every deploy measured its first three clients before any peer had
+/// proven the path, and six cells read inconclusive that read `unsupported` on
+/// every later run -- a verdict decided by run order, which is not a verdict.
+///
+/// Expires, because a path that genuinely stops carrying ECT must be able to
+/// say so rather than being contradicted by a note from last month.
+pub const ECN_EVIDENCE_DIR: &str = "/var/lib/pqcrypta/conformance/ecn-evidence";
+
+/// How long remembered evidence stands before the path has to prove itself
+/// again.
+const ECN_EVIDENCE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+fn chrono_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A port's ECN path evidence: the flag, and where it is remembered.
+///
+/// One object because the two were separate and drifted immediately -- the
+/// flag lived on `Counters` and also behind an `Arc` on every `PeerView`, and
+/// the file path only on `Counters`, so the copy that observations actually
+/// call set the flag and wrote nothing. Sharing one thing removes the chance.
+#[derive(Debug, Default)]
+pub struct EcnEvidence {
+    proven: std::sync::atomic::AtomicBool,
+    path: parking_lot::Mutex<Option<std::path::PathBuf>>,
+}
+
+impl EcnEvidence {
+    pub fn proven(&self) -> bool {
+        self.proven.load(Ordering::Relaxed)
+    }
+
+    /// Say where to remember it, and load what is already remembered.
+    pub fn remember_at(&self, path: std::path::PathBuf) {
+        if ecn_evidence_remembered(&path) {
+            self.proven.store(true, Ordering::Relaxed);
+        }
+        *self.path.lock() = Some(path);
+    }
+
+    /// A peer echoed the markings this port sent.
+    pub fn note(&self) {
+        if self.proven.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        if let Some(path) = self.path.lock().as_ref() {
+            // Best effort: losing the file costs one cold run, not a wrong
+            // answer.
+            let _ = std::fs::create_dir_all(ECN_EVIDENCE_DIR);
+            let _ = std::fs::write(path, chrono_secs().to_string());
+        }
+    }
+}
+
+/// Read this port's remembered evidence, if it is still within its TTL.
+pub fn ecn_evidence_remembered(path: &std::path::Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(written) = text.trim().parse::<u64>() else {
+        return false;
+    };
+    chrono_secs().saturating_sub(written) < ECN_EVIDENCE_TTL_SECS
+}
+
 /// What the socket counted while a test ran.
 #[derive(Debug, Default)]
 pub struct Counters {
@@ -108,17 +182,14 @@ pub struct Counters {
     pub shadow_failed: AtomicU64,
     /// Client datagrams that reached us carrying ECT(0) or ECT(1).
     pub ect_in: AtomicU64,
-    /// Whether any peer on this port has ever echoed ECN counts back.
+    /// Whether any peer on this port has ever echoed ECN counts back, and
+    /// where that is remembered between restarts.
     ///
-    /// Deliberately per-port and sticky, and deliberately not a per-connection
-    /// fact read from shared state -- which is the bug class this suite has
-    /// closed twice. What it records is a property of the *path*: if one peer
-    /// ever reported the markings this endpoint sent, then the codepoint
-    /// survives from here to there, and that does not become untrue for the
-    /// next client. A client that then reports nothing is choosing not to,
-    /// which §13.4.1 permits and which is a fact about the client rather than
-    /// a gap in the run.
-    pub ecn_echoed_by_any_peer: Arc<std::sync::atomic::AtomicBool>,
+    /// Per-port and sticky on purpose, and deliberately not the bug this suite
+    /// has closed three times: what it records is a property of the *path*,
+    /// not a per-connection fact read from shared state. A client that then
+    /// reports nothing is choosing not to, which §13.4.1 permits.
+    pub ecn_evidence: Arc<EcnEvidence>,
     /// Client datagrams that carried a QUIC Initial packet.
     ///
     /// The evidence for `t-hybrid-large-hello`. An ML-KEM-768 key share is 1,216
@@ -207,12 +278,12 @@ impl Counters {
 
     /// Whether this port has ever been shown that the path carries ECT.
     pub fn path_carries_ect(&self) -> bool {
-        self.ecn_echoed_by_any_peer.load(Ordering::Relaxed)
+        self.ecn_evidence.proven()
     }
 
     /// Record that a peer echoed ECN counts, which proves the path.
     pub fn note_ecn_echoed(&self) {
-        self.ecn_echoed_by_any_peer.store(true, Ordering::Relaxed);
+        self.ecn_evidence.note();
     }
 
     pub fn reordered(&self) -> u64 {
@@ -314,7 +385,7 @@ impl Counters {
         // is lost. A later one baselines, which bounds what a reused address
         // can inherit.
         let first = !peer.viewed.swap(true, std::sync::atomic::Ordering::Relaxed);
-        PeerView::new(peer, first, Arc::clone(&self.ecn_echoed_by_any_peer))
+        PeerView::new(peer, first, Arc::clone(&self.ecn_evidence))
     }
 }
 
@@ -346,15 +417,11 @@ pub struct PeerView {
     datagrams_in: u64,
     /// The port's path evidence, shared rather than snapshotted: it is a fact
     /// about the path and stays true once shown.
-    path_ect: Arc<std::sync::atomic::AtomicBool>,
+    path_ect: Arc<EcnEvidence>,
 }
 
 impl PeerView {
-    fn new(
-        counters: Arc<PeerCounters>,
-        from_zero: bool,
-        path_ect: Arc<std::sync::atomic::AtomicBool>,
-    ) -> Self {
+    fn new(counters: Arc<PeerCounters>, from_zero: bool, path_ect: Arc<EcnEvidence>) -> Self {
         if from_zero {
             return Self {
                 zero_rtt_in: 0,
@@ -406,13 +473,13 @@ macro_rules! peer_delta {
 impl PeerView {
     /// Whether this port has ever been shown that the path carries ECT.
     pub fn path_carries_ect(&self) -> bool {
-        self.path_ect.load(Ordering::Relaxed)
+        self.path_ect.proven()
     }
 
     /// Record that this peer echoed ECN counts, which proves the path for
     /// every peer after it.
     pub fn note_ecn_echoed(&self) {
-        self.path_ect.store(true, Ordering::Relaxed);
+        self.path_ect.note();
     }
 }
 
