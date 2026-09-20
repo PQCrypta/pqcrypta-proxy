@@ -112,17 +112,29 @@ async fn get(url: &str) -> anyhow::Result<u16> {
     endpoint.set_default_client_config(client_config);
 
     if resuming {
-        // One connection purely to be issued a ticket. Its failure is not this
-        // run's failure: without a ticket the connection below is an ordinary
-        // one and the suite reports honestly that no early data was offered.
-        if let Ok(connecting) = endpoint.connect(addr, host) {
-            if let Ok(priming) = connecting.await {
-                // The ticket arrives after the handshake, not with it, so the
-                // connection has to outlive the handshake to receive one.
-                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-                priming.close(0u32.into(), b"primed");
-            }
-        }
+        // One connection purely to be issued a ticket, and it makes an
+        // ordinary request like any other.
+        //
+        // It used to handshake, sleep, and close. The server judges every
+        // connection it is given, so that one was judged too -- and a peer
+        // that connects and then goes away without asking for anything reads
+        // as a client that dropped out. q-zero-rtt-reject scored our own
+        // stack "Dropped the connection instead of recovering" on the
+        // strength of the priming connection, while the connection the test
+        // was actually about completed and returned 200.
+        //
+        // The clients that already worked here prime by running themselves
+        // twice, so their first connection is a complete exchange. This does
+        // the same. Its failure is still not this run's failure: without a
+        // ticket the connection below is an ordinary one and the suite
+        // reports honestly that no early data was offered.
+        let _ = plain_exchange(&endpoint, addr, host, &uri).await;
+        // The ticket arrives after the response, not with it. Without this
+        // wait the resumed connection sometimes finds an empty store and
+        // offers no early data, which made q-zero-rtt-replay alternate
+        // between pass and inconclusive between runs -- an unstable cell is
+        // not a result.
+        tokio::time::sleep(Duration::from_millis(400)).await;
     }
 
     let connecting = endpoint
@@ -132,9 +144,9 @@ async fn get(url: &str) -> anyhow::Result<u16> {
     // `into_0rtt` is what actually puts the request in the first flight. A
     // resumed handshake that waits for completion sends its request in 1-RTT
     // like any other, which is indistinguishable from never having resumed.
-    let connection = match connecting.into_0rtt() {
-        Ok((connection, _accepted)) => connection,
-        Err(connecting) => connecting.await.context("completing the handshake")?,
+    let (connection, zero_rtt) = match connecting.into_0rtt() {
+        Ok((connection, accepted)) => (connection, Some(accepted)),
+        Err(connecting) => (connecting.await.context("completing the handshake")?, None),
     };
 
     let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(connection))
@@ -164,21 +176,87 @@ async fn get(url: &str) -> anyhow::Result<u16> {
             async move { futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await },
         );
 
-    let outcome = exchange(&mut send_request, &uri).await;
+    let mut outcome = exchange(&mut send_request, &uri).await;
 
-    // Let the driver finish what it started, whether that is a clean close or
-    // the connection error it just raised, and then wait for the datagram to
-    // actually leave. Bounded: a client that hangs here would be worse than
-    // one that closes silently.
+    // A refused 0-RTT is not a failed request.
+    //
+    // RFC 9001 §4.6.2: when a server rejects early data the handshake carries
+    // on, the streams opened in the first flight are reset, and the client is
+    // expected to send the data again once the handshake completes. This
+    // client did not -- it surfaced the reset as an error and gave up, so
+    // q-zero-rtt-reject read "Dropped the connection instead of recovering"
+    // against our own stack, which was accurate.
+    //
+    // Retried once, on a fresh connection that does not offer early data, so
+    // the retry cannot be refused for the same reason and cannot loop.
+    if outcome.is_err() {
+        let rejected = match zero_rtt {
+            Some(accepted) => !accepted.await,
+            None => false,
+        };
+        if rejected {
+            drop(send_request);
+            let _ = tokio::time::timeout(DRAIN, driving).await;
+            return plain_exchange(&endpoint, addr, host, &uri).await;
+        }
+        // Put the error back where the caller expects it.
+        outcome = outcome.map_err(|e| e);
+    }
+
+    // Only on the way out through an error.
+    //
+    // The drain exists so that a rejection this client decided on reaches the
+    // wire before the process exits. On a *successful* exchange there is
+    // nothing to flush, and draining anyway turns the exit into a deliberate
+    // application close -- which q-zero-rtt-reject read as "Dropped the
+    // connection instead of recovering", failing our own stack for a request
+    // that had completed and returned 200. Every other client in the fleet
+    // simply exits here, and so does this one now.
     drop(send_request);
-    let _ = tokio::time::timeout(DRAIN, driving).await;
-    let _ = tokio::time::timeout(DRAIN, endpoint.wait_idle()).await;
+    if outcome.is_err() {
+        let _ = tokio::time::timeout(DRAIN, driving).await;
+        let _ = tokio::time::timeout(DRAIN, endpoint.wait_idle()).await;
+    }
 
     outcome
 }
 
 /// How long to let a decided close reach the wire before giving up on it.
 const DRAIN: Duration = Duration::from_secs(2);
+
+/// A complete exchange on a fresh connection that offers no early data.
+///
+/// Used twice: to be issued a session ticket before the resumed connection,
+/// and to retry after a server refuses the early data that ticket allowed.
+async fn plain_exchange(
+    endpoint: &quinn::Endpoint,
+    addr: std::net::SocketAddr,
+    host: &str,
+    uri: &http::Uri,
+) -> anyhow::Result<u16> {
+    let connection = endpoint
+        .connect(addr, host)
+        .context("starting the retry connection")?
+        .await
+        .context("completing the retry handshake")?;
+
+    let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(connection))
+        .await
+        .map_err(|e| anyhow!("opening the HTTP/3 connection for the retry: {e}"))?;
+    let driving =
+        tokio::spawn(
+            async move { futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await },
+        );
+
+    let outcome = exchange(&mut send_request, uri).await;
+
+    drop(send_request);
+    if outcome.is_err() {
+        let _ = tokio::time::timeout(DRAIN, driving).await;
+        let _ = tokio::time::timeout(DRAIN, endpoint.wait_idle()).await;
+    }
+    outcome
+}
 
 async fn exchange(
     send_request: &mut h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>,

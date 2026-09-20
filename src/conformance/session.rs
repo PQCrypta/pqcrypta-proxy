@@ -637,9 +637,36 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
             Verdict::Fail,
             format!("Gave up ({what}) instead of recovering."),
         ),
+        // A close carrying no error code is a graceful shutdown, not a
+        // surrender.
+        //
+        // This was a flat Fail, which made the test reward the worse
+        // behaviour: on a QUIC-tier test there are no critical streams, so the
+        // liveness watcher is bypassed and the close alone decides -- and the
+        // only way to pass was to walk away without closing at all.
+        // `NoCloseObserved` passed; closing politely failed. Our own client
+        // recovered from a refused 0-RTT, completed the request, returned 200
+        // and closed cleanly, and was scored "Dropped the connection instead
+        // of recovering" for the last of those.
+        //
+        // Giving up has its own arms: `ClosedWith` an error code, and
+        // `ObjectedAtTransport`. Both are still failures here.
+        (Class::Resilience, Observation::ClosedSilently) if test.tier == catalog::Tier::Quic => (
+            Verdict::Pass,
+            "Recovered, then closed the connection without an error code, which §8.1 makes \
+             a graceful shutdown rather than an objection."
+                .to_string(),
+        ),
+        // On the HTTP/3 tier there *is* a follow-up request, and completing it
+        // is what recovery means -- a client that completes it reaches this
+        // function as `SurvivedAndContinued`, not here. Reaching here means it
+        // closed instead, politely or not.
         (Class::Resilience, Observation::ClosedSilently) => (
             Verdict::Fail,
-            "Dropped the connection instead of recovering.".to_string(),
+            "Closed the connection without completing the follow-up request. The close \
+             carried no error code, so nothing was objected to -- but recovering is what \
+             this test asks for and the request never came."
+                .to_string(),
         ),
         (Class::Resilience, Observation::TimedOut) => {
             (Verdict::Fail, "Stalled instead of recovering.".to_string())
