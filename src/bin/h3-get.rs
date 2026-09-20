@@ -203,20 +203,24 @@ async fn get(url: &str) -> anyhow::Result<u16> {
         outcome = outcome.map_err(|e| e);
     }
 
-    // Only on the way out through an error.
+    // Always, not only on the error path.
     //
-    // The drain exists so that a rejection this client decided on reaches the
-    // wire before the process exits. On a *successful* exchange there is
-    // nothing to flush, and draining anyway turns the exit into a deliberate
-    // application close -- which q-zero-rtt-reject read as "Dropped the
-    // connection instead of recovering", failing our own stack for a request
-    // that had completed and returned 200. Every other client in the fleet
-    // simply exits here, and so does this one now.
+    // It does two jobs and both matter. A rejection this client decided on
+    // has to reach the wire before the process exits, and the connection has
+    // to stay up long enough to answer the server's close-elicitation PING --
+    // a client that vanishes the instant its request completes is recorded as
+    // PeerUnreachable, which establishes less than a live peer that says
+    // nothing.
+    //
+    // It was briefly made conditional, because draining on success turned the
+    // exit into a graceful close and q-zero-rtt-reject read that as "Dropped
+    // the connection instead of recovering". That was the suite's reading to
+    // fix, not this client's behaviour: a close carrying no error code is a
+    // shutdown, not a surrender. Making it conditional here cost five cells
+    // that the unconditional version had already resolved.
     drop(send_request);
-    if outcome.is_err() {
-        let _ = tokio::time::timeout(DRAIN, driving).await;
-        let _ = tokio::time::timeout(DRAIN, endpoint.wait_idle()).await;
-    }
+    let _ = tokio::time::timeout(DRAIN, driving).await;
+    let _ = tokio::time::timeout(DRAIN, endpoint.wait_idle()).await;
 
     outcome
 }
@@ -251,10 +255,8 @@ async fn plain_exchange(
     let outcome = exchange(&mut send_request, uri).await;
 
     drop(send_request);
-    if outcome.is_err() {
-        let _ = tokio::time::timeout(DRAIN, driving).await;
-        let _ = tokio::time::timeout(DRAIN, endpoint.wait_idle()).await;
-    }
+    let _ = tokio::time::timeout(DRAIN, driving).await;
+    let _ = tokio::time::timeout(DRAIN, endpoint.wait_idle()).await;
     outcome
 }
 

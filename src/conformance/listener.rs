@@ -2752,12 +2752,25 @@ fn quic_observation(
                      lost",
                     p.current_mtu, p.lost_plpmtud_probes
                 )),
-                // Nothing large was ever sent, so the black hole never bit. A
-                // plain GET does not reach the limit; this needs a client that
-                // sends a body.
+                // The client never raised its path MTU above the floor, so
+                // there was never a packet large enough for the hole to take.
+                //
+                // That is a property of the client, not a gap in the run: the
+                // server streams 96 KiB at it and a client doing DPLPMTUD has
+                // every opportunity to probe upward. One that stays at the
+                // 1200-byte minimum has no black hole to detect, which is
+                // what `unsupported` is for.
+                Some(p) if p.current_mtu <= 1200 => Observation::Unsupported(format!(
+                    "does not raise its path MTU above the {}-byte minimum, so there is no \
+                     black hole for it to detect. The server streamed 96 KiB at it and the \
+                     path swallows anything over 1300, but nothing it sent was ever that \
+                     large",
+                    p.current_mtu
+                )),
+                // It did raise the MTU, and still sent nothing over the limit.
                 Some(p) => Observation::NotExercised(format!(
                     "nothing over the limit was sent, so the path never swallowed anything; \
-                     the MTU stayed at {}. This test needs a client that sends enough data \
+                     the MTU reached {}. This test needs a client that sends enough data \
                      to reach it",
                     p.current_mtu
                 )),
