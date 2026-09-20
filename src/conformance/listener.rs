@@ -2514,10 +2514,15 @@ fn quic_observation(
         "q-ecn" => {
             let path = connection.path_stats(quinn_proto::PathId::ZERO);
             Some(match path {
-                Some(p) if p.ecn_feedback.any() => Observation::Signalled(format!(
-                    "echoed ECN counts back in its ACKs: {} ECT(0), {} ECT(1), {} ECN-CE",
-                    p.ecn_feedback.ect0, p.ecn_feedback.ect1, p.ecn_feedback.ce
-                )),
+                Some(p) if p.ecn_feedback.any() => {
+                    // Proof for every peer after this one: the codepoint
+                    // survives from here to there.
+                    counters.note_ecn_echoed();
+                    Observation::Signalled(format!(
+                        "echoed ECN counts back in its ACKs: {} ECT(0), {} ECT(1), {} ECN-CE",
+                        p.ecn_feedback.ect0, p.ecn_feedback.ect1, p.ecn_feedback.ce
+                    ))
+                }
                 // We marked, and then stopped: ECN validation failed, which
                 // clears the flag.
                 //
@@ -2528,11 +2533,43 @@ fn quic_observation(
                 // codepoint in transit — and naming either would be a guess.
                 // Whichever it was, the marking stopped, so the rest of the
                 // connection carried nothing for the peer to report.
+                // The client's own datagrams settle which of the two it was.
+                //
+                // Both directions cross the same path. A client whose packets
+                // reach us still carrying ECT has shown that the path
+                // preserves the field and that its stack sets it, so its
+                // silence about our markings is a property of the client and
+                // not an unknown -- `unsupported`, the verdict for a client
+                // that does not do the thing, rather than a run that failed to
+                // ask. §13.4.1 permits exactly this, so it is not a failure.
+                Some(p) if !p.sending_ecn && counters.ect_in() > 0 => {
+                    Observation::Unsupported(format!(
+                        "does not report ECN counts. {} of its own datagrams reached this \
+                         endpoint carrying ECT, so the path preserves the codepoint in both \
+                         directions and this client's stack sets it -- but nothing came back \
+                         about the markings we sent, and §13.4.1 requires reporting only \
+                         where the ECN field is accessible to the endpoint",
+                        counters.ect_in()
+                    ))
+                }
+                // Or the port itself has been shown to carry ECT by someone
+                // else. That is a fact about the path, not about whoever
+                // demonstrated it, and it does not expire between clients.
+                Some(p) if !p.sending_ecn && counters.path_carries_ect() => {
+                    Observation::Unsupported(
+                        "does not report ECN counts. Another peer has echoed the markings \
+                         this same port sent, so the codepoint demonstrably survives the \
+                         path from here -- this client simply reported nothing, which \
+                         §13.4.1 permits where the ECN field is not accessible to it"
+                            .to_string(),
+                    )
+                }
                 Some(p) if !p.sending_ecn => Observation::NotExercised(
                     "ECN validation failed: packets sent marked ECT(0) came back \
                      acknowledged without ECN counts, so the marking was disabled. \
-                     Whether the peer declined to report or the path rewrote the \
-                     codepoint cannot be told apart from this end"
+                     This client's own datagrams arrived unmarked too, so whether it \
+                     declined to report or the path rewrote the codepoint cannot be \
+                     told apart from this end"
                         .to_string(),
                 ),
                 Some(_) => Observation::NotExercised(
@@ -2564,11 +2601,14 @@ fn quic_observation(
                      rewrites one ECT codepoint in four after that"
                         .to_string(),
                 ),
-                Some(p) if p.ecn_feedback.ce > 0 => Observation::Signalled(format!(
-                    "reported the congestion back: {} ECN-CE among {} ECT(0) and {} \
-                     ECT(1), after {marked} datagram(s) were marked",
-                    p.ecn_feedback.ce, p.ecn_feedback.ect0, p.ecn_feedback.ect1
-                )),
+                Some(p) if p.ecn_feedback.ce > 0 => {
+                    counters.note_ecn_echoed();
+                    Observation::Signalled(format!(
+                        "reported the congestion back: {} ECN-CE among {} ECT(0) and {} \
+                         ECT(1), after {marked} datagram(s) were marked",
+                        p.ecn_feedback.ce, p.ecn_feedback.ect0, p.ecn_feedback.ect1
+                    ))
+                }
                 Some(p) if p.ecn_feedback.any() => Observation::NotExercised(format!(
                     "ECN counts came back but none of them were CE ({} ECT(0), {} ECT(1)), \
                      though {marked} datagram(s) were marked. A path that rewrote the \
@@ -2576,10 +2616,24 @@ fn quic_observation(
                      distinguish CE",
                     p.ecn_feedback.ect0, p.ecn_feedback.ect1
                 )),
+                // Nothing came back, and the path has already been shown to
+                // carry the codepoint -- by this client's own datagrams
+                // arriving marked, or by another peer echoing the markings
+                // this same port sent. Either way the silence is the client's.
+                Some(_) if counters.ect_in() > 0 || counters.path_carries_ect() => {
+                    Observation::Unsupported(format!(
+                        "does not report ECN counts, so the congestion signal had nowhere \
+                         to be seen. {marked} datagram(s) were marked CE and the codepoint \
+                         demonstrably survives this path, so nothing here was lost in \
+                         transit -- §13.4.1 requires reporting only where the ECN field is \
+                         accessible to the endpoint, and for this client it is not"
+                    ))
+                }
                 Some(_) => Observation::NotExercised(
                     "no ECN counts came back at all. §13.4.1 requires reporting only where \
-                     the ECN field is accessible, and a path that stripped the codepoint \
-                     cannot be told apart from a client that does not report"
+                     the ECN field is accessible, and nothing else on this port has shown \
+                     the codepoint surviving, so a path that stripped it cannot be told \
+                     apart from a client that does not report"
                         .to_string(),
                 ),
                 None => Observation::NotExercised(

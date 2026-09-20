@@ -438,8 +438,16 @@ pub const CATALOG: &[Test] = &[
                       endpoint MUST report the markings it receives \"if these are \
                       accessible\", and explicitly permits an endpoint with no access to \
                       the ECN field to report nothing. So counts coming back is a pass, \
-                      and silence is inconclusive rather than a failure: it cannot be \
-                      told apart from a path that stripped the codepoint in transit.",
+                      and silence is never a failure.\n\nSilence is read against the \
+                      path rather than left unresolved. Both directions cross the same \
+                      path: a client whose own datagrams reach this endpoint still \
+                      carrying ECT has shown the codepoint survives and that its stack \
+                      sets it, and so has a port where any peer has ever echoed the \
+                      markings sent from it. Either makes the silence the client's own \
+                      and the result `unsupported` -- a property of the client, which \
+                      §13.4.1 expressly allows. Only where nothing has shown the \
+                      codepoint surviving is the run inconclusive, because only there \
+                      is a stripped path still a live possibility.",
         implemented: true,
         port_offset: Some(8),
     },
@@ -617,9 +625,13 @@ pub const CATALOG: &[Test] = &[
                       markings at all, and this asks whether it distinguishes the one that \
                       means something. A client that echoes ECT(0) counts faithfully and \
                       never reports a CE has a congestion signal it cannot see.\n\n\
-                      Silence is inconclusive, not a failure, for the same reason: the ECN \
-                      field may be inaccessible to the peer, and a path that rewrites the \
-                      codepoint in transit is indistinguishable from here.",
+                      Silence is never a failure, for the same reason, and it is read \
+                      against the path in the same way: where this client's own datagrams \
+                      arrived carrying ECT, or where any peer has echoed the markings this \
+                      port sent, the codepoint demonstrably survives and the silence is \
+                      the client's own -- `unsupported`, which §13.4.1 expressly allows. \
+                      Only where nothing has shown the codepoint surviving is a stripped \
+                      path still possible, and only there is the run inconclusive.",
         implemented: true,
         port_offset: Some(48),
     },

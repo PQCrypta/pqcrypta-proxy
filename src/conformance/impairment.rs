@@ -58,6 +58,7 @@ pub struct PeerCounters {
     pub reordered: AtomicU64,
     pub shadowed: AtomicU64,
     pub shadow_failed: AtomicU64,
+    pub ect_in: AtomicU64,
     pub initials_in: AtomicU64,
     pub dropped_loss: AtomicU64,
     pub zero_rtt_in: AtomicU64,
@@ -105,6 +106,19 @@ pub struct Counters {
     /// Copies that could not be sent at all, which is our failure and not the
     /// client's. Separated because for a year the two were the same zero.
     pub shadow_failed: AtomicU64,
+    /// Client datagrams that reached us carrying ECT(0) or ECT(1).
+    pub ect_in: AtomicU64,
+    /// Whether any peer on this port has ever echoed ECN counts back.
+    ///
+    /// Deliberately per-port and sticky, and deliberately not a per-connection
+    /// fact read from shared state -- which is the bug class this suite has
+    /// closed twice. What it records is a property of the *path*: if one peer
+    /// ever reported the markings this endpoint sent, then the codepoint
+    /// survives from here to there, and that does not become untrue for the
+    /// next client. A client that then reports nothing is choosing not to,
+    /// which §13.4.1 permits and which is a fact about the client rather than
+    /// a gap in the run.
+    pub ecn_echoed_by_any_peer: Arc<std::sync::atomic::AtomicBool>,
     /// Client datagrams that carried a QUIC Initial packet.
     ///
     /// The evidence for `t-hybrid-large-hello`. An ML-KEM-768 key share is 1,216
@@ -189,6 +203,16 @@ impl Counters {
 
     pub fn shadow_failed(&self) -> u64 {
         self.shadow_failed.load(Ordering::Relaxed)
+    }
+
+    /// Whether this port has ever been shown that the path carries ECT.
+    pub fn path_carries_ect(&self) -> bool {
+        self.ecn_echoed_by_any_peer.load(Ordering::Relaxed)
+    }
+
+    /// Record that a peer echoed ECN counts, which proves the path.
+    pub fn note_ecn_echoed(&self) {
+        self.ecn_echoed_by_any_peer.store(true, Ordering::Relaxed);
     }
 
     pub fn reordered(&self) -> u64 {
@@ -290,7 +314,7 @@ impl Counters {
         // is lost. A later one baselines, which bounds what a reused address
         // can inherit.
         let first = !peer.viewed.swap(true, std::sync::atomic::Ordering::Relaxed);
-        PeerView::new(peer, first)
+        PeerView::new(peer, first, Arc::clone(&self.ecn_echoed_by_any_peer))
     }
 }
 
@@ -318,11 +342,19 @@ pub struct PeerView {
     reordered: u64,
     shadowed: u64,
     shadow_failed: u64,
+    ect_in: u64,
     datagrams_in: u64,
+    /// The port's path evidence, shared rather than snapshotted: it is a fact
+    /// about the path and stays true once shown.
+    path_ect: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PeerView {
-    fn new(counters: Arc<PeerCounters>, from_zero: bool) -> Self {
+    fn new(
+        counters: Arc<PeerCounters>,
+        from_zero: bool,
+        path_ect: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
         if from_zero {
             return Self {
                 zero_rtt_in: 0,
@@ -334,7 +366,9 @@ impl PeerView {
                 reordered: 0,
                 shadowed: 0,
                 shadow_failed: 0,
+                ect_in: 0,
                 datagrams_in: 0,
+                path_ect,
                 counters,
             };
         }
@@ -348,7 +382,9 @@ impl PeerView {
             reordered: counters.reordered.load(Ordering::Relaxed),
             shadowed: counters.shadowed.load(Ordering::Relaxed),
             shadow_failed: counters.shadow_failed.load(Ordering::Relaxed),
+            ect_in: counters.ect_in.load(Ordering::Relaxed),
             datagrams_in: counters.datagrams_in.load(Ordering::Relaxed),
+            path_ect,
             counters,
         }
     }
@@ -367,6 +403,19 @@ macro_rules! peer_delta {
     };
 }
 
+impl PeerView {
+    /// Whether this port has ever been shown that the path carries ECT.
+    pub fn path_carries_ect(&self) -> bool {
+        self.path_ect.load(Ordering::Relaxed)
+    }
+
+    /// Record that this peer echoed ECN counts, which proves the path for
+    /// every peer after it.
+    pub fn note_ecn_echoed(&self) {
+        self.path_ect.store(true, Ordering::Relaxed);
+    }
+}
+
 peer_delta!(
     zero_rtt_in,
     version_negotiations_out,
@@ -377,6 +426,7 @@ peer_delta!(
     reordered,
     shadowed,
     shadow_failed,
+    ect_in,
     datagrams_in,
 );
 
@@ -639,10 +689,23 @@ impl AsyncUdpSocket for ImpairedSocket {
             // to the first sender would reintroduce exactly the cross-client
             // contamination this split removes.
             for m in meta.iter().take(n) {
-                self.counters
-                    .peer(m.addr)
-                    .datagrams_in
-                    .fetch_add(1, Ordering::Relaxed);
+                let peer = self.counters.peer(m.addr);
+                peer.datagrams_in.fetch_add(1, Ordering::Relaxed);
+                // Whether the client marks its own packets, and whether those
+                // marks survive the path to us.
+                //
+                // This is what separates "the network stripped the codepoint"
+                // from "this client does not report ECN" when no counts come
+                // back. Both directions cross the same path, so a client whose
+                // own datagrams arrive carrying ECT has shown that the path
+                // preserves the field and that its stack can set it -- and its
+                // silence about ours is then a property of the client, not an
+                // unknown. Without this the two were indistinguishable and
+                // seven clients were recorded as an inconclusive run.
+                if matches!(m.ecn, Some(EcnCodepoint::Ect0 | EcnCodepoint::Ect1)) {
+                    self.counters.ect_in.fetch_add(1, Ordering::Relaxed);
+                    peer.ect_in.fetch_add(1, Ordering::Relaxed);
+                }
             }
 
             if let Some(m) = meta.first().filter(|_| n > 0) {
