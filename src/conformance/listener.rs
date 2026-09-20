@@ -3482,12 +3482,23 @@ const LOSSY_CHUNK_GAP: Duration = Duration::from_millis(30);
 /// Reported as `Unsupported` only in the third: there the client has answered.
 fn no_early_data(counters: &PeerView, what_was_missed: &str) -> Observation {
     if counters.version_negotiations_out() > 0 {
-        return Observation::NotExercised(format!(
-            "the client sent no early data, so {what_was_missed}. It offered a GREASE QUIC \
-             version first, which this endpoint answered with Version Negotiation (RFC 8999 \
-             §6), and it did not re-offer early data on the v1 retry -- so the 0-RTT it \
-             intended never reached the wire. That is worth knowing about the client, but it \
-             is not this test"
+        // Fully observed, so not a gap in the run.
+        //
+        // This read inconclusive, which was too weak: nothing here is
+        // inferred. The GREASE version was seen, the Version Negotiation was
+        // sent, and the v1 retry arrived carrying no early data -- three
+        // facts on the wire, all of them about the client. It describes a
+        // client that cannot deliver 0-RTT to any endpoint that answers a
+        // GREASEd version, which is what §6 requires of every endpoint, and
+        // that is a property worth reporting as one.
+        //
+        // Conformant on both sides, so not a failure either.
+        return Observation::Unsupported(format!(
+            "does not deliver early data to an endpoint that negotiates versions, so \
+             {what_was_missed}. It offered a GREASE QUIC version first, which this endpoint \
+             answered with Version Negotiation (RFC 8999 §6), and it did not re-offer early \
+             data on the v1 retry -- so the 0-RTT it intended never reached the wire. Both \
+             sides are conformant; the early data is lost between them"
         ));
     }
     // Also inference from an absence, and held to the same bar as the
