@@ -352,7 +352,12 @@ impl Endpoint {
     /// the anti-amplification size check both decline to send, and neither is
     /// counted.
     pub fn stateless_resets_sent(&self) -> u64 {
-        self.inner.state.lock().unwrap().inner.stateless_resets_sent()
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .inner
+            .stateless_resets_sent()
     }
 
     /// Close all of this endpoint's connections immediately and cease accepting new connections.

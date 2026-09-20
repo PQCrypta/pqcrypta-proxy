@@ -345,7 +345,8 @@ impl Connection {
         let mut rng = StdRng::from_seed(rng_seed);
         let ack_threshold = config.local_ack_eliciting_threshold;
         let mut initial_space = PacketSpace::new(now, SpaceId::Initial, &mut rng, ack_threshold);
-        let mut handshake_space = PacketSpace::new(now, SpaceId::Handshake, &mut rng, ack_threshold);
+        let mut handshake_space =
+            PacketSpace::new(now, SpaceId::Handshake, &mut rng, ack_threshold);
         #[cfg(test)]
         let mut data_space = match config.deterministic_packet_numbers {
             true => PacketSpace::new_deterministic(now, SpaceId::Data, ack_threshold),
@@ -4451,6 +4452,28 @@ impl Connection {
                 }
                 ConnectionError::TransportError(err) => {
                     debug!("closing connection due to transport error: {}", err);
+                    // Say so, rather than closing in silence.
+                    //
+                    // §10.2 has an endpoint that detects an error send
+                    // CONNECTION_CLOSE, and §10.2.3 expects it during a
+                    // handshake. The only place that queues one in response to
+                    // a received packet requires the path to be *validated*,
+                    // which holds after a handshake and never during one.
+                    //
+                    // Client side only: that validation gate guards a server
+                    // against answering an address an attacker faked a
+                    // migration from, and a client sent its Initial to an
+                    // address it chose itself.
+                    //
+                    // The state transition is deliberately left as
+                    // `move_to_closed`. Marking it locally closed as well made
+                    // the connection outlive the application's read of the
+                    // error, and `move_to_drained` then yields `error: None`
+                    // for a state whose error was already read -- which the
+                    // driver asserts cannot happen.
+                    if self.side.is_client() {
+                        self.connection_close_pending = true;
+                    }
                     self.state.move_to_closed(err);
                 }
                 ConnectionError::VersionMismatch => {

@@ -47,8 +47,13 @@ impl PacketSpace {
     }
 
     #[cfg(test)]
-    pub(super) fn new_deterministic(now: Instant, space: SpaceId, ack_eliciting_threshold: u64) -> Self {
-        let number_space_0 = PacketNumberSpace::new_deterministic(now, space, ack_eliciting_threshold);
+    pub(super) fn new_deterministic(
+        now: Instant,
+        space: SpaceId,
+        ack_eliciting_threshold: u64,
+    ) -> Self {
+        let number_space_0 =
+            PacketNumberSpace::new_deterministic(now, space, ack_eliciting_threshold);
         Self {
             pending: Retransmits::default(),
             number_spaces: BTreeMap::from([(PathId::ZERO, number_space_0)]),
@@ -1567,7 +1572,10 @@ mod test {
         dedup.insert(1);
         delayed.insert_one(1, now);
         delayed.packet_received(now, 1, true, &dedup);
-        assert!(delayed.can_send(), "threshold 1 acknowledges every other packet");
+        assert!(
+            delayed.can_send(),
+            "threshold 1 acknowledges every other packet"
+        );
     }
 
     #[test]

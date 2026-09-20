@@ -535,6 +535,71 @@ fn reject_self_signed_server_cert() {
                     if error.code == TransportErrorCode::crypto(AlertDescription::UnknownCA.into()));
 }
 
+/// A client that rejects the server's certificate must *say* so.
+///
+/// §10.2 has an endpoint that detects an error send CONNECTION_CLOSE, and
+/// §10.2.3 expects exactly that during a handshake. This connection closes
+/// locally and the server is told nothing: the only place that queues a close
+/// in response to a received packet requires the path to be validated, which
+/// is true after a handshake and never during one.
+///
+/// Found from the other end. Our HTTP/3 conformance suite has three tests
+/// whose verdict is what a client says when it refuses what the server
+/// offered -- a key share for a group it never sent, a transport parameter
+/// out of range, a certificate it will not accept -- and this client names
+/// the alert internally and sends nothing, while nine of twelve other
+/// implementations send a close the server can read.
+///
+/// Ignored, not deleted: the obvious fix -- queueing the close here and
+/// marking the state locally closed -- makes the connection live long enough
+/// for the application to read the error, and `move_to_drained` then yields
+/// `error: None` for a state whose error was already read, which the driver
+/// asserts cannot happen ("drained connections always have an error"). That
+/// assertion and this requirement disagree, and reconciling them is the work.
+/// It panicked the proxy in production once already; the test states the
+/// requirement so the next attempt has something to pass.
+#[test]
+#[ignore = "known gap: a locally-detected handshake error sends no CONNECTION_CLOSE"]
+fn handshake_rejection_is_signalled_to_the_peer() {
+    let _guard = subscribe();
+
+    let mut pair = Pair::default();
+    let mut cert = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+    let mut issuer = rcgen::DistinguishedName::new();
+    issuer.push(rcgen::DnType::OrganizationName, "Not A Trusted Issuer");
+    cert.distinguished_name = issuer;
+    let cert = cert
+        .self_signed(&rcgen::KeyPair::generate().unwrap())
+        .unwrap();
+    let client_ch = pair.begin_connect(client_config_with_certs(vec![cert.into()]));
+    pair.drive();
+
+    // The client decided, which is not in question.
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::ConnectionLost {
+            reason: ConnectionError::TransportError(ref error)
+        }) if error.code == TransportErrorCode::crypto(AlertDescription::UnknownCA.into())
+    );
+
+    // What matters is whether it said so. The server should have been given a
+    // CONNECTION_CLOSE carrying the alert, rather than silence.
+    let server_ch = pair.server.assert_accept();
+    let mut told = false;
+    while let Some(event) = pair.server_conn_mut(server_ch).poll() {
+        if let Event::ConnectionLost { reason } = event {
+            told = matches!(
+                reason,
+                ConnectionError::ConnectionClosed(_) | ConnectionError::TransportError(_)
+            );
+        }
+    }
+    assert!(
+        told,
+        "the client rejected the certificate and the server was told nothing"
+    );
+}
+
 #[test]
 fn reject_missing_client_cert() {
     let _guard = subscribe();

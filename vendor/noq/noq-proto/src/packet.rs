@@ -333,7 +333,9 @@ impl Header {
                 number,
                 version,
             } => {
-                w.write(LongHeaderType::Standard(ty).to_byte(version == 0x6b33_43cf) | number.tag());
+                w.write(
+                    LongHeaderType::Standard(ty).to_byte(version == 0x6b33_43cf) | number.tag(),
+                );
                 w.write(version);
                 dst_cid.encode_long(w);
                 src_cid.encode_long(w);
@@ -1025,7 +1027,9 @@ mod tests {
     #[test]
     fn header_encoding() {
         use crate::Side;
-        use crate::crypto::rustls::{configured_provider, initial_keys, initial_suite_from_provider};
+        use crate::crypto::rustls::{
+            configured_provider, initial_keys, initial_suite_from_provider,
+        };
         use rustls::quic::Version;
 
         let dcid = ConnectionId::new(&hex!("06b858ec6f80452b"));
