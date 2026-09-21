@@ -3211,6 +3211,33 @@ pub(super) async fn answer_probe(
 ) -> anyhow::Result<()> {
     const BODY: &[u8] = b"liveness probe received; this connection survived the test\n";
 
+    // Wait for the client's SETTINGS before deciding what its limits are.
+    //
+    // Zero and "not read yet" are the same value in `QpackLimits`, so reading
+    // it early does not fail — it answers "the client permits nothing", which
+    // is a sentence about the client. `settle` was added for exactly that and
+    // then wired into one of the three places that ask.
+    //
+    // Removing the accept race made the limits *usually* arrive first, and
+    // usually is not a measurement: across three repeat matrices of one
+    // binary, `h-qpack-dynamic-table` and `h-qpack-blocked-stream` still
+    // flipped between `unsupported` and a real verdict on lsquic and xquic.
+    // Same defect, one level along.
+    //
+    // Scoped to the two tests whose output depends on the answer: every other
+    // port would be paying up to half a second to consult a value it never
+    // reads, and the hold that costs would change the timing the test is
+    // measuring.
+    if matches!(test.id, "h-qpack-dynamic-table" | "h-qpack-blocked-stream")
+        && !qpack.settle(SETTINGS_SETTLE).await
+    {
+        debug!(
+            "conformance: {} deciding against a default limit — the client's SETTINGS \
+             did not arrive within {:?}",
+            test.id, SETTINGS_SETTLE
+        );
+    }
+
     match test.id {
         // A frame of a reserved type ahead of the response. The client must
         // skip it using its length and read the HEADERS that follow.
