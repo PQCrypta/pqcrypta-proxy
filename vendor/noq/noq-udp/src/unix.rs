@@ -125,7 +125,29 @@ impl UdpSocketState {
                 )?;
             }
 
-            if set_socket_option(&*io, libc::SOL_UDP, libc::UDP_GRO, OPTION_ON).is_ok() {
+            // GRO costs ECN, and the two cannot both be had on this kernel.
+            //
+            // Measured on 2026-09-21 against our own conformance suite, four
+            // trials each way on the same port and build: with UDP_GRO the
+            // receiver saw 1 ECN-marked datagram per connection, without it
+            // 12 to 19. The kernel coalesces datagrams and does not deliver
+            // the IP_TOS control message for most of the resulting batches,
+            // so the marks are not undercounted -- they are absent.
+            //
+            // It matters in both directions and more as a server. An endpoint
+            // that reports fewer ECT(0) than its peer sent fails that peer's
+            // ECN validation (§13.4.2), and the peer then disables ECN for
+            // the path. So every client that marks toward this proxy is being
+            // told the path is broken and turning ECN off, which is worse
+            // than never offering it.
+            //
+            // Left switchable rather than decided here: GRO is a real CPU
+            // saving at load and turning it off globally is a throughput
+            // change that should be measured, not assumed. `NOQ_NO_GRO=1`
+            // disables it.
+            if std::env::var_os("NOQ_NO_GRO").is_none()
+                && set_socket_option(&*io, libc::SOL_UDP, libc::UDP_GRO, OPTION_ON).is_ok()
+            {
                 // As defined in net/ipv4/udp_offload.c
                 // #define UDP_GRO_CNT_MAX 64
                 //
