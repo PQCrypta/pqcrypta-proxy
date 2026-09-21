@@ -717,6 +717,28 @@ async fn run_one(
                 // A definite answer, and the one this tier exists to get. Every
                 // TLS port negotiates exactly one group, so a refusal here is
                 // the client saying it does not have that group.
+                // ...except on the one port where the refusal is not a
+                // missing capability but the answer.
+                //
+                // `t-classical-only` offers X25519 alone and asks what a
+                // client does when the post-quantum group it wanted is not
+                // available. Declining is one of the two conformant outcomes
+                // the catalogue names, and `tls_handshake_observation` says
+                // so -- but only for a refusal that surfaces *after* a
+                // `Connecting` exists. The same client, declining the same
+                // offer, landed here instead whenever rustls reached the
+                // decision a moment earlier, and got `unsupported`.
+                //
+                // That is one behaviour with two verdicts, chosen by an
+                // internal timing detail of this server: the cell flipped
+                // between `pass` and `unsupported` across three repeat
+                // matrices of one binary. Where the refusal surfaced is our
+                // business, not the client's.
+                Tier::Tls if test.id == "t-classical-only" => Observation::Signalled(format!(
+                    "declined to negotiate when only the classical X25519 was offered, which \
+                     is a deliberate post-quantum floor. No RFC requires this and none forbids \
+                     it. Refused before a handshake existed ({e})"
+                )),
                 Tier::Tls => Observation::Unsupported(format!(
                     "The client offers no key exchange group this port will negotiate, so it \
                      was refused before a handshake existed ({e}). That is a capability this \
@@ -962,7 +984,23 @@ async fn run_one(
             ),
             async {
                 match probe_control.as_mut() {
-                    Some(stream) => control_stream_was_read(test.id, &connection, stream).await,
+                    Some(stream) => {
+                        // The anomaly goes on the stream before the padding
+                        // does, and it goes on *this* handle because there is
+                        // only one.
+                        //
+                        // `h-qpack-encoder-overflow` needs the client's
+                        // SETTINGS to size its capacity, so it cannot be
+                        // written in `emit` with the other encoder-stream
+                        // anomaly -- and by the time the code that can size it
+                        // runs, the read proof has taken the stream. It was
+                        // therefore written nowhere at all: the port sent a
+                        // client 1.2 MB of padding and no violation to object
+                        // to, and recorded "completed its request and closed
+                        // without objecting" against every client for it.
+                        write_capacity_overflow(test, &qpack, Some(&mut *stream)).await;
+                        control_stream_was_read(test.id, &connection, stream).await
+                    }
                     None => None,
                 }
             }
@@ -2295,6 +2333,16 @@ pub(super) async fn write_capacity_overflow(
         return;
     }
     let Some(encoder) = encoder else {
+        // Never silently. This returned quietly for two runs while the
+        // read proof held the only handle to the encoder stream, so the
+        // instruction this whole port is about was simply not sent and the
+        // resulting `inconclusive` looked like a fact about the client.
+        warn!(
+            "conformance: {} has no encoder stream to write its capacity on — \
+             the anomaly was not sent and any verdict from this connection is \
+             about nothing",
+            test.id
+        );
         return;
     };
     if !qpack.settle(SETTINGS_SETTLE).await {
@@ -2361,7 +2409,7 @@ async fn watch_for_liveness(
     early_data_seen: bool,
 ) -> Observation {
     let ServerStreams {
-        mut encoder,
+        encoder,
         late_control,
     } = ours;
     let timeout = Duration::from_millis(conformance.config.liveness_timeout_ms);
@@ -2441,7 +2489,29 @@ async fn watch_for_liveness(
     });
 
     let probe = tokio::time::timeout(timeout, connection.accept_bi()).await;
-    drainer.abort();
+
+    // The acceptor is deliberately *not* aborted here.
+    //
+    // It used to be, the moment the probe arrived, and that threw away every
+    // unidirectional stream the client had opened but that the acceptor had
+    // not yet picked up -- a scheduling race between `accept_uni` and
+    // `accept_bi`, decided differently on each connection. The two costs:
+    // the control stream's SETTINGS were never parsed, so the connection
+    // reported "advertised 0 and 0" whatever the client actually sent; and
+    // the stream was then never drained, which is the STOP_SENDING hazard
+    // the read loop above was rewritten to avoid. Fixed at the read and left
+    // in place at the accept, which is a quieter version of the same bug.
+    //
+    // Measured: three repeat matrices over the same binary disagreed on
+    // seven of 708 cells, five of them `h-qpack-dynamic-table` or
+    // `h-qpack-blocked-stream` flipping between `unsupported` and a real
+    // verdict -- including one where the race hid an xquic failure behind
+    // "the client granted no table". A test that only sometimes runs is
+    // worse than one that never does, because its silence looks like data.
+    //
+    // Nothing leaks: `accept_uni()` resolves `Err` when the connection ends,
+    // so the loop retires itself, and the spawned readers end with it.
+    drop(drainer);
 
     // Whether the frame `late_control` exists for actually went out.
     //
@@ -2506,8 +2576,6 @@ async fn watch_for_liveness(
                         Err(e) => debug!("conformance: {} could not send GOAWAY: {}", test.id, e),
                     }
                 }
-
-                write_capacity_overflow(test, qpack, encoder.as_deref_mut()).await;
 
                 // Give a control-stream anomaly time to be read before the
                 // response lets the client go.

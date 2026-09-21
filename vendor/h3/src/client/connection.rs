@@ -403,10 +403,6 @@ where
         self.inner.poll_qpack_decoder_send(cx);
 
         // Drain the peer's QPACK encoder stream.
-        //
-        // Client side only for now: the same machinery would serve the server
-        // half, but that half runs the live proxy and this is the first time
-        // these instructions have been processed at all. One end at a time.
         if let Poll::Ready(err) = self.inner.poll_qpack_encoder(cx) {
             return Poll::Ready(err);
         }
@@ -503,6 +499,28 @@ where
                     return Poll::Ready(connection_error);
                 }
             }
+        }
+
+        // And again, now that the control loop has run.
+        //
+        // `poll_accept_recv` lives inside `poll_control`, so the peer's QPACK
+        // encoder stream does not exist as far as this connection is
+        // concerned until that loop has run at least once. The call above it
+        // therefore takes the `encoder_recv.is_none()` path on the very
+        // wakeup that accepts the stream, returning Pending with no waker
+        // registered -- because there was no stream to register one on. The
+        // first read then waits for some unrelated wakeup, and a one-shot
+        // client that has its response and is closing may never produce one.
+        //
+        // Measured, on our own client: the server wrote an oversized
+        // Set Dynamic Table Capacity and 1.2 MB behind it, our client read
+        // none of it, and both `h-qpack-encoder-overflow` and
+        // `h-qpack-encoder-bad-name-index` recorded `inconclusive` --
+        // "completed its request and closed without objecting" -- against a
+        // decoder that had been taught to object and was never given the
+        // bytes.
+        if let Poll::Ready(err) = self.inner.poll_qpack_encoder(cx) {
+            return Poll::Ready(err);
         }
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-6.1
