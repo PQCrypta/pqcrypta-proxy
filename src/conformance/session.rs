@@ -870,10 +870,37 @@ impl Session {
         // — because the priming connection only outlives the resume when the
         // run is busy enough to make it slow.
         //
-        // So `NotExercised` is the one observation that never overwrites. It
-        // means "this connection did not put the client in the situation",
-        // which is not a reason to discard a connection that did.
-        if matches!(obs, Observation::NotExercised(_)) {
+        // So no inconclusive result ever overwrites a conclusive one. The
+        // absence of evidence does not erase evidence gathered on the same
+        // port seconds earlier.
+        //
+        // This was written as "`NotExercised` never overwrites", which is the
+        // same rule stated in terms of one observation instead of the property
+        // that made it right. `Observation::Ambiguous` judges inconclusive
+        // too, and walked straight past the guard. Chromium is the client that
+        // shows it, because Chromium does not connect once:
+        //
+        //   19:11:26.686  Unsupported  NoSignatureSchemesInCommon
+        //   19:11:30.688  Ambiguous    idle timeout after 4001805us
+        //
+        // Both on `t-cert-compression-pq`, both in one session, four seconds
+        // apart. The first connection established the finding this port
+        // exists to produce -- this client's signature_algorithms cannot
+        // verify an ML-DSA-87 chain. The second was a reconnect that sat idle
+        // until Chrome's 4s pre-handshake timeout, learned nothing, and
+        // replaced it.
+        //
+        // Whether the driver read the report before or after that second
+        // connection expired decided the published verdict, so the cell came
+        // out `unsupported` or `inconclusive` at about one in two: measured
+        // at 4/4 over eight consecutive single-cell runs, and it had been
+        // flipping across full matrix runs for as long as there are staged
+        // datasets to check.
+        //
+        // A conclusive verdict overwrites a conclusive verdict as before; a
+        // client that answers differently on a second connection is telling
+        // us something, and the later answer wins.
+        if verdict == Verdict::Inconclusive {
             if let Some(existing) = self.results.get(test.id) {
                 if existing.verdict != Verdict::Inconclusive {
                     // Logged because it is otherwise invisible: without this
