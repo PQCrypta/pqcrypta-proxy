@@ -602,13 +602,39 @@ where
                     ));
                 }
                 Ok(false) => {}
-                Err(e) => {
+                //= https://www.rfc-editor.org/rfc/rfc9204#section-4.2
+                //# Closure of either unidirectional stream type MUST be
+                //# treated as a connection error of type
+                //# H3_CLOSED_CRITICAL_STREAM.
+                //
+                // A reset of the encoder stream is the peer closing it, so
+                // it lands here with the FIN above.
+                Err(
+                    e @ (StreamErrorIncoming::StreamTerminated { .. }
+                    | StreamErrorIncoming::Unknown(_)),
+                ) => {
                     return Poll::Ready(self.handle_connection_error(
                         InternalConnectionError::new(
                             Code::H3_CLOSED_CRITICAL_STREAM,
                             format!("the QPACK encoder stream failed: {e}"),
                         ),
                     ));
+                }
+                // The connection ended. Nothing about the encoder stream was
+                // closed that the connection ending did not close, and this
+                // arm used to answer H3_CLOSED_CRITICAL_STREAM anyway --
+                // accusing, on the server side, every browser that finished
+                // a page and went away. It reached production as an ERROR
+                // line per connection close, reading "the QPACK encoder
+                // stream failed: ConnectionError: Error undefined by h3:
+                // closed", where "closed" is our own local close.
+                //
+                // §4.2 is about the peer closing a critical stream, which is
+                // the two arms above. A read that fails because there is no
+                // longer a connection to read over is the connection's
+                // error, and is reported as one.
+                Err(StreamErrorIncoming::ConnectionErrorIncoming { connection_error }) => {
+                    return Poll::Ready(self.handle_connection_error(connection_error));
                 }
             }
 
