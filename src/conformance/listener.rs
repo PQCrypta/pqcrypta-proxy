@@ -1586,7 +1586,34 @@ async fn abandon_and_watch(
     /// How long the body is allowed to flow before the connection is abandoned.
     const IN_FLIGHT: Duration = Duration::from_millis(200);
     /// How long to wait for the peer to say something that draws the reset.
-    const UNTIL_RESET: Duration = Duration::from_secs(8);
+    ///
+    /// Twelve seconds because the client has two ways of answering and the
+    /// slow one is on a ten-second timer. Measured by capturing udp/4465
+    /// across nine runs and timing the gap from the abandon to the client's
+    /// next packet:
+    ///
+    ///   pass x7          0.000s, 0.000s, 0.000s, 0.000s, 0.000s, 0.000s, 0.027s
+    ///   inconclusive x2  10.007s, 10.009s
+    ///
+    /// Nothing about the connection at the moment of abandoning tells the two
+    /// apart -- bytes sent, packets lost, acknowledgements received and the
+    /// peer's own traffic all overlap completely between them. The difference
+    /// is only what the client does next. If a packet is still in flight it
+    /// acknowledges within microseconds and the reset comes straight back. If
+    /// it is all square it has nothing to say, and the next thing it sends is
+    /// whatever its own idle timer produces at ten seconds.
+    ///
+    /// At eight this gave up two seconds before that packet, on about one run
+    /// in fourteen, and reported that no Stateless Reset had been triggered --
+    /// true of the window, and not true of the client. Nothing else was wrong:
+    /// four earlier explanations for this (a starved connection driver, a peer
+    /// that had already left, packet loss, a shut flow-control window) were
+    /// each measured and each was false.
+    ///
+    /// Waiting longer is close to free, because the loop stops at the first
+    /// reset: the fast path still finishes in microseconds and only the slow
+    /// path pays, which is the run that would otherwise have been wasted.
+    const UNTIL_RESET: Duration = Duration::from_secs(12);
     /// How often to look while waiting.
     const POLL: Duration = Duration::from_millis(100);
     /// How long silence has to hold to count. Longer than any reasonable PTO at
@@ -1605,38 +1632,96 @@ async fn abandon_and_watch(
     // requires it to acknowledge — and those acknowledgements, arriving at an
     // endpoint that has just forgotten the connection, are what the Stateless
     // Reset answers.
-    if let Some(send) = held.first_mut() {
-        // Written under a deadline, and deliberately more than the peer can
-        // finish.
-        //
-        // Size and pacing both decide whether this works. An earlier version
-        // wrote a fixed 128 KiB and paused: some clients swallowed the lot in
-        // under that pause, and a client that has read a complete response
-        // closes — so by the time the endpoint forgot the connection there was
-        // no peer left to speak, no reset was drawn, and the verdict turned on
-        // how fast the client was rather than on anything about its conformance.
-        // Writing until the deadline leaves the transfer unfinished by
-        // construction.
-        //
-        // `write_all` returns when the data is accepted for sending, and the
-        // peer's flow control decides how much that is, so the write is bounded
-        // by time rather than by a byte count that a slow reader would stall on.
-        let chunk = vec![b'.'; 64 * 1024];
-        let deadline = Instant::now() + IN_FLIGHT;
-        while Instant::now() < deadline {
-            if tokio::time::timeout(IN_FLIGHT, send.write_all(&f::data(&chunk)))
-                .await
-                .is_err()
-            {
-                // Blocked on the peer's flow control, which means plenty is
-                // already in flight — exactly the state being arranged.
+    // No request, no body, no test.
+    //
+    // `held` carries the response streams the client's own requests opened, so
+    // an empty one means this connection never asked for anything. Falling
+    // through wrote nothing, abandoned an idle connection, waited the full
+    // eight seconds and then reported that no Stateless Reset had been
+    // triggered — true, and about the wrong thing. The peer was silent because
+    // it had never spoken, not because it ignored anything.
+    let Some(send) = held.first_mut() else {
+        return Observation::NotExercised(
+            "the client opened no request this endpoint could answer, so there was no response \
+             body to put in front of it and nothing it was obliged to acknowledge. A Stateless \
+             Reset is drawn out by a packet arriving for a connection the endpoint has \
+             forgotten, and a peer that never asked for anything sends none"
+                .to_string(),
+        );
+    };
+
+    // Write until the peer is demonstrably mid-conversation, then vanish.
+    //
+    // Size and pacing both decide whether this works. An earlier version wrote
+    // a fixed 128 KiB and paused: some clients swallowed the lot in under that
+    // pause, and a client that has read a complete response closes — so by the
+    // time the endpoint forgot the connection there was no peer left to speak,
+    // no reset was drawn, and the verdict turned on how fast the client was
+    // rather than on anything about its conformance. Writing until a deadline
+    // leaves the transfer unfinished by construction, which fixed that.
+    //
+    // It did not fix the whole of it, because a wall-clock deadline arranges
+    // the wrong thing. `abandon()` transmits nothing: whatever is still queued
+    // in the send buffer is discarded with the connection. So what draws the
+    // reset is not how much was written but how much the peer still owes us
+    // when we disappear — unacknowledged packets it must acknowledge, or
+    // outstanding data it must probe for. Write for a fixed 200ms on a loaded
+    // box and the connection driver is starved, less actually reaches the
+    // wire, the peer catches up, and it has nothing left to say. That is a
+    // regime effect and it read as one: `q-stateless-reset` passed 10/10 for
+    // quic-go run alone and came back inconclusive once in eleven full matrix
+    // runs, with "0 datagram(s) arrived" — the signature of a peer that was
+    // all square rather than one that ignored the reset.
+    //
+    // `write_all` returns when the data is accepted for sending, and the
+    // peer's flow control decides how much that is, so the write is bounded by
+    // time rather than by a byte count that a slow reader would stall on.
+    let chunk = vec![b'.'; 64 * 1024];
+    let peer_before_flow = counters.datagrams_in();
+    let flow_started = Instant::now();
+    let flow_deadline = flow_started + IN_FLIGHT;
+    let mut write_failed = None;
+    while Instant::now() < flow_deadline {
+        match tokio::time::timeout(IN_FLIGHT, send.write_all(&f::data(&chunk))).await {
+            // Blocked on the peer's flow control, which means plenty is
+            // already in flight -- exactly the state being arranged.
+            Err(_) => break,
+            // The peer is gone, or reset the stream. Only the timeout was
+            // being checked here and the write's own error was dropped, so a
+            // dead connection was written to in a hot loop for the rest of
+            // the window.
+            Ok(Err(e)) => {
+                write_failed = Some(e);
                 break;
             }
+            Ok(Ok(())) => {}
         }
+    }
+    let spoken_while_flowing = counters.datagrams_in() - peer_before_flow;
+
+    // A peer that said nothing while 64 KiB chunks were aimed at it is not a
+    // peer this test can say anything about. Reported separately from the
+    // silence *after* the abandon, which is the measurement.
+    if spoken_while_flowing == 0 {
+        return Observation::NotExercised(match write_failed {
+            Some(e) => format!(
+                "the client stopped receiving the response body before the connection could be \
+                 abandoned ({e}), so it was owed nothing at the moment the endpoint forgot the \
+                 connection and had no reason to send the packet a Stateless Reset answers"
+            ),
+            None => format!(
+                "the client acknowledged nothing in the {}ms the response body was flowing, so \
+                 it was all square when the endpoint forgot the connection and had nothing left \
+                 to send. A Stateless Reset is drawn out by a packet arriving for a forgotten \
+                 connection, and none was owed",
+                flow_started.elapsed().as_millis()
+            ),
+        });
     }
 
     let before_abandon = counters.datagrams_in();
     let resets_before = endpoint.stateless_resets_sent();
+
     connection.abandon();
 
     // Wait for the peer to say something, and watch rather than guess when.
