@@ -607,8 +607,22 @@ pub fn single_group_server_config(
 /// `/pqc/` publishes: a private CA, so nothing outside this box trusts it,
 /// which is deliberate — see the `t-cert-compression-pq` catalogue entry for
 /// why being *untrusted* is what makes the measurement work.
-const PQ_CHAIN: &str = "/etc/pqcrypta/pqc-certs/fullchain.pem";
-const PQ_CHAIN_KEY: &str = "/etc/pqcrypta/pqc-certs/server.key";
+/// The chain `t-cert-compression-pq` serves: ML-DSA-87 throughout.
+///
+/// Deliberately not the showcase chain one directory up. That one is a
+/// SLH-DSA-SHA2-256s root over ML-DSA-87 intermediates -- a hash-based trust
+/// anchor above lattice signatures -- and it is what /pqc/ and
+/// pqc.pqcrypta.com:443 demonstrate publicly. It should stay that way.
+///
+/// It made a poor test fixture, though. Verifying it needs two post-quantum
+/// signature families, and nothing in the client fleet has both: the two
+/// clients that passed this test reached the end with certificate
+/// verification disabled, which the verdict text says out loud. The test asks
+/// whether a client can process a compressed ML-DSA-87 certificate message,
+/// and the CA's signature family is incidental to that -- so the fixture is
+/// one family, and a client with ML-DSA-87 can verify it rather than skip it.
+const PQ_CHAIN: &str = "/etc/pqcrypta/pqc-certs/conformance/fullchain.pem";
+const PQ_CHAIN_KEY: &str = "/etc/pqcrypta/pqc-certs/conformance/server.key";
 
 /// A config that serves the post-quantum certificate chain, for the one
 /// conformance port whose subject is the certificate rather than the key

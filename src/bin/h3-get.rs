@@ -22,6 +22,24 @@ use anyhow::{anyhow, Context as _};
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    // No UDP_GRO, so ECN markings are actually seen.
+    //
+    // The kernel does not deliver IP_TOS for most coalesced batches: measured
+    // four trials each way, 1 marked datagram per connection with GRO against
+    // 12-19 without. A client that cannot see the markings reports no ECN
+    // counts, its peer's ECN validation fails, and the peer disables ECN for
+    // the path -- so a measurement client with GRO on reports a conformance
+    // result about the kernel rather than about the protocol.
+    //
+    // The proxy makes the same choice from `server.udp_gro`; this binary is a
+    // separate process and has to make it for itself.
+    //
+    // SAFETY: first statement in main, before any runtime or socket exists.
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var("NOQ_NO_GRO", "1")
+    };
+
     let mut args = std::env::args().skip(1);
     let Some(url) = args.next() else {
         eprintln!("usage: h3-get <url> [timeout-seconds]");
@@ -92,17 +110,21 @@ async fn get(url: &str) -> anyhow::Result<u16> {
     //
     // Missing file is not fatal: away from this host the test is unreachable
     // anyway, and every other port uses the public roots above.
-    const PQ_ROOT: &str = "/etc/pqcrypta/pqc-certs/root_ca.crt";
-    match std::fs::read(PQ_ROOT) {
-        Ok(pem) => {
-            let mut rd = std::io::BufReader::new(std::io::Cursor::new(pem));
-            for cert in rustls_pemfile::certs(&mut rd).flatten() {
-                if let Err(e) = roots.add(cert) {
-                    eprintln!("h3-get: ignoring {PQ_ROOT}: {e}");
+    for pq_root in [
+        "/etc/pqcrypta/pqc-certs/conformance/root_ca.crt",
+        "/etc/pqcrypta/pqc-certs/root_ca.crt",
+    ] {
+        match std::fs::read(pq_root) {
+            Ok(pem) => {
+                let mut rd = std::io::BufReader::new(std::io::Cursor::new(pem));
+                for cert in rustls_pemfile::certs(&mut rd).flatten() {
+                    if let Err(e) = roots.add(cert) {
+                        eprintln!("h3-get: ignoring {pq_root}: {e}");
+                    }
                 }
             }
+            Err(e) => eprintln!("h3-get: {pq_root} not readable ({e}); skipping"),
         }
-        Err(e) => eprintln!("h3-get: {PQ_ROOT} not readable ({e}); public roots only"),
     }
 
     let mut crypto = rustls::ClientConfig::builder_with_provider(Arc::new(

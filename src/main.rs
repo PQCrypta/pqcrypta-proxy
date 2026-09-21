@@ -406,6 +406,22 @@ async fn run() -> anyhow::Result<()> {
     // Apply CLI overrides
     let mut config = (*config_manager.get()).clone();
 
+    // UDP_GRO is decided here because the socket layer that reads it is
+    // vendored and has no view of this config. Set before any endpoint binds.
+    //
+    // Off unless asked for: the kernel does not deliver IP_TOS for most
+    // coalesced batches, so GRO costs this endpoint its ECN readings, and an
+    // endpoint that under-reports ECT(0) makes every peer disable ECN for the
+    // path (RFC 9000 §13.4.2). See `server.udp_gro` for the measurements.
+    if !config.server.udp_gro {
+        // SAFETY: single-threaded here, before any runtime or socket exists.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("NOQ_NO_GRO", "1")
+        };
+        info!("UDP_GRO disabled (server.udp_gro = false): ECN readings over throughput");
+    }
+
     if let Some(port) = args.udp_port {
         config.server.udp_port = port;
         info!("UDP port overridden to: {}", port);

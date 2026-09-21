@@ -770,6 +770,31 @@ pub struct ServerConfig {
     #[serde(default = "default_tcp_nodelay")]
     pub tcp_nodelay: bool,
 
+    /// Coalesce received UDP datagrams with the kernel's UDP_GRO.
+    ///
+    /// Off by default, and that is a correctness choice with a throughput
+    /// cost attached. Measured 2026-09-21, four trials each way against our
+    /// own conformance suite: with GRO the receiver saw 1 ECN-marked datagram
+    /// per connection, without it 12 to 19. The kernel does not deliver the
+    /// IP_TOS control message for most coalesced batches, so the markings are
+    /// absent rather than undercounted.
+    ///
+    /// That matters more as a server than as a client. An endpoint reporting
+    /// fewer ECT(0) than its peer sent fails that peer's ECN validation
+    /// (RFC 9000 §13.4.2), and the peer then disables ECN for the path -- so
+    /// every client marking toward this proxy was being told the path was
+    /// broken. Silently degrading every peer's congestion control is a worse
+    /// trade than spending some receive-side CPU.
+    ///
+    /// Turn it back on if inbound volume ever makes it pay: GRO helps where
+    /// many datagrams from one flow arrive together, which is bulk upload,
+    /// not the small requests and acknowledgements a content site receives.
+    /// There was no h3 inbound traffic at all in a 45-second capture when
+    /// this was decided, so the cost could not be measured -- and the
+    /// benchmark rig drives HTTP/2 over TCP, which never touches this path.
+    #[serde(default)]
+    pub udp_gro: bool,
+
     /// Enable QUIC Retry for explicit address validation (RFC 9000 §8.1.2).
     ///
     /// When enabled, a new connection whose source address has not yet been
@@ -943,6 +968,7 @@ impl Default for ServerConfig {
             enable_ack_frequency: true,
             ack_eliciting_threshold: default_ack_eliciting_threshold(),
             tcp_nodelay: default_tcp_nodelay(),
+            udp_gro: false,
             enable_quic_retry: false,
             max_concurrent_multipath_paths: 4,
             webtransport_max_sessions_per_origin: 100,
