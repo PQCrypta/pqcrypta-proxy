@@ -3289,15 +3289,22 @@ pub(super) async fn answer_probe(
         // followed.
         "h-qpack-dynamic-table" => {
             let section = if qpack.dynamic_table_usable() {
-                if let Some(encoder) = encoder {
+                let capacity = if let Some(encoder) = encoder {
+                    // Tell the decoder to make room before putting anything
+                    // in it, then insert.
+                    let capacity = open_dynamic_table(Some(encoder), qpack).await;
                     for (name, value) in DYNAMIC_ENTRIES {
                         encoder
                             .write_all(&f::qpack_insert_with_literal_name(name, value))
                             .await?;
                     }
-                }
+                    capacity
+                } else {
+                    qpack.capacity()
+                };
                 f::qpack_dynamic_headers(
                     DYNAMIC_INSERTS,
+                    capacity,
                     &[(":status", "200"), ("content-type", "text/plain")],
                 )
             } else {
@@ -3328,8 +3335,16 @@ pub(super) async fn answer_probe(
         // than one that says it did not run.
         "h-qpack-blocked-stream" => {
             if qpack.dynamic_table_usable() {
+                // The capacity goes out ahead of the section, not with the
+                // insertions behind it. A decoder cannot be asked to hold a
+                // reference into a table it has not been told to allocate,
+                // and the block this test is about is the insertions being
+                // late -- not the table being absent.
+                let mut encoder = encoder;
+                let capacity = open_dynamic_table(encoder.as_deref_mut(), qpack).await;
                 let section = f::qpack_dynamic_headers(
                     DYNAMIC_INSERTS,
+                    capacity,
                     &[(":status", "200"), ("content-type", "text/plain")],
                 );
                 send.write_all(&f::headers_raw(&section)).await?;
@@ -3673,6 +3688,42 @@ pub(super) async fn answer_probe(
 /// Named field lines rather than filler: they arrive in the client's response
 /// headers, so anyone reading the exchange in a packet capture can see which
 /// entries the section was pointing at.
+/// Open the dynamic table on this connection, and say how big it now is.
+///
+/// RFC 9204 §3.2.2: a decoder's table starts at zero and only a Set Dynamic
+/// Table Capacity instruction changes it — "the encoder MUST NOT insert
+/// entries into the dynamic table ... unless it has sent" one. This endpoint
+/// never sent one. It wrote two inserts into a table the client had never
+/// been told to make room for, so a decoder that starts at zero, as the
+/// specification says it does, dropped both and could not resolve the
+/// references that followed.
+///
+/// Five of the seven clients that reached the test failed it for our
+/// violation: Chromium, neqo (Firefox), ngtcp2, xquic and our own. The two
+/// that passed did so by sizing their table from their advertised maximum
+/// rather than waiting to be told — leniency that read, in the published
+/// matrix, as the only two correct implementations.
+///
+/// The capacity is the smaller of what we want and what the client granted,
+/// and it is returned because the Required Insert Count encoding has to be
+/// computed against the same number.
+async fn open_dynamic_table(encoder: Option<&mut quinn::SendStream>, qpack: &QpackLimits) -> u64 {
+    if let Some(encoder) = encoder {
+        // The size we ask for: no more than the client granted, no more than
+        // we want.
+        let size = qpack.capacity().min(f::QPACK_MAX_TABLE_CAPACITY);
+        if let Err(e) = encoder.write_all(&f::qpack_set_capacity(size)).await {
+            debug!("conformance: could not set the QPACK table capacity: {e}");
+        }
+    }
+    // The number the *encoding* is computed against, which is a different
+    // thing: §4.5.1.1 derives MaxEntries from the capacity the decoder
+    // advertised in SETTINGS, not from the size its encoder went on to ask
+    // for. A client granting more than we choose to use would otherwise read
+    // a different Required Insert Count out of the same bytes.
+    qpack.capacity()
+}
+
 const DYNAMIC_ENTRIES: &[(&str, &str)] = &[
     ("x-conformance-dynamic", "first-dynamic-table-entry"),
     ("x-conformance-dynamic-2", "second-dynamic-table-entry"),

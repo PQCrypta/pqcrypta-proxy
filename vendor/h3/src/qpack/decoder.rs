@@ -113,8 +113,25 @@ impl Decoder {
     // Decode field lines received on Request of Push stream.
     // https://www.rfc-editor.org/rfc/rfc9204.html#name-field-line-representations
     pub fn decode_header<T: Buf>(&self, buf: &mut T) -> Result<Decoded, DecoderError> {
-        let (required_ref, base) = HeaderPrefix::decode(buf)?
-            .get(self.table.total_inserted(), self.table.max_mem_size())?;
+        //= https://www.rfc-editor.org/rfc/rfc9204#section-4.5.1.1
+        //# MaxEntries is the maximum number of entries -- that is, the number
+        //# of entries that fit in the dynamic table of maximum capacity.
+        //
+        // Maximum capacity, which §3.2.2 ties to the value *this* decoder
+        // advertised in SETTINGS_QPACK_MAX_TABLE_CAPACITY -- not the current
+        // size, which the peer's Set Dynamic Table Capacity sets and which is
+        // zero until that instruction arrives.
+        //
+        // Passing the current size made the two indistinguishable. A section
+        // that overtook the capacity instruction -- legal, they travel on
+        // different streams -- hit `max_table_size == 0`, which returns a
+        // Required Insert Count of zero rather than an error, so the
+        // references decoded against an empty table and came back
+        // `InvalidIndex`. The connection died with QPACK_DECOMPRESSION_FAILED
+        // on a blocked stream, which is the one thing the parking machinery
+        // exists to prevent, and it did it about one time in three.
+        let (required_ref, base) =
+            HeaderPrefix::decode(buf)?.get(self.table.total_inserted(), self.max_capacity)?;
 
         if required_ref > self.table.total_inserted() {
             return Err(DecoderError::MissingRefs(required_ref));

@@ -196,9 +196,18 @@ async fn drive(test_id: &'static str) -> Wire {
                             continue;
                         }
                         if seen.len() > off {
-                            *encoder_bytes.lock().await = seen[off..].to_vec();
+                            let payload = &seen[off..];
+                            *encoder_bytes.lock().await = payload.to_vec();
+                            // The first *insertion*, not the first byte.
+                            //
+                            // The stream now opens with Set Dynamic Table
+                            // Capacity, which is written before the section
+                            // rather than with the insertions behind it, so
+                            // timestamping the first payload byte measured
+                            // the capacity instruction and reported a gap of
+                            // zero for a test whose whole subject is the gap.
                             let mut at = insertions_at.lock().await;
-                            if at.is_none() {
+                            if at.is_none() && count_insertions(payload) > 0 {
                                 *at = Some(Instant::now());
                             }
                         }
@@ -266,12 +275,42 @@ fn headers_frame(stream: &[u8]) -> Option<&[u8]> {
     None
 }
 
+/// The Set Dynamic Table Capacity the encoder stream opens with, if any, and
+/// how many bytes it took.
+///
+/// `001` then a 5-bit prefix integer (RFC 9204 §4.3.1). Returning `None` is
+/// the finding this parser exists for: for months the stream opened straight
+/// into an insertion, and §3.2.2 forbids inserting before the capacity has
+/// been set.
+fn set_capacity(encoder: &[u8]) -> Option<(u64, usize)> {
+    let &first = encoder.first()?;
+    if first & 0b1110_0000 != 0b0010_0000 {
+        return None;
+    }
+    let mask = 0b0001_1111u64;
+    let head = u64::from(first) & mask;
+    if head < mask {
+        return Some((head, 1));
+    }
+    let mut value = head;
+    let mut shift = 0;
+    for (i, &byte) in encoder[1..].iter().enumerate() {
+        value += u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some((value, i + 2));
+        }
+        shift += 7;
+    }
+    None
+}
+
 /// How many "Insert With Literal Name" instructions the encoder stream carries.
 ///
 /// The pattern is `01NH` then a 5-bit name length (RFC 9204 §4.3.3), so the two
-/// top bits identify it without decoding the rest.
+/// top bits identify it without decoding the rest. Counting starts past the
+/// Set Dynamic Table Capacity the stream must open with.
 fn count_insertions(encoder: &[u8]) -> usize {
-    let mut off = 0usize;
+    let mut off = set_capacity(encoder).map_or(0, |(_, used)| used);
     let mut seen = 0usize;
     while off < encoder.len() {
         if encoder[off] & 0b1100_0000 != 0b0100_0000 {
@@ -300,6 +339,16 @@ async fn the_dynamic_table_entries_a_section_references_are_actually_inserted() 
         "the section must reference the dynamic table, not fall back to literals"
     );
 
+    // RFC 9204 §3.2.2: "the encoder MUST NOT insert entries into the dynamic
+    // table ... unless it has sent" a Set Dynamic Table Capacity instruction.
+    // Without it the section's references are into a table the client was never told to allocate.
+    let (capacity, _) = set_capacity(&wire.encoder)
+        .expect("the encoder stream must open with Set Dynamic Table Capacity");
+    assert!(
+        capacity > 0,
+        "a capacity of zero leaves no room to insert into"
+    );
+
     assert_eq!(
         count_insertions(&wire.encoder),
         2,
@@ -324,6 +373,16 @@ async fn the_blocked_stream_test_sends_its_insertions_after_the_section() {
     assert_ne!(
         required_insert_count, 0,
         "a stream cannot block on a section that references nothing"
+    );
+
+    // RFC 9204 §3.2.2: "the encoder MUST NOT insert entries into the dynamic
+    // table ... unless it has sent" a Set Dynamic Table Capacity instruction.
+    // Without it a decoder cannot hold a reference into a table it has not been told to allocate.
+    let (capacity, _) = set_capacity(&wire.encoder)
+        .expect("the encoder stream must open with Set Dynamic Table Capacity");
+    assert!(
+        capacity > 0,
+        "a capacity of zero leaves no room to insert into"
     );
 
     assert_eq!(

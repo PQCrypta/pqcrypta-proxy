@@ -420,10 +420,24 @@ pub fn qpack_insert_with_literal_name(name: &str, value: &str) -> BytesMut {
     b
 }
 
-/// The largest table capacity we advertise, and the entry count it implies
-/// (RFC 9204 §3.2.2: `MaxEntries = floor(capacity / 32)`).
-const QPACK_MAX_TABLE_CAPACITY: u64 = 4096;
-const QPACK_MAX_ENTRIES: u64 = QPACK_MAX_TABLE_CAPACITY / 32;
+/// The largest table this endpoint's encoder will ask for.
+///
+/// A ceiling on our own appetite, not a description of the peer: the capacity
+/// actually used is the smaller of this and what the client granted, and
+/// everything derived from it must be derived from *that* number.
+pub const QPACK_MAX_TABLE_CAPACITY: u64 = 4096;
+
+/// `MaxEntries` for a given table capacity (RFC 9204 §3.2.2:
+/// `MaxEntries = floor(capacity / 32)`).
+///
+/// It was a constant folded from the 4096 above, which is the decoder's
+/// capacity only when the decoder happens to advertise 4096. §4.5.1.1 decodes
+/// the Required Insert Count against the capacity *the decoder* advertised,
+/// so a client granting anything else read a different number out of the same
+/// bytes.
+fn qpack_max_entries(capacity: u64) -> u64 {
+    capacity / 32
+}
 
 /// A field section that references the dynamic table.
 ///
@@ -432,13 +446,18 @@ const QPACK_MAX_ENTRIES: u64 = QPACK_MAX_TABLE_CAPACITY / 32;
 /// (`(count mod 2*MaxEntries) + 1`), Base equals it so Delta Base is zero, and
 /// each field line is an Indexed Field Line with T=0 — a dynamic-table
 /// reference, relative to Base.
-pub fn qpack_dynamic_headers(insert_count: u64, literal: &[(&str, &str)]) -> BytesMut {
+pub fn qpack_dynamic_headers(
+    insert_count: u64,
+    capacity: u64,
+    literal: &[(&str, &str)],
+) -> BytesMut {
     let mut b = BytesMut::new();
 
-    let encoded = if insert_count == 0 {
+    let max_entries = qpack_max_entries(capacity);
+    let encoded = if insert_count == 0 || max_entries == 0 {
         0
     } else {
-        (insert_count % (2 * QPACK_MAX_ENTRIES)) + 1
+        (insert_count % (2 * max_entries)) + 1
     };
     put_prefixed_int(&mut b, encoded, 8, 0x00);
     // Delta Base 0, S=0: Base == Required Insert Count.
@@ -757,7 +776,7 @@ mod tests {
         // RFC 9204 §4.5.1 with capacity 4096 → MaxEntries 128, so an insert
         // count of 2 encodes as (2 mod 256) + 1 = 3. Encoding it as the raw
         // count would make the client wait for an insertion that never comes.
-        let section = qpack_dynamic_headers(2, &[(":status", "200")]);
+        let section = qpack_dynamic_headers(2, QPACK_MAX_TABLE_CAPACITY, &[(":status", "200")]);
         assert_eq!(section[0], 3, "encoded required insert count");
         assert_eq!(section[1], 0, "delta base zero, S clear");
         // The literals come first (pseudo-headers must precede regular fields),
@@ -774,7 +793,7 @@ mod tests {
 
     #[test]
     fn an_empty_dynamic_section_encodes_a_zero_insert_count() {
-        let section = qpack_dynamic_headers(0, &[(":status", "200")]);
+        let section = qpack_dynamic_headers(0, QPACK_MAX_TABLE_CAPACITY, &[(":status", "200")]);
         assert_eq!(section[0], 0, "0 must stay 0, not become 1");
     }
 
@@ -890,7 +909,7 @@ mod tests {
     fn pseudo_headers_precede_regular_fields_in_a_dynamic_section() {
         // RFC 9114 §4.3. Emitting the dynamic references first put `:status`
         // after them and invalidated the section.
-        let section = qpack_dynamic_headers(2, &[(":status", "200")]);
+        let section = qpack_dynamic_headers(2, QPACK_MAX_TABLE_CAPACITY, &[(":status", "200")]);
         let text = String::from_utf8_lossy(&section);
         let status_at = text.find(":status").expect("status present");
         // The indexed field lines are the 0x80-prefixed bytes; none may precede.
