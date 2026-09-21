@@ -739,10 +739,30 @@ async fn run_one(
                      is a deliberate post-quantum floor. No RFC requires this and none forbids \
                      it. Refused before a handshake existed ({e})"
                 )),
+                // Only say "no key exchange group" when that is what the
+                // error said.
+                //
+                // This asserted it for every TLS-tier refusal regardless of
+                // cause. picoquic's certificate cell read "offers no key
+                // exchange group this port will negotiate" while the error
+                // in the same sentence was "authentication failed", and
+                // picoquic passes t-hybrid-only — it offers the group
+                // perfectly well. The sentence named a cause the run had not
+                // established, which is the one thing this suite is built
+                // not to do.
+                Tier::Tls if format!("{e}").contains("NoKxGroupsInCommon") => {
+                    Observation::Unsupported(format!(
+                        "The client offers no key exchange group this port will negotiate, so \
+                         it was refused before a handshake existed ({e}). That is a capability \
+                         this client does not have, rather than something the run failed to \
+                         measure"
+                    ))
+                }
                 Tier::Tls => Observation::Unsupported(format!(
-                    "The client offers no key exchange group this port will negotiate, so it \
-                     was refused before a handshake existed ({e}). That is a capability this \
-                     client does not have, rather than something the run failed to measure"
+                    "The client was refused before a handshake existed ({e}). The refusal is \
+                     itself the measurement on this tier, but what the client lacked is not \
+                     recorded in it: this endpoint constrains both the key exchange group and \
+                     the certificate's signature algorithm, and the error names neither"
                 )),
                 // Nothing is known here, and that is our problem rather than
                 // the client's.
@@ -1422,6 +1442,29 @@ fn tls_handshake_observation(test: &'static Test, e: &quinn::ConnectionError) ->
                  rather than anything about trust -- the outcome a post-quantum deployment \
                  needs to know about"
             )),
+            // handshake_failure is not evidence about the certificate.
+            //
+            // Alert 40 is what a client sends when it cannot agree the
+            // parameters at all, which on this port most often means the key
+            // exchange group — the certificate is never reached. xquic was
+            // scored a pass here on alert 40 while reporting
+            // NoKxGroupsInCommon on t-hybrid-only, which offers the same
+            // group: it cannot both fail to negotiate the group and have
+            // processed a chain that only arrives afterwards. That pass was
+            // counted toward "N of 11 can receive a post-quantum
+            // certificate" on the page that argues from this test, so a
+            // generous reading here inflated the headline.
+            //
+            // 42, 46 and 48 stay a pass: those are judgements *about a
+            // certificate*, and a client cannot reach them without having
+            // parsed one.
+            TlsAbort::Alert(40) => Observation::Unsupported(
+                "The client aborted with handshake_failure (alert 40), which it sends when the \
+                 parameters cannot be agreed at all — on this port, most often the key exchange \
+                 group. Nothing shows the certificate was reached, so this is not evidence \
+                 either way about its handling of an ML-DSA-87 chain"
+                    .to_string(),
+            ),
             TlsAbort::Alert(code) => Observation::Signalled(format!(
                 "aborted over the certificate with TLS alert {code}. Reported rather than \
                  graded: RFC 8879 §4 lets a receiver cap the decompressed size and abort, and \
