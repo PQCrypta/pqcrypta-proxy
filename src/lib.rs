@@ -35,6 +35,39 @@
     ),
     deny(unused_mut)
 )]
+// The other half of those four denies, and the half that was missing.
+//
+// Lifting a `deny` only drops a lint back to its default, and all four
+// default to `warn`. CI runs `cargo clippy --all-targets --all-features
+// -- -D warnings`, which promotes every warning back to an error -- so the
+// exemption above was written, looked right, and did nothing: `--all-features`
+// turns both measurement features on, and Clippy failed on every push for
+// exactly the unused imports and unreferenced middlewares the exemption
+// names. Granting the allow is what actually exempts them.
+//
+// `unreachable_code` joins them because `bench-null-middleware` returns at
+// the top of each middleware, which is what makes the remainder of the
+// function unreachable. That is the measurement, not a mistake.
+//
+// A shipping build has neither feature and keeps all five in force.
+#![cfg_attr(
+    any(feature = "bench-no-middleware", feature = "bench-null-middleware"),
+    allow(
+        dead_code,
+        unused_variables,
+        unused_imports,
+        unused_mut,
+        unreachable_code,
+        // The chain builder still takes the states it would have installed
+        // into a chain this build does not assemble, so none of them are
+        // consumed. Changing the signature to suit the measurement would
+        // change the thing being measured.
+        clippy::needless_pass_by_value,
+        // Same shape: with the chain gone, the last clone of a state has
+        // nothing after it, so every one of them reads as redundant.
+        clippy::redundant_clone
+    )
+)]
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_panics_doc)]
