@@ -350,6 +350,11 @@ impl TransportConfig {
         self
     }
 
+    /// Configures the ACK Frequency extension (draft-ietf-quic-ack-frequency).
+    ///
+    /// `None` disables it, which is the default: the extension is only useful
+    /// when the peer also implements it, and a peer that does not simply
+    /// ignores the frames.
     pub fn ack_frequency_config(&mut self, value: Option<AckFrequencyConfig>) -> &mut Self {
         self.ack_frequency_config = value;
         self

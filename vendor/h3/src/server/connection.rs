@@ -175,6 +175,23 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<C::BidiStream>, ConnectionError>> {
+        // Read the client's QPACK encoder stream and flush our decoder
+        // stream.
+        //
+        // This half was never driven. The consequence was not a wrong
+        // answer but a stream nobody read: an encoder instruction sat in the
+        // receive buffer forever, so the client got no flow-control credit
+        // back on a stream RFC 9204 4.2 says is processed as it arrives, and
+        // an instruction we are required to reject (2.2.3) was accepted by
+        // being ignored. This endpoint advertises a table capacity of zero,
+        // so a conformant client sends nothing here and nothing changes for
+        // it; what changes is that a client which sends something now gets
+        // an answer.
+        if let Poll::Ready(err) = self.inner.poll_qpack_encoder(cx) {
+            return Poll::Ready(Err(err));
+        }
+        self.inner.poll_qpack_decoder_send(cx);
+
         let _ = self.poll_control(cx)?;
         let _ = self.poll_requests_completion(cx);
         loop {

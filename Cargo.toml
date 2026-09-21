@@ -46,7 +46,14 @@ legacy-pqc = []
 # GeoIP blocking support
 geoip = ["maxminddb"]
 # FIPS mode for aws-lc-rs (requires FIPS-validated build)
-fips = ["aws-lc-rs/fips"]
+#
+# `rustls/fips` is part of it, not an extra. Without it the vendored rustls
+# was built non-FIPS against a FIPS backend -- and, concretely, kept compiling
+# in an ML-DSA-87 verifier that calls `aws_lc_rs::unstable::signature`, a
+# module aws-lc-rs deletes under FIPS. `cargo {clippy,test,doc} --all-features`
+# turns on every feature at once, so CI met that combination on every push and
+# failed three jobs on it for two days.
+fips = ["aws-lc-rs/fips", "rustls/fips"]
 
 [dependencies]
 # Async runtime

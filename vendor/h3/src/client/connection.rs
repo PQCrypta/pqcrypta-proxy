@@ -395,6 +395,13 @@ where
     /// Maintain the connection state until it is closed
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<ConnectionError> {
+        // Flush anything the request streams have queued for the peer's
+        // QPACK decoder stream. First, so an acknowledgement produced by a
+        // section that has just decoded goes out on this wakeup rather than
+        // waiting for the next encoder instruction to arrive -- which, if the
+        // encoder is waiting on that very acknowledgement, would be never.
+        self.inner.poll_qpack_decoder_send(cx);
+
         // Drain the peer's QPACK encoder stream.
         //
         // Client side only for now: the same machinery would serve the server

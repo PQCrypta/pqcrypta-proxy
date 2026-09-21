@@ -62,6 +62,7 @@ aws_lc_rs = [
     "webpki/aws-lc-rs",
     "aws-lc-rs/aws-lc-sys",
     "aws-lc-rs/prebuilt-nasm",
+    "aws-lc-rs/unstable",
 ]
 brotli = [
     "dep:brotli",

@@ -1837,8 +1837,9 @@ mod peer_counter_tests {
 
         // Far more peers than the bound, interleaved with traffic on the live
         // one exactly as a real connection would be.
-        for p in 0..(MAX_TRACKED_PEERS as u32 * 2) {
-            let port = 10000u32.wrapping_add(p) as u16;
+        for p in 0..u32::try_from(MAX_TRACKED_PEERS * 2).expect("the peer bound fits in u32") {
+            let port = u16::try_from(10000u32.wrapping_add(p) % 65536)
+                .expect("reduced modulo 65536, so it fits");
             counters
                 .peer(addr(port))
                 .datagrams_in

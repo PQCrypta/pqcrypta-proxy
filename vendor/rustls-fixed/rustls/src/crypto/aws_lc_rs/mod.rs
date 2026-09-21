@@ -176,9 +176,11 @@ static SUPPORTED_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms
         webpki_algs::RSA_PKCS1_2048_8192_SHA256_ABSENT_PARAMS,
         webpki_algs::RSA_PKCS1_2048_8192_SHA384_ABSENT_PARAMS,
         webpki_algs::RSA_PKCS1_2048_8192_SHA512_ABSENT_PARAMS,
+        #[cfg(not(feature = "fips"))]
         ML_DSA_87_VERIFY,
     ],
     mapping: &[
+        #[cfg(not(feature = "fips"))]
         (SignatureScheme::ML_DSA_87, &[ML_DSA_87_VERIFY]),
         // Note: for TLS1.2 the curve is not fixed by SignatureScheme. For TLS1.3 it is.
         (
@@ -360,15 +362,24 @@ mod tests {
 ///
 /// The signing half already exists outside this crate, built on the same
 /// `PqdsaKeyPair`. This is the half that was missing.
+///
+/// Absent under `fips`, because aws-lc-rs's own `unstable` module is:
+/// `#[cfg(not(feature = "fips"))] pub mod signature;`. ML-DSA there is not
+/// part of the validated boundary, so a FIPS build has no ML-DSA-87 to call
+/// and this endpoint must not claim the scheme it cannot verify. Same gate
+/// the proxy's signing half carries, for the same reason.
+#[cfg(not(feature = "fips"))]
 #[derive(Debug)]
 struct MlDsa87Verify;
 
 /// DER of the AlgorithmIdentifier contents for id-ml-dsa-87
 /// (OID 2.16.840.1.101.3.4.3.19), parameters absent.
+#[cfg(not(feature = "fips"))]
 const ML_DSA_87_ALG_ID: &[u8] = &[
     0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x13,
 ];
 
+#[cfg(not(feature = "fips"))]
 impl pki_types::SignatureVerificationAlgorithm for MlDsa87Verify {
     fn public_key_alg_id(&self) -> pki_types::AlgorithmIdentifier {
         pki_types::AlgorithmIdentifier::from_slice(ML_DSA_87_ALG_ID)
@@ -393,4 +404,5 @@ impl pki_types::SignatureVerificationAlgorithm for MlDsa87Verify {
     }
 }
 
+#[cfg(not(feature = "fips"))]
 static ML_DSA_87_VERIFY: &dyn pki_types::SignatureVerificationAlgorithm = &MlDsa87Verify;

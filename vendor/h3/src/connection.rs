@@ -247,6 +247,23 @@ where
         shared: Arc<SharedState>,
         config: Config,
     ) -> Result<Self, ConnectionError> {
+        // Publish what we are about to advertise, before anything can be
+        // received against it.
+        //
+        // Both numbers are promises with a matching obligation: a table
+        // capacity we must refuse to exceed (RFC 9204 3.2.3), and a count of
+        // streams we must be willing to park (4.1.1). Reading them from the
+        // config here is what keeps the SETTINGS frame and the behaviour from
+        // drifting apart -- the earlier version advertised a capacity of
+        // 4096 while the decode path could not resolve a dynamic reference at
+        // all, and our own conformance suite failed us for it.
+        shared.set_qpack_blocked_max(config.settings.qpack_blocked_streams);
+        shared
+            .qpack_decoder
+            .lock()
+            .expect("the QPACK decoder lock is never held across a panic")
+            .set_max_capacity(config.settings.qpack_max_table_capacity as usize);
+
         //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
         //# Endpoints SHOULD create the HTTP control stream as well as the
         //# unidirectional streams required by mandatory extensions (such as the
@@ -529,6 +546,31 @@ where
 
     /// Waits for the control stream to be received and reads subsequent frames.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    /// Write whatever the request streams have queued for the QPACK decoder
+    /// stream.
+    ///
+    /// Section Acknowledgment and Stream Cancellation (RFC 9204 4.4.1 and
+    /// 4.4.2) are decided where a field section is decoded or abandoned,
+    /// which is a request stream, and can only be written by whoever owns the
+    /// decoder stream, which is this task. The request stream queues and
+    /// wakes; this drains.
+    ///
+    /// Without the acknowledgements the encoder's known-received count never
+    /// advances, so it can never evict and in practice stops referencing the
+    /// dynamic table at all -- a table advertised and then made useless,
+    /// which is worse than declining one.
+    pub(crate) fn poll_qpack_decoder_send(&mut self, _cx: &mut Context<'_>) {
+        let Some(out) = self.shared.take_decoder_instructions() else {
+            return;
+        };
+        if let Some(send) = self.qpack_streams.decoder_send.as_mut() {
+            // Queued rather than awaited, as with the Insert Count Increment
+            // below: these are a few bytes each and the transport flushes
+            // them with everything else.
+            let _ = send.send_data(WriteBuf::<B>::from_raw(&out));
+        }
+    }
+
     /// Read whatever the peer has put on the QPACK encoder stream.
     ///
     /// RFC 9204 §4.2: encoder instructions are processed as they arrive. Two
@@ -594,17 +636,15 @@ where
                     ),
                 ));
             }
-            // Acknowledgements belong on the decoder stream, and are not sent
-            // yet.
+            // Unpark anything waiting on an insert.
             //
-            // `on_encoder_recv` produces an Insert Count Increment only when
-            // the table actually grew, and this endpoint advertises a
-            // capacity of zero, so nothing can be inserted and `out` stays
-            // empty. Writing it needs a `WriteBuf` bound the generic `B` does
-            // not carry here, and adding one to feed a branch that cannot be
-            // reached would be speculative. It becomes required the moment
-            // the advertised capacity is non-zero, which is the next step and
-            // is deliberately not this one.
+            // `on_encoder_recv` may have grown the table, which is the only
+            // event that can turn a `MissingRefs` into a decodable field
+            // section. Bumping unconditionally rather than comparing insert
+            // counts: a spurious wakeup costs one retry of a decode that has
+            // to happen anyway, a missed one hangs a request.
+            self.shared.qpack_made_progress();
+
             if !out.is_empty() {
                 //= https://www.rfc-editor.org/rfc/rfc9204#section-4.4.3
                 //# The Insert Count Increment instruction ... informs the

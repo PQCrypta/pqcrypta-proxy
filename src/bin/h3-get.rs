@@ -37,7 +37,7 @@ async fn main() -> std::process::ExitCode {
     // SAFETY: first statement in main, before any runtime or socket exists.
     #[allow(unsafe_code)]
     unsafe {
-        std::env::set_var("NOQ_NO_GRO", "1")
+        std::env::set_var("NOQ_NO_GRO", "1");
     };
 
     let mut args = std::env::args().skip(1);
@@ -224,25 +224,30 @@ async fn get(url: &str) -> anyhow::Result<u16> {
         },
     };
 
-    // Offer the server a QPACK dynamic table, and no blocked streams.
+    // Offer the server a QPACK dynamic table, and room to block on it.
     //
-    // The table is honest now: the encoder stream is read and applied, and
-    // field sections decode against the same decoder that applied them.
+    // Both numbers are now backed by machinery rather than optimism, which
+    // is the whole history of this call. The table came first and was an
+    // overclaim: the capacity was advertised while field sections were still
+    // decoded statelessly, so the first server to use the table got
+    // QPACK_DECOMPRESSION_FAILED. Then the blocked-stream count was an
+    // overclaim in the same shape: 16 advertised, and a section referencing
+    // an insert that had not arrived killed the connection.
     //
-    // Blocked streams are not, and saying 16 was an overclaim that the suite
-    // caught within one run. A blocked stream is one whose field section
-    // references an insert the decoder has not received yet, and handling it
-    // means parking the section until the encoder stream catches up. This
-    // decoder does not park: `decode_header` returns MissingRefs and the
-    // connection fails with QPACK_DECOMPRESSION_FAILED. Advertising zero is
-    // what a decoder without that machinery is required to say -- the encoder
-    // then may not reference an insert we have not acknowledged, so the
-    // situation never arises.
+    // A blocked stream is the ordinary consequence of QPACK on QUIC. Field
+    // sections travel on request streams and inserts on the encoder stream,
+    // with no ordering between them, so a correct encoder can have a section
+    // overtake the insert it references. The decoder now parks that section
+    // (RFC 9204 4.1.1) until the insert lands, and acknowledges the sections
+    // it decodes (4.4.1) so the encoder can evict behind them.
     //
-    // h-qpack-blocked-stream therefore reads `unsupported`, which is true.
+    // Sixteen because that is what a decoder willing to park should offer an
+    // encoder that has to decide, per section, whether referencing a recent
+    // insert is worth the risk: zero forbids the reference outright, and the
+    // table is then advertised and unusable.
     let (mut driver, mut send_request) = h3::client::builder()
         .qpack_max_table_capacity(4096)
-        .qpack_blocked_streams(0)
+        .qpack_blocked_streams(16)
         .build(h3_quinn::Connection::new(connection))
         .await
         .map_err(|e| anyhow!("opening the HTTP/3 connection: {e}"))?;
@@ -270,7 +275,7 @@ async fn get(url: &str) -> anyhow::Result<u16> {
             async move { futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await },
         );
 
-    let mut outcome = exchange(&mut send_request, &uri).await;
+    let outcome = exchange(&mut send_request, &uri).await;
 
     // A refused 0-RTT is not a failed request.
     //
@@ -293,8 +298,6 @@ async fn get(url: &str) -> anyhow::Result<u16> {
             let _ = tokio::time::timeout(DRAIN, driving).await;
             return plain_exchange(&endpoint, addr, host, &uri).await;
         }
-        // Put the error back where the caller expects it.
-        outcome = outcome.map_err(|e| e);
     }
 
     // Always, not only on the error path.

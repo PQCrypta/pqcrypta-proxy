@@ -38,6 +38,8 @@ pub enum DecoderError {
     UnexpectedEnd,
     HeaderTooLong(u64),
     BufSize(TryFromIntError),
+    /// The encoder asked for a table larger than we advertised.
+    CapacityExceedsAdvertised(usize),
 }
 
 impl std::error::Error for DecoderError {}
@@ -56,6 +58,11 @@ impl std::fmt::Display for DecoderError {
             DecoderError::UnexpectedEnd => write!(f, "unexpected end"),
             DecoderError::HeaderTooLong(_) => write!(f, "header too long"),
             DecoderError::BufSize(_) => write!(f, "number in buffer wrong size"),
+            DecoderError::CapacityExceedsAdvertised(size) => write!(
+                f,
+                "requested dynamic table capacity {} exceeds the advertised maximum",
+                size
+            ),
         }
     }
 }
@@ -81,6 +88,8 @@ pub struct Decoded {
 #[derive(Default)]
 pub struct Decoder {
     table: DynamicTable,
+    /// SETTINGS_QPACK_MAX_TABLE_CAPACITY as this endpoint advertised it.
+    max_capacity: usize,
 }
 
 impl std::fmt::Debug for Decoder {
@@ -92,6 +101,15 @@ impl std::fmt::Debug for Decoder {
 }
 
 impl Decoder {
+    /// Record the capacity this endpoint advertised in its SETTINGS.
+    ///
+    /// Kept separately from the table's current maximum size, which is what
+    /// the *encoder* has asked for with Set Dynamic Table Capacity and starts
+    /// at zero regardless of what we offered.
+    pub fn set_max_capacity(&mut self, capacity: usize) {
+        self.max_capacity = capacity;
+    }
+
     // Decode field lines received on Request of Push stream.
     // https://www.rfc-editor.org/rfc/rfc9204.html#name-field-line-representations
     pub fn decode_header<T: Buf>(&self, buf: &mut T) -> Result<Decoded, DecoderError> {
@@ -134,6 +152,18 @@ impl Decoder {
             match instruction {
                 Instruction::Insert(field) => self.table.put(field)?,
                 Instruction::TableSizeUpdate(size) => {
+                    //= https://www.rfc-editor.org/rfc/rfc9204#section-3.2.3
+                    //# The decoder MUST treat a new dynamic table capacity
+                    //# value that exceeds this limit as a connection error of
+                    //# type QPACK_ENCODER_STREAM_ERROR.
+                    //
+                    // The table's own ceiling is a sanity bound on the wire
+                    // format, not our promise: without this an encoder that
+                    // ignored our SETTINGS could size the table anywhere
+                    // below that bound and we would allocate for it.
+                    if size > self.max_capacity {
+                        return Err(DecoderError::CapacityExceedsAdvertised(size));
+                    }
                     self.table.set_max_size(size)?;
                 }
             }
@@ -273,7 +303,10 @@ pub fn decode_stateless<T: Buf>(buf: &mut T, max_size: u64) -> Result<Decoded, D
 #[cfg(test)]
 impl From<DynamicTable> for Decoder {
     fn from(table: DynamicTable) -> Self {
-        Self { table }
+        Self {
+            max_capacity: table.max_mem_size(),
+            table,
+        }
     }
 }
 

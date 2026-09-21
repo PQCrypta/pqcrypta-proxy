@@ -14,7 +14,7 @@ use crate::{
     error::{internal_error::InternalConnectionError, Code},
     frame::FrameStream,
     proto::{
-        coding::{Decode as _, Encode},
+        coding::Encode,
         frame::{Frame, Settings},
         stream::StreamType,
         varint::VarInt,
@@ -351,6 +351,9 @@ where
                     Some(StreamEnd::Reset(error_code))
                 }
                 Err(StreamErrorIncoming::Unknown(err)) => {
+                    // Borrowed unconditionally: the only reader is behind the
+                    // `tracing` feature, which is off in this build.
+                    let _ = &err;
                     #[cfg(feature = "tracing")]
                     tracing::error!("Unknown error when reading stream {}", err);
 
@@ -409,6 +412,9 @@ where
 
 enum StreamEnd {
     EndOfStream,
+    // The code is carried but not yet read: `poll_type` discards the whole
+    // `StreamEnd`, which is the TODO above it.
+    #[allow(dead_code)]
     Reset(u64),
     // if the quic layer returns an unknown error
     Other,

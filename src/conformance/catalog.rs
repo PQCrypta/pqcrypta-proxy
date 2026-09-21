@@ -192,6 +192,28 @@ pub fn anomaly_may_be_unread(test: &Test) -> bool {
     )
 }
 
+/// What to call the stream `test` wrote its anomaly to, in a sentence.
+///
+/// The verdict text used to say "the control stream" for every test that
+/// `anomaly_may_be_unread` covers, which was true when that was the only
+/// unidirectional variant and became false the moment `OtherUniStream`
+/// existed. Four tests were then published with a report naming a stream they
+/// do not touch -- a small wrong fact in a document whose whole claim is that
+/// it does not state any.
+pub fn anomaly_stream_name(test: &Test) -> &'static str {
+    match test.id {
+        "h-qpack-encoder-overflow" | "h-qpack-encoder-bad-name-index" => "the QPACK encoder stream",
+        "h-push-stream-unpromised" => "a server-initiated push stream",
+        "h-reserved-uni-stream" => "a unidirectional stream of a reserved type",
+        _ => match anomaly_stream(test) {
+            Anomaly::ControlStream => "the control stream",
+            Anomaly::OtherUniStream => "a server-opened unidirectional stream",
+            Anomaly::ResponseStream => "the response stream",
+            Anomaly::Transport => "the transport",
+        },
+    }
+}
+
 /// Where `test` writes its anomaly.
 ///
 /// Keyed by id, like the error codes are, rather than adding a field to all
@@ -1053,9 +1075,12 @@ pub const CATALOG: &[Test] = &[
                       the decoder advertised, and that a decoder \"MUST treat a new \
                       dynamic table capacity value that exceeds this limit as a connection \
                       error of type QPACK_ENCODER_STREAM_ERROR\".\n\nUnlike the other \
-                      two dynamic-table tests, this one runs against every client: they \
-                      all advertise a capacity of zero, and any capacity at all exceeds a \
-                      limit of zero.",
+                      two dynamic-table tests, this one runs against every client, because \
+                      the capacity asked for is computed from the one that client \
+                      advertised: one byte more, whatever it said. It was a fixed 4096 \
+                      until 2026-09-20, which exceeded the zero every client then \
+                      advertised and would have exceeded nothing at all for a client that \
+                      granted a 4096-byte table.",
         implemented: true,
         port_offset: Some(42),
     },

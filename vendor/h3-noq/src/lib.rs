@@ -358,13 +358,8 @@ pub struct RecvStream {
 // noq's ordered `RecvStream::read_chunk(max_len)` returns `Bytes` directly
 // (unlike quinn's `read_chunk(max_len, ordered) -> Chunk`), so the future's
 // output carries `Option<Bytes>` rather than `Option<Chunk>`.
-type ReadChunkFuture = ReusableBoxFuture<
-    'static,
-    (
-        noq::RecvStream,
-        Result<Option<Bytes>, noq::ReadError>,
-    ),
->;
+type ReadChunkFuture =
+    ReusableBoxFuture<'static, (noq::RecvStream, Result<Option<Bytes>, noq::ReadError>)>;
 
 impl RecvStream {
     fn new(stream: noq::RecvStream) -> Self {

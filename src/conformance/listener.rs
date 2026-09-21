@@ -2022,21 +2022,20 @@ pub(super) async fn emit(
     }
 
     // One test's anomaly belongs on the encoder stream rather than the control
-    // stream, and unlike the two dynamic-table tests it needs no permission from
-    // the client: every capacity exceeds a limit of zero, which is what every
-    // client in reach advertises.
+    // stream, and needs no permission from the client: a name reference to a
+    // static index that does not exist is invalid whatever table the client
+    // granted, because §3.1 rejects it while parsing the instruction and
+    // before any capacity question arises.
+    //
+    // `h-qpack-encoder-overflow` is *not* here, and used to be. Its capacity
+    // has to exceed the one the client advertised, and the client's SETTINGS
+    // have not arrived yet at this point -- see `answer_probe`.
     if test.id == "h-qpack-encoder-bad-name-index" {
         encoder
             .write_all(&f::qpack_insert_bad_name_index(
                 INVALID_STATIC_INDEX,
                 "bad-name-reference",
             ))
-            .await?;
-    }
-
-    if test.id == "h-qpack-encoder-overflow" {
-        encoder
-            .write_all(&f::qpack_set_capacity(OVERSIZED_TABLE_CAPACITY))
             .await?;
     }
 
@@ -2065,13 +2064,41 @@ pub(super) async fn emit(
 pub(super) struct QpackLimits {
     capacity: std::sync::atomic::AtomicU64,
     blocked_streams: std::sync::atomic::AtomicU64,
+    /// Whether the client's SETTINGS frame has actually been parsed.
+    ///
+    /// Zero and "not yet known" were the same value, and everything that read
+    /// these limits read them at a moment chosen by the response schedule
+    /// rather than by the client. That was survivable while the answer was
+    /// only ever "may we use the table", where guessing no is the safe guess.
+    /// It stopped being survivable when a number we *send* began depending on
+    /// it.
+    seen: std::sync::atomic::AtomicBool,
+    settled: tokio::sync::Notify,
 }
 
 impl QpackLimits {
     pub(super) fn observe(&self, limits: f::ClientQpackLimits) {
-        use std::sync::atomic::Ordering::Relaxed;
+        use std::sync::atomic::Ordering::{Relaxed, Release};
         self.capacity.store(limits.capacity, Relaxed);
         self.blocked_streams.store(limits.blocked_streams, Relaxed);
+        self.seen.store(true, Release);
+        self.settled.notify_waiters();
+    }
+
+    /// Wait until the client's SETTINGS have been read, up to `limit`.
+    ///
+    /// Returns whether they arrived. The waiter is created before the second
+    /// check so a frame parsed in between is not slept through.
+    async fn settle(&self, limit: Duration) -> bool {
+        use std::sync::atomic::Ordering::Acquire;
+        if self.seen.load(Acquire) {
+            return true;
+        }
+        let waiting = self.settled.notified();
+        if self.seen.load(Acquire) {
+            return true;
+        }
+        tokio::time::timeout(limit, waiting).await.is_ok()
     }
 
     fn capacity(&self) -> u64 {
@@ -2228,11 +2255,63 @@ const GOAWAY_INCREASED_TO: u64 = 16;
 /// clear of the boundary and cannot be mistaken for an off-by-one.
 const INVALID_STATIC_INDEX: u64 = 200;
 
-/// The dynamic table capacity `h-qpack-encoder-overflow` asks for.
+/// The dynamic table capacity `h-qpack-encoder-overflow` asks for, given what
+/// this client advertised.
 ///
-/// Any non-zero value exceeds the limit every client in reach advertises, and a
-/// round number makes the instruction obvious in a packet capture.
-const OVERSIZED_TABLE_CAPACITY: u64 = 4096;
+/// One byte over the limit, every time. It was the constant 4096, on the
+/// reasoning that "any non-zero value exceeds the limit every client in reach
+/// advertises" -- true of the twelve clients when it was written, and false
+/// the day our own client began advertising a 4096-byte table. It would then
+/// have sent that client a capacity exactly equal to its limit, which §3.2.3
+/// expressly permits, and graded it for not rejecting a legal instruction.
+///
+/// A number typed from a survey of the field decays when the field moves.
+/// Deriving it from the SETTINGS this connection actually received cannot.
+fn oversized_table_capacity(advertised: u64) -> u64 {
+    advertised.saturating_add(1)
+}
+
+/// How long to wait for the client's SETTINGS before sizing the overflow.
+///
+/// The frame is the first thing a client puts on its control stream, so this
+/// is generous. It is a bound rather than an unconditional wait because a
+/// client that never sends SETTINGS must still be answered: the capacity then
+/// falls back to one, which exceeds the zero such a client is held to.
+const SETTINGS_SETTLE: Duration = Duration::from_millis(500);
+
+/// Ask this client's decoder for one byte more table than it granted.
+///
+/// Separate from `emit` because the number is the client's, and separate from
+/// `answer_probe` because it has to be on the wire *before* the probe answer:
+/// the response is what lets a one-shot client finish and close, and a client
+/// that has closed cannot object to an instruction it never read. Same reason
+/// `probe_hold` exists, and this runs just ahead of it.
+pub(super) async fn write_capacity_overflow(
+    test: &'static Test,
+    qpack: &QpackLimits,
+    encoder: Option<&mut quinn::SendStream>,
+) {
+    if test.id != "h-qpack-encoder-overflow" {
+        return;
+    }
+    let Some(encoder) = encoder else {
+        return;
+    };
+    if !qpack.settle(SETTINGS_SETTLE).await {
+        debug!(
+            "conformance: {} sizing the overflow against a default limit — the client's \
+             SETTINGS did not arrive within {:?}",
+            test.id, SETTINGS_SETTLE
+        );
+    }
+    let capacity = oversized_table_capacity(qpack.capacity());
+    if let Err(e) = encoder.write_all(&f::qpack_set_capacity(capacity)).await {
+        debug!(
+            "conformance: {} could not write the oversized capacity: {}",
+            test.id, e
+        );
+    }
+}
 
 /// The request stream `h-priority-update` claims to reprioritise.
 ///
@@ -2282,7 +2361,7 @@ async fn watch_for_liveness(
     early_data_seen: bool,
 ) -> Observation {
     let ServerStreams {
-        encoder,
+        mut encoder,
         late_control,
     } = ours;
     let timeout = Duration::from_millis(conformance.config.liveness_timeout_ms);
@@ -2427,6 +2506,8 @@ async fn watch_for_liveness(
                         Err(e) => debug!("conformance: {} could not send GOAWAY: {}", test.id, e),
                     }
                 }
+
+                write_capacity_overflow(test, qpack, encoder.as_deref_mut()).await;
 
                 // Give a control-stream anomaly time to be read before the
                 // response lets the client go.

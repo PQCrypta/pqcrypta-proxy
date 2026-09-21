@@ -176,7 +176,7 @@ impl std::fmt::Debug for Conformance {
             .field("host", &self.config.host)
             .field("port_range", &self.config.port_range)
             .field("sessions", &self.sessions.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

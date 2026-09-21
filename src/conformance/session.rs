@@ -554,9 +554,10 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
             Observation::ReadThenSilent(_),
         ) => (
             Verdict::Pass,
-            "Read the element on the control stream and carried on, which is what this \
-             test asks for."
-                .to_string(),
+            format!(
+                "Read the element on {} and carried on, which is what this test asks for.",
+                catalog::anomaly_stream_name(test)
+            ),
         ),
 
         // Everything below is the *absence* of a rejection, which only means
@@ -568,15 +569,17 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
             | Observation::ClosedWith { .. },
         ) if catalog::anomaly_may_be_unread(test) => (
             Verdict::Inconclusive,
-            "The client completed its request and closed without objecting, and the anomaly \
-             was on the control stream — a unidirectional stream nothing obliges it to read \
-             on any schedule. Accepting the violation and never reaching the stream look \
-             the same from here. The one signal that separates reading from receiving is a \
-             flow-control credit grant, and a receiver grants credit only as its \
-             consumption approaches the window it advertised, so a client with a large \
-             window reads everything sent and says nothing. Not a judgement withheld — a \
-             distinction this vantage point cannot draw for this client."
-                .to_string(),
+            format!(
+                "The client completed its request and closed without objecting, and the \
+                 anomaly was on {} — a unidirectional stream nothing obliges it to read on \
+                 any schedule. Accepting the violation and never reaching the stream look \
+                 the same from here. The one signal that separates reading from receiving \
+                 is a flow-control credit grant, and a receiver grants credit only as its \
+                 consumption approaches the window it advertised, so a client with a large \
+                 window reads everything sent and says nothing. Not a judgement withheld — \
+                 a distinction this vantage point cannot draw for this client.",
+                catalog::anomaly_stream_name(test)
+            ),
         ),
         (Class::Correctness, Observation::SurvivedAndContinued) => (
             Verdict::Fail,
@@ -599,9 +602,11 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
         ),
         (Class::Correctness, Observation::TimedOut) if catalog::anomaly_may_be_unread(test) => (
             Verdict::Inconclusive,
-            "Nothing further arrived, and the anomaly was on the control stream, so \
-                 there is no way to tell whether the client read it."
-                .to_string(),
+            format!(
+                "Nothing further arrived, and the anomaly was on {}, so there is no way to \
+                 tell whether the client read it.",
+                catalog::anomaly_stream_name(test)
+            ),
         ),
         (Class::Correctness, Observation::TimedOut) => (
             Verdict::Fail,

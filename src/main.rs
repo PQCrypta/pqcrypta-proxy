@@ -417,7 +417,7 @@ async fn run() -> anyhow::Result<()> {
         // SAFETY: single-threaded here, before any runtime or socket exists.
         #[allow(unsafe_code)]
         unsafe {
-            std::env::set_var("NOQ_NO_GRO", "1")
+            std::env::set_var("NOQ_NO_GRO", "1");
         };
         info!("UDP_GRO disabled (server.udp_gro = false): ECN readings over throughput");
     }

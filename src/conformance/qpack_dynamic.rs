@@ -1,11 +1,17 @@
 //! Proof that the two QPACK dynamic-table tests emit what they claim.
 //!
-//! Neither can be exercised from outside. Every HTTP/3 client within reach —
-//! curl/ngtcp2, quinn, aioquic, Chromium's QUICHE and quic-go — advertises
-//! `SETTINGS_QPACK_MAX_TABLE_CAPACITY` of 0 and `SETTINGS_QPACK_BLOCKED_STREAMS`
-//! of 0, which forbids the server's encoder from touching the dynamic table at
-//! all. Both ports therefore report `inconclusive` against every real client,
-//! for the right reason, and the emission behind them is never run.
+//! Neither could be exercised from outside when this was written. Every HTTP/3
+//! client within reach — curl/ngtcp2, quinn, aioquic, Chromium's QUICHE and
+//! quic-go — advertised `SETTINGS_QPACK_MAX_TABLE_CAPACITY` of 0 and
+//! `SETTINGS_QPACK_BLOCKED_STREAMS` of 0, which forbids the server's encoder
+//! from touching the dynamic table at all. Both ports therefore reported
+//! `unsupported` against every real client, for the right reason, and the
+//! emission behind them was never run.
+//!
+//! Our own client now grants both (4096 bytes, 16 blocked streams), so one of
+//! the twelve does reach these ports. That does not retire this module: a
+//! single client exercising the path proves the path runs, not that the bytes
+//! on it are the ones claimed, and the assertions below are about the bytes.
 //!
 //! An unrun path is not a working path. `h-qpack-dynamic-table` shipped for
 //! months writing a field section whose Required Insert Count claimed two
@@ -38,7 +44,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::h3_frames as f;
-use super::listener::{answer_probe, emit, QpackLimits};
+use super::listener::{answer_probe, emit, write_capacity_overflow, QpackLimits};
 use super::zero_rtt::{throwaway_cert, OneCert, PinnedTo, Throwaway};
 
 /// A client that permits the dynamic table, which no real one does.
@@ -131,6 +137,10 @@ async fn drive(test_id: &'static str) -> Wire {
         // The limits the drainer would have read from the client's SETTINGS.
         let qpack = QpackLimits::default();
         qpack.observe(CLIENT_LIMITS);
+
+        // Same order as the live listener: settings observed, the overflow
+        // sized against them, then the probe answered.
+        write_capacity_overflow(test, &qpack, Some(&mut emitted.encoder)).await;
 
         let (mut send, mut recv) = connection
             .accept_bi()
@@ -333,4 +343,59 @@ async fn the_blocked_stream_test_sends_its_insertions_after_the_section() {
         "the section must arrive a clear interval before the insertions, or nothing is \
          blocked and the test measures ordinary decoding; the gap was {gap:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_overflow_test_asks_for_more_than_this_client_granted() {
+    // The regression this exists for: the capacity was the constant 4096,
+    // chosen because every client then advertised zero. `CLIENT_LIMITS` here
+    // advertises 4096, which is what our own client now sends, and 4096 does
+    // not exceed 4096 -- so the port would have sent a legal instruction and
+    // the suite would have graded a client for accepting it.
+    let wire = drive("h-qpack-encoder-overflow").await;
+
+    let encoder = wire.encoder.as_slice();
+    assert!(
+        !encoder.is_empty(),
+        "the port must write a Set Dynamic Table Capacity instruction"
+    );
+
+    // Set Dynamic Table Capacity: 001 prefix, 5-bit prefix integer.
+    assert_eq!(
+        encoder[0] & 0b1110_0000,
+        0b0010_0000,
+        "the first encoder instruction must be Set Dynamic Table Capacity, got {:#04x}",
+        encoder[0]
+    );
+    let capacity = qpack_prefix_int(encoder, 5).expect("the capacity prefix integer");
+
+    assert!(
+        capacity > CLIENT_LIMITS.capacity,
+        "the capacity asked for ({capacity}) must exceed the {} this client advertised, \
+         or §3.2.3 permits it and there is no violation to reject",
+        CLIENT_LIMITS.capacity
+    );
+}
+
+/// Decode a QPACK prefix integer (RFC 7541 §5.1, which RFC 9204 inherits).
+///
+/// Not the QUIC varint `read_varint` reads: the first byte carries `n` value
+/// bits under the instruction's own flag bits, and only overflows into
+/// continuation bytes when those `n` bits are all ones.
+fn qpack_prefix_int(buf: &[u8], prefix_bits: u32) -> Option<u64> {
+    let mask = (1u64 << prefix_bits) - 1;
+    let first = u64::from(*buf.first()?) & mask;
+    if first < mask {
+        return Some(first);
+    }
+    let mut value = first;
+    let mut shift = 0;
+    for &byte in &buf[1..] {
+        value += u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+        shift += 7;
+    }
+    None
 }
