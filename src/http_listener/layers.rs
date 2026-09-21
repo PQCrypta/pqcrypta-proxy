@@ -525,6 +525,21 @@ pub(super) async fn advanced_rate_limit_middleware(
             if let Ok(v) = HeaderValue::from_str(&remaining.to_string()) {
                 resp_headers.insert("x-ratelimit-remaining", v);
             }
+            // A backend's own reset must not survive next to our numbers.
+            //
+            // `limit`, `remaining` and `reset` describe one policy, and this
+            // arm overwrites the first two with this proxy's figures while
+            // leaving the third as the backend wrote it. Measured on
+            // /api/, which runs its own limiter: the origin sent
+            // limit=900 remaining=899 reset=T, and a client received
+            // limit=100 remaining=99 reset=T -- a retry time computed
+            // against a window it does not belong to.
+            //
+            // Removed rather than recomputed because `Allowed` carries no
+            // reset to put there. Two honest headers beat three that
+            // disagree; the rejection arm below has all three and sets them
+            // together.
+            resp_headers.remove("x-ratelimit-reset");
 
             response
         }
