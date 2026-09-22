@@ -1439,52 +1439,76 @@ pub fn documents(test: &Test) -> Vec<String> {
 }
 
 /// Look a test up by its stable id.
-/// How long after the stimulus a silence may be read as an answer.
+/// What establishes that the client had its chance to react.
 ///
-/// The evidence deadline: the earliest moment at which this test can
-/// legitimately assert that a required response is absent. Before it, silence
-/// means nothing — the answer was not yet due.
+/// Not a timer, and not one event for every assertion. A silence-based
+/// failure asks whether a required reaction was absent, and that question is
+/// only answerable once the client has had the causal opportunity to produce
+/// it. What counts as that opportunity is a property of the clause.
 ///
-/// A fraction of the observation window would not do. The window is sized for
-/// the slowest thing that could still arrive, which for one test is a close
-/// that should come within a round trip and for another is a peer's own idle
-/// timer ten seconds later; the same percentage means different things in
-/// each. So this is stated per mechanism, in milliseconds after the anomaly
-/// is fully written, and it is the only number the downgrade rule consults.
-pub fn evidence_window_ms(test: &Test) -> u64 {
+/// Measured evidence for why this is per-clause rather than universal: on
+/// `h-goaway-increasing`, msquic extends flow-control credit on the control
+/// stream carrying the second GOAWAY -- it demonstrably consumed the thing
+/// RFC 9114 §5.2 requires it to react to -- and then never completes an HTTP
+/// exchange, which is reasonable for a client that has just been told to stop
+/// starting requests. Waiting for exchange completion there declared the
+/// opportunity unobserved while the read proof in the same cell said the
+/// opposite. picoquic, with the same positive read proof, was scored `fail`.
+/// The verdicts differed on the definition, not on the evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReactionOpportunity {
+    /// The client completed the exchange the anomaly was delivered in.
+    ///
+    /// For assertions whose required reaction is in-band: a connection error,
+    /// a stream reset, a refusal to proceed with the request itself.
+    ExchangeCompleted,
+    /// The client consumed the stream carrying the anomaly.
+    ///
+    /// For assertions triggered by *receipt*. RFC 9000 §4.1 has a receiver
+    /// extend MAX_STREAM_DATA as its application consumes, so credit on that
+    /// stream is the client stating it took delivery. It does not establish
+    /// that the HTTP/3 state machine interpreted the frame correctly or
+    /// emitted the required error -- that is precisely what the assertion
+    /// then evaluates.
+    AnomalyStreamRead,
+    /// The client learned its early data was rejected.
+    ///
+    /// RFC 9001 §4.6.2 ties the duty to the rejection, which is delivered in
+    /// the handshake and long before any application exchange need exist.
+    HandshakeEarlyDataRejected,
+    /// The client had to still be present later, because the behaviour under
+    /// test happens after the exchange.
+    StillPresentAfter(u64),
+}
+
+/// What establishes the reaction opportunity for one test.
+pub fn reaction_opportunity(test: &Test) -> ReactionOpportunity {
     match test.id {
-        // The client's own idle timer is the second of two ways it can answer,
-        // and it fires at ten seconds. Judging its silence before that is
-        // judging a clock rather than a client.
-        "q-stateless-reset" => 11_000,
+        // Answered by whatever the peer sends next, which may be nothing
+        // until its own idle timer fires.
+        "q-stateless-reset" => ReactionOpportunity::StillPresentAfter(11_000),
 
-        // Early data is accepted or rejected during the handshake, but the
-        // client's reaction — retrying on 1-RTT, or not — needs a further
-        // round trip and the wrapper's own resumption attempt.
-        "q-zero-rtt-reject" | "q-zero-rtt-replay" => 2_500,
+        // Answered on the protocol's own timer: RFC 9000 §8.2.4 ties
+        // PATH_CHALLENGE retransmission to the PTO.
+        "q-path-challenge" | "q-connection-migration" | "q-pmtu-blackhole" => {
+            ReactionOpportunity::StillPresentAfter(3_000)
+        }
 
-        // A path validation has a timer of its own: RFC 9000 §8.2.4 ties the
-        // PATH_CHALLENGE retransmission to the PTO, so the answer can
-        // legitimately arrive later than a close would.
-        "q-path-challenge" | "q-connection-migration" | "q-pmtu-blackhole" => 3_000,
+        // The duty begins when the client learns of the rejection.
+        "q-zero-rtt-reject" => ReactionOpportunity::HandshakeEarlyDataRejected,
 
-        // The read proof runs for its own window before this test can say
-        // whether the anomaly was read at all, and no absence means anything
-        // until it has finished.
+        // Triggered by receipt of something written to a server-opened
+        // stream, so consumption of that stream is the opportunity.
         _ if matches!(
             anomaly_stream(test),
             Anomaly::ControlStream | Anomaly::OtherUniStream
         ) =>
         {
-            2_000
+            ReactionOpportunity::AnomalyStreamRead
         }
 
-        // Everything else is a close, and a close is due within a round trip
-        // plus the elicitation this endpoint sends to shake a lost one loose.
-        // Generous against these round-trip times rather than tight, because
-        // the cost of being late here is a cell that says inconclusive and the
-        // cost of being early is a client accused of something it did not do.
-        _ => 900,
+        // Everything else is answered in the exchange that carried it.
+        _ => ReactionOpportunity::ExchangeCompleted,
     }
 }
 

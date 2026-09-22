@@ -741,17 +741,17 @@ fn report_for(conformance: &Arc<Conformance>, path: &str) -> Response<Body> {
     // other goodbye, and `Registry::associate` needs to know the difference
     // between a run that ended and one still being driven. The HTML form is
     // deliberately not counted -- see `Session::mark_reported`.
-    let Some(results) = conformance.sessions.with(&id, |s| {
+    let Some(snap) = conformance.sessions.with(&id, |s| {
         if wants_json {
             s.mark_reported();
         }
-        s.results()
+        s.snapshot()
     }) else {
         return not_found(wants_json);
     };
 
     let generated = chrono_now();
-    let built = report::build(&id, &results, generated);
+    let built = report::build(&id, &snap, generated);
 
     if wants_json {
         match serde_json::to_string_pretty(&built) {
@@ -777,10 +777,10 @@ fn badge_for(conformance: &Arc<Conformance>, path: &str) -> Response<Body> {
     let Some(id) = session_id(path, "/badge/", ".svg") else {
         return not_found(false);
     };
-    let Some(results) = conformance.sessions.with(&id, |s| s.results()) else {
+    let Some(snap) = conformance.sessions.with(&id, |s| s.snapshot()) else {
         return not_found(false);
     };
-    let built = report::build(&id, &results, chrono_now());
+    let built = report::build(&id, &snap, chrono_now());
     let mut resp = text(
         StatusCode::OK,
         "image/svg+xml; charset=utf-8",

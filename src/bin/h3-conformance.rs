@@ -406,6 +406,14 @@ fn invoke_client(
     timeout_secs: u64,
     resume: bool,
 ) -> ClientEnd {
+    // `{url}` and `{port}` are this tool's own placeholder syntax, documented
+    // on `--client` and written that way in every wrapper the matrix drives.
+    // They are literals on purpose; clippy's nursery lint reads any braced word
+    // in a string as a stray format argument.
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "the braces are the --client placeholder syntax, not a format string"
+    )]
     let rendered = template
         .replace("{url}", url)
         .replace("{port}", &port.to_string());

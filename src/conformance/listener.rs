@@ -38,7 +38,7 @@ use tracing::{debug, info, warn};
 use super::catalog::{self, Test, Tier};
 use super::h3_frames as f;
 use super::impairment::{Counters, ImpairedSocket, Impairments, PeerView};
-use super::session::Observation;
+use super::session::{Evidence, Observation};
 use super::Conformance;
 use crate::tls::TlsProvider;
 
@@ -623,17 +623,28 @@ async fn watch_version_negotiation(
             .and_then(|ip| conformance.sessions.for_source(ip))
             .unwrap_or_else(|| conformance.sessions.create());
         conformance.sessions.with(&session_id, |s| {
-            s.record(
+            s.record_evidence(
                 test,
-                &Observation::Signalled(format!(
-                    "sent Version Negotiation for {arrived} datagram(s); the client did not \
-                     persist with an unsupported version"
-                )),
-                None,
-                0,
-                // No connection followed, so the stimulus and the observation
-                // are the same instant and nothing here rests on a silence.
-                0,
+                Evidence {
+                    test_id: test.id.to_string(),
+                    test_version: 1,
+                    observation: Observation::Signalled(format!(
+                        "sent Version Negotiation for {arrived} datagram(s); the client did not \
+                         persist with an unsupported version"
+                    )),
+                    expected_code: None,
+                    read_proof: None,
+                    early_data_accepted: false,
+                    zero_rtt_datagrams_in: 0,
+                    // No connection followed, so the stimulus and the
+                    // observation are the same instant.
+                    t_anomaly_ms: 0,
+                    t_exchange_completed_ms: None,
+                    t_observation_end_ms: 0,
+                    t_exit_ms: None,
+                    connection_seq: 0,
+                    recorded_at_ms: 0,
+                },
             );
         });
         info!(
@@ -778,14 +789,25 @@ async fn run_one(
             };
             conformance.sessions.with(&session_id, |sess| {
                 let refused_at = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
-                sess.record(
+                sess.record_evidence(
                     test,
-                    &observation,
-                    expected_code(test),
-                    refused_at,
-                    // Refused before a handshake existed, so the anomaly was
-                    // never reached and there is no silence to read.
-                    refused_at,
+                    Evidence {
+                        test_id: test.id.to_string(),
+                        test_version: 1,
+                        observation: observation.clone(),
+                        expected_code: expected_code(test),
+                        read_proof: None,
+                        early_data_accepted: false,
+                        zero_rtt_datagrams_in: 0,
+                        // Refused before a handshake existed, so the anomaly
+                        // was never reached.
+                        t_anomaly_ms: refused_at,
+                        t_exchange_completed_ms: None,
+                        t_observation_end_ms: refused_at,
+                        t_exit_ms: None,
+                        connection_seq: 0,
+                        recorded_at_ms: 0,
+                    },
                 );
             });
             info!(
@@ -870,7 +892,24 @@ async fn run_one(
             // established. There is no silence to interpret here and the
             // deadline is the moment itself.
             conformance.sessions.with(&session_id, |s| {
-                s.record(test, &observation, expected_code(test), elapsed, elapsed);
+                s.record_evidence(
+                    test,
+                    Evidence {
+                        test_id: test.id.to_string(),
+                        test_version: 1,
+                        observation: observation.clone(),
+                        expected_code: expected_code(test),
+                        read_proof: None,
+                        early_data_accepted: false,
+                        zero_rtt_datagrams_in: 0,
+                        t_anomaly_ms: elapsed,
+                        t_exchange_completed_ms: None,
+                        t_observation_end_ms: elapsed,
+                        t_exit_ms: None,
+                        connection_seq: 0,
+                        recorded_at_ms: 0,
+                    },
+                );
             });
             info!(
                 "conformance: {} session={} observed={:?} (closed during the handshake: {})",
@@ -890,11 +929,6 @@ async fn run_one(
     // written but before the client had read it — so a correct client saw our
     // violation, closed the connection, and reported an error on a test it had
     // just passed.
-    // When the stimulus is fully established, measured from the connection's
-    // start. Everything the evidence deadline is reckoned from hangs off this
-    // one instant: before the anomaly is written there is nothing for a client
-    // to answer, so a silence before it means nothing at all.
-    let t_anomaly_ms;
     let (critical_streams, mut encoder, mut control, mut probe_target, control_is_late) =
         match emit(&connection, test).await {
             Ok(emitted) => (
@@ -909,7 +943,11 @@ async fn run_one(
                 (Vec::new(), None, None, None, false)
             }
         };
-    t_anomaly_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+    // When the stimulus is fully established, measured from the connection's
+    // start. Every reaction opportunity is reckoned from this one instant:
+    // before the anomaly is written there is nothing for a client to answer,
+    // so a silence before it means nothing at all.
+    let t_anomaly_ms: u64 = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
 
     // The one anomaly that is not written to any stream.
     //
@@ -957,6 +995,10 @@ async fn run_one(
     // be parked somewhere that outlives the wait.
     let mut held: Vec<quinn::SendStream> = Vec::new();
     let qpack = Arc::new(QpackLimits::default());
+    // When the client's exchange completed, which for most assertions is the
+    // moment it had its chance to react. `u64::MAX` means it never did, and
+    // that is a different thing from having reacted with silence.
+    let exchange_completed_ms = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
 
     // The read-proof has to run *while the client is still there*.
     //
@@ -1012,11 +1054,15 @@ async fn run_one(
                     },
                 },
                 &qpack,
-                // Not just "0-RTT was possible" — `into_0rtt` succeeds whenever the
-                // configuration offers early data, whether or not the client sent
-                // any. The wire count is the same evidence the verdict is built on,
-                // so the response and the verdict cannot disagree.
-                early_data_accepted && since.zero_rtt_in() > 0,
+                Progress {
+                    // Not just "0-RTT was possible" — `into_0rtt` succeeds whenever
+                    // the configuration offers early data, whether or not the client
+                    // sent any. The wire count is the same evidence the verdict is
+                    // built on, so the response and the verdict cannot disagree.
+                    early_data_seen: early_data_accepted && since.zero_rtt_in() > 0,
+                    started,
+                    exchange_completed_ms: &exchange_completed_ms,
+                },
             ),
             async {
                 match probe_control.as_mut() {
@@ -1035,7 +1081,7 @@ async fn run_one(
                         // to, and recorded "completed its request and closed
                         // without objecting" against every client for it.
                         write_capacity_overflow(test, &qpack, Some(&mut *stream)).await;
-                        control_stream_was_read(test.id, &connection, stream).await
+                        control_stream_was_read(test.id, &session_id, &connection, stream).await
                     }
                     None => None,
                 }
@@ -1181,12 +1227,31 @@ async fn run_one(
     let elapsed = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
 
     conformance.sessions.with(&session_id, |s| {
-        s.record(
+        s.record_evidence(
             test,
-            &observation,
-            expected_code(test),
-            elapsed,
-            t_anomaly_ms,
+            Evidence {
+                test_id: test.id.to_string(),
+                test_version: 1,
+                observation: observation.clone(),
+                expected_code: expected_code(test),
+                // Carried rather than folded away: a later oracle may read
+                // this where the current one does not, and it is the evidence
+                // `AnomalyStreamRead` turns on.
+                read_proof,
+                early_data_accepted,
+                zero_rtt_datagrams_in: since.zero_rtt_in(),
+                t_anomaly_ms,
+                t_exchange_completed_ms: match exchange_completed_ms
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    u64::MAX => None,
+                    ms => Some(ms),
+                },
+                t_observation_end_ms: elapsed,
+                t_exit_ms: None,
+                connection_seq: 0,
+                recorded_at_ms: 0,
+            },
         );
     });
 
@@ -2375,6 +2440,28 @@ pub(super) struct Emitted {
     pub(super) control_is_late: bool,
 }
 
+/// What this connection has done so far, and when.
+///
+/// One parameter rather than three for the same reason as [`ServerStreams`]:
+/// they travel together and they mean one thing. Every one of them is an input
+/// to a reaction opportunity -- the instant the anomaly landed is reckoned from
+/// `started`, the completed exchange is the opportunity for most tests, and
+/// whether early data actually arrived is the opportunity for the 0-RTT ones.
+/// Passed loose they were three unrelated-looking arguments at the end of a
+/// long list, and the argument count said so.
+pub(super) struct Progress<'a> {
+    /// Whether early data actually arrived on the wire, not merely whether the
+    /// configuration offered it.
+    pub(super) early_data_seen: bool,
+    /// When this connection began. Every millisecond in the evidence is
+    /// measured from here.
+    pub(super) started: Instant,
+    /// Stamped when the client's request/response exchange completes, which is
+    /// the reaction opportunity for every test whose anomaly rides the
+    /// exchange.
+    pub(super) exchange_completed_ms: &'a Arc<std::sync::atomic::AtomicU64>,
+}
+
 /// The server-side streams `watch_for_liveness` may still write to.
 ///
 /// One parameter rather than two because they travel together and mean the same
@@ -2556,12 +2643,17 @@ async fn watch_for_liveness(
     hold: &mut Vec<quinn::SendStream>,
     ours: ServerStreams<'_>,
     qpack: &Arc<QpackLimits>,
-    early_data_seen: bool,
+    progress: Progress<'_>,
 ) -> Observation {
     let ServerStreams {
         encoder,
         late_control,
     } = ours;
+    let Progress {
+        early_data_seen,
+        started,
+        exchange_completed_ms,
+    } = progress;
     let timeout = Duration::from_millis(conformance.config.liveness_timeout_ms);
 
     // Drain the client's unidirectional streams for the life of this
@@ -2757,6 +2849,15 @@ async fn watch_for_liveness(
                 {
                     debug!("conformance: could not answer liveness probe: {}", e);
                 }
+                // The exchange carrying the anomaly is now complete. For every
+                // assertion answered in-band this is the client's opportunity
+                // to have reacted, and anything it does after it -- including
+                // exiting, which every wrapper here does -- leaves the silence
+                // meaning what it says.
+                exchange_completed_ms.store(
+                    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                    std::sync::atomic::Ordering::Release,
+                );
                 // Handed to the caller rather than dropped. `Drop for SendStream`
                 // finishes the stream, so letting it fall out of scope would end
                 // the response the moment it was written — and a client that has
@@ -4040,6 +4141,7 @@ const READ_PROOF_WAIT: Duration = Duration::from_millis(1_500);
 /// the consequence of never asking.
 pub(super) async fn control_stream_was_read(
     test_id: &str,
+    session_id: &str,
     connection: &quinn::Connection,
     control: &mut quinn::SendStream,
 ) -> Option<bool> {
@@ -4066,12 +4168,12 @@ pub(super) async fn control_stream_was_read(
     // now ends at the first grant, so a large window costs no more than a
     // small one, and every client is measured on the same terms.
     if limit == 0 {
-        info!("conformance: {test_id} read-proof skipped (peer window not yet known)");
+        info!("conformance: {test_id} session={session_id} read-proof skipped (peer window not yet known)");
         return None;
     }
     info!(
-        "conformance: {} read-proof starting (peer window {} bytes)",
-        test_id, limit
+        "conformance: {} session={} read-proof starting (peer window {} bytes)",
+        test_id, session_id, limit
     );
 
     // Watch this stream's own credit, and stop the moment it moves.
@@ -4095,7 +4197,7 @@ pub(super) async fn control_stream_was_read(
     let baseline = match control.peer_max_data() {
         Ok(v) => v,
         Err(_) => {
-            info!("conformance: {test_id} read-proof skipped (stream already closed)");
+            info!("conformance: {test_id} session={session_id} read-proof skipped (stream already closed)");
             return None;
         }
     };
@@ -4174,8 +4276,8 @@ pub(super) async fn control_stream_was_read(
         ),
     };
     info!(
-        "conformance: {test_id} read-proof result={verdict:?} window={limit} wrote={written} \
-         why={why}"
+        "conformance: {test_id} session={session_id} read-proof result={verdict:?} \
+         window={limit} wrote={written} why={why}"
     );
     verdict
 }

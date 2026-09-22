@@ -107,7 +107,7 @@ impl Verdict {
 /// what was being tested. A connection closed with `H3_SETTINGS_ERROR` is
 /// exactly right for `h-duplicate-setting` and exactly wrong for
 /// `h-grease-settings`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Observation {
     /// The liveness probe arrived and the client then closed cleanly, with no
     /// objection to the anomaly.
@@ -247,27 +247,12 @@ pub struct Result_ {
     /// spec citation, so a failing client gets a sentence it can act on rather
     /// than a bare status.
     pub detail: String,
-    pub elapsed_ms: u64,
-    /// When the stimulus was fully established, from the connection's start.
-    pub t_anomaly_ms: u64,
-    /// The earliest moment this test may read a silence as an answer.
-    pub t_due_ms: u64,
-    /// Machine-readable reason a verdict is what it is, where the scoring
-    /// rules changed it from what the observation alone would have given.
+    /// Why the oracle reached this verdict, where a rule changed it from what
+    /// the observation alone would have given.
     pub reason: Option<&'static str>,
-    /// Whether the client was gone before this test's evidence deadline.
-    pub exit_before_deadline: bool,
-    /// When the client process exited, where the driver reported it.
-    pub t_exit_ms: Option<u64>,
-    /// Whether this verdict was reached because nothing came back.
-    ///
-    /// Set from the observation at the moment it is judged, which is the only
-    /// point where the fact is available. Deriving it later from the detail
-    /// sentence looked cheaper and is not: "never answered 425" is about this
-    /// endpoint not answering, and "went quiet" is what a client that handled
-    /// a Stateless Reset correctly does. Both matched a prose test and neither
-    /// is a peer falling silent.
-    pub rests_on_absence: bool,
+    pub elapsed_ms: u64,
+    /// What the verdict was derived from. `None` only for a test never run.
+    pub evidence: Option<Evidence>,
 }
 
 /// Turn an observation into a verdict, in light of what the test was measuring.
@@ -818,11 +803,174 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
     }
 }
 
+/// The oracle: evidence in, verdict out.
+///
+/// A free function over `Evidence` and the catalogue entry, reading nothing
+/// else. That is what makes a stored run replayable — the same evidence
+/// through a later oracle gives the later verdict, with no client involved.
+pub fn score(test: &'static Test, ev: &Evidence) -> (Verdict, String, Option<&'static str>) {
+    let (verdict, detail) = judge(test, &ev.observation, ev.expected_code);
+
+    // Only a verdict resting on an absence can be affected: the others were
+    // reached from something the client did.
+    let rests_on_absence = matches!(
+        ev.observation,
+        Observation::NoCloseObserved
+            | Observation::ClosedSilently
+            | Observation::TimedOut
+            | Observation::PeerUnreachable
+            | Observation::SurvivedAndContinued
+            | Observation::ReadThenSilent(_)
+            | Observation::Ambiguous(_)
+    );
+    let Some(exited) = ev.t_exit_ms else {
+        return (verdict, detail, None);
+    };
+    if !rests_on_absence {
+        return (verdict, detail, None);
+    }
+
+    // When the client had its chance, by the clause's own trigger.
+    let opportunity: Option<u64> = match catalog::reaction_opportunity(test) {
+        catalog::ReactionOpportunity::ExchangeCompleted => ev.t_exchange_completed_ms,
+        // Consumption of the stream carrying the anomaly. The proof is a
+        // boolean rather than an instant, so the opportunity is taken at the
+        // point the anomaly was delivered: credit can only follow it.
+        catalog::ReactionOpportunity::AnomalyStreamRead => match ev.read_proof {
+            Some(true) => Some(ev.t_anomaly_ms),
+            _ => None,
+        },
+        // The rejection is delivered in the handshake, so a client that
+        // offered early data against a rejecting port has learned of it.
+        catalog::ReactionOpportunity::HandshakeEarlyDataRejected => {
+            if ev.zero_rtt_datagrams_in > 0 || ev.early_data_accepted {
+                Some(ev.t_anomaly_ms)
+            } else {
+                None
+            }
+        }
+        catalog::ReactionOpportunity::StillPresentAfter(ms) => Some(ev.t_anomaly_ms + ms),
+    };
+
+    let reached = exited >= ev.t_anomaly_ms && matches!(opportunity, Some(t) if exited >= t);
+    if reached {
+        return (verdict, detail, None);
+    }
+
+    let where_ = opportunity
+        .map(|t| format!("{t}ms"))
+        .unwrap_or_else(|| "never observed".to_string());
+    let reason = Some("client_exit_before_reaction_opportunity");
+    if verdict == Verdict::Fail {
+        (
+            Verdict::Inconclusive,
+            format!(
+                "The client process exited {}ms in, before it had the opportunity to react — the \
+                 anomaly was delivered at {}ms and this test's reaction point is {}. What the \
+                 server saw was: {} That is also what a client which had already gone looks \
+                 like, so it is recorded as inconclusive rather than as a failure.",
+                exited, ev.t_anomaly_ms, where_, detail
+            ),
+            reason,
+        )
+    } else {
+        (
+            verdict,
+            format!(
+                "{detail} The client process had already exited {exited}ms in, before this \
+                 test's reaction point at {where_}, so the silence after that is not evidence \
+                 either way."
+            ),
+            reason,
+        )
+    }
+}
+
+/// Everything a verdict is derived from, stored so it can be derived again.
+///
+/// The verdict used to be the primary artefact and its inputs were discarded
+/// the moment it was computed. That made an oracle correction unreplayable:
+/// changing how a silence is judged meant re-executing twelve clients against
+/// the wire, because the only record of what they had done was a sentence
+/// written by the previous oracle. It also made a correction unauditable --
+/// the one honest way to check a re-score was to run it again and hope the
+/// clients behaved the same.
+///
+/// So the pipeline is now
+///
+///     client run -> observations -> stored evidence -> oracle(v) -> verdict
+///
+/// and the verdict is derived. An oracle-only correction no longer needs a
+/// rerun **where the evidence it consults was persisted** -- which is the
+/// honest form of that promise, since a future oracle may need an input this
+/// struct does not carry, and then a rerun is the correct answer.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Evidence {
+    /// The catalogue entry, by id, and the version of the definition used.
+    pub test_id: String,
+    pub test_version: u32,
+    /// What the connection did.
+    pub observation: Observation,
+    /// The error code the clause names, where it names one.
+    pub expected_code: Option<u64>,
+    /// Whether the read proof established that the client consumed the
+    /// stream carrying the anomaly. `None` where the question was not put.
+    pub read_proof: Option<bool>,
+    /// Whether the handshake accepted early data, and whether any arrived.
+    pub early_data_accepted: bool,
+    pub zero_rtt_datagrams_in: u64,
+    /// The timeline, in milliseconds from the connection's start.
+    pub t_anomaly_ms: u64,
+    pub t_exchange_completed_ms: Option<u64>,
+    pub t_observation_end_ms: u64,
+    /// When the driver's client process exited, where it reported one.
+    pub t_exit_ms: Option<u64>,
+    /// Which connection within the session produced this, and when it was
+    /// stored.
+    ///
+    /// One test can be answered by several connections -- the 0-RTT wrapper
+    /// connects twice, browsers reconnect two to four times -- and a report
+    /// is a snapshot of whichever had been recorded when it was taken. Without
+    /// these a cell cannot say which evidence its verdict consumed, and a
+    /// report collected between two connections is indistinguishable from one
+    /// that disagrees with the run. That cost half an hour to tell apart once.
+    pub connection_seq: u64,
+    pub recorded_at_ms: u64,
+}
+
+impl Evidence {
+    /// Whether this connection learned anything about the client's handling.
+    ///
+    /// `NotExercised` says outright that the client was never put in the
+    /// situation. `Ambiguous` is a connection that ended without anything
+    /// readable — the shape a browser's extra reconnect takes when it sits
+    /// idle until its own pre-handshake timeout. Neither is a reason to
+    /// discard a connection that did observe something.
+    ///
+    /// Everything else is informative even when it is unwelcome: a silence
+    /// that followed a demonstrated read is evidence, and so is a close
+    /// carrying the wrong code.
+    pub fn informative(&self) -> bool {
+        !matches!(
+            self.observation,
+            Observation::NotExercised(_) | Observation::Ambiguous(_)
+        )
+    }
+}
+
+/// The oracle that turned this evidence into a verdict.
+///
+/// Stored beside the verdict so a matrix states which rules produced it, and
+/// so two matrices can be compared without guessing whether a difference came
+/// from the clients or from us.
+pub const ORACLE_VERSION: &str = "reaction-opportunity/2";
+
 /// One client's walk through the catalogue.
 pub struct Session {
     pub id: String,
     created: Instant,
-    results: HashMap<&'static str, Result_>,
+    /// The evidence, by test. The verdicts are derived from this.
+    evidence: HashMap<&'static str, Evidence>,
     /// When the driver's client process exited, per test, in milliseconds
     /// from the moment it was invoked.
     ///
@@ -832,6 +980,19 @@ pub struct Session {
     /// driver holds the process, so it posts the exit and the report reads
     /// the two together.
     client_exit_ms: HashMap<String, u64>,
+    /// Connections recorded into this session, in order.
+    recorded: u64,
+    /// Readings taken of this session, in order.
+    ///
+    /// A report is a reading at an instant, and the session keeps moving under
+    /// it: the 0-RTT wrapper connects twice, a browser reconnects two to four
+    /// times. Two readings taken either side of one of those legitimately
+    /// differ, and with nothing naming the instant that is indistinguishable
+    /// from two accounts of the *same* instant disagreeing -- which is a
+    /// persistence defect and a far more serious thing. Numbering the readings
+    /// is what lets an auditor tell those two apart without re-deriving the
+    /// timeline by hand.
+    snapshots: u64,
     /// Whether this session's machine-readable report has been collected.
     ///
     /// The driver reads `/report/<id>.json` once, at the end, after it has
@@ -849,8 +1010,10 @@ impl Session {
         Self {
             id,
             created: Instant::now(),
-            results: HashMap::new(),
+            evidence: HashMap::new(),
             client_exit_ms: HashMap::new(),
+            recorded: 0,
+            snapshots: 0,
             reported: false,
         }
     }
@@ -862,6 +1025,12 @@ impl Session {
     /// guaranteed order.
     pub fn note_client_exit(&mut self, test_id: &str, elapsed_ms: u64) {
         self.client_exit_ms.insert(test_id.to_string(), elapsed_ms);
+        // The driver posts this after the connection has ended, so the
+        // evidence usually exists already and is completed in place. Where it
+        // does not, the map above carries it until the evidence arrives.
+        if let Some(ev) = self.evidence.get_mut(test_id) {
+            ev.t_exit_ms = Some(elapsed_ms);
+        }
     }
 
     /// How long after invocation the client process for this test exited.
@@ -881,205 +1050,127 @@ impl Session {
     /// Record an outcome. A test re-run within the same session overwrites its
     /// previous result — clients under active development re-run constantly,
     /// and a report that accumulated every historical attempt would be unusable.
-    pub fn record(
-        &mut self,
-        test: &'static Test,
-        obs: &Observation,
-        expected_code: Option<u64>,
-        elapsed_ms: u64,
-        t_anomaly_ms: u64,
-    ) {
-        let (verdict, detail) = judge(test, obs, expected_code);
-        let t_due_ms = t_anomaly_ms + catalog::evidence_window_ms(test);
-
-        // A connection that did not exercise the test must not overwrite one
-        // that did.
+    /// Store the evidence for one test, and derive its verdict from it.
+    ///
+    /// The evidence is the record. The verdict is computed here so the live
+    /// report has one, and recomputed from the same evidence by anything that
+    /// re-scores a stored run — the two cannot disagree, because there is only
+    /// one oracle and it reads only what is stored.
+    pub fn record_evidence(&mut self, test: &'static Test, ev: Evidence) {
+        // A connection that learned nothing must not overwrite one that did.
         //
-        // One test can be answered by more than one connection. The 0-RTT
-        // ports are driven by a wrapper that connects twice — once to be
-        // issued a session ticket, once to resume with it and offer early
-        // data — and only the second is the measurement. The first, by
-        // construction, sends no early data.
+        // One test can be answered by more than one connection: the 0-RTT
+        // ports are driven by a wrapper that connects twice and only the
+        // resume is the measurement, and clients open two to four connections
+        // per session, so a late reconnect that sat idle must not erase the
+        // one that established the finding.
         //
-        // This used to be a plain insert, so the verdict belonged to whichever
-        // connection finished last rather than to whichever exercised the
-        // test. Measured on `q-zero-rtt-replay` with ngtcp2:
-        //
-        //   13:24:39  peer :50932  elapsed     0ms  ObjectedAtTransport(...)
-        //   13:24:47  peer :38030  elapsed 20003ms  NotExercised("no early data")
-        //
-        // The resume answered correctly and immediately; the priming
-        // connection, started twenty seconds earlier and outliving the resume
-        // server-side, landed afterwards and replaced a real verdict with
-        // "the client sent no early data". It looked like a regime effect —
-        // the same cell passed when run alone and failed in a full catalogue
-        // — because the priming connection only outlives the resume when the
-        // run is busy enough to make it slow.
-        //
-        // So no inconclusive result ever overwrites a conclusive one. The
-        // absence of evidence does not erase evidence gathered on the same
-        // port seconds earlier.
-        //
-        // This was written as "`NotExercised` never overwrites", which is the
-        // same rule stated in terms of one observation instead of the property
-        // that made it right. `Observation::Ambiguous` judges inconclusive
-        // too, and walked straight past the guard. Chromium is the client that
-        // shows it, because Chromium does not connect once:
-        //
-        //   19:11:26.686  Unsupported  NoSignatureSchemesInCommon
-        //   19:11:30.688  Ambiguous    idle timeout after 4001805us
-        //
-        // Both on `t-cert-compression-pq`, both in one session, four seconds
-        // apart. The first connection established the finding this port
-        // exists to produce -- this client's signature_algorithms cannot
-        // verify an ML-DSA-87 chain. The second was a reconnect that sat idle
-        // until Chrome's 4s pre-handshake timeout, learned nothing, and
-        // replaced it.
-        //
-        // Whether the driver read the report before or after that second
-        // connection expired decided the published verdict, so the cell came
-        // out `unsupported` or `inconclusive` at about one in two: measured
-        // at 4/4 over eight consecutive single-cell runs, and it had been
-        // flipping across full matrix runs for as long as there are staged
-        // datasets to check.
-        //
-        // A conclusive verdict overwrites a conclusive verdict as before; a
-        // client that answers differently on a second connection is telling
-        // us something, and the later answer wins.
-        if verdict == Verdict::Inconclusive {
-            if let Some(existing) = self.results.get(test.id) {
-                if existing.verdict != Verdict::Inconclusive {
-                    // Logged because it is otherwise invisible: without this
-                    // line the only trace of a discarded overwrite is a
-                    // verdict that quietly does not change.
+        // Decided on the evidence, deliberately, and not on the verdict it
+        // would produce. Keying it on the verdict would mean a future oracle
+        // could change *which raw observation survives* — the stored record
+        // would then depend on the scoring rules, which is the coupling this
+        // whole refactor exists to remove.
+        if !ev.informative() {
+            if let Some(existing) = self.evidence.get(test.id) {
+                if existing.informative() {
                     tracing::info!(
-                        "conformance: {} keeping {:?} from the connection that exercised it, \
-                         rather than a later one that did not",
-                        test.id,
-                        existing.verdict
+                        "conformance: {} keeping the connection that exercised it, rather than \
+                         a later one that did not",
+                        test.id
                     );
                     return;
                 }
             }
         }
-
-        self.results.insert(
-            test.id,
-            Result_ {
-                test_id: test.id,
-                verdict,
-                detail,
-                elapsed_ms,
-                t_anomaly_ms,
-                t_due_ms,
-                reason: None,
-                exit_before_deadline: false,
-                t_exit_ms: None,
-                // The observations that mean "we waited and nothing came".
-                // `Unsupported` and `Violated` are statements by the client;
-                // `Signalled` and `ClosedWith` are answers. These are not.
-                rests_on_absence: matches!(
-                    obs,
-                    Observation::NoCloseObserved
-                        | Observation::ClosedSilently
-                        | Observation::TimedOut
-                        | Observation::PeerUnreachable
-                        | Observation::SurvivedAndContinued
-                        | Observation::ReadThenSilent(_)
-                        | Observation::Ambiguous(_)
-                ),
-            },
-        );
+        let mut ev = ev;
+        if ev.t_exit_ms.is_none() {
+            ev.t_exit_ms = self.client_exit_ms.get(test.id).copied();
+        }
+        self.recorded += 1;
+        ev.connection_seq = self.recorded;
+        ev.recorded_at_ms = self
+            .created
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        self.evidence.insert(test.id, ev);
     }
 
     /// Every catalogue entry, with `NotRun` filled in for those untouched.
     ///
-    /// The report always lists the full catalogue: a client that connected once
-    /// and gave up should show 26 `NotRun` rows, not a single pass and a
-    /// misleading 100%.
+    /// Derived, every time, from the stored evidence. The report always lists
+    /// the full catalogue: a client that connected once and gave up should
+    /// show its untouched rows rather than a single pass and a misleading
+    /// 100%.
     pub fn results(&self) -> Vec<Result_> {
         catalog::CATALOG
             .iter()
-            .map(|t| {
-                let mut row = self.results.get(t.id).cloned().unwrap_or_else(|| Result_ {
+            .map(|t| match self.evidence.get(t.id) {
+                Some(ev) => {
+                    let (verdict, detail, reason) = score(t, ev);
+                    Result_ {
+                        test_id: t.id,
+                        verdict,
+                        detail,
+                        reason,
+                        elapsed_ms: ev.t_observation_end_ms,
+                        evidence: Some(ev.clone()),
+                    }
+                }
+                None => Result_ {
                     test_id: t.id,
                     verdict: Verdict::NotRun,
                     detail: "Not attempted.".to_string(),
-                    elapsed_ms: 0,
-                    t_anomaly_ms: 0,
-                    t_due_ms: 0,
                     reason: None,
-                    exit_before_deadline: false,
-                    t_exit_ms: None,
-                    rests_on_absence: false,
-                });
-                self.apply_evidence_deadline(t.id, &mut row);
-                row
+                    elapsed_ms: 0,
+                    evidence: None,
+                },
             })
             .collect()
     }
 
-    /// Hold a silence-based verdict to the temporal invariant.
+    /// Take a numbered reading of this session.
     ///
-    /// A verdict may not depend on an observation that became impossible
-    /// before the observation was due. The suite cannot tell "the client saw
-    /// the violation, tolerated it and stayed alive" from "the client
-    /// disappeared before the question could be answered" — and `Fail` claims
-    /// the first.
-    ///
-    /// So a silence-based `Fail` requires the client to have still been there
-    /// at the evidence deadline: `t_exit` unknown, or `t_exit >= t_due`. An
-    /// exit before it yields `Inconclusive`; an exit after it erases nothing,
-    /// because by then the evidence had already been collected.
-    ///
-    /// Deliberately not a fraction of the observation window. That window is
-    /// sized for the slowest thing that could still arrive, which is a round
-    /// trip for one test and a peer's ten-second idle timer for another, so
-    /// the same percentage means different things in each and the cutoff
-    /// would be an artefact of this file rather than a property of the test.
-    fn apply_evidence_deadline(&self, test_id: &str, row: &mut Result_) {
-        let Some(exited) = self.client_exit_ms(test_id) else {
-            // fall through: nothing reported, nothing claimed
-            // Unknown exit: the driver may not report them at all, and a
-            // verdict is reached exactly as it was before this existed.
-            return;
-        };
-        row.t_exit_ms = Some(exited);
-        if exited >= row.t_due_ms {
-            // The client was still there when the answer fell due. Whatever
-            // happened afterwards cannot unmake what was already established.
-            return;
-        }
-        if !row.rests_on_absence {
-            // The client answered, or stated it cannot do this. When it left
-            // afterwards is beside the point.
-            return;
-        }
-
-        row.exit_before_deadline = true;
-        if row.verdict == Verdict::Fail {
-            row.verdict = Verdict::Inconclusive;
-            row.reason = Some("client_exit_before_evidence_deadline");
-            row.detail = format!(
-                "The client process exited {}ms into the run, before this test's evidence \
-                 deadline at {}ms — the anomaly was established at {}ms and the answer was not \
-                 yet due. What the server saw was: {} That is what a client which had already \
-                 gone looks like, so it is recorded as inconclusive rather than as a failure.",
-                exited, row.t_due_ms, row.t_anomaly_ms, row.detail
-            );
-        } else {
-            row.reason = Some("client_exit_before_evidence_deadline");
-            row.detail.push_str(&format!(
-                " The client process had already exited {}ms in, before this test's evidence \
-                 deadline at {}ms, so the silence after that point is not evidence either way.",
-                exited, row.t_due_ms
-            ));
+    /// Everything that renders a session -- the JSON report, the HTML one, the
+    /// badge -- goes through here, so every reading carries what identifies it:
+    /// which reading it was, how long after the session started it was taken,
+    /// and how many connections had been recorded by then. Comparing a stored
+    /// verdict against the live server is then a comparison between two
+    /// identified instants rather than between two unlabelled ones.
+    pub fn snapshot(&mut self) -> Snapshot {
+        self.snapshots += 1;
+        Snapshot {
+            seq: self.snapshots,
+            collected_at_ms: self
+                .created
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            connections_recorded: self.recorded,
+            results: self.results(),
         }
     }
 
     pub fn age(&self) -> Duration {
         self.created.elapsed()
     }
+}
+
+/// One reading of a session, with what identifies the reading.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    /// Which reading of this session this was, counting from one.
+    pub seq: u64,
+    /// When it was taken, in milliseconds from the session's start.
+    pub collected_at_ms: u64,
+    /// How many connections had been recorded when it was taken. A cell whose
+    /// evidence carries a higher `connection_seq` than this cannot have been
+    /// in the reading, which is the check that distinguishes a stale report
+    /// from a disagreeing one.
+    pub connections_recorded: u64,
+    pub results: Vec<Result_>,
 }
 
 /// All live sessions.
@@ -1206,7 +1297,7 @@ impl Registry {
             }
             prev_id.clone()
         };
-        let (recorded, reported) = self.with(&prev_id, |s| (s.results.len(), s.reported))?;
+        let (recorded, reported) = self.with(&prev_id, |s| (s.evidence.len(), s.reported))?;
         (recorded > 0 && !reported).then_some((prev_id, recorded))
     }
 
@@ -1263,93 +1354,191 @@ fn new_session_id() -> String {
 #[cfg(test)]
 mod tests {
 
-    /// The invariant under test: a verdict may not depend on an observation
-    /// that became impossible before the observation was due.
-    fn row(verdict: Verdict, rests_on_absence: bool, t_anomaly: u64, t_due: u64) -> Result_ {
-        Result_ {
-            test_id: "q-retry",
-            verdict,
-            detail: "Nothing came back.".to_string(),
-            elapsed_ms: 8_000,
+    /// Record an observation with a plausible timeline, for tests about
+    /// something other than the timeline itself.
+    fn record_obs(
+        s: &mut Session,
+        t: &'static Test,
+        obs: &Observation,
+        code: Option<u64>,
+        end_ms: u64,
+    ) {
+        s.record_evidence(
+            t,
+            Evidence {
+                test_id: t.id.to_string(),
+                test_version: 1,
+                observation: obs.clone(),
+                expected_code: code,
+                read_proof: Some(true),
+                early_data_accepted: true,
+                zero_rtt_datagrams_in: 1,
+                t_anomaly_ms: 0,
+                t_exchange_completed_ms: Some(1),
+                t_observation_end_ms: end_ms,
+                t_exit_ms: None,
+                connection_seq: 0,
+                recorded_at_ms: 0,
+            },
+        );
+    }
+
+    fn ev(obs: Observation, t_anomaly: u64, exch: Option<u64>, exit: Option<u64>) -> Evidence {
+        Evidence {
+            test_id: "q-retry".to_string(),
+            test_version: 1,
+            observation: obs,
+            expected_code: None,
+            read_proof: None,
+            early_data_accepted: false,
+            zero_rtt_datagrams_in: 0,
             t_anomaly_ms: t_anomaly,
-            t_due_ms: t_due,
-            reason: None,
-            exit_before_deadline: false,
-            t_exit_ms: None,
-            rests_on_absence,
+            t_exchange_completed_ms: exch,
+            t_observation_end_ms: 8_000,
+            t_exit_ms: exit,
+            connection_seq: 1,
+            recorded_at_ms: 0,
         }
     }
 
+    /// The property the whole refactor exists for: a stored run can be scored
+    /// again without the client. Evidence through the oracle, then the same
+    /// evidence through serialisation and back, must give the same verdict —
+    /// otherwise "re-score instead of rerun" is a promise the format cannot
+    /// keep.
     #[test]
-    fn a_silence_fail_is_downgraded_when_the_client_left_before_the_answer_was_due() {
-        let mut s = Session::new("s".to_string());
-        s.note_client_exit("q-retry", 300);
-        let mut r = row(Verdict::Fail, true, 184, 900);
-        s.apply_evidence_deadline("q-retry", &mut r);
-        assert_eq!(r.verdict, Verdict::Inconclusive);
-        assert_eq!(r.reason, Some("client_exit_before_evidence_deadline"));
-        assert_eq!(r.t_exit_ms, Some(300));
-        assert!(
-            r.detail.contains("900ms"),
-            "names the deadline: {}",
-            r.detail
+    fn evidence_survives_a_round_trip_and_scores_identically() {
+        let t = test_of("h-goaway-increasing");
+        let mut e = ev(
+            Observation::ReadThenSilent("extended flow-control credit on it".into()),
+            92,
+            None,
+            Some(250),
         );
+        e.read_proof = Some(true);
+        e.early_data_accepted = true;
+        e.zero_rtt_datagrams_in = 7;
+        e.expected_code = Some(0x105);
+
+        let live = score(t, &e);
+        let json = serde_json::to_string(&e).expect("evidence serialises");
+        let back: Evidence = serde_json::from_str(&json).expect("evidence deserialises");
+
+        // Every field the oracle can consult survives the round trip.
+        assert_eq!(back.observation, e.observation);
+        assert_eq!(back.read_proof, Some(true));
+        assert!(back.early_data_accepted);
+        assert_eq!(back.zero_rtt_datagrams_in, 7);
+        assert_eq!(back.expected_code, Some(0x105));
+        assert_eq!(back.t_anomaly_ms, 92);
+        assert_eq!(back.t_exchange_completed_ms, None);
+        assert_eq!(back.t_observation_end_ms, 8_000);
+        assert_eq!(back.t_exit_ms, Some(250));
+        assert_eq!(back.test_version, 1);
+
+        let replayed = score(t, &back);
+        assert_eq!(live.0, replayed.0, "verdict differs after a round trip");
+        assert_eq!(live.1, replayed.1, "detail differs after a round trip");
+        assert_eq!(live.2, replayed.2, "reason differs after a round trip");
     }
 
-    /// The case that rules out any "percentage of the window" test: this
-    /// client left at 95% of an 8s observation and the verdict stands,
-    /// because the answer fell due at 900ms and it was still there.
+    /// The cell that demonstrated the oracle defect. msquic consumed the
+    /// control stream carrying the second GOAWAY — RFC 9114 §5.2 ties the
+    /// duty to that receipt — and then never completed an HTTP exchange,
+    /// which is reasonable for a client told to stop opening requests.
     #[test]
-    fn a_silence_fail_stands_when_the_client_outlived_the_deadline() {
-        let mut s = Session::new("s".to_string());
-        s.note_client_exit("q-retry", 7_600);
-        let mut r = row(Verdict::Fail, true, 184, 900);
-        s.apply_evidence_deadline("q-retry", &mut r);
-        assert_eq!(
-            r.verdict,
-            Verdict::Fail,
-            "evidence already collected is not erased"
+    fn a_read_proof_is_the_opportunity_where_receipt_is_the_trigger() {
+        let t = test_of("h-goaway-increasing");
+        let mut e = ev(
+            Observation::ReadThenSilent("credit".into()),
+            92,
+            None,
+            Some(250),
         );
-        assert_eq!(r.reason, None);
+        e.read_proof = Some(true);
+        let (v, _, reason) = score(t, &e);
+        assert_eq!(v, Verdict::Fail, "it read the GOAWAY and said nothing");
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn without_a_read_proof_that_opportunity_is_unobserved() {
+        let t = test_of("h-goaway-increasing");
+        let mut e = ev(Observation::ReadThenSilent("x".into()), 92, None, Some(250));
+        e.read_proof = None;
+        let (v, _, reason) = score(t, &e);
+        assert_eq!(v, Verdict::Inconclusive);
+        assert_eq!(reason, Some("client_exit_before_reaction_opportunity"));
+    }
+
+    /// The thin-wrapper case: completed its exchange, then exited.
+    #[test]
+    fn a_wrapper_that_completed_its_exchange_and_exited_keeps_its_failure() {
+        let t = test_of("h-push-promise-unsolicited");
+        let e = ev(Observation::SurvivedAndContinued, 120, Some(240), Some(260));
+        let (v, _, reason) = score(t, &e);
+        assert_eq!(v, Verdict::Fail);
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn a_client_gone_before_the_anomaly_was_delivered_is_inconclusive() {
+        let t = test_of("h-push-promise-unsolicited");
+        let e = ev(Observation::SurvivedAndContinued, 120, Some(240), Some(90));
+        assert_eq!(score(t, &e).0, Verdict::Inconclusive);
     }
 
     #[test]
     fn a_verdict_the_client_answered_is_untouched_whenever_it_left() {
-        let mut s = Session::new("s".to_string());
-        s.note_client_exit("q-retry", 10);
-        for v in [Verdict::Fail, Verdict::Pass, Verdict::Unsupported] {
-            let mut r = row(v, false, 184, 900);
-            s.apply_evidence_deadline("q-retry", &mut r);
-            assert_eq!(
-                r.verdict, v,
-                "an answered verdict rests on evidence, not silence"
-            );
-            assert_eq!(r.reason, None);
-        }
-    }
-
-    #[test]
-    fn an_inconclusive_over_a_departed_client_says_so_without_changing_verdict() {
-        let mut s = Session::new("s".to_string());
-        s.note_client_exit("q-retry", 50);
-        let mut r = row(Verdict::Inconclusive, true, 184, 900);
-        s.apply_evidence_deadline("q-retry", &mut r);
-        assert_eq!(r.verdict, Verdict::Inconclusive);
-        assert_eq!(r.reason, Some("client_exit_before_evidence_deadline"));
+        let t = test_of("h-push-promise-unsolicited");
+        let e = ev(
+            Observation::Signalled("rejected it".into()),
+            120,
+            Some(240),
+            Some(10),
+        );
+        let (v, _, reason) = score(t, &e);
+        assert_eq!(v, Verdict::Pass);
+        assert_eq!(reason, None);
     }
 
     #[test]
     fn nothing_is_claimed_about_a_client_whose_exit_was_never_reported() {
-        let s = Session::new("s".to_string());
-        let mut r = row(Verdict::Fail, true, 184, 900);
-        s.apply_evidence_deadline("q-retry", &mut r);
+        let t = test_of("h-push-promise-unsolicited");
+        let e = ev(Observation::SurvivedAndContinued, 120, None, None);
+        let (v, _, reason) = score(t, &e);
         assert_eq!(
-            r.verdict,
+            v,
             Verdict::Fail,
             "a driver that does not post changes nothing"
         );
-        assert_eq!(r.reason, None);
-        assert_eq!(r.t_exit_ms, None);
+        assert_eq!(reason, None);
+    }
+
+    /// The overwrite guard reads the evidence, not the verdict, so a later
+    /// oracle cannot change which raw observation survives.
+    #[test]
+    fn a_connection_that_learned_nothing_does_not_replace_one_that_did() {
+        let t = test_of("h-push-promise-unsolicited");
+        let mut s = Session::new("s".to_string());
+        s.record_evidence(
+            t,
+            ev(Observation::SurvivedAndContinued, 120, Some(240), None),
+        );
+        s.record_evidence(
+            t,
+            ev(
+                Observation::Ambiguous("idle timeout".into()),
+                120,
+                None,
+                None,
+            ),
+        );
+        let kept = s.evidence.get(t.id).expect("evidence kept");
+        assert!(matches!(
+            kept.observation,
+            Observation::SurvivedAndContinued
+        ));
     }
 
     use super::*;
@@ -1365,14 +1554,19 @@ mod tests {
         let mut sess = Session::new("overwrite-test".into());
 
         // The resume answers, immediately and correctly.
-        sess.record(
+        record_obs(
+            &mut sess,
             t,
             &Observation::ObjectedAtTransport("rejected at the QUIC layer".into()),
             None,
             0,
-            0,
         );
-        let after_resume = sess.results.get(t.id).expect("recorded").verdict;
+        let after_resume = sess
+            .results()
+            .iter()
+            .find(|r| r.test_id == t.id)
+            .expect("recorded")
+            .verdict;
         assert_ne!(
             after_resume,
             Verdict::Inconclusive,
@@ -1380,15 +1574,19 @@ mod tests {
         );
 
         // The priming connection lands twenty seconds later with nothing.
-        sess.record(
+        record_obs(
+            &mut sess,
             t,
             &Observation::NotExercised("the client sent no early data".into()),
             None,
             20_003,
-            0,
         );
         assert_eq!(
-            sess.results.get(t.id).expect("still recorded").verdict,
+            sess.results()
+                .iter()
+                .find(|r| r.test_id == t.id)
+                .expect("still recorded")
+                .verdict,
             after_resume,
             "a connection that exercised nothing must not replace one that did"
         );
@@ -1402,26 +1600,34 @@ mod tests {
         // reached it.
         let t = catalog::find("q-zero-rtt-replay").expect("the test exists");
         let mut sess = Session::new("improve-test".into());
-        sess.record(
+        record_obs(
+            &mut sess,
             t,
             &Observation::NotExercised("nothing yet".into()),
             None,
             1,
-            0,
         );
         assert_eq!(
-            sess.results.get(t.id).unwrap().verdict,
+            sess.results()
+                .iter()
+                .find(|r| r.test_id == t.id)
+                .unwrap()
+                .verdict,
             Verdict::Inconclusive
         );
-        sess.record(
+        record_obs(
+            &mut sess,
             t,
             &Observation::ObjectedAtTransport("rejected at the QUIC layer".into()),
             None,
             2,
-            0,
         );
         assert_ne!(
-            sess.results.get(t.id).unwrap().verdict,
+            sess.results()
+                .iter()
+                .find(|r| r.test_id == t.id)
+                .unwrap()
+                .verdict,
             Verdict::Inconclusive,
             "a connection that reached the anomaly must be able to replace an inconclusive"
         );
@@ -1884,9 +2090,9 @@ mod tests {
         let id = reg.create();
         let t = test_of("h-grease-settings");
 
-        reg.with(&id, |s| s.record(t, &Observation::TimedOut, None, 1, 0));
+        reg.with(&id, |s| record_obs(s, t, &Observation::TimedOut, None, 1));
         reg.with(&id, |s| {
-            s.record(t, &Observation::SurvivedAndContinued, None, 2, 0);
+            record_obs(s, t, &Observation::SurvivedAndContinued, None, 2);
         });
 
         let r = reg
@@ -1962,7 +2168,7 @@ mod tests {
         // A run in progress, though, is exactly the case worth shouting about.
         let t = test_of("h-grease-settings");
         reg.with(&first, |s| {
-            s.record(t, &Observation::SurvivedAndContinued, None, 1, 0);
+            record_obs(s, t, &Observation::SurvivedAndContinued, None, 1);
         });
         assert_eq!(
             reg.displaced_by(ip, &second),
@@ -1997,7 +2203,7 @@ mod tests {
 
         let t = test_of("h-grease-settings");
         reg.with(&first, |s| {
-            s.record(t, &Observation::SurvivedAndContinued, None, 1, 0);
+            record_obs(s, t, &Observation::SurvivedAndContinued, None, 1);
         });
 
         // Still being driven: displacing it now is the real thing.

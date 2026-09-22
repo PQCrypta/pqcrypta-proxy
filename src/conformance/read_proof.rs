@@ -123,7 +123,13 @@ async fn probe_against(drains_uni_streams: bool) -> Option<bool> {
             .write_all(b"\x00\x04\x00")
             .await
             .expect("writing a SETTINGS-shaped prelude");
-        control_stream_was_read("read-proof-self-test", &connection, &mut control).await
+        control_stream_was_read(
+            "read-proof-self-test",
+            "self-test",
+            &connection,
+            &mut control,
+        )
+        .await
     });
 
     let client = client_endpoint(&throwaway);
@@ -231,7 +237,13 @@ async fn probe_with_busy_request_stream() -> Option<bool> {
             .write_all(b"\x00\x04\x00")
             .await
             .expect("writing a SETTINGS-shaped prelude");
-        control_stream_was_read("credit-elsewhere-self-test", &connection, &mut control).await
+        control_stream_was_read(
+            "credit-elsewhere-self-test",
+            "self-test",
+            &connection,
+            &mut control,
+        )
+        .await
     });
 
     let client = client_endpoint(&throwaway);

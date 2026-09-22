@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use super::catalog;
-use super::session::{Result_, Verdict};
+use super::session::{self, Verdict};
 
 /// Counts for one class of test.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -56,6 +56,16 @@ impl ClassSummary {
 pub struct Report {
     pub session: String,
     pub generated_at: String,
+    /// Which reading of this session this report is, as `<session>#<n>`.
+    ///
+    /// A session keeps running while it is read, so two reports of one session
+    /// can differ without either being wrong. Naming the reading is what lets
+    /// a later comparison say which of the two it is holding.
+    pub snapshot_id: String,
+    /// When the reading was taken, in milliseconds from the session's start,
+    /// and how many connections had been recorded by then.
+    pub collected_at_ms: u64,
+    pub connections_recorded: u64,
     pub catalog_size: usize,
     pub by_class: BTreeMap<String, ClassSummary>,
     pub totals: ClassSummary,
@@ -82,22 +92,24 @@ pub struct ResultRow {
     /// be audited without re-deriving the reasoning from the prose.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
-    /// The stimulus timeline, emitted only where a scoring rule consulted it.
+    /// What this verdict was derived from.
+    ///
+    /// Emitted in full rather than summarised: the point of storing it is
+    /// that a later oracle can read it, and a summary is a guess about what
+    /// that oracle will need.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub t_anomaly_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub t_due_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub t_exit_ms: Option<u64>,
+    pub evidence: Option<session::Evidence>,
+    /// Which scoring rules produced the verdict beside it.
+    pub oracle_version: &'static str,
 }
 
-/// Assemble a report from a session's results.
-pub fn build(session_id: &str, results: &[Result_], generated_at: String) -> Report {
+/// Assemble a report from one reading of a session.
+pub fn build(session_id: &str, snap: &session::Snapshot, generated_at: String) -> Report {
     let mut by_class: BTreeMap<String, ClassSummary> = BTreeMap::new();
     let mut totals = ClassSummary::default();
-    let mut rows = Vec::with_capacity(results.len());
+    let mut rows = Vec::with_capacity(snap.results.len());
 
-    for r in results {
+    for r in &snap.results {
         let Some(test) = catalog::find(r.test_id) else {
             continue;
         };
@@ -128,15 +140,19 @@ pub fn build(session_id: &str, results: &[Result_], generated_at: String) -> Rep
             detail: r.detail.clone(),
             elapsed_ms: r.elapsed_ms,
             reason: r.reason,
-            t_anomaly_ms: r.reason.map(|_| r.t_anomaly_ms),
-            t_due_ms: r.reason.map(|_| r.t_due_ms),
-            t_exit_ms: r.t_exit_ms,
+            // The evidence the verdict was derived from, so a stored run can
+            // be re-scored by a later oracle instead of re-executed.
+            evidence: r.evidence.clone(),
+            oracle_version: session::ORACLE_VERSION,
         });
     }
 
     Report {
         session: session_id.to_string(),
         generated_at,
+        snapshot_id: format!("{session_id}#{}", snap.seq),
+        collected_at_ms: snap.collected_at_ms,
+        connections_recorded: snap.connections_recorded,
         catalog_size: catalog::CATALOG.len(),
         by_class,
         totals,
@@ -303,10 +319,29 @@ mod tests {
         let id = reg.create();
         for (test_id, obs, code) in recorded {
             let t = catalog::find(test_id).expect("catalogue entry");
-            reg.with(&id, |s| s.record(t, obs, *code, 5, 0));
+            reg.with(&id, |s| {
+                s.record_evidence(
+                    t,
+                    session::Evidence {
+                        test_id: t.id.to_string(),
+                        test_version: 1,
+                        observation: obs.clone(),
+                        expected_code: *code,
+                        read_proof: Some(true),
+                        early_data_accepted: true,
+                        zero_rtt_datagrams_in: 1,
+                        t_anomaly_ms: 0,
+                        t_exchange_completed_ms: Some(1),
+                        t_observation_end_ms: 5,
+                        t_exit_ms: None,
+                        connection_seq: 0,
+                        recorded_at_ms: 0,
+                    },
+                );
+            });
         }
-        let results = reg.with(&id, |s| s.results()).unwrap();
-        build(&id, &results, "2026-08-26T00:00:00Z".to_string())
+        let snap = reg.with(&id, session::Session::snapshot).unwrap();
+        build(&id, &snap, "2026-08-26T00:00:00Z".to_string())
     }
 
     #[test]
