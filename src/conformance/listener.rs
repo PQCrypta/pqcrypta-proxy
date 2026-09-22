@@ -631,6 +631,9 @@ async fn watch_version_negotiation(
                 )),
                 None,
                 0,
+                // No connection followed, so the stimulus and the observation
+                // are the same instant and nothing here rests on a silence.
+                0,
             );
         });
         info!(
@@ -774,11 +777,15 @@ async fn run_one(
                 )),
             };
             conformance.sessions.with(&session_id, |sess| {
+                let refused_at = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
                 sess.record(
                     test,
                     &observation,
                     expected_code(test),
-                    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                    refused_at,
+                    // Refused before a handshake existed, so the anomaly was
+                    // never reached and there is no silence to read.
+                    refused_at,
                 );
             });
             info!(
@@ -859,8 +866,11 @@ async fn run_one(
                     }
                 });
             let elapsed = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+            // The handshake never completed, so no anomaly was ever
+            // established. There is no silence to interpret here and the
+            // deadline is the moment itself.
             conformance.sessions.with(&session_id, |s| {
-                s.record(test, &observation, expected_code(test), elapsed);
+                s.record(test, &observation, expected_code(test), elapsed, elapsed);
             });
             info!(
                 "conformance: {} session={} observed={:?} (closed during the handshake: {})",
@@ -880,6 +890,11 @@ async fn run_one(
     // written but before the client had read it — so a correct client saw our
     // violation, closed the connection, and reported an error on a test it had
     // just passed.
+    // When the stimulus is fully established, measured from the connection's
+    // start. Everything the evidence deadline is reckoned from hangs off this
+    // one instant: before the anomaly is written there is nothing for a client
+    // to answer, so a silence before it means nothing at all.
+    let t_anomaly_ms;
     let (critical_streams, mut encoder, mut control, mut probe_target, control_is_late) =
         match emit(&connection, test).await {
             Ok(emitted) => (
@@ -894,6 +909,7 @@ async fn run_one(
                 (Vec::new(), None, None, None, false)
             }
         };
+    t_anomaly_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
 
     // The one anomaly that is not written to any stream.
     //
@@ -1165,7 +1181,13 @@ async fn run_one(
     let elapsed = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
 
     conformance.sessions.with(&session_id, |s| {
-        s.record(test, &observation, expected_code(test), elapsed);
+        s.record(
+            test,
+            &observation,
+            expected_code(test),
+            elapsed,
+            t_anomaly_ms,
+        );
     });
 
     info!(

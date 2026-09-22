@@ -75,6 +75,20 @@ pub struct ResultRow {
     pub verdict: &'static str,
     pub detail: String,
     pub elapsed_ms: u64,
+    /// Why this verdict is what it is, where a scoring rule changed it from
+    /// what the observation alone would have given.
+    ///
+    /// Present rather than implied, so a cell that stopped being a failure can
+    /// be audited without re-deriving the reasoning from the prose.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    /// The stimulus timeline, emitted only where a scoring rule consulted it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub t_anomaly_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub t_due_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub t_exit_ms: Option<u64>,
 }
 
 /// Assemble a report from a session's results.
@@ -113,6 +127,10 @@ pub fn build(session_id: &str, results: &[Result_], generated_at: String) -> Rep
             verdict: r.verdict.as_str(),
             detail: r.detail.clone(),
             elapsed_ms: r.elapsed_ms,
+            reason: r.reason,
+            t_anomaly_ms: r.reason.map(|_| r.t_anomaly_ms),
+            t_due_ms: r.reason.map(|_| r.t_due_ms),
+            t_exit_ms: r.t_exit_ms,
         });
     }
 
@@ -285,7 +303,7 @@ mod tests {
         let id = reg.create();
         for (test_id, obs, code) in recorded {
             let t = catalog::find(test_id).expect("catalogue entry");
-            reg.with(&id, |s| s.record(t, obs, *code, 5));
+            reg.with(&id, |s| s.record(t, obs, *code, 5, 0));
         }
         let results = reg.with(&id, |s| s.results()).unwrap();
         build(&id, &results, "2026-08-26T00:00:00Z".to_string())

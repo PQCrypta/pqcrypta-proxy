@@ -248,6 +248,17 @@ pub struct Result_ {
     /// than a bare status.
     pub detail: String,
     pub elapsed_ms: u64,
+    /// When the stimulus was fully established, from the connection's start.
+    pub t_anomaly_ms: u64,
+    /// The earliest moment this test may read a silence as an answer.
+    pub t_due_ms: u64,
+    /// Machine-readable reason a verdict is what it is, where the scoring
+    /// rules changed it from what the observation alone would have given.
+    pub reason: Option<&'static str>,
+    /// Whether the client was gone before this test's evidence deadline.
+    pub exit_before_deadline: bool,
+    /// When the client process exited, where the driver reported it.
+    pub t_exit_ms: Option<u64>,
     /// Whether this verdict was reached because nothing came back.
     ///
     /// Set from the observation at the moment it is judged, which is the only
@@ -876,8 +887,10 @@ impl Session {
         obs: &Observation,
         expected_code: Option<u64>,
         elapsed_ms: u64,
+        t_anomaly_ms: u64,
     ) {
         let (verdict, detail) = judge(test, obs, expected_code);
+        let t_due_ms = t_anomaly_ms + catalog::evidence_window_ms(test);
 
         // A connection that did not exercise the test must not overwrite one
         // that did.
@@ -957,6 +970,11 @@ impl Session {
                 verdict,
                 detail,
                 elapsed_ms,
+                t_anomaly_ms,
+                t_due_ms,
+                reason: None,
+                exit_before_deadline: false,
+                t_exit_ms: None,
                 // The observations that mean "we waited and nothing came".
                 // `Unsupported` and `Violated` are statements by the client;
                 // `Signalled` and `ClosedWith` are answers. These are not.
@@ -988,48 +1006,75 @@ impl Session {
                     verdict: Verdict::NotRun,
                     detail: "Not attempted.".to_string(),
                     elapsed_ms: 0,
+                    t_anomaly_ms: 0,
+                    t_due_ms: 0,
+                    reason: None,
+                    exit_before_deadline: false,
+                    t_exit_ms: None,
                     rests_on_absence: false,
                 });
-                if let Some(extra) = self.departure_note(t.id, &row) {
-                    row.detail.push(' ');
-                    row.detail.push_str(&extra);
-                }
+                self.apply_evidence_deadline(t.id, &mut row);
                 row
             })
             .collect()
     }
 
-    /// Say so when a verdict rests on silence and the client had already gone.
+    /// Hold a silence-based verdict to the temporal invariant.
     ///
-    /// Silence from a peer means one of two things and the connection cannot
-    /// tell them apart: the client read the anomaly and chose to carry on, or
-    /// it was no longer running. The driver holds the process, so it knows,
-    /// and a cell that turns on the difference should not be written as though
-    /// only the first were possible.
+    /// A verdict may not depend on an observation that became impossible
+    /// before the observation was due. The suite cannot tell "the client saw
+    /// the violation, tolerated it and stayed alive" from "the client
+    /// disappeared before the question could be answered" — and `Fail` claims
+    /// the first.
     ///
-    /// Added to the detail rather than the verdict. Whether the observation
-    /// was the right one is a separate question from whether the sentence
-    /// describing it is honest, and only the second is answerable from here.
-    fn departure_note(&self, test_id: &str, row: &Result_) -> Option<String> {
-        let exited = self.client_exit_ms(test_id)?;
-        // Only where the verdict was decided by an absence. Everything else
-        // observed something, and when the process ended is beside the point.
-        if !matches!(row.verdict, Verdict::Fail | Verdict::Inconclusive) {
-            return None;
+    /// So a silence-based `Fail` requires the client to have still been there
+    /// at the evidence deadline: `t_exit` unknown, or `t_exit >= t_due`. An
+    /// exit before it yields `Inconclusive`; an exit after it erases nothing,
+    /// because by then the evidence had already been collected.
+    ///
+    /// Deliberately not a fraction of the observation window. That window is
+    /// sized for the slowest thing that could still arrive, which is a round
+    /// trip for one test and a peer's ten-second idle timer for another, so
+    /// the same percentage means different things in each and the cutoff
+    /// would be an artefact of this file rather than a property of the test.
+    fn apply_evidence_deadline(&self, test_id: &str, row: &mut Result_) {
+        let Some(exited) = self.client_exit_ms(test_id) else {
+            // fall through: nothing reported, nothing claimed
+            // Unknown exit: the driver may not report them at all, and a
+            // verdict is reached exactly as it was before this existed.
+            return;
+        };
+        row.t_exit_ms = Some(exited);
+        if exited >= row.t_due_ms {
+            // The client was still there when the answer fell due. Whatever
+            // happened afterwards cannot unmake what was already established.
+            return;
         }
         if !row.rests_on_absence {
-            return None;
+            // The client answered, or stated it cannot do this. When it left
+            // afterwards is beside the point.
+            return;
         }
-        // A client still running when the window closed is the ordinary case
-        // and needs no remark.
-        if exited >= row.elapsed_ms {
-            return None;
+
+        row.exit_before_deadline = true;
+        if row.verdict == Verdict::Fail {
+            row.verdict = Verdict::Inconclusive;
+            row.reason = Some("client_exit_before_evidence_deadline");
+            row.detail = format!(
+                "The client process exited {}ms into the run, before this test's evidence \
+                 deadline at {}ms — the anomaly was established at {}ms and the answer was not \
+                 yet due. What the server saw was: {} That is what a client which had already \
+                 gone looks like, so it is recorded as inconclusive rather than as a failure.",
+                exited, row.t_due_ms, row.t_anomaly_ms, row.detail
+            );
+        } else {
+            row.reason = Some("client_exit_before_evidence_deadline");
+            row.detail.push_str(&format!(
+                " The client process had already exited {}ms in, before this test's evidence \
+                 deadline at {}ms, so the silence after that point is not evidence either way.",
+                exited, row.t_due_ms
+            ));
         }
-        Some(format!(
-            "The client process had already exited {}ms into a {}ms observation, so the silence \
-             after that point is not evidence either way.",
-            exited, row.elapsed_ms
-        ))
     }
 
     pub fn age(&self) -> Duration {
@@ -1218,68 +1263,93 @@ fn new_session_id() -> String {
 #[cfg(test)]
 mod tests {
 
-    /// The note exists to answer one question — was the peer still there? —
-    /// and the ways it can be wrong are all ways of answering it when it was
-    /// not asked.
-    fn row(verdict: Verdict, rests_on_absence: bool, elapsed_ms: u64) -> Result_ {
+    /// The invariant under test: a verdict may not depend on an observation
+    /// that became impossible before the observation was due.
+    fn row(verdict: Verdict, rests_on_absence: bool, t_anomaly: u64, t_due: u64) -> Result_ {
         Result_ {
             test_id: "q-retry",
             verdict,
-            detail: "Something happened.".to_string(),
-            elapsed_ms,
+            detail: "Nothing came back.".to_string(),
+            elapsed_ms: 8_000,
+            t_anomaly_ms: t_anomaly,
+            t_due_ms: t_due,
+            reason: None,
+            exit_before_deadline: false,
+            t_exit_ms: None,
             rests_on_absence,
         }
     }
 
     #[test]
-    fn a_client_that_left_early_is_noted_where_the_verdict_rests_on_silence() {
+    fn a_silence_fail_is_downgraded_when_the_client_left_before_the_answer_was_due() {
         let mut s = Session::new("s".to_string());
-        s.note_client_exit("q-retry", 1_000);
-        let note = s.departure_note("q-retry", &row(Verdict::Inconclusive, true, 8_000));
-        let note = note.expect("an absence verdict over a departed client should be noted");
-        assert!(note.contains("1000ms"), "names when it left: {note}");
+        s.note_client_exit("q-retry", 300);
+        let mut r = row(Verdict::Fail, true, 184, 900);
+        s.apply_evidence_deadline("q-retry", &mut r);
+        assert_eq!(r.verdict, Verdict::Inconclusive);
+        assert_eq!(r.reason, Some("client_exit_before_evidence_deadline"));
+        assert_eq!(r.t_exit_ms, Some(300));
         assert!(
-            note.contains("8000ms"),
-            "names the window it left during: {note}"
+            r.detail.contains("900ms"),
+            "names the deadline: {}",
+            r.detail
         );
     }
 
+    /// The case that rules out any "percentage of the window" test: this
+    /// client left at 95% of an 8s observation and the verdict stands,
+    /// because the answer fell due at 900ms and it was still there.
     #[test]
-    fn a_client_still_running_when_the_window_closed_is_not_noted() {
+    fn a_silence_fail_stands_when_the_client_outlived_the_deadline() {
         let mut s = Session::new("s".to_string());
-        s.note_client_exit("q-retry", 9_000);
-        assert!(
-            s.departure_note("q-retry", &row(Verdict::Inconclusive, true, 8_000))
-                .is_none(),
-            "a peer that outlived the observation explains nothing about it"
+        s.note_client_exit("q-retry", 7_600);
+        let mut r = row(Verdict::Fail, true, 184, 900);
+        s.apply_evidence_deadline("q-retry", &mut r);
+        assert_eq!(
+            r.verdict,
+            Verdict::Fail,
+            "evidence already collected is not erased"
         );
+        assert_eq!(r.reason, None);
     }
 
     #[test]
-    fn a_verdict_the_client_answered_is_never_noted() {
+    fn a_verdict_the_client_answered_is_untouched_whenever_it_left() {
         let mut s = Session::new("s".to_string());
         s.note_client_exit("q-retry", 10);
-        // The client objected, or stated it cannot do this. When it exited
-        // afterwards is beside the point and saying so would imply doubt.
-        assert!(s
-            .departure_note("q-retry", &row(Verdict::Fail, false, 8_000))
-            .is_none());
-        assert!(s
-            .departure_note("q-retry", &row(Verdict::Pass, true, 8_000))
-            .is_none());
-        assert!(s
-            .departure_note("q-retry", &row(Verdict::Unsupported, true, 8_000))
-            .is_none());
+        for v in [Verdict::Fail, Verdict::Pass, Verdict::Unsupported] {
+            let mut r = row(v, false, 184, 900);
+            s.apply_evidence_deadline("q-retry", &mut r);
+            assert_eq!(
+                r.verdict, v,
+                "an answered verdict rests on evidence, not silence"
+            );
+            assert_eq!(r.reason, None);
+        }
+    }
+
+    #[test]
+    fn an_inconclusive_over_a_departed_client_says_so_without_changing_verdict() {
+        let mut s = Session::new("s".to_string());
+        s.note_client_exit("q-retry", 50);
+        let mut r = row(Verdict::Inconclusive, true, 184, 900);
+        s.apply_evidence_deadline("q-retry", &mut r);
+        assert_eq!(r.verdict, Verdict::Inconclusive);
+        assert_eq!(r.reason, Some("client_exit_before_evidence_deadline"));
     }
 
     #[test]
     fn nothing_is_claimed_about_a_client_whose_exit_was_never_reported() {
         let s = Session::new("s".to_string());
-        assert!(
-            s.departure_note("q-retry", &row(Verdict::Inconclusive, true, 8_000))
-                .is_none(),
-            "a driver that does not post leaves every verdict as it was"
+        let mut r = row(Verdict::Fail, true, 184, 900);
+        s.apply_evidence_deadline("q-retry", &mut r);
+        assert_eq!(
+            r.verdict,
+            Verdict::Fail,
+            "a driver that does not post changes nothing"
         );
+        assert_eq!(r.reason, None);
+        assert_eq!(r.t_exit_ms, None);
     }
 
     use super::*;
@@ -1300,6 +1370,7 @@ mod tests {
             &Observation::ObjectedAtTransport("rejected at the QUIC layer".into()),
             None,
             0,
+            0,
         );
         let after_resume = sess.results.get(t.id).expect("recorded").verdict;
         assert_ne!(
@@ -1314,6 +1385,7 @@ mod tests {
             &Observation::NotExercised("the client sent no early data".into()),
             None,
             20_003,
+            0,
         );
         assert_eq!(
             sess.results.get(t.id).expect("still recorded").verdict,
@@ -1330,7 +1402,13 @@ mod tests {
         // reached it.
         let t = catalog::find("q-zero-rtt-replay").expect("the test exists");
         let mut sess = Session::new("improve-test".into());
-        sess.record(t, &Observation::NotExercised("nothing yet".into()), None, 1);
+        sess.record(
+            t,
+            &Observation::NotExercised("nothing yet".into()),
+            None,
+            1,
+            0,
+        );
         assert_eq!(
             sess.results.get(t.id).unwrap().verdict,
             Verdict::Inconclusive
@@ -1340,6 +1418,7 @@ mod tests {
             &Observation::ObjectedAtTransport("rejected at the QUIC layer".into()),
             None,
             2,
+            0,
         );
         assert_ne!(
             sess.results.get(t.id).unwrap().verdict,
@@ -1805,9 +1884,9 @@ mod tests {
         let id = reg.create();
         let t = test_of("h-grease-settings");
 
-        reg.with(&id, |s| s.record(t, &Observation::TimedOut, None, 1));
+        reg.with(&id, |s| s.record(t, &Observation::TimedOut, None, 1, 0));
         reg.with(&id, |s| {
-            s.record(t, &Observation::SurvivedAndContinued, None, 2);
+            s.record(t, &Observation::SurvivedAndContinued, None, 2, 0);
         });
 
         let r = reg
@@ -1883,7 +1962,7 @@ mod tests {
         // A run in progress, though, is exactly the case worth shouting about.
         let t = test_of("h-grease-settings");
         reg.with(&first, |s| {
-            s.record(t, &Observation::SurvivedAndContinued, None, 1);
+            s.record(t, &Observation::SurvivedAndContinued, None, 1, 0);
         });
         assert_eq!(
             reg.displaced_by(ip, &second),
@@ -1918,7 +1997,7 @@ mod tests {
 
         let t = test_of("h-grease-settings");
         reg.with(&first, |s| {
-            s.record(t, &Observation::SurvivedAndContinued, None, 1);
+            s.record(t, &Observation::SurvivedAndContinued, None, 1, 0);
         });
 
         // Still being driven: displacing it now is the real thing.

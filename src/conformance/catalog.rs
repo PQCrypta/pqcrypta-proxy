@@ -1439,6 +1439,55 @@ pub fn documents(test: &Test) -> Vec<String> {
 }
 
 /// Look a test up by its stable id.
+/// How long after the stimulus a silence may be read as an answer.
+///
+/// The evidence deadline: the earliest moment at which this test can
+/// legitimately assert that a required response is absent. Before it, silence
+/// means nothing — the answer was not yet due.
+///
+/// A fraction of the observation window would not do. The window is sized for
+/// the slowest thing that could still arrive, which for one test is a close
+/// that should come within a round trip and for another is a peer's own idle
+/// timer ten seconds later; the same percentage means different things in
+/// each. So this is stated per mechanism, in milliseconds after the anomaly
+/// is fully written, and it is the only number the downgrade rule consults.
+pub fn evidence_window_ms(test: &Test) -> u64 {
+    match test.id {
+        // The client's own idle timer is the second of two ways it can answer,
+        // and it fires at ten seconds. Judging its silence before that is
+        // judging a clock rather than a client.
+        "q-stateless-reset" => 11_000,
+
+        // Early data is accepted or rejected during the handshake, but the
+        // client's reaction — retrying on 1-RTT, or not — needs a further
+        // round trip and the wrapper's own resumption attempt.
+        "q-zero-rtt-reject" | "q-zero-rtt-replay" => 2_500,
+
+        // A path validation has a timer of its own: RFC 9000 §8.2.4 ties the
+        // PATH_CHALLENGE retransmission to the PTO, so the answer can
+        // legitimately arrive later than a close would.
+        "q-path-challenge" | "q-connection-migration" | "q-pmtu-blackhole" => 3_000,
+
+        // The read proof runs for its own window before this test can say
+        // whether the anomaly was read at all, and no absence means anything
+        // until it has finished.
+        _ if matches!(
+            anomaly_stream(test),
+            Anomaly::ControlStream | Anomaly::OtherUniStream
+        ) =>
+        {
+            2_000
+        }
+
+        // Everything else is a close, and a close is due within a round trip
+        // plus the elicitation this endpoint sends to shake a lost one loose.
+        // Generous against these round-trip times rather than tight, because
+        // the cost of being late here is a cell that says inconclusive and the
+        // cost of being early is a client accused of something it did not do.
+        _ => 900,
+    }
+}
+
 pub fn find(id: &str) -> Option<&'static Test> {
     CATALOG.iter().find(|t| t.id == id)
 }
