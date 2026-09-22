@@ -248,6 +248,15 @@ pub struct Result_ {
     /// than a bare status.
     pub detail: String,
     pub elapsed_ms: u64,
+    /// Whether this verdict was reached because nothing came back.
+    ///
+    /// Set from the observation at the moment it is judged, which is the only
+    /// point where the fact is available. Deriving it later from the detail
+    /// sentence looked cheaper and is not: "never answered 425" is about this
+    /// endpoint not answering, and "went quiet" is what a client that handled
+    /// a Stateless Reset correctly does. Both matched a prose test and neither
+    /// is a peer falling silent.
+    pub rests_on_absence: bool,
 }
 
 /// Turn an observation into a verdict, in light of what the test was measuring.
@@ -803,6 +812,15 @@ pub struct Session {
     pub id: String,
     created: Instant,
     results: HashMap<&'static str, Result_>,
+    /// When the driver's client process exited, per test, in milliseconds
+    /// from the moment it was invoked.
+    ///
+    /// A verdict that rests on silence is ambiguous in a specific way: the
+    /// client may have read the anomaly and carried on, or it may not have
+    /// been there any more. Only the driver knows which, because only the
+    /// driver holds the process, so it posts the exit and the report reads
+    /// the two together.
+    client_exit_ms: HashMap<String, u64>,
     /// Whether this session's machine-readable report has been collected.
     ///
     /// The driver reads `/report/<id>.json` once, at the end, after it has
@@ -821,8 +839,23 @@ impl Session {
             id,
             created: Instant::now(),
             results: HashMap::new(),
+            client_exit_ms: HashMap::new(),
             reported: false,
         }
+    }
+
+    /// Record that the driver's client process for one test has exited.
+    ///
+    /// Kept whether or not a verdict exists yet: the driver posts this as it
+    /// goes and the report is composed at the end, so the two arrive in no
+    /// guaranteed order.
+    pub fn note_client_exit(&mut self, test_id: &str, elapsed_ms: u64) {
+        self.client_exit_ms.insert(test_id.to_string(), elapsed_ms);
+    }
+
+    /// How long after invocation the client process for this test exited.
+    pub fn client_exit_ms(&self, test_id: &str) -> Option<u64> {
+        self.client_exit_ms.get(test_id).copied()
     }
 
     /// Note that the results have been collected, so this run is over.
@@ -924,6 +957,19 @@ impl Session {
                 verdict,
                 detail,
                 elapsed_ms,
+                // The observations that mean "we waited and nothing came".
+                // `Unsupported` and `Violated` are statements by the client;
+                // `Signalled` and `ClosedWith` are answers. These are not.
+                rests_on_absence: matches!(
+                    obs,
+                    Observation::NoCloseObserved
+                        | Observation::ClosedSilently
+                        | Observation::TimedOut
+                        | Observation::PeerUnreachable
+                        | Observation::SurvivedAndContinued
+                        | Observation::ReadThenSilent(_)
+                        | Observation::Ambiguous(_)
+                ),
             },
         );
     }
@@ -937,14 +983,53 @@ impl Session {
         catalog::CATALOG
             .iter()
             .map(|t| {
-                self.results.get(t.id).cloned().unwrap_or_else(|| Result_ {
+                let mut row = self.results.get(t.id).cloned().unwrap_or_else(|| Result_ {
                     test_id: t.id,
                     verdict: Verdict::NotRun,
                     detail: "Not attempted.".to_string(),
                     elapsed_ms: 0,
-                })
+                    rests_on_absence: false,
+                });
+                if let Some(extra) = self.departure_note(t.id, &row) {
+                    row.detail.push(' ');
+                    row.detail.push_str(&extra);
+                }
+                row
             })
             .collect()
+    }
+
+    /// Say so when a verdict rests on silence and the client had already gone.
+    ///
+    /// Silence from a peer means one of two things and the connection cannot
+    /// tell them apart: the client read the anomaly and chose to carry on, or
+    /// it was no longer running. The driver holds the process, so it knows,
+    /// and a cell that turns on the difference should not be written as though
+    /// only the first were possible.
+    ///
+    /// Added to the detail rather than the verdict. Whether the observation
+    /// was the right one is a separate question from whether the sentence
+    /// describing it is honest, and only the second is answerable from here.
+    fn departure_note(&self, test_id: &str, row: &Result_) -> Option<String> {
+        let exited = self.client_exit_ms(test_id)?;
+        // Only where the verdict was decided by an absence. Everything else
+        // observed something, and when the process ended is beside the point.
+        if !matches!(row.verdict, Verdict::Fail | Verdict::Inconclusive) {
+            return None;
+        }
+        if !row.rests_on_absence {
+            return None;
+        }
+        // A client still running when the window closed is the ordinary case
+        // and needs no remark.
+        if exited >= row.elapsed_ms {
+            return None;
+        }
+        Some(format!(
+            "The client process had already exited {}ms into a {}ms observation, so the silence \
+             after that point is not evidence either way.",
+            exited, row.elapsed_ms
+        ))
     }
 
     pub fn age(&self) -> Duration {
@@ -1132,6 +1217,71 @@ fn new_session_id() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The note exists to answer one question — was the peer still there? —
+    /// and the ways it can be wrong are all ways of answering it when it was
+    /// not asked.
+    fn row(verdict: Verdict, rests_on_absence: bool, elapsed_ms: u64) -> Result_ {
+        Result_ {
+            test_id: "q-retry",
+            verdict,
+            detail: "Something happened.".to_string(),
+            elapsed_ms,
+            rests_on_absence,
+        }
+    }
+
+    #[test]
+    fn a_client_that_left_early_is_noted_where_the_verdict_rests_on_silence() {
+        let mut s = Session::new("s".to_string());
+        s.note_client_exit("q-retry", 1_000);
+        let note = s.departure_note("q-retry", &row(Verdict::Inconclusive, true, 8_000));
+        let note = note.expect("an absence verdict over a departed client should be noted");
+        assert!(note.contains("1000ms"), "names when it left: {note}");
+        assert!(
+            note.contains("8000ms"),
+            "names the window it left during: {note}"
+        );
+    }
+
+    #[test]
+    fn a_client_still_running_when_the_window_closed_is_not_noted() {
+        let mut s = Session::new("s".to_string());
+        s.note_client_exit("q-retry", 9_000);
+        assert!(
+            s.departure_note("q-retry", &row(Verdict::Inconclusive, true, 8_000))
+                .is_none(),
+            "a peer that outlived the observation explains nothing about it"
+        );
+    }
+
+    #[test]
+    fn a_verdict_the_client_answered_is_never_noted() {
+        let mut s = Session::new("s".to_string());
+        s.note_client_exit("q-retry", 10);
+        // The client objected, or stated it cannot do this. When it exited
+        // afterwards is beside the point and saying so would imply doubt.
+        assert!(s
+            .departure_note("q-retry", &row(Verdict::Fail, false, 8_000))
+            .is_none());
+        assert!(s
+            .departure_note("q-retry", &row(Verdict::Pass, true, 8_000))
+            .is_none());
+        assert!(s
+            .departure_note("q-retry", &row(Verdict::Unsupported, true, 8_000))
+            .is_none());
+    }
+
+    #[test]
+    fn nothing_is_claimed_about_a_client_whose_exit_was_never_reported() {
+        let s = Session::new("s".to_string());
+        assert!(
+            s.departure_note("q-retry", &row(Verdict::Inconclusive, true, 8_000))
+                .is_none(),
+            "a driver that does not post leaves every verdict as it was"
+        );
+    }
+
     use super::*;
     use crate::conformance::catalog::{self, Class, Test, Tier};
 

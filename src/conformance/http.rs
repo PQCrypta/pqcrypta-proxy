@@ -19,6 +19,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{header, HeaderValue, Method, Response, StatusCode};
 
+use super::catalog;
 use super::report;
 use super::Conformance;
 
@@ -66,6 +67,7 @@ pub fn route(
         }
         (&Method::GET, "/robots.txt") => Some(robots(conformance)),
         (&Method::GET, "/sitemap.xml") => Some(sitemap(conformance)),
+        (&Method::POST, p) if p.starts_with("/client-exit/") => Some(client_exit(conformance, p)),
         (&Method::GET, p) if p.starts_with("/report/") => Some(report_for(conformance, p)),
         (&Method::GET, p) if p.starts_with("/badge/") => Some(badge_for(conformance, p)),
         _ => None,
@@ -626,6 +628,54 @@ fn new_session(conformance: &Arc<Conformance>, client_ip: std::net::IpAddr) -> R
          \"badge\": \"https://{host}/badge/{id}.svg\"\n}}\n"
     );
     text(StatusCode::OK, "application/json; charset=utf-8", body)
+}
+
+/// The driver telling us its client process has exited.
+///
+/// `POST /client-exit/<session>/<test>/<elapsed_ms>`, with everything in the
+/// path so the body can stay empty and the handler needs no parser.
+///
+/// Only the driver holds the client process, so only the driver knows when it
+/// stopped. The server cannot infer it: a peer that has exited and a peer that
+/// is reading quietly look identical from a socket. Verdicts that rest on an
+/// absence say which one it was because of this.
+///
+/// Advisory. A driver that never posts is the behaviour before this existed,
+/// and every verdict is still reached the same way -- the sentence explaining
+/// one is simply less specific.
+fn client_exit(conformance: &Arc<Conformance>, path: &str) -> Response<Body> {
+    let mut parts = path.trim_start_matches("/client-exit/").split('/');
+    let (Some(session), Some(test), Some(ms)) = (parts.next(), parts.next(), parts.next()) else {
+        return text(
+            StatusCode::BAD_REQUEST,
+            "text/plain; charset=utf-8",
+            "expected /client-exit/<session>/<test>/<elapsed_ms>\n".to_string(),
+        );
+    };
+    let Ok(elapsed) = ms.parse::<u64>() else {
+        return text(
+            StatusCode::BAD_REQUEST,
+            "text/plain; charset=utf-8",
+            "elapsed_ms must be a number\n".to_string(),
+        );
+    };
+    // An unknown test id is dropped rather than stored: the map is keyed by
+    // catalogue id and nothing else should be able to put entries in it.
+    if catalog::find(test).is_none() {
+        return text(
+            StatusCode::NOT_FOUND,
+            "text/plain; charset=utf-8",
+            "unknown test\n".to_string(),
+        );
+    }
+    conformance.sessions.with(session, |s| {
+        s.note_client_exit(test, elapsed);
+    });
+    text(
+        StatusCode::NO_CONTENT,
+        "text/plain; charset=utf-8",
+        String::new(),
+    )
 }
 
 /// The report stylesheet.

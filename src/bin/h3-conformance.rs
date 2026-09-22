@@ -303,7 +303,22 @@ async fn run(args: &Args) -> i32 {
         // variable behaves exactly as before, which is the honest outcome for
         // curl and Chromium -- neither offers early data over HTTP/3.
         let resume = test.id.starts_with("q-zero-rtt");
-        invoke_client(&args.client, &url, port, args.timeout, resume);
+        // Tell the server when the process stopped, so a verdict that rests on
+        // silence can say which kind of silence it was. Advisory: a failure to
+        // post leaves every verdict exactly as it would have been, with a less
+        // specific sentence explaining it.
+        if let ClientEnd::Exited(ms) = invoke_client(&args.client, &url, port, args.timeout, resume)
+        {
+            // Reported rather than discarded. A diagnostic that quietly fails
+            // is indistinguishable from one that was never wired up, which is
+            // the shape of defect this suite keeps finding in itself.
+            let url = format!("{base}/client-exit/{}/{}/{ms}", session.id, test.id);
+            match http.post(&url).send().await {
+                Ok(r) if r.status().is_success() => {}
+                Ok(r) => eprintln!("  client-exit for {} rejected: {}", test.id, r.status()),
+                Err(e) => eprintln!("  client-exit for {} failed: {e}", test.id),
+            }
+        }
     }
 
     // ── Let the server finish deciding ──────────────────────────────────
@@ -367,18 +382,41 @@ async fn run(args: &Args) -> i32 {
     reason = "{url} and {port} are literal placeholders in a user-supplied template, \
               substituted by replace(); they are not format arguments"
 )]
-fn invoke_client(template: &str, url: &str, port: u16, timeout_secs: u64, resume: bool) {
+/// How a client invocation ended.
+///
+/// The exit *status* stays ignored -- a client failing a test frequently
+/// should exit non-zero, and reading that would discard the result the run
+/// exists to collect. When it exited is a different fact, and one the server
+/// cannot obtain: from a socket, a peer that has gone and a peer reading
+/// quietly are the same thing.
+enum ClientEnd {
+    /// The process ended on its own, this many milliseconds after it started.
+    Exited(u64),
+    /// It was still running when the per-test deadline arrived, so it was
+    /// killed. Nothing about the peer's silence is explained by this.
+    Killed,
+    /// It could not be started or parsed; nothing was driven.
+    NotRun,
+}
+
+fn invoke_client(
+    template: &str,
+    url: &str,
+    port: u16,
+    timeout_secs: u64,
+    resume: bool,
+) -> ClientEnd {
     let rendered = template
         .replace("{url}", url)
         .replace("{port}", &port.to_string());
 
     let Some(parts) = shell_words(&rendered) else {
         eprintln!("  could not parse the client command: {rendered}");
-        return;
+        return ClientEnd::NotRun;
     };
     let Some((program, rest)) = parts.split_first() else {
         eprintln!("  empty client command");
-        return;
+        return ClientEnd::NotRun;
     };
 
     let mut command = Command::new(program);
@@ -394,23 +432,28 @@ fn invoke_client(template: &str, url: &str, port: u16, timeout_secs: u64, resume
         Ok(c) => c,
         Err(e) => {
             eprintln!("  could not run {program}: {e}");
-            return;
+            return ClientEnd::NotRun;
         }
     };
 
     // Bounded: a client that hangs on a test must not hang the whole run. The
     // server's own liveness timeout will have decided the verdict regardless.
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let started = std::time::Instant::now();
+    let deadline = started + Duration::from_secs(timeout_secs);
     loop {
         match child.try_wait() {
             // Exited, or we cannot tell — either way this invocation is done.
             // The exit status is not consulted, so the two are the same
             // outcome here.
-            Ok(Some(_)) | Err(_) => return,
+            Ok(Some(_)) | Err(_) => {
+                return ClientEnd::Exited(
+                    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                )
+            }
             Ok(None) if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return;
+                return ClientEnd::Killed;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
         }
