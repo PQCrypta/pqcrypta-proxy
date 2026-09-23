@@ -105,7 +105,7 @@
 | **Log Rotation (SIGHUP)** | ✅ | `SIGHUP` reopens all log file handles in-place; compatible with logrotate `postrotate` — no restart required |
 | **TLS 1.3 Default** | ✅ | TLS 1.3 minimum by default on all listeners (`min_version = "1.3"`); configurable to allow TLS 1.2 via `min_version` in `[tls]` |
 | **Certificate Compression (RFC 8879)** | ✅ | The certificate chain is sent compressed to any client that offers `compress_certificate`. Measured on pqcrypta.com: 3,435 bytes to 2,376 with zlib (1.45:1), about 1&nbsp;KB off every full handshake — which roughly offsets what the X25519MLKEM768 key share adds. Both TLS stacks are covered, and they need different treatment: on the OpenSSL TCP listener it takes `SSL_CTX_set1_cert_comp_preference` **and** `SSL_CTX_compress_certs` (the preference alone reports success and changes nothing on the wire), while rustls on QUIC/HTTP-3 needs only its `brotli`/`zlib` crate features. zlib on TCP because these OpenSSL builds carry `-DZLIB` and nothing else; brotli and zlib on the QUIC side |
-| **Server Identity Concealment** | ✅ | Server header suppressed and replaced with configurable custom branding |
+| **Server Identity Concealment** | ✅ | Backend `Server` header replaced by `server_header` in `[server]` (default `pqcrypta`, no version); an empty value passes the backend's through |
 | **JWT Rate Limiting** | ✅ | Per-subject rate limiting with HMAC-SHA256 signature verification; unsigned `sub` claims rejected; non-HMAC algorithms blocked |
 | **Log Injection Prevention** | ✅ | Newlines and control characters stripped from all user-controlled fields before writing to access and audit logs |
 | **NEL (Network Error Logging)** | ✅ | Network Error Logging headers with configurable policy for client-side error reporting |
@@ -183,7 +183,7 @@
 - **Per-Route Security Policy**: Per-route mTLS requirement, JA3 allowlist, rate limit override, WAF mode override, 0-RTT control
 - **Security Headers**: HSTS, X-Frame-Options, CSP, COEP, COOP, CORP, and more
 - **CORS Handling**: Full CORS support with preflight OPTIONS handling; all rate-limit 429 responses include `Access-Control-Allow-Origin` and `Access-Control-Allow-Credentials` headers when the request Origin matches an allowed origin — prevents browsers from reporting rate-limit errors as CORS failures
-- **Server Identity Concealment**: Server header suppressed; configurable custom branding replaces backend identity
+- **Server Identity Concealment**: the backend's `Server` header is replaced by `server_header` in `[server]` (default `pqcrypta`, no version); an empty value passes the backend's own header through, as HAProxy and NGINX do by default
 - **Log Injection Prevention**: Newlines and all control characters stripped from every user-controlled field before writing to access or audit logs
 - **`tls_skip_verify` Production Block**: `tls_skip_verify = true` rejected at config load; requires explicit `--allow-insecure-backends` CLI flag to override
 - **IP Blocklists (DB-synced)**: Live-synced IP, fingerprint, and country blocklists pulled from the application database — supports individual IPs and CIDR subnet ranges (e.g. `192.0.2.0/24`); updates without restart. The reload **reconciles in both directions**: entries added to the synced file are blocked, and database-sourced entries that disappear from it are released from memory on the next reload (60 s), so deactivating a row or clicking unblock in the threat dashboard actually lifts a live block. Only `DatabaseSync` entries are reconciled — blocks the proxy raised itself (rate limit, WAF, `Manual` config entries) are unaffected. For an immediate release, `POST /blocklist/unblock/:ip` on the admin API drops the IP (and any CIDR entry covering it) without waiting for the next sync; `GET /blocklist` shows what the running proxy is actually enforcing, which is the copy that decides whether a request is refused
@@ -215,7 +215,7 @@
 - **Early Hints (103)**: Preload CSS/JS resources via Link headers — dns-prefetch, preconnect, modulepreload, and speculative prerender hint types supported. Preload rules are scoped per host/path in `[[http3.preload_resources]]` and hot-reload at runtime (preconnect origins + preload rules apply on the next request, no restart). Note: an `href` is only used by the browser when it byte-matches the page URL, so any `?v=` cache-buster must be included and kept in sync.
 - **Priority Hints**: RFC 9218 Extensible Priorities for resource scheduling (`u=3,i=?0`)
 - **Request Coalescing**: Deduplicate identical GET/HEAD requests in flight
-- **Alt-Svc Advertisement**: Dynamic HTTP/3 upgrade headers on all ports — built from `udp_port` and `additional_ports` so every listener advertises its actual address, and **varying by transport** per RFC 7838: over TCP the value lists h3 on every UDP port, over QUIC it lists `h2` on the same port plus any *other* h3 port, never the connection already in use. `alt_svc_ports` in `[server]` replaces the derived list outright, for the case where a bound port does not serve HTTP/3 — a provider filtering inbound UDP/443 upstream, or a port handed to the WebTransport server — since advertising one costs every visitor a QUIC attempt that can only time out. An empty list advertises no HTTP/3 at all, which is the truthful value for a node that serves none. `tcp_only_hosts` in `[server]` sends `Alt-Svc: clear` for designated TCP-only origins; `http11_only_hosts` in `[server]` suppresses `h2` ALPN entirely so browsers open an independent TCP connection per stream (required for parallel TCP speed tests)
+- **Alt-Svc Advertisement**: Dynamic HTTP/3 upgrade headers on all ports — built from `udp_port` and `additional_ports` so every listener advertises its actual address, and **varying by transport** per RFC 7838: over TCP the value lists h3 on every UDP port, over QUIC it lists `h2` on the same port plus any *other* h3 port, never the connection already in use. `alt_svc_ports` in `[server]` replaces the derived list outright, for the case where a bound port does not serve HTTP/3 — a provider filtering inbound UDP/443 upstream, or a port handed to the WebTransport server — since advertising one costs every visitor a QUIC attempt that can only time out. An empty list advertises no HTTP/3 at all, which is the truthful value for a node that serves none. `tcp_only_hosts` in `[server]` sends `Alt-Svc: clear` for designated TCP-only origins, as do `alt_svc_clear_user_agents` (case-insensitive User-Agent substrings: search crawlers and TLS scanners by default) and `alt_svc_clear_cidrs` (source networks: Cloudflare's published ranges by default, since Cloudflare Radar sends a generic Chrome UA); `alt_svc_max_age_secs` sets `ma` on every advertisement (default 86400). With nothing advertised, `x-webtransport-port` is not sent either; `http11_only_hosts` in `[server]` suppresses `h2` ALPN entirely so browsers open an independent TCP connection per stream (required for parallel TCP speed tests)
 - **Virtual Host Routing**: Proper `:authority` pseudo-header handling for backend routing
 - **Server-Timing**: Performance metrics header for browser DevTools (RFC 6797)
 - **NEL (Network Error Logging)**: Client-side error reporting with configurable policy
@@ -376,6 +376,23 @@ private network where RFC1918 sources are legitimate, add them explicitly:
 # Default: empty (only loopback 127.x/::1 is trusted; RFC1918 is NOT trusted by default).
 trusted_internal_cidrs = ["10.200.0.0/16"]
 ```
+
+### Refusals: CORS, geo-block page, exempt path
+
+```toml
+[security]
+# Origins that may read the proxy's own 403/429 refusals cross-origin. Without
+# CORS headers a refusal reaches the page as an opaque CORS error, so it cannot
+# see the status and back off. One list for every transport and both limiters.
+refusal_cors_origins = ["https://example.com"]      # default: none
+# Where a geo-blocked request is redirected (302). Empty refuses with a plain 403.
+geo_block_redirect_url = "https://example.com/error_pages/403.html"   # default: ""
+# Exempt from IP, country and rate blocking, so a blocked visitor can load the
+# page explaining the block. Must contain geo_block_redirect_url's path.
+error_pages_path_prefix = "/error_pages/"           # default: "" (nothing exempt)
+```
+
+None of these name a site by default; each deployment names its own.
 
 ### JA3/JA4 Fingerprint Database
 
@@ -1261,6 +1278,48 @@ the one header the origin can override: a CSP sent by the backend (typically one
 carrying per-request script nonces) is forwarded untouched, and the configured
 policy is injected only when the backend sent none.
 
+Every value is optional: **an empty string omits that header** on every
+transport. `accept_ch`, `nel`, `report_to` and `priority` are empty unless set,
+and the Outlook add-in exception (`addin_hosts`, `addin_path_prefix`,
+`addin_csp`) is off unless all three are configured. `server_timing_enabled`
+adds a `Server-Timing` metric whose description is `server_timing_desc`. The set
+is validated once at startup; a value that is not a legal header value is
+logged and omitted.
+
+`headers_override` on a route takes literal header names
+(`cross-origin-embedder-policy`), not the snake_case keys of this section. The
+proxy refuses to load a route that spells a managed header the `[headers]` way,
+because that sends a header of the literal name, which no browser reads, while the
+real policy stays in force.
+
+### Pay only for what you enable
+
+The TCP middleware chain is assembled once at startup, and a layer whose
+feature is off is **left out**, not skipped per request: response cache,
+security headers (when every value is empty and Server-Timing is off), Alt-Svc
+(when nothing is advertised and `tcp_only_hosts` is empty), compression, the
+HTTP/3-features layer (coalescing and priority hints both off), the advanced
+rate limiter, and trace-context extraction (when OTel is off and INFO spans are
+filtered out). The startup log names every layer left out. The security
+evaluator always runs; it carries the request-size, header-size and blocklist
+enforcement that has no switch of its own. The chain is not rebuilt on a hot
+reload, so enabling one of these needs a restart.
+
+### Response Compression
+
+```toml
+[compression]
+enabled = true          # default
+min_size = 1024         # bytes; smaller responses are sent as-is
+brotli_quality = 4
+zstd_level = 3
+gzip_level = 6
+compress_types = ["text/html", "text/css", "application/json"]   # exact MIME type; charset etc. ignored
+```
+
+Applies to HTTP/1.1 and HTTP/2 responses. Before this section existed the
+compression settings were fixed in code and could not be changed or turned off.
+
 ### CORS Configuration
 
 ```toml
@@ -1277,6 +1336,21 @@ allow_headers = ["Content-Type", "Authorization", "X-API-Key"]
 allow_credentials = true
 max_age = 86400
 ```
+
+### Backend cookies
+
+```toml
+[[routes]]
+name = "app"
+path_prefix = "/app"
+backend = "app"
+enforce_cookie_security = true   # add HttpOnly and Secure where the backend omitted them
+set_cookie_domain = "example.com" # add Domain where the backend omitted it
+```
+
+Both apply to every backend `Set-Cookie` on HTTP/1.1, HTTP/2 and HTTP/3,
+streamed (SSE) or buffered, and attributes are matched by name, so a cookie
+*named* `securetoken` is not mistaken for one carrying `Secure`.
 
 > **Configuration validation** rejects `allow_origin = "*"` combined with `allow_credentials = true` at startup (RFC 6454 / CORS spec). All modern browsers refuse this combination; the proxy enforces it at load time rather than producing confusing runtime failures. Use a specific origin string when credentials are required.
 

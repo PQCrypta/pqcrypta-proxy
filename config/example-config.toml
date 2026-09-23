@@ -12,6 +12,16 @@
 # Bind address for QUIC/UDP listener
 bind_address = "0.0.0.0"
 
+# Server header on every response (default "pqcrypta", no version). "" passes
+# the backend's own Server header through, as HAProxy and NGINX do.
+server_header = "pqcrypta"
+# max-age (seconds) on every Alt-Svc alternative (default 86400)
+alt_svc_max_age_secs = 86400
+# Clients sent `Alt-Svc: clear` so they stay on TCP. Defaults: search crawlers
+# and TLS scanners by User-Agent substring, Cloudflare's ranges by source network.
+# alt_svc_clear_user_agents = ["googlebot", "bingbot", "ssllabs"]
+# alt_svc_clear_cidrs = ["173.245.48.0/20", "2400:cb00::/32"]
+
 # Primary UDP port for QUIC/HTTP3/WebTransport (default: 443)
 udp_port = 443
 
@@ -142,6 +152,15 @@ redirect_to_https = true
 # the cache. Responses with Set-Cookie or Content-Encoding are
 # never stored. x-cache: HIT/MISS and Age headers are added to
 # every response.
+[compression]
+# Response compression on HTTP/1.1 and HTTP/2 (default on). Was not configurable.
+enabled = true
+min_size = 1024
+brotli_quality = 4
+zstd_level = 3
+gzip_level = 6
+compress_types = ["text/html", "text/css", "text/javascript", "application/javascript", "application/json", "image/svg+xml"]
+
 [cache]
 # Enable response caching (opt-in)
 enabled = false
@@ -209,6 +228,11 @@ x_security_level = "Post-Quantum Ready"
 # Enable Server-Timing header for performance metrics
 # Shows proxy processing time in browser DevTools
 server_timing_enabled = true
+server_timing_desc = "Proxy"
+
+# Any header in this section set to "" is omitted, on every transport. With all
+# of them empty and server_timing_enabled = false, the TCP listener leaves this
+# layer out of its middleware chain entirely.
 
 # Accept-CH header for Client Hints (responsive content delivery)
 # Tells browsers which client hints to send on subsequent requests
@@ -225,7 +249,7 @@ nel = '{"report_to":"default","max_age":86400,"include_subdomains":true}'
 # JSON array defining where browsers should send error reports
 # group: Report group name (must match nel.report_to)
 # endpoints: Array of URLs to receive reports
-report_to = '{"group":"default","max_age":86400,"endpoints":[{"url":"https://api.pqcrypta.com/reports"}]}'
+report_to = '{"group":"default","max_age":86400,"endpoints":[{"url":"https://example.com/reports"}]}'
 
 # HTTP/3 Priority (RFC 9218) for response prioritization
 # Format: "u=<urgency>, i" where:
@@ -570,6 +594,14 @@ std_dev_multiplier = 3.0  # Requests > mean + 3*std_dev = anomaly
 [security]
 # Maximum request body size in bytes (10MB default)
 max_request_size = 10485760
+
+# Origins that may read the proxy's own 403/429 refusals cross-origin, on every
+# transport and both rate limiters (default: none).
+refusal_cors_origins = ["https://example.com", "https://www.example.com"]
+# Geo-blocked requests are redirected here; "" refuses with a plain 403 (default).
+geo_block_redirect_url = "https://example.com/error_pages/403.html"
+# Exempt from IP/country/rate blocking so the page above always loads (default: "").
+error_pages_path_prefix = "/error_pages/"
 
 # Maximum header size in bytes (64KB default)
 max_header_size = 65536
@@ -1147,12 +1179,14 @@ backend = "apache"
 forward_client_identity = true
 priority = 100
 
-# www redirect to non-www
+# Moved content: a route-level redirect. Targets must be relative paths
+# (SEC-09 refuses absolute URLs at load), so a host redirect such as www ->
+# apex belongs in [http_redirect] or the origin, not here.
 [[routes]]
-name = "www-redirect"
-host = "www.example.com"
-path_prefix = "/"
-redirect = "https://example.com"
+name = "legacy-docs-redirect"
+host = "example.com"
+path_prefix = "/old-docs"
+redirect = "/docs"
 redirect_permanent = true
 priority = 1
 
@@ -1218,8 +1252,8 @@ priority = 50
 
 # Override global security headers for this route
 [routes.headers_override]
-x_frame_options = "SAMEORIGIN"  # Allow embedding from same origin
-cross_origin_embedder_policy = "unsafe-none"  # Disable for legacy content
+x-frame-options = "SAMEORIGIN"  # Allow embedding from same origin
+cross-origin-embedder-policy = "unsafe-none"  # Disable for legacy content
 
 # PHP-FPM route
 [[routes]]
