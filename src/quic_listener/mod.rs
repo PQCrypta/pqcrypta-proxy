@@ -73,6 +73,11 @@ fn is_benign_h3_close<E: std::fmt::Display>(err: &E) -> bool {
         || msg.contains("aborted by peer")
         || msg.contains("closed abruptly")
         || msg.contains("Timeout")
+        // The peer closed with an application code h3 does not define —
+        // browsers do this dropping a connection, and every connection open
+        // across a restart does it at once. "Remote" is the discriminator: a
+        // failure on this side is reported as a "Local error".
+        || (msg.contains("Remote error") && msg.contains("closed"))
 }
 
 /// The Alt-Svc value for a response being sent **over QUIC**.
@@ -1591,5 +1596,22 @@ mod alt_svc_tests {
         assert_eq!(alt_svc_for_host(&c, Some("ssllabs.pqcrypta.com")), "clear");
         assert_ne!(alt_svc_for_host(&c, Some("pqcrypta.com")), "clear");
         assert_ne!(alt_svc_for_host(&c, None), "clear");
+    }
+}
+
+#[cfg(test)]
+mod close_classification_tests {
+    use super::is_benign_h3_close;
+
+    /// Every connection open across a restart closes at once with a code h3
+    /// does not define; logged as ERROR that was a burst of false alarms per
+    /// deploy. A failure on this side must still be an error.
+    #[test]
+    fn a_peer_close_is_benign_and_a_local_failure_is_not() {
+        assert!(is_benign_h3_close(
+            &"Remote error: Error undefined by h3: closed"
+        ));
+        assert!(!is_benign_h3_close(&"Local error: H3_FRAME_UNEXPECTED"));
+        assert!(!is_benign_h3_close(&"Remote error: H3_FRAME_ERROR"));
     }
 }
