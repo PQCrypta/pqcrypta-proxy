@@ -326,8 +326,8 @@ impl AdminServer {
 /// SEC-005 / AUD-10 / F-03 / F-08: Shared state for the admin authentication middleware.
 ///
 /// Tracks per-IP failed attempt counts with a sliding 1-minute window so that
-/// brute-force attacks against a weak or leaked token are rate-limited before
-/// they can enumerate secrets.
+/// failing callers are rate-limited. A request carrying the correct token is
+/// never refused by any of these counters: the token is checked first.
 ///
 /// AUD-10 adds a *global* failed-auth counter so that distributed attacks from
 /// many IPs (each making fewer than ADMIN_AUTH_MAX_FAILURES attempts) are also
@@ -407,47 +407,20 @@ async fn auth_middleware(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    // Check auth token if configured
+    // Check auth token if configured.
+    //
+    // The token is evaluated FIRST, and a correct token is never refused.
+    // The per-IP limit and the global cooldown used to be checked before it,
+    // so while either was armed a caller holding the right token got 429 too
+    // — and anything still sending a stale token kept re-arming them. That is
+    // what happened after the 2026-09-17 rotation: the metrics collector and
+    // Prometheus kept the old token, held the global cooldown at its 30-minute
+    // cap for six days, and every client with the new token was locked out
+    // with them. The throttles cannot protect the token itself — validate()
+    // refuses one shorter than 32 characters, which no request rate
+    // enumerates — so what they bound is failure noise, and they now bound
+    // only failures.
     if let Some(ref expected_token) = auth.auth_token {
-        // AUD-10: Check global cooldown first — this catches distributed brute-force
-        // attacks where each source IP stays below the per-IP threshold.
-        {
-            let cooldown_until = auth.global_cooldown_until.read();
-            if let Some(until) = *cooldown_until {
-                if Instant::now() < until {
-                    warn!(
-                        "Admin API: global auth cooldown active — rejecting request from {}",
-                        client_ip
-                    );
-                    return StatusCode::TOO_MANY_REQUESTS.into_response();
-                }
-            }
-        }
-
-        // SEC-005: Check and enforce per-IP rate limit before doing any token work.
-        {
-            let now = Instant::now();
-            let mut entry = auth
-                .failed_attempts
-                .entry(client_ip.clone())
-                .or_insert((0, now));
-            let (ref mut count, ref mut window_start) = *entry;
-
-            // Reset the window if it has expired.
-            if now.duration_since(*window_start) >= ADMIN_AUTH_WINDOW {
-                *count = 0;
-                *window_start = now;
-            }
-
-            if *count >= ADMIN_AUTH_MAX_FAILURES {
-                warn!(
-                    "Admin API: rate limit exceeded for {} ({} failures in 60s) — blocking",
-                    client_ip, count
-                );
-                return StatusCode::TOO_MANY_REQUESTS.into_response();
-            }
-        }
-
         let provided_token = headers
             .get("Authorization")
             .and_then(|v| v.to_str().ok())
@@ -457,8 +430,30 @@ async fn auth_middleware(
         let provided_bytes = provided_token.unwrap_or("").as_bytes();
         let authorized: bool = provided_bytes.ct_eq(expected_token.as_bytes()).into();
 
-        if !authorized {
-            // Record the failure against this IP.
+        if authorized {
+            // Clear this IP's failures and the global counters. F-08: this also
+            // resets the exponential back-off to its base duration.
+            auth.failed_attempts.remove(&client_ip);
+            auth.global_failure_count.store(0, Ordering::Relaxed);
+            auth.global_cooldown_count.store(0, Ordering::Relaxed);
+            *auth.global_cooldown_until.write() = None;
+        } else {
+            // AUD-10: while the global cooldown is armed, a failing request is
+            // refused cheaply and not counted again.
+            {
+                let cooldown_until = auth.global_cooldown_until.read();
+                if let Some(until) = *cooldown_until {
+                    if Instant::now() < until {
+                        warn!(
+                            "Admin API: global auth cooldown active — rejecting failed auth from {}",
+                            client_ip
+                        );
+                        return StatusCode::TOO_MANY_REQUESTS.into_response();
+                    }
+                }
+            }
+
+            // SEC-005: per-IP limit over a sliding window, then record this failure.
             {
                 let now = Instant::now();
                 let mut entry = auth
@@ -469,6 +464,13 @@ async fn auth_middleware(
                 if now.duration_since(*window_start) >= ADMIN_AUTH_WINDOW {
                     *count = 0;
                     *window_start = now;
+                }
+                if *count >= ADMIN_AUTH_MAX_FAILURES {
+                    warn!(
+                        "Admin API: rate limit exceeded for {} ({} failures in 60s) — blocking",
+                        client_ip, count
+                    );
+                    return StatusCode::TOO_MANY_REQUESTS.into_response();
                 }
                 *count += 1;
                 warn!(
@@ -499,7 +501,7 @@ async fn auth_middleware(
                 auth.global_failure_count.store(0, Ordering::Relaxed);
                 warn!(
                     "Admin API: global failure threshold reached ({} total, trigger #{}) — \
-                     activating {}s global cooldown (F-08 exponential back-off)",
+                     activating {}s global cooldown for failing requests (F-08 exponential back-off)",
                     global,
                     trigger_count,
                     cooldown_duration.as_secs()
@@ -508,13 +510,6 @@ async fn auth_middleware(
 
             return StatusCode::UNAUTHORIZED.into_response();
         }
-
-        // Successful auth: clear per-IP failure count and reset global counter.
-        // F-08: Also reset the exponential back-off counter so a successful
-        // authentication returns the system to the base cooldown duration.
-        auth.failed_attempts.remove(&client_ip);
-        auth.global_failure_count.store(0, Ordering::Relaxed);
-        auth.global_cooldown_count.store(0, Ordering::Relaxed);
     }
 
     // Proof-of-possession: verify HMAC-SHA256 per-request signature if configured.
@@ -1752,4 +1747,76 @@ async fn blocklist_unblock_handler(
             "IP was not blocked in memory".to_string()
         },
     }))
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn state() -> Arc<AdminAuthState> {
+        Arc::new(AdminAuthState {
+            allowed_ips: Vec::new(),
+            auth_token: Some(TOKEN.to_string()),
+            hmac_secret: None,
+            hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(300)),
+            failed_attempts: Arc::new(DashMap::new()),
+            global_failure_count: Arc::new(AtomicU32::new(0)),
+            global_cooldown_until: Arc::new(RwLock::new(None)),
+            global_cooldown_count: Arc::new(AtomicU32::new(0)),
+        })
+    }
+
+    async fn call(auth: &Arc<AdminAuthState>, token: &str) -> StatusCode {
+        let app = axum::Router::new()
+            .route("/metrics", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                auth.clone(),
+                auth_middleware,
+            ));
+        let mut req = axum::http::Request::builder()
+            .uri("/metrics")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    /// A stale client re-arming the throttles must not lock out the right token:
+    /// after the 2026-09-17 rotation it held the admin API shut for six days.
+    #[tokio::test]
+    async fn a_correct_token_passes_an_armed_cooldown_and_disarms_it() {
+        let auth = state();
+        *auth.global_cooldown_until.write() = Some(Instant::now() + Duration::from_secs(600));
+        auth.failed_attempts.insert(
+            "127.0.0.1".to_string(),
+            (ADMIN_AUTH_MAX_FAILURES, Instant::now()),
+        );
+
+        assert_eq!(
+            call(&auth, "stale-token").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(call(&auth, TOKEN).await, StatusCode::OK);
+        assert!(
+            auth.global_cooldown_until.read().is_none(),
+            "success disarms the cooldown"
+        );
+        assert_eq!(call(&auth, "stale-token").await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn failures_still_trip_the_per_ip_limit() {
+        let auth = state();
+        for _ in 0..ADMIN_AUTH_MAX_FAILURES {
+            assert_eq!(call(&auth, "wrong").await, StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(call(&auth, "wrong").await, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(call(&auth, TOKEN).await, StatusCode::OK);
+    }
 }
