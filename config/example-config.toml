@@ -15,6 +15,10 @@ bind_address = "0.0.0.0"
 # Server header on every response (default "pqcrypta", no version). "" passes
 # the backend's own Server header through, as HAProxy and NGINX do.
 server_header = "pqcrypta"
+# Per-request ID header sent to the backend and echoed to the client, on every
+# transport. A well-formed client-supplied ID is kept; otherwise 128 random bits
+# in hex. "" (default) turns it off.
+request_id_header = "x-request-id"
 # max-age (seconds) on every Alt-Svc alternative (default 86400)
 alt_svc_max_age_secs = 86400
 # Clients sent `Alt-Svc: clear` so they stay on TCP. Defaults: search crawlers

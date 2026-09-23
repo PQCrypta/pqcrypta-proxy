@@ -2065,6 +2065,13 @@ async fn proxy_handler(
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
+    // `server.request_id_header`: resolved once, sent to the backend and echoed
+    // on the response. `None` when the setting is empty.
+    let request_id =
+        crate::request_id::header_name(&state.config.server.request_id_header).map(|name| {
+            let id = crate::request_id::resolve(&headers, &name);
+            (name, id)
+        });
     // The connection's real protocol, for the per-route HTTP/1.1 gate. Read here
     // rather than from `x-connection-protocol`: only two of the three TCP accept
     // loops injected that header, so the gate was inert on the third.
@@ -2642,6 +2649,9 @@ async fn proxy_handler(
                     h.insert(name, val);
                 }
             }
+            if let Some((name, id)) = &request_id {
+                h.insert(name.clone(), id.clone());
+            }
 
             // Forward client identity if configured
             if route.forward_client_identity {
@@ -2874,6 +2884,9 @@ async fn proxy_handler(
                     parts.headers.remove("connection");
                     parts.headers.remove("transfer-encoding");
                     parts.headers.remove("upgrade");
+                    if let Some((name, id)) = &request_id {
+                        parts.headers.insert(name.clone(), id.clone());
+                    }
                     if let Some(server) = &state.server_header_value {
                         parts.headers.insert(header::SERVER, server.clone());
                     }
@@ -3044,6 +3057,9 @@ async fn proxy_handler(
                 // software and target known CVEs.
                 if let Some(server) = &state.server_header_value {
                     parts.headers.insert(header::SERVER, server.clone());
+                }
+                if let Some((name, id)) = &request_id {
+                    parts.headers.insert(name.clone(), id.clone());
                 }
 
                 // Build response from buffered body bytes.

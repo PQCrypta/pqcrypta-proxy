@@ -155,6 +155,7 @@ pub mod pqc_tls;
 pub mod proxy;
 pub mod quic_listener;
 pub mod rate_limiter; // Must be before config (config imports from it)
+pub mod request_id;
 pub mod route_gate;
 pub mod security;
 pub mod speedtest;

@@ -1438,6 +1438,18 @@ impl QuicListener {
         // Stripping them again here would have discarded the real JA3/JA4 and
         // re-asserted only the subset this block knew about.
 
+        // `server.request_id_header`: the same module the TCP path calls, so
+        // both transports keep or mint an ID by one rule. After the forwarding
+        // loop, so a client's malformed ID cannot survive it.
+        let request_id =
+            crate::request_id::header_name(&config.server.request_id_header).map(|name| {
+                let id = crate::request_id::resolve(request.headers(), &name);
+                (name, id)
+            });
+        if let Some((name, id)) = &request_id {
+            headers.insert(name.clone(), id.clone());
+        }
+
         // Forward Host header to backend (required for virtual host routing)
         if let Some(ref host_value) = host {
             if let Ok(v) = HeaderValue::from_str(host_value) {
@@ -1581,6 +1593,9 @@ impl QuicListener {
             }
             sse_builder = sse_builder.header("cache-control", "no-cache");
             sse_builder = sse_builder.server_header(&config);
+            if let Some((name, id)) = &request_id {
+                sse_builder = sse_builder.header(name, id);
+            }
             sse_builder = sse_builder.header("alt-svc", alt_svc_for_host(&config, host.as_deref()));
             // CORS headers must be present on the streamed response itself, not
             // just the preflight — otherwise browsers block the SSE fetch with
@@ -1702,6 +1717,9 @@ impl QuicListener {
 
         // Build HTTP/3 response with headers from backend
         let mut response_builder = http::Response::builder().status(stream_status);
+        if let Some((name, id)) = &request_id {
+            response_builder = response_builder.header(name, id);
+        }
 
         // Forward selected headers from backend (including CORS if backend sets them)
         // Note: x-content-type-options excluded from whitelist since proxy adds its own

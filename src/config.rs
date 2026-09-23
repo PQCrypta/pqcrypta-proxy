@@ -881,6 +881,12 @@ pub struct ServerConfig {
     #[serde(default = "default_server_header")]
     pub server_header: String,
 
+    /// Header carrying a per-request ID to the backend and back to the client
+    /// (e.g. "x-request-id"). A sane client-supplied ID is kept; otherwise
+    /// 128 random bits are minted as hex. Empty (the default) turns it off.
+    #[serde(default)]
+    pub request_id_header: String,
+
     /// `ma` (max-age, seconds) on every Alt-Svc alternative the proxy advertises.
     #[serde(default = "default_alt_svc_max_age_secs")]
     pub alt_svc_max_age_secs: u64,
@@ -1016,6 +1022,7 @@ impl Default for ServerConfig {
             webtransport_port: 4433,
             tcp_only_hosts: Vec::new(),
             server_header: default_server_header(),
+            request_id_header: String::new(),
             alt_svc_max_age_secs: default_alt_svc_max_age_secs(),
             alt_svc_clear_cidrs: default_alt_svc_clear_cidrs(),
             alt_svc_clear_user_agents: default_alt_svc_clear_user_agents(),
@@ -3259,6 +3266,15 @@ impl ProxyConfig {
                 ));
             }
             Some(_) => {}
+        }
+
+        if !self.server.request_id_header.is_empty()
+            && crate::request_id::header_name(&self.server.request_id_header).is_none()
+        {
+            return Err(anyhow::anyhow!(
+                "server.request_id_header {:?} is not a valid header name",
+                self.server.request_id_header
+            ));
         }
 
         if let Err(e) = regex::RegexSet::new(&self.waf.scanner_ua_exempt_paths) {
