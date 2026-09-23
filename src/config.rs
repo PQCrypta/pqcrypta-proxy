@@ -2120,6 +2120,9 @@ pub struct SecurityConfig {
     /// exempts nothing.
     #[serde(default = "default_error_pages_path_prefix")]
     pub error_pages_path_prefix: String,
+    /// Request hygiene limits, checked before the WAF on every transport.
+    #[serde(default)]
+    pub validation: RequestValidationConfig,
     /// How many distinct TLS fingerprints the observed corpus retains.
     ///
     /// This began as a memory-exhaustion guard at a hardcoded 50,000 and is now
@@ -2160,6 +2163,108 @@ fn default_error_pages_path_prefix() -> String {
     String::new()
 }
 
+/// `[security.validation]`: structural limits on a request.
+///
+/// Each is refused with the status that names the problem (414, 431, 405,
+/// 400). A missing Host is
+/// already refused by routing, which matches on it — over HTTP/2 and HTTP/3 the
+/// host is the `:authority` pseudo-header rather than a `Host` field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RequestValidationConfig {
+    pub enabled: bool,
+    /// Path plus query string, in bytes (414 above it).
+    pub max_uri_length: usize,
+    /// Number of header fields (431 above it).
+    pub max_headers_count: usize,
+    /// Longest header name, in bytes (431 above it).
+    pub max_header_name_length: usize,
+    /// Longest single header value, in bytes (431 above it).
+    pub max_header_value_length: usize,
+    /// Methods accepted; empty accepts any (405 otherwise).
+    pub allowed_methods: Vec<String>,
+    /// Refuse a NUL byte, raw or percent-encoded, in the path or query (400).
+    pub reject_null_bytes: bool,
+}
+
+impl Default for RequestValidationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_uri_length: 16384,
+            max_headers_count: 200,
+            max_header_name_length: 256,
+            max_header_value_length: 16384,
+            allowed_methods: Vec::new(),
+            reject_null_bytes: true,
+        }
+    }
+}
+
+impl RequestValidationConfig {
+    /// The status and reason for a request these limits refuse, if any.
+    pub fn check(
+        &self,
+        method: &str,
+        path: &str,
+        query: &str,
+        headers: &http::HeaderMap,
+    ) -> Option<(u16, String)> {
+        if !self.enabled {
+            return None;
+        }
+        let uri_len = path.len() + if query.is_empty() { 0 } else { query.len() + 1 };
+        if uri_len > self.max_uri_length {
+            return Some((
+                414,
+                format!("URI of {uri_len} bytes exceeds {}", self.max_uri_length),
+            ));
+        }
+        if self.reject_null_bytes {
+            let has_nul = |s: &str| {
+                s.contains('\0')
+                    || s.as_bytes()
+                        .windows(3)
+                        .any(|w| w[0] == b'%' && w[1] == b'0' && w[2] == b'0')
+            };
+            if has_nul(path) || has_nul(query) {
+                return Some((400, "NUL byte in request target".to_string()));
+            }
+        }
+        if !self.allowed_methods.is_empty() && !self.allowed_methods.iter().any(|m| m == method) {
+            return Some((405, format!("method {method} not allowed")));
+        }
+        if headers.len() > self.max_headers_count {
+            return Some((
+                431,
+                format!(
+                    "{} header fields exceed {}",
+                    headers.len(),
+                    self.max_headers_count
+                ),
+            ));
+        }
+        for (name, value) in headers {
+            if name.as_str().len() > self.max_header_name_length {
+                return Some((
+                    431,
+                    format!("header name exceeds {} bytes", self.max_header_name_length),
+                ));
+            }
+            if value.len() > self.max_header_value_length {
+                return Some((
+                    431,
+                    format!(
+                        "header {} exceeds {} bytes",
+                        name, self.max_header_value_length
+                    ),
+                ));
+            }
+        }
+        None
+    }
+}
+
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
@@ -2190,6 +2295,7 @@ impl Default for SecurityConfig {
             refusal_cors_origins: default_refusal_cors_origins(),
             geo_block_redirect_url: default_geo_block_redirect_url(),
             error_pages_path_prefix: default_error_pages_path_prefix(),
+            validation: RequestValidationConfig::default(),
         }
     }
 }

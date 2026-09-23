@@ -378,6 +378,23 @@ private network where RFC1918 sources are legitimate, add them explicitly:
 trusted_internal_cidrs = ["10.200.0.0/16"]
 ```
 
+### Request validation
+
+```toml
+[security.validation]
+enabled = true                   # default on
+max_uri_length = 16384           # path + query, bytes -> 414
+max_headers_count = 200          # header fields -> 431
+max_header_name_length = 256     # bytes -> 431
+max_header_value_length = 16384  # bytes, per value -> 431
+allowed_methods = []             # empty accepts any method; otherwise -> 405
+reject_null_bytes = true         # raw or %00 in path or query -> 400
+```
+
+Checked in `SecurityState::evaluate`, the one evaluator HTTP/1.1, HTTP/2 and
+HTTP/3 all call, after the blocklist and header-size checks and before the WAF.
+A request with no host is refused by routing, which matches on it.
+
 ### Refusals: CORS, geo-block page, exempt path
 
 ```toml

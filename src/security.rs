@@ -381,6 +381,8 @@ pub enum SecurityDecision {
     Ja3Rejected,
     /// Header block exceeds `security.max_header_size`.
     HeadersTooLarge { max: usize },
+    /// Refused by `[security.validation]`: status and the reason for the log.
+    InvalidRequest { status: u16, reason: String },
     /// WAF matched in block mode. `rule` identifies which.
     WafBlock { rule: String },
 }
@@ -1615,6 +1617,17 @@ impl SecurityState {
             };
         }
 
+        // 5b. Request hygiene ([security.validation]).
+        let invalid =
+            self.config
+                .read()
+                .validation
+                .check(view.method, view.path, view.query, view.headers);
+        if let Some((status, reason)) = invalid {
+            warn!("Invalid request from {}: {}", ip, reason);
+            return SecurityDecision::InvalidRequest { status, reason };
+        }
+
         // 6. WAF
         self.run_waf(view, policy, is_pentest)
     }
@@ -2591,6 +2604,16 @@ pub fn decision_rendering(
             body: format!("Headers exceed maximum size of {} bytes", max),
         }),
 
+        SecurityDecision::InvalidRequest { status, .. } => Some(DecisionRendering {
+            status: StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_REQUEST),
+            headers: Vec::new(),
+            body: StatusCode::from_u16(*status)
+                .ok()
+                .and_then(|s| s.canonical_reason())
+                .unwrap_or("Bad Request")
+                .to_string(),
+        }),
+
         SecurityDecision::WafBlock { .. } => Some(DecisionRendering {
             status: StatusCode::FORBIDDEN,
             headers: vec![("x-waf-block", "1".to_string())],
@@ -2854,6 +2877,74 @@ mod tests {
     /// by benchmarking from a non-loopback address with every security feature
     /// disabled: the load generator was banned inside a second and 100% of
     /// 820,380 requests came back 4xx.
+    /// `[security.validation]` refuses with the status that names the problem,
+    /// through the one evaluator both transports call.
+    #[tokio::test]
+    async fn request_validation_refuses_with_the_right_status() {
+        let ip: IpAddr = "203.0.113.44".parse().unwrap();
+        let policy = RequestPolicy::default();
+        let mut config = ProxyConfig::default();
+        config.rate_limiting.enabled = false;
+        config.security.validation.max_uri_length = 32;
+        config.security.validation.allowed_methods = vec!["GET".into(), "HEAD".into()];
+        config.security.validation.max_headers_count = 3;
+        let security = SecurityState::new(&config);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", "Mozilla/5.0".parse().unwrap());
+        let status =
+            |method: &'static str, path: &'static str, query: &'static str, h: &HeaderMap| {
+                match security.evaluate(
+                    &SecurityRequestView {
+                        ip,
+                        method,
+                        path,
+                        query,
+                        headers: h,
+                        body: None,
+                    },
+                    &policy,
+                ) {
+                    SecurityDecision::InvalidRequest { status, .. } => status,
+                    SecurityDecision::Allow => 200,
+                    other => panic!("unexpected {other:?}"),
+                }
+            };
+        assert_eq!(status("GET", "/ok", "", &headers), 200);
+        assert_eq!(
+            status("GET", "/a-path-that-is-far-too-long-for-this", "", &headers),
+            414
+        );
+        assert_eq!(status("GET", "/file%00.php", "", &headers), 400);
+        assert_eq!(status("GET", "/x", "q=%00", &headers), 400);
+        assert_eq!(status("DELETE", "/x", "", &headers), 405);
+        let mut many = headers.clone();
+        for i in 0..4 {
+            many.insert(
+                http::HeaderName::from_bytes(format!("x-h{i}").as_bytes()).unwrap(),
+                "1".parse().unwrap(),
+            );
+        }
+        assert_eq!(status("GET", "/x", "", &many), 431);
+
+        config.security.validation.enabled = false;
+        let security = SecurityState::new(&config);
+        assert!(matches!(
+            security.evaluate(
+                &SecurityRequestView {
+                    ip,
+                    method: "DELETE",
+                    path: "/x",
+                    query: "",
+                    headers: &headers,
+                    body: None
+                },
+                &policy
+            ),
+            SecurityDecision::Allow
+        ));
+    }
+
     /// The scanner-UA exemption is configuration: a path is exempt only when
     /// `waf.scanner_ua_exempt_paths` says so, and injection scanning still runs.
     #[tokio::test]
@@ -3200,6 +3291,10 @@ mod decision_rendering_tests {
             },
             SecurityDecision::Ja3Rejected,
             SecurityDecision::HeadersTooLarge { max: 8192 },
+            SecurityDecision::InvalidRequest {
+                status: 414,
+                reason: "test".to_string(),
+            },
             SecurityDecision::WafBlock {
                 rule: "PQW-000".to_string(),
             },
