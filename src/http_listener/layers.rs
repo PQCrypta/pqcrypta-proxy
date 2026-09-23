@@ -689,6 +689,23 @@ pub(super) async fn advanced_rate_limit_middleware(
             // Add Alt-Svc header to advertise HTTP/3
             add_alt_svc_to_response(&mut response, alt_svc.as_ref());
 
+            // A 429 is exactly the response an operator looks for in the log.
+            let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+            log_access(&AccessLogEntry {
+                remote_addr: client_addr,
+                method: &method,
+                path: &path,
+                protocol: protocol_str,
+                status: 429,
+                body_size: 0,
+                referer: header("referer"),
+                user_agent: header("user-agent"),
+                host: header("host"),
+                response_time_ms: 0,
+                ja3: header("x-ja3-hash"),
+                ja4: header("x-ja4-hash"),
+                backend: None,
+            });
             response
         }
         RateLimitResult::Blocked { reason } => {

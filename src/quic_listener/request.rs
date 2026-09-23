@@ -271,6 +271,18 @@ impl QuicListener {
                             "[QUIC/H3] Advanced rate limit exceeded for {} (reason: {:?})",
                             ip, reason
                         );
+                        log_h3_refusal(
+                            remote_addr,
+                            method,
+                            &path,
+                            host.as_deref(),
+                            referer,
+                            user_agent,
+                            fingerprint.ja3_hash.as_deref(),
+                            fingerprint.ja4_hash.as_deref(),
+                            start_time,
+                            429,
+                        );
                         metrics.requests.request_end_full(
                             429,
                             start_time.elapsed(),
@@ -315,6 +327,18 @@ impl QuicListener {
                         warn!(
                             "[QUIC/H3] Advanced rate limiter blocked {} (reason: {})",
                             ip, reason
+                        );
+                        log_h3_refusal(
+                            remote_addr,
+                            method,
+                            &path,
+                            host.as_deref(),
+                            referer,
+                            user_agent,
+                            fingerprint.ja3_hash.as_deref(),
+                            fingerprint.ja4_hash.as_deref(),
+                            start_time,
+                            403,
                         );
                         metrics.requests.request_end_full(
                             403,
@@ -369,6 +393,18 @@ impl QuicListener {
                     warn!(
                         "[QUIC/H3] security decision {:?} for {} {}",
                         decision, ip, path
+                    );
+                    log_h3_refusal(
+                        remote_addr,
+                        method,
+                        &path,
+                        host.as_deref(),
+                        referer,
+                        user_agent,
+                        fingerprint.ja3_hash.as_deref(),
+                        fingerprint.ja4_hash.as_deref(),
+                        start_time,
+                        rendering.status.as_u16(),
                     );
                     metrics.requests.request_end_full(
                         rendering.status.as_u16(),
@@ -748,6 +784,18 @@ impl QuicListener {
                         .header("x-ratelimit-remaining", "0")
                         .body(())?;
                     respond_and_finish(&mut stream, response).await?;
+                    log_h3_refusal(
+                        remote_addr,
+                        method,
+                        &path,
+                        host.as_deref(),
+                        referer,
+                        user_agent,
+                        fingerprint.ja3_hash.as_deref(),
+                        fingerprint.ja4_hash.as_deref(),
+                        start_time,
+                        429,
+                    );
                     metrics.requests.request_end_full(
                         429,
                         start_time.elapsed(),
@@ -1072,6 +1120,18 @@ impl QuicListener {
                         chunk.advance(bytes.len());
                     }
                     if body.len() > config.security.max_request_size {
+                        log_h3_refusal(
+                            remote_addr,
+                            method,
+                            &path,
+                            host.as_deref(),
+                            referer,
+                            user_agent,
+                            fingerprint.ja3_hash.as_deref(),
+                            fingerprint.ja4_hash.as_deref(),
+                            start_time,
+                            413,
+                        );
                         metrics.requests.request_end_full(
                             413,
                             start_time.elapsed(),
@@ -1092,6 +1152,18 @@ impl QuicListener {
                     // Stream-level error (flow-control, reset, etc.) — respond 500
                     // and return Ok so the QUIC connection stays alive for other streams.
                     debug!("QUIC recv_data error on {} {}: {}", method, path, e);
+                    log_h3_refusal(
+                        remote_addr,
+                        method,
+                        &path,
+                        host.as_deref(),
+                        referer,
+                        user_agent,
+                        fingerprint.ja3_hash.as_deref(),
+                        fingerprint.ja4_hash.as_deref(),
+                        start_time,
+                        500,
+                    );
                     metrics.requests.request_end_full(
                         500,
                         start_time.elapsed(),
@@ -1155,6 +1227,18 @@ impl QuicListener {
                 warn!(
                     "[QUIC/H3] WAF body decision {:?} for {} {}",
                     decision, ip, path
+                );
+                log_h3_refusal(
+                    remote_addr,
+                    method,
+                    &path,
+                    host.as_deref(),
+                    referer,
+                    user_agent,
+                    fingerprint.ja3_hash.as_deref(),
+                    fingerprint.ja4_hash.as_deref(),
+                    start_time,
+                    rendering.status.as_u16(),
                 );
                 metrics.requests.request_end_full(
                     rendering.status.as_u16(),
@@ -1920,4 +2004,38 @@ impl QuicListener {
 
         Ok(())
     }
+}
+
+/// Write the access-log line for a response the proxy refuses on its own —
+/// rate limit, block, WAF, oversize body — which never reaches the logging
+/// in the proxied path. These were missing from the log entirely on HTTP/3,
+/// so the responses an operator most needs to see were the ones not there.
+#[allow(clippy::too_many_arguments)]
+fn log_h3_refusal(
+    remote_addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    host: Option<&str>,
+    referer: Option<&str>,
+    user_agent: Option<&str>,
+    ja3: Option<&str>,
+    ja4: Option<&str>,
+    start: std::time::Instant,
+    status: u16,
+) {
+    log_access(&AccessLogEntry {
+        remote_addr,
+        method,
+        path,
+        protocol: "HTTP/3",
+        status,
+        body_size: 0,
+        referer,
+        user_agent,
+        host,
+        response_time_ms: start.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+        ja3,
+        ja4,
+        backend: None,
+    });
 }
