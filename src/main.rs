@@ -823,6 +823,9 @@ async fn run() -> anyhow::Result<()> {
     let quic_reload_senders: Arc<parking_lot::Mutex<Vec<mpsc::Sender<ConfigReloadEvent>>>> =
         Arc::default();
     let reload_quic_senders = quic_reload_senders.clone();
+    // Every TCP listener rebuilds its routes and middleware from each config
+    // this carries.
+    let (tcp_config_tx, tcp_config_rx) = tokio::sync::watch::channel(config.clone());
     let reload_security = security_state.clone();
     let reload_rate_limiter = shared_rate_limiter.clone();
 
@@ -871,6 +874,8 @@ async fn run() -> anyhow::Result<()> {
                     // [security], [rate_limiting] and [advanced_rate_limiting]
                     // are read per request, so they apply on the next one.
                     reload_security.apply_reloaded_config(&new_config);
+                    // TCP listeners: routes, backends, headers, middleware.
+                    let _ = tcp_config_tx.send(new_config.clone());
                     reload_rate_limiter.update_config(new_config.advanced_rate_limiting.clone());
                     info!("Security and rate-limit configuration updated");
                 }
@@ -1176,6 +1181,7 @@ async fn run() -> anyhow::Result<()> {
         let http_lb = shared_lb.clone();
         let http_security = security_state.clone();
         let http_rate_limiter = shared_rate_limiter.clone();
+        let http_config_updates = tcp_config_rx.clone();
         let http_resolver = std::sync::Arc::clone(&tls_provider.resolver);
 
         // Priority 1: PQC + TLS-layer fingerprinting (OpenSSL with ClientHello capture)
@@ -1204,6 +1210,7 @@ async fn run() -> anyhow::Result<()> {
                     http_sni_map,
                     http_security.clone(),
                     http_rate_limiter,
+                    http_config_updates,
                 )
                 .await
                 {
@@ -1239,6 +1246,7 @@ async fn run() -> anyhow::Result<()> {
                     Some(http_resolver),
                     http_security.clone(),
                     http_rate_limiter,
+                    http_config_updates,
                 )
                 .await
                 {
@@ -1273,6 +1281,7 @@ async fn run() -> anyhow::Result<()> {
                     http_sni_map,
                     http_security.clone(),
                     http_rate_limiter,
+                    http_config_updates,
                 )
                 .await
                 {
@@ -1298,6 +1307,7 @@ async fn run() -> anyhow::Result<()> {
                 http_lb,
                 http_security,
                 http_rate_limiter,
+                http_config_updates,
             )
             .await
             {

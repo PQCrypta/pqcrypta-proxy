@@ -398,6 +398,18 @@ applies on one path and not the other. The Tor list is fetched in the
 background and swapped in whole; a failed fetch keeps the previous list. The
 speed test reads the same two database paths.
 
+### Configuration reload
+
+`--watch-config` (file edits), `POST /reload`, and SIGHUP (which also reopens
+log files) all trigger the same reload. Every TCP listener rebuilds its routes,
+backend clients, headers, compression, cache and middleware chain from the new
+configuration and swaps them in atomically: the next request on any
+connection, including keep-alive connections already open, uses them, while a
+request in flight finishes on the configuration it started with. HTTP/3
+listeners, TLS and PQC settings, certificates, Early Hints, and the security
+and rate-limit settings are applied too. Bind addresses and ports need a
+restart.
+
 ### PROXY protocol
 
 ```toml

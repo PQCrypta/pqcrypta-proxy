@@ -742,37 +742,36 @@ impl LayerSelection {
     }
 }
 
-/// Create and run the HTTP listener with TLS termination
-#[allow(clippy::similar_names, clippy::too_many_arguments)]
-pub async fn run_http_listener(
-    addr: SocketAddr,
-    cert_path: &str,
-    key_path: &str,
-    config: Arc<ProxyConfig>,
+/// What a TCP listener's app is built from besides the configuration: the
+/// process-wide shared state, and the fingerprint extractor its TLS acceptor
+/// feeds. Kept across rebuilds.
+#[derive(Clone)]
+struct AppParts {
+    port: u16,
     metrics: Arc<MetricsRegistry>,
     load_balancer: Arc<LoadBalancer>,
-    // The process-wide security state, constructed once in `main`. This used to be
-    // built here, which meant every listener had its own blocklist, its own
-    // suspicious-pattern counters and its own rate buckets — a source blocked on one
-    // port began clean on the next — and the startup attestation could only ever probe
-    // a further instance that served nobody. One instance, shared.
     security_state: SecurityState,
-    // One limiter for the whole process, like `security_state`: a limiter per
-    // listener gave a client a separate budget on every port and protocol.
-    advanced_rate_limiter: Arc<AdvancedRateLimiter>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Read once here: `config` is moved into builders further down in
-    // several of these functions.
-    let port = addr.port();
+    rate_limiter: Arc<AdvancedRateLimiter>,
+    fingerprint_extractor: Arc<FingerprintExtractor>,
+}
 
-    info!(
-        "🌐 Starting HTTP/1.1 & HTTP/2 reverse proxy on {} (TCP)",
-        addr
-    );
-    info!("📢 Will advertise Alt-Svc: h3=\":{}\"; ma=86400", port);
-
-    // Create HTTP client for plain backend connections (terminate mode)
-    // Using configurable connection pool settings
+/// Build a TCP listener's whole request-handling app from `config`: backend
+/// clients, routes, headers, and the middleware chain. The four listener
+/// kinds each carried their own copy of this; there is one now, which is also
+/// what a reload rebuilds.
+fn build_listener_app(
+    config: &Arc<ProxyConfig>,
+    parts: &AppParts,
+) -> impl tower::Service<
+    Request<Body>,
+    Response = Response,
+    Error = Infallible,
+    Future = impl Future<Output = Result<Response, Infallible>> + Send + 'static,
+> + Clone
+       + Send
+       + Sync
+       + 'static {
+    let config = config.clone();
     let pool_config = &config.connection_pool;
     // TCP_NODELAY on backend connections. hyper's default connector leaves Nagle
     // enabled, which is the wrong trade for a reverse proxy: a proxied request is
@@ -810,14 +809,14 @@ pub async fn run_http_listener(
         .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
         .build(https_connector);
 
-    // Security state is constructed once in main and shared across every listener and
-    // the startup attestation; see the parameter's documentation.
-
-    // Initialize fingerprint extractor for JA3/JA4 tracking
-    let fingerprint_extractor = Arc::new(FingerprintExtractor::new());
-
-    // Initialize advanced multi-dimensional rate limiter
-    let rate_limiter = advanced_rate_limiter;
+    let AppParts {
+        port,
+        metrics,
+        load_balancer,
+        security_state,
+        rate_limiter,
+        fingerprint_extractor,
+    } = parts.clone();
     let state_metrics = metrics.clone();
     let alt_svc_value = layers::alt_svc_header_value(port, &config);
     let rl_state = layers::RateLimitLayer {
@@ -837,7 +836,7 @@ pub async fn run_http_listener(
         conformance: crate::conformance::shared(&config.conformance),
         config: config.clone(),
         port,
-        alt_svc_value: alt_svc_value.clone(),
+        alt_svc_value,
         response_headers: Arc::new(layers::ResponseHeaderSet::from_config(&config.headers)),
         server_header_value: server_header_value(&config),
         webtransport_port_value: HeaderValue::from_str(&port.to_string())
@@ -888,7 +887,7 @@ pub async fn run_http_listener(
         None
     };
 
-    let app = build_proxy_service(
+    build_proxy_service(
         &state,
         response_cache,
         compression_state,
@@ -896,6 +895,131 @@ pub async fn run_http_listener(
         Arc::new(security_state),
         fingerprint_state,
         rl_state,
+    )
+}
+
+/// A service whose implementation can be replaced while it serves.
+///
+/// Cloning takes the current snapshot, and hyper clones the service for every
+/// request, so a new app is picked up by the next request on every connection
+/// — including keep-alive connections already open — while requests in flight
+/// finish on the one they started with. No connection is dropped.
+struct Swappable<S> {
+    cell: Arc<arc_swap::ArcSwap<S>>,
+    current: S,
+}
+
+impl<S: Clone> Clone for Swappable<S> {
+    fn clone(&self) -> Self {
+        Self {
+            cell: self.cell.clone(),
+            current: (**self.cell.load()).clone(),
+        }
+    }
+}
+
+impl<S> tower::Service<Request<Body>> for Swappable<S>
+where
+    S: tower::Service<Request<Body>, Response = Response, Error = Infallible>,
+{
+    type Response = Response;
+    type Error = Infallible;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), Infallible>> {
+        self.current.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<Body>) -> Self::Future {
+        self.current.call(req)
+    }
+}
+
+/// The listener's app, rebuilt from every configuration `updates` delivers:
+/// routes, backends, headers, compression, cache and middleware all follow a
+/// reload. The bind address, ports and TLS listener kind are fixed at start.
+fn reloadable_app(
+    config: &Arc<ProxyConfig>,
+    parts: AppParts,
+    mut updates: watch::Receiver<Arc<ProxyConfig>>,
+) -> Swappable<
+    impl tower::Service<
+            Request<Body>,
+            Response = Response,
+            Error = Infallible,
+            Future = impl Future<Output = Result<Response, Infallible>> + Send + 'static,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+> {
+    let first = build_listener_app(config, &parts);
+    let cell = Arc::new(arc_swap::ArcSwap::from_pointee(first.clone()));
+    let swap = cell.clone();
+    let port = parts.port;
+    tokio::spawn(async move {
+        // Mark the configuration we started with as seen.
+        updates.borrow_and_update();
+        while updates.changed().await.is_ok() {
+            let config = updates.borrow_and_update().clone();
+            swap.store(Arc::new(build_listener_app(&config, &parts)));
+            info!(
+                "TCP listener on port {}: routes and middleware reloaded",
+                port
+            );
+        }
+    });
+    Swappable {
+        cell,
+        current: first,
+    }
+}
+
+/// Create and run the HTTP listener with TLS termination
+#[allow(clippy::similar_names, clippy::too_many_arguments)]
+pub async fn run_http_listener(
+    addr: SocketAddr,
+    cert_path: &str,
+    key_path: &str,
+    config: Arc<ProxyConfig>,
+    metrics: Arc<MetricsRegistry>,
+    load_balancer: Arc<LoadBalancer>,
+    // The process-wide security state, constructed once in `main`. This used to be
+    // built here, which meant every listener had its own blocklist, its own
+    // suspicious-pattern counters and its own rate buckets — a source blocked on one
+    // port began clean on the next — and the startup attestation could only ever probe
+    // a further instance that served nobody. One instance, shared.
+    security_state: SecurityState,
+    // One limiter for the whole process, like `security_state`: a limiter per
+    // listener gave a client a separate budget on every port and protocol.
+    advanced_rate_limiter: Arc<AdvancedRateLimiter>,
+    // Every reloaded configuration; the listener rebuilds its app from each.
+    config_updates: watch::Receiver<Arc<ProxyConfig>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Read once here: `config` is moved into builders further down in
+    // several of these functions.
+    let port = addr.port();
+
+    info!(
+        "🌐 Starting HTTP/1.1 & HTTP/2 reverse proxy on {} (TCP)",
+        addr
+    );
+    info!("📢 Will advertise Alt-Svc: h3=\":{}\"; ma=86400", port);
+
+    // Create HTTP client for plain backend connections (terminate mode)
+    // Using configurable connection pool settings
+    let fingerprint_extractor = Arc::new(FingerprintExtractor::new());
+    let app = reloadable_app(
+        &config,
+        AppParts {
+            port,
+            metrics,
+            load_balancer,
+            security_state: security_state.clone(),
+            rate_limiter: advanced_rate_limiter,
+            fingerprint_extractor: fingerprint_extractor.clone(),
+        },
+        config_updates,
     );
 
     // Build TLS config using the per-domain SNI resolver (no single cert required)
@@ -948,6 +1072,8 @@ pub async fn run_http_listener_pqc(
     // One limiter for the whole process, like `security_state`: a limiter per
     // listener gave a client a separate budget on every port and protocol.
     advanced_rate_limiter: Arc<AdvancedRateLimiter>,
+    // Every reloaded configuration; the listener rebuilds its app from each.
+    config_updates: watch::Receiver<Arc<ProxyConfig>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Read once here: `config` is moved into builders further down in
     // several of these functions.
@@ -961,127 +1087,18 @@ pub async fn run_http_listener_pqc(
 
     // Create HTTP client for plain backend connections (terminate mode)
     // Using configurable connection pool settings
-    let pool_config = &config.connection_pool;
-    // TCP_NODELAY on backend connections. hyper's default connector leaves Nagle
-    // enabled, which is the wrong trade for a reverse proxy: a proxied request is
-    // a small write followed by a wait for the reply, so Nagle holds the write
-    // looking for more data that is never coming while the backend's delayed ACK
-    // holds the other side. Measured against a local backend, mean request
-    // latency was 917us with it left on.
-    let mut backend_connector = HttpConnector::new();
-    backend_connector.set_nodelay(true);
-    let http_client = Client::builder(TokioExecutor::new())
-        .pool_max_idle_per_host(pool_config.max_idle_per_host)
-        .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
-        .build(backend_connector);
-
-    // Client with pooling disabled, for backends configured with disable_pooling = true.
-    // pool_max_idle_per_host(0) means a connection is never returned to the pool
-    // after a response completes, so every request pays for a fresh connection.
-    let mut direct_connector = HttpConnector::new();
-    direct_connector.set_nodelay(true);
-    let direct_client = Client::builder(TokioExecutor::new())
-        .pool_max_idle_per_host(0)
-        .build(direct_connector);
-
-    // Create HTTPS client for re-encrypt mode
-    let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_native_roots()
-        .expect("Failed to load native root certificates")
-        .https_or_http()
-        .enable_http1()
-        .enable_http2()
-        .build();
-
-    let https_client = Client::builder(TokioExecutor::new())
-        .pool_max_idle_per_host(pool_config.max_idle_per_host)
-        .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
-        .build(https_connector);
-
-    // Initialize security state from config (must be created before state)
-
-    // Initialize fingerprint extractor for JA3/JA4 tracking
     let fingerprint_extractor = Arc::new(FingerprintExtractor::new());
-
-    // Initialize advanced multi-dimensional rate limiter
-    let rate_limiter = advanced_rate_limiter;
-    let state_metrics = metrics.clone();
-    let alt_svc_value = layers::alt_svc_header_value(port, &config);
-    let rl_state = layers::RateLimitLayer {
-        limiter: rate_limiter.clone(),
-        metrics,
-        alt_svc: alt_svc_value.clone(),
-        refusal_cors_origins: config.security.refusal_cors_origins.clone().into(),
-    };
-    if config.advanced_rate_limiting.enabled {
-        info!(
-            "🚦 Advanced rate limiter enabled (key strategy: {:?})",
-            config.advanced_rate_limiting.key_strategy.order.first()
-        );
-    }
-
-    let state = HttpListenerState {
-        conformance: crate::conformance::shared(&config.conformance),
-        config: config.clone(),
-        port,
-        alt_svc_value: alt_svc_value.clone(),
-        response_headers: Arc::new(layers::ResponseHeaderSet::from_config(&config.headers)),
-        server_header_value: server_header_value(&config),
-        webtransport_port_value: HeaderValue::from_str(&port.to_string())
-            .unwrap_or_else(|_| HeaderValue::from_static("443")),
-        http_client: Arc::new(http_client),
-        https_client: Arc::new(https_client),
-        direct_client: Arc::new(direct_client),
-        security: Arc::new(security_state.clone()),
-        fingerprint: fingerprint_extractor.clone(),
-        load_balancer,
-        metrics: state_metrics,
-        rate_limiter,
-    };
-
-    // axum clones `State<T>` for the handler and again for every middleware
-    // layer that takes it, so the struct was being copied field-by-field several
-    // times per request. One `Arc` makes each of those a refcount bump; field
-    // access is unchanged through `Deref`.
-    let state = Arc::new(state);
-
-    // Initialize compression state
-    let compression_state = CompressionState {
-        config: config.compression.clone(),
-    };
-
-    // Initialize HTTP/3 features state (Early Hints, Priority, Coalescing)
-    let http3_features_state = Http3FeaturesState::from_proxy_config(&config.http3);
-
-    // Initialize response cache
-    let response_cache = crate::cache::shared(&config.cache);
-    if config.cache.enabled {
-        info!(
-            "💾 Response cache enabled (max {}MiB, default TTL {}s)",
-            config.cache.max_size_mb, config.cache.default_ttl_secs
-        );
-    }
-
-    // Initialize fingerprint middleware state (if enabled)
-    let fingerprint_state = if config.fingerprint.enabled {
-        info!("🔍 TLS fingerprinting middleware enabled (PQC mode)");
-        Some(FingerprintMiddlewareState::new(
-            fingerprint_extractor,
-            security_state.clone(),
-            Arc::new(config.fingerprint.clone()),
-        ))
-    } else {
-        None
-    };
-
-    let app = build_proxy_service(
-        &state,
-        response_cache,
-        compression_state,
-        http3_features_state,
-        Arc::new(security_state),
-        fingerprint_state,
-        rl_state,
+    let app = reloadable_app(
+        &config,
+        AppParts {
+            port,
+            metrics,
+            load_balancer,
+            security_state: security_state.clone(),
+            rate_limiter: advanced_rate_limiter,
+            fingerprint_extractor: fingerprint_extractor.clone(),
+        },
+        config_updates,
     );
 
     // =========================================================================
@@ -1195,6 +1212,7 @@ pub async fn run_http_listener_with_fingerprint(
     load_balancer: Arc<LoadBalancer>,
     security_state: SecurityState,
     advanced_rate_limiter: Arc<AdvancedRateLimiter>,
+    config_updates: watch::Receiver<Arc<ProxyConfig>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     run_http_listener_with_fingerprint_and_resolver(
         addr,
@@ -1207,6 +1225,7 @@ pub async fn run_http_listener_with_fingerprint(
         None,
         security_state,
         advanced_rate_limiter,
+        config_updates,
     )
     .await
 }
@@ -1234,6 +1253,8 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
     // One limiter for the whole process, like `security_state`: a limiter per
     // listener gave a client a separate budget on every port and protocol.
     advanced_rate_limiter: Arc<AdvancedRateLimiter>,
+    // Every reloaded configuration; the listener rebuilds its app from each.
+    config_updates: watch::Receiver<Arc<ProxyConfig>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Read once here: `config` is moved into builders further down in
     // several of these functions.
@@ -1251,123 +1272,19 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
     info!("📢 Will advertise Alt-Svc: h3=\":{}\"; ma=86400", port);
 
     // Create HTTP client for plain backend connections (terminate mode)
-    let pool_config = &config.connection_pool;
-    // TCP_NODELAY on backend connections. hyper's default connector leaves Nagle
-    // enabled, which is the wrong trade for a reverse proxy: a proxied request is
-    // a small write followed by a wait for the reply, so Nagle holds the write
-    // looking for more data that is never coming while the backend's delayed ACK
-    // holds the other side. Measured against a local backend, mean request
-    // latency was 917us with it left on.
-    let mut backend_connector = HttpConnector::new();
-    backend_connector.set_nodelay(true);
-    let http_client = Client::builder(TokioExecutor::new())
-        .pool_max_idle_per_host(pool_config.max_idle_per_host)
-        .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
-        .build(backend_connector);
-
-    // Client with pooling disabled, for backends configured with disable_pooling = true.
-    // pool_max_idle_per_host(0) means a connection is never returned to the pool
-    // after a response completes, so every request pays for a fresh connection.
-    let mut direct_connector = HttpConnector::new();
-    direct_connector.set_nodelay(true);
-    let direct_client = Client::builder(TokioExecutor::new())
-        .pool_max_idle_per_host(0)
-        .build(direct_connector);
-
-    // Create HTTPS client for re-encrypt mode
-    let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_native_roots()
-        .expect("Failed to load native root certificates")
-        .https_or_http()
-        .enable_http1()
-        .enable_http2()
-        .build();
-
-    let https_client = Client::builder(TokioExecutor::new())
-        .pool_max_idle_per_host(pool_config.max_idle_per_host)
-        .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
-        .build(https_connector);
-
-    // Initialize security state from config
-
-    // Initialize fingerprint extractor for JA3/JA4 tracking
     let fingerprint_extractor = Arc::new(FingerprintExtractor::new());
-
-    // Initialize advanced multi-dimensional rate limiter
-    let rate_limiter = advanced_rate_limiter;
     let conn_metrics = metrics.clone();
-    let state_metrics = metrics.clone();
-    let alt_svc_value = layers::alt_svc_header_value(port, &config);
-    let rl_state = layers::RateLimitLayer {
-        limiter: rate_limiter.clone(),
-        metrics,
-        alt_svc: alt_svc_value.clone(),
-        refusal_cors_origins: config.security.refusal_cors_origins.clone().into(),
-    };
-    if config.advanced_rate_limiting.enabled {
-        info!(
-            "🚦 Advanced rate limiter enabled (key strategy: {:?})",
-            config.advanced_rate_limiting.key_strategy.order.first()
-        );
-    }
-
-    let state = HttpListenerState {
-        conformance: crate::conformance::shared(&config.conformance),
-        config: config.clone(),
-        port,
-        alt_svc_value: alt_svc_value.clone(),
-        response_headers: Arc::new(layers::ResponseHeaderSet::from_config(&config.headers)),
-        server_header_value: server_header_value(&config),
-        webtransport_port_value: HeaderValue::from_str(&port.to_string())
-            .unwrap_or_else(|_| HeaderValue::from_static("443")),
-        http_client: Arc::new(http_client),
-        https_client: Arc::new(https_client),
-        direct_client: Arc::new(direct_client),
-        security: Arc::new(security_state.clone()),
-        fingerprint: fingerprint_extractor.clone(),
-        load_balancer,
-        metrics: state_metrics,
-        rate_limiter: rate_limiter.clone(),
-    };
-
-    // axum clones `State<T>` for the handler and again for every middleware
-    // layer that takes it, so the struct was being copied field-by-field several
-    // times per request. One `Arc` makes each of those a refcount bump; field
-    // access is unchanged through `Deref`.
-    let state = Arc::new(state);
-
-    // Initialize compression state
-    let compression_state = CompressionState {
-        config: config.compression.clone(),
-    };
-
-    // Initialize HTTP/3 features state
-    let http3_features_state = Http3FeaturesState::from_proxy_config(&config.http3);
-
-    // Initialize response cache
-    let response_cache = crate::cache::shared(&config.cache);
-    if config.cache.enabled {
-        info!(
-            "💾 Response cache enabled (max {}MiB, default TTL {}s)",
-            config.cache.max_size_mb, config.cache.default_ttl_secs
-        );
-    }
-
-    // Initialize fingerprint middleware state
-    let fingerprint_state = FingerprintMiddlewareState::new(
-        fingerprint_extractor.clone(),
-        security_state.clone(),
-        Arc::new(config.fingerprint.clone()),
-    );
-
-    let app = build_proxy_service(
-        &state,
-        response_cache,
-        compression_state,
-        http3_features_state,
-        Arc::new(security_state.clone()),
-        Some(fingerprint_state),
-        rl_state,
+    let app = reloadable_app(
+        &config,
+        AppParts {
+            port,
+            metrics,
+            load_balancer,
+            security_state: security_state.clone(),
+            rate_limiter: advanced_rate_limiter,
+            fingerprint_extractor: fingerprint_extractor.clone(),
+        },
+        config_updates,
     );
 
     // Build rustls server config (h2 + http/1.1).
@@ -1709,6 +1626,8 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     // One limiter for the whole process, like `security_state`: a limiter per
     // listener gave a client a separate budget on every port and protocol.
     advanced_rate_limiter: Arc<AdvancedRateLimiter>,
+    // Every reloaded configuration; the listener rebuilds its app from each.
+    config_updates: watch::Receiver<Arc<ProxyConfig>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Read once here: `config` is moved into builders further down in
     // several of these functions.
@@ -1729,120 +1648,19 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     info!("📢 Will advertise Alt-Svc: h3=\":{}\"; ma=86400", port);
 
     // Create HTTP client for plain backend connections
-    let pool_config = &config.connection_pool;
-    // TCP_NODELAY on backend connections. hyper's default connector leaves Nagle
-    // enabled, which is the wrong trade for a reverse proxy: a proxied request is
-    // a small write followed by a wait for the reply, so Nagle holds the write
-    // looking for more data that is never coming while the backend's delayed ACK
-    // holds the other side. Measured against a local backend, mean request
-    // latency was 917us with it left on.
-    let mut backend_connector = HttpConnector::new();
-    backend_connector.set_nodelay(true);
-    let http_client = Client::builder(TokioExecutor::new())
-        .pool_max_idle_per_host(pool_config.max_idle_per_host)
-        .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
-        .build(backend_connector);
-
-    // Client with pooling disabled, for backends configured with disable_pooling = true.
-    // pool_max_idle_per_host(0) means a connection is never returned to the pool
-    // after a response completes, so every request pays for a fresh connection.
-    let mut direct_connector = HttpConnector::new();
-    direct_connector.set_nodelay(true);
-    let direct_client = Client::builder(TokioExecutor::new())
-        .pool_max_idle_per_host(0)
-        .build(direct_connector);
-
-    // Create HTTPS client for re-encrypt mode
-    let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_native_roots()
-        .expect("Failed to load native root certificates")
-        .https_or_http()
-        .enable_http1()
-        .enable_http2()
-        .build();
-
-    let https_client = Client::builder(TokioExecutor::new())
-        .pool_max_idle_per_host(pool_config.max_idle_per_host)
-        .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
-        .build(https_connector);
-
-    // Initialize security state
-
-    // Initialize fingerprint extractor
     let fingerprint_extractor = Arc::new(FingerprintExtractor::new());
-
-    // Initialize rate limiter
-    let rate_limiter = advanced_rate_limiter;
     let conn_metrics = metrics.clone();
-    let state_metrics = metrics.clone();
-    let alt_svc_value = layers::alt_svc_header_value(port, &config);
-    let rl_state = layers::RateLimitLayer {
-        limiter: rate_limiter.clone(),
-        metrics,
-        alt_svc: alt_svc_value.clone(),
-        refusal_cors_origins: config.security.refusal_cors_origins.clone().into(),
-    };
-    if config.advanced_rate_limiting.enabled {
-        info!(
-            "🚦 Advanced rate limiter enabled (key strategy: {:?})",
-            config.advanced_rate_limiting.key_strategy.order.first()
-        );
-    }
-
-    let state = HttpListenerState {
-        conformance: crate::conformance::shared(&config.conformance),
-        config: config.clone(),
-        port,
-        alt_svc_value: alt_svc_value.clone(),
-        response_headers: Arc::new(layers::ResponseHeaderSet::from_config(&config.headers)),
-        server_header_value: server_header_value(&config),
-        webtransport_port_value: HeaderValue::from_str(&port.to_string())
-            .unwrap_or_else(|_| HeaderValue::from_static("443")),
-        http_client: Arc::new(http_client),
-        https_client: Arc::new(https_client),
-        direct_client: Arc::new(direct_client),
-        security: Arc::new(security_state.clone()),
-        fingerprint: fingerprint_extractor.clone(),
-        load_balancer,
-        metrics: state_metrics,
-        rate_limiter,
-    };
-
-    // axum clones `State<T>` for the handler and again for every middleware
-    // layer that takes it, so the struct was being copied field-by-field several
-    // times per request. One `Arc` makes each of those a refcount bump; field
-    // access is unchanged through `Deref`.
-    let state = Arc::new(state);
-
-    // Initialize middleware states
-    let compression_state = CompressionState {
-        config: config.compression.clone(),
-    };
-    let http3_features_state = Http3FeaturesState::from_proxy_config(&config.http3);
-
-    // Initialize response cache
-    let response_cache = crate::cache::shared(&config.cache);
-    if config.cache.enabled {
-        info!(
-            "💾 Response cache enabled (max {}MiB, default TTL {}s)",
-            config.cache.max_size_mb, config.cache.default_ttl_secs
-        );
-    }
-
-    let fingerprint_state = FingerprintMiddlewareState::new(
-        fingerprint_extractor.clone(),
-        security_state.clone(),
-        Arc::new(config.fingerprint.clone()),
-    );
-
-    let app = build_proxy_service(
-        &state,
-        response_cache,
-        compression_state,
-        http3_features_state,
-        Arc::new(security_state.clone()),
-        Some(fingerprint_state),
-        rl_state,
+    let app = reloadable_app(
+        &config,
+        AppParts {
+            port,
+            metrics,
+            load_balancer,
+            security_state: security_state.clone(),
+            rate_limiter: advanced_rate_limiter,
+            fingerprint_extractor: fingerprint_extractor.clone(),
+        },
+        config_updates,
     );
 
     // Create OpenSSL PQC acceptor with SNI multi-domain support.
