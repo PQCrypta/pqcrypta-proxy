@@ -898,7 +898,9 @@ pub fn score(test: &'static Test, ev: &Evidence) -> (Verdict, String, Option<&'s
 ///
 /// So the pipeline is now
 ///
-///     client run -> observations -> stored evidence -> oracle(v) -> verdict
+/// ```text
+/// client run -> observations -> stored evidence -> oracle(v) -> verdict
+/// ```
 ///
 /// and the verdict is derived. An oracle-only correction no longer needs a
 /// rerun **where the evidence it consults was persisted** -- which is the
