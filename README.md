@@ -591,15 +591,10 @@ blocked_countries = ["CN", "RU", "KP"]
 requests_per_second = 100
 burst_size = 200
 
-[security]
-auto_block_threshold = 10           # suspicious patterns before an IP is blocked
-auto_block_duration_secs = 300      # how long that block lasts
-max_connections_per_ip = 100
-
-[security.circuit_breaker]
+[circuit_breaker]                   # top-level, not under [security]
 failure_threshold = 5
 success_threshold = 2
-timeout_secs = 30
+half_open_delay_secs = 30           # open -> half-open after this long
 ```
 
 ### Advanced Rate Limiting Configuration
@@ -926,6 +921,7 @@ Each audit event is a JSON object with `timestamp`, `level`, `category`, and eve
 ```toml
 [backends.api]
 name = "api"
+type = "http1"
 address = "127.0.0.1:3003"
 retries = 3                                        # default 3
 retry_backoff_ms = 50                              # initial backoff; doubles each attempt
@@ -937,6 +933,7 @@ retry_on = ["connect-failure", "5xx", "timeout"]   # default: connect-failure + 
 ```toml
 [backends.critical-api]
 name = "critical-api"
+type = "http1"
 address = "127.0.0.1:4000"
 
 [backends.critical-api.circuit_breaker]
@@ -1102,6 +1099,10 @@ priority = 100
 Canary routing lets you ship a new server version to a small percentage of traffic while stable servers handle the rest. The configuration lives in a `[backend_pools.NAME.canary]` subsection placed **before** the first `[[NAME.servers]]` entry. Canary routing is active on **all transport protocols**: HTTP/1.1, HTTP/2, and HTTP/3/QUIC.
 
 ```toml
+[backend_pools.api-pool]
+name = "api-pool"
+algorithm = "weighted_round_robin"
+
 # Pool-level canary settings — place before [[servers]] entries
 [backend_pools.api-pool.canary]
 enabled                = true               # activate canary routing
@@ -2032,13 +2033,10 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 
 ### Benchmarking
 
-```bash
-# Run benchmarks
-cargo bench
-
-# Test QUIC throughput
-cargo run --release --bin quic-bench -- --target localhost:443
-```
+The throughput comparison against HAProxy, the instructions-per-request A/B
+used for optimisation work, and the handshake benchmarks live in
+`benchmarks/` as scripts, not `cargo bench` targets; `benchmarks/README.md`
+describes the rig and the traps it guards against.
 
 ## Security
 
@@ -2143,8 +2141,11 @@ Per-subject JWT rate limiting verifies the token's HMAC-SHA256 signature before 
 
 ```toml
 [advanced_rate_limiting]
-key_strategy = "jwt_subject"
 jwt_secret = "your-hmac-sha256-secret-at-least-32-bytes"
+jwt_algorithms = ["HS256"]
+
+[advanced_rate_limiting.key_strategy]
+order = ["jwt_subject", "source_ip"]
 ```
 
 Without `jwt_secret`, the `jwt_subject` strategy is disabled and falls back to the next configured key strategy.
@@ -2175,6 +2176,7 @@ PQCRYPTA_ENV=development pqcrypta-proxy --config config.toml
 # Only valid when PQCRYPTA_ENV=development and acme.enabled = false
 [backends.dev-backend]
 name = "dev-backend"
+type = "http1"
 tls_mode = "reencrypt"
 address = "localhost:8443"
 tls_skip_verify = true

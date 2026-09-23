@@ -407,7 +407,13 @@ pub struct PreloadResourceConfig {
     pub path: String,
     /// Resource href (e.g. "/css/style.css")
     pub href: String,
-    /// Resource type for the `as=` attribute (style, script, font, image, etc.)
+    /// Link relation: "preload" (default), "modulepreload", "preconnect",
+    /// "dns-prefetch" or "prerender".
+    #[serde(default = "default_preload_rel")]
+    pub rel: String,
+    /// Resource type for the `as=` attribute (style, script, font, image, etc.).
+    /// Required for `rel = "preload"`, ignored by the others.
+    #[serde(default)]
     pub as_type: String,
     /// Optional crossorigin attribute value
     #[serde(default)]
@@ -1068,6 +1074,10 @@ fn default_scanner_ua_exempt_paths() -> Vec<String> {
     .iter()
     .map(|s| (*s).to_string())
     .collect()
+}
+
+fn default_preload_rel() -> String {
+    "preload".to_string()
 }
 
 fn default_server_header() -> String {
@@ -3301,6 +3311,25 @@ impl ProxyConfig {
                 ));
             }
             Some(_) => {}
+        }
+
+        for (i, r) in self.http3.preload_resources.iter().enumerate() {
+            match r.rel.as_str() {
+                "preload" if r.as_type.is_empty() => {
+                    return Err(anyhow::anyhow!(
+                        "http3.preload_resources[{i}] ({}): rel = \"preload\" needs as_type",
+                        r.href
+                    ));
+                }
+                "preload" | "modulepreload" | "preconnect" | "dns-prefetch" | "prerender" => {}
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "http3.preload_resources[{i}] ({}): rel {other:?} is not one of \
+                         preload, modulepreload, preconnect, dns-prefetch, prerender",
+                        r.href
+                    ));
+                }
+            }
         }
 
         if !matches!(self.http_redirect.redirect_status, 301 | 302 | 307 | 308) {

@@ -36,7 +36,6 @@ admin-api = ["tower-http"]
 # ACME certificate automation (works with any ACME CA: Let's Encrypt, ZeroSSL, Buypass, etc.)
 acme = ["instant-acme"]
 # Windows service support
-windows-service = ["windows-service-rs"]
 # SEC-006: Legacy pre-NIST Kyber768 support (disabled by default).
 # Enables Kyber768 and X25519Kyber768 for backward compatibility with deployments
 # that have not yet migrated to the finalised ML-KEM (FIPS 203) standard.
@@ -227,7 +226,6 @@ hyper-rustls = { version = "0.27", features = ["http1", "http2", "native-tokio",
 tokio-rustls = "0.26"
 
 # Windows service (optional)
-windows-service-rs = { version = "0.7", package = "windows-service", optional = true }
 
 # Temporary files (cross-platform)
 tempfile = "3.14"

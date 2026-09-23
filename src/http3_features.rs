@@ -101,6 +101,24 @@ pub enum LinkHint {
 }
 
 impl LinkHint {
+    /// The hint a `[[http3.preload_resources]]` entry describes. `rel` is
+    /// checked at config load, so anything unrecognised here is `preload`.
+    pub fn from_config(res: &crate::config::PreloadResourceConfig) -> Self {
+        let href = res.href.clone();
+        let crossorigin = res.crossorigin.clone();
+        match res.rel.as_str() {
+            "modulepreload" => LinkHint::ModulePreload { href, crossorigin },
+            "preconnect" => LinkHint::Preconnect { href, crossorigin },
+            "dns-prefetch" => LinkHint::DnsPrefetch { href },
+            "prerender" => LinkHint::Prerender { href },
+            _ => LinkHint::Preload {
+                href,
+                as_type: res.as_type.clone(),
+                crossorigin,
+            },
+        }
+    }
+
     /// Convert to Link header value
     pub fn to_link_header(&self) -> String {
         match self {
@@ -169,11 +187,7 @@ impl EarlyHintsState {
             by_key
                 .entry((res.host.clone(), res.path.clone(), res.exact))
                 .or_default()
-                .push(LinkHint::Preload {
-                    href: res.href.clone(),
-                    as_type: res.as_type.clone(),
-                    crossorigin: res.crossorigin.clone(),
-                });
+                .push(LinkHint::from_config(res));
         }
         let preload_rules: Vec<PreloadRule> = by_key
             .into_iter()
@@ -885,6 +899,31 @@ pub async fn early_hints_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_rel_is_reachable_from_config() {
+        let res = |rel: &str, as_type: &str| crate::config::PreloadResourceConfig {
+            host: None,
+            path: "/".into(),
+            href: "/m.js".into(),
+            rel: rel.into(),
+            as_type: as_type.into(),
+            crossorigin: None,
+            exact: false,
+        };
+        let h = |rel, as_type| LinkHint::from_config(&res(rel, as_type)).to_link_header();
+        assert_eq!(h("preload", "script"), "</m.js>; rel=preload; as=script");
+        assert_eq!(h("modulepreload", ""), "</m.js>; rel=modulepreload");
+        assert_eq!(h("preconnect", ""), "</m.js>; rel=preconnect");
+        assert_eq!(h("dns-prefetch", ""), "</m.js>; rel=dns-prefetch");
+        assert_eq!(h("prerender", ""), "</m.js>; rel=prerender");
+
+        let mut c = crate::config::ProxyConfig::default();
+        c.http3.preload_resources = vec![res("prefetch", "")];
+        assert!(c.validate().unwrap_err().to_string().contains("rel"));
+        c.http3.preload_resources = vec![res("preload", "")];
+        assert!(c.validate().unwrap_err().to_string().contains("as_type"));
+    }
 
     #[test]
     fn test_link_hint_to_header() {
