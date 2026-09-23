@@ -15,6 +15,10 @@ bind_address = "0.0.0.0"
 # Server header on every response (default "pqcrypta", no version). "" passes
 # the backend's own Server header through, as HAProxy and NGINX do.
 server_header = "pqcrypta"
+# Load balancers that front this proxy with a PROXY protocol header (v1 or v2).
+# A connection from one must send it; other peers are never parsed. [] = off.
+proxy_protocol_trusted = []
+proxy_protocol_timeout_ms = 3000
 # Per-request ID header sent to the backend and echoed to the client, on every
 # transport. A well-formed client-supplied ID is kept; otherwise 128 random bits
 # in hex. "" (default) turns it off.

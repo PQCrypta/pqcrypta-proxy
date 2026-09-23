@@ -199,34 +199,128 @@ impl tower::Service<Request<Body>> for ProxyDispatch {
     }
 }
 
-/// Route one request. `Host` and `ConnectInfo` were extractor arguments while
-/// this went through the Router; they are run by hand here so `proxy_handler`
-/// keeps its signature.
-/// An `axum_server` acceptor that applies `TCP_NODELAY` when the configuration
-/// asks for it.
+/// The accepting side of every `axum_server` TCP listener: `TCP_NODELAY` when
+/// configured, and the PROXY protocol header from a trusted load balancer.
 ///
-/// `axum_server` ships `DefaultAcceptor` (never sets it) and `NoDelayAcceptor`
-/// (always sets it) as two distinct types, which would make the choice a branch
-/// over two different `Server` types at every call site. One type carrying the
-/// flag keeps that to a value.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ConfigurableNoDelay(pub(crate) bool);
+/// A peer in `server.proxy_protocol_trusted` must open with a PROXY header,
+/// v1 or v2 — as with HAProxy's `accept-proxy`, a connection without one is
+/// refused — and the address it names becomes the client address everywhere
+/// downstream. Any other peer is never parsed for one, so a client cannot
+/// claim an address by sending a header of its own.
+#[derive(Clone)]
+pub(crate) struct TcpAcceptor {
+    nodelay: bool,
+    proxy_trusted: Arc<[ipnet::IpNet]>,
+    proxy_timeout: std::time::Duration,
+}
 
-impl<S> Accept<tokio::net::TcpStream, S> for ConfigurableNoDelay {
-    type Stream = tokio::net::TcpStream;
-    type Service = S;
-    type Future = std::future::Ready<std::io::Result<(Self::Stream, Self::Service)>>;
-
-    fn accept(&self, stream: Self::Stream, service: S) -> Self::Future {
-        if self.0 {
-            if let Err(e) = stream.set_nodelay(true) {
-                warn!("Failed to set TCP_NODELAY on an accepted socket: {}", e);
-            }
+impl TcpAcceptor {
+    fn new(config: &ProxyConfig) -> Self {
+        Self {
+            nodelay: config.server.tcp_nodelay,
+            proxy_trusted: config.server.proxy_protocol_trusted.clone().into(),
+            proxy_timeout: std::time::Duration::from_millis(
+                config.server.proxy_protocol_timeout_ms,
+            ),
         }
-        std::future::ready(Ok((stream, service)))
     }
 }
 
+/// The client address a PROXY header supplied, carried on each request of the
+/// connection until [`BodyShim`] makes it the `ConnectInfo`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProxiedPeer(pub(crate) SocketAddr);
+
+/// Tags every request on one connection with its [`ProxiedPeer`].
+#[derive(Clone)]
+pub(crate) struct ProxiedPeerService<S> {
+    inner: S,
+    peer: Option<SocketAddr>,
+}
+
+impl<S, B> tower::Service<Request<B>> for ProxiedPeerService<S>
+where
+    S: tower::Service<Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: Request<B>) -> Self::Future {
+        if let Some(peer) = self.peer {
+            req.extensions_mut().insert(ProxiedPeer(peer));
+        }
+        self.inner.call(req)
+    }
+}
+
+/// Read the PROXY header if `peer` is a trusted load balancer. `Ok(None)`: not
+/// trusted, or a v2 LOCAL / v1 UNKNOWN health check — keep the socket address.
+pub(crate) async fn proxied_peer<R>(
+    stream: &mut R,
+    peer: SocketAddr,
+    trusted: &[ipnet::IpNet],
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<SocketAddr>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let ip = crate::security::canonical_addr(peer).ip();
+    if !trusted.iter().any(|net| net.contains(&ip)) {
+        return Ok(None);
+    }
+    match tokio::time::timeout(timeout, proxy_protocol::read_proxy_header(stream)).await {
+        Ok(Ok(header)) => Ok(header.source.map(crate::security::canonical_addr)),
+        Ok(Err(e)) => {
+            warn!("Refusing {}: {}", peer, e);
+            Err(e)
+        }
+        Err(_) => {
+            warn!("Refusing {}: no PROXY header within {:?}", peer, timeout);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "PROXY header timeout",
+            ))
+        }
+    }
+}
+
+impl<S: Send + 'static> Accept<tokio::net::TcpStream, S> for TcpAcceptor {
+    type Stream = tokio::net::TcpStream;
+    type Service = ProxiedPeerService<S>;
+    type Future = std::pin::Pin<
+        Box<dyn Future<Output = std::io::Result<(Self::Stream, Self::Service)>> + Send>,
+    >;
+
+    fn accept(&self, mut stream: Self::Stream, service: S) -> Self::Future {
+        let this = self.clone();
+        Box::pin(async move {
+            if this.nodelay {
+                if let Err(e) = stream.set_nodelay(true) {
+                    warn!("Failed to set TCP_NODELAY on an accepted socket: {}", e);
+                }
+            }
+            let peer = stream.peer_addr()?;
+            let proxied =
+                proxied_peer(&mut stream, peer, &this.proxy_trusted, this.proxy_timeout).await?;
+            Ok((
+                stream,
+                ProxiedPeerService {
+                    inner: service,
+                    peer: proxied,
+                },
+            ))
+        })
+    }
+}
+
+/// Route one request. `Host` and `ConnectInfo` were extractor arguments while
+/// this went through the Router; they are run by hand here so `proxy_handler`
+/// keeps its signature.
 async fn dispatch(state: Arc<HttpListenerState>, req: Request<Body>) -> Response {
     if req.uri().path() == TCP_UPLOAD_PATH {
         return match *req.method() {
@@ -419,7 +513,12 @@ where
     }
 
     fn call(&mut self, req: Request<B>) -> Self::Future {
-        let (parts, body) = req.into_parts();
+        let (mut parts, body) = req.into_parts();
+        // A PROXY header's address replaces the socket's: `ConnectInfo` was set
+        // from the load balancer's address before the header was read.
+        if let Some(ProxiedPeer(peer)) = parts.extensions.get::<ProxiedPeer>().copied() {
+            parts.extensions.insert(ConnectInfo(peer));
+        }
         self.0.call(Request::from_parts(parts, Body::new(body)))
     }
 }
@@ -664,7 +763,6 @@ pub async fn run_http_listener(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Read once here: `config` is moved into builders further down in
     // several of these functions.
-    let nodelay = config.server.tcp_nodelay;
     let port = addr.port();
 
     info!(
@@ -815,7 +913,7 @@ pub async fn run_http_listener(
     // Spelled out rather than `bind_rustls`, which composes the same acceptor
     // over `DefaultAcceptor` and so leaves Nagle on every accepted socket.
     axum_server::bind(addr)
-        .acceptor(RustlsAcceptor::new(tls_config).acceptor(ConfigurableNoDelay(nodelay)))
+        .acceptor(RustlsAcceptor::new(tls_config).acceptor(TcpAcceptor::new(&config)))
         // Spelled out: `ServiceExt` is generic over the request type, and
         // hyper hands `axum_server` an `Incoming` body that only `BodyShim`
         // converts.
@@ -853,7 +951,6 @@ pub async fn run_http_listener_pqc(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Read once here: `config` is moved into builders further down in
     // several of these functions.
-    let nodelay = config.server.tcp_nodelay;
     let port = addr.port();
 
     info!(
@@ -1045,7 +1142,7 @@ pub async fn run_http_listener_pqc(
     // Run HTTPS server with OpenSSL 3.5+ (PQC-enabled with native ML-KEM)
     // Spelled out rather than `bind_openssl`, for the reason above.
     axum_server::bind(addr)
-        .acceptor(OpenSSLAcceptor::new(openssl_config).acceptor(ConfigurableNoDelay(nodelay)))
+        .acceptor(OpenSSLAcceptor::new(openssl_config).acceptor(TcpAcceptor::new(&config)))
         // Spelled out: `ServiceExt` is generic over the request type, and
         // hyper hands `axum_server` an `Incoming` body that only `BodyShim`
         // converts.
@@ -1141,6 +1238,8 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
     // Read once here: `config` is moved into builders further down in
     // several of these functions.
     let nodelay = config.server.tcp_nodelay;
+    let proxy_trusted: Arc<[ipnet::IpNet]> = config.server.proxy_protocol_trusted.clone().into();
+    let proxy_timeout = std::time::Duration::from_millis(config.server.proxy_protocol_timeout_ms);
     let mut shutdown_rx = shutdown_rx;
     let port = addr.port();
 
@@ -1364,7 +1463,16 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
 
                 // Spawn connection handler
                 let conn_metrics_clone = conn_metrics.clone();
+                let proxy_trusted = proxy_trusted.clone();
                 tokio::spawn(async move {
+                    let mut stream = stream;
+                    // PROXY header from a trusted load balancer, read in the
+                    // connection's own task so a slow one cannot stall accept().
+                    let remote_addr = match proxied_peer(&mut stream, remote_addr, &proxy_trusted, proxy_timeout).await {
+                        Ok(Some(client)) => client,
+                        Ok(None) => remote_addr,
+                        Err(_) => return,
+                    };
                     handle_fingerprinted_connection(stream, remote_addr, acceptor, app, conn_metrics_clone).await;
                 });
             }
@@ -1605,6 +1713,8 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     // Read once here: `config` is moved into builders further down in
     // several of these functions.
     let nodelay = config.server.tcp_nodelay;
+    let proxy_trusted: Arc<[ipnet::IpNet]> = config.server.proxy_protocol_trusted.clone().into();
+    let proxy_timeout = std::time::Duration::from_millis(config.server.proxy_protocol_timeout_ms);
     let mut shutdown_rx = shutdown_rx;
     use openssl::ssl::SslContext;
 
@@ -1808,8 +1918,17 @@ pub async fn run_http_listener_pqc_with_fingerprint(
                 let fp_config = config.fingerprint.clone();
                 let router = app.clone();
                 let conn_metrics_clone = conn_metrics.clone();
+                let proxy_trusted = proxy_trusted.clone();
 
                 tokio::spawn(async move {
+                    let mut stream = stream;
+                    // PROXY header from a trusted load balancer, read in the
+                    // connection's own task so a slow one cannot stall accept().
+                    let remote_addr = match proxied_peer(&mut stream, remote_addr, &proxy_trusted, proxy_timeout).await {
+                        Ok(Some(client)) => client,
+                        Ok(None) => remote_addr,
+                        Err(_) => return,
+                    };
                     handle_pqc_fingerprinted_connection(
                         stream,
                         remote_addr,

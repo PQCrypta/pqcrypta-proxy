@@ -398,6 +398,21 @@ applies on one path and not the other. The Tor list is fetched in the
 background and swapped in whole; a failed fetch keeps the previous list. The
 speed test reads the same two database paths.
 
+### PROXY protocol
+
+```toml
+[server]
+proxy_protocol_trusted = ["10.0.0.0/8"]   # load balancers that send PROXY headers
+proxy_protocol_timeout_ms = 3000
+```
+
+A connection from a trusted peer must open with a PROXY header, v1 or v2, and
+the address it names becomes the client address for logging, rate limits, the
+WAF and GeoIP; without one it is refused. Other peers are never parsed for a
+header. v2 TLVs are validated and a CRC32C TLV verified. Separately,
+`proxy_protocol = true` on a `[[passthrough_routes]]` entry sends a v2 header to
+that backend.
+
 ### Access log format
 
 ```toml

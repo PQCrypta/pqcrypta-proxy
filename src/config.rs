@@ -893,6 +893,17 @@ pub struct ServerConfig {
     #[serde(default)]
     pub request_id_header: String,
 
+    /// Load balancers allowed to send a PROXY protocol header (v1 or v2). A
+    /// connection from one of these must open with it, and the address it
+    /// names becomes the client address; from anyone else no header is read.
+    /// Empty (the default) accepts no PROXY headers.
+    #[serde(default)]
+    pub proxy_protocol_trusted: Vec<ipnet::IpNet>,
+
+    /// How long a trusted peer has to send its PROXY header.
+    #[serde(default = "default_proxy_protocol_timeout_ms")]
+    pub proxy_protocol_timeout_ms: u64,
+
     /// `ma` (max-age, seconds) on every Alt-Svc alternative the proxy advertises.
     #[serde(default = "default_alt_svc_max_age_secs")]
     pub alt_svc_max_age_secs: u64,
@@ -1029,6 +1040,8 @@ impl Default for ServerConfig {
             tcp_only_hosts: Vec::new(),
             server_header: default_server_header(),
             request_id_header: String::new(),
+            proxy_protocol_trusted: Vec::new(),
+            proxy_protocol_timeout_ms: default_proxy_protocol_timeout_ms(),
             alt_svc_max_age_secs: default_alt_svc_max_age_secs(),
             alt_svc_clear_cidrs: default_alt_svc_clear_cidrs(),
             alt_svc_clear_user_agents: default_alt_svc_clear_user_agents(),
@@ -1088,6 +1101,10 @@ fn default_observed_fingerprints_path() -> Option<PathBuf> {
 
 fn default_access_log_format() -> String {
     "combined".to_string()
+}
+
+fn default_proxy_protocol_timeout_ms() -> u64 {
+    3000
 }
 
 fn default_server_header() -> String {
