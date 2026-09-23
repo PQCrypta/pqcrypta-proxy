@@ -644,7 +644,7 @@ impl LayerSelection {
 }
 
 /// Create and run the HTTP listener with TLS termination
-#[allow(clippy::similar_names)]
+#[allow(clippy::similar_names, clippy::too_many_arguments)]
 pub async fn run_http_listener(
     addr: SocketAddr,
     cert_path: &str,
@@ -658,6 +658,9 @@ pub async fn run_http_listener(
     // port began clean on the next — and the startup attestation could only ever probe
     // a further instance that served nobody. One instance, shared.
     security_state: SecurityState,
+    // One limiter for the whole process, like `security_state`: a limiter per
+    // listener gave a client a separate budget on every port and protocol.
+    advanced_rate_limiter: Arc<AdvancedRateLimiter>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Read once here: `config` is moved into builders further down in
     // several of these functions.
@@ -716,9 +719,7 @@ pub async fn run_http_listener(
     let fingerprint_extractor = Arc::new(FingerprintExtractor::new());
 
     // Initialize advanced multi-dimensional rate limiter
-    let rate_limiter = Arc::new(AdvancedRateLimiter::new(
-        config.advanced_rate_limiting.clone(),
-    ));
+    let rate_limiter = advanced_rate_limiter;
     let state_metrics = metrics.clone();
     let alt_svc_value = layers::alt_svc_header_value(port, &config);
     let rl_state = layers::RateLimitLayer {
@@ -846,6 +847,9 @@ pub async fn run_http_listener_pqc(
     // observed fingerprint or a DB-synced blocklist entry existed only on
     // whichever listener happened to see it.
     security_state: SecurityState,
+    // One limiter for the whole process, like `security_state`: a limiter per
+    // listener gave a client a separate budget on every port and protocol.
+    advanced_rate_limiter: Arc<AdvancedRateLimiter>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Read once here: `config` is moved into builders further down in
     // several of these functions.
@@ -903,9 +907,7 @@ pub async fn run_http_listener_pqc(
     let fingerprint_extractor = Arc::new(FingerprintExtractor::new());
 
     // Initialize advanced multi-dimensional rate limiter
-    let rate_limiter = Arc::new(AdvancedRateLimiter::new(
-        config.advanced_rate_limiting.clone(),
-    ));
+    let rate_limiter = advanced_rate_limiter;
     let state_metrics = metrics.clone();
     let alt_svc_value = layers::alt_svc_header_value(port, &config);
     let rl_state = layers::RateLimitLayer {
@@ -1095,6 +1097,7 @@ pub async fn run_http_listener_with_fingerprint(
     metrics: Arc<MetricsRegistry>,
     load_balancer: Arc<LoadBalancer>,
     security_state: SecurityState,
+    advanced_rate_limiter: Arc<AdvancedRateLimiter>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     run_http_listener_with_fingerprint_and_resolver(
         addr,
@@ -1106,6 +1109,7 @@ pub async fn run_http_listener_with_fingerprint(
         load_balancer,
         None,
         security_state,
+        advanced_rate_limiter,
     )
     .await
 }
@@ -1130,6 +1134,9 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
     // observed fingerprint or a DB-synced blocklist entry existed only on
     // whichever listener happened to see it.
     security_state: SecurityState,
+    // One limiter for the whole process, like `security_state`: a limiter per
+    // listener gave a client a separate budget on every port and protocol.
+    advanced_rate_limiter: Arc<AdvancedRateLimiter>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Read once here: `config` is moved into builders further down in
     // several of these functions.
@@ -1188,9 +1195,7 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
     let fingerprint_extractor = Arc::new(FingerprintExtractor::new());
 
     // Initialize advanced multi-dimensional rate limiter
-    let rate_limiter = Arc::new(AdvancedRateLimiter::new(
-        config.advanced_rate_limiting.clone(),
-    ));
+    let rate_limiter = advanced_rate_limiter;
     let conn_metrics = metrics.clone();
     let state_metrics = metrics.clone();
     let alt_svc_value = layers::alt_svc_header_value(port, &config);
@@ -1593,6 +1598,9 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     // observed fingerprint or a DB-synced blocklist entry existed only on
     // whichever listener happened to see it.
     security_state: SecurityState,
+    // One limiter for the whole process, like `security_state`: a limiter per
+    // listener gave a client a separate budget on every port and protocol.
+    advanced_rate_limiter: Arc<AdvancedRateLimiter>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Read once here: `config` is moved into builders further down in
     // several of these functions.
@@ -1654,9 +1662,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     let fingerprint_extractor = Arc::new(FingerprintExtractor::new());
 
     // Initialize rate limiter
-    let rate_limiter = Arc::new(AdvancedRateLimiter::new(
-        config.advanced_rate_limiting.clone(),
-    ));
+    let rate_limiter = advanced_rate_limiter;
     let conn_metrics = metrics.clone();
     let state_metrics = metrics.clone();
     let alt_svc_value = layers::alt_svc_header_value(port, &config);

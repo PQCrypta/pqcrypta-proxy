@@ -283,6 +283,12 @@ impl AdminServer {
                 }),
             )
             .route("/ratelimit", get(ratelimit_handler))
+            .route("/ratelimit/reset/:key", post(ratelimit_reset_handler))
+            .route("/blocklist/block/:ip", post(blocklist_block_handler))
+            .route("/security/status", get(security_status_handler))
+            .route("/security/geoip/:ip", get(security_geoip_handler))
+            .route("/security/fingerprints", get(security_fingerprints_handler))
+            .route("/security/threats", get(security_threats_handler))
             .route("/health/quic", get(health_quic_handler))
             .route("/health/webtransport", get(health_webtransport_handler))
             .route("/canary", get(canary_handler))
@@ -1747,6 +1753,192 @@ async fn blocklist_unblock_handler(
             "IP was not blocked in memory".to_string()
         },
     }))
+}
+
+type AdminJson = Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)>;
+
+fn admin_error(status: StatusCode, msg: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({ "success": false, "error": msg })),
+    )
+}
+
+fn security_state(
+    state: &AdminState,
+) -> Result<&crate::security::SecurityState, (StatusCode, Json<serde_json::Value>)> {
+    state.security.as_ref().ok_or_else(|| {
+        admin_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Security state not available",
+        )
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockParams {
+    /// Seconds; absent or 0 blocks until an unblock or restart.
+    duration_secs: Option<u64>,
+}
+
+/// `POST /blocklist/block/:ip[?duration_secs=N]` — block an address by hand.
+async fn blocklist_block_handler(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AdminState>>,
+    Path(ip): Path<String>,
+    Query(params): Query<BlockParams>,
+) -> AdminJson {
+    let parsed: std::net::IpAddr = ip
+        .trim()
+        .parse()
+        .map_err(|_| admin_error(StatusCode::BAD_REQUEST, "Invalid IP address"))?;
+    let sec = security_state(&state)?;
+    let duration = params
+        .duration_secs
+        .filter(|s| *s > 0)
+        .map(Duration::from_secs);
+    sec.block_ip(parsed, crate::security::BlockReason::Manual, duration);
+    if let Some(ref logger) = state.audit_logger {
+        logger.log(AuditEvent::AdminAction {
+            ip: remote_addr.ip().to_string(),
+            action: "blocklist_block".to_string(),
+            success: true,
+            detail: Some(format!(
+                "{parsed} for {}",
+                duration.map_or_else(|| "ever".to_string(), |d| format!("{}s", d.as_secs()))
+            )),
+        });
+    }
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "ip": parsed.to_string(),
+        "duration_secs": duration.map(|d| d.as_secs()),
+    })))
+}
+
+/// `POST /ratelimit/reset/:key` — clear a client's rate-limit buckets. `key`
+/// may be a whole key (`SourceIp:203.0.113.7`) or just its value.
+async fn ratelimit_reset_handler(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AdminState>>,
+    Path(key): Path<String>,
+) -> AdminJson {
+    let limiter = state.rate_limiter.as_ref().ok_or_else(|| {
+        admin_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Rate limiter not available",
+        )
+    })?;
+    let removed = limiter.reset_key(key.trim());
+    if let Some(ref logger) = state.audit_logger {
+        logger.log(AuditEvent::AdminAction {
+            ip: remote_addr.ip().to_string(),
+            action: "ratelimit_reset".to_string(),
+            success: true,
+            detail: Some(format!("{key} ({removed} buckets)")),
+        });
+    }
+    Ok(Json(
+        serde_json::json!({ "success": true, "key": key, "buckets_removed": removed }),
+    ))
+}
+
+/// `GET /security/status` — which protections are on and what they have loaded.
+async fn security_status_handler(State(state): State<Arc<AdminState>>) -> AdminJson {
+    let sec = security_state(&state)?;
+    let config = state.config_manager.get();
+    let (city_db, asn_db, tor_exits) = sec.geo_sources();
+    let (ips, cidrs) = sec.blocklist_snapshot();
+    Ok(Json(serde_json::json!({
+        "waf": { "enabled": config.waf.enabled, "loaded": sec.waf_engine.is_some() },
+        "fingerprinting": config.fingerprint.enabled,
+        "rate_limiting": config.rate_limiting.enabled,
+        "advanced_rate_limiting": config.advanced_rate_limiting.enabled,
+        "request_validation": config.security.validation.enabled,
+        "geoip": {
+            "city_database": city_db,
+            "asn_database": asn_db,
+            "blocked_countries": config.security.blocked_countries,
+            "allowed_countries": config.security.allowed_countries,
+            "blocked_regions": config.security.blocked_regions,
+            "blocked_asns": config.security.blocked_asns,
+        },
+        "tor": {
+            "blocking": config.security.block_tor_exit_nodes,
+            "exit_addresses_loaded": tor_exits,
+        },
+        "blocklist": { "ips": ips.len(), "cidrs": cidrs.len() },
+    })))
+}
+
+/// `GET /security/geoip/:ip` — location, AS, Tor status and verdicts for an address.
+async fn security_geoip_handler(
+    State(state): State<Arc<AdminState>>,
+    Path(ip): Path<String>,
+) -> AdminJson {
+    let parsed: std::net::IpAddr = ip
+        .trim()
+        .parse()
+        .map_err(|_| admin_error(StatusCode::BAD_REQUEST, "Invalid IP address"))?;
+    Ok(Json(security_state(&state)?.geo_report(&parsed)))
+}
+
+#[derive(Debug, Deserialize)]
+struct FingerprintParams {
+    /// Most recently seen first; default 100, at most 1000.
+    limit: Option<usize>,
+}
+
+/// `GET /security/fingerprints[?limit=N]` — observed JA3/JA4 fingerprints.
+async fn security_fingerprints_handler(
+    State(state): State<Arc<AdminState>>,
+    Query(params): Query<FingerprintParams>,
+) -> AdminJson {
+    let mut records = security_state(&state)?.observed_records();
+    let total = records.len();
+    records.sort_by_key(|r| std::cmp::Reverse(r.last_seen));
+    records.truncate(params.limit.unwrap_or(100).min(1000));
+    Ok(Json(
+        serde_json::json!({ "total": total, "fingerprints": records }),
+    ))
+}
+
+/// `GET /security/threats` — what is being refused and why.
+async fn security_threats_handler(State(state): State<Arc<AdminState>>) -> AdminJson {
+    let sec = security_state(&state)?;
+    let (ips, cidrs) = sec.blocklist_snapshot();
+    let mut by_reason: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for reason in ips
+        .iter()
+        .map(|(_, r)| r)
+        .chain(cidrs.iter().map(|(_, r)| r))
+    {
+        *by_reason.entry(reason.clone()).or_default() += 1;
+    }
+    let waf = sec.waf_engine.as_ref().map(|w| {
+        let stats = w.stats();
+        let mut rules = stats.rules;
+        rules.sort_by_key(|r| std::cmp::Reverse(r.hits));
+        rules.truncate(20);
+        serde_json::json!({
+            "inspected": stats.inspected,
+            "blocked": stats.blocked,
+            "detected": stats.detected,
+            "top_rules": rules.iter().map(|r| serde_json::json!({
+                "rule": r.id, "category": r.category, "severity": r.severity, "hits": r.hits,
+            })).collect::<Vec<_>>(),
+        })
+    });
+    let mut classes: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for f in sec.observed_records() {
+        *classes.entry(f.classification).or_default() += f.request_count;
+    }
+    Ok(Json(serde_json::json!({
+        "blocklist": { "ips": ips.len(), "cidrs": cidrs.len(), "by_reason": by_reason },
+        "waf": waf,
+        "fingerprint_requests_by_class": classes,
+    })))
 }
 
 #[cfg(test)]

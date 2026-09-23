@@ -558,9 +558,6 @@ fn default_transport() -> char {
 }
 
 impl SecurityState {
-    /// Where observed fingerprints are persisted between restarts.
-    pub const OBSERVED_PATH: &'static str = "/var/lib/pqcrypta-proxy/fingerprints/observed.json";
-
     /// Snapshot the observed-fingerprint corpus to disk.
     ///
     /// Written atomically through a temp file: the public directory reads this
@@ -570,33 +567,9 @@ impl SecurityState {
     /// `Instant` is a monotonic reading with no meaning to another process, so
     /// timestamps are converted to Unix seconds here by walking each elapsed
     /// duration back from the current wall clock.
-    pub fn flush_observed_fingerprints(&self) -> std::io::Result<usize> {
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let to_unix = |i: Instant| now_unix.saturating_sub(i.elapsed().as_secs());
+    pub fn flush_observed_fingerprints(&self, path: &std::path::Path) -> std::io::Result<usize> {
+        let records = self.observed_records();
 
-        let records: Vec<ObservedFingerprint> = self
-            .ja3_cache
-            .iter()
-            .map(|e| {
-                let v = e.value();
-                ObservedFingerprint {
-                    ja3_hash: v.ja3_hash.clone(),
-                    ja4_hash: v.ja4_hash.clone(),
-                    ja3_string: v.ja3_string.clone(),
-                    classification: format!("{:?}", v.classification),
-                    transport: v.transport,
-                    first_seen: to_unix(v.first_seen),
-                    last_seen: to_unix(v.last_seen),
-                    request_count: v.request_count,
-                    user_agents: v.user_agents.clone(),
-                }
-            })
-            .collect();
-
-        let path = std::path::Path::new(Self::OBSERVED_PATH);
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -614,6 +587,35 @@ impl SecurityState {
         std::fs::rename(&tmp, path)?;
 
         Ok(records.len())
+    }
+
+    /// The observed-fingerprint corpus, timestamps in Unix seconds: what
+    /// `flush_observed_fingerprints` writes and `GET /security/fingerprints`
+    /// serves.
+    pub fn observed_records(&self) -> Vec<ObservedFingerprint> {
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let to_unix = |i: Instant| now_unix.saturating_sub(i.elapsed().as_secs());
+
+        self.ja3_cache
+            .iter()
+            .map(|e| {
+                let v = e.value();
+                ObservedFingerprint {
+                    ja3_hash: v.ja3_hash.clone(),
+                    ja4_hash: v.ja4_hash.clone(),
+                    ja3_string: v.ja3_string.clone(),
+                    classification: format!("{:?}", v.classification),
+                    transport: v.transport,
+                    first_seen: to_unix(v.first_seen),
+                    last_seen: to_unix(v.last_seen),
+                    request_count: v.request_count,
+                    user_agents: v.user_agents.clone(),
+                }
+            })
+            .collect()
     }
 
     /// Record the User-Agent a request carrying this fingerprint presented.
@@ -672,8 +674,8 @@ impl SecurityState {
     ///
     /// A missing or corrupt file is not an error — first boot is the normal
     /// case, and a bad file must not stop the proxy starting.
-    pub fn load_observed_fingerprints(&self) -> usize {
-        let Ok(bytes) = std::fs::read(Self::OBSERVED_PATH) else {
+    pub fn load_observed_fingerprints(&self, path: &std::path::Path) -> usize {
+        let Ok(bytes) = std::fs::read(path) else {
             return 0;
         };
         let Ok(records) = serde_json::from_slice::<Vec<ObservedFingerprint>>(&bytes) else {
@@ -1037,6 +1039,47 @@ impl SecurityState {
             }
         }
         None
+    }
+
+    /// Everything the proxy knows about where `ip` is, for `GET /security/geoip/:ip`.
+    pub fn geo_report(&self, ip: &IpAddr) -> serde_json::Value {
+        #[cfg(feature = "geoip")]
+        let (location, asn) = match self.geoip_db {
+            Some(ref db) => (db.lookup(*ip), db.asn(*ip)),
+            None => (None, None),
+        };
+        #[cfg(feature = "geoip")]
+        let location = location.map(|l| {
+            serde_json::json!({
+                "country_code": l.country_code,
+                "country": l.country_name,
+                "regions": l.regions,
+                "city": l.city,
+                "continent": l.continent,
+            })
+        });
+        #[cfg(not(feature = "geoip"))]
+        let (location, asn): (Option<serde_json::Value>, Option<u32>) = (None, None);
+        serde_json::json!({
+            "ip": ip.to_string(),
+            "location": location,
+            "asn": asn,
+            "tor_exit": self.tor_exits.load().contains(ip),
+            "blocked_by_geo_policy": self.geo_block_reason(ip),
+            "blocklisted": self.is_blocked(ip).map(|b| format!("{:?}", b.reason)),
+        })
+    }
+
+    /// Which geo data sources are loaded, for `GET /security/status`.
+    pub fn geo_sources(&self) -> (bool, bool, usize) {
+        #[cfg(feature = "geoip")]
+        let (city, asn) = self
+            .geoip_db
+            .as_ref()
+            .map_or((false, false), |db| (true, db.has_asn()));
+        #[cfg(not(feature = "geoip"))]
+        let (city, asn) = (false, false);
+        (city, asn, self.tor_exits.load().len())
     }
 
     /// Whether `ip` is refused by location or network ([`Self::geo_block_reason`]).
@@ -2795,6 +2838,11 @@ mod geoip {
         pub fn with_asn(mut self, asn: Option<Reader<Vec<u8>>>) -> Self {
             self.asn = asn;
             self
+        }
+
+        /// Whether an ASN database is attached.
+        pub fn has_asn(&self) -> bool {
+            self.asn.is_some()
         }
 
         /// The autonomous system announcing `ip`.

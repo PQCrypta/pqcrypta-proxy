@@ -2324,6 +2324,32 @@ impl AdvancedRateLimiter {
     }
 
     /// Update configuration dynamically without restarting
+    /// Drop every bucket, global or per-route, whose key is `key` or has a
+    /// component equal to it, so a client's limits start fresh. `key` may be a
+    /// whole key (`SourceIp:203.0.113.7`) or just its value (`203.0.113.7`),
+    /// which also clears composite keys containing it. Returns buckets removed.
+    pub fn reset_key(&self, key: &str) -> usize {
+        let matches = |k: &str| {
+            k == key
+                || k.split('|')
+                    .any(|part| part == key || part.split_once(':').is_some_and(|(_, v)| v == key))
+        };
+        let mut removed = 0;
+        self.buckets.retain(|k, _| {
+            let hit = matches(k);
+            removed += usize::from(hit);
+            !hit
+        });
+        for route in self.route_buckets.iter() {
+            route.value().retain(|k, _| {
+                let hit = matches(k);
+                removed += usize::from(hit);
+                !hit
+            });
+        }
+        removed
+    }
+
     pub fn update_config(&self, config: AdvancedRateLimitConfig) {
         // Update trusted CIDRs with proper error logging
         let trusted_cidrs: Vec<ipnet::IpNet> = config

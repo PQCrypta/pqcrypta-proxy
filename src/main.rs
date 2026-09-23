@@ -558,6 +558,14 @@ async fn run() -> anyhow::Result<()> {
     let security_state = pqcrypta_proxy::security::SecurityState::new(&config)
         .with_audit_logger(audit_logger.clone());
 
+    // One advanced rate limiter for the process: every TCP listener, every QUIC
+    // port and the admin API. Each listener used to build its own, so a client
+    // had a separate budget on every port and protocol, and the admin API had
+    // none — `GET /ratelimit` answered "not configured" on every node.
+    let shared_rate_limiter = Arc::new(AdvancedRateLimiter::new(
+        config.advanced_rate_limiting.clone(),
+    ));
+
     // Reload the observed-fingerprint corpus and keep snapshotting it.
     //
     // Without this the corpus resets on every start, and this proxy restarts on
@@ -565,8 +573,16 @@ async fn run() -> anyhow::Result<()> {
     // policy: nothing here bans anybody, it is what lets the public directory
     // show live traffic next to the curated list, and what would let that list
     // eventually be grown from something other than guesswork.
-    {
-        let loaded = security_state.load_observed_fingerprints();
+    //
+    // Only while fingerprinting is on: with it off nothing is observed, and an
+    // instance that loaded and flushed the corpus anyway (a benchmark or test
+    // proxy on the same box) would read production's file and, after five
+    // minutes, write its own copy back over it.
+    if let (true, Some(observed_path)) = (
+        config.fingerprint.enabled,
+        config.fingerprint.observed_path.clone(),
+    ) {
+        let loaded = security_state.load_observed_fingerprints(&observed_path);
         if loaded > 0 {
             info!("Loaded {} observed TLS fingerprints from disk", loaded);
         }
@@ -579,7 +595,7 @@ async fn run() -> anyhow::Result<()> {
             ticker.tick().await; // the first tick fires immediately
             loop {
                 ticker.tick().await;
-                match flush_state.flush_observed_fingerprints() {
+                match flush_state.flush_observed_fingerprints(&observed_path) {
                     Ok(n) => tracing::debug!("Flushed {} observed TLS fingerprints", n),
                     Err(e) => warn!("Could not flush observed fingerprints: {}", e),
                 }
@@ -1035,7 +1051,7 @@ async fn run() -> anyhow::Result<()> {
         backend_pool.clone(),
         ocsp_service,
         acme_service,
-        None, // Rate limiter created per-listener in http_listener
+        Some(shared_rate_limiter.clone()),
         shutdown_tx.clone(),
         Some(metrics_registry.clone()),
         Some(audit_logger),
@@ -1137,6 +1153,7 @@ async fn run() -> anyhow::Result<()> {
         let http_metrics = metrics_registry.clone();
         let http_lb = shared_lb.clone();
         let http_security = security_state.clone();
+        let http_rate_limiter = shared_rate_limiter.clone();
         let http_resolver = std::sync::Arc::clone(&tls_provider.resolver);
 
         // Priority 1: PQC + TLS-layer fingerprinting (OpenSSL with ClientHello capture)
@@ -1164,6 +1181,7 @@ async fn run() -> anyhow::Result<()> {
                     http_lb,
                     http_sni_map,
                     http_security.clone(),
+                    http_rate_limiter,
                 )
                 .await
                 {
@@ -1198,6 +1216,7 @@ async fn run() -> anyhow::Result<()> {
                     http_lb,
                     Some(http_resolver),
                     http_security.clone(),
+                    http_rate_limiter,
                 )
                 .await
                 {
@@ -1231,6 +1250,7 @@ async fn run() -> anyhow::Result<()> {
                     http_lb,
                     http_sni_map,
                     http_security.clone(),
+                    http_rate_limiter,
                 )
                 .await
                 {
@@ -1255,6 +1275,7 @@ async fn run() -> anyhow::Result<()> {
                 http_metrics,
                 http_lb,
                 http_security,
+                http_rate_limiter,
             )
             .await
             {
@@ -1309,9 +1330,7 @@ async fn run() -> anyhow::Result<()> {
         // Store shutdown sender to keep it alive
         quic_shutdown_senders.push(quic_shutdown_tx);
 
-        let quic_advanced_rl = Arc::new(AdvancedRateLimiter::new(
-            quic_config.advanced_rate_limiting.clone(),
-        ));
+        let quic_advanced_rl = shared_rate_limiter.clone();
         let quic_lb = shared_lb.clone();
         let quic_early_hints = early_hints_state.clone();
         let quic_cache = pqcrypta_proxy::cache::shared(&quic_config.cache);

@@ -1080,6 +1080,12 @@ fn default_preload_rel() -> String {
     "preload".to_string()
 }
 
+fn default_observed_fingerprints_path() -> Option<PathBuf> {
+    Some(PathBuf::from(
+        "/var/lib/pqcrypta-proxy/fingerprints/observed.json",
+    ))
+}
+
 fn default_server_header() -> String {
     "pqcrypta".to_string()
 }
@@ -2374,6 +2380,11 @@ pub struct FingerprintConfig {
     /// "browser", "bot", "legitimate_bot", "malicious", "scanner", "api_client"
     /// If None or the file is missing, an empty database is used (advisory only).
     pub fingerprint_db_path: Option<PathBuf>,
+    /// Where the observed-fingerprint corpus persists between restarts.
+    /// `None` keeps it in memory only. Loaded and flushed only while
+    /// fingerprinting is enabled.
+    #[serde(default = "default_observed_fingerprints_path")]
+    pub observed_path: Option<PathBuf>,
     /// AUD-12: Automatically block connections whose JA3/JA4 fingerprint is classified
     /// as Malicious in the fingerprint database.
     /// Default: true — Malicious fingerprints are blocked, which is the point of
@@ -2427,6 +2438,7 @@ impl Default for FingerprintConfig {
             fingerprint_db_path: Some(PathBuf::from(
                 "/var/lib/pqcrypta-proxy/fingerprints/ja3.json",
             )),
+            observed_path: default_observed_fingerprints_path(),
             block_malicious: true, // Block malicious fingerprints by default (AUD-12)
             replay_detection: true,
             replay_window_secs: 60,
