@@ -314,6 +314,22 @@ pub struct GlobalLimits {
     /// Default limits applied to composite (multi-dimension) keys.
     #[serde(default = "default_per_composite_limits")]
     pub per_composite: PerKeyLimits,
+
+    /// Limits for a key resolved from a verified JWT's `sub` claim — one
+    /// authenticated user, however many addresses they come from. Defaults to
+    /// the per-IP values, which is what such a key received before it had its
+    /// own block.
+    #[serde(default = "default_per_jwt_subject_limits")]
+    pub per_jwt_subject: PerKeyLimits,
+}
+
+fn default_per_jwt_subject_limits() -> PerKeyLimits {
+    PerKeyLimits {
+        requests_per_second: 1000,
+        burst_size: 500,
+        requests_per_minute: Some(30_000),
+        requests_per_hour: Some(500_000),
+    }
 }
 
 fn default_global_rps() -> u32 {
@@ -361,6 +377,7 @@ impl Default for GlobalLimits {
             },
             per_api_key: default_per_api_key_limits(),
             per_composite: default_per_composite_limits(),
+            per_jwt_subject: default_per_jwt_subject_limits(),
         }
     }
 }
@@ -2226,6 +2243,11 @@ impl AdvancedRateLimiter {
             return config.global_limits.per_api_key.clone();
         }
 
+        // A verified JWT subject is one user across however many addresses.
+        if matches!(key_type, RateLimitKeyType::JwtSubject) {
+            return config.global_limits.per_jwt_subject.clone();
+        }
+
         // Composite keys get their limits from CompositeKeyConfig directly
         // in resolve_key_and_limits, but fall back to the configurable default here.
         if matches!(key_type, RateLimitKeyType::Composite(_)) {
@@ -2997,6 +3019,20 @@ mod tests {
         let norm2 = limiter.normalize_ip(ip2, 64);
 
         assert_eq!(norm1, norm2);
+    }
+
+    #[tokio::test]
+    async fn jwt_subject_keys_have_their_own_limits() {
+        let mut config = AdvancedRateLimitConfig::default();
+        config.global_limits.per_jwt_subject.requests_per_second = 7;
+        let limiter = AdvancedRateLimiter::new(config.clone());
+        let limits = limiter.get_limits_for_key(&RateLimitKeyType::JwtSubject, "user-1", &config);
+        assert_eq!(limits.requests_per_second, 7);
+        let ip = limiter.get_limits_for_key(&RateLimitKeyType::SourceIp, "203.0.113.1", &config);
+        assert_eq!(
+            ip.requests_per_second,
+            config.global_limits.per_ip.requests_per_second
+        );
     }
 
     #[tokio::test]
