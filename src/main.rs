@@ -1076,11 +1076,15 @@ async fn run() -> anyhow::Result<()> {
         // the Host header before building the HTTPS URL.
         let redirect_allowed_domains = config.http_redirect.allowed_domains.clone();
         let redirect_to_https = config.http_redirect.redirect_to_https;
+        let redirect_status =
+            axum::http::StatusCode::from_u16(config.http_redirect.redirect_status)
+                .unwrap_or(axum::http::StatusCode::PERMANENT_REDIRECT);
         tokio::spawn(async move {
             if let Err(e) = run_http_redirect_server(
                 redirect_port,
                 https_port,
                 redirect_to_https,
+                redirect_status,
                 challenges,
                 redirect_allowed_domains,
             )

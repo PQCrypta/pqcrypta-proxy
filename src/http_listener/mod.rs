@@ -3373,6 +3373,8 @@ pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 
     // challenges are still answered either way, so certificate renewal does not
     // depend on this being on.
     redirect_to_https: bool,
+    // `http_redirect.redirect_status`, validated at load to 301/302/307/308.
+    redirect_status: StatusCode,
     acme_challenges: Option<
         Arc<
             parking_lot::RwLock<
@@ -3464,7 +3466,10 @@ pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 
                     .into_response();
             }
 
-            Redirect::permanent(&https_url).into_response()
+            match HeaderValue::from_str(&https_url) {
+                Ok(location) => (redirect_status, [(header::LOCATION, location)]).into_response(),
+                Err(_) => StatusCode::BAD_REQUEST.into_response(),
+            }
         }
     });
 

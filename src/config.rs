@@ -1034,6 +1034,30 @@ impl Default for ServerConfig {
     }
 }
 
+/// Parse a configuration, returning it with every key serde discarded.
+///
+/// `ProxyConfig` does not deny unknown fields — a node may carry a key a newer
+/// or older binary does not know — so a misspelt or invented key used to be
+/// dropped without a word, and the setting the operator thought they had made
+/// silently did not exist. The paths are reported instead.
+pub fn parse_config_str(content: &str) -> Result<(ProxyConfig, Vec<String>), toml::de::Error> {
+    let mut ignored = Vec::new();
+    let config = serde_ignored::deserialize(toml::Deserializer::new(content), |path| {
+        ignored.push(path.to_string());
+    })?;
+    Ok((config, ignored))
+}
+
+fn warn_ignored_keys(path: &Path, ignored: &[String]) {
+    for key in ignored {
+        warn!(
+            "{}: `{}` is not a configuration setting and was ignored",
+            path.display(),
+            key
+        );
+    }
+}
+
 fn default_scanner_ua_exempt_paths() -> Vec<String> {
     [
         r"^/robots\.txt$",
@@ -2467,6 +2491,10 @@ pub struct HttpRedirectConfig {
     /// Requests whose Host header is not in this list receive 400 Bad Request,
     /// preventing open-redirect abuse.  An empty list disables host validation.
     pub allowed_domains: Vec<String>,
+    /// Status of the HTTP→HTTPS redirect: 301, 302, 307 or 308 (default).
+    /// 307/308 keep the method and body; 301/302 let a client turn a POST into
+    /// a GET, which breaks anything that posts over plain HTTP first.
+    pub redirect_status: u16,
 }
 
 impl Default for HttpRedirectConfig {
@@ -2476,6 +2504,7 @@ impl Default for HttpRedirectConfig {
             port: 80,
             redirect_to_https: true,
             allowed_domains: vec![],
+            redirect_status: 308,
         }
     }
 }
@@ -2829,8 +2858,9 @@ impl ConfigManager {
         let content = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("Failed to read config file {:?}: {}", path, e))?;
 
-        let mut config: ProxyConfig = toml::from_str(&content)
+        let (mut config, ignored) = parse_config_str(&content)
             .map_err(|e| anyhow::anyhow!("Failed to parse config file {:?}: {}", path, e))?;
+        warn_ignored_keys(path, &ignored);
 
         config.apply_body_size_override();
 
@@ -2937,6 +2967,10 @@ impl ConfigManager {
         let merged_str = toml::to_string(&merged_val)
             .map_err(|e| anyhow::anyhow!("Failed to serialise merged config: {}", e))?;
 
+        let overlay_ignored = parse_config_str(&overlay_str)
+            .map(|(_, ignored)| ignored)
+            .unwrap_or_default();
+        warn_ignored_keys(overlay_path, &overlay_ignored);
         let new_config: ProxyConfig = toml::from_str(&merged_str)
             .map_err(|e| anyhow::anyhow!("Failed to parse merged config: {}", e))?;
         new_config.validate()?;
@@ -3267,6 +3301,13 @@ impl ProxyConfig {
                 ));
             }
             Some(_) => {}
+        }
+
+        if !matches!(self.http_redirect.redirect_status, 301 | 302 | 307 | 308) {
+            return Err(anyhow::anyhow!(
+                "http_redirect.redirect_status must be 301, 302, 307 or 308, not {}",
+                self.http_redirect.redirect_status
+            ));
         }
 
         if !self.server.request_id_header.is_empty()
@@ -3853,6 +3894,45 @@ mod tests {
             r.rewrite_set_cookie("sid=x; Path=/; Domain=example.test"),
             None
         );
+    }
+
+    #[test]
+    fn ignored_keys_are_reported_with_their_path() {
+        // The production defect: keys after an array-of-tables header belong
+        // to its last entry, where nothing reads them.
+        let (_, ignored) = parse_config_str(
+            "[http3]\ncoalescing_enabled = true\n[[http3.preload_resources]]\nhost = \"a\"\npath = \"/\"\nhref = \"/x.css\"\nas_type = \"style\"\ncoalescing_max_wait_ms = 5\n[headers]\nstrict_transport_security = \"x\"\n",
+        )
+        .unwrap();
+        assert!(
+            ignored
+                .iter()
+                .any(|k| k == "http3.preload_resources.0.coalescing_max_wait_ms"),
+            "{ignored:?}"
+        );
+        assert!(
+            ignored
+                .iter()
+                .any(|k| k == "headers.strict_transport_security"),
+            "{ignored:?}"
+        );
+        let (_, clean) = parse_config_str("[headers]\nhsts = \"x\"\n").unwrap();
+        assert!(clean.is_empty(), "{clean:?}");
+    }
+
+    #[test]
+    fn redirect_status_is_validated() {
+        let mut c = ProxyConfig::default();
+        c.http_redirect.redirect_status = 200;
+        assert!(c
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("redirect_status"));
+        c.http_redirect.redirect_status = 301;
+        if let Err(e) = c.validate() {
+            assert!(!e.to_string().contains("redirect_status"), "{e}");
+        }
     }
 
     /// Build a route carrying just the matching fields under test.
