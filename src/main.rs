@@ -813,6 +813,16 @@ async fn run() -> anyhow::Result<()> {
     // QUIC listener so the reload handler below can update preload rules live.
     let early_hints_state = Arc::new(EarlyHintsState::from_http3_config(&config.http3));
 
+    // Each QUIC listener's reload channel. The listeners are created further
+    // down; the handler forwards every event to whichever have registered.
+    // Their senders used to be dropped on creation, so no HTTP/3 listener ever
+    // saw a reload.
+    let quic_reload_senders: Arc<parking_lot::Mutex<Vec<mpsc::Sender<ConfigReloadEvent>>>> =
+        Arc::default();
+    let reload_quic_senders = quic_reload_senders.clone();
+    let reload_security = security_state.clone();
+    let reload_rate_limiter = shared_rate_limiter.clone();
+
     // Spawn config reload handler for hot-reload support
     let reload_tls_provider = tls_provider.clone();
     let reload_pqc_provider = pqc_provider.clone();
@@ -820,6 +830,13 @@ async fn run() -> anyhow::Result<()> {
     let reload_config_manager = config_manager.clone();
     tokio::spawn(async move {
         while let Some(event) = reload_rx.recv().await {
+            // Every HTTP/3 listener applies it too.
+            let senders: Vec<_> = reload_quic_senders.lock().clone();
+            for tx in senders {
+                if tx.send(event.clone()).await.is_err() {
+                    warn!("A QUIC listener's reload channel is closed");
+                }
+            }
             match event {
                 ConfigReloadEvent::ConfigReloaded(new_config) => {
                     info!("Configuration reloaded - applying changes");
@@ -848,9 +865,11 @@ async fn run() -> anyhow::Result<()> {
                     reload_early_hints.update_from_http3_config(&new_config.http3);
                     info!("HTTP/3 Early Hints configuration updated");
 
-                    // Note: BackendPool update requires mutable access
-                    // which would require additional synchronization
-                    info!("Backend pool will use new config for new connections");
+                    // [security], [rate_limiting] and [advanced_rate_limiting]
+                    // are read per request, so they apply on the next one.
+                    reload_security.apply_reloaded_config(&new_config);
+                    reload_rate_limiter.update_config(new_config.advanced_rate_limiting.clone());
+                    info!("Security and rate-limit configuration updated");
                 }
                 ConfigReloadEvent::TlsCertsReloaded => {
                     info!("TLS certificates reloaded");
@@ -1325,7 +1344,8 @@ async fn run() -> anyhow::Result<()> {
 
         // Create channels for graceful shutdown
         let (quic_shutdown_tx, quic_shutdown_rx) = mpsc::channel::<()>(1);
-        let (_reload_tx, reload_rx) = mpsc::channel(1);
+        let (reload_tx, reload_rx) = mpsc::channel(8);
+        quic_reload_senders.lock().push(reload_tx);
 
         // Store shutdown sender to keep it alive
         quic_shutdown_senders.push(quic_shutdown_tx);
@@ -1524,16 +1544,22 @@ async fn run() -> anyhow::Result<()> {
     // Print startup summary
     print_startup_summary(&config, tls_provider.is_pqc_enabled());
 
-    // SIGHUP handler: reopen log files without restarting (for log rotation)
+    // SIGHUP: reopen log files (for rotation) and reload the configuration.
     #[cfg(unix)]
-    tokio::spawn(async {
+    let sighup_config_manager = config_manager.clone();
+    #[cfg(unix)]
+    tokio::spawn(async move {
         use tokio::signal::unix::{signal, SignalKind};
         let mut sighup = signal(SignalKind::hangup()).expect("Failed to install SIGHUP handler");
         loop {
             sighup.recv().await;
-            info!("Received SIGHUP — reopening log files");
+            info!("Received SIGHUP — reopening log files and reloading configuration");
             if let Some(logger) = pqcrypta_proxy::access_logger::get_access_logger() {
                 logger.reopen();
+            }
+            // The same reload POST /reload and the file watcher trigger.
+            if let Err(e) = sighup_config_manager.reload().await {
+                error!("SIGHUP configuration reload failed: {}", e);
             }
         }
     });

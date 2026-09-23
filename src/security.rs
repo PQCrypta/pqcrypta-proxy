@@ -989,6 +989,15 @@ impl SecurityState {
         });
     }
 
+    /// Apply a reloaded configuration's `[security]` and `[rate_limiting]`
+    /// sections. Everything read per request picks them up on the next one;
+    /// the WAF rule table, the GeoIP databases and the Tor refresh task are
+    /// built at startup and need a restart.
+    pub fn apply_reloaded_config(&self, config: &ProxyConfig) {
+        *self.config.write() = config.security.clone();
+        *self.rate_config.write() = config.rate_limiting.clone();
+    }
+
     /// Why `ip` is refused by location or network, if it is: blocked or
     /// not-allowed country, blocked region, blocked AS, or a Tor exit. One
     /// function, so the per-request evaluator and the HTTP/3 per-connection
