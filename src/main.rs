@@ -549,6 +549,12 @@ async fn run() -> anyhow::Result<()> {
     // exist before the state that emits them.
     let audit_logger = Arc::new(AuditLogger::new(&config.logging));
 
+    // The speed test annotates sessions from the same databases the security
+    // layer blocks with.
+    pqcrypta_proxy::speedtest::configure_geoip(
+        config.security.geoip_db_path.clone(),
+        config.security.geoip_asn_db_path.clone(),
+    );
     let security_state = pqcrypta_proxy::security::SecurityState::new(&config)
         .with_audit_logger(audit_logger.clone());
 

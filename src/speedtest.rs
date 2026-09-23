@@ -83,9 +83,34 @@ const MIN_DATAGRAM_BYTES: usize = 8;
 /// Traceroute: max hops
 const TRACEROUTE_MAX_HOPS: u32 = 30;
 
-/// GeoLite2 database paths (alongside the binary in data/geoip/)
-const GEOIP_CITY_PATH: &str = "/var/www/html/pqcrypta-proxy/data/geoip/GeoLite2-City.mmdb";
-const GEOIP_ASN_PATH: &str = "/var/www/html/pqcrypta-proxy/data/geoip/GeoLite2-ASN.mmdb";
+/// GeoLite2 database paths: `security.geoip_db_path` and
+/// `security.geoip_asn_db_path`, set once at startup by [`configure_geoip`].
+/// These were compiled-in paths, so a node whose config named another
+/// location (api3 keeps the City database under /etc/pqcrypta/geoip) had its
+/// speed tests annotated from a file the rest of the proxy did not use.
+static GEOIP_PATHS: OnceLock<(Option<std::path::PathBuf>, Option<std::path::PathBuf>)> =
+    OnceLock::new();
+
+/// Tell the speed test where the City and ASN databases are. Call once, before
+/// the first session; later calls are ignored.
+pub fn configure_geoip(city: Option<std::path::PathBuf>, asn: Option<std::path::PathBuf>) {
+    let _ = GEOIP_PATHS.set((city, asn));
+}
+
+#[cfg(feature = "geoip")]
+fn open_geoip(
+    which: &str,
+    path: Option<&std::path::PathBuf>,
+) -> Option<maxminddb::Reader<Vec<u8>>> {
+    let path = path?;
+    match maxminddb::Reader::open_readfile(path) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            warn!("GeoLite2-{} unavailable ({}): {}", which, path.display(), e);
+            None
+        }
+    }
+}
 
 // ─── GeoIP readers (lazy, loaded once) ────────────────────────────────────
 
@@ -114,14 +139,8 @@ fn lookup_geoip(ip: IpAddr) -> GeoInfo {
     #[cfg(feature = "geoip")]
     {
         // ── City ─────────────────────────────────────────────────────────
-        let city_slot =
-            CITY_READER.get_or_init(|| match maxminddb::Reader::open_readfile(GEOIP_CITY_PATH) {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    warn!("GeoLite2-City unavailable ({}): {}", GEOIP_CITY_PATH, e);
-                    None
-                }
-            });
+        let city_slot = CITY_READER
+            .get_or_init(|| open_geoip("City", GEOIP_PATHS.get().and_then(|p| p.0.as_ref())));
         if let Some(reader) = city_slot {
             if let Ok(result) = reader.lookup(ip) {
                 if let Ok(Some(city)) = result.decode::<maxminddb::geoip2::City>() {
@@ -135,14 +154,8 @@ fn lookup_geoip(ip: IpAddr) -> GeoInfo {
         }
 
         // ── ASN ──────────────────────────────────────────────────────────
-        let asn_slot =
-            ASN_READER.get_or_init(|| match maxminddb::Reader::open_readfile(GEOIP_ASN_PATH) {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    warn!("GeoLite2-ASN unavailable ({}): {}", GEOIP_ASN_PATH, e);
-                    None
-                }
-            });
+        let asn_slot = ASN_READER
+            .get_or_init(|| open_geoip("ASN", GEOIP_PATHS.get().and_then(|p| p.1.as_ref())));
         if let Some(reader) = asn_slot {
             if let Ok(result) = reader.lookup(ip) {
                 if let Ok(Some(asn)) = result.decode::<maxminddb::geoip2::Asn>() {

@@ -378,6 +378,26 @@ private network where RFC1918 sources are legitimate, add them explicitly:
 trusted_internal_cidrs = ["10.200.0.0/16"]
 ```
 
+### GeoIP, ASN and Tor blocking
+
+```toml
+[security]
+geoip_db_path = "/etc/pqcrypta/geoip/GeoLite2-City.mmdb"
+geoip_asn_db_path = "/etc/pqcrypta/geoip/GeoLite2-ASN.mmdb"
+blocked_countries = ["KP"]          # ISO 3166-1 alpha-2
+allowed_countries = []              # non-empty: only these; an unlocated address passes
+blocked_regions = []                # ISO 3166-2, e.g. "US-CA"
+blocked_asns = []                   # autonomous system numbers
+block_tor_exit_nodes = false        # fetch tor_exit_list_url every tor_exit_refresh_secs
+geoip_block_duration_secs = 86400   # 0 = permanent
+```
+
+All of these are one check (`SecurityState::geo_block_reason`) that the
+per-request evaluator and the HTTP/3 per-connection gate both call, so no rule
+applies on one path and not the other. The Tor list is fetched in the
+background and swapped in whole; a failed fetch keeps the previous list. The
+speed test reads the same two database paths.
+
 ### Request validation
 
 ```toml

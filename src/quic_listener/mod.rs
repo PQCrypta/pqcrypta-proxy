@@ -593,7 +593,7 @@ impl QuicListener {
                                 ip, block_info.reason
                             );
                             true
-                        } else if self.security.is_country_blocked(&ip) {
+                        } else if self.security.is_geo_blocked(&ip) {
                             warn!("[QUIC] Refusing connection from GeoIP-blocked IP {}", ip);
                             self.security.block_ip(ip, BlockReason::GeoBlocked, None);
                             true

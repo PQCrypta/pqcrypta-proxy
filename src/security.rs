@@ -272,6 +272,9 @@ pub struct SecurityState {
     /// GeoIP database (optional)
     #[cfg(feature = "geoip")]
     pub geoip_db: Option<Arc<GeoIpDb>>,
+    /// Current Tor exit addresses (`security.block_tor_exit_nodes`), swapped
+    /// whole on each refresh.
+    pub tor_exits: Arc<arc_swap::ArcSwap<std::collections::HashSet<IpAddr>>>,
     /// JA3/JA4 fingerprint database (advisory-only, never blocks)
     pub ja3_db: Arc<Ja3Database>,
     /// WAF engine (None if WAF disabled)
@@ -826,7 +829,18 @@ impl SecurityState {
                 .and_then(|path| match GeoIpDb::new(path) {
                     Ok(db) => {
                         info!("✅ GeoIP database loaded from {:?}", path);
-                        Some(Arc::new(db))
+                        let asn = config.security.geoip_asn_db_path.as_ref().and_then(|p| {
+                            match maxminddb::Reader::open_readfile(p) {
+                                Ok(r) => Some(r),
+                                Err(e) => {
+                                    if !config.security.blocked_asns.is_empty() {
+                                        warn!("⚠️ blocked_asns is set but the ASN database {:?} could not load: {}", p, e);
+                                    }
+                                    None
+                                }
+                            }
+                        });
+                        Some(Arc::new(db.with_asn(asn)))
                     }
                     Err(e) => {
                         warn!("⚠️ Failed to load GeoIP database from {:?}: {}", path, e);
@@ -900,6 +914,19 @@ impl SecurityState {
             global_rate_limiter,
             #[cfg(feature = "geoip")]
             geoip_db,
+            tor_exits: {
+                let set = Arc::new(arc_swap::ArcSwap::from_pointee(
+                    std::collections::HashSet::new(),
+                ));
+                if config.security.block_tor_exit_nodes {
+                    spawn_tor_exit_refresh(
+                        set.clone(),
+                        config.security.tor_exit_list_url.clone(),
+                        Duration::from_secs(config.security.tor_exit_refresh_secs.max(60)),
+                    );
+                }
+                set
+            },
             ja3_db: Arc::new(ja3_db),
             waf_engine,
             scanner_ua_exempt: Arc::new(
@@ -960,23 +987,61 @@ impl SecurityState {
         });
     }
 
-    /// Check if an IP is from a blocked country
-    #[cfg(feature = "geoip")]
-    pub fn is_country_blocked(&self, ip: &IpAddr) -> bool {
-        let config = self.config.read();
-        if config.blocked_countries.is_empty() {
-            return false;
+    /// Why `ip` is refused by location or network, if it is: blocked or
+    /// not-allowed country, blocked region, blocked AS, or a Tor exit. One
+    /// function, so the per-request evaluator and the HTTP/3 per-connection
+    /// gate apply the same policy.
+    pub fn geo_block_reason(&self, ip: &IpAddr) -> Option<String> {
+        let c = self.config.read();
+        if c.block_tor_exit_nodes && self.tor_exits.load().contains(ip) {
+            return Some("Tor exit node".to_string());
         }
-
+        #[cfg(feature = "geoip")]
         if let Some(ref db) = self.geoip_db {
-            return db.is_country_blocked(*ip, &config.blocked_countries);
+            if !c.blocked_asns.is_empty() {
+                if let Some(asn) = db.asn(*ip) {
+                    if c.blocked_asns.contains(&asn) {
+                        return Some(format!("AS{asn}"));
+                    }
+                }
+            }
+            let wants_location = !c.blocked_countries.is_empty()
+                || !c.allowed_countries.is_empty()
+                || !c.blocked_regions.is_empty();
+            if wants_location {
+                if let Some(loc) = db.lookup(*ip) {
+                    if let Some(ref cc) = loc.country_code {
+                        if c.blocked_countries
+                            .iter()
+                            .any(|b| b.eq_ignore_ascii_case(cc))
+                        {
+                            return Some(format!("country {cc}"));
+                        }
+                        if !c.allowed_countries.is_empty()
+                            && !c
+                                .allowed_countries
+                                .iter()
+                                .any(|a| a.eq_ignore_ascii_case(cc))
+                        {
+                            return Some(format!("country {cc} not allowed"));
+                        }
+                    }
+                    if let Some(region) = loc
+                        .regions
+                        .iter()
+                        .find(|r| c.blocked_regions.iter().any(|b| b.eq_ignore_ascii_case(r)))
+                    {
+                        return Some(format!("region {region}"));
+                    }
+                }
+            }
         }
-        false
+        None
     }
 
-    #[cfg(not(feature = "geoip"))]
-    pub fn is_country_blocked(&self, _ip: &IpAddr) -> bool {
-        false
+    /// Whether `ip` is refused by location or network ([`Self::geo_block_reason`]).
+    pub fn is_geo_blocked(&self, ip: &IpAddr) -> bool {
+        self.geo_block_reason(ip).is_some()
     }
 
     /// Get or create rate limiter for an IP.
@@ -1512,9 +1577,9 @@ impl SecurityState {
             }
         }
 
-        // 3. GeoIP country blocking
-        if self.is_country_blocked(&ip) {
-            warn!("GeoIP blocked request from {}", ip);
+        // 3. Location and network: country, region, AS, Tor exit.
+        if let Some(reason) = self.geo_block_reason(&ip) {
+            warn!("GeoIP blocked request from {} ({})", ip, reason);
             // `geoip_block_duration_secs = 0` means the block never expires.
             //
             // TOML has no null, and the field carries a serde default, so
@@ -2704,21 +2769,44 @@ mod geoip {
     #[derive(Debug, Clone)]
     pub struct GeoLocation {
         pub country_code: Option<String>,
+        /// ISO 3166-2 codes, country-prefixed ("US-CA"), most to least specific.
+        pub regions: Vec<String>,
         pub country_name: Option<String>,
         pub city: Option<String>,
         pub continent: Option<String>,
     }
 
-    /// GeoIP database wrapper
+    /// GeoIP database wrapper: the City database, and the ASN database when
+    /// one is configured.
     pub struct GeoIpDb {
         reader: Reader<Vec<u8>>,
+        asn: Option<Reader<Vec<u8>>>,
     }
 
     impl GeoIpDb {
         /// Load GeoIP database from file
         pub fn new(path: impl AsRef<Path>) -> Result<Self, maxminddb::MaxMindDbError> {
             let reader = Reader::open_readfile(path)?;
-            Ok(Self { reader })
+            Ok(Self { reader, asn: None })
+        }
+
+        /// Attach the ASN database.
+        #[must_use]
+        pub fn with_asn(mut self, asn: Option<Reader<Vec<u8>>>) -> Self {
+            self.asn = asn;
+            self
+        }
+
+        /// The autonomous system announcing `ip`.
+        pub fn asn(&self, ip: IpAddr) -> Option<u32> {
+            self.asn
+                .as_ref()?
+                .lookup(ip)
+                .ok()?
+                .decode::<maxminddb::geoip2::Asn>()
+                .ok()
+                .flatten()?
+                .autonomous_system_number
         }
 
         /// Look up IP address
@@ -2726,6 +2814,7 @@ mod geoip {
             #[derive(serde::Deserialize)]
             struct City {
                 country: Option<Country>,
+                subdivisions: Option<Vec<Subdivision>>,
                 city: Option<CityName>,
                 continent: Option<Continent>,
             }
@@ -2734,6 +2823,11 @@ mod geoip {
             struct Country {
                 iso_code: Option<String>,
                 names: Option<std::collections::HashMap<String, String>>,
+            }
+
+            #[derive(serde::Deserialize)]
+            struct Subdivision {
+                iso_code: Option<String>,
             }
 
             #[derive(serde::Deserialize)]
@@ -2748,8 +2842,17 @@ mod geoip {
 
             let city: City = self.reader.lookup(ip).ok()?.decode().ok().flatten()?;
 
+            let country_code = city.country.as_ref().and_then(|c| c.iso_code.clone());
+            let regions = match (&country_code, city.subdivisions) {
+                (Some(cc), Some(subs)) => subs
+                    .into_iter()
+                    .filter_map(|s| s.iso_code.map(|code| format!("{cc}-{code}")))
+                    .collect(),
+                _ => Vec::new(),
+            };
             Some(GeoLocation {
-                country_code: city.country.as_ref().and_then(|c| c.iso_code.clone()),
+                country_code,
+                regions,
                 country_name: city
                     .country
                     .as_ref()
@@ -2762,23 +2865,58 @@ mod geoip {
                 continent: city.continent.and_then(|c| c.code),
             })
         }
-
-        /// Check if country is blocked
-        pub fn is_country_blocked(&self, ip: IpAddr, blocked_countries: &[String]) -> bool {
-            if let Some(location) = self.lookup(ip) {
-                if let Some(country_code) = location.country_code {
-                    return blocked_countries
-                        .iter()
-                        .any(|c| c.eq_ignore_ascii_case(&country_code));
-                }
-            }
-            false
-        }
     }
 }
 
 #[cfg(feature = "geoip")]
 pub use geoip::*;
+
+/// Keep `set` holding the current Tor exit list: fetch now, then every
+/// `every`. A failed fetch keeps the previous list rather than emptying it.
+/// Needs a Tokio runtime; constructed outside one (as in unit tests) it does
+/// nothing.
+fn spawn_tor_exit_refresh(
+    set: Arc<arc_swap::ArcSwap<std::collections::HashSet<IpAddr>>>,
+    url: String,
+    every: Duration,
+) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
+        loop {
+            match client.get(&url).send().await.and_then(reqwest::Response::error_for_status) {
+                Ok(resp) => match resp.text().await {
+                    Ok(body) => {
+                        let exits = parse_address_list(&body);
+                        if exits.is_empty() {
+                            warn!("Tor exit list from {} parsed to nothing; keeping the previous one", url);
+                        } else {
+                            info!("Tor exit list refreshed: {} addresses", exits.len());
+                            set.store(Arc::new(exits));
+                        }
+                    }
+                    Err(e) => warn!("Tor exit list body from {} unreadable: {}", url, e),
+                },
+                Err(e) => warn!("Tor exit list fetch from {} failed: {}", url, e),
+            }
+            tokio::time::sleep(every).await;
+        }
+    });
+}
+
+/// One address per line; blank lines and `#` comments ignored.
+fn parse_address_list(body: &str) -> std::collections::HashSet<IpAddr> {
+    body.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| l.parse().ok())
+        .collect()
+}
 
 #[cfg(test)]
 mod tests {
@@ -2877,6 +3015,82 @@ mod tests {
     /// by benchmarking from a non-loopback address with every security feature
     /// disabled: the load generator was banned inside a second and 100% of
     /// 820,380 requests came back 4xx.
+    #[tokio::test]
+    async fn tor_exit_list_parsing_and_blocking() {
+        let parsed = parse_address_list("# comment\n185.220.101.1\n\n2a0b:f4c2::1\nnot-an-ip\n");
+        assert_eq!(parsed.len(), 2);
+
+        let mut config = ProxyConfig::default();
+        config.security.block_tor_exit_nodes = true;
+        // Unroutable, so the background fetch fails fast and keeps the empty list.
+        config.security.tor_exit_list_url = "http://127.0.0.1:9/none".into();
+        let security = SecurityState::new(&config);
+        let ip: IpAddr = "185.220.101.1".parse().unwrap();
+        assert!(
+            security.geo_block_reason(&ip).is_none(),
+            "empty list blocks nothing"
+        );
+        security.tor_exits.store(Arc::new(parsed));
+        assert_eq!(
+            security.geo_block_reason(&ip).as_deref(),
+            Some("Tor exit node")
+        );
+
+        config.security.block_tor_exit_nodes = false;
+        let security = SecurityState::new(&config);
+        security
+            .tor_exits
+            .store(Arc::new(parse_address_list("185.220.101.1")));
+        assert!(security.geo_block_reason(&ip).is_none(), "off means off");
+    }
+
+    /// Against the real GeoLite2 databases when present (every node has them).
+    #[cfg(feature = "geoip")]
+    #[tokio::test]
+    async fn asn_country_allowlist_and_region_blocking() {
+        let city = std::path::Path::new("data/geoip/GeoLite2-City.mmdb");
+        let asn = std::path::Path::new("data/geoip/GeoLite2-ASN.mmdb");
+        if !city.exists() || !asn.exists() {
+            eprintln!("GeoLite2 databases not present; skipping");
+            return;
+        }
+        let google: IpAddr = "8.8.8.8".parse().unwrap();
+        let base = || {
+            let mut c = ProxyConfig::default();
+            c.security.geoip_db_path = Some(city.to_path_buf());
+            c.security.geoip_asn_db_path = Some(asn.to_path_buf());
+            c
+        };
+
+        let mut c = base();
+        c.security.blocked_asns = vec![15169];
+        assert_eq!(
+            SecurityState::new(&c).geo_block_reason(&google).as_deref(),
+            Some("AS15169")
+        );
+
+        let mut c = base();
+        c.security.allowed_countries = vec!["GB".into()];
+        let reason = SecurityState::new(&c).geo_block_reason(&google).unwrap();
+        assert!(reason.contains("not allowed"), "{reason}");
+
+        let mut c = base();
+        c.security.allowed_countries = vec!["us".into()]; // case-insensitive
+        assert!(SecurityState::new(&c).geo_block_reason(&google).is_none());
+
+        // A region the lookup reports, blocked by its ISO 3166-2 code.
+        let db = GeoIpDb::new(city).unwrap();
+        let probe: IpAddr = "128.111.1.1".parse().unwrap(); // UC Santa Barbara
+        if let Some(region) = db.lookup(probe).and_then(|l| l.regions.first().cloned()) {
+            let mut c = base();
+            c.security.blocked_regions = vec![region.clone()];
+            assert_eq!(
+                SecurityState::new(&c).geo_block_reason(&probe),
+                Some(format!("region {region}"))
+            );
+        }
+    }
+
     /// `[security.validation]` refuses with the status that names the problem,
     /// through the one evaluator both transports call.
     #[tokio::test]

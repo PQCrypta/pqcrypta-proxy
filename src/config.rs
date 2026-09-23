@@ -2123,6 +2123,29 @@ pub struct SecurityConfig {
     /// Request hygiene limits, checked before the WAF on every transport.
     #[serde(default)]
     pub validation: RequestValidationConfig,
+    /// When non-empty, only these countries (ISO 3166-1 alpha-2) are served;
+    /// an address with no country in the database is not refused by it.
+    #[serde(default)]
+    pub allowed_countries: Vec<String>,
+    /// Refused regions, ISO 3166-2 (e.g. "US-CA"), from the City database.
+    #[serde(default)]
+    pub blocked_regions: Vec<String>,
+    /// Refused autonomous systems, by number, from the ASN database.
+    #[serde(default)]
+    pub blocked_asns: Vec<u32>,
+    /// MaxMind GeoLite2-ASN database: `blocked_asns` and the speed test's
+    /// ISP lookup.
+    #[serde(default = "default_geoip_asn_db_path")]
+    pub geoip_asn_db_path: Option<PathBuf>,
+    /// Refuse Tor exit nodes, from the list at `tor_exit_list_url`.
+    #[serde(default)]
+    pub block_tor_exit_nodes: bool,
+    /// One address per line; the Tor Project publishes the current exits.
+    #[serde(default = "default_tor_exit_list_url")]
+    pub tor_exit_list_url: String,
+    /// How often the exit list is re-fetched.
+    #[serde(default = "default_tor_exit_refresh_secs")]
+    pub tor_exit_refresh_secs: u64,
     /// How many distinct TLS fingerprints the observed corpus retains.
     ///
     /// This began as a memory-exhaustion guard at a hardcoded 50,000 and is now
@@ -2142,6 +2165,20 @@ pub struct SecurityConfig {
 
 fn default_max_tracked_fingerprints() -> usize {
     250_000
+}
+
+fn default_geoip_asn_db_path() -> Option<PathBuf> {
+    Some(PathBuf::from(
+        "/var/www/html/pqcrypta-proxy/data/geoip/GeoLite2-ASN.mmdb",
+    ))
+}
+
+fn default_tor_exit_list_url() -> String {
+    "https://check.torproject.org/torbulkexitlist".to_string()
+}
+
+fn default_tor_exit_refresh_secs() -> u64 {
+    3600
 }
 
 fn default_geoip_block_duration_secs() -> Option<u64> {
@@ -2296,6 +2333,13 @@ impl Default for SecurityConfig {
             geo_block_redirect_url: default_geo_block_redirect_url(),
             error_pages_path_prefix: default_error_pages_path_prefix(),
             validation: RequestValidationConfig::default(),
+            allowed_countries: Vec::new(),
+            blocked_regions: Vec::new(),
+            blocked_asns: Vec::new(),
+            geoip_asn_db_path: default_geoip_asn_db_path(),
+            block_tor_exit_nodes: false,
+            tor_exit_list_url: default_tor_exit_list_url(),
+            tor_exit_refresh_secs: default_tor_exit_refresh_secs(),
         }
     }
 }
