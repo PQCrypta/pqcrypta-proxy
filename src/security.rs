@@ -2246,6 +2246,9 @@ pub async fn security_middleware(
                 |name: hyper::header::HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
             let protocol = crate::access_logger::protocol_name(request.version());
             log_access(&AccessLogEntry {
+                ja3: None,
+                ja4: None,
+                backend: None,
                 remote_addr: client_addr,
                 method: request.method().as_str(),
                 path: request.uri().path(),

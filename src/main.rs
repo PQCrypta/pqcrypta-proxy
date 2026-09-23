@@ -739,6 +739,9 @@ async fn run() -> anyhow::Result<()> {
     pqcrypta_proxy::init_access_logger(
         config.logging.access_log,
         config.logging.access_log_file.clone(),
+        // validate() has already refused an unparseable format.
+        pqcrypta_proxy::access_logger::LogFormat::parse(&config.logging.access_log_format)
+            .unwrap_or(pqcrypta_proxy::access_logger::LogFormat::Combined),
     );
     if config.logging.access_log {
         info!(

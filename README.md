@@ -398,6 +398,23 @@ applies on one path and not the other. The Tor list is fetched in the
 background and swapped in whole; a failed fetch keeps the previous list. The
 speed test reads the same two database paths.
 
+### Access log format
+
+```toml
+[logging]
+access_log = true
+access_log_file = "/var/log/pqcrypta/access.log"
+access_log_format = "combined"   # or "json", or a template:
+# access_log_format = '$remote_addr [$time_local] "$request" $status $body_bytes_sent $request_time_ms $ja4 $backend'
+```
+
+Template variables: `remote_addr`, `time_local`, `time_iso8601`, `request`,
+`method`, `path`, `protocol`, `status`, `body_bytes_sent`, `http_referer`,
+`http_user_agent`, `host`, `request_time_ms`, `trace_id`, `ja3`, `ja4`,
+`backend`. Client-supplied fields are sanitised against log injection; JSON
+escapes them. A streamed response is logged when the stream ends, with the
+bytes actually sent.
+
 ### Request validation
 
 ```toml

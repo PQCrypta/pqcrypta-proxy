@@ -707,6 +707,9 @@ pub(super) async fn advanced_rate_limit_middleware(
             let header_str =
                 |name: hyper::header::HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
             log_access(&AccessLogEntry {
+                ja3: None,
+                ja4: None,
+                backend: None,
                 remote_addr: client_addr,
                 method: &method,
                 path: &path,

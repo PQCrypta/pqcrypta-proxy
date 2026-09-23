@@ -2870,6 +2870,9 @@ async fn proxy_handler(
 
                 // Log backend timeout
                 log_access(&AccessLogEntry {
+                    ja3: headers.get("x-ja3-hash").and_then(|v| v.to_str().ok()),
+                    ja4: headers.get("x-ja4-hash").and_then(|v| v.to_str().ok()),
+                    backend: Some(route.backend.as_str()),
                     remote_addr: client_addr,
                     method: &method_str,
                     path: &path,
@@ -2978,6 +2981,15 @@ async fn proxy_handler(
                     let body = logged_stream(
                         Body::new(incoming_body),
                         crate::access_logger::DeferredAccessLog {
+                            ja3: headers
+                                .get("x-ja3-hash")
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_owned),
+                            ja4: headers
+                                .get("x-ja4-hash")
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_owned),
+                            backend: Some(route.backend.clone()),
                             remote_addr: client_addr,
                             method: method_str.clone(),
                             path: path.clone(),
@@ -3145,6 +3157,9 @@ async fn proxy_handler(
                 let response = match body_source {
                     BodySource::Streamed(_) if head_without_length => {
                         log_access(&AccessLogEntry {
+                            ja3: headers.get("x-ja3-hash").and_then(|v| v.to_str().ok()),
+                            ja4: headers.get("x-ja4-hash").and_then(|v| v.to_str().ok()),
+                            backend: Some(route.backend.as_str()),
                             remote_addr: client_addr,
                             method: &method_str,
                             path: &path,
@@ -3173,6 +3188,15 @@ async fn proxy_handler(
                         logged_stream(
                             body,
                             crate::access_logger::DeferredAccessLog {
+                                ja3: headers
+                                    .get("x-ja3-hash")
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(str::to_owned),
+                                ja4: headers
+                                    .get("x-ja4-hash")
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(str::to_owned),
+                                backend: Some(route.backend.clone()),
                                 remote_addr: client_addr,
                                 method: method_str.clone(),
                                 path: path.clone(),
@@ -3187,6 +3211,9 @@ async fn proxy_handler(
                     ),
                     BodySource::Buffered(bytes) => {
                         log_access(&AccessLogEntry {
+                            ja3: headers.get("x-ja3-hash").and_then(|v| v.to_str().ok()),
+                            ja4: headers.get("x-ja4-hash").and_then(|v| v.to_str().ok()),
+                            backend: Some(route.backend.as_str()),
                             remote_addr: client_addr,
                             method: &method_str,
                             path: &path,
@@ -3254,6 +3281,9 @@ async fn proxy_handler(
 
                 // Log backend error
                 log_access(&AccessLogEntry {
+                    ja3: headers.get("x-ja3-hash").and_then(|v| v.to_str().ok()),
+                    ja4: headers.get("x-ja4-hash").and_then(|v| v.to_str().ok()),
+                    backend: Some(route.backend.as_str()),
                     remote_addr: client_addr,
                     method: &method_str,
                     path: &path,
@@ -3289,6 +3319,9 @@ async fn proxy_handler(
 
         // Log 404
         log_access(&AccessLogEntry {
+            ja3: headers.get("x-ja3-hash").and_then(|v| v.to_str().ok()),
+            ja4: headers.get("x-ja4-hash").and_then(|v| v.to_str().ok()),
+            backend: route.map(|r| r.backend.as_str()),
             remote_addr: client_addr,
             method: &method_str,
             path: &path,

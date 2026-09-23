@@ -1086,6 +1086,10 @@ fn default_observed_fingerprints_path() -> Option<PathBuf> {
     ))
 }
 
+fn default_access_log_format() -> String {
+    "combined".to_string()
+}
+
 fn default_server_header() -> String {
     "pqcrypta".to_string()
 }
@@ -1950,6 +1954,10 @@ pub struct LoggingConfig {
     pub access_log: bool,
     /// Access log file path
     pub access_log_file: Option<PathBuf>,
+    /// Access log line format: "combined" (default), "json", or a template of
+    /// `$variables` such as `$remote_addr [$time_local] "$request" $status $ja4`.
+    #[serde(default = "default_access_log_format")]
+    pub access_log_format: String,
     /// Audit log file path (None = write to stderr)
     pub audit_log_path: Option<PathBuf>,
     /// Enable structured audit logging (default true)
@@ -1986,6 +1994,7 @@ impl Default for LoggingConfig {
             file: None,
             access_log: true,
             access_log_file: None,
+            access_log_format: default_access_log_format(),
             audit_log_path: None,
             audit_log_enabled: true,
             max_size_mb: default_log_max_size_mb(),
@@ -3499,6 +3508,10 @@ impl ProxyConfig {
                 "http_redirect.redirect_status must be 301, 302, 307 or 308, not {}",
                 self.http_redirect.redirect_status
             ));
+        }
+
+        if let Err(e) = crate::access_logger::LogFormat::parse(&self.logging.access_log_format) {
+            return Err(anyhow::anyhow!("logging.access_log_format: {e}"));
         }
 
         if !self.server.request_id_header.is_empty()

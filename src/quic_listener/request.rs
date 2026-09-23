@@ -666,6 +666,9 @@ impl QuicListener {
                 warn!("HTTP/3 no route found for host={:?} path={}", host, path);
                 // Log 404 response
                 log_access(&AccessLogEntry {
+                    ja3: fingerprint.ja3_hash.as_deref(),
+                    ja4: fingerprint.ja4_hash.as_deref(),
+                    backend: None,
                     remote_addr,
                     method,
                     path: &path,
@@ -1277,6 +1280,9 @@ impl QuicListener {
                         is_health_check,
                     );
                     log_access(&AccessLogEntry {
+                        ja3: fingerprint.ja3_hash.as_deref(),
+                        ja4: fingerprint.ja4_hash.as_deref(),
+                        backend: Some(route.backend.as_str()),
                         remote_addr,
                         method,
                         path: &path,
@@ -1328,6 +1334,9 @@ impl QuicListener {
                         is_health_check,
                     );
                     log_access(&AccessLogEntry {
+                        ja3: fingerprint.ja3_hash.as_deref(),
+                        ja4: fingerprint.ja4_hash.as_deref(),
+                        backend: Some(route.backend.as_str()),
                         remote_addr,
                         method,
                         path: &path,
@@ -1647,6 +1656,9 @@ impl QuicListener {
                 is_health_check,
             );
             log_access(&AccessLogEntry {
+                ja3: fingerprint.ja3_hash.as_deref(),
+                ja4: fingerprint.ja4_hash.as_deref(),
+                backend: Some(route.backend.as_str()),
                 remote_addr,
                 method,
                 path: &path,
@@ -1891,6 +1903,9 @@ impl QuicListener {
 
         // Log successful response
         log_access(&AccessLogEntry {
+            ja3: fingerprint.ja3_hash.as_deref(),
+            ja4: fingerprint.ja4_hash.as_deref(),
+            backend: Some(route.backend.as_str()),
             remote_addr,
             method,
             path: &path,
