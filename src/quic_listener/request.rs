@@ -23,7 +23,7 @@ use crate::rate_limiter::{build_context_from_request, AdvancedRateLimiter, RateL
 use crate::security::SecurityState;
 
 use super::cors::add_cors_headers_to_builder;
-use super::{alt_svc_for_host, resolve_route_policy, QuicListener, SERVER_HEADER};
+use super::{alt_svc_for_host, resolve_route_policy, QuicListener, ServerHeader};
 
 /// Take whatever the client already sent, so the receive side closes cleanly.
 ///
@@ -296,7 +296,7 @@ impl QuicListener {
                                 "x-ratelimit-reason",
                                 format!("{:?}", reason).to_ascii_lowercase(),
                             )
-                            .header("server", SERVER_HEADER);
+                            .server_header(&config);
                         for (k, v) in crate::security::cors_refusal_headers(req_origin_adv) {
                             builder_adv = builder_adv.header(k, v);
                         }
@@ -319,7 +319,7 @@ impl QuicListener {
                         );
                         let response = http::Response::builder()
                             .status(http::StatusCode::FORBIDDEN)
-                            .header("server", SERVER_HEADER)
+                            .server_header(&config)
                             .body(())?;
                         respond_and_finish(&mut stream, response).await?;
                         return Ok(());
@@ -371,7 +371,7 @@ impl QuicListener {
                     );
                     let mut builder = http::Response::builder()
                         .status(rendering.status)
-                        .header("server", SERVER_HEADER);
+                        .server_header(&config);
                     for (k, v) in rendering.headers {
                         builder = builder.header(k, v);
                     }
@@ -393,7 +393,7 @@ impl QuicListener {
                 let mut early_response_builder = http::Response::builder()
                     .status(http::StatusCode::EARLY_HINTS)
                     .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
-                    .header("server", SERVER_HEADER);
+                    .server_header(&config);
 
                 for hint in &hints {
                     early_response_builder = early_response_builder.header("link", hint.as_str());
@@ -468,7 +468,7 @@ impl QuicListener {
                         builder = builder.header(name, value);
                     }
                     let response = builder
-                        .header("server", SERVER_HEADER)
+                        .server_header(&config)
                         .header(
                             "alt-svc",
                             alt_svc_for_host(&config, Some(&conformance_host)),
@@ -516,7 +516,7 @@ impl QuicListener {
                 .header("content-length", bytes_to_send.to_string())
                 .header("cache-control", "no-store")
                 .header("x-content-type-options", "nosniff")
-                .header("server", SERVER_HEADER)
+                .server_header(&config)
                 .body(())?;
             stream.send_response(response).await?;
 
@@ -623,7 +623,7 @@ impl QuicListener {
                 .header("content-type", "application/json")
                 .header("content-length", json_len.to_string())
                 .header("cache-control", "no-store")
-                .header("server", SERVER_HEADER)
+                .server_header(&config)
                 .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
                 .body(())?;
             stream.send_response(response).await?;
@@ -685,7 +685,7 @@ impl QuicListener {
                 // receive "clear" and the browser stops upgrading to HTTP/3.
                 let response = http::Response::builder()
                     .status(http::StatusCode::NOT_FOUND)
-                    .header("server", SERVER_HEADER)
+                    .server_header(&config)
                     .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
                     .body(())?;
 
@@ -729,7 +729,7 @@ impl QuicListener {
                     );
                     let response = http::Response::builder()
                         .status(http::StatusCode::TOO_MANY_REQUESTS)
-                        .header("server", SERVER_HEADER)
+                        .server_header(&config)
                         .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
                         .header("retry-after", (retry_after_ms / 1000).to_string())
                         .header("x-ratelimit-limit", limit.to_string())
@@ -770,7 +770,7 @@ impl QuicListener {
                 let response = http::Response::builder()
                     .status(status)
                     .header("location", &target)
-                    .header("server", SERVER_HEADER)
+                    .server_header(&config)
                     .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
                     .body(())?;
                 respond_and_finish(&mut stream, response).await?;
@@ -792,7 +792,7 @@ impl QuicListener {
                 let mut response_builder = http::Response::builder()
                     .status(http::StatusCode::OK)
                     .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
-                    .header("server", SERVER_HEADER);
+                    .server_header(&config);
 
                 // Access-Control-Allow-Origin — reflect when allow_origins list is set
                 let req_origin_str = request
@@ -889,7 +889,7 @@ impl QuicListener {
             {
                 let mut builder = http::Response::builder()
                     .status(status)
-                    .header("server", SERVER_HEADER)
+                    .server_header(&config)
                     .header("alt-svc", alt_svc_for_host(&config, host.as_deref()));
                 for (k, v) in extra {
                     builder = builder.header(k, v);
@@ -1016,7 +1016,7 @@ impl QuicListener {
                         );
                         let response = http::Response::builder()
                             .status(http::StatusCode::SERVICE_UNAVAILABLE)
-                            .header("server", SERVER_HEADER)
+                            .server_header(&config)
                             .body(())?;
                         respond_and_finish(&mut stream, response).await?;
                         return Ok(());
@@ -1037,7 +1037,7 @@ impl QuicListener {
                         );
                         let response = http::Response::builder()
                             .status(http::StatusCode::BAD_GATEWAY)
-                            .header("server", SERVER_HEADER)
+                            .server_header(&config)
                             .body(())?;
                         respond_and_finish(&mut stream, response).await?;
                         return Ok(());
@@ -1150,7 +1150,7 @@ impl QuicListener {
                 );
                 let mut builder = http::Response::builder()
                     .status(rendering.status)
-                    .header("server", SERVER_HEADER);
+                    .server_header(&config);
                 for (k, v) in rendering.headers {
                     builder = builder.header(k, v);
                 }
@@ -1207,12 +1207,12 @@ impl QuicListener {
                         .header("age", age_secs.to_string())
                         .header("x-cache", "HIT")
                         .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
-                        .header("server", SERVER_HEADER);
+                        .server_header(&config);
                     for (k, v) in &cached_headers {
                         // Skip headers the proxy sets itself in this block. The cached
                         // entry holds the raw backend headers, so replaying `server`
                         // would emit a second `server: <backend>` alongside our own
-                        // SERVER_HEADER — duplicate `server` values that leak the backend
+                        // server_header — duplicate `server` values that leak the backend
                         // identity and shadow ours for some HTTP/3 clients. Same for
                         // alt-svc/age/x-cache/content-length which are set above.
                         let lk = k.to_lowercase();
@@ -1293,7 +1293,7 @@ impl QuicListener {
                         .header("age", age_secs.to_string())
                         .header("x-cache", "HIT")
                         .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
-                        .header("server", SERVER_HEADER);
+                        .server_header(&config);
                     if let Some(et) = etag {
                         response_builder = response_builder.header("etag", et);
                     }
@@ -1356,7 +1356,7 @@ impl QuicListener {
             );
             let response = http::Response::builder()
                 .status(http::StatusCode::BAD_REQUEST)
-                .header("server", SERVER_HEADER)
+                .server_header(&config)
                 .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
                 .body(())?;
             respond_and_finish(&mut stream, response).await?;
@@ -1563,7 +1563,7 @@ impl QuicListener {
                 sse_builder = sse_builder.header(name, value);
             }
             sse_builder = sse_builder.header("cache-control", "no-cache");
-            sse_builder = sse_builder.header("server", SERVER_HEADER);
+            sse_builder = sse_builder.server_header(&config);
             sse_builder = sse_builder.header("alt-svc", alt_svc_for_host(&config, host.as_deref()));
             // CORS headers must be present on the streamed response itself, not
             // just the preflight — otherwise browsers block the SSE fetch with
@@ -1728,7 +1728,10 @@ impl QuicListener {
                     | "access-control-allow-credentials"
                     | "access-control-expose-headers"
                     | "access-control-max-age"
-            ) {
+            ) || (lower_name == "server" && config.server.server_header.is_empty())
+            {
+                // `server` passes through only when `server.server_header` is
+                // empty; otherwise the configured value replaces it.
                 response_builder = response_builder.header(name, value);
             }
         }
@@ -1805,8 +1808,9 @@ impl QuicListener {
         if config.headers.server_timing_enabled {
             let processing_time = start_time.elapsed();
             let server_timing = format!(
-                "proxy;dur={:.2};desc=\"PQ Crypta Processing\", quic;desc=\"QUIC v1\"",
-                processing_time.as_secs_f64() * 1000.0
+                "proxy;dur={:.2};desc=\"{}\", quic;desc=\"QUIC v1\"",
+                processing_time.as_secs_f64() * 1000.0,
+                config.headers.server_timing_desc.replace('"', "'")
             );
             response_builder = response_builder.header("server-timing", server_timing);
         }

@@ -1457,7 +1457,7 @@ async fn run() -> anyhow::Result<()> {
     // Build Alt-Svc header value for logging
     let alt_svc_parts: Vec<String> = all_ports
         .iter()
-        .map(|p| format!("h3=\":{}\"; ma=86400", p))
+        .map(|p| format!("h3=\":{}\"; ma={}", p, config.server.alt_svc_max_age_secs))
         .collect();
 
     info!("═══════════════════════════════════════════════════════════════");

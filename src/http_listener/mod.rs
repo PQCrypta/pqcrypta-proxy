@@ -81,6 +81,8 @@ mod speedtest_tcp;
 mod tls_config;
 mod websocket;
 
+pub(crate) use layers::build_alt_svc_header_with_override;
+
 pub use backend_tls::create_backend_tls_connector;
 pub use passthrough::run_tls_passthrough_server;
 
@@ -116,6 +118,10 @@ pub struct HttpListenerState {
     /// port this listener actually terminates.
     pub alt_svc_value: Option<HeaderValue>,
     pub webtransport_port_value: HeaderValue,
+    /// `[headers]`, validated once at startup.
+    pub(crate) response_headers: Arc<layers::ResponseHeaderSet>,
+    /// `server.server_header`; `None` passes the backend's `Server` through.
+    pub server_header_value: Option<HeaderValue>,
     // Behind `Arc` for the same reason as `security`: axum clones the state per
     // request, and hyper's `Client::clone` copies its config, its HTTP/1 and
     // HTTP/2 builders and its connector — real struct copies, not refcounts.
@@ -253,27 +259,62 @@ async fn dispatch(state: Arc<HttpListenerState>, req: Request<Body>) -> Response
     .await
 }
 
-/// Static dispatch for the optional fingerprint layer.
+/// `server.server_header` as a header value; `None` when empty (pass-through)
+/// or not a valid header value.
+fn server_header_value(config: &ProxyConfig) -> Option<HeaderValue> {
+    let raw = &config.server.server_header;
+    if raw.is_empty() {
+        return None;
+    }
+    match HeaderValue::from_str(raw) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            warn!(
+                "server.server_header is not a valid header value, omitting it: {}",
+                e
+            );
+            None
+        }
+    }
+}
+
+/// Static dispatch for a layer the configuration may leave out.
+///
+/// A disabled feature used to stay in the chain and return early: its layer
+/// still boxed a future and cloned its state on every request, and several did
+/// real work before looking at `enabled` (cloning the request's `HeaderMap`,
+/// building a rate-limit context, stamping `x-ratelimit-limit: 4294967295`).
+/// Every layer here is fixed at startup — a hot reload rebuilds TLS and PQC,
+/// not this chain — so a feature that is off is now simply not in it.
 ///
 /// `tower::util::Either` maps both branches onto `BoxError`, which would break
 /// the `Error = Infallible` bound the surrounding axum layers require, and
-/// boxing a branch would put back the per-request allocation this module exists
-/// to remove. Both branches are `from_fn` services, and `FromFn::Future` is the
-/// same non-generic type either way, so the enum needs no future of its own.
+/// boxing a branch would put back the per-request allocation this exists to
+/// remove. `futures::future::Either` forwards the output unchanged.
 #[derive(Clone)]
-enum MaybeFingerprint<A, B> {
+enum Maybe<A, B> {
     With(A),
     Without(B),
 }
 
-impl<A, B> tower::Service<Request<Body>> for MaybeFingerprint<A, B>
+impl<A, B> Maybe<A, B> {
+    fn new(enabled: bool, with: impl FnOnce(B) -> A, inner: B) -> Self {
+        if enabled {
+            Self::With(with(inner))
+        } else {
+            Self::Without(inner)
+        }
+    }
+}
+
+impl<A, B> tower::Service<Request<Body>> for Maybe<A, B>
 where
     A: tower::Service<Request<Body>, Response = Response, Error = Infallible>,
-    B: tower::Service<Request<Body>, Response = Response, Error = Infallible, Future = A::Future>,
+    B: tower::Service<Request<Body>, Response = Response, Error = Infallible>,
 {
     type Response = Response;
     type Error = Infallible;
-    type Future = A::Future;
+    type Future = futures::future::Either<A::Future, B::Future>;
 
     fn poll_ready(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), Infallible>> {
         match self {
@@ -284,8 +325,8 @@ where
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         match self {
-            Self::With(svc) => svc.call(req),
-            Self::Without(svc) => svc.call(req),
+            Self::With(svc) => futures::future::Either::Left(svc.call(req)),
+            Self::Without(svc) => futures::future::Either::Right(svc.call(req)),
         }
     }
 }
@@ -335,20 +376,28 @@ where
 /// Order (outside to inside): trace context -> advanced rate limit ->
 /// fingerprint -> security -> http3 features -> compression -> Alt-Svc ->
 /// security headers -> cache -> dispatch.
+///
+/// Every layer but `security` is optional and present only when its feature is
+/// on. `security` always runs: it carries the request-size, header-size and
+/// blocklist enforcement that has no switch of its own.
 #[allow(clippy::too_many_arguments)]
 fn build_proxy_service(
-    state: Arc<HttpListenerState>,
+    state: &Arc<HttpListenerState>,
     response_cache: Arc<crate::cache::ResponseCache>,
     compression_state: CompressionState,
     http3_features_state: Http3FeaturesState,
     security_state: Arc<SecurityState>,
     fingerprint_state: Option<FingerprintMiddlewareState>,
-    rl_state: (Arc<AdvancedRateLimiter>, Arc<MetricsRegistry>),
+    rl_state: (
+        Arc<AdvancedRateLimiter>,
+        Arc<MetricsRegistry>,
+        Option<HeaderValue>,
+    ),
 ) -> impl tower::Service<
     Request<Body>,
     Response = Response,
     Error = Infallible,
-    Future = axum::middleware::future::FromFnResponseFuture,
+    Future = impl Future<Output = Result<Response, Infallible>> + Send + 'static,
 > + Clone
        + Send
        + 'static {
@@ -367,36 +416,69 @@ fn build_proxy_service(
             &fingerprint_state,
             &rl_state,
         );
-        // The `With` variant is never constructed here, so name a type for it.
-        MaybeFingerprint::<ProxyDispatch, ProxyDispatch>::Without(ProxyDispatch {
+        ProxyDispatch {
             state: state.clone(),
-        })
+        }
     };
 
     #[cfg(not(feature = "bench-no-middleware"))]
     let svc = {
+        let config = state.config.clone();
+        let layers_on = LayerSelection::from_config(&config, state, &http3_features_state);
+        layers_on.log();
+
         // Cache is innermost: it stores pre-compression bodies, so every outer layer
         // applies to hits and misses alike.
-        let svc = wrap(
-            middleware::from_fn_with_state(response_cache, cache_middleware),
+        let svc = Maybe::new(
+            layers_on.cache,
+            |inner| {
+                wrap(
+                    middleware::from_fn_with_state(response_cache, cache_middleware),
+                    inner,
+                )
+            },
             ProxyDispatch {
                 state: state.clone(),
             },
         );
-        let svc = wrap(
-            middleware::from_fn_with_state(state.clone(), security_headers_middleware),
+        let svc = Maybe::new(
+            layers_on.security_headers,
+            |inner| {
+                wrap(
+                    middleware::from_fn_with_state(state.clone(), security_headers_middleware),
+                    inner,
+                )
+            },
             svc,
         );
-        let svc = wrap(
-            middleware::from_fn_with_state(state, alt_svc_middleware),
+        let svc = Maybe::new(
+            layers_on.alt_svc,
+            |inner| {
+                wrap(
+                    middleware::from_fn_with_state(state.clone(), alt_svc_middleware),
+                    inner,
+                )
+            },
             svc,
         );
-        let svc = wrap(
-            middleware::from_fn_with_state(compression_state, compression_middleware),
+        let svc = Maybe::new(
+            layers_on.compression,
+            |inner| {
+                wrap(
+                    middleware::from_fn_with_state(compression_state, compression_middleware),
+                    inner,
+                )
+            },
             svc,
         );
-        let svc = wrap(
-            middleware::from_fn_with_state(http3_features_state, http3_features_middleware),
+        let svc = Maybe::new(
+            layers_on.http3_features,
+            |inner| {
+                wrap(
+                    middleware::from_fn_with_state(http3_features_state, http3_features_middleware),
+                    inner,
+                )
+            },
             svc,
         );
         // Arc: axum clones the layer's state per request, and this one holds 19 Arcs
@@ -407,22 +489,97 @@ fn build_proxy_service(
         );
 
         let svc = match fingerprint_state {
-            Some(fp_state) => MaybeFingerprint::With(wrap(
+            Some(fp_state) => Maybe::With(wrap(
                 middleware::from_fn_with_state(fp_state, fingerprint_middleware),
                 svc,
             )),
-            None => MaybeFingerprint::Without(svc),
+            None => Maybe::Without(svc),
         };
 
-        wrap(
-            middleware::from_fn_with_state(rl_state, advanced_rate_limit_middleware),
+        let svc = Maybe::new(
+            layers_on.advanced_rate_limit,
+            |inner| {
+                wrap(
+                    middleware::from_fn_with_state(rl_state, advanced_rate_limit_middleware),
+                    inner,
+                )
+            },
+            svc,
+        );
+
+        // Trace context is the absolute outermost layer so the trace ID is available
+        // to every inner middleware and to the access logger.
+        Maybe::new(
+            layers_on.trace_context,
+            |inner| wrap(middleware::from_fn(trace_context_middleware), inner),
             svc,
         )
     };
 
-    // Trace context is the absolute outermost layer so the trace ID is available
-    // to every inner middleware and to the access logger.
-    wrap(middleware::from_fn(trace_context_middleware), svc)
+    svc
+}
+
+/// Which optional layers `build_proxy_service` puts in the chain.
+#[cfg(not(feature = "bench-no-middleware"))]
+#[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)]
+struct LayerSelection {
+    trace_context: bool,
+    advanced_rate_limit: bool,
+    http3_features: bool,
+    compression: bool,
+    alt_svc: bool,
+    security_headers: bool,
+    cache: bool,
+}
+
+#[cfg(not(feature = "bench-no-middleware"))]
+impl LayerSelection {
+    fn from_config(
+        config: &ProxyConfig,
+        state: &HttpListenerState,
+        http3_features: &Http3FeaturesState,
+    ) -> Self {
+        Self {
+            // The span it opens carries method and path into every log line
+            // written during the request, and is the OTel parent. With OTel off
+            // and INFO spans filtered out it opens a disabled span and nothing
+            // else. The level filter is fixed at startup.
+            trace_context: config.otel.enabled || layers::request_span_enabled(),
+            advanced_rate_limit: config.advanced_rate_limiting.enabled,
+            http3_features: http3_features.coalescing.config.read().enabled
+                || http3_features.priority.config.read().enabled,
+            compression: config.compression.enabled,
+            // Also sends `alt-svc: clear` to tcp_only_hosts, which stays needed
+            // even when this listener advertises nothing.
+            alt_svc: state.alt_svc_value.is_some() || !config.server.tcp_only_hosts.is_empty(),
+            security_headers: !state.response_headers.is_empty(),
+            cache: config.cache.enabled,
+        }
+    }
+
+    fn log(&self) {
+        let off: Vec<&str> = [
+            ("trace_context", self.trace_context),
+            ("advanced_rate_limit", self.advanced_rate_limit),
+            ("http3_features", self.http3_features),
+            ("compression", self.compression),
+            ("alt_svc", self.alt_svc),
+            ("security_headers", self.security_headers),
+            ("cache", self.cache),
+        ]
+        .into_iter()
+        .filter_map(|(name, on)| (!on).then_some(name))
+        .collect();
+        if off.is_empty() {
+            info!("Middleware chain: every layer enabled");
+        } else {
+            info!(
+                "Middleware chain: disabled by configuration, left out: {}",
+                off.join(", ")
+            );
+        }
+    }
 }
 
 /// Create and run the HTTP listener with TLS termination
@@ -502,22 +659,22 @@ pub async fn run_http_listener(
         config.advanced_rate_limiting.clone(),
     ));
     let state_metrics = metrics.clone();
-    let rl_state = (rate_limiter.clone(), metrics);
-    info!(
-        "🚦 Advanced rate limiter enabled (key strategy: {:?})",
-        config.advanced_rate_limiting.key_strategy.order.first()
-    );
+    let alt_svc_value = layers::alt_svc_header_value(port, &config);
+    let rl_state = (rate_limiter.clone(), metrics, alt_svc_value.clone());
+    if config.advanced_rate_limiting.enabled {
+        info!(
+            "🚦 Advanced rate limiter enabled (key strategy: {:?})",
+            config.advanced_rate_limiting.key_strategy.order.first()
+        );
+    }
 
     let state = HttpListenerState {
         conformance: crate::conformance::shared(&config.conformance),
         config: config.clone(),
         port,
-        alt_svc_value: HeaderValue::from_str(&layers::build_alt_svc_header_with_override(
-            port,
-            &config.server.additional_ports,
-            config.server.alt_svc_ports.as_deref(),
-        ))
-        .ok(),
+        alt_svc_value: alt_svc_value.clone(),
+        response_headers: Arc::new(layers::ResponseHeaderSet::from_config(&config.headers)),
+        server_header_value: server_header_value(&config),
         webtransport_port_value: HeaderValue::from_str(&port.to_string())
             .unwrap_or_else(|_| HeaderValue::from_static("443")),
         http_client: Arc::new(http_client),
@@ -537,7 +694,9 @@ pub async fn run_http_listener(
     let state = Arc::new(state);
 
     // Initialize compression state
-    let compression_state = CompressionState::default();
+    let compression_state = CompressionState {
+        config: config.compression.clone(),
+    };
 
     // Initialize HTTP/3 features state (Early Hints, Priority, Coalescing)
     let http3_features_state = Http3FeaturesState::from_proxy_config(&config.http3);
@@ -565,7 +724,7 @@ pub async fn run_http_listener(
     };
 
     let app = build_proxy_service(
-        state.clone(),
+        &state,
         response_cache,
         compression_state,
         http3_features_state,
@@ -682,22 +841,22 @@ pub async fn run_http_listener_pqc(
         config.advanced_rate_limiting.clone(),
     ));
     let state_metrics = metrics.clone();
-    let rl_state = (rate_limiter.clone(), metrics);
-    info!(
-        "🚦 Advanced rate limiter enabled (key strategy: {:?})",
-        config.advanced_rate_limiting.key_strategy.order.first()
-    );
+    let alt_svc_value = layers::alt_svc_header_value(port, &config);
+    let rl_state = (rate_limiter.clone(), metrics, alt_svc_value.clone());
+    if config.advanced_rate_limiting.enabled {
+        info!(
+            "🚦 Advanced rate limiter enabled (key strategy: {:?})",
+            config.advanced_rate_limiting.key_strategy.order.first()
+        );
+    }
 
     let state = HttpListenerState {
         conformance: crate::conformance::shared(&config.conformance),
         config: config.clone(),
         port,
-        alt_svc_value: HeaderValue::from_str(&layers::build_alt_svc_header_with_override(
-            port,
-            &config.server.additional_ports,
-            config.server.alt_svc_ports.as_deref(),
-        ))
-        .ok(),
+        alt_svc_value: alt_svc_value.clone(),
+        response_headers: Arc::new(layers::ResponseHeaderSet::from_config(&config.headers)),
+        server_header_value: server_header_value(&config),
         webtransport_port_value: HeaderValue::from_str(&port.to_string())
             .unwrap_or_else(|_| HeaderValue::from_static("443")),
         http_client: Arc::new(http_client),
@@ -717,7 +876,9 @@ pub async fn run_http_listener_pqc(
     let state = Arc::new(state);
 
     // Initialize compression state
-    let compression_state = CompressionState::default();
+    let compression_state = CompressionState {
+        config: config.compression.clone(),
+    };
 
     // Initialize HTTP/3 features state (Early Hints, Priority, Coalescing)
     let http3_features_state = Http3FeaturesState::from_proxy_config(&config.http3);
@@ -744,7 +905,7 @@ pub async fn run_http_listener_pqc(
     };
 
     let app = build_proxy_service(
-        state.clone(),
+        &state,
         response_cache,
         compression_state,
         http3_features_state,
@@ -961,22 +1122,22 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
     ));
     let conn_metrics = metrics.clone();
     let state_metrics = metrics.clone();
-    let rl_state = (rate_limiter.clone(), metrics);
-    info!(
-        "🚦 Advanced rate limiter enabled (key strategy: {:?})",
-        config.advanced_rate_limiting.key_strategy.order.first()
-    );
+    let alt_svc_value = layers::alt_svc_header_value(port, &config);
+    let rl_state = (rate_limiter.clone(), metrics, alt_svc_value.clone());
+    if config.advanced_rate_limiting.enabled {
+        info!(
+            "🚦 Advanced rate limiter enabled (key strategy: {:?})",
+            config.advanced_rate_limiting.key_strategy.order.first()
+        );
+    }
 
     let state = HttpListenerState {
         conformance: crate::conformance::shared(&config.conformance),
         config: config.clone(),
         port,
-        alt_svc_value: HeaderValue::from_str(&layers::build_alt_svc_header_with_override(
-            port,
-            &config.server.additional_ports,
-            config.server.alt_svc_ports.as_deref(),
-        ))
-        .ok(),
+        alt_svc_value: alt_svc_value.clone(),
+        response_headers: Arc::new(layers::ResponseHeaderSet::from_config(&config.headers)),
+        server_header_value: server_header_value(&config),
         webtransport_port_value: HeaderValue::from_str(&port.to_string())
             .unwrap_or_else(|_| HeaderValue::from_static("443")),
         http_client: Arc::new(http_client),
@@ -996,7 +1157,9 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
     let state = Arc::new(state);
 
     // Initialize compression state
-    let compression_state = CompressionState::default();
+    let compression_state = CompressionState {
+        config: config.compression.clone(),
+    };
 
     // Initialize HTTP/3 features state
     let http3_features_state = Http3FeaturesState::from_proxy_config(&config.http3);
@@ -1018,7 +1181,7 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
     );
 
     let app = build_proxy_service(
-        state.clone(),
+        &state,
         response_cache,
         compression_state,
         http3_features_state,
@@ -1420,22 +1583,22 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     ));
     let conn_metrics = metrics.clone();
     let state_metrics = metrics.clone();
-    let rl_state = (rate_limiter.clone(), metrics);
-    info!(
-        "🚦 Advanced rate limiter enabled (key strategy: {:?})",
-        config.advanced_rate_limiting.key_strategy.order.first()
-    );
+    let alt_svc_value = layers::alt_svc_header_value(port, &config);
+    let rl_state = (rate_limiter.clone(), metrics, alt_svc_value.clone());
+    if config.advanced_rate_limiting.enabled {
+        info!(
+            "🚦 Advanced rate limiter enabled (key strategy: {:?})",
+            config.advanced_rate_limiting.key_strategy.order.first()
+        );
+    }
 
     let state = HttpListenerState {
         conformance: crate::conformance::shared(&config.conformance),
         config: config.clone(),
         port,
-        alt_svc_value: HeaderValue::from_str(&layers::build_alt_svc_header_with_override(
-            port,
-            &config.server.additional_ports,
-            config.server.alt_svc_ports.as_deref(),
-        ))
-        .ok(),
+        alt_svc_value: alt_svc_value.clone(),
+        response_headers: Arc::new(layers::ResponseHeaderSet::from_config(&config.headers)),
+        server_header_value: server_header_value(&config),
         webtransport_port_value: HeaderValue::from_str(&port.to_string())
             .unwrap_or_else(|_| HeaderValue::from_static("443")),
         http_client: Arc::new(http_client),
@@ -1455,7 +1618,9 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     let state = Arc::new(state);
 
     // Initialize middleware states
-    let compression_state = CompressionState::default();
+    let compression_state = CompressionState {
+        config: config.compression.clone(),
+    };
     let http3_features_state = Http3FeaturesState::from_proxy_config(&config.http3);
 
     // Initialize response cache
@@ -1474,7 +1639,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     );
 
     let app = build_proxy_service(
-        state.clone(),
+        &state,
         response_cache,
         compression_state,
         http3_features_state,
@@ -2692,9 +2857,9 @@ async fn proxy_handler(
                     parts.headers.remove("connection");
                     parts.headers.remove("transfer-encoding");
                     parts.headers.remove("upgrade");
-                    parts
-                        .headers
-                        .insert(header::SERVER, HeaderValue::from_static("pqcrypta"));
+                    if let Some(server) = &state.server_header_value {
+                        parts.headers.insert(header::SERVER, server.clone());
+                    }
                     // Remove content-length — SSE has no fixed length
                     parts.headers.remove("content-length");
                     let resp_status = parts.status.as_u16();
@@ -2888,9 +3053,9 @@ async fn proxy_handler(
                 // SEC-08: Version-agnostic Server header — do not disclose product name or
                 // build version to clients. Attackers use Server headers to fingerprint
                 // software and target known CVEs.
-                parts
-                    .headers
-                    .insert(header::SERVER, HeaderValue::from_static("pqcrypta"));
+                if let Some(server) = &state.server_header_value {
+                    parts.headers.insert(header::SERVER, server.clone());
+                }
 
                 // Build response from buffered body bytes.
                 //

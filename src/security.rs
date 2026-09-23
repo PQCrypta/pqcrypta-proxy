@@ -122,6 +122,10 @@ fn cidr_contains_ip(net: &IpNet, addr: &IpAddr) -> bool {
 /// P3-fix: header value is now passed in from SecurityState::alt_svc_header
 /// (built from config ports) rather than a hardcoded constant.
 fn add_alt_svc(response: &mut Response, header: &str) {
+    // Empty when the node advertises no HTTP/3: send no header, not an empty one.
+    if header.is_empty() {
+        return;
+    }
     if let Ok(value) = HeaderValue::from_str(header) {
         response.headers_mut().insert("alt-svc", value);
     }
@@ -909,15 +913,18 @@ impl SecurityState {
             None
         };
 
-        // P3-fix: Build the Alt-Svc header from the configured ports rather than
-        // a hardcoded string.  Collect the primary UDP port + any additional ports.
-        let alt_svc_header: Arc<str> = {
-            let mut parts = vec![format!("h3=\":{}\"; ma=86400", config.server.udp_port)];
-            for p in &config.server.additional_ports {
-                parts.push(format!("h3=\":{}\"; ma=86400", p));
-            }
-            parts.join(", ").into()
-        };
+        // The Alt-Svc on the proxy's own refusals (403/429/413): the same value
+        // the TCP listener on `udp_port` advertises, so `server.alt_svc_ports`
+        // and `server.alt_svc_max_age_secs` apply here too. This used to list
+        // `udp_port` plus every additional port, ignoring the override that
+        // exists because a bound port is not necessarily a reachable one.
+        let alt_svc_header: Arc<str> = crate::http_listener::build_alt_svc_header_with_override(
+            config.server.udp_port,
+            &config.server.additional_ports,
+            config.server.alt_svc_ports.as_deref(),
+            config.server.alt_svc_max_age_secs,
+        )
+        .into();
 
         let state = Self {
             ip_rate_limiters: Arc::new(DashMap::new()),

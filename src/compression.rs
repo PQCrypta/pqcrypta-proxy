@@ -18,8 +18,9 @@ use axum::middleware::Next;
 use axum::response::Response;
 use tracing::{debug, trace};
 
-/// Compression configuration
-#[derive(Debug, Clone)]
+/// Compression configuration, read from `[compression]`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct CompressionConfig {
     /// Enable compression
     pub enabled: bool,

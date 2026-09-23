@@ -42,7 +42,22 @@ mod websocket;
 
 use websocket::ws_h3_tunnel;
 
-const SERVER_HEADER: &str = "pqcrypta"; // SEC-08: no version disclosure
+/// `server.server_header` (SEC-08: product name, no version) on a response the
+/// proxy builds; an empty setting sends none.
+pub(super) trait ServerHeader {
+    fn server_header(self, config: &ProxyConfig) -> Self;
+}
+
+impl ServerHeader for http::response::Builder {
+    fn server_header(self, config: &ProxyConfig) -> Self {
+        let server = config.server.server_header.as_str();
+        if server.is_empty() {
+            self
+        } else {
+            self.header("server", server)
+        }
+    }
+}
 
 /// True when an h3 error is just the peer hanging up rather than a fault here.
 ///
@@ -88,7 +103,8 @@ fn build_alt_svc_header_over_quic(config: &ProxyConfig) -> String {
 
     // The same port over TCP. Both listeners bind the same port set, so a client on
     // h3:P can always reach h2:P.
-    let mut parts = vec![format!("h2=\":{current}\"; ma=86400")];
+    let max_age = config.server.alt_svc_max_age_secs;
+    let mut parts = vec![format!("h2=\":{current}\"; ma={max_age}")];
 
     // `server.alt_svc_ports`, when the operator has set it, is the list of ports
     // that actually serve HTTP/3 — a bound port is not necessarily a reachable one.
@@ -105,7 +121,7 @@ fn build_alt_svc_header_over_quic(config: &ProxyConfig) -> String {
             continue;
         }
         seen.push(p);
-        parts.push(format!("h3=\":{p}\"; ma=86400"));
+        parts.push(format!("h3=\":{p}\"; ma={max_age}"));
     }
 
     parts.join(", ")
@@ -243,12 +259,16 @@ fn resolve_route_policy(
 
 fn build_static_response_headers(config: &ProxyConfig) -> HeaderMap {
     let mut h = HeaderMap::with_capacity(16);
+    // An empty value omits the header, as on the TCP path.
     let mut put = |name: &'static str, value: &str| {
+        if value.is_empty() {
+            return;
+        }
         if let Ok(v) = HeaderValue::from_str(value) {
             h.append(HeaderName::from_static(name), v);
         }
     };
-    put("server", SERVER_HEADER);
+    put("server", &config.server.server_header);
     if !config.headers.accept_ch.is_empty() {
         put("accept-ch", &config.headers.accept_ch);
     }

@@ -145,6 +145,10 @@ pub struct ProxyConfig {
     /// Security headers configuration
     #[serde(default)]
     pub headers: HeadersConfig,
+    /// Response compression (TCP listeners). Defaults to on, as it always was;
+    /// before this section existed the setting could not be changed at all.
+    #[serde(default)]
+    pub compression: crate::compression::CompressionConfig,
     /// HTTP redirect configuration
     #[serde(default)]
     pub http_redirect: HttpRedirectConfig,
@@ -472,6 +476,7 @@ impl Default for ProxyConfig {
             advanced_rate_limiting: AdvancedRateLimitConfig::default(),
             security: SecurityConfig::default(),
             headers: HeadersConfig::default(),
+            compression: crate::compression::CompressionConfig::default(),
             http_redirect: HttpRedirectConfig::default(),
             load_balancer: LoadBalancerConfig::default(),
             fingerprint: FingerprintConfig::default(),
@@ -859,6 +864,31 @@ pub struct ServerConfig {
     #[serde(default)]
     pub tcp_only_hosts: Vec<String>,
 
+    /// Value of the `Server` header on every response (SEC-08: product name,
+    /// no version). An empty string leaves the backend's own `Server` header in
+    /// place on proxied responses and sends none on the proxy's own — the
+    /// pass-through HAProxy and NGINX do by default, which discloses whatever
+    /// the backend advertises.
+    #[serde(default = "default_server_header")]
+    pub server_header: String,
+
+    /// `ma` (max-age, seconds) on every Alt-Svc alternative the proxy advertises.
+    #[serde(default = "default_alt_svc_max_age_secs")]
+    pub alt_svc_max_age_secs: u64,
+
+    /// Clients that get `Alt-Svc: clear` instead of an HTTP/3 advertisement on
+    /// TCP, by source network. Defaults to Cloudflare's published ranges:
+    /// Cloudflare Radar / URLScan fetch with a generic Chrome UA, so they can
+    /// only be recognised by address, and they fail on a QUIC upgrade.
+    #[serde(default = "default_alt_svc_clear_cidrs")]
+    pub alt_svc_clear_cidrs: Vec<ipnet::IpNet>,
+
+    /// Clients that get `Alt-Svc: clear`, by case-insensitive User-Agent
+    /// substring. Defaults to the search-engine crawlers and TLS scanners that
+    /// either fail on QUIC or record empty MIME types after upgrading.
+    #[serde(default = "default_alt_svc_clear_user_agents")]
+    pub alt_svc_clear_user_agents: Vec<String>,
+
     /// Hosts that must negotiate HTTP/1.1 only — `h2` is NOT included in the
     /// ALPN list for these SNI names.
     ///
@@ -976,12 +1006,84 @@ impl Default for ServerConfig {
             webtransport_max_datagrams_per_sec: 500,
             webtransport_port: 4433,
             tcp_only_hosts: Vec::new(),
+            server_header: default_server_header(),
+            alt_svc_max_age_secs: default_alt_svc_max_age_secs(),
+            alt_svc_clear_cidrs: default_alt_svc_clear_cidrs(),
+            alt_svc_clear_user_agents: default_alt_svc_clear_user_agents(),
             http11_only_hosts: Vec::new(),
             webtransport_cert_path: None,
             webtransport_key_path: None,
             normalize_paths: true,
         }
     }
+}
+
+fn default_server_header() -> String {
+    "pqcrypta".to_string()
+}
+
+fn default_alt_svc_max_age_secs() -> u64 {
+    86400
+}
+
+fn default_alt_svc_clear_cidrs() -> Vec<ipnet::IpNet> {
+    // https://www.cloudflare.com/ips/
+    [
+        "173.245.48.0/20",
+        "103.21.244.0/22",
+        "103.22.200.0/22",
+        "103.31.4.0/22",
+        "141.101.64.0/18",
+        "108.162.192.0/18",
+        "190.93.240.0/20",
+        "188.114.96.0/20",
+        "197.234.240.0/22",
+        "198.41.128.0/17",
+        "162.158.0.0/15",
+        "104.16.0.0/13",
+        "104.24.0.0/14",
+        "172.64.0.0/13",
+        "131.0.72.0/22",
+        "2400:cb00::/32",
+        "2606:4700::/32",
+        "2803:f800::/32",
+        "2405:b500::/32",
+        "2405:8100::/32",
+        "2a06:98c0::/29",
+        "2c0f:f248::/32",
+    ]
+    .iter()
+    .filter_map(|c| c.parse().ok())
+    .collect()
+}
+
+fn default_alt_svc_clear_user_agents() -> Vec<String> {
+    [
+        "googlebot",
+        "adsbot-google",
+        "google-inspectiontool",
+        "googleother",
+        "bingbot",
+        "msnbot",
+        "yandexbot",
+        "baiduspider",
+        "duckduckbot",
+        "slurp",
+        "applebot",
+        "semrushbot",
+        "ahrefsbot",
+        "dotbot",
+        "sogou",
+        "exabot",
+        "facebot",
+        "ia_archiver",
+        "ssllabs",
+        "qualys",
+        "ssl-pulse",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
 }
 
 fn default_max_uni_streams() -> u32 {
@@ -2072,6 +2174,10 @@ impl Default for ConnectionPoolConfig {
 }
 
 /// Security headers configuration (similar to nginx/Apache security headers)
+///
+/// Every value is optional: an empty string omits that header. With all of
+/// them empty and `server_timing_enabled = false` the TCP listener leaves the
+/// response-header layer out of its middleware chain altogether.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HeadersConfig {
@@ -2112,6 +2218,10 @@ pub struct HeadersConfig {
     #[serde(default = "default_true")]
     pub server_timing_enabled: bool,
 
+    /// `desc` of the Server-Timing metric.
+    #[serde(default = "default_server_timing_desc")]
+    pub server_timing_desc: String,
+
     /// Accept-CH header for Client Hints (responsive content delivery)
     /// Example: "DPR, Viewport-Width, Width, ECT, RTT, Downlink, Sec-CH-UA-Platform"
     #[serde(default)]
@@ -2147,6 +2257,10 @@ pub struct HeadersConfig {
     /// CSP applied to the add-in surface. Empty disables the exception entirely.
     #[serde(default = "default_addin_csp")]
     pub addin_csp: String,
+}
+
+fn default_server_timing_desc() -> String {
+    "PQ Crypta Processing".to_string()
 }
 
 fn default_addin_hosts() -> Vec<String> {
@@ -2187,20 +2301,17 @@ impl Default for HeadersConfig {
 
             // HTTP/3 Performance & Monitoring Headers
             server_timing_enabled: true,
+            server_timing_desc: default_server_timing_desc(),
 
-            // Client Hints for responsive content delivery
-            accept_ch: "DPR, Viewport-Width, Width, ECT, RTT, Downlink, Sec-CH-UA-Platform, Sec-CH-UA-Mobile".to_string(),
-
-            // Network Error Logging configuration
-            // Reports connection errors to the configured endpoint
-            nel: r#"{"report_to":"default","max_age":86400,"include_subdomains":true}"#.to_string(),
-
-            // Reporting API endpoint configuration
-            // Groups for NEL, CSP violations, and other reports
-            report_to: r#"{"group":"default","max_age":86400,"endpoints":[{"url":"https://pqcrypta.com/api/reports"}]}"#.to_string(),
-
-            // HTTP/3 Priority (RFC 9218) - u=3 is default urgency, i=?0 means non-incremental
-            priority: "u=3,i=?0".to_string(),
+            // Accept-CH, NEL, Report-To and Priority are empty by default, the same
+            // value `#[serde(default)]` gives each field when a `[headers]` section
+            // omits it. The two used to disagree: a config with no `[headers]`
+            // section at all took these from here, and this default pointed every
+            // other operator's browsers at pqcrypta.com's report collector.
+            accept_ch: String::new(),
+            nel: String::new(),
+            report_to: String::new(),
+            priority: String::new(),
 
             // Outlook add-in surface exception
             addin_hosts: default_addin_hosts(),
