@@ -13,9 +13,10 @@ use std::io::Write;
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{header, HeaderMap, HeaderValue, Request};
+use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
+use futures_util::TryStreamExt;
 use tracing::{debug, trace};
 
 /// Compression configuration, read from `[compression]`.
@@ -205,7 +206,7 @@ pub fn compress_bytes(
         }
         CompressionEncoding::Deflate => {
             use std::io::Write;
-            let mut encoder = flate2::write::DeflateEncoder::new(
+            let mut encoder = flate2::write::ZlibEncoder::new(
                 Vec::new(),
                 flate2::Compression::new(config.gzip_level),
             );
@@ -268,6 +269,9 @@ pub async fn compression_middleware(
 
     trace!("Client accepts compression: {:?}", encoding);
 
+    // HEAD carries no body to encode; its headers must describe the GET's.
+    let is_head = request.method() == axum::http::Method::HEAD;
+
     // Run the next handler
     let response = next.run(request).await;
 
@@ -311,69 +315,46 @@ pub async fn compression_middleware(
         return response;
     }
 
-    // Collect body bytes for compression
-    // Note: For very large responses, streaming compression would be better
+    // Responses with no body to encode.
+    let status = response.status();
+    if is_head || status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED {
+        return response;
+    }
+
+    // Streaming compression. The body is encoded as it arrives, in the
+    // encoder's own small chunks, so memory stays constant whatever the size,
+    // the first bytes leave before the backend has finished, and no single
+    // poll runs long enough to stall the other connections on this worker.
+    // This replaced collecting the whole body with a 100 MB cap, where a body
+    // over the cap or a backend stream error became a 200 with an empty body.
     let (mut parts, body) = response.into_parts();
+    let reader =
+        tokio_util::io::StreamReader::new(body.into_data_stream().map_err(std::io::Error::other));
+    let encoded = encode_stream(reader, encoding, config);
 
-    // Try to collect the body
-    let body_bytes = match axum::body::to_bytes(body, 100 * 1024 * 1024).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            debug!("Failed to read body for compression: {}", e);
-            return Response::from_parts(parts, Body::empty());
-        }
-    };
+    debug!("Streaming compression: {}", encoding.as_str());
 
-    // Check size after reading
-    if body_bytes.len() < config.min_size {
-        trace!("Body too small after reading: {} bytes", body_bytes.len());
-        return Response::from_parts(parts, Body::from(body_bytes));
-    }
-
-    // Compress the body
-    let compressed = match compress_bytes(&body_bytes, encoding, config) {
-        Some(compressed) => compressed,
-        None => {
-            debug!("Compression failed, returning uncompressed");
-            return Response::from_parts(parts, Body::from(body_bytes));
-        }
-    };
-
-    // Only use compressed version if it's smaller
-    if compressed.len() >= body_bytes.len() {
-        trace!(
-            "Compressed size ({}) >= original ({}), skipping",
-            compressed.len(),
-            body_bytes.len()
-        );
-        return Response::from_parts(parts, Body::from(body_bytes));
-    }
-
-    let original_size = body_bytes.len();
-    let compressed_size = compressed.len();
-    // clamp(0.0, u32::MAX as f64) ensures value is non-negative and within u32 range.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let ratio =
-        (compressed_size as f64 / original_size as f64 * 100.0).clamp(0.0, u32::MAX as f64) as u32;
-
-    debug!(
-        "Compressed response: {} -> {} bytes ({}%, {})",
-        original_size,
-        compressed_size,
-        ratio,
-        encoding.as_str()
-    );
-
-    // Update headers
     parts.headers.insert(
         header::CONTENT_ENCODING,
         HeaderValue::from_static(encoding.as_str()),
     );
-    parts.headers.insert(
-        header::CONTENT_LENGTH,
-        HeaderValue::from_str(&compressed_size.to_string())
-            .unwrap_or_else(|_| HeaderValue::from_static("0")),
-    );
+    // The encoded length is not known until the stream ends.
+    parts.headers.remove(header::CONTENT_LENGTH);
+    // Byte ranges index the identity representation; a compressed body cannot
+    // honour them.
+    parts.headers.remove(header::ACCEPT_RANGES);
+    // RFC 9110 §8.8.3: a strong validator names exact bytes, and these are no
+    // longer the backend's. Weaken it, as nginx does, so revalidation still
+    // works without claiming byte identity.
+    if let Some(etag) = parts.headers.get(header::ETAG).cloned() {
+        if let Ok(tag) = etag.to_str() {
+            if !tag.starts_with("W/") {
+                if let Ok(weak) = HeaderValue::from_str(&format!("W/{tag}")) {
+                    parts.headers.insert(header::ETAG, weak);
+                }
+            }
+        }
+    }
 
     // Add Vary header to indicate response varies by Accept-Encoding
     if let Some(vary) = parts.headers.get(header::VARY) {
@@ -391,7 +372,37 @@ pub async fn compression_middleware(
             .insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
     }
 
-    Response::from_parts(parts, Body::from(compressed))
+    Response::from_parts(parts, encoded)
+}
+
+/// Wrap `reader` in the streaming encoder for `encoding`, at the configured
+/// level, and hand it back as a response body.
+fn encode_stream<R>(reader: R, encoding: CompressionEncoding, config: &CompressionConfig) -> Body
+where
+    R: tokio::io::AsyncBufRead + Send + 'static,
+{
+    use async_compression::tokio::bufread::{BrotliEncoder, GzipEncoder, ZlibEncoder, ZstdEncoder};
+    use async_compression::Level;
+    use tokio_util::io::ReaderStream;
+    #[allow(clippy::cast_possible_wrap)]
+    match encoding {
+        CompressionEncoding::Brotli => Body::from_stream(ReaderStream::new(
+            BrotliEncoder::with_quality(reader, Level::Precise(config.brotli_quality as i32)),
+        )),
+        CompressionEncoding::Zstd => Body::from_stream(ReaderStream::new(
+            ZstdEncoder::with_quality(reader, Level::Precise(config.zstd_level)),
+        )),
+        CompressionEncoding::Gzip => Body::from_stream(ReaderStream::new(
+            GzipEncoder::with_quality(reader, Level::Precise(config.gzip_level as i32)),
+        )),
+        // HTTP's "deflate" coding is the zlib format (RFC 9110 §8.4.1.2), not
+        // raw DEFLATE; a raw stream is undecodable by a conforming client.
+        CompressionEncoding::Deflate => Body::from_stream(ReaderStream::new(
+            ZlibEncoder::with_quality(reader, Level::Precise(config.gzip_level as i32)),
+        )),
+        // Never reaches here: identity requests return before encoding.
+        CompressionEncoding::Identity => Body::from_stream(ReaderStream::new(reader)),
+    }
 }
 
 #[cfg(test)]

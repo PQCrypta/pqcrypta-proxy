@@ -175,7 +175,7 @@ nonzero_ext = "0.3"
 redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
 
 # Compression
-async-compression = { version = "0.4", features = ["tokio", "brotli", "zstd", "gzip", "deflate"] }
+async-compression = { version = "0.4", features = ["tokio", "brotli", "zstd", "gzip", "zlib"] }
 brotli = "7.0"
 zstd = "0.13"
 flate2 = "1.0"

@@ -278,6 +278,71 @@ fn server_header_value(config: &ProxyConfig) -> Option<HeaderValue> {
     }
 }
 
+/// Largest body buffered for `strip_response_json_fields`.
+const STRIP_JSON_MAX_BYTES: usize = 100 * 1024 * 1024;
+
+/// How a proxied response body leaves the proxy.
+enum BodySource {
+    /// Forwarded as it arrives.
+    Streamed(Body),
+    /// Held whole because a transformation needed the complete document.
+    Buffered(bytes::Bytes),
+}
+
+/// Remove `fields` from a JSON object body (e.g. Frappe's `exc` traces),
+/// correcting Content-Length. Anything that is not a JSON object is returned
+/// untouched.
+fn strip_json_fields(
+    bytes: bytes::Bytes,
+    fields: &[String],
+    headers: &mut HeaderMap,
+) -> bytes::Bytes {
+    let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return bytes;
+    };
+    let Some(obj) = json.as_object_mut() else {
+        return bytes;
+    };
+    for field in fields {
+        obj.remove(field.as_str());
+    }
+    match serde_json::to_vec(&json) {
+        Ok(stripped) => {
+            if let Ok(v) = HeaderValue::from_str(&stripped.len().to_string()) {
+                headers.insert(header::CONTENT_LENGTH, v);
+            }
+            stripped.into()
+        }
+        Err(_) => bytes,
+    }
+}
+
+/// Forward `body` as a stream, counting its bytes, and write the access-log
+/// line when the stream ends or the client goes away mid-stream.
+fn logged_stream(body: Body, log: crate::access_logger::DeferredAccessLog) -> Body {
+    let (guard, counter) = crate::access_logger::StreamedBodyLogger::new(log);
+    let counted = futures_util::StreamExt::filter_map(
+        futures_util::StreamExt::map(http_body_util::BodyStream::new(body), move |frame| {
+            // `guard` is owned by this closure, so it is dropped with the stream
+            // and logs exactly once.
+            let _logger = &guard;
+            match frame {
+                Ok(f) => match f.into_data() {
+                    Ok(data) => {
+                        counter.fetch_add(data.len(), Ordering::Relaxed);
+                        Some(Ok(data))
+                    }
+                    // Trailers carry no body bytes.
+                    Err(_) => None,
+                },
+                Err(e) => Some(Err(e)),
+            }
+        }),
+        |item| async move { item },
+    );
+    Body::from_stream(counted)
+}
+
 /// Static dispatch for a layer the configuration may leave out.
 ///
 /// A disabled feature used to stay in the chain and return early: its layer
@@ -2902,10 +2967,10 @@ async fn proxy_handler(
                         is_health_check,
                     );
                     // This branch forwards the body without buffering it, so there is
-                    // no length to log yet. Hold the line open and write it when the
-                    // stream ends — or when the client disconnects mid-stream, which
-                    // the guard's Drop covers.
-                    let (guard, counter) = crate::access_logger::StreamedBodyLogger::new(
+                    // no length to log yet: the helper writes the line when the stream
+                    // ends, or when the client disconnects mid-stream.
+                    let body = logged_stream(
+                        Body::new(incoming_body),
                         crate::access_logger::DeferredAccessLog {
                             remote_addr: client_addr,
                             method: method_str.clone(),
@@ -2918,69 +2983,50 @@ async fn proxy_handler(
                             started: request_start,
                         },
                     );
-                    let counted = futures_util::StreamExt::filter_map(
-                        futures_util::StreamExt::map(
-                            http_body_util::BodyStream::new(Body::new(incoming_body)),
-                            move |frame| {
-                                // `guard` is owned by this closure, so it is dropped
-                                // with the stream and logs exactly once.
-                                let _logger = &guard;
-                                match frame {
-                                    Ok(f) => match f.into_data() {
-                                        Ok(data) => {
-                                            counter.fetch_add(data.len(), Ordering::Relaxed);
-                                            Some(Ok(data))
-                                        }
-                                        // Trailers carry no body bytes.
-                                        Err(_) => None,
-                                    },
-                                    Err(e) => Some(Err(e)),
-                                }
-                            },
-                        ),
-                        |item| async move { item },
-                    );
-                    return Response::from_parts(parts, Body::from_stream(counted));
+                    return Response::from_parts(parts, body);
                 }
 
-                // Buffer the response body BEFORE releasing the backend connection.
-                // For HTTP/1.1 streaming responses, releasing the connection closes the
-                // socket — any subsequent to_bytes() call in cache/compression middleware
-                // then fails and returns Body::empty() (0-byte response to client).
-                let mut body_bytes =
-                    axum::body::to_bytes(Body::new(incoming_body), 100 * 1024 * 1024)
-                        .await
-                        .unwrap_or_default();
-
-                // Strip specified JSON fields from the response body (e.g. Frappe `exc` traces).
-                // Only applied when Content-Type is application/json and the field list is non-empty.
-                if !route.strip_response_json_fields.is_empty() {
-                    let is_json = parts
+                // Stream the body. Every response used to be buffered whole first,
+                // capped at 100 MB, and a body over the cap — or a backend stream
+                // that failed — became `unwrap_or_default()`: the backend's status
+                // and headers with an EMPTY body. A 150 MB download arrived as a 200
+                // with nothing in it. Buffering is kept only where a transformation
+                // needs the whole document, and there a body that cannot be read is
+                // a 502, never an empty 200. The live body holds the backend
+                // connection open, so releasing the pool slot below does not cut it.
+                let strip_json = !route.strip_response_json_fields.is_empty()
+                    && parts
                         .headers
-                        .get("content-type")
+                        .get(header::CONTENT_TYPE)
                         .and_then(|v| v.to_str().ok())
-                        .map(|ct| ct.contains("application/json"))
-                        .unwrap_or(false);
-                    if is_json {
-                        if let Ok(mut json) =
-                            serde_json::from_slice::<serde_json::Value>(&body_bytes)
-                        {
-                            if let Some(obj) = json.as_object_mut() {
-                                for field in &route.strip_response_json_fields {
-                                    obj.remove(field.as_str());
-                                }
+                        .is_some_and(|ct| ct.contains("application/json"));
+                let body_source = if strip_json {
+                    match axum::body::to_bytes(Body::new(incoming_body), STRIP_JSON_MAX_BYTES).await
+                    {
+                        Ok(bytes) => BodySource::Buffered(strip_json_fields(
+                            bytes,
+                            &route.strip_response_json_fields,
+                            &mut parts.headers,
+                        )),
+                        Err(e) => {
+                            warn!("Could not buffer {} for JSON field stripping: {}", path, e);
+                            if let (Some(server), Some(ref pn)) = (&pool_server, &pool_name) {
+                                state.load_balancer.record_completion(
+                                    pn,
+                                    server.as_ref(),
+                                    response_time,
+                                    false,
+                                );
+                                server.release_connection();
                             }
-                            if let Ok(stripped) = serde_json::to_vec(&json) {
-                                if let Ok(v) = HeaderValue::from_str(&stripped.len().to_string()) {
-                                    parts.headers.insert(header::CONTENT_LENGTH, v);
-                                }
-                                body_bytes = stripped.into();
-                            }
+                            return (StatusCode::BAD_GATEWAY, "Bad Gateway").into_response();
                         }
                     }
-                }
+                } else {
+                    BodySource::Streamed(Body::new(incoming_body))
+                };
 
-                // Record success for load balancer pool — safe to release now that body is buffered
+                // Record success for the load balancer pool at headers, as the SSE path does
                 if let (Some(server), Some(ref pn)) = (&pool_server, &pool_name) {
                     state
                         .load_balancer
@@ -3078,26 +3124,7 @@ async fn proxy_handler(
                 // it did, that value is already correct and is passed through.
                 let head_without_length =
                     method == Method::HEAD && !parts.headers.contains_key(header::CONTENT_LENGTH);
-                // The body was buffered above, so its size is known here; the note
-                // that used to sit on the log call ("Can't know body size for
-                // streaming response") described a different branch — the
-                // passthrough one, which now counts its bytes as they go.
-                // Read before the move, and zero for a bodyless HEAD.
-                let body_len = if head_without_length {
-                    0
-                } else {
-                    body_bytes.len()
-                };
-                let response_body = if head_without_length {
-                    Body::from_stream(futures_util::stream::empty::<
-                        Result<bytes::Bytes, std::io::Error>,
-                    >())
-                } else {
-                    Body::from(body_bytes)
-                };
-                let response = Response::from_parts(parts, response_body);
-
-                let resp_status = response.status().as_u16();
+                let resp_status = parts.status.as_u16();
 
                 // Record request metrics (skip error tracking for health check traffic)
                 state.metrics.requests.request_end_full(
@@ -3109,23 +3136,78 @@ async fn proxy_handler(
                     is_health_check,
                 );
 
-                // Log successful response
-                log_access(&AccessLogEntry {
-                    remote_addr: client_addr,
-                    method: &method_str,
-                    path: &path,
-                    protocol: protocol_str,
-                    status: resp_status,
-                    body_size: body_len,
-                    referer: referer.as_deref(),
-                    user_agent: user_agent.as_deref(),
-                    host: Some(&host_str),
-                    response_time_ms: request_start
-                        .elapsed()
-                        .as_millis()
-                        .try_into()
-                        .unwrap_or(u64::MAX),
-                });
+                let response = match body_source {
+                    BodySource::Streamed(_) if head_without_length => {
+                        log_access(&AccessLogEntry {
+                            remote_addr: client_addr,
+                            method: &method_str,
+                            path: &path,
+                            protocol: protocol_str,
+                            status: resp_status,
+                            body_size: 0,
+                            referer: referer.as_deref(),
+                            user_agent: user_agent.as_deref(),
+                            host: Some(&host_str),
+                            response_time_ms: request_start
+                                .elapsed()
+                                .as_millis()
+                                .try_into()
+                                .unwrap_or(u64::MAX),
+                        });
+                        Response::from_parts(
+                            parts,
+                            Body::from_stream(futures_util::stream::empty::<
+                                Result<bytes::Bytes, std::io::Error>,
+                            >()),
+                        )
+                    }
+                    // The length is written to the access log when the stream ends.
+                    BodySource::Streamed(body) => Response::from_parts(
+                        parts,
+                        logged_stream(
+                            body,
+                            crate::access_logger::DeferredAccessLog {
+                                remote_addr: client_addr,
+                                method: method_str.clone(),
+                                path: path.clone(),
+                                protocol: protocol_str,
+                                status: resp_status,
+                                referer: referer.clone(),
+                                user_agent: user_agent.clone(),
+                                host: Some(host_str.clone()),
+                                started: request_start,
+                            },
+                        ),
+                    ),
+                    BodySource::Buffered(bytes) => {
+                        log_access(&AccessLogEntry {
+                            remote_addr: client_addr,
+                            method: &method_str,
+                            path: &path,
+                            protocol: protocol_str,
+                            status: resp_status,
+                            body_size: bytes.len(),
+                            referer: referer.as_deref(),
+                            user_agent: user_agent.as_deref(),
+                            host: Some(&host_str),
+                            response_time_ms: request_start
+                                .elapsed()
+                                .as_millis()
+                                .try_into()
+                                .unwrap_or(u64::MAX),
+                        });
+                        if head_without_length {
+                            Response::from_parts(
+                                parts,
+                                Body::from_stream(futures_util::stream::empty::<
+                                    Result<bytes::Bytes, std::io::Error>,
+                                >()),
+                            )
+                        } else {
+                            Response::from_parts(parts, Body::from(bytes))
+                        }
+                    }
+                };
 
                 response
             }
