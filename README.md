@@ -882,9 +882,14 @@ full rule table.
 
 `block_scanner_uas` matches against a built-in regex set covering common attack tools. It operates independently from path/payload pattern matching — a request can be blocked purely by its User-Agent even if the body is clean. Disable per-route via `waf_mode = "detect"` if you need to allow scanner tools from specific paths (e.g., an internal security tooling endpoint).
 
-The scanner-UA check also matches the default `curl/N` and `Wget/N` User-Agents, which are the expected clients for public binary-download endpoints (e.g. install scripts distributed as `curl -o file https://.../stream/downloads/...`). Paths under `/stream/downloads/` are hard-exempted from this specific check (same mechanism as the `X-Health-Check-Bypass` header) so documented `curl`/`wget` install commands aren't blocked — injection and path-traversal scanning still runs on these paths.
+The scanner-UA check also matches the default `curl/N` and `Wget/N` User-Agents, which are the expected clients for artefacts a site publishes for programmatic access (install scripts, datasets, certificate chains). `scanner_ua_exempt_paths` in `[waf]` lists them as regular expressions over the lowercased path; injection and path-traversal scanning still runs on them. The default covers only files that exist for tools by convention (`/robots.txt`, `/sitemap.xml`, `/llms.txt`, `/.well-known/`); a site adds its own, and setting the key replaces the default, so list those too. An invalid pattern is refused at load.
 
-A route can declare the same exemption rather than relying on the built-in path prefix: `skip_bot_blocking = true` on a `[[routes]]` entry turns off the scanner/bot User-Agent check for that route only, on both the TCP and HTTP/3 paths. Prefer it over adding hardcoded prefixes.
+```toml
+[waf]
+scanner_ua_exempt_paths = ['^/robots\.txt$', '^/\.well-known/', '^/downloads/']
+```
+
+A route can declare the same exemption instead: `skip_bot_blocking = true` on a `[[routes]]` entry turns off the scanner/bot User-Agent check for that route only, on both the TCP and HTTP/3 paths. Prefer it over adding hardcoded prefixes.
 
 Route-level WAF override:
 ```toml

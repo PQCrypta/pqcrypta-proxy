@@ -134,7 +134,7 @@ use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
 use parking_lot::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::access_logger::{log_access, AccessLogEntry};
 use crate::audit_logger::AuditLogger;
@@ -276,6 +276,14 @@ pub struct SecurityState {
     pub ja3_db: Arc<Ja3Database>,
     /// WAF engine (None if WAF disabled)
     pub waf_engine: Option<Arc<WafEngine>>,
+    /// `waf.scanner_ua_exempt_paths`, compiled once.
+    ///
+    /// The bad-bot user-agent rules return 403 to curl, wget, python-requests,
+    /// Go's HTTP client and an empty UA alike. That is a reasonable default for
+    /// pages and leaves crawling untouched, but it is the wrong answer for paths
+    /// whose purpose is programmatic access. Invisible from the server itself:
+    /// loopback and the bypass IPs pass, so verify from a node with no bypass.
+    pub scanner_ua_exempt: Arc<regex::RegexSet>,
     /// Structured audit logger, when one is configured.
     ///
     /// `AuditLogger` has carried `log_waf_block`/`log_waf_detect` — and the
@@ -409,58 +417,6 @@ pub struct SecurityRequestView<'a> {
     /// Body bytes when already buffered, for WAF body inspection. None means
     /// the caller has not buffered a body — not that the body is empty.
     pub body: Option<&'a [u8]>,
-}
-
-/// Whether this path is one we publish *for* machines to fetch.
-///
-/// The bad-bot user-agent rules return 403 to curl, wget, python-requests, Go's
-/// HTTP client and an empty UA alike. That is a reasonable default for pages,
-/// and it leaves crawling untouched (Googlebot passes). It is the wrong answer
-/// for the handful of paths whose entire purpose is programmatic access — and
-/// our own documentation tells people to `curl` every one of these, so following
-/// the instructions on the site produced a 403.
-///
-/// Invisible from the server itself: loopback, this host's egress and api3 are
-/// all in `pentest_bypass_ips`, so a check run from any of them passes while
-/// real visitors are blocked. Verify from a node with no bypass.
-///
-/// Deliberately a list of exact paths and narrow prefixes rather than whole page
-/// directories: the aim is to unblock the published artefacts, not to switch the
-/// protection off for the pages around them.
-fn is_machine_readable_path(path: &str) -> bool {
-    // Files that exist to be read by tools, by convention.
-    const WELL_KNOWN: &[&str] = &[
-        "/robots.txt",
-        "/sitemap.xml",
-        "/llms.txt",
-        // Datasets and APIs our pages document with a curl command.
-        "/ja4/api.php", // llms.txt calls this "machine-readable, no auth, CORS open"
-        "/handshake/api.php",
-    ];
-
-    if WELL_KNOWN.contains(&path) {
-        return true;
-    }
-
-    // Sitemaps, and the .well-known tree (security.txt and friends).
-    if path.starts_with("/sitemaps/") || path.starts_with("/.well-known/") {
-        return true;
-    }
-
-    // The published post-quantum certificate chain, which /pqc/ documents
-    // fetching with curl. Extension-gated so this covers the artefacts and not
-    // the page that describes them. `view.path` arrives lowercased, so a
-    // lowercase match here is exact.
-    if path.starts_with("/pqc/")
-        && path
-            .rsplit_once('.')
-            .is_some_and(|(_, ext)| matches!(ext, "pem" | "crt" | "der" | "json"))
-    {
-        return true;
-    }
-
-    // The MASQUE reference client source, which /masque/ tells you to curl.
-    path.starts_with("/masque/client/")
 }
 
 /// Whether `host` is the conformance suite's own vhost.
@@ -944,6 +900,14 @@ impl SecurityState {
             geoip_db,
             ja3_db: Arc::new(ja3_db),
             waf_engine,
+            scanner_ua_exempt: Arc::new(
+                regex::RegexSet::new(&config.waf.scanner_ua_exempt_paths).unwrap_or_else(|e| {
+                    // validate() refuses this at load; reaching here means a
+                    // config that skipped it, so fail towards no exemption.
+                    error!("waf.scanner_ua_exempt_paths is invalid, exempting nothing: {e}");
+                    regex::RegexSet::empty()
+                }),
+            ),
             audit_logger: None,
             blocked_cidrs: Arc::new(RwLock::new(Vec::new())),
             alt_svc_header,
@@ -1355,8 +1319,7 @@ impl SecurityState {
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v == "1")
                 .unwrap_or(false)
-                || view.path.starts_with("/stream/downloads/")
-                || is_machine_readable_path(view.path)
+                || self.scanner_ua_exempt.is_match(view.path)
                 || policy.skip_bot_blocking
                 // pentest_bypass_ips covers the authorized red-team host plus this
                 // server's own egress and loopback. Those addresses run curl-driven
@@ -2891,6 +2854,52 @@ mod tests {
     /// by benchmarking from a non-loopback address with every security feature
     /// disabled: the load generator was banned inside a second and 100% of
     /// 820,380 requests came back 4xx.
+    /// The scanner-UA exemption is configuration: a path is exempt only when
+    /// `waf.scanner_ua_exempt_paths` says so, and injection scanning still runs.
+    #[tokio::test]
+    async fn scanner_ua_exemption_comes_from_config() {
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", "curl/8.5.0".parse().unwrap());
+        let policy = RequestPolicy::default();
+        let ip: IpAddr = "203.0.113.43".parse().unwrap();
+        let view = |path: &'static str| SecurityRequestView {
+            ip,
+            method: "GET",
+            path,
+            query: "",
+            headers: &headers,
+            body: None,
+        };
+        let mut config = ProxyConfig::default();
+        config.waf.enabled = true;
+        config.waf.block_scanner_uas = true;
+        config.rate_limiting.enabled = false;
+        config.security.auto_block_threshold = u32::MAX;
+
+        let security = SecurityState::new(&config);
+        assert!(matches!(
+            security.evaluate(&view("/robots.txt"), &policy),
+            SecurityDecision::Allow
+        ));
+        assert!(
+            !matches!(
+                security.evaluate(&view("/stream/downloads/agent"), &policy),
+                SecurityDecision::Allow
+            ),
+            "a site path is not exempt until configured"
+        );
+
+        config
+            .waf
+            .scanner_ua_exempt_paths
+            .push(r"^/stream/downloads/".to_string());
+        let security = SecurityState::new(&config);
+        assert!(matches!(
+            security.evaluate(&view("/stream/downloads/agent"), &policy),
+            SecurityDecision::Allow
+        ));
+    }
+
     #[tokio::test]
     async fn test_rate_limiting_disabled_also_disables_connection_limiter() {
         let headers = HeaderMap::new();

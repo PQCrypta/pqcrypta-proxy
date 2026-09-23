@@ -219,6 +219,14 @@ pub struct WafConfig {
     /// Block known malicious scanner/bot user-agents (sqlmap, nikto, masscan, etc.)
     #[serde(default = "default_true")]
     pub block_scanner_uas: bool,
+    /// Paths exempt from the scanner/bot User-Agent check, as regular
+    /// expressions over the lowercased request path. For artefacts whose whole
+    /// purpose is programmatic access — the ones a site tells people to `curl`.
+    /// Injection and traversal scanning still run on them. The default covers
+    /// files that exist for tools by convention; a site adds its own. These
+    /// used to be compiled in, and named one site's pages.
+    #[serde(default = "default_scanner_ua_exempt_paths")]
+    pub scanner_ua_exempt_paths: Vec<String>,
     /// OWASP A03: OS command injection detection
     #[serde(default = "default_true")]
     pub cmd_injection: bool,
@@ -343,6 +351,7 @@ impl Default for WafConfig {
             custom_patterns: Vec::new(),
             scanner_probe: true,
             block_scanner_uas: true,
+            scanner_ua_exempt_paths: default_scanner_ua_exempt_paths(),
             cmd_injection: true,
             xxe: true,
             deserialization: true,
@@ -1016,6 +1025,18 @@ impl Default for ServerConfig {
             normalize_paths: true,
         }
     }
+}
+
+fn default_scanner_ua_exempt_paths() -> Vec<String> {
+    [
+        r"^/robots\.txt$",
+        r"^/sitemap\.xml$",
+        r"^/llms\.txt$",
+        r"^/\.well-known/",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
 }
 
 fn default_server_header() -> String {
@@ -3240,6 +3261,10 @@ impl ProxyConfig {
             Some(_) => {}
         }
 
+        if let Err(e) = regex::RegexSet::new(&self.waf.scanner_ua_exempt_paths) {
+            return Err(anyhow::anyhow!("waf.scanner_ua_exempt_paths: {e}"));
+        }
+
         // `headers_override` takes literal header names, while `[headers]` spells
         // the same headers as snake_case TOML keys. Copying one into the other
         // produced `cross_origin_embedder_policy: unsafe-none` on the wire — a
@@ -3807,7 +3832,10 @@ mod tests {
             Some("sid=x; Path=/; Domain=example.test")
         );
         // Idempotent, so a cached, already-rewritten header is left alone.
-        assert_eq!(r.rewrite_set_cookie("sid=x; Path=/; Domain=example.test"), None);
+        assert_eq!(
+            r.rewrite_set_cookie("sid=x; Path=/; Domain=example.test"),
+            None
+        );
     }
 
     /// Build a route carrying just the matching fields under test.
