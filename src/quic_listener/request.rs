@@ -1574,6 +1574,14 @@ impl QuicListener {
         // The route's Set-Cookie policy, before anything forwards or caches a
         // header: the same method the TCP paths call, so the transports agree.
         route.apply_set_cookie_policy(&mut stream_headers);
+        // routes.remove_headers, as on the TCP path: HTTP/3 forwards only an
+        // allowlist, but a listed header on that allowlist (cache-control,
+        // vary, ...) used to reach HTTP/3 clients regardless.
+        for key in &route.remove_headers {
+            if let Ok(name) = HeaderName::from_bytes(key.as_bytes()) {
+                stream_headers.remove(&name);
+            }
+        }
 
         let is_sse = stream_headers
             .get(header::CONTENT_TYPE)

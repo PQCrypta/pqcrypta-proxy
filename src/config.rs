@@ -1615,7 +1615,8 @@ pub struct RouteConfig {
     /// Headers to add to backend request
     #[serde(default)]
     pub add_headers: HashMap<String, String>,
-    /// Headers to remove from backend request
+    /// Backend response headers not to forward to the client, on every
+    /// transport. (Applied to the response, not the backend request.)
     #[serde(default)]
     pub remove_headers: Vec<String>,
     /// Forward client identity header
