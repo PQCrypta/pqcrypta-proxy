@@ -528,12 +528,19 @@ pub(super) fn add_alt_svc_to_response(response: &mut Response, alt_svc: Option<&
     }
 }
 
+/// State for [`advanced_rate_limit_middleware`], fixed at startup.
+#[derive(Clone)]
+pub(super) struct RateLimitLayer {
+    pub(super) limiter: Arc<AdvancedRateLimiter>,
+    pub(super) metrics: Arc<MetricsRegistry>,
+    /// This listener's Alt-Svc, for the 429s this layer renders itself.
+    pub(super) alt_svc: Option<HeaderValue>,
+    /// `security.refusal_cors_origins`.
+    pub(super) refusal_cors_origins: Arc<[String]>,
+}
+
 pub(super) async fn advanced_rate_limit_middleware(
-    State((rate_limiter, metrics, alt_svc)): State<(
-        Arc<AdvancedRateLimiter>,
-        Arc<MetricsRegistry>,
-        Option<HeaderValue>,
-    )>,
+    State(layer): State<RateLimitLayer>,
     ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     request: Request<Body>,
@@ -576,6 +583,12 @@ pub(super) async fn advanced_rate_limit_middleware(
     );
 
     // Check rate limit (async — uses Redis when configured, local fallback otherwise)
+    let RateLimitLayer {
+        limiter: rate_limiter,
+        metrics,
+        alt_svc,
+        ..
+    } = &layer;
     match rate_limiter.check(&ctx).await {
         RateLimitResult::Allowed { remaining, limit } => {
             metrics.rate_limiter.request_checked(true, false);
@@ -661,23 +674,16 @@ pub(super) async fn advanced_rate_limit_middleware(
                 resp_headers.insert("x-ratelimit-reset", v);
             }
 
-            // CORS headers on 429 so browser sees the status code, not a CORS error
-            const ALLOWED_ORIGINS: &[&str] = &[
-                "https://pqcrypta.com",
-                "https://www.pqcrypta.com",
-                "https://pqpdf.com",
-                "https://www.pqpdf.com",
-            ];
-            let origin_value = request_origin.as_deref().unwrap_or("");
-            if ALLOWED_ORIGINS.contains(&origin_value) {
-                if let Ok(v) = HeaderValue::from_str(origin_value) {
-                    resp_headers.insert("access-control-allow-origin", v);
+            // CORS headers on 429 so browser sees the status code, not a CORS
+            // error — from `security.refusal_cors_origins`, the list every other
+            // refusal reads.
+            for (k, v) in crate::security::cors_refusal_headers(
+                &layer.refusal_cors_origins,
+                request_origin.as_deref(),
+            ) {
+                if let Ok(v) = HeaderValue::from_str(&v) {
+                    resp_headers.insert(k, v);
                 }
-                resp_headers.insert(
-                    "access-control-allow-credentials",
-                    HeaderValue::from_static("true"),
-                );
-                resp_headers.insert("vary", HeaderValue::from_static("Origin"));
             }
 
             // Add Alt-Svc header to advertise HTTP/3

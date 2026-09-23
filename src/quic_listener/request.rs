@@ -297,7 +297,14 @@ impl QuicListener {
                                 format!("{:?}", reason).to_ascii_lowercase(),
                             )
                             .server_header(&config);
-                        for (k, v) in crate::security::cors_refusal_headers(req_origin_adv) {
+                        let cors = {
+                            let sc = security.config.read();
+                            crate::security::cors_refusal_headers(
+                                &sc.refusal_cors_origins,
+                                req_origin_adv,
+                            )
+                        };
+                        for (k, v) in cors {
                             builder_adv = builder_adv.header(k, v);
                         }
                         let response = builder_adv.body(())?;
@@ -354,9 +361,11 @@ impl QuicListener {
                     .headers()
                     .get("origin")
                     .and_then(|v| v.to_str().ok());
-                if let Some(rendering) =
-                    crate::security::decision_rendering(&decision, request_origin)
-                {
+                let rendering = {
+                    let sc = security.config.read();
+                    crate::security::decision_rendering(&decision, request_origin, &sc)
+                };
+                if let Some(rendering) = rendering {
                     warn!(
                         "[QUIC/H3] security decision {:?} for {} {}",
                         decision, ip, path
@@ -1135,7 +1144,11 @@ impl QuicListener {
                 .headers()
                 .get("origin")
                 .and_then(|v| v.to_str().ok());
-            if let Some(rendering) = crate::security::decision_rendering(&decision, body_origin) {
+            let rendering = {
+                let sc = security.config.read();
+                crate::security::decision_rendering(&decision, body_origin, &sc)
+            };
+            if let Some(rendering) = rendering {
                 warn!(
                     "[QUIC/H3] WAF body decision {:?} for {} {}",
                     decision, ip, path
@@ -1536,7 +1549,7 @@ impl QuicListener {
         let request_body = Bytes::from(body);
         let request_body_len = request_body.len() as u64;
 
-        let (stream_status, stream_headers, stream_body) = backend_pool
+        let (stream_status, mut stream_headers, stream_body) = backend_pool
             .proxy_stream(
                 &backend,
                 request.method(),
@@ -1545,6 +1558,10 @@ impl QuicListener {
                 request_body.clone(),
             )
             .await?;
+
+        // The route's Set-Cookie policy, before anything forwards or caches a
+        // header: the same method the TCP paths call, so the transports agree.
+        route.apply_set_cookie_policy(&mut stream_headers);
 
         let is_sse = stream_headers
             .get(header::CONTENT_TYPE)
@@ -1688,16 +1705,10 @@ impl QuicListener {
 
         // Forward selected headers from backend (including CORS if backend sets them)
         // Note: x-content-type-options excluded from whitelist since proxy adds its own
-        // Note: set-cookie for /grafana is handled separately below with Domain rewriting
-        let is_grafana = path.starts_with("/grafana");
         for (name, value) in &stream_headers {
             // `HeaderName` is already lowercase; the old loop allocated a
             // lowercased String per response header to learn that.
             let lower_name = name.as_str();
-            // Skip set-cookie for Grafana routes (handled below with Domain attribute)
-            if is_grafana && lower_name == "set-cookie" {
-                continue;
-            }
             if matches!(
                 lower_name,
                 "content-type"
@@ -1754,32 +1765,6 @@ impl QuicListener {
             // the origin's own value. When it sent none the response is chunked
             // and HTTP/3 needs no length at all.
             response_builder = response_builder.header(header::CONTENT_LENGTH, origin_len);
-        }
-
-        // For Grafana routes: rewrite set-cookie headers from backend
-        // to work around browser H3 cookie handling by adding Domain attribute
-        if path.starts_with("/grafana") {
-            // Remove set-cookie from whitelist-forwarded headers (already added above)
-            // and re-add with explicit Domain to help browser cookie storage
-            let mut has_cookies = false;
-            for value in stream_headers.get_all(header::SET_COOKIE) {
-                let Ok(cookie) = value.to_str() else { continue };
-                has_cookies = true;
-                // Add Domain=pqcrypta.com to help browser store cookie
-                if cookie.contains("Domain=") {
-                    response_builder = response_builder.header(header::SET_COOKIE, value);
-                } else {
-                    response_builder = response_builder
-                        .header(header::SET_COOKIE, format!("{cookie}; Domain=pqcrypta.com"));
-                }
-            }
-            if has_cookies {
-                // Also add a simple proxy test cookie to verify H3 cookie delivery
-                response_builder = response_builder.header(
-                    "set-cookie",
-                    "pqc_h3_test=1; Path=/; Secure; SameSite=None; Max-Age=3600",
-                );
-            }
         }
 
         // Inject canary sticky cookie if pool selection assigned one

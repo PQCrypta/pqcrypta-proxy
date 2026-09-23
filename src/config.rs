@@ -1664,8 +1664,81 @@ pub struct RouteConfig {
     /// Enforce HttpOnly and Secure attributes on all Set-Cookie headers from
     /// the backend. Use for backends (e.g. Frappe/ERPNext) that intentionally
     /// omit HttpOnly on non-session cookies but where the proxy should add it.
+    /// Applied on HTTP/1.1, HTTP/2 and HTTP/3, streamed or buffered.
     #[serde(default)]
     pub enforce_cookie_security: bool,
+
+    /// `Domain` added to every backend Set-Cookie that has none. Applied on
+    /// every transport: a cookie scoped one way over HTTP/2 and another over
+    /// HTTP/3 leaves the browser holding two cookies of the same name.
+    #[serde(default)]
+    pub set_cookie_domain: Option<String>,
+}
+
+impl RouteConfig {
+    /// Whether this route rewrites backend Set-Cookie headers at all.
+    pub fn rewrites_set_cookie(&self) -> bool {
+        self.enforce_cookie_security
+            || self
+                .set_cookie_domain
+                .as_deref()
+                .is_some_and(|d| !d.is_empty())
+    }
+
+    /// Apply this route's Set-Cookie policy to one backend cookie, or `None`
+    /// when it needs no change.
+    ///
+    /// Attributes are matched by name. The substring test this replaced read
+    /// a cookie *named* `securetoken` as already carrying `Secure`.
+    pub fn rewrite_set_cookie(&self, cookie: &str) -> Option<String> {
+        let has = |attr: &str| {
+            cookie.split(';').skip(1).any(|a| {
+                a.split('=')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .eq_ignore_ascii_case(attr)
+            })
+        };
+        let mut out = String::new();
+        if self.enforce_cookie_security {
+            if !has("HttpOnly") {
+                out.push_str("; HttpOnly");
+            }
+            if !has("Secure") {
+                out.push_str("; Secure");
+            }
+        }
+        if let Some(domain) = self.set_cookie_domain.as_deref().filter(|d| !d.is_empty()) {
+            if !has("Domain") {
+                out.push_str("; Domain=");
+                out.push_str(domain);
+            }
+        }
+        (!out.is_empty()).then(|| format!("{cookie}{out}"))
+    }
+
+    /// Apply [`Self::rewrite_set_cookie`] to every Set-Cookie in `headers`.
+    pub fn apply_set_cookie_policy(&self, headers: &mut http::HeaderMap) {
+        if !self.rewrites_set_cookie() || !headers.contains_key(http::header::SET_COOKIE) {
+            return;
+        }
+        let cookies: Vec<http::HeaderValue> = headers
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .map(|v| {
+                v.to_str()
+                    .ok()
+                    .and_then(|c| self.rewrite_set_cookie(c))
+                    .and_then(|c| http::HeaderValue::from_str(&c).ok())
+                    .unwrap_or_else(|| v.clone())
+            })
+            .collect();
+        headers.remove(http::header::SET_COOKIE);
+        for c in cookies {
+            headers.append(http::header::SET_COOKIE, c);
+        }
+    }
 }
 
 fn default_priority() -> i32 {
@@ -1968,6 +2041,22 @@ pub struct SecurityConfig {
     /// Remove these entries after the pentest engagement ends.
     #[serde(default)]
     pub pentest_bypass_ips: Vec<String>,
+    /// Origins allowed to read the proxy's own refusals (403/429) cross-origin.
+    /// Without CORS headers a refusal reaches the page as an opaque CORS error,
+    /// so it cannot see the status and retries instead of backing off. One list
+    /// for every transport and both rate limiters.
+    #[serde(default = "default_refusal_cors_origins")]
+    pub refusal_cors_origins: Vec<String>,
+    /// Where a geo-blocked request is redirected (302). Empty refuses it with a
+    /// plain 403 instead. Must be served under `error_pages_path_prefix`, which
+    /// is exempt from blocking, or the redirect loops.
+    #[serde(default = "default_geo_block_redirect_url")]
+    pub geo_block_redirect_url: String,
+    /// Path prefix exempt from IP, country and rate blocking, so a blocked
+    /// visitor can still load the error page that explains the block. Empty
+    /// exempts nothing.
+    #[serde(default = "default_error_pages_path_prefix")]
+    pub error_pages_path_prefix: String,
     /// How many distinct TLS fingerprints the observed corpus retains.
     ///
     /// This began as a memory-exhaustion guard at a hardcoded 50,000 and is now
@@ -1991,6 +2080,21 @@ fn default_max_tracked_fingerprints() -> usize {
 
 fn default_geoip_block_duration_secs() -> Option<u64> {
     Some(86400) // 24 hours — prevents permanent blocks from stale GeoIP data
+}
+
+// Site-specific refusal settings default to nothing: no origin trusted, a
+// plain 403 for a geo block, no exempt path. Each deployment names its own in
+// `[security]`; these used to be literals naming pqcrypta.com.
+fn default_refusal_cors_origins() -> Vec<String> {
+    Vec::new()
+}
+
+fn default_geo_block_redirect_url() -> String {
+    String::new()
+}
+
+fn default_error_pages_path_prefix() -> String {
+    String::new()
 }
 
 impl Default for SecurityConfig {
@@ -2020,6 +2124,9 @@ impl Default for SecurityConfig {
             geoip_block_duration_secs: default_geoip_block_duration_secs(),
             zero_trust_mode: false,
             pentest_bypass_ips: Vec::new(),
+            refusal_cors_origins: default_refusal_cors_origins(),
+            geo_block_redirect_url: default_geo_block_redirect_url(),
+            error_pages_path_prefix: default_error_pages_path_prefix(),
         }
     }
 }
@@ -2263,21 +2370,17 @@ fn default_server_timing_desc() -> String {
     "PQ Crypta Processing".to_string()
 }
 
+// The Outlook add-in exception is off unless configured. These defaults used
+// to name pqpdf.com's hosts and CSP, so every deployment inherited one site's
+// framing exception.
 fn default_addin_hosts() -> Vec<String> {
-    vec!["pqpdf.com".to_string(), "www.pqpdf.com".to_string()]
+    Vec::new()
 }
 fn default_addin_path_prefix() -> String {
-    "/outlook/".to_string()
+    String::new()
 }
 fn default_addin_csp() -> String {
-    "default-src 'self'; \
-script-src 'self' 'unsafe-inline' https://appsforoffice.microsoft.com https://*.officeapps.live.com; \
-style-src 'self' 'unsafe-inline'; \
-img-src 'self' data: https:; \
-font-src 'self' data:; \
-connect-src 'self' https://api.pqpdf.com https://*.office.com https://*.officeapps.live.com; \
-frame-ancestors https://outlook.office.com https://outlook.office365.com https://outlook.live.com https://*.office.com https://*.officeapps.live.com 'self'"
-        .to_string()
+    String::new()
 }
 
 impl Default for HeadersConfig {
@@ -3137,6 +3240,51 @@ impl ProxyConfig {
             Some(_) => {}
         }
 
+        // `headers_override` takes literal header names, while `[headers]` spells
+        // the same headers as snake_case TOML keys. Copying one into the other
+        // produced `cross_origin_embedder_policy: unsafe-none` on the wire — a
+        // header no browser reads — while the real policy stayed in force.
+        // Refuse a snake_case spelling of a header the proxy itself manages.
+        {
+            const MANAGED: &[&str] = &[
+                "strict-transport-security",
+                "x-frame-options",
+                "x-content-type-options",
+                "referrer-policy",
+                "permissions-policy",
+                "cross-origin-opener-policy",
+                "cross-origin-embedder-policy",
+                "cross-origin-resource-policy",
+                "x-permitted-cross-domain-policies",
+                "x-download-options",
+                "x-dns-prefetch-control",
+                "content-security-policy",
+                "access-control-allow-origin",
+                "cache-control",
+            ];
+            let bad: Vec<String> = self
+                .routes
+                .iter()
+                .flat_map(|r| {
+                    r.headers_override.keys().filter_map(move |k| {
+                        let dashed = k.to_ascii_lowercase().replace('_', "-");
+                        (k.contains('_') && MANAGED.contains(&dashed.as_str())).then(|| {
+                            format!(
+                                "route {:?}: headers_override key {k:?} (did you mean {dashed:?}?)",
+                                r.name.as_deref().unwrap_or("<unnamed>")
+                            )
+                        })
+                    })
+                })
+                .collect();
+            if !bad.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "headers_override takes header names, not [headers] keys: {}",
+                    bad.join("; ")
+                ));
+            }
+        }
+
         // An unknown load balancing algorithm used to fall through to
         // `least_connections` in silence. An operator who wrote `ip_hash ` with a
         // stray space, or `leastconn` from HAProxy muscle memory, would get
@@ -3616,6 +3764,50 @@ mod tests {
         assert!(config.server.udp_port > 0);
         assert!(config.admin.port > 0);
         assert!(config.pqc.enabled);
+    }
+
+    #[test]
+    fn headers_override_refuses_a_snake_case_managed_header() {
+        let mut config = ProxyConfig::default();
+        let mut r = route(None, Some("/grafana"), None, None, 3);
+        r.headers_override
+            .insert("cross_origin_embedder_policy".into(), "unsafe-none".into());
+        config.routes.push(r);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("cross-origin-embedder-policy"), "{err}");
+
+        // The header name itself is accepted, and so is an unmanaged underscore.
+        let mut r = route(None, Some("/grafana"), None, None, 3);
+        r.headers_override
+            .insert("cross-origin-embedder-policy".into(), "unsafe-none".into());
+        r.headers_override.insert("x_custom".into(), "1".into());
+        config.routes = vec![r];
+        if let Err(e) = config.validate() {
+            assert!(!e.to_string().contains("headers_override"), "{e}");
+        }
+    }
+
+    #[test]
+    fn set_cookie_policy_matches_attributes_by_name() {
+        let mut r = route(None, Some("/"), None, None, 1);
+        assert_eq!(r.rewrite_set_cookie("a=1"), None, "no policy, no change");
+
+        r.enforce_cookie_security = true;
+        // A cookie NAMED securetoken does not carry the Secure attribute.
+        assert_eq!(
+            r.rewrite_set_cookie("securetoken=1; Path=/").as_deref(),
+            Some("securetoken=1; Path=/; HttpOnly; Secure")
+        );
+        assert_eq!(r.rewrite_set_cookie("a=1; Secure; HttpOnly"), None);
+
+        r.enforce_cookie_security = false;
+        r.set_cookie_domain = Some("example.test".into());
+        assert_eq!(
+            r.rewrite_set_cookie("sid=x; Path=/").as_deref(),
+            Some("sid=x; Path=/; Domain=example.test")
+        );
+        // Idempotent, so a cached, already-rewritten header is left alone.
+        assert_eq!(r.rewrite_set_cookie("sid=x; Path=/; Domain=example.test"), None);
     }
 
     /// Build a route carrying just the matching fields under test.

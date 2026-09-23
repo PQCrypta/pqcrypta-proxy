@@ -388,11 +388,7 @@ fn build_proxy_service(
     http3_features_state: Http3FeaturesState,
     security_state: Arc<SecurityState>,
     fingerprint_state: Option<FingerprintMiddlewareState>,
-    rl_state: (
-        Arc<AdvancedRateLimiter>,
-        Arc<MetricsRegistry>,
-        Option<HeaderValue>,
-    ),
+    rl_state: layers::RateLimitLayer,
 ) -> impl tower::Service<
     Request<Body>,
     Response = Response,
@@ -660,7 +656,12 @@ pub async fn run_http_listener(
     ));
     let state_metrics = metrics.clone();
     let alt_svc_value = layers::alt_svc_header_value(port, &config);
-    let rl_state = (rate_limiter.clone(), metrics, alt_svc_value.clone());
+    let rl_state = layers::RateLimitLayer {
+        limiter: rate_limiter.clone(),
+        metrics,
+        alt_svc: alt_svc_value.clone(),
+        refusal_cors_origins: config.security.refusal_cors_origins.clone().into(),
+    };
     if config.advanced_rate_limiting.enabled {
         info!(
             "🚦 Advanced rate limiter enabled (key strategy: {:?})",
@@ -842,7 +843,12 @@ pub async fn run_http_listener_pqc(
     ));
     let state_metrics = metrics.clone();
     let alt_svc_value = layers::alt_svc_header_value(port, &config);
-    let rl_state = (rate_limiter.clone(), metrics, alt_svc_value.clone());
+    let rl_state = layers::RateLimitLayer {
+        limiter: rate_limiter.clone(),
+        metrics,
+        alt_svc: alt_svc_value.clone(),
+        refusal_cors_origins: config.security.refusal_cors_origins.clone().into(),
+    };
     if config.advanced_rate_limiting.enabled {
         info!(
             "🚦 Advanced rate limiter enabled (key strategy: {:?})",
@@ -1123,7 +1129,12 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
     let conn_metrics = metrics.clone();
     let state_metrics = metrics.clone();
     let alt_svc_value = layers::alt_svc_header_value(port, &config);
-    let rl_state = (rate_limiter.clone(), metrics, alt_svc_value.clone());
+    let rl_state = layers::RateLimitLayer {
+        limiter: rate_limiter.clone(),
+        metrics,
+        alt_svc: alt_svc_value.clone(),
+        refusal_cors_origins: config.security.refusal_cors_origins.clone().into(),
+    };
     if config.advanced_rate_limiting.enabled {
         info!(
             "🚦 Advanced rate limiter enabled (key strategy: {:?})",
@@ -1584,7 +1595,12 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     let conn_metrics = metrics.clone();
     let state_metrics = metrics.clone();
     let alt_svc_value = layers::alt_svc_header_value(port, &config);
-    let rl_state = (rate_limiter.clone(), metrics, alt_svc_value.clone());
+    let rl_state = layers::RateLimitLayer {
+        limiter: rate_limiter.clone(),
+        metrics,
+        alt_svc: alt_svc_value.clone(),
+        refusal_cors_origins: config.security.refusal_cors_origins.clone().into(),
+    };
     if config.advanced_rate_limiting.enabled {
         info!(
             "🚦 Advanced rate limiter enabled (key strategy: {:?})",
@@ -2854,6 +2870,7 @@ async fn proxy_handler(
                             parts.headers.remove(&name);
                         }
                     }
+                    route.apply_set_cookie_policy(&mut parts.headers);
                     parts.headers.remove("connection");
                     parts.headers.remove("transfer-encoding");
                     parts.headers.remove("upgrade");
@@ -3003,36 +3020,8 @@ async fn proxy_handler(
                     }
                 }
 
-                // Enforce HttpOnly + Secure on all Set-Cookie headers from the backend.
-                // Used for backends (e.g. Frappe/ERPNext) that intentionally omit HttpOnly
-                // on informational cookies (user_id, full_name) but where the proxy should add it.
-                if route.enforce_cookie_security {
-                    let existing: Vec<String> = parts
-                        .headers
-                        .get_all(header::SET_COOKIE)
-                        .iter()
-                        .filter_map(|v| v.to_str().ok())
-                        .map(|cookie| {
-                            let mut c = cookie.to_string();
-                            let lower = c.to_lowercase();
-                            if !lower.contains("httponly") {
-                                c.push_str("; HttpOnly");
-                            }
-                            if !lower.contains("secure") {
-                                c.push_str("; Secure");
-                            }
-                            c
-                        })
-                        .collect();
-                    if !existing.is_empty() {
-                        parts.headers.remove(header::SET_COOKIE);
-                        for cookie in existing {
-                            if let Ok(val) = HeaderValue::from_str(&cookie) {
-                                parts.headers.append(header::SET_COOKIE, val);
-                            }
-                        }
-                    }
-                }
+                // The route's Set-Cookie policy (HttpOnly/Secure, Domain).
+                route.apply_set_cookie_policy(&mut parts.headers);
 
                 // Handle Stripe compatibility (remove COEP/COOP)
                 if route.stripe_compatibility {

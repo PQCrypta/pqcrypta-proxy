@@ -2064,10 +2064,17 @@ pub async fn security_middleware(
     }
 
     // Error pages are public content — exempt from all blocks so geo-redirected users can
-    // reach /error_pages/ even after their IP has been added to the temporary blocklist.
+    // reach them even after their IP has been added to the temporary blocklist.
     {
-        let path = request.uri().path();
-        if path.starts_with("/error_pages/") {
+        let exempt = {
+            let config = security.config.read();
+            !config.error_pages_path_prefix.is_empty()
+                && request
+                    .uri()
+                    .path()
+                    .starts_with(&config.error_pages_path_prefix)
+        };
+        if exempt {
             return next.run(request).await;
         }
     }
@@ -2130,7 +2137,10 @@ pub async fn security_middleware(
                 .get("origin")
                 .and_then(|v| v.to_str().ok())
                 .map(String::from);
-            let response = render_decision(&decision, alt_svc, request_origin.as_deref());
+            let response = {
+                let config = security.config.read();
+                render_decision(&decision, alt_svc, request_origin.as_deref(), &config)
+            };
 
             // Security refusals used to return without ever reaching the access
             // logger, so a blocked client saw a 403 while access.log stayed
@@ -2493,22 +2503,21 @@ pub async fn security_middleware(
     response
 }
 
-/// Origins allowed to read a security refusal cross-origin.
+/// The CORS headers a refusal needs so `request_origin` may read it, or empty
+/// when that origin is not in `allowed` (`security.refusal_cors_origins`).
 ///
 /// Without these headers a 429 or 403 reaches the browser as an opaque CORS
 /// error, so the page cannot see the status and retries blindly instead of
-/// backing off. The HTTP/3 handler kept its own copy of this list; one list
-/// means the two transports cannot disagree about who may read a refusal.
-const CORS_REFUSAL_ORIGINS: &[&str] = &["https://pqcrypta.com", "https://www.pqcrypta.com"];
-
-/// The CORS headers a refusal needs so `request_origin` may read it, or empty
-/// when that origin is not on the allowlist.
-///
-/// Exposed because the advanced rate limiter renders its own 429s on both
-/// transports and must consult the same allowlist as [`decision_rendering`].
-pub fn cors_refusal_headers(request_origin: Option<&str>) -> Vec<(&'static str, String)> {
+/// backing off. Every refusal on every transport — the security evaluator and
+/// both rate limiters — reads this one list. There used to be three copies,
+/// and the TCP rate limiter's alone admitted pqpdf.com, so the same 429 was
+/// readable over HTTP/2 and opaque over HTTP/3.
+pub fn cors_refusal_headers(
+    allowed: &[String],
+    request_origin: Option<&str>,
+) -> Vec<(&'static str, String)> {
     let origin = request_origin.unwrap_or("");
-    if CORS_REFUSAL_ORIGINS.contains(&origin) {
+    if !origin.is_empty() && allowed.iter().any(|a| a == origin) {
         vec![
             ("access-control-allow-origin", origin.to_string()),
             ("access-control-allow-credentials", "true".to_string()),
@@ -2544,6 +2553,7 @@ pub struct DecisionRendering {
 pub fn decision_rendering(
     decision: &SecurityDecision,
     request_origin: Option<&str>,
+    config: &SecurityConfig,
 ) -> Option<DecisionRendering> {
     match decision {
         SecurityDecision::Allow => None,
@@ -2563,15 +2573,22 @@ pub fn decision_rendering(
             })
         }
 
-        // Redirected rather than refused: a geo-blocked visitor is a person, and
-        // the styled error page explains the block. The page itself is exempt
-        // from security checks so the redirect always resolves.
+        // Redirected rather than refused when an error page is configured: a
+        // geo-blocked visitor is a person, and the styled page explains the
+        // block. The page sits under `error_pages_path_prefix`, which is exempt
+        // from security checks, so the redirect always resolves. This URL was a
+        // literal on pqcrypta.com, so every other site behind the proxy sent
+        // its blocked visitors to pqcrypta.com.
+        SecurityDecision::GeoBlocked if config.geo_block_redirect_url.is_empty() => {
+            Some(DecisionRendering {
+                status: StatusCode::FORBIDDEN,
+                headers: Vec::new(),
+                body: "Access denied".to_string(),
+            })
+        }
         SecurityDecision::GeoBlocked => Some(DecisionRendering {
             status: StatusCode::FOUND,
-            headers: vec![(
-                "location",
-                "https://pqcrypta.com/error_pages/pqcrypt_403.html".to_string(),
-            )],
+            headers: vec![("location", config.geo_block_redirect_url.clone())],
             body: String::new(),
         }),
 
@@ -2585,7 +2602,10 @@ pub fn decision_rendering(
                 ("x-ratelimit-limit", limit.to_string()),
                 ("x-ratelimit-remaining", "0".to_string()),
             ];
-            headers.extend(cors_refusal_headers(request_origin));
+            headers.extend(cors_refusal_headers(
+                &config.refusal_cors_origins,
+                request_origin,
+            ));
             Some(DecisionRendering {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 headers,
@@ -2621,8 +2641,9 @@ fn render_decision(
     decision: &SecurityDecision,
     alt_svc: &str,
     request_origin: Option<&str>,
+    config: &SecurityConfig,
 ) -> Response {
-    let Some(rendering) = decision_rendering(decision, request_origin) else {
+    let Some(rendering) = decision_rendering(decision, request_origin, config) else {
         // Callers check for Allow before calling; treat it as a no-op 200.
         let mut r = StatusCode::OK.into_response();
         add_alt_svc(&mut r, alt_svc);
@@ -3185,9 +3206,9 @@ mod decision_rendering_tests {
     /// `evaluate`.
     #[test]
     fn tcp_and_h3_agree_on_status_for_every_decision() {
-        for decision in all_decisions() {
-            let tcp = render_decision(&decision, "", None);
-            let h3 = decision_rendering(&decision, None);
+        for (config, decision) in configs_and_decisions() {
+            let tcp = render_decision(&decision, "", None, &config);
+            let h3 = decision_rendering(&decision, None, &config);
 
             match h3 {
                 None => {
@@ -3211,11 +3232,11 @@ mod decision_rendering_tests {
     /// status it can act on.
     #[test]
     fn tcp_and_h3_agree_on_headers_for_every_decision() {
-        for decision in all_decisions() {
-            let Some(rendering) = decision_rendering(&decision, None) else {
+        for (config, decision) in configs_and_decisions() {
+            let Some(rendering) = decision_rendering(&decision, None, &config) else {
                 continue;
             };
-            let tcp = render_decision(&decision, "", None);
+            let tcp = render_decision(&decision, "", None, &config);
             for (name, value) in rendering.headers {
                 let actual = tcp
                     .headers()
@@ -3255,7 +3276,8 @@ mod decision_rendering_tests {
             expires_at: Some(Instant::now() + Duration::from_secs(300)),
             block_count: 1,
         });
-        let rendering = decision_rendering(&decision, None).expect("a block renders");
+        let rendering = decision_rendering(&decision, None, &SecurityConfig::default())
+            .expect("a block renders");
         assert_eq!(rendering.status, StatusCode::FORBIDDEN);
         let retry = rendering
             .headers
@@ -3276,17 +3298,69 @@ mod decision_rendering_tests {
             kind: RateLimitKind::Request,
         };
 
-        let allowed = decision_rendering(&decision, Some("https://pqcrypta.com")).unwrap();
+        let config = configured();
+        let allowed = decision_rendering(&decision, Some("https://pqcrypta.com"), &config).unwrap();
         assert!(allowed
             .headers
             .iter()
             .any(|(k, v)| *k == "access-control-allow-origin" && v == "https://pqcrypta.com"));
         assert!(allowed.headers.iter().any(|(k, _)| *k == "vary"));
 
-        let stranger = decision_rendering(&decision, Some("https://evil.example")).unwrap();
+        let stranger =
+            decision_rendering(&decision, Some("https://evil.example"), &config).unwrap();
         assert!(!stranger
             .headers
             .iter()
             .any(|(k, _)| k.starts_with("access-control-")));
+
+        // The default list is empty: no origin is trusted until configured.
+        let unconfigured = decision_rendering(
+            &decision,
+            Some("https://pqcrypta.com"),
+            &SecurityConfig::default(),
+        )
+        .unwrap();
+        assert!(!unconfigured
+            .headers
+            .iter()
+            .any(|(k, _)| k.starts_with("access-control-")));
+    }
+
+    /// A security config with every site-specific refusal setting filled in.
+    fn configured() -> SecurityConfig {
+        SecurityConfig {
+            refusal_cors_origins: vec!["https://pqcrypta.com".to_string()],
+            geo_block_redirect_url: "https://example.test/error_pages/403.html".to_string(),
+            error_pages_path_prefix: "/error_pages/".to_string(),
+            ..SecurityConfig::default()
+        }
+    }
+
+    /// Every decision under both the unconfigured defaults and [`configured`].
+    fn configs_and_decisions() -> Vec<(SecurityConfig, SecurityDecision)> {
+        [SecurityConfig::default(), configured()]
+            .into_iter()
+            .flat_map(|c| all_decisions().into_iter().map(move |d| (c.clone(), d)))
+            .collect()
+    }
+
+    #[test]
+    fn geo_block_redirects_only_where_a_page_is_configured() {
+        let plain = decision_rendering(
+            &SecurityDecision::GeoBlocked,
+            None,
+            &SecurityConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(plain.status, StatusCode::FORBIDDEN);
+        assert!(plain.headers.iter().all(|(k, _)| *k != "location"));
+
+        let config = configured();
+        let redirect = decision_rendering(&SecurityDecision::GeoBlocked, None, &config).unwrap();
+        assert_eq!(redirect.status, StatusCode::FOUND);
+        assert!(redirect
+            .headers
+            .iter()
+            .any(|(k, v)| *k == "location" && *v == config.geo_block_redirect_url));
     }
 }
