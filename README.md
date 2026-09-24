@@ -1065,6 +1065,29 @@ ct_logs = [
 ]
 ```
 
+### Conformance Suite Configuration
+
+Off by default: it serves malformed protocol output on purpose. Each test owns
+one UDP port in `port_range`, and startup refuses a range that overlaps
+`server.udp_port` or `server.additional_ports`, or one too narrow for the
+catalogue, rather than serving the tests that fit.
+
+```toml
+[conformance]
+enabled = false                    # master switch
+host = "conformance.pqcrypta.com"  # the vhost for the catalogue, reports and badge
+port_range = [4460, 4600]          # inclusive; one UDP port per test
+session_ttl_secs = 3600            # how long one client's verdicts are kept
+max_sessions = 512                 # cap on concurrent sessions
+liveness_timeout_ms = 5000         # wait for the probe that follows each anomaly
+
+# The ML-DSA-87 chain t-cert-compression-pq serves, and its key. Verdicts on
+# that port quote the chain's size as loaded from here, so replacing the file
+# changes what they say.
+pq_chain_cert = "/etc/pqcrypta/pqc-certs/conformance/fullchain.pem"
+pq_chain_key  = "/etc/pqcrypta/pqc-certs/conformance/server.key"
+```
+
 ### WebTransport Rate Limiting Configuration
 
 ```toml

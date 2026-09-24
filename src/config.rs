@@ -615,6 +615,28 @@ pub struct ConformanceConfig {
     /// the close go missing, so a probe that never comes is judged against what
     /// the test was measuring rather than read as acceptance. Default: 5000.
     pub liveness_timeout_ms: u64,
+
+    /// The certificate chain `t-cert-compression-pq` serves, PEM, leaf first.
+    ///
+    /// ML-DSA-87 throughout, and deliberately not the showcase chain /pqc/
+    /// publishes. That one is an SLH-DSA-SHA2-256s root over ML-DSA-87
+    /// intermediates, and verifying it needs two post-quantum signature
+    /// families, which nothing in the client fleet has: the clients that passed
+    /// against it reached the end with certificate verification disabled. The
+    /// test asks whether a client can process a compressed ML-DSA-87
+    /// certificate message, and the CA's family is incidental to that, so the
+    /// fixture is one family and a client with ML-DSA-87 can verify it rather
+    /// than skip it.
+    ///
+    /// Issued by a private CA on purpose -- see the catalogue entry for why
+    /// being untrusted is what makes the measurement work. The verdicts quote
+    /// the chain's size as loaded from here, so replacing the file changes
+    /// what they say. Default: `/etc/pqcrypta/pqc-certs/conformance/fullchain.pem`.
+    pub pq_chain_cert: PathBuf,
+
+    /// The private key for [`pq_chain_cert`](Self::pq_chain_cert).
+    /// Default: `/etc/pqcrypta/pqc-certs/conformance/server.key`.
+    pub pq_chain_key: PathBuf,
 }
 
 impl Default for ConformanceConfig {
@@ -626,6 +648,8 @@ impl Default for ConformanceConfig {
             session_ttl_secs: 3600,
             max_sessions: 512,
             liveness_timeout_ms: 5000,
+            pq_chain_cert: PathBuf::from("/etc/pqcrypta/pqc-certs/conformance/fullchain.pem"),
+            pq_chain_key: PathBuf::from("/etc/pqcrypta/pqc-certs/conformance/server.key"),
         }
     }
 }

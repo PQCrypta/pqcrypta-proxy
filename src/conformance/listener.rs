@@ -40,7 +40,7 @@ use super::h3_frames as f;
 use super::impairment::{Counters, ImpairedSocket, Impairments, PeerView};
 use super::session::{Evidence, Observation};
 use super::Conformance;
-use crate::tls::TlsProvider;
+use crate::tls::{ChainSize, TlsProvider};
 
 /// The unknown QUIC frame type `q-reserved-frame` emits.
 ///
@@ -122,6 +122,9 @@ pub struct TestListener {
     /// What the socket saw. Two tests are judged from this rather than from
     /// anything the peer said — see [`impairment`](super::impairment).
     counters: Arc<Counters>,
+    /// The post-quantum chain this port serves, as loaded; `None` on every
+    /// port but `t-cert-compression-pq`.
+    chain: Option<ChainSize>,
 }
 
 impl TestListener {
@@ -132,6 +135,7 @@ impl TestListener {
         tls_provider: &Arc<TlsProvider>,
         conformance: Arc<Conformance>,
     ) -> anyhow::Result<Self> {
+        let mut chain = None;
         // One port needs a TLS configuration of its own: it must offer early
         // data (which production does not) and refuse it (which production has
         // no reason to). Everything else shares the edge's own configuration, so
@@ -150,9 +154,14 @@ impl TestListener {
             // The one TLS-tier port whose subject is the certificate rather
             // than the key exchange: an ML-DSA-87 chain, sent compressed when
             // the client offers a codec we share.
-            tls_provider
-                .build_pq_chain_config()
-                .with_context(|| format!("building the TLS config for {}", test.id))?
+            let (crypto, size) = tls_provider
+                .build_pq_chain_config(
+                    &conformance.config.pq_chain_cert,
+                    &conformance.config.pq_chain_key,
+                )
+                .with_context(|| format!("building the TLS config for {}", test.id))?;
+            chain = Some(size);
+            crypto
         } else if matches!(test.tier, Tier::Tls) {
             // The TLS tier's whole anomaly is which group the server will
             // negotiate. Nothing malformed is emitted; the port simply refuses
@@ -519,6 +528,7 @@ impl TestListener {
             test,
             conformance,
             counters,
+            chain,
         })
     }
 
@@ -547,6 +557,7 @@ impl TestListener {
             let test = self.test;
             let conformance = self.conformance.clone();
             let counters = self.counters.clone();
+            let chain = self.chain;
             // Cheap handle clone. `q-stateless-reset` reads the endpoint's reset
             // counter, which is the only place a Stateless Reset is observable.
             let endpoint = self.endpoint.clone();
@@ -567,7 +578,9 @@ impl TestListener {
             }
 
             tokio::spawn(async move {
-                if let Err(e) = run_one(incoming, test, conformance, counters, endpoint).await {
+                if let Err(e) =
+                    run_one(incoming, test, conformance, counters, endpoint, chain).await
+                {
                     // A client failing a test often means a broken connection,
                     // which surfaces here as an error. That is data, not a
                     // fault: the verdict has already been recorded.
@@ -661,6 +674,7 @@ async fn run_one(
     conformance: Arc<Conformance>,
     conformance_counters: Arc<Counters>,
     endpoint: quinn::Endpoint,
+    chain: Option<ChainSize>,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
 
@@ -867,7 +881,7 @@ async fn run_one(
                         // non-event. Saying "the client never reached the
                         // anomaly" here would be false: it reached it, and this
                         // is what it did about it.
-                        tls_handshake_observation(test, &e)
+                        tls_handshake_observation(test, &e, chain)
                     } else if test.id == "q-invalid-transport-param" {
                         // This one did reach the anomaly: the parameter travels
                         // in the handshake, so it is among the first things the
@@ -1165,7 +1179,7 @@ async fn run_one(
     // sentence rather than the generic discretionary one.
     //
     // "Tolerated it and continued" is true of a client that ignored a GREASE
-    // codepoint; it is a poor description of one that decompressed 40 KB of
+    // codepoint; it is a poor description of one that decompressed a chain of
     // ML-DSA-87 certificates and verified a signature scheme standardised this
     // decade. The distinction matters because this row is the certificate-side
     // answer to the question the TLS tier exists to ask, and today almost
@@ -1177,14 +1191,14 @@ async fn run_one(
                 | Observation::NoCloseObserved
                 | Observation::PeerUnreachable
         ) {
-        Observation::Signalled(
-            "completed the handshake against an ML-DSA-87 chain: the compressed certificate \
-             message was decompressed, the chain parsed, and a post-quantum signature verified. \
-             Note that a client run with certificate verification disabled reaches this point \
-             without trusting anything, so what this shows is that the chain was processed, not \
-             that it was trusted"
-                .to_string(),
-        )
+        Observation::Signalled(format!(
+            "completed the handshake against {}: the compressed certificate message was \
+             decompressed, the chain parsed, and a post-quantum signature verified. Note that a \
+             client run with certificate verification disabled reaches this point without \
+             trusting anything, so what this shows is that the chain was processed, not that it \
+             was trusted",
+            the_chain(chain)
+        ))
     } else {
         observation
     };
@@ -1369,7 +1383,19 @@ fn classify_tls_abort(e: &quinn::ConnectionError) -> TlsAbort {
 /// document hands it in writing — the exact false accusation this suite exists
 /// to avoid. What §4.1.3 of RFC 8446 requires is the *abort*; the alert value
 /// is reported rather than judged.
-fn tls_handshake_observation(test: &'static Test, e: &quinn::ConnectionError) -> Observation {
+/// "the 2-certificate, 15,430-byte ML-DSA-87 chain", from what the port loaded.
+fn the_chain(chain: Option<ChainSize>) -> String {
+    match chain {
+        Some(size) => format!("the {size} ML-DSA-87 chain"),
+        None => "the ML-DSA-87 chain".to_string(),
+    }
+}
+
+fn tls_handshake_observation(
+    test: &'static Test,
+    e: &quinn::ConnectionError,
+    chain: Option<ChainSize>,
+) -> Observation {
     let abort = classify_tls_abort(e);
 
     // Common to every port here: a client that offered no group this port will
@@ -1493,7 +1519,7 @@ fn tls_handshake_observation(test: &'static Test, e: &quinn::ConnectionError) ->
         // ── The post-quantum chain ──
         //
         // Graded not at all, and the alert is the entire measurement. A client
-        // that rejects our private CA has already decompressed 40 KB of
+        // that rejects our private CA has already decompressed a chain of
         // ML-DSA-87 certificates to find out who signed them, which is the
         // capability under test; one that cannot parse the chain says so with a
         // different code entirely.
@@ -1514,9 +1540,10 @@ fn tls_handshake_observation(test: &'static Test, e: &quinn::ConnectionError) ->
                     .to_string(),
             ),
             TlsAbort::Alert(code @ (42 | 46 | 48)) => Observation::Signalled(format!(
-                "decompressed and parsed the 40 KB ML-DSA-87 chain, then rejected it on trust \
-                 (alert {code}). That is the right answer to a private CA, and reaching it \
-                 means the certificate message itself was handled"
+                "decompressed and parsed {}, then rejected it on trust (alert {code}). That is \
+                 the right answer to a private CA, and reaching it means the certificate \
+                 message itself was handled",
+                the_chain(chain)
             )),
             TlsAbort::Alert(code @ 43) => Observation::Signalled(format!(
                 "parsed the chain and rejected it as unsupported (alert {code}), which reads \
@@ -1525,9 +1552,10 @@ fn tls_handshake_observation(test: &'static Test, e: &quinn::ConnectionError) ->
             )),
             TlsAbort::Alert(code @ 50) => Observation::Signalled(format!(
                 "could not decode the certificate message (alert {code}). The chain is the \
-                 only thing unusual about this port, so this is the compressed 40 KB of it \
-                 rather than anything about trust -- the outcome a post-quantum deployment \
-                 needs to know about"
+                 only thing unusual about this port, so this is {} arriving compressed rather \
+                 than anything about trust -- the outcome a post-quantum deployment needs to \
+                 know about",
+                the_chain(chain)
             )),
             // handshake_failure is not evidence about the certificate.
             //

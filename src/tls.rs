@@ -601,43 +601,93 @@ pub fn single_group_server_config(
     ))
 }
 
-/// Where the deployed ML-DSA-87 chain lives.
+/// The size of the chain the post-quantum port serves, as loaded.
 ///
-/// The same files [`crate::tls`]'s integration test loads, and the chain
-/// `/pqc/` publishes: a private CA, so nothing outside this box trusts it,
-/// which is deliberate — see the `t-cert-compression-pq` catalogue entry for
-/// why being *untrusted* is what makes the measurement work.
-/// The chain `t-cert-compression-pq` serves: ML-DSA-87 throughout.
-///
-/// Deliberately not the showcase chain one directory up. That one is a
-/// SLH-DSA-SHA2-256s root over ML-DSA-87 intermediates -- a hash-based trust
-/// anchor above lattice signatures -- and it is what /pqc/ and
-/// pqc.pqcrypta.com:443 demonstrate publicly. It should stay that way.
-///
-/// It made a poor test fixture, though. Verifying it needs two post-quantum
-/// signature families, and nothing in the client fleet has both: the two
-/// clients that passed this test reached the end with certificate
-/// verification disabled, which the verdict text says out loud. The test asks
-/// whether a client can process a compressed ML-DSA-87 certificate message,
-/// and the CA's signature family is incidental to that -- so the fixture is
-/// one family, and a client with ML-DSA-87 can verify it rather than skip it.
-const PQ_CHAIN: &str = "/etc/pqcrypta/pqc-certs/conformance/fullchain.pem";
-const PQ_CHAIN_KEY: &str = "/etc/pqcrypta/pqc-certs/conformance/server.key";
+/// Verdicts on that port describe the chain, and they once described it from
+/// memory: "40 KB" survived the fixture being replaced by one well under half
+/// that, and went on appearing in every result. Measured at load time, the
+/// sentence cannot outlive the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainSize {
+    pub certificates: usize,
+    pub der_bytes: usize,
+}
+
+impl std::fmt::Display for ChainSize {
+    /// "2-certificate, 15,430-byte"
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let digits = self.der_bytes.to_string();
+        let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+        for (i, c) in digits.chars().enumerate() {
+            if i > 0 && (digits.len() - i).is_multiple_of(3) {
+                grouped.push(',');
+            }
+            grouped.push(c);
+        }
+        write!(f, "{}-certificate, {grouped}-byte", self.certificates)
+    }
+}
+
+#[cfg(test)]
+mod chain_size_tests {
+    use super::{CertificateDer, ChainSize, PemObject};
+
+    #[test]
+    fn groups_bytes_in_thousands() {
+        let size = |certificates, der_bytes| {
+            ChainSize {
+                certificates,
+                der_bytes,
+            }
+            .to_string()
+        };
+        assert_eq!(size(2, 15_430), "2-certificate, 15,430-byte");
+        assert_eq!(size(3, 999), "3-certificate, 999-byte");
+        assert_eq!(size(1, 1_000), "1-certificate, 1,000-byte");
+        assert_eq!(size(4, 1_234_567), "4-certificate, 1,234,567-byte");
+    }
+
+    /// The deployed fixture, when this box has it: the size a verdict quotes
+    /// is the one on disk.
+    #[test]
+    fn measures_the_fixture_it_loads() {
+        let cert = std::path::Path::new("/etc/pqcrypta/pqc-certs/conformance/fullchain.pem");
+        let key = std::path::Path::new("/etc/pqcrypta/pqc-certs/conformance/server.key");
+        if !cert.exists() || !key.exists() {
+            return;
+        }
+        let (_, size) = super::pq_chain_server_config(cert, key).expect("fixture loads");
+        let pem = std::fs::read(cert).expect("fixture readable");
+        let der: Vec<_> = CertificateDer::pem_reader_iter(&mut &pem[..])
+            .collect::<Result<_, _>>()
+            .expect("fixture parses");
+        assert_eq!(size.certificates, der.len());
+        assert_eq!(size.der_bytes, der.iter().map(|c| c.len()).sum::<usize>());
+    }
+}
 
 /// A config that serves the post-quantum certificate chain, for the one
 /// conformance port whose subject is the certificate rather than the key
 /// exchange.
 ///
 /// Ordinary key exchange, ordinary ALPN, ordinary everything else: what differs
-/// is a 40 KB ML-DSA-87 chain in place of the 5 KB ECDSA one, sent compressed
-/// under RFC 8879 when the client offers a codec this build also has.
+/// is an ML-DSA-87 chain (`conformance.pq_chain_cert`) in place of the edge's
+/// own, sent compressed under RFC 8879 when the client offers a codec this
+/// build also has.
 ///
 /// Fails loudly when the chain is missing rather than falling back to the
 /// ordinary resolver. A port that silently served the classical chain would
 /// report every client as handling a post-quantum one.
-pub fn pq_chain_server_config() -> anyhow::Result<Arc<quinn::crypto::rustls::QuicServerConfig>> {
-    let key = load_certified_key(Path::new(PQ_CHAIN), Path::new(PQ_CHAIN_KEY))
-        .with_context(|| format!("loading the post-quantum chain from {PQ_CHAIN}"))?;
+pub fn pq_chain_server_config(
+    cert: &Path,
+    key: &Path,
+) -> anyhow::Result<(Arc<quinn::crypto::rustls::QuicServerConfig>, ChainSize)> {
+    let key = load_certified_key(cert, key)
+        .with_context(|| format!("loading the post-quantum chain from {}", cert.display()))?;
+    let size = ChainSize {
+        certificates: key.cert.len(),
+        der_bytes: key.cert.iter().map(|c| c.len()).sum(),
+    };
 
     let mut config = RustlsServerConfig::builder_with_provider(Arc::new(build_pqc_provider()))
         .with_protocol_versions(&[&TLS13])
@@ -648,9 +698,13 @@ pub fn pq_chain_server_config() -> anyhow::Result<Arc<quinn::crypto::rustls::Qui
     config.alpn_protocols = vec![b"h3".to_vec()];
     crate::cert_compression::apply(&mut config);
 
-    Ok(Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(config)
-            .map_err(|e| anyhow::anyhow!("failed to build the post-quantum QUIC config: {e}"))?,
+    Ok((
+        Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(config).map_err(|e| {
+                anyhow::anyhow!("failed to build the post-quantum QUIC config: {e}")
+            })?,
+        ),
+        size,
     ))
 }
 
@@ -812,8 +866,10 @@ impl TlsProvider {
     /// `t-cert-compression-pq`.
     pub fn build_pq_chain_config(
         &self,
-    ) -> anyhow::Result<Arc<quinn::crypto::rustls::QuicServerConfig>> {
-        pq_chain_server_config()
+        cert: &Path,
+        key: &Path,
+    ) -> anyhow::Result<(Arc<quinn::crypto::rustls::QuicServerConfig>, ChainSize)> {
+        pq_chain_server_config(cert, key)
     }
 
     /// Check if PQC is available and enabled
