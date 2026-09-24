@@ -187,7 +187,7 @@ where
         //# more cookie-pairs, before compression.
 
         let mut block = BytesMut::new();
-        let mem_size = qpack::encode_stateless(&mut block, headers).map_err(|_e| {
+        let mem_size = qpack::encode_header_stateless(&mut block, &headers).map_err(|_e| {
             self.handle_connection_error_on_stream(InternalConnectionError {
                 code: Code::H3_INTERNAL_ERROR,
                 message: "Failed to encode headers".to_string(),
@@ -431,7 +431,6 @@ where
                 Ok(Frame::Settings(_)) => {
                     #[cfg(feature = "tracing")]
                     trace!("Got settings");
-                    ()
                 }
 
                 Ok(Frame::Goaway(id)) => {

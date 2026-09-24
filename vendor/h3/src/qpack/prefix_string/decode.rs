@@ -6,18 +6,21 @@ pub enum Error {
     Unhandled(BitWindow, usize),
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 enum DecodeValue {
     Partial(&'static HuffmanDecoder),
     Sym(u8),
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct HuffmanDecoder {
     lookup: u32,
     table: &'static [DecodeValue],
 }
 
+#[cfg(test)]
 impl HuffmanDecoder {
     fn check_eof(&self, bit_pos: &mut BitWindow, input: &[u8]) -> Result<Option<u32>, Error> {
         use std::cmp::Ordering;
@@ -75,6 +78,7 @@ impl HuffmanDecoder {
     }
 }
 
+#[cfg(test)]
 /// Read `len` bits from the `src` slice at the specified position
 ///
 /// Never read more than 8 bits at a time. `bit_offset` may be larger than 8.
@@ -98,6 +102,7 @@ fn read_bits(src: &[u8], mut byte_offset: u32, mut bit_offset: u32, len: u32) ->
     })
 }
 
+#[cfg(test)]
 macro_rules! bits_decode {
     // general way
     (
@@ -173,6 +178,7 @@ macro_rules! bits_decode {
     };
 }
 
+#[cfg(test)]
 #[rustfmt::skip]
 bits_decode![
     HPACK_STRING => (
@@ -294,11 +300,13 @@ bits_decode![
     EOF => (lookup: 8, []),
     ];
 
+#[cfg(test)]
 pub struct DecodeIter<'a> {
     bit_pos: BitWindow,
     content: &'a Vec<u8>,
 }
 
+#[cfg(test)]
 impl<'a> Iterator for DecodeIter<'a> {
     type Item = Result<u8, Error>;
 
@@ -311,10 +319,168 @@ impl<'a> Iterator for DecodeIter<'a> {
     }
 }
 
+/// Canonical-Huffman decode tables for RFC 7541 Appendix B, built at compile
+/// time from the encoder's code table (plus EOS), so the code list is written
+/// down once for both directions.
+///
+/// The HPACK code is canonical: the codes of each length are consecutive and
+/// follow on from the last code of the previous length. That makes a code's
+/// length decidable by comparing the next bits against one limit per length,
+/// and a direct table on the next eight bits resolves every code of eight bits
+/// or fewer — which covers the characters header values are mostly made of —
+/// in one lookup.
+struct Canonical {
+    /// First code of each length, right-aligned.
+    first: [u32; 31],
+    /// Number of codes of each length.
+    count: [u32; 31],
+    /// Index into `syms` of each length's first symbol.
+    base: [u32; 31],
+    /// Symbols ordered by (length, code); 256 is EOS.
+    syms: [u16; 257],
+    /// For each value of the next eight bits: (symbol, length) when a code of
+    /// at most eight bits matches, length 0 otherwise.
+    fast: [(u8, u8); 256],
+}
+
+const EOS: u16 = 256;
+
+const CANONICAL: Canonical = {
+    let codes = super::encode::CODES;
+    // (symbol, code, length), EOS included: 30 one-bits.
+    let mut all = [(0u16, 0u32, 0u8); 257];
+    let mut i = 0;
+    while i < 256 {
+        all[i] = (i as u16, codes[i].0, codes[i].1);
+        i += 1;
+    }
+    all[256] = (EOS, 0x3fff_ffff, 30);
+    // Insertion sort by (length, code).
+    let mut a = 1;
+    while a < 257 {
+        let mut b = a;
+        while b > 0
+            && (all[b - 1].2 > all[b].2 || (all[b - 1].2 == all[b].2 && all[b - 1].1 > all[b].1))
+        {
+            let t = all[b - 1];
+            all[b - 1] = all[b];
+            all[b] = t;
+            b -= 1;
+        }
+        a += 1;
+    }
+    let mut c = Canonical {
+        first: [0; 31],
+        count: [0; 31],
+        base: [0; 31],
+        syms: [0; 257],
+        fast: [(0, 0); 256],
+    };
+    let mut k = 0;
+    while k < 257 {
+        let (sym, code, len) = all[k];
+        let l = len as usize;
+        if c.count[l] == 0 {
+            c.first[l] = code;
+            c.base[l] = k as u32;
+        }
+        c.count[l] += 1;
+        c.syms[k] = sym;
+        k += 1;
+    }
+    let mut b = 0;
+    while b < 256 {
+        let mut l = 1;
+        while l <= 8 {
+            let code = (b as u32) >> (8 - l);
+            if c.count[l] > 0 && code.wrapping_sub(c.first[l]) < c.count[l] {
+                let sym = c.syms[(c.base[l] + code - c.first[l]) as usize];
+                c.fast[b] = (sym as u8, l as u8);
+                break;
+            }
+            l += 1;
+        }
+        b += 1;
+    }
+    c
+};
+
+/// Decode `input` into `out`, appending.
+///
+/// Up to 64 bits are held left-aligned in an accumulator and consumed a code at
+/// a time. At the end fewer than eight bits may remain and they must be the
+/// high bits of EOS — all ones — or the string is malformed (RFC 7541 §5.2),
+/// as is an EOS decoded as a symbol.
+///
+/// This replaced a decoder that walked a tree of lookup tables through a bit
+/// window, calling a bounds-checked bit reader and building a `Result` for
+/// every symbol, then pushed each byte through an iterator.
+pub fn hpack_decode_into(input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+    let t = &CANONICAL;
+    out.reserve(input.len() * 8 / 5);
+    let mut acc: u64 = 0;
+    let mut bits: u32 = 0;
+    let mut i = 0;
+    loop {
+        while bits <= 56 && i < input.len() {
+            acc |= (input[i] as u64) << (56 - bits);
+            bits += 8;
+            i += 1;
+        }
+        if bits == 0 {
+            return Ok(());
+        }
+        let w = (acc >> 32) as u32;
+        let (sym, len) = match t.fast[(w >> 24) as usize] {
+            (s, l) if l != 0 => (s as u16, l as u32),
+            _ => {
+                let mut found = (EOS, 0u32);
+                let mut l = 9;
+                while l <= 30 {
+                    let code = w >> (32 - l);
+                    if code.wrapping_sub(t.first[l]) < t.count[l] {
+                        found = (t.syms[(t.base[l] + code - t.first[l]) as usize], l as u32);
+                        break;
+                    }
+                    l += 1;
+                }
+                found
+            }
+        };
+        if len == 0 || len > bits {
+            // Not a whole code left: this is the padding. It must be shorter
+            // than a byte and all ones.
+            let pad_ok = bits < 8 && (acc >> (64 - bits)) == (1u64 << bits) - 1;
+            if pad_ok {
+                return Ok(());
+            }
+            let pos = (input.len() as u32 * 8).saturating_sub(bits);
+            let mut at = BitWindow::new();
+            at.byte = pos / 8;
+            at.bit = pos % 8;
+            return Err(Error::MissingBits(at));
+        }
+        if sym == EOS {
+            let pos = input.len() as u32 * 8 - bits;
+            let mut at = BitWindow::new();
+            at.byte = pos / 8;
+            at.bit = pos % 8;
+            return Err(Error::Unhandled(at, EOS as usize));
+        }
+        out.push(sym as u8);
+        acc <<= len;
+        bits -= len;
+    }
+}
+
+#[cfg(test)]
+/// The original tree decoder, kept as the reference [`hpack_decode_into`] is
+/// tested against.
 pub trait HpackStringDecode {
     fn hpack_decode(&self) -> DecodeIter<'_>;
 }
 
+#[cfg(test)]
 impl HpackStringDecode for Vec<u8> {
     fn hpack_decode(&self) -> DecodeIter<'_> {
         DecodeIter {
@@ -1721,5 +1887,45 @@ mod tests {
         let expected = (0u8..=255).collect();
         let res: Result<Vec<_>, Error> = bytes.hpack_decode().collect();
         assert_eq!(res, Ok(expected));
+    }
+
+    /// The canonical decoder against the tree decoder it replaced, on the
+    /// encoder's output for every symbol and for random strings, and on
+    /// malformed padding.
+    #[test]
+    fn canonical_decoder_matches_reference() {
+        use super::super::encode::HpackStringEncode;
+        fn reference(v: &Vec<u8>) -> Result<Vec<u8>, Error> {
+            v.hpack_decode().collect()
+        }
+        let mut x: u32 = 0x1234_5678;
+        let mut inputs: Vec<Vec<u8>> = (0..=255u8).map(|c| vec![c]).collect();
+        inputs.push((0..=255u8).collect());
+        for len in 0..300 {
+            inputs.push(
+                (0..len)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 17;
+                        x ^= x << 5;
+                        (x % 96 + 32) as u8
+                    })
+                    .collect(),
+            );
+        }
+        for v in &inputs {
+            let enc = v.hpack_encode().unwrap();
+            let mut got = Vec::new();
+            hpack_decode_into(&enc, &mut got).unwrap();
+            assert_eq!(&got, v);
+            assert_eq!(Ok(got), reference(&enc));
+        }
+        // Padding of a full byte, and padding that is not all ones.
+        let mut out = Vec::new();
+        assert!(hpack_decode_into(&[0xff], &mut out).is_err());
+        // '0' is 00000; followed by 3 zero bits of "padding".
+        assert!(hpack_decode_into(&[0b0000_0000], &mut out).is_err());
+        // EOS itself.
+        assert!(hpack_decode_into(&[0xff, 0xff, 0xff, 0xfc], &mut out).is_err());
     }
 }

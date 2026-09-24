@@ -204,8 +204,9 @@ fn blocked_header_decodes_once_the_insert_arrives() {
 
     // The parked section is decoded from the start, not from wherever the
     // failed attempt left the cursor.
-    let Decoded { fields, dyn_ref, .. } =
-        decoder.decode_header(&mut Cursor::new(&block_buf)).unwrap();
+    let Decoded {
+        fields, dyn_ref, ..
+    } = decoder.decode_header(&mut Cursor::new(&block_buf)).unwrap();
     assert_eq!(fields, header);
     assert!(dyn_ref, "the section referenced the dynamic table");
 }

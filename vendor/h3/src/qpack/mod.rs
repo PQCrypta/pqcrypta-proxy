@@ -1,6 +1,8 @@
+#[cfg(test)]
+pub use self::encoder::encode_stateless;
 pub use self::{
     decoder::{ack_header, decode_stateless, stream_canceled, Decoded, Decoder, DecoderError},
-    encoder::{encode_stateless, EncoderError},
+    encoder::{encode_header_stateless, EncoderError},
     field::HeaderField,
 };
 

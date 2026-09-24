@@ -18,7 +18,13 @@ impl StaticTable {
     }
 
     pub fn find(field: &HeaderField) -> Option<usize> {
-        match (&field.name[..], &field.value[..]) {
+        Self::find_bytes(&field.name, &field.value)
+    }
+
+    /// [`find`](Self::find) on borrowed bytes, for encoders that never build a
+    /// `HeaderField`.
+    pub fn find_bytes(name: &[u8], value: &[u8]) -> Option<usize> {
+        match (name, value) {
             (b":authority", b"") => Some(0),
             (b":path", b"/") => Some(1),
             (b"age", b"0") => Some(2),

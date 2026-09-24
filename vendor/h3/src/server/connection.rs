@@ -3,17 +3,20 @@
 //! The [`Connection`] struct manages a connection from the side of the HTTP/3 server
 
 use std::{
-    collections::HashSet,
     future::poll_fn,
     option::Option,
     result::Result,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     task::{ready, Context, Poll},
 };
 
 use bytes::Buf;
+use futures_util::task::AtomicWaker;
 use quic::RecvStream;
 use quic::StreamId;
-use tokio::sync::mpsc;
 
 use crate::{
     connection::ConnectionInner,
@@ -48,11 +51,11 @@ where
     /// TODO: temporarily break encapsulation for `WebTransportSession`
     pub inner: ConnectionInner<C, B>,
     pub(super) max_field_section_size: u64,
-    // List of all incoming streams that are currently running.
-    pub(super) ongoing_streams: HashSet<StreamId>,
-    // Let the streams tell us when they are no longer running.
-    pub(super) request_end_recv: mpsc::UnboundedReceiver<StreamId>,
-    pub(super) request_end_send: mpsc::UnboundedSender<StreamId>,
+    // Requests accepted and not yet finished; see `Ongoing`.
+    pub(super) ongoing: Arc<Ongoing>,
+    // Accepts since the auxiliary streams were last polled; see
+    // `poll_accept_request_stream_internal`.
+    pub(super) accepts_since_aux: u32,
     // Has a GOAWAY frame been sent? If so, this StreamId is the last we are willing to accept.
     pub(super) sent_closing: Option<StreamId>,
     // Has a GOAWAY frame been received? If so, this is PushId the last the remote will accept.
@@ -145,8 +148,10 @@ where
         stream: FrameStream<C::BidiStream, B>,
     ) -> RequestResolver<C, B> {
         RequestResolver {
+            request_end: Arc::new(RequestEnd {
+                ongoing: self.ongoing.clone(),
+            }),
             frame_stream: stream,
-            request_end_send: self.request_end_send.clone(),
             send_grease_frame: self.inner.send_grease_frame,
             max_field_section_size: self.max_field_section_size,
             shared: self.inner.shared.clone(),
@@ -187,51 +192,78 @@ where
         // so a conformant client sends nothing here and nothing changes for
         // it; what changes is that a client which sends something now gets
         // an answer.
+        // Requests already waiting are taken first. The auxiliary streams
+        // below — QPACK encoder and decoder, control, request completions —
+        // are polled when no request is waiting, which is when this task would
+        // otherwise go to sleep, and at least every `AUX_EVERY` accepts so a
+        // connection that always has a request queued still reads its control
+        // stream. Polling all four before every accept cost each request of a
+        // burst four polls of the QUIC connection for streams that almost never
+        // have anything on them.
+        const AUX_EVERY: u32 = 16;
+        if self.accepts_since_aux < AUX_EVERY {
+            self.accepts_since_aux += 1;
+            while let Poll::Ready(s) = self.inner.poll_accept_bi(cx)? {
+                if let Some(ready) = self.admit(s, cx) {
+                    return ready;
+                }
+            }
+        }
+        self.accepts_since_aux = 0;
+
         if let Poll::Ready(err) = self.inner.poll_qpack_encoder(cx) {
             return Poll::Ready(Err(err));
         }
         self.inner.poll_qpack_decoder_send(cx);
 
         let _ = self.poll_control(cx)?;
-        let _ = self.poll_requests_completion(cx);
         loop {
             let conn = self.inner.poll_accept_bi(cx)?;
             return match conn {
                 Poll::Pending => {
-                    let done = if conn.is_pending() {
-                        self.recv_closing.is_some() && self.poll_requests_completion(cx).is_ready()
-                    } else {
-                        self.poll_requests_completion(cx).is_ready()
-                    };
+                    let done =
+                        self.recv_closing.is_some() && self.poll_requests_completion(cx).is_ready();
 
                     if done {
                         Poll::Ready(Ok(None))
                     } else {
-                        // Wait for all the requests to be finished, request_end_recv will wake
-                        // us on each request completion.
+                        // Wait for all the requests to be finished; the last
+                        // one to finish wakes us.
                         Poll::Pending
                     }
                 }
-                Poll::Ready(mut s) => {
-                    // When the connection is in a graceful shutdown procedure, reject all
-                    // incoming requests not belonging to the grace interval. It's possible that
-                    // some acceptable request streams arrive after rejected requests.
-                    if let Some(max_id) = self.sent_closing {
-                        if s.send_id() > max_id {
-                            s.stop_sending(Code::H3_REQUEST_REJECTED.value());
-                            s.reset(Code::H3_REQUEST_REJECTED.value());
-                            if self.poll_requests_completion(cx).is_ready() {
-                                break Poll::Ready(Ok(None));
-                            }
-                            continue;
-                        }
-                    }
-                    self.last_accepted_stream = Some(s.send_id());
-                    self.ongoing_streams.insert(s.send_id());
-                    Poll::Ready(Ok(Some(s)))
-                }
+                Poll::Ready(s) => match self.admit(s, cx) {
+                    Some(ready) => ready,
+                    None => continue,
+                },
             };
         }
+    }
+
+    /// Take an incoming request stream, or reject it during a graceful
+    /// shutdown. `None` means it was rejected and the caller should look for
+    /// the next one.
+    fn admit(
+        &mut self,
+        mut s: C::BidiStream,
+        cx: &mut Context<'_>,
+    ) -> Option<Poll<Result<Option<C::BidiStream>, ConnectionError>>> {
+        // When the connection is in a graceful shutdown procedure, reject all
+        // incoming requests not belonging to the grace interval. It's possible that
+        // some acceptable request streams arrive after rejected requests.
+        if let Some(max_id) = self.sent_closing {
+            if s.send_id() > max_id {
+                s.stop_sending(Code::H3_REQUEST_REJECTED.value());
+                s.reset(Code::H3_REQUEST_REJECTED.value());
+                if self.poll_requests_completion(cx).is_ready() {
+                    return Some(Poll::Ready(Ok(None)));
+                }
+                return None;
+            }
+        }
+        self.last_accepted_stream = Some(s.send_id());
+        self.ongoing.count.fetch_add(1, Ordering::AcqRel);
+        Some(Poll::Ready(Ok(Some(s))))
     }
 
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
@@ -254,7 +286,6 @@ where
             Frame::Settings(_setting) => {
                 #[cfg(feature = "tracing")]
                 trace!("Got settings > {:?}", _setting);
-                ()
             }
             &Frame::Goaway(id) => self.inner.process_goaway(&mut self.recv_closing, id)?,
             _frame @ Frame::MaxPushId(_) | _frame @ Frame::CancelPush(_) => {
@@ -291,26 +322,19 @@ where
         Poll::Ready(Ok(frame))
     }
 
+    /// Ready once no accepted request is still running.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     fn poll_requests_completion(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        loop {
-            match self.request_end_recv.poll_recv(cx) {
-                // The channel is closed
-                Poll::Ready(None) => return Poll::Ready(()),
-                // A request has completed
-                Poll::Ready(Some(id)) => {
-                    self.ongoing_streams.remove(&id);
-                }
-                Poll::Pending => {
-                    if self.ongoing_streams.is_empty() {
-                        // Tell the caller there is not more ongoing requests.
-                        // Still, the completion of future requests will wake us.
-                        return Poll::Ready(());
-                    } else {
-                        return Poll::Pending;
-                    }
-                }
-            }
+        if self.ongoing.count.load(Ordering::Acquire) == 0 {
+            return Poll::Ready(());
+        }
+        self.ongoing.waker.register(cx.waker());
+        // Re-check: the last request may have finished between the load and
+        // the registration.
+        if self.ongoing.count.load(Ordering::Acquire) == 0 {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
         }
     }
 }
@@ -342,7 +366,32 @@ where
 //# parallelism, at least 100 request streams SHOULD be permitted at a
 //# time.
 
+/// How many accepted requests are still running.
+///
+/// This was a `HashSet<StreamId>` fed by a channel: an insert per request, a
+/// message per completion, and — because the accept loop was the channel's
+/// only reader — a wake of the connection task for every request that
+/// finished, all to answer "is anything still running?" during a graceful
+/// shutdown. A count answers the same question, and the connection is woken
+/// only when it reaches zero.
+pub(super) struct Ongoing {
+    pub(super) count: AtomicUsize,
+    pub(super) waker: AtomicWaker,
+}
+
+impl Ongoing {
+    pub(super) fn new() -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+            waker: AtomicWaker::new(),
+        }
+    }
+}
+
+/// Created with the request's resolver, so a request is counted finished
+/// however it ends — including a resolve that fails, which previously left
+/// its stream counted as running for the life of the connection and kept a
+/// graceful shutdown from ever completing.
 pub(super) struct RequestEnd {
-    pub(super) request_end: mpsc::UnboundedSender<StreamId>,
-    pub(super) stream_id: StreamId,
+    pub(super) ongoing: Arc<Ongoing>,
 }

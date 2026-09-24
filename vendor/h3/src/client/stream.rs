@@ -263,13 +263,13 @@ where
                     // connection already failed this reports that failure
                     // rather than replacing it; the message below is only
                     // ever seen when the wait itself is the whole story.
-                    return Err(self.handle_connection_error_on_stream(
-                        InternalConnectionError {
+                    return Err(
+                        self.handle_connection_error_on_stream(InternalConnectionError {
                             code: Code::QPACK_DECOMPRESSION_FAILED,
                             message: "the connection ended while a field section was blocked"
                                 .to_string(),
-                        },
-                    ));
+                        }),
+                    );
                 }
             };
             drop(blocked);
@@ -384,10 +384,8 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
         let res = self.inner.poll_recv_trailers(cx);
-        if let Poll::Ready(Err(e)) = &res {
-            if let StreamError::HeaderTooBig { .. } = e {
-                self.inner.stream.stop_sending(Code::H3_REQUEST_CANCELLED);
-            }
+        if let Poll::Ready(Err(StreamError::HeaderTooBig { .. })) = &res {
+            self.inner.stream.stop_sending(Code::H3_REQUEST_CANCELLED);
         }
         res
     }

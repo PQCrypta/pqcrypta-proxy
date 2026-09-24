@@ -39,6 +39,38 @@ impl Header {
         }
     }
 
+    /// Every field line in the order it is sent — pseudo-header fields first
+    /// (RFC 9114 §4.3), then the regular fields, each value of a repeated name
+    /// on its own line — borrowed from `self`.
+    pub fn field_slices(&self) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
+        let p = &self.pseudo;
+        let pseudo: [Option<(&[u8], &[u8])>; 6] = [
+            p.method
+                .as_ref()
+                .map(|m| (&b":method"[..], m.as_str().as_bytes())),
+            p.scheme
+                .as_ref()
+                .map(|s| (&b":scheme"[..], s.as_str().as_bytes())),
+            p.authority
+                .as_ref()
+                .map(|a| (&b":authority"[..], a.as_str().as_bytes())),
+            p.path
+                .as_ref()
+                .map(|x| (&b":path"[..], x.as_str().as_bytes())),
+            p.status
+                .as_ref()
+                .map(|s| (&b":status"[..], s.as_str().as_bytes())),
+            p.protocol
+                .as_ref()
+                .map(|x| (&b":protocol"[..], x.as_str().as_bytes())),
+        ];
+        pseudo.into_iter().flatten().chain(
+            self.fields
+                .iter()
+                .map(|(n, v)| (n.as_str().as_bytes(), v.as_bytes())),
+        )
+    }
+
     pub fn response(status: StatusCode, fields: HeaderMap) -> Self {
         Self {
             pseudo: Pseudo::response(status),

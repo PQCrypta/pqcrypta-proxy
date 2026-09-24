@@ -200,18 +200,46 @@ where
     HeaderPrefix::new(0, 0, 0, 0).encode(block);
     for field in fields {
         let field = field.as_ref();
-
-        if let Some(index) = StaticTable::find(field) {
-            Indexed::Static(index).encode(block);
-        } else if let Some(index) = StaticTable::find_name(&field.name) {
-            LiteralWithNameRef::new_static(index, field.value.clone()).encode(block)?;
-        } else {
-            Literal::new(field.name.clone(), field.value.clone()).encode(block)?;
-        }
-
+        encode_field_stateless(block, &field.name, &field.value)?;
         size += field.mem_size() as u64;
     }
     Ok(size)
+}
+
+/// [`encode_stateless`] for a [`Header`](crate::proto::headers::Header),
+/// reading each field line in place.
+///
+/// Going through `encode_stateless` turned every field into a `HeaderField`
+/// owning copies of its name and value, and the encoder then cloned those
+/// again into a literal to write it — two to four allocations per header
+/// line, to write bytes that were already sitting in the `HeaderMap`.
+pub fn encode_header_stateless<W: BufMut>(
+    block: &mut W,
+    header: &crate::proto::headers::Header,
+) -> Result<u64, EncoderError> {
+    let mut size = 0;
+    HeaderPrefix::new(0, 0, 0, 0).encode(block);
+    for (name, value) in header.field_slices() {
+        encode_field_stateless(block, name, value)?;
+        size += (name.len() + value.len() + super::field::ESTIMATED_OVERHEAD_BYTES) as u64;
+    }
+    Ok(size)
+}
+
+/// One field line of a field section that uses the static table only.
+fn encode_field_stateless<W: BufMut>(
+    block: &mut W,
+    name: &[u8],
+    value: &[u8],
+) -> Result<(), EncoderError> {
+    if let Some(index) = StaticTable::find_bytes(name, value) {
+        Indexed::Static(index).encode(block);
+    } else if let Some(index) = StaticTable::find_name(name) {
+        super::block::encode_static_name_ref(index, value, block)?;
+    } else {
+        super::block::encode_literal(name, value, block)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -34,7 +34,7 @@ use crate::{
 };
 
 #[cfg(feature = "tracing")]
-use tracing::{error, instrument};
+use tracing::instrument;
 
 /// Manage request and response transfer for an incoming request
 ///
@@ -123,8 +123,16 @@ where
         } = parts;
         let headers = Header::response(status, headers);
 
-        let mut block = BytesMut::new();
-        let mem_size = qpack::encode_stateless(&mut block, headers).map_err(|_e| {
+        // Sized for the literal worst case, so the block is allocated once
+        // instead of grown by doubling as the fields go in.
+        let mut block = BytesMut::with_capacity(
+            headers
+                .field_slices()
+                .map(|(n, v)| n.len() + v.len() + 4)
+                .sum::<usize>()
+                + 2,
+        );
+        let mem_size = qpack::encode_header_stateless(&mut block, &headers).map_err(|_e| {
             self.handle_connection_error_on_stream(InternalConnectionError {
                 code: Code::H3_INTERNAL_ERROR,
                 message: "Failed to encode headers".to_string(),
@@ -225,12 +233,12 @@ where
 
 impl Drop for RequestEnd {
     fn drop(&mut self) {
-        if let Err(_error) = self.request_end.send(self.stream_id) {
-            #[cfg(feature = "tracing")]
-            error!(
-                "failed to notify connection of request end: {} {}",
-                self.stream_id, _error
-            );
+        let previous = self
+            .ongoing
+            .count
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        if previous == 1 {
+            self.ongoing.waker.wake();
         }
     }
 }

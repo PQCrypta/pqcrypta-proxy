@@ -11,8 +11,8 @@ use bytes::{Buf, BufMut};
 pub use self::bitwin::BitWindow;
 
 pub use self::{
-    decode::{Error as HuffmanDecodingError, HpackStringDecode},
-    encode::{hpack_encoded_len, Error as HuffmanEncodingError, HpackStringEncode},
+    decode::Error as HuffmanDecodingError,
+    encode::{hpack_encoded_len, Error as HuffmanEncodingError},
 };
 
 use crate::qpack::prefix_int::{self, Error as IntegerError};
@@ -45,14 +45,17 @@ pub fn decode<B: Buf>(size: u8, buf: &mut B) -> Result<Vec<u8>, Error> {
         return Err(Error::UnexpectedEnd);
     }
 
-    let payload = buf.copy_to_bytes(len);
+    // One copy for a literal, one decode pass for Huffman. Both used to go
+    // byte by byte through an iterator, the Huffman form after first
+    // collecting the input into a second vector.
     let value = if flags & 1 == 0 {
-        payload.into_iter().collect()
+        let mut v = vec![0u8; len];
+        buf.copy_to_slice(&mut v);
+        v
     } else {
+        let payload = buf.copy_to_bytes(len);
         let mut decoded = Vec::new();
-        for byte in payload.into_iter().collect::<Vec<u8>>().hpack_decode() {
-            decoded.push(byte?);
-        }
+        decode::hpack_decode_into(&payload, &mut decoded)?;
         decoded
     };
     Ok(value)
@@ -70,11 +73,10 @@ pub fn encode<B: BufMut>(size: u8, flags: u8, value: &[u8], buf: &mut B) -> Resu
         return Ok(());
     }
 
-    // `Vec::from(value)` copied the input before encoding it; the slice impl
-    // does not. `put_slice` replaces a byte-at-a-time write loop.
-    let encoded = value.hpack_encode()?;
-    prefix_int::encode(size - 1, flags << 1 | 1, encoded.len().try_into()?, buf);
-    buf.put_slice(&encoded);
+    // Straight into `buf`: the length is already known, so the prefix goes
+    // first and the encoded bytes follow with no intermediate vector.
+    prefix_int::encode(size - 1, flags << 1 | 1, huffman_len.try_into()?, buf);
+    encode::hpack_encode_into(value, buf);
     Ok(())
 }
 
@@ -107,6 +109,7 @@ impl From<TryFromIntError> for Error {
 
 #[cfg(test)]
 mod tests {
+    use super::encode::HpackStringEncode;
     use super::*;
     use assert_matches::assert_matches;
     use std::io::Cursor;

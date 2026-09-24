@@ -21,11 +21,9 @@
 //! }
 //! ```
 
-use std::{collections::HashSet, result::Result, sync::Arc};
+use std::{result::Result, sync::Arc};
 
 use bytes::Buf;
-
-use tokio::sync::mpsc;
 
 use crate::{
     config::Config,
@@ -128,15 +126,13 @@ impl Builder {
         C: quic::Connection<B>,
         B: Buf,
     {
-        let (sender, receiver) = mpsc::unbounded_channel();
         let shared = SharedState::default();
 
         Ok(Connection {
             inner: ConnectionInner::new(conn, Arc::new(shared), self.config).await?,
             max_field_section_size: self.config.settings.max_field_section_size,
-            request_end_send: sender,
-            request_end_recv: receiver,
-            ongoing_streams: HashSet::new(),
+            ongoing: Arc::new(super::connection::Ongoing::new()),
+            accepts_since_aux: 0,
             sent_closing: None,
             recv_closing: None,
             last_accepted_stream: None,

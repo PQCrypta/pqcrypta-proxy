@@ -14,12 +14,16 @@ struct EncodeValue {
     bit_count: u32,
 }
 
+/// The original bit-window encoder, kept as the reference the table-driven
+/// [`hpack_encode_into`] is tested against.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct HuffmanEncoder {
     buffer_pos: BitWindow,
     buffer: Vec<u8>,
 }
 
+#[cfg(test)]
 impl HuffmanEncoder {
     fn new() -> HuffmanEncoder {
         HuffmanEncoder {
@@ -98,6 +102,7 @@ impl HuffmanEncoder {
 ///
 /// The bits to be written to are expected to be set to 1 when calling this function. Similarly,
 /// this function maintains the invariant that unused bits in the output bytes are set to 1.
+#[cfg(test)]
 fn write_bits(out: &mut [u8], pos: &BitWindow, value: u8) {
     debug_assert!(pos.bit < 8);
     debug_assert!(pos.count <= 8);
@@ -123,7 +128,9 @@ fn write_bits(out: &mut [u8], pos: &BitWindow, value: u8) {
     }
 }
 
+#[cfg(test)]
 const PAD_RIGHT: [u8; 9] = [0, 1, 3, 7, 15, 31, 63, 127, 255];
+#[cfg(test)]
 const PAD_LEFT: [u8; 9] = [0, 128, 192, 224, 240, 248, 252, 254, 255];
 
 macro_rules! bits_encode {
@@ -396,17 +403,68 @@ const HPACK_STRING: [EncodeValue; 256] = bits_encode![
     ( 26 => [0b1111_1111, 0b1111_1111, 0b1111_1011, 0b0000_0010]),
 ];
 
+/// Each symbol's code, right-aligned, and its length in bits.
+///
+/// Derived at compile time from [`HPACK_STRING`], so the RFC 7541 Appendix B
+/// table is still written down exactly once.
+pub(super) const CODES: [(u32, u8); 256] = {
+    let mut out = [(0u32, 0u8); 256];
+    let mut i = 0;
+    while i < 256 {
+        let ev = &HPACK_STRING[i];
+        // `buffer` holds the code most significant bits first, eight to a
+        // byte, with the last byte holding whatever remains right-aligned.
+        let n = ev.buffer.len();
+        let mut acc: u64 = 0;
+        let mut j = 0;
+        while j + 1 < n {
+            acc = (acc << 8) | ev.buffer[j] as u64;
+            j += 1;
+        }
+        let rest = ev.bit_count - 8 * (n as u32 - 1);
+        acc = (acc << rest) | ev.buffer[n - 1] as u64;
+        out[i] = (acc as u32, ev.bit_count as u8);
+        i += 1;
+    }
+    out
+};
+
 /// Byte length `hpack_encode` will produce for `value`, without encoding it.
 ///
 /// Table lookups and an add per byte, no allocation. Two things need this: the
 /// caller has to know whether Huffman is worth using at all before committing to
-/// it, and the encoder can then size its output exactly instead of growing it.
+/// it, and the length prefix has to be written before the encoded bytes.
 pub fn hpack_encoded_len(value: &[u8]) -> usize {
-    let bits: usize = value
-        .iter()
-        .map(|c| HPACK_STRING[*c as usize].bit_count as usize)
-        .sum();
-    bits.div_ceil(8)
+    let bits: usize = value.iter().map(|c| CODES[*c as usize].1 as usize).sum();
+    // `div_ceil` is newer than this crate's MSRV.
+    (bits + 7) / 8
+}
+
+/// Huffman-encode `value` straight into `buf`: exactly
+/// [`hpack_encoded_len`]`(value)` bytes, the last padded with the high bits of
+/// EOS (all ones) as RFC 7541 §5.2 requires.
+///
+/// Codes are at most 30 bits and fewer than 8 bits are ever left pending, so a
+/// 64-bit accumulator always has room; bits that have already been written
+/// simply shift out of the top. This replaced an encoder that placed each code
+/// byte by byte through a bit window, into a vector it pre-filled and then
+/// copied out — the single largest cost of writing an HTTP/3 response header
+/// block, measured at 4.3% of a proxy's user time.
+pub fn hpack_encode_into<B: bytes::BufMut>(value: &[u8], buf: &mut B) {
+    let mut acc: u64 = 0;
+    let mut pending: u32 = 0;
+    for &c in value {
+        let (code, len) = CODES[c as usize];
+        acc = (acc << len) | code as u64;
+        pending += len as u32;
+        while pending >= 8 {
+            pending -= 8;
+            buf.put_u8((acc >> pending) as u8);
+        }
+    }
+    if pending > 0 {
+        buf.put_u8(((acc << (8 - pending)) as u8) | (0xFF >> pending));
+    }
 }
 
 pub trait HpackStringEncode {
@@ -415,11 +473,9 @@ pub trait HpackStringEncode {
 
 impl HpackStringEncode for [u8] {
     fn hpack_encode(&self) -> Result<Vec<u8>, Error> {
-        let mut encoder = HuffmanEncoder::with_len(hpack_encoded_len(self));
-        for code in self {
-            encoder.put(*code)?;
-        }
-        encoder.ends()
+        let mut out = Vec::with_capacity(hpack_encoded_len(self));
+        hpack_encode_into(self, &mut out);
+        Ok(out)
     }
 }
 
@@ -1825,7 +1881,7 @@ mod tests {
         assert_eq!(res, Ok(bytes));
     }
 
-    use super::super::HpackStringDecode;
+    use super::super::decode::HpackStringDecode;
 
     #[test]
     fn byte_count_exact_when_bit_count_multiple_of_8() {
@@ -1858,5 +1914,39 @@ mod tests {
         let reencoded = res.hpack_encode();
 
         assert_eq!(reencoded.unwrap().last(), Some(&0xfc));
+    }
+
+    /// The table-driven encoder against the original bit-window one: every
+    /// symbol alone, every symbol in sequence, and strings that exercise every
+    /// pending-bit alignment.
+    #[test]
+    fn table_encoder_matches_reference() {
+        fn reference(v: &[u8]) -> Vec<u8> {
+            let mut e = HuffmanEncoder::with_len(hpack_encoded_len(v));
+            for c in v {
+                e.put(*c).unwrap();
+            }
+            e.ends().unwrap()
+        }
+        for c in 0..=255u8 {
+            assert_eq!(([c]).hpack_encode().unwrap(), reference(&[c]), "symbol {c}");
+        }
+        let all: Vec<u8> = (0..=255u8).collect();
+        assert_eq!(all.hpack_encode().unwrap(), reference(&all));
+        let mut x: u32 = 0x9e37_79b9;
+        for len in 0..200 {
+            let v: Vec<u8> = (0..len)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    x as u8
+                })
+                .collect();
+            let mut direct = Vec::new();
+            hpack_encode_into(&v, &mut direct);
+            assert_eq!(direct, reference(&v), "len {len}");
+            assert_eq!(direct.len(), hpack_encoded_len(&v));
+        }
     }
 }

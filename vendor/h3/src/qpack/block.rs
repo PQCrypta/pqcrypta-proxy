@@ -321,8 +321,7 @@ impl LiteralWithNameRef {
     pub fn encode<W: BufMut>(&self, buf: &mut W) -> Result<(), prefix_string::Error> {
         match self {
             LiteralWithNameRef::Static { index, value } => {
-                prefix_int::encode(4, 0b0101, *index as u64, buf);
-                prefix_string::encode(8, 0, value, buf)?;
+                encode_static_name_ref(*index, value, buf)?;
             }
             LiteralWithNameRef::Dynamic { index, value } => {
                 prefix_int::encode(4, 0b0100, *index as u64, buf);
@@ -399,10 +398,30 @@ impl Literal {
     }
 
     pub fn encode<W: BufMut>(&self, buf: &mut W) -> Result<(), prefix_string::Error> {
-        prefix_string::encode(4, 0b0010, &self.name, buf)?;
-        prefix_string::encode(8, 0, &self.value, buf)?;
-        Ok(())
+        encode_literal(&self.name, &self.value, buf)
     }
+}
+
+/// A literal field line with a static-table name reference (RFC 9204
+/// §4.5.4), written from borrowed bytes.
+pub fn encode_static_name_ref<W: BufMut>(
+    index: usize,
+    value: &[u8],
+    buf: &mut W,
+) -> Result<(), prefix_string::Error> {
+    prefix_int::encode(4, 0b0101, index as u64, buf);
+    prefix_string::encode(8, 0, value, buf)
+}
+
+/// A literal field line with a literal name (RFC 9204 §4.5.6), written from
+/// borrowed bytes.
+pub fn encode_literal<W: BufMut>(
+    name: &[u8],
+    value: &[u8],
+    buf: &mut W,
+) -> Result<(), prefix_string::Error> {
+    prefix_string::encode(4, 0b0010, name, buf)?;
+    prefix_string::encode(8, 0, value, buf)
 }
 
 #[cfg(test)]
