@@ -43,8 +43,6 @@ use axum::{
 use axum_server::accept::Accept;
 use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
 use hyper::upgrade::OnUpgrade;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use tokio::net::{TcpListener, TcpStream};
@@ -58,6 +56,7 @@ use crate::tls_acceptor::FingerprintingTlsAcceptor;
 use crate::pqc_tls::{openssl_pqc, PqcTlsProvider};
 
 use crate::access_logger::{log_access, AccessLogEntry};
+use crate::backend_client::BackendClient;
 use crate::cache::cache_middleware;
 use crate::compression::{compression_middleware, CompressionState};
 use crate::config::{BackendConfig, ProxyConfig, ShadowConfig, TlsMode};
@@ -126,16 +125,11 @@ pub struct HttpListenerState {
     // request, and hyper's `Client::clone` copies its config, its HTTP/1 and
     // HTTP/2 builders and its connector — real struct copies, not refcounts.
     // Three of them per request came to 7.4 % of CPU in the profile.
-    pub http_client: Arc<Client<HttpConnector, Body>>,
-    pub https_client: Arc<Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>>,
-    /// Dedicated client with connection pooling disabled (`pool_max_idle_per_host(0)`)
-    /// — used instead of `http_client` when `BackendConfig::disable_pooling` is set.
-    /// Every request opens a fresh connection rather than reusing a pooled one;
-    /// for backends under sustained concurrent load that occasionally hang or
-    /// reset on a *reused* pooled connection (root cause not yet isolated further
-    /// upstream — see pqcrypta-api's connection handling), this trades a bit of
-    /// per-request handshake overhead for reliability. Cheap on loopback backends.
-    pub direct_client: Arc<Client<HttpConnector, Body>>,
+    /// Pooled HTTP/1.1 connections to the backends, plain and TLS, honouring
+    /// each backend's TLS settings and `disable_pooling`; see
+    /// [`crate::backend_client`]. One client where there were three: plain,
+    /// HTTPS with native roots only, and unpooled.
+    pub backend_client: Arc<BackendClient<Body>>,
     /// Behind an `Arc` because axum clones the whole `State<T>` for every
     /// request, and `SecurityState` holds 19 `Arc` fields — so cloning it by
     /// value cost 19 atomic increments and 19 decrements per request, on cache
@@ -773,41 +767,11 @@ fn build_listener_app(
        + 'static {
     let config = config.clone();
     let pool_config = &config.connection_pool;
-    // TCP_NODELAY on backend connections. hyper's default connector leaves Nagle
-    // enabled, which is the wrong trade for a reverse proxy: a proxied request is
-    // a small write followed by a wait for the reply, so Nagle holds the write
-    // looking for more data that is never coming while the backend's delayed ACK
-    // holds the other side. Measured against a local backend, mean request
-    // latency was 917us with it left on.
-    let mut backend_connector = HttpConnector::new();
-    backend_connector.set_nodelay(true);
-    let http_client = Client::builder(TokioExecutor::new())
-        .pool_max_idle_per_host(pool_config.max_idle_per_host)
-        .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
-        .build(backend_connector);
-
-    // Client with pooling disabled, for backends configured with disable_pooling = true.
-    // pool_max_idle_per_host(0) means a connection is never returned to the pool
-    // after a response completes, so every request pays for a fresh connection.
-    let mut direct_connector = HttpConnector::new();
-    direct_connector.set_nodelay(true);
-    let direct_client = Client::builder(TokioExecutor::new())
-        .pool_max_idle_per_host(0)
-        .build(direct_connector);
-
-    // Create HTTPS client for re-encrypt mode
-    let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_native_roots()
-        .expect("Failed to load native root certificates")
-        .https_or_http()
-        .enable_http1()
-        .enable_http2()
-        .build();
-
-    let https_client = Client::builder(TokioExecutor::new())
-        .pool_max_idle_per_host(pool_config.max_idle_per_host)
-        .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
-        .build(https_connector);
+    let backend_client = Arc::new(BackendClient::new(
+        Duration::from_secs(pool_config.idle_timeout_secs),
+        pool_config.max_idle_per_host,
+        Duration::from_secs(config.security.connection_timeout_secs),
+    ));
 
     let AppParts {
         port,
@@ -841,9 +805,7 @@ fn build_listener_app(
         server_header_value: server_header_value(&config),
         webtransport_port_value: HeaderValue::from_str(&port.to_string())
             .unwrap_or_else(|_| HeaderValue::from_static("443")),
-        http_client: Arc::new(http_client),
-        https_client: Arc::new(https_client),
-        direct_client: Arc::new(direct_client),
+        backend_client,
         security: Arc::new(security_state.clone()),
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
@@ -2425,7 +2387,7 @@ async fn proxy_handler(
 
         // Check if backend is a pool first, then fall back to single backend
         let mut canary_cookie_to_set: Option<String> = None;
-        let (backend_address, tls_mode, pool_server, pool_name, backend_timeout, disable_pooling) =
+        let (backend_cfg, pool_server, pool_name, backend_timeout) =
             if let Some(pool) = state.load_balancer.get_pool(&route.backend) {
                 // Extract session cookie for sticky sessions
                 let cookie_header = headers.get("cookie").and_then(|v| v.to_str().ok());
@@ -2475,19 +2437,13 @@ async fn proxy_handler(
                 // Select backend from pool
                 match pool.select(&ctx) {
                     Some(result) => {
-                        let address = result.server.address.to_string();
-                        let tls = result.server.tls_mode.clone();
                         let timeout = result.server.timeout;
                         canary_cookie_to_set = result.set_canary_cookie;
                         (
-                            address,
-                            tls,
+                            std::borrow::Cow::Owned(result.server.backend_config()),
                             Some(result.server),
                             Some(route.backend.clone()),
                             timeout,
-                            // Pool servers don't carry a disable_pooling field today —
-                            // no pool member currently needs it.
-                            false,
                         )
                     }
                     None => {
@@ -2517,25 +2473,21 @@ async fn proxy_handler(
                         .into_response();
                 }
 
-                // Determine TLS mode (use tls_mode, or legacy tls bool)
-                let tls_mode = if backend.tls {
-                    TlsMode::Reencrypt
-                } else {
-                    backend.tls_mode.clone()
-                };
-
                 (
-                    backend.address.clone(),
-                    tls_mode,
+                    std::borrow::Cow::Borrowed(backend),
                     None,
                     None,
                     Duration::from_millis(backend.timeout_ms),
-                    backend.disable_pooling,
                 )
             } else {
                 error!("Backend or pool not found: {}", route.backend);
                 return (StatusCode::BAD_GATEWAY, "Backend not configured").into_response();
             };
+
+        // Counted in the server's active connections until this handler
+        // returns — at the response head, which is where the pool records the
+        // request's outcome.
+        let _pool_slot = pool_server.as_ref().map(|s| s.acquire_slot());
 
         // A route may raise or lower the backend's timeout for its own traffic —
         // one slow endpoint (an LLM chat completion, a large PDF conversion)
@@ -2547,16 +2499,18 @@ async fn proxy_handler(
             None => backend_timeout,
         };
 
-        // Build backend URL based on TLS mode
-        let (backend_url, use_https) = match tls_mode {
-            TlsMode::Terminate => (
-                format!("http://{}{}{}", backend_address, path, query),
-                false,
-            ),
-            TlsMode::Reencrypt => (
-                format!("https://{}{}{}", backend_address, path, query),
-                true,
-            ),
+        // TLS to the backend by the one rule both transports use; see
+        // `BackendConfig::wants_tls`.
+        let backend_address = backend_cfg.address.as_str();
+        let tls_mode = if backend_cfg.wants_tls() {
+            TlsMode::Reencrypt
+        } else {
+            backend_cfg.tls_mode.clone()
+        };
+        // Origin form: the connection is already to the backend.
+        let use_https = match tls_mode {
+            TlsMode::Terminate => false,
+            TlsMode::Reencrypt => true,
             TlsMode::Passthrough => {
                 // Passthrough mode shouldn't reach here - it's handled at TCP level
                 error!("Passthrough mode backend reached HTTP handler - this is a config error");
@@ -2569,8 +2523,8 @@ async fn proxy_handler(
         };
 
         debug!(
-            "Proxying to backend: {} (TLS mode: {:?})",
-            backend_url, tls_mode
+            "Proxying to backend: {}{}{} (TLS mode: {:?})",
+            backend_address, path, query, tls_mode
         );
 
         // WebSocket upgrade passthrough — extract the OnUpgrade future from the request
@@ -2587,7 +2541,7 @@ async fn proxy_handler(
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             };
             return handle_websocket_tunnel(
-                &backend_address,
+                backend_address,
                 use_https,
                 &headers,
                 on_upgrade,
@@ -2600,7 +2554,9 @@ async fn proxy_handler(
         }
 
         // Build proxy request
-        let mut proxy_req = Request::builder().method(method.clone()).uri(&backend_url);
+        let mut proxy_req = Request::builder()
+            .method(method.clone())
+            .uri(format!("{path}{query}"));
 
         // Copy headers with modifications
         if let Some(h) = proxy_req.headers_mut() {
@@ -2743,8 +2699,7 @@ async fn proxy_handler(
                         client_addr,
                         state.port,
                         &route.add_headers,
-                        (*state.http_client).clone(),
-                        (*state.https_client).clone(),
+                        state.backend_client.clone(),
                     );
                 } else {
                     warn!(
@@ -2758,15 +2713,10 @@ async fn proxy_handler(
         // Send request to backend (using appropriate client), bounded by the
         // per-backend/pool-server timeout so a hung backend can't hold the
         // connection open indefinitely.
-        let result = tokio::time::timeout(backend_timeout, async {
-            if use_https {
-                state.https_client.request(proxy_request).await
-            } else if disable_pooling {
-                state.direct_client.request(proxy_request).await
-            } else {
-                state.http_client.request(proxy_request).await
-            }
-        })
+        let result = tokio::time::timeout(
+            backend_timeout,
+            state.backend_client.send(&backend_cfg, proxy_request),
+        )
         .await;
 
         match result {
@@ -2784,7 +2734,6 @@ async fn proxy_handler(
                         response_time,
                         false,
                     );
-                    server.release_connection();
                 }
 
                 warn!(
@@ -2829,13 +2778,16 @@ async fn proxy_handler(
 
                 (StatusCode::GATEWAY_TIMEOUT, timeout_body).into_response()
             }
-            Ok(Ok(backend_response)) => {
+            Ok(Ok((backend_response, lease))) => {
                 let response_time = request_start.elapsed();
 
                 // Record success for circuit breaker (single backend)
                 state.security.record_backend_result(&route.backend, true);
 
                 let (mut parts, incoming_body) = backend_response.into_parts();
+                // The connection goes back to the pool when whoever reads this
+                // body reaches its end.
+                let incoming_body = crate::backend_client::ReleaseOnEnd::new(incoming_body, lease);
 
                 // The TLS-terminating proxy speaks plain HTTP to the backend, so the
                 // backend's self-referential redirects (Apache mod_speling case-fixes,
@@ -2868,7 +2820,6 @@ async fn proxy_handler(
                             response_time,
                             true,
                         );
-                        server.release_connection();
                     }
                     if let Some(ref cors) = route.cors {
                         let req_origin = headers.get("origin").and_then(|v| v.to_str().ok());
@@ -2973,7 +2924,6 @@ async fn proxy_handler(
                                     response_time,
                                     false,
                                 );
-                                server.release_connection();
                             }
                             return (StatusCode::BAD_GATEWAY, "Bad Gateway").into_response();
                         }
@@ -2987,7 +2937,6 @@ async fn proxy_handler(
                     state
                         .load_balancer
                         .record_completion(pn, server.as_ref(), response_time, true);
-                    server.release_connection();
                 }
 
                 // Add CORS headers if configured
@@ -3196,14 +3145,9 @@ async fn proxy_handler(
                         response_time,
                         false,
                     );
-                    server.release_connection();
                 }
 
-                error!(
-                    "Backend request failed: {:?} (source: {:?})",
-                    e,
-                    std::error::Error::source(&e)
-                );
+                error!("Backend request failed: {:#}", e);
 
                 // Record request metrics (skip error tracking for health check traffic)
                 state.metrics.requests.request_end_full(
@@ -3298,15 +3242,10 @@ fn spawn_shadow_request(
     client_addr: SocketAddr,
     proxy_port: u16,
     route_add_headers: &std::collections::HashMap<String, String>,
-    http_client: Client<HttpConnector, Body>,
-    https_client: Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>,
+    backend_client: Arc<BackendClient<Body>>,
 ) {
-    let shadow_use_https = shadow_backend.tls;
-    let shadow_url = if shadow_use_https {
-        format!("https://{}{}{}", shadow_backend.address, path, query)
-    } else {
-        format!("http://{}{}{}", shadow_backend.address, path, query)
-    };
+    let shadow_backend = shadow_backend.clone();
+    let shadow_path = format!("{path}{query}");
 
     // Clone all values needed inside the spawned task
     let timeout_ms = shadow_cfg.timeout_ms;
@@ -3322,7 +3261,7 @@ fn spawn_shadow_request(
     tokio::task::spawn(async move {
         let start = std::time::Instant::now();
 
-        let mut req_builder = Request::builder().method(method).uri(&shadow_url);
+        let mut req_builder = Request::builder().method(method).uri(shadow_path.as_str());
 
         if let Some(h) = req_builder.headers_mut() {
             // Copy original headers, stripping hop-by-hop and internal proxy tags
@@ -3391,22 +3330,27 @@ fn spawn_shadow_request(
             }
         };
 
-        let result = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
-            if shadow_use_https {
-                https_client.request(shadow_req).await
-            } else {
-                http_client.request(shadow_req).await
-            }
-        })
+        let result = tokio::time::timeout(
+            Duration::from_millis(timeout_ms),
+            backend_client.send(&shadow_backend, shadow_req),
+        )
         .await;
 
         match result {
-            Ok(Ok(resp)) => {
+            Ok(Ok((resp, lease))) => {
+                let status = resp.status();
+                // Read to the end so the connection can be reused.
+                if http_body_util::BodyExt::collect(resp.into_body())
+                    .await
+                    .is_ok()
+                {
+                    lease.release();
+                }
                 if log_responses {
                     info!(
                         "Shadow → '{}' status={} latency={}ms",
                         backend_name,
-                        resp.status().as_u16(),
+                        status.as_u16(),
                         start.elapsed().as_millis()
                     );
                 }

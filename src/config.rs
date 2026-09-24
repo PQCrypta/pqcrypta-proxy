@@ -1607,6 +1607,20 @@ pub struct BackendConfig {
     pub disable_pooling: bool,
 }
 
+impl BackendConfig {
+    /// Whether requests to this backend go over TLS: `tls = true`, or
+    /// `tls_mode = "reencrypt"`.
+    ///
+    /// The two settings say the same thing and both are documented, but the
+    /// transports each read one: the TCP listener re-encrypted on `tls_mode`
+    /// while HTTP/3 looked only at `tls`, so a backend configured with
+    /// `tls_mode = "reencrypt"` alone was reached over TLS from HTTP/1.1 and
+    /// HTTP/2 and in plain text from HTTP/3.
+    pub fn wants_tls(&self) -> bool {
+        self.tls || matches!(self.tls_mode, TlsMode::Reencrypt)
+    }
+}
+
 /// Per-backend circuit breaker parameter overrides
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CircuitBreakerOverride {

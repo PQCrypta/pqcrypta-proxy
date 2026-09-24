@@ -85,6 +85,70 @@ impl<B> Lease<B> {
     }
 }
 
+/// A response body that returns its connection to the pool when it ends.
+///
+/// For callers that hand the body on rather than reading it themselves — the
+/// TCP listener passes it to hyper's server, which decides when to poll it.
+/// The connection is released when the body reports its end, including when
+/// the last data frame is also the end (`is_end_stream`), because a server that
+/// knows the length stops polling there and would never see the final `None`.
+/// A body that fails, or is dropped part-way, closes its connection instead.
+pub struct ReleaseOnEnd<Bd, B> {
+    body: Bd,
+    lease: Option<Lease<B>>,
+}
+
+impl<Bd, B> ReleaseOnEnd<Bd, B> {
+    pub fn new(body: Bd, lease: Lease<B>) -> Self {
+        Self {
+            body,
+            lease: Some(lease),
+        }
+    }
+}
+
+impl<Bd, B> Body for ReleaseOnEnd<Bd, B>
+where
+    Bd: Body + Unpin,
+    B: Unpin,
+{
+    type Data = Bd::Data;
+    type Error = Bd::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let this = &mut *self;
+        let polled = std::pin::Pin::new(&mut this.body).poll_frame(cx);
+        match &polled {
+            std::task::Poll::Ready(None) => {
+                if let Some(lease) = this.lease.take() {
+                    lease.release();
+                }
+            }
+            std::task::Poll::Ready(Some(Err(_))) => {
+                this.lease = None;
+            }
+            std::task::Poll::Ready(Some(Ok(_))) if this.body.is_end_stream() => {
+                if let Some(lease) = this.lease.take() {
+                    lease.release();
+                }
+            }
+            _ => {}
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
 impl<B> Origin<B> {
     /// Return a connection, pruning any that have sat idle too long.
     fn put(&self, tx: http1::SendRequest<B>) {
@@ -118,7 +182,7 @@ impl<B> Origin<B> {
 
     fn matches(&self, backend: &BackendConfig) -> bool {
         self.address == backend.address
-            && self.tls.is_some() == backend.tls
+            && self.tls.is_some() == backend.wants_tls()
             && self.pooling != backend.disable_pooling
     }
 }
@@ -209,7 +273,7 @@ where
                 return Ok(o.clone());
             }
         }
-        let tls = if backend.tls {
+        let tls = if backend.wants_tls() {
             let connector = crate::http_listener::create_backend_tls_connector(backend)
                 .map_err(|e| anyhow::anyhow!("backend {} TLS setup: {e}", backend.name))?;
             let host = match &backend.tls_sni {
@@ -374,6 +438,29 @@ mod tests {
             let _ = resp.into_body().collect().await.unwrap();
         }
         assert_eq!(accepted.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_body_read_to_its_length_releases_through_the_wrapper() {
+        // Read exactly as a length-aware server does: stop at is_end_stream
+        // without polling for the final None.
+        let (addr, accepted) = server(usize::MAX).await;
+        let client = BackendClient::new(Duration::from_secs(60), 8, Duration::from_secs(5));
+        let b = backend(&addr);
+        for _ in 0..3 {
+            let (resp, lease) = client.send(&b, get()).await.unwrap();
+            let mut body = ReleaseOnEnd::new(resp.into_body(), lease);
+            let mut got = Vec::new();
+            while !body.is_end_stream() {
+                match std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await
+                {
+                    Some(Ok(f)) => got.extend_from_slice(f.data_ref().unwrap()),
+                    _ => break,
+                }
+            }
+            assert_eq!(got, b"ok");
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

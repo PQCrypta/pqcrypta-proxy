@@ -59,6 +59,20 @@ pub struct ProxyResponse {
     pub body: Bytes,
 }
 
+/// A backend did not answer within its timeout. Carried inside the
+/// `anyhow::Error` so callers can answer 504 rather than 502 without matching
+/// on message text.
+#[derive(Debug)]
+pub struct BackendTimeout(pub Duration);
+
+impl std::fmt::Display for BackendTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "backend did not respond within {}ms", self.0.as_millis())
+    }
+}
+
+impl std::error::Error for BackendTimeout {}
+
 /// The connection a streamed backend response arrived on; release it once the
 /// body has been read to its end.
 pub type BackendLease = crate::backend_client::Lease<Full<Bytes>>;
@@ -151,7 +165,7 @@ impl BackendPool {
         let timeout = Duration::from_millis(backend.timeout_ms);
         let (response, lease) = tokio::time::timeout(timeout, self.client.send(backend, request))
             .await
-            .map_err(|_| anyhow::anyhow!("Backend request timeout"))?
+            .map_err(|_| anyhow::Error::new(BackendTimeout(timeout)))?
             .map_err(|e| anyhow::anyhow!("Backend request failed: {}", e))?;
 
         // Check status
@@ -213,7 +227,7 @@ impl BackendPool {
         let timeout = Duration::from_millis(backend.timeout_ms);
         let (response, lease) = tokio::time::timeout(timeout, self.client.send(backend, request))
             .await
-            .map_err(|_| anyhow::anyhow!("Backend request timeout"))?
+            .map_err(|_| anyhow::Error::new(BackendTimeout(timeout)))?
             .map_err(|e| anyhow::anyhow!("Backend request failed: {}", e))?;
 
         // Extract status and headers (use Vec to preserve multiple headers with same name).
@@ -283,7 +297,7 @@ impl BackendPool {
         let timeout = Duration::from_millis(backend.timeout_ms);
         let (response, lease) = tokio::time::timeout(timeout, self.client.send(backend, request))
             .await
-            .map_err(|_| anyhow::anyhow!("Backend stream request timeout"))?
+            .map_err(|_| anyhow::Error::new(BackendTimeout(timeout)))?
             .map_err(|e| anyhow::anyhow!("Backend stream request failed: {}", e))?;
 
         let status = response.status();
@@ -770,7 +784,10 @@ fn is_retryable_error(e: &anyhow::Error, retry_on: &[String]) -> bool {
         || msg.contains("connection")
         || msg.contains("refused")
         || msg.contains("reset");
-    let is_timeout = msg.contains("timeout");
+    // By type for the proxy's own timeout; by text for the ones raised inside
+    // the connect path ("connect to ... timed out").
+    let is_timeout =
+        e.is::<BackendTimeout>() || msg.contains("timeout") || msg.contains("timed out");
     (is_connect && retry_on.iter().any(|s| s == "connect-failure"))
         || (is_timeout && retry_on.iter().any(|s| s == "timeout"))
 }
@@ -779,6 +796,14 @@ fn is_retryable_error(e: &anyhow::Error, retry_on: &[String]) -> bool {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn a_backend_timeout_is_retryable_as_a_timeout() {
+        let retry = vec!["timeout".to_string()];
+        let e = anyhow::Error::new(BackendTimeout(Duration::from_millis(5)));
+        assert!(is_retryable_error(&e, &retry));
+        assert!(!is_retryable_error(&e, &["connect-failure".to_string()]));
+    }
 
     /// Helper: build a minimal BackendPool for unit testing build_http_request.
     #[cfg(unix)]

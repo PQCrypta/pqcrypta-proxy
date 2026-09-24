@@ -24,7 +24,6 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use rand::Rng;
-use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 use crate::config::{
@@ -98,6 +97,22 @@ pub struct SelectionResult {
 // Backend Server
 // ═══════════════════════════════════════════════════════════════
 
+/// One request in flight on a [`BackendServer`]; see
+/// [`BackendServer::acquire_slot`].
+pub struct ConnectionSlot {
+    server: Arc<BackendServer>,
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        let _ = self.server.active_connections.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |n| n.checked_sub(1),
+        );
+    }
+}
+
 /// Individual backend server in a pool
 pub struct BackendServer {
     /// Server ID (unique within pool)
@@ -116,6 +131,14 @@ pub struct BackendServer {
     pub timeout: Duration,
     /// TLS mode
     pub tls_mode: TlsMode,
+    /// CA to verify this server against when re-encrypting, beyond the native
+    /// roots.
+    pub tls_cert: Option<std::path::PathBuf>,
+    /// Skip certificate verification (refused in production by config
+    /// validation).
+    pub tls_skip_verify: bool,
+    /// Server name to present and verify, when it is not the address's host.
+    pub tls_sni: Option<String>,
 
     // === Circuit breaker thresholds (per-backend overrides) ===
     /// Consecutive failures before tripping the circuit breaker
@@ -134,8 +157,6 @@ pub struct BackendServer {
     pub avg_response_time_us: AtomicU64,
 
     // === State ===
-    /// Connection limiter
-    connection_limiter: Semaphore,
     /// Health status
     pub health: RwLock<BackendHealth>,
     /// Slow start state
@@ -208,6 +229,38 @@ pub struct DrainingState {
 }
 
 impl BackendServer {
+    /// This pool member as a [`BackendConfig`], for the backend client.
+    ///
+    /// One definition for both transports; each built its own, and they
+    /// disagreed on nothing only by luck.
+    pub fn backend_config(&self) -> crate::config::BackendConfig {
+        crate::config::BackendConfig {
+            name: self.id.clone(),
+            backend_type: crate::config::BackendType::Http1,
+            address: self.address.to_string(),
+            tls_mode: self.tls_mode.clone(),
+            tls: matches!(self.tls_mode, TlsMode::Reencrypt),
+            // The pool member's own TLS settings. These were parsed from the
+            // pool config and then dropped, so a pool of re-encrypting
+            // servers was verified against the native roots only, whatever it
+            // configured.
+            tls_cert: self.tls_cert.clone(),
+            tls_client_cert: None,
+            tls_client_key: None,
+            tls_skip_verify: self.tls_skip_verify,
+            tls_sni: self.tls_sni.clone(),
+            timeout_ms: u64::try_from(self.timeout.as_millis()).unwrap_or(u64::MAX),
+            max_connections: self.max_connections,
+            health_check: None,
+            health_check_interval_secs: 30,
+            retries: None,
+            retry_backoff_ms: None,
+            retry_on: None,
+            circuit_breaker: None,
+            disable_pooling: false,
+        }
+    }
+
     /// Create from configuration.
     ///
     /// F-06: Returns `Result` instead of panicking on an invalid address so that
@@ -228,13 +281,15 @@ impl BackendServer {
             max_connections: config.max_connections,
             timeout: Duration::from_millis(config.timeout_ms),
             tls_mode: config.tls_mode.clone(),
+            tls_cert: config.tls_cert.clone(),
+            tls_skip_verify: config.tls_skip_verify,
+            tls_sni: config.tls_sni.clone(),
             cb_failure_threshold: config.cb_failure_threshold.unwrap_or(5),
             cb_success_threshold: config.cb_success_threshold.unwrap_or(3),
             active_connections: AtomicU32::new(0),
             total_requests: AtomicU64::new(0),
             total_failures: AtomicU64::new(0),
             avg_response_time_us: AtomicU64::new(0),
-            connection_limiter: Semaphore::new(config.max_connections as usize),
             health: RwLock::new(BackendHealth::default()),
             slow_start: RwLock::new(None),
             draining: RwLock::new(None),
@@ -267,31 +322,21 @@ impl BackendServer {
         self.is_canary && self.is_available()
     }
 
-    /// Acquire connection to this server.
+    /// Count a request in flight on this server until the returned slot drops.
     ///
-    /// P1-fix: Previously `try_acquire().is_ok()` dropped the `SemaphorePermit`
-    /// immediately (auto-release on drop), while `release_connection` called
-    /// `add_permits(1)` unconditionally — causing the semaphore to grow without
-    /// bound on every completed connection.  `permit.forget()` suppresses the
-    /// auto-release so that the semaphore slot stays taken until `release_connection`
-    /// explicitly restores it with `add_permits(1)`.
-    pub fn try_acquire_connection(&self) -> bool {
-        match self.connection_limiter.try_acquire() {
-            Ok(permit) => {
-                // Keep the semaphore slot taken until release_connection is called.
-                permit.forget();
-                self.active_connections.fetch_add(1, Ordering::Relaxed);
-                true
-            }
-            Err(_) => false,
+    /// `active_connections` is what least-connections, least-response-time and
+    /// first-available read, and what `max_connections` is enforced against.
+    /// It used to be decremented by a `release_connection` the TCP listener
+    /// called after every pooled request, paired with an acquire nothing ever
+    /// called: the counter wrapped below zero to `u32::MAX` on the first
+    /// request and counted down from there, so least-connections chose
+    /// whichever server had served the *most* — and HTTP/3 never counted at
+    /// all. A slot cannot be released twice or not at all.
+    pub fn acquire_slot(self: &Arc<Self>) -> ConnectionSlot {
+        self.active_connections.fetch_add(1, Ordering::Relaxed);
+        ConnectionSlot {
+            server: Arc::clone(self),
         }
-    }
-
-    /// Release connection (counterpart to a successful try_acquire_connection).
-    pub fn release_connection(&self) {
-        self.active_connections.fetch_sub(1, Ordering::Relaxed);
-        // Restore the slot that was forgotten in try_acquire_connection.
-        self.connection_limiter.add_permits(1);
     }
 
     /// Get effective weight considering slow start
@@ -2387,5 +2432,23 @@ mod tests {
         let hdr2 = "PQCPROXY_CANARY_EXTRA=yes; PQCPROXY_CANARY=target";
         let extracted2 = extract_cookie_by_name(Some(hdr2), "PQCPROXY_CANARY");
         assert_eq!(extracted2, Some("target".to_string()));
+    }
+
+    /// A slot counts exactly one request for exactly as long as it lives, and
+    /// dropping one on a counter already at zero leaves it at zero instead of
+    /// wrapping to `u32::MAX`.
+    #[test]
+    fn connection_slots_count_and_never_wrap() {
+        let server = create_test_server("127.0.0.1:1", 1);
+        {
+            let _a = server.acquire_slot();
+            let _b = server.acquire_slot();
+            assert_eq!(server.active_connections.load(Ordering::Relaxed), 2);
+        }
+        assert_eq!(server.active_connections.load(Ordering::Relaxed), 0);
+        let s = server.acquire_slot();
+        server.active_connections.store(0, Ordering::Relaxed);
+        drop(s);
+        assert_eq!(server.active_connections.load(Ordering::Relaxed), 0);
     }
 }

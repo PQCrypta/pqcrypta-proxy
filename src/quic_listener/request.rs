@@ -13,7 +13,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::access_logger::{log_access, AccessLogEntry};
 use crate::cache::{CacheLookup, ResponseCache};
-use crate::config::{BackendConfig, BackendType, ProxyConfig};
+use crate::config::{BackendConfig, ProxyConfig};
 use crate::http3_features::EarlyHintsState;
 use crate::load_balancer::{LoadBalancer, SelectionContext};
 use crate::metrics::MetricsRegistry;
@@ -1006,7 +1006,11 @@ impl QuicListener {
         // Borrowed from the config unless a pool built one for this request:
         // cloning the configured backend copied its name, address and every
         // other owned field on each request, to read them once.
-        let (backend, canary_cookie_to_set): (Cow<'_, BackendConfig>, Option<String>) = {
+        let (backend, canary_cookie_to_set, pool_server): (
+            Cow<'_, BackendConfig>,
+            Option<String>,
+            Option<Arc<crate::load_balancer::BackendServer>>,
+        ) = {
             // Extract cookies from request headers for sticky session / canary routing
             let cookie_str = request
                 .headers()
@@ -1075,31 +1079,12 @@ impl QuicListener {
 
                 match pool.select(&ctx) {
                     Some(result) => {
-                        let server = &result.server;
-                        let tls = matches!(server.tls_mode, crate::config::TlsMode::Reencrypt);
-                        let cfg = BackendConfig {
-                            name: server.id.clone(),
-                            backend_type: BackendType::Http1,
-                            address: server.address.to_string(),
-                            tls_mode: server.tls_mode.clone(),
-                            tls,
-                            tls_cert: None,
-                            tls_client_cert: None,
-                            tls_client_key: None,
-                            tls_skip_verify: false,
-                            tls_sni: None,
-                            timeout_ms: u64::try_from(server.timeout.as_millis())
-                                .unwrap_or(u64::MAX),
-                            max_connections: server.max_connections,
-                            health_check: None,
-                            health_check_interval_secs: 30,
-                            retries: None,
-                            retry_backoff_ms: None,
-                            retry_on: None,
-                            circuit_breaker: None,
-                            disable_pooling: false,
-                        };
-                        (Cow::Owned(cfg), result.set_canary_cookie)
+                        let cfg = result.server.backend_config();
+                        (
+                            Cow::Owned(cfg),
+                            result.set_canary_cookie,
+                            Some(result.server),
+                        )
                     }
                     None => {
                         error!("No healthy server available in pool: {}", route.backend);
@@ -1121,7 +1106,42 @@ impl QuicListener {
                 }
             } else {
                 match config.get_backend(&route.backend) {
-                    Some(b) => (Cow::Borrowed(b), None),
+                    // The same circuit breaker the TCP listener consults: HTTP/3
+                    // used to send traffic to a backend whose breaker was open,
+                    // and its failures never counted towards opening it.
+                    Some(_) if !security.circuit_allows(&route.backend) => {
+                        warn!(
+                            "Circuit breaker open for backend '{}', rejecting HTTP/3 request",
+                            route.backend
+                        );
+                        metrics.requests.request_end_full(
+                            503,
+                            start_time.elapsed(),
+                            0,
+                            0,
+                            Some(&path),
+                            is_health_check,
+                        );
+                        log_h3_refusal(
+                            remote_addr,
+                            method,
+                            &path,
+                            host.as_deref(),
+                            referer,
+                            user_agent,
+                            fingerprint.ja3_hash.as_deref(),
+                            fingerprint.ja4_hash.as_deref(),
+                            start_time,
+                            503,
+                        );
+                        let response = http::Response::builder()
+                            .status(http::StatusCode::SERVICE_UNAVAILABLE)
+                            .server_header(&config)
+                            .body(())?;
+                        respond_and_finish(&mut stream, response).await?;
+                        return Ok(());
+                    }
+                    Some(b) => (Cow::Borrowed(b), None, None),
                     None => {
                         error!("Backend not found: {}", route.backend);
                         metrics.requests.request_end_full(
@@ -1699,7 +1719,11 @@ impl QuicListener {
         let request_body = Bytes::from(body);
         let request_body_len = request_body.len() as u64;
 
-        let (stream_status, mut stream_headers, stream_body, backend_lease) = backend_pool
+        // Counted in the pool server's active connections until this request
+        // finishes; see `BackendServer::acquire_slot`.
+        let _pool_slot = pool_server.as_ref().map(|s| s.acquire_slot());
+        let backend_start = std::time::Instant::now();
+        let proxied = backend_pool
             .proxy_stream(
                 &backend,
                 request.method(),
@@ -1707,7 +1731,70 @@ impl QuicListener {
                 headers,
                 request_body.clone(),
             )
-            .await?;
+            .await;
+        // The outcome goes to the pool and the circuit breaker, as it does on TCP.
+        let backend_ok = proxied.is_ok();
+        if let Some(server) = &pool_server {
+            load_balancer.record_completion(
+                &route.backend,
+                server,
+                backend_start.elapsed(),
+                backend_ok,
+            );
+        } else {
+            security.record_backend_result(&route.backend, backend_ok);
+        }
+        let (stream_status, mut stream_headers, stream_body, backend_lease) = match proxied {
+            Ok(r) => r,
+            Err(e) => {
+                // A failed backend request is answered, not dropped. The `?`
+                // here reset the stream with no final response at all, so a
+                // client saw nothing — or only the 103 sent ahead of it —
+                // where HTTP/1.1 and HTTP/2 answer 502.
+                let status = if e.is::<crate::proxy::BackendTimeout>() {
+                    http::StatusCode::GATEWAY_TIMEOUT
+                } else {
+                    http::StatusCode::BAD_GATEWAY
+                };
+                error!(
+                    "HTTP/3 backend request to '{}' failed: {:#}",
+                    route.backend, e
+                );
+                metrics.requests.request_end_full(
+                    status.as_u16(),
+                    start_time.elapsed(),
+                    request_body_len,
+                    0,
+                    Some(&path),
+                    is_health_check,
+                );
+                log_access(&AccessLogEntry {
+                    ja3: fingerprint.ja3_hash.as_deref(),
+                    ja4: fingerprint.ja4_hash.as_deref(),
+                    backend: Some(route.backend.as_str()),
+                    remote_addr,
+                    method,
+                    path: &path,
+                    protocol: "HTTP/3",
+                    status: status.as_u16(),
+                    body_size: 0,
+                    referer,
+                    user_agent,
+                    host: host.as_deref(),
+                    response_time_ms: start_time
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                });
+                let response = http::Response::builder()
+                    .status(status)
+                    .server_header(&config)
+                    .body(())?;
+                respond_and_finish(&mut stream, response).await?;
+                return Ok(());
+            }
+        };
 
         // The route's Set-Cookie policy, before anything forwards or caches a
         // header: the same method the TCP paths call, so the transports agree.
