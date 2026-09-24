@@ -93,16 +93,34 @@ impl<B> Lease<B> {
 /// the last data frame is also the end (`is_end_stream`), because a server that
 /// knows the length stops polling there and would never see the final `None`.
 /// A body that fails, or is dropped part-way, closes its connection instead.
-pub struct ReleaseOnEnd<Bd, B> {
+pub struct ReleaseOnEnd<Bd: Body, B> {
     body: Bd,
     lease: Option<Lease<B>>,
 }
 
-impl<Bd, B> ReleaseOnEnd<Bd, B> {
+impl<Bd: Body, B> ReleaseOnEnd<Bd, B> {
     pub fn new(body: Bd, lease: Lease<B>) -> Self {
         Self {
             body,
             lease: Some(lease),
+        }
+    }
+}
+
+/// A body dropped at its end still returns its connection.
+///
+/// hyper's server does not poll a body that reports `is_end_stream()` before
+/// the first poll — an empty `Content-Length: 0` response, a 204, a 304, the
+/// answer to a HEAD — so for those `poll_frame` never runs. Without this the
+/// lease was dropped with the body and the connection closed: every such
+/// response opened a new backend connection, measured as HTTP/1.1 empty-body
+/// throughput falling from 48,000 to 13,800 req/s.
+impl<Bd: Body, B> Drop for ReleaseOnEnd<Bd, B> {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            if self.body.is_end_stream() {
+                lease.release();
+            }
         }
     }
 }
@@ -374,6 +392,17 @@ mod tests {
     /// and answers every request with `ok`; `close_after` closes a connection
     /// after that many requests without saying so.
     async fn server(close_after: usize) -> (String, Arc<AtomicUsize>) {
+        server_with(
+            close_after,
+            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok",
+        )
+        .await
+    }
+
+    async fn server_with(
+        close_after: usize,
+        response: &'static [u8],
+    ) -> (String, Arc<AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let accepted = Arc::new(AtomicUsize::new(0));
@@ -393,9 +422,7 @@ mod tests {
                                 Ok(n) => got.extend_from_slice(&buf[..n]),
                             }
                         }
-                        let _ = s
-                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
-                            .await;
+                        let _ = s.write_all(response).await;
                         served += 1;
                         if served == close_after {
                             return;
@@ -461,6 +488,36 @@ mod tests {
             assert_eq!(got, b"ok");
         }
         assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    /// The case hyper's server produces for an empty response: the body is
+    /// never polled at all, only dropped.
+    #[tokio::test]
+    async fn an_empty_body_dropped_unpolled_releases() {
+        let (addr, accepted) = server_with(usize::MAX, b"HTTP/1.1 204 No Content\r\n\r\n").await;
+        let client = BackendClient::new(Duration::from_secs(60), 8, Duration::from_secs(5));
+        let b = backend(&addr);
+        for _ in 0..4 {
+            let (resp, lease) = client.send(&b, get()).await.unwrap();
+            let body = ReleaseOnEnd::new(resp.into_body(), lease);
+            assert!(body.is_end_stream());
+            drop(body);
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    /// A body abandoned part-way closes its connection rather than returning
+    /// one with unread bytes on it.
+    #[tokio::test]
+    async fn a_body_dropped_part_way_is_not_released() {
+        let (addr, accepted) = server(usize::MAX).await;
+        let client = BackendClient::new(Duration::from_secs(60), 8, Duration::from_secs(5));
+        let b = backend(&addr);
+        for _ in 0..3 {
+            let (resp, lease) = client.send(&b, get()).await.unwrap();
+            drop(ReleaseOnEnd::new(resp.into_body(), lease));
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
