@@ -1877,16 +1877,28 @@ impl SecurityState {
     }
 
     /// Record circuit breaker result
+    /// The breaker for `backend`, created on first use. Looked up by `&str`
+    /// first: `entry(backend.to_string())` allocated a key on every call, and
+    /// both transports call this twice per proxied request.
+    fn circuit_breaker(
+        &self,
+        backend: &str,
+    ) -> dashmap::mapref::one::RefMut<'_, String, CircuitBreakerState> {
+        if let Some(state) = self.circuit_breakers.get_mut(backend) {
+            return state;
+        }
+        self.circuit_breakers
+            .entry(backend.to_string())
+            .or_default()
+    }
+
     pub fn record_backend_result(&self, backend: &str, success: bool) {
         let cb_config = self.circuit_breaker_config.read();
         let failure_threshold = cb_config.failure_threshold;
         let success_threshold = cb_config.success_threshold;
         drop(cb_config);
 
-        let mut state = self
-            .circuit_breakers
-            .entry(backend.to_string())
-            .or_default();
+        let mut state = self.circuit_breaker(backend);
 
         if success {
             state.success_count += 1;
@@ -1934,10 +1946,7 @@ impl SecurityState {
         let half_open_max = cb_config.half_open_max_requests;
         drop(cb_config);
 
-        let mut state = self
-            .circuit_breakers
-            .entry(backend.to_string())
-            .or_default();
+        let mut state = self.circuit_breaker(backend);
 
         match state.state {
             CircuitState::Closed => true,

@@ -140,7 +140,8 @@ impl Decoder {
         let decoder_table = self.table.decoder(base);
 
         let mut mem_size = 0;
-        let mut fields = Vec::new();
+        // Sized as in `decode_stateless`.
+        let mut fields = Vec::with_capacity(buf.remaining() / 4 + 1);
         while buf.has_remaining() {
             let field = Self::parse_header_field(&decoder_table, buf)?;
             mem_size += field.mem_size() as u64;
@@ -279,7 +280,10 @@ pub fn decode_stateless<T: Buf>(buf: &mut T, max_size: u64) -> Result<Decoded, D
     }
 
     let mut mem_size = 0;
-    let mut fields = Vec::new();
+    // Most field lines in a request are one to three bytes when indexed and a
+    // dozen or so as literals; a quarter of the block's length covers the
+    // common request without the vector doubling its way up.
+    let mut fields = Vec::with_capacity(buf.remaining() / 4 + 1);
     while buf.has_remaining() {
         let field = match HeaderBlockField::decode(buf.chunk()[0]) {
             HeaderBlockField::IndexedWithPostBase => return Err(DecoderError::MissingRefs(0)),

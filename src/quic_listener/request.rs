@@ -115,6 +115,10 @@ impl QuicListener {
                 HeaderName::from_static("x-pqc-enabled"),
             ];
             let h = request.headers_mut();
+            // Room for what is inserted below — up to five handshake values,
+            // the protocol, three fingerprint values and the client type — so
+            // the map h3 built to the request's exact size is not regrown.
+            h.reserve(10);
             // A request carries a handful of headers and almost never one of
             // these, so look at its own names first: that is a few short
             // comparisons, where removing unconditionally was eight hashed
@@ -1969,8 +1973,13 @@ impl QuicListener {
             );
         }
 
-        // Build HTTP/3 response with headers from backend
+        // Build HTTP/3 response with headers from backend. Sized up front for
+        // the forwarded headers, the static set and the handful added below,
+        // instead of growing from empty one header at a time.
         let mut response_builder = http::Response::builder().status(stream_status);
+        if let Some(h) = response_builder.headers_mut() {
+            h.reserve(stream_headers.len() + conn_headers.static_headers.len() + 8);
+        }
         if let Some((name, id)) = &request_id {
             response_builder = response_builder.header(name, id);
         }
