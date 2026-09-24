@@ -2097,14 +2097,32 @@ fn path_open_challenge_lost() -> TestResult {
     info!("dropping client's packet");
     pair.server.inbound.clear();
 
-    // Send the 3rd PATH_CHALLENGE
-    pair.time = pair
-        .client
-        .next_wakeup()
-        .expect("couldn't drive client forward");
-    info!("advancing to {:?} for client", pair.time - pair.epoch);
-    let third_challenge = pair.time;
-    pair.drive_client();
+    // Send the 3rd PATH_CHALLENGE.
+    //
+    // The next wakeup is not necessarily the challenge timer: a PTO on the new
+    // path can come first. The path is seeded conservatively from path 0's
+    // latest RTT sample, which includes whatever ACK delay the peer reported,
+    // so how early the challenge timer fires depends on the ACK timing of the
+    // handshake rather than on anything this test is about. PTO probes on the
+    // new path are lost along with the challenges.
+    let third_challenge = loop {
+        pair.time = pair
+            .client
+            .next_wakeup()
+            .expect("couldn't drive client forward");
+        info!("advancing to {:?} for client", pair.time - pair.epoch);
+        pair.drive_client();
+        let sent = pair
+            .path_stats(Client, path_id)
+            .unwrap()
+            .frame_tx
+            .path_challenge;
+        if sent == 3 {
+            break pair.time;
+        }
+        assert_eq!(sent, 2, "a challenge was sent out of turn");
+        pair.server.inbound.clear();
+    };
     let client_stats = pair.path_stats(Client, path_id).unwrap();
     assert_eq!(client_stats.frame_tx.path_challenge, 3);
     assert!(pair.path_stats(Server, path_id).is_none());

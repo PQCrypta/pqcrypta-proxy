@@ -1318,6 +1318,16 @@ impl PendingAcks {
     ///
     /// Should be called immediately before a non-probing packet is composed, when we've already
     /// committed to sending a packet regardless.
+    /// Whether ack-eliciting packets have arrived that no ACK has covered yet.
+    ///
+    /// Not the same as [`Self::can_send`], which is whether an ACK is *urgent*;
+    /// this is whether one is owed at all, for piggybacking on a packet that is
+    /// being sent anyway. See
+    /// [`TransportConfig::ack_piggyback`](crate::TransportConfig::ack_piggyback).
+    pub(super) fn is_owed(&self) -> bool {
+        self.ack_eliciting_since_last_ack_sent > 0 && !self.ranges.is_empty()
+    }
+
     pub(super) fn maybe_ack_non_eliciting(&mut self) {
         // If we're going to send a packet anyway, and we've received a significant number of
         // non-ACK-eliciting packets, then include an ACK to help the peer perform timely loss

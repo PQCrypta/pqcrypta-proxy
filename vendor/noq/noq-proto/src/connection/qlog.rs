@@ -523,8 +523,8 @@ impl QlogRecvPacket {
     pub(crate) fn frame(&mut self, frame: &Frame) {
         #[cfg(feature = "qlog")]
         {
-            if matches!(frame, Frame::Padding) {
-                self.padding += 1;
+            if let Frame::Padding(run) = frame {
+                self.padding += *run;
             } else {
                 self.emit_padding();
                 self.inner

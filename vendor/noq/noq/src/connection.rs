@@ -262,6 +262,23 @@ impl Future for ConnectionDriver {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let conn = &mut *self.0.lock_without_waking("poll");
 
+        // Coalesce: let the runtime run what is ready — including the I/O it
+        // has not polled for yet — before this transmits, so every write that
+        // work makes leaves in the same transmit. See
+        // `TransportConfig::send_coalescing`. Skipped when the previous pass
+        // asked to be polled again straight away: that is a transmit burst
+        // already in progress, not a new activation.
+        if conn.send_coalescing && !std::mem::take(&mut conn.continue_burst) {
+            let runtime = conn.runtime.clone();
+            let y = conn
+                .coalesce_yield
+                .get_or_insert_with(|| runtime.yield_now());
+            if y.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            conn.coalesce_yield = None;
+        }
+
         let span = debug_span!("drive", id = conn.handle.0);
         let _guard = span.enter();
 
@@ -279,6 +296,7 @@ impl Future for ConnectionDriver {
         if !conn.inner.is_drained() {
             if keep_going {
                 // If the connection hasn't processed all tasks, schedule it again
+                conn.continue_burst = true;
                 cx.waker().wake_by_ref();
             } else {
                 conn.driver = Some(cx.waker().clone());
@@ -1548,6 +1566,12 @@ pub(crate) struct State {
     pub(crate) observed_external_addr: watch::Sender<Option<SocketAddr>>,
     pub(crate) nat_traversal_updates: tokio::sync::broadcast::Sender<n0_nat_traversal::Event>,
     on_closed: Vec<oneshot::Sender<Closed>>,
+    /// [`proto::TransportConfig::send_coalescing`], read once.
+    send_coalescing: bool,
+    /// The yield this activation is waiting on before it transmits.
+    coalesce_yield: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    /// The last pass had more to do and re-armed itself; run without yielding.
+    continue_burst: bool,
 }
 
 impl State {
@@ -1562,6 +1586,7 @@ impl State {
         sender: Pin<Box<dyn UdpSender>>,
         runtime: Arc<dyn Runtime>,
     ) -> Self {
+        let send_coalescing = inner.send_coalescing();
         Self {
             inner,
             driver: None,
@@ -1590,6 +1615,9 @@ impl State {
             on_closed: Vec::new(),
             final_path_stats: Default::default(),
             path_refs: Default::default(),
+            send_coalescing,
+            coalesce_yield: None,
+            continue_burst: false,
         }
     }
 

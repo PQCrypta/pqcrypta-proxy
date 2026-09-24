@@ -22,7 +22,7 @@ impl PartialEq for Frame {
 
 fn encode_frame<B: BufMut>(frame: &Frame, buf: &mut B) {
     match frame {
-        Frame::Padding => buf.put_u8(0),
+        Frame::Padding(run) => buf.put_bytes(0, *run),
         Frame::Ping => Ping.encode(buf),
         Frame::Ack(a) => Ack::encoder(a.delay, &a.ranges, a.ecn.as_ref()).encode(buf),
         Frame::PathAck(pa) => {
@@ -90,4 +90,30 @@ fn maybe_frame_known_never_padding(frame: MaybeFrame) {
     if let MaybeFrame::Known(ft) = frame {
         prop_assert_ne!(ft, FrameType::Padding);
     }
+}
+
+#[test]
+fn padding_run_decodes_as_one_frame() {
+    // 1,200 bytes of padding followed by a PING: two frames, not 1,201, and
+    // the run's length survives for qlog.
+    let mut buf = BytesMut::new();
+    buf.put_bytes(0, 1200);
+    Ping.encode(&mut buf);
+    buf.put_bytes(0, 3);
+    let frames: Vec<Frame> = crate::frame::Iter::new(buf.freeze())
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(frames.len(), 3);
+    assert!(matches!(frames[0], Frame::Padding(1200)));
+    assert!(matches!(frames[1], Frame::Ping));
+    assert!(matches!(frames[2], Frame::Padding(3)));
+}
+
+#[proptest]
+fn ack_encoder_size_matches_encoding(frame: Ack) {
+    let enc = Ack::encoder(frame.delay, &frame.ranges, frame.ecn.as_ref());
+    let mut buf = Vec::new();
+    enc.encode(&mut buf);
+    prop_assert_eq!(enc.size(), buf.len());
 }

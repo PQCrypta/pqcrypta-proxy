@@ -30,6 +30,35 @@ pub trait Runtime: Send + Sync + Debug + 'static {
     fn now(&self) -> Instant {
         Instant::now()
     }
+
+    /// A future that completes once the runtime has run the other work that is
+    /// ready, ideally including I/O it has not polled for yet.
+    ///
+    /// The connection driver awaits this before transmitting when
+    /// [`TransportConfig::send_coalescing`](crate::TransportConfig::send_coalescing)
+    /// is on, so that responses finishing together leave together. The default
+    /// completes on its second poll, which on most executors means "after the
+    /// tasks already queued"; a runtime that can defer past its next I/O poll
+    /// should, because that is the batch an event loop flushes.
+    fn yield_now(&self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(YieldOnce(false))
+    }
+}
+
+/// Completes on its second poll, waking itself on the first.
+#[derive(Debug)]
+struct YieldOnce(bool);
+
+impl Future for YieldOnce {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            return Poll::Ready(());
+        }
+        self.0 = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
 }
 
 /// Abstract implementation of an async timer for runtime independence

@@ -425,8 +425,17 @@ impl DatagramInfo {
 #[derive(Debug, derive_more::Display)]
 #[cfg_attr(test, derive(Arbitrary))]
 pub(crate) enum Frame {
+    /// A run of consecutive PADDING frames, carrying how many there were.
+    ///
+    /// RFC 9000 §19.1: each PADDING frame is a single zero byte with no
+    /// content, so a padded packet holds one frame per padding byte. Decoding
+    /// them one at a time ran the whole varint decode and frame dispatch once
+    /// per byte — for a client that pads its datagrams, as many do to hide
+    /// request sizes, over a thousand frames to read one small request, and
+    /// the largest single cost in receiving it. The run is consumed in one
+    /// step; the count is kept so qlog still records the padding's length.
     #[display("PADDING")]
-    Padding,
+    Padding(#[cfg_attr(test, strategy(1usize..=64))] usize),
     #[display("PING")]
     Ping,
     Ack(Ack),
@@ -469,7 +478,7 @@ impl Frame {
     pub(crate) fn ty(&self) -> FrameType {
         use Frame::*;
         match &self {
-            Padding => FrameType::Padding,
+            Padding(_) => FrameType::Padding,
             ResetStream(_) => FrameType::ResetStream,
             Close(self::Close::Connection(_)) => FrameType::ConnectionClose,
             Close(self::Close::Application(_)) => FrameType::ConnectionClose,
@@ -520,7 +529,7 @@ impl Frame {
     pub(crate) fn is_ack_eliciting(&self) -> bool {
         !matches!(
             *self,
-            Self::Ack(_) | Self::PathAck(_) | Self::Padding | Self::Close(_)
+            Self::Ack(_) | Self::PathAck(_) | Self::Padding(_) | Self::Close(_)
         )
     }
 
@@ -1179,6 +1188,31 @@ pub(crate) struct AckEncoder<'a> {
 }
 
 impl<'a> AckEncoder<'a> {
+    /// Encoded length in bytes, computed without encoding.
+    pub(crate) fn size(&self) -> usize {
+        fn var(x: u64) -> usize {
+            VarInt::from_u64(x).map_or(8, VarInt::size)
+        }
+        let mut rest = self.ranges.iter().rev();
+        let Some(first) = rest.next() else {
+            return 0;
+        };
+        let mut n = self.get_type().size()
+            + var(first.end - 1)
+            + var(self.delay)
+            + var(self.ranges.range_count() as u64 - 1)
+            + var(first.end - first.start - 1);
+        let mut prev = first.start;
+        for block in rest {
+            n += var(prev - block.end - 1) + var(block.end - block.start - 1);
+            prev = block.start;
+        }
+        if let Some(e) = self.ecn {
+            n += var(e.ect0) + var(e.ect1) + var(e.ce);
+        }
+        n
+    }
+
     const fn get_type(&self) -> FrameType {
         match self.ecn.is_some() {
             true => FrameType::AckEcn,
@@ -1533,7 +1567,12 @@ impl Iter {
             MaybeFrame::Known(frame_type) => frame_type,
         };
         Ok(match ty {
-            FrameType::Padding => Frame::Padding,
+            FrameType::Padding => {
+                // The type byte just read was the first of the run.
+                let run = self.bytes.iter().take_while(|&&b| b == 0).count();
+                self.bytes.advance(run);
+                Frame::Padding(1 + run)
+            }
             FrameType::ResetStream => Frame::ResetStream(ResetStream {
                 id: self.bytes.get()?,
                 error_code: self.bytes.get()?,

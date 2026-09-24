@@ -39,6 +39,13 @@ impl Runtime for TokioRuntime {
     fn now(&self) -> Instant {
         tokio::time::Instant::now().into_std()
     }
+
+    /// tokio's own yield: on a runtime worker the wake is deferred until the
+    /// worker has run its queue and polled the I/O driver, which is exactly the
+    /// batch boundary transmit coalescing wants.
+    fn yield_now(&self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(tokio::task::yield_now())
+    }
 }
 
 impl AsyncTimer for Sleep {

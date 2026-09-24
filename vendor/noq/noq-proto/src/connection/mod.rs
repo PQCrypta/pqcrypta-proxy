@@ -2651,6 +2651,12 @@ impl Connection {
         Datagrams { conn: self }
     }
 
+    /// Whether the I/O driver should coalesce transmits; see
+    /// [`TransportConfig::send_coalescing`].
+    pub fn send_coalescing(&self) -> bool {
+        self.config.send_coalescing
+    }
+
     /// Returns connection statistics
     pub fn stats(&mut self) -> ConnectionStats {
         let mut stats = self.partial_stats.clone();
@@ -4584,7 +4590,7 @@ impl Connection {
                     };
                     qlog.frame(&frame);
 
-                    if let Frame::Padding = frame {
+                    if let Frame::Padding(_) = frame {
                         continue;
                     };
 
@@ -4894,7 +4900,7 @@ impl Connection {
             let frame = result?;
             qlog.frame(&frame);
             let span = match frame {
-                Frame::Padding => continue,
+                Frame::Padding(_) => continue,
                 _ => Some(trace_span!("frame", ty = %frame.ty(), path = tracing::field::Empty)),
             };
 
@@ -4911,7 +4917,7 @@ impl Connection {
             }
 
             match frame {
-                Frame::Padding | Frame::Ping => {}
+                Frame::Padding(_) | Frame::Ping => {}
                 Frame::Crypto(frame) => {
                     self.read_crypto(packet.header.space().into(), &frame, payload_len)?;
                 }
@@ -4971,7 +4977,7 @@ impl Connection {
             let frame = result?;
             qlog.frame(&frame);
             let span = match frame {
-                Frame::Padding => continue,
+                Frame::Padding(_) => continue,
                 _ => trace_span!("frame", ty = %frame.ty(), path = tracing::field::Empty),
             };
 
@@ -5014,7 +5020,7 @@ impl Connection {
 
             // Check whether this could be a probing packet
             match frame {
-                Frame::Padding
+                Frame::Padding(_)
                 | Frame::PathChallenge(_)
                 | Frame::PathResponse(_)
                 | Frame::NewConnectionId(_)
@@ -5045,7 +5051,7 @@ impl Connection {
                     span.record("path", tracing::field::display(&ack.path_id));
                     self.on_path_ack_received(now, SpaceId::Data, ack)?;
                 }
-                Frame::Padding | Frame::Ping => {}
+                Frame::Padding(_) | Frame::Ping => {}
                 Frame::Close(reason) => {
                     close = Some(reason);
                 }
@@ -6673,6 +6679,66 @@ impl Connection {
             // ack-eliciting, and an unknown one is not one of those three.
             builder.ack_eliciting = true;
         }
+
+        // Owed ACKs ride on a packet that is leaving anyway; see
+        // `TransportConfig::ack_piggyback`. Decided here, after everything else
+        // is written, because only now is it known that the packet really does
+        // carry something: `SendableFrames` can announce data that then does not
+        // go in, and deciding up front would turn that packet into an ACK-only
+        // one the threshold never asked for. Skipped when the ACK does not fit —
+        // the threshold and the delay timer still cover it.
+        if self.config.ack_piggyback
+            && builder.ack_eliciting
+            && space_has_keys
+            && !is_0rtt
+            && !scheduling_info.is_abandoned
+            && scheduling_info.may_send_data
+        {
+            let is_multipath_negotiated = self.is_multipath_negotiated();
+            // Stack copy of the path ids so `populate_acks` can borrow the space
+            // mutably; one entry without multipath, a handful with it.
+            let mut owed = [PathId::ZERO; 8];
+            let mut n = 0;
+            for (&pid, pns) in self.spaces[space_id].number_spaces.iter() {
+                if n < owed.len()
+                    && pns.pending_acks.is_owed()
+                    && !builder.sent_frames().largest_acked.contains_key(&pid)
+                {
+                    owed[n] = pid;
+                    n += 1;
+                }
+            }
+            for &pid in &owed[..n] {
+                let pns = self.spaces[space_id].for_path(pid);
+                let ecn = if self.receiving_ecn {
+                    Some(&pns.ecn_counters)
+                } else {
+                    None
+                };
+                // Sized with a zero delay; the real one is written by
+                // `populate_acks` and needs at most three more bytes (a
+                // four-byte varint holds over an hour of scaled delay).
+                let mut size = frame::Ack::encoder(0, pns.pending_acks.ranges(), ecn).size() + 3;
+                if is_multipath_negotiated && space_id == SpaceId::Data {
+                    // PATH_ACK adds a path id and has a longer type.
+                    size += 16;
+                }
+                if builder.frame_space_remaining() < size {
+                    continue;
+                }
+                Self::populate_acks(
+                    now,
+                    self.receiving_ecn,
+                    pid,
+                    space_id,
+                    &mut self.spaces[space_id],
+                    is_multipath_negotiated,
+                    builder,
+                    &mut self.path_stats.get_mut(pid).frame_tx,
+                    space_has_keys,
+                );
+            }
+        }
     }
 
     /// Write pending ACKs into a buffer
@@ -7742,10 +7808,15 @@ struct SentFrames {
 impl SentFrames {
     /// Returns whether the packet contains only ACKs
     fn is_ack_only(&self, streams: &StreamsState) -> bool {
+        // `path_retransmits` counts: an OBSERVED_ADDRESS frame is recorded
+        // there and nowhere else, so leaving it out called a packet carrying
+        // one "ACK-only". Nothing noticed while such packets never also held an
+        // ACK; piggybacking owed ACKs puts one in them.
         !self.largest_acked.is_empty()
             && !self.non_retransmits
             && self.stream_frames.is_empty()
             && self.retransmits.is_empty(streams)
+            && self.path_retransmits.is_empty()
     }
 
     fn retransmits_mut(&mut self) -> &mut Retransmits {

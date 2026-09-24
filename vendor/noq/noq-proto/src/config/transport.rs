@@ -48,6 +48,8 @@ pub struct TransportConfig {
     pub(crate) pad_to_mtu: bool,
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
     pub(crate) local_ack_eliciting_threshold: u64,
+    pub(crate) ack_piggyback: bool,
+    pub(crate) send_coalescing: bool,
     pub(crate) max_outgoing_bytes_per_second: Option<u64>,
 
     pub(crate) persistent_congestion_threshold: u32,
@@ -345,8 +347,58 @@ impl TransportConfig {
     /// which is what the default exists to save; measured here that cost was
     /// nil at fifty in-flight streams (0.97×, inside the run-to-run spread)
     /// while the gain was 58× at one stream and 3.3× at ten.
+    ///
+    /// Those figures predate [`ack_piggyback`](Self::ack_piggyback). With it
+    /// on, the lone request's ACK rides on its response and the stall is gone
+    /// at the default of 1, which then beats 0 at every concurrency measured:
+    /// the extra ACK-only datagram per request that 0 sends is pure cost.
     pub fn local_ack_eliciting_threshold(&mut self, value: u64) -> &mut Self {
         self.local_ack_eliciting_threshold = value;
+        self
+    }
+
+    /// Whether a packet sent for any other reason carries the ACKs still owed.
+    ///
+    /// Below [`local_ack_eliciting_threshold`](Self::local_ack_eliciting_threshold)
+    /// an acknowledgement is not *urgent*, and without this it is not sent at
+    /// all until the threshold is crossed or `max_ack_delay` expires — even when
+    /// a packet is leaving anyway and has room for it. A server answering a
+    /// request then sends the response without acknowledging the request it
+    /// answers, and the client, which cannot close the stream until its request
+    /// is acknowledged, waits out the timer. That was the whole of the 25 ms
+    /// one-stream stall the threshold was later lowered to 0 to escape; 0 fixed
+    /// it by sending a separate ACK-only datagram for every request instead,
+    /// measured at 0.64 extra datagrams per request at a hundred connections.
+    ///
+    /// With this on, an owed ACK rides on the next packet that carries anything
+    /// else, so the threshold goes back to governing only ACK-only packets.
+    /// Defaults to true: an ACK frame is a few bytes in a packet that is being
+    /// sent regardless, and RFC 9000 §13.2.1 asks for prompt acknowledgement.
+    pub fn ack_piggyback(&mut self, value: bool) -> &mut Self {
+        self.ack_piggyback = value;
+        self
+    }
+
+    /// Whether the connection driver lets other ready work run before it
+    /// transmits.
+    ///
+    /// Without it the driver transmits on every wake, and every stream write
+    /// wakes it — on a work-stealing runtime usually straight away, ahead of
+    /// anything else queued. A server finishing a burst of responses on one
+    /// connection then sends each in its own packet, and the client, getting
+    /// them one at a time, answers each with its own packet: measured on an
+    /// HTTP/3 proxy at a hundred connections, **2.1 datagrams per request
+    /// against 0.31 for an event-loop server** on the same machine, and the
+    /// gap grew with connection count where the event loop's shrank.
+    ///
+    /// With it, a woken driver first yields once, to the back of the run
+    /// queue, so the tasks already runnable — other streams' responses, the
+    /// reads that produce them — queue their writes first and one transmit
+    /// carries them all. This is what an event loop does by construction:
+    /// flush once per turn. The cost is one extra poll per activation and,
+    /// on an idle runtime, one scheduler pass of latency. Default: true.
+    pub fn send_coalescing(&mut self, value: bool) -> &mut Self {
+        self.send_coalescing = value;
         self
     }
 
@@ -673,6 +725,8 @@ impl Default for TransportConfig {
             pad_to_mtu: false,
             ack_frequency_config: None,
             local_ack_eliciting_threshold: 1,
+            ack_piggyback: true,
+            send_coalescing: true,
             max_outgoing_bytes_per_second: None,
 
             persistent_congestion_threshold: 3,
@@ -727,6 +781,8 @@ impl fmt::Debug for TransportConfig {
             pad_to_mtu,
             ack_frequency_config,
             local_ack_eliciting_threshold,
+            ack_piggyback,
+            send_coalescing,
             max_outgoing_bytes_per_second,
             persistent_congestion_threshold,
             keep_alive_interval,
@@ -771,6 +827,8 @@ impl fmt::Debug for TransportConfig {
                 "local_ack_eliciting_threshold",
                 local_ack_eliciting_threshold,
             )
+            .field("ack_piggyback", ack_piggyback)
+            .field("send_coalescing", send_coalescing)
             .field(
                 "max_outgoing_bytes_per_second",
                 max_outgoing_bytes_per_second,
