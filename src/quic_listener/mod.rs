@@ -73,11 +73,42 @@ fn is_benign_h3_close<E: std::fmt::Display>(err: &E) -> bool {
         || msg.contains("aborted by peer")
         || msg.contains("closed abruptly")
         || msg.contains("Timeout")
+        // quinn's idle and handshake timeouts: the peer stopped answering.
+        || msg.contains("timed out")
+        // A browser cancelling a request it no longer wants (navigation,
+        // a superseded fetch). RFC 9114 §4.1.1 defines it for exactly that.
+        || msg.contains("H3_REQUEST_CANCELLED")
         // The peer closed with an application code h3 does not define —
         // browsers do this dropping a connection, and every connection open
         // across a restart does it at once. "Remote" is the discriminator: a
         // failure on this side is reported as a "Local error".
         || (msg.contains("Remote error") && msg.contains("closed"))
+}
+
+/// How loudly to report a QUIC connection that ended in an error.
+///
+/// Most of what ends a connection is the client's doing and says nothing about
+/// this server: a scanner that offers no h3 ALPN, a peer that aborts or goes
+/// quiet. Those were logged at error, several a day on an idle node, which the
+/// log collector counts as error spikes. What stays loud is anything this side
+/// could have caused; a handshake with no certificate for the requested name is
+/// a warning, because it is usually a client asking for a name we never served
+/// but is also what a missing certificate looks like.
+fn log_connection_end(remote_addr: SocketAddr, err: &anyhow::Error) {
+    let msg = format!("{err:#}");
+    if is_benign_h3_close(&msg)
+        || msg.contains("peer doesn't support any known protocol")
+        || msg.contains("received fatal alert")
+    {
+        debug!("QUIC connection from {} ended: {}", remote_addr, msg);
+    } else if msg.contains("no server certificate chain resolved") {
+        warn!(
+            "QUIC handshake from {}: no certificate for the requested server name ({})",
+            remote_addr, msg
+        );
+    } else {
+        error!("Connection error from {}: {}", remote_addr, msg);
+    }
 }
 
 /// The Alt-Svc value for a response being sent **over QUIC**.
@@ -730,7 +761,7 @@ impl QuicListener {
                                 fingerprint_extractor,
                                 fingerprint_config,
                             ).await {
-                                error!("Connection error from {}: {}", remote_addr, e);
+                                log_connection_end(remote_addr, &e);
                             }
                             metrics.connections.connection_closed();
                         });
@@ -1090,7 +1121,11 @@ impl QuicListener {
                     let (request, stream) = match resolver.resolve_request().await {
                         Ok(result) => result,
                         Err(e) => {
-                            error!("Failed to resolve request: {}", e);
+                            if is_benign_h3_close(&e) {
+                                debug!("HTTP/3 request abandoned before its headers: {}", e);
+                            } else {
+                                error!("Failed to resolve request: {}", e);
+                            }
                             continue;
                         }
                     };
@@ -1716,5 +1751,18 @@ mod close_classification_tests {
         ));
         assert!(!is_benign_h3_close(&"Local error: H3_FRAME_UNEXPECTED"));
         assert!(!is_benign_h3_close(&"Remote error: H3_FRAME_ERROR"));
+    }
+
+    /// The shapes seen in a day of production logs at error level, every one
+    /// of them caused by the client.
+    #[test]
+    fn client_caused_endings_are_benign() {
+        assert!(is_benign_h3_close(&"timed out"));
+        assert!(is_benign_h3_close(&"Remote reset: H3_REQUEST_CANCELLED"));
+        assert!(is_benign_h3_close(
+            &"aborted by peer: the connection is being closed abruptly in the absence of any error"
+        ));
+        // A local protocol failure still is not.
+        assert!(!is_benign_h3_close(&"Local error: H3_INTERNAL_ERROR"));
     }
 }
