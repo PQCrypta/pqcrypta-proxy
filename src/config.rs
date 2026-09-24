@@ -3787,6 +3787,37 @@ impl ProxyConfig {
             ));
         }
 
+        // [pqc] group settings that contradict each other or name nothing.
+        if ![1, 3, 5].contains(&self.pqc.min_security_level) {
+            return Err(anyhow::anyhow!(
+                "pqc.min_security_level = {} is not a NIST level; use 1, 3 or 5",
+                self.pqc.min_security_level
+            ));
+        }
+        let unknown: Vec<&str> = self
+            .pqc
+            .additional_kems
+            .iter()
+            .filter(|k| crate::pqc_tls::PqcKemAlgorithm::from_str(k).is_none())
+            .map(String::as_str)
+            .collect();
+        if !unknown.is_empty() {
+            return Err(anyhow::anyhow!(
+                "pqc.additional_kems names unknown KEM(s): {}",
+                unknown.join(", ")
+            ));
+        }
+        if let Some(kem) = crate::pqc_tls::PqcKemAlgorithm::from_str(&self.pqc.preferred_kem) {
+            if kem.security_level() < self.pqc.min_security_level {
+                return Err(anyhow::anyhow!(
+                    "pqc.preferred_kem {} is NIST level {}, below pqc.min_security_level {}",
+                    self.pqc.preferred_kem,
+                    kem.security_level(),
+                    self.pqc.min_security_level
+                ));
+            }
+        }
+
         // Admin mTLS needs a CA to verify client certificates against.
         if self.admin.require_mtls
             && self.admin.client_ca_path.is_none()

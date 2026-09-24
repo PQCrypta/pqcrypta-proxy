@@ -809,6 +809,50 @@ mod server_policy_tests {
         assert!(g.contains(&NamedGroup::secp384r1) && g.contains(&NamedGroup::secp256r1));
     }
 
+    /// min_security_level drops post-quantum groups below the NIST level;
+    /// additional_kems orders the offer after preferred_kem and may name a
+    /// pure ML-KEM group. Both were read by nothing before.
+    #[test]
+    fn min_security_level_and_additional_kems() {
+        let g = groups(&PqcConfig {
+            min_security_level: 5,
+            preferred_kem: "SecP384r1MLKEM1024".into(),
+            ..PqcConfig::default()
+        });
+        let pq: Vec<_> = g
+            .iter()
+            .copied()
+            .filter(|n| is_post_quantum_group(*n))
+            .collect();
+        assert_eq!(pq, vec![NamedGroup::secp384r1MLKEM1024], "{g:?}");
+
+        let g = groups(&PqcConfig {
+            additional_kems: vec!["SecP384r1MLKEM1024".into(), "MLKEM1024".into()],
+            ..PqcConfig::default()
+        });
+        assert_eq!(
+            &g[..3],
+            &[
+                NamedGroup::X25519MLKEM768,
+                NamedGroup::secp384r1MLKEM1024,
+                NamedGroup::MLKEM1024
+            ],
+            "{g:?}"
+        );
+        assert!(g.contains(&NamedGroup::secp256r1MLKEM768));
+
+        // ML-KEM-512 is level 1: named and allowed only with the minimum at 1.
+        let named512 = |min| {
+            groups(&PqcConfig {
+                additional_kems: vec!["MLKEM512".into()],
+                min_security_level: min,
+                ..PqcConfig::default()
+            })
+        };
+        assert!(!named512(3).contains(&NamedGroup::MLKEM512));
+        assert!(named512(1).contains(&NamedGroup::MLKEM512));
+    }
+
     /// SecP384r1MLKEM1024 -- added to the vendored rustls -- completes a
     /// handshake end to end.
     #[test]
@@ -1160,9 +1204,10 @@ fn is_hybrid_group(group: rustls::NamedGroup) -> bool {
 /// - `pqc.enabled` false (or the provider unavailable): the classical groups
 ///   alone.
 /// - Otherwise every hybrid -- X25519MLKEM768, SecP256r1MLKEM768 and
-///   SecP384r1MLKEM1024 -- with `preferred_kem` first. A pure ML-KEM group is
-///   offered only when `preferred_kem` names it, and never under
-///   `require_hybrid`.
+///   SecP384r1MLKEM1024 -- led by `preferred_kem` and then `additional_kems`
+///   in the order listed. A pure ML-KEM group is offered only when one of
+///   those names it, and never under `require_hybrid`. A post-quantum group
+///   below `min_security_level` is not offered.
 /// - The classical fallback stays unless `require_hybrid` is set or
 ///   `fallback_to_classical` is false.
 ///
@@ -1181,9 +1226,18 @@ fn is_hybrid_group(group: rustls::NamedGroup) -> bool {
 pub fn server_provider(post_quantum: bool, pqc: &PqcConfig) -> CryptoProvider {
     let mut provider = build_pqc_provider();
     let norm = |s: &str| s.to_ascii_lowercase().replace(['-', '_'], "");
-    let preferred = norm(&pqc.preferred_kem);
-    let is_preferred =
-        |g: rustls::NamedGroup| !preferred.is_empty() && norm(&format!("{g:?}")) == preferred;
+    // preferred_kem, then additional_kems as listed: the groups the
+    // configuration names, which lead the offer in that order.
+    let named: Vec<String> = std::iter::once(&pqc.preferred_kem)
+        .chain(pqc.additional_kems.iter())
+        .map(|k| norm(k))
+        .filter(|k| !k.is_empty())
+        .collect();
+    let named_at = |g: rustls::NamedGroup| named.iter().position(|n| *n == norm(&format!("{g:?}")));
+    let level = |g: rustls::NamedGroup| {
+        crate::pqc_tls::PqcKemAlgorithm::from_str(&format!("{g:?}"))
+            .map_or(0, |k| k.security_level())
+    };
     let keep_classical = !post_quantum || (pqc.fallback_to_classical && !pqc.require_hybrid);
 
     let mut groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup> =
@@ -1199,18 +1253,19 @@ pub fn server_provider(post_quantum: bool, pqc: &PqcConfig) -> CryptoProvider {
                     return keep_classical;
                 }
                 post_quantum
-                    && (is_hybrid_group(name) || (is_preferred(name) && !pqc.require_hybrid))
+                    && level(name) >= pqc.min_security_level
+                    && (is_hybrid_group(name) || (named_at(name).is_some() && !pqc.require_hybrid))
             })
             .collect();
     groups.sort_by_key(|g| {
         let name = g.name();
-        match () {
-            _ if is_preferred(name) => 0u8,
-            _ if name == rustls::NamedGroup::X25519MLKEM768 => 1,
-            _ if is_hybrid_group(name) => 2,
-            _ if is_post_quantum_group(name) => 3,
-            _ if name == rustls::NamedGroup::secp384r1 => 4,
-            _ => 5,
+        match named_at(name) {
+            Some(i) => i,
+            None if name == rustls::NamedGroup::X25519MLKEM768 => 100,
+            None if is_hybrid_group(name) => 101,
+            None if is_post_quantum_group(name) => 102,
+            None if name == rustls::NamedGroup::secp384r1 => 103,
+            None => 104,
         }
     });
     provider.kx_groups = groups;

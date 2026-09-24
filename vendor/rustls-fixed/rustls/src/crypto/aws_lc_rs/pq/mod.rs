@@ -56,6 +56,9 @@ pub static SECP384R1MLKEM1024: &dyn SupportedKxGroup = &hybrid::Hybrid {
 /// [MLKEM]: https://datatracker.ietf.org/doc/draft-connolly-tls-mlkem-key-agreement
 pub static MLKEM768: &dyn SupportedKxGroup = &mlkem::MLKEM768_PARAMS;
 
+/// ML-KEM-512 on its own; see [`MLKEM768`]. NIST level 1.
+pub static MLKEM512: &dyn SupportedKxGroup = &mlkem::MLKEM512_PARAMS;
+
 /// ML-KEM-1024 on its own; see [`MLKEM768`].
 pub static MLKEM1024: &dyn SupportedKxGroup = &mlkem::MLKEM1024_PARAMS;
 

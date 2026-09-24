@@ -55,9 +55,12 @@ impl PqcKemAlgorithm {
             Self::SecP256r1MlKem768 => "SecP256r1MLKEM768",
             Self::SecP384r1MlKem1024 => "SecP384r1MLKEM1024",
             Self::X448MlKem1024 => "X448MLKEM1024",
-            Self::MlKem512 => "ML-KEM-512",
-            Self::MlKem768 => "ML-KEM-768",
-            Self::MlKem1024 => "ML-KEM-1024",
+            // OpenSSL's TLS group names. "ML-KEM-1024" is its algorithm name,
+            // which set_groups_list rejects, so a pure ML-KEM preference was
+            // silently not offered.
+            Self::MlKem512 => "MLKEM512",
+            Self::MlKem768 => "MLKEM768",
+            Self::MlKem1024 => "MLKEM1024",
             #[cfg(feature = "legacy-pqc")]
             Self::Kyber768 => "kyber768",
             #[cfg(feature = "legacy-pqc")]
@@ -445,29 +448,52 @@ impl PqcTlsProvider {
     ) -> String {
         let mut groups = Vec::new();
 
-        // Add preferred KEM first if available. Under require_hybrid a pure-PQC
-        // preference is skipped: the point of the setting is that every
-        // negotiated group carries both a classical and a post-quantum
-        // component, so a break of either alone is not enough.
-        if let Some(kem) = preferred {
-            let name = kem.openssl_name();
-            if config.require_hybrid && !kem.is_hybrid() {
-                warn!(
-                    "require_hybrid is set, so preferred_kem {} (pure PQC) is not offered",
-                    name
-                );
-            } else if available_kems.iter().any(|k| k.contains(name)) {
-                groups.push(name.to_string());
+        // In order: preferred_kem, then additional_kems as listed, then every
+        // recommended hybrid. A pure ML-KEM group is offered only when named
+        // (preferred or additional) and never under require_hybrid, whose point
+        // is that every negotiated group carries a classical and a
+        // post-quantum component so a break of either alone is not enough.
+        // min_security_level drops groups below the NIST level. The last two
+        // were read by nothing until 2026-09-24.
+        let mut named: Vec<PqcKemAlgorithm> = preferred.into_iter().collect();
+        for name in &config.additional_kems {
+            match PqcKemAlgorithm::from_str(name) {
+                Some(kem) => named.push(kem),
+                None => warn!("additional_kems: \"{}\" is not a known KEM; ignored", name),
             }
         }
-
-        // Add other hybrid KEMs in recommended order
-        for kem in PqcKemAlgorithm::recommended_hybrids() {
+        let candidates = named.iter().map(|k| (*k, true)).chain(
+            PqcKemAlgorithm::recommended_hybrids()
+                .into_iter()
+                .map(|k| (k, false)),
+        );
+        for (kem, explicit) in candidates {
             let name = kem.openssl_name();
-            if !groups.contains(&name.to_string()) {
-                if available_kems.iter().any(|k| k.contains(name)) {
-                    groups.push(name.to_string());
+            if groups.iter().any(|g| g == name) {
+                continue;
+            }
+            if !kem.is_hybrid() && (config.require_hybrid || !explicit) {
+                if explicit {
+                    warn!(
+                        "require_hybrid is set, so {} (pure PQC) is not offered",
+                        name
+                    );
                 }
+                continue;
+            }
+            if kem.security_level() < config.min_security_level {
+                if explicit {
+                    warn!(
+                        "{} is NIST level {}, below min_security_level {}; not offered",
+                        name,
+                        kem.security_level(),
+                        config.min_security_level
+                    );
+                }
+                continue;
+            }
+            if available_kems.iter().any(|k| k.contains(name)) {
+                groups.push(name.to_string());
             }
         }
 
@@ -1397,7 +1423,7 @@ mod tests {
             PqcKemAlgorithm::X25519MlKem768.openssl_name(),
             "X25519MLKEM768"
         );
-        assert_eq!(PqcKemAlgorithm::MlKem1024.openssl_name(), "ML-KEM-1024");
+        assert_eq!(PqcKemAlgorithm::MlKem1024.openssl_name(), "MLKEM1024");
     }
 
     #[test]

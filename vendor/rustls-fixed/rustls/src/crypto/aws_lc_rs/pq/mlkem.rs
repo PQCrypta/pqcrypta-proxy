@@ -8,13 +8,19 @@ use crate::crypto::{ActiveKeyExchange, CompletedKeyExchange, SharedSecret, Suppo
 use crate::ffdhe_groups::FfdheGroup;
 use crate::{Error, NamedGroup, ProtocolVersion};
 
-/// ML-KEM at one parameter set: 768 on its own and inside X25519MLKEM768 and
-/// SecP256r1MLKEM768, 1024 on its own and inside SecP384r1MLKEM1024.
+/// ML-KEM at one parameter set: 512 on its own, 768 on its own and inside
+/// X25519MLKEM768 and SecP256r1MLKEM768, 1024 on its own and inside
+/// SecP384r1MLKEM1024.
 #[derive(Debug)]
 pub(crate) struct MlKem {
     pub(crate) algorithm: &'static kem::Algorithm<kem::AlgorithmId>,
     pub(crate) name: NamedGroup,
 }
+
+pub(crate) static MLKEM512_PARAMS: MlKem = MlKem {
+    algorithm: &kem::ML_KEM_512,
+    name: NamedGroup::MLKEM512,
+};
 
 pub(crate) static MLKEM768_PARAMS: MlKem = MlKem {
     algorithm: &kem::ML_KEM_768,
