@@ -129,17 +129,27 @@ impl AdminServer {
             return Ok(());
         }
 
-        // SEC-A03: The admin API does not yet implement mTLS.  Refuse to start
-        // when require_mtls = true so that operators who set this option are not
-        // silently left with an unprotected endpoint.
-        if self.config.require_mtls {
-            return Err(anyhow::anyhow!(
-                "Admin API: require_mtls = true but mTLS is not supported on the admin \
-                 listener.  Either set require_mtls = false and rely on the auth_token + \
-                 allowed_ips controls, or disable the admin API.  Aborting startup to \
-                 prevent operating without the expected security control."
-            ));
-        }
+        // SEC-A03: require_mtls used to refuse to start because the listener
+        // had no TLS at all. It serves TLS 1.3 with a required client
+        // certificate now; the config is built before binding so a missing
+        // certificate or CA stops startup rather than leaving the API open.
+        let mtls = if self.config.require_mtls {
+            let path = |p: &Option<std::path::PathBuf>, what: &str| {
+                p.clone().ok_or_else(|| {
+                    anyhow::anyhow!("Admin API: require_mtls = true but no {what} is configured")
+                })
+            };
+            let config = crate::tls::admin_server_config(
+                &path(&self.config.tls_cert_path, "certificate")?,
+                &path(&self.config.tls_key_path, "private key")?,
+                &path(&self.config.client_ca_path, "client CA")?,
+            )?;
+            Some(axum_server::tls_rustls::RustlsConfig::from_config(
+                Arc::new(config),
+            ))
+        } else {
+            None
+        };
 
         let addr = self.config.socket_addr()?;
 
@@ -148,7 +158,7 @@ impl AdminServer {
         // plain HTTP.  Operators who need remote admin access should place the proxy
         // behind a TLS-terminating tunnel (e.g. SSH port-forward or WireGuard).
         let is_loopback = addr.ip().is_loopback();
-        if !is_loopback {
+        if !is_loopback && mtls.is_none() {
             warn!(
                 "⚠️  Admin API is bound to {} (non-loopback) without TLS. \
                  All admin traffic including auth tokens is transmitted in cleartext. \
@@ -162,7 +172,7 @@ impl AdminServer {
         // admin bind address is not loopback.  Operators who need remote admin
         // access must set [admin] require_loopback = false and accept the risk of
         // transmitting Bearer tokens in cleartext (or place a TLS tunnel in front).
-        if self.config.require_loopback && !is_loopback {
+        if self.config.require_loopback && !is_loopback && mtls.is_none() {
             return Err(anyhow::anyhow!(
                 "Admin API: bind address {} is not loopback and require_loopback = true. \
                  Set [admin] require_loopback = false to allow non-loopback binds, \
@@ -177,6 +187,12 @@ impl AdminServer {
         // active (the token changes each restart until the operator pins one).
         let effective_token: Option<String> = match &self.config.auth_token {
             Some(t) => Some(t.clone()),
+            // Under mTLS the client certificate is the credential; a token is
+            // checked when configured and not invented when it is not.
+            None if mtls.is_some() => {
+                info!("Admin API: mTLS enabled and no auth_token set; the client certificate authenticates");
+                None
+            }
             None => {
                 // P3-fix: use OsRng (cryptographically secure) instead of thread_rng
                 // (designed for simulation, not secret generation).
@@ -308,6 +324,30 @@ impl AdminServer {
         let app = public_routes
             .merge(protected_routes)
             .layer(TraceLayer::new_for_http());
+
+        if let Some(tls) = mtls {
+            info!(
+                "Admin API listening on {} (TLS 1.3, client certificate required)",
+                addr
+            );
+            let handle = axum_server::Handle::new();
+            let on_shutdown = handle.clone();
+            tokio::spawn(async move {
+                shutdown.await;
+                info!("Admin API shutting down");
+                on_shutdown.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
+            });
+            // NoDelayAcceptor for the same reason as the plain listener below.
+            return axum_server::bind(addr)
+                .acceptor(
+                    axum_server::tls_rustls::RustlsAcceptor::new(tls)
+                        .acceptor(axum_server::accept::NoDelayAcceptor),
+                )
+                .handle(handle)
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .map_err(|e| anyhow::anyhow!("Admin server error: {e}"));
+        }
 
         // Start server
         info!("Admin API listening on {}", addr);

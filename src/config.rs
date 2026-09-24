@@ -2003,8 +2003,19 @@ pub struct AdminConfig {
     pub bind_address: String,
     /// Admin API port
     pub port: u16,
-    /// Require mTLS for admin API
+    /// Serve the admin API over TLS 1.3 and require a client certificate
+    /// issued by [`client_ca_path`](Self::client_ca_path). The certificate is
+    /// then the credential: `auth_token` becomes optional, and is still
+    /// checked when set.
     pub require_mtls: bool,
+    /// Certificate the admin listener presents under `require_mtls`.
+    /// Default: `tls.cert_path`.
+    pub tls_cert_path: Option<PathBuf>,
+    /// Its private key. Default: `tls.key_path`.
+    pub tls_key_path: Option<PathBuf>,
+    /// CA that issues admin client certificates. Default: `tls.ca_cert_path`;
+    /// `require_mtls` refuses to start with neither.
+    pub client_ca_path: Option<PathBuf>,
     /// Admin API token for authentication (if not using mTLS)
     pub auth_token: Option<String>,
     /// Allowed IP addresses for admin API
@@ -2015,9 +2026,10 @@ pub struct AdminConfig {
     /// Provides per-request proof without replacing the bearer token.
     pub hmac_secret: Option<String>,
     /// Refuse to start if the admin bind address is not loopback (default: true).
-    /// Admin traffic is plain HTTP; a non-loopback bind transmits Bearer tokens in
-    /// cleartext.  Set to `false` only when the bind interface is protected by a
-    /// TLS tunnel (e.g. SSH port-forward or WireGuard).
+    /// Applies to the plain-HTTP listener, where a non-loopback bind transmits
+    /// Bearer tokens in cleartext; set it to `false` only behind a TLS tunnel
+    /// (SSH port-forward, WireGuard). Under `require_mtls` the listener is TLS
+    /// with client authentication, and a non-loopback bind is what it is for.
     #[serde(default = "default_require_loopback")]
     pub require_loopback: bool,
 }
@@ -2036,6 +2048,9 @@ impl Default for AdminConfig {
             bind_address: "127.0.0.1".to_string(),
             port: 8081,
             require_mtls: false,
+            tls_cert_path: None,
+            tls_key_path: None,
+            client_ca_path: None,
             auth_token: None,
             allowed_ips: vec!["127.0.0.1".to_string(), "::1".to_string()],
             hmac_secret: None,
@@ -2220,7 +2235,7 @@ pub struct SecurityConfig {
     /// - All backends must use tls_mode = "reencrypt" or "passthrough" (no plaintext)
     /// - trusted_internal_cidrs must be empty
     /// - TLS require_client_cert must be true
-    /// - admin.hmac_secret must be set (bearer-only admin auth is insufficient)
+    /// - admin.hmac_secret or admin.require_mtls must be set (bearer-only admin auth is insufficient)
     ///
     /// Startup aborts if any constraint is violated.
     #[serde(default)]
@@ -3551,6 +3566,21 @@ fn ends_with_ignore_ascii_case(haystack: &str, suffix: &str) -> bool {
 }
 
 impl ProxyConfig {
+    /// `[admin]` with its TLS paths filled from `[tls]` where it names none.
+    pub fn admin_resolved(&self) -> AdminConfig {
+        let mut admin = self.admin.clone();
+        admin
+            .tls_cert_path
+            .get_or_insert_with(|| self.tls.cert_path.clone());
+        admin
+            .tls_key_path
+            .get_or_insert_with(|| self.tls.key_path.clone());
+        if admin.client_ca_path.is_none() {
+            admin.client_ca_path = self.tls.ca_cert_path.clone();
+        }
+        admin
+    }
+
     /// How the listeners ask for client certificates: required of every
     /// client when `tls.require_client_cert` is set; requested but optional
     /// when only some routes need one, so the TLS layer still carries the
@@ -3757,11 +3787,14 @@ impl ProxyConfig {
             ));
         }
 
-        // Config conflict: admin require_mtls (not yet implemented)
-        if self.admin.require_mtls {
+        // Admin mTLS needs a CA to verify client certificates against.
+        if self.admin.require_mtls
+            && self.admin.client_ca_path.is_none()
+            && self.tls.ca_cert_path.is_none()
+        {
             return Err(anyhow::anyhow!(
-                "admin.require_mtls = true is not yet implemented. \
-                 Remove this setting to start the proxy."
+                "admin.require_mtls = true but neither admin.client_ca_path nor \
+                 tls.ca_cert_path is set. Provide the CA that issues admin client certificates."
             ));
         }
 

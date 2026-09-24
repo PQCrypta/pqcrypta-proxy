@@ -1183,34 +1183,38 @@ pub mod openssl_pqc {
         builder: &mut openssl::ssl::SslContextBuilder,
         pqc_provider: &PqcTlsProvider,
     ) {
-        // ── A+ Key Exchange: 192-bit minimum ──────────────────────────────────
-        // X25519MLKEM768 first (PQC hybrid, ~256-bit).
-        // P-384 (secp384r1, 192-bit) only for classical fallback.
-        // P-256 and X25519 are excluded: both are 128-bit and score 90% on SSL Labs.
-        // Clients offering only a secp256r1 or X25519 key_share will receive HRR
-        // requesting secp384r1 — all major TLS 1.3 stacks support it.
-        if pqc_provider.is_available() {
-            let pqc_options = [
-                "X25519MLKEM768:P-384",
-                "X25519-MLKEM768:P-384",
-                "ML-KEM-768:P-384",
-                "MLKEM768:P-384",
-            ];
-            let mut configured = false;
-            for groups in pqc_options {
-                if builder.set_groups_list(groups).is_ok() {
-                    info!("TLS named groups configured: {}", groups);
-                    configured = true;
-                    break;
+        // ── Key exchange: the groups `[pqc]` asks for ─────────────────────────
+        // `groups_string` is built from preferred_kem, require_hybrid and
+        // fallback_to_classical against the KEMs OpenSSL reports. It used to be
+        // logged and then ignored: this applied a fixed "X25519MLKEM768:P-384",
+        // so all three settings did nothing and the log described groups that
+        // were never offered. Each name is kept only if the linked libssl
+        // accepts it, so a group the probe binary knows and the library does
+        // not is dropped rather than failing the whole list -- and no fallback
+        // can quietly put back a classical group require_hybrid removed.
+        // X25519 and P-256 are never offered here (128-bit; 90% on SSL Labs).
+        let configured = pqc_provider.groups_string();
+        let mut accepted: Vec<&str> = Vec::new();
+        if pqc_provider.is_available() && !configured.is_empty() {
+            for group in configured.split(':') {
+                if builder.set_groups_list(group).is_ok() {
+                    accepted.push(group);
+                } else {
+                    info!(
+                        "TLS group {} is not a TLS group in the linked OpenSSL; not offered",
+                        group
+                    );
                 }
             }
-            if !configured {
-                let _ = builder.set_groups_list("P-384");
-                info!("TLS named groups configured (classical fallback): P-384");
-            }
+        }
+        let groups = if accepted.is_empty() {
+            "P-384".to_string()
         } else {
-            let _ = builder.set_groups_list("P-384");
-            info!("TLS named groups configured (no PQC): P-384");
+            accepted.join(":")
+        };
+        match builder.set_groups_list(&groups) {
+            Ok(()) => info!("TLS named groups configured: {}", groups),
+            Err(e) => warn!("Failed to set TLS groups {}: {}", groups, e),
         }
 
         // ── A+ Cipher Strength: 256-bit TLS 1.3 ciphers only ─────────────────

@@ -8,12 +8,27 @@ use crate::crypto::{ActiveKeyExchange, CompletedKeyExchange, SharedSecret, Suppo
 use crate::ffdhe_groups::FfdheGroup;
 use crate::{Error, NamedGroup, ProtocolVersion};
 
+/// ML-KEM at one parameter set: 768 on its own and inside X25519MLKEM768 and
+/// SecP256r1MLKEM768, 1024 on its own and inside SecP384r1MLKEM1024.
 #[derive(Debug)]
-pub(crate) struct MlKem768;
+pub(crate) struct MlKem {
+    pub(crate) algorithm: &'static kem::Algorithm<kem::AlgorithmId>,
+    pub(crate) name: NamedGroup,
+}
 
-impl SupportedKxGroup for MlKem768 {
+pub(crate) static MLKEM768_PARAMS: MlKem = MlKem {
+    algorithm: &kem::ML_KEM_768,
+    name: NamedGroup::MLKEM768,
+};
+
+pub(crate) static MLKEM1024_PARAMS: MlKem = MlKem {
+    algorithm: &kem::ML_KEM_1024,
+    name: NamedGroup::MLKEM1024,
+};
+
+impl SupportedKxGroup for MlKem {
     fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, Error> {
-        let decaps_key = kem::DecapsulationKey::generate(&kem::ML_KEM_768)
+        let decaps_key = kem::DecapsulationKey::generate(self.algorithm)
             .map_err(|_| Error::General("key generation failed".into()))?;
 
         let pub_key_bytes = decaps_key
@@ -24,11 +39,12 @@ impl SupportedKxGroup for MlKem768 {
         Ok(Box::new(Active {
             decaps_key: Box::new(decaps_key),
             encaps_key_bytes: Vec::from(pub_key_bytes.as_ref()),
+            name: self.name,
         }))
     }
 
     fn start_and_complete(&self, client_share: &[u8]) -> Result<CompletedKeyExchange, Error> {
-        let encaps_key = kem::EncapsulationKey::new(&kem::ML_KEM_768, client_share)
+        let encaps_key = kem::EncapsulationKey::new(self.algorithm, client_share)
             .map_err(|_| INVALID_KEY_SHARE)?;
 
         let (ciphertext, shared_secret) = encaps_key
@@ -47,7 +63,7 @@ impl SupportedKxGroup for MlKem768 {
     }
 
     fn name(&self) -> NamedGroup {
-        NamedGroup::MLKEM768
+        self.name
     }
 
     fn fips(&self) -> bool {
@@ -56,7 +72,7 @@ impl SupportedKxGroup for MlKem768 {
         // is FIPS-pending.  Some regulatory regimes (eg, FedRAMP rev 5 SC-13) allow
         // use of implementations in this state, as if they are already approved.
         //
-        // We follow this liberal interpretation, and say MlKem768 is FIPS-compliant
+        // We follow this liberal interpretation, and say ML-KEM is FIPS-compliant
         // if the underlying library is in FIPS mode.
         //
         // TODO: adjust the `fips()` function return type to allow more policies to
@@ -74,6 +90,7 @@ impl SupportedKxGroup for MlKem768 {
 struct Active {
     decaps_key: Box<kem::DecapsulationKey<kem::AlgorithmId>>,
     encaps_key_bytes: Vec<u8>,
+    name: NamedGroup,
 }
 
 impl ActiveKeyExchange for Active {
@@ -98,6 +115,6 @@ impl ActiveKeyExchange for Active {
     }
 
     fn group(&self) -> NamedGroup {
-        NamedGroup::MLKEM768
+        self.name
     }
 }

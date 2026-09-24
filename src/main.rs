@@ -518,10 +518,11 @@ async fn run() -> anyhow::Result<()> {
             zt_errors.push("tls.require_client_cert must be true in zero_trust_mode".to_string());
         }
 
-        // 4. Admin API must require proof-of-possession.
-        if config.admin.hmac_secret.is_none() {
+        // 4. Admin API must require proof-of-possession: a signed request
+        //    (hmac_secret) or a client certificate (require_mtls).
+        if config.admin.hmac_secret.is_none() && !config.admin.require_mtls {
             zt_errors.push(
-                "admin.hmac_secret must be set in zero_trust_mode; \
+                "admin.hmac_secret or admin.require_mtls must be set in zero_trust_mode; \
                  bearer-only admin auth is insufficient for zero-trust"
                     .to_string(),
             );
@@ -616,7 +617,10 @@ async fn run() -> anyhow::Result<()> {
     // The handshake below uses the same provider the listeners will use --
     // server_provider, less its ML-KEM groups when pqc.enabled is false -- so
     // what is attested is what serves.
-    let verify_provider = Arc::new(pqcrypta_proxy::tls::server_provider(config.pqc.enabled));
+    let verify_provider = Arc::new(pqcrypta_proxy::tls::server_provider(
+        config.pqc.enabled,
+        &config.pqc,
+    ));
     let tls13_only = config.tls.min_version == "1.3";
     let runtime = startup_verify::verify_runtime(verify_provider, tls13_only);
 
@@ -1079,7 +1083,7 @@ async fn run() -> anyhow::Result<()> {
     };
 
     let admin_server = AdminServer::new(
-        config.admin.clone(),
+        config.admin_resolved(),
         config_manager.clone(),
         tls_provider.clone(),
         backend_pool.clone(),

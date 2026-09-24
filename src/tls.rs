@@ -678,7 +678,7 @@ mod server_policy_tests {
     use rustls::{ClientConfig, ClientConnection, NamedGroup, ProtocolVersion, RootCertStore};
 
     use super::{is_post_quantum_group, server_provider, ServerTlsPolicy};
-    use crate::config::{ClientAuth, TlsConfig};
+    use crate::config::{ClientAuth, PqcConfig, TlsConfig};
     use crate::startup_verify::{pump_handshake, self_signed_pair, VERIFY_SNI};
 
     fn tls(min_version: &str) -> TlsConfig {
@@ -728,12 +728,12 @@ mod server_policy_tests {
 
     #[test]
     fn groups_follow_pqc_enabled() {
-        let on: Vec<_> = server_provider(true)
+        let on: Vec<_> = server_provider(true, &PqcConfig::default())
             .kx_groups
             .iter()
             .map(|g| g.name())
             .collect();
-        let off: Vec<_> = server_provider(false)
+        let off: Vec<_> = server_provider(false, &PqcConfig::default())
             .kx_groups
             .iter()
             .map(|g| g.name())
@@ -751,9 +751,112 @@ mod server_policy_tests {
         assert!(!on.contains(&NamedGroup::X25519) && !off.contains(&NamedGroup::X25519));
     }
 
+    fn groups(pqc: &PqcConfig) -> Vec<NamedGroup> {
+        server_provider(true, pqc)
+            .kx_groups
+            .iter()
+            .map(|g| g.name())
+            .collect()
+    }
+
+    /// Every hybrid the build implements is offered, the preferred one first,
+    /// and no pure ML-KEM group unless preferred_kem names it.
+    #[test]
+    fn every_hybrid_is_offered_preferred_first() {
+        let g = groups(&PqcConfig::default());
+        assert_eq!(g.first(), Some(&NamedGroup::X25519MLKEM768), "{g:?}");
+        for hybrid in [
+            NamedGroup::X25519MLKEM768,
+            NamedGroup::secp256r1MLKEM768,
+            NamedGroup::secp384r1MLKEM1024,
+        ] {
+            assert!(g.contains(&hybrid), "{hybrid:?} missing from {g:?}");
+        }
+        assert!(!g.contains(&NamedGroup::MLKEM768) && !g.contains(&NamedGroup::MLKEM1024));
+
+        let g = groups(&PqcConfig {
+            preferred_kem: "SecP384r1MLKEM1024".into(),
+            ..PqcConfig::default()
+        });
+        assert_eq!(g.first(), Some(&NamedGroup::secp384r1MLKEM1024), "{g:?}");
+
+        let g = groups(&PqcConfig {
+            preferred_kem: "ML-KEM-1024".into(),
+            ..PqcConfig::default()
+        });
+        assert_eq!(g.first(), Some(&NamedGroup::MLKEM1024), "{g:?}");
+    }
+
+    /// require_hybrid: hybrids only -- no classical group, no pure ML-KEM
+    /// even when preferred. fallback_to_classical false: no classical group.
+    #[test]
+    fn require_hybrid_and_fallback_shape_the_offer() {
+        let g = groups(&PqcConfig {
+            require_hybrid: true,
+            preferred_kem: "MLKEM1024".into(),
+            ..PqcConfig::default()
+        });
+        assert!(g.iter().all(|n| is_post_quantum_group(*n)), "{g:?}");
+        assert!(!g.contains(&NamedGroup::MLKEM1024), "{g:?}");
+
+        let g = groups(&PqcConfig {
+            fallback_to_classical: false,
+            ..PqcConfig::default()
+        });
+        assert!(g.iter().all(|n| is_post_quantum_group(*n)), "{g:?}");
+
+        let g = groups(&PqcConfig::default());
+        assert!(g.contains(&NamedGroup::secp384r1) && g.contains(&NamedGroup::secp256r1));
+    }
+
+    /// SecP384r1MLKEM1024 -- added to the vendored rustls -- completes a
+    /// handshake end to end.
+    #[test]
+    fn secp384r1_mlkem1024_negotiates() {
+        let policy = ServerTlsPolicy::from_config(
+            &tls("1.3"),
+            &PqcConfig::default(),
+            true,
+            ClientAuth::None,
+        )
+        .unwrap();
+        let (cert, key) = self_signed_pair().unwrap();
+        let server = policy
+            .builder()
+            .unwrap()
+            .with_single_cert(vec![cert.clone()], key)
+            .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let mut client_provider = rustls_post_quantum::provider();
+        client_provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::SECP384R1MLKEM1024];
+        let client = ClientConfig::builder_with_provider(Arc::new(client_provider))
+            .with_protocol_versions(TLS13)
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut client = ClientConnection::new(
+            Arc::new(client),
+            ServerName::try_from(VERIFY_SNI).unwrap().to_owned(),
+        )
+        .unwrap();
+        let mut server = rustls::ServerConnection::new(Arc::new(server)).unwrap();
+        pump_handshake(&mut client, &mut server).unwrap();
+        assert_eq!(
+            client.negotiated_key_exchange_group().unwrap().name(),
+            NamedGroup::secp384r1MLKEM1024
+        );
+    }
+
     #[test]
     fn pqc_enabled_negotiates_the_hybrid() {
-        let policy = ServerTlsPolicy::from_config(&tls("1.3"), true, ClientAuth::None).unwrap();
+        let policy = ServerTlsPolicy::from_config(
+            &tls("1.3"),
+            &PqcConfig::default(),
+            true,
+            ClientAuth::None,
+        )
+        .unwrap();
         assert!(policy.post_quantum);
         let (group, _) = negotiate(&policy, TLS13).unwrap();
         assert_eq!(group, NamedGroup::X25519MLKEM768);
@@ -764,7 +867,13 @@ mod server_policy_tests {
     /// that offered it.
     #[test]
     fn pqc_disabled_negotiates_classical_even_when_the_client_offers_the_hybrid() {
-        let policy = ServerTlsPolicy::from_config(&tls("1.3"), false, ClientAuth::None).unwrap();
+        let policy = ServerTlsPolicy::from_config(
+            &tls("1.3"),
+            &PqcConfig::default(),
+            false,
+            ClientAuth::None,
+        )
+        .unwrap();
         assert!(!policy.post_quantum);
         let (group, _) = negotiate(&policy, TLS13).unwrap();
         assert!(!is_post_quantum_group(group), "{group:?}");
@@ -775,14 +884,26 @@ mod server_policy_tests {
 
     #[test]
     fn min_version_1_3_refuses_tls_1_2() {
-        let policy = ServerTlsPolicy::from_config(&tls("1.3"), true, ClientAuth::None).unwrap();
+        let policy = ServerTlsPolicy::from_config(
+            &tls("1.3"),
+            &PqcConfig::default(),
+            true,
+            ClientAuth::None,
+        )
+        .unwrap();
         assert!(policy.tls13_only());
         assert!(negotiate(&policy, TLS12).is_err());
     }
 
     #[test]
     fn min_version_1_2_accepts_tls_1_2() {
-        let policy = ServerTlsPolicy::from_config(&tls("1.2"), true, ClientAuth::None).unwrap();
+        let policy = ServerTlsPolicy::from_config(
+            &tls("1.2"),
+            &PqcConfig::default(),
+            true,
+            ClientAuth::None,
+        )
+        .unwrap();
         assert!(!policy.tls13_only());
         let (group, version) = negotiate(&policy, TLS12).unwrap();
         assert_eq!(version, ProtocolVersion::TLSv1_2);
@@ -859,16 +980,34 @@ mod server_policy_tests {
             ca_cert_path: Some(file.path().to_path_buf()),
             ..tls("1.3")
         };
-        let policy = ServerTlsPolicy::from_config(&config, true, ClientAuth::Required).unwrap();
+        let policy = ServerTlsPolicy::from_config(
+            &config,
+            &PqcConfig::default(),
+            true,
+            ClientAuth::Required,
+        )
+        .unwrap();
         assert!(policy.client_verifier.is_some());
         assert!(negotiate(&policy, TLS13).is_err());
         // Requested -- some routes need one -- lets the same client finish the
         // handshake, for the route gate to refuse where it must.
-        let requested = ServerTlsPolicy::from_config(&config, true, ClientAuth::Requested).unwrap();
+        let requested = ServerTlsPolicy::from_config(
+            &config,
+            &PqcConfig::default(),
+            true,
+            ClientAuth::Requested,
+        )
+        .unwrap();
         assert!(requested.client_verifier.is_some());
         assert!(negotiate(&requested, TLS13).is_ok());
         // And without the setting the same client is served.
-        let open = ServerTlsPolicy::from_config(&tls("1.3"), true, ClientAuth::None).unwrap();
+        let open = ServerTlsPolicy::from_config(
+            &tls("1.3"),
+            &PqcConfig::default(),
+            true,
+            ClientAuth::None,
+        )
+        .unwrap();
         assert!(negotiate(&open, TLS13).is_ok());
     }
 }
@@ -913,6 +1052,34 @@ pub fn pq_chain_server_config(
         ),
         size,
     ))
+}
+
+/// The admin API's TLS under `[admin] require_mtls`.
+///
+/// TLS 1.3, every hybrid group preferred, and a client certificate from
+/// `client_ca` required of every connection. One certificate for every name:
+/// the admin API is reached by address as often as by name, and without SNI
+/// the per-domain resolver would have nothing to answer with.
+pub fn admin_server_config(
+    cert: &Path,
+    key: &Path,
+    client_ca: &Path,
+) -> anyhow::Result<RustlsServerConfig> {
+    let tls = TlsConfig {
+        min_version: "1.3".to_string(),
+        ca_cert_path: Some(client_ca.to_path_buf()),
+        pqc_session_tickets: false,
+        ..TlsConfig::default()
+    };
+    let policy =
+        ServerTlsPolicy::from_config(&tls, &PqcConfig::default(), true, ClientAuth::Required)?;
+    let key = load_certified_key(cert, key)
+        .with_context(|| format!("loading the admin certificate from {}", cert.display()))?;
+    let mut config = policy
+        .builder()?
+        .with_cert_resolver(Arc::new(SingleChain(Arc::new(key))));
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(config)
 }
 
 /// One chain for every name, because this port is about the chain.
@@ -980,22 +1147,73 @@ pub fn is_post_quantum_group(group: rustls::NamedGroup) -> bool {
     format!("{group:?}").to_ascii_uppercase().contains("MLKEM")
 }
 
-/// The server provider for a listener: [`build_pqc_provider`]'s groups and
-/// cipher order, less every ML-KEM group when post-quantum key exchange is off.
+/// True for a hybrid: ML-KEM combined with an elliptic-curve exchange, so a
+/// break of either alone is not enough.
+fn is_hybrid_group(group: rustls::NamedGroup) -> bool {
+    let name = format!("{group:?}").to_ascii_uppercase();
+    name.contains("MLKEM") && (name.contains("X25519") || name.contains("SECP"))
+}
+
+/// The server provider for a listener: every group this build implements,
+/// shaped by `[pqc]`, with [`build_pqc_provider`]'s cipher order.
 ///
-/// Classical here means the elliptic-curve groups the post-quantum policy
-/// keeps as fallbacks, so turning PQC off removes the hybrid and changes
-/// nothing else. Which of them a handshake uses is the client's choice: rustls
-/// takes the first group in the client's list that the server also offers, so
-/// the order here decides nothing, and a classical client that lists
-/// secp256r1 first gets secp256r1.
-pub fn server_provider(post_quantum: bool) -> CryptoProvider {
+/// - `pqc.enabled` false (or the provider unavailable): the classical groups
+///   alone.
+/// - Otherwise every hybrid -- X25519MLKEM768, SecP256r1MLKEM768 and
+///   SecP384r1MLKEM1024 -- with `preferred_kem` first. A pure ML-KEM group is
+///   offered only when `preferred_kem` names it, and never under
+///   `require_hybrid`.
+/// - The classical fallback stays unless `require_hybrid` is set or
+///   `fallback_to_classical` is false.
+///
+/// Classical means secp384r1 and secp256r1. X25519 is not offered on any
+/// listener. secp256r1 is kept here although the OpenSSL listener refuses it:
+/// RFC 8446 makes it the one group every TLS 1.3 implementation must support,
+/// and QUIC stacks such as picotls offer nothing else classical.
+///
+/// Before this read `[pqc]` at all, `preferred_kem`, `require_hybrid` and
+/// `fallback_to_classical` shaped a group list the OpenSSL listener logged and
+/// never applied, and this provider ignored them.
+///
+/// Which group a handshake uses is the client's choice: rustls takes the first
+/// group in the client's list that the server also offers, so the order here
+/// matters to clients built from this provider, not to the server.
+pub fn server_provider(post_quantum: bool, pqc: &PqcConfig) -> CryptoProvider {
     let mut provider = build_pqc_provider();
-    if !post_quantum {
-        provider
-            .kx_groups
-            .retain(|g| !is_post_quantum_group(g.name()));
-    }
+    let norm = |s: &str| s.to_ascii_lowercase().replace(['-', '_'], "");
+    let preferred = norm(&pqc.preferred_kem);
+    let is_preferred =
+        |g: rustls::NamedGroup| !preferred.is_empty() && norm(&format!("{g:?}")) == preferred;
+    let keep_classical = !post_quantum || (pqc.fallback_to_classical && !pqc.require_hybrid);
+
+    let mut groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup> =
+        rustls::crypto::aws_lc_rs::ALL_KX_GROUPS
+            .iter()
+            .copied()
+            .filter(|g| {
+                let name = g.name();
+                if name == rustls::NamedGroup::X25519 {
+                    return false;
+                }
+                if !is_post_quantum_group(name) {
+                    return keep_classical;
+                }
+                post_quantum
+                    && (is_hybrid_group(name) || (is_preferred(name) && !pqc.require_hybrid))
+            })
+            .collect();
+    groups.sort_by_key(|g| {
+        let name = g.name();
+        match () {
+            _ if is_preferred(name) => 0u8,
+            _ if name == rustls::NamedGroup::X25519MLKEM768 => 1,
+            _ if is_hybrid_group(name) => 2,
+            _ if is_post_quantum_group(name) => 3,
+            _ if name == rustls::NamedGroup::secp384r1 => 4,
+            _ => 5,
+        }
+    });
+    provider.kx_groups = groups;
     provider
 }
 
@@ -1054,10 +1272,17 @@ impl ServerTlsPolicy {
     /// `ProxyConfig::client_auth`.
     pub fn from_config(
         tls: &TlsConfig,
+        pqc: &PqcConfig,
         post_quantum: bool,
         client_auth: ClientAuth,
     ) -> anyhow::Result<Self> {
-        let provider = Arc::new(server_provider(post_quantum));
+        let provider = Arc::new(server_provider(post_quantum, pqc));
+        if provider.kx_groups.is_empty() {
+            return Err(anyhow::anyhow!(
+                "[pqc] leaves no key exchange group to offer: pqc.enabled is false but \
+                 no classical group is available"
+            ));
+        }
         let versions = if tls.min_version == "1.3" {
             TLS13_ONLY
         } else {
@@ -1509,6 +1734,7 @@ impl TlsProvider {
         // in its own list that this server offers.
         let policy = ServerTlsPolicy::from_config(
             tls_config,
+            pqc_config,
             pqc_config.enabled && pqc_available,
             client_auth,
         )?;

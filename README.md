@@ -1635,7 +1635,11 @@ require_pqc_provider = true    # refuse to start if our own PQC provider is brok
 
 These two were one flag until they were split, and the split matters because they answer different questions.
 
-`fallback_to_classical` is **client compatibility**: whether a classical group (P-384, 192-bit) is offered alongside the hybrid PQC groups. X25519 and P-256 are refused regardless. With it off, a client with no ML-KEM support cannot complete a handshake at all — on this deployment that measurably includes curl built against quictls, third-party uptime monitoring and several crawlers, all of which reach the site today over P-384. It is a live lockout, not a posture setting. `require_hybrid = true` states the same lockout deliberately.
+These settings shape the groups on **every** listener, TCP and QUIC alike. With PQC enabled the offer is every hybrid the TLS stack implements — X25519MLKEM768, SecP256r1MLKEM768 and SecP384r1MLKEM1024 on both OpenSSL and rustls (the last added to the vendored rustls) — with `preferred_kem` first. The OpenSSL list is checked name by name against the linked library, and a KEM with no TLS group codepoint (X448MLKEM1024 in OpenSSL 3.5) is left out rather than failing the list. A pure ML-KEM group is offered only when `preferred_kem` names it, and never under `require_hybrid`. X25519 is never offered. The classical fallback is P-384 on the OpenSSL (TCP) listener and P-384 plus P-256 on rustls (QUIC, and TCP when the OpenSSL provider is unavailable): RFC 8446 makes P-256 the one group every TLS 1.3 implementation must support, and QUIC stacks such as picotls offer nothing else classical. With `pqc.enabled = false` only the classical groups are offered.
+
+Until 2026-09-24 the OpenSSL listener logged the group list these settings produced and applied a fixed `X25519MLKEM768:P-384`, and the QUIC listener ignored them — so `preferred_kem`, `require_hybrid` and `fallback_to_classical` did nothing, and `pqc.enabled = false` still negotiated the hybrid on HTTP/3.
+
+`fallback_to_classical` is **client compatibility**: whether the classical fallback is offered alongside the hybrid PQC groups. With it off, a client with no ML-KEM support cannot complete a handshake at all — on this deployment that measurably includes curl built against quictls, third-party uptime monitoring and several crawlers, all of which reach the site today over P-384. It is a live lockout, not a posture setting. `require_hybrid = true` states the same lockout deliberately.
 
 `require_pqc_provider` is **our own posture**: what happens when PQC is enabled and its provider cannot be used. It defaults to refusing to start. Previously the only way to fail closed here was to turn off `fallback_to_classical`, which also cut off every non-PQC client — so the safe choice carried a price nobody wanted to pay, and the unsafe one was the default.
 
@@ -2187,7 +2191,7 @@ describes the rig and the traps it guards against.
 - [x] Environment config overlay (`--env <name>` merges `config.<name>.toml` over base)
 - [x] Config schema versioning (warns on absent version; errors on future version)
 - [x] Admin API non-loopback warning (WARN when bind_address is not loopback)
-- [x] `require_mtls = true` hard startup error (prevents false sense of security — mTLS not yet implemented on admin listener)
+- [x] `[admin] require_mtls = true` serves the admin API over TLS 1.3 with a required client certificate (it used to be a hard startup error, because the listener had no TLS)
 - [x] Backend topology not disclosed in logs (resolved host:port pairs removed from startup output)
 - [x] Loopback-only trust for `is_trusted_ip()` (RFC1918 not trusted by default — closes XFF bypass)
 - [x] Graceful shutdown drain polling (100 ms poll loop exits when connections reach zero — no fixed sleep)
@@ -2202,13 +2206,53 @@ describes the rig and the traps it guards against.
 
 ### mTLS Configuration
 
+Whether a client is asked for a certificate is decided once from the
+configuration and applied on every listener — HTTP/1.1, HTTP/2 and HTTP/3,
+whichever TLS stack serves them:
+
+- **`require_client_cert = true`** — every client must present one; the
+  handshake fails without it.
+- **A route that needs one** — `internal = true`, or
+  `[routes.security] mtls_required = true` on any route — with no global
+  requirement: the listeners ask for a certificate, a client may still finish
+  the handshake without one, and the route answers it `401`. Other routes are
+  unaffected, and no client is asked when no route needs a certificate, so
+  browsers are not shown a certificate picker for nothing.
+- **Neither** — not asked.
+
+Both of the first two need `ca_cert_path`; the proxy refuses to start without
+it rather than accept any publicly issued certificate. The route gate reads
+`x-client-cert`, which only the accept loop sets — any copy a client sends is
+stripped on every listener.
+
 ```toml
 [tls]
 ca_cert_path = "/etc/pqcrypta/client-ca.pem"
-require_client_cert = true
+require_client_cert = true          # every client, every route
+# ...or leave it false and mark the routes that need one:
 
+[[routes]]
+name = "internal-api"
+internal = true                     # mTLS by default; opt out with [routes.security] mtls_required = false
+```
+
+The admin API takes the same protection on its own listener. With
+`require_mtls = true` it serves TLS 1.3 only, prefers the hybrid groups, and
+requires a client certificate issued by `client_ca_path` (default:
+`tls.ca_cert_path`); the certificate is then the credential, and `auth_token`
+is still checked when set. Because the listener is encrypted and
+authenticated, `require_loopback` no longer applies to it, and in
+`zero_trust_mode` a required client certificate satisfies the admin
+proof-of-possession requirement as `hmac_secret` does.
+
+```toml
 [admin]
+enabled = true
+bind_address = "10.0.0.5"           # reachable from the management network
+port = 8082
 require_mtls = true
+client_ca_path = "/etc/pqcrypta/admin-ca.pem"
+# tls_cert_path / tls_key_path default to [tls] cert_path / key_path
 ```
 
 ## Admin API Authentication

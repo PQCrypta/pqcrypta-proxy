@@ -1104,6 +1104,7 @@ pub async fn run_http_listener(
     let _ = key_path; // keys are resolved per domain from the certificate directory
     let policy = crate::tls::ServerTlsPolicy::from_config(
         &config.tls,
+        &config.pqc,
         config.pqc.enabled,
         config.client_auth(),
     )?;
@@ -1388,6 +1389,7 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
     };
     let policy = crate::tls::ServerTlsPolicy::from_config(
         &config.tls,
+        &config.pqc,
         config.pqc.enabled,
         config.client_auth(),
     )?;
