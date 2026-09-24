@@ -73,6 +73,20 @@ enable_quic_migration = true
 # that do not support it. Default: true.
 enable_ack_frequency = true
 
+# Ack-eliciting packets accepted before an ACK-only packet is sent. 1 is
+# RFC 9000's "every other packet"; below it an owed ACK rides on the next packet
+# sent for any other reason (ack_piggyback). 0 acknowledges every packet at once.
+ack_eliciting_threshold = 1
+
+# Carry owed ACKs on packets being sent anyway, so a response acknowledges the
+# request it answers. Without it a lone request's ACK waits max_ack_delay
+# (25 ms) and the client will not start its next request until it arrives.
+ack_piggyback = true
+
+# Let responses that finish together on one connection leave in one transmit:
+# the connection driver yields past the runtime's next I/O poll before sending.
+quic_send_coalescing = true
+
 # Enable QUIC Retry for explicit source-address validation (RFC 9000 §8.1.2).
 # A new, unvalidated connection is answered with a Retry token that the client
 # must echo before the handshake proceeds, proving it controls the address it

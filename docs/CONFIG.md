@@ -51,6 +51,9 @@ Complete reference for all configuration options in PQCrypta Proxy.
 | `worker_threads` | usize | `0` | Worker threads (0 = auto-detect based on CPU cores) |
 | `enable_quic_migration` | bool | `true` | Enable QUIC connection migration (RFC 9000 §9) |
 | `enable_ack_frequency` | bool | `true` | Enable the QUIC ACK Frequency extension (draft-ietf-quic-ack-frequency) — fewer, batched ACKs on high-throughput connections |
+| `ack_eliciting_threshold` | u64 | `1` | Ack-eliciting QUIC packets accepted before an ACK-only packet is sent (1 = every other packet, RFC 9000). Below it, owed ACKs ride on outgoing packets when `ack_piggyback` is on; 0 acknowledges every packet immediately |
+| `ack_piggyback` | bool | `true` | Carry owed QUIC ACKs on any packet already being sent, so a response acknowledges the request it answers rather than the ACK waiting out `max_ack_delay` (25 ms) |
+| `quic_send_coalescing` | bool | `true` | The QUIC connection driver yields past the runtime's next I/O poll before transmitting, so responses that finish together leave in one transmit (measured 2.08 → ~1.3 datagrams per request at 100 connections) |
 
 ---
 
