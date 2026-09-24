@@ -24,7 +24,7 @@ use rustls::version::{TLS12, TLS13};
 use rustls_pki_types::pem::PemObject;
 use tracing::{debug, info, warn};
 
-use crate::config::{PqcConfig, TlsConfig};
+use crate::config::{ClientAuth, PqcConfig, TlsConfig};
 
 // ── SNI-based per-domain certificate resolver ────────────────────────────────
 
@@ -162,10 +162,12 @@ pub fn load_certified_key(
         }
     }
 
-    // Create a signing key using the installed crypto provider
-    let provider = CryptoProvider::get_default()
-        .ok_or_else(|| anyhow::anyhow!("No rustls CryptoProvider installed"))?;
-    let signing_key = provider
+    // Load the signing key with the provider every listener is built on rather
+    // than the process default. Nothing guarantees a default is installed:
+    // with pqc.enabled false nothing installs one on purpose, and keys loaded
+    // only because some earlier `ServerConfig::builder()` call happened to
+    // install rustls's crate default as a side effect.
+    let signing_key = build_pqc_provider()
         .key_provider
         .load_private_key(private_key)
         .map_err(|e| anyhow::anyhow!("Cannot load signing key from {:?}: {}", key_path, e))?;
@@ -422,6 +424,8 @@ pub struct TlsProvider {
     last_cert_modified: RwLock<Option<SystemTime>>,
     /// PQC availability status
     pqc_available: RwLock<bool>,
+    /// Whether clients are asked for a certificate; see `ProxyConfig::client_auth`.
+    client_auth: ClientAuth,
     /// SNI cert resolver — shared across all listeners
     pub resolver: Arc<MultiDomainCertResolver>,
 }
@@ -666,6 +670,209 @@ mod chain_size_tests {
     }
 }
 
+#[cfg(test)]
+mod server_policy_tests {
+    use std::sync::Arc;
+
+    use rustls::pki_types::ServerName;
+    use rustls::{ClientConfig, ClientConnection, NamedGroup, ProtocolVersion, RootCertStore};
+
+    use super::{is_post_quantum_group, server_provider, ServerTlsPolicy};
+    use crate::config::{ClientAuth, TlsConfig};
+    use crate::startup_verify::{pump_handshake, self_signed_pair, VERIFY_SNI};
+
+    fn tls(min_version: &str) -> TlsConfig {
+        TlsConfig {
+            min_version: min_version.to_string(),
+            ..TlsConfig::default()
+        }
+    }
+
+    /// Handshake a client against `policy` in memory and report what was
+    /// agreed. The client offers the hybrid and every classical group, as
+    /// OpenSSL 3.5 and current browsers do, so the server's policy is what
+    /// decides.
+    fn negotiate(
+        policy: &ServerTlsPolicy,
+        client_versions: &[&'static rustls::SupportedProtocolVersion],
+    ) -> anyhow::Result<(NamedGroup, ProtocolVersion)> {
+        let (cert, key) = self_signed_pair()?;
+        let server = policy
+            .builder()?
+            .with_single_cert(vec![cert.clone()], key)?;
+        let mut roots = RootCertStore::empty();
+        roots.add(cert)?;
+        let client = ClientConfig::builder_with_provider(Arc::new(rustls_post_quantum::provider()))
+            .with_protocol_versions(client_versions)?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut client = ClientConnection::new(
+            Arc::new(client),
+            ServerName::try_from(VERIFY_SNI)?.to_owned(),
+        )?;
+        let mut server = rustls::ServerConnection::new(Arc::new(server))?;
+        pump_handshake(&mut client, &mut server)?;
+        Ok((
+            client
+                .negotiated_key_exchange_group()
+                .ok_or_else(|| anyhow::anyhow!("no group"))?
+                .name(),
+            client
+                .protocol_version()
+                .ok_or_else(|| anyhow::anyhow!("no version"))?,
+        ))
+    }
+
+    const TLS13: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
+    const TLS12: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS12];
+
+    #[test]
+    fn groups_follow_pqc_enabled() {
+        let on: Vec<_> = server_provider(true)
+            .kx_groups
+            .iter()
+            .map(|g| g.name())
+            .collect();
+        let off: Vec<_> = server_provider(false)
+            .kx_groups
+            .iter()
+            .map(|g| g.name())
+            .collect();
+        assert_eq!(on.first(), Some(&NamedGroup::X25519MLKEM768));
+        assert!(off.iter().all(|g| !is_post_quantum_group(*g)), "{off:?}");
+        assert_eq!(off.first(), Some(&NamedGroup::secp384r1));
+        // Turning PQC off removes the hybrid and nothing else.
+        let on_classical: Vec<_> = on
+            .iter()
+            .copied()
+            .filter(|g| !is_post_quantum_group(*g))
+            .collect();
+        assert_eq!(on_classical, off);
+        assert!(!on.contains(&NamedGroup::X25519) && !off.contains(&NamedGroup::X25519));
+    }
+
+    #[test]
+    fn pqc_enabled_negotiates_the_hybrid() {
+        let policy = ServerTlsPolicy::from_config(&tls("1.3"), true, ClientAuth::None).unwrap();
+        assert!(policy.post_quantum);
+        let (group, _) = negotiate(&policy, TLS13).unwrap();
+        assert_eq!(group, NamedGroup::X25519MLKEM768);
+    }
+
+    /// The defect this policy exists for: with pqc.enabled false the QUIC and
+    /// rustls TCP listeners still negotiated X25519MLKEM768 with any client
+    /// that offered it.
+    #[test]
+    fn pqc_disabled_negotiates_classical_even_when_the_client_offers_the_hybrid() {
+        let policy = ServerTlsPolicy::from_config(&tls("1.3"), false, ClientAuth::None).unwrap();
+        assert!(!policy.post_quantum);
+        let (group, _) = negotiate(&policy, TLS13).unwrap();
+        assert!(!is_post_quantum_group(group), "{group:?}");
+        // The client's first classical group the server offers: this client
+        // lists secp256r1 ahead of secp384r1, and X25519 is never offered.
+        assert_eq!(group, NamedGroup::secp256r1);
+    }
+
+    #[test]
+    fn min_version_1_3_refuses_tls_1_2() {
+        let policy = ServerTlsPolicy::from_config(&tls("1.3"), true, ClientAuth::None).unwrap();
+        assert!(policy.tls13_only());
+        assert!(negotiate(&policy, TLS12).is_err());
+    }
+
+    #[test]
+    fn min_version_1_2_accepts_tls_1_2() {
+        let policy = ServerTlsPolicy::from_config(&tls("1.2"), true, ClientAuth::None).unwrap();
+        assert!(!policy.tls13_only());
+        let (group, version) = negotiate(&policy, TLS12).unwrap();
+        assert_eq!(version, ProtocolVersion::TLSv1_2);
+        // ML-KEM is TLS 1.3 only, so a 1.2 handshake is classical.
+        assert!(!is_post_quantum_group(group));
+    }
+
+    /// The QUIC listener's config, built the way the listener builds it, over
+    /// a TLS handshake: the rustls `ServerConfig` QUIC wraps is where the group
+    /// is chosen, so this is the HTTP/3 half of the defect.
+    #[test]
+    fn quic_config_honours_pqc_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec![VERIFY_SNI.to_string()]).unwrap();
+        std::fs::write(
+            dir.path().join(format!("{VERIFY_SNI}.crt")),
+            cert.cert.pem(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(format!("{VERIFY_SNI}.key")),
+            cert.signing_key.serialize_pem(),
+        )
+        .unwrap();
+        let resolver = Arc::new(super::MultiDomainCertResolver::new(dir.path()).unwrap());
+        let der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
+
+        for enabled in [true, false] {
+            let pqc = crate::config::PqcConfig {
+                enabled,
+                ..crate::config::PqcConfig::default()
+            };
+            let server = super::TlsProvider::create_rustls_config_with_resolver(
+                &tls("1.3"),
+                &pqc,
+                true,
+                ClientAuth::None,
+                resolver.clone(),
+            )
+            .unwrap();
+            let mut roots = RootCertStore::empty();
+            roots.add(der.clone()).unwrap();
+            let client =
+                ClientConfig::builder_with_provider(Arc::new(rustls_post_quantum::provider()))
+                    .with_protocol_versions(TLS13)
+                    .unwrap()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth();
+            let mut client = ClientConnection::new(
+                Arc::new(client),
+                ServerName::try_from(VERIFY_SNI).unwrap().to_owned(),
+            )
+            .unwrap();
+            let mut server = rustls::ServerConnection::new(Arc::new(server)).unwrap();
+            pump_handshake(&mut client, &mut server).unwrap();
+            let group = client.negotiated_key_exchange_group().unwrap().name();
+            assert_eq!(
+                is_post_quantum_group(group),
+                enabled,
+                "pqc.enabled = {enabled}: {group:?}"
+            );
+        }
+    }
+
+    /// `require_client_cert` refuses a client that presents none. The rustls
+    /// TCP listeners used to build with no client authentication at all.
+    #[test]
+    fn require_client_cert_refuses_a_client_without_one() {
+        let ca = rcgen::generate_simple_self_signed(vec!["client-ca.invalid".to_string()]).unwrap();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, ca.cert.pem().as_bytes()).unwrap();
+        let config = TlsConfig {
+            require_client_cert: true,
+            ca_cert_path: Some(file.path().to_path_buf()),
+            ..tls("1.3")
+        };
+        let policy = ServerTlsPolicy::from_config(&config, true, ClientAuth::Required).unwrap();
+        assert!(policy.client_verifier.is_some());
+        assert!(negotiate(&policy, TLS13).is_err());
+        // Requested -- some routes need one -- lets the same client finish the
+        // handshake, for the route gate to refuse where it must.
+        let requested = ServerTlsPolicy::from_config(&config, true, ClientAuth::Requested).unwrap();
+        assert!(requested.client_verifier.is_some());
+        assert!(negotiate(&requested, TLS13).is_ok());
+        // And without the setting the same client is served.
+        let open = ServerTlsPolicy::from_config(&tls("1.3"), true, ClientAuth::None).unwrap();
+        assert!(negotiate(&open, TLS13).is_ok());
+    }
+}
+
 /// A config that serves the post-quantum certificate chain, for the one
 /// conformance port whose subject is the certificate rather than the key
 /// exchange.
@@ -765,9 +972,179 @@ fn prefer_256_bit_aeads(provider: &mut rustls::crypto::CryptoProvider) {
     });
 }
 
+/// True for a group whose key exchange includes ML-KEM, alone or in a hybrid.
+///
+/// Read off the name rather than listed, so a hybrid added to rustls later is
+/// classified without anyone remembering to add it here.
+pub fn is_post_quantum_group(group: rustls::NamedGroup) -> bool {
+    format!("{group:?}").to_ascii_uppercase().contains("MLKEM")
+}
+
+/// The server provider for a listener: [`build_pqc_provider`]'s groups and
+/// cipher order, less every ML-KEM group when post-quantum key exchange is off.
+///
+/// Classical here means the elliptic-curve groups the post-quantum policy
+/// keeps as fallbacks, so turning PQC off removes the hybrid and changes
+/// nothing else. Which of them a handshake uses is the client's choice: rustls
+/// takes the first group in the client's list that the server also offers, so
+/// the order here decides nothing, and a classical client that lists
+/// secp256r1 first gets secp256r1.
+pub fn server_provider(post_quantum: bool) -> CryptoProvider {
+    let mut provider = build_pqc_provider();
+    if !post_quantum {
+        provider
+            .kx_groups
+            .retain(|g| !is_post_quantum_group(g.name()));
+    }
+    provider
+}
+
+static TLS13_ONLY: &[&rustls::SupportedProtocolVersion] = &[&TLS13];
+static TLS12_AND_TLS13: &[&rustls::SupportedProtocolVersion] = &[&TLS12, &TLS13];
+
+/// What every rustls listener's TLS is built from: the key-exchange groups,
+/// protocol versions, client authentication and session tickets the
+/// configuration asks for.
+///
+/// Each listener used to decide these for itself, and they decided
+/// differently. The QUIC listener offered X25519MLKEM768 whether or not
+/// `pqc.enabled` was set. The rustls TCP listeners took rustls's crate
+/// defaults, which prefer the hybrid as well, accept TLS 1.2 whatever
+/// `tls.min_version` says, never ask for a client certificate and issue no
+/// PQC-sealed tickets. The OpenSSL listener fixed TLS 1.3 and never asked for
+/// a client certificate either. A setting honoured on one transport and
+/// ignored on the next is one nobody can rely on, and for `require_client_cert`
+/// that is a hole rather than a surprise: the startup probe could report mTLS
+/// as not enforced, but nothing enforced it.
+pub struct ServerTlsPolicy {
+    /// Groups and cipher suites; see [`server_provider`].
+    pub provider: Arc<CryptoProvider>,
+    /// From `tls.min_version`: TLS 1.3 alone, or 1.2 and 1.3.
+    pub versions: &'static [&'static rustls::SupportedProtocolVersion],
+    /// From [`ClientAuth`] and `tls.ca_cert_path`.
+    pub client_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+    /// Whether the provider offers an ML-KEM group.
+    pub post_quantum: bool,
+    pqc_session_tickets: bool,
+    session_ticket_lifetime_secs: u32,
+}
+
+impl std::fmt::Debug for ServerTlsPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerTlsPolicy")
+            .field(
+                "groups",
+                &self
+                    .provider
+                    .kx_groups
+                    .iter()
+                    .map(|g| g.name())
+                    .collect::<Vec<_>>(),
+            )
+            .field("tls13_only", &self.tls13_only())
+            .field("client_auth", &self.client_verifier.is_some())
+            .field("pqc_session_tickets", &self.pqc_session_tickets)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ServerTlsPolicy {
+    /// Build the policy. `post_quantum` is `pqc.enabled`, and false as well
+    /// when the post-quantum provider is unavailable; `client_auth` is
+    /// `ProxyConfig::client_auth`.
+    pub fn from_config(
+        tls: &TlsConfig,
+        post_quantum: bool,
+        client_auth: ClientAuth,
+    ) -> anyhow::Result<Self> {
+        let provider = Arc::new(server_provider(post_quantum));
+        let versions = if tls.min_version == "1.3" {
+            TLS13_ONLY
+        } else {
+            TLS12_AND_TLS13
+        };
+        let client_verifier = if client_auth == ClientAuth::None {
+            None
+        } else {
+            let roots = TlsProvider::load_client_ca(&tls.ca_cert_path)?;
+            let builder = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(roots),
+                provider.clone(),
+            );
+            // Requested: a client without a certificate still completes the
+            // handshake, and the route gate refuses it where one is needed.
+            let builder = if client_auth == ClientAuth::Requested {
+                builder.allow_unauthenticated()
+            } else {
+                builder
+            };
+            Some(
+                builder
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("Failed to create client verifier: {}", e))?,
+            )
+        };
+        Ok(Self {
+            post_quantum: provider
+                .kx_groups
+                .iter()
+                .any(|g| is_post_quantum_group(g.name())),
+            provider,
+            versions,
+            client_verifier,
+            pqc_session_tickets: tls.pqc_session_tickets,
+            session_ticket_lifetime_secs: tls.session_ticket_lifetime_secs,
+        })
+    }
+
+    /// True when TLS 1.2 is refused.
+    pub fn tls13_only(&self) -> bool {
+        !self
+            .versions
+            .iter()
+            .any(|v| v.version == rustls::ProtocolVersion::TLSv1_2)
+    }
+
+    /// A `ServerConfig` builder carrying the provider, versions and client
+    /// authentication, ready for a certificate or resolver.
+    pub fn builder(
+        &self,
+    ) -> anyhow::Result<rustls::ConfigBuilder<RustlsServerConfig, rustls::server::WantsServerCert>>
+    {
+        let with_versions = RustlsServerConfig::builder_with_provider(self.provider.clone())
+            .with_protocol_versions(self.versions)
+            .map_err(|e| anyhow::anyhow!("Failed to set protocol versions: {}", e))?;
+        Ok(match &self.client_verifier {
+            Some(v) => with_versions.with_client_cert_verifier(v.clone()),
+            None => with_versions.with_no_client_auth(),
+        })
+    }
+
+    /// Install the ML-KEM-1024 session ticketer when `tls.pqc_session_tickets`
+    /// asks for it. Refuses rather than falls back: an operator who asked for
+    /// PQC-protected resumption must not silently get none.
+    pub fn apply_tickets(&self, config: &mut RustlsServerConfig) -> anyhow::Result<()> {
+        if self.pqc_session_tickets {
+            let ticketer = crate::pqc_tickets::PqcTicketer::new(self.session_ticket_lifetime_secs)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "pqc_session_tickets is enabled but the ticketer could not start: {}",
+                        e
+                    )
+                })?;
+            config.ticketer = Arc::new(ticketer);
+        }
+        Ok(())
+    }
+}
+
 impl TlsProvider {
     /// Create a new TLS provider with initial configuration
-    pub fn new(tls_config: &TlsConfig, pqc_config: &PqcConfig) -> anyhow::Result<Self> {
+    pub fn new(
+        tls_config: &TlsConfig,
+        pqc_config: &PqcConfig,
+        client_auth: ClientAuth,
+    ) -> anyhow::Result<Self> {
         // Check PQC availability
         let pqc_available = if pqc_config.enabled {
             Self::check_pqc_availability(pqc_config)
@@ -791,6 +1168,7 @@ impl TlsProvider {
             tls_config,
             pqc_config,
             pqc_available,
+            client_auth,
             Arc::clone(&resolver),
         )?;
         let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
@@ -805,6 +1183,7 @@ impl TlsProvider {
             pqc_config: RwLock::new(pqc_config.clone()),
             last_cert_modified: RwLock::new(cert_modified),
             pqc_available: RwLock::new(pqc_available),
+            client_auth,
             resolver,
         })
     }
@@ -893,6 +1272,7 @@ impl TlsProvider {
             &tls_config,
             &pqc_config,
             pqc_available,
+            self.client_auth,
             Arc::clone(&self.resolver),
         )?;
         let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
@@ -1117,93 +1497,39 @@ impl TlsProvider {
         tls_config: &TlsConfig,
         pqc_config: &PqcConfig,
         pqc_available: bool,
+        client_auth: ClientAuth,
         resolver: Arc<MultiDomainCertResolver>,
     ) -> anyhow::Result<RustlsServerConfig> {
-        // Build the base PQC-aware crypto provider. Shared with the startup
-        // verification handshake so that what is verified is what serves — a
-        // separately-constructed provider could drift from this one and make the
-        // attestation describe a stack nothing uses.
-        let pq_provider = build_pqc_provider();
-
-        // ── A+ Key Exchange ───────────────────────────────────────────────────
-        // NOTE: TLS_AES_128_GCM_SHA256 is intentionally kept in rustls cipher suites.
-        // QUIC (RFC 9001) requires it for initial packet protection; removing it
-        // causes QuicServerConfig creation to fail. The 256-bit cipher restriction
-        // for HTTP/1.1 and HTTP/2 (what SSL Labs tests) is handled by the OpenSSL
-        // stack via apply_pqc_groups() in pqc_tls.rs.
-        // Remove X25519 (128-bit / ~3072-bit RSA equivalent → 90% SSL Labs score).
-        // Clients that offer only an X25519 key_share receive HelloRetryRequest
-        // and fall back to secp384r1 (192-bit → 100%). secp256r1 is kept as a
-        // last-resort fallback since RFC 8446 mandates all TLS 1.3 implementations
-        // support it.  Preferred order: X25519MLKEM768 (PQC) → secp384r1 → secp256r1.
-        if pqc_config.enabled && pqc_available {
-            info!("Using rustls-post-quantum crypto provider with X25519MLKEM768 (PQC enabled)");
-        } else {
-            info!("Using rustls-post-quantum crypto provider (PQC fallback to classical)");
-        }
+        // Groups, versions, client authentication and tickets come from the one
+        // policy every rustls listener builds from -- see ServerTlsPolicy.
+        //
+        // TLS_AES_128_GCM_SHA256 stays in the suite list: QUIC (RFC 9001) needs
+        // it for Initial packet protection. X25519 is not offered; a client whose
+        // only key_share is X25519 gets a HelloRetryRequest for the first group
+        // in its own list that this server offers.
+        let policy = ServerTlsPolicy::from_config(
+            tls_config,
+            pqc_config.enabled && pqc_available,
+            client_auth,
+        )?;
         info!(
             "TLS (QUIC/HTTP3) cipher suites: {} — named groups: {:?}",
-            pq_provider.cipher_suites.len(),
-            pq_provider
+            policy.provider.cipher_suites.len(),
+            policy
+                .provider
                 .kx_groups
                 .iter()
                 .map(|g| g.name())
                 .collect::<Vec<_>>()
         );
-
-        let crypto_provider = Arc::new(pq_provider);
-
-        // Create base configuration with the appropriate crypto provider
-        // SEC-01: Enforce the configured minimum TLS version instead of accepting
-        // the rustls safe-default range (which includes TLS 1.2).
-        let protocol_versions: &[&rustls::SupportedProtocolVersion] =
-            if tls_config.min_version == "1.3" {
-                info!("TLS min_version = 1.3 — disabling TLS 1.2");
-                &[&TLS13]
-            } else {
-                info!("TLS min_version = 1.2 — allowing TLS 1.2 and 1.3");
-                &[&TLS12, &TLS13]
-            };
-
-        let mut config = if tls_config.require_client_cert {
-            // mTLS configuration
-            let client_ca = Self::load_client_ca(&tls_config.ca_cert_path)?;
-            let client_auth = rustls::server::WebPkiClientVerifier::builder(Arc::new(client_ca))
-                .build()
-                .map_err(|e| anyhow::anyhow!("Failed to create client verifier: {}", e))?;
-
-            RustlsServerConfig::builder_with_provider(crypto_provider)
-                .with_protocol_versions(protocol_versions)
-                .map_err(|e| anyhow::anyhow!("Failed to set protocol versions: {}", e))?
-                .with_client_cert_verifier(client_auth)
-                .with_cert_resolver(resolver)
+        if policy.tls13_only() {
+            info!("TLS min_version = 1.3 — disabling TLS 1.2");
         } else {
-            // Standard TLS configuration with SNI per-domain cert resolver
-            RustlsServerConfig::builder_with_provider(crypto_provider)
-                .with_protocol_versions(protocol_versions)
-                .map_err(|e| anyhow::anyhow!("Failed to set protocol versions: {}", e))?
-                .with_no_client_auth()
-                .with_cert_resolver(resolver)
-        };
-
-        // Install the ML-KEM-1024 session ticketer when configured. rustls
-        // issues no tickets without one, so this is what makes TLS 1.3
-        // resumption available at all — pqc_session_tickets used to describe a
-        // ticketer that did not exist.
-        if tls_config.pqc_session_tickets {
-            match crate::pqc_tickets::PqcTicketer::new(tls_config.session_ticket_lifetime_secs) {
-                Ok(ticketer) => config.ticketer = Arc::new(ticketer),
-                Err(e) => {
-                    // Refuse rather than fall back to no tickets: an operator
-                    // who asked for PQC-protected resumption must not silently
-                    // get none.
-                    return Err(anyhow::anyhow!(
-                        "pqc_session_tickets is enabled but the ticketer could not start: {}",
-                        e
-                    ));
-                }
-            }
+            info!("TLS min_version = 1.2 — allowing TLS 1.2 and 1.3");
         }
+
+        let mut config = policy.builder()?.with_cert_resolver(resolver);
+        policy.apply_tickets(&mut config)?;
 
         // Configure ALPN protocols
         config.alpn_protocols = tls_config

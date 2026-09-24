@@ -204,6 +204,14 @@ pub(super) struct H3ConnHeaders {
     pub(super) ja3: Option<HeaderValue>,
     pub(super) ja4: Option<HeaderValue>,
     pub(super) client_name: Option<HeaderValue>,
+    /// Whether the client presented a certificate the handshake verified --
+    /// `x-client-cert`, which per-route mTLS enforcement reads. Never set on
+    /// this transport before, so an mTLS route refused every HTTP/3 client,
+    /// including one that had authenticated.
+    pub(super) client_cert: bool,
+    /// `x-pqc-enabled`: whether this handshake was post-quantum, as the TCP
+    /// listeners report it.
+    pub(super) pqc_enabled: HeaderValue,
     /// The Host value forwarded to the backend, for the first host this
     /// connection asked for. A connection nearly always asks for one host;
     /// another one is simply built per request.
@@ -215,8 +223,15 @@ impl H3ConnHeaders {
         config: &ProxyConfig,
         remote_addr: SocketAddr,
         fingerprint: &crate::fingerprint::FingerprintResult,
+        handshake: &crate::tls_acceptor::HandshakeFacts,
+        client_cert: bool,
     ) -> Self {
         let value = |s: Option<&str>| s.and_then(|s| HeaderValue::from_str(s).ok());
+        let pqc = handshake
+            .kex_group
+            .as_deref()
+            .and_then(crate::pqc_tls::PqcKemAlgorithm::from_str)
+            .is_some();
         Self {
             static_headers: build_static_response_headers(config),
             alt_svc: HeaderValue::from_str(&build_alt_svc_header_over_quic(config)).ok(),
@@ -224,6 +239,8 @@ impl H3ConnHeaders {
             ja3: value(fingerprint.ja3_hash.as_deref()),
             ja4: value(fingerprint.ja4_hash.as_deref()),
             client_name: value(fingerprint.client_name.as_deref()),
+            client_cert,
+            pqc_enabled: HeaderValue::from_static(if pqc { "true" } else { "false" }),
             host: std::sync::OnceLock::new(),
         }
     }
@@ -1068,7 +1085,20 @@ impl QuicListener {
 
         // Built once for the connection rather than once per request; see
         // `H3ConnHeaders`.
-        let conn_headers = Arc::new(H3ConnHeaders::new(&config, remote_addr, &fingerprint));
+        let client_cert = quic_connection
+            .peer_identity()
+            .and_then(|id| {
+                id.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                    .ok()
+            })
+            .is_some_and(|certs| !certs.is_empty());
+        let conn_headers = Arc::new(H3ConnHeaders::new(
+            &config,
+            remote_addr,
+            &fingerprint,
+            &handshake,
+            client_cert,
+        ));
 
         // Every ordinary request becomes its own task. One definition for both
         // places that dispatch one: the plain-request fast path below and an
@@ -1724,7 +1754,13 @@ mod alt_svc_tests {
             classification: None,
             client_name: None,
         };
-        let h = H3ConnHeaders::new(&c, "192.0.2.1:50000".parse().unwrap(), &fp);
+        let h = H3ConnHeaders::new(
+            &c,
+            "192.0.2.1:50000".parse().unwrap(),
+            &fp,
+            &crate::tls_acceptor::HandshakeFacts::default(),
+            false,
+        );
         assert_eq!(h.alt_svc(&c, Some("ssllabs.pqcrypta.com")), "clear");
         assert_ne!(h.alt_svc(&c, Some("pqcrypta.com")), "clear");
         assert_ne!(h.alt_svc(&c, None), "clear");

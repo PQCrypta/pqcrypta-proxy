@@ -81,6 +81,7 @@ impl WebTransportServer {
             &config.tls,
             &config.pqc,
             config.pqc.enabled,
+            config.client_auth(),
             resolver,
         )
         .map_err(|e| {

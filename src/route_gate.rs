@@ -217,23 +217,18 @@ fn http11_gate(cx: &GateContext<'_>) -> Option<GateOutcome> {
     None
 }
 
-/// Internal-route mTLS enforcement.
+/// Per-route mTLS enforcement: `[routes.security] mtls_required`, which
+/// defaults to true on an `internal = true` route and false elsewhere.
+///
+/// It used to run for internal routes only, so `mtls_required = true` on any
+/// other route -- documented as "Require mTLS for this route" -- did nothing.
 ///
 /// `x-client-cert` is set exclusively by the TLS accept loop, stripped from any
 /// client-supplied copy, so it cannot be forged. A transport that cannot present
 /// a client certificate therefore fails this closed, which is the intent: an
-/// internal route is not reachable from a transport that cannot authenticate.
+/// mTLS route is not reachable from a transport that cannot authenticate.
 fn mtls_gate(cx: &GateContext<'_>) -> Option<GateOutcome> {
-    if !cx.route.internal {
-        return None;
-    }
-    let mtls_required = cx
-        .route
-        .security
-        .as_ref()
-        .and_then(|s| s.mtls_required)
-        .unwrap_or(true); // default true when internal = true
-    if !mtls_required {
+    if !cx.route.requires_client_cert() {
         return None;
     }
 
@@ -245,7 +240,7 @@ fn mtls_gate(cx: &GateContext<'_>) -> Option<GateOutcome> {
         .unwrap_or(false);
     if !client_cert_present {
         warn!(
-            "Internal route {:?} rejected request from {}: no client certificate",
+            "mTLS route {:?} rejected request from {}: no client certificate",
             cx.route.name, cx.client_ip
         );
         return refuse(StatusCode::UNAUTHORIZED);
@@ -440,6 +435,43 @@ mod tests {
         let store = HmacNonceStore::new(300);
         let safe: Vec<String> = vec![];
         assert!(status_of(&evaluate(&ctx(&r, &h, &store, "GET", &safe))).is_none());
+    }
+
+    /// `mtls_required` on a route that is not internal. The gate used to run
+    /// for internal routes only, so this setting did nothing.
+    #[test]
+    fn mtls_required_applies_to_any_route() {
+        let mut r = route();
+        r.security = Some(crate::config::RouteSecurityPolicy {
+            mtls_required: Some(true),
+            ..Default::default()
+        });
+        assert!(r.requires_client_cert());
+        let store = HmacNonceStore::new(300);
+        let safe: Vec<String> = vec![];
+        let none = HeaderMap::new();
+        assert_eq!(
+            status_of(&evaluate(&ctx(&r, &none, &store, "GET", &safe))),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        let mut with = HeaderMap::new();
+        with.insert("x-client-cert", HeaderValue::from_static("1"));
+        assert!(status_of(&evaluate(&ctx(&r, &with, &store, "GET", &safe))).is_none());
+    }
+
+    /// An internal route may opt out explicitly.
+    #[test]
+    fn internal_route_can_opt_out_of_mtls() {
+        let mut r = route();
+        r.internal = true;
+        r.security = Some(crate::config::RouteSecurityPolicy {
+            mtls_required: Some(false),
+            ..Default::default()
+        });
+        assert!(!r.requires_client_cert());
+        let store = HmacNonceStore::new(300);
+        let safe: Vec<String> = vec![];
+        assert!(status_of(&evaluate(&ctx(&r, &HeaderMap::new(), &store, "GET", &safe))).is_none());
     }
 
     /// Early data on a route that did not opt in is 425, per RFC 8470.

@@ -31,93 +31,50 @@ pub(super) fn load_private_key_from_pem(
     .into())
 }
 
-/// Build rustls server configuration using the per-domain SNI cert resolver.
-/// Loads all `{domain}.crt` / `{domain}.key` pairs from the certs directory.
-pub(super) fn build_rustls_server_config(
+/// ALPN for a TCP listener: HTTP/2 and HTTP/1.1, or HTTP/1.1 alone for the
+/// hosts in `http11_only_hosts`, so a browser opens independent connections per
+/// `fetch()` rather than coalescing them onto one HTTP/2 pipe.
+pub(super) const ALPN_H2_HTTP11: &[&[u8]] = &[b"h2", b"http/1.1"];
+pub(super) const ALPN_HTTP11: &[&[u8]] = &[b"http/1.1"];
+
+/// A per-domain SNI resolver over the directory `cert_path` sits in, loading
+/// every `{domain}.crt` / `{domain}.key` pair, for a listener that is not given
+/// the shared one.
+pub(super) fn private_resolver(
     cert_path: &str,
-    _key_path: &str,
-) -> Result<rustls::ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<
+    std::sync::Arc<crate::tls::MultiDomainCertResolver>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     use std::path::Path;
 
     let certs_dir = Path::new(cert_path)
         .parent()
         .unwrap_or_else(|| Path::new("/etc/pqcrypta/certs"));
-
     let resolver = crate::tls::MultiDomainCertResolver::new(certs_dir).map_err(|e| {
         format!(
             "Failed to build SNI cert resolver from {:?}: {}",
             certs_dir, e
         )
     })?;
-
-    let mut config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_cert_resolver(std::sync::Arc::new(resolver));
-
-    // Set ALPN protocols for HTTP/2 and HTTP/1.1 negotiation
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    config.ech = crate::ech_config::load();
-    crate::cert_compression::apply(&mut config);
-
-    Ok(config)
+    Ok(std::sync::Arc::new(resolver))
 }
 
-/// Build a rustls ServerConfig that advertises only HTTP/1.1 (no h2).
+/// A rustls `ServerConfig` for a TCP listener.
 ///
-/// Used for hostnames in `http11_only_hosts` so browsers open independent
-/// TCP connections per fetch() rather than coalescing onto one HTTP/2 pipe.
-pub(super) fn build_rustls_server_config_http11_only(
-    cert_path: &str,
-    _key_path: &str,
-) -> Result<rustls::ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
-    use std::path::Path;
-
-    let certs_dir = Path::new(cert_path)
-        .parent()
-        .unwrap_or_else(|| Path::new("/etc/pqcrypta/certs"));
-
-    let resolver = crate::tls::MultiDomainCertResolver::new(certs_dir).map_err(|e| {
-        format!(
-            "Failed to build SNI cert resolver from {:?}: {}",
-            certs_dir, e
-        )
-    })?;
-
-    let mut config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_cert_resolver(std::sync::Arc::new(resolver));
-
-    // HTTP/1.1 only — browser cannot coalesce streams onto a single TCP pipe
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    config.ech = crate::ech_config::load();
-    crate::cert_compression::apply(&mut config);
-
-    Ok(config)
-}
-
-/// Build a rustls ServerConfig using an already-constructed shared SNI resolver.
-/// The resolver is shared with the ACME subsystem so hot-reloaded certs are
-/// served immediately without restarting the TLS listener.
-pub(super) fn build_rustls_server_config_with_resolver(
+/// Groups, protocol versions, client authentication and session tickets come
+/// from `policy`, which the QUIC listener builds from too. These listeners used
+/// `ServerConfig::builder()` -- rustls's crate defaults -- so `pqc.enabled`,
+/// `tls.min_version`, `tls.require_client_cert` and `tls.pqc_session_tickets`
+/// each had no effect here while taking effect on HTTP/3.
+pub(super) fn build_rustls_server_config(
+    policy: &crate::tls::ServerTlsPolicy,
     resolver: std::sync::Arc<crate::tls::MultiDomainCertResolver>,
+    alpn: &[&[u8]],
 ) -> Result<rustls::ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_cert_resolver(resolver);
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    config.ech = crate::ech_config::load();
-    crate::cert_compression::apply(&mut config);
-    Ok(config)
-}
-
-/// Like `build_rustls_server_config_with_resolver` but advertises only HTTP/1.1.
-pub(super) fn build_rustls_server_config_http11_only_with_resolver(
-    resolver: std::sync::Arc<crate::tls::MultiDomainCertResolver>,
-) -> Result<rustls::ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_cert_resolver(resolver);
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let mut config = policy.builder()?.with_cert_resolver(resolver);
+    policy.apply_tickets(&mut config)?;
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     config.ech = crate::ech_config::load();
     crate::cert_compression::apply(&mut config);
     Ok(config)

@@ -42,7 +42,7 @@ use tracing::{error, info, warn};
 /// `.invalid` is reserved by RFC 2606 and can never resolve, so this name cannot
 /// collide with a real certificate or be mistaken for a deployment domain if it
 /// appears in a log.
-const VERIFY_SNI: &str = "startup-verify.invalid";
+pub(crate) const VERIFY_SNI: &str = "startup-verify.invalid";
 
 /// Key exchange groups that provide post-quantum security.
 ///
@@ -161,6 +161,33 @@ fn run_handshake(
     let mut server =
         ServerConnection::new(Arc::new(server_config)).context("server: connection setup")?;
 
+    pump_handshake(&mut client, &mut server)?;
+
+    let group = client
+        .negotiated_key_exchange_group()
+        .map(|g| format!("{:?}", g.name()))
+        .ok_or_else(|| anyhow!("handshake completed but reported no key exchange group"))?;
+    let version = client
+        .protocol_version()
+        .map(|v| format!("{v:?}"))
+        .unwrap_or_else(|| "unknown".to_string());
+    let suite = client
+        .negotiated_cipher_suite()
+        .map(|s| format!("{:?}", s.suite()))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    Ok((group, version, suite))
+}
+
+/// Move a client and server through their handshake in memory: bytes from
+/// whichever side wants to write, until neither is handshaking.
+///
+/// Shared by the startup verification and the TLS policy tests, so both drive a
+/// handshake the same way.
+pub(crate) fn pump_handshake(
+    client: &mut ClientConnection,
+    server: &mut ServerConnection,
+) -> Result<()> {
     // Pump bytes between the two until neither wants to send. Bounded so a provider bug
     // cannot spin startup forever: a TLS 1.3 handshake needs a handful of flights, and
     // anything beyond this is a malfunction rather than a slow negotiation.
@@ -204,27 +231,14 @@ fn run_handshake(
         ));
     }
 
-    let group = client
-        .negotiated_key_exchange_group()
-        .map(|g| format!("{:?}", g.name()))
-        .ok_or_else(|| anyhow!("handshake completed but reported no key exchange group"))?;
-    let version = client
-        .protocol_version()
-        .map(|v| format!("{v:?}"))
-        .unwrap_or_else(|| "unknown".to_string());
-    let suite = client
-        .negotiated_cipher_suite()
-        .map(|s| format!("{:?}", s.suite()))
-        .unwrap_or_else(|| "unknown".to_string());
-
-    Ok((group, version, suite))
+    Ok(())
 }
 
 /// A throwaway certificate for the verification handshake.
 ///
 /// Generated per start and never written to disk: it exists for the duration of one
 /// in-memory handshake and is not an identity the proxy ever presents to a peer.
-fn self_signed_pair() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
+pub(crate) fn self_signed_pair() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
     let cert = rcgen::generate_simple_self_signed(vec![VERIFY_SNI.to_string()])?;
     let der = CertificateDer::from(cert.cert.der().to_vec());
     let key = PrivateKeyDer::try_from(cert.signing_key.serialize_der())
@@ -887,9 +901,12 @@ impl rustls::client::danger::ServerCertVerifier for ProbeVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::CryptoProvider::get_default()
-            .map(|p| p.signature_verification_algorithms.supported_schemes())
-            .unwrap_or_default()
+        // Our provider rather than the process default, which nothing
+        // guarantees is installed; with none, this probe offered no schemes
+        // and every handshake it attempted failed.
+        crate::tls::build_pqc_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 

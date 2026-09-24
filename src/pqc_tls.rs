@@ -16,7 +16,7 @@ use std::process::Command;
 use parking_lot::RwLock;
 use tracing::{error, info, warn};
 
-use crate::config::PqcConfig;
+use crate::config::{ClientAuth, PqcConfig, TlsConfig};
 
 /// Supported PQC KEM algorithms
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +158,47 @@ pub struct PqcTlsProvider {
     status: RwLock<PqcStatus>,
     /// Configured groups string for OpenSSL
     groups_string: RwLock<String>,
+    /// `[tls]` settings the OpenSSL contexts apply; see [`OpensslTlsSettings`].
+    tls_settings: OpensslTlsSettings,
+}
+
+/// The `[tls]` settings every OpenSSL context this provider builds applies.
+///
+/// The OpenSSL listener fixed TLS 1.3 and never asked for a client
+/// certificate, whatever `tls.min_version` and `tls.require_client_cert` said,
+/// while the QUIC listener honoured both. These are the same two settings
+/// `crate::tls::ServerTlsPolicy` carries for the rustls listeners.
+#[derive(Debug, Clone)]
+pub struct OpensslTlsSettings {
+    /// `tls.min_version == "1.3"`.
+    pub tls13_only: bool,
+    /// Whether clients are asked for a certificate; see `ProxyConfig::client_auth`.
+    pub client_auth: ClientAuth,
+    /// `tls.ca_cert_path`: the CA client certificates are verified against, or
+    /// `None` for the system roots.
+    pub client_ca: Option<std::path::PathBuf>,
+}
+
+impl Default for OpensslTlsSettings {
+    /// TLS 1.3 only, no client authentication: what the contexts did before
+    /// they read the configuration.
+    fn default() -> Self {
+        Self {
+            tls13_only: true,
+            client_auth: ClientAuth::None,
+            client_ca: None,
+        }
+    }
+}
+
+impl OpensslTlsSettings {
+    pub fn from_config(tls: &TlsConfig, client_auth: ClientAuth) -> Self {
+        Self {
+            tls13_only: tls.min_version == "1.3",
+            client_auth,
+            client_ca: tls.ca_cert_path.clone(),
+        }
+    }
 }
 
 impl PqcTlsProvider {
@@ -174,11 +215,24 @@ impl PqcTlsProvider {
                 error: None,
             }),
             groups_string: RwLock::new(String::new()),
+            tls_settings: OpensslTlsSettings::default(),
         };
 
         // Initialize and check availability
         provider.initialize();
         provider
+    }
+
+    /// Apply the `[tls]` settings to every context this provider builds.
+    #[must_use]
+    pub fn with_tls_settings(mut self, tls: &TlsConfig, client_auth: ClientAuth) -> Self {
+        self.tls_settings = OpensslTlsSettings::from_config(tls, client_auth);
+        self
+    }
+
+    /// The `[tls]` settings the OpenSSL contexts apply.
+    pub fn tls_settings(&self) -> &OpensslTlsSettings {
+        &self.tls_settings
     }
 
     /// Initialize the PQC provider
@@ -586,8 +640,9 @@ impl PqcTlsProvider {
 #[cfg(feature = "pqc")]
 pub mod openssl_pqc {
     use super::{PqcHandshakeInfo, PqcKemAlgorithm, PqcTlsProvider};
+    use crate::config::ClientAuth;
     use foreign_types::ForeignTypeRef;
-    use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVersion};
+    use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
     use parking_lot::RwLock;
     use std::collections::HashMap;
     use std::path::Path;
@@ -751,18 +806,76 @@ pub mod openssl_pqc {
         }
     }
 
+    /// TLS 1.2 suites when `tls.min_version` allows 1.2: ECDHE with a 256-bit
+    /// AEAD only, the TLS 1.2 counterpart of the 1.3 suites set in
+    /// `apply_pqc_groups`.
+    const TLS12_CIPHERS: &str = "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:\
+                                 ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305";
+
+    /// Apply the provider's `[tls]` settings -- minimum version and client
+    /// authentication -- to one context. Called for the default context and
+    /// for every per-domain SNI context, because a handshake that switches
+    /// context on SNI verifies against the context it switched to.
+    fn apply_tls_settings(
+        builder: &mut openssl::ssl::SslContextBuilder,
+        pqc_provider: &PqcTlsProvider,
+    ) -> Result<(), String> {
+        let settings = pqc_provider.tls_settings();
+        let min = if settings.tls13_only {
+            SslVersion::TLS1_3
+        } else {
+            SslVersion::TLS1_2
+        };
+        builder
+            .set_min_proto_version(Some(min))
+            .map_err(|e| format!("Failed to set TLS version: {}", e))?;
+        if !settings.tls13_only {
+            builder
+                .set_cipher_list(TLS12_CIPHERS)
+                .map_err(|e| format!("Failed to set TLS 1.2 cipher list: {}", e))?;
+        }
+        if settings.client_auth != ClientAuth::None {
+            match &settings.client_ca {
+                Some(path) => {
+                    builder
+                        .set_ca_file(path)
+                        .map_err(|e| format!("Failed to load client CA {:?}: {}", path, e))?;
+                    let names = openssl::x509::X509Name::load_client_ca_file(path)
+                        .map_err(|e| format!("Failed to read client CA names {:?}: {}", path, e))?;
+                    builder.set_client_ca_list(names);
+                }
+                None => builder
+                    .set_default_verify_paths()
+                    .map_err(|e| format!("Failed to load system roots for client auth: {}", e))?,
+            }
+            // Requested: ask, verify what is presented, but let a client with
+            // none finish the handshake -- the route gate refuses it where one
+            // is needed.
+            builder.set_verify(if settings.client_auth == ClientAuth::Required {
+                SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT
+            } else {
+                SslVerifyMode::PEER
+            });
+        }
+        Ok(())
+    }
+
     pub fn create_pqc_acceptor(
         cert_path: &Path,
         key_path: &Path,
         pqc_provider: &PqcTlsProvider,
     ) -> Result<SslAcceptor, String> {
-        let mut builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls_server())
-            .map_err(|e| format!("Failed to create SSL acceptor: {}", e))?;
+        // Mozilla's modern profile is TLS 1.3 only; intermediate adds 1.2,
+        // whose suites apply_tls_settings then narrows to 256-bit AEADs.
+        let mut builder = if pqc_provider.tls_settings().tls13_only {
+            SslAcceptor::mozilla_modern_v5(SslMethod::tls_server())
+        } else {
+            SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())
+        }
+        .map_err(|e| format!("Failed to create SSL acceptor: {}", e))?;
 
-        // Set minimum TLS version to 1.3 (required for ML-KEM)
-        builder
-            .set_min_proto_version(Some(SslVersion::TLS1_3))
-            .map_err(|e| format!("Failed to set TLS version: {}", e))?;
+        // ML-KEM needs TLS 1.3, so a 1.2 handshake is classical (P-384).
+        apply_tls_settings(&mut builder, pqc_provider)?;
 
         // Load certificate chain (includes intermediate certificates)
         builder
@@ -893,11 +1006,13 @@ pub mod openssl_pqc {
         use openssl::ssl::NameType;
 
         // Build the main acceptor with the default cert
-        let mut builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls_server())
-            .map_err(|e| format!("Failed to create SSL acceptor: {}", e))?;
-        builder
-            .set_min_proto_version(Some(SslVersion::TLS1_3))
-            .map_err(|e| format!("Failed to set TLS version: {}", e))?;
+        let mut builder = if pqc_provider.tls_settings().tls13_only {
+            SslAcceptor::mozilla_modern_v5(SslMethod::tls_server())
+        } else {
+            SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())
+        }
+        .map_err(|e| format!("Failed to create SSL acceptor: {}", e))?;
+        apply_tls_settings(&mut builder, pqc_provider)?;
         builder
             .set_certificate_chain_file(default_cert_path)
             .map_err(|e| format!("Failed to load default certificate chain: {}", e))?;
@@ -965,9 +1080,7 @@ pub mod openssl_pqc {
         use openssl::ssl::SslMethod;
         let mut builder = openssl::ssl::SslContext::builder(SslMethod::tls_server())
             .map_err(|e| format!("Failed to create SslContext builder: {}", e))?;
-        builder
-            .set_min_proto_version(Some(SslVersion::TLS1_3))
-            .map_err(|e| format!("Failed to set TLS version: {}", e))?;
+        apply_tls_settings(&mut builder, pqc_provider)?;
         builder
             .set_certificate_chain_file(cert_path)
             .map_err(|e| format!("Failed to load cert {:?}: {}", cert_path, e))?;
@@ -1023,9 +1136,7 @@ pub mod openssl_pqc {
         use openssl::ssl::SslMethod;
         let mut builder = openssl::ssl::SslContext::builder(SslMethod::tls_server())
             .map_err(|e| format!("Failed to create SslContext builder: {}", e))?;
-        builder
-            .set_min_proto_version(Some(SslVersion::TLS1_3))
-            .map_err(|e| format!("Failed to set TLS version: {}", e))?;
+        apply_tls_settings(&mut builder, pqc_provider)?;
         builder
             .set_certificate_chain_file(cert_path)
             .map_err(|e| format!("Failed to load cert {:?}: {}", cert_path, e))?;

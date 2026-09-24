@@ -374,6 +374,19 @@ impl Default for WafConfig {
     }
 }
 
+/// Whether the TLS listeners ask the client for a certificate; see
+/// [`ProxyConfig::client_auth`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientAuth {
+    /// Not requested.
+    None,
+    /// Requested; a client without one still completes the handshake, and the
+    /// route gate refuses it on the routes that need one.
+    Requested,
+    /// Required of every client at the handshake.
+    Required,
+}
+
 /// Per-route security policy override
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RouteSecurityPolicy {
@@ -1838,6 +1851,15 @@ pub struct RouteConfig {
 }
 
 impl RouteConfig {
+    /// Whether requests to this route must come with a client certificate:
+    /// `security.mtls_required`, defaulting to `internal`.
+    pub fn requires_client_cert(&self) -> bool {
+        self.security
+            .as_ref()
+            .and_then(|s| s.mtls_required)
+            .unwrap_or(self.internal)
+    }
+
     /// Whether this route rewrites backend Set-Cookie headers at all.
     pub fn rewrites_set_cookie(&self) -> bool {
         self.enforce_cookie_security
@@ -3529,6 +3551,24 @@ fn ends_with_ignore_ascii_case(haystack: &str, suffix: &str) -> bool {
 }
 
 impl ProxyConfig {
+    /// How the listeners ask for client certificates: required of every
+    /// client when `tls.require_client_cert` is set; requested but optional
+    /// when only some routes need one, so the TLS layer still carries the
+    /// certificate to the route gate that decides; not requested otherwise.
+    ///
+    /// Without the middle case a route with `mtls_required` could never be
+    /// satisfied unless every route required a certificate: no listener asked
+    /// for one, so no client ever sent one.
+    pub fn client_auth(&self) -> ClientAuth {
+        if self.tls.require_client_cert {
+            ClientAuth::Required
+        } else if self.routes.iter().any(RouteConfig::requires_client_cert) {
+            ClientAuth::Requested
+        } else {
+            ClientAuth::None
+        }
+    }
+
     /// Validate the configuration
     /// Fold `server.max_request_body_bytes` into the limit that is actually
     /// enforced (`security.max_request_size`).
@@ -3698,6 +3738,22 @@ impl ProxyConfig {
             return Err(anyhow::anyhow!(
                 "tls.require_client_cert = true but tls.ca_cert_path is not set. \
                  Provide a CA certificate path to verify client certificates."
+            ));
+        }
+        // The same for a route that needs one: without a CA the listeners would
+        // verify against the system roots, and any publicly issued certificate
+        // would satisfy the route.
+        if self.client_auth() == ClientAuth::Requested && self.tls.ca_cert_path.is_none() {
+            let routes: Vec<&str> = self
+                .routes
+                .iter()
+                .filter(|r| r.requires_client_cert())
+                .map(|r| r.name.as_deref().unwrap_or("(unnamed)"))
+                .collect();
+            return Err(anyhow::anyhow!(
+                "route(s) {} require a client certificate (mtls_required, or internal = true) \
+                 but tls.ca_cert_path is not set. Provide the CA that issues them.",
+                routes.join(", ")
             ));
         }
 

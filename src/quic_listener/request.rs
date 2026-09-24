@@ -116,9 +116,10 @@ impl QuicListener {
             ];
             let h = request.headers_mut();
             // Room for what is inserted below — up to five handshake values,
-            // the protocol, three fingerprint values and the client type — so
-            // the map h3 built to the request's exact size is not regrown.
-            h.reserve(10);
+            // the protocol, three fingerprint values, the client type, the
+            // client-certificate flag and the PQC flag — so the map h3 built to
+            // the request's exact size is not regrown.
+            h.reserve(12);
             // A request carries a handful of headers and almost never one of
             // these, so look at its own names first: that is a few short
             // comparisons, where removing unconditionally was eight hashed
@@ -154,6 +155,16 @@ impl QuicListener {
                     HeaderValue::from_static("browser"),
                 );
             }
+            if conn_headers.client_cert {
+                h.insert(
+                    HeaderName::from_static("x-client-cert"),
+                    HeaderValue::from_static("1"),
+                );
+            }
+            h.insert(
+                HeaderName::from_static("x-pqc-enabled"),
+                conn_headers.pqc_enabled.clone(),
+            );
         }
 
         let uri = request.uri();

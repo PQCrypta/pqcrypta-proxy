@@ -91,10 +91,7 @@ use layers::{
     trace_context_middleware,
 };
 use speedtest_tcp::{tcp_upload_cors_preflight, tcp_upload_measure_handler};
-use tls_config::{
-    build_rustls_server_config, build_rustls_server_config_http11_only,
-    build_rustls_server_config_http11_only_with_resolver, build_rustls_server_config_with_resolver,
-};
+use tls_config::{build_rustls_server_config, private_resolver, ALPN_H2_HTTP11, ALPN_HTTP11};
 use websocket::handle_websocket_tunnel;
 
 /// HTTP listener state
@@ -248,6 +245,124 @@ where
         if let Some(peer) = self.peer {
             req.extensions_mut().insert(ProxiedPeer(peer));
         }
+        self.inner.call(req)
+    }
+}
+
+/// What a TLS stream reports once its handshake is done.
+pub(crate) trait HandshakeSource {
+    fn handshake_facts(&self) -> crate::tls_acceptor::HandshakeFacts;
+    fn client_cert_present(&self) -> bool;
+}
+
+impl<T> HandshakeSource for tokio_rustls::server::TlsStream<T> {
+    fn handshake_facts(&self) -> crate::tls_acceptor::HandshakeFacts {
+        crate::tls_acceptor::HandshakeFacts::from_connection(self.get_ref().1)
+    }
+    fn client_cert_present(&self) -> bool {
+        self.get_ref()
+            .1
+            .peer_certificates()
+            .is_some_and(|c| !c.is_empty())
+    }
+}
+
+impl<T> HandshakeSource for tokio_openssl::SslStream<T> {
+    fn handshake_facts(&self) -> crate::tls_acceptor::HandshakeFacts {
+        pqc_handshake_facts(self.ssl())
+    }
+    fn client_cert_present(&self) -> bool {
+        self.ssl().peer_certificate().is_some()
+    }
+}
+
+/// Sets the connection-derived headers on every request of a connection
+/// accepted through `axum_server`: the standard rustls listener and the
+/// OpenSSL listener without fingerprinting.
+///
+/// Those two had no accept loop of their own to do it in, and so did nothing:
+/// a client's own `x-client-cert: 1` reached the internal-route mTLS gate, its
+/// own `x-ja3-hash` reached a route's JA3 allowlist, and a certificate the
+/// client really had presented was never reported. Sits outside the TLS
+/// acceptor, reads the handshake once it completes, and applies
+/// [`FingerprintedConnection::apply_headers`](crate::tls_acceptor::FingerprintedConnection::apply_headers)
+/// -- the same method the fingerprinting listeners use.
+#[derive(Clone)]
+pub(crate) struct ConnectionHeadersAcceptor<A> {
+    inner: A,
+}
+
+impl<A> ConnectionHeadersAcceptor<A> {
+    pub(crate) fn new(inner: A) -> Self {
+        Self { inner }
+    }
+}
+
+impl<A, S> Accept<TcpStream, S> for ConnectionHeadersAcceptor<A>
+where
+    A: Accept<TcpStream, S>,
+    A::Stream: HandshakeSource + Send + 'static,
+    A::Service: Send + 'static,
+    A::Future: Send + 'static,
+{
+    type Stream = A::Stream;
+    type Service = ConnectionHeadersService<A::Service>;
+    type Future =
+        Pin<Box<dyn Future<Output = std::io::Result<(Self::Stream, Self::Service)>> + Send>>;
+
+    fn accept(&self, stream: TcpStream, service: S) -> Self::Future {
+        let remote_addr = stream
+            .peer_addr()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+        let accepted = self.inner.accept(stream, service);
+        Box::pin(async move {
+            let (stream, inner) = accepted.await?;
+            let handshake = stream.handshake_facts();
+            let is_http1 = handshake.alpn.as_deref() != Some("h2");
+            let conn = crate::tls_acceptor::FingerprintedConnection {
+                remote_addr,
+                ja3_hash: None,
+                ja4_hash: None,
+                client_name: None,
+                is_browser: false,
+                is_early_data: false,
+                client_cert_present: stream.client_cert_present(),
+                handshake,
+            };
+            Ok((
+                stream,
+                ConnectionHeadersService {
+                    inner,
+                    conn: Arc::new(conn),
+                    is_http1,
+                },
+            ))
+        })
+    }
+}
+
+/// The per-connection service [`ConnectionHeadersAcceptor`] wraps.
+#[derive(Clone)]
+pub(crate) struct ConnectionHeadersService<S> {
+    inner: S,
+    conn: Arc<crate::tls_acceptor::FingerprintedConnection>,
+    is_http1: bool,
+}
+
+impl<S, B> tower::Service<Request<B>> for ConnectionHeadersService<S>
+where
+    S: tower::Service<Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: Request<B>) -> Self::Future {
+        self.conn.apply_headers(req.headers_mut(), self.is_http1);
         self.inner.call(req)
     }
 }
@@ -984,11 +1099,21 @@ pub async fn run_http_listener(
         config_updates,
     );
 
-    // Build TLS config using the per-domain SNI resolver (no single cert required)
-    let rustls_server_config = build_rustls_server_config(cert_path, key_path).map_err(|e| {
-        error!("❌ TLS configuration error: {}", e);
-        e
-    })?;
+    // Build TLS config using the per-domain SNI resolver (no single cert required),
+    // on the same policy as every other listener.
+    let _ = key_path; // keys are resolved per domain from the certificate directory
+    let policy = crate::tls::ServerTlsPolicy::from_config(
+        &config.tls,
+        config.pqc.enabled,
+        config.client_auth(),
+    )?;
+    let rustls_server_config =
+        build_rustls_server_config(&policy, private_resolver(cert_path)?, ALPN_H2_HTTP11).map_err(
+            |e| {
+                error!("❌ TLS configuration error: {}", e);
+                e
+            },
+        )?;
     let tls_config = RustlsConfig::from_config(Arc::new(rustls_server_config));
 
     info!("✅ TLS configured for HTTP listener (SNI per-domain resolver)");
@@ -999,7 +1124,9 @@ pub async fn run_http_listener(
     // Spelled out rather than `bind_rustls`, which composes the same acceptor
     // over `DefaultAcceptor` and so leaves Nagle on every accepted socket.
     axum_server::bind(addr)
-        .acceptor(RustlsAcceptor::new(tls_config).acceptor(TcpAcceptor::new(&config)))
+        .acceptor(ConnectionHeadersAcceptor::new(
+            RustlsAcceptor::new(tls_config).acceptor(TcpAcceptor::new(&config)),
+        ))
         // Spelled out: `ServiceExt` is generic over the request type, and
         // hyper hands `axum_server` an `Incoming` body that only `BodyShim`
         // converts.
@@ -1121,7 +1248,9 @@ pub async fn run_http_listener_pqc(
     // Run HTTPS server with OpenSSL 3.5+ (PQC-enabled with native ML-KEM)
     // Spelled out rather than `bind_openssl`, for the reason above.
     axum_server::bind(addr)
-        .acceptor(OpenSSLAcceptor::new(openssl_config).acceptor(TcpAcceptor::new(&config)))
+        .acceptor(ConnectionHeadersAcceptor::new(
+            OpenSSLAcceptor::new(openssl_config).acceptor(TcpAcceptor::new(&config)),
+        ))
         // Spelled out: `ServiceExt` is generic over the request type, and
         // hyper hands `axum_server` an `Incoming` body that only `BodyShim`
         // converts.
@@ -1252,22 +1381,28 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
     // Build rustls server config (h2 + http/1.1).
     // Use the shared resolver when provided so ACME-issued certs are hot-reloaded
     // without restarting the listener; fall back to a private resolver otherwise.
-    let rustls_config = if let Some(ref resolver) = shared_resolver {
-        build_rustls_server_config_with_resolver(std::sync::Arc::clone(resolver))?
-    } else {
-        build_rustls_server_config(cert_path, key_path)?
+    let _ = key_path; // keys are resolved per domain from the certificate directory
+    let resolver = match shared_resolver {
+        Some(ref resolver) => std::sync::Arc::clone(resolver),
+        None => private_resolver(cert_path)?,
     };
-    let rustls_config = Arc::new(rustls_config);
+    let policy = crate::tls::ServerTlsPolicy::from_config(
+        &config.tls,
+        config.pqc.enabled,
+        config.client_auth(),
+    )?;
+    let rustls_config = Arc::new(build_rustls_server_config(
+        &policy,
+        std::sync::Arc::clone(&resolver),
+        ALPN_H2_HTTP11,
+    )?);
 
     // Build HTTP/1.1-only config for SNI-selected hosts that must not use HTTP/2.
     // Browsers that negotiate http/1.1 open independent TCP connections per stream
     // (up to 6 per origin) instead of coalescing all streams on one HTTP/2 pipe.
     let http11_only_config = if !config.server.http11_only_hosts.is_empty() {
-        let cfg = if let Some(ref resolver) = shared_resolver {
-            build_rustls_server_config_http11_only_with_resolver(std::sync::Arc::clone(resolver))?
-        } else {
-            build_rustls_server_config_http11_only(cert_path, key_path)?
-        };
+        let cfg =
+            build_rustls_server_config(&policy, std::sync::Arc::clone(&resolver), ALPN_HTTP11)?;
         Some(Arc::new(cfg))
     } else {
         None
@@ -1427,78 +1562,13 @@ async fn handle_fingerprinted_connection<S>(
 
     // Create service that injects fingerprint headers and routes to axum
     let service = hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
-        // Clone data for async block
-        let ja3 = ja3_hash.clone();
-        let ja4 = ja4_hash.clone();
         let ci = conn_info.clone();
         let router = app.clone();
 
         async move {
-            // SEC-002: Strip any client-supplied x-tls-early-data header before
-            // setting it from the TLS connection state.  This prevents external
-            // callers from spoofing the flag by including it in their request.
-            req.headers_mut().remove("x-tls-early-data");
-            // Strip any client-supplied x-client-cert header before injecting
-            // the authoritative value from the TLS handshake result.
-            req.headers_mut().remove("x-client-cert");
-            // Strip any client-supplied x-connection-protocol header before
-            // injecting the authoritative value from ALPN negotiation.
-            req.headers_mut().remove("x-connection-protocol");
-            // Same for the classification headers. These are only inserted when
-            // the fingerprinter has something to say, so without an
-            // unconditional strip a caller could simply assert
-            // `x-client-type: browser` and have it survive to the backend —
-            // curl arriving labelled as a browser.
-            req.headers_mut().remove("x-client-type");
-            req.headers_mut().remove("x-client-name");
-
-            // Inject the negotiated-handshake headers the Handshake Mirror
-            // reads. Strips any client-supplied copies first (see
-            // HandshakeFacts::inject_headers).
-            ci.handshake.inject_headers(req.headers_mut());
-
-            // Inject fingerprint headers for downstream middleware
-            if let Some(ref hash) = ja3 {
-                if let Ok(v) = HeaderValue::from_str(hash) {
-                    req.headers_mut().insert("x-ja3-hash", v);
-                }
-            }
-            if let Some(ref hash) = ja4 {
-                if let Ok(v) = HeaderValue::from_str(hash) {
-                    req.headers_mut().insert("x-ja4-hash", v);
-                }
-            }
-            if let Some(ref name) = ci.client_name {
-                if let Ok(v) = HeaderValue::from_str(name) {
-                    req.headers_mut().insert("x-client-name", v);
-                }
-            }
-            if ci.is_browser {
-                req.headers_mut()
-                    .insert("x-client-type", HeaderValue::from_static("browser"));
-            }
-
-            // SEC-002: Tag early-data connections so proxy_handler can enforce
-            // per-route allow_0rtt policy and respond 425 Too Early when needed.
-            if ci.is_early_data {
-                req.headers_mut()
-                    .insert("x-tls-early-data", HeaderValue::from_static("1"));
-            }
-
-            // Tag connections where the client presented a TLS certificate so
-            // proxy_handler can enforce per-route internal mTLS requirements.
-            if ci.client_cert_present {
-                req.headers_mut()
-                    .insert("x-client-cert", HeaderValue::from_static("1"));
-            }
-
-            // Tag HTTP/1.1 connections so proxy_handler can enforce per-route
-            // allow_http11 policy and respond 426 Upgrade Required when needed.
-            // The header is stripped above so it cannot be forged by clients.
-            if is_http1 {
-                req.headers_mut()
-                    .insert("x-connection-protocol", HeaderValue::from_static("h1"));
-            }
+            // Every connection-derived header, strip-then-set; see
+            // FingerprintedConnection::apply_headers.
+            ci.apply_headers(req.headers_mut(), is_http1);
 
             // Store connection info in extensions
             req.extensions_mut().insert(ci);
@@ -1903,88 +1973,13 @@ async fn handle_pqc_fingerprinted_connection<S>(
 
     // Create service that injects fingerprint headers
     let service = hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
-        let ja3 = ja3_hash.clone();
-        let ja4 = ja4_hash.clone();
-        let cn = client_name.clone();
         let ci = conn_info.clone();
         let router = app.clone();
 
         async move {
-            // SEC-002: Strip any client-supplied x-tls-early-data header.
-            req.headers_mut().remove("x-tls-early-data");
-            // Strip any client-supplied x-client-cert header before injecting
-            // the authoritative value from the TLS handshake result.
-            req.headers_mut().remove("x-client-cert");
-            // Strip any client-supplied x-connection-protocol header before
-            // injecting the authoritative value from ALPN negotiation.
-            req.headers_mut().remove("x-connection-protocol");
-            // Same for the classification headers. These are only inserted when
-            // the fingerprinter has something to say, so without an
-            // unconditional strip a caller could simply assert
-            // `x-client-type: browser` and have it survive to the backend —
-            // curl arriving labelled as a browser.
-            req.headers_mut().remove("x-client-type");
-            req.headers_mut().remove("x-client-name");
-
-            // Inject the negotiated-handshake headers the Handshake Mirror
-            // reads. Strips any client-supplied copies first (see
-            // HandshakeFacts::inject_headers).
-            ci.handshake.inject_headers(req.headers_mut());
-
-            // Inject fingerprint headers
-            if let Some(ref hash) = ja3 {
-                if let Ok(v) = HeaderValue::from_str(hash) {
-                    req.headers_mut().insert("x-ja3-hash", v);
-                }
-            }
-            if let Some(ref hash) = ja4 {
-                if let Ok(v) = HeaderValue::from_str(hash) {
-                    req.headers_mut().insert("x-ja4-hash", v);
-                }
-            }
-            if let Some(ref name) = cn {
-                if let Ok(v) = HeaderValue::from_str(name) {
-                    req.headers_mut().insert("x-client-name", v);
-                }
-            }
-            if ci.is_browser {
-                req.headers_mut()
-                    .insert("x-client-type", HeaderValue::from_static("browser"));
-            }
-
-            // Report whether *this handshake* was post-quantum, not whether the
-            // listener supports it. The constant `true` this replaced was wrong
-            // for every classical-only client that reached this port.
-            req.headers_mut().remove("x-pqc-enabled");
-            let pqc_negotiated = ci
-                .handshake
-                .kex_group
-                .as_deref()
-                .and_then(crate::pqc_tls::PqcKemAlgorithm::from_str)
-                .is_some();
-            req.headers_mut().insert(
-                "x-pqc-enabled",
-                if pqc_negotiated {
-                    HeaderValue::from_static("true")
-                } else {
-                    HeaderValue::from_static("false")
-                },
-            );
-
-            // Tag connections where the client presented a TLS certificate so
-            // proxy_handler can enforce per-route internal mTLS requirements.
-            if ci.client_cert_present {
-                req.headers_mut()
-                    .insert("x-client-cert", HeaderValue::from_static("1"));
-            }
-
-            // Tag HTTP/1.1 connections so proxy_handler can enforce per-route
-            // allow_http11 policy and respond 426 Upgrade Required when needed.
-            // The header is stripped above so it cannot be forged by clients.
-            if is_http1 {
-                req.headers_mut()
-                    .insert("x-connection-protocol", HeaderValue::from_static("h1"));
-            }
+            // Every connection-derived header, strip-then-set; see
+            // FingerprintedConnection::apply_headers.
+            ci.apply_headers(req.headers_mut(), is_http1);
 
             // Store connection info in extensions
             req.extensions_mut().insert(ci);

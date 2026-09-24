@@ -613,9 +613,10 @@ async fn run() -> anyhow::Result<()> {
     // 2026-08-14: three hosts, three different mapped libcryptos, all three
     // negotiating X25519MLKEM768 regardless of any of them.
     //
-    // The handshake below uses the same provider the listener will use, so what is
-    // attested is what serves.
-    let verify_provider = Arc::new(pqcrypta_proxy::tls::build_pqc_provider());
+    // The handshake below uses the same provider the listeners will use --
+    // server_provider, less its ML-KEM groups when pqc.enabled is false -- so
+    // what is attested is what serves.
+    let verify_provider = Arc::new(pqcrypta_proxy::tls::server_provider(config.pqc.enabled));
     let tls13_only = config.tls.min_version == "1.3";
     let runtime = startup_verify::verify_runtime(verify_provider, tls13_only);
 
@@ -769,12 +770,18 @@ async fn run() -> anyhow::Result<()> {
 
     // Initialize PQC TLS provider (OpenSSL 3.5 with ML-KEM)
     info!("Initializing PQC TLS provider...");
-    let pqc_provider = Arc::new(PqcTlsProvider::new(&config.pqc));
+    let pqc_provider = Arc::new(
+        PqcTlsProvider::new(&config.pqc).with_tls_settings(&config.tls, config.client_auth()),
+    );
     let pqc_status = pqc_provider.status();
 
     // Initialize TLS provider (rustls for QUIC)
     info!("Initializing TLS provider...");
-    let tls_provider = Arc::new(TlsProvider::new(&config.tls, &config.pqc)?);
+    let tls_provider = Arc::new(TlsProvider::new(
+        &config.tls,
+        &config.pqc,
+        config.client_auth(),
+    )?);
 
     if tls_provider.is_pqc_enabled() {
         info!(
@@ -1631,7 +1638,9 @@ async fn run() -> anyhow::Result<()> {
             startup_verify::bound_listener_section(&probe, probe_addr),
             startup_verify::enforcement_section(waf, conn_rate, req_rate, mtls),
         ]);
-        if probe.succeeded() && !probe.is_post_quantum {
+        // Only a surprise when post-quantum key exchange was asked for; with
+        // pqc.enabled false a classical group is what the listener should pick.
+        if config.pqc.enabled && probe.succeeded() && !probe.is_post_quantum {
             warn!(
                 "The bound listener negotiated {} — the in-memory verification passed, \
                  so the provider is capable and the listener is not using it.",

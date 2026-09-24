@@ -165,6 +165,69 @@ pub struct FingerprintedConnection {
     pub handshake: HandshakeFacts,
 }
 
+impl FingerprintedConnection {
+    /// Every header a TCP listener derives from the connection rather than
+    /// takes from the client, besides the handshake set in
+    /// [`HandshakeFacts::HEADER_NAMES`]. The HTTP/3 path strips the same eight.
+    pub const DERIVED_HEADERS: [&'static str; 8] = [
+        "x-ja3-hash",
+        "x-ja4-hash",
+        "x-client-name",
+        "x-client-type",
+        "x-client-cert",
+        "x-tls-early-data",
+        "x-connection-protocol",
+        "x-pqc-enabled",
+    ];
+
+    /// Replace every connection-derived header the client sent with what this
+    /// connection established: strip all of them, then set the ones that apply.
+    ///
+    /// One implementation for every TCP listener. It was written out per
+    /// listener and the copies disagreed -- only one set `x-pqc-enabled`, and
+    /// neither stripped `x-ja3-hash` or `x-ja4-hash` when the fingerprinter had
+    /// no hash, so a client could supply its own to a route's JA3 allowlist --
+    /// while the two listeners served through `axum_server` had none at all,
+    /// so a client there could send `x-client-cert: 1` to an internal route.
+    pub fn apply_headers(&self, headers: &mut http::HeaderMap, is_http1: bool) {
+        use http::HeaderValue;
+
+        // Most requests carry no `x-` header at all; look before hashing eight
+        // names for removal.
+        if headers.keys().any(|k| k.as_str().starts_with("x-")) {
+            for name in Self::DERIVED_HEADERS {
+                headers.remove(name);
+            }
+        }
+        self.handshake.inject_headers(headers);
+
+        let mut set = |name: &'static str, value: Option<&str>| {
+            if let Some(v) = value.and_then(|v| HeaderValue::from_str(v).ok()) {
+                headers.insert(name, v);
+            }
+        };
+        set("x-ja3-hash", self.ja3_hash.as_deref());
+        set("x-ja4-hash", self.ja4_hash.as_deref());
+        set("x-client-name", self.client_name.as_deref());
+        set("x-client-type", self.is_browser.then_some("browser"));
+        // SEC-002: proxy_handler answers 425 on routes that do not allow 0-RTT.
+        set("x-tls-early-data", self.is_early_data.then_some("1"));
+        // Per-route mTLS enforcement reads this.
+        set("x-client-cert", self.client_cert_present.then_some("1"));
+        // Per-route allow_http11 enforcement reads this.
+        set("x-connection-protocol", is_http1.then_some("h1"));
+        // Whether *this handshake* was post-quantum, not whether the listener
+        // supports it.
+        let pqc = self
+            .handshake
+            .kex_group
+            .as_deref()
+            .and_then(crate::pqc_tls::PqcKemAlgorithm::from_str)
+            .is_some();
+        set("x-pqc-enabled", Some(if pqc { "true" } else { "false" }));
+    }
+}
+
 /// The negotiated properties of one completed TLS handshake.
 ///
 /// Deliberately `String`/`&'static str` rather than the rustls types: this is
@@ -251,7 +314,7 @@ impl HandshakeFacts {
     }
 
     /// Capture from a completed server-side handshake.
-    fn from_connection(conn: &rustls::ServerConnection) -> Self {
+    pub(crate) fn from_connection(conn: &rustls::ServerConnection) -> Self {
         Self {
             tls_version: conn.protocol_version().map(|v| format!("{v:?}")),
             cipher_suite: conn
