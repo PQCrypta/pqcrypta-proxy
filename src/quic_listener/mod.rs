@@ -101,8 +101,8 @@ fn is_benign_h3_close<E: std::fmt::Display>(err: &E) -> bool {
 /// clones the config per port and overwrites the field — so it identifies the
 /// current connection without threading a parameter through every call site.
 ///
-/// Returns "clear" for hosts listed in `server.tcp_only_hosts` so browsers evict any
-/// cached QUIC upgrade and fall back to TCP/TLS.
+/// Built once per connection into [`H3ConnHeaders`], whose `alt_svc` answers
+/// `clear` instead for hosts listed in `server.tcp_only_hosts`.
 fn build_alt_svc_header_over_quic(config: &ProxyConfig) -> String {
     let current = config.server.udp_port;
 
@@ -148,16 +148,80 @@ fn quic_handshake_facts_empty() -> crate::tls_acceptor::HandshakeFacts {
         kex_group: None,
         alpn: None,
         ech: "unknown",
+        prepared: std::sync::OnceLock::default(),
     }
 }
 
-fn alt_svc_for_host(config: &ProxyConfig, host: Option<&str>) -> String {
-    if let Some(h) = host {
-        if config.server.tcp_only_hosts.iter().any(|t| t == h) {
-            return "clear".to_string();
+/// Response and forwarding header values that are fixed for a connection,
+/// built once when it is accepted instead of on every request.
+///
+/// Each of these used to be formatted or validated per request: the Alt-Svc
+/// value was assembled with a `format!` per advertised port and a join, the
+/// client address was rendered with `to_string` and re-validated, and each
+/// fingerprint hash was copied into a fresh `HeaderValue`. None of them can
+/// change while the connection lives — the config is the connection's own
+/// snapshot, the address and the handshake are the connection's — so the
+/// per-request cost bought nothing.
+pub(super) struct H3ConnHeaders {
+    /// Server, Client-Hints, reporting and security headers; see
+    /// `build_static_response_headers`.
+    pub(super) static_headers: HeaderMap,
+    /// This listener's Alt-Svc value for hosts not in `tcp_only_hosts`.
+    alt_svc: Option<HeaderValue>,
+    /// The client address as forwarded in `x-forwarded-for` / `x-real-ip`.
+    pub(super) client_ip: Option<HeaderValue>,
+    pub(super) ja3: Option<HeaderValue>,
+    pub(super) ja4: Option<HeaderValue>,
+    pub(super) client_name: Option<HeaderValue>,
+    /// The Host value forwarded to the backend, for the first host this
+    /// connection asked for. A connection nearly always asks for one host;
+    /// another one is simply built per request.
+    host: std::sync::OnceLock<(Box<str>, HeaderValue)>,
+}
+
+impl H3ConnHeaders {
+    fn new(
+        config: &ProxyConfig,
+        remote_addr: SocketAddr,
+        fingerprint: &crate::fingerprint::FingerprintResult,
+    ) -> Self {
+        let value = |s: Option<&str>| s.and_then(|s| HeaderValue::from_str(s).ok());
+        Self {
+            static_headers: build_static_response_headers(config),
+            alt_svc: HeaderValue::from_str(&build_alt_svc_header_over_quic(config)).ok(),
+            client_ip: HeaderValue::from_str(&remote_addr.ip().to_string()).ok(),
+            ja3: value(fingerprint.ja3_hash.as_deref()),
+            ja4: value(fingerprint.ja4_hash.as_deref()),
+            client_name: value(fingerprint.client_name.as_deref()),
+            host: std::sync::OnceLock::new(),
         }
     }
-    build_alt_svc_header_over_quic(config)
+
+    /// `host` as a header value, built once for the connection's usual host.
+    pub(super) fn host_value(&self, host: &str) -> Option<HeaderValue> {
+        if let Some((h, v)) = self.host.get() {
+            if **h == *host {
+                return Some(v.clone());
+            }
+        }
+        let v = HeaderValue::from_str(host).ok()?;
+        let _ = self.host.set((host.into(), v.clone()));
+        Some(v)
+    }
+
+    /// The Alt-Svc value for a response: `clear` for a host listed in
+    /// `server.tcp_only_hosts`, so browsers evict any cached QUIC upgrade and
+    /// fall back to TCP, otherwise the value built for this connection.
+    pub(super) fn alt_svc(&self, config: &ProxyConfig, host: Option<&str>) -> HeaderValue {
+        if let Some(h) = host {
+            if config.server.tcp_only_hosts.iter().any(|t| t == h) {
+                return HeaderValue::from_static("clear");
+            }
+        }
+        self.alt_svc
+            .clone()
+            .unwrap_or_else(|| HeaderValue::from_static("clear"))
+    }
 }
 
 /// QUIC/HTTP3/WebTransport listener
@@ -431,23 +495,26 @@ impl QuicListener {
                 .map_err(|e| anyhow::anyhow!("Invalid idle timeout: {}", e))?,
         ));
 
-        // When we acknowledge. The stack's default of 1 means "acknowledge every
-        // other ack-eliciting packet", so a request the client does not overlap
-        // with another waits out max_ack_delay — 25 ms — before its ACK leaves,
-        // and the client will not start the next request on that connection
-        // until it arrives. Measured here at 384 req/s and 26.04 ms for one
-        // in-flight HTTP/3 stream, against 22,272 req/s and 448 µs at 0.
+        // When we acknowledge, and when we transmit. Owed ACKs ride on any
+        // packet that is leaving anyway (piggyback), so a request is
+        // acknowledged by its own response; the threshold then only decides
+        // when an ACK is worth a packet of its own. Without piggybacking a lone
+        // request waited out max_ack_delay — 25 ms — for its ACK, and the
+        // client would not start its next request until it arrived. Send
+        // coalescing lets responses that finish together leave together. See
+        // `ServerConfig` for each setting's measurement.
         //
         // Distinct from the ACK Frequency extension below, which asks the PEER
         // to change ITS behaviour and cannot affect ours.
         transport_config.local_ack_eliciting_threshold(config.server.ack_eliciting_threshold);
-        if config.server.ack_eliciting_threshold > 0 {
-            info!(
-                "QUIC: acknowledging every {} ack-eliciting packets (threshold {})",
-                config.server.ack_eliciting_threshold + 1,
-                config.server.ack_eliciting_threshold
-            );
-        }
+        transport_config.ack_piggyback(config.server.ack_piggyback);
+        transport_config.send_coalescing(config.server.quic_send_coalescing);
+        info!(
+            "QUIC: ACK-only packet every {} ack-eliciting packets, piggyback {}, send coalescing {}",
+            config.server.ack_eliciting_threshold + 1,
+            if config.server.ack_piggyback { "on" } else { "off" },
+            if config.server.quic_send_coalescing { "on" } else { "off" },
+        );
 
         // ACK Frequency extension (draft-ietf-quic-ack-frequency): allow the peer
         // to request fewer, batched ACKs, reducing ACK traffic and CPU on
@@ -968,9 +1035,53 @@ impl QuicListener {
         // never use MASQUE pay nothing for the datagram reader task.
         let mut datagram_router: Option<Arc<DatagramRouter>> = None;
 
-        // Built once for the connection rather than once per response; see
-        // `build_static_response_headers`.
-        let static_headers = Arc::new(build_static_response_headers(&config));
+        // Built once for the connection rather than once per request; see
+        // `H3ConnHeaders`.
+        let conn_headers = Arc::new(H3ConnHeaders::new(&config, remote_addr, &fingerprint));
+
+        // Every ordinary request becomes its own task. One definition for both
+        // places that dispatch one: the plain-request fast path below and an
+        // extended CONNECT this listener does not terminate itself.
+        let spawn_request = |stream, request| {
+            let config_clone = config.clone();
+            let backend_pool_clone = backend_pool.clone();
+            let early_hints_clone = early_hints_state.clone();
+            let metrics_clone = metrics.clone();
+            let security_clone = security.clone();
+            let rl_clone = advanced_rate_limiter.clone();
+            let lb_clone = load_balancer.clone();
+            let cache_clone = cache.clone();
+            let handshake_clone = handshake.clone();
+            let fingerprint_clone = fingerprint.clone();
+            let conn_headers_clone = conn_headers.clone();
+
+            tokio::spawn(async move {
+                if let Err(e) = Self::handle_h3_request(
+                    stream,
+                    request,
+                    remote_addr,
+                    config_clone,
+                    backend_pool_clone,
+                    early_hints_clone,
+                    security_clone,
+                    metrics_clone,
+                    rl_clone,
+                    lb_clone,
+                    cache_clone,
+                    handshake_clone,
+                    fingerprint_clone,
+                    conn_headers_clone,
+                )
+                .await
+                {
+                    if is_benign_h3_close(&e) {
+                        debug!("HTTP/3 request ended by peer: {}", e);
+                    } else {
+                        error!("HTTP/3 request error: {}", e);
+                    }
+                }
+            });
+        };
 
         loop {
             match h3.accept().await {
@@ -983,6 +1094,21 @@ impl QuicListener {
                             continue;
                         }
                     };
+
+                    // Everything below is for extended CONNECT — WebTransport,
+                    // WebSocket and CONNECT-UDP. An ordinary request needs none
+                    // of it, and computing it first cost every request a URI
+                    // clone and two owned strings it never read.
+                    if request.method() != http::Method::CONNECT {
+                        debug!(
+                            "HTTP/3 request: {} {} from {}",
+                            request.method(),
+                            request.uri().path(),
+                            remote_addr
+                        );
+                        spawn_request(stream, request);
+                        continue;
+                    }
 
                     let method = request.method().clone();
                     let uri = request.uri().clone();
@@ -1337,46 +1463,9 @@ impl QuicListener {
                             }
                         });
                     } else {
-                        // Regular HTTP/3 request
-                        let config_clone = config.clone();
-                        let backend_pool_clone = backend_pool.clone();
-                        let early_hints_clone = early_hints_state.clone();
-                        let metrics_clone = metrics.clone();
-                        let security_clone = security.clone();
-                        let rl_clone = advanced_rate_limiter.clone();
-                        let lb_clone = load_balancer.clone();
-                        let cache_clone = cache.clone();
-                        let handshake_clone = handshake.clone();
-                        let fingerprint_clone = fingerprint.clone();
-                        let static_headers_clone = static_headers.clone();
-
-                        tokio::spawn(async move {
-                            // Note: health check detection happens inside handle_h3_request
-                            if let Err(e) = Self::handle_h3_request(
-                                stream,
-                                request,
-                                remote_addr,
-                                config_clone,
-                                backend_pool_clone,
-                                early_hints_clone,
-                                security_clone,
-                                metrics_clone,
-                                rl_clone,
-                                lb_clone,
-                                cache_clone,
-                                handshake_clone,
-                                fingerprint_clone,
-                                static_headers_clone,
-                            )
-                            .await
-                            {
-                                if is_benign_h3_close(&e) {
-                                    debug!("HTTP/3 request ended by peer: {}", e);
-                                } else {
-                                    error!("HTTP/3 request error: {}", e);
-                                }
-                            }
-                        });
+                        // An extended CONNECT with a protocol this listener does
+                        // not terminate itself: an ordinary request.
+                        spawn_request(stream, request);
                     }
                 }
                 Ok(None) => {
@@ -1593,9 +1682,23 @@ mod alt_svc_tests {
     #[test]
     fn tcp_only_hosts_still_clear() {
         let c = config_with(443, vec![4434], vec!["ssllabs.pqcrypta.com".to_string()]);
-        assert_eq!(alt_svc_for_host(&c, Some("ssllabs.pqcrypta.com")), "clear");
-        assert_ne!(alt_svc_for_host(&c, Some("pqcrypta.com")), "clear");
-        assert_ne!(alt_svc_for_host(&c, None), "clear");
+        let fp = crate::fingerprint::FingerprintResult {
+            allowed: true,
+            ja3_hash: None,
+            ja4_hash: None,
+            classification: None,
+            client_name: None,
+        };
+        let h = H3ConnHeaders::new(&c, "192.0.2.1:50000".parse().unwrap(), &fp);
+        assert_eq!(h.alt_svc(&c, Some("ssllabs.pqcrypta.com")), "clear");
+        assert_ne!(h.alt_svc(&c, Some("pqcrypta.com")), "clear");
+        assert_ne!(h.alt_svc(&c, None), "clear");
+        // Built once, and the same value the builder produces.
+        assert_eq!(
+            h.alt_svc(&c, None),
+            build_alt_svc_header_over_quic(&c).as_str()
+        );
+        assert_eq!(h.client_ip.as_ref().unwrap(), "192.0.2.1");
     }
 }
 

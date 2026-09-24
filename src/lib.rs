@@ -132,6 +132,7 @@ pub mod access_logger;
 pub mod acme;
 pub mod admin;
 pub mod audit_logger;
+pub mod backend_client;
 pub mod cache;
 pub mod cert_compression;
 pub mod compression;

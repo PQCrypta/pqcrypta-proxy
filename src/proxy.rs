@@ -10,13 +10,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::backend_client::BackendClient;
 use bytes::{Buf, Bytes};
 use dashmap::DashMap;
 use http_body_util::{BodyExt, Full};
 use hyper::header::HeaderMap;
 use hyper::{Method, Request, StatusCode};
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
@@ -60,10 +59,14 @@ pub struct ProxyResponse {
     pub body: Bytes,
 }
 
+/// The connection a streamed backend response arrived on; release it once the
+/// body has been read to its end.
+pub type BackendLease = crate::backend_client::Lease<Full<Bytes>>;
+
 /// Backend connection pool manager
 pub struct BackendPool {
-    /// HTTP client for HTTP/1.1 and HTTP/2 backends
-    http_client: Client<hyper_util::client::legacy::connect::HttpConnector, Full<Bytes>>,
+    /// Pooled HTTP/1.1 connections to the backends; see [`crate::backend_client`].
+    client: BackendClient<Full<Bytes>>,
     /// Connection limiters per backend
     limiters: DashMap<String, Arc<Semaphore>>,
     /// Configuration
@@ -73,31 +76,19 @@ pub struct BackendPool {
 impl BackendPool {
     /// Create a new backend pool
     pub fn new(config: Arc<ProxyConfig>) -> Self {
-        // Create HTTP client using configurable connection pool settings.
         // connect_timeout comes from security.connection_timeout_secs, which
-        // previously bounded nothing: a backend that accepted TCP but never
-        // completed the connection could hold a request until the much longer
+        // once bounded nothing: a backend that accepted TCP but never completed
+        // the connection could hold a request until the much longer
         // per-backend response timeout expired.
-        let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
         let pool_config = &config.connection_pool;
-        connector.set_connect_timeout(Some(Duration::from_secs(
-            config.security.connection_timeout_secs,
-        )));
-        // TCP_NODELAY on backend connections. hyper's HttpConnector leaves Nagle
-        // enabled by default, which is wrong for a reverse proxy: a proxied
-        // request is a small write followed by a wait for the reply, so Nagle
-        // holds the write looking for more data that is never coming, and the
-        // backend's delayed ACK holds the other side. Benchmarking against a
-        // local backend put mean latency at 917us with it on and a fraction of
-        // that with it off.
-        connector.set_nodelay(true);
-        let http_client = Client::builder(TokioExecutor::new())
-            .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
-            .pool_max_idle_per_host(pool_config.max_idle_per_host)
-            .build(connector);
+        let client = BackendClient::new(
+            Duration::from_secs(pool_config.idle_timeout_secs),
+            pool_config.max_idle_per_host,
+            Duration::from_secs(config.security.connection_timeout_secs),
+        );
 
         let pool = Self {
-            http_client,
+            client,
             limiters: DashMap::new(),
             config,
         };
@@ -136,18 +127,11 @@ impl BackendPool {
         // Inject W3C TraceContext + B3 headers so the backend can continue the trace
         otel::inject_current_context_into_map(&mut headers);
 
-        // Build URI
-        let uri = if backend.tls {
-            format!("https://{}{}", backend.address, path)
-        } else {
-            format!("http://{}{}", backend.address, path)
-        };
+        debug!("Proxying to HTTP backend: {} {}", method, path);
 
-        debug!("Proxying to HTTP backend: {} {}", method, uri);
-
-        // Build request
+        // Build request. Origin form: the connection is already to the backend.
         let method = method.parse::<Method>()?;
-        let mut request_builder = Request::builder().method(method).uri(&uri);
+        let mut request_builder = Request::builder().method(method).uri(path);
 
         // Add headers
         for (key, value) in &headers {
@@ -165,7 +149,7 @@ impl BackendPool {
 
         // Send request with timeout
         let timeout = Duration::from_millis(backend.timeout_ms);
-        let response = tokio::time::timeout(timeout, self.http_client.request(request))
+        let (response, lease) = tokio::time::timeout(timeout, self.client.send(backend, request))
             .await
             .map_err(|_| anyhow::anyhow!("Backend request timeout"))?
             .map_err(|e| anyhow::anyhow!("Backend request failed: {}", e))?;
@@ -183,6 +167,7 @@ impl BackendPool {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read response body: {}", e))?
             .to_bytes();
+        lease.release();
 
         debug!("Received {} bytes from HTTP backend", body_bytes.len());
 
@@ -204,18 +189,11 @@ impl BackendPool {
         // Inject W3C TraceContext + B3 headers so the backend can continue the trace
         otel::inject_current_context_into_map(&mut headers);
 
-        // Build URI
-        let uri = if backend.tls {
-            format!("https://{}{}", backend.address, path)
-        } else {
-            format!("http://{}{}", backend.address, path)
-        };
+        debug!("Proxying to HTTP backend (full): {} {}", method, path);
 
-        debug!("Proxying to HTTP backend (full): {} {}", method, uri);
-
-        // Build request
+        // Build request. Origin form: the connection is already to the backend.
         let method = method.parse::<Method>()?;
-        let mut request_builder = Request::builder().method(method).uri(&uri);
+        let mut request_builder = Request::builder().method(method).uri(path);
 
         // Add headers
         for (key, value) in &headers {
@@ -233,7 +211,7 @@ impl BackendPool {
 
         // Send request with timeout
         let timeout = Duration::from_millis(backend.timeout_ms);
-        let response = tokio::time::timeout(timeout, self.http_client.request(request))
+        let (response, lease) = tokio::time::timeout(timeout, self.client.send(backend, request))
             .await
             .map_err(|_| anyhow::anyhow!("Backend request timeout"))?
             .map_err(|e| anyhow::anyhow!("Backend request failed: {}", e))?;
@@ -255,6 +233,7 @@ impl BackendPool {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read response body: {}", e))?
             .to_bytes();
+        lease.release();
 
         debug!(
             "Received {} bytes from HTTP backend (status {})",
@@ -290,23 +269,19 @@ impl BackendPool {
         path: &str,
         mut headers: HeaderMap,
         body: Bytes,
-    ) -> anyhow::Result<(StatusCode, HeaderMap, hyper::body::Incoming)> {
+    ) -> anyhow::Result<(StatusCode, HeaderMap, hyper::body::Incoming, BackendLease)> {
         let _permit = self.acquire_permit(&backend.name).await?;
 
         otel::inject_current_context_into_headers(&mut headers);
 
-        let scheme = if backend.tls { "https" } else { "http" };
-        let uri = format!("{}://{}{}", scheme, backend.address, path);
-
         let mut request = Request::new(Full::new(body));
         *request.method_mut() = method.clone();
-        *request.uri_mut() = uri
-            .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid backend URI {uri}: {e}"))?;
+        *request.uri_mut() = http::Uri::try_from(path)
+            .map_err(|e| anyhow::anyhow!("Invalid backend request path {path}: {e}"))?;
         *request.headers_mut() = headers;
 
         let timeout = Duration::from_millis(backend.timeout_ms);
-        let response = tokio::time::timeout(timeout, self.http_client.request(request))
+        let (response, lease) = tokio::time::timeout(timeout, self.client.send(backend, request))
             .await
             .map_err(|_| anyhow::anyhow!("Backend stream request timeout"))?
             .map_err(|e| anyhow::anyhow!("Backend stream request failed: {}", e))?;
@@ -321,7 +296,7 @@ impl BackendPool {
             response_headers.remove(*name);
         }
 
-        Ok((status, response_headers, body_part))
+        Ok((status, response_headers, body_part, lease))
     }
 
     /// Proxy request to HTTP backend with per-backend retry policy.
@@ -735,15 +710,9 @@ impl BackendPool {
         if let Some(ref health_endpoint) = backend.health_check {
             match backend.backend_type {
                 BackendType::Http1 | BackendType::Http2 => {
-                    let uri = if backend.tls {
-                        format!("https://{}{}", backend.address, health_endpoint)
-                    } else {
-                        format!("http://{}{}", backend.address, health_endpoint)
-                    };
-
                     let request = match Request::builder()
                         .method(Method::GET)
-                        .uri(&uri)
+                        .uri(health_endpoint.as_str())
                         .body(Full::new(Bytes::new()))
                     {
                         Ok(r) => r,
@@ -751,8 +720,15 @@ impl BackendPool {
                     };
 
                     let timeout = Duration::from_secs(5);
-                    match tokio::time::timeout(timeout, self.http_client.request(request)).await {
-                        Ok(Ok(response)) => response.status().is_success(),
+                    match tokio::time::timeout(timeout, self.client.send(backend, request)).await {
+                        Ok(Ok((response, lease))) => {
+                            let healthy = response.status().is_success();
+                            // Read to the end so the connection can be reused.
+                            if response.into_body().collect().await.is_ok() {
+                                lease.release();
+                            }
+                            healthy
+                        }
                         _ => false,
                     }
                 }

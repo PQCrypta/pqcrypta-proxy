@@ -23,7 +23,7 @@ use crate::rate_limiter::{build_context_from_request, AdvancedRateLimiter, RateL
 use crate::security::SecurityState;
 
 use super::cors::add_cors_headers_to_builder;
-use super::{alt_svc_for_host, resolve_route_policy, QuicListener, ServerHeader};
+use super::{resolve_route_policy, QuicListener, ServerHeader};
 
 /// Take whatever the client already sent, so the receive side closes cleanly.
 ///
@@ -81,7 +81,7 @@ impl QuicListener {
         cache: Arc<ResponseCache>,
         handshake: Arc<crate::tls_acceptor::HandshakeFacts>,
         fingerprint: Arc<crate::fingerprint::FingerprintResult>,
-        static_headers: Arc<HeaderMap>,
+        conn_headers: Arc<super::H3ConnHeaders>,
     ) -> anyhow::Result<()>
     where
         S: h3::quic::BidiStream<Bytes>,
@@ -101,46 +101,54 @@ impl QuicListener {
         // Strip first, then set: a field this path cannot observe must come out
         // absent rather than keep the client's value.
         {
+            // Every name this path derives from the connection rather than
+            // taking from the client. Constants, so neither the check nor the
+            // removals parse a name.
+            const DERIVED: [HeaderName; 8] = [
+                HeaderName::from_static("x-ja3-hash"),
+                HeaderName::from_static("x-ja4-hash"),
+                HeaderName::from_static("x-client-name"),
+                HeaderName::from_static("x-client-type"),
+                HeaderName::from_static("x-client-cert"),
+                HeaderName::from_static("x-tls-early-data"),
+                HeaderName::from_static("x-connection-protocol"),
+                HeaderName::from_static("x-pqc-enabled"),
+            ];
             let h = request.headers_mut();
-            for name in crate::tls_acceptor::HandshakeFacts::HEADER_NAMES {
-                h.remove(name);
-            }
-            for name in [
-                "x-ja3-hash",
-                "x-ja4-hash",
-                "x-client-name",
-                "x-client-type",
-                "x-client-cert",
-                "x-tls-early-data",
-                "x-connection-protocol",
-                "x-pqc-enabled",
-            ] {
-                h.remove(name);
+            // A request carries a handful of headers and almost never one of
+            // these, so look at its own names first: that is a few short
+            // comparisons, where removing unconditionally was eight hashed
+            // lookups on every request. The handshake names are handled by
+            // `inject_headers`, which replaces or removes each of them itself.
+            if h.keys().any(|n| DERIVED.contains(n)) {
+                for name in &DERIVED {
+                    h.remove(name);
+                }
             }
 
             handshake.inject_headers(h);
-            h.insert("x-connection-protocol", HeaderValue::from_static("h3"));
-
-            if let Some(ref v) = fingerprint.ja3_hash {
-                if let Ok(v) = HeaderValue::from_str(v) {
-                    h.insert("x-ja3-hash", v);
-                }
+            h.insert(
+                HeaderName::from_static("x-connection-protocol"),
+                HeaderValue::from_static("h3"),
+            );
+            // Built once per connection; see `H3ConnHeaders`.
+            if let Some(v) = &conn_headers.ja3 {
+                h.insert(HeaderName::from_static("x-ja3-hash"), v.clone());
             }
-            if let Some(ref v) = fingerprint.ja4_hash {
-                if let Ok(v) = HeaderValue::from_str(v) {
-                    h.insert("x-ja4-hash", v);
-                }
+            if let Some(v) = &conn_headers.ja4 {
+                h.insert(HeaderName::from_static("x-ja4-hash"), v.clone());
             }
-            if let Some(ref v) = fingerprint.client_name {
-                if let Ok(v) = HeaderValue::from_str(v) {
-                    h.insert("x-client-name", v);
-                }
+            if let Some(v) = &conn_headers.client_name {
+                h.insert(HeaderName::from_static("x-client-name"), v.clone());
             }
             if matches!(
                 fingerprint.classification,
                 Some(crate::security::FingerprintClass::Browser)
             ) {
-                h.insert("x-client-type", HeaderValue::from_static("browser"));
+                h.insert(
+                    HeaderName::from_static("x-client-type"),
+                    HeaderValue::from_static("browser"),
+                );
             }
         }
 
@@ -149,7 +157,12 @@ impl QuicListener {
         // then neither of these allocates at all. Before, every request built a
         // `path` String, an (often empty) `query` String, and a third String
         // concatenating them.
-        let path: Cow<'_, str> = if config.server.normalize_paths {
+        // Lowercased only when there is something to lowercase: a path that
+        // is already lowercase is the same either way, and copying it was an
+        // allocation on almost every request.
+        let path: Cow<'_, str> = if config.server.normalize_paths
+            && uri.path().bytes().any(|b| b.is_ascii_uppercase())
+        {
             Cow::Owned(uri.path().to_ascii_lowercase())
         } else {
             Cow::Borrowed(uri.path())
@@ -437,7 +450,10 @@ impl QuicListener {
                 // Build 103 Early Hints response with Link headers and alt-svc for QUIC advertisement
                 let mut early_response_builder = http::Response::builder()
                     .status(http::StatusCode::EARLY_HINTS)
-                    .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
+                    .header(
+                        header::ALT_SVC,
+                        conn_headers.alt_svc(&config, host.as_deref()),
+                    )
                     .server_header(&config);
 
                 for hint in &hints {
@@ -515,8 +531,8 @@ impl QuicListener {
                     let response = builder
                         .server_header(&config)
                         .header(
-                            "alt-svc",
-                            alt_svc_for_host(&config, Some(&conformance_host)),
+                            header::ALT_SVC,
+                            conn_headers.alt_svc(&config, Some(&conformance_host)),
                         )
                         .body(())?;
 
@@ -669,7 +685,10 @@ impl QuicListener {
                 .header("content-length", json_len.to_string())
                 .header("cache-control", "no-store")
                 .server_header(&config)
-                .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
+                .header(
+                    header::ALT_SVC,
+                    conn_headers.alt_svc(&config, host.as_deref()),
+                )
                 .body(())?;
             stream.send_response(response).await?;
             stream.send_data(json_bytes).await?;
@@ -734,7 +753,10 @@ impl QuicListener {
                 let response = http::Response::builder()
                     .status(http::StatusCode::NOT_FOUND)
                     .server_header(&config)
-                    .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
+                    .header(
+                        header::ALT_SVC,
+                        conn_headers.alt_svc(&config, host.as_deref()),
+                    )
                     .body(())?;
 
                 respond_and_finish(&mut stream, response).await?;
@@ -778,7 +800,10 @@ impl QuicListener {
                     let response = http::Response::builder()
                         .status(http::StatusCode::TOO_MANY_REQUESTS)
                         .server_header(&config)
-                        .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
+                        .header(
+                            header::ALT_SVC,
+                            conn_headers.alt_svc(&config, host.as_deref()),
+                        )
                         .header("retry-after", (retry_after_ms / 1000).to_string())
                         .header("x-ratelimit-limit", limit.to_string())
                         .header("x-ratelimit-remaining", "0")
@@ -831,7 +856,10 @@ impl QuicListener {
                     .status(status)
                     .header("location", &target)
                     .server_header(&config)
-                    .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
+                    .header(
+                        header::ALT_SVC,
+                        conn_headers.alt_svc(&config, host.as_deref()),
+                    )
                     .body(())?;
                 respond_and_finish(&mut stream, response).await?;
                 metrics.requests.request_end_full(
@@ -851,7 +879,10 @@ impl QuicListener {
             if let Some(ref cors) = route.cors {
                 let mut response_builder = http::Response::builder()
                     .status(http::StatusCode::OK)
-                    .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
+                    .header(
+                        header::ALT_SVC,
+                        conn_headers.alt_svc(&config, host.as_deref()),
+                    )
                     .server_header(&config);
 
                 // Access-Control-Allow-Origin — reflect when allow_origins list is set
@@ -950,7 +981,10 @@ impl QuicListener {
                 let mut builder = http::Response::builder()
                     .status(status)
                     .server_header(&config)
-                    .header("alt-svc", alt_svc_for_host(&config, host.as_deref()));
+                    .header(
+                        header::ALT_SVC,
+                        conn_headers.alt_svc(&config, host.as_deref()),
+                    );
                 for (k, v) in extra {
                     builder = builder.header(k, v);
                 }
@@ -969,7 +1003,10 @@ impl QuicListener {
 
         // Pool-aware backend selection: supports canary routing and load balancing.
         // Falls back to direct backend config lookup if no matching pool is configured.
-        let (backend, canary_cookie_to_set): (BackendConfig, Option<String>) = {
+        // Borrowed from the config unless a pool built one for this request:
+        // cloning the configured backend copied its name, address and every
+        // other owned field on each request, to read them once.
+        let (backend, canary_cookie_to_set): (Cow<'_, BackendConfig>, Option<String>) = {
             // Extract cookies from request headers for sticky session / canary routing
             let cookie_str = request
                 .headers()
@@ -1062,7 +1099,7 @@ impl QuicListener {
                             circuit_breaker: None,
                             disable_pooling: false,
                         };
-                        (cfg, result.set_canary_cookie)
+                        (Cow::Owned(cfg), result.set_canary_cookie)
                     }
                     None => {
                         error!("No healthy server available in pool: {}", route.backend);
@@ -1084,7 +1121,7 @@ impl QuicListener {
                 }
             } else {
                 match config.get_backend(&route.backend) {
-                    Some(b) => (b.clone(), None),
+                    Some(b) => (Cow::Borrowed(b), None),
                     None => {
                         error!("Backend not found: {}", route.backend);
                         metrics.requests.request_end_full(
@@ -1306,7 +1343,10 @@ impl QuicListener {
                         .status(status_code)
                         .header("age", age_secs.to_string())
                         .header("x-cache", "HIT")
-                        .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
+                        .header(
+                            header::ALT_SVC,
+                            conn_headers.alt_svc(&config, host.as_deref()),
+                        )
                         .server_header(&config);
                     for (k, v) in &cached_headers {
                         // Skip headers the proxy sets itself in this block. The cached
@@ -1343,7 +1383,7 @@ impl QuicListener {
                     response_builder = super::apply_response_policy_headers(
                         response_builder,
                         &config,
-                        &static_headers,
+                        &conn_headers.static_headers,
                         host.as_deref(),
                         &path,
                     );
@@ -1395,7 +1435,10 @@ impl QuicListener {
                         .status(http::StatusCode::NOT_MODIFIED)
                         .header("age", age_secs.to_string())
                         .header("x-cache", "HIT")
-                        .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
+                        .header(
+                            header::ALT_SVC,
+                            conn_headers.alt_svc(&config, host.as_deref()),
+                        )
                         .server_header(&config);
                     if let Some(et) = etag {
                         response_builder = response_builder.header("etag", et);
@@ -1463,7 +1506,10 @@ impl QuicListener {
             let response = http::Response::builder()
                 .status(http::StatusCode::BAD_REQUEST)
                 .server_header(&config)
-                .header("alt-svc", alt_svc_for_host(&config, host.as_deref()))
+                .header(
+                    header::ALT_SVC,
+                    conn_headers.alt_svc(&config, host.as_deref()),
+                )
                 .body(())?;
             respond_and_finish(&mut stream, response).await?;
             return Ok(());
@@ -1545,7 +1591,7 @@ impl QuicListener {
 
         // Forward Host header to backend (required for virtual host routing)
         if let Some(ref host_value) = host {
-            if let Ok(v) = HeaderValue::from_str(host_value) {
+            if let Some(v) = conn_headers.host_value(host_value) {
                 headers.insert(header::HOST, v);
             }
         }
@@ -1561,8 +1607,7 @@ impl QuicListener {
             HeaderName::from_static("x-forwarded-proto"),
             HeaderValue::from_static("https"),
         );
-        let client_ip = remote_addr.ip().to_string();
-        if let Ok(ip_value) = HeaderValue::from_str(&client_ip) {
+        if let Some(ip_value) = conn_headers.client_ip.clone() {
             headers.insert(HeaderName::from_static("x-forwarded-for"), ip_value.clone());
             headers.insert(HeaderName::from_static("x-real-ip"), ip_value.clone());
 
@@ -1654,7 +1699,7 @@ impl QuicListener {
         let request_body = Bytes::from(body);
         let request_body_len = request_body.len() as u64;
 
-        let (stream_status, mut stream_headers, stream_body) = backend_pool
+        let (stream_status, mut stream_headers, stream_body, backend_lease) = backend_pool
             .proxy_stream(
                 &backend,
                 request.method(),
@@ -1697,7 +1742,10 @@ impl QuicListener {
             if let Some((name, id)) = &request_id {
                 sse_builder = sse_builder.header(name, id);
             }
-            sse_builder = sse_builder.header("alt-svc", alt_svc_for_host(&config, host.as_deref()));
+            sse_builder = sse_builder.header(
+                header::ALT_SVC,
+                conn_headers.alt_svc(&config, host.as_deref()),
+            );
             // CORS headers must be present on the streamed response itself, not
             // just the preflight — otherwise browsers block the SSE fetch with
             // "No 'Access-Control-Allow-Origin' header". The non-SSE path adds
@@ -1716,9 +1764,12 @@ impl QuicListener {
             // pass through, so the access log can report what was actually sent
             // instead of the 0 a streamed response used to record.
             let mut sse_bytes = 0usize;
-            while let Some(frame_result) = body_stream.frame().await {
-                match frame_result {
-                    Ok(frame) => {
+            // The backend connection goes back to the pool only if the event
+            // stream reached its end; one that failed part-way is closed.
+            let mut sse_complete = false;
+            loop {
+                match body_stream.frame().await {
+                    Some(Ok(frame)) => {
                         if let Some(data) = frame.data_ref() {
                             if !data.is_empty() {
                                 sse_bytes += data.len();
@@ -1726,8 +1777,15 @@ impl QuicListener {
                             }
                         }
                     }
-                    Err(_) => break,
+                    Some(Err(_)) => break,
+                    None => {
+                        sse_complete = true;
+                        break;
+                    }
                 }
+            }
+            if sse_complete {
+                backend_lease.release();
             }
             stream.finish().await?;
 
@@ -1778,15 +1836,20 @@ impl QuicListener {
             && !cache.is_excluded_path(&path)
             && !cache.is_excluded_host(cache_host_str);
 
+        // Released once the body has been read to its end, from whichever of
+        // the two paths below reads it.
+        let mut backend_lease = Some(backend_lease);
         let mut streaming_body: Option<hyper::body::Incoming> = None;
         let buffered: Option<Bytes> = if will_cache || method == "HEAD" {
-            Some(
-                stream_body
-                    .collect()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to read response body: {}", e))?
-                    .to_bytes(),
-            )
+            let body = stream_body
+                .collect()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to read response body: {}", e))?
+                .to_bytes();
+            if let Some(lease) = backend_lease.take() {
+                lease.release();
+            }
+            Some(body)
         } else {
             streaming_body = Some(stream_body);
             None
@@ -1895,8 +1958,10 @@ impl QuicListener {
         }
 
         // Add Alt-Svc header to advertise HTTP/3 support
-        response_builder =
-            response_builder.header("alt-svc", alt_svc_for_host(&config, host.as_deref()));
+        response_builder = response_builder.header(
+            header::ALT_SVC,
+            conn_headers.alt_svc(&config, host.as_deref()),
+        );
 
         // Server, Client-Hints, reporting and security headers: the fixed ones
         // are built once per connection and applied here by cloning (see
@@ -1905,7 +1970,7 @@ impl QuicListener {
         response_builder = super::apply_response_policy_headers(
             response_builder,
             &config,
-            &static_headers,
+            &conn_headers.static_headers,
             host.as_deref(),
             &path,
         );
@@ -1969,6 +2034,9 @@ impl QuicListener {
                     }
                 }
                 trace!("HTTP/3 streamed {sent} bytes to client in {frames} frames");
+                if let Some(lease) = backend_lease.take() {
+                    lease.release();
+                }
                 sent
             }
         };

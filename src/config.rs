@@ -750,27 +750,58 @@ pub struct ServerConfig {
     #[serde(default = "default_true")]
     pub enable_ack_frequency: bool,
 
-    /// How many ack-eliciting QUIC packets to accept before acknowledging.
+    /// How many ack-eliciting QUIC packets to accept before sending an
+    /// ACK-only packet.
     ///
-    /// An ACK goes out at once once the count *exceeds* this, so 1 — the QUIC
-    /// stack's default — means "acknowledge every other packet" and a lone
-    /// request waits out `max_ack_delay`, 25 ms. For a request/response proxy
-    /// that is 25 ms added to every request the client does not overlap with
-    /// another one, which is what a browser fetching a single resource does.
+    /// An ACK-only packet goes out once the count *exceeds* this; 1 — RFC 9000's
+    /// "acknowledge every other packet" — is the default. Below it, an owed ACK
+    /// rides on the next packet sent for any other reason (`ack_piggyback`), so
+    /// a lone request is acknowledged by its own response rather than waiting.
     ///
-    /// Measured on this proxy, HTTP/3, ten connections, one stream each:
+    /// This was 0 before piggybacking existed, because without it a lone request
+    /// was not acknowledged until `max_ack_delay` (25 ms) expired and the client
+    /// would not start its next request until it was — 384 req/s at one stream.
+    /// 0 fixed that by sending a separate ACK for every request, which at a
+    /// hundred connections was 0.64 extra datagrams per request. With
+    /// piggybacking, measured on one machine, HTTP/3, interleaved:
     ///
-    /// | threshold | req/s | mean latency | CPU of 200% |
-    /// |---|---|---|---|
-    /// | 1 | 384 | 26.04 ms | 8% |
-    /// | 0 | 22,272 | 448 µs | 197% |
+    /// | cell | threshold 0 | threshold 1 |
+    /// |---|---|---|
+    /// | 1 KB, 10 connections × 1 stream | 11,392 req/s | 13,171 req/s |
+    /// | empty, 10 × 10 | 21,063 | 21,286 |
+    /// | empty, 100 × 10 | 12,289 | 13,404 |
     ///
-    /// 0 is the default here because the cost it trades away — extra ACK
-    /// packets — measured as nothing at fifty in-flight streams (0.97×, inside
-    /// the run-to-run spread) while the gain was 58× at one stream and 3.3× at
-    /// ten. Raise it if you are ACK-bound on a link where that trade differs.
+    /// Set 0 to acknowledge every packet immediately regardless.
     #[serde(default = "default_ack_eliciting_threshold")]
     pub ack_eliciting_threshold: u64,
+
+    /// Carry owed QUIC ACKs on packets that are being sent anyway (default: true).
+    ///
+    /// Without it an acknowledgement below `ack_eliciting_threshold` is not
+    /// sent until the threshold is crossed or `max_ack_delay` expires, even
+    /// when a response packet is leaving with room for it — so the response
+    /// arrives without acknowledging the request it answers. With it the ACK
+    /// rides on that packet, and `ack_eliciting_threshold` only decides when a
+    /// separate ACK-only packet is worth sending.
+    #[serde(default = "default_true")]
+    pub ack_piggyback: bool,
+
+    /// Let other ready work run before a QUIC connection transmits (default: true).
+    ///
+    /// Each response written to a connection wakes its driver, which otherwise
+    /// sends at once — one packet per response, and the client answers each
+    /// with one of its own. With this the driver yields once first, so every
+    /// response already finishing on that connection leaves in the same
+    /// transmit: the flush-once-per-turn an event-loop server does by
+    /// construction.
+    ///
+    /// Measured on one machine, HTTP/3, empty body, a hundred connections of
+    /// ten streams: 13,540 req/s without it, 19,528 with it, and datagrams per
+    /// request from 2.08 to about 1.3 — on the same machine HAProxy's event
+    /// loop sends 0.31. At ten connections and at one stream per connection it
+    /// measured level: there is less finishing together to coalesce.
+    #[serde(default = "default_true")]
+    pub quic_send_coalescing: bool,
 
     /// Set `TCP_NODELAY` on accepted client-facing sockets (default: true).
     ///
@@ -1029,6 +1060,8 @@ impl Default for ServerConfig {
             enable_quic_migration: true,
             enable_ack_frequency: true,
             ack_eliciting_threshold: default_ack_eliciting_threshold(),
+            ack_piggyback: true,
+            quic_send_coalescing: true,
             tcp_nodelay: default_tcp_nodelay(),
             udp_gro: false,
             enable_quic_retry: false,
@@ -1179,10 +1212,11 @@ fn default_max_uni_streams() -> u32 {
     100
 }
 
-/// Acknowledge every ack-eliciting packet at once. See
-/// [`ServerConfig::ack_eliciting_threshold`] for the measurement behind this.
+/// ACK-only packets for every other ack-eliciting packet; owed ACKs otherwise
+/// ride on outgoing data. See [`ServerConfig::ack_eliciting_threshold`] for the
+/// measurement behind this.
 fn default_ack_eliciting_threshold() -> u64 {
-    0
+    1
 }
 
 /// Nagle off on accepted sockets. See [`ServerConfig::tcp_nodelay`].

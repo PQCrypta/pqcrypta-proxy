@@ -117,9 +117,12 @@ pub fn create_backend_tls_connector(
                 .ok_or("mTLS key path is not valid UTF-8")?,
         )?;
 
-        // Note: Using empty root store for mTLS (preserving original behavior)
+        // Presenting a client certificate does not stop us verifying the
+        // server's: the same roots as the non-mTLS case, native plus the
+        // configured CA. This used an empty store, so no server certificate
+        // could ever verify and mTLS worked only with verification off.
         ClientConfig::builder()
-            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_root_certificates(root_store)
             .with_client_auth_cert(certs, key)?
     } else {
         ClientConfig::builder()

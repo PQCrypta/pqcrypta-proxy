@@ -1793,6 +1793,7 @@ fn pqc_handshake_facts(ssl: &openssl::ssl::SslRef) -> crate::tls_acceptor::Hands
             .selected_alpn_protocol()
             .map(|p| String::from_utf8_lossy(p).into_owned()),
         ech: "not-supported",
+        prepared: std::sync::OnceLock::default(),
     }
 }
 

@@ -184,6 +184,13 @@ pub struct HandshakeFacts {
     pub alpn: Option<String>,
     /// Encrypted Client Hello outcome: `not-offered`, `rejected`, or `accepted`.
     pub ech: &'static str,
+    /// The five header values, built on first use. A connection's handshake
+    /// does not change, so validating and copying these strings on every
+    /// request — five `HeaderValue::from_str` allocations and five
+    /// name parses each time — was work done once per request for an answer
+    /// fixed per connection. Filled after the fields above are final: every
+    /// constructor finishes them before the facts are shared.
+    pub(crate) prepared: std::sync::OnceLock<[Option<http::HeaderValue>; 5]>,
 }
 
 impl HandshakeFacts {
@@ -211,23 +218,36 @@ impl HandshakeFacts {
     /// filled with a placeholder — "unknown" and "we didn't look" are different
     /// answers and the mirror renders them differently.
     pub fn inject_headers(&self, headers: &mut http::HeaderMap) {
-        for name in Self::HEADER_NAMES {
-            headers.remove(name);
-        }
-
-        let mut set = |name: &'static str, value: Option<&str>| {
-            if let Some(v) = value {
-                if let Ok(v) = http::HeaderValue::from_str(v) {
-                    headers.insert(name, v);
+        const NAMES: [http::HeaderName; 5] = [
+            http::HeaderName::from_static(HandshakeFacts::HEADER_NAMES[0]),
+            http::HeaderName::from_static(HandshakeFacts::HEADER_NAMES[1]),
+            http::HeaderName::from_static(HandshakeFacts::HEADER_NAMES[2]),
+            http::HeaderName::from_static(HandshakeFacts::HEADER_NAMES[3]),
+            http::HeaderName::from_static(HandshakeFacts::HEADER_NAMES[4]),
+        ];
+        let values = self.prepared.get_or_init(|| {
+            let v = |s: Option<&str>| s.and_then(|s| http::HeaderValue::from_str(s).ok());
+            [
+                v(self.tls_version.as_deref()),
+                v(self.cipher_suite.as_deref()),
+                v(self.kex_group.as_deref()),
+                v(self.alpn.as_deref()),
+                v(Some(self.ech)),
+            ]
+        });
+        // `insert` replaces every value the client sent under the name, so
+        // strip-then-set is one operation; a field we could not determine is
+        // removed instead.
+        for (name, value) in NAMES.iter().zip(values) {
+            match value {
+                Some(v) => {
+                    headers.insert(name.clone(), v.clone());
+                }
+                None => {
+                    headers.remove(name);
                 }
             }
-        };
-
-        set("x-tls-version", self.tls_version.as_deref());
-        set("x-tls-cipher", self.cipher_suite.as_deref());
-        set("x-tls-group", self.kex_group.as_deref());
-        set("x-tls-alpn", self.alpn.as_deref());
-        set("x-tls-ech", Some(self.ech));
+        }
     }
 
     /// Capture from a completed server-side handshake.
@@ -248,6 +268,7 @@ impl HandshakeFacts {
                 rustls::server::EchAcceptance::Rejected => "rejected",
                 rustls::server::EchAcceptance::Accepted => "accepted",
             },
+            prepared: std::sync::OnceLock::default(),
         }
     }
 }
@@ -854,6 +875,7 @@ mod tests {
             kex_group: Some("secp384r1".to_string()),
             alpn: Some("h2".to_string()),
             ech: "not-offered",
+            prepared: std::sync::OnceLock::default(),
         };
 
         let mut headers = http::HeaderMap::new();
@@ -881,6 +903,7 @@ mod tests {
             kex_group: None,
             alpn: Some("h3".to_string()),
             ech: "unknown",
+            prepared: std::sync::OnceLock::default(),
         };
 
         let mut headers = http::HeaderMap::new();
