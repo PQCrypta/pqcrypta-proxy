@@ -134,6 +134,9 @@ elif kind == "window":
                     started=iso(born(f"{src}/run.log")), finished=done.group(1),
                     haproxy={**haproxy, "config": conf("haproxy.cfg")},
                     ours={"arm": "lean-now", "config": conf("pqc-bench-lean.toml")},
+                    # The page reads it to flag a run whose backend stalled
+                    # 64 KB responses (sendfile + tcp_nopush, before 2026-09-25).
+                    backend={"config": conf("nginx.conf")},
                     load=h2load_load("window-study.sh") | {"body": script_default("window-study.sh", "BODY")})
 elif kind == "consistency":
     stamp = src
