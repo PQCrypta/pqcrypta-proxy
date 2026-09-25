@@ -579,13 +579,38 @@ where
         if self.qpack_streams.encoder_recv.is_none() {
             return Poll::Pending;
         }
+        // Apply what the stream already holds before asking for more.
+        //
+        // Identifying the stream reads its type byte, and whatever arrived in
+        // the same chunk stays buffered: when the peer's first instructions
+        // leave together with the type byte -- a Set Dynamic Table Capacity
+        // and the inserts written straight after opening the stream -- they
+        // are here before this function ever reads. It used to read first,
+        // get Pending, and return with them unapplied; nothing then woke it
+        // until the stream's next data, so a field section referencing those
+        // inserts stayed parked on inserts we already had. Our client hung on
+        // one run in three of the conformance suite's h-qpack-dynamic-table
+        // until the server closed the stream ten seconds later.
+        //
+        // Once per entry: after that, anything left is a partial instruction
+        // that only more data can complete.
+        let mut read_first = !matches!(
+            self.qpack_streams.encoder_recv.as_mut(),
+            Some(AcceptedRecvStream::Encoder(encoder)) if bytes::Buf::has_remaining(encoder.buf())
+        );
         loop {
             let Some(AcceptedRecvStream::Encoder(encoder)) =
                 self.qpack_streams.encoder_recv.as_mut()
             else {
                 return Poll::Pending;
             };
-            match ready!(encoder.poll_read(cx)) {
+            let read = if read_first {
+                ready!(encoder.poll_read(cx))
+            } else {
+                Ok(false)
+            };
+            read_first = true;
+            match read {
                 Ok(true) => {
                     //= https://www.rfc-editor.org/rfc/rfc9204#section-4.2
                     //# Closure of either unidirectional stream type MUST be treated as a

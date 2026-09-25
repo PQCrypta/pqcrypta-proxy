@@ -357,9 +357,9 @@ async fn run(args: &Args) -> i32 {
 /// inconclusive, and return the report read afterwards.
 ///
 /// An inconclusive verdict says the client was never put in the situation
-/// under test: it crashed on its own (lsquic's demo client treats EAGAIN on its
-/// socket as fatal and exits without a close), or it quit before reading a
-/// unidirectional stream nothing obliged it to read (msquic, one run in four).
+/// under test: it quit before reading a unidirectional stream nothing obliged
+/// it to read (msquic, one run in four), or went quiet before its reaction
+/// point.
 /// The next attempt usually does put it there. Evidence from a later attempt
 /// can only replace an inconclusive one, never a verdict, so a retry cannot
 /// turn a result the client earned into a different one.
@@ -470,9 +470,7 @@ async fn drive(
 /// protocol violation usually exits non-zero, and treating that as a harness
 /// error would turn every correct rejection into a broken run. What the client
 /// did is decided by the server, which is the only party in a position to judge
-/// it. The status is reported all the same, for the one question the server
-/// cannot answer from a socket: whether a client it saw nothing from finished
-/// its work or failed.
+/// it. The status is reported all the same, as evidence a reader can consult.
 #[allow(
     clippy::literal_string_with_formatting_args,
     reason = "{url} and {port} are literal placeholders in a user-supplied template, \
@@ -482,10 +480,9 @@ async fn drive(
 ///
 /// When it exited is a fact the server cannot obtain: from a socket, a peer
 /// that has gone and a peer reading quietly are the same thing. The status is
-/// reported too, and used for one thing only: a pass the server reached from
-/// silence ("decoded it and completed the request") is not credited to a
-/// client that exited non-zero, since that client failed on its own terms and
-/// said nothing on the wire about why.
+/// reported too, for the record only: it means different things per client
+/// (Chromium's wrapper exits 1 on tests it passes; curl exits 18 when a reset
+/// stream correctly ends its request), so no verdict reads it.
 enum ClientEnd {
     /// The process ended on its own, this many milliseconds after it started,
     /// with this exit status (none when a signal ended it).
