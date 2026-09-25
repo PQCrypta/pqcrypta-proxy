@@ -95,6 +95,12 @@ const CID_LIFETIME: Duration = Duration::from_millis(300);
 /// connection rather than after the client has gone.
 const CID_ROTATION_HOLD: Duration = Duration::from_millis(900);
 
+/// How long `q-path-challenge` holds the response for the PATH_RESPONSE.
+///
+/// §8.2.2 asks for an immediate answer; a second is two orders of magnitude
+/// beyond any round trip this service is reached over.
+const PATH_RESPONSE_WAIT: Duration = Duration::from_secs(1);
+
 /// How many datagrams `q-connection-migration` copies out of a second socket.
 const SHADOW_DATAGRAMS: u64 = 6;
 
@@ -2110,20 +2116,14 @@ async fn abandon_and_watch(
     let before_abandon = counters.datagrams_in();
     let resets_before = endpoint.stateless_resets_sent();
 
-    // Abandoned in the driver pass that sends a PING, so the peer is never all
-    // square at the moment the endpoint forgets it. Two scored runs on
-    // 2026-09-25 read "0 datagram(s) arrived" for quiche and neqo -- clients
-    // that pass on every other run -- because the body had been fully
-    // acknowledged when `abandon()` discarded the send queue.
+    // Abandoned, then a PING the peer must acknowledge, sent once the
+    // endpoint has provably forgotten the connection -- so the peer is never
+    // all square when the endpoint forgets it, and its answer always meets a
+    // forgotten connection. Scored runs on 2026-09-25 read "0 datagram(s)
+    // arrived" (the body fully acknowledged before `abandon()` discarded the
+    // send queue) and, with the PING sent first, "1 datagram arrived" with no
+    // reset (the acknowledgement beat the endpoint's forget).
     connection.abandon_after_ping();
-    // A connection that can send nothing -- the peer already gone -- never
-    // gets its PING out, so the plain abandon still follows within a second.
-    if tokio::time::timeout(Duration::from_secs(1), connection.closed())
-        .await
-        .is_err()
-    {
-        connection.abandon();
-    }
 
     // Wait for the peer to say something, and watch rather than guess when.
     //
@@ -3224,6 +3224,22 @@ async fn watch_for_liveness(
                         () = tokio::time::sleep(hold) => {}
                         // Already objected: nothing to wait for.
                         _ = connection.closed() => {}
+                    }
+                }
+
+                // The PATH_CHALLENGE goes out in the first 1-RTT packet with
+                // room, and a client that reads its response and closes can
+                // leave before its PATH_RESPONSE reaches us -- picoquic, in one
+                // scored run of four, read "no path validation was triggered".
+                // §8.2.2 has the peer answer immediately, so the response is
+                // held until the answer is in, never longer than the bound.
+                if test.id == "q-path-challenge" {
+                    let until = Instant::now() + PATH_RESPONSE_WAIT;
+                    while connection.stats().frame_rx.path_response == 0
+                        && connection.close_reason().is_none()
+                        && Instant::now() < until
+                    {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                 }
 
