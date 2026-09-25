@@ -1,0 +1,23 @@
+# A DashMap guard is a synchronous lock on one shard of the map. Held across
+# an `.await`, it parks every worker thread that touches the same shard, and
+# once all of them are parked nothing is left to poll the task that holds it.
+# That stopped the whole proxy twice on 2026-09-25 (webtransport_server.rs,
+# `OriginSlot`). `await_holding_lock` knows std and parking_lot guards, not
+# these, so they are named here, and CI's `-D warnings` makes each one an
+# error.
+await-holding-invalid-types = [
+    { path = "dashmap::mapref::one::Ref", reason = "a DashMap shard read lock; clone what you need out of it before awaiting" },
+    { path = "dashmap::mapref::one::RefMut", reason = "a DashMap shard write lock; clone what you need out of it before awaiting" },
+    { path = "dashmap::mapref::one::MappedRef", reason = "a DashMap shard read lock; clone what you need out of it before awaiting" },
+    { path = "dashmap::mapref::one::MappedRefMut", reason = "a DashMap shard write lock; clone what you need out of it before awaiting" },
+    { path = "dashmap::mapref::multiple::RefMulti", reason = "a DashMap shard read lock taken while iterating; collect before awaiting" },
+    { path = "dashmap::mapref::multiple::RefMutMulti", reason = "a DashMap shard write lock taken while iterating; collect before awaiting" },
+    { path = "dashmap::mapref::entry::Entry", reason = "a DashMap shard write lock; finish with the entry before awaiting" },
+    { path = "dashmap::mapref::entry::OccupiedEntry", reason = "a DashMap shard write lock; finish with the entry before awaiting" },
+    { path = "dashmap::mapref::entry::VacantEntry", reason = "a DashMap shard write lock; finish with the entry before awaiting" },
+    { path = "dashmap::iter::Iter", reason = "holds a DashMap shard read lock; collect before awaiting" },
+    { path = "dashmap::iter::IterMut", reason = "holds a DashMap shard write lock; collect before awaiting" },
+    { path = "dashmap::setref::one::Ref", reason = "a DashSet shard read lock; clone what you need out of it before awaiting" },
+    { path = "dashmap::setref::multiple::RefMulti", reason = "a DashSet shard read lock taken while iterating; collect before awaiting" },
+    { path = "dashmap::iter_set::Iter", reason = "holds a DashSet shard read lock; collect before awaiting" },
+]

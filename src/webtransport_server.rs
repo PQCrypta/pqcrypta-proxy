@@ -343,34 +343,23 @@ async fn handle_incoming_session(
 
     // WT-RL-01: Per-origin session limit.
     let max_sessions = config.server.webtransport_max_sessions_per_origin;
-    let counter = origin_session_counts
-        .entry(origin_key.clone())
-        .or_insert_with(|| Arc::new(AtomicU32::new(0)));
-    let counter = Arc::clone(counter.value());
-    let current = counter.load(Ordering::Relaxed);
-    if current >= max_sessions {
+    let Some(_slot) = OriginSlot::reserve(&origin_session_counts, &origin_key, max_sessions) else {
         warn!(
             "WT-RL-01: WebTransport session limit ({}) reached for origin '{}' — rejecting {}",
             max_sessions, origin_key, remote_addr
         );
         session_request.forbidden().await;
         return Ok(());
-    }
-    counter.fetch_add(1, Ordering::Relaxed);
+    };
 
     // Accept the session
-    let connection = match session_request.accept().await {
-        Ok(c) => c,
-        Err(e) => {
-            counter.fetch_sub(1, Ordering::Relaxed);
-            return Err(e.into());
-        }
-    };
+    let connection = session_request.accept().await?;
 
     info!("✅ WebTransport connection established: {}", remote_addr);
 
-    // Handle the connection; decrement counter when it closes
-    let result = handle_connection(
+    // The slot is given back when `_slot` drops: when the session ends, and
+    // equally when this task panics or is cancelled.
+    handle_connection(
         connection,
         remote_addr,
         path,
@@ -378,9 +367,48 @@ async fn handle_incoming_session(
         backend_pool,
         security,
     )
-    .await;
-    counter.fetch_sub(1, Ordering::Relaxed);
-    result
+    .await
+}
+
+/// One origin's claim on a concurrent-session slot, given back on drop.
+///
+/// The counter is cloned out of the map in one expression, so the map's guard
+/// is gone before anything awaits. It used to be read through the `RefMut`
+/// that `entry` returns, bound to a name that was then shadowed -- and
+/// shadowing drops nothing. That guard is a write lock on the map's shard, it
+/// lived for the whole session, and it is not an async lock: the next session
+/// from the same origin parked a worker thread waiting for it. Once every
+/// worker was parked, nothing could poll the session holding the lock, and the
+/// proxy stopped outright -- every listener, the admin port, SIGTERM -- until
+/// the hang watchdog restarted it, twice on 2026-09-25.
+struct OriginSlot(Arc<AtomicU32>);
+
+impl OriginSlot {
+    /// Take a slot for `origin`, or `None` when it already has `max` sessions.
+    ///
+    /// A compare-and-swap, not a load followed by an add: with the separate
+    /// read, two sessions arriving together could both see room for one and
+    /// both take it.
+    fn reserve(counts: &DashMap<String, Arc<AtomicU32>>, origin: &str, max: u32) -> Option<Self> {
+        let counter = Arc::clone(
+            counts
+                .entry(origin.to_string())
+                .or_insert_with(|| Arc::new(AtomicU32::new(0)))
+                .value(),
+        );
+        counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < max).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Self(counter))
+    }
+}
+
+impl Drop for OriginSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Handle an established WebTransport connection
@@ -928,4 +956,175 @@ fn find_backend_for_path(path: &str, config: &ProxyConfig) -> String {
         .next()
         .cloned()
         .unwrap_or_else(|| "main".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ORIGIN: &str = "https://origin.test";
+
+    /// A runtime whose workers can all be parked at once, so a stall shows.
+    fn server_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// A WebTransport server on a free IPv6 loopback port, with a self-signed
+    /// `localhost` certificate its clients trust.
+    async fn server(
+        dir: &std::path::Path,
+        per_origin: u32,
+    ) -> (
+        WebTransportServer,
+        rustls::pki_types::CertificateDer<'static>,
+    ) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        std::fs::write(dir.join("localhost.crt"), cert.cert.pem()).unwrap();
+        std::fs::write(dir.join("localhost.key"), cert.signing_key.serialize_pem()).unwrap();
+        // `localhost` resolves to ::1 first, so that is where the server listens.
+        let port = std::net::UdpSocket::bind("[::1]:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut config = ProxyConfig::default();
+        config.server.webtransport_allowed_origins = vec![ORIGIN.to_string()];
+        config.server.webtransport_max_sessions_per_origin = per_origin;
+        let config = Arc::new(config);
+        let crt = dir.join("localhost.crt");
+        let key = dir.join("localhost.key");
+        let server = WebTransportServer::new(
+            SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port)),
+            crt.to_str().unwrap(),
+            key.to_str().unwrap(),
+            config.clone(),
+            Arc::new(BackendPool::new(config)),
+        )
+        .await
+        .unwrap();
+        (server, cert.cert.der().clone())
+    }
+
+    fn client(
+        root: rustls::pki_types::CertificateDer<'static>,
+    ) -> wtransport::Endpoint<wtransport::endpoint::endpoint_side::Client> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(root).unwrap();
+        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let config = wtransport::ClientConfig::builder()
+            .with_bind_default()
+            .with_custom_tls(tls)
+            .build();
+        wtransport::Endpoint::client(config).unwrap()
+    }
+
+    async fn open(
+        endpoint: &wtransport::Endpoint<wtransport::endpoint::endpoint_side::Client>,
+        port: u16,
+    ) -> Result<wtransport::Connection, wtransport::error::ConnectingError> {
+        endpoint
+            .connect(
+                wtransport::endpoint::ConnectOptions::builder(format!(
+                    "https://localhost:{port}/webtransport"
+                ))
+                .add_header("origin", ORIGIN)
+                .build(),
+            )
+            .await
+    }
+
+    /// Sessions from one origin, open at once, must leave the runtime running.
+    ///
+    /// The per-origin counter used to be read through the `RefMut` that
+    /// `DashMap::entry` returns, and rebinding the name did not drop it: the
+    /// guard -- a write lock on the map's shard -- lived until the handler
+    /// returned, which is when the session ended. The next session from the
+    /// same origin then waited for that lock, and the lock is not async: it
+    /// parks the worker thread. One parked worker per waiting session, and when
+    /// every worker was parked nothing was left to poll the session that held
+    /// the lock, so it never let go. The whole proxy stopped -- every listener,
+    /// the admin port, even SIGTERM -- until the hang watchdog restarted it.
+    ///
+    /// Production has four workers, and it stopped twice on 2026-09-25, each
+    /// time after one browser's speed test held a session and four more
+    /// requests arrived from the same page. Two workers make the same stall
+    /// with two.
+    #[test]
+    fn sessions_from_one_origin_cannot_stop_the_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_rt = server_runtime();
+        let (server, root) = server_rt.block_on(server(dir.path(), 100));
+        let port = server.local_addr().port();
+        let handle = server_rt.handle().clone();
+        server_rt.spawn(server.run());
+
+        // The clients run elsewhere, so a stalled server cannot stall them.
+        let client_rt = tokio::runtime::Runtime::new().unwrap();
+        client_rt.block_on(async move {
+            let endpoint = client(root);
+            let mut held = Vec::new();
+            for n in 0..3 {
+                let session = tokio::time::timeout(Duration::from_secs(10), open(&endpoint, port))
+                    .await
+                    .unwrap_or_else(|_| panic!("session {n} was never answered"))
+                    .unwrap_or_else(|e| panic!("session {n} failed: {e}"));
+                held.push(session);
+            }
+            // Anything at all must still run on the server's runtime.
+            tokio::time::timeout(Duration::from_secs(5), handle.spawn(async {}))
+                .await
+                .expect("the server's runtime stopped running tasks")
+                .unwrap();
+            drop(held);
+        });
+        server_rt.shutdown_background();
+    }
+
+    /// The per-origin cap still holds, and a slot comes back when its
+    /// session ends.
+    #[test]
+    fn the_per_origin_cap_is_enforced_and_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_rt = server_runtime();
+        let (server, root) = server_rt.block_on(server(dir.path(), 1));
+        let port = server.local_addr().port();
+        server_rt.spawn(server.run());
+
+        let client_rt = tokio::runtime::Runtime::new().unwrap();
+        client_rt.block_on(async move {
+            let endpoint = client(root);
+            let first = open(&endpoint, port)
+                .await
+                .expect("the first session is within the cap");
+            let second = tokio::time::timeout(Duration::from_secs(10), open(&endpoint, port))
+                .await
+                .expect("the refusal never came");
+            assert!(second.is_err(), "a second session exceeded a cap of one");
+
+            first.close(0u32.into(), b"done");
+            let mut reopened = None;
+            for _ in 0..50 {
+                if let Ok(Ok(s)) =
+                    tokio::time::timeout(Duration::from_secs(2), open(&endpoint, port)).await
+                {
+                    reopened = Some(s);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(reopened.is_some(), "the slot was never given back");
+        });
+        server_rt.shutdown_background();
+    }
 }

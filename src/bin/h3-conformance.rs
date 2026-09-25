@@ -175,6 +175,23 @@ async fn collect_report(
 ) -> Result<String, i32> {
     loop {
         let body = match http.get(url).send().await {
+            // Sessions live in the service's memory, so a restart mid-run
+            // takes this one with it and the report URL answers 404 with an
+            // error body. That body used to be returned as the report, and
+            // `--json` printed it: the runner then recorded the client with no
+            // results at all -- 59 cells, twice on 2026-09-25, each time the
+            // proxy was restarted under a run.
+            Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+                eprintln!(
+                    "the service no longer has this session: it was restarted during the \
+                     run, and the verdicts recorded so far went with it. Run the client again"
+                );
+                return Err(exit::UNREACHABLE);
+            }
+            Ok(r) if !r.status().is_success() => {
+                eprintln!("could not fetch the report: {}", r.status());
+                return Err(exit::UNREACHABLE);
+            }
             Ok(r) => match r.text().await {
                 Ok(t) => t,
                 Err(e) => {
@@ -330,10 +347,8 @@ async fn run(args: &Args) -> i32 {
         Err(code) => return code,
     };
 
-    if args.json {
-        println!("{body}");
-    }
-
+    // Parsed before anything is printed, so `--json` emits a report or
+    // nothing: a consumer never has to tell a report from an error body.
     let report: Report = match serde_json::from_str(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -342,7 +357,9 @@ async fn run(args: &Args) -> i32 {
         }
     };
 
-    if !args.json {
+    if args.json {
+        println!("{body}");
+    } else {
         render(&report, args.quiet, &base, &session.id);
     }
 
