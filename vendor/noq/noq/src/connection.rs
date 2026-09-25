@@ -287,6 +287,17 @@ impl Future for ConnectionDriver {
             return Poll::Ready(Ok(()));
         }
         let mut keep_going = conn.drive_transmit(cx)?;
+        // A PING has left for the socket since `abandon_after_ping`: forget
+        // the connection now, in the same pass, before any answer to it can
+        // arrive. The peer must acknowledge it within its max_ack_delay, and
+        // that acknowledgement reaches an endpoint that no longer knows the
+        // connection -- which is exactly what a Stateless Reset answers.
+        if let Some(pings_before) = conn.abandon_after_ping {
+            if conn.buffered_transmit.is_none() && conn.inner.stats().frame_tx.ping > pings_before {
+                conn.abandon_after_ping = None;
+                conn.abandon(&self.0.shared);
+            }
+        }
         // If a timer expires, there might be more to transmit. When we transmit something, we
         // might need to reset a timer. Hence, we must loop until neither happens.
         keep_going |= conn.drive_timer(cx);
@@ -718,6 +729,23 @@ impl Connection {
     pub fn abandon(&self) {
         let conn = &mut *self.0.lock_without_waking("abandon"); // conn.abandon self-wakes
         conn.abandon(&self.0.shared);
+    }
+
+    /// Send a PING, then abandon the connection the moment it has left.
+    ///
+    /// [`Self::abandon`] transmits nothing: whatever is queued is discarded
+    /// with the connection. So a peer that happened to be all square when it
+    /// was called had nothing to say afterwards, and the conformance suite's
+    /// Stateless Reset test waited out its window for a packet that never
+    /// came -- a race between the abandon and the peer's last acknowledgement,
+    /// lost on roughly one run in three. A PING the peer must acknowledge,
+    /// sent in the same driver pass as the abandon, leaves it owing exactly
+    /// one packet, and that packet meets a forgotten connection.
+    pub fn abandon_after_ping(&self) {
+        let conn = &mut *self.0.lock_and_wake("abandon_after_ping");
+        let pings_before = conn.inner.stats().frame_tx.ping;
+        conn.inner.ping();
+        conn.abandon_after_ping = Some(pings_before);
     }
 
     /// Wait for the handshake to be confirmed.
@@ -1568,6 +1596,10 @@ pub(crate) struct State {
     /// Set by [`State::abandon`]: the endpoint has been told to forget this
     /// connection, so neither Drop path may send anything to the peer.
     abandoned: bool,
+    /// Set by [`Connection::abandon_after_ping`]: the PING frames sent before
+    /// the request. The driver abandons the connection in the pass that hands
+    /// the next PING to the socket.
+    abandon_after_ping: Option<u64>,
     /// Tracks paths being opened
     open_path: FxHashMap<PathId, watch::Sender<Result<(), PathError>>>,
     /// Tracks reference counts for paths.
@@ -1634,6 +1666,7 @@ impl State {
             open_path: FxHashMap::default(),
             error: None,
             abandoned: false,
+            abandon_after_ping: None,
             sender,
             runtime,
             send_buffer: Vec::new(),

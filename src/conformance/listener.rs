@@ -1124,6 +1124,11 @@ async fn run_one(
         }
     };
 
+    let note_exchange = |at: Instant| {
+        conformance
+            .sessions
+            .with(&session_id, |s| s.note_exchange_completed(test, at));
+    };
     let (observation, read_proof) = if critical_streams.is_empty() {
         (
             classify_close(&connection, &conformance.close_elicitation).await,
@@ -1153,6 +1158,7 @@ async fn run_one(
                     early_data_seen: early_data_accepted && since.zero_rtt_in() > 0,
                     started,
                     exchange_completed_ms: &exchange_completed_ms,
+                    on_exchange_completed: &note_exchange,
                 },
             ),
             async {
@@ -2104,7 +2110,20 @@ async fn abandon_and_watch(
     let before_abandon = counters.datagrams_in();
     let resets_before = endpoint.stateless_resets_sent();
 
-    connection.abandon();
+    // Abandoned in the driver pass that sends a PING, so the peer is never all
+    // square at the moment the endpoint forgets it. Two scored runs on
+    // 2026-09-25 read "0 datagram(s) arrived" for quiche and neqo -- clients
+    // that pass on every other run -- because the body had been fully
+    // acknowledged when `abandon()` discarded the send queue.
+    connection.abandon_after_ping();
+    // A connection that can send nothing -- the peer already gone -- never
+    // gets its PING out, so the plain abandon still follows within a second.
+    if tokio::time::timeout(Duration::from_secs(1), connection.closed())
+        .await
+        .is_err()
+    {
+        connection.abandon();
+    }
 
     // Wait for the peer to say something, and watch rather than guess when.
     //
@@ -2806,6 +2825,14 @@ pub(super) struct Progress<'a> {
     /// the reaction opportunity for every test whose anomaly rides the
     /// exchange.
     pub(super) exchange_completed_ms: &'a Arc<std::sync::atomic::AtomicU64>,
+    /// Told the instant the exchange completes, so the session knows at once.
+    ///
+    /// The session learned it only when this connection's whole handler
+    /// finished -- some 2.4 s later, after the observation window -- and a
+    /// client that makes its second connection within 300 ms (.NET) had its
+    /// verdict decided in that gap about half the time: "never held a ticket",
+    /// inconclusive, where the other runs read "does not resume".
+    pub(super) on_exchange_completed: &'a (dyn Fn(Instant) + Sync),
 }
 
 /// The server-side streams `watch_for_liveness` may still write to.
@@ -3007,6 +3034,7 @@ async fn watch_for_liveness(
         early_data_seen,
         started,
         exchange_completed_ms,
+        on_exchange_completed,
     } = progress;
     let timeout = Duration::from_millis(conformance.config.liveness_timeout_ms);
 
@@ -3212,6 +3240,7 @@ async fn watch_for_liveness(
                     started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
                     std::sync::atomic::Ordering::Release,
                 );
+                on_exchange_completed(Instant::now());
                 // Handed to the caller rather than dropped. `Drop for SendStream`
                 // finishes the stream, so letting it fall out of scope would end
                 // the response the moment it was written — and a client that has
