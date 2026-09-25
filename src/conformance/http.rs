@@ -649,8 +649,23 @@ fn client_exit(conformance: &Arc<Conformance>, path: &str) -> Response<Body> {
         return text(
             StatusCode::BAD_REQUEST,
             "text/plain; charset=utf-8",
-            "expected /client-exit/<session>/<test>/<elapsed_ms>\n".to_string(),
+            "expected /client-exit/<session>/<test>/<elapsed_ms>[/<exit_status>]\n".to_string(),
         );
+    };
+    // Optional: a driver that predates it posts three segments, and one whose
+    // client was ended by a signal has no status to give.
+    let status = match parts.next() {
+        None => None,
+        Some(code) => match code.parse::<i32>() {
+            Ok(c) => Some(c),
+            Err(_) => {
+                return text(
+                    StatusCode::BAD_REQUEST,
+                    "text/plain; charset=utf-8",
+                    "exit_status must be a number\n".to_string(),
+                );
+            }
+        },
     };
     let Ok(elapsed) = ms.parse::<u64>() else {
         return text(
@@ -669,7 +684,7 @@ fn client_exit(conformance: &Arc<Conformance>, path: &str) -> Response<Body> {
         );
     }
     conformance.sessions.with(session, |s| {
-        s.note_client_exit(test, elapsed);
+        s.note_client_exit(test, elapsed, status);
     });
     text(
         StatusCode::NO_CONTENT,

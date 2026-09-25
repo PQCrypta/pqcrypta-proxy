@@ -823,6 +823,25 @@ pub fn score(test: &'static Test, ev: &Evidence) -> (Verdict, String, Option<&'s
             | Observation::ReadThenSilent(_)
             | Observation::Ambiguous(_)
     );
+    // A pass from silence says the client handled the anomaly and finished.
+    // A process that exited non-zero did not finish, and said nothing on the
+    // wire about why: a crash of its own (lsquic's demo client exits on EAGAIN
+    // without a close) looks exactly like a silent rejection of what it was
+    // sent. Neither is "decoded it and completed the request".
+    if verdict == Verdict::Pass && rests_on_absence {
+        if let Some(code) = ev.exit_status.filter(|c| *c != 0) {
+            return (
+                Verdict::Inconclusive,
+                format!(
+                    "The server saw no objection, but the client process exited with status \
+                     {code} and sent nothing on the wire about why. That is a client failing \
+                     on its own terms, which cannot be told from one that silently refused \
+                     what it was sent, so it is not credited as having handled it."
+                ),
+                Some("client_exit_nonzero_without_close"),
+            );
+        }
+    }
     let Some(exited) = ev.t_exit_ms else {
         return (verdict, detail, None);
     };
@@ -927,6 +946,15 @@ pub struct Evidence {
     pub t_observation_end_ms: u64,
     /// When the driver's client process exited, where it reported one.
     pub t_exit_ms: Option<u64>,
+    /// The client process's exit status, where the driver reported one (none
+    /// when a signal ended it, or from a driver that predates it).
+    ///
+    /// Never a verdict on its own: a client that correctly rejects an anomaly
+    /// often exits non-zero. It decides one thing -- a pass the oracle reached
+    /// from silence is not credited to a client that exited non-zero, which
+    /// failed on its own terms and said nothing on the wire about why.
+    #[serde(default)]
+    pub exit_status: Option<i32>,
     /// Which connection within the session produced this, and when it was
     /// stored.
     ///
@@ -974,7 +1002,12 @@ impl Evidence {
 /// Stored beside the verdict so a matrix states which rules produced it, and
 /// so two matrices can be compared without guessing whether a difference came
 /// from the clients or from us.
-pub const ORACLE_VERSION: &str = "reaction-opportunity/2";
+///
+/// `/3` (2026-09-25): a pass reached from silence is not credited to a client
+/// whose process exited non-zero. lsquic's demo client, which treats EAGAIN on
+/// its own socket as fatal, exits without a close; under `/2` that silence read
+/// "decoded it and completed the request".
+pub const ORACLE_VERSION: &str = "reaction-opportunity/3";
 
 /// One client's walk through the catalogue.
 pub struct Session {
@@ -991,6 +1024,7 @@ pub struct Session {
     /// driver holds the process, so it posts the exit and the report reads
     /// the two together.
     client_exit_ms: HashMap<String, u64>,
+    client_exit_status: HashMap<String, i32>,
     /// Connections recorded into this session, in order.
     recorded: u64,
     /// When a connection on each test's port first completed its exchange.
@@ -1032,6 +1066,7 @@ impl Session {
             created: Instant::now(),
             evidence: HashMap::new(),
             client_exit_ms: HashMap::new(),
+            client_exit_status: HashMap::new(),
             recorded: 0,
             first_exchange_completed: HashMap::new(),
             snapshots: 0,
@@ -1065,13 +1100,18 @@ impl Session {
     /// Kept whether or not a verdict exists yet: the driver posts this as it
     /// goes and the report is composed at the end, so the two arrive in no
     /// guaranteed order.
-    pub fn note_client_exit(&mut self, test_id: &str, elapsed_ms: u64) {
+    pub fn note_client_exit(&mut self, test_id: &str, elapsed_ms: u64, status: Option<i32>) {
         self.client_exit_ms.insert(test_id.to_string(), elapsed_ms);
+        match status {
+            Some(code) => self.client_exit_status.insert(test_id.to_string(), code),
+            None => self.client_exit_status.remove(test_id),
+        };
         // The driver posts this after the connection has ended, so the
         // evidence usually exists already and is completed in place. Where it
-        // does not, the map above carries it until the evidence arrives.
+        // does not, the maps above carry it until the evidence arrives.
         if let Some(ev) = self.evidence.get_mut(test_id) {
             ev.t_exit_ms = Some(elapsed_ms);
+            ev.exit_status = status;
         }
     }
 
@@ -1147,6 +1187,7 @@ impl Session {
         let mut ev = ev;
         if ev.t_exit_ms.is_none() {
             ev.t_exit_ms = self.client_exit_ms.get(test.id).copied();
+            ev.exit_status = self.client_exit_status.get(test.id).copied();
         }
         self.recorded += 1;
         ev.connection_seq = self.recorded;
@@ -1439,6 +1480,7 @@ mod tests {
                 t_exchange_completed_ms: Some(1),
                 t_observation_end_ms: end_ms,
                 t_exit_ms: None,
+                exit_status: None,
                 connection_seq: 0,
                 recorded_at_ms: 0,
             },
@@ -1458,9 +1500,48 @@ mod tests {
             t_exchange_completed_ms: exch,
             t_observation_end_ms: 8_000,
             t_exit_ms: exit,
+            exit_status: None,
             connection_seq: 1,
             recorded_at_ms: 0,
         }
+    }
+
+    /// lsquic's demo client exits on EAGAIN without sending a close. Under
+    /// `reaction-opportunity/2` the silence that follows scored "decoded it and
+    /// completed the request" on `h-trailers`, one run in four, against three
+    /// runs in which the same client rejected the response with 0x10e.
+    #[test]
+    fn a_silent_pass_is_not_credited_to_a_client_that_exited_non_zero() {
+        let t = test_of("h-trailers");
+        let mut e = ev(Observation::PeerUnreachable, 5, Some(5), Some(50));
+        e.exit_status = Some(2);
+        let (v, d, reason) = score(t, &e);
+        assert_eq!(v, Verdict::Inconclusive, "{d}");
+        assert_eq!(reason, Some("client_exit_nonzero_without_close"));
+
+        e.exit_status = Some(0);
+        assert_eq!(
+            score(t, &e).0,
+            Verdict::Pass,
+            "a clean exit after silence still passes"
+        );
+
+        e.exit_status = None;
+        assert_eq!(
+            score(t, &e).0,
+            Verdict::Pass,
+            "a driver that reports no status changes nothing"
+        );
+
+        // What the client said on the wire is untouched by how it exited.
+        let mut closed = ev(
+            Observation::ClosedWith { code: 0x10e },
+            5,
+            Some(5),
+            Some(50),
+        );
+        closed.exit_status = Some(2);
+        assert_eq!(score(t, &closed).0, Verdict::Fail);
     }
 
     /// The property the whole refactor exists for: a stored run can be scored

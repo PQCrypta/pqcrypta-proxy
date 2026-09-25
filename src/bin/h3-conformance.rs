@@ -80,6 +80,14 @@ struct Args {
     /// Run only tests whose id contains this substring.
     #[arg(long)]
     filter: Option<String>,
+
+    /// Drive a test again, up to this many times, when its first attempt
+    /// ends inconclusive. A client that crashed for its own reasons, or quit
+    /// before reading a stream nothing obliged it to read, has not been put in
+    /// the situation under test; another attempt can put it there. The
+    /// listener never lets an inconclusive attempt overwrite a conclusive one.
+    #[arg(long, default_value_t = 1)]
+    retries: u32,
 }
 
 /// How long to keep asking for a verdict that has not landed yet.
@@ -276,52 +284,7 @@ async fn run(args: &Args) -> i32 {
 
     // ── Drive the client, once per test ─────────────────────────────────
     for (i, test) in selected.iter().enumerate() {
-        let port = test.port.expect("filtered to Some above");
-        let url = format!("https://{}:{}/", args.host, port);
-        if !args.quiet && !args.json {
-            println!(
-                "  [{:>2}/{}] {:<28} {}",
-                i + 1,
-                selected.len(),
-                test.id,
-                test.title
-            );
-        }
-        // The 0-RTT ports need a connection that has something to resume.
-        //
-        // Early data is only possible with a session ticket from an earlier
-        // connection to the same port, and the driver makes exactly one
-        // connection per test -- so in the 2026-09-18 run these two tests were
-        // inconclusive for eleven of twelve clients with "the client sent no
-        // early data". True, and not the client's doing: it was never given a
-        // ticket to send any with.
-        //
-        // The wrapper is told to resume rather than the driver making the
-        // extra connection itself, because only the wrapper knows the flags
-        // its client wants (`--session-file`, `-0`, a resumption token) and
-        // whether that client can do this at all. A wrapper that ignores the
-        // variable behaves exactly as before. Every client in the matrix now
-        // makes the pair -- curl through a session file, Chromium within one
-        // launch, .NET with two connections in one process -- so what a cell
-        // reports is whether the client resumed and sent early data, never
-        // that it was not given the chance.
-        let resume = test.id.starts_with("q-zero-rtt");
-        // Tell the server when the process stopped, so a verdict that rests on
-        // silence can say which kind of silence it was. Advisory: a failure to
-        // post leaves every verdict exactly as it would have been, with a less
-        // specific sentence explaining it.
-        if let ClientEnd::Exited(ms) = invoke_client(&args.client, &url, port, args.timeout, resume)
-        {
-            // Reported rather than discarded. A diagnostic that quietly fails
-            // is indistinguishable from one that was never wired up, which is
-            // the shape of defect this suite keeps finding in itself.
-            let url = format!("{base}/client-exit/{}/{}/{ms}", session.id, test.id);
-            match http.post(&url).send().await {
-                Ok(r) if r.status().is_success() => {}
-                Ok(r) => eprintln!("  client-exit for {} rejected: {}", test.id, r.status()),
-                Err(e) => eprintln!("  client-exit for {} failed: {e}", test.id),
-            }
-        }
+        drive(args, &http, &base, &session.id, test, i + 1, selected.len()).await;
     }
 
     // ── Let the server finish deciding ──────────────────────────────────
@@ -345,7 +308,24 @@ async fn run(args: &Args) -> i32 {
     let driven: std::collections::BTreeSet<&str> = selected.iter().map(|t| t.id.as_str()).collect();
     let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
 
-    let body = match collect_report(&http, &url, &driven, deadline, args.json).await {
+    let mut body = match collect_report(&http, &url, &driven, deadline, args.json).await {
+        Ok(body) => body,
+        Err(code) => return code,
+    };
+
+    // ── Again, for what came back inconclusive ──────────────────────────
+    body = match retry_inconclusive(
+        args,
+        &http,
+        &base,
+        &session.id,
+        &selected,
+        &url,
+        &driven,
+        body,
+    )
+    .await
+    {
         Ok(body) => body,
         Err(code) => return code,
     };
@@ -373,13 +353,126 @@ async fn run(args: &Args) -> i32 {
     }
 }
 
+/// Drive again, up to `--retries` times, every test whose verdict came back
+/// inconclusive, and return the report read afterwards.
+///
+/// An inconclusive verdict says the client was never put in the situation
+/// under test: it crashed on its own (lsquic's demo client treats EAGAIN on its
+/// socket as fatal and exits without a close), or it quit before reading a
+/// unidirectional stream nothing obliged it to read (msquic, one run in four).
+/// The next attempt usually does put it there. Evidence from a later attempt
+/// can only replace an inconclusive one, never a verdict, so a retry cannot
+/// turn a result the client earned into a different one.
+#[allow(clippy::too_many_arguments)]
+async fn retry_inconclusive(
+    args: &Args,
+    http: &reqwest::Client,
+    base: &str,
+    session_id: &str,
+    selected: &[&CatalogEntry],
+    url: &str,
+    driven: &std::collections::BTreeSet<&str>,
+    mut body: String,
+) -> Result<String, i32> {
+    for attempt in 1..=args.retries {
+        let Ok(report) = serde_json::from_str::<Report>(&body) else {
+            break;
+        };
+        let again: Vec<&CatalogEntry> = selected
+            .iter()
+            .copied()
+            .filter(|t| {
+                report
+                    .results
+                    .iter()
+                    .any(|r| r.id == t.id && r.verdict == "inconclusive")
+            })
+            .collect();
+        if again.is_empty() {
+            break;
+        }
+        if !args.quiet && !args.json {
+            println!(
+                "\n  attempt {} for {} inconclusive test(s)",
+                attempt + 1,
+                again.len()
+            );
+        }
+        for (i, test) in again.iter().enumerate() {
+            drive(args, http, base, session_id, test, i + 1, again.len()).await;
+        }
+        let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
+        body = collect_report(http, url, driven, deadline, args.json).await?;
+    }
+    Ok(body)
+}
+
+/// Drive the client at one test's port, and tell the server when and how the
+/// process ended.
+async fn drive(
+    args: &Args,
+    http: &reqwest::Client,
+    base: &str,
+    session_id: &str,
+    test: &CatalogEntry,
+    n: usize,
+    of: usize,
+) {
+    let port = test.port.expect("only tests with a port are driven");
+    let url = format!("https://{}:{}/", args.host, port);
+    if !args.quiet && !args.json {
+        println!("  [{:>2}/{}] {:<28} {}", n, of, test.id, test.title);
+    }
+    // The 0-RTT ports need a connection that has something to resume.
+    //
+    // Early data is only possible with a session ticket from an earlier
+    // connection to the same port, and the driver makes exactly one
+    // connection per test -- so in the 2026-09-18 run these two tests were
+    // inconclusive for eleven of twelve clients with "the client sent no
+    // early data". True, and not the client's doing: it was never given a
+    // ticket to send any with.
+    //
+    // The wrapper is told to resume rather than the driver making the
+    // extra connection itself, because only the wrapper knows the flags
+    // its client wants (`--session-file`, `-0`, a resumption token) and
+    // whether that client can do this at all. A wrapper that ignores the
+    // variable behaves exactly as before. Every client in the matrix now
+    // makes the pair -- curl through a session file, Chromium within one
+    // launch, .NET with two connections in one process -- so what a cell
+    // reports is whether the client resumed and sent early data, never
+    // that it was not given the chance.
+    let resume = test.id.starts_with("q-zero-rtt");
+    // Tell the server when the process stopped, and with what status, so a
+    // verdict that rests on silence can say which kind of silence it was.
+    // Advisory: a failure to post leaves every verdict as it would have been,
+    // with a less specific sentence explaining it.
+    if let ClientEnd::Exited(ms, status) =
+        invoke_client(&args.client, &url, port, args.timeout, resume)
+    {
+        // Reported rather than discarded. A diagnostic that quietly fails
+        // is indistinguishable from one that was never wired up, which is
+        // the shape of defect this suite keeps finding in itself.
+        let url = status.map_or_else(
+            || format!("{base}/client-exit/{session_id}/{}/{ms}", test.id),
+            |code| format!("{base}/client-exit/{session_id}/{}/{ms}/{code}", test.id),
+        );
+        match http.post(&url).send().await {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => eprintln!("  client-exit for {} rejected: {}", test.id, r.status()),
+            Err(e) => eprintln!("  client-exit for {} failed: {e}", test.id),
+        }
+    }
+}
+
 /// Run the client command for one test.
 ///
-/// The exit status is deliberately ignored. A client that correctly rejects a
+/// The exit status is never a verdict. A client that correctly rejects a
 /// protocol violation usually exits non-zero, and treating that as a harness
 /// error would turn every correct rejection into a broken run. What the client
 /// did is decided by the server, which is the only party in a position to judge
-/// it.
+/// it. The status is reported all the same, for the one question the server
+/// cannot answer from a socket: whether a client it saw nothing from finished
+/// its work or failed.
 #[allow(
     clippy::literal_string_with_formatting_args,
     reason = "{url} and {port} are literal placeholders in a user-supplied template, \
@@ -387,14 +480,16 @@ async fn run(args: &Args) -> i32 {
 )]
 /// How a client invocation ended.
 ///
-/// The exit *status* stays ignored -- a client failing a test frequently
-/// should exit non-zero, and reading that would discard the result the run
-/// exists to collect. When it exited is a different fact, and one the server
-/// cannot obtain: from a socket, a peer that has gone and a peer reading
-/// quietly are the same thing.
+/// When it exited is a fact the server cannot obtain: from a socket, a peer
+/// that has gone and a peer reading quietly are the same thing. The status is
+/// reported too, and used for one thing only: a pass the server reached from
+/// silence ("decoded it and completed the request") is not credited to a
+/// client that exited non-zero, since that client failed on its own terms and
+/// said nothing on the wire about why.
 enum ClientEnd {
-    /// The process ended on its own, this many milliseconds after it started.
-    Exited(u64),
+    /// The process ended on its own, this many milliseconds after it started,
+    /// with this exit status (none when a signal ended it).
+    Exited(u64, Option<i32>),
     /// It was still running when the per-test deadline arrived, so it was
     /// killed. Nothing about the peer's silence is explained by this.
     Killed,
@@ -453,12 +548,17 @@ fn invoke_client(
     let deadline = started + Duration::from_secs(timeout_secs);
     loop {
         match child.try_wait() {
-            // Exited, or we cannot tell — either way this invocation is done.
-            // The exit status is not consulted, so the two are the same
-            // outcome here.
-            Ok(Some(_)) | Err(_) => {
+            // Exited, or we cannot tell -- either way this invocation is done.
+            Ok(Some(status)) => {
                 return ClientEnd::Exited(
                     started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                    status.code(),
+                )
+            }
+            Err(_) => {
+                return ClientEnd::Exited(
+                    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                    None,
                 )
             }
             Ok(None) if std::time::Instant::now() >= deadline => {

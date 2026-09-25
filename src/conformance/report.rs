@@ -334,6 +334,7 @@ mod tests {
                         t_exchange_completed_ms: Some(1),
                         t_observation_end_ms: 5,
                         t_exit_ms: None,
+                        exit_status: None,
                         connection_seq: 0,
                         recorded_at_ms: 0,
                     },
