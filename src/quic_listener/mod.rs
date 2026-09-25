@@ -208,7 +208,12 @@ pub(super) struct H3ConnHeaders {
     /// `x-client-cert`, which per-route mTLS enforcement reads. Never set on
     /// this transport before, so an mTLS route refused every HTTP/3 client,
     /// including one that had authenticated.
-    pub(super) client_cert: bool,
+    ///
+    /// Settled by the first request accepted after the handshake completed
+    /// (see `resolve_client_cert`). A connection serving 0-RTT is set up
+    /// before the client's certificate has been verified, and its early
+    /// requests never report one.
+    pub(super) client_cert: std::sync::OnceLock<bool>,
     /// `x-pqc-enabled`: whether this handshake was post-quantum, as the TCP
     /// listeners report it.
     pub(super) pqc_enabled: HeaderValue,
@@ -224,14 +229,9 @@ impl H3ConnHeaders {
         remote_addr: SocketAddr,
         fingerprint: &crate::fingerprint::FingerprintResult,
         handshake: &crate::tls_acceptor::HandshakeFacts,
-        client_cert: bool,
     ) -> Self {
         let value = |s: Option<&str>| s.and_then(|s| HeaderValue::from_str(s).ok());
-        let pqc = handshake
-            .kex_group
-            .as_deref()
-            .and_then(crate::pqc_tls::PqcKemAlgorithm::from_str)
-            .is_some();
+        let pqc = handshake.is_post_quantum();
         Self {
             static_headers: build_static_response_headers(config),
             alt_svc: HeaderValue::from_str(&build_alt_svc_header_over_quic(config)).ok(),
@@ -239,10 +239,26 @@ impl H3ConnHeaders {
             ja3: value(fingerprint.ja3_hash.as_deref()),
             ja4: value(fingerprint.ja4_hash.as_deref()),
             client_name: value(fingerprint.client_name.as_deref()),
-            client_cert,
+            client_cert: std::sync::OnceLock::new(),
             pqc_enabled: HeaderValue::from_static(if pqc { "true" } else { "false" }),
             host: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Read the client certificate off a connection whose handshake has
+    /// completed, once. Called for every stream that was not 0-RTT, which
+    /// noq decides against the connection's own state when it hands the
+    /// stream over, so the first such call already sees the final answer.
+    pub(super) fn resolve_client_cert(&self, connection: &QuinnConnection) {
+        self.client_cert.get_or_init(|| {
+            connection
+                .peer_identity()
+                .and_then(|id| {
+                    id.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                        .ok()
+                })
+                .is_some_and(|certs| !certs.is_empty())
+        });
     }
 
     /// `host` as a header value, built once for the connection's usual host.
@@ -852,13 +868,82 @@ impl QuicListener {
         fingerprint_config: crate::config::FingerprintConfig,
     ) -> anyhow::Result<()> {
         // Accept connection
-        let connecting = incoming.accept()?;
-        let connection = connecting.await?;
+        let mut connecting = incoming.accept()?;
 
-        info!("QUIC connection established: {}", remote_addr);
+        // Readable once the server has processed the ClientHello. Whether it
+        // accepted 0-RTT is settled in that same step, and when it did, nothing
+        // else here can still change: early data is impossible after a
+        // HelloRetryRequest, which is the one thing that leaves the group and
+        // ALPN undecided at this point.
+        let hello_data = connecting
+            .handshake_data()
+            .await?
+            .downcast::<quinn::crypto::rustls::HandshakeData>()
+            .ok();
+        let early_data = hello_data.as_ref().is_some_and(|d| d.early_data_accepted);
 
-        // Log ALPN negotiation and record TLS handshake
-        metrics.tls.handshake_completed(true, false);
+        // 0.5-RTT: take the connection before the handshake completes, so the
+        // HTTP/3 SETTINGS below leave with the server's first flight instead of
+        // after the client's Finished.
+        //
+        // The order matters to a resuming client. RFC 9114 §7.2.4.2 has it keep
+        // the server's SETTINGS alongside a session ticket, and the tickets go
+        // out the moment the handshake completes; SETTINGS sent after that
+        // arrive behind them. neqo -- Firefox's stack -- drops a ticket that
+        // arrives before SETTINGS, so it kept none of ours and never resumed or
+        // sent 0-RTT here, while it did both against Cloudflare, Google and
+        // nginx. Measured 2026-09-24 against pqcrypta.com and the conformance
+        // 0-RTT ports alike.
+        //
+        // Nothing sent here depends on who the client is: SETTINGS carry no
+        // secret and no client authentication has happened yet, which is
+        // exactly the caution noq documents for 0.5-RTT data.
+        let (connection, established) = connecting
+            .into_0rtt()
+            .map_err(|_| anyhow::anyhow!("QUIC stack refused 0.5-RTT on an incoming connection"))?;
+
+        // Advertises SETTINGS_ENABLE_WEBTRANSPORT=1 and
+        // SETTINGS_WEBTRANSPORT_MAX_SESSIONS (draft-ietf-webtrans-http3-09 §8.2).
+        //
+        // The advertised limit is the limit actually enforced. It was hardcoded
+        // to 1000 while `webtransport_max_sessions_per_origin` — the value
+        // `handle_webtransport_session` refuses connections against — defaults
+        // to 100. A client was told it could open ten times what it would be
+        // given, which is worse than saying nothing: the setting exists so a
+        // peer can size its own behaviour, and a wrong number is acted upon.
+        let h3_built = h3::server::builder()
+            .enable_webtransport(true)
+            .enable_extended_connect(true)
+            .enable_datagram(true)
+            .max_webtransport_sessions(config.server.webtransport_max_sessions_per_origin as u64)
+            .build(H3Connection::new(connection.clone()))
+            .await;
+
+        // Serving waits for the handshake unless the connection carries 0-RTT.
+        // A request that arrives after it is safe from replay, since a replayed
+        // flight can never produce the client's Finished; the ones that arrive
+        // before it are marked per stream (`x-tls-early-data`) and held to
+        // RFC 8470 by the route gate.
+        let (handshake_data, completing) = if early_data {
+            info!("QUIC connection accepted with 0-RTT: {}", remote_addr);
+            (hello_data, Some(established))
+        } else {
+            // Resolves when the handshake ends either way. Its value is whether
+            // 0-RTT was accepted -- false on every ordinary connection, so it
+            // says nothing about success; a close reason does.
+            established.await;
+            if let Some(reason) = connection.close_reason() {
+                metrics.tls.handshake_completed(false, false);
+                return Err(reason.into());
+            }
+            info!("QUIC connection established: {}", remote_addr);
+            // Read again: this is where a HelloRetryRequest's group and ALPN
+            // become final.
+            let data = connection
+                .handshake_data()
+                .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok());
+            (data.or(hello_data), None)
+        };
 
         // Read everything the handshake exposes in one pass: ALPN, the
         // negotiated group and cipher suite for the Handshake Mirror, and the
@@ -871,32 +956,46 @@ impl QuicListener {
         let mut handshake_facts = quic_handshake_facts_empty();
         let mut client_hello: Option<Vec<u8>> = None;
 
-        if let Some(handshake_data) = connection.handshake_data() {
-            if let Some(crypto_data) =
-                handshake_data.downcast_ref::<quinn::crypto::rustls::HandshakeData>()
-            {
-                if let Some(protocol) = &crypto_data.protocol {
-                    let alpn = String::from_utf8_lossy(protocol);
-                    info!("ALPN negotiated: {} for {}", alpn, remote_addr);
-                    handshake_facts.alpn = Some(alpn.into_owned());
-                }
-                handshake_facts.kex_group = crypto_data
-                    .negotiated_key_exchange_group
-                    .map(|g| format!("{g:?}"));
-                handshake_facts.cipher_suite = crypto_data
-                    .negotiated_cipher_suite
-                    .map(|c| format!("{c:?}"));
-                client_hello = crypto_data.client_hello_wire.clone();
-                // ECH applies over QUIC exactly as over TCP; the page reported
-                // it as "not observable over HTTP/3" only because nothing
-                // carried the result up here.
-                if let Some(ech) = crypto_data.ech_accepted {
-                    handshake_facts.ech = match ech {
-                        rustls::server::EchAcceptance::NotOffered => "not-offered",
-                        rustls::server::EchAcceptance::Rejected => "rejected",
-                        rustls::server::EchAcceptance::Accepted => "accepted",
-                    };
-                }
+        if let Some(crypto_data) = handshake_data.as_deref() {
+            if let Some(protocol) = &crypto_data.protocol {
+                let alpn = String::from_utf8_lossy(protocol);
+                info!("ALPN negotiated: {} for {}", alpn, remote_addr);
+                handshake_facts.alpn = Some(alpn.into_owned());
+            }
+            handshake_facts.kex_group = crypto_data
+                .negotiated_key_exchange_group
+                .map(|g| format!("{g:?}"));
+            handshake_facts.cipher_suite = crypto_data
+                .negotiated_cipher_suite
+                .map(|c| format!("{c:?}"));
+            client_hello = crypto_data.client_hello_wire.clone();
+            // ECH applies over QUIC exactly as over TCP; the page reported
+            // it as "not observable over HTTP/3" only because nothing
+            // carried the result up here.
+            if let Some(ech) = crypto_data.ech_accepted {
+                handshake_facts.ech = match ech {
+                    rustls::server::EchAcceptance::NotOffered => "not-offered",
+                    rustls::server::EchAcceptance::Rejected => "rejected",
+                    rustls::server::EchAcceptance::Accepted => "accepted",
+                };
+            }
+        }
+
+        // Counted once the facts are final: now, or -- for a connection that
+        // is already serving 0-RTT -- when its handshake completes, which a
+        // replayed flight never does.
+        let pqc = handshake_facts.is_post_quantum();
+        match completing {
+            None => metrics.tls.handshake_completed(true, pqc),
+            Some(established) => {
+                let metrics = metrics.clone();
+                let connection = connection.clone();
+                tokio::spawn(async move {
+                    established.await;
+                    if connection.close_reason().is_none() {
+                        metrics.tls.handshake_completed(true, pqc);
+                    }
+                });
             }
         }
 
@@ -1011,26 +1110,7 @@ impl QuicListener {
             });
         }
 
-        // Create H3 connection
-        let h3_conn = H3Connection::new(connection.clone());
-
-        // Advertises SETTINGS_ENABLE_WEBTRANSPORT=1 and
-        // SETTINGS_WEBTRANSPORT_MAX_SESSIONS (draft-ietf-webtrans-http3-09 §8.2).
-        //
-        // The advertised limit is the limit actually enforced. It was hardcoded
-        // to 1000 while `webtransport_max_sessions_per_origin` — the value
-        // `handle_webtransport_session` refuses connections against — defaults
-        // to 100. A client was told it could open ten times what it would be
-        // given, which is worse than saying nothing: the setting exists so a
-        // peer can size its own behaviour, and a wrong number is acted upon.
-        match h3::server::builder()
-            .enable_webtransport(true)
-            .enable_extended_connect(true)
-            .enable_datagram(true)
-            .max_webtransport_sessions(config.server.webtransport_max_sessions_per_origin as u64)
-            .build(h3_conn)
-            .await
-        {
+        match h3_built {
             Ok(mut h3) => {
                 // HTTP/3 connection established
                 Self::handle_h3_connection(
@@ -1085,19 +1165,11 @@ impl QuicListener {
 
         // Built once for the connection rather than once per request; see
         // `H3ConnHeaders`.
-        let client_cert = quic_connection
-            .peer_identity()
-            .and_then(|id| {
-                id.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
-                    .ok()
-            })
-            .is_some_and(|certs| !certs.is_empty());
         let conn_headers = Arc::new(H3ConnHeaders::new(
             &config,
             remote_addr,
             &fingerprint,
             &handshake,
-            client_cert,
         ));
 
         // Every ordinary request becomes its own task. One definition for both
@@ -1160,6 +1232,10 @@ impl QuicListener {
                         }
                     };
 
+                    if !stream.is_0rtt() {
+                        conn_headers.resolve_client_cert(&quic_connection);
+                    }
+
                     // Everything below is for extended CONNECT — WebTransport,
                     // WebSocket and CONNECT-UDP. An ordinary request needs none
                     // of it, and computing it first cost every request a URI
@@ -1172,6 +1248,26 @@ impl QuicListener {
                             remote_addr
                         );
                         spawn_request(stream, request);
+                        continue;
+                    }
+
+                    // A session or tunnel opened from 0-RTT is one a replayed
+                    // flight could open as well, and none of them is a request
+                    // the route gate's safe-method list can vouch for. RFC 8470
+                    // §5.2: 425 asks the client to repeat it once the handshake
+                    // has completed, where it is served as usual.
+                    if stream.is_0rtt() {
+                        debug!(
+                            "Extended CONNECT in 0-RTT from {} answered 425 Too Early",
+                            remote_addr
+                        );
+                        let mut stream = stream;
+                        let too_early = http::Response::builder()
+                            .status(http::StatusCode::TOO_EARLY)
+                            .body(())?;
+                        if stream.send_response(too_early).await.is_ok() {
+                            let _ = stream.finish().await;
+                        }
                         continue;
                     }
 
@@ -1759,7 +1855,6 @@ mod alt_svc_tests {
             "192.0.2.1:50000".parse().unwrap(),
             &fp,
             &crate::tls_acceptor::HandshakeFacts::default(),
-            false,
         );
         assert_eq!(h.alt_svc(&c, Some("ssllabs.pqcrypta.com")), "clear");
         assert_ne!(h.alt_svc(&c, Some("pqcrypta.com")), "clear");
@@ -1770,6 +1865,9 @@ mod alt_svc_tests {
             build_alt_svc_header_over_quic(&c).as_str()
         );
         assert_eq!(h.client_ip.as_ref().unwrap(), "192.0.2.1");
+        // No request has settled it yet: a connection serving 0-RTT is set up
+        // before any certificate could have been verified.
+        assert_eq!(h.client_cert.get(), None);
     }
 }
 

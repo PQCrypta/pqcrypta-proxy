@@ -155,7 +155,16 @@ impl QuicListener {
                     HeaderValue::from_static("browser"),
                 );
             }
-            if conn_headers.client_cert {
+            // A request accepted before the handshake completed rode on 0-RTT:
+            // marked for the route gate, which answers 425 wherever a replay is
+            // not acceptable (RFC 8470), and never credited with a client
+            // certificate the handshake has not yet verified.
+            if stream.is_0rtt() {
+                h.insert(
+                    HeaderName::from_static("x-tls-early-data"),
+                    HeaderValue::from_static("1"),
+                );
+            } else if conn_headers.client_cert.get() == Some(&true) {
                 h.insert(
                     HeaderName::from_static("x-client-cert"),
                     HeaderValue::from_static("1"),

@@ -984,6 +984,15 @@ pub struct Session {
     client_exit_ms: HashMap<String, u64>,
     /// Connections recorded into this session, in order.
     recorded: u64,
+    /// When a connection on each test's port first completed its exchange.
+    ///
+    /// The server issues its session tickets as the handshake completes, so a
+    /// client that has completed an exchange here holds tickets for this port.
+    /// A connection it opens *after* that instant and does not resume on has
+    /// declined to resume, which is an answer about the client; one opened
+    /// before it never had a ticket to use. The 0-RTT tests read the
+    /// difference.
+    first_exchange_completed: HashMap<&'static str, Instant>,
     /// Readings taken of this session, in order.
     ///
     /// A report is a reading at an instant, and the session keeps moving under
@@ -1015,9 +1024,26 @@ impl Session {
             evidence: HashMap::new(),
             client_exit_ms: HashMap::new(),
             recorded: 0,
+            first_exchange_completed: HashMap::new(),
             snapshots: 0,
             reported: false,
         }
+    }
+
+    /// Note that a connection on `test`'s port completed its exchange at `at`.
+    pub fn note_exchange_completed(&mut self, test: &'static Test, at: Instant) {
+        self.first_exchange_completed
+            .entry(test.id)
+            .and_modify(|first| *first = (*first).min(at))
+            .or_insert(at);
+    }
+
+    /// Whether an earlier connection on `test`'s port had completed its
+    /// exchange -- and so held this port's session tickets -- before `started`.
+    pub fn held_tickets_before(&self, test: &'static Test, started: Instant) -> bool {
+        self.first_exchange_completed
+            .get(test.id)
+            .is_some_and(|first| *first < started)
     }
 
     /// Record that the driver's client process for one test has exited.
@@ -1545,6 +1571,30 @@ mod tests {
 
     use super::*;
     use crate::conformance::catalog::{self, Class, Test, Tier};
+
+    /// A ticket counts only if the exchange that delivered it finished before
+    /// the later connection began: one opened in parallel never had it.
+    #[test]
+    fn tickets_are_held_only_after_an_earlier_exchange_completed() {
+        let t = catalog::find("q-zero-rtt-reject").expect("the test exists");
+        let other = catalog::find("q-zero-rtt-replay").expect("the test exists");
+        let mut s = Session::new("s".into());
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_millis(50);
+        assert!(!s.held_tickets_before(t, later), "nothing completed yet");
+
+        s.note_exchange_completed(t, t0 + Duration::from_millis(20));
+        assert!(s.held_tickets_before(t, later));
+        assert!(
+            !s.held_tickets_before(t, t0 + Duration::from_millis(10)),
+            "a connection that began before the exchange finished held nothing"
+        );
+        assert!(!s.held_tickets_before(other, later), "tickets are per port");
+
+        // A later completion does not move the first one.
+        s.note_exchange_completed(t, t0 + Duration::from_millis(40));
+        assert!(s.held_tickets_before(t, t0 + Duration::from_millis(30)));
+    }
 
     #[test]
     fn a_connection_that_did_not_exercise_the_test_does_not_overwrite_one_that_did() {

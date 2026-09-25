@@ -290,11 +290,15 @@ impl<T> HandshakeSource for tokio_openssl::SslStream<T> {
 #[derive(Clone)]
 pub(crate) struct ConnectionHeadersAcceptor<A> {
     inner: A,
+    /// Every handshake is counted where its facts are read, as on the other
+    /// listeners and over QUIC. These two listeners counted none, so the
+    /// monitor's handshake and PQC-handshake figures described HTTP/3 alone.
+    metrics: Arc<MetricsRegistry>,
 }
 
 impl<A> ConnectionHeadersAcceptor<A> {
-    pub(crate) fn new(inner: A) -> Self {
-        Self { inner }
+    pub(crate) fn new(inner: A, metrics: Arc<MetricsRegistry>) -> Self {
+        Self { inner, metrics }
     }
 }
 
@@ -315,9 +319,19 @@ where
             .peer_addr()
             .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
         let accepted = self.inner.accept(stream, service);
+        let metrics = Arc::clone(&self.metrics);
         Box::pin(async move {
-            let (stream, inner) = accepted.await?;
+            let (stream, inner) = match accepted.await {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    metrics.tls.handshake_completed(false, false);
+                    return Err(e);
+                }
+            };
             let handshake = stream.handshake_facts();
+            metrics
+                .tls
+                .handshake_completed(true, handshake.is_post_quantum());
             let is_http1 = handshake.alpn.as_deref() != Some("h2");
             let conn = crate::tls_acceptor::FingerprintedConnection {
                 remote_addr,
@@ -1090,7 +1104,7 @@ pub async fn run_http_listener(
         &config,
         AppParts {
             port,
-            metrics,
+            metrics: Arc::clone(&metrics),
             load_balancer,
             security_state: security_state.clone(),
             rate_limiter: advanced_rate_limiter,
@@ -1127,6 +1141,7 @@ pub async fn run_http_listener(
     axum_server::bind(addr)
         .acceptor(ConnectionHeadersAcceptor::new(
             RustlsAcceptor::new(tls_config).acceptor(TcpAcceptor::new(&config)),
+            Arc::clone(&metrics),
         ))
         // Spelled out: `ServiceExt` is generic over the request type, and
         // hyper hands `axum_server` an `Incoming` body that only `BodyShim`
@@ -1182,7 +1197,7 @@ pub async fn run_http_listener_pqc(
         &config,
         AppParts {
             port,
-            metrics,
+            metrics: Arc::clone(&metrics),
             load_balancer,
             security_state: security_state.clone(),
             rate_limiter: advanced_rate_limiter,
@@ -1251,6 +1266,7 @@ pub async fn run_http_listener_pqc(
     axum_server::bind(addr)
         .acceptor(ConnectionHeadersAcceptor::new(
             OpenSSLAcceptor::new(openssl_config).acceptor(TcpAcceptor::new(&config)),
+            Arc::clone(&metrics),
         ))
         // Spelled out: `ServiceExt` is generic over the request type, and
         // hyper hands `axum_server` an `Incoming` body that only `BodyShim`
@@ -1533,6 +1549,7 @@ async fn handle_fingerprinted_connection<S>(
             return;
         }
         Err(e) => {
+            metrics.tls.handshake_completed(false, false);
             debug!("TLS accept failed for {}: {}", remote_addr, e);
             return;
         }
@@ -1551,6 +1568,9 @@ async fn handle_fingerprinted_connection<S>(
 
     // Extract fingerprint info from the connection
     let conn_info = tls_stream.conn_info.clone();
+    metrics
+        .tls
+        .handshake_completed(true, conn_info.handshake.is_post_quantum());
     let ja3_hash = conn_info.ja3_hash.clone();
     let ja4_hash = conn_info.ja4_hash.clone();
 
@@ -1930,6 +1950,7 @@ async fn handle_pqc_fingerprinted_connection<S>(
 
     // Perform async TLS handshake
     if let Err(e) = std::pin::Pin::new(&mut ssl_stream).accept().await {
+        metrics.tls.handshake_completed(false, false);
         debug!("PQC TLS handshake failed for {}: {}", remote_addr, e);
         return;
     }
@@ -1972,6 +1993,9 @@ async fn handle_pqc_fingerprinted_connection<S>(
         client_cert_present,
         handshake: pqc_handshake_facts(ssl_stream.ssl()),
     };
+    metrics
+        .tls
+        .handshake_completed(true, conn_info.handshake.is_post_quantum());
 
     // Create service that injects fingerprint headers
     let service = hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {

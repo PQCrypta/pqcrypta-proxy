@@ -218,6 +218,17 @@ pub trait RecvStream {
 
     /// Get QUIC send stream id
     fn recv_id(&self) -> StreamId;
+
+    /// Whether the stream was accepted before the handshake completed, and so
+    /// carries 0-RTT data that an attacker could have replayed.
+    ///
+    /// A server acting on such a request before the handshake completes is
+    /// what RFC 8470 is about: it has to be able to tell, so it can answer
+    /// `425 Too Early` to anything it will not risk twice. Transports without
+    /// 0-RTT keep the default.
+    fn is_0rtt(&self) -> bool {
+        false
+    }
 }
 
 /// Optional trait to allow "splitting" a bidirectional stream into two sides.

@@ -308,6 +308,10 @@ impl<B: Buf> quic::RecvStream for BidiStream<B> {
     fn recv_id(&self) -> StreamId {
         self.recv.recv_id()
     }
+
+    fn is_0rtt(&self) -> bool {
+        self.recv.is_0rtt()
+    }
 }
 
 impl<B> quic::SendStream<B> for BidiStream<B>
@@ -353,6 +357,9 @@ where
 pub struct RecvStream {
     stream: Option<noq::RecvStream>,
     read_chunk_fut: ReadChunkFuture,
+    /// Read from the stream when it is wrapped: `stream` is moved into the
+    /// read future while a read is pending, and the answer never changes.
+    is_0rtt: bool,
 }
 
 // noq's ordered `RecvStream::read_chunk(max_len)` returns `Bytes` directly
@@ -364,6 +371,7 @@ type ReadChunkFuture =
 impl RecvStream {
     fn new(stream: noq::RecvStream) -> Self {
         Self {
+            is_0rtt: stream.is_0rtt(),
             stream: Some(stream),
             // Should only allocate once the first time it's used
             read_chunk_fut: ReusableBoxFuture::new(async { unreachable!() }),
@@ -406,6 +414,10 @@ impl quic::RecvStream for RecvStream {
         let num: u64 = self.stream.as_ref().unwrap().id().into();
 
         num.try_into().expect("invalid stream id")
+    }
+
+    fn is_0rtt(&self) -> bool {
+        self.is_0rtt
     }
 }
 

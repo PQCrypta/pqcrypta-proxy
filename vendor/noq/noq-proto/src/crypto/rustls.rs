@@ -74,6 +74,16 @@ impl crypto::Session for TlsSession {
                 Connection::Client(_) => None,
                 Connection::Server(ref session) => Some(session.ech_acceptance()),
             },
+            resumed: self
+                .inner
+                .handshake_kind()
+                .map(|k| k == rustls::HandshakeKind::Resumed),
+            // rustls keeps the server's early secret only when it accepts early
+            // data, and clears it when it declines.
+            early_data_accepted: match self.inner {
+                Connection::Client(ref session) => session.is_early_data_accepted(),
+                Connection::Server(_) => self.inner.zero_rtt_keys().is_some(),
+            },
         }))
     }
 
@@ -306,6 +316,22 @@ pub struct HandshakeData {
     /// application had no way to read that result back, and could only ever
     /// report ECH as unknown on HTTP/3.
     pub ech_accepted: Option<rustls::server::EchAcceptance>,
+    /// Whether the handshake resumed a session (a PSK from an earlier ticket)
+    /// or ran in full. `None` until rustls has decided.
+    ///
+    /// Surfaced for the conformance suite's 0-RTT tests: a client that resumed
+    /// and sent no early data has declined 0-RTT, a fact about the client,
+    /// while one that never resumed was never in a position to send any.
+    pub resumed: Option<bool>,
+    /// Whether 0-RTT data is accepted on this connection.
+    ///
+    /// On the server this is settled by the ClientHello, in the same step
+    /// that picks the group and the ALPN protocol, and it can only be true on
+    /// a resumption that needed no HelloRetryRequest. So once it reads true
+    /// every other field here is final, which is what lets a server act on
+    /// early data before the handshake completes. On the client it stays
+    /// false until the server's EncryptedExtensions arrive.
+    pub early_data_accepted: bool,
 }
 
 /// A QUIC-compatible TLS client configuration

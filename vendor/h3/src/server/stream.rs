@@ -105,6 +105,12 @@ where
     pub fn id(&self) -> StreamId {
         self.inner.stream.id()
     }
+
+    /// Whether the request arrived as 0-RTT data, accepted before the
+    /// handshake completed; see [`quic::RecvStream::is_0rtt`].
+    pub fn is_0rtt(&self) -> bool {
+        self.inner.stream.is_0rtt()
+    }
 }
 
 impl<S, B> RequestStream<S, B>

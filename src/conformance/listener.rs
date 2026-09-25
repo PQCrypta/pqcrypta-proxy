@@ -846,92 +846,104 @@ async fn run_one(
     });
 
     let mut early_data_accepted = false;
-    let connection = match accept_connection(connecting, test, &mut early_data_accepted).await {
-        Ok(connection) => connection,
-        Err(e) => {
-            // The client closed before the handshake finished. For most tests
-            // that is a connection that failed; for one whose anomaly rides in
-            // the first 1-RTT packet it is the client rejecting the anomaly at
-            // the earliest possible moment — the correct answer, arriving before
-            // this code used to be listening for it.
-            //
-            // `q-reserved-frame` is that test: the unknown frame is coalesced
-            // with the server's handshake completion, so a conforming client
-            // closes within a round trip and `accept()` never yields. Scored
-            // here or not at all.
-            let session_id = resolve_session(sni.as_deref(), peer_ip, &conformance);
-            let observation = frame_encoding_verdict(test, &e)
-                .or_else(|| transport_param_verdict(test, &e))
-                .unwrap_or_else(|| {
-                    // Anything else that dies in the handshake never met the
-                    // anomaly, so there is nothing to score.
-                    //
-                    // `q-reserved-frame` is the only test whose anomaly rides early
-                    // enough to be rejected here, and it is claimed above. For the
-                    // rest the anomaly is written after the connection is
-                    // established, so a handshake that failed is a client that never
-                    // saw one — and the generic classification would have called
-                    // that a signal, which for four of the five classes is a pass.
-                    // A client whose key exchange had nothing in common with ours
-                    // was being credited with recovering from a 0-RTT rejection it
-                    // was never sent.
-                    if matches!(test.tier, Tier::Tls) {
-                        // On this tier the handshake IS the anomaly, so a
-                        // handshake that failed is a result rather than a
-                        // non-event. Saying "the client never reached the
-                        // anomaly" here would be false: it reached it, and this
-                        // is what it did about it.
-                        tls_handshake_observation(test, &e, chain)
-                    } else if test.id == "q-invalid-transport-param" {
-                        // This one did reach the anomaly: the parameter travels
-                        // in the handshake, so it is among the first things the
-                        // client reads. What is missing is its answer.
-                        Observation::NotExercised(format!(
-                            "the client abandoned the handshake ({e}) without a \
+    let (connection, emitted_early) =
+        match accept_connection(connecting, test, &mut early_data_accepted).await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                // The client closed before the handshake finished. For most tests
+                // that is a connection that failed; for one whose anomaly rides in
+                // the first 1-RTT packet it is the client rejecting the anomaly at
+                // the earliest possible moment — the correct answer, arriving before
+                // this code used to be listening for it.
+                //
+                // `q-reserved-frame` is that test: the unknown frame is coalesced
+                // with the server's handshake completion, so a conforming client
+                // closes within a round trip and `accept()` never yields. Scored
+                // here or not at all.
+                let session_id = resolve_session(sni.as_deref(), peer_ip, &conformance);
+                let observation = frame_encoding_verdict(test, &e)
+                    .or_else(|| transport_param_verdict(test, &e))
+                    .unwrap_or_else(|| {
+                        // Anything else that dies in the handshake never met the
+                        // anomaly, so there is nothing to score.
+                        //
+                        // `q-reserved-frame` is the only test whose anomaly rides early
+                        // enough to be rejected here, and it is claimed above. For the
+                        // rest the anomaly is written after the connection is
+                        // established, so a handshake that failed is a client that never
+                        // saw one — and the generic classification would have called
+                        // that a signal, which for four of the five classes is a pass.
+                        // A client whose key exchange had nothing in common with ours
+                        // was being credited with recovering from a 0-RTT rejection it
+                        // was never sent.
+                        if matches!(test.tier, Tier::Tls) {
+                            // On this tier the handshake IS the anomaly, so a
+                            // handshake that failed is a result rather than a
+                            // non-event. Saying "the client never reached the
+                            // anomaly" here would be false: it reached it, and this
+                            // is what it did about it.
+                            tls_handshake_observation(test, &e, chain)
+                        } else if test.id == "q-invalid-transport-param" {
+                            // This one did reach the anomaly: the parameter travels
+                            // in the handshake, so it is among the first things the
+                            // client reads. What is missing is its answer.
+                            Observation::NotExercised(format!(
+                                "the client abandoned the handshake ({e}) without a \
                              CONNECTION_CLOSE this endpoint could read. It certainly saw \
                              the parameter — that travels in the handshake — but §7.4 \
                              asks for a rejection carrying TRANSPORT_PARAMETER_ERROR, and \
                              none was observed. A close that was sent and lost cannot be \
                              told apart from one that was never sent"
-                        ))
-                    } else {
-                        Observation::NotExercised(format!(
-                            "the connection failed during the handshake ({e}), so the \
+                            ))
+                        } else if test.id == "q-zero-rtt-reject" && since.zero_rtt_in() > 0 {
+                            // This test's anomaly is in the handshake: the early
+                            // data is refused there. It arrived, so the client
+                            // met the refusal, and abandoning the handshake instead
+                            // of carrying on with 1-RTT keys is its answer --
+                            // scored as the test scores giving up. It read "never
+                            // reached the anomaly" until 2026-09-24.
+                            classify_error(&e)
+                        } else {
+                            Observation::NotExercised(format!(
+                                "the connection failed during the handshake ({e}), so the \
                              client never reached the anomaly"
-                        ))
-                    }
+                            ))
+                        }
+                    });
+                let elapsed = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+                // The handshake never completed, so no anomaly was ever
+                // established. There is no silence to interpret here and the
+                // deadline is the moment itself.
+                conformance.sessions.with(&session_id, |s| {
+                    s.record_evidence(
+                        test,
+                        Evidence {
+                            test_id: test.id.to_string(),
+                            test_version: 1,
+                            observation: observation.clone(),
+                            expected_code: expected_code(test),
+                            read_proof: None,
+                            early_data_accepted: false,
+                            // Counted, not assumed: on the 0-RTT reject port the
+                            // refusal happens in the handshake, and the reaction
+                            // opportunity is "early data arrived and was refused".
+                            zero_rtt_datagrams_in: since.zero_rtt_in(),
+                            t_anomaly_ms: elapsed,
+                            t_exchange_completed_ms: None,
+                            t_observation_end_ms: elapsed,
+                            t_exit_ms: None,
+                            connection_seq: 0,
+                            recorded_at_ms: 0,
+                        },
+                    );
                 });
-            let elapsed = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
-            // The handshake never completed, so no anomaly was ever
-            // established. There is no silence to interpret here and the
-            // deadline is the moment itself.
-            conformance.sessions.with(&session_id, |s| {
-                s.record_evidence(
-                    test,
-                    Evidence {
-                        test_id: test.id.to_string(),
-                        test_version: 1,
-                        observation: observation.clone(),
-                        expected_code: expected_code(test),
-                        read_proof: None,
-                        early_data_accepted: false,
-                        zero_rtt_datagrams_in: 0,
-                        t_anomaly_ms: elapsed,
-                        t_exchange_completed_ms: None,
-                        t_observation_end_ms: elapsed,
-                        t_exit_ms: None,
-                        connection_seq: 0,
-                        recorded_at_ms: 0,
-                    },
+                info!(
+                    "conformance: {} session={} observed={:?} (closed during the handshake: {})",
+                    test.id, session_id, observation, e
                 );
-            });
-            info!(
-                "conformance: {} session={} observed={:?} (closed during the handshake: {})",
-                test.id, session_id, observation, e
-            );
-            return Ok(());
-        }
-    };
+                return Ok(());
+            }
+        };
 
     let session_id = resolve_session(sni.as_deref(), peer_ip, &conformance);
 
@@ -943,8 +955,12 @@ async fn run_one(
     // written but before the client had read it — so a correct client saw our
     // violation, closed the connection, and reported an error on a test it had
     // just passed.
+    let emitted = match emitted_early {
+        Some(emitted) => emitted,
+        None => emit(&connection, test).await,
+    };
     let (critical_streams, mut encoder, mut control, mut probe_target, control_is_late) =
-        match emit(&connection, test).await {
+        match emitted {
             Ok(emitted) => (
                 emitted.keep_open,
                 Some(emitted.encoder),
@@ -1173,7 +1189,14 @@ async fn run_one(
     // Some QUIC-layer tests are judged on what the connection did rather than
     // on whether a request arrived, so the transport's own account of it
     // supersedes the liveness result.
-    let observation = quic_observation(&connection, test, &since, &qpack).unwrap_or(observation);
+    // Read before this connection's own exchange is noted below, so it can
+    // only ever see an earlier connection's.
+    let held_tickets = conformance
+        .sessions
+        .with(&session_id, |s| s.held_tickets_before(test, started))
+        .unwrap_or(false);
+    let observation =
+        quic_observation(&connection, test, &since, &qpack, held_tickets).unwrap_or(observation);
 
     // A completed handshake on the post-quantum chain port deserves its own
     // sentence rather than the generic discretionary one.
@@ -1240,7 +1263,15 @@ async fn run_one(
     };
     let elapsed = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
 
+    let exchange_completed = match exchange_completed_ms.load(std::sync::atomic::Ordering::Acquire)
+    {
+        u64::MAX => None,
+        ms => Some(ms),
+    };
     conformance.sessions.with(&session_id, |s| {
+        if let Some(ms) = exchange_completed {
+            s.note_exchange_completed(test, started + Duration::from_millis(ms));
+        }
         s.record_evidence(
             test,
             Evidence {
@@ -1255,12 +1286,7 @@ async fn run_one(
                 early_data_accepted,
                 zero_rtt_datagrams_in: since.zero_rtt_in(),
                 t_anomaly_ms,
-                t_exchange_completed_ms: match exchange_completed_ms
-                    .load(std::sync::atomic::Ordering::Acquire)
-                {
-                    u64::MAX => None,
-                    ms => Some(ms),
-                },
+                t_exchange_completed_ms: exchange_completed,
                 t_observation_end_ms: elapsed,
                 t_exit_ms: None,
                 connection_seq: 0,
@@ -1625,18 +1651,43 @@ fn tls_handshake_observation(
 /// It hands the `Connecting` back when 0-RTT is not possible — no ticket, or a
 /// fresh client — and that is the ordinary case, so the fall-through is the
 /// normal handshake rather than an error.
+///
+/// On the reject port the anomaly is emitted *here*, before the handshake
+/// completes, and handed back. A client resuming here needs a ticket from an
+/// earlier connection to this port, and RFC 9114 §7.2.4.2 has it store the
+/// server's SETTINGS with that ticket -- tickets go out as the handshake
+/// completes, so SETTINGS written after it arrive behind them, and neqo drops
+/// a ticket it has no SETTINGS for. It never resumed here, and every 0-RTT
+/// verdict it got said so. The replay port already emits before the handshake
+/// completes, because it returns the connection as soon as it exists.
 async fn accept_connection(
     connecting: quinn::Connecting,
     test: &'static Test,
     early_data_accepted: &mut bool,
-) -> Result<quinn::Connection, quinn::ConnectionError> {
+) -> Result<(quinn::Connection, Option<anyhow::Result<Emitted>>), quinn::ConnectionError> {
     if test.id == "q-zero-rtt-replay" && test.implemented {
         return match connecting.into_0rtt() {
             Ok((connection, _accepted)) => {
                 *early_data_accepted = true;
-                Ok(connection)
+                Ok((connection, None))
             }
-            Err(connecting) => connecting.await,
+            Err(connecting) => connecting.await.map(|c| (c, None)),
+        };
+    }
+
+    if test.id == "q-zero-rtt-reject" && test.implemented {
+        return match connecting.into_0rtt() {
+            Ok((connection, established)) => {
+                let emitted = emit(&connection, test).await;
+                // Its value is whether 0-RTT was accepted, never whether the
+                // handshake succeeded; the close reason says that.
+                established.await;
+                match connection.close_reason() {
+                    None => Ok((connection, Some(emitted))),
+                    Some(reason) => Err(reason),
+                }
+            }
+            Err(connecting) => connecting.await.map(|c| (c, None)),
         };
     }
 
@@ -1660,12 +1711,12 @@ async fn accept_connection(
     if matches!(test.tier, Tier::Tls) {
         const TLS_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
         return match tokio::time::timeout(TLS_HANDSHAKE_DEADLINE, connecting).await {
-            Ok(result) => result,
+            Ok(result) => result.map(|c| (c, None)),
             Err(_elapsed) => Err(quinn::ConnectionError::TimedOut),
         };
     }
 
-    connecting.await
+    connecting.await.map(|c| (c, None))
 }
 
 /// Vanish, and watch whether the client accepts being reset.
@@ -2978,6 +3029,9 @@ fn quic_observation(
     // and there is no route from this type to the port aggregate.
     counters: &PeerView,
     qpack: &QpackLimits,
+    // Whether an earlier connection in this session completed an exchange on
+    // this port first, and so held its session tickets. See `no_early_data`.
+    held_tickets: bool,
 ) -> Option<Observation> {
     let rx = connection.stats().frame_rx;
 
@@ -3094,7 +3148,12 @@ fn quic_observation(
             // follow-up request as recovery and a stall or a give-up as failure.
             return None;
         } else {
-            no_early_data(counters, "nothing was rejected")
+            no_early_data(
+                counters,
+                handshake_resumed(connection),
+                held_tickets,
+                "nothing was rejected",
+            )
         }),
 
         // Every packet this endpoint sends is marked ECT(0), so a client with
@@ -3458,7 +3517,12 @@ fn quic_observation(
             if counters.zero_rtt_in() > 0 {
                 return None;
             }
-            Some(no_early_data(counters, "it was never answered 425"))
+            Some(no_early_data(
+                counters,
+                handshake_resumed(connection),
+                held_tickets,
+                "it was never answered 425",
+            ))
         }
 
         // Almost nothing on the public internet speaks multipath, which is
@@ -4093,7 +4157,14 @@ const LOSSY_CHUNK_GAP: Duration = Duration::from_millis(30);
 ///     case that is a fact about the client.
 ///
 /// Reported as `Unsupported` only in the third: there the client has answered.
-fn no_early_data(counters: &PeerView, what_was_missed: &str) -> Observation {
+/// Whether it had every opportunity is read off the handshake: a connection
+/// that resumed the session it was issued could have offered early data.
+fn no_early_data(
+    counters: &PeerView,
+    resumed: Option<bool>,
+    held_tickets: bool,
+    what_was_missed: &str,
+) -> Observation {
     if counters.version_negotiations_out() > 0 {
         // Fully observed, so not a gap in the run.
         //
@@ -4114,25 +4185,55 @@ fn no_early_data(counters: &PeerView, what_was_missed: &str) -> Observation {
              sides are conformant; the early data is lost between them"
         ));
     }
-    // Also inference from an absence, and held to the same bar as the
-    // control-stream case above.
+    // Resumed and still no early data: the client held a ticket that allowed
+    // 0-RTT, used it, and chose to send nothing early. Every step is on the
+    // wire here, so this is the client's answer rather than a gap in the run.
     //
-    // A client that was primed and sends no early data has probably declined
-    // 0-RTT -- but "probably" is the word doing the work. The driver primes,
-    // so a ticket was issued; whether *this* client resumed with it is not
-    // visible from here, and a client that silently failed to store the ticket
-    // is indistinguishable from one that stored it and chose not to use it.
-    // Calling that `Unsupported` would put a declaration in the client's mouth.
-    //
-    // Promoting it needs one more fact: whether the handshake resumed. rustls
-    // knows, and the fork could surface it the way `peer_initial_max_stream_data_uni`
-    // was surfaced. Until it does, this is inconclusive and the reason says so.
+    // This read inconclusive until 2026-09-24 with the reason "whether this
+    // client resumed the session at all is not observable from this end". It
+    // was: rustls decides it in the handshake, and the noq fork now carries it
+    // on the connection's handshake data.
+    if resumed == Some(true) {
+        return Observation::Unsupported(format!(
+            "resumes a session but does not offer early data on it, so {what_was_missed}. \
+             The handshake resumed the session this endpoint issued, with a ticket that \
+             permits 0-RTT, and the client sent nothing before it completed"
+        ));
+    }
+    // Not resumed, although it held tickets: an earlier connection to this port
+    // in the same session completed its exchange -- and tickets are issued as
+    // the handshake completes, before any response -- and this one, opened
+    // after that, ran a full handshake anyway. A client that does not resume
+    // cannot send early data, and it had every chance to here. Measured on
+    // .NET's HttpClient over msquic, 2026-09-24: two connections in one
+    // process, tickets issued on the first, a full handshake on the second.
+    if resumed == Some(false) && held_tickets {
+        return Observation::Unsupported(format!(
+            "does not resume sessions, so {what_was_missed}. An earlier connection to this \
+             port in the same session completed its exchange, and with it received session \
+             tickets that permit 0-RTT; this connection, opened afterwards, ran a full \
+             handshake instead of resuming, and a client that does not resume cannot offer \
+             early data"
+        ));
+    }
+    // Not resumed, and no earlier connection here held tickets: the client
+    // never had the session to use, so it was never in a position to send
+    // early data. That is a limit of how the run drove it -- a driver that
+    // never made the second connection -- not an answer from the client.
     Observation::NotExercised(format!(
-        "the client sent no early data, so {what_was_missed}. A session was issued for it to \
-         resume from, so the opportunity existed -- but whether this client resumed the \
-         session at all is not observable from this end, and a client that failed to store \
-         the ticket looks exactly like one that stored it and chose not to offer early data"
+        "the client sent no early data, so {what_was_missed}. It did not resume the session \
+         it was issued: every handshake it made here ran in full, so it was never in a \
+         position to offer early data, and the run did not establish what it would do"
     ))
+}
+
+/// Whether this connection's handshake resumed a session, as rustls decided
+/// it. `None` when the handshake data is not available.
+fn handshake_resumed(connection: &quinn::Connection) -> Option<bool> {
+    connection
+        .handshake_data()
+        .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|d| d.resumed)
 }
 
 /// How much padding the read proof writes at a time.
@@ -4559,6 +4660,48 @@ pub fn catalog_json(conformance: &Conformance) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn a_quiet_peer() -> PeerView {
+        crate::conformance::impairment::Counters::default()
+            .view_for("192.0.2.1:40000".parse().expect("address"))
+    }
+
+    /// Resumed with a 0-RTT ticket and still sent nothing early: the client's
+    /// answer, fully on the wire.
+    #[test]
+    fn resuming_without_early_data_is_the_clients_answer() {
+        let o = no_early_data(&a_quiet_peer(), Some(true), false, "nothing was rejected");
+        assert!(
+            matches!(&o, Observation::Unsupported(r) if r.starts_with("resumes a session")),
+            "{o:?}"
+        );
+    }
+
+    /// Held this port's tickets from an earlier exchange and ran a full
+    /// handshake anyway: a client that does not resume.
+    #[test]
+    fn declining_to_resume_with_tickets_in_hand_is_the_clients_answer() {
+        let o = no_early_data(
+            &a_quiet_peer(),
+            Some(false),
+            true,
+            "it was never answered 425",
+        );
+        assert!(
+            matches!(&o, Observation::Unsupported(r) if r.starts_with("does not resume sessions")),
+            "{o:?}"
+        );
+    }
+
+    /// Never held a ticket: the run did not give the client the chance, so
+    /// nothing about the client was learned.
+    #[test]
+    fn a_client_that_never_held_a_ticket_was_not_exercised() {
+        for resumed in [Some(false), None] {
+            let o = no_early_data(&a_quiet_peer(), resumed, false, "nothing was rejected");
+            assert!(matches!(o, Observation::NotExercised(_)), "{o:?}");
+        }
+    }
 
     #[test]
     fn a_session_is_recovered_from_the_sni() {

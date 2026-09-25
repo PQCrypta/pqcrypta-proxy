@@ -541,6 +541,10 @@ impl<S: RecvStream, B> RecvStream for BufRecvStream<S, B> {
     fn recv_id(&self) -> quic::StreamId {
         self.stream.recv_id()
     }
+
+    fn is_0rtt(&self) -> bool {
+        self.stream.is_0rtt()
+    }
 }
 
 impl<S, B> SendStream<B> for BufRecvStream<S, B>

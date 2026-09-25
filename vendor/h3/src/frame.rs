@@ -152,6 +152,10 @@ where
     pub fn id(&self) -> StreamId {
         self.stream.recv_id()
     }
+
+    pub fn is_0rtt(&self) -> bool {
+        self.stream.is_0rtt()
+    }
 }
 
 impl<T, B> SendStream<B> for FrameStream<T, B>

@@ -218,12 +218,7 @@ impl FingerprintedConnection {
         set("x-connection-protocol", is_http1.then_some("h1"));
         // Whether *this handshake* was post-quantum, not whether the listener
         // supports it.
-        let pqc = self
-            .handshake
-            .kex_group
-            .as_deref()
-            .and_then(crate::pqc_tls::PqcKemAlgorithm::from_str)
-            .is_some();
+        let pqc = self.handshake.is_post_quantum();
         set("x-pqc-enabled", Some(if pqc { "true" } else { "false" }));
     }
 }
@@ -257,6 +252,17 @@ pub struct HandshakeFacts {
 }
 
 impl HandshakeFacts {
+    /// Whether the negotiated group carries ML-KEM.
+    ///
+    /// One definition for everything that reports it: `x-pqc-enabled` on
+    /// every transport and the handshake counters the monitor shows.
+    pub fn is_post_quantum(&self) -> bool {
+        self.kex_group
+            .as_deref()
+            .and_then(crate::pqc_tls::PqcKemAlgorithm::from_str)
+            .is_some()
+    }
+
     /// The headers [`inject_headers`](Self::inject_headers) owns.
     ///
     /// Named in one place because they have to be stripped and set as a set:

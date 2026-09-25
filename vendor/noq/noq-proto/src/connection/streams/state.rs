@@ -137,6 +137,13 @@ pub struct StreamsState {
     receive_window_shrink_debt: u64,
     /// Whether the locally-initiated stream limit has been hit, per direction
     pub(super) streams_blocked: [bool; 2],
+    /// Whether a local open has been refused at the current limit since the
+    /// last `StreamEvent::Available`, per direction.
+    ///
+    /// `streams_blocked` cannot answer that: it is cleared as soon as the
+    /// STREAMS_BLOCKED frame is queued. This is what says someone is waiting
+    /// to be woken when the limit rises.
+    pub(super) open_refused: [bool; 2],
 }
 
 impl StreamsState {
@@ -182,6 +189,7 @@ impl StreamsState {
             initial_max_stream_data_bidi_remote: 0u32.into(),
             receive_window_shrink_debt: 0,
             streams_blocked: [false, false],
+            open_refused: [false, false],
         }
     }
 
@@ -189,8 +197,30 @@ impl StreamsState {
         self.initial_max_stream_data_uni = params.initial_max_stream_data_uni;
         self.initial_max_stream_data_bidi_local = params.initial_max_stream_data_bidi_local;
         self.initial_max_stream_data_bidi_remote = params.initial_max_stream_data_bidi_remote;
-        self.max[Dir::Bi as usize] = params.initial_max_streams_bidi.into();
-        self.max[Dir::Uni as usize] = params.initial_max_streams_uni.into();
+        for (dir, count) in [
+            (Dir::Bi, params.initial_max_streams_bidi),
+            (Dir::Uni, params.initial_max_streams_uni),
+        ] {
+            let count: u64 = count.into();
+            let before = self.max[dir as usize];
+            self.max[dir as usize] = count;
+            // A raised limit has to wake whoever was refused against the old
+            // one, exactly as MAX_STREAMS does in `received_max_streams`.
+            //
+            // A server that opens streams in 0.5-RTT is refused against zero
+            // when it opens before the client's parameters are known -- which is
+            // what happens after a HelloRetryRequest, since the first
+            // ClientHello already makes handshake data readable and the
+            // parameters only apply with the second. Without the wake-up the
+            // opener waited for a MAX_STREAMS that never comes, and the
+            // connection stalled: an HTTP/3 server sending its SETTINGS early
+            // served nothing to any client that needed an HRR.
+            if count > before && self.open_refused[dir as usize] {
+                self.open_refused[dir as usize] = false;
+                self.streams_blocked[dir as usize] = false;
+                self.events.push_back(StreamEvent::Available { dir });
+            }
+        }
         self.received_max_data(params.initial_max_data);
         for (&id, slot) in self.send.iter_mut() {
             if id.initiator() != self.side
@@ -662,6 +692,7 @@ impl StreamsState {
         if count > *current {
             *current = count;
             self.streams_blocked[dir as usize] = false;
+            self.open_refused[dir as usize] = false;
             self.events.push_back(StreamEvent::Available { dir });
         }
 

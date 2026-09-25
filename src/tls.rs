@@ -955,6 +955,52 @@ mod server_policy_tests {
         assert!(!is_post_quantum_group(group));
     }
 
+    /// `tls.enable_0rtt` on the QUIC listener.
+    ///
+    /// It set 16384, the TCP figure, and RFC 9001 §4.6.1 allows only
+    /// 0xffffffff: rustls refuses to start a QUIC session on anything else, and
+    /// noq unwraps that refusal, so the first HTTP/3 connection after turning
+    /// 0-RTT on panicked the listener. Asserted at the call that failed.
+    #[test]
+    fn quic_zero_rtt_uses_the_only_value_quic_allows() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec![VERIFY_SNI.to_string()]).unwrap();
+        std::fs::write(
+            dir.path().join(format!("{VERIFY_SNI}.crt")),
+            cert.cert.pem(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(format!("{VERIFY_SNI}.key")),
+            cert.signing_key.serialize_pem(),
+        )
+        .unwrap();
+        let resolver = Arc::new(super::MultiDomainCertResolver::new(dir.path()).unwrap());
+        for enable_0rtt in [true, false] {
+            let server = super::TlsProvider::create_rustls_config_with_resolver(
+                &TlsConfig {
+                    enable_0rtt,
+                    ..tls("1.3")
+                },
+                &crate::config::PqcConfig::default(),
+                true,
+                ClientAuth::None,
+                resolver.clone(),
+            )
+            .unwrap();
+            assert_eq!(
+                server.max_early_data_size,
+                if enable_0rtt { u32::MAX } else { 0 }
+            );
+            rustls::quic::ServerConnection::new(
+                Arc::new(server),
+                rustls::quic::Version::V1,
+                Vec::new(),
+            )
+            .expect("rustls accepts the configuration for a QUIC session");
+        }
+    }
+
     /// The QUIC listener's config, built the way the listener builds it, over
     /// a TLS handshake: the rustls `ServerConfig` QUIC wraps is where the group
     /// is chosen, so this is the HTTP/3 half of the defect.
@@ -1833,8 +1879,17 @@ impl TlsProvider {
         // are safe to receive replayed requests, and restrict to idempotent methods
         // via `tls.zero_rtt_safe_methods` (default: GET, HEAD only).
         if tls_config.enable_0rtt {
-            // Enable 0-RTT with 16KB max early data
-            config.max_early_data_size = 16384;
+            // This configuration is the QUIC listener's, and RFC 9001 §4.6.1
+            // allows exactly one non-zero value here: 0xffffffff, with QUIC's
+            // own flow control bounding what is sent. It was 16384, the TCP
+            // figure, and a client MUST treat any other value in a ticket as
+            // PROTOCOL_VIOLATION -- so turning 0-RTT on would have failed every
+            // resumption rather than enable one.
+            //
+            // Requests that arrive in 0-RTT are served before the handshake
+            // completes and marked `x-tls-early-data`, which is what the route
+            // gate's 425 answers are decided on.
+            config.max_early_data_size = u32::MAX;
             warn!(
                 "⚠️  0-RTT (early data) ENABLED — replay-attack risk. \
                  Safe HTTP methods: {:?}. \

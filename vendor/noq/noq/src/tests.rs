@@ -433,6 +433,130 @@ async fn zero_rtt() {
     endpoint.wait_all_draining().await;
 }
 
+/// 0.5-RTT after a HelloRetryRequest.
+///
+/// The first ClientHello already makes handshake data readable -- the server
+/// name is known -- but the client's transport parameters only apply with the
+/// second one. A server that opens a stream at that point is refused against a
+/// limit of zero, and has to be woken when the parameters raise it.
+#[tokio::test]
+async fn half_rtt_after_hello_retry_request() {
+    let _guard = subscribe();
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let key = PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());
+
+    // The server offers only P-256; the client's first key share is anything
+    // else, so the handshake needs a HelloRetryRequest.
+    let mut server_provider = default_provider();
+    server_provider.kx_groups = server_provider
+        .kx_groups
+        .iter()
+        .copied()
+        .filter(|g| g.name() == rustls::NamedGroup::secp256r1)
+        .collect();
+    let client_provider = default_provider();
+    assert_ne!(
+        client_provider.kx_groups[0].name(),
+        rustls::NamedGroup::secp256r1,
+        "the client's first key share must not be the server's group"
+    );
+    let mut server_crypto = rustls::ServerConfig::builder_with_provider(server_provider.into())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.cert.der().clone()], key)
+        .unwrap();
+    server_crypto.alpn_protocols = vec![b"test".to_vec()];
+    let server_config = crate::ServerConfig::with_crypto(Arc::new(
+        crate::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap(),
+    ));
+    let server = Endpoint::server(
+        server_config,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+    )
+    .unwrap();
+
+    let mut roots = RootCertStore::empty();
+    roots.add(cert.cert.der().clone()).unwrap();
+    let mut client_crypto = rustls::ClientConfig::builder_with_provider(client_provider.into())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    client_crypto.alpn_protocols = vec![b"test".to_vec()];
+    let client = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+    client.set_default_client_config(crate::ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(client_crypto).unwrap(),
+    )));
+
+    let server_addr = server.local_addr().unwrap();
+    let server_task = tokio::spawn(async move {
+        let mut connecting = server.accept().await.unwrap().accept().unwrap();
+        connecting.handshake_data().await.expect("handshake data");
+        let (connection, _established) = connecting.into_0rtt().unwrap_or_else(|_| unreachable!());
+        let mut s = connection.open_uni().await.expect("open_uni");
+        s.write_all(b"half").await.expect("write");
+        s.finish().unwrap();
+        let mut r = connection.accept_uni().await.expect("accept_uni");
+        assert_eq!(r.read_to_end(usize::MAX).await.expect("read"), b"client");
+        connection
+    });
+    let connection = client
+        .connect(server_addr, "localhost")
+        .unwrap()
+        .await
+        .expect("connect");
+    let mut s = tokio::time::timeout(Duration::from_secs(5), connection.accept_uni())
+        .await
+        .expect("the server's 0.5-RTT stream never arrived")
+        .expect("accept_uni");
+    assert_eq!(s.read_to_end(usize::MAX).await.expect("read"), b"half");
+    let mut c = connection.open_uni().await.expect("open_uni");
+    c.write_all(b"client").await.expect("write");
+    c.finish().unwrap();
+    let server_connection = tokio::time::timeout(Duration::from_secs(5), server_task)
+        .await
+        .expect("the server stalled")
+        .unwrap();
+    drop((server_connection, connection));
+}
+
+/// 0.5-RTT on a fresh connection: the server writes before the handshake has
+/// completed, as an HTTP/3 server does with its SETTINGS, and must then still
+/// read what the client sends once it has.
+#[tokio::test]
+async fn half_rtt_on_fresh_connection() {
+    let _guard = subscribe();
+    let endpoint = endpoint();
+    let endpoint2 = endpoint.clone();
+    let server = tokio::spawn(async move {
+        let incoming = endpoint2.accept().await.unwrap().accept().unwrap();
+        let (connection, _established) = incoming.into_0rtt().unwrap_or_else(|_| unreachable!());
+        let mut s = connection.open_uni().await.expect("open_uni");
+        s.write_all(b"half").await.expect("write");
+        s.finish().unwrap();
+        let mut r = connection.accept_uni().await.expect("accept_uni");
+        let msg = r.read_to_end(usize::MAX).await.expect("read_to_end");
+        assert_eq!(msg, b"client");
+        connection
+    });
+    let connection = endpoint
+        .connect(endpoint.local_addr().unwrap(), "localhost")
+        .unwrap()
+        .await
+        .expect("connect");
+    let mut s = connection.accept_uni().await.expect("accept_uni");
+    assert_eq!(s.read_to_end(usize::MAX).await.expect("read"), b"half");
+    let mut c = connection.open_uni().await.expect("open_uni");
+    c.write_all(b"client").await.expect("write");
+    c.finish().unwrap();
+    let server_connection = tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("the server never read the client's 1-RTT stream")
+        .unwrap();
+    drop((server_connection, connection));
+}
+
 #[test]
 #[cfg_attr(
     any(target_os = "solaris", target_os = "illumos"),
