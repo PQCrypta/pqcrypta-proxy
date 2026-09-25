@@ -726,6 +726,48 @@ mod server_policy_tests {
     const TLS13: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
     const TLS12: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS12];
 
+    /// With 0-RTT on, TCP tickets allow early data and rustls resumption stays
+    /// stateful even under `pqc_session_tickets`: rustls writes no early-data
+    /// allowance into a stateless ticket, so 0-RTT would do nothing.
+    #[test]
+    fn zero_rtt_keeps_rustls_resumption_stateful() {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        let ck = rcgen::generate_simple_self_signed(vec!["t.invalid".to_string()]).unwrap();
+        let build = |enable_0rtt: bool, pqc_session_tickets: bool| {
+            let tls = TlsConfig {
+                enable_0rtt,
+                pqc_session_tickets,
+                ..tls("1.3")
+            };
+            let policy =
+                ServerTlsPolicy::from_config(&tls, &PqcConfig::default(), true, ClientAuth::None)
+                    .unwrap();
+            let mut config = policy
+                .builder()
+                .unwrap()
+                .with_single_cert(
+                    vec![CertificateDer::from(ck.cert.der().to_vec())],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der())),
+                )
+                .unwrap();
+            policy.apply_tickets(&mut config).unwrap();
+            policy.apply_tcp_early_data(&mut config);
+            config
+        };
+        let on = build(true, true);
+        assert!(
+            !on.ticketer.enabled(),
+            "stateful, so early data can be accepted"
+        );
+        assert_eq!(on.max_early_data_size, 16_384);
+        let sealed = build(false, true);
+        assert!(
+            sealed.ticketer.enabled(),
+            "ML-KEM-sealed tickets when 0-RTT is off"
+        );
+        assert_eq!(sealed.max_early_data_size, 0);
+    }
+
     #[test]
     fn groups_follow_pqc_enabled() {
         let on: Vec<_> = server_provider(true, &PqcConfig::default())
@@ -1346,6 +1388,13 @@ pub struct ServerTlsPolicy {
     pub post_quantum: bool,
     pqc_session_tickets: bool,
     session_ticket_lifetime_secs: u32,
+    /// `tls.enable_0rtt`: resumption then stays stateful; see `apply_tickets`.
+    zero_rtt: bool,
+    session_cache_entries: usize,
+    /// Early data a TCP session ticket allows: `tls.zero_rtt_max_early_data`
+    /// when `tls.enable_0rtt`, otherwise none. QUIC sets its own; see
+    /// `create_rustls_config_with_resolver`.
+    tcp_max_early_data: u32,
 }
 
 impl std::fmt::Debug for ServerTlsPolicy {
@@ -1420,7 +1469,21 @@ impl ServerTlsPolicy {
             client_verifier,
             pqc_session_tickets: tls.pqc_session_tickets,
             session_ticket_lifetime_secs: tls.session_ticket_lifetime_secs,
+            zero_rtt: tls.enable_0rtt,
+            session_cache_entries: tls.session_cache_entries,
+            tcp_max_early_data: if tls.enable_0rtt {
+                tls.zero_rtt_max_early_data
+            } else {
+                0
+            },
         })
+    }
+
+    /// Early data on a TCP listener's configuration. TCP tickets advertised
+    /// none whatever `tls.enable_0rtt` said; the listeners now serve it
+    /// (`crate::early_data`), so the tickets offer it.
+    pub fn apply_tcp_early_data(&self, config: &mut RustlsServerConfig) {
+        config.max_early_data_size = self.tcp_max_early_data;
     }
 
     /// True when TLS 1.2 is refused.
@@ -1449,7 +1512,23 @@ impl ServerTlsPolicy {
     /// Install the ML-KEM-1024 session ticketer when `tls.pqc_session_tickets`
     /// asks for it. Refuses rather than falls back: an operator who asked for
     /// PQC-protected resumption must not silently get none.
+    ///
+    /// With `tls.enable_0rtt` on, resumption stays stateful whatever
+    /// `pqc_session_tickets` says: rustls puts no early-data allowance in a
+    /// stateless ticket and accepts early data only from a session it can use
+    /// once, so 0-RTT with ML-KEM-sealed tickets was a setting that did nothing
+    /// on every rustls listener, QUIC included. A stateful ticket carries
+    /// nothing to seal, which is what the sealed tickets exist to achieve.
     pub fn apply_tickets(&self, config: &mut RustlsServerConfig) -> anyhow::Result<()> {
+        config.session_storage =
+            rustls::server::ServerSessionMemoryCache::new(self.session_cache_entries.max(1));
+        if self.pqc_session_tickets && self.zero_rtt {
+            info!(
+                "0-RTT on: rustls resumption is stateful and single-use rather than \
+                 pqc_session_tickets; a stateful ticket carries no session secret to seal"
+            );
+            return Ok(());
+        }
         if self.pqc_session_tickets {
             let ticketer = crate::pqc_tickets::PqcTicketer::new(self.session_ticket_lifetime_secs)
                 .map_err(|e| {

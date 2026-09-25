@@ -140,6 +140,7 @@ pub mod config;
 pub mod conformance;
 pub mod connect_udp;
 pub mod crawler_verify;
+pub mod early_data;
 pub mod ech_config;
 pub mod fingerprint;
 pub mod handlers;

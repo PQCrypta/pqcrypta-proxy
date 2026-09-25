@@ -524,51 +524,6 @@ impl PqcCapabilities {
 
         candidates.first().copied()
     }
-
-    /// Build the TLS groups string for the given backend
-    pub fn build_groups_string(&self, backend: TlsBackend, config: &ExtendedPqcConfig) -> String {
-        let mut groups = Vec::new();
-
-        // Add preferred KEM first
-        if self.has_kem(config.preferred_kem) {
-            groups.push(config.preferred_kem.openssl_name().to_string());
-        }
-
-        // Add additional configured KEMs
-        for kem in &config.additional_kems {
-            if self.has_kem(*kem) && !groups.contains(&kem.openssl_name().to_string()) {
-                groups.push(kem.openssl_name().to_string());
-            }
-        }
-
-        // Add other available KEMs meeting security requirements
-        for kem in PqcKem::recommended_hybrids() {
-            if self.has_kem(kem)
-                && kem.security_level() >= config.min_security_level
-                && !groups.contains(&kem.openssl_name().to_string())
-            {
-                groups.push(kem.openssl_name().to_string());
-            }
-        }
-
-        // Add classical fallback if enabled
-        if config.fallback_to_classical {
-            match backend {
-                TlsBackend::Rustls => {
-                    groups.push("X25519".to_string());
-                    groups.push("secp256r1".to_string());
-                    groups.push("secp384r1".to_string());
-                }
-                TlsBackend::OpenSsl | TlsBackend::Auto => {
-                    groups.push("X25519".to_string());
-                    groups.push("P-256".to_string());
-                    groups.push("P-384".to_string());
-                }
-            }
-        }
-
-        groups.join(":")
-    }
 }
 
 /// Security check for TLS key file permissions

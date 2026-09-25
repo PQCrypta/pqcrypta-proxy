@@ -76,18 +76,119 @@ impl ZeroRttNonceStore {
     ///
     /// Expired entries are evicted before the lookup.
     pub fn check_and_insert(&self, client_hello: &[u8]) -> bool {
+        self.check_and_insert_digest(Self::nonce_from_client_hello(client_hello))
+    }
+
+    /// As [`check_and_insert`](Self::check_and_insert), for a key already
+    /// reduced to a digest.
+    pub fn check_and_insert_digest(&self, nonce: [u8; 32]) -> bool {
         let now = Instant::now();
         let window = self.window_secs;
-        // Lazy eviction of expired entries
         self.nonces
             .retain(|_, inserted_at| now.duration_since(*inserted_at).as_secs() < window);
-
-        let nonce = Self::nonce_from_client_hello(client_hello);
-        if self.nonces.contains_key(&nonce) {
-            return true; // replay
+        // One atomic step: two connections carrying the same ClientHello must
+        // not both find it absent.
+        match self.nonces.entry(nonce) {
+            dashmap::mapref::entry::Entry::Occupied(_) => true, // replay
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                v.insert(now);
+                false
+            }
         }
-        self.nonces.insert(nonce, now);
-        false
+    }
+}
+
+/// The body of extension `ext_type` in a raw ClientHello record (record and
+/// handshake headers included), or `None` if it is absent or the extensions
+/// block is not all in `data`.
+pub fn client_hello_extension(data: &[u8], ext_type: u16) -> Option<&[u8]> {
+    // TLS record header (5 bytes) and handshake header (4 bytes).
+    let ch = data.get(9..)?;
+    // legacy_version (2) + random (32)
+    let mut off = 34usize;
+    let session_id_len = *ch.get(off)? as usize;
+    off += 1 + session_id_len;
+    let cipher_len = u16::from_be_bytes([*ch.get(off)?, *ch.get(off + 1)?]) as usize;
+    off += 2 + cipher_len;
+    let compression_len = *ch.get(off)? as usize;
+    off += 1 + compression_len;
+    let ext_total = u16::from_be_bytes([*ch.get(off)?, *ch.get(off + 1)?]) as usize;
+    off += 2;
+    let ext_end = off.checked_add(ext_total)?;
+    if ext_end > ch.len() {
+        return None;
+    }
+    while off + 4 <= ext_end {
+        let ty = u16::from_be_bytes([ch[off], ch[off + 1]]);
+        let len = u16::from_be_bytes([ch[off + 2], ch[off + 3]]) as usize;
+        off += 4;
+        let body = ch.get(off..off.checked_add(len)?.min(ext_end))?;
+        if ty == ext_type {
+            return Some(body);
+        }
+        off += len;
+    }
+    None
+}
+
+/// The first PSK identity -- the session ticket being resumed -- in a
+/// ClientHello's `pre_shared_key` extension (RFC 8446 §4.2.11).
+pub fn client_hello_psk_identity(data: &[u8]) -> Option<&[u8]> {
+    let ext = client_hello_extension(data, 0x0029)?;
+    // identities<7..2^16-1>, each identity<1..2^16-1> + obfuscated_ticket_age.
+    let len = u16::from_be_bytes([*ext.get(2)?, *ext.get(3)?]) as usize;
+    ext.get(4..4 + len).filter(|id| !id.is_empty())
+}
+
+/// SEC-002: `tls.zero_rtt_replay_protection`, applied to a ClientHello that
+/// offers early data before its handshake starts. One guard for both TCP
+/// stacks; the OpenSSL listener applied none.
+#[derive(Clone)]
+pub struct ZeroRttReplayGuard {
+    mode: ZeroRttReplayMode,
+    store: Option<Arc<ZeroRttNonceStore>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZeroRttReplayMode {
+    Strict,
+    Session,
+    Off,
+}
+
+impl ZeroRttReplayGuard {
+    pub fn from_config(mode: &str, window_secs: u64) -> Self {
+        let mode = match mode {
+            "none" => ZeroRttReplayMode::Off,
+            "session" => ZeroRttReplayMode::Session,
+            // "strict", and anything unrecognised: the safe reading.
+            _ => ZeroRttReplayMode::Strict,
+        };
+        Self {
+            mode,
+            store: (mode != ZeroRttReplayMode::Off)
+                .then(|| Arc::new(ZeroRttNonceStore::new(window_secs))),
+        }
+    }
+
+    /// True when `client_hello` offers early data and repeats one seen within
+    /// the window: under "strict" the ClientHello itself, under "session" the
+    /// ticket it resumes, so each ticket carries early data once.
+    pub fn is_replay(&self, client_hello: &[u8]) -> bool {
+        let Some(store) = &self.store else {
+            return false;
+        };
+        if !FingerprintingTlsAcceptor::client_hello_has_early_data_extension(client_hello) {
+            return false;
+        }
+        match (self.mode, client_hello_psk_identity(client_hello)) {
+            (ZeroRttReplayMode::Session, Some(ticket)) => {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&Sha256::digest(ticket));
+                store.check_and_insert_digest(key)
+            }
+            _ => store.check_and_insert(client_hello),
+        }
     }
 }
 
@@ -147,11 +248,16 @@ pub struct FingerprintedConnection {
     pub ja4_hash: Option<String>,
     pub client_name: Option<String>,
     pub is_browser: bool,
-    /// SEC-002: True when the client offered TLS 1.3 early data (0-RTT) in its
-    /// ClientHello AND the server has 0-RTT enabled.  Handlers must check the
-    /// matched route's `allow_0rtt` flag and return 425 Too Early for
-    /// non-idempotent routes to prevent replay attacks.
-    pub is_early_data: bool,
+    /// SEC-002: whether this connection's handshake has completed. A request
+    /// dispatched before it has is early data (see [`crate::early_data`]), and
+    /// the route gate answers 425 unless the route and method allow 0-RTT.
+    /// [`HandshakeDone::completed`](crate::early_data::HandshakeDone::completed)
+    /// on every connection that cannot carry early data.
+    ///
+    /// This was a flag set when the ClientHello *offered* early data, which
+    /// marked every request on the connection, including those sent after the
+    /// handshake, and said nothing about whether any early data was accepted.
+    pub handshake_done: crate::early_data::HandshakeDone,
     /// True when the client presented a valid certificate during the TLS handshake.
     /// Used by per-route internal mTLS enforcement: routes with `internal = true`
     /// default to requiring a client certificate.
@@ -210,8 +316,13 @@ impl FingerprintedConnection {
         set("x-ja4-hash", self.ja4_hash.as_deref());
         set("x-client-name", self.client_name.as_deref());
         set("x-client-type", self.is_browser.then_some("browser"));
-        // SEC-002: proxy_handler answers 425 on routes that do not allow 0-RTT.
-        set("x-tls-early-data", self.is_early_data.then_some("1"));
+        // SEC-002: the route gate answers 425 on routes that do not allow
+        // 0-RTT. Read as each request is dispatched: early until the
+        // handshake completes, and never after.
+        set(
+            "x-tls-early-data",
+            (!self.handshake_done.is_done()).then_some("1"),
+        );
         // Per-route mTLS enforcement reads this.
         set("x-client-cert", self.client_cert_present.then_some("1"));
         // Per-route allow_http11 enforcement reads this.
@@ -342,9 +453,92 @@ impl HandshakeFacts {
     }
 }
 
-impl Connected<&FingerprintedTlsStream<TlsStream<TcpStream>>> for FingerprintedConnection {
-    fn connect_info(target: &FingerprintedTlsStream<TlsStream<TcpStream>>) -> Self {
+impl Connected<&FingerprintedTlsStream<ServerTlsStream>> for FingerprintedConnection {
+    fn connect_info(target: &FingerprintedTlsStream<ServerTlsStream>) -> Self {
         target.conn_info.clone()
+    }
+}
+
+/// The server side of a rustls connection on the fingerprinting listener:
+/// tokio-rustls's stream, or [`EarlyRustls`](crate::early_data::EarlyRustls)
+/// when 0-RTT is enabled.
+pub enum ServerTlsStream {
+    Rustls(TlsStream<TcpStream>),
+    Early(crate::early_data::EarlyRustls<TcpStream>),
+}
+
+impl ServerTlsStream {
+    pub fn connection(&self) -> &rustls::ServerConnection {
+        match self {
+            Self::Rustls(s) => s.get_ref().1,
+            Self::Early(s) => s.connection(),
+        }
+    }
+
+    pub fn handshake_done(&self) -> crate::early_data::HandshakeDone {
+        match self {
+            Self::Rustls(_) => crate::early_data::HandshakeDone::completed(),
+            Self::Early(s) => s.handshake_done(),
+        }
+    }
+}
+
+impl AsyncRead for ServerTlsStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Rustls(s) => Pin::new(s).poll_read(cx, buf),
+            Self::Early(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for ServerTlsStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Rustls(s) => Pin::new(s).poll_write(cx, buf),
+            Self::Early(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    // Forwarded for the reason given on `FingerprintedTlsStream`'s.
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Rustls(s) => Pin::new(s).poll_write_vectored(cx, bufs),
+            Self::Early(s) => Pin::new(s).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Rustls(s) => s.is_write_vectored(),
+            Self::Early(s) => s.is_write_vectored(),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Rustls(s) => Pin::new(s).poll_flush(cx),
+            Self::Early(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Rustls(s) => Pin::new(s).poll_shutdown(cx),
+            Self::Early(s) => Pin::new(s).poll_shutdown(cx),
+        }
     }
 }
 
@@ -421,14 +615,15 @@ pub struct FingerprintingTlsAcceptor {
     fingerprint_extractor: Arc<FingerprintExtractor>,
     security_state: SecurityState,
     fingerprint_config: FingerprintConfig,
-    /// SEC-002: Whether the server has 0-RTT (early data) enabled.
-    /// Used to set `FingerprintedConnection::is_early_data` only when the server
-    /// would actually accept early data from a resumed session.
+    /// SEC-002: whether 0-RTT is enabled. Handshakes then run on
+    /// [`EarlyRustls`](crate::early_data::EarlyRustls), which serves early data
+    /// before the handshake completes; otherwise on tokio-rustls, unchanged.
     zero_rtt_enabled: bool,
-    /// 0-RTT replay protection mode: "strict" | "session" | "none"
-    zero_rtt_replay_mode: String,
-    /// Nonce store for strict 0-RTT replay protection
-    zero_rtt_nonce_store: Option<Arc<ZeroRttNonceStore>>,
+    /// `tls.zero_rtt_replay_protection`.
+    zero_rtt_replay: ZeroRttReplayGuard,
+    /// `tls.handshake_timeout_secs`: with 0-RTT on, also how long closing a
+    /// connection waits for its handshake to finish.
+    handshake_timeout: std::time::Duration,
     /// HTTP/1.1-only TLS acceptor used when the SNI matches http11_only_hosts.
     /// Advertises only "http/1.1" in ALPN so browsers open independent TCP
     /// connections per fetch() stream instead of coalescing into one HTTP/2 pipe.
@@ -451,8 +646,8 @@ impl FingerprintingTlsAcceptor {
             security_state,
             fingerprint_config,
             zero_rtt_enabled,
-            zero_rtt_replay_mode: "strict".to_string(),
-            zero_rtt_nonce_store: Some(Arc::new(ZeroRttNonceStore::new(60))),
+            zero_rtt_replay: ZeroRttReplayGuard::from_config("strict", 60),
+            handshake_timeout: std::time::Duration::from_secs(10),
             http11_only_tls_acceptor: None,
             http11_only_hosts: Vec::new(),
         }
@@ -480,12 +675,14 @@ impl FingerprintingTlsAcceptor {
     /// Call this after `new()` when the TLS config has non-default 0-RTT settings.
     #[must_use]
     pub fn with_zero_rtt_protection(mut self, mode: &str, window_secs: u64) -> Self {
-        self.zero_rtt_replay_mode = mode.to_string();
-        self.zero_rtt_nonce_store = if mode == "strict" {
-            Some(Arc::new(ZeroRttNonceStore::new(window_secs)))
-        } else {
-            None
-        };
+        self.zero_rtt_replay = ZeroRttReplayGuard::from_config(mode, window_secs);
+        self
+    }
+
+    /// `tls.handshake_timeout_secs`.
+    #[must_use]
+    pub fn with_handshake_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.handshake_timeout = timeout;
         self
     }
 
@@ -563,68 +760,7 @@ impl FingerprintingTlsAcceptor {
     /// extension (type 0x002a, RFC 8446 §4.2.10).  Returns true if the client
     /// offered early data, regardless of whether the server will accept it.
     pub fn client_hello_has_early_data_extension(data: &[u8]) -> bool {
-        // Minimum TLS record + ClientHello header: 5 (record) + 4 (handshake) = 9 bytes
-        if data.len() < 9 {
-            return false;
-        }
-        // Skip TLS record header (5 bytes) and handshake header (4 bytes)
-        let client_hello = &data[9..];
-        if client_hello.len() < 34 {
-            return false;
-        }
-        // Skip legacy version (2) + random (32) = 34 bytes
-        let mut offset = 34usize;
-
-        // Session ID length
-        if offset >= client_hello.len() {
-            return false;
-        }
-        let session_id_len = client_hello[offset] as usize;
-        offset = offset.saturating_add(1 + session_id_len);
-
-        // Cipher suites length (2 bytes)
-        if offset + 2 > client_hello.len() {
-            return false;
-        }
-        let cipher_len =
-            u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]) as usize;
-        offset = offset.saturating_add(2 + cipher_len);
-
-        // Compression methods length (1 byte)
-        if offset >= client_hello.len() {
-            return false;
-        }
-        let compression_len = client_hello[offset] as usize;
-        offset = offset.saturating_add(1 + compression_len);
-
-        // Extensions length (2 bytes)
-        if offset + 2 > client_hello.len() {
-            return false;
-        }
-        let ext_total =
-            u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]) as usize;
-        offset += 2;
-
-        let ext_end = offset.saturating_add(ext_total);
-        if ext_end > client_hello.len() {
-            return false;
-        }
-
-        // Walk extensions looking for type 0x002a (early_data).
-        while offset + 4 <= ext_end {
-            let ext_type = u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]);
-            let ext_len =
-                u16::from_be_bytes([client_hello[offset + 2], client_hello[offset + 3]]) as usize;
-            offset += 4;
-
-            if ext_type == 0x002a {
-                return true;
-            }
-
-            offset = offset.saturating_add(ext_len);
-        }
-
-        false
+        client_hello_extension(data, 0x002a).is_some()
     }
 
     /// Accept a TLS connection with fingerprint capture
@@ -632,7 +768,7 @@ impl FingerprintingTlsAcceptor {
         &self,
         stream: TcpStream,
         remote_addr: SocketAddr,
-    ) -> io::Result<Option<FingerprintedTlsStream<TlsStream<TcpStream>>>> {
+    ) -> io::Result<Option<FingerprintedTlsStream<ServerTlsStream>>> {
         // Peek at the ClientHello before TLS handshake
         let mut peek_buf = vec![0u8; MAX_CLIENT_HELLO_SIZE];
         let peek_result = stream.peek(&mut peek_buf).await;
@@ -690,21 +826,21 @@ impl FingerprintingTlsAcceptor {
             return Ok(None);
         }
 
-        // SEC-002 / STEP 10: 0-RTT replay protection (strict mode).
-        // Only runs when early_data was offered AND strict mode is configured.
-        if offered_early_data && self.zero_rtt_replay_mode == "strict" && peek_len > 0 {
-            if let Some(ref store) = self.zero_rtt_nonce_store {
-                if store.check_and_insert(&peek_buf[..peek_len]) {
-                    warn!(
-                        "0-RTT replay detected from {} — rejecting early data",
-                        remote_addr
-                    );
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionRefused,
-                        "0-RTT replay protection: duplicate early data rejected",
-                    ));
-                }
-            }
+        // SEC-002 / STEP 10: 0-RTT replay protection, before any handshake
+        // work: a repeated ClientHello (or, under "session", ticket) that
+        // offers early data is refused outright.
+        if offered_early_data
+            && peek_len > 0
+            && self.zero_rtt_replay.is_replay(&peek_buf[..peek_len])
+        {
+            warn!(
+                "0-RTT replay detected from {} — rejecting early data",
+                remote_addr
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "0-RTT replay protection: duplicate early data rejected",
+            ));
         }
 
         // Log fingerprint info
@@ -734,19 +870,27 @@ impl FingerprintingTlsAcceptor {
             .unwrap_or(false);
 
         // Perform TLS handshake
-        let tls_stream = if use_http11_only {
-            if let Some(ref h11_acceptor) = self.http11_only_tls_acceptor {
+        let acceptor = match (use_http11_only, &self.http11_only_tls_acceptor) {
+            (true, Some(h11_acceptor)) => {
                 trace!(
                     "Using HTTP/1.1-only TLS config for SNI {:?} from {}",
                     sni,
                     remote_addr
                 );
-                h11_acceptor.accept(stream).await
-            } else {
-                self.tls_acceptor.accept(stream).await
+                h11_acceptor.as_ref()
             }
+            _ => &self.tls_acceptor,
+        };
+        let tls_stream = if self.zero_rtt_enabled {
+            crate::early_data::EarlyRustls::accept(
+                Arc::clone(acceptor.config()),
+                stream,
+                self.handshake_timeout,
+            )
+            .await
+            .map(ServerTlsStream::Early)
         } else {
-            self.tls_acceptor.accept(stream).await
+            acceptor.accept(stream).await.map(ServerTlsStream::Rustls)
         }
         .map_err(|e| {
             debug!("TLS handshake failed for {}: {}", remote_addr, e);
@@ -755,8 +899,7 @@ impl FingerprintingTlsAcceptor {
 
         // Detect whether client presented a certificate (for per-route mTLS enforcement).
         let client_cert_present = tls_stream
-            .get_ref()
-            .1
+            .connection()
             .peer_certificates()
             .map(|certs| !certs.is_empty())
             .unwrap_or(false);
@@ -768,7 +911,7 @@ impl FingerprintingTlsAcceptor {
             .map(|c| matches!(c, crate::security::FingerprintClass::Browser))
             .unwrap_or(false);
 
-        let handshake = HandshakeFacts::from_connection(tls_stream.get_ref().1);
+        let handshake = HandshakeFacts::from_connection(tls_stream.connection());
 
         let conn_info = FingerprintedConnection {
             remote_addr,
@@ -776,7 +919,7 @@ impl FingerprintingTlsAcceptor {
             ja4_hash: fingerprint_result.ja4_hash,
             client_name: fingerprint_result.client_name,
             is_browser,
-            is_early_data: offered_early_data,
+            handshake_done: tls_stream.handshake_done(),
             client_cert_present,
             handshake,
         };
@@ -986,6 +1129,97 @@ mod tests {
         assert_eq!(headers.get("x-tls-alpn").unwrap(), "h3");
     }
 
+    /// A ClientHello record with the given extensions (type, body).
+    fn client_hello(random: u8, exts: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[random; 32]);
+        body.push(0); // session id
+        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // one cipher suite
+        body.extend_from_slice(&[0x01, 0x00]); // null compression
+        let mut ext = Vec::new();
+        for (ty, b) in exts {
+            ext.extend_from_slice(&ty.to_be_bytes());
+            ext.extend_from_slice(&u16::try_from(b.len()).unwrap().to_be_bytes());
+            ext.extend_from_slice(b);
+        }
+        body.extend_from_slice(&u16::try_from(ext.len()).unwrap().to_be_bytes());
+        body.extend_from_slice(&ext);
+        let mut hs = vec![0x01, 0x00];
+        hs.extend_from_slice(&u16::try_from(body.len()).unwrap().to_be_bytes());
+        hs.extend_from_slice(&body);
+        let mut rec = vec![0x16, 0x03, 0x01];
+        rec.extend_from_slice(&u16::try_from(hs.len()).unwrap().to_be_bytes());
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
+    /// A pre_shared_key extension body naming one ticket.
+    fn psk(ticket: &[u8]) -> Vec<u8> {
+        let mut ids = u16::try_from(ticket.len()).unwrap().to_be_bytes().to_vec();
+        ids.extend_from_slice(ticket);
+        ids.extend_from_slice(&[0, 0, 0, 1]); // obfuscated_ticket_age
+        let mut b = u16::try_from(ids.len()).unwrap().to_be_bytes().to_vec();
+        b.extend_from_slice(&ids);
+        b.extend_from_slice(&[0x00, 0x21, 0x20]); // binders, contents irrelevant here
+        b.extend_from_slice(&[0u8; 32]);
+        b
+    }
+
+    fn early_hello(random: u8, ticket: &[u8]) -> Vec<u8> {
+        client_hello(random, &[(0x002a, vec![]), (0x0029, psk(ticket))])
+    }
+
+    #[test]
+    fn extensions_and_the_resumed_ticket_are_read_from_a_client_hello() {
+        let ch = early_hello(7, b"ticket-one");
+        assert!(FingerprintingTlsAcceptor::client_hello_has_early_data_extension(&ch));
+        assert_eq!(client_hello_psk_identity(&ch), Some(&b"ticket-one"[..]));
+        let plain = client_hello(7, &[(0x0000, vec![0, 0])]);
+        assert!(!FingerprintingTlsAcceptor::client_hello_has_early_data_extension(&plain));
+        assert_eq!(client_hello_psk_identity(&plain), None);
+        // Cut short, the extensions block is not all there: nothing is claimed.
+        assert_eq!(client_hello_psk_identity(&ch[..ch.len() - 10]), None);
+    }
+
+    #[test]
+    fn strict_refuses_a_repeated_client_hello() {
+        let guard = ZeroRttReplayGuard::from_config("strict", 60);
+        assert!(!guard.is_replay(&early_hello(1, b"t")));
+        assert!(
+            guard.is_replay(&early_hello(1, b"t")),
+            "the same ClientHello again"
+        );
+        assert!(
+            !guard.is_replay(&early_hello(2, b"t")),
+            "a new random is a new ClientHello"
+        );
+    }
+
+    #[test]
+    fn session_refuses_a_ticket_used_twice_for_early_data() {
+        let guard = ZeroRttReplayGuard::from_config("session", 60);
+        assert!(!guard.is_replay(&early_hello(1, b"ticket-a")));
+        assert!(
+            guard.is_replay(&early_hello(2, b"ticket-a")),
+            "a different ClientHello resuming the same ticket"
+        );
+        assert!(!guard.is_replay(&early_hello(3, b"ticket-b")));
+    }
+
+    #[test]
+    fn only_client_hellos_offering_early_data_are_tracked() {
+        let guard = ZeroRttReplayGuard::from_config("strict", 60);
+        let plain = client_hello(9, &[(0x0029, psk(b"t"))]);
+        assert!(!guard.is_replay(&plain));
+        assert!(
+            !guard.is_replay(&plain),
+            "a resumption without early data can repeat"
+        );
+        let off = ZeroRttReplayGuard::from_config("none", 60);
+        assert!(!off.is_replay(&early_hello(1, b"t")));
+        assert!(!off.is_replay(&early_hello(1, b"t")));
+    }
+
     #[test]
     fn test_fingerprinted_connection() {
         let conn = FingerprintedConnection {
@@ -994,7 +1228,7 @@ mod tests {
             ja4_hash: Some("t13d0102h2_def456_ghi789".to_string()),
             client_name: Some("Chrome".to_string()),
             is_browser: true,
-            is_early_data: false,
+            handshake_done: crate::early_data::HandshakeDone::completed(),
             client_cert_present: false,
             handshake: HandshakeFacts::default(),
         };

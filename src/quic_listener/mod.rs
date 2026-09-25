@@ -201,6 +201,9 @@ pub(super) struct H3ConnHeaders {
     alt_svc: Option<HeaderValue>,
     /// The client address as forwarded in `x-forwarded-for` / `x-real-ip`.
     pub(super) client_ip: Option<HeaderValue>,
+    /// `x-forwarded-port`: the port this listener serves, as the TCP
+    /// listeners send it. HTTP/3 set none, so a client's own passed through.
+    pub(super) forwarded_port: HeaderValue,
     pub(super) ja3: Option<HeaderValue>,
     pub(super) ja4: Option<HeaderValue>,
     pub(super) client_name: Option<HeaderValue>,
@@ -227,6 +230,7 @@ impl H3ConnHeaders {
     fn new(
         config: &ProxyConfig,
         remote_addr: SocketAddr,
+        local_port: u16,
         fingerprint: &crate::fingerprint::FingerprintResult,
         handshake: &crate::tls_acceptor::HandshakeFacts,
     ) -> Self {
@@ -236,6 +240,7 @@ impl H3ConnHeaders {
             static_headers: build_static_response_headers(config),
             alt_svc: HeaderValue::from_str(&build_alt_svc_header_over_quic(config)).ok(),
             client_ip: HeaderValue::from_str(&remote_addr.ip().to_string()).ok(),
+            forwarded_port: HeaderValue::from(local_port),
             ja3: value(fingerprint.ja3_hash.as_deref()),
             ja4: value(fingerprint.ja4_hash.as_deref()),
             client_name: value(fingerprint.client_name.as_deref()),
@@ -710,6 +715,9 @@ impl QuicListener {
         );
 
         let mut accept_count = 0u64;
+        // The port this endpoint listens on, for `X-Forwarded-Port`: one
+        // listener runs per port, so the configuration cannot say which.
+        let local_port = self.endpoint.local_addr()?.port();
 
         loop {
             tokio::select! {
@@ -783,6 +791,7 @@ impl QuicListener {
                             if let Err(e) = Self::handle_connection(
                                 incoming,
                                 remote_addr,
+                                local_port,
                                 config,
                                 backend_pool,
                                 early_hints_state,
@@ -856,6 +865,7 @@ impl QuicListener {
     async fn handle_connection(
         incoming: quinn::Incoming,
         remote_addr: SocketAddr,
+        local_port: u16,
         config: Arc<ProxyConfig>,
         backend_pool: Arc<BackendPool>,
         early_hints_state: Arc<EarlyHintsState>,
@@ -1117,6 +1127,7 @@ impl QuicListener {
                     &mut h3,
                     connection,
                     remote_addr,
+                    local_port,
                     config,
                     backend_pool,
                     early_hints_state,
@@ -1143,11 +1154,11 @@ impl QuicListener {
 
     /// Handle HTTP/3 connection with WebTransport support
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     async fn handle_h3_connection(
         h3: &mut h3::server::Connection<H3Connection, Bytes>,
         quic_connection: QuinnConnection,
         remote_addr: SocketAddr,
+        local_port: u16,
         config: Arc<ProxyConfig>,
         backend_pool: Arc<BackendPool>,
         early_hints_state: Arc<EarlyHintsState>,
@@ -1168,6 +1179,7 @@ impl QuicListener {
         let conn_headers = Arc::new(H3ConnHeaders::new(
             &config,
             remote_addr,
+            local_port,
             &fingerprint,
             &handshake,
         ));
@@ -1853,6 +1865,7 @@ mod alt_svc_tests {
         let h = H3ConnHeaders::new(
             &c,
             "192.0.2.1:50000".parse().unwrap(),
+            443,
             &fp,
             &crate::tls_acceptor::HandshakeFacts::default(),
         );

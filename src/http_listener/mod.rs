@@ -91,7 +91,11 @@ use layers::{
     trace_context_middleware,
 };
 use speedtest_tcp::{tcp_upload_cors_preflight, tcp_upload_measure_handler};
-use tls_config::{build_rustls_server_config, private_resolver, ALPN_H2_HTTP11, ALPN_HTTP11};
+#[cfg(feature = "pqc")]
+use tls_config::EarlyOpensslAcceptor;
+use tls_config::{
+    build_rustls_server_config, private_resolver, EarlyRustlsAcceptor, ALPN_H2_HTTP11, ALPN_HTTP11,
+};
 use websocket::handle_websocket_tunnel;
 
 /// HTTP listener state
@@ -253,6 +257,43 @@ where
 pub(crate) trait HandshakeSource {
     fn handshake_facts(&self) -> crate::tls_acceptor::HandshakeFacts;
     fn client_cert_present(&self) -> bool;
+    /// Complete by the time a stream is returned, unless it serves early data.
+    fn handshake_done(&self) -> crate::early_data::HandshakeDone {
+        crate::early_data::HandshakeDone::completed()
+    }
+}
+
+impl<T> HandshakeSource for crate::early_data::EarlyRustls<T>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    fn handshake_facts(&self) -> crate::tls_acceptor::HandshakeFacts {
+        crate::tls_acceptor::HandshakeFacts::from_connection(self.connection())
+    }
+    fn client_cert_present(&self) -> bool {
+        self.connection()
+            .peer_certificates()
+            .is_some_and(|c| !c.is_empty())
+    }
+    fn handshake_done(&self) -> crate::early_data::HandshakeDone {
+        crate::early_data::EarlyRustls::handshake_done(self)
+    }
+}
+
+#[cfg(feature = "pqc")]
+impl<T> HandshakeSource for crate::early_data::EarlyOpenssl<T>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    fn handshake_facts(&self) -> crate::tls_acceptor::HandshakeFacts {
+        pqc_handshake_facts(self.ssl())
+    }
+    fn client_cert_present(&self) -> bool {
+        self.ssl().peer_certificate().is_some()
+    }
+    fn handshake_done(&self) -> crate::early_data::HandshakeDone {
+        crate::early_data::EarlyOpenssl::handshake_done(self)
+    }
 }
 
 impl<T> HandshakeSource for tokio_rustls::server::TlsStream<T> {
@@ -339,7 +380,7 @@ where
                 ja4_hash: None,
                 client_name: None,
                 is_browser: false,
-                is_early_data: false,
+                handshake_done: stream.handshake_done(),
                 client_cert_present: stream.client_cert_present(),
                 handshake,
             };
@@ -1122,36 +1163,58 @@ pub async fn run_http_listener(
         config.pqc.enabled,
         config.client_auth(),
     )?;
-    let rustls_server_config =
+    let rustls_server_config = Arc::new(
         build_rustls_server_config(&policy, private_resolver(cert_path)?, ALPN_H2_HTTP11).map_err(
             |e| {
                 error!("❌ TLS configuration error: {}", e);
                 e
             },
-        )?;
-    let tls_config = RustlsConfig::from_config(Arc::new(rustls_server_config));
+        )?,
+    );
+    let handshake_timeout = std::time::Duration::from_secs(config.tls.handshake_timeout_secs);
 
     info!("✅ TLS configured for HTTP listener (SNI per-domain resolver)");
     info!("🔒 HTTPS reverse proxy ready on port {} (TCP)", port);
     // SEC-A04: Hardcoded backend addresses removed from logs to prevent topology disclosure.
 
+    // Spelled out: `ServiceExt` is generic over the request type, and hyper
+    // hands `axum_server` an `Incoming` body that only `BodyShim` converts.
+    let make_service =
+        axum::ServiceExt::<Request<hyper::body::Incoming>>::into_make_service_with_connect_info::<
+            SocketAddr,
+        >(BodyShim(app));
+
     // Run HTTPS server
     // Spelled out rather than `bind_rustls`, which composes the same acceptor
     // over `DefaultAcceptor` and so leaves Nagle on every accepted socket.
-    axum_server::bind(addr)
-        .acceptor(ConnectionHeadersAcceptor::new(
-            RustlsAcceptor::new(tls_config).acceptor(TcpAcceptor::new(&config)),
-            Arc::clone(&metrics),
-        ))
-        // Spelled out: `ServiceExt` is generic over the request type, and
-        // hyper hands `axum_server` an `Incoming` body that only `BodyShim`
-        // converts.
-        .serve(
-            axum::ServiceExt::<Request<hyper::body::Incoming>>::into_make_service_with_connect_info::<
-                SocketAddr,
-            >(BodyShim(app)),
-        )
-        .await?;
+    if config.tls.enable_0rtt {
+        // SEC-002: early data served before the handshake completes.
+        axum_server::bind(addr)
+            .acceptor(ConnectionHeadersAcceptor::new(
+                EarlyRustlsAcceptor::new(
+                    rustls_server_config,
+                    TcpAcceptor::new(&config),
+                    handshake_timeout,
+                    crate::tls_acceptor::ZeroRttReplayGuard::from_config(
+                        &config.tls.zero_rtt_replay_protection,
+                        config.tls.zero_rtt_nonce_window_secs,
+                    ),
+                ),
+                Arc::clone(&metrics),
+            ))
+            .serve(make_service)
+            .await?;
+    } else {
+        axum_server::bind(addr)
+            .acceptor(ConnectionHeadersAcceptor::new(
+                RustlsAcceptor::new(RustlsConfig::from_config(rustls_server_config))
+                    .handshake_timeout(handshake_timeout)
+                    .acceptor(TcpAcceptor::new(&config)),
+                Arc::clone(&metrics),
+            ))
+            .serve(make_service)
+            .await?;
+    }
 
     Ok(())
 }
@@ -1231,7 +1294,8 @@ pub async fn run_http_listener_pqc(
     .map_err(|e| format!("Failed to create PQC SSL acceptor: {}", e))?;
 
     // Create OpenSSL config from the PQC-enabled acceptor (requires Arc)
-    let openssl_config = OpenSSLConfig::from_acceptor(Arc::new(ssl_acceptor));
+    let ssl_acceptor = Arc::new(ssl_acceptor);
+    let handshake_timeout = std::time::Duration::from_secs(config.tls.handshake_timeout_secs);
 
     // Get PQC status for logging
     let pqc_status = pqc_provider.status();
@@ -1261,22 +1325,44 @@ pub async fn run_http_listener_pqc(
     info!("📊 Configured groups: {}", pqc_provider.groups_string());
     // SEC-A04: Hardcoded backend addresses removed from logs to prevent topology disclosure.
 
+    // Spelled out: `ServiceExt` is generic over the request type, and hyper
+    // hands `axum_server` an `Incoming` body that only `BodyShim` converts.
+    let make_service =
+        axum::ServiceExt::<Request<hyper::body::Incoming>>::into_make_service_with_connect_info::<
+            SocketAddr,
+        >(BodyShim(app));
+
     // Run HTTPS server with OpenSSL 3.5+ (PQC-enabled with native ML-KEM)
     // Spelled out rather than `bind_openssl`, for the reason above.
-    axum_server::bind(addr)
-        .acceptor(ConnectionHeadersAcceptor::new(
-            OpenSSLAcceptor::new(openssl_config).acceptor(TcpAcceptor::new(&config)),
-            Arc::clone(&metrics),
-        ))
-        // Spelled out: `ServiceExt` is generic over the request type, and
-        // hyper hands `axum_server` an `Incoming` body that only `BodyShim`
-        // converts.
-        .serve(
-            axum::ServiceExt::<Request<hyper::body::Incoming>>::into_make_service_with_connect_info::<
-                SocketAddr,
-            >(BodyShim(app)),
-        )
-        .await?;
+    if config.tls.enable_0rtt {
+        // SEC-002: every connection through SSL_read_early_data, as OpenSSL
+        // requires once the context allows early data.
+        axum_server::bind(addr)
+            .acceptor(ConnectionHeadersAcceptor::new(
+                EarlyOpensslAcceptor::new(
+                    ssl_acceptor,
+                    TcpAcceptor::new(&config),
+                    handshake_timeout,
+                    crate::tls_acceptor::ZeroRttReplayGuard::from_config(
+                        &config.tls.zero_rtt_replay_protection,
+                        config.tls.zero_rtt_nonce_window_secs,
+                    ),
+                ),
+                Arc::clone(&metrics),
+            ))
+            .serve(make_service)
+            .await?;
+    } else {
+        axum_server::bind(addr)
+            .acceptor(ConnectionHeadersAcceptor::new(
+                OpenSSLAcceptor::new(OpenSSLConfig::from_acceptor(ssl_acceptor))
+                    .handshake_timeout(handshake_timeout)
+                    .acceptor(TcpAcceptor::new(&config)),
+                Arc::clone(&metrics),
+            ))
+            .serve(make_service)
+            .await?;
+    }
 
     Ok(())
 }
@@ -1367,6 +1453,7 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
     // Read once here: `config` is moved into builders further down in
     // several of these functions.
     let nodelay = config.server.tcp_nodelay;
+    let handshake_timeout = std::time::Duration::from_secs(config.tls.handshake_timeout_secs);
     let proxy_trusted: Arc<[ipnet::IpNet]> = config.server.proxy_protocol_trusted.clone().into();
     let proxy_timeout = std::time::Duration::from_millis(config.server.proxy_protocol_timeout_ms);
     let mut shutdown_rx = shutdown_rx;
@@ -1432,8 +1519,8 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
         fingerprint_extractor,
         security_state,
         config.fingerprint.clone(),
-        // SEC-002: propagate 0-RTT enabled flag so the acceptor can detect
-        // early data offered in ClientHello and tag the connection accordingly.
+        // SEC-002: with 0-RTT on, handshakes serve early data before they
+        // complete (crate::early_data).
         config.tls.enable_0rtt,
     );
     // The acceptor defaulted to mode "strict" with a 60 s window regardless of
@@ -1446,6 +1533,9 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
         &config.tls.zero_rtt_replay_protection,
         config.tls.zero_rtt_nonce_window_secs,
     );
+    acceptor_builder = acceptor_builder.with_handshake_timeout(std::time::Duration::from_secs(
+        config.tls.handshake_timeout_secs,
+    ));
     if let Some(h11_cfg) = http11_only_config {
         acceptor_builder = acceptor_builder
             .with_http11_only_acceptor(h11_cfg, config.server.http11_only_hosts.clone());
@@ -1505,7 +1595,7 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
                         Ok(None) => remote_addr,
                         Err(_) => return,
                     };
-                    handle_fingerprinted_connection(stream, remote_addr, acceptor, app, conn_metrics_clone).await;
+                    handle_fingerprinted_connection(stream, remote_addr, acceptor, app, conn_metrics_clone, handshake_timeout).await;
                 });
             }
 
@@ -1528,6 +1618,8 @@ async fn handle_fingerprinted_connection<S>(
     acceptor: Arc<FingerprintingTlsAcceptor>,
     app: S,
     metrics: Arc<MetricsRegistry>,
+    // `tls.handshake_timeout_secs`, over the ClientHello peek and the handshake.
+    handshake_timeout: std::time::Duration,
 ) where
     S: tower::Service<Request<Body>, Response = Response, Error = Infallible>
         + Clone
@@ -1538,7 +1630,15 @@ async fn handle_fingerprinted_connection<S>(
     trace!("New TCP connection from {}", remote_addr);
 
     // Accept TLS connection with fingerprint capture
-    let tls_stream = match acceptor.accept(stream, remote_addr).await {
+    let accepted = tokio::time::timeout(handshake_timeout, acceptor.accept(stream, remote_addr))
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "TLS handshake timed out",
+            ))
+        });
+    let tls_stream = match accepted {
         Ok(Some(stream)) => stream,
         Ok(None) => {
             // Connection blocked by fingerprint policy
@@ -1557,7 +1657,7 @@ async fn handle_fingerprinted_connection<S>(
 
     // Detect HTTP protocol from ALPN negotiation
     let protocol = {
-        let (_, server_conn) = tls_stream.get_ref().get_ref();
+        let server_conn = tls_stream.get_ref().connection();
         match server_conn.alpn_protocol() {
             Some(b"h2") => ConnectionProtocol::Http2,
             _ => ConnectionProtocol::Http1,
@@ -1686,8 +1786,18 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     // Read once here: `config` is moved into builders further down in
     // several of these functions.
     let nodelay = config.server.tcp_nodelay;
+    let handshake_timeout = std::time::Duration::from_secs(config.tls.handshake_timeout_secs);
     let proxy_trusted: Arc<[ipnet::IpNet]> = config.server.proxy_protocol_trusted.clone().into();
     let proxy_timeout = std::time::Duration::from_millis(config.server.proxy_protocol_timeout_ms);
+    // SEC-002: with 0-RTT on, accepted through SSL_read_early_data and served
+    // before the handshake completes, behind the same replay guard as the
+    // rustls listener -- this one applied none.
+    let zero_rtt = config.tls.enable_0rtt.then(|| {
+        crate::tls_acceptor::ZeroRttReplayGuard::from_config(
+            &config.tls.zero_rtt_replay_protection,
+            config.tls.zero_rtt_nonce_window_secs,
+        )
+    });
     let mut shutdown_rx = shutdown_rx;
     use openssl::ssl::SslContext;
 
@@ -1791,6 +1901,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
                 let router = app.clone();
                 let conn_metrics_clone = conn_metrics.clone();
                 let proxy_trusted = proxy_trusted.clone();
+                let zero_rtt = zero_rtt.clone();
 
                 tokio::spawn(async move {
                     let mut stream = stream;
@@ -1810,6 +1921,8 @@ pub async fn run_http_listener_pqc_with_fingerprint(
                         fp_config,
                         router,
                         conn_metrics_clone,
+                        zero_rtt,
+                        handshake_timeout,
                     )
                     .await;
                 });
@@ -1864,6 +1977,11 @@ async fn handle_pqc_fingerprinted_connection<S>(
     fingerprint_config: crate::config::FingerprintConfig,
     app: S,
     metrics: Arc<MetricsRegistry>,
+    // Some when `tls.enable_0rtt`: the replay guard for ClientHellos that
+    // offer early data.
+    zero_rtt: Option<crate::tls_acceptor::ZeroRttReplayGuard>,
+    // `tls.handshake_timeout_secs`, over the ClientHello peek and the handshake.
+    handshake_timeout: std::time::Duration,
 ) where
     S: tower::Service<Request<Body>, Response = Response, Error = Infallible>
         + Clone
@@ -1872,13 +1990,24 @@ async fn handle_pqc_fingerprinted_connection<S>(
     S::Future: Send,
 {
     use openssl::ssl::Ssl;
-    use tokio_openssl::SslStream;
 
     trace!("New TCP connection from {} (PQC mode)", remote_addr);
+    let deadline = tokio::time::Instant::now() + handshake_timeout;
 
     // Peek at the ClientHello before TLS handshake
     let mut peek_buf = vec![0u8; 4096];
-    let fingerprint_result = match stream.peek(&mut peek_buf).await {
+    let peeked = match tokio::time::timeout_at(deadline, stream.peek(&mut peek_buf)).await {
+        Ok(r) => r,
+        Err(_) => {
+            debug!(
+                "No ClientHello from {} within {:?}",
+                remote_addr, handshake_timeout
+            );
+            return;
+        }
+    };
+    let peek_len = peeked.as_ref().map(|n| *n).unwrap_or(0);
+    let fingerprint_result = match peeked {
         Ok(n) if n > 0 => {
             trace!("Peeked {} bytes of ClientHello from {}", n, remote_addr);
             fingerprint_extractor.process_client_hello(
@@ -1931,6 +2060,18 @@ async fn handle_pqc_fingerprinted_connection<S>(
         );
     }
 
+    // SEC-002: a repeated ClientHello (or ticket) offering early data is
+    // refused before any handshake work.
+    if let Some(guard) = &zero_rtt {
+        if peek_len > 0 && guard.is_replay(&peek_buf[..peek_len]) {
+            warn!(
+                "0-RTT replay detected from {} — rejecting early data",
+                remote_addr
+            );
+            return;
+        }
+    }
+
     // Create SSL instance and perform handshake
     let ssl = match Ssl::new(&ssl_context) {
         Ok(ssl) => ssl,
@@ -1940,20 +2081,30 @@ async fn handle_pqc_fingerprinted_connection<S>(
         }
     };
 
-    let mut ssl_stream = match SslStream::new(ssl, stream) {
-        Ok(s) => s,
-        Err(e) => {
-            debug!("Failed to create SSL stream for {}: {}", remote_addr, e);
+    // Through SSL_read_early_data when 0-RTT is on: the stream is then served
+    // as soon as the server's flight is out, early data first.
+    let ssl_stream = match tokio::time::timeout_at(
+        deadline,
+        crate::early_data::OpensslStream::accept(
+            ssl,
+            stream,
+            zero_rtt.is_some().then_some(handshake_timeout),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            metrics.tls.handshake_completed(false, false);
+            debug!("PQC TLS handshake failed for {}: {}", remote_addr, e);
+            return;
+        }
+        Err(_) => {
+            metrics.tls.handshake_completed(false, false);
+            debug!("PQC TLS handshake from {} timed out", remote_addr);
             return;
         }
     };
-
-    // Perform async TLS handshake
-    if let Err(e) = std::pin::Pin::new(&mut ssl_stream).accept().await {
-        metrics.tls.handshake_completed(false, false);
-        debug!("PQC TLS handshake failed for {}: {}", remote_addr, e);
-        return;
-    }
 
     // Detect HTTP protocol from ALPN negotiation (OpenSSL)
     let protocol = match ssl_stream.ssl().selected_alpn_protocol() {
@@ -1982,14 +2133,13 @@ async fn handle_pqc_fingerprinted_connection<S>(
     // Detect whether client presented a certificate (for per-route mTLS enforcement).
     let client_cert_present = ssl_stream.ssl().peer_certificate().is_some();
 
-    // Create connection info (OpenSSL PQC path does not use rustls 0-RTT)
     let conn_info = crate::tls_acceptor::FingerprintedConnection {
         remote_addr,
         ja3_hash: ja3_hash.clone(),
         ja4_hash: ja4_hash.clone(),
         client_name: client_name.clone(),
         is_browser,
-        is_early_data: false,
+        handshake_done: ssl_stream.handshake_done(),
         client_cert_present,
         handshake: pqc_handshake_facts(ssl_stream.ssl()),
     };
@@ -2045,6 +2195,67 @@ async fn handle_pqc_fingerprinted_connection<S>(
     }
 
     metrics.connections.connection_closed();
+}
+
+/// Copy a client request's headers onto a backend request.
+///
+/// Every field but the hop-by-hop ones (RFC 9110 §7.6.1), pseudo-headers, the
+/// proxy's internal early-data tag and the forwarding headers the proxy sets
+/// from the connection itself -- which callers set after this, from what the
+/// connection established.
+///
+/// A repeated field is kept whole. There were three copies of this loop, for
+/// TCP, TCP shadowing and HTTP/3, and all three used `insert`, which keeps only
+/// the last value: `Accept: a` and `Accept: b` reached the backend as `b`, and
+/// a cookie split across fields lost every crumb but the last on TCP. Cookie
+/// fields are joined into one with `"; "` (RFC 9113 §8.2.3, RFC 9114 §4.2.1),
+/// since the next hop may be HTTP/1.1 and a server that merges repeated
+/// fields with `", "` would misparse them. A request dispatched as early data
+/// carries `Early-Data: 1` (RFC 8470 §5.1), decided from the internal tag.
+pub(crate) fn copy_forwardable_headers(src: &http::HeaderMap, dst: &mut http::HeaderMap) {
+    let mut cookie: Option<Vec<u8>> = None;
+    for (name, value) in src {
+        let n = name.as_str();
+        if n.starts_with(':')
+            || matches!(
+                n,
+                "host"
+                    | "connection"
+                    | "transfer-encoding"
+                    | "upgrade"
+                    | "keep-alive"
+                    | "proxy-authenticate"
+                    | "proxy-authorization"
+                    | "te"
+                    | "trailer"
+                    | "x-tls-early-data"
+                    | "x-forwarded-for"
+                    | "x-forwarded-proto"
+                    | "x-forwarded-port"
+                    | "x-real-ip"
+            )
+        {
+            continue;
+        }
+        if *name == header::COOKIE {
+            let c = cookie.get_or_insert_with(Vec::new);
+            if !c.is_empty() {
+                c.extend_from_slice(b"; ");
+            }
+            c.extend_from_slice(value.as_bytes());
+            continue;
+        }
+        dst.append(name.clone(), value.clone());
+    }
+    if let Some(v) = cookie.and_then(|c| HeaderValue::from_bytes(&c).ok()) {
+        dst.insert(header::COOKIE, v);
+    }
+    if src
+        .get("x-tls-early-data")
+        .is_some_and(|v| v.as_bytes() == b"1")
+    {
+        dst.insert("early-data", HeaderValue::from_static("1"));
+    }
 }
 
 /// Main proxy handler - routes requests to appropriate backends
@@ -2581,35 +2792,7 @@ async fn proxy_handler(
 
         // Copy headers with modifications
         if let Some(h) = proxy_req.headers_mut() {
-            // Copy original headers
-            for (name, value) in headers.iter() {
-                // Skip hop-by-hop headers and internal proxy-only headers that
-                // must not be forwarded to backends.
-                let name_str = name.as_str().to_lowercase();
-                if ![
-                    "host",
-                    "connection",
-                    "transfer-encoding",
-                    "upgrade",
-                    "keep-alive",
-                    "proxy-authenticate",
-                    "proxy-authorization",
-                    "te",
-                    "trailer",
-                    // SEC-002: internal 0-RTT tag — never forward to backends
-                    "x-tls-early-data",
-                    // SEC-03: strip client-supplied forwarding headers; the proxy injects
-                    // trusted values from the actual socket address below.
-                    "x-forwarded-for",
-                    "x-forwarded-proto",
-                    "x-forwarded-port",
-                    "x-real-ip",
-                ]
-                .contains(&name_str.as_str())
-                {
-                    h.insert(name.clone(), value.clone());
-                }
-            }
+            copy_forwardable_headers(&headers, h);
 
             // Set correct host header for backend
             if let Ok(v) = HeaderValue::from_str(&host) {
@@ -3285,30 +3468,7 @@ fn spawn_shadow_request(
         let mut req_builder = Request::builder().method(method).uri(shadow_path.as_str());
 
         if let Some(h) = req_builder.headers_mut() {
-            // Copy original headers, stripping hop-by-hop and internal proxy tags
-            for (name, value) in headers.iter() {
-                let n = name.as_str().to_lowercase();
-                if ![
-                    "host",
-                    "connection",
-                    "transfer-encoding",
-                    "upgrade",
-                    "keep-alive",
-                    "proxy-authenticate",
-                    "proxy-authorization",
-                    "te",
-                    "trailer",
-                    "x-tls-early-data",
-                    "x-forwarded-for",
-                    "x-forwarded-proto",
-                    "x-forwarded-port",
-                    "x-real-ip",
-                ]
-                .contains(&n.as_str())
-                {
-                    h.insert(name.clone(), value.clone());
-                }
-            }
+            copy_forwardable_headers(&headers, h);
             // Correct Host for shadow backend
             if let Ok(v) = HeaderValue::from_str(&host) {
                 h.insert(header::HOST, v);
@@ -3514,4 +3674,63 @@ pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod forwarding_tests {
+    use super::copy_forwardable_headers;
+    use http::{HeaderMap, HeaderValue};
+
+    fn copied(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut src = HeaderMap::new();
+        for (k, v) in pairs {
+            src.append(*k, HeaderValue::from_static(v));
+        }
+        let mut dst = HeaderMap::new();
+        copy_forwardable_headers(&src, &mut dst);
+        dst
+    }
+
+    #[test]
+    fn a_repeated_field_reaches_the_backend_whole() {
+        let h = copied(&[("accept", "text/a"), ("accept", "text/b")]);
+        let got: Vec<_> = h.get_all("accept").iter().collect();
+        assert_eq!(got, ["text/a", "text/b"]);
+    }
+
+    #[test]
+    fn cookie_crumbs_are_joined_into_one_field() {
+        let h = copied(&[
+            ("cookie", "one=1"),
+            ("cookie", "two=2"),
+            ("cookie", "three=3"),
+        ]);
+        assert_eq!(h.get_all("cookie").iter().count(), 1);
+        assert_eq!(h.get("cookie").unwrap(), "one=1; two=2; three=3");
+    }
+
+    #[test]
+    fn hop_by_hop_internal_and_forwarding_fields_are_not_copied() {
+        let h = copied(&[
+            ("connection", "keep-alive"),
+            ("te", "trailers"),
+            ("x-forwarded-for", "6.6.6.6"),
+            ("x-forwarded-port", "1"),
+            ("x-real-ip", "6.6.6.6"),
+            ("x-tls-early-data", "0"),
+            ("user-agent", "t"),
+        ]);
+        assert_eq!(h.len(), 1, "only user-agent survives: {h:?}");
+        assert!(h.get("early-data").is_none());
+    }
+
+    #[test]
+    fn a_request_dispatched_as_early_data_carries_early_data_1() {
+        let h = copied(&[("x-tls-early-data", "1"), ("accept", "*/*")]);
+        assert_eq!(h.get("early-data").unwrap(), "1");
+        assert!(
+            h.get("x-tls-early-data").is_none(),
+            "the internal tag stays inside"
+        );
+    }
 }

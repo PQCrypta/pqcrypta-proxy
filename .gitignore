@@ -65,3 +65,4 @@ data/blocklists/sync_status.json
 config/proxy-config.toml
 config/remotellm-proxy.toml
 /target-fp/
+__pycache__/

@@ -1308,18 +1308,32 @@ pub struct TlsConfig {
     pub ocsp_stapling: bool,
     /// Certificate reload interval in seconds (0 = disabled)
     pub cert_reload_interval_secs: u64,
-    /// Enable 0-RTT (early data) - SECURITY WARNING: vulnerable to replay attacks.
-    /// Default: false (disabled for security).
+    /// Enable 0-RTT (early data) on TCP and QUIC. SECURITY: early data can be
+    /// replayed by anyone who recorded it. Default: false.
     ///
-    /// When enabled, TLS 0-RTT early data is forwarded to backends WITHOUT replay
-    /// detection. Only enable on routes where ALL of the following are true:
-    ///
-    /// 1. The HTTP method is idempotent (GET or HEAD)
-    /// 2. The backend handles duplicate requests safely
-    /// 3. The route has `allow_0rtt = true` set explicitly
-    ///
-    /// Use `zero_rtt_safe_methods` to declare which HTTP methods may use early data.
+    /// When enabled, session tickets allow early data and requests that arrive
+    /// in it are served before the handshake completes (see `early_data.rs`).
+    /// A request dispatched before completion is early: the route gate answers
+    /// 425 Too Early unless the route has `allow_0rtt = true` and the method is
+    /// in `zero_rtt_safe_methods`, and one that is forwarded carries
+    /// `Early-Data: 1` to the backend (RFC 8470 §5.1). `zero_rtt_replay_protection`
+    /// refuses a repeated ClientHello or ticket within its window.
     pub enable_0rtt: bool,
+
+    /// Bytes of early data a TCP session ticket allows when `enable_0rtt` is
+    /// on (default 16384, OpenSSL's receive limit). QUIC tickets always carry
+    /// 0xffffffff, the only non-zero value RFC 9001 §4.6.1 allows, with
+    /// QUIC's own flow control bounding what is sent.
+    #[serde(default = "default_zero_rtt_max_early_data")]
+    pub zero_rtt_max_early_data: u32,
+
+    /// Seconds a TCP client has to complete its TLS handshake, ClientHello
+    /// included, before the connection is dropped (default 10). The listeners
+    /// served through `axum_server` had its fixed 10 s; the two with their own
+    /// accept loops had no bound at all, so a client that connected and sent
+    /// nothing held its task for as long as it kept the socket open.
+    #[serde(default = "default_tls_handshake_timeout_secs")]
+    pub handshake_timeout_secs: u64,
 
     /// L-5: HTTP methods that are safe to forward via 0-RTT early data.
     /// Defaults to `["GET", "HEAD"]` (the only idempotent, side-effect-free methods).
@@ -1329,9 +1343,16 @@ pub struct TlsConfig {
     pub zero_rtt_safe_methods: Vec<String>,
 
     /// 0-RTT replay protection mode: "strict" | "session" | "none" — default "strict".
-    /// - "strict": nonce tracked globally; duplicate nonces rejected with 425.
-    /// - "session": nonce tracked per TLS session only.
+    /// Applied to every TCP ClientHello that offers early data; a repeat
+    /// within `zero_rtt_nonce_window_secs` is refused before the handshake.
+    /// - "strict": the ClientHello itself (its random is among the bytes
+    ///   hashed), so an exact replay is refused.
+    /// - "session": the session ticket it resumes, so each ticket carries early
+    ///   data once (RFC 8446 §8.1, single-use tickets). A ClientHello whose
+    ///   ticket was not in the bytes read falls back to "strict".
     /// - "none": no replay protection (not recommended).
+    ///
+    /// "session" was documented and did nothing until 2026-09-25.
     #[serde(default = "default_zero_rtt_replay_protection")]
     pub zero_rtt_replay_protection: String,
 
@@ -1349,6 +1370,17 @@ pub struct TlsConfig {
     /// generation of overlap. Default: false.
     #[serde(default)]
     pub pqc_session_tickets: bool,
+
+    /// Sessions a rustls listener keeps for stateful resumption (default
+    /// 16384). Used whenever it issues no stateless tickets: with
+    /// `pqc_session_tickets` off, and with `enable_0rtt` on -- rustls accepts
+    /// early data only from a session it can use once, which a stateless ticket
+    /// cannot be. A stateful ticket is an opaque handle with nothing sealed in
+    /// it, so it meets the purpose of `pqc_session_tickets` too: there is no
+    /// ticket content on the wire for a future quantum adversary to open.
+    /// rustls's own default was 256, which a busy listener evicts in seconds.
+    #[serde(default = "default_session_cache_entries")]
+    pub session_cache_entries: usize,
 
     /// Ticket key lifetime in seconds; also the lifetime hint sent to clients.
     /// Rotation is what bounds the damage a stolen ticket can do, so this is a
@@ -1393,14 +1425,29 @@ impl Default for TlsConfig {
             ocsp_stapling: true,
             cert_reload_interval_secs: 3600,
             enable_0rtt: false, // Disabled by default for security (replay attack risk)
+            zero_rtt_max_early_data: default_zero_rtt_max_early_data(),
+            handshake_timeout_secs: default_tls_handshake_timeout_secs(),
             zero_rtt_safe_methods: default_zero_rtt_safe_methods(),
             zero_rtt_replay_protection: default_zero_rtt_replay_protection(),
             zero_rtt_nonce_window_secs: default_zero_rtt_nonce_window(),
             pqc_session_tickets: false,
+            session_cache_entries: default_session_cache_entries(),
             session_ticket_lifetime_secs: default_session_ticket_lifetime(),
             certificate_compression: default_certificate_compression(),
         }
     }
+}
+
+fn default_session_cache_entries() -> usize {
+    16_384
+}
+
+fn default_zero_rtt_max_early_data() -> u32 {
+    16_384
+}
+
+fn default_tls_handshake_timeout_secs() -> u64 {
+    10
 }
 
 fn default_zero_rtt_replay_protection() -> String {

@@ -145,7 +145,11 @@ as_type = "style"
 | `min_version` | string | `"1.3"` | Minimum TLS version. Options: `"1.2"`, `"1.3"` |
 | `ocsp_stapling` | bool | `true` | Enable OCSP stapling for certificate validation |
 | `cert_reload_interval_secs` | u64 | `3600` | Certificate reload interval (0 = disabled) |
-| `enable_0rtt` | bool | `false` | Enable 0-RTT early data. **WARNING**: Vulnerable to replay attacks |
+| `enable_0rtt` | bool | `false` | Enable 0-RTT early data on TCP and QUIC; early requests are served before the handshake completes and gated per route (425 Too Early). **WARNING**: early data can be replayed |
+| `zero_rtt_max_early_data` | u32 | `16384` | Early data a TCP session ticket allows when `enable_0rtt` is on (QUIC tickets always carry 0xffffffff) |
+| `zero_rtt_replay_protection` | string | `"strict"` | `strict`: refuse a repeated ClientHello; `session`: each ticket carries early data once (RFC 8446 §8.1); `none` |
+| `zero_rtt_nonce_window_secs` | u64 | `60` | How long a ClientHello or ticket is remembered for replay protection |
+| `handshake_timeout_secs` | u64 | `10` | Seconds a TCP client has to complete its TLS handshake, ClientHello included |
 
 ---
 

@@ -99,7 +99,11 @@ use pqcrypta_proxy::{run_http_listener_pqc, run_http_listener_pqc_with_fingerpri
 /// PQCrypta Proxy - QUIC/HTTP3/WebTransport Proxy with PQC TLS
 #[derive(Parser, Debug)]
 #[command(name = "pqcrypta-proxy")]
-#[command(version, about, long_about = None)]
+#[command(
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("PQCRYPTA_GIT_COMMIT"), ")"),
+    about,
+    long_about = None
+)]
 struct Args {
     /// Configuration file path
     #[arg(

@@ -1,3 +1,18 @@
+# pqcrypta-proxy benchmark configuration — AS DEPLOYED.
+#
+# The third arm of the HAProxy comparison: everything the production nodes run
+# that a single-backend benchmark can exercise -- the WAF in block mode,
+# TLS-layer JA3/JA4 fingerprinting with replay and drift detection, both rate
+# limiters and DoS protection (thresholds lifted so they evaluate every request
+# without banning the generator), the default security and Alt-Svc headers,
+# compression, early hints, priority hints, request coalescing, Server-Timing,
+# PQC-sealed session tickets, and post-quantum key exchange on the OpenSSL
+# provider. Bound to 10.99.0.1 because loopback is trusted and skips the
+# security path. Left out, and why: the response cache (it would answer these
+# fixed bodies from memory and stop measuring proxying), OCSP stapling (the
+# bench certificate has no responder), ACME, GeoIP and the admin API.
+#
+# Derived from pqc-sec-on.toml:
 # pqcrypta-proxy benchmark configuration.
 #
 # Matched to the HAProxy config: same certificate, same backend, same worker count,
@@ -35,13 +50,15 @@ min_version = "1.3"
 alpn_protocols = ["h3", "h2", "http/1.1"]
 ocsp_stapling = false
 enable_0rtt = false
-pqc_session_tickets = false
+pqc_session_tickets = true
 
 [pqc]
-# Classical for the like-for-like run. The PQC handshake cost is measured
-# separately, against HAProxy also configured for X25519MLKEM768, so that
-# number is a comparison rather than a penalty applied to one side only.
-enabled = false
+enabled = true
+provider = "openssl3.5"
+openssl_path = "/usr/local/openssl-pq/bin/openssl"
+openssl_lib_path = "/usr/local/openssl-pq/lib64"
+preferred_kem = "X25519MLKEM768"
+fallback_to_classical = true
 
 [backends.static]
 name = "static"
@@ -162,11 +179,11 @@ acquire_timeout_ms = 5000
 # them on while HAProxy does plain proxying is not the like-for-like comparison
 # it claims to be. conf/pqc-bench-features.toml keeps them on for the second
 # arm, which is the number anyone actually deploying this should read.
-early_hints_enabled = false
-priority_hints_enabled = false
-coalescing_enabled = false
+early_hints_enabled = true
+priority_hints_enabled = true
+coalescing_enabled = true
 preconnect_origins = []
 
 [headers]
 # Same reasoning: Server-Timing instruments every request and emits a header.
-server_timing_enabled = false
+server_timing_enabled = true

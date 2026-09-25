@@ -1567,51 +1567,18 @@ impl QuicListener {
         // them. Cloning a `HeaderName` is cheap and a `HeaderValue` is
         // `Bytes`-backed, so carrying the real type costs no allocations at all.
         let mut headers = HeaderMap::with_capacity(request.headers().len() + 8);
+        // The same copy as the TCP listeners'; see its notes on repeated
+        // fields, cookie crumbs and Early-Data.
+        crate::http_listener::copy_forwardable_headers(request.headers(), &mut headers);
+        // The route's own headers after the client's, as on TCP, so a client
+        // cannot overwrite one by sending it. They went in first here, and the
+        // client's copy replaced them.
         for (name, value) in &route.add_headers {
             if let (Ok(n), Ok(v)) = (
                 HeaderName::from_bytes(name.as_bytes()),
                 HeaderValue::from_str(value),
             ) {
                 headers.insert(n, v);
-            }
-        }
-
-        // Forward original request headers (excluding hop-by-hop headers)
-        let mut cookie_parts: Vec<&str> = Vec::new();
-        for (name, value) in request.headers() {
-            // `HeaderName` is always lowercase, so this compares without
-            // allocating the lowercased copy the old loop built per header.
-            let name_str = name.as_str();
-            if matches!(
-                name_str,
-                "host"
-                    | "connection"
-                    | "transfer-encoding"
-                    | "upgrade"
-                    | "keep-alive"
-                    | "proxy-authenticate"
-                    | "proxy-authorization"
-                    | "te"
-                    | "trailer"
-            ) || name_str.starts_with(':')
-            {
-                continue;
-            }
-            if name_str == "cookie" {
-                // HTTP/3 splits Cookie across multiple header fields
-                // (RFC 9114 §4.2.1); collect them and join once below so the
-                // HTTP/1.1 backend sees a single Cookie header.
-                if let Ok(v) = value.to_str() {
-                    cookie_parts.push(v);
-                }
-            } else {
-                headers.insert(name.clone(), value.clone());
-            }
-        }
-        if !cookie_parts.is_empty() {
-            let joined = cookie_parts.join("; ");
-            if let Ok(v) = HeaderValue::from_str(&joined) {
-                headers.insert(header::COOKIE, v);
             }
         }
 
@@ -1650,6 +1617,10 @@ impl QuicListener {
         headers.insert(
             HeaderName::from_static("x-forwarded-proto"),
             HeaderValue::from_static("https"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-forwarded-port"),
+            conn_headers.forwarded_port.clone(),
         );
         if let Some(ip_value) = conn_headers.client_ip.clone() {
             headers.insert(HeaderName::from_static("x-forwarded-for"), ip_value.clone());

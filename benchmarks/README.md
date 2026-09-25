@@ -6,23 +6,25 @@ re-run rather than taken on trust.
 
 ## Measuring an optimisation: use `instr-ab.sh`, not req/s
 
-**Throughput on this rig has a run-to-run cv of 21–27 %.** Measured six ways
-(2026-09-09): fresh process each run, same process throughout, per-second
-sampling, CPU steal, hardware counters. What it is *not*: the clock
-(cycles/second is flat to 0.3 %), our code doing more work (instructions per
-request is flat to 0.5 %), CPU steal (exactly zero), TLB or huge pages
-(3.7 dTLB misses per packet), or SMT sharing (splitting the two workers onto
-separate physical cores made it *slower* and only slightly steadier). It is
-**IPC**: on an identical instruction stream, the CPU retires instructions
-1.6× slower in the slow mode (1.08 → 0.66) and holds that mode for tens of
-seconds. The machine's speed varies; the work does not.
+**Throughput on this rig is not a steady instrument.** Measured on the build of
+2026-09-24 (`cycles.sh`, `stalls.sh`, `steal.sh`, `smt.sh`, `instr.sh`; the
+per-second data is published as `runs/consistency-*` beside /proxy-comparison/):
+throughput sits in a slow mode near 129,000 packets/s or a fast one near 187,000
+for up to 100 s at a stretch. Across the two, cycles per second are no lower in
+the slow mode and instructions per packet agree to 0.04 %; what changes is IPC,
+1.14 in the fast mode and 0.74 in the slow. CPU steal is exactly zero in every
+second, dTLB misses are about 2 per packet against ~59,000 cycles, and moving
+the two workers onto separate physical cores raised throughput 5 % while
+*widening* the scatter. The one counter that moves with the mode is cache
+misses, 19 % more per packet in the slow mode. The machine's speed varies; the
+work does not.
 
-So measure the work:
+So measure the work (`instr.sh`, six fresh runs, same build):
 
 | metric | cv over 6 fresh runs |
 |---|---|
-| req/s | **27.0 %** |
-| instructions per request | **0.30 %** |
+| req/s | **17.4 %** |
+| instructions per request | **0.77 %** |
 
 ```sh
 ./instr-ab.sh <binA> <binB> [rounds] [config]
@@ -30,9 +32,8 @@ So measure the work:
 
 Counts instructions retired by the proxy process over the *same* window the
 generator is measuring, and reports instructions per request for each binary.
-A 1 % change is visible in four rounds (~5 minutes); ~0.5 % needs about ten.
-Compare that with req/s, which needs two pooled 108-cell passes — most of a
-day — to resolve 5 %.
+At that spread a 1 % change stands two standard errors clear in about five
+rounds of A/B (~9 minutes); by throughput it would take over two thousand.
 
 Two things this does not replace. It measures instructions, so a change that
 trades instructions for cache behaviour or syscalls will not show up correctly
@@ -42,8 +43,8 @@ gets; this is the development feedback loop, not the headline.
 
 **Align the windows.** `perf` must not start until the generator's warm-up is
 over. Charging warm-up and idle instructions against measured requests took the
-cv from 0.30 % to 3.98 % — still far better than req/s, but with a trend in it
-that reads like a real effect.
+cv from 0.30 % to 3.98 % on an earlier build — still far better than req/s, but
+with a trend in it that reads like a real effect.
 
 ## Layout
 
@@ -64,46 +65,51 @@ worth publishing if both stay several times clear of whatever the proxy can
 drive — a clipped generator or backend understates *whichever proxy is faster*,
 which is the direction that flatters us.
 
-The backend's own ceiling, measured by `bench-backend.sh` with nothing in front
-of it and the same threaded generator:
+The backend's own ceiling is measured by `bench-backend.sh` with nothing in
+front of it, before every comparison run, and published with the run as
+`backend-ceiling.csv`; the page reads each cell against it.
 
-| body | c=10 | c=100 |
-|---|---|---|
-| empty | 240k req/s | 378k req/s |
-| 1 KB | 195k req/s | 278k req/s |
-| 64 KB | 55k req/s (3.3 GB/s) | 132k req/s (8.1 GB/s) |
+**The backend runs nginx's defaults for file serving: `sendfile off`.** Until
+2026-09-25 it ran `sendfile on; tcp_nopush on;`, and that combination holds
+about one 64 KB response in three hundred for the peer's 40 ms delayed-ACK
+timer: request time max 42 ms and sd 2.4 ms with nothing in front of nginx at
+all, against ~2 ms and under 0.12 ms with sendfile off (`tail-h1.sh` shows it
+through either proxy). Both proxies inherited the stall on every 64 KB fetch,
+and a fixed stall costs the faster one proportionally more — the direction guard
+6 warns about. Runs measured the old way are flagged on the page, which reads
+the published `nginx.conf.txt`.
 
-Re-measure this whenever the layout changes, and read it against what the
-proxies posted. It is not a formality: see guard 6.
+## The arms, and what each actually varies
 
-## Two arms, and what each actually varies
+`run-lean.sh` measures every arm of a run interleaved within each cell, with
+the order rotated each repetition (a Latin square at `REPS=4`), so the slot
+effect cancels instead of landing on one arm:
 
-- **plumbing-only** (`conf/pqc-bench.toml`) — everything HAProxy does not have
-  is off. Answers *how fast is the proxy*. This is the arm `run-bench.sh` runs.
-- **as-deployed** (`conf/pqc-bench-features.toml`) — differs from the plumbing
-  config **only** in `[http3]` and `[headers]`: early hints, priority hints,
-  request coalescing and Server-Timing. That is all it has ever varied.
-
-It does **not** price the WAF, fingerprinting or rate limiting, and it never
-did. Those are `enabled = false` in both configs, and everything above runs over
-loopback, where `SecurityState::is_trusted()` short-circuits the whole
-per-request security block before any of them is consulted. A figure from this
-pair is a figure about four HTTP/3 extras; label it that way.
-
-- **security cost** (`conf/pqc-sec-off.toml` / `conf/pqc-sec-on.toml`, driven by
-  `run-sec.sh`) — the real one. Both bind `10.99.0.1` on a dummy interface,
-  because RFC1918 is *not* implicitly trusted (only loopback and explicit
-  `trusted_internal_cidrs`), so the security path actually runs. Limits are
-  raised far above the offered load on purpose: the cost under test is
-  *evaluating* a request, and a run that trips the limiter measures the
-  rejection path instead. `run-sec.sh` refuses to start unless a SQLi probe
-  returns 403 on the on-arm and 200 on the off-arm, a plain GET returns 200 on
-  both, **and** a five-second burst at a hundred connections returns zero 4xx on
-  both. That last check exists because two full arms were measured and thrown
-  away after a preflight of one request passed and the run then tripped a ban it
-  could never have reached — the connection rate limiter the first time, the
-  fingerprint suspicious-rate threshold the second. A guard that tests a
-  different workload from the one it guards is not a guard.
+- **`haproxy`** — `conf/haproxy.cfg`, unchanged.
+- **`lean-now`** — `conf/pqc-bench-lean.toml`: our proxy configured to do what
+  HAProxy's configuration does and no more — no added headers, no Alt-Svc on
+  TCP, the backend's `Server` header passed through, no compression. The
+  preflight refuses to run if its responses carry a header the proxy adds of its
+  own accord.
+- **`pqc-full`** — `conf/pqc-bench-full.toml` off `10.99.0.1`: as deployed, WAF
+  in block mode, TLS-layer fingerprinting, both rate limiters, the optional
+  features and post-quantum key exchange.
+- **`plumb` / `feat`** — `conf/pqc-bench.toml` against
+  `pqc-bench-features.toml`: what early hints, priority hints, request
+  coalescing and Server-Timing cost, one build against itself.
+- **`sec-off` / `sec-on`** — `conf/pqc-sec-off.toml` / `pqc-sec-on.toml`, both
+  on `10.99.0.1` on a dummy interface, because RFC1918 is *not* implicitly
+  trusted (only loopback and explicit `trusted_internal_cidrs`), so the security
+  path actually runs. Limits are raised far above the offered load on purpose:
+  the cost under test is *evaluating* a request, and a run that trips the
+  limiter measures the rejection path instead. The preflight refuses to start
+  unless a SQLi probe returns 403 on the on-arm and 200 on the off-arm, a plain
+  GET returns 200 on both, **and** a five-second burst at a hundred connections
+  returns zero 4xx on both. That last check exists because two full arms were
+  measured and thrown away after a preflight of one request passed and the run
+  then tripped a ban it could never have reached — the connection rate limiter
+  the first time, the fingerprint suspicious-rate threshold the second. A guard
+  that tests a different workload from the one it guards is not a guard.
 
 Set up the interface once:
 
@@ -114,30 +120,31 @@ ip link set pqcbench0 up
 echo '10.99.0.1 bench-sec.local' >> /etc/hosts
 ```
 
-## Running
+## Running, and publishing
 
 ```sh
-./run_all.sh            # the whole published suite, in the right order
-./run-bench.sh          # both proxies, h1 + h2 + h3, three body sizes
-./run-pqc-only.sh       # pqcrypta as-deployed arm only
-./run-sec.sh            # security on vs off, off a non-loopback address
 ./bench-backend.sh      # the backend's own ceiling — run this first, always
-./bench-routes.sh       # one config, one cell — for A/B on a code change
-./bench-handshake2.sh   # TLS handshake cost, classical vs X25519MLKEM768
-./repeat.sh A B 5       # interleaved A/B of two binaries
-./onestream.sh          # one in-flight stream per connection, all protocols
-./mw3.sh                # middleware arms, counterbalanced
-./spread-confirm.sh     # coefficient of variation, both proxies
-python3 pagefigs2.py out/res-<stamp>    # every figure the page publishes
+ARMS="haproxy lean-now pqc-full" RUN_TAG=cmp- RESULTS=out/cmp/matrix.csv REPS=6 ./run-lean.sh
+./run-handshake.sh      # connect time per key-exchange group, both proxies interleaved
+./nd-ab.sh              # TCP_NODELAY on vs off (server.tcp_nodelay)
+./window-study.sh       # 10 s / 2 s against 60 s / 15 s windows, both proxies
+./cycles.sh; ./stalls.sh; ./steal.sh; ./smt.sh; ./instr.sh   # the consistency probes
+./launch-rerun.sh       # the published comparison, both cost pairs and the Nagle study, then packaged
 ```
 
-`pagefigs2.py` is the single source of every number on the page: one line there
-per figure the page states. It replaced `analyse-final.py` and `emit-json.py`,
-which computed overlapping figures in three places and let three of them drift
-out of date unnoticed. `run-plumbing.sh` was deleted outright — it drove
-`h2load` with no `-t`, so it produced a single-threaded-generator arm that was
-then compared against six-threaded ones, and `run-bench.sh` already runs the
-same binary on the same config with the right generator.
+Nothing the page says is typed. A run is packaged by `export-bench.py`
+(comparison and cost runs) or `export-study.py KIND` (`handshake`, `nagle`,
+`window`, `consistency`) into a directory the page reads as it renders
+(`includes/proxy-bench.php`): the rows as CSV, the configurations as run, and a
+manifest read from the rig — binary hash, the commit from the binary's own
+`--version`, versions, pinning, the preflight's results and anything else that
+ran on the host during the run. The page picks the newest run of each kind by
+its start time and words every claim from the data, so a new run replaces the
+published one without an edit. `pagefigs2.py` computed the page's figures from
+a transcript before this and is kept only for the runs it produced; the
+scripts it read (`run-bench.sh`, `run-pqc-only.sh`, `run-sec.sh`,
+`bench-handshake2.sh`) block-measured each arm and are superseded by
+`run-lean.sh` and `run-handshake.sh`.
 
 `h2load` must be built with HTTP/3 (ngtcp2 + nghttp3 + `ngtcp2_crypto_ossl`);
 the packaged one has no h3, and driving the three protocols with three different
@@ -205,9 +212,11 @@ sample must never invent — `ressample.py` matches the backend by its config
 *directory*, having once silently stopped matching when the filename changed.
 
 8. **A cell must be long enough to reach steady state.** Ten seconds is not.
-   Coefficient of variation over repeats of one unchanged cell: **~14 % at 10 s,
-   ~14 % at 30 s, ~5–8 % at 60 s** with a 15-second warm-up — and HAProxy's goes
-   from ~7 % to **1.4 %**. The short window measures a transient: the 10-second
+   `window-study.sh`, 2026-09-25, six runs of each proxy per window, alternating:
+   our coefficient of variation is **9.5 % at 10 s / 2 s against 3.6 % at 60 s /
+   15 s**, HAProxy's 2.8 % and 1.1 %, and the short window reads our proxy
+   **19 % higher** while moving HAProxy 0.5 %. Earlier, on a slower build: ~14 %
+   at 10 s and at 30 s, ~5–8 % at 60 s. The short window measures a transient: the 10-second
    distribution is bimodal, mostly ~18k req/s with jumps to ~25k, and the mode
    persists for a whole 30-second run. It is a harness fix rather than a thumb on
    the scale precisely because it improves HAProxy too — a duration that
@@ -249,6 +258,20 @@ sample must never invent — `ressample.py` matches the backend by its config
     because a truncated CSV analyses cleanly and produces a plausible table from
     half the data. Note that `chmod 444` on a finished file is a hint and not a
     guard: this harness runs as root, and root ignores the permission bits.
+
+11. **Record what else ran.** The rig is a production host: a deploy restarts
+    the proxy there and an on-node `--validate` burns CPU beside the generator.
+    `export-bench.py` reads the host's journal for production-proxy restarts and
+    for steps logged as `logger -t pqc-rig "begin: WHAT"` / `"end: WHAT"`, and
+    lists each with the cells whose window it overlapped. Tag anything you run
+    on the rig during a queue that way.
+12. **Publish the configuration that ran, not the one there now.** The export
+    reads `RUN/conf/NAME` when the run has a snapshot, and otherwise refuses a
+    rig file modified after the run started. It once published the fixed
+    backend config under a run measured with the old one.
+13. **Count repetitions from the rows.** A launcher passes `REPS=6`; the
+    manifest took the runner's default of 4 and the page said "median of 4" for
+    a week.
 
 ## Measurement-only builds
 

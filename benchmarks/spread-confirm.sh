@@ -28,7 +28,7 @@ print('  %-10s median %9.0f  min %9.0f  max %9.0f  spread %.2fx  cv %.1f%%'
          100*statistics.stdev(v)/statistics.mean(v)))" "$@"; }
 
 bench_stop_proxies
-bench_spawn_proxy /root/bench/pqcrypta-proxy /root/bench/conf/pqc-bench.toml
+bench_spawn_proxy "${BIN:-/root/bench/pqcrypta-proxy}" /root/bench/conf/pqc-bench.toml
 p=(); for i in $(seq "$N"); do p+=("$(measure 18444)"); done
 bench_stop_proxies
 report pqcrypta "${p[@]}"

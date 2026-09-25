@@ -2335,14 +2335,21 @@ Replace self-signed backend certificates with CA-signed ones before enabling ACM
 
 ## 0-RTT Early Data
 
-0-RTT (TLS 1.3 early data) is **disabled by default**. When enabled, the proxy detects early-data connections at the TLS accept layer by inspecting the ClientHello and enforces per-route replay protection at the HTTP dispatch layer.
+0-RTT (TLS 1.3 early data) is **disabled by default**. When enabled it works on every listener, TCP and QUIC: session tickets allow early data, and a request that arrives in it is served **before the handshake completes**, its response leaving as 0.5-RTT data. Waiting for the handshake would answer at the moment a 1-RTT connection does, which is no saving at all.
 
 ```toml
 [tls]
 enable_0rtt = true
 # Methods safe for 0-RTT forwarding (idempotent, no side effects)
 zero_rtt_safe_methods = ["GET", "HEAD"]
+# Early data a TCP ticket allows (QUIC tickets always carry 0xffffffff, RFC 9001 §4.6.1)
+zero_rtt_max_early_data = 16384
+# "strict": refuse a repeated ClientHello; "session": each ticket carries early data once
+zero_rtt_replay_protection = "strict"
+zero_rtt_nonce_window_secs = 60
 ```
+
+**What counts as early.** A request is early when it is dispatched before the client's Finished has been verified. That is the property replay turns on: an attacker can re-send a recorded ClientHello and its early data, but never the Finished, so everything a replayed connection dispatches is early. On TCP the OpenSSL listeners read early data with `SSL_read_early_data` and the rustls listeners through a driver of their own (tokio-rustls completes a server handshake before returning); on QUIC each request stream reports whether it arrived in 0-RTT. Replay protection runs on the ClientHello before any handshake work, on both TCP stacks; OpenSSL adds its own single-use tickets when early data is on.
 
 ### Per-route enforcement (RFC 8470)
 
@@ -2367,6 +2374,8 @@ path_prefix = "/"
 backend = "api"
 # allow_0rtt = false  ← default; early-data requests receive 425 Too Early
 ```
+
+A request that is forwarded while early carries **`Early-Data: 1`** to the backend (RFC 8470 §5.1), so an origin that cannot tolerate replay can answer 425 itself.
 
 The `x-tls-early-data` header used internally to propagate the early-data flag is stripped from all incoming requests before being set by the accept loop, and is removed from every outgoing backend request, so it cannot be forged by clients or leaked to backends.
 

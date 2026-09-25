@@ -74,8 +74,154 @@ pub(super) fn build_rustls_server_config(
 ) -> Result<rustls::ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
     let mut config = policy.builder()?.with_cert_resolver(resolver);
     policy.apply_tickets(&mut config)?;
+    policy.apply_tcp_early_data(&mut config);
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     config.ech = crate::ech_config::load();
     crate::cert_compression::apply(&mut config);
     Ok(config)
+}
+
+/// The acceptor `axum_server` hands a rustls listener's connections to when
+/// 0-RTT is on: the handshake runs on [`EarlyRustls`](crate::early_data::EarlyRustls),
+/// which serves early data before it completes. With 0-RTT off the listener
+/// keeps `axum_server`'s own acceptor.
+#[derive(Clone)]
+pub(super) struct EarlyRustlsAcceptor<A> {
+    config: std::sync::Arc<rustls::ServerConfig>,
+    inner: A,
+    handshake_timeout: std::time::Duration,
+    replay: crate::tls_acceptor::ZeroRttReplayGuard,
+}
+
+impl<A> EarlyRustlsAcceptor<A> {
+    pub(super) fn new(
+        config: std::sync::Arc<rustls::ServerConfig>,
+        inner: A,
+        handshake_timeout: std::time::Duration,
+        replay: crate::tls_acceptor::ZeroRttReplayGuard,
+    ) -> Self {
+        Self {
+            config,
+            inner,
+            handshake_timeout,
+            replay,
+        }
+    }
+}
+
+fn handshake_timed_out() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS handshake timed out")
+}
+
+/// SEC-002: refuse a repeated ClientHello (or ticket) that offers early data,
+/// as the fingerprinting listeners do, before any handshake work.
+async fn refuse_replay(
+    stream: &tokio::net::TcpStream,
+    replay: &crate::tls_acceptor::ZeroRttReplayGuard,
+) -> std::io::Result<()> {
+    let mut hello = vec![0u8; 4096];
+    let n = stream.peek(&mut hello).await?;
+    if replay.is_replay(&hello[..n]) {
+        tracing::warn!("0-RTT replay detected — rejecting early data");
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "0-RTT replay protection: duplicate early data rejected",
+        ));
+    }
+    Ok(())
+}
+
+impl<A, S> axum_server::accept::Accept<tokio::net::TcpStream, S> for EarlyRustlsAcceptor<A>
+where
+    A: axum_server::accept::Accept<tokio::net::TcpStream, S, Stream = tokio::net::TcpStream>,
+    A::Future: Send + 'static,
+    A::Service: Send + 'static,
+{
+    type Stream = crate::early_data::EarlyRustls<tokio::net::TcpStream>;
+    type Service = A::Service;
+    type Future = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = std::io::Result<(Self::Stream, Self::Service)>> + Send,
+        >,
+    >;
+
+    fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
+        let inner = self.inner.accept(stream, service);
+        let config = std::sync::Arc::clone(&self.config);
+        let timeout = self.handshake_timeout;
+        let replay = self.replay.clone();
+        Box::pin(async move {
+            let (stream, service) = inner.await?;
+            let tls = tokio::time::timeout(timeout, async {
+                refuse_replay(&stream, &replay).await?;
+                crate::early_data::EarlyRustls::accept(config, stream, timeout).await
+            })
+            .await
+            .map_err(|_| handshake_timed_out())??;
+            Ok((tls, service))
+        })
+    }
+}
+
+/// The OpenSSL counterpart of [`EarlyRustlsAcceptor`]: accepts through
+/// `SSL_read_early_data`, which OpenSSL requires of every connection once a
+/// context allows early data.
+#[cfg(feature = "pqc")]
+#[derive(Clone)]
+pub(super) struct EarlyOpensslAcceptor<A> {
+    acceptor: std::sync::Arc<openssl::ssl::SslAcceptor>,
+    inner: A,
+    handshake_timeout: std::time::Duration,
+    replay: crate::tls_acceptor::ZeroRttReplayGuard,
+}
+
+#[cfg(feature = "pqc")]
+impl<A> EarlyOpensslAcceptor<A> {
+    pub(super) fn new(
+        acceptor: std::sync::Arc<openssl::ssl::SslAcceptor>,
+        inner: A,
+        handshake_timeout: std::time::Duration,
+        replay: crate::tls_acceptor::ZeroRttReplayGuard,
+    ) -> Self {
+        Self {
+            acceptor,
+            inner,
+            handshake_timeout,
+            replay,
+        }
+    }
+}
+
+#[cfg(feature = "pqc")]
+impl<A, S> axum_server::accept::Accept<tokio::net::TcpStream, S> for EarlyOpensslAcceptor<A>
+where
+    A: axum_server::accept::Accept<tokio::net::TcpStream, S, Stream = tokio::net::TcpStream>,
+    A::Future: Send + 'static,
+    A::Service: Send + 'static,
+{
+    type Stream = crate::early_data::EarlyOpenssl<tokio::net::TcpStream>;
+    type Service = A::Service;
+    type Future = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = std::io::Result<(Self::Stream, Self::Service)>> + Send,
+        >,
+    >;
+
+    fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
+        let inner = self.inner.accept(stream, service);
+        let acceptor = std::sync::Arc::clone(&self.acceptor);
+        let timeout = self.handshake_timeout;
+        let replay = self.replay.clone();
+        Box::pin(async move {
+            let (stream, service) = inner.await?;
+            let ssl = openssl::ssl::Ssl::new(acceptor.context()).map_err(std::io::Error::other)?;
+            let tls = tokio::time::timeout(timeout, async {
+                refuse_replay(&stream, &replay).await?;
+                crate::early_data::EarlyOpenssl::accept(ssl, stream, timeout).await
+            })
+            .await
+            .map_err(|_| handshake_timed_out())??;
+            Ok((tls, service))
+        })
+    }
 }

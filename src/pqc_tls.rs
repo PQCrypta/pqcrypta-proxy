@@ -180,6 +180,11 @@ pub struct OpensslTlsSettings {
     /// `tls.ca_cert_path`: the CA client certificates are verified against, or
     /// `None` for the system roots.
     pub client_ca: Option<std::path::PathBuf>,
+    /// Early data a session ticket allows: `tls.zero_rtt_max_early_data` when
+    /// `tls.enable_0rtt`, otherwise 0. Non-zero also turns on OpenSSL's own
+    /// replay protection, and obliges every connection to be accepted through
+    /// `SSL_read_early_data` (`crate::early_data::EarlyOpenssl`).
+    pub max_early_data: u32,
 }
 
 impl Default for OpensslTlsSettings {
@@ -190,6 +195,7 @@ impl Default for OpensslTlsSettings {
             tls13_only: true,
             client_auth: ClientAuth::None,
             client_ca: None,
+            max_early_data: 0,
         }
     }
 }
@@ -200,6 +206,11 @@ impl OpensslTlsSettings {
             tls13_only: tls.min_version == "1.3",
             client_auth,
             client_ca: tls.ca_cert_path.clone(),
+            max_early_data: if tls.enable_0rtt {
+                tls.zero_rtt_max_early_data
+            } else {
+                0
+            },
         }
     }
 }
@@ -673,7 +684,7 @@ pub mod openssl_pqc {
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Arc;
-    use tracing::{debug, info, warn};
+    use tracing::{info, warn};
 
     /// Live-reloadable OpenSSL SNI context map.
     ///
@@ -847,6 +858,31 @@ pub mod openssl_pqc {
         pqc_provider: &PqcTlsProvider,
     ) -> Result<(), String> {
         let settings = pqc_provider.tls_settings();
+        if settings.max_early_data > 0 {
+            // Every context, the SNI ones included: the one a connection ends
+            // up on after the servername callback is the one it resumes on.
+            builder
+                .set_max_early_data(settings.max_early_data)
+                .map_err(|e| format!("Failed to set max early data: {}", e))?;
+            // What OpenSSL will read of early data is the lower of the ticket's
+            // figure and this one (16384 by default), and a client sending more
+            // than it is aborted; never below what the tickets advertise. Raw
+            // FFI, as for certificate compression: openssl-sys does not bind it.
+            // int SSL_CTX_set_recv_max_early_data(SSL_CTX *ctx, uint32_t recv_max_early_data);
+            unsafe extern "C" {
+                fn SSL_CTX_set_recv_max_early_data(
+                    ctx: *mut openssl_sys::SSL_CTX,
+                    recv_max_early_data: u32,
+                ) -> std::os::raw::c_int;
+            }
+            // Safety: `builder` owns the live SSL_CTX; the call copies a u32.
+            let ok = unsafe {
+                SSL_CTX_set_recv_max_early_data(builder.as_ptr(), settings.max_early_data)
+            };
+            if ok != 1 {
+                return Err("Failed to set recv max early data".to_string());
+            }
+        }
         let min = if settings.tls13_only {
             SslVersion::TLS1_3
         } else {
@@ -886,135 +922,10 @@ pub mod openssl_pqc {
         Ok(())
     }
 
-    pub fn create_pqc_acceptor(
-        cert_path: &Path,
-        key_path: &Path,
-        pqc_provider: &PqcTlsProvider,
-    ) -> Result<SslAcceptor, String> {
-        // Mozilla's modern profile is TLS 1.3 only; intermediate adds 1.2,
-        // whose suites apply_tls_settings then narrows to 256-bit AEADs.
-        let mut builder = if pqc_provider.tls_settings().tls13_only {
-            SslAcceptor::mozilla_modern_v5(SslMethod::tls_server())
-        } else {
-            SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())
-        }
-        .map_err(|e| format!("Failed to create SSL acceptor: {}", e))?;
-
-        // ML-KEM needs TLS 1.3, so a 1.2 handshake is classical (P-384).
-        apply_tls_settings(&mut builder, pqc_provider)?;
-
-        // Load certificate chain (includes intermediate certificates)
-        builder
-            .set_certificate_chain_file(cert_path)
-            .map_err(|e| format!("Failed to load certificate chain: {}", e))?;
-
-        // Load private key
-        builder
-            .set_private_key_file(key_path, SslFiletype::PEM)
-            .map_err(|e| format!("Failed to load private key: {}", e))?;
-
-        // Configure PQC groups if available
-        if pqc_provider.is_available() {
-            // Try different PQC group configurations
-            // OpenSSL 3.5 supports multiple name formats for ML-KEM hybrid groups
-            // X25519 and P-256 excluded: both 128-bit = 90% SSL Labs key exchange score.
-            // P-384 (secp384r1, 192-bit) is the only classical group.
-            let pqc_group_options = [
-                "X25519MLKEM768:P-384",
-                "X25519-MLKEM768:P-384",
-                "ML-KEM-768:P-384",
-                "MLKEM768:P-384",
-            ];
-
-            let mut pqc_configured = false;
-            for groups in pqc_group_options {
-                info!("Trying PQC groups configuration: {}", groups);
-                match builder.set_groups_list(groups) {
-                    Ok(()) => {
-                        info!("PQC groups configured successfully: {}", groups);
-                        pqc_configured = true;
-                        break;
-                    }
-                    Err(e) => {
-                        debug!("Group config '{}' failed: {}", groups, e);
-                    }
-                }
-            }
-
-            if !pqc_configured {
-                let classical_groups = "P-384";
-                warn!(
-                    "All PQC group configurations failed, falling back to classical: {}",
-                    classical_groups
-                );
-                builder
-                    .set_groups_list(classical_groups)
-                    .map_err(|e| format!("Failed to set classical groups: {}", e))?;
-            }
-
-            // Restrict to 256-bit TLS 1.3 cipher suites
-            if let Err(e) =
-                builder.set_ciphersuites("TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256")
-            {
-                warn!("Failed to restrict TLS 1.3 ciphersuites: {}", e);
-            }
-        }
-
-        // Set ALPN protocols - advertise h2 and http/1.1
-        // Wire format: length-prefixed protocol names
-        builder
-            .set_alpn_protos(b"\x02h2\x08http/1.1")
-            .map_err(|e| format!("Failed to set ALPN protos: {}", e))?;
-
-        // Set ALPN selection callback - prefer h2 over http/1.1
-        builder.set_alpn_select_callback(|_, client_protos| {
-            // Parse client's ALPN protocol list (length-prefixed strings)
-            let mut pos = 0;
-            while pos < client_protos.len() {
-                let len = client_protos[pos] as usize;
-                if pos + 1 + len > client_protos.len() {
-                    break;
-                }
-                let proto = &client_protos[pos + 1..pos + 1 + len];
-
-                // Prefer h2 (HTTP/2) over http/1.1
-                if proto == b"h2" {
-                    return Ok(b"h2");
-                }
-                pos += 1 + len;
-            }
-
-            // Second pass: accept http/1.1 if no h2
-            pos = 0;
-            while pos < client_protos.len() {
-                let len = client_protos[pos] as usize;
-                if pos + 1 + len > client_protos.len() {
-                    break;
-                }
-                let proto = &client_protos[pos + 1..pos + 1 + len];
-
-                if proto == b"http/1.1" {
-                    return Ok(b"http/1.1");
-                }
-                pos += 1 + len;
-            }
-
-            Err(openssl::ssl::AlpnError::NOACK)
-        });
-
-        // Set session cache for resumption
-        builder.set_session_cache_mode(openssl::ssl::SslSessionCacheMode::SERVER);
-
-        Ok(builder.build())
-    }
-
     /// Create an OpenSSL SSL acceptor with SNI-based per-domain certificate selection.
     ///
-    /// Loads every `{domain}.crt` / `{domain}.key` pair from `certs_dir` and installs
-    /// a servername callback that switches to the matching SSL context for each SNI.
     /// Falls back to the default cert (`default_cert_path` / `default_key_path`) when
-    /// the SNI name is unknown.
-    /// Create an OpenSSL SSL acceptor with SNI-based per-domain certificate selection.
+    /// the SNI name is not in the map.
     ///
     /// The acceptor's servername callback reads from `sni_map` on every TLS handshake.
     /// Because `sni_map` is an `Arc<RwLock<...>>`, calling `reload_sni_map()` from the

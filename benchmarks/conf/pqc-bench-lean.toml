@@ -1,4 +1,16 @@
-# pqcrypta-proxy benchmark configuration.
+# pqcrypta-proxy benchmark configuration — LEAN arm.
+#
+# pqc-bench.toml turns off every *feature* HAProxy lacks, but a feature switched
+# off in config still left its work on the wire: sixteen security headers, an
+# x-ratelimit pair, alt-svc and x-webtransport-port on every response, the
+# backend's Server header replaced, and response compression that could not be
+# switched off at all — ~900 bytes per response against HAProxy's zero. This
+# file is that config plus the header, Alt-Svc, Server and compression settings
+# HAProxy's own config does not use, so both proxies put the same response on
+# the wire. It needs the build in which a disabled layer leaves the middleware
+# chain; the startup log names every layer left out.
+#
+# Original header of pqc-bench.toml follows.
 #
 # Matched to the HAProxy config: same certificate, same backend, same worker count,
 # TLS 1.3 only. Every security feature that HAProxy has no equivalent for is
@@ -8,7 +20,7 @@
 version = 1
 
 [server]
-bind_address = "10.99.0.1"
+bind_address = "127.0.0.1"
 udp_port = 18444
 # One physical core each (CPUs 4-5 are SMT siblings), two workers each, matched
 # to HAProxy nbthread 2. The backend needs two physical cores of its own: on one
@@ -27,10 +39,15 @@ enable_quic_migration = true
 # not touch its ports: WebTransport off its default 4433, and the port-80 HTTP
 # redirect server disabled outright (see [http_redirect]).
 webtransport_port = 18445
+# HAProxy's TCP frontend advertises no Alt-Svc (its QUIC frontend does, and so
+# does ours: the HTTP/3 response always names h2 on this port).
+alt_svc_ports = []
+# HAProxy passes the backend's Server header through; so does an empty value.
+server_header = ""
 
 [tls]
-cert_path = "/root/bench/certs/bench-sec.local.crt"
-key_path  = "/root/bench/certs/bench-sec.local.key"
+cert_path = "/root/bench/certs/bench.local.crt"
+key_path  = "/root/bench/certs/bench.local.key"
 min_version = "1.3"
 alpn_protocols = ["h3", "h2", "http/1.1"]
 ocsp_stapling = false
@@ -53,65 +70,30 @@ max_connections = 20000
 
 [[routes]]
 name = "all"
-host = "bench-sec.local"
+host = "bench.local"
 path_prefix = "/"
 backend = "static"
-# Both arms must handle protocols identically or the comparison includes the
-# route gate. The gate is enforced only on the fingerprinting accept loop, so
-# without this the security-on arm answers 426 to every HTTP/1.1 request while
-# the security-off arm serves them.
+# The HTTP/1.1 column measures a route that permits HTTP/1.1. This used to be
+# implicit: the per-route gate read a header the plain accept loop never set, so
+# it was inert here and h1 was served regardless. Now that the gate reads the
+# request version, the route has to say what it always meant.
 allow_http11 = true
 
 [waf]
-enabled = true
-mode = "block"
-scan_json_body = true
+enabled = false
+
 [fingerprint]
-enabled = true
-tls_layer_capture = true
-# Classification, replay detection and drift detection all still run — that work
-# is exactly what this arm is pricing. What is lifted is the ability to ban:
-# h2load's JA3 classifies as Suspicious, and the default threshold of 100
-# requests per minute bans a load generator inside the warm-up.
-block_scanners = false
-block_malicious = false
-suspicious_rate_threshold = 4000000000
-suspicious_rate_window_secs = 1
-suspicious_block_duration_secs = 1
-malicious_block_duration_secs = 1
-replay_detection = true
-drift_detection = true
+enabled = false
+
 [rate_limiting]
-enabled = true
-# Far above the offered load: the cost under test is evaluating a request, and a
-# run that trips the limiter measures the rejection path instead.
-requests_per_second = 4000000
-burst_size = 2000000
-connection_rate_limit = true
-connections_per_second = 1000000
+enabled = false
+
 [advanced_rate_limiting]
-enabled = true
+enabled = false
 
-[advanced_rate_limiting.global_limits]
-requests_per_second = 4000000
-burst_size = 2000000
-
-[advanced_rate_limiting.global_limits.per_ip]
-requests_per_second = 4000000
-burst_size = 2000000
-requests_per_minute = 240000000
-requests_per_hour = 4000000000
-
-[advanced_rate_limiting.global_limits.per_fingerprint]
-requests_per_second = 4000000
-burst_size = 2000000
-requests_per_minute = 240000000
-requests_per_hour = 4000000000
 [security]
-dos_protection = true
-# The generator is one IP holding a hundred connections; the default cap of 100
-# sits exactly on that edge.
-max_connections_per_ip = 60000
+dos_protection = false
+
 [logging]
 level = "error"
 access_log = false
@@ -170,3 +152,28 @@ preconnect_origins = []
 [headers]
 # Same reasoning: Server-Timing instruments every request and emits a header.
 server_timing_enabled = false
+# Every response header the proxy adds of its own accord. HAProxy adds none;
+# an empty value now omits the header rather than sending it empty.
+hsts = ""
+x_frame_options = ""
+x_content_type_options = ""
+referrer_policy = ""
+permissions_policy = ""
+cross_origin_opener_policy = ""
+cross_origin_embedder_policy = ""
+cross_origin_resource_policy = ""
+x_permitted_cross_domain_policies = ""
+x_download_options = ""
+x_dns_prefetch_control = ""
+x_quantum_resistant = ""
+x_security_level = ""
+content_security_policy = ""
+accept_ch = ""
+nel = ""
+report_to = ""
+priority = ""
+addin_csp = ""
+
+[compression]
+# HAProxy compresses only when `compression algo` is configured, and it is not.
+enabled = false

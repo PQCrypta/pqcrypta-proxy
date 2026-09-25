@@ -1,6 +1,6 @@
 # pqcrypta-proxy benchmark configuration.
 #
-# Matched to the HAProxy config: same certificate, same backend, 4 workers,
+# Matched to the HAProxy config: same certificate, same backend, same worker count,
 # TLS 1.3 only. Every security feature that HAProxy has no equivalent for is
 # OFF for the like-for-like run — WAF, fingerprinting, rate limiting, audit
 # logging. A second run turns them back on, because that is the configuration
