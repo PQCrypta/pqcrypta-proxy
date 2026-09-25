@@ -17,7 +17,6 @@ use crate::config::{BackendConfig, ProxyConfig};
 use crate::http3_features::EarlyHintsState;
 use crate::load_balancer::{LoadBalancer, SelectionContext};
 use crate::metrics::MetricsRegistry;
-use crate::otel;
 use crate::proxy::BackendPool;
 use crate::rate_limiter::{build_context_from_request, AdvancedRateLimiter, RateLimitResult};
 use crate::security::SecurityState;
@@ -1606,12 +1605,6 @@ impl QuicListener {
                 headers.insert(header::HOST, v);
             }
         }
-
-        // Extract distributed trace context from the incoming QUIC/HTTP3 request
-        // headers and stitch this request into the caller's trace.  The current
-        // span becomes a child of the caller's span; proxy.rs then injects the
-        // new child span context into the upstream backend request.
-        otel::set_parent_from_headers(&tracing::Span::current(), &headers);
 
         // Forward X-Forwarded headers. The IP is formatted once and shared.
         headers.insert(

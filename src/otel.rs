@@ -33,7 +33,7 @@ use opentelemetry::{
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
     propagation::TraceContextPropagator,
-    trace::{self as sdktrace, Sampler, TracerProvider},
+    trace::{Sampler, SdkTracerProvider},
     Resource,
 };
 use tracing::Span;
@@ -191,18 +191,14 @@ impl TextMapPropagator for B3Propagator {
 /// W3C TraceContext + B3 propagator.
 ///
 /// This function is synchronous — it only builds the OTLP HTTP client and
-/// registers the global provider/propagator.  Actual span export happens
-/// asynchronously via the tokio-based batch processor.
+/// registers the global provider/propagator.  Actual span export happens in
+/// the batch processor's own thread, off the tokio runtime.
 ///
 /// # Errors
 /// Returns an error if the OTLP exporter cannot be constructed (e.g. invalid endpoint).
-pub fn init_otel(config: &OtelConfig) -> anyhow::Result<TracerProvider> {
+pub fn init_otel(config: &OtelConfig) -> anyhow::Result<SdkTracerProvider> {
     // 1. Install composite propagator: W3C TraceContext first, then B3
-    let propagators: Vec<Box<dyn TextMapPropagator + Send + Sync>> = vec![
-        Box::new(TraceContextPropagator::new()),
-        Box::new(B3Propagator),
-    ];
-    global::set_text_map_propagator(TextMapCompositePropagator::new(propagators));
+    install_propagators();
 
     // 2. Build OTLP span exporter (HTTP/JSON, no protobuf required)
     let exporter = opentelemetry_otlp::SpanExporter::builder()
@@ -211,12 +207,19 @@ pub fn init_otel(config: &OtelConfig) -> anyhow::Result<TracerProvider> {
         .build()
         .map_err(|e| anyhow::anyhow!("OTLP exporter init failed: {}", e))?;
 
-    // 3. Build service resource with user-supplied attributes
-    let mut kv = vec![KeyValue::new("service.name", config.service_name.clone())];
-    for (k, v) in &config.resource_attributes {
-        kv.push(KeyValue::new(k.clone(), v.clone()));
-    }
-    let resource = Resource::new(kv);
+    // 3. Build service resource with user-supplied attributes. `builder()`
+    //    also runs the SDK's standard detectors: telemetry.sdk.* and anything
+    //    in OTEL_RESOURCE_ATTRIBUTES / OTEL_SERVICE_NAME, with the configured
+    //    service name taking precedence.
+    let resource = Resource::builder()
+        .with_service_name(config.service_name.clone())
+        .with_attributes(
+            config
+                .resource_attributes
+                .iter()
+                .map(|(k, v)| KeyValue::new(k.clone(), v.clone())),
+        )
+        .build();
 
     // 4. Sampler — parentBased wraps the configured root sampler
     let root_sampler = if config.sample_ratio >= 1.0 {
@@ -227,9 +230,11 @@ pub fn init_otel(config: &OtelConfig) -> anyhow::Result<TracerProvider> {
         Sampler::TraceIdRatioBased(config.sample_ratio)
     };
 
-    // 5. Build tracer provider with batch exporter (tokio runtime)
-    let provider = sdktrace::TracerProvider::builder()
-        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+    // 5. Build tracer provider with the batch exporter. The batch processor
+    //    runs on a thread of its own and exports with a blocking client, so a
+    //    slow or unreachable collector can never occupy a runtime worker.
+    let provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
         .with_resource(resource)
         .with_sampler(Sampler::ParentBased(Box::new(root_sampler)))
         .build();
@@ -247,8 +252,17 @@ pub fn init_otel(config: &OtelConfig) -> anyhow::Result<TracerProvider> {
     Ok(provider)
 }
 
+/// Install the composite propagator: W3C TraceContext first, then B3.
+fn install_propagators() {
+    let propagators: Vec<Box<dyn TextMapPropagator + Send + Sync>> = vec![
+        Box::new(TraceContextPropagator::new()),
+        Box::new(B3Propagator),
+    ];
+    global::set_text_map_propagator(TextMapCompositePropagator::new(propagators));
+}
+
 /// Flush and shut down the OTLP exporter, blocking until the queue is drained.
-pub fn shutdown_otel(provider: &TracerProvider) {
+pub fn shutdown_otel(provider: &SdkTracerProvider) {
     if let Err(e) = provider.shutdown() {
         tracing::warn!("OpenTelemetry shutdown error: {}", e);
     }
@@ -285,15 +299,24 @@ pub fn inject_context_into_map(ctx: &Context, map: &mut HashMap<String, String>)
 /// Call this at the top of every server-side request handler to stitch the incoming
 /// trace into the local span tree.
 pub fn set_parent_from_headers(span: &Span, headers: &HeaderMap) {
-    let ctx = extract_context_from_headers(headers);
-    span.set_parent(ctx);
+    set_parent(span, extract_context_from_headers(headers));
 }
 
 /// Set the parent from a `HashMap<String, String>` (QUIC / WebTransport path).
 #[allow(clippy::implicit_hasher)]
 pub fn set_parent_from_map(span: &Span, map: &HashMap<String, String>) {
-    let ctx = extract_context_from_map(map);
-    span.set_parent(ctx);
+    set_parent(span, extract_context_from_map(map));
+}
+
+/// Attach `ctx` as the parent of `span`, which must not have been entered yet.
+///
+/// An entered span has already begun a trace of its own, and a span the
+/// filters dropped has nothing to attach to: either way the caller's trace is
+/// not continued, and a disconnected trace is otherwise invisible.
+fn set_parent(span: &Span, ctx: Context) {
+    if let Err(e) = span.set_parent(ctx) {
+        tracing::debug!("incoming trace context not applied: {e}");
+    }
 }
 
 /// Inject the **current** active tracing span's context into an HTTP `HeaderMap`.
@@ -316,10 +339,77 @@ pub fn inject_current_context_into_map(map: &mut HashMap<String, String>) {
 /// Returns an empty string when there is no active span. Used to stamp trace IDs
 /// into access-log entries for log → trace correlation.
 pub fn current_trace_id() -> String {
-    let trace_id = Span::current().context().span().span_context().trace_id();
+    trace_id_of(&Span::current())
+}
+
+/// Return the trace-ID hex string of `span`, or an empty string when it has none.
+pub fn trace_id_of(span: &Span) -> String {
+    let trace_id = span.context().span().span_context().trace_id();
     if trace_id == TraceId::INVALID {
         String::new()
     } else {
         format!("{}", trace_id)
+    }
+}
+
+/// Run `f` under a subscriber that records spans into an in-process tracer,
+/// with the propagators `init_otel` installs.
+#[cfg(test)]
+pub(crate) fn with_test_tracing<R>(f: impl FnOnce() -> R) -> R {
+    use opentelemetry::trace::TracerProvider as _;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    install_propagators();
+    let provider = SdkTracerProvider::builder().build();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+    tracing::subscriber::with_default(subscriber, f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+    #[test]
+    fn a_span_joins_the_trace_its_headers_name() {
+        with_test_tracing(|| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "traceparent",
+                HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+            );
+            let span = tracing::info_span!("t");
+            set_parent_from_headers(&span, &headers);
+            assert_eq!(trace_id_of(&span), TRACE);
+        });
+    }
+
+    #[test]
+    fn a_span_joins_a_b3_trace_from_a_map() {
+        with_test_tracing(|| {
+            let map = HashMap::from([("b3".to_string(), format!("{TRACE}-00f067aa0ba902b7-1"))]);
+            let span = tracing::info_span!("t");
+            set_parent_from_map(&span, &map);
+            assert_eq!(trace_id_of(&span), TRACE);
+        });
+    }
+
+    /// The reason every caller attaches the parent before entering: once a
+    /// span is entered it has begun a trace of its own.
+    #[test]
+    fn an_entered_span_keeps_its_own_trace() {
+        with_test_tracing(|| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "traceparent",
+                HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+            );
+            let span = tracing::info_span!("t");
+            let _entered = span.enter();
+            set_parent_from_headers(&span, &headers);
+            assert_ne!(trace_id_of(&span), TRACE);
+        });
     }
 }

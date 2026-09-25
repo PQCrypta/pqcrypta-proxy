@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 use wtransport::config::QuicTransportConfig;
 use wtransport::{Connection, Endpoint, ServerConfig};
 
@@ -352,21 +352,46 @@ async fn handle_incoming_session(
         return Ok(());
     };
 
-    // Accept the session
-    let connection = session_request.accept().await?;
+    // The session's server span, stitched into the caller's trace from the
+    // CONNECT request's headers. Its stream and datagram tasks inherit it, so
+    // what they forward carries the caller's trace to the backend -- without
+    // it they injected an empty context, whatever the docs said.
+    let span = if config.otel.enabled || tracing::span_enabled!(tracing::Level::INFO) {
+        let span = tracing::info_span!(
+            "webtransport.session",
+            url.path = %path,
+            otel.kind = "server",
+            trace_id = tracing::field::Empty,
+        );
+        crate::otel::set_parent_from_map(&span, session_request.headers());
+        let trace_id = crate::otel::trace_id_of(&span);
+        if !trace_id.is_empty() {
+            span.record("trace_id", trace_id);
+        }
+        span
+    } else {
+        tracing::Span::none()
+    };
 
-    info!("✅ WebTransport connection established: {}", remote_addr);
+    async move {
+        // Accept the session
+        let connection = session_request.accept().await?;
 
-    // The slot is given back when `_slot` drops: when the session ends, and
-    // equally when this task panics or is cancelled.
-    handle_connection(
-        connection,
-        remote_addr,
-        path,
-        config,
-        backend_pool,
-        security,
-    )
+        info!("✅ WebTransport connection established: {}", remote_addr);
+
+        // The slot is given back when `_slot` drops: when the session ends,
+        // and equally when this task panics or is cancelled.
+        handle_connection(
+            connection,
+            remote_addr,
+            path,
+            config,
+            backend_pool,
+            security,
+        )
+        .await
+    }
+    .instrument(span)
     .await
 }
 
@@ -456,7 +481,7 @@ async fn handle_connection(
                         tokio::spawn(handle_uni_stream(
                             recv_stream, remote_addr, conn, path_clone, config_clone, backend_clone,
                             security_clone,
-                        ));
+                        ).in_current_span());
                     }
                     Err(e) => {
                         debug!("Unidirectional stream closed from {}: {}", remote_addr, e);
@@ -478,7 +503,7 @@ async fn handle_connection(
                         tokio::spawn(handle_bi_stream(
                             send_stream, recv_stream, remote_addr, conn, path_clone, config_clone,
                             backend_clone, security_clone,
-                        ));
+                        ).in_current_span());
                     }
                     Err(e) => {
                         debug!("Bidirectional stream closed from {}: {}", remote_addr, e);
@@ -518,7 +543,7 @@ async fn handle_connection(
                         tokio::spawn(handle_datagram(
                             datagram.to_vec(), remote_addr, conn, path_clone, config_clone,
                             backend_clone, security_clone,
-                        ));
+                        ).in_current_span());
                     }
                     Err(e) => {
                         debug!("Datagram stream closed from {}: {}", remote_addr, e);

@@ -653,7 +653,14 @@ mod chain_size_tests {
 
     /// The deployed fixture, when this box has it: the size a verdict quotes
     /// is the one on disk.
+    ///
+    /// Not under `fips`: that build has no ML-DSA signing at all (aws-lc-rs
+    /// removes the module), so the fixture's ML-DSA-87 key cannot load there
+    /// by design. CI never saw it -- its runners have no fixture, and the test
+    /// returns early -- but `cargo test --all-features` failed on every node
+    /// that serves the chain.
     #[test]
+    #[cfg(not(feature = "fips"))]
     fn measures_the_fixture_it_loads() {
         let cert = std::path::Path::new("/etc/pqcrypta/pqc-certs/conformance/fullchain.pem");
         let key = std::path::Path::new("/etc/pqcrypta/pqc-certs/conformance/server.key");

@@ -38,7 +38,8 @@ pub(super) fn request_span_enabled() -> bool {
 ///
 /// Supports W3C TraceContext (`traceparent`/`tracestate`) and B3 headers
 /// (`x-b3-traceid` / `x-b3-spanid` / `x-b3-sampled` / `b3`).
-/// Works across HTTP/1.1 and HTTP/2; the QUIC/HTTP3 path has its own extraction.
+/// Works across HTTP/1.1 and HTTP/2; the QUIC/HTTP3 listener opens the same span per
+/// request (`quic_listener::request_span`).
 ///
 /// When OTEL is disabled (default NOOP provider) this middleware is a no-op.
 pub(super) async fn trace_context_middleware(request: Request<Body>, next: Next) -> Response {
@@ -65,8 +66,9 @@ pub(super) async fn trace_context_middleware(request: Request<Body>, next: Next)
     otel::set_parent_from_headers(&span, request.headers());
 
     // Record the resolved trace ID as a span field for easy log correlation.
+    // This span's own, not the current one's: it has not been entered yet.
     {
-        let trace_id = otel::current_trace_id();
+        let trace_id = otel::trace_id_of(&span);
         if !trace_id.is_empty() {
             span.record("trace_id", trace_id);
         }

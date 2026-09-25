@@ -20,7 +20,7 @@ use quinn::{
     TransportConfig, VarInt,
 };
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 
 use crate::cache::ResponseCache;
 use crate::config::{ConfigReloadEvent, ProxyConfig};
@@ -1184,10 +1184,19 @@ impl QuicListener {
             &handshake,
         ));
 
+        // Decided once per connection, as the TCP listeners decide it once per
+        // router: with tracing off, a request pays nothing for it.
+        let request_spans = config.otel.enabled || request_span_enabled();
+
         // Every ordinary request becomes its own task. One definition for both
         // places that dispatch one: the plain-request fast path below and an
         // extended CONNECT this listener does not terminate itself.
-        let spawn_request = |stream, request| {
+        let spawn_request = |stream, request: http::Request<()>| {
+            let span = if request_spans {
+                request_span(&request)
+            } else {
+                tracing::Span::none()
+            };
             let config_clone = config.clone();
             let backend_pool_clone = backend_pool.clone();
             let early_hints_clone = early_hints_state.clone();
@@ -1200,32 +1209,35 @@ impl QuicListener {
             let fingerprint_clone = fingerprint.clone();
             let conn_headers_clone = conn_headers.clone();
 
-            tokio::spawn(async move {
-                if let Err(e) = Self::handle_h3_request(
-                    stream,
-                    request,
-                    remote_addr,
-                    config_clone,
-                    backend_pool_clone,
-                    early_hints_clone,
-                    security_clone,
-                    metrics_clone,
-                    rl_clone,
-                    lb_clone,
-                    cache_clone,
-                    handshake_clone,
-                    fingerprint_clone,
-                    conn_headers_clone,
-                )
-                .await
-                {
-                    if is_benign_h3_close(&e) {
-                        debug!("HTTP/3 request ended by peer: {}", e);
-                    } else {
-                        error!("HTTP/3 request error: {}", e);
+            tokio::spawn(
+                async move {
+                    if let Err(e) = Self::handle_h3_request(
+                        stream,
+                        request,
+                        remote_addr,
+                        config_clone,
+                        backend_pool_clone,
+                        early_hints_clone,
+                        security_clone,
+                        metrics_clone,
+                        rl_clone,
+                        lb_clone,
+                        cache_clone,
+                        handshake_clone,
+                        fingerprint_clone,
+                        conn_headers_clone,
+                    )
+                    .await
+                    {
+                        if is_benign_h3_close(&e) {
+                            debug!("HTTP/3 request ended by peer: {}", e);
+                        } else {
+                            error!("HTTP/3 request error: {}", e);
+                        }
                     }
                 }
-            });
+                .instrument(span),
+            );
         };
 
         loop {
@@ -1911,5 +1923,63 @@ mod close_classification_tests {
         ));
         // A local protocol failure still is not.
         assert!(!is_benign_h3_close(&"Local error: H3_INTERNAL_ERROR"));
+    }
+}
+
+/// Whether an HTTP/3 request span would be recorded by the installed
+/// subscriber. Evaluated in this module, whose target the span carries.
+fn request_span_enabled() -> bool {
+    tracing::span_enabled!(tracing::Level::INFO)
+}
+
+/// The server span for one HTTP/3 request: the same span the TCP listeners
+/// open in `trace_context_middleware`, stitched into the caller's trace.
+///
+/// The parent is attached before the span is ever entered -- once entered it
+/// has begun a trace of its own and a remote parent is refused. This listener
+/// used to call `set_parent` on `Span::current()` partway through the request,
+/// and there was no current span on this path at all, so an HTTP/3 request
+/// never joined its caller's trace and the backend was handed an empty
+/// context, whatever the documentation said about all transports.
+fn request_span(request: &http::Request<()>) -> tracing::Span {
+    let span = tracing::info_span!(
+        "http.request",
+        http.method = %request.method(),
+        http.uri = %request.uri().path(),
+        http.flavor = "3",
+        otel.kind = "server",
+        trace_id = tracing::field::Empty,
+    );
+    crate::otel::set_parent_from_headers(&span, request.headers());
+    let trace_id = crate::otel::trace_id_of(&span);
+    if !trace_id.is_empty() {
+        span.record("trace_id", trace_id);
+    }
+    span
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An HTTP/3 request continues its caller's trace. It did not: the parent
+    /// was set on `Span::current()`, and on this path there was none.
+    #[test]
+    fn an_http3_request_span_joins_the_callers_trace() {
+        crate::otel::with_test_tracing(|| {
+            let request = http::Request::builder()
+                .uri("https://pqcrypta.com/x")
+                .header(
+                    "traceparent",
+                    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                )
+                .body(())
+                .unwrap();
+            let span = request_span(&request);
+            assert_eq!(
+                crate::otel::trace_id_of(&span),
+                "4bf92f3577b34da6a3ce929d0e0e4736"
+            );
+        });
     }
 }

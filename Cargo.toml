@@ -103,7 +103,7 @@ rustls-pemfile = "2.2"
 rustls-pki-types = { version = "1.9", features = ["alloc"] }
 rustls-native-certs = "0.8"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
-webpki-roots = "0.26"
+webpki-roots = "1.0"
 
 # Post-quantum support for rustls (X25519MLKEM768 hybrid via aws-lc-rs)
 rustls-post-quantum = "0.2"
@@ -130,10 +130,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 
 # OpenTelemetry distributed tracing — W3C TraceContext + B3 propagation, OTLP export
-opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", default-features = false, features = ["trace", "http-json", "reqwest-client"] }
-tracing-opentelemetry = "0.28"
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "http-json", "reqwest-blocking-client", "reqwest-rustls"] }
+tracing-opentelemetry = "0.34"
 
 # Admin API and HTTP listener
 axum = { version = "0.7", features = ["macros"] }
@@ -141,7 +141,7 @@ axum-server = { version = "0.7", features = ["tls-rustls", "tls-openssl"] }
 tower = "0.5"
 # Async OpenSSL for TLS connections with PQC
 tokio-openssl = "0.6"
-tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "limit"], optional = true }
+tower-http = { version = "0.7", features = ["cors", "trace", "timeout", "limit"], optional = true }
 
 # Metrics (optional feature)
 prometheus = { version = "0.14", optional = true }
@@ -156,7 +156,7 @@ hex = "0.4"
 hmac = "0.13"
 rand = "0.8"
 subtle = "2.6"
-jsonwebtoken = "9.3"
+jsonwebtoken = { version = "11.1", default-features = false, features = ["aws_lc_rs"] }
 parking_lot = "0.12"
 dashmap = "6.1"
 # Reverse/forward DNS for verified search-engine crawler checks (crawler_verify.rs).
@@ -195,7 +195,7 @@ md-5 = "0.11"
 x509-parser = "0.16"
 
 # HTTP client for OCSP requests and ACME
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 
 # ACME client (RFC 8555) - works with any ACME CA
 instant-acme = { version = "0.8", optional = true }
@@ -213,7 +213,7 @@ url = "2.5"
 
 # IP address handling
 ipnetwork = "0.20"
-ipnet = { version = "2.10", features = ["serde"] }
+ipnet = { version = "2.12", features = ["serde"] }
 
 # Regex for route matching
 regex = "1.11"
