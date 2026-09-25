@@ -99,6 +99,12 @@ impl Incoming {
         self.0.as_ref().unwrap().inner.orig_dst_cid()
     }
 
+    /// The source connection ID of the client's first Initial, which it keeps
+    /// for every long-header packet of the handshake, 0-RTT included.
+    pub fn remote_cid(&self) -> ConnectionId {
+        self.0.as_ref().unwrap().inner.remote_cid()
+    }
+
     /// Decrypt the Initial packet payload
     ///
     /// This clones and decrypts the packet payload (~1200 bytes).

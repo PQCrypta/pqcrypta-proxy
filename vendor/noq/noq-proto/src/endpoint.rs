@@ -1314,6 +1314,17 @@ impl Incoming {
         self.token.orig_dst_cid
     }
 
+    /// The connection ID the client chose for itself: the source connection ID
+    /// of its first Initial.
+    ///
+    /// Unlike the destination connection ID, the client keeps this one for the
+    /// whole handshake -- every Initial, 0-RTT and Handshake packet it sends
+    /// carries it -- so it names the connection even after the server's first
+    /// reply has made the client switch destination IDs.
+    pub fn remote_cid(&self) -> ConnectionId {
+        self.packet.header.src_cid
+    }
+
     /// Decrypt the Initial packet payload
     ///
     /// This clones and decrypts the packet payload (~1200 bytes).

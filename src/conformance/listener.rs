@@ -715,7 +715,11 @@ async fn run_one(
     // address — unusual for this runner, where each client is a fresh process
     // with a fresh ephemeral port, but the suite is public and a CI harness
     // behind NAT would do it.
-    let since = conformance_counters.view_for(peer_addr);
+    let since = conformance_counters.view_for(peer_addr).for_connection(
+        &conformance_counters,
+        peer_addr,
+        &incoming.remote_cid(),
+    );
 
     // A refusal here used to leave no trace, and the report said the opposite of
     // what happened.

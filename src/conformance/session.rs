@@ -958,6 +958,15 @@ impl Evidence {
             Observation::NotExercised(_) | Observation::Ambiguous(_)
         )
     }
+
+    /// Whether early data from this connection reached the endpoint, by the
+    /// count taken off the wire for this connection alone.
+    ///
+    /// Not `early_data_accepted`: on the replay port that is set for every
+    /// connection, since a server's `into_0rtt` always succeeds.
+    pub fn met_early_data(&self) -> bool {
+        self.zero_rtt_datagrams_in > 0
+    }
 }
 
 /// The oracle that turned this evidence into a verdict.
@@ -1109,6 +1118,26 @@ impl Session {
                     tracing::info!(
                         "conformance: {} keeping the connection that exercised it, rather than \
                          a later one that did not",
+                        test.id
+                    );
+                    return;
+                }
+            }
+        }
+        // On the 0-RTT ports, the connection whose early data arrived is the
+        // measurement, and a later one without early data is not an answer
+        // to the same question. A client whose 0-RTT is refused may well
+        // retry on a fresh connection -- our own h3-get does, as RFC 9001
+        // §4.6.2 invites -- and that retry resumes without early data. Once
+        // "resumes but offers none" became an informative verdict, the retry
+        // overwrote the refusal it was recovering from, and our client read
+        // as never sending early data on the one port that had refused it.
+        if matches!(test.id, "q-zero-rtt-reject" | "q-zero-rtt-replay") && !ev.met_early_data() {
+            if let Some(existing) = self.evidence.get(test.id) {
+                if existing.met_early_data() {
+                    tracing::info!(
+                        "conformance: {} keeping the connection whose early data arrived, \
+                         rather than a later one that sent none",
                         test.id
                     );
                     return;
@@ -1576,6 +1605,29 @@ mod tests {
 
     use super::*;
     use crate::conformance::catalog::{self, Class, Test, Tier};
+
+    /// A client's own retry after its early data was refused resumes without
+    /// early data; it must not replace the connection that met the refusal.
+    #[test]
+    fn a_retry_without_early_data_does_not_replace_the_refusal() {
+        let t = catalog::find("q-zero-rtt-reject").expect("the test exists");
+        let mut s = Session::new("s".into());
+        let mut refused = ev(Observation::SurvivedAndContinued, 1, Some(1), Some(900));
+        refused.zero_rtt_datagrams_in = 5;
+        s.record_evidence(t, refused);
+        let retry = ev(
+            Observation::Unsupported("resumes a session but does not offer early data".into()),
+            1,
+            Some(1),
+            Some(900),
+        );
+        s.record_evidence(t, retry);
+        assert_eq!(s.evidence[t.id].zero_rtt_datagrams_in, 5);
+        assert!(matches!(
+            s.evidence[t.id].observation,
+            Observation::SurvivedAndContinued
+        ));
+    }
 
     /// A ticket counts only if the exchange that delivered it finished before
     /// the later connection began: one opened in parallel never had it.

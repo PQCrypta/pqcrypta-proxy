@@ -249,9 +249,39 @@ pub struct Counters {
     /// mildly wrong; losing a counter entry restarts a delta at zero and a
     /// verdict reads a partial count as a whole one.
     peers: DashMap<SocketAddr, (Arc<PeerCounters>, Instant)>,
+    /// 0-RTT datagrams by the connection they belong to: the client's address
+    /// and the source connection ID its packets carry. See [`zero_rtt_scid`].
+    /// A client using zero-length IDs is keyed by address alone, still without
+    /// a baseline -- and the connection that earns a ticket sends no early
+    /// data, so the pair it resumes with is counted correctly.
+    ///
+    /// The per-peer count cannot answer "how much early data did *this*
+    /// connection send" when two connections share an address. A client that
+    /// resumes from the socket that earned the ticket does exactly that -- our
+    /// own h3-get and neqo both do -- and the second connection's view is
+    /// baselined when its handler starts, by which time its 0-RTT datagrams
+    /// have already been counted. The baseline swallowed them: our client's
+    /// reject cell read one datagram in one run and none in the next, and was
+    /// scored "resumes but sends no early data" while the wire carried five.
+    zero_rtt_by_cid: Arc<DashMap<(SocketAddr, Vec<u8>), (u64, Instant)>>,
 }
 
 impl Counters {
+    /// Count one 0-RTT datagram against the connection its packets name.
+    fn note_zero_rtt(&self, from: SocketAddr, scid: &[u8]) {
+        let now = Instant::now();
+        if self.zero_rtt_by_cid.len() >= MAX_TRACKED_PEERS {
+            self.zero_rtt_by_cid
+                .retain(|_, (_, seen)| now.duration_since(*seen) < PEER_MEMORY);
+        }
+        let mut entry = self
+            .zero_rtt_by_cid
+            .entry((from, scid.to_vec()))
+            .or_insert((0, now));
+        entry.0 += 1;
+        entry.1 = now;
+    }
+
     pub fn datagrams_in(&self) -> u64 {
         self.datagrams_in.load(Ordering::Relaxed)
     }
@@ -418,6 +448,12 @@ pub struct PeerView {
     /// The port's path evidence, shared rather than snapshotted: it is a fact
     /// about the path and stays true once shown.
     path_ect: Arc<EcnEvidence>,
+    /// This connection's own 0-RTT tally, where its original destination
+    /// connection ID is known -- exact whatever address it shares.
+    zero_rtt_own: Option<(
+        Arc<DashMap<(SocketAddr, Vec<u8>), (u64, Instant)>>,
+        (SocketAddr, Vec<u8>),
+    )>,
 }
 
 impl PeerView {
@@ -437,6 +473,7 @@ impl PeerView {
                 datagrams_in: 0,
                 path_ect,
                 counters,
+                zero_rtt_own: None,
             };
         }
         Self {
@@ -453,6 +490,29 @@ impl PeerView {
             datagrams_in: counters.datagrams_in.load(Ordering::Relaxed),
             path_ect,
             counters,
+            zero_rtt_own: None,
+        }
+    }
+
+    /// Scope the 0-RTT count to the connection the client at `from` named
+    /// `scid` -- the source connection ID of its first Initial -- instead of to
+    /// its address.
+    #[must_use]
+    pub fn for_connection(mut self, counters: &Counters, from: SocketAddr, scid: &[u8]) -> Self {
+        self.zero_rtt_own = Some((Arc::clone(&counters.zero_rtt_by_cid), (from, scid.to_vec())));
+        self
+    }
+
+    /// 0-RTT datagrams from this connection: its own tally where the
+    /// connection is known, otherwise how far the peer's count moved.
+    pub fn zero_rtt_in(&self) -> u64 {
+        match &self.zero_rtt_own {
+            Some((by_cid, key)) => by_cid.get(key).map_or(0, |e| e.0),
+            None => self
+                .counters
+                .zero_rtt_in
+                .load(Ordering::Relaxed)
+                .saturating_sub(self.zero_rtt_in),
         }
     }
 }
@@ -484,7 +544,6 @@ impl PeerView {
 }
 
 peer_delta!(
-    zero_rtt_in,
     version_negotiations_out,
     initials_in,
     marked_ce,
@@ -791,9 +850,10 @@ impl AsyncUdpSocket for ImpairedSocket {
                     // one reader that has no connection to speak of, and this
                     // peer's own for every verdict.
                     let peer = self.counters.peer(m.addr);
-                    if carries_zero_rtt(dgram) {
+                    if let Some(scid) = zero_rtt_scid(dgram) {
                         self.counters.zero_rtt_in.fetch_add(1, Ordering::Relaxed);
                         peer.zero_rtt_in.fetch_add(1, Ordering::Relaxed);
+                        self.counters.note_zero_rtt(m.addr, scid);
                     }
                     if carries_initial(dgram) {
                         self.counters.initials_in.fetch_add(1, Ordering::Relaxed);
@@ -890,8 +950,22 @@ impl AsyncUdpSocket for ImpairedSocket {
 ///
 /// Conservative by construction: anything it cannot parse ends the walk, so the
 /// answer is only ever "a 0-RTT packet was definitely here".
+#[cfg(test)]
 fn carries_zero_rtt(dgram: &[u8]) -> bool {
-    walk_for_packet_type(dgram, 0x1).unwrap_or(false)
+    zero_rtt_scid(dgram).is_some()
+}
+
+/// The source connection ID of the first 0-RTT packet in a datagram.
+///
+/// The client's own connection ID, which it keeps for every long-header packet
+/// of the handshake. So it names the connection a 0-RTT packet belongs to,
+/// where the source address does not -- a client resuming from the socket that
+/// earned the ticket shares one address between the two -- and where the
+/// destination ID does not either: a client whose ClientHello spans two
+/// Initials switches to the server's ID on the first reply and sends its early
+/// data under that (measured on our own h3-get with a post-quantum hello).
+fn zero_rtt_scid(dgram: &[u8]) -> Option<&[u8]> {
+    walk_for_packet_type(dgram, 0x1).map(|(_, scid)| scid)
 }
 
 /// Whether this datagram carries a QUIC Initial packet.
@@ -902,13 +976,14 @@ fn carries_zero_rtt(dgram: &[u8]) -> bool {
 /// undercount makes `t-hybrid-large-hello` report itself unexercised rather than
 /// claim a client handled something it was never shown.
 fn carries_initial(dgram: &[u8]) -> bool {
-    walk_for_packet_type(dgram, 0x0).unwrap_or(false)
+    walk_for_packet_type(dgram, 0x0).is_some()
 }
 
-/// The walk itself. `None` means "could not parse any further", which the caller
-/// reads as "not found" — the answer is only ever "a 0-RTT packet was definitely
-/// here".
-fn walk_for_packet_type(mut dgram: &[u8], wanted: u8) -> Option<bool> {
+/// The walk itself: the destination and source connection IDs of the first
+/// packet of the wanted type, or `None` for "not found" -- which includes
+/// "could not parse any further", so the answer is only ever "one was
+/// definitely here".
+fn walk_for_packet_type(mut dgram: &[u8], wanted: u8) -> Option<(&[u8], &[u8])> {
     /// QUIC v1. A different version is a different packet layout, and guessing
     /// at one is how a parser starts inventing results.
     const V1: u32 = 1;
@@ -920,7 +995,7 @@ fn walk_for_packet_type(mut dgram: &[u8], wanted: u8) -> Option<bool> {
         // nothing can be coalesced behind it.
         let (&first, rest) = dgram.split_first()?;
         if first & 0x80 == 0 {
-            return Some(false);
+            return None;
         }
         if rest.len() < 4 {
             return None;
@@ -930,19 +1005,23 @@ fn walk_for_packet_type(mut dgram: &[u8], wanted: u8) -> Option<bool> {
         if version != V1 {
             // Version Negotiation (version 0) and anything newer than v1 use
             // layouts this does not know.
-            return Some(false);
+            return None;
         }
 
         let packet_type = (first & 0x30) >> 4;
         if packet_type == wanted {
-            return Some(true);
+            let (&dcid_len, after) = rest.split_first()?;
+            let dcid = after.get(..usize::from(dcid_len))?;
+            let (&scid_len, after) = after.get(usize::from(dcid_len)..)?.split_first()?;
+            let scid = after.get(..usize::from(scid_len))?;
+            return Some((dcid, scid));
         }
 
         // Skip this packet to reach whatever is coalesced behind it.
         let rest = skip_cid(rest).and_then(skip_cid)?;
         if packet_type == RETRY {
             // A Retry carries no Length field and nothing may follow it.
-            return Some(false);
+            return None;
         }
         let rest = if packet_type == INITIAL {
             // Token Length, then the token itself.
@@ -1572,6 +1651,50 @@ mod tests {
         p.push(u8::try_from(payload_len).expect("test payloads are small")); // Length varint
         p.extend(std::iter::repeat_n(0u8, payload_len));
         p
+    }
+
+    /// The 0-RTT packet names its connection, and a second connection from the
+    /// same address is counted apart from the first -- the case a per-address
+    /// baseline got wrong for clients that resume from one socket.
+    #[test]
+    fn zero_rtt_is_counted_against_its_own_connection() {
+        let mut zero_rtt = vec![0xd0];
+        zero_rtt.extend_from_slice(&1u32.to_be_bytes());
+        zero_rtt.push(4);
+        zero_rtt.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]); // DCID: the server's, after a reply
+        zero_rtt.push(4);
+        zero_rtt.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]); // SCID: the client's own
+        let mut dgram = initial(16);
+        dgram.extend(&zero_rtt);
+        assert_eq!(zero_rtt_scid(&dgram), Some(&[0xaa, 0xbb, 0xcc, 0xdd][..]));
+
+        let counters = Counters::default();
+        let addr: SocketAddr = "192.0.2.7:4433".parse().expect("address");
+        // The first connection from this address was viewed long ago; the
+        // second's view is taken after its early data was already counted.
+        let _earlier = counters.view_for(addr);
+        counters
+            .peer(addr)
+            .zero_rtt_in
+            .fetch_add(3, Ordering::Relaxed);
+        for _ in 0..3 {
+            counters.note_zero_rtt(addr, &[0xaa, 0xbb, 0xcc, 0xdd]);
+        }
+        let by_address = counters.view_for(addr);
+        assert_eq!(
+            by_address.zero_rtt_in(),
+            0,
+            "the address baseline swallows it"
+        );
+        let by_connection =
+            counters
+                .view_for(addr)
+                .for_connection(&counters, addr, &[0xaa, 0xbb, 0xcc, 0xdd]);
+        assert_eq!(by_connection.zero_rtt_in(), 3);
+        let other = counters
+            .view_for(addr)
+            .for_connection(&counters, addr, &[0x01]);
+        assert_eq!(other.zero_rtt_in(), 0);
     }
 
     #[test]
