@@ -16,6 +16,17 @@ fn git(args: &[&str]) -> Option<String> {
 }
 
 fn main() {
+    // A build with no git checkout -- the Docker image, whose context has no
+    // .git -- is given the commit instead (a build argument in CI).
+    println!("cargo:rerun-if-env-changed=PQCRYPTA_GIT_COMMIT");
+    if let Some(given) = std::env::var("PQCRYPTA_GIT_COMMIT")
+        .ok()
+        .filter(|c| !c.is_empty())
+    {
+        let short: String = given.chars().take(7).collect();
+        println!("cargo:rustc-env=PQCRYPTA_GIT_COMMIT={short}");
+        return;
+    }
     let commit = git(&["rev-parse", "--short=7", "HEAD"]).unwrap_or_else(|| "unknown".into());
     let dirty = git(&[
         "status",

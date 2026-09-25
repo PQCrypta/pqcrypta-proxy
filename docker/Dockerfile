@@ -50,6 +50,12 @@ RUN cargo build --release && rm -rf src target/release/deps/pqcrypta*
 # Copy actual source
 COPY src ./src
 COPY tests ./tests
+# build.rs names the commit in `--version`; the context has no .git, so CI
+# passes it (docker build --build-arg PQCRYPTA_GIT_COMMIT=<sha>). Without it
+# the version reads "unknown" rather than failing the build.
+COPY build.rs ./
+ARG PQCRYPTA_GIT_COMMIT=
+ENV PQCRYPTA_GIT_COMMIT=${PQCRYPTA_GIT_COMMIT}
 
 # Build release binary
 RUN cargo build --release --locked

@@ -278,6 +278,8 @@ jobs:
           file: docker/Dockerfile
           push: false
           tags: pqcrypta-proxy:${{ github.sha }}
+          build-args: |
+            PQCRYPTA_GIT_COMMIT=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
