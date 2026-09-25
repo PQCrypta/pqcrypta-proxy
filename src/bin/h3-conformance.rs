@@ -300,8 +300,11 @@ async fn run(args: &Args) -> i32 {
         // extra connection itself, because only the wrapper knows the flags
         // its client wants (`--session-file`, `-0`, a resumption token) and
         // whether that client can do this at all. A wrapper that ignores the
-        // variable behaves exactly as before, which is the honest outcome for
-        // curl and Chromium -- neither offers early data over HTTP/3.
+        // variable behaves exactly as before. Every client in the matrix now
+        // makes the pair -- curl through a session file, Chromium within one
+        // launch, .NET with two connections in one process -- so what a cell
+        // reports is whether the client resumed and sent early data, never
+        // that it was not given the chance.
         let resume = test.id.starts_with("q-zero-rtt");
         // Tell the server when the process stopped, so a verdict that rests on
         // silence can say which kind of silence it was. Advisory: a failure to

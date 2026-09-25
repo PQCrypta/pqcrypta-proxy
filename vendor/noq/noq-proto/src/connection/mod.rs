@@ -220,6 +220,13 @@ pub struct Connection {
     timers: TimerTable,
     /// Number of packets received which could not be authenticated
     authentication_failures: u64,
+    /// The last STOP_SENDING the peer sent, on whichever stream.
+    ///
+    /// Kept apart from stream state because that state may already be gone: a
+    /// send stream whose data was all acknowledged is freed, and a STOP_SENDING
+    /// for it is then dropped with its code. A peer rejecting a response it has
+    /// already received does exactly that.
+    last_stop_sending: Option<(StreamId, VarInt)>,
 
     //
     // Queued non-retransmittable 1-RTT data
@@ -409,6 +416,7 @@ impl Connection {
             },
             timers: TimerTable::default(),
             authentication_failures: 0,
+            last_stop_sending: None,
             connection_close_pending: false,
 
             ack_frequency: AckFrequencyState::new(get_max_ack_delay(
@@ -2707,6 +2715,30 @@ impl Connection {
     /// Zero until the handshake has supplied the peer's parameters.
     pub fn peer_initial_max_stream_data_uni(&self) -> u64 {
         self.peer_params.initial_max_stream_data_uni.into_inner()
+    }
+
+    /// The peer's most recent STOP_SENDING, recorded whether or not the stream
+    /// it names still exists.
+    ///
+    /// A send stream whose data was all acknowledged is freed, and a
+    /// STOP_SENDING arriving for it afterwards is dropped along with its code.
+    /// A peer that rejects a response it has already received sends exactly
+    /// that -- and the code is the whole of its answer.
+    pub fn last_stop_sending(&self) -> Option<(StreamId, VarInt)> {
+        self.last_stop_sending
+    }
+
+    /// How many unidirectional streams the peer lets this endpoint open before
+    /// it grants more with MAX_STREAMS.
+    ///
+    /// HTTP/3 needs three (control and the two QPACK streams), and a peer may
+    /// grant exactly that. A fourth is then impossible until the peer says
+    /// otherwise -- which an application opening one should know, rather than
+    /// wait on credit that may never come.
+    ///
+    /// Zero until the handshake has supplied the peer's parameters.
+    pub fn peer_initial_max_streams_uni(&self) -> u64 {
+        self.peer_params.initial_max_streams_uni.into_inner()
     }
 
     /// Ping the remote endpoint
@@ -5147,6 +5179,7 @@ impl Connection {
                             "STOP_SENDING on unopened stream",
                         ));
                     }
+                    self.last_stop_sending = Some((id, error_code));
                     self.streams.received_stop_sending(id, error_code);
                 }
                 Frame::RetireConnectionId(frame::RetireConnectionId { path_id, sequence }) => {

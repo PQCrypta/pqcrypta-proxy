@@ -667,6 +667,35 @@ impl Connection {
             .peer_initial_max_stream_data_uni()
     }
 
+    /// The peer's most recent STOP_SENDING and the stream it named, kept even
+    /// when that stream's state has already been freed.
+    ///
+    /// The conformance suite reads it for a client that rejects a response
+    /// only after receiving it all: by then the stream is gone, and without
+    /// this the rejection -- code and all -- read as silence.
+    pub fn last_stop_sending(&self) -> Option<(StreamId, VarInt)> {
+        self.0
+            .lock_without_waking("last_stop_sending")
+            .inner
+            .last_stop_sending()
+    }
+
+    /// How many unidirectional streams the peer lets this endpoint open before
+    /// it grants more with MAX_STREAMS.
+    ///
+    /// The conformance suite checks it before opening a fourth: a client that
+    /// grants the three HTTP/3 needs cannot be sent a push stream or a second
+    /// control stream at all, and an unbounded `open_uni` there waited forever
+    /// and held back the response with it.
+    ///
+    /// Zero before the handshake completes.
+    pub fn peer_initial_max_streams_uni(&self) -> u64 {
+        self.0
+            .lock_without_waking("peer_initial_max_streams_uni")
+            .inner
+            .peer_initial_max_streams_uni()
+    }
+
     /// Abandon the connection without telling the peer.
     ///
     /// Where [`close()`] sends a CONNECTION_CLOSE frame and lets the peer finish

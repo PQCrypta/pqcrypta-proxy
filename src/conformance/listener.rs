@@ -272,8 +272,9 @@ impl TestListener {
             // and say so. A client that ignores them is overrunning a limit it
             // agreed to.
             "q-flow-control" => {
-                transport.receive_window(quinn::VarInt::from_u32(1024));
-                transport.stream_receive_window(quinn::VarInt::from_u32(512));
+                transport.receive_window(quinn::VarInt::from_u32(FLOW_CONTROL_CONNECTION_WINDOW));
+                transport
+                    .stream_receive_window(quinn::VarInt::from_u32(FLOW_CONTROL_STREAM_WINDOW));
             }
             // Offer the extension and see whether the peer takes it up. Either
             // answer conforms; falling over does not.
@@ -686,6 +687,18 @@ async fn run_one(
     let peer_addr = incoming.remote_address();
     let peer_ip = crate::security::canonical_addr(peer_addr).ip();
 
+    // Whether the client runs on this endpoint's own host: the datagram came
+    // from the address it arrived at. Such a path never leaves the kernel, so
+    // nothing the client sends is lost in transit -- and "a close that was sent
+    // and lost looks like one that was never sent", the one caveat that keeps
+    // a silent handshake abort inconclusive, does not apply to it. The
+    // published matrix is run from this host; a client anywhere else keeps
+    // the caveat.
+    let same_host = peer_ip.is_loopback()
+        || incoming.local_ip().is_some_and(|local| {
+            crate::security::canonical_addr((local, 0).into()).ip() == peer_ip
+        });
+
     // This connection's counters, and the only ones any verdict can reach.
     //
     // `Counters` belongs to the listener — one per port, created at start-up
@@ -882,7 +895,44 @@ async fn run_one(
                             // non-event. Saying "the client never reached the
                             // anomaly" here would be false: it reached it, and this
                             // is what it did about it.
-                            tls_handshake_observation(test, &e, chain)
+                            tls_handshake_observation(test, &e, chain, same_host)
+                        } else if test.id == "q-invalid-transport-param"
+                            && same_host
+                            && matches!(e, quinn::ConnectionError::TimedOut)
+                        {
+                            // Nothing lost on this path, so nothing was sent.
+                            Observation::Violated(
+                                "abandoned the handshake without a CONNECTION_CLOSE. It saw the \
+                             parameter -- that travels in the handshake -- and §7.4 requires \
+                             treating it as a connection error of type \
+                             TRANSPORT_PARAMETER_ERROR, which RFC 9000 §10.2 signals in a \
+                             CONNECTION_CLOSE. None was sent: this client runs on the \
+                             endpoint's own host, where nothing is lost in transit"
+                                    .to_string(),
+                            )
+                        } else if test.id == "q-flow-control"
+                            && same_host
+                            && matches!(e, quinn::ConnectionError::TimedOut)
+                            && conformance
+                                .sessions
+                                .with(&session_id, |s| s.completed_any_exchange())
+                                .unwrap_or(false)
+                        {
+                            // The windows travel in this port's transport
+                            // parameters, so they are part of the handshake, and
+                            // they are all that separates it from the ports this
+                            // client completed exchanges on. A refusal of them,
+                            // and a legal one: RFC 9000 sets no minimum.
+                            Observation::Unsupported(format!(
+                                "does not accept a server whose flow-control windows are this \
+                             tight. It abandoned the handshake on this port, whose transport \
+                             parameters grant {FLOW_CONTROL_STREAM_WINDOW} bytes per stream \
+                             and {FLOW_CONTROL_CONNECTION_WINDOW} per connection and differ \
+                             from the other ports in nothing else, while completing exchanges \
+                             on others in this session. It sent no CONNECTION_CLOSE to say so \
+                             (this client runs on the endpoint's own host, where nothing is \
+                             lost), so the refusal is inferred from where it happened"
+                            ))
                         } else if test.id == "q-invalid-transport-param" {
                             // This one did reach the anomaly: the parameter travels
                             // in the handshake, so it is among the first things the
@@ -959,20 +1009,27 @@ async fn run_one(
         Some(emitted) => emitted,
         None => emit(&connection, test).await,
     };
-    let (critical_streams, mut encoder, mut control, mut probe_target, control_is_late) =
-        match emitted {
-            Ok(emitted) => (
-                emitted.keep_open,
-                Some(emitted.encoder),
-                Some(emitted.control),
-                emitted.probe_target,
-                emitted.control_is_late,
-            ),
-            Err(e) => {
-                debug!("conformance: {} could not emit anomaly: {}", test.id, e);
-                (Vec::new(), None, None, None, false)
-            }
-        };
+    let (
+        critical_streams,
+        mut encoder,
+        mut control,
+        mut probe_target,
+        control_is_late,
+        undeliverable,
+    ) = match emitted {
+        Ok(emitted) => (
+            emitted.keep_open,
+            Some(emitted.encoder),
+            Some(emitted.control),
+            emitted.probe_target,
+            emitted.control_is_late,
+            emitted.undeliverable,
+        ),
+        Err(e) => {
+            debug!("conformance: {} could not emit anomaly: {}", test.id, e);
+            (Vec::new(), None, None, None, false, None)
+        }
+    };
     // When the stimulus is fully established, measured from the connection's
     // start. Every reaction opportunity is reckoned from this one instant:
     // before the anomaly is written there is nothing for a client to answer,
@@ -1172,6 +1229,14 @@ async fn run_one(
     // bytes were consumed; its absence is still the old ambiguity and is left
     // as inconclusive, so nothing is failed for a probe that merely did not
     // land.
+    //
+    // Every unidirectional anomaly stream, not only the control stream. The
+    // probe was pointed at the anomaly's own stream -- the QPACK encoder
+    // stream, a push stream -- and measured there, but this still admitted the
+    // control stream alone, so a proven read of those streams was recorded and
+    // then ignored: quiche, picoquic, msquic and aioquic each consumed the
+    // stream carrying the violation and carried on, and nine cells read "a
+    // distinction this vantage point cannot draw" over evidence that drew it.
     let observation = match (&observation, read_proof) {
         (
             Observation::SurvivedAndContinued
@@ -1180,8 +1245,38 @@ async fn run_one(
             | Observation::PeerUnreachable
             | Observation::TimedOut,
             Some(true),
-        ) if catalog::anomaly_stream(test) == catalog::Anomaly::ControlStream => {
+        ) if matches!(
+            catalog::anomaly_stream(test),
+            catalog::Anomaly::ControlStream | catalog::Anomaly::OtherUniStream
+        ) =>
+        {
             Observation::ReadThenSilent("extended flow-control credit on it".to_string())
+        }
+        // Never read: the probe filled the window this client granted on its
+        // QPACK encoder stream and it gave nothing back, while it stayed
+        // connected. A decoder with no dynamic table may leave the stream
+        // unread -- quic-go reads the stream type and returns, "our QPACK
+        // implementation doesn't use the dynamic table yet" -- and then the
+        // invalid instruction never reached it. That is an answer about the
+        // client, not a gap in the run.
+        (
+            Observation::SurvivedAndContinued
+            | Observation::ClosedSilently
+            | Observation::NoCloseObserved,
+            Some(false),
+        ) if matches!(
+            test.id,
+            "h-qpack-encoder-overflow" | "h-qpack-encoder-bad-name-index"
+        ) =>
+        {
+            Observation::Unsupported(
+                "does not read the QPACK encoder stream, so the invalid instruction on it never \
+                 reached its decoder. This endpoint filled the flow-control window the client \
+                 granted on that stream and no credit came back while the client stayed \
+                 connected -- a client that had consumed the stream would have had to grant \
+                 more"
+                    .to_string(),
+            )
         }
         _ => observation,
     };
@@ -1234,10 +1329,29 @@ async fn run_one(
     // Left to the generic path, giving up reads as a discretionary test that
     // stalled, which is scored as a failure.
     let observation = if test.id == "q-max-streams-credit"
+        && matches!(observation, Observation::ClosedSilently)
+        && started.elapsed() < STREAM_CREDIT_AFTER
+    {
+        // Closed, cleanly and before the credit was due, without opening a
+        // stream it had no credit for: the client's own decision, and a
+        // conformant one -- §4.6 forbids exceeding the limit, not giving up.
+        // It read "not exercised" as though the run had failed to ask; the
+        // run asked, and this is the answer. Measured on curl, which closes
+        // 36ms in. A client that goes silent instead is still the ambiguous
+        // case below: waiting and hanging look alike.
+        Observation::Unsupported(format!(
+            "does not wait for stream credit. This port grants no bidirectional stream \
+             until {}ms in; the client closed the connection before then without opening \
+             one, so it never exceeded the limit -- which is all §4.6 requires -- and never \
+             made its request",
+            STREAM_CREDIT_AFTER.as_millis()
+        ))
+    } else if test.id == "q-max-streams-credit"
         && matches!(
             observation,
             Observation::TimedOut | Observation::ClosedSilently
-        ) {
+        )
+    {
         Observation::NotExercised(format!(
             "the client did not wait for the credit. This port grants no bidirectional \
              stream until {}ms in, and declining to wait that long is not a violation of \
@@ -1246,6 +1360,59 @@ async fn run_one(
         ))
     } else {
         observation
+    };
+
+    // A QPACK decoding failure answered on the request stream alone.
+    //
+    // Every QPACK_DECOMPRESSION_FAILED is a connection error (RFC 9204 §2.2,
+    // §3.1 for an invalid static index). A client may instead stop the request
+    // stream and keep the connection -- quic-go cancels both directions with
+    // the right code -- and this listener never looked at stream-level
+    // signals, so that answer read as silence ("answered nothing at all").
+    // It is on the wire: the peer's STOP_SENDING on the request stream.
+    let observation = if expected_code(test) == Some(f::error_code::QPACK_DECOMPRESSION_FAILED)
+        && matches!(
+            observation,
+            Observation::PeerUnreachable
+                | Observation::NoCloseObserved
+                | Observation::SurvivedAndContinued
+                | Observation::TimedOut
+                | Observation::ClosedSilently
+        ) {
+        // Read off the connection rather than the held stream: the client
+        // stops the response only after receiving all of it, by which point
+        // noq has freed the stream and would drop the frame with its code.
+        let stopped_with = connection
+            .last_stop_sending()
+            .filter(|(id, _)| {
+                id.initiator() == quinn_proto::Side::Client && id.dir() == quinn_proto::Dir::Bi
+            })
+            .map(|(_, code)| u64::from(code));
+        match stopped_with {
+            Some(code) if code == f::error_code::QPACK_DECOMPRESSION_FAILED => {
+                Observation::Violated(
+                    "rejected the field section with QPACK_DECOMPRESSION_FAILED, but as a stream \
+                 error: it stopped the request stream and kept the connection open. The code \
+                 is right and the scope is not -- RFC 9204 makes every decompression failure \
+                 a connection error"
+                        .to_string(),
+                )
+            }
+            Some(code) => Observation::Violated(format!(
+                "stopped the request stream with 0x{code:x} and kept the connection open. RFC \
+                 9204 requires a connection error of type QPACK_DECOMPRESSION_FAILED"
+            )),
+            None => observation,
+        }
+    } else {
+        observation
+    };
+
+    // The client's own stream limit kept the anomaly off the wire, so whatever
+    // happened afterwards says nothing about how it treats one.
+    let observation = match undeliverable {
+        Some(why) => Observation::Unsupported(why),
+        None => observation,
     };
 
     // An unbuilt test served a correct control stream, so whatever the client
@@ -1361,6 +1528,16 @@ enum TlsAbort {
     /// Only reachable on the post-quantum chain port. Every other port serves
     /// an ECDSA certificate that every client in existence can verify.
     NoSignatureSchemesInCommon,
+    /// The peer closed with a transport error code instead of a TLS alert --
+    /// INTERNAL_ERROR, PROTOCOL_VIOLATION and the like.
+    ///
+    /// Still an abort, and a permitted way to deliver one: RFC 9000 §11 lets an
+    /// endpoint use a generic code "in place of specific error codes", and RFC
+    /// 9001 §4.8 applies that to TLS alerts. This used to fall into `Other`,
+    /// where the TLS tests read it as "nothing shows how it refused" -- while
+    /// the same client sending handshake_failure instead would have been
+    /// reported as the abort it was. Carries the code.
+    GenericClose(u64),
     /// The handshake stopped and nothing arrived to say why.
     Silent,
     /// Something else ended it.
@@ -1377,7 +1554,7 @@ fn classify_tls_abort(e: &quinn::ConnectionError) -> TlsAbort {
             let code = u64::from(close.error_code);
             match code {
                 0x0100..=0x01ff => TlsAbort::Alert((code & 0xff) as u8),
-                _ => TlsAbort::Other,
+                _ => TlsAbort::GenericClose(code),
             }
         }
         // Raised on this side, not received. `NoKxGroupsInCommon` is rustls
@@ -1421,6 +1598,8 @@ fn tls_handshake_observation(
     test: &'static Test,
     e: &quinn::ConnectionError,
     chain: Option<ChainSize>,
+    // See `same_host` in `run_one`: silence on such a path is the client's.
+    same_host: bool,
 ) -> Observation {
     let abort = classify_tls_abort(e);
 
@@ -1456,11 +1635,29 @@ fn tls_handshake_observation(
                  reported and not judged",
                 0x0100 | u64::from(code)
             )),
+            TlsAbort::GenericClose(code) => Observation::Signalled(format!(
+                "aborted the handshake with CONNECTION_CLOSE 0x{code:x}, a transport error code, \
+                 rather than the illegal_parameter alert. §4.1.3 requires the abort, and RFC \
+                 9000 §11 lets a generic code stand in for a specific one -- RFC 9001 §4.8 \
+                 applies that to TLS alerts -- so the code is reported and not judged"
+            )),
             // No CONNECTION_CLOSE arrived. The handshake certainly did not
             // complete, so the client did not accept the group -- but a close
             // that was never sent cannot be told from one that was lost, and
             // "stopped talking" cannot be told from "stalled". The requirement
             // is met either way; the manner of it is not observable.
+            // On a path that loses nothing, no close arrived because none was
+            // sent. Measured on lsquic, whose shipped default
+            // (LSQUIC_DF_SILENT_CLOSE) sends no CONNECTION_CLOSE when a
+            // handshake fails.
+            TlsAbort::Silent if same_host => Observation::Violated(
+                "abandoned the handshake without any alert. The group was not accepted, but \
+                 §4.1.3 requires the abort to carry illegal_parameter, and RFC 9001 §4.8 \
+                 delivers an alert -- a generic one is permitted -- in a CONNECTION_CLOSE. None \
+                 was sent: this client runs on the endpoint's own host, where nothing is lost \
+                 in transit"
+                    .to_string(),
+            ),
             TlsAbort::Silent => Observation::Ambiguous(
                 "The handshake did not complete, so the group was not accepted, but nothing \
                  arrived to say the client rejected it deliberately. RFC 9001 §4.8 carries a \
@@ -1528,6 +1725,21 @@ fn tls_handshake_observation(
                  share also breaks the key schedule, so this abort does not on its own show \
                  the length was what the client objected to"
             )),
+            // Measured on picoquic: CONNECTION_CLOSE with INTERNAL_ERROR.
+            TlsAbort::GenericClose(code) => Observation::Signalled(format!(
+                "aborted the handshake with CONNECTION_CLOSE 0x{code:x}, a transport error code, \
+                 rather than the illegal_parameter alert. §3.1.2 requires the abort and RFC 9000 \
+                 §11 lets a generic code stand in for a specific one, so the code is reported \
+                 and not judged -- though a truncated share also breaks the key schedule, so \
+                 this abort does not on its own show the length was what the client objected to"
+            )),
+            TlsAbort::Silent if same_host => Observation::Violated(
+                "abandoned the handshake without any alert. §3.1.2 requires the abort to carry \
+                 illegal_parameter, and RFC 9001 §4.8 delivers an alert -- a generic one is \
+                 permitted -- in a CONNECTION_CLOSE. None was sent: this client runs on the \
+                 endpoint's own host, where nothing is lost in transit"
+                    .to_string(),
+            ),
             TlsAbort::Silent => Observation::Ambiguous(
                 "The handshake did not complete, which it could not have done with half the \
                  shared secret missing, but nothing arrived to say the client rejected the \
@@ -2114,6 +2326,36 @@ fn expected_code(test: &Test) -> Option<u64> {
     }
 }
 
+/// How long to wait for credit to open a fourth unidirectional stream.
+const EXTRA_UNI_STREAM_WAIT: Duration = Duration::from_millis(500);
+
+/// Open a server unidirectional stream beyond the three HTTP/3 needs, or say
+/// why it cannot be.
+///
+/// A client may grant exactly three -- lsquic does -- and then no push stream,
+/// reserved stream or second control stream can exist on its connection until
+/// it sends MAX_STREAMS. The open was unbounded, so on such a client `emit`
+/// waited for credit that never came, the response was never sent, and each
+/// of those cells timed out a minute later reading "nothing further arrived".
+/// The anomaly never left this endpoint; the verdict now says so.
+async fn open_extra_uni(
+    connection: &quinn::Connection,
+    what: &str,
+) -> Result<quinn::SendStream, String> {
+    match tokio::time::timeout(EXTRA_UNI_STREAM_WAIT, connection.open_uni()).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(e)) => Err(format!("{what} could not be opened: {e}")),
+        Err(_) => Err(format!(
+            "grants this endpoint {} unidirectional streams -- the control stream and \
+             the two QPACK streams HTTP/3 requires take them all -- and granted no more \
+             within {}ms, so {what} could not be opened. The violation cannot be \
+             delivered to this client; its stream limit rules it out",
+            connection.peer_initial_max_streams_uni(),
+            EXTRA_UNI_STREAM_WAIT.as_millis()
+        )),
+    }
+}
+
 /// Write this test's anomaly onto the connection.
 ///
 /// Tests not yet implemented open a well-formed control stream and nothing
@@ -2136,6 +2378,8 @@ pub(super) async fn emit(
     // The anomaly's own stream, where that is a unidirectional stream other
     // than the control stream. See `Emitted::probe_target`.
     let mut probe_target: Option<quinn::SendStream> = None;
+    // Why the anomaly could not be put, where the client's limits rule it out.
+    let mut undeliverable: Option<String> = None;
 
     let mut control = connection.open_uni().await?;
     control
@@ -2191,26 +2435,35 @@ pub(super) async fn emit(
         // Only one control stream per direction is permitted.
         "h-second-control-stream" => {
             control.write_all(&f::settings_with_grease()).await?;
-            let mut second = connection.open_uni().await?;
-            second
-                .write_all(&f::uni_stream_header(f::stream_type::CONTROL))
-                .await?;
-            second.write_all(&f::settings_with_grease()).await?;
-            // Held open like the first: the violation under test is that a
-            // second control stream exists at all, not that one was closed.
-            keep_open.push(second);
+            match open_extra_uni(connection, "a second control stream").await {
+                Ok(mut second) => {
+                    second
+                        .write_all(&f::uni_stream_header(f::stream_type::CONTROL))
+                        .await?;
+                    second.write_all(&f::settings_with_grease()).await?;
+                    // Held open like the first: the violation under test is
+                    // that a second control stream exists at all, not that one
+                    // was closed.
+                    keep_open.push(second);
+                }
+                Err(why) => undeliverable = Some(why),
+            }
         }
 
         // A unidirectional stream of a type the client does not know must be
         // ignored, not treated as fatal.
         "h-reserved-uni-stream" => {
             control.write_all(&f::settings_with_grease()).await?;
-            let mut reserved = connection.open_uni().await?;
-            reserved
-                .write_all(&f::reserved_uni_stream_header(3))
-                .await?;
-            reserved.write_all(b"ignore me").await?;
-            let _ = reserved.finish();
+            match open_extra_uni(connection, "a reserved-type stream").await {
+                Ok(mut reserved) => {
+                    reserved
+                        .write_all(&f::reserved_uni_stream_header(3))
+                        .await?;
+                    reserved.write_all(b"ignore me").await?;
+                    let _ = reserved.finish();
+                }
+                Err(why) => undeliverable = Some(why),
+            }
         }
 
         // GOAWAY mid-connection: stop starting new requests, finish the rest.
@@ -2237,19 +2490,23 @@ pub(super) async fn emit(
         // test is that the stream exists, not that it was closed.
         "h-push-stream-unpromised" => {
             control.write_all(&f::settings_with_grease()).await?;
-            let mut push = connection.open_uni().await?;
-            push.write_all(&f::push_stream_header(UNPROMISED_PUSH_ID_ZERO))
-                .await?;
-            push.write_all(&f::headers(&[
-                (":status", "200"),
-                ("content-type", "text/plain"),
-            ]))
-            .await?;
-            push.write_all(&f::data(b"a push nobody asked for\n"))
-                .await?;
-            // Handed to the read proof rather than parked: this is the stream
-            // whose consumption the verdict turns on.
-            probe_target = Some(push);
+            match open_extra_uni(connection, "a push stream").await {
+                Ok(mut push) => {
+                    push.write_all(&f::push_stream_header(UNPROMISED_PUSH_ID_ZERO))
+                        .await?;
+                    push.write_all(&f::headers(&[
+                        (":status", "200"),
+                        ("content-type", "text/plain"),
+                    ]))
+                    .await?;
+                    push.write_all(&f::data(b"a push nobody asked for\n"))
+                        .await?;
+                    // Handed to the read proof rather than parked: this is the
+                    // stream whose consumption the verdict turns on.
+                    probe_target = Some(push);
+                }
+                Err(why) => undeliverable = Some(why),
+            }
         }
 
         // A push nobody permitted.
@@ -2380,6 +2637,7 @@ pub(super) async fn emit(
         control,
         probe_target,
         control_is_late: test.id == GOAWAY_AFTER_REQUEST,
+        undeliverable,
     })
 }
 
@@ -2517,6 +2775,11 @@ pub(super) struct Emitted {
     /// Whether `control` still has its frame to write, which is `h-goaway`
     /// and nothing else.
     pub(super) control_is_late: bool,
+    /// Why the anomaly could not be put on this connection, where the
+    /// client's own limits rule it out -- a fourth unidirectional stream on a
+    /// client that granted three. The verdict is then about that, not about a
+    /// violation the client was never sent.
+    pub(super) undeliverable: Option<String>,
 }
 
 /// What this connection has done so far, and when.
@@ -2602,6 +2865,14 @@ const UNPROMISED_PUSH_ID_ZERO: u64 = 0;
 
 /// The identifier `h-goaway-increasing` raises its second GOAWAY to.
 const GOAWAY_INCREASED_TO: u64 = 16;
+
+/// The windows `q-flow-control` advertises, per connection and per stream.
+///
+/// Small enough that a real request has to stop and wait. Named because a
+/// verdict quotes them: lsquic refuses any server offering under 4096 bytes
+/// (its `es_check_tp_sanity`), and the cell says which numbers it refused.
+const FLOW_CONTROL_CONNECTION_WINDOW: u32 = 1024;
+const FLOW_CONTROL_STREAM_WINDOW: u32 = 512;
 
 /// The static table index `h-qpack-static-index-invalid` references.
 ///
@@ -3110,6 +3381,29 @@ fn quic_observation(
             Observation::Signalled(format!(
                 "rotated connection IDs and retired {} of them",
                 rx.retire_connection_id
+            ))
+        } else if let Some(quinn::ConnectionError::ConnectionClosed(close)) =
+            connection.close_reason().filter(|reason| {
+                matches!(reason, quinn::ConnectionError::ConnectionClosed(c)
+                    if c.error_code != quinn_proto::TransportErrorCode::NO_ERROR)
+            })
+        {
+            // The client left, but not because it was finished: a transport
+            // error closes on something it objected to, and this port shows it
+            // nothing but the rotation. Measured on xquic: the NEW_CONNECTION_ID
+            // raising retire_prior_to past every ID it held made it retire its
+            // current ID before adding the new one, find no ID left to send
+            // on, and close with FRAME_ENCODING_ERROR over a frame that is
+            // legal (retire_prior_to may equal the sequence number, §19.15).
+            // This read "a client that closed before the expiry was never
+            // asked" -- it was asked, and this was its answer.
+            Observation::ObjectedAtTransport(format!(
+                "closed the connection with transport error {:?} (\"{}\") and retired none of \
+                 the connection IDs this endpoint asked it to. The port's only departure \
+                 from an ordinary one is the rotation: a NEW_CONNECTION_ID whose \
+                 retire_prior_to retires every earlier ID",
+                close.error_code,
+                String::from_utf8_lossy(&close.reason)
             ))
         } else {
             Observation::NotExercised(
@@ -4399,9 +4693,19 @@ pub(super) async fn control_stream_was_read(
         // The stream died under us: the client is gone and nothing is proven.
         Ok(Err(e)) => (None, format!("stream ended under the probe: {e}")),
         // Still connected, still not granting credit on this stream.
-        Err(_) => (
+        // Only a filled window is an answer. The wait ending with room still
+        // left says nothing -- a reader need not grant credit until it nears
+        // the window -- so that case stays unknown. With the window full and
+        // the connection alive for the whole wait, a client that had consumed
+        // what it was sent would have had to grant more: this is the one
+        // absence that is evidence.
+        Err(_) if written + frame.len() as u64 >= limit => (
             Some(false),
-            "no credit granted on this stream for the whole wait".to_string(),
+            format!("filled the {limit}-byte window and no credit came back for the whole wait"),
+        ),
+        Err(_) => (
+            None,
+            "the wait ended before the window was filled, which proves nothing".to_string(),
         ),
     };
     info!(
@@ -4660,6 +4964,55 @@ pub fn catalog_json(conformance: &Conformance) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test(id: &str) -> &'static Test {
+        catalog::find(id).expect("catalogue entry")
+    }
+
+    fn closed_with(code: quinn_proto::TransportErrorCode) -> quinn::ConnectionError {
+        quinn::ConnectionError::ConnectionClosed(quinn_proto::ConnectionClose {
+            error_code: code,
+            frame_type: quinn_proto::MaybeFrame::None,
+            reason: bytes::Bytes::new(),
+        })
+    }
+
+    /// A transport-code close is an abort delivered with a generic code, which
+    /// RFC 9000 §11 permits -- reported like a substitute alert, not as
+    /// "nothing shows how it refused". Measured on picoquic (INTERNAL_ERROR).
+    #[test]
+    fn a_generic_close_is_the_abort_it_is() {
+        for id in ["t-hybrid-share-length", "t-group-not-offered"] {
+            let o = tls_handshake_observation(
+                test(id),
+                &closed_with(quinn_proto::TransportErrorCode::INTERNAL_ERROR),
+                None,
+                false,
+            );
+            assert!(
+                matches!(&o, Observation::Signalled(r) if r.contains("transport error code")),
+                "{id}: {o:?}"
+            );
+        }
+    }
+
+    /// Silence is the client's only where nothing can be lost on the way: a
+    /// client on the endpoint's own host sent no alert; one elsewhere may have
+    /// sent one that was lost.
+    #[test]
+    fn a_silent_abort_is_conclusive_only_on_a_lossless_path() {
+        for id in ["t-hybrid-share-length", "t-group-not-offered"] {
+            let here =
+                tls_handshake_observation(test(id), &quinn::ConnectionError::TimedOut, None, true);
+            assert!(matches!(here, Observation::Violated(_)), "{id}: {here:?}");
+            let elsewhere =
+                tls_handshake_observation(test(id), &quinn::ConnectionError::TimedOut, None, false);
+            assert!(
+                matches!(elsewhere, Observation::Ambiguous(_)),
+                "{id}: {elsewhere:?}"
+            );
+        }
+    }
 
     fn a_quiet_peer() -> PeerView {
         crate::conformance::impairment::Counters::default()

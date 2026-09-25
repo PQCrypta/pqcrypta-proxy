@@ -536,17 +536,17 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
 
         // Proven to have read it, and said nothing.
         //
-        // This is the control-stream case with the evidence that used to be
+        // The unidirectional-stream case with the evidence that used to be
         // missing, so it is judged as the response-stream case is: the client
         // saw the violation and carried on.
         (Class::Correctness, Observation::ReadThenSilent(how)) => (
             Verdict::Fail,
             format!(
-                "Accepted a protocol violation and carried on. The anomaly was on the \
-                 control stream, and this client {how} -- a receiver extends credit on a \
-                 stream only once its application has consumed what was already there, so \
-                 the bytes were read rather than merely delivered. This should have been \
-                 rejected."
+                "Accepted a protocol violation and carried on. The anomaly was on {}, and \
+                 this client {how} -- a receiver extends credit on a stream only once its \
+                 application has consumed what was already there, so the bytes were read \
+                 rather than merely delivered. This should have been rejected.",
+                catalog::anomaly_stream_name(test)
             ),
         ),
         // For the classes whose pass is carrying on, proving the read changes
@@ -1036,6 +1036,11 @@ impl Session {
             .entry(test.id)
             .and_modify(|first| *first = (*first).min(at))
             .or_insert(at);
+    }
+
+    /// Whether any connection in this session has completed an exchange.
+    pub fn completed_any_exchange(&self) -> bool {
+        !self.first_exchange_completed.is_empty()
     }
 
     /// Whether an earlier connection on `test`'s port had completed its

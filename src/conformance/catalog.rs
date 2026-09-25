@@ -166,9 +166,10 @@ pub enum Anomaly {
     /// the QPACK encoder stream, a push stream, a reserved type.
     ///
     /// Judged exactly as `ControlStream` is -- nothing obliges a client to
-    /// read either on any schedule -- but kept apart because the read proof
-    /// measures credit on the control stream, and that says nothing about
-    /// whether a different stream was consumed.
+    /// read either on any schedule -- and the read proof is put the same way,
+    /// on this stream's own credit. Kept apart because the probe has to write
+    /// something legal *for this stream*: QPACK instructions on the encoder
+    /// stream, a reserved frame elsewhere.
     OtherUniStream,
     /// Written to the response stream, which the client must read to be served.
     ResponseStream,
