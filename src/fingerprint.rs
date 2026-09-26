@@ -652,7 +652,10 @@ impl FingerprintExtractor {
             elliptic_curves,
             ec_point_formats,
             sni,
-            alpn_protocols,
+            alpn_protocols: alpn_protocols
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect(),
         })
     }
 
@@ -675,7 +678,7 @@ impl FingerprintExtractor {
         tls_version: u16,
         ciphers: &[u16],
         extensions: &[u16],
-        alpn: &[String],
+        alpn: &[Vec<u8>],
         sig_algs: &[u16],
         has_sni: bool,
         transport: Ja4Transport,
@@ -702,17 +705,7 @@ impl FingerprintExtractor {
         let cipher_count = format!("{:02}", ciphers.len().min(99));
         let ext_count = format!("{:02}", extensions.len().min(99));
 
-        // First ALPN protocol (truncated)
-        let alpn_str = alpn
-            .first()
-            .map(|a| {
-                if a.len() >= 2 {
-                    a[..2].to_string()
-                } else {
-                    format!("{:0<2}", a)
-                }
-            })
-            .unwrap_or_else(|| "00".to_string());
+        let alpn_str = ja4_alpn(alpn.first().map(Vec::as_slice));
 
         // Hash of sorted ciphers (truncated to 12 hex chars)
         let mut sorted_ciphers = ciphers.to_vec();
@@ -1441,7 +1434,9 @@ fn parse_supported_versions(data: &[u8]) -> Option<u16> {
         .max()
 }
 
-fn parse_alpn(data: &[u8]) -> Vec<String> {
+/// The ALPN protocol names as sent, bytes and all. Names that were not UTF-8
+/// used to be dropped, which silently changed which name counted as "first".
+fn parse_alpn(data: &[u8]) -> Vec<Vec<u8>> {
     if data.len() < 2 {
         return Vec::new();
     }
@@ -1453,13 +1448,34 @@ fn parse_alpn(data: &[u8]) -> Vec<String> {
         let proto_len = data[offset] as usize;
         offset += 1;
         if offset + proto_len <= data.len() {
-            if let Ok(proto) = std::str::from_utf8(&data[offset..offset + proto_len]) {
-                protocols.push(proto.to_string());
-            }
+            protocols.push(data[offset..offset + proto_len].to_vec());
         }
         offset += proto_len;
     }
     protocols
+}
+
+/// JA4's ALPN field (FoxIO JA4 spec): the first and last characters of the
+/// first ALPN value ("http/1.1" -> "h1", "h2" -> "h2", a one-character value
+/// counts as both); "00" when there is none; and when either end is not
+/// ASCII alphanumeric, the first and last characters of the value's hex form.
+///
+/// This used to take the first two characters of a UTF-8 string: "http/1.1"
+/// became "ht", raw newlines ended up in fingerprints (and in sitemap URLs),
+/// and a value starting with a three-byte character such as "€" was sliced
+/// mid-character -- a panic, and with panic = "abort" one ClientHello took the
+/// whole proxy down.
+fn ja4_alpn(first: Option<&[u8]>) -> String {
+    let Some(value) = first.filter(|v| !v.is_empty()) else {
+        return "00".to_string();
+    };
+    let (head, tail) = (value[0], value[value.len() - 1]);
+    if head.is_ascii_alphanumeric() && tail.is_ascii_alphanumeric() {
+        format!("{}{}", head as char, tail as char)
+    } else {
+        let hex = hex::encode(value);
+        format!("{}{}", &hex[..1], &hex[hex.len() - 1..])
+    }
 }
 
 #[cfg(test)]
@@ -1655,7 +1671,7 @@ mod tests {
             0x08, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1', // "http/1.1"
         ];
         let result = parse_alpn(&data);
-        assert_eq!(result, vec!["h2".to_string(), "http/1.1".to_string()]);
+        assert_eq!(result, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
     }
 
     #[test]
@@ -1671,7 +1687,7 @@ mod tests {
             0x02, b'h', b'2', // "h2"
         ];
         let result = parse_alpn(&data);
-        assert_eq!(result, vec!["h2".to_string()]);
+        assert_eq!(result, vec![b"h2".to_vec()]);
     }
 
     #[test]
@@ -1681,7 +1697,7 @@ mod tests {
             0x02, b'h', b'3', // "h3"
         ];
         let result = parse_alpn(&data);
-        assert_eq!(result, vec!["h3".to_string()]);
+        assert_eq!(result, vec![b"h3".to_vec()]);
     }
 
     // ========================================================================
@@ -1878,7 +1894,7 @@ mod tests {
             0x0304,                    // TLS 1.3
             &[0x1301, 0x1302, 0x1303], // 3 ciphers
             &[0, 10, 11, 13, 16],      // 5 extensions
-            &["h2".to_string()],       // ALPN
+            &[b"h2".to_vec()],         // ALPN
             &[0x0401, 0x0403],         // Signature algorithms
             true,                      // Has SNI
             Ja4Transport::Tcp,
@@ -1893,6 +1909,49 @@ mod tests {
         assert!(ja4_str.contains("05")); // 5 extensions
         assert!(ja4_str.contains("h2")); // ALPN
         assert!(ja4_str.contains("_")); // Separators
+    }
+
+    /// The JA4 spec's ALPN rules, including the value that used to panic
+    /// (and, with panic = "abort", take the whole proxy down): a first ALPN
+    /// starting with a three-byte character was sliced at byte 2.
+    #[test]
+    fn ja4_alpn_follows_the_spec_and_never_panics() {
+        assert_eq!(ja4_alpn(None), "00");
+        assert_eq!(ja4_alpn(Some(b"")), "00");
+        assert_eq!(ja4_alpn(Some(b"h2")), "h2");
+        assert_eq!(ja4_alpn(Some(b"h3")), "h3");
+        assert_eq!(ja4_alpn(Some(b"http/1.1")), "h1");
+        assert_eq!(ja4_alpn(Some(b"h")), "hh");
+        // Non-alphanumeric at either end: first and last hex characters.
+        assert_eq!(ja4_alpn(Some(&[0xab, 0xcd])), "ad");
+        assert_eq!(ja4_alpn(Some(b"\n\n")), "0a");
+        assert_eq!(ja4_alpn(Some("€x".as_bytes())), "e8");
+        assert_eq!(ja4_alpn(Some("x€".as_bytes())), "7c");
+        assert_eq!(ja4_alpn(Some(&[0xff])), "ff");
+    }
+
+    /// A ClientHello whose ALPN list starts with "€x" and a non-UTF-8 name:
+    /// parsed end to end without panicking, and the non-UTF-8 name is kept.
+    #[test]
+    fn hostile_alpn_values_do_not_panic() {
+        let extractor = FingerprintExtractor::new();
+        for first in ["€x".as_bytes(), &[0xc3, 0x28][..], b"\n\n", &[0u8][..]] {
+            let ja4 = extractor
+                .calculate_ja4(
+                    0x0304,
+                    &[0x1301],
+                    &[16],
+                    &[first.to_vec(), b"h2".to_vec()],
+                    &[0x0403],
+                    true,
+                    Ja4Transport::Tcp,
+                )
+                .expect("ja4");
+            let a = ja4.split('_').next().unwrap();
+            assert!(a.is_ascii() && !a.contains(char::is_whitespace), "{ja4:?}");
+        }
+        let alpn = [&[0u8, 6, 2][..], &[0xc3, 0x28], b"\x02h2"].concat();
+        assert_eq!(parse_alpn(&alpn), vec![vec![0xc3, 0x28], b"h2".to_vec()]);
     }
 
     #[test]
@@ -1925,7 +1984,7 @@ mod tests {
                 0x0304,
                 &[0x1301, 0x1302],
                 &[0, 43],
-                &["h3".to_string()],
+                &[b"h3".to_vec()],
                 &[0x0403],
                 true,
                 Ja4Transport::Tcp,
@@ -1936,7 +1995,7 @@ mod tests {
                 0x0304,
                 &[0x1301, 0x1302],
                 &[0, 43],
-                &["h3".to_string()],
+                &[b"h3".to_vec()],
                 &[0x0403],
                 true,
                 Ja4Transport::Quic,
