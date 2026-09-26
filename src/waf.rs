@@ -482,8 +482,12 @@ const PAYLOAD_RULES: &[RuleDef] = &[
         r"(?i)%\{[^}]*(@|#)[a-z]"),
     RuleDef::payload("PQW-JNDI-006", Category::Jndi, Severity::High,
         r"(?i)#\{[^}]*(T\(|new\s+|\.getClass\(|getRuntime)"),
+    // OGNL with its expression syntax around it: `@ognl.OgnlContext`,
+    // `#ognlUtil`, `xwork2.ognl.OgnlUtil`, `(#_memberAccess=...)`. A bare
+    // `ognl` matched random base64 -- one in a million four-letter windows --
+    // and blocked encryption keys and ciphertexts at critical severity.
     RuleDef::payload("PQW-JNDI-007", Category::Jndi, Severity::Critical,
-        r"(?i)(ognl|_memberAccess|\bContext\.getRuntime)"),
+        r"(?i)([@#.]ognl|\bognl\.|_memberAccess|\bContext\.getRuntime)"),
 
     // ---------------------------------------------------------------------
     // A03 — Server-side template injection
@@ -2154,6 +2158,85 @@ mod tests {
 
     fn engine() -> WafEngine {
         WafEngine::new(&config())
+    }
+
+    /// PQW-JNDI-007 still catches OGNL as it is actually sent, with the
+    /// expression syntax the tightened pattern now requires.
+    #[test]
+    fn pqw_jndi_007_matches_real_ognl_payloads() {
+        let engine = WafEngine::new(&WafConfig {
+            enabled: true,
+            anomaly_threshold: 1,
+            ..Default::default()
+        });
+        let mut headers = browser_headers();
+        headers.insert(
+            "content-type",
+            "application/x-www-form-urlencoded".parse().unwrap(),
+        );
+        for payload in [
+            // S2-045
+            "%{(#_='multipart/form-data').(#dm=@ognl.OgnlContext@DEFAULT_MEMBER_ACCESS).(#_memberAccess?(#_memberAccess=#dm):1)}",
+            // S2-057
+            "${(#ct=#request['struts.valueStack'].context).(#cr=#ct['com.opensymphony.xwork2.ActionContext.container']).(#ou=#cr.getInstance(@com.opensymphony.xwork2.ognl.OgnlUtil@class))}",
+            "(#ognlUtil=#container.getInstance(@com.opensymphony.xwork2.ognl.OgnlUtil@class))",
+        ] {
+            let body = format!("q={payload}");
+            let verdict = engine.inspect(&WafRequest {
+                method: "POST",
+                path: "/search",
+                query: "",
+                headers: &headers,
+                body: Some(body.as_bytes()),
+                skip_bot_ua_check: false,
+                mode_override: None,
+            });
+            assert!(!matches!(verdict, WafVerdict::Allow), "{payload}: {verdict:?}");
+        }
+    }
+
+    /// No rule may match random base64. Cryptographic material is random
+    /// base64, and it is most of what /encrypt, /decrypt and /keys carry: a
+    /// rule that can match it blocks a random share of legitimate requests,
+    /// more often the larger the keys. PQW-JNDI-007 matched a bare `ognl`,
+    /// case-insensitive, and a 403 met pq3-stack, max-secure-hybrid-transition
+    /// and lattice-code-hybrid from outside while the local health check -- whose
+    /// address the WAF skips -- reported every algorithm healthy.
+    ///
+    /// Any single match counts (threshold 1), over ~24 MB of seeded base64 in
+    /// JSON bodies shaped like /encrypt's, each under the body-scan limit.
+    #[test]
+    fn no_rule_matches_random_base64() {
+        use base64::Engine as _;
+        use rand::{RngCore, SeedableRng};
+
+        let engine = WafEngine::new(&WafConfig {
+            enabled: true,
+            anomaly_threshold: 1,
+            ..Default::default()
+        });
+        let mut headers = browser_headers();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x9E37_79B9_7F4A_7C15);
+        let mut raw = vec![0u8; 45_000];
+        for i in 0..400 {
+            rng.fill_bytes(&mut raw);
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
+            let body = format!(r#"{{"algorithm":"classical","data":"{b64}"}}"#);
+            let verdict = engine.inspect(&WafRequest {
+                method: "POST",
+                path: "/encrypt",
+                query: "",
+                headers: &headers,
+                body: Some(body.as_bytes()),
+                skip_bot_ua_check: false,
+                mode_override: None,
+            });
+            assert!(
+                matches!(verdict, WafVerdict::Allow),
+                "body {i} of random base64: {verdict:?}"
+            );
+        }
     }
 
     fn req<'a>(method: &'a str, path: &'a str, headers: &'a HeaderMap) -> WafRequest<'a> {
