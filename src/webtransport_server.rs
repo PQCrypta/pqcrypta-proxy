@@ -41,6 +41,11 @@ pub struct WebTransportServer {
     /// transport further out than HTTP/3. `None` leaves inspection off (the WAF
     /// is opt-in), matching the HTTP paths.
     security: Option<crate::security::SecurityState>,
+    /// Fires when the process begins to shut down; `run` then closes the
+    /// endpoint. Without it the server never heard about shutdown, and every
+    /// open session -- a speed test, a telemetry wall -- held the connection
+    /// drain in `main` to its full budget.
+    shutdown: Option<tokio::sync::watch::Receiver<()>>,
 }
 
 impl WebTransportServer {
@@ -206,6 +211,7 @@ impl WebTransportServer {
             metrics: None,
             origin_session_counts: Arc::new(DashMap::new()),
             security: None,
+            shutdown: None,
         })
     }
 
@@ -221,6 +227,13 @@ impl WebTransportServer {
     #[must_use]
     pub fn with_security(mut self, security: crate::security::SecurityState) -> Self {
         self.security = Some(security);
+        self
+    }
+
+    /// Close every session and stop accepting when `shutdown` fires.
+    #[must_use]
+    pub fn with_shutdown(mut self, shutdown: tokio::sync::watch::Receiver<()>) -> Self {
+        self.shutdown = Some(shutdown);
         self
     }
 
@@ -241,9 +254,23 @@ impl WebTransportServer {
         info!("🔗 Ready to accept WebTransport connections");
         info!("🔄 Starting accept loop...");
 
+        let mut shutdown = self.shutdown.clone();
         loop {
             // Accept incoming QUIC connection (returns IncomingSession future)
-            let incoming_session = self.server.accept().await;
+            let incoming_session = match shutdown.as_mut() {
+                Some(rx) => tokio::select! {
+                    incoming = self.server.accept() => incoming,
+                    _ = rx.changed() => {
+                        // Sessions cannot be drained -- a speed test runs for
+                        // minutes -- so they are closed, with a reason the
+                        // client can show, and the drain sees them go.
+                        info!("🛑 WebTransport server shutting down: closing all sessions");
+                        self.server.close(0u32.into(), b"server shutting down");
+                        return Ok(());
+                    }
+                },
+                None => self.server.accept().await,
+            };
 
             info!("📨 Received incoming WebTransport session");
 

@@ -1586,6 +1586,7 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
                 // Spawn connection handler
                 let conn_metrics_clone = conn_metrics.clone();
                 let proxy_trusted = proxy_trusted.clone();
+                let conn_shutdown = shutdown_rx.clone();
                 tokio::spawn(async move {
                     let mut stream = stream;
                     // PROXY header from a trusted load balancer, read in the
@@ -1595,7 +1596,7 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
                         Ok(None) => remote_addr,
                         Err(_) => return,
                     };
-                    handle_fingerprinted_connection(stream, remote_addr, acceptor, app, conn_metrics_clone, handshake_timeout).await;
+                    handle_fingerprinted_connection(stream, remote_addr, acceptor, app, conn_metrics_clone, handshake_timeout, conn_shutdown).await;
                 });
             }
 
@@ -1620,6 +1621,7 @@ async fn handle_fingerprinted_connection<S>(
     metrics: Arc<MetricsRegistry>,
     // `tls.handshake_timeout_secs`, over the ClientHello peek and the handshake.
     handshake_timeout: std::time::Duration,
+    shutdown: watch::Receiver<()>,
 ) where
     S: tower::Service<Request<Body>, Response = Response, Error = Infallible>
         + Clone
@@ -1726,7 +1728,8 @@ async fn handle_fingerprinted_connection<S>(
         .initial_stream_window_size(16 * 1024 * 1024u32)
         .initial_connection_window_size(64 * 1024 * 1024u32);
 
-    if let Err(e) = auto_builder.serve_connection(io, service).await {
+    if let Err(e) = serve_until_shutdown(auto_builder.serve_connection(io, service), shutdown).await
+    {
         if !e.to_string().contains("connection reset") {
             debug!("HTTP connection error for {}: {}", remote_addr, e);
         }
@@ -1902,6 +1905,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
                 let conn_metrics_clone = conn_metrics.clone();
                 let proxy_trusted = proxy_trusted.clone();
                 let zero_rtt = zero_rtt.clone();
+                let conn_shutdown = shutdown_rx.clone();
 
                 tokio::spawn(async move {
                     let mut stream = stream;
@@ -1923,6 +1927,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
                         conn_metrics_clone,
                         zero_rtt,
                         handshake_timeout,
+                        conn_shutdown,
                     )
                     .await;
                 });
@@ -1982,6 +1987,7 @@ async fn handle_pqc_fingerprinted_connection<S>(
     zero_rtt: Option<crate::tls_acceptor::ZeroRttReplayGuard>,
     // `tls.handshake_timeout_secs`, over the ClientHello peek and the handshake.
     handshake_timeout: std::time::Duration,
+    shutdown: watch::Receiver<()>,
 ) where
     S: tower::Service<Request<Body>, Response = Response, Error = Infallible>
         + Clone
@@ -2188,13 +2194,47 @@ async fn handle_pqc_fingerprinted_connection<S>(
         .initial_stream_window_size(16 * 1024 * 1024u32)
         .initial_connection_window_size(64 * 1024 * 1024u32);
 
-    if let Err(e) = auto_builder.serve_connection(io, service).await {
+    if let Err(e) = serve_until_shutdown(auto_builder.serve_connection(io, service), shutdown).await
+    {
         if !e.to_string().contains("connection reset") {
             debug!("PQC HTTP connection error for {}: {}", remote_addr, e);
         }
     }
 
     metrics.connections.connection_closed();
+}
+
+/// Serve a connection until it ends -- and when the process begins to shut
+/// down, have it finish what it is doing and close.
+///
+/// Stopping the accept loop is not enough. A browser's keep-alive or HTTP/2
+/// connection stays open between requests, and each one is counted as active,
+/// so the drain in `main` waited out its whole budget on connections that were
+/// doing nothing: every restart refused new connections for 30s, the drain
+/// timeout, plus startup. `graceful_shutdown` sends HTTP/2 GOAWAY and closes
+/// HTTP/1.1 after the response in progress; requests already running finish.
+async fn serve_until_shutdown<I, S, E, B>(
+    conn: hyper_util::server::conn::auto::Connection<'_, I, S, E>,
+    mut shutdown: watch::Receiver<()>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: hyper::service::Service<Request<hyper::body::Incoming>, Response = http::Response<B>> + Send,
+    S::Future: Send + 'static,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    B: hyper::body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    E: hyper_util::server::conn::auto::HttpServerConnExec<S::Future, B> + Send + Sync,
+{
+    tokio::pin!(conn);
+    tokio::select! {
+        result = conn.as_mut() => result,
+        _ = shutdown.changed() => {
+            conn.as_mut().graceful_shutdown();
+            conn.await
+        }
+    }
 }
 
 /// Copy a client request's headers onto a backend request.

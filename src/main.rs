@@ -66,7 +66,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::Parser;
-use tokio::signal;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -334,6 +333,9 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run() -> anyhow::Result<()> {
+    // Before anything that takes time: see `ShutdownSignals`.
+    let mut shutdown_signals = ShutdownSignals::install()?;
+
     // SR-08: Install aws-lc-rs as the default rustls CryptoProvider.
     // This ensures the ML-KEM post-quantum key exchange offered by aws-lc-rs is
     // active for ALL TLS paths, including QUIC/HTTP3.  Previously ring was
@@ -1501,6 +1503,8 @@ async fn run() -> anyhow::Result<()> {
         let wt_metrics = metrics_registry.clone();
 
         let wt_port = webtransport_port;
+        let (wt_shutdown_tx, wt_shutdown_rx) = tokio::sync::watch::channel(());
+        http_shutdown_senders.push(wt_shutdown_tx);
         tokio::spawn(async move {
             // SR-04: Use the configured bind_address instead of a hardcoded "0.0.0.0"
             // so the WebTransport server honours the operator's bind_address setting
@@ -1518,7 +1522,10 @@ async fn run() -> anyhow::Result<()> {
                 .await
             {
                 Ok(server) => {
-                    let server = server.with_metrics(wt_metrics).with_security(wt_security);
+                    let server = server
+                        .with_metrics(wt_metrics)
+                        .with_security(wt_security)
+                        .with_shutdown(wt_shutdown_rx);
                     info!("✅ WebTransport server ready on {}", server.local_addr());
                     if let Err(e) = server.run().await {
                         error!("WebTransport server error: {}", e);
@@ -1660,10 +1667,7 @@ async fn run() -> anyhow::Result<()> {
     // Wait for shutdown signal
     info!("Press Ctrl+C to shutdown gracefully");
     tokio::select! {
-        _ = signal::ctrl_c() => {
-            info!("Received Ctrl+C, initiating graceful shutdown...");
-        }
-        _ = shutdown_signal() => {
+        () = shutdown_signals.recv() => {
             info!("Received shutdown signal, initiating graceful shutdown...");
         }
         _ = shutdown_rx.recv() => {
@@ -1964,37 +1968,77 @@ fn init_logging(
     Ok(destination)
 }
 
-/// Wait for OS shutdown signal
+/// The process's shutdown signals, registered before startup does anything.
+///
+/// They used to be registered by the final `select!`, once startup -- every
+/// listener, the post-bind verification probes, several seconds of it -- had
+/// finished. A SIGTERM in that window met the default disposition, and the
+/// process died on the spot with no drain: a `systemctl restart` of a node
+/// still starting, or the hang watchdog's restart, cut every connection. Held
+/// from here, a signal that arrives during startup waits, and is acted on the
+/// moment startup is done.
 #[cfg(unix)]
-async fn shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
+struct ShutdownSignals {
+    term: tokio::signal::unix::Signal,
+    quit: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+}
 
-    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
-    let mut sigquit = signal(SignalKind::quit()).expect("Failed to install SIGQUIT handler");
+#[cfg(unix)]
+impl ShutdownSignals {
+    fn install() -> anyhow::Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Self {
+            term: signal(SignalKind::terminate())?,
+            quit: signal(SignalKind::quit())?,
+            int: signal(SignalKind::interrupt())?,
+        })
+    }
 
-    tokio::select! {
-        _ = sigterm.recv() => {
-            info!("Received SIGTERM");
-        }
-        _ = sigquit.recv() => {
-            info!("Received SIGQUIT");
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.term.recv() => info!("Received SIGTERM"),
+            _ = self.quit.recv() => info!("Received SIGQUIT"),
+            _ = self.int.recv() => info!("Received SIGINT"),
         }
     }
 }
 
 #[cfg(windows)]
-async fn shutdown_signal() {
-    use tokio::signal::windows::ctrl_break;
+struct ShutdownSignals {
+    ctrl_c: tokio::signal::windows::CtrlC,
+    ctrl_break: tokio::signal::windows::CtrlBreak,
+}
 
-    let mut ctrl_break = ctrl_break().expect("Failed to install Ctrl+Break handler");
-    ctrl_break.recv().await;
-    info!("Received Ctrl+Break");
+#[cfg(windows)]
+impl ShutdownSignals {
+    fn install() -> anyhow::Result<Self> {
+        Ok(Self {
+            ctrl_c: tokio::signal::windows::ctrl_c()?,
+            ctrl_break: tokio::signal::windows::ctrl_break()?,
+        })
+    }
+
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.ctrl_c.recv() => info!("Received Ctrl+C"),
+            _ = self.ctrl_break.recv() => info!("Received Ctrl+Break"),
+        }
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
-async fn shutdown_signal() {
-    // Fallback: just wait forever
-    std::future::pending::<()>().await;
+struct ShutdownSignals;
+
+#[cfg(not(any(unix, windows)))]
+impl ShutdownSignals {
+    fn install() -> anyhow::Result<Self> {
+        Ok(Self)
+    }
+
+    async fn recv(&mut self) {
+        std::future::pending::<()>().await;
+    }
 }
 
 /// Print startup summary
