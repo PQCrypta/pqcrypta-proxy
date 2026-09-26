@@ -496,16 +496,14 @@ impl FingerprintExtractor {
             u16::from_be_bytes([client_hello_data[offset], client_hello_data[offset + 1]]) as usize;
         offset += 2;
 
-        if offset + cipher_suites_len > client_hello_data.len() {
-            return None;
-        }
-
+        // Read through a checked slice in whole pairs. Stepping by two up to an
+        // odd length read one byte past the list, and past the buffer when the
+        // list ended it: an out-of-bounds index, which with panic = "abort"
+        // let any client end the process with a truncated hello.
+        let cipher_bytes = client_hello_data.get(offset..offset + cipher_suites_len)?;
         let mut ciphers = Vec::new();
-        for i in (0..cipher_suites_len).step_by(2) {
-            let cipher = u16::from_be_bytes([
-                client_hello_data[offset + i],
-                client_hello_data[offset + i + 1],
-            ]);
+        for pair in cipher_bytes.chunks_exact(2) {
+            let cipher = u16::from_be_bytes([pair[0], pair[1]]);
             // Skip GREASE values (0x?a?a pattern)
             if !is_grease(cipher) {
                 ciphers.push(cipher);
@@ -1909,6 +1907,102 @@ mod tests {
         assert!(ja4_str.contains("05")); // 5 extensions
         assert!(ja4_str.contains("h2")); // ALPN
         assert!(ja4_str.contains("_")); // Separators
+    }
+
+    /// Hostile ClientHellos must never panic: with panic = "abort" in release,
+    /// a panic here takes the whole proxy down, and this parser runs on every
+    /// handshake, TCP and QUIC, before anything else has looked at the client.
+    /// Seeded mutations (byte flips, length fields rewritten, truncation, and
+    /// multibyte UTF-8 spliced into names) of a realistic hello.
+    #[test]
+    fn mutated_client_hellos_never_panic() {
+        fn ext(kind: u16, body: &[u8]) -> Vec<u8> {
+            let mut v = kind.to_be_bytes().to_vec();
+            v.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            v.extend_from_slice(body);
+            v
+        }
+        let mut exts = Vec::new();
+        exts.extend(ext(0, b"\x00\x0e\x00\x00\x0bexample.com"));
+        exts.extend(ext(16, b"\x00\x0c\x02h2\x08http/1.1"));
+        exts.extend(ext(43, b"\x04\x03\x04\x03\x03"));
+        exts.extend(ext(13, b"\x00\x04\x04\x03\x08\x04"));
+        exts.extend(ext(10, b"\x00\x04\x00\x1d\x00\x17"));
+        exts.extend(ext(11, b"\x01\x00"));
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[7u8; 32]);
+        body.push(0);
+        body.extend_from_slice(b"\x00\x04\x13\x01\x13\x02\x01\x00");
+        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&exts);
+        let mut handshake = vec![0x01, 0, (body.len() >> 8) as u8, body.len() as u8];
+        handshake.extend_from_slice(&body);
+        let mut record = vec![
+            0x16,
+            0x03,
+            0x01,
+            (handshake.len() >> 8) as u8,
+            handshake.len() as u8,
+        ];
+        record.extend_from_slice(&handshake);
+
+        let extractor = FingerprintExtractor::new();
+        assert!(extractor.extract_ja3(&record).is_some(), "the seed parses");
+
+        // xorshift64*: deterministic, so a failure reproduces. PQ_FUZZ_SEED and
+        // PQ_FUZZ_ITERS run a longer or different campaign.
+        let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok());
+        let seed = env("PQ_FUZZ_SEED").unwrap_or(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut state = seed;
+        let iterations = env("PQ_FUZZ_ITERS").unwrap_or(300_000);
+        let mut next = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        };
+        let multibyte: [&[u8]; 4] = [
+            "€".as_bytes(),
+            "é".as_bytes(),
+            "😀".as_bytes(),
+            &[0xff, 0xfe],
+        ];
+        for iteration in 0..iterations {
+            let mut m = record.clone();
+            for _ in 0..(next() % 4 + 1) {
+                let at = (next() as usize) % m.len();
+                match next() % 5 {
+                    0 => m[at] ^= 1 << (next() % 8),
+                    1 => m[at] = next() as u8,
+                    2 => m.truncate(at.max(1)),
+                    3 => {
+                        let splice = multibyte[(next() % 4) as usize];
+                        m.splice(at..at, splice.iter().copied());
+                    }
+                    _ => {
+                        // rewrite a two-byte length field with an arbitrary value
+                        if at + 1 < m.len() {
+                            let v = (next() as u16).to_be_bytes();
+                            m[at] = v[0];
+                            m[at + 1] = v[1];
+                        }
+                    }
+                }
+            }
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = extractor.extract_ja3(&m);
+                if m.len() > 5 {
+                    let _ = extractor.extract_ja3_quic(&m[5..]);
+                }
+            }));
+            // Name the failing input exactly, so it can become a regression
+            // case without re-running the campaign.
+            assert!(
+                outcome.is_ok(),
+                "panicked at seed {seed:#x}, iteration {iteration}, input {}",
+                hex::encode(&m)
+            );
+        }
     }
 
     /// The JA4 spec's ALPN rules, including the value that used to panic
