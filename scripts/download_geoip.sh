@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# F-11: Download MaxMind GeoLite2 databases.
+# F-11: Download MaxMind GeoLite2 databases for a first install: City (the
+# proxy's `geoip_db_path`, which carries the country too) and ASN (speedtest).
+# Nothing reads GeoLite2-Country, so it is not fetched.
+#
+# Keeping them current is scripts/refresh_fingerprint_db.sh's job (geoipupdate
+# weekly, each file validated before it replaces the live one); do not cron
+# this script as well.
 #
 # These files are excluded from version control because:
 #   1. MaxMind updates them weekly — a committed copy goes stale silently.
@@ -68,10 +74,9 @@ download_db() {
     echo "  → ${out_file}"
 }
 
-download_db "GeoLite2-Country"
 download_db "GeoLite2-City"
 download_db "GeoLite2-ASN"
 
 echo ""
 echo "GeoIP databases updated in ${DATA_DIR}"
-echo "Database age check: consider running this script weekly (Sunday) via cron."
+echo "Weekly refresh: scripts/refresh_fingerprint_db.sh (cron) keeps them current."

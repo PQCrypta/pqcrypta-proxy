@@ -362,8 +362,12 @@ export MAXMIND_LICENSE_KEY=<your license key>
 scripts/download_geoip.sh
 ```
 
-This writes `GeoLite2-Country.mmdb`, `GeoLite2-City.mmdb`, and `GeoLite2-ASN.mmdb` to
-`data/geoip/`. Add this script to a weekly cron job to keep the databases current.
+This writes `GeoLite2-City.mmdb` (the `geoip_db_path` database, which carries the country too)
+and `GeoLite2-ASN.mmdb` to `data/geoip/`. After that, `scripts/refresh_fingerprint_db.sh` keeps
+them current: run weekly from cron, it calls `geoipupdate` with `/etc/GeoIP.conf`
+(`EditionIDs GeoLite2-City GeoLite2-ASN`), validates each downloaded file, replaces the live one
+by rename only when it changed, and pushes it to the other proxy nodes. It is the only scheduler
+for `geoipupdate`; disable the Ubuntu package's own `geoipupdate.timer`.
 
 ### Trusted Internal CIDRs
 
