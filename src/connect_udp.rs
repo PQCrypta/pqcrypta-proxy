@@ -278,6 +278,15 @@ pub async fn run_session(
 mod tests {
     use super::*;
 
+    /// CONNECT-UDP targets come from the request path. See crate::fuzz_support.
+    #[test]
+    fn target_parsing_never_panics() {
+        let seed = b"/.well-known/masque/udp/%5B2001%3Adb8%3A%3A1%5D/443/".to_vec();
+        crate::fuzz_support::fuzz_bytes(&seed, 200_000, |m| {
+            let _ = parse_target(&String::from_utf8_lossy(m));
+        });
+    }
+
     #[test]
     fn parses_default_template() {
         assert_eq!(

@@ -275,6 +275,19 @@ fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// The passthrough listener reads the SNI of a ClientHello it never
+    /// terminates; with panic = "abort" a panic here ends the process.
+    #[test]
+    fn sni_extraction_never_panics() {
+        crate::fuzz_support::fuzz_bytes(
+            &build_client_hello_with_sni("example.com"),
+            200_000,
+            |m| {
+                let _ = extract_sni_from_client_hello(m);
+            },
+        );
+    }
+
     // =========================================================================
     // ClientHello SNI Parser Tests
     // =========================================================================

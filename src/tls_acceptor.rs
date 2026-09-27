@@ -958,6 +958,35 @@ impl FingerprintExt for FingerprintedConnection {
 mod tests {
     use super::*;
 
+    /// Every reader of raw ClientHello bytes here runs before the handshake,
+    /// on bytes any client chooses; with panic = "abort" a panic in one ends
+    /// the process. See crate::fuzz_support.
+    #[test]
+    fn client_hello_readers_never_panic() {
+        let record = client_hello(
+            7,
+            &[
+                (0, b"\x00\x0e\x00\x00\x0bexample.com".to_vec()),
+                (16, b"\x00\x03\x02h2".to_vec()),
+                (42, Vec::new()),
+                (41, psk(b"ticket-bytes")),
+            ],
+        );
+        let store = ZeroRttNonceStore::new(60);
+        let strict = ZeroRttReplayGuard::from_config("strict", 60);
+        let session = ZeroRttReplayGuard::from_config("session", 60);
+        crate::fuzz_support::fuzz_bytes(&record, 200_000, |m| {
+            let _ = client_hello_extension(m, 41);
+            let _ = client_hello_extension(m, 0);
+            let _ = client_hello_psk_identity(m);
+            let _ = FingerprintingTlsAcceptor::extract_sni(m);
+            let _ = FingerprintingTlsAcceptor::client_hello_has_early_data_extension(m);
+            let _ = store.check_and_insert(m);
+            let _ = strict.is_replay(m);
+            let _ = session.is_replay(m);
+        });
+    }
+
     /// Build a minimal TLS 1.3 ClientHello with optional extensions.
     /// Used by SEC-002 tests.
     fn build_client_hello(extensions: &[(u16, &[u8])]) -> Vec<u8> {

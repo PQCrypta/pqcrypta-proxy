@@ -348,6 +348,24 @@ fn crc32c(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
+    /// PROXY protocol headers (v1 text, v2 binary) are parsed before anything
+    /// else on a listener that accepts them. See crate::fuzz_support.
+    #[test]
+    fn proxy_headers_never_panic() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let v1 = b"PROXY TCP4 192.0.2.1 198.51.100.2 51234 443\r\nGET / HTTP/1.1\r\n\r\n".to_vec();
+        let mut v2 = b"\r\n\r\n\x00\r\nQUIT\n\x21\x11\x00\x0c".to_vec();
+        v2.extend_from_slice(&[192, 0, 2, 1, 198, 51, 100, 2, 0xc8, 0x22, 0x01, 0xbb]);
+        v2.extend_from_slice(b"GET / HTTP/1.1\r\n\r\n");
+        for seed in [v1, v2] {
+            crate::fuzz_support::fuzz_bytes(&seed, 100_000, |m| {
+                let _ = rt.block_on(parse(m));
+            });
+        }
+    }
+
     async fn parse(bytes: &[u8]) -> (std::io::Result<ProxyHeader>, Vec<u8>) {
         use tokio::io::AsyncReadExt;
         let mut r = bytes;

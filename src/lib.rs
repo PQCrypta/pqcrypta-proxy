@@ -143,6 +143,8 @@ pub mod crawler_verify;
 pub mod early_data;
 pub mod ech_config;
 pub mod fingerprint;
+#[cfg(test)]
+pub(crate) mod fuzz_support;
 pub mod handlers;
 pub mod http3_features;
 pub mod http_listener;
