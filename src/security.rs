@@ -1432,13 +1432,11 @@ impl SecurityState {
             .as_ref()
             .filter(|_| policy.waf_enabled != Some(false))
         {
-            let skip_bot_ua = view
-                .headers
-                .get("x-health-check-bypass")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v == "1")
-                .unwrap_or(false)
-                || self.scanner_ua_exempt.is_match(view.path)
+            // `x-health-check-bypass: 1` used to skip these rules for anyone
+            // who sent it -- a scanner could add the header and walk past every
+            // bad-bot user-agent rule. Our own checks come from the addresses
+            // in pentest_bypass_ips, which `is_pentest` covers.
+            let skip_bot_ua = self.scanner_ua_exempt.is_match(view.path)
                 || policy.skip_bot_blocking
                 // pentest_bypass_ips covers the authorized red-team host plus this
                 // server's own egress and loopback. Those addresses run curl-driven
@@ -2378,13 +2376,7 @@ pub async fn security_middleware(
                 if security.waf_engine.is_some() && waf_enabled_cl != Some(false) {
                     let waf_path = parts.uri.path().to_string();
                     let waf_query = parts.uri.query().unwrap_or("").to_string();
-                    let skip_bot_ua_cl = parts
-                        .headers
-                        .get("x-health-check-bypass")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|v| v == "1")
-                        .unwrap_or(false)
-                        || route_skip_bot;
+                    let skip_bot_ua_cl = is_pentest_bypass || route_skip_bot;
                     let scan_slice_end = collected_bytes.len().min(scan_limit);
                     let body_view = SecurityRequestView {
                         ip,
@@ -2488,13 +2480,7 @@ pub async fn security_middleware(
             if security.waf_engine.is_some() && waf_enabled_cl != Some(false) {
                 let waf_path = parts.uri.path().to_string();
                 let waf_query = parts.uri.query().unwrap_or("").to_string();
-                let skip_bot_ua_body = parts
-                    .headers
-                    .get("x-health-check-bypass")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|v| v == "1")
-                    .unwrap_or(false)
-                    || route_skip_bot;
+                let skip_bot_ua_body = is_pentest_bypass || route_skip_bot;
                 let body_view_chunked = SecurityRequestView {
                     ip,
                     method: parts.method.as_str(),

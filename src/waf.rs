@@ -1203,6 +1203,29 @@ struct Assessment {
     /// Rules already counted, so the same rule matching in several decoded
     /// forms of one input contributes its score once.
     seen: Vec<usize>,
+    /// Explaining rather than enforcing: every rule is evaluated, nothing is
+    /// counted in the engine's statistics.
+    explain: bool,
+}
+
+/// One rule that matched, as reported by [`WafEngine::explain`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WafMatch {
+    pub rule: String,
+    pub category: &'static str,
+    pub severity: &'static str,
+    pub score: u32,
+}
+
+/// Every rule a request matches, and what enforcement would do with them.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WafExplanation {
+    pub matches: Vec<WafMatch>,
+    pub score: u32,
+    pub threshold: u32,
+    pub mode: String,
+    /// The score reaches the threshold and the engine is in block mode.
+    pub would_block: bool,
 }
 
 impl WafEngine {
@@ -1623,7 +1646,45 @@ impl WafEngine {
             .mode_override
             .map_or(self.config.mode == "block", |m| m == "block");
         let threshold = self.config.anomaly_threshold.max(1);
+        let a = self.assess(req, threshold, false);
+        self.verdict(&a, block_mode, threshold, req)
+    }
 
+    /// Every rule the request matches, without stopping at the threshold and
+    /// without touching the statistics: the same evaluation `inspect`
+    /// enforces, run to completion for an operator or an analysis.
+    pub fn explain(&self, req: &WafRequest<'_>) -> WafExplanation {
+        let mode = req
+            .mode_override
+            .unwrap_or(self.config.mode.as_str())
+            .to_string();
+        let threshold = self.config.anomaly_threshold.max(1);
+        let a = self.assess(req, u32::MAX, true);
+        let matches = a
+            .seen
+            .iter()
+            .map(|&idx| {
+                let r = &self.rules[idx];
+                WafMatch {
+                    rule: r.id.clone(),
+                    category: r.category.as_str(),
+                    severity: r.severity.as_str(),
+                    score: r.severity.score(),
+                }
+            })
+            .collect();
+        WafExplanation {
+            matches,
+            score: a.score,
+            threshold,
+            would_block: a.score >= threshold && mode == "block",
+            mode,
+        }
+    }
+
+    /// Run the rules over a request. Scanning stops once the score reaches
+    /// `threshold`; `explain` passes `u32::MAX` so every rule is evaluated.
+    fn assess(&self, req: &WafRequest<'_>, threshold: u32, explain: bool) -> Assessment {
         // Exclusions matching this path. Almost always empty, and when the
         // operator has configured none this costs a length check.
         let excluded: Vec<&CompiledExclusion> = if self.exclusions.is_empty() {
@@ -1635,7 +1696,10 @@ impl WafEngine {
                 .collect()
         };
 
-        let mut a = Assessment::default();
+        let mut a = Assessment {
+            explain,
+            ..Assessment::default()
+        };
 
         // --- Structural anomalies (smuggling, header injection) --------------
         if self.config.request_anomaly {
@@ -1707,7 +1771,7 @@ impl WafEngine {
             }
         }
 
-        self.verdict(&a, block_mode, threshold, req)
+        a
     }
 
     /// Turn an assessment into a verdict, updating the verdict counters.
@@ -1771,8 +1835,10 @@ impl WafEngine {
         }
         a.seen.push(idx);
 
-        if let Some(counter) = self.stats.per_rule.get(idx) {
-            counter.fetch_add(1, Ordering::Relaxed);
+        if !a.explain {
+            if let Some(counter) = self.stats.per_rule.get(idx) {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         let rule = &self.rules[idx];
@@ -2237,6 +2303,46 @@ mod tests {
                 "body {i} of random base64: {verdict:?}"
             );
         }
+    }
+
+    /// `explain` reports every rule, not only those before the threshold,
+    /// and leaves the enforcement counters alone.
+    #[test]
+    fn explain_reports_every_rule_without_counting() {
+        let engine = engine();
+        let headers = browser_headers();
+        let body = b"' OR 1=1 -- ; <script>alert(1)</script> ${jndi:ldap://x/a}";
+        let request = WafRequest {
+            body: Some(body),
+            ..req("POST", "/", &headers)
+        };
+        let before = engine.stats();
+        let e = engine.explain(&request);
+        let after = engine.stats();
+
+        let categories: std::collections::BTreeSet<&str> =
+            e.matches.iter().map(|m| m.category).collect();
+        assert!(categories.contains("sqli"), "{categories:?}");
+        assert!(categories.contains("xss"), "{categories:?}");
+        assert!(categories.contains("jndi"), "{categories:?}");
+        assert!(e.score >= e.threshold && e.would_block);
+        assert_eq!(e.score, e.matches.iter().map(|m| m.score).sum::<u32>());
+        assert_eq!(before.inspected, after.inspected);
+        assert_eq!(before.blocked, after.blocked);
+        assert!(after.rules.is_empty(), "explain counted rule hits");
+
+        // Enforcement stops at the threshold and counts the request.
+        assert!(matches!(engine.inspect(&request), WafVerdict::Block { .. }));
+        assert_eq!(engine.stats().inspected, before.inspected + 1);
+    }
+
+    #[test]
+    fn explain_on_a_clean_request_matches_nothing() {
+        let headers = browser_headers();
+        let e = engine().explain(&req("GET", "/docs/", &headers));
+        assert!(e.matches.is_empty());
+        assert_eq!(e.score, 0);
+        assert!(!e.would_block);
     }
 
     fn req<'a>(method: &'a str, path: &'a str, headers: &'a HeaderMap) -> WafRequest<'a> {

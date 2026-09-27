@@ -129,6 +129,10 @@ impl QuicListener {
                     h.remove(name);
                 }
             }
+            // Headers only the proxy may set (see `PROXY_ONLY_HEADERS`).
+            for name in crate::tls_acceptor::PROXY_ONLY_HEADERS {
+                h.remove(name);
+            }
 
             handshake.inject_headers(h);
             h.insert(

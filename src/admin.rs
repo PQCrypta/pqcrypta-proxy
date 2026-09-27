@@ -305,6 +305,7 @@ impl AdminServer {
             .route("/security/geoip/:ip", get(security_geoip_handler))
             .route("/security/fingerprints", get(security_fingerprints_handler))
             .route("/security/threats", get(security_threats_handler))
+            .route("/waf/explain", post(waf_explain_handler))
             .route("/health/quic", get(health_quic_handler))
             .route("/health/webtransport", get(health_webtransport_handler))
             .route("/canary", get(canary_handler))
@@ -1978,6 +1979,92 @@ async fn security_threats_handler(State(state): State<Arc<AdminState>>) -> Admin
         "blocklist": { "ips": ips.len(), "cidrs": cidrs.len(), "by_reason": by_reason },
         "waf": waf,
         "fingerprint_requests_by_class": classes,
+    })))
+}
+
+/// A request to run through the WAF without serving it.
+#[derive(Debug, Deserialize)]
+struct WafExplainRequest {
+    #[serde(default = "default_explain_method")]
+    method: String,
+    #[serde(default = "default_explain_path")]
+    path: String,
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    headers: std::collections::BTreeMap<String, String>,
+    /// The body, base64-encoded (it may be binary).
+    #[serde(default)]
+    body_base64: Option<String>,
+}
+
+fn default_explain_method() -> String {
+    "POST".to_string()
+}
+
+fn default_explain_path() -> String {
+    "/".to_string()
+}
+
+/// `POST /waf/explain` — every WAF rule a request matches and what
+/// enforcement would do, without counting it in the WAF statistics. The API's
+/// threat analysis runs payloads through this, so there is one rule set.
+async fn waf_explain_handler(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<WafExplainRequest>,
+) -> AdminJson {
+    use base64::Engine as _;
+    let bad = |msg: String| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": msg })),
+        )
+    };
+    let sec = security_state(&state)?;
+    let Some(waf) = sec.waf_engine.as_ref() else {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "the WAF is not enabled on this node" })),
+        ));
+    };
+    let mut headers = HeaderMap::new();
+    for (name, value) in &req.headers {
+        let name = axum::http::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|e| bad(format!("header name {name:?}: {e}")))?;
+        let value = axum::http::HeaderValue::from_str(value)
+            .map_err(|e| bad(format!("header {name}: {e}")))?;
+        headers.insert(name, value);
+    }
+    let mut body = match &req.body_base64 {
+        Some(b) => Some(
+            base64::engine::general_purpose::STANDARD
+                .decode(b)
+                .map_err(|e| bad(format!("body_base64: {e}")))?,
+        ),
+        None => None,
+    };
+    // The same cap enforcement applies before inspecting a body.
+    let cap = state.config_manager.get().waf.max_body_scan_bytes;
+    if let Some(b) = body.as_mut() {
+        b.truncate(cap);
+    }
+    let explanation = waf.explain(&crate::waf::WafRequest {
+        method: &req.method,
+        path: &req.path,
+        query: &req.query,
+        headers: &headers,
+        body: body.as_deref(),
+        skip_bot_ua_check: false,
+        mode_override: None,
+    });
+    Ok(Json(serde_json::json!({
+        "matches": explanation.matches,
+        "score": explanation.score,
+        "threshold": explanation.threshold,
+        "mode": explanation.mode,
+        "would_block": explanation.would_block,
+        "body_bytes_inspected": body.as_ref().map_or(0, Vec::len),
+        "rules_loaded": waf.rule_count(),
     })))
 }
 

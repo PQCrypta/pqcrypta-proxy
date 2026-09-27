@@ -271,6 +271,16 @@ pub struct FingerprintedConnection {
     pub handshake: HandshakeFacts,
 }
 
+/// Headers only this proxy may put on a request to a backend. A client's copy
+/// is removed on every listener and nothing sets them on client traffic.
+///
+/// `x-webtransport-proxy` marks requests the WebTransport server forwards on
+/// behalf of its sessions, and the API skipped authentication, its WAF and its
+/// rate limits for any request carrying it on the crypto routes. It reached
+/// the API from any client that sent it: `POST /keys/generate` answered 200
+/// without an API key.
+pub const PROXY_ONLY_HEADERS: [&str; 1] = ["x-webtransport-proxy"];
+
 impl FingerprintedConnection {
     /// Every header a TCP listener derives from the connection rather than
     /// takes from the client, besides the handshake set in
@@ -301,8 +311,8 @@ impl FingerprintedConnection {
         // Most requests carry no `x-` header at all; look before hashing eight
         // names for removal.
         if headers.keys().any(|k| k.as_str().starts_with("x-")) {
-            for name in Self::DERIVED_HEADERS {
-                headers.remove(name);
+            for name in Self::DERIVED_HEADERS.iter().chain(&PROXY_ONLY_HEADERS) {
+                headers.remove(*name);
             }
         }
         self.handshake.inject_headers(headers);
@@ -1102,6 +1112,35 @@ mod tests {
         // The handshake set is stripped wholesale by inject_headers; the rest
         // are stripped explicitly at each listener's injection site.
         assert_eq!(HandshakeFacts::HEADER_NAMES.len(), 5);
+    }
+
+    /// A client's `x-webtransport-proxy` never reaches a backend: the API
+    /// skipped authentication for any request carrying it.
+    #[test]
+    fn proxy_only_headers_are_removed_from_client_requests() {
+        let conn = FingerprintedConnection {
+            remote_addr: "198.51.100.7:40000".parse().unwrap(),
+            ja3_hash: None,
+            ja4_hash: None,
+            client_name: None,
+            is_browser: false,
+            handshake_done: crate::early_data::HandshakeDone::completed(),
+            client_cert_present: false,
+            handshake: HandshakeFacts {
+                tls_version: Some("TLSv1_3".to_string()),
+                cipher_suite: None,
+                kex_group: None,
+                alpn: Some("h2".to_string()),
+                ech: "not-offered",
+                prepared: std::sync::OnceLock::default(),
+            },
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-webtransport-proxy", "pqcrypta-proxy".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+        conn.apply_headers(&mut headers, false);
+        assert!(headers.get("x-webtransport-proxy").is_none());
+        assert!(headers.get("content-type").is_some());
     }
 
     #[test]
