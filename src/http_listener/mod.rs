@@ -2329,14 +2329,7 @@ async fn proxy_handler(
         .map(|v| v.eq_ignore_ascii_case("websocket"))
         .unwrap_or(false);
     let request_start = std::time::Instant::now();
-    let is_health_check = headers
-        .get("x-health-check-bypass")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    if !is_health_check {
-        state.metrics.requests.request_start();
-    }
+    state.metrics.requests.request_start();
     // Strip port from host if present — axum's Host extractor includes the port
     // for non-standard ports (e.g. "tcp2.pqcrypta.com:4433"). All subsequent host
     // comparisons (tcp_only_hosts, route matching, etc.) expect bare hostnames.
@@ -2993,7 +2986,6 @@ async fn proxy_handler(
                     0,
                     0,
                     Some(&path),
-                    is_health_check,
                 );
 
                 let timeout_body =
@@ -3106,7 +3098,6 @@ async fn proxy_handler(
                         0,
                         0,
                         Some(&path),
-                        is_health_check,
                     );
                     // This branch forwards the body without buffering it, so there is
                     // no length to log yet: the helper writes the line when the stream
@@ -3282,7 +3273,6 @@ async fn proxy_handler(
                     0,
                     0,
                     Some(&path),
-                    is_health_check,
                 );
 
                 let response = match body_source {
@@ -3400,7 +3390,6 @@ async fn proxy_handler(
                     0,
                     0,
                     Some(&path),
-                    is_health_check,
                 );
 
                 let error_body = format!("Backend error: {}", e);
@@ -3434,14 +3423,10 @@ async fn proxy_handler(
         warn!("No route matched for {} {}", host, path);
 
         // Record request metrics (skip error tracking for health check traffic)
-        state.metrics.requests.request_end_full(
-            404,
-            request_start.elapsed(),
-            0,
-            0,
-            Some(&path),
-            is_health_check,
-        );
+        state
+            .metrics
+            .requests
+            .request_end_full(404, request_start.elapsed(), 0, 0, Some(&path));
 
         // Log 404
         log_access(&AccessLogEntry {

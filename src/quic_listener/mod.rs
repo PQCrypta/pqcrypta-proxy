@@ -83,6 +83,12 @@ fn is_benign_h3_close<E: std::fmt::Display>(err: &E) -> bool {
         // across a restart does it at once. "Remote" is the discriminator: a
         // failure on this side is reported as a "Local error".
         || (msg.contains("Remote error") && msg.contains("closed"))
+        // The peer closed cleanly, as quinn prints it: application code 0
+        // (scanners end with "scan complete (code 0)") or H3_NO_ERROR, 0x100.
+        // A peer closing with any other code stays loud: it may be answering
+        // something this side sent.
+        || (msg.contains("closed by peer")
+            && (msg.ends_with("(code 0)") || msg.ends_with(": 256") || msg.ends_with("(code 256)")))
 }
 
 /// How loudly to report a QUIC connection that ended in an error.
@@ -1923,6 +1929,14 @@ mod close_classification_tests {
         ));
         // A local protocol failure still is not.
         assert!(!is_benign_h3_close(&"Local error: H3_INTERNAL_ERROR"));
+        // Clean closes by the peer, as quinn prints them (seen 2026-09-28).
+        assert!(is_benign_h3_close(
+            &"closed by peer: scan complete (code 0)"
+        ));
+        assert!(is_benign_h3_close(&"closed by peer: 256"));
+        // A peer closing with an error code may be answering us: stays loud.
+        assert!(!is_benign_h3_close(&"closed by peer: 263"));
+        assert!(!is_benign_h3_close(&"closed by peer: frame error (code 7)"));
     }
 }
 

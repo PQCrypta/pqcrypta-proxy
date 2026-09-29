@@ -233,16 +233,7 @@ impl QuicListener {
             .headers()
             .get("referer")
             .and_then(|v| v.to_str().ok());
-        let is_health_check = request
-            .headers()
-            .get("x-health-check-bypass")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v == "1")
-            .unwrap_or(false);
-
-        if !is_health_check {
-            metrics.requests.request_start();
-        }
+        metrics.requests.request_start();
 
         info!(
             "HTTP/3 request: {} {} host={:?} from {}",
@@ -329,7 +320,6 @@ impl QuicListener {
                             0,
                             0,
                             Some(&path),
-                            is_health_check,
                         );
                         // CORS headers on 429 so browsers see the status code
                         // rather than an opaque CORS failure. The allowlist is
@@ -386,7 +376,6 @@ impl QuicListener {
                             0,
                             0,
                             Some(&path),
-                            is_health_check,
                         );
                         let response = http::Response::builder()
                             .status(http::StatusCode::FORBIDDEN)
@@ -452,7 +441,6 @@ impl QuicListener {
                         0,
                         0,
                         Some(&path),
-                        is_health_check,
                     );
                     let mut builder = http::Response::builder()
                         .status(rendering.status)
@@ -649,14 +637,9 @@ impl QuicListener {
                 elapsed.as_secs_f64(),
                 remote_addr
             );
-            metrics.requests.request_end_full(
-                200,
-                elapsed,
-                0,
-                bytes_to_send,
-                Some(&path),
-                is_health_check,
-            );
+            metrics
+                .requests
+                .request_end_full(200, elapsed, 0, bytes_to_send, Some(&path));
             return Ok(());
         }
 
@@ -728,7 +711,6 @@ impl QuicListener {
                 total_bytes,
                 json_len as u64,
                 Some(&path),
-                is_health_check,
             );
             return Ok(());
         }
@@ -767,14 +749,9 @@ impl QuicListener {
                         .try_into()
                         .unwrap_or(u64::MAX),
                 });
-                metrics.requests.request_end_full(
-                    404,
-                    start_time.elapsed(),
-                    0,
-                    0,
-                    Some(&path),
-                    is_health_check,
-                );
+                metrics
+                    .requests
+                    .request_end_full(404, start_time.elapsed(), 0, 0, Some(&path));
                 // Return 404 — include Alt-Svc so tcp_only_hosts origins
                 // receive "clear" and the browser stops upgrading to HTTP/3.
                 let response = http::Response::builder()
@@ -848,14 +825,9 @@ impl QuicListener {
                         start_time,
                         429,
                     );
-                    metrics.requests.request_end_full(
-                        429,
-                        start_time.elapsed(),
-                        0,
-                        0,
-                        Some(&path),
-                        is_health_check,
-                    );
+                    metrics
+                        .requests
+                        .request_end_full(429, start_time.elapsed(), 0, 0, Some(&path));
                     return Ok(());
                 }
             }
@@ -895,7 +867,6 @@ impl QuicListener {
                     0,
                     0,
                     Some(&path),
-                    is_health_check,
                 );
                 return Ok(());
             }
@@ -966,14 +937,9 @@ impl QuicListener {
 
                 let response = response_builder.body(())?;
                 respond_and_finish(&mut stream, response).await?;
-                metrics.requests.request_end_full(
-                    200,
-                    start_time.elapsed(),
-                    0,
-                    0,
-                    None,
-                    is_health_check,
-                );
+                metrics
+                    .requests
+                    .request_end_full(200, start_time.elapsed(), 0, 0, None);
                 return Ok(());
             }
             // If no CORS config, fall through to normal handling / backend
@@ -1022,7 +988,6 @@ impl QuicListener {
                     0,
                     0,
                     Some(&path),
-                    is_health_check,
                 );
                 return Ok(());
             }
@@ -1121,7 +1086,6 @@ impl QuicListener {
                             0,
                             0,
                             Some(&path),
-                            is_health_check,
                         );
                         let response = http::Response::builder()
                             .status(http::StatusCode::SERVICE_UNAVAILABLE)
@@ -1147,7 +1111,6 @@ impl QuicListener {
                             0,
                             0,
                             Some(&path),
-                            is_health_check,
                         );
                         log_h3_refusal(
                             remote_addr,
@@ -1177,7 +1140,6 @@ impl QuicListener {
                             0,
                             0,
                             Some(&path),
-                            is_health_check,
                         );
                         let response = http::Response::builder()
                             .status(http::StatusCode::BAD_GATEWAY)
@@ -1222,7 +1184,6 @@ impl QuicListener {
                             body.len() as u64,
                             0,
                             Some(&path),
-                            is_health_check,
                         );
                         let response = http::Response::builder()
                             .status(http::StatusCode::PAYLOAD_TOO_LARGE)
@@ -1254,7 +1215,6 @@ impl QuicListener {
                         body.len() as u64,
                         0,
                         Some(&path),
-                        is_health_check,
                     );
                     if let Ok(response) = http::Response::builder()
                         .status(http::StatusCode::INTERNAL_SERVER_ERROR)
@@ -1330,7 +1290,6 @@ impl QuicListener {
                     body.len() as u64,
                     0,
                     Some(&path),
-                    is_health_check,
                 );
                 let mut builder = http::Response::builder()
                     .status(rendering.status)
@@ -1448,7 +1407,6 @@ impl QuicListener {
                         body.len() as u64,
                         body_size as u64,
                         Some(&path),
-                        is_health_check,
                     );
                     log_access(&AccessLogEntry {
                         ja3: fingerprint.ja3_hash.as_deref(),
@@ -1505,7 +1463,6 @@ impl QuicListener {
                         body.len() as u64,
                         0,
                         Some(&path),
-                        is_health_check,
                     );
                     log_access(&AccessLogEntry {
                         ja3: fingerprint.ja3_hash.as_deref(),
@@ -1542,14 +1499,9 @@ impl QuicListener {
             .headers()
             .contains_key(http::header::TRANSFER_ENCODING)
         {
-            metrics.requests.request_end_full(
-                400,
-                start_time.elapsed(),
-                0,
-                0,
-                Some(&path),
-                is_health_check,
-            );
+            metrics
+                .requests
+                .request_end_full(400, start_time.elapsed(), 0, 0, Some(&path));
             let response = http::Response::builder()
                 .status(http::StatusCode::BAD_REQUEST)
                 .server_header(&config)
@@ -1758,7 +1710,6 @@ impl QuicListener {
                     request_body_len,
                     0,
                     Some(&path),
-                    is_health_check,
                 );
                 log_access(&AccessLogEntry {
                     ja3: fingerprint.ja3_hash.as_deref(),
@@ -1874,7 +1825,6 @@ impl QuicListener {
                 request_body_len,
                 0,
                 Some(&path),
-                is_health_check,
             );
             log_access(&AccessLogEntry {
                 ja3: fingerprint.ja3_hash.as_deref(),
@@ -2134,7 +2084,6 @@ impl QuicListener {
             request_body_len,
             body_size as u64,
             Some(&path),
-            is_health_check,
         );
 
         // Log successful response

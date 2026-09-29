@@ -279,7 +279,12 @@ pub struct FingerprintedConnection {
 /// rate limits for any request carrying it on the crypto routes. It reached
 /// the API from any client that sent it: `POST /keys/generate` answered 200
 /// without an API key.
-pub const PROXY_ONLY_HEADERS: [&str; 1] = ["x-webtransport-proxy"];
+///
+/// `x-health-check-bypass` marks the health-check cron's requests, which go
+/// straight to the API on localhost and never through here. From a client it
+/// kept that client's failures out of the API's and the proxy's error figures
+/// and let it skip the threat-intel refresh.
+pub const PROXY_ONLY_HEADERS: [&str; 2] = ["x-webtransport-proxy", "x-health-check-bypass"];
 
 impl FingerprintedConnection {
     /// Every header a TCP listener derives from the connection rather than
