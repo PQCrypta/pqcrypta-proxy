@@ -1837,6 +1837,14 @@ pub struct RouteConfig {
     /// Skip bot blocking for this route
     #[serde(default)]
     pub skip_bot_blocking: bool,
+    /// Let programmatic HTTP clients (curl, Wget, python-requests,
+    /// python-urllib, Go, Java, or no User-Agent) through the user-agent rules
+    /// when they carry a credential: `X-API-Key` or `Authorization: Bearer`.
+    /// Scanner, scraper and headless-browser user agents stay blocked whatever
+    /// they carry. The backend must refuse a credential that is not valid,
+    /// even on endpoints that need none, or this is a way around the rules.
+    #[serde(default)]
+    pub allow_credentialed_clients: bool,
     /// Stripe.js compatibility (removes COEP/COOP headers)
     #[serde(default)]
     pub stripe_compatibility: bool,

@@ -458,6 +458,9 @@ pub fn is_conformance_host(config: &ProxyConfig, host: Option<&str>) -> bool {
 pub struct RequestPolicy {
     /// Route opts out of scanner/bot user-agent blocking
     pub skip_bot_blocking: bool,
+    /// Route lets credentialed programmatic clients past the generic-client
+    /// user-agent rules (`RouteConfig::allow_credentialed_clients`)
+    pub credentialed_clients: bool,
     /// Only these JA3 hashes may reach this route
     pub allowed_ja3: Option<Vec<String>>,
     /// Per-route WAF on/off, overriding waf.enabled
@@ -1452,6 +1455,8 @@ impl SecurityState {
                 headers: view.headers,
                 body: view.body,
                 skip_bot_ua_check: skip_bot_ua,
+                credentialed_client: policy.credentialed_clients
+                    && crate::waf::carries_credential(view.headers),
                 mode_override: policy.waf_mode.as_deref(),
             };
             match waf.inspect(&waf_req) {
@@ -2130,6 +2135,7 @@ pub async fn security_middleware(
             .find_route(host.as_deref(), &req_path, false)
             .map(|r| RequestPolicy {
                 skip_bot_blocking: r.skip_bot_blocking,
+                credentialed_clients: r.allow_credentialed_clients,
                 allowed_ja3: r.security.as_ref().and_then(|s| s.allowed_ja3.clone()),
                 waf_enabled: r.security.as_ref().and_then(|s| s.waf_enabled),
                 waf_mode: r.security.as_ref().and_then(|s| s.waf_mode.clone()),
@@ -2154,6 +2160,7 @@ pub async fn security_middleware(
     let waf_enabled_cl = route_policy.waf_enabled;
     let waf_mode_body = route_policy.waf_mode.clone();
     let route_skip_bot = route_policy.skip_bot_blocking;
+    let route_credentialed = route_policy.credentialed_clients;
 
     // Fast path: skip all security checks for trusted IPs (loopback, or CIDRs listed in
     // security.trusted_internal_cidrs). RFC1918 ranges are no longer implicitly trusted
@@ -2388,6 +2395,7 @@ pub async fn security_middleware(
                     };
                     let body_policy = RequestPolicy {
                         skip_bot_blocking: skip_bot_ua_cl,
+                        credentialed_clients: route_credentialed,
                         waf_mode: waf_mode_cl.clone(),
                         waf_enabled: waf_enabled_cl,
                         ..Default::default()
@@ -2491,6 +2499,7 @@ pub async fn security_middleware(
                 };
                 let body_policy_chunked = RequestPolicy {
                     skip_bot_blocking: skip_bot_ua_body,
+                    credentialed_clients: route_credentialed,
                     waf_mode: waf_mode_body.clone(),
                     waf_enabled: waf_enabled_cl,
                     ..Default::default()
