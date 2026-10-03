@@ -17,6 +17,15 @@
 //! be written to a reused connection is retried on a new one — hyper hands the
 //! unsent request back, so nothing is sent twice.
 //!
+//! One closure checkout cannot see: the backend's keep-alive timeout firing
+//! just as a request is written (Apache's `KeepAliveTimeout` is 5 s; idle
+//! connections live here up to `idle_timeout_secs`). The request went out and
+//! the connection closed before any answer: "connection closed before message
+//! completed", a 502 to the client. A request that may be repeated (RFC 9110
+//! §9.2.2: GET, HEAD, OPTIONS, TRACE, PUT, DELETE) and whose body can be
+//! replayed ([`Replay`]) is sent again on another connection; anything else
+//! fails as before, since its first copy may have been acted on.
+//!
 //! It also gives backend TLS a real implementation: a backend with
 //! `tls = true` connects through [`create_backend_tls_connector`], so its CA,
 //! client certificate, SNI and verification settings apply.
@@ -35,6 +44,47 @@ use tokio::net::TcpStream;
 use tracing::debug;
 
 use crate::config::BackendConfig;
+
+/// A request body that can be sent again when a reused connection closes
+/// before answering. Only a body certain to be the same the second time is.
+pub trait Replay: Sized {
+    fn replay(&self) -> Option<Self>;
+}
+
+impl<D: bytes::Buf + Clone> Replay for http_body_util::Full<D> {
+    fn replay(&self) -> Option<Self> {
+        Some(self.clone())
+    }
+}
+
+/// A streamed body cannot be read twice; an empty one (a GET's) is empty
+/// again.
+impl Replay for axum::body::Body {
+    fn replay(&self) -> Option<Self> {
+        (Body::size_hint(self).exact() == Some(0)).then(axum::body::Body::empty)
+    }
+}
+
+/// A copy of `req` to send again, when its method may be repeated (RFC 9110
+/// §9.2.2) and its body replayed.
+fn replayable<B: Replay>(req: &http::Request<B>) -> Option<http::Request<B>> {
+    use http::Method;
+    let idempotent = matches!(
+        *req.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE | Method::PUT | Method::DELETE
+    );
+    if !idempotent {
+        return None;
+    }
+    let body = req.body().replay()?;
+    let mut copy = http::Request::new(body);
+    *copy.method_mut() = req.method().clone();
+    *copy.uri_mut() = req.uri().clone();
+    *copy.version_mut() = req.version();
+    *copy.headers_mut() = req.headers().clone();
+    *copy.extensions_mut() = req.extensions().clone();
+    Some(copy)
+}
 
 /// Pooled HTTP/1.1 client for one proxy's backends.
 pub struct BackendClient<B> {
@@ -207,7 +257,7 @@ impl<B> Origin<B> {
 
 impl<B> BackendClient<B>
 where
-    B: Body + Send + 'static,
+    B: Body + Replay + Send + 'static,
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
@@ -245,6 +295,7 @@ where
                 Ok(Ok(())) => {}
                 _ => continue,
             }
+            let again = replayable(&req);
             match tx.try_send_request(req).await {
                 Ok(resp) => {
                     return Ok((
@@ -263,7 +314,22 @@ where
                         );
                         req = unsent;
                     }
-                    None => return Err(e.into_error().into()),
+                    None => {
+                        let error = e.into_error();
+                        match again {
+                            // Written, then the connection closed with no
+                            // answer: the backend's keep-alive timeout won
+                            // the race. Safe to repeat on another.
+                            Some(copy) if error.is_incomplete_message() => {
+                                debug!(
+                                    "backend {}: reused connection closed before answering, sending again",
+                                    backend.name
+                                );
+                                req = copy;
+                            }
+                            _ => return Err(error.into()),
+                        }
+                    }
                 },
             }
         }
@@ -532,6 +598,103 @@ mod tests {
             lease.release();
         }
         assert_eq!(accepted.load(Ordering::SeqCst), 3);
+    }
+
+    /// A server that answers a connection's first request and, on the second,
+    /// reads it and closes without answering: a keep-alive timeout firing
+    /// just as the request arrives.
+    async fn closes_on_second_request() -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    for n in 0.. {
+                        let mut got = Vec::new();
+                        while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                            match s.read(&mut buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(k) => got.extend_from_slice(&buf[..k]),
+                            }
+                        }
+                        if n == 1 {
+                            return; // read, then closed: no answer
+                        }
+                        if s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, accepted)
+    }
+
+    #[tokio::test]
+    async fn an_idempotent_request_on_a_connection_closed_unanswered_goes_again() {
+        let (addr, accepted) = closes_on_second_request().await;
+        let client = BackendClient::new(Duration::from_secs(60), 8, Duration::from_secs(5));
+        let b = backend(&addr);
+        let (resp, lease) = client.send(&b, get()).await.unwrap();
+        resp.into_body().collect().await.unwrap();
+        lease.release();
+        // Reuses the connection, which closes unanswered; sent again on a new one.
+        let (resp, lease) = client.send(&b, get()).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"ok");
+        lease.release();
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_post_on_a_connection_closed_unanswered_is_not_repeated() {
+        let (addr, accepted) = closes_on_second_request().await;
+        let client = BackendClient::new(Duration::from_secs(60), 8, Duration::from_secs(5));
+        let b = backend(&addr);
+        let (resp, lease) = client.send(&b, get()).await.unwrap();
+        resp.into_body().collect().await.unwrap();
+        lease.release();
+        let post = http::Request::post("/")
+            .body(Full::new(Bytes::from_static(b"once")))
+            .unwrap();
+        let Err(error) = client.send(&b, post).await else {
+            panic!("a POST on a connection closed unanswered was sent again");
+        };
+        assert!(error.to_string().contains("connection closed"), "{error}");
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn only_repeatable_requests_with_replayable_bodies_are_copied() {
+        let get = http::Request::get("/a")
+            .header("x", "1")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let copy = replayable(&get).unwrap();
+        assert_eq!(copy.uri(), "/a");
+        assert_eq!(copy.headers()["x"], "1");
+        let post = http::Request::post("/a")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert!(replayable(&post).is_none());
+        let empty = http::Request::get("/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(replayable(&empty).is_some());
+        let streamed = http::Request::put("/")
+            .body(axum::body::Body::from_stream(futures::stream::iter(vec![
+                Ok::<_, std::io::Error>(Bytes::from_static(b"x")),
+            ])))
+            .unwrap();
+        assert!(replayable(&streamed).is_none());
     }
 
     #[tokio::test]

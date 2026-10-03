@@ -70,7 +70,7 @@
 | **Cache Purge (admin API)** | ✅ | `GET /cache` reports entries and bytes held; `POST /cache/purge` drops them — everything, or narrowed by `?host=`, `?prefix=` or `?host=&path=` for one exact URL across every method. Exists because a deploy that changes generated output otherwise leaves the edge serving the old body until max-age expires, and the alternative was restarting the proxy. `path=` without `host=` is refused rather than silently widened. Audit-logged with scope and target |
 | **Single Shared Response Cache** | ✅ | One cache instance per process rather than one per listener. There were five — one per HTTP listener variant and one per QUIC port — so the same URL was cached separately for h2 and h3 and for each port, and a purge would have cleared one while the others served the old body. The key is `METHOD\|host\|path`, with no port or protocol in it, so sharing is what the key already assumed |
 | **Correct HEAD Semantics (RFC 9110 §9.3.2)** | ✅ | A HEAD response carries the header fields a GET would have. Backends serving chunked send no `Content-Length`, and the proxy no longer synthesizes `content-length: 0` from the empty buffered body — which had been telling every link checker, uptime monitor, CDN probe and security scanner that every dynamic page was empty. Fixed on all three transports (HTTP/1.1, HTTP/2 and the separate HTTP/3 implementation) |
-| **Per-Backend Connection Pool** | ✅ | Per-host idle timeout, max idle connections, max total connections, and acquire timeout for the HTTP/1.1 backend pool |
+| **Per-Backend Connection Pool** | ✅ | Per-host idle timeout, max idle connections, max total connections, and acquire timeout for the HTTP/1.1 backend pool. A reused connection the backend closes just as a request is written (its keep-alive timeout racing the reuse) no longer turns into a 502: an idempotent request (RFC 9110 §9.2.2) with a replayable body is sent again on another connection; a POST is not, since its first copy may have been acted on |
 | **Per-Backend Retry** | ✅ | Configurable retries with exponential backoff per backend; retry on 5xx/connect-failure/timeout |
 | **Per-Backend Circuit Breaker** | ✅ | Per-backend overrides for failure threshold, half-open delay, and success threshold |
 | **0-RTT Replay Protection** | ✅ | Nonce store (strict/session/none); rejects replayed early-data nonces |
@@ -207,7 +207,7 @@
 - **Slow Start**: Gradually increases traffic to recovering servers to avoid thundering herd after circuit breaker reopens
 - **Connection Draining**: Graceful server removal with configurable drain timeout; in-flight requests complete before backend is taken out of rotation
 - **Request Queuing**: Queues requests when all backends are saturated; configurable queue depth and wait timeout
-- **Connection Pool**: Per-backend connection pool with configurable max idle connections, max total connections, acquire timeout, and idle timeout
+- **Connection Pool**: Per-backend connection pool with configurable max idle connections, max total connections, acquire timeout, and idle timeout; idempotent requests that meet a pooled connection the backend closed as they were written are sent again on another connection instead of failing with a 502
 - **Per-Server Keep-Alive**: Configurable QUIC keep-alive interval per server to prevent idle connection timeouts
 - **Priority Failover**: Primary servers first, then failover to lower priority
 
