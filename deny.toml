@@ -65,6 +65,13 @@ skip = [
     { name = "ipnetwork", reason = "multiple transitive versions from sqlx and network crate sub-trees" },
     # openssl-probe — version split between openssl-related crate trees
     { name = "openssl-probe", reason = "multiple transitive versions from openssl/rustls bridging crates" },
+    # redox_syscall — 0.5 via parking_lot_core, 0.7 via libredox/filetime/notify.
+    # Both are Redox-OS-only target dependencies; cargo-deny 0.20 (as CI runs it)
+    # evaluates every target and reports the pair, 0.19 did not.
+    { name = "redox_syscall", reason = "0.5 via parking_lot_core; 0.7 via libredox/filetime/notify; Redox target only" },
+    # syn — wasm-bindgen 0.2.129 (wasm32 only, via chrono/js-sys) moved its macro
+    # crate to syn 3; every other proc macro in the graph is still on syn 2.
+    { name = "syn", reason = "3.x via wasm-bindgen-macro-support (wasm32 only); 2.x via every other proc macro" },
     # untrusted — 0.7 retained by webpki 0.22; 0.9 used by newer ring-based crates
     { name = "untrusted", reason = "0.7 retained by webpki 0.22 sub-tree; 0.9 used by newer ring crates" },
     # base64 — reqwest 0.13 moved to 0.23; jsonwebtoken, pem, hyper-util,
