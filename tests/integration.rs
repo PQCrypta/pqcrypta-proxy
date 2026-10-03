@@ -51,7 +51,7 @@ enabled = false
         let config = pqcrypta_proxy::config::ProxyConfig::default();
 
         // Verify defaults exist - don't hardcode actual values
-        assert!(!config.server.bind_address.is_empty());
+        assert_ne!(config.server.bind_address, "");
         assert!(config.server.udp_port > 0);
     }
 
@@ -137,8 +137,8 @@ timeout_ms = 5000
             .values()
             .next()
             .expect("Backend should exist");
-        assert!(!backend.name.is_empty());
-        assert!(!backend.address.is_empty());
+        assert_ne!(backend.name, "");
+        assert_ne!(backend.address, "");
         assert_eq!(backend.tls_mode, TlsMode::Reencrypt);
         assert!(backend.tls_sni.is_some());
         assert!(backend.timeout_ms > 0);
@@ -189,7 +189,7 @@ max_age = 3600
         // Verify CORS parsed correctly
         let cors = route.cors.as_ref().unwrap();
         assert!(cors.allow_origin.is_some());
-        assert!(!cors.allow_methods.is_empty());
+        assert_ne!(cors.allow_methods, [] as [String; 0]);
         assert!(cors.allow_credentials);
         assert!(cors.max_age > 0);
     }
@@ -219,8 +219,8 @@ timeout_ms = 30000
         // Verify passthrough routes parsed correctly
         assert_eq!(config.passthrough_routes.len(), 1);
         let route = &config.passthrough_routes[0];
-        assert!(!route.sni.is_empty());
-        assert!(!route.backend.is_empty());
+        assert_ne!(route.sni, "");
+        assert_ne!(route.backend, "");
         assert!(route.proxy_protocol);
         assert!(route.timeout_ms > 0);
     }
@@ -245,8 +245,8 @@ timeout_ms = 30000
         );
 
         // Test OpenSSL names are valid
-        assert!(!PqcKem::X25519MlKem768.openssl_name().is_empty());
-        assert!(!PqcKem::MlKem768.openssl_name().is_empty());
+        assert_ne!(PqcKem::X25519MlKem768.openssl_name(), "");
+        assert_ne!(PqcKem::MlKem768.openssl_name(), "");
     }
 
     /// Test PQC capabilities detection

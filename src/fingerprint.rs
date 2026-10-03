@@ -1596,13 +1596,13 @@ mod tests {
     #[test]
     fn test_parse_supported_groups_empty() {
         let result = parse_supported_groups(&[]);
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [u16; 0]);
     }
 
     #[test]
     fn test_parse_supported_groups_too_short() {
         let result = parse_supported_groups(&[0x00]);
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [u16; 0]);
     }
 
     #[test]
@@ -1622,7 +1622,7 @@ mod tests {
     #[test]
     fn test_parse_ec_point_formats_empty() {
         let result = parse_ec_point_formats(&[]);
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [u8; 0]);
     }
 
     #[test]
@@ -1650,13 +1650,13 @@ mod tests {
     #[test]
     fn test_parse_signature_algorithms_empty() {
         let result = parse_signature_algorithms(&[]);
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [u16; 0]);
     }
 
     #[test]
     fn test_parse_signature_algorithms_too_short() {
         let result = parse_signature_algorithms(&[0x00]);
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [u16; 0]);
     }
 
     #[test]
@@ -1675,7 +1675,7 @@ mod tests {
     #[test]
     fn test_parse_alpn_empty() {
         let result = parse_alpn(&[]);
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [Vec<u8>; 0]);
     }
 
     #[test]

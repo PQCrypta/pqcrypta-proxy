@@ -403,6 +403,7 @@ impl QuicListener {
             {
                 let view = crate::security::SecurityRequestView {
                     ip,
+                    peer_port: Some(remote_addr.port()),
                     method,
                     path: &path,
                     query: request.uri().query().unwrap_or(""),
@@ -1252,6 +1253,7 @@ impl QuicListener {
                 .get_or_insert_with(|| resolve_route_policy(&security, &request, &path));
             let body_view = crate::security::SecurityRequestView {
                 ip,
+                peer_port: Some(remote_addr.port()),
                 method,
                 path: &path,
                 query: &body_query,

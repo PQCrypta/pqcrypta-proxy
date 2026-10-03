@@ -105,11 +105,10 @@ pub struct ConnectionSlot {
 
 impl Drop for ConnectionSlot {
     fn drop(&mut self) {
-        let _ = self.server.active_connections.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |n| n.checked_sub(1),
-        );
+        let _ =
+            self.server
+                .active_connections
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
     }
 }
 

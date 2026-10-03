@@ -414,6 +414,11 @@ impl RateLimitKind {
 /// that cannot be expressed here does not belong in a shared rule.
 pub struct SecurityRequestView<'a> {
     pub ip: IpAddr,
+    /// Source port of the connection carrying the request. Every request
+    /// multiplexed on one HTTP/2 or HTTP/3 connection shares it, which is how
+    /// [`SecurityState::connection_rate_exceeded`] counts connections rather
+    /// than requests. `None` where there is no connection to name.
+    pub peer_port: Option<u16>,
     pub method: &'a str,
     /// Lowercased path
     pub path: &'a str,
@@ -476,8 +481,12 @@ pub struct RequestPolicy {
 pub struct ConnectionRateWindow {
     /// Start of the current one-second window
     pub window_start: Instant,
-    /// Connections accepted from this IP within the window
+    /// Connections seen from this IP within the window
     pub count: u32,
+    /// Source ports already counted in this window, so the further requests
+    /// of a connection do not count it again. Bounded: once the count is past
+    /// the limit nothing more needs remembering.
+    pub ports: Vec<u16>,
 }
 
 /// Request counter for adaptive rate limiting
@@ -1679,7 +1688,7 @@ impl SecurityState {
             // second and every subsequent request answered 403.
             if rate_enabled
                 && conn_rate_enabled
-                && self.connection_rate_exceeded(ip, conn_rate_per_sec)
+                && self.connection_rate_exceeded(ip, view.peer_port, conn_rate_per_sec)
             {
                 warn!(
                     "Connection rate limit exceeded for {} ({} conn/s)",
@@ -1752,13 +1761,27 @@ impl SecurityState {
         self.run_waf(view, policy, is_pentest)
     }
 
-    /// Record a new connection from `ip` and report whether it exceeds
-    /// `connections_per_second`.
+    /// Record the connection a request from `ip` arrived on, and report
+    /// whether `ip` has opened more than `connections_per_second` connections
+    /// in the current one-second window.
     ///
-    /// A one-second sliding window per IP. `max_connections_per_ip` already
-    /// caps concurrency, but an attacker that opens and closes connections as
-    /// fast as it can never trips it, so the accept rate needs its own bound.
-    pub fn connection_rate_exceeded(&self, ip: IpAddr, per_second: u32) -> bool {
+    /// `max_connections_per_ip` already caps concurrency, but an attacker that
+    /// opens and closes connections as fast as it can never trips it, so the
+    /// connection rate needs its own bound.
+    ///
+    /// This runs per request (from `evaluate`), so a connection is recognised
+    /// by its source port: the first request on it counts, the rest do not.
+    /// It used to count every request, which made it a requests-per-second
+    /// limit with a 300 s ban on the first offence. One HTTP/2 or HTTP/3
+    /// connection loading a page with 50 subresources crossed it, and real
+    /// visitors were locked out of /encryption/ mid-load. `peer_port: None`
+    /// counts every call, as before.
+    pub fn connection_rate_exceeded(
+        &self,
+        ip: IpAddr,
+        peer_port: Option<u16>,
+        per_second: u32,
+    ) -> bool {
         if per_second == 0 {
             return false;
         }
@@ -1769,10 +1792,20 @@ impl SecurityState {
             .or_insert_with(|| ConnectionRateWindow {
                 window_start: now,
                 count: 0,
+                ports: Vec::new(),
             });
         if now.duration_since(window.window_start) >= Duration::from_secs(1) {
             window.window_start = now;
             window.count = 0;
+            window.ports.clear();
+        }
+        if let Some(port) = peer_port {
+            if window.ports.contains(&port) {
+                return false;
+            }
+            if window.count <= per_second {
+                window.ports.push(port);
+            }
         }
         window.count += 1;
         window.count > per_second
@@ -1992,6 +2025,12 @@ impl SecurityState {
             let mut cidrs = self.blocked_cidrs.write();
             cidrs.retain(|(_, info)| info.expires_at.map(|e| Instant::now() < e).unwrap_or(true));
         }
+
+        // Connection-rate windows last one second; an older one would be reset
+        // on its next use, so dropping it loses nothing. Nothing pruned this
+        // map before, so it held an entry for every address ever seen.
+        self.connection_rates
+            .retain(|_, window| window.window_start.elapsed() < Duration::from_secs(1));
 
         // Remove old request counters (configurable age)
         self.request_counts.retain(|_, counter| {
@@ -2231,6 +2270,7 @@ pub async fn security_middleware(
     {
         let view = SecurityRequestView {
             ip,
+            peer_port: Some(client_addr.port()),
             method: request.method().as_str(),
             path: &request_path,
             query: request.uri().query().unwrap_or(""),
@@ -2387,6 +2427,7 @@ pub async fn security_middleware(
                     let scan_slice_end = collected_bytes.len().min(scan_limit);
                     let body_view = SecurityRequestView {
                         ip,
+                        peer_port: Some(client_addr.port()),
                         method: parts.method.as_str(),
                         path: &waf_path,
                         query: &waf_query,
@@ -2491,6 +2532,7 @@ pub async fn security_middleware(
                 let skip_bot_ua_body = is_pentest_bypass || route_skip_bot;
                 let body_view_chunked = SecurityRequestView {
                     ip,
+                    peer_port: Some(client_addr.port()),
                     method: parts.method.as_str(),
                     path: &waf_path,
                     query: &waf_query,
@@ -3108,6 +3150,91 @@ mod tests {
         assert!(security.geo_block_reason(&ip).is_none(), "off means off");
     }
 
+    /// The production settings, from an address that is neither trusted nor a
+    /// pentest source.
+    fn production_rate_limits() -> (SecurityState, IpAddr) {
+        let mut config = ProxyConfig::default();
+        config.rate_limiting.enabled = true;
+        config.rate_limiting.requests_per_second = 200;
+        config.rate_limiting.burst_size = 300;
+        config.rate_limiting.connection_rate_limit = true;
+        config.rate_limiting.connections_per_second = 50;
+        (SecurityState::new(&config), "203.0.113.9".parse().unwrap())
+    }
+
+    /// 2026-10-03: a visitor's first load of /encryption/ over one HTTP/3
+    /// connection sent 53 requests in a second and was banned for 300 s as a
+    /// connection flood. Every request on a connection shares its source port.
+    #[tokio::test]
+    async fn a_page_load_on_one_connection_is_one_connection() {
+        let (security, ip) = production_rate_limits();
+        let headers = HeaderMap::new();
+        for _ in 0..120 {
+            let view = SecurityRequestView {
+                ip,
+                peer_port: Some(55064),
+                method: "GET",
+                path: "/encryption/js/browser-crypto/algorithms.js",
+                query: "",
+                headers: &headers,
+                body: None,
+            };
+            assert!(matches!(
+                security.evaluate(&view, &RequestPolicy::default()),
+                SecurityDecision::Allow
+            ));
+        }
+        assert!(security.is_blocked(&ip).is_none());
+    }
+
+    #[tokio::test]
+    async fn new_connections_past_the_limit_are_still_refused_and_banned() {
+        let (security, ip) = production_rate_limits();
+        let headers = HeaderMap::new();
+        let decisions: Vec<_> = (0..51u16)
+            .map(|n| {
+                // Each connection makes a few requests; only its first counts.
+                let view = SecurityRequestView {
+                    ip,
+                    peer_port: Some(40_000 + n),
+                    method: "GET",
+                    path: "/",
+                    query: "",
+                    headers: &headers,
+                    body: None,
+                };
+                let first = security.evaluate(&view, &RequestPolicy::default());
+                if matches!(first, SecurityDecision::Allow) {
+                    for _ in 0..2 {
+                        assert!(matches!(
+                            security.evaluate(&view, &RequestPolicy::default()),
+                            SecurityDecision::Allow
+                        ));
+                    }
+                }
+                first
+            })
+            .collect();
+        assert!(decisions[..50]
+            .iter()
+            .all(|d| matches!(d, SecurityDecision::Allow)));
+        assert!(matches!(
+            decisions[50],
+            SecurityDecision::RateLimited {
+                kind: RateLimitKind::Connection,
+                ..
+            }
+        ));
+        assert!(security.is_blocked(&ip).is_some());
+    }
+
+    #[tokio::test]
+    async fn without_a_port_every_call_counts() {
+        let (security, ip) = production_rate_limits();
+        assert!((0..50).all(|_| !security.connection_rate_exceeded(ip, None, 50)));
+        assert!(security.connection_rate_exceeded(ip, None, 50));
+    }
+
     /// Against the real GeoLite2 databases when present (every node has them).
     #[cfg(feature = "geoip")]
     #[tokio::test]
@@ -3175,6 +3302,7 @@ mod tests {
                 match security.evaluate(
                     &SecurityRequestView {
                         ip,
+                        peer_port: None,
                         method,
                         path,
                         query,
@@ -3211,6 +3339,7 @@ mod tests {
             security.evaluate(
                 &SecurityRequestView {
                     ip,
+                    peer_port: None,
                     method: "DELETE",
                     path: "/x",
                     query: "",
@@ -3233,6 +3362,7 @@ mod tests {
         let ip: IpAddr = "203.0.113.43".parse().unwrap();
         let view = |path: &'static str| SecurityRequestView {
             ip,
+            peer_port: None,
             method: "GET",
             path,
             query: "",
@@ -3278,6 +3408,7 @@ mod tests {
         let ip: IpAddr = "203.0.113.42".parse().unwrap();
         let view = SecurityRequestView {
             ip,
+            peer_port: None,
             method: "GET",
             path: "/",
             query: "",
@@ -3292,8 +3423,9 @@ mod tests {
         assert!(config.rate_limiting.connection_rate_limit);
         let security = SecurityState::new(&config);
 
-        // Far past connections_per_second (10) in one window.
-        for _ in 0..50 {
+        // Far past connections_per_second (50) in one window; no port, so
+        // every call counts as a new connection.
+        for _ in 0..150 {
             let decision = security.evaluate(&view, &policy);
             assert!(
                 matches!(decision, SecurityDecision::Allow),

@@ -449,7 +449,7 @@ impl OriginSlot {
                 .value(),
         );
         counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < max).then_some(n + 1)
             })
             .ok()
@@ -872,6 +872,7 @@ async fn proxy_request(
             let headers = axum::http::HeaderMap::new();
             let view = crate::security::SecurityRequestView {
                 ip,
+                peer_port: Some(remote_addr.port()),
                 method: "POST",
                 path,
                 query: "",

@@ -434,8 +434,10 @@ burst_size = 50
 # Enable connection rate limiting
 connection_rate_limit = true
 
-# New connections per second per IP
-connections_per_second = 10
+# New connections per second per IP; exceeding it bans the address for
+# auto_block_duration_secs on the first offence. Each connection counts once,
+# however many requests it carries.
+connections_per_second = 50
 
 # =============================
 # Advanced Multi-Dimensional Rate Limiting

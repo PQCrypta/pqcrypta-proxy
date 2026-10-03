@@ -2202,7 +2202,9 @@ pub struct RateLimitConfig {
     pub burst_size: u32,
     /// Enable connection rate limiting. Only consulted when `enabled` is true.
     pub connection_rate_limit: bool,
-    /// New connections per second per IP
+    /// New connections per second per IP. Each connection counts once, by its
+    /// source port, however many requests it carries; exceeding it bans the
+    /// address on the first offence.
     pub connections_per_second: u32,
 }
 
@@ -2213,7 +2215,9 @@ impl Default for RateLimitConfig {
             requests_per_second: 100,
             burst_size: 50,
             connection_rate_limit: true,
-            connections_per_second: 10,
+            // 10 was low enough for one HTTP/1.1 browser on two hosts (six
+            // connections each) to be banned.
+            connections_per_second: 50,
         }
     }
 }

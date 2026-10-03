@@ -691,12 +691,14 @@ The advanced rate limiter provides multi-dimensional rate limiting inspired by C
 # Basic layer: request rate and, separately, how fast an IP may OPEN connections.
 # max_connections_per_ip caps concurrency; a client that opens and closes as fast
 # as it can never trips a concurrency cap, which is what connection_rate_limit is for.
+# A connection counts once (by its source port) however many requests it carries,
+# so a page load multiplexed over one HTTP/2 or HTTP/3 connection is one connection.
 [rate_limiting]
 enabled = true
 requests_per_second = 100
 burst_size = 50
 connection_rate_limit = true
-connections_per_second = 10
+connections_per_second = 50
 
 [advanced_rate_limiting]
 enabled = true

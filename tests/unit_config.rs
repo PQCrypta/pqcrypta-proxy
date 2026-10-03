@@ -9,11 +9,11 @@ fn test_default_config() {
     let config = ProxyConfig::default();
 
     // Just verify defaults exist and are sensible - actual values come from config
-    assert!(!config.server.bind_address.is_empty());
+    assert_ne!(config.server.bind_address, "");
     assert!(config.server.udp_port > 0);
     assert!(config.admin.port > 0);
     assert!(config.pqc.enabled);
-    assert!(!config.pqc.provider.is_empty());
+    assert_ne!(config.pqc.provider, "");
 }
 
 #[test]
@@ -23,7 +23,7 @@ fn test_server_socket_addr() {
 
     // Verify socket address can be parsed - don't hardcode port values
     assert!(addr.port() > 0);
-    assert!(!addr.ip().to_string().is_empty());
+    assert_ne!(addr.ip().to_string(), "");
 }
 
 #[test]
@@ -33,7 +33,7 @@ fn test_admin_socket_addr() {
 
     // Verify socket address can be parsed
     assert!(addr.port() > 0);
-    assert!(!addr.ip().to_string().is_empty());
+    assert_ne!(addr.ip().to_string(), "");
 }
 
 #[test]
@@ -109,7 +109,7 @@ fn test_pqc_config_defaults() {
     let config = PqcConfig::default();
     assert!(config.enabled);
     assert_eq!(config.provider, "auto");
-    assert!(!config.preferred_kem.is_empty());
+    assert_ne!(config.preferred_kem, "");
     assert!(config.fallback_to_classical);
     assert!(config.min_security_level >= 1 && config.min_security_level <= 5);
 }
@@ -203,8 +203,8 @@ proxy_protocol = true
 timeout_ms = 30000
 "#;
     let route: PassthroughRoute = toml::from_str(toml_content).unwrap();
-    assert!(!route.sni.is_empty());
-    assert!(!route.backend.is_empty());
+    assert_ne!(route.sni, "");
+    assert_ne!(route.backend, "");
     assert!(route.proxy_protocol);
     assert!(route.timeout_ms > 0);
 }
@@ -233,7 +233,7 @@ fn test_masque_defaults_disabled() {
     // MASQUE must be off by default — it is a UDP relay.
     let config = ProxyConfig::default();
     assert!(!config.masque.enabled);
-    assert!(config.masque.allowed_targets.is_empty());
+    assert_eq!(config.masque.allowed_targets, [] as [String; 0]);
 }
 
 #[test]

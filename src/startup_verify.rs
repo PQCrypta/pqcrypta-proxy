@@ -1051,6 +1051,7 @@ pub fn probe_waf(
     let policy = RequestPolicy::default();
     let view = |path: &'static str, query: &'static str| SecurityRequestView {
         ip: PROBE_SOURCE_WAF,
+        peer_port: None,
         method: "GET",
         path,
         query,
@@ -1111,15 +1112,14 @@ const PROBE_SOURCE_REQRATE: std::net::IpAddr =
 /// cannot describe them.
 ///
 /// Probing only through `evaluate()` tests whichever threshold is lower and leaves the
-/// other unverified, and on this deployment it is worse than that:
-/// `connection_rate_exceeded()` increments its window on *every request*, not once per
-/// connection, so with `connections_per_second = 10` against
-/// `requests_per_second = 200` the request limiter is not merely untested — it is
-/// unreachable through that path, and the 200 an operator reads in their config never
-/// applies. Reporting a single "rate limiting: ENFORCED" would have let that stand.
+/// other unverified. Reporting a single "rate limiting: ENFORCED" would let an
+/// unreachable limiter stand — and one did: `connection_rate_exceeded()` used to count
+/// every request, so the request limiter could never be reached through `evaluate()`.
 ///
-/// So the request limiter is exercised directly, through the same per-IP governor
-/// bucket `evaluate()` consults, on a source of its own.
+/// So the connection limiter is probed through `evaluate()` with a new source port on
+/// every attempt (each attempt is a new connection), and the request limiter is
+/// exercised directly, through the same per-IP governor bucket `evaluate()` consults,
+/// on a source of its own.
 pub async fn probe_rate_limits(
     config: &crate::config::ProxyConfig,
     engine: &crate::security::SecurityState,
@@ -1140,11 +1140,12 @@ pub async fn probe_rate_limits(
         .saturating_mul(3)
         .clamp(10, 2000);
     let mut connection = ProbeOutcome::NotEnforced(format!(
-        "{conn_ceiling} consecutive requests from one source were all allowed"
+        "{conn_ceiling} consecutive connections from one source were all allowed"
     ));
     for attempt in 1..=conn_ceiling {
         let view = SecurityRequestView {
             ip: PROBE_SOURCE_RATELIMIT,
+            peer_port: u16::try_from(attempt).ok(),
             method: "GET",
             path: "/",
             query: "",
@@ -1154,7 +1155,7 @@ pub async fn probe_rate_limits(
         match engine.evaluate(&view, &policy) {
             SecurityDecision::RateLimited { limit, kind, .. } => {
                 connection = ProbeOutcome::Enforced(format!(
-                    "{} denied at request {attempt} (limit {limit}/s)",
+                    "{} denied at connection {attempt} (limit {limit}/s)",
                     kind.as_str()
                 ));
                 break;
