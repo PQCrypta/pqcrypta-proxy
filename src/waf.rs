@@ -245,8 +245,12 @@ const PAYLOAD_RULES: &[RuleDef] = &[
         r"(?i)\bor\s+1\s*=\s*1"),
     RuleDef::payload("PQW-SQLI-004", Category::Sqli, Severity::High,
         r"(?i)\b(sleep|benchmark|waitfor\s+delay)\s*\("),
+    // Stacked query: a statement after `;` or a comment. The keyword alone is
+    // not one: `(;|--)\s*(drop|select|update|...)` with no word boundary read
+    // `;q=0.9, updated` or `; created=` in an ordinary header as SQL, and
+    // refused DuckDuckBot's every request for `/`. A statement has its shape.
     RuleDef::payload("PQW-SQLI-005", Category::Sqli, Severity::High,
-        r"(?i)(;|--)\s*(drop|select|insert|update|delete|create|alter)"),
+        r"(?i)(;|--)\s*(drop\s+(table|database|schema|view|index|user|function|procedure)\b|select\s+(\*|[\w@`\x22\[(]+[\s,]|\d|null\b|@@)|insert\s+into\b|update\s+[\w`\x22\[.]+\s+set\b|delete\s+from\b|create\s+(table|database|schema|view|index|user|function|procedure|trigger)\b|alter\s+(table|database|user|system)\b)"),
     // Quoted-string equality. Ambiguous enough to appear in prose and in JSON
     // payloads, so it corroborates rather than blocks alone.
     RuleDef::payload("PQW-SQLI-006", Category::Sqli, Severity::Low,
@@ -1114,6 +1118,8 @@ pub enum WafVerdict {
         score: u32,
         /// How many distinct rules matched
         matched: u32,
+        /// Where the reported rule matched (`path+query`, `header:<name>`, ...)
+        location: String,
     },
     /// Request blocked
     Block {
@@ -1121,6 +1127,8 @@ pub enum WafVerdict {
         severity: Severity,
         score: u32,
         matched: u32,
+        /// Where the reported rule matched (`path+query`, `header:<name>`, ...)
+        location: String,
     },
 }
 
@@ -1245,6 +1253,13 @@ struct Assessment {
     /// Explaining rather than enforcing: every rule is evaluated, nothing is
     /// counted in the engine's statistics.
     explain: bool,
+    /// The part of the request being scanned: `path`, `query`, `header:<name>`,
+    /// `body`, `user-agent`, `request`.
+    scanning: String,
+    /// Where the reported rule matched, so a block says which part of the
+    /// request it was about. A block that named only the rule left a false
+    /// positive on an unlogged header impossible to diagnose.
+    top_location: String,
 }
 
 /// One rule that matched, as reported by [`WafEngine::explain`].
@@ -1746,6 +1761,7 @@ impl WafEngine {
         };
 
         // --- Structural anomalies (smuggling, header injection) --------------
+        a.scanning = "request".into();
         if self.config.request_anomaly {
             self.check_anomalies(&mut a, req, &excluded, threshold);
         }
@@ -1753,6 +1769,7 @@ impl WafEngine {
         // --- Scanner/reconnaissance probe paths ------------------------------
         // Path-only: the path itself is the signal, and matching these strings
         // in a query or body would fire on our own security documentation.
+        a.scanning = "path".into();
         if a.score < threshold {
             for set_idx in self.path_set.matches(req.path) {
                 let idx = self.path_map[set_idx];
@@ -1768,6 +1785,7 @@ impl WafEngine {
 
         // --- User-Agent ------------------------------------------------------
         if a.score < threshold && !req.skip_bot_ua_check && self.config.block_scanner_uas {
+            a.scanning = "user-agent".into();
             self.check_user_agent(&mut a, req, &excluded, threshold);
         }
 
@@ -1778,6 +1796,12 @@ impl WafEngine {
             } else {
                 format!("{}?{}", req.path, req.query)
             };
+            a.scanning = if req.query.is_empty() {
+                "path"
+            } else {
+                "path+query"
+            }
+            .into();
             self.scan_payload(
                 &mut a,
                 &target,
@@ -1796,6 +1820,7 @@ impl WafEngine {
         // --- Body -------------------------------------------------------------
         if a.score < threshold {
             if let Some(body) = req.body {
+                a.scanning = "body".into();
                 let content_encoding = req
                     .headers
                     .get("content-encoding")
@@ -1856,6 +1881,7 @@ impl WafEngine {
                 severity,
                 score: a.score,
                 matched: a.matched,
+                location: a.top_location.clone(),
             }
         } else {
             self.stats.detected.fetch_add(1, Ordering::Relaxed);
@@ -1864,6 +1890,7 @@ impl WafEngine {
                 severity,
                 score: a.score,
                 matched: a.matched,
+                location: a.top_location.clone(),
             }
         }
     }
@@ -1891,6 +1918,7 @@ impl WafEngine {
         if a.top_severity.is_none_or(|s| rule.severity > s) {
             a.top = Some(idx);
             a.top_severity = Some(rule.severity);
+            a.top_location.clone_from(&a.scanning);
         }
         a.score >= threshold
     }
@@ -2026,6 +2054,7 @@ impl WafEngine {
             } else {
                 Filter::ALL
             };
+            a.scanning = format!("header:{name_str}");
             if self.scan_payload(
                 a,
                 v,
@@ -2600,6 +2629,71 @@ mod tests {
             "ordinary browser request must pass, got {}",
             rule_of(&v)
         );
+    }
+
+    /// PQW-SQLI-005 is a stacked statement, not a keyword after a semicolon:
+    /// the old pattern read headers like these as SQL and refused DuckDuckBot.
+    #[test]
+    fn stacked_query_rule_ignores_words_that_start_with_keywords() {
+        for value in [
+            "text/html;q=0.9, updated",
+            "max-age=0; created=1696000000",
+            "a=1; selection=all",
+            "--deleted",
+            "theme=dark;alternate",
+            "ref=x;dropbox",
+            "note; update pending",
+        ] {
+            let mut headers = browser_headers();
+            headers.insert("x-test", value.parse().unwrap());
+            let v = engine().inspect(&req("GET", "/", &headers));
+            assert!(
+                matches!(v, WafVerdict::Allow),
+                "{value:?} is not SQL, got {}",
+                rule_of(&v)
+            );
+        }
+    }
+
+    #[test]
+    fn stacked_query_rule_still_catches_statements() {
+        let headers = browser_headers();
+        for query in [
+            "id=1;DROP TABLE users",
+            "id=1; select * from users",
+            "id=1;SELECT 1",
+            "id=1;update users set admin=1",
+            "id=1; delete from sessions",
+            "id=1;insert into admins values(1)",
+            "id=1;create user x",
+            "id=1;alter table users add c int",
+        ] {
+            let v = engine().inspect(&WafRequest {
+                query,
+                ..req("GET", "/item", &headers)
+            });
+            assert!(blocked(&v), "{query:?} must be blocked");
+        }
+    }
+
+    /// A block says which part of the request it was about.
+    #[test]
+    fn verdicts_name_where_the_rule_matched() {
+        let mut headers = browser_headers();
+        headers.insert("x-filter", "1; DROP TABLE users".parse().unwrap());
+        match engine().inspect(&req("GET", "/", &headers)) {
+            WafVerdict::Block { location, .. } => assert_eq!(location, "header:x-filter"),
+            other => panic!("expected a block, got {}", rule_of(&other)),
+        }
+
+        let headers = browser_headers();
+        match engine().inspect(&WafRequest {
+            query: "id=1;DROP TABLE users",
+            ..req("GET", "/item", &headers)
+        }) {
+            WafVerdict::Block { location, .. } => assert_eq!(location, "path+query"),
+            other => panic!("expected a block, got {}", rule_of(&other)),
+        }
     }
 
     /// X-Forwarded-For carries loopback and private addresses by design. With

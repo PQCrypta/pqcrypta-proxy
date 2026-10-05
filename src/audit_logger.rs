@@ -57,12 +57,16 @@ pub enum AuditEvent {
         ip: String,
         rule: String,
         path: String,
+        /// The part of the request the rule matched (`header:<name>`, ...)
+        location: String,
     },
     /// WAF rule triggered — detection mode (logged, not blocked)
     WafDetect {
         ip: String,
         rule: String,
         path: String,
+        /// The part of the request the rule matched (`header:<name>`, ...)
+        location: String,
     },
     /// Configuration reloaded
     ConfigReload {
@@ -211,20 +215,34 @@ impl AuditLogger {
     }
 
     /// Convenience: log a WAF block.
-    pub fn log_waf_block(&self, ip: IpAddr, rule: impl Into<String>, path: impl Into<String>) {
+    pub fn log_waf_block(
+        &self,
+        ip: IpAddr,
+        rule: impl Into<String>,
+        path: impl Into<String>,
+        location: impl Into<String>,
+    ) {
         self.log(AuditEvent::WafBlock {
             ip: ip.to_string(),
             rule: rule.into(),
             path: path.into(),
+            location: location.into(),
         });
     }
 
     /// Convenience: log a WAF detect.
-    pub fn log_waf_detect(&self, ip: IpAddr, rule: impl Into<String>, path: impl Into<String>) {
+    pub fn log_waf_detect(
+        &self,
+        ip: IpAddr,
+        rule: impl Into<String>,
+        path: impl Into<String>,
+        location: impl Into<String>,
+    ) {
         self.log(AuditEvent::WafDetect {
             ip: ip.to_string(),
             rule: rule.into(),
             path: path.into(),
+            location: location.into(),
         });
     }
 }

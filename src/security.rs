@@ -1474,18 +1474,20 @@ impl SecurityState {
                     severity,
                     score,
                     matched,
+                    ref location,
                 } => {
                     warn!(
-                        "WAF block: rule={} severity={} score={} rules_matched={} ip={} path={}",
+                        "WAF block: rule={} severity={} score={} rules_matched={} location={} ip={} path={}",
                         rule,
                         severity.as_str(),
                         score,
                         matched,
+                        location,
                         ip,
                         view.path
                     );
                     if let Some(audit) = &self.audit_logger {
-                        audit.log_waf_block(ip, rule.clone(), view.path);
+                        audit.log_waf_block(ip, rule.clone(), view.path, location.clone());
                     }
                     if !is_pentest {
                         let mut counter = self.request_counts.entry(ip).or_default();
@@ -1506,18 +1508,20 @@ impl SecurityState {
                     severity,
                     score,
                     matched,
+                    ref location,
                 } => {
                     warn!(
-                        "WAF detect: rule={} severity={} score={} rules_matched={} ip={} path={}",
+                        "WAF detect: rule={} severity={} score={} rules_matched={} location={} ip={} path={}",
                         rule,
                         severity.as_str(),
                         score,
                         matched,
+                        location,
                         ip,
                         view.path
                     );
                     if let Some(audit) = &self.audit_logger {
-                        audit.log_waf_detect(ip, rule.clone(), view.path);
+                        audit.log_waf_detect(ip, rule.clone(), view.path, location.clone());
                     }
                 }
                 WafVerdict::Allow => {}
