@@ -919,7 +919,16 @@ impl SecurityState {
             blocked_ips,
             request_counts: Arc::new(DashMap::new()),
             ja3_cache: Arc::new(DashMap::new()),
-            crawler_verifier: Arc::new(CrawlerVerifier::new()),
+            // Unit tests never fetch the feeds nor read the live cache.
+            crawler_verifier: Arc::new(
+                if config.security.crawler_published_ranges && !cfg!(test) {
+                    CrawlerVerifier::with_published_ranges(std::path::Path::new(
+                        crate::crawler_verify::RANGES_CACHE,
+                    ))
+                } else {
+                    CrawlerVerifier::new()
+                },
+            ),
             circuit_breakers: Arc::new(DashMap::new()),
             config: Arc::new(RwLock::new(config.security.clone())),
             rate_config: Arc::new(RwLock::new(config.rate_limiting.clone())),
@@ -1586,7 +1595,8 @@ impl SecurityState {
             crate::config::ip_list_contains(&c.pentest_bypass_ips, &ip)
         };
 
-        // Search-engine crawlers, verified by forward-confirmed reverse DNS.
+        // Search-engine crawlers, verified by their operators' published address
+        // ranges or, failing those, forward-confirmed reverse DNS.
         //
         // Verified  -> exempt from the rate limiters entirely. A render burst is
         //              normal crawler behaviour, not abuse.
