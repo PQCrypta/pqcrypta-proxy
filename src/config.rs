@@ -2346,6 +2346,13 @@ pub struct SecurityConfig {
     /// How often the exit list is re-fetched.
     #[serde(default = "default_tor_exit_refresh_secs")]
     pub tor_exit_refresh_secs: u64,
+    /// Verify crawlers against the address ranges their operators publish
+    /// (Google, Bing, DuckDuckGo, Apple, OpenAI, Perplexity, Common Crawl,
+    /// Ahrefs), fetched every six hours and cached in
+    /// `/var/lib/pqcrypta-proxy/crawler-ranges.json`. Off, crawlers are
+    /// verified by reverse DNS alone, which cannot verify DuckDuckBot.
+    #[serde(default = "default_true")]
+    pub crawler_published_ranges: bool,
     /// How many distinct TLS fingerprints the observed corpus retains.
     ///
     /// This began as a memory-exhaustion guard at a hardcoded 50,000 and is now
@@ -2540,6 +2547,7 @@ impl Default for SecurityConfig {
             block_tor_exit_nodes: false,
             tor_exit_list_url: default_tor_exit_list_url(),
             tor_exit_refresh_secs: default_tor_exit_refresh_secs(),
+            crawler_published_ranges: true,
         }
     }
 }

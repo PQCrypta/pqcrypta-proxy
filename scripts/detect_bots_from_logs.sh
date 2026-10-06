@@ -21,6 +21,45 @@ mkdir -p "$(dirname "${STATE_FILE}")" "${TEMP_DIR}"
 TS=$(date '+%Y-%m-%d %H:%M:%S')
 log() { echo "[${TS}] $1" >> "${LOG_FILE}"; }
 
+# Verified crawlers: the address ranges their operators publish (Google, Bing,
+# DuckDuckGo, Apple, OpenAI, ...), fetched and cached by the proxy
+# (src/crawler_verify.rs). A crawler follows links; a link to a honeypot path,
+# or to a page that 404s, is not an attack. Both passes below banned Googlebot
+# and Bingbot for exactly that, for 72 hours on every site behind the proxy,
+# and the 403s the ban produced counted as fresh probes, renewing it.
+CRAWLER_RANGES="/var/lib/pqcrypta-proxy/crawler-ranges.json"
+
+# split_verified_crawlers IN OUT VERIFIED: copy the TSV lines of IN (address in
+# the first field) to OUT unless the address is a verified crawler's; write
+# those addresses, once each, to VERIFIED. Without the cache nothing is split.
+split_verified_crawlers() {
+    python3 -c '
+import ipaddress, json, sys
+src, out, verified = sys.argv[1:4]
+try:
+    families = json.load(open(sys.argv[4]))["families"]
+    nets = [ipaddress.ip_network(n) for v in families.values() for n in v]
+except Exception:
+    nets = []
+seen, crawlers = {}, set()
+with open(src) as f, open(out, "w") as o:
+    for line in f:
+        ip = line.split("\t", 1)[0].strip()
+        if ip not in seen:
+            try:
+                addr = ipaddress.ip_address(ip)
+                seen[ip] = any(addr in n for n in nets if n.version == addr.version)
+            except ValueError:
+                seen[ip] = False
+        if seen[ip]:
+            crawlers.add(ip)
+        else:
+            o.write(line)
+with open(verified, "w") as v:
+    v.writelines(ip + "\n" for ip in sorted(crawlers))
+' "$1" "$2" "$3" "${CRAWLER_RANGES}"
+}
+
 # Suspicious path patterns
 PATTERNS='wp-admin|wp-login|wp-content|wp-includes|\.git|\.env|\.sql|\.bak|\.old|backup|admin\.php|phpmyadmin|xmlrpc\.php|eval-stdin|shell|config\.php|\.zip|\.tar|\.gz|setup\.php|install\.php|filemanager|wp_filemanager|rip\.php|c99|r57|wso|alfa|filesman|webshell|\.htaccess|\.htpasswd|passwd|shadow|boot\.ini|win\.ini|phpinfo|adminer|\.svn|\.hg|\.DS_Store|Thumbs\.db|\.idea|\.vscode|node_modules|vendor/|composer\.(json|lock)|package\.json|\.npmrc|id_rsa|id_dsa|\.pem|\.key|credentials|secrets|token'
 
@@ -44,10 +83,6 @@ log "Processing ${BYTES_TO_PROCESS} bytes (from byte ${LAST_BYTE} to ${CURRENT_S
 # Extract new data once; both the suspicious-pattern pass and the honeypot
 # feed below consume the same slice
 tail -c "+$((LAST_BYTE + 1))" "${ACCESS_LOG}" > "${TEMP_DIR}/new_lines.txt" 2>/dev/null || true
-grep -iE "${PATTERNS}" "${TEMP_DIR}/new_lines.txt" > "${TEMP_DIR}/suspicious.txt" 2>/dev/null || true
-
-SUSPICIOUS_COUNT=$(wc -l < "${TEMP_DIR}/suspicious.txt" 2>/dev/null || echo "0")
-log "Found ${SUSPICIOUS_COUNT} suspicious entries"
 
 # ---------------------------------------------------------------------------
 # Honeypot feed: the proxy WAF blocks scanner probes at the edge, so they never
@@ -92,7 +127,43 @@ BEGIN { FS = "\"" }
     gsub(/\t/, " ", path); gsub(/\t/, " ", qs); gsub(/\t/, " ", ua); gsub(/\t/, " ", host);
 
     print ip "\t" method "\t" substr(path, 1, 500) "\t" substr(qs, 1, 500) "\t" substr(ua, 1, 500) "\t" host;
-}' "${TEMP_DIR}/new_lines.txt" > "${TEMP_DIR}/probes.tsv" 2>/dev/null || true
+}' "${TEMP_DIR}/new_lines.txt" > "${TEMP_DIR}/all_probes.tsv" 2>/dev/null || true
+
+# Verified crawlers' requests are neither probes nor suspicious
+split_verified_crawlers "${TEMP_DIR}/all_probes.tsv" "${TEMP_DIR}/probes.tsv" "${TEMP_DIR}/crawlers.txt" \
+    || cp "${TEMP_DIR}/all_probes.tsv" "${TEMP_DIR}/probes.tsv"
+
+# ...and a ban already on one is lifted: it was earned by following links.
+# Only the automatic edge bans; an operator's own block stands.
+if [ -s "${TEMP_DIR}/crawlers.txt" ]; then
+    CRAWLER_IPS="{$(paste -sd, "${TEMP_DIR}/crawlers.txt")}"
+    LIFTED=$(psql -U "${DB_USER}" -d "${DB_NAME}" -q -t -A -v "ips=${CRAWLER_IPS}" << 'ENDSQL' 2>>"${LOG_FILE}" || echo "0"
+WITH honeypot AS (
+    UPDATE security_blocklist SET is_active = false
+    WHERE ip_address = ANY (:'ips'::inet[]) AND is_active AND block_type = 'honeypot_trigger'
+    RETURNING 1
+), proxy AS (
+    UPDATE bot_blocklist SET is_active = false, updated_at = NOW()
+    WHERE ip_address = ANY (:'ips'::inet[]) AND is_active AND detection_source = 'proxy'
+    RETURNING 1
+)
+SELECT (SELECT COUNT(*) FROM honeypot) + (SELECT COUNT(*) FROM proxy);
+ENDSQL
+)
+    LIFTED=$(printf '%s' "${LIFTED}" | tr -dc '0-9')
+    [ -n "${LIFTED}" ] && [ "${LIFTED}" -gt 0 ] && \
+        log "Lifted ${LIFTED} ban(s) on verified crawlers: $(paste -sd' ' "${TEMP_DIR}/crawlers.txt")"
+fi
+
+# Suspicious paths, among failed requests only: a page that answered is no
+# evidence, and the pattern list holds words (token, backup, shell, secrets)
+# that this site's own documentation URLs contain. This grepped the whole log
+# line, user agent and referer included, whatever the status.
+awk -F'\t' '{ print $1 "\t" $3 }' "${TEMP_DIR}/probes.tsv" \
+    | grep -iE "^[^	]*	.*(${PATTERNS})" > "${TEMP_DIR}/suspicious.txt" 2>/dev/null || true
+
+SUSPICIOUS_COUNT=$(wc -l < "${TEMP_DIR}/suspicious.txt" 2>/dev/null || echo "0")
+log "Found ${SUSPICIOUS_COUNT} suspicious entries"
 
 PROBE_LINES=$(wc -l < "${TEMP_DIR}/probes.tsv" 2>/dev/null || echo "0")
 if [ "${PROBE_LINES}" -gt 0 ]; then
@@ -156,6 +227,11 @@ blocked AS (
            NOW(), '{}'::jsonb, true
     FROM matched
     WHERE threat_level IN ('critical', 'high')
+      -- Generic login and dashboard routes (/login, /dashboard, /portal,
+      -- /saml/login, ...) exist for real on many sites: on a web host a hit is
+      -- logged, not banned. A person who mistyped one was locked out of every
+      -- site for three days; a scanner trips the never-legitimate paths too.
+      AND (category <> 'admin_panels' OR host ~ '^api[0-9]*\.pqcrypta\.com$')
     ORDER BY ip, CASE threat_level WHEN 'critical' THEN 0 WHEN 'high' THEN 1
                                    WHEN 'medium' THEN 2 ELSE 3 END
     ON CONFLICT (ip_address) DO UPDATE
@@ -256,7 +332,7 @@ sanitize_path() {
 
 if [ "${SUSPICIOUS_COUNT}" -gt 0 ]; then
     # Extract unique IPs with counts
-    awk '{print $1}' "${TEMP_DIR}/suspicious.txt" | \
+    cut -f1 "${TEMP_DIR}/suspicious.txt" | \
         grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | \
         sort | uniq -c | sort -rn > "${TEMP_DIR}/ip_counts.txt"
 
@@ -265,7 +341,7 @@ if [ "${SUSPICIOUS_COUNT}" -gt 0 ]; then
         [ -z "$ip" ] && continue
 
         # Get sample path for this IP — sanitized before any SQL context
-        RAW_PATH=$(grep "^${ip} " "${TEMP_DIR}/suspicious.txt" | head -1 | grep -oE '"(GET|POST|HEAD|PUT|DELETE) [^"]+' | awk '{print $2}' | head -1)
+        RAW_PATH=$(awk -F'\t' -v ip="${ip}" '$1 == ip { print $2; exit }' "${TEMP_DIR}/suspicious.txt")
         SAMPLE_PATH=$(sanitize_path "${RAW_PATH:-/unknown}")
         [ -z "${SAMPLE_PATH}" ] && SAMPLE_PATH="/unknown"
 
@@ -321,6 +397,6 @@ fi
 echo "${CURRENT_SIZE}" > "${STATE_FILE}"
 
 # Cleanup
-rm -f "${TEMP_DIR}/suspicious.txt" "${TEMP_DIR}/ip_counts.txt"
+rm -f "${TEMP_DIR}/suspicious.txt" "${TEMP_DIR}/ip_counts.txt" "${TEMP_DIR}/all_probes.tsv" "${TEMP_DIR}/crawlers.txt"
 
 log "Bot detection complete"
