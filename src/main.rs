@@ -1225,6 +1225,7 @@ async fn run() -> anyhow::Result<()> {
                     http_metrics,
                     http_lb,
                     http_sni_map,
+                    http_resolver,
                     http_security.clone(),
                     http_rate_limiter,
                     http_config_updates,
