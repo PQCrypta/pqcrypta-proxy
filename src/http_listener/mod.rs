@@ -1490,61 +1490,12 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
         Some(ref resolver) => std::sync::Arc::clone(resolver),
         None => private_resolver(cert_path)?,
     };
-    let policy = crate::tls::ServerTlsPolicy::from_config(
-        &config.tls,
-        &config.pqc,
-        config.pqc.enabled,
-        config.client_auth(),
-    )?;
-    let rustls_config = Arc::new(build_rustls_server_config(
-        &policy,
-        std::sync::Arc::clone(&resolver),
-        ALPN_H2_HTTP11,
-    )?);
-
-    // Build HTTP/1.1-only config for SNI-selected hosts that must not use HTTP/2.
-    // Browsers that negotiate http/1.1 open independent TCP connections per stream
-    // (up to 6 per origin) instead of coalescing all streams on one HTTP/2 pipe.
-    let http11_only_config = if !config.server.http11_only_hosts.is_empty() {
-        let cfg =
-            build_rustls_server_config(&policy, std::sync::Arc::clone(&resolver), ALPN_HTTP11)?;
-        Some(Arc::new(cfg))
-    } else {
-        None
-    };
-
-    // Create fingerprinting TLS acceptor
-    let mut acceptor_builder = FingerprintingTlsAcceptor::new(
-        rustls_config,
+    let fingerprinting_acceptor = Arc::new(build_fingerprinting_acceptor(
+        &config,
+        &resolver,
         fingerprint_extractor,
         security_state,
-        config.fingerprint.clone(),
-        // SEC-002: with 0-RTT on, handshakes serve early data before they
-        // complete (crate::early_data).
-        config.tls.enable_0rtt,
-    );
-    // The acceptor defaulted to mode "strict" with a 60 s window regardless of
-    // what the operator configured, so `tls.zero_rtt_replay_protection` and
-    // `tls.zero_rtt_nonce_window_secs` were validated at startup and then
-    // discarded.  Selecting "none" or "session" silently still got "strict",
-    // and — worse for anyone who trusted the knob — shortening the window did
-    // nothing.  Feed the acceptor the real values.
-    acceptor_builder = acceptor_builder.with_zero_rtt_protection(
-        &config.tls.zero_rtt_replay_protection,
-        config.tls.zero_rtt_nonce_window_secs,
-    );
-    acceptor_builder = acceptor_builder.with_handshake_timeout(std::time::Duration::from_secs(
-        config.tls.handshake_timeout_secs,
-    ));
-    if let Some(h11_cfg) = http11_only_config {
-        acceptor_builder = acceptor_builder
-            .with_http11_only_acceptor(h11_cfg, config.server.http11_only_hosts.clone());
-        info!(
-            "🔒 HTTP/1.1-only ALPN active for: {:?}",
-            config.server.http11_only_hosts
-        );
-    }
-    let fingerprinting_acceptor = Arc::new(acceptor_builder);
+    )?);
 
     // Bind TCP listener
     let listener = TcpListener::bind(addr).await?;
@@ -1610,6 +1561,75 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
 
     info!("✅ HTTP listener stopped gracefully");
     Ok(())
+}
+
+/// The rustls acceptor of a fingerprinting TCP listener: the server policy
+/// (groups in tuples, versions, client auth, tickets), the domain resolver
+/// (ML-DSA companions included), ECH, the 0-RTT replay guard, the handshake
+/// timeout and the HTTP/1.1-only hosts. The rustls listener serves every
+/// connection through it; the OpenSSL listener, which cannot do ECH, hands
+/// it the connections that offer one of this server's ECH configs.
+fn build_fingerprinting_acceptor(
+    config: &ProxyConfig,
+    resolver: &std::sync::Arc<crate::tls::MultiDomainCertResolver>,
+    fingerprint_extractor: Arc<FingerprintExtractor>,
+    security_state: SecurityState,
+) -> Result<FingerprintingTlsAcceptor, Box<dyn std::error::Error + Send + Sync>> {
+    let policy = crate::tls::ServerTlsPolicy::from_config(
+        &config.tls,
+        &config.pqc,
+        config.pqc.enabled,
+        config.client_auth(),
+    )?;
+    let rustls_config = Arc::new(build_rustls_server_config(
+        &policy,
+        std::sync::Arc::clone(resolver),
+        ALPN_H2_HTTP11,
+    )?);
+
+    // Build HTTP/1.1-only config for SNI-selected hosts that must not use HTTP/2.
+    // Browsers that negotiate http/1.1 open independent TCP connections per stream
+    // (up to 6 per origin) instead of coalescing all streams on one HTTP/2 pipe.
+    let http11_only_config = if !config.server.http11_only_hosts.is_empty() {
+        let cfg =
+            build_rustls_server_config(&policy, std::sync::Arc::clone(resolver), ALPN_HTTP11)?;
+        Some(Arc::new(cfg))
+    } else {
+        None
+    };
+
+    // Create fingerprinting TLS acceptor
+    let mut acceptor_builder = FingerprintingTlsAcceptor::new(
+        rustls_config,
+        fingerprint_extractor,
+        security_state,
+        config.fingerprint.clone(),
+        // SEC-002: with 0-RTT on, handshakes serve early data before they
+        // complete (crate::early_data).
+        config.tls.enable_0rtt,
+    );
+    // The acceptor defaulted to mode "strict" with a 60 s window regardless of
+    // what the operator configured, so `tls.zero_rtt_replay_protection` and
+    // `tls.zero_rtt_nonce_window_secs` were validated at startup and then
+    // discarded.  Selecting "none" or "session" silently still got "strict",
+    // and — worse for anyone who trusted the knob — shortening the window did
+    // nothing.  Feed the acceptor the real values.
+    acceptor_builder = acceptor_builder.with_zero_rtt_protection(
+        &config.tls.zero_rtt_replay_protection,
+        config.tls.zero_rtt_nonce_window_secs,
+    );
+    acceptor_builder = acceptor_builder.with_handshake_timeout(std::time::Duration::from_secs(
+        config.tls.handshake_timeout_secs,
+    ));
+    if let Some(h11_cfg) = http11_only_config {
+        acceptor_builder = acceptor_builder
+            .with_http11_only_acceptor(h11_cfg, config.server.http11_only_hosts.clone());
+        info!(
+            "🔒 HTTP/1.1-only ALPN active for: {:?}",
+            config.server.http11_only_hosts
+        );
+    }
+    Ok(acceptor_builder)
 }
 
 /// Handle a single connection with fingerprinting
@@ -1775,6 +1795,9 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     metrics: Arc<MetricsRegistry>,
     load_balancer: Arc<LoadBalancer>,
     sni_map: openssl_pqc::PqcSniMap,
+    // The rustls listeners' resolver: connections that offer this server's
+    // ECH are handed to rustls, which can decrypt them (OpenSSL 3.5 cannot).
+    rustls_resolver: Arc<crate::tls::MultiDomainCertResolver>,
     // Shared with every other listener. Each of these built its own
     // `SecurityState` before, so a blocked IP, a rate-limit counter, an
     // observed fingerprint or a DB-synced blocklist entry existed only on
@@ -1829,6 +1852,28 @@ pub async fn run_http_listener_pqc_with_fingerprint(
         },
         config_updates,
     );
+
+    // ECH over TCP. OpenSSL 3.5 has no server-side ECH, so this listener
+    // rejected every encrypted ClientHello: a browser reconnected without
+    // ECH and sent the hostname in clear, while DNS advertised ECH and only
+    // HTTP/3 (rustls) accepted it. A connection whose ClientHello names one
+    // of this server's ECH configs goes to the rustls acceptor instead --
+    // ECH, the same groups and certificates, fingerprinting and 0-RTT guard.
+    let ech_ids: Arc<[u8]> = crate::ech_config::config_ids().into();
+    let ech_acceptor = if !ech_ids.is_empty() && crate::ech_config::load().is_some() {
+        info!(
+            "🔏 ECH over TCP: ClientHellos naming ECH config(s) {:02x?} are served by rustls",
+            ech_ids
+        );
+        Some(Arc::new(build_fingerprinting_acceptor(
+            &config,
+            &rustls_resolver,
+            fingerprint_extractor.clone(),
+            security_state.clone(),
+        )?))
+    } else {
+        None
+    };
 
     // Create OpenSSL PQC acceptor with SNI multi-domain support.
     // The `sni_map` was pre-built by the caller and is shared with the ACME
@@ -1906,6 +1951,9 @@ pub async fn run_http_listener_pqc_with_fingerprint(
                 let proxy_trusted = proxy_trusted.clone();
                 let zero_rtt = zero_rtt.clone();
                 let conn_shutdown = shutdown_rx.clone();
+                let ech_route = ech_acceptor
+                    .clone()
+                    .map(|acceptor| EchRoute { acceptor, config_ids: ech_ids.clone() });
 
                 tokio::spawn(async move {
                     let mut stream = stream;
@@ -1919,6 +1967,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
                     handle_pqc_fingerprinted_connection(
                         stream,
                         remote_addr,
+                        ech_route,
                         ssl_ctx,
                         fp_extractor,
                         sec_state,
@@ -1969,6 +2018,44 @@ fn pqc_handshake_facts(ssl: &openssl::ssl::SslRef) -> crate::tls_acceptor::Hands
     }
 }
 
+/// The rustls acceptor the OpenSSL listener hands ECH connections to, and
+/// the config ids that select them.
+#[derive(Clone)]
+struct EchRoute {
+    acceptor: Arc<FingerprintingTlsAcceptor>,
+    config_ids: Arc<[u8]>,
+}
+
+/// Peek the ClientHello's TLS record until it is whole (its length is in the
+/// record header), the buffer is full, or `deadline`. None when nothing came
+/// in time; otherwise the last peek's result.
+async fn peek_client_hello(
+    stream: &TcpStream,
+    buf: &mut [u8],
+    deadline: tokio::time::Instant,
+) -> Option<std::io::Result<usize>> {
+    loop {
+        let n = match tokio::time::timeout_at(deadline, stream.peek(buf))
+            .await
+            .ok()?
+        {
+            Ok(n) => n,
+            Err(e) => return Some(Err(e)),
+        };
+        let whole = n >= 5 && n >= 5 + u16::from_be_bytes([buf[3], buf[4]]) as usize;
+        if n == 0 || whole || n == buf.len() || buf[0] != 22 {
+            return Some(Ok(n));
+        }
+        // More of the record is in flight: peek returns at once while
+        // anything is buffered, so wait a little before looking again
+        let pause = std::time::Duration::from_millis(2);
+        if tokio::time::Instant::now() + pause >= deadline {
+            return Some(Ok(n));
+        }
+        tokio::time::sleep(pause).await;
+    }
+}
+
 // Every argument is a distinct per-connection dependency with no natural
 // grouping; bundling them into a struct purely to satisfy the lint would add an
 // indirection this accept path does not otherwise need.
@@ -1976,6 +2063,8 @@ fn pqc_handshake_facts(ssl: &openssl::ssl::SslRef) -> crate::tls_acceptor::Hands
 async fn handle_pqc_fingerprinted_connection<S>(
     stream: TcpStream,
     remote_addr: SocketAddr,
+    // Where a ClientHello offering this server's ECH goes; None without ECH keys
+    ech_route: Option<EchRoute>,
     ssl_context: Arc<openssl::ssl::SslContext>,
     fingerprint_extractor: Arc<FingerprintExtractor>,
     security_state: SecurityState,
@@ -2000,11 +2089,13 @@ async fn handle_pqc_fingerprinted_connection<S>(
     trace!("New TCP connection from {} (PQC mode)", remote_addr);
     let deadline = tokio::time::Instant::now() + handshake_timeout;
 
-    // Peek at the ClientHello before TLS handshake
-    let mut peek_buf = vec![0u8; 4096];
-    let peeked = match tokio::time::timeout_at(deadline, stream.peek(&mut peek_buf)).await {
-        Ok(r) => r,
-        Err(_) => {
+    // Peek at the ClientHello before TLS handshake: the whole record, which
+    // a browser's (an ML-KEM key share, perhaps ECH) often spreads over two
+    // TCP segments. The first segment alone missed extensions further on.
+    let mut peek_buf = vec![0u8; 5 + 16 * 1024];
+    let peeked = match peek_client_hello(&stream, &mut peek_buf, deadline).await {
+        Some(r) => r,
+        None => {
             debug!(
                 "No ClientHello from {} within {:?}",
                 remote_addr, handshake_timeout
@@ -2013,6 +2104,28 @@ async fn handle_pqc_fingerprinted_connection<S>(
         }
     };
     let peek_len = peeked.as_ref().map(|n| *n).unwrap_or(0);
+
+    // A ClientHello for one of this server's ECH configs: rustls serves the
+    // connection (and fingerprints it, once). GREASE ECH names a random
+    // config_id and stays here.
+    if let Some(route) = ech_route {
+        if crate::ech_config::offered_config_id(&peek_buf[..peek_len])
+            .is_some_and(|id| route.config_ids.contains(&id))
+        {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            handle_fingerprinted_connection(
+                stream,
+                remote_addr,
+                route.acceptor,
+                app,
+                metrics,
+                left,
+                shutdown,
+            )
+            .await;
+            return;
+        }
+    }
     let fingerprint_result = match peeked {
         Ok(n) if n > 0 => {
             trace!("Peeked {} bytes of ClientHello from {}", n, remote_addr);
