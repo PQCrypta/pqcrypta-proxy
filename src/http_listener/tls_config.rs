@@ -74,6 +74,7 @@ pub(super) fn build_rustls_server_config(
 ) -> Result<rustls::ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
     let mut config = policy.builder()?.with_cert_resolver(resolver);
     policy.apply_tickets(&mut config)?;
+    policy.apply_group_tuples(&mut config);
     policy.apply_tcp_early_data(&mut config);
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     config.ech = crate::ech_config::load();

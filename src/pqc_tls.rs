@@ -283,7 +283,7 @@ impl PqcTlsProvider {
                 }
 
                 // Build groups string with fallback chain
-                let groups = self.build_groups_string(&config, &kems, preferred);
+                let groups = Self::build_groups_string(&config, &kems, preferred);
                 *self.groups_string.write() = groups.clone();
 
                 status.configured_kem = preferred;
@@ -452,12 +452,12 @@ impl PqcTlsProvider {
 
     /// Build OpenSSL groups string for TLS configuration
     fn build_groups_string(
-        &self,
         config: &PqcConfig,
         available_kems: &[String],
         preferred: Option<PqcKemAlgorithm>,
     ) -> String {
-        let mut groups = Vec::new();
+        // (name, NIST level, hybrid) of each post-quantum group offered
+        let mut groups: Vec<(&'static str, u8, bool)> = Vec::new();
 
         // In order: preferred_kem, then additional_kems as listed, then every
         // recommended hybrid. A pure ML-KEM group is offered only when named
@@ -480,7 +480,7 @@ impl PqcTlsProvider {
         );
         for (kem, explicit) in candidates {
             let name = kem.openssl_name();
-            if groups.iter().any(|g| g == name) {
+            if groups.iter().any(|(g, _, _)| *g == name) {
                 continue;
             }
             if !kem.is_hybrid() && (config.require_hybrid || !explicit) {
@@ -504,7 +504,32 @@ impl PqcTlsProvider {
                 continue;
             }
             if available_kems.iter().any(|k| k.contains(name)) {
-                groups.push(name.to_string());
+                groups.push((name, kem.security_level(), kem.is_hybrid()));
+            }
+        }
+
+        // Tuples of comparable strength, "/" between them (OpenSSL 3.5): the
+        // strongest NIST level first, hybrids ahead of pure ML-KEM within a
+        // level, the classical fallback last. OpenSSL takes the first tuple
+        // holding a group the client supports, asking with a HelloRetryRequest
+        // when the client sent no key share for it, so a client that lists a
+        // classical group first still gets a post-quantum one it supports.
+        // As one colon-separated list, a single tuple, it took the client's
+        // order: such a client got P-384 (OpenSSL's documentation warns that
+        // this lets a network attacker downgrade). Browsers send an
+        // X25519MLKEM768 key share and do not list ML-KEM-1024, so they still
+        // get X25519MLKEM768 without a retry; a client that lists ML-KEM-1024
+        // gets it, as CNSA 2.0 asks a server to prefer.
+        groups.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+        let mut tuples: Vec<String> = Vec::new();
+        for level in [5u8, 3, 1] {
+            let tier: Vec<&str> = groups
+                .iter()
+                .filter(|(_, l, _)| *l == level)
+                .map(|(n, _, _)| *n)
+                .collect();
+            if !tier.is_empty() {
+                tuples.push(tier.join(":"));
             }
         }
 
@@ -517,7 +542,7 @@ impl PqcTlsProvider {
         // client finds no mutually supported group and the handshake fails —
         // which is the intended, and deliberately disruptive, behaviour.
         if config.fallback_to_classical && !config.require_hybrid {
-            groups.push("P-384".to_string());
+            tuples.push("P-384".to_string());
         } else {
             // Warn whichever setting caused it. `require_hybrid` used to warn and
             // `fallback_to_classical = false` did not, so the more obscure of the
@@ -536,7 +561,7 @@ impl PqcTlsProvider {
             );
         }
 
-        groups.join(":")
+        tuples.join("/")
     }
 
     /// Get current PQC status
@@ -1106,7 +1131,8 @@ pub mod openssl_pqc {
 
     /// Apply PQC group list and 256-bit-only TLS 1.3 cipher restriction to an SslContextBuilder.
     ///
-    /// Named groups: X25519MLKEM768 (PQC hybrid) → P-384 (secp384r1, 192-bit = 100% key exchange).
+    /// Named groups: post-quantum tuples by NIST level (ML-KEM-1024, then ML-KEM-768), then
+    /// P-384 (secp384r1, 192-bit = 100% key exchange); see `build_groups_string`.
     /// P-256 (secp256r1) is intentionally excluded: if it were present SSL Labs' test client
     /// (which sends a secp256r1 key_share) would negotiate secp256r1 (128-bit = 90%) instead of
     /// being sent HelloRetryRequest for secp384r1. All TLS 1.3 clients that support secp256r1
@@ -1130,29 +1156,47 @@ pub mod openssl_pqc {
         // not is dropped rather than failing the whole list -- and no fallback
         // can quietly put back a classical group require_hybrid removed.
         // X25519 and P-256 are never offered here (128-bit; 90% on SSL Labs).
+        // The list comes in tuples ("/"); see `build_groups_string`.
         let configured = pqc_provider.groups_string();
-        let mut accepted: Vec<&str> = Vec::new();
+        let mut accepted: Vec<String> = Vec::new();
         if pqc_provider.is_available() && !configured.is_empty() {
-            for group in configured.split(':') {
-                if builder.set_groups_list(group).is_ok() {
-                    accepted.push(group);
-                } else {
-                    info!(
-                        "TLS group {} is not a TLS group in the linked OpenSSL; not offered",
-                        group
-                    );
+            for tuple in configured.split('/') {
+                let mut kept: Vec<&str> = Vec::new();
+                for group in tuple.split(':') {
+                    if builder.set_groups_list(group).is_ok() {
+                        kept.push(group);
+                    } else {
+                        info!(
+                            "TLS group {} is not a TLS group in the linked OpenSSL; not offered",
+                            group
+                        );
+                    }
+                }
+                if !kept.is_empty() {
+                    accepted.push(kept.join(":"));
                 }
             }
         }
         let groups = if accepted.is_empty() {
             "P-384".to_string()
         } else {
-            accepted.join(":")
+            accepted.join("/")
         };
         match builder.set_groups_list(&groups) {
             Ok(()) => info!("TLS named groups configured: {}", groups),
             Err(e) => warn!("Failed to set TLS groups {}: {}", groups, e),
         }
+
+        // ── The server's order, for suites and within a group tuple ──────────
+        // AES-256-GCM first (CNSA 2.0), unless the client puts ChaCha20 at the
+        // top of its list: PRIORITIZE_CHACHA serves a client without AES
+        // hardware the cipher it is fast at. Within a group tuple, server
+        // preference takes the tuple's order among the key shares a client
+        // sent, the same rule the rustls listeners follow (kx_group_tuples).
+        builder.set_options(
+            openssl::ssl::SslOptions::CIPHER_SERVER_PREFERENCE
+                | openssl::ssl::SslOptions::PRIORITIZE_CHACHA,
+        );
 
         // ── A+ Cipher Strength: 256-bit TLS 1.3 ciphers only ─────────────────
         // Remove TLS_AES_128_GCM_SHA256 (128-bit → 90% SSL Labs cipher strength).
@@ -1327,6 +1371,49 @@ pub fn verify_pqc_support(config: &PqcConfig) -> Result<PqcStatus, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Post-quantum tuples by NIST level, hybrids first, the classical
+    /// fallback last: a client that lists P-384 first still gets ML-KEM.
+    #[test]
+    fn groups_come_in_tuples_strongest_first() {
+        let all: Vec<String> = [
+            "X25519MLKEM768",
+            "SecP256r1MLKEM768",
+            "SecP384r1MLKEM1024",
+            "MLKEM768",
+            "MLKEM1024",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let config = PqcConfig {
+            additional_kems: vec!["MLKEM1024".into(), "MLKEM768".into()],
+            ..PqcConfig::default()
+        };
+        let groups = PqcTlsProvider::build_groups_string(
+            &config,
+            &all,
+            PqcKemAlgorithm::from_str("X25519MLKEM768"),
+        );
+        assert_eq!(
+            groups,
+            "SecP384r1MLKEM1024:MLKEM1024/X25519MLKEM768:SecP256r1MLKEM768:MLKEM768/P-384"
+        );
+
+        // require_hybrid: no pure ML-KEM and no classical tuple
+        let hybrid_only = PqcTlsProvider::build_groups_string(
+            &PqcConfig {
+                require_hybrid: true,
+                ..config
+            },
+            &all,
+            PqcKemAlgorithm::from_str("X25519MLKEM768"),
+        );
+        assert_eq!(
+            hybrid_only,
+            "SecP384r1MLKEM1024/X25519MLKEM768:SecP256r1MLKEM768"
+        );
+    }
 
     #[test]
     fn test_kem_algorithm_names() {

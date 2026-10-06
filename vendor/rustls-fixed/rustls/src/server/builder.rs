@@ -105,6 +105,7 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
             verifier: self.state.verifier,
             cert_resolver,
             ignore_client_order: false,
+            kx_group_tuples: Vec::new(),
             max_fragment_size: None,
             #[cfg(feature = "std")]
             session_storage: handy::ServerSessionMemoryCache::new(256),

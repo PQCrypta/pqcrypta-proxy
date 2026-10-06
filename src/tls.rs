@@ -703,13 +703,28 @@ mod server_policy_tests {
         policy: &ServerTlsPolicy,
         client_versions: &[&'static rustls::SupportedProtocolVersion],
     ) -> anyhow::Result<(NamedGroup, ProtocolVersion)> {
+        negotiate_offering(policy, client_versions, None)
+    }
+
+    /// `negotiate` with a client that offers `client_groups`, in that order,
+    /// with a key share for the first only (rustls's client), when given.
+    fn negotiate_offering(
+        policy: &ServerTlsPolicy,
+        client_versions: &[&'static rustls::SupportedProtocolVersion],
+        client_groups: Option<Vec<&'static dyn rustls::crypto::SupportedKxGroup>>,
+    ) -> anyhow::Result<(NamedGroup, ProtocolVersion)> {
         let (cert, key) = self_signed_pair()?;
-        let server = policy
+        let mut server = policy
             .builder()?
             .with_single_cert(vec![cert.clone()], key)?;
+        policy.apply_group_tuples(&mut server);
         let mut roots = RootCertStore::empty();
         roots.add(cert)?;
-        let client = ClientConfig::builder_with_provider(Arc::new(rustls_post_quantum::provider()))
+        let mut client_provider = rustls_post_quantum::provider();
+        if let Some(groups) = client_groups {
+            client_provider.kx_groups = groups;
+        }
+        let client = ClientConfig::builder_with_provider(Arc::new(client_provider))
             .with_protocol_versions(client_versions)?
             .with_root_certificates(roots)
             .with_no_client_auth();
@@ -732,6 +747,55 @@ mod server_policy_tests {
 
     const TLS13: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
     const TLS12: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS12];
+
+    /// A client that lists P-384 first and sends its key share for it, then
+    /// X25519MLKEM768, still gets X25519MLKEM768 (asked for with a
+    /// HelloRetryRequest): the post-quantum tuple comes first. One listing
+    /// SecP384r1MLKEM1024 gets that over X25519MLKEM768. Without the tuples,
+    /// rustls took the client's first group and the first client got P-384.
+    #[test]
+    fn post_quantum_wins_whatever_the_client_lists_first() {
+        use rustls::crypto::aws_lc_rs::kx_group::{SECP384R1, SECP384R1MLKEM1024, X25519MLKEM768};
+        let policy = ServerTlsPolicy::from_config(
+            &tls("1.3"),
+            &PqcConfig::default(),
+            true,
+            ClientAuth::None,
+        )
+        .unwrap();
+        let tuples = super::group_tuples(&policy.provider);
+        assert_eq!(
+            tuples.first(),
+            Some(&vec![NamedGroup::secp384r1MLKEM1024]),
+            "{tuples:?}"
+        );
+        assert!(tuples
+            .last()
+            .unwrap()
+            .iter()
+            .all(|g| !is_post_quantum_group(*g)));
+
+        let (group, _) =
+            negotiate_offering(&policy, TLS13, Some(vec![SECP384R1, X25519MLKEM768])).unwrap();
+        assert_eq!(group, NamedGroup::X25519MLKEM768);
+
+        let (group, _) = negotiate_offering(
+            &policy,
+            TLS13,
+            Some(vec![X25519MLKEM768, SECP384R1MLKEM1024, SECP384R1]),
+        )
+        .unwrap();
+        assert_eq!(group, NamedGroup::secp384r1MLKEM1024);
+
+        // A browser's offer: its X25519MLKEM768 share is used, no retry needed
+        let (group, _) =
+            negotiate_offering(&policy, TLS13, Some(vec![X25519MLKEM768, SECP384R1])).unwrap();
+        assert_eq!(group, NamedGroup::X25519MLKEM768);
+
+        // A client with no ML-KEM still gets the classical fallback
+        let (group, _) = negotiate_offering(&policy, TLS13, Some(vec![SECP384R1])).unwrap();
+        assert_eq!(group, NamedGroup::secp384r1);
+    }
 
     /// With 0-RTT on, TCP tickets allow early data and rustls resumption stays
     /// stateful even under `pqc_session_tickets`: rustls writes no early-data
@@ -970,9 +1034,11 @@ mod server_policy_tests {
         assert!(!policy.post_quantum);
         let (group, _) = negotiate(&policy, TLS13).unwrap();
         assert!(!is_post_quantum_group(group), "{group:?}");
-        // The client's first classical group the server offers: this client
-        // lists secp256r1 ahead of secp384r1, and X25519 is never offered.
-        assert_eq!(group, NamedGroup::secp256r1);
+        // The classical tuple in the server's order: this client sent no
+        // classical key share the server offers (X25519 never is), so the
+        // server asks for secp384r1, as the OpenSSL listener does, where it
+        // took the client's first, secp256r1, before group_tuples.
+        assert_eq!(group, NamedGroup::secp384r1);
     }
 
     #[test]
@@ -1217,6 +1283,7 @@ pub fn admin_server_config(
     let mut config = policy
         .builder()?
         .with_cert_resolver(Arc::new(SingleChain(Arc::new(key))));
+    policy.apply_group_tuples(&mut config);
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(config)
 }
@@ -1315,9 +1382,10 @@ fn is_hybrid_group(group: rustls::NamedGroup) -> bool {
 /// `fallback_to_classical` shaped a group list the OpenSSL listener logged and
 /// never applied, and this provider ignored them.
 ///
-/// Which group a handshake uses is the client's choice: rustls takes the first
-/// group in the client's list that the server also offers, so the order here
-/// matters to clients built from this provider, not to the server.
+/// Which group a handshake uses is decided by [`group_tuples`], applied to
+/// every listener's configuration by [`ServerTlsPolicy::apply_group_tuples`]:
+/// left to rustls, the first group in the client's list that the server also
+/// offers wins, and a client listing a classical group first got it.
 pub fn server_provider(post_quantum: bool, pqc: &PqcConfig) -> CryptoProvider {
     let mut provider = build_pqc_provider();
     let norm = |s: &str| s.to_ascii_lowercase().replace(['-', '_'], "");
@@ -1367,6 +1435,48 @@ pub fn server_provider(post_quantum: bool, pqc: &PqcConfig) -> CryptoProvider {
     provider
 }
 
+/// The provider's groups in tuples of comparable strength, for
+/// `ServerConfig::kx_group_tuples` (vendored rustls).
+///
+/// Post-quantum groups by NIST level, strongest first, hybrids ahead of pure
+/// ML-KEM within a level, then the classical groups. The OpenSSL listener's
+/// groups come in the same tuples (`PqcTlsProvider::build_groups_string`).
+///
+/// The server takes the first tuple holding a group the client supports, so a
+/// client that supports ML-KEM gets it even when it lists a classical group
+/// first, and a client that lists ML-KEM-1024 gets that, as CNSA 2.0 asks a
+/// server to prefer. Within a tuple, a group the client sent a key share for
+/// wins, so browsers (an X25519MLKEM768 share, no ML-KEM-1024 listed) need no
+/// retry.
+pub fn group_tuples(provider: &CryptoProvider) -> Vec<Vec<rustls::NamedGroup>> {
+    let level = |g: rustls::NamedGroup| {
+        crate::pqc_tls::PqcKemAlgorithm::from_str(&format!("{g:?}"))
+            .map_or(0, |k| k.security_level())
+    };
+    let names: Vec<rustls::NamedGroup> = provider.kx_groups.iter().map(|g| g.name()).collect();
+    let mut tuples = Vec::new();
+    for tier in [5u8, 3, 1] {
+        let mut groups: Vec<rustls::NamedGroup> = names
+            .iter()
+            .copied()
+            .filter(|g| is_post_quantum_group(*g) && level(*g) == tier)
+            .collect();
+        groups.sort_by_key(|g| !is_hybrid_group(*g));
+        if !groups.is_empty() {
+            tuples.push(groups);
+        }
+    }
+    let classical: Vec<rustls::NamedGroup> = names
+        .iter()
+        .copied()
+        .filter(|g| !is_post_quantum_group(*g))
+        .collect();
+    if !classical.is_empty() {
+        tuples.push(classical);
+    }
+    tuples
+}
+
 static TLS13_ONLY: &[&rustls::SupportedProtocolVersion] = &[&TLS13];
 static TLS12_AND_TLS13: &[&rustls::SupportedProtocolVersion] = &[&TLS12, &TLS13];
 
@@ -1393,6 +1503,8 @@ pub struct ServerTlsPolicy {
     pub client_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
     /// Whether the provider offers an ML-KEM group.
     pub post_quantum: bool,
+    /// See [`group_tuples`].
+    group_tuples: Vec<Vec<rustls::NamedGroup>>,
     pqc_session_tickets: bool,
     session_ticket_lifetime_secs: u32,
     /// `tls.enable_0rtt`: resumption then stays stateful; see `apply_tickets`.
@@ -1471,6 +1583,7 @@ impl ServerTlsPolicy {
                 .kx_groups
                 .iter()
                 .any(|g| is_post_quantum_group(g.name())),
+            group_tuples: group_tuples(&provider),
             provider,
             versions,
             client_verifier,
@@ -1484,6 +1597,12 @@ impl ServerTlsPolicy {
                 0
             },
         })
+    }
+
+    /// The key-exchange group tuples on a listener's configuration; see
+    /// [`group_tuples`].
+    pub fn apply_group_tuples(&self, config: &mut RustlsServerConfig) {
+        config.kx_group_tuples = self.group_tuples.clone();
     }
 
     /// Early data on a TCP listener's configuration. TCP tickets advertised
@@ -1943,6 +2062,7 @@ impl TlsProvider {
 
         let mut config = policy.builder()?.with_cert_resolver(resolver);
         policy.apply_tickets(&mut config)?;
+        policy.apply_group_tuples(&mut config);
 
         // Configure ALPN protocols
         config.alpn_protocols = tls_config
@@ -1992,11 +2112,14 @@ impl TlsProvider {
             info!("0-RTT disabled (secure default)");
         }
 
-        // Log PQC status
+        // What the listener will choose from, as configured: the tuples, not a
+        // fixed "X25519MLKEM768, NIST Level 3" written before the groups
+        // followed [pqc] at all.
         if pqc_config.enabled && pqc_available {
-            info!("🛡️  PQC hybrid key exchange ACTIVE via rustls-post-quantum");
-            info!("🔐 Key Exchange: X25519MLKEM768 (hybrid classical + post-quantum)");
-            info!("📊 Security Level: NIST Level 3 (192-bit equivalent)");
+            info!(
+                "🛡️  Post-quantum key exchange active; group tuples, most preferred first: {:?}",
+                config.kx_group_tuples
+            );
         } else if pqc_config.enabled {
             warn!("PQC requested but not available - using classical key exchange");
         }
