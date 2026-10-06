@@ -870,6 +870,32 @@ mod server_policy_tests {
         assert_eq!(group, NamedGroup::secp384r1);
     }
 
+    /// With pure ML-KEM-1024 offered, a CNSA 2.0 client -- ML-KEM-1024 listed
+    /// first, its key share for it -- gets ML-KEM-1024, not the hybrid.
+    #[test]
+    fn a_cnsa_client_gets_pure_ml_kem_1024() {
+        use rustls::crypto::aws_lc_rs::kx_group::{MLKEM1024, SECP384R1MLKEM1024, X25519MLKEM768};
+        let pqc = PqcConfig {
+            additional_kems: vec!["MLKEM1024".into(), "MLKEM768".into()],
+            ..PqcConfig::default()
+        };
+        let policy =
+            ServerTlsPolicy::from_config(&tls("1.3"), &pqc, true, ClientAuth::None).unwrap();
+        let tuples = super::group_tuples(&policy.provider);
+        assert_eq!(
+            tuples.first(),
+            Some(&vec![NamedGroup::MLKEM1024, NamedGroup::secp384r1MLKEM1024]),
+            "{tuples:?}"
+        );
+        let (group, _) = negotiate_offering(
+            &policy,
+            TLS13,
+            Some(vec![MLKEM1024, SECP384R1MLKEM1024, X25519MLKEM768]),
+        )
+        .unwrap();
+        assert_eq!(group, NamedGroup::MLKEM1024);
+    }
+
     /// With 0-RTT on, TCP tickets allow early data and rustls resumption stays
     /// stateful even under `pqc_session_tickets`: rustls writes no early-data
     /// allowance into a stateless ticket, so 0-RTT would do nothing.
@@ -1534,7 +1560,13 @@ pub fn group_tuples(provider: &CryptoProvider) -> Vec<Vec<rustls::NamedGroup>> {
             .copied()
             .filter(|g| is_post_quantum_group(*g) && level(*g) == tier)
             .collect();
-        groups.sort_by_key(|g| !is_hybrid_group(*g));
+        // Hybrids first, except pure ML-KEM-1024, which leads (see
+        // `PqcTlsProvider::build_groups_string`: the CNSA 2.0 TLS profile)
+        groups.sort_by_key(|g| match *g {
+            rustls::NamedGroup::MLKEM1024 => 0,
+            g if is_hybrid_group(g) => 1,
+            _ => 2,
+        });
         if !groups.is_empty() {
             tuples.push(groups);
         }

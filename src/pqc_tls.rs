@@ -520,7 +520,16 @@ impl PqcTlsProvider {
         // X25519MLKEM768 key share and do not list ML-KEM-1024, so they still
         // get X25519MLKEM768 without a retry; a client that lists ML-KEM-1024
         // gets it, as CNSA 2.0 asks a server to prefer.
-        groups.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+        // Within a level, hybrids lead (a break of ML-KEM alone is not enough),
+        // except pure ML-KEM-1024: the CNSA 2.0 TLS profile admits nothing
+        // else, and a CNSA client lists it first and must not be given a
+        // hybrid, so it leads the level-5 tuple.
+        let rank = |&(name, _, hybrid): &(&str, u8, bool)| match (name, hybrid) {
+            ("MLKEM1024", _) => 0,
+            (_, true) => 1,
+            _ => 2,
+        };
+        groups.sort_by(|a, b| b.1.cmp(&a.1).then(rank(a).cmp(&rank(b))));
         let mut tuples: Vec<String> = Vec::new();
         for level in [5u8, 3, 1] {
             let tier: Vec<&str> = groups
@@ -1455,7 +1464,7 @@ mod tests {
         );
         assert_eq!(
             groups,
-            "SecP384r1MLKEM1024:MLKEM1024/X25519MLKEM768:SecP256r1MLKEM768:MLKEM768/P-384"
+            "MLKEM1024:SecP384r1MLKEM1024/X25519MLKEM768:SecP256r1MLKEM768:MLKEM768/P-384"
         );
 
         // require_hybrid: no pure ML-KEM and no classical tuple
