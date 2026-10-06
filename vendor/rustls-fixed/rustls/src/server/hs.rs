@@ -464,6 +464,13 @@ impl ExpectClientHello {
                     .named_groups
                     .as_deref()
                     .unwrap_or_default(),
+                &client_hello
+                    .key_shares
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|share| share.group)
+                    .collect::<Vec<_>>(),
                 &client_hello.cipher_suites,
             )
             .map_err(|incompat| {
@@ -537,6 +544,7 @@ impl ExpectClientHello {
         sig_key_algorithm: SignatureAlgorithm,
         protocol: Protocol,
         client_groups: &[NamedGroup],
+        client_shares: &[NamedGroup],
         client_suites: &[CipherSuite],
     ) -> Result<(SupportedCipherSuite, &'static dyn SupportedKxGroup), PeerIncompatible> {
         // Determine which `KeyExchangeAlgorithm`s are theoretically possible, based
@@ -638,6 +646,9 @@ impl ExpectClientHello {
             });
 
         if selected_version == ProtocolVersion::TLSv1_3 {
+            if let Some(skxg) = self.tuple_kx_group(selected_version, client_groups, client_shares) {
+                return Ok((*suite, skxg));
+            }
             // This unwrap is structurally guaranteed by the early return for `!ffdhe_possible && !ecdhe_possible`
             return Ok((*suite, *maybe_skxg.unwrap()));
         }
@@ -661,6 +672,41 @@ impl ExpectClientHello {
 }
 
 impl ExpectClientHello {
+    /// The group `ServerConfig::kx_group_tuples` chooses: in the first tuple
+    /// holding a group both sides support, a group the client sent a key share
+    /// for, else the first it supports. None when no tuples are configured or
+    /// none holds such a group; the caller then takes the client's order.
+    fn tuple_kx_group(
+        &self,
+        version: ProtocolVersion,
+        client_groups: &[NamedGroup],
+        client_shares: &[NamedGroup],
+    ) -> Option<&'static dyn SupportedKxGroup> {
+        let ours = |name: &NamedGroup| {
+            self.config
+                .provider
+                .kx_groups
+                .iter()
+                .find(|skxg| skxg.usable_for_version(version) && skxg.name() == *name)
+                .copied()
+        };
+        self.config
+            .kx_group_tuples
+            .iter()
+            .find_map(|tuple| {
+                tuple
+                    .iter()
+                    .filter(|g| client_groups.contains(g) && client_shares.contains(g))
+                    .find_map(ours)
+                    .or_else(|| {
+                        tuple
+                            .iter()
+                            .filter(|g| client_groups.contains(g))
+                            .find_map(ours)
+                    })
+            })
+    }
+
     /// If this connection has ECH configured, look for an
     /// `encrypted_client_hello` extension on `m` and, if present, attempt to
     /// decrypt and substitute the real ClientHelloInner in its place. Records

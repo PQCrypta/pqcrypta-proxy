@@ -303,6 +303,21 @@ pub struct ServerConfig {
     /// which is supported by the client.
     pub ignore_client_order: bool,
 
+    /// Key-exchange groups in tuples of comparable strength, the most
+    /// preferred tuple first: OpenSSL 3.5's `SSL_CTX_set1_groups_list` with
+    /// its "/" separator and `SSL_OP_CIPHER_SERVER_PREFERENCE`. For TLS 1.3
+    /// the server takes the first tuple holding a group the client supports,
+    /// and within it, in the tuple's order, a group the client sent a key
+    /// share for (no retry), else the first the client supports (a
+    /// HelloRetryRequest).
+    ///
+    /// Empty, as by default: the first group in the client's list that the
+    /// provider offers, as upstream rustls does. That lets a client which
+    /// lists a classical group first get it from a server that offers a
+    /// post-quantum one the client supports too; a post-quantum tuple ahead
+    /// of a classical one does not.
+    pub kx_group_tuples: Vec<Vec<NamedGroup>>,
+
     /// The maximum size of plaintext input to be emitted in a single TLS record.
     /// A value of None is equivalent to the [TLS maximum] of 16 kB.
     ///
