@@ -28,15 +28,52 @@ use crate::config::{ClientAuth, PqcConfig, TlsConfig};
 
 // ── SNI-based per-domain certificate resolver ────────────────────────────────
 
+/// File stem suffix of a domain's post-quantum companion certificate:
+/// `{domain}.mldsa.crt` / `{domain}.mldsa.key` beside `{domain}.crt`.
+pub const POST_QUANTUM_COMPANION: &str = ".mldsa";
+
+/// A domain's certificates: the one most clients verify (an ACME chain), and
+/// an ML-DSA one for a client that accepts nothing else.
+#[derive(Debug, Clone)]
+pub struct DomainCerts {
+    pub primary: Arc<rustls::sign::CertifiedKey>,
+    pub post_quantum: Option<Arc<rustls::sign::CertifiedKey>>,
+}
+
+/// Which of a domain's certificates a client gets.
+///
+/// The primary whenever its key can sign with a scheme the client offers,
+/// the post-quantum companion only when it cannot and the companion can.
+/// A client that accepts ML-DSA
+/// and the primary's scheme too (OpenSSL 3.5 offers ML-DSA by default) keeps
+/// getting the chain it can verify; a client that accepts only ML-DSA -- a
+/// CNSA 2.0 client -- gets an ML-DSA-87 chain instead of no handshake.
+pub fn choose_certified_key(
+    certs: &DomainCerts,
+    offered: &[rustls::SignatureScheme],
+) -> Arc<rustls::sign::CertifiedKey> {
+    match &certs.post_quantum {
+        Some(pq)
+            if certs.primary.key.choose_scheme(offered).is_none()
+                && pq.key.choose_scheme(offered).is_some() =>
+        {
+            pq.clone()
+        }
+        _ => certs.primary.clone(),
+    }
+}
+
 /// SNI-based per-domain certificate resolver.
 ///
-/// Reads `{domain}.crt` / `{domain}.key` pairs from the certs directory.
+/// Reads `{domain}.crt` / `{domain}.key` pairs from the certs directory, and a
+/// post-quantum companion `{domain}.mldsa.crt` / `{domain}.mldsa.key` where
+/// one exists (see [`choose_certified_key`]).
 /// Thread-safe hot-reload via `reload()` — all listeners sharing the same
 /// `Arc` immediately serve the refreshed certificate after a call to `reload()`.
 #[derive(Debug)]
 pub struct MultiDomainCertResolver {
-    /// domain → `CertifiedKey` map, updated atomically on reload
-    certs: RwLock<HashMap<String, Arc<rustls::sign::CertifiedKey>>>,
+    /// domain → its certificates, updated atomically on reload
+    certs: RwLock<HashMap<String, DomainCerts>>,
     /// Directory containing `{domain}.crt` / `{domain}.key` files
     certs_dir: PathBuf,
 }
@@ -74,15 +111,46 @@ impl MultiDomainCertResolver {
                 Some(d) => d.to_ascii_lowercase(),
                 None => continue,
             };
-            match load_certified_key(&cert_path, &key_path) {
-                Ok(ck) => {
-                    new_certs.insert(domain.clone(), Arc::new(ck));
-                    debug!("SNI resolver loaded cert for '{}'", domain);
-                }
+            // A companion is loaded with its domain below, not as a domain
+            if domain.ends_with(POST_QUANTUM_COMPANION) {
+                continue;
+            }
+            let primary = match load_certified_key(&cert_path, &key_path) {
+                Ok(ck) => Arc::new(ck),
                 Err(e) => {
                     warn!("SNI resolver: skipping '{}' — {}", domain, e);
+                    continue;
                 }
-            }
+            };
+            let pq_cert = self
+                .certs_dir
+                .join(format!("{domain}{POST_QUANTUM_COMPANION}.crt"));
+            let pq_key = pq_cert.with_extension("key");
+            let post_quantum = if pq_cert.exists() && pq_key.exists() {
+                match load_certified_key(&pq_cert, &pq_key) {
+                    Ok(ck) => {
+                        info!(
+                            "SNI resolver: '{}' has an ML-DSA companion certificate",
+                            domain
+                        );
+                        Some(Arc::new(ck))
+                    }
+                    Err(e) => {
+                        warn!("SNI resolver: '{}' companion not loaded — {}", domain, e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            debug!("SNI resolver loaded cert for '{}'", domain);
+            new_certs.insert(
+                domain.clone(),
+                DomainCerts {
+                    primary,
+                    post_quantum,
+                },
+            );
         }
 
         info!(
@@ -101,7 +169,12 @@ impl rustls::server::ResolvesServerCert for MultiDomainCertResolver {
         client_hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
         let sni = client_hello.server_name()?;
-        self.certs.read().get(sni).cloned()
+        let certs = self.certs.read();
+        let domain = certs.get(sni)?;
+        Some(choose_certified_key(
+            domain,
+            client_hello.signature_schemes(),
+        ))
     }
 }
 
