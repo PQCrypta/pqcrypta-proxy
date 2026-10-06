@@ -764,6 +764,10 @@ pub mod openssl_pqc {
                     Some(d) => d.to_string(),
                     None => continue,
                 };
+                // A post-quantum companion is loaded into its domain's context
+                if domain.ends_with(crate::tls::POST_QUANTUM_COMPANION) {
+                    continue;
+                }
                 let key_path = path.with_extension("key");
                 if !key_path.exists() {
                     continue;
@@ -1033,6 +1037,36 @@ pub mod openssl_pqc {
         Ok(builder.build())
     }
 
+    /// A domain's ML-DSA companion, `{domain}.mldsa.crt` / `.mldsa.key` beside
+    /// `cert_path`, loaded into the same context as a second certificate.
+    /// OpenSSL keeps one certificate per key type and signs with the first
+    /// shared signature algorithm in the server's list (server preference,
+    /// see `apply_pqc_groups`), whose classical algorithms come first: a
+    /// client that can verify the primary chain gets it, one that accepts
+    /// only ML-DSA gets this one.
+    fn load_post_quantum_companion(
+        builder: &mut openssl::ssl::SslContextBuilder,
+        cert_path: &Path,
+    ) {
+        let Some(stem) = cert_path.file_stem().and_then(|s| s.to_str()) else {
+            return;
+        };
+        let pq_cert =
+            cert_path.with_file_name(format!("{stem}{}.crt", crate::tls::POST_QUANTUM_COMPANION));
+        let pq_key = pq_cert.with_extension("key");
+        if !pq_cert.exists() || !pq_key.exists() {
+            return;
+        }
+        let loaded = builder
+            .set_certificate_chain_file(&pq_cert)
+            .and_then(|()| builder.set_private_key_file(&pq_key, SslFiletype::PEM))
+            .and_then(|()| builder.check_private_key());
+        match loaded {
+            Ok(()) => info!("SNI: '{}' has an ML-DSA companion certificate", stem),
+            Err(e) => warn!("SNI: '{}' companion {:?} not loaded — {}", stem, pq_cert, e),
+        }
+    }
+
     /// Build a standalone `SslContext` for a single domain — used by the SNI map.
     fn build_ssl_context(
         cert_path: &Path,
@@ -1049,6 +1083,7 @@ pub mod openssl_pqc {
         builder
             .set_private_key_file(key_path, SslFiletype::PEM)
             .map_err(|e| format!("Failed to load key {:?}: {}", key_path, e))?;
+        load_post_quantum_companion(&mut builder, cert_path);
         apply_pqc_groups(&mut builder, pqc_provider);
         enable_cert_compression(builder.as_ptr());
         builder
@@ -1105,6 +1140,7 @@ pub mod openssl_pqc {
         builder
             .set_private_key_file(key_path, SslFiletype::PEM)
             .map_err(|e| format!("Failed to load key {:?}: {}", key_path, e))?;
+        load_post_quantum_companion(&mut builder, cert_path);
         apply_pqc_groups(&mut builder, pqc_provider);
         enable_cert_compression(builder.as_ptr());
         // HTTP/1.1 only — no h2 advertised
@@ -1128,6 +1164,14 @@ pub mod openssl_pqc {
         builder.set_session_cache_mode(openssl::ssl::SslSessionCacheMode::SERVER);
         Ok(builder.build())
     }
+
+    /// The server's signature algorithms, most preferred first: see
+    /// `apply_pqc_groups`.
+    pub const SERVER_SIGALGS: &str =
+        "ecdsa_secp384r1_sha384:ecdsa_secp256r1_sha256:ecdsa_secp521r1_sha512:\
+        ed25519:ed448:rsa_pss_rsae_sha384:rsa_pss_rsae_sha256:rsa_pss_rsae_sha512:\
+        rsa_pss_pss_sha384:rsa_pss_pss_sha256:rsa_pss_pss_sha512:\
+        rsa_pkcs1_sha384:rsa_pkcs1_sha256:rsa_pkcs1_sha512:mldsa87:mldsa65:mldsa44";
 
     /// Apply PQC group list and 256-bit-only TLS 1.3 cipher restriction to an SslContextBuilder.
     ///
@@ -1197,6 +1241,20 @@ pub mod openssl_pqc {
             openssl::ssl::SslOptions::CIPHER_SERVER_PREFERENCE
                 | openssl::ssl::SslOptions::PRIORITIZE_CHACHA,
         );
+
+        // ── Signature algorithms, classical first ────────────────────────────
+        // With server preference, OpenSSL signs with the first algorithm in
+        // this list the client also offers and a loaded certificate can make.
+        // OpenSSL 3.5's default list puts ML-DSA first and its clients offer
+        // it: a host with an ML-DSA companion would have sent every curl the
+        // ML-DSA chain, which only clients holding our root verify. Classical
+        // first, the companion goes to clients that accept nothing else.
+        if let Err(e) = builder.set_sigalgs_list(SERVER_SIGALGS) {
+            warn!(
+                "Failed to set signature algorithms {}: {}",
+                SERVER_SIGALGS, e
+            );
+        }
 
         // ── A+ Cipher Strength: 256-bit TLS 1.3 ciphers only ─────────────────
         // Remove TLS_AES_128_GCM_SHA256 (128-bit → 90% SSL Labs cipher strength).
