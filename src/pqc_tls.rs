@@ -153,6 +153,41 @@ pub struct PqcStatus {
     pub error: Option<String>,
 }
 
+/// Whether an `experimental_groups` entry is a hybrid: the OQS provider
+/// names one for its classical half (p384_frodo976shake).
+pub fn experimental_group_is_hybrid(name: &str) -> bool {
+    ["p256_", "p384_", "p521_", "x25519_", "x448_"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+/// An `experimental_groups` entry: a provider's group name, and neither a
+/// standard ML-KEM group nor a classical one, which have their own settings
+/// and their own place in the offer.
+pub fn check_experimental_group(name: &str) -> Result<(), String> {
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return Err(format!("\"{}\" is not an OpenSSL group name", name));
+    }
+    if PqcKemAlgorithm::from_str(name).is_some() {
+        return Err(format!(
+            "{} is a standard ML-KEM group: name it in additional_kems",
+            name
+        ));
+    }
+    let lower = name.to_ascii_lowercase();
+    if matches!(lower.as_str(), "x25519" | "x448")
+        || ["secp", "prime", "ffdhe", "brainpool"]
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+    {
+        return Err(format!(
+            "{} is a classical group: the classical fallback is fallback_to_classical",
+            name
+        ));
+    }
+    Ok(())
+}
+
 /// PQC TLS Provider
 pub struct PqcTlsProvider {
     /// PQC configuration
@@ -550,6 +585,20 @@ impl PqcTlsProvider {
         // in would make the setting meaningless. With it suppressed, such a
         // client finds no mutually supported group and the handshake fails —
         // which is the intended, and deliberately disruptive, behaviour.
+        // Experimental groups (`experimental_groups`), a tuple of their own:
+        // after standard ML-KEM, so a client that offers ML-KEM gets it, and
+        // before the classical fallback, so a client that offers one of these
+        // and a classical group gets post-quantum.
+        let experimental: Vec<&str> = config
+            .experimental_groups
+            .iter()
+            .map(String::as_str)
+            .filter(|g| !config.require_hybrid || experimental_group_is_hybrid(g))
+            .collect();
+        if !experimental.is_empty() {
+            tuples.push(experimental.join(":"));
+        }
+
         if config.fallback_to_classical && !config.require_hybrid {
             tuples.push("P-384".to_string());
         } else {
@@ -1480,6 +1529,60 @@ mod tests {
             hybrid_only,
             "SecP384r1MLKEM1024/X25519MLKEM768:SecP256r1MLKEM768"
         );
+    }
+
+    /// Experimental groups follow standard ML-KEM and lead the classical
+    /// fallback; under require_hybrid only their hybrids are offered.
+    #[test]
+    fn experimental_groups_sit_between_ml_kem_and_classical() {
+        let all: Vec<String> = [
+            "X25519MLKEM768",
+            "SecP256r1MLKEM768",
+            "SecP384r1MLKEM1024",
+            "MLKEM768",
+            "MLKEM1024",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let config = PqcConfig {
+            additional_kems: vec!["MLKEM1024".into(), "MLKEM768".into()],
+            experimental_groups: vec!["frodo1344shake".into(), "p384_frodo976shake".into()],
+            ..PqcConfig::default()
+        };
+        let x25519 = PqcKemAlgorithm::from_str("X25519MLKEM768");
+        assert_eq!(
+            PqcTlsProvider::build_groups_string(&config, &all, x25519),
+            "MLKEM1024:SecP384r1MLKEM1024/X25519MLKEM768:SecP256r1MLKEM768:MLKEM768/\
+             frodo1344shake:p384_frodo976shake/P-384"
+        );
+        let hybrid_only = PqcConfig {
+            require_hybrid: true,
+            ..config
+        };
+        assert_eq!(
+            PqcTlsProvider::build_groups_string(&hybrid_only, &all, x25519),
+            "SecP384r1MLKEM1024/X25519MLKEM768:SecP256r1MLKEM768/p384_frodo976shake"
+        );
+    }
+
+    #[test]
+    fn experimental_groups_are_provider_names_only() {
+        assert!(check_experimental_group("frodo976shake").is_ok());
+        assert!(check_experimental_group("p521_hqc256").is_ok());
+        for misplaced in [
+            "MLKEM768",
+            "X25519MLKEM768",
+            "x25519",
+            "secp384r1",
+            "ffdhe2048",
+        ] {
+            assert!(check_experimental_group(misplaced).is_err(), "{misplaced}");
+        }
+        // No list syntax smuggled into the OpenSSL groups string
+        for malformed in ["", "frodo976shake:hqc192", "frodo/hqc", "?frodo", "P-384"] {
+            assert!(check_experimental_group(malformed).is_err(), "{malformed}");
+        }
     }
 
     #[test]

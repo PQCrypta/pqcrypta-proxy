@@ -209,6 +209,7 @@ All responses automatically include these security headers. The `Server` header 
 | `fallback_to_classical` | bool | `true` | Fallback to classical TLS if PQC unavailable |
 | `min_security_level` | u8 | `3` | Minimum NIST security level (1-5) |
 | `additional_kems` | array[string] | `[]` | Additional KEMs to enable |
+| `experimental_groups` | array[string] | `[]` | Provider groups with no IANA codepoint (OQS: `frodo976shake`, `p384_frodo976shake`, ...), offered over TCP after standard ML-KEM and before the classical fallback; hybrids only under `require_hybrid` |
 | `enable_signatures` | bool | `false` | Enable PQC signature algorithms (ML-DSA) |
 | `require_hybrid` | bool | `true` | Require hybrid mode (classical + PQC) |
 | `verify_provider` | bool | `true` | Verify PQC provider at startup |

@@ -1547,6 +1547,18 @@ pub struct PqcConfig {
     /// Additional KEM algorithms to offer (in preference order)
     #[serde(default)]
     pub additional_kems: Vec<String>,
+    /// Key-exchange groups a loaded OpenSSL provider adds that have no IANA
+    /// codepoint -- the OQS provider's FrodoKEM, HQC and the like -- by their
+    /// OpenSSL group names, in preference order. Offered by the OpenSSL
+    /// listeners in a tuple of their own, after the standard ML-KEM tuples
+    /// and before the classical fallback: a client that offers ML-KEM gets
+    /// ML-KEM, one that offers only these and a classical group gets one of
+    /// these. No browser offers them. Each is kept only if the linked libssl
+    /// accepts it; under `require_hybrid` only the hybrids (named for their
+    /// classical half: p384_frodo976shake); `min_security_level` does not
+    /// apply. The rustls listeners (HTTP/3) cannot offer them. Default: none.
+    #[serde(default)]
+    pub experimental_groups: Vec<String>,
     /// PQC downgrade action: "allow" | "log" | "block" — default "log".
     /// "block" rejects connections that negotiate classical-only KEM when PQC is enabled.
     #[serde(default = "default_downgrade_action")]
@@ -1612,6 +1624,7 @@ impl Default for PqcConfig {
                 "SecP256r1MLKEM768".to_string(),
                 "SecP384r1MLKEM1024".to_string(),
             ],
+            experimental_groups: Vec::new(),
             downgrade_action: default_downgrade_action(),
             log_downgrades: true,
             enable_signatures: true,
@@ -3873,6 +3886,10 @@ impl ProxyConfig {
                 "pqc.additional_kems names unknown KEM(s): {}",
                 unknown.join(", ")
             ));
+        }
+        for group in &self.pqc.experimental_groups {
+            crate::pqc_tls::check_experimental_group(group)
+                .map_err(|why| anyhow::anyhow!("pqc.experimental_groups: {}", why))?;
         }
         if let Some(kem) = crate::pqc_tls::PqcKemAlgorithm::from_str(&self.pqc.preferred_kem) {
             if kem.security_level() < self.pqc.min_security_level {

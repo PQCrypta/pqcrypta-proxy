@@ -358,6 +358,12 @@ min_security_level = 3
 # Additional KEM algorithms to offer (in preference order after preferred_kem)
 additional_kems = ["SecP256r1MLKEM768", "SecP384r1MLKEM1024"]
 
+# Groups a loaded OpenSSL provider adds without an IANA codepoint (the OQS
+# provider's FrodoKEM, HQC, ...), by OpenSSL name. Offered by the TCP listener
+# after standard ML-KEM and before the classical fallback; browsers do not
+# offer them. Each is checked against the linked libssl.
+# experimental_groups = ["frodo1344shake", "frodo976shake"]
+
 # Enable PQC signatures (ML-DSA) - requires pqc-signatures feature
 enable_signatures = false
 
