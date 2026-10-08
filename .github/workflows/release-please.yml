@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: googleapis/release-please-action@v4
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
         id: release
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -22,10 +22,10 @@ jobs:
           manifest-file: .release-please-manifest.json
 
       # After a release is created, build and upload release binaries
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         if: ${{ steps.release.outputs.release_created }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         if: ${{ steps.release.outputs.release_created }}
 
       - name: Install OpenSSL
@@ -38,7 +38,7 @@ jobs:
 
       - name: Upload binary to release
         if: ${{ steps.release.outputs.release_created }}
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           tag_name: ${{ steps.release.outputs.tag_name }}
           files: target/release/pqcrypta-proxy
