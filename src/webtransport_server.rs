@@ -923,21 +923,43 @@ async fn proxy_request(
                     _ => path,
                 };
 
-                // Forward to backend
-                return forward_to_backend(data, backend_path, remote_addr, config, backend_pool)
-                    .await;
+                // Forward to backend, with the request's own credential
+                return forward_to_backend(
+                    data,
+                    backend_path,
+                    request_credential(&request).as_deref(),
+                    remote_addr,
+                    config,
+                    backend_pool,
+                )
+                .await;
             }
         }
     }
 
     // For non-JSON data, forward to the path directly
-    forward_to_backend(data, path, remote_addr, config, backend_pool).await
+    forward_to_backend(data, path, None, remote_addr, config, backend_pool).await
+}
+
+/// The API key a WebTransport request carries in its body ("api_key"),
+/// to send on as `X-API-Key`. A WebTransport frame has no headers, and the
+/// backend authenticates every request: `X-WebTransport-Proxy` only says the
+/// proxy forwarded it (and its WAF already inspected it), it is not a
+/// credential. Anything a header cannot carry is not a key.
+fn request_credential(request: &serde_json::Value) -> Option<String> {
+    request
+        .get("api_key")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|k| !k.is_empty() && k.len() <= 512 && k.bytes().all(|b| b.is_ascii_graphic()))
+        .map(str::to_string)
 }
 
 /// Forward request to HTTP backend using the BackendPool
 async fn forward_to_backend(
     data: &[u8],
     path: &str,
+    api_key: Option<&str>,
     remote_addr: SocketAddr,
     config: &Arc<ProxyConfig>,
     backend_pool: &Arc<BackendPool>,
@@ -966,6 +988,9 @@ async fn forward_to_backend(
         "pqcrypta-proxy".to_string(),
     );
     headers.insert("X-Real-IP".to_string(), remote_addr.ip().to_string());
+    if let Some(key) = api_key {
+        headers.insert("X-API-Key".to_string(), key.to_string());
+    }
 
     // Use the BackendPool's proxy_http method
     let response = backend_pool
@@ -1013,6 +1038,25 @@ fn find_backend_for_path(path: &str, config: &ProxyConfig) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_request_s_api_key_is_its_credential() {
+        use super::request_credential;
+        use serde_json::json;
+        assert_eq!(
+            request_credential(&json!({"operation": "encrypt", "api_key": " WebUI_key_123 "}))
+                .as_deref(),
+            Some("WebUI_key_123")
+        );
+        assert_eq!(request_credential(&json!({"operation": "encrypt"})), None);
+        assert_eq!(request_credential(&json!({"api_key": ""})), None);
+        // Nothing that could break out of a header
+        assert_eq!(
+            request_credential(&json!({"api_key": "key\r\nX-Admin: 1"})),
+            None
+        );
+        assert_eq!(request_credential(&json!({"api_key": 42})), None);
+    }
+
     use super::*;
 
     const ORIGIN: &str = "https://origin.test";
