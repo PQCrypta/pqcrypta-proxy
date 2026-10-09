@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
 use aws_lc_rs::hkdf::{Salt, HKDF_SHA384};
 use aws_lc_rs::kem::{Ciphertext, DecapsulationKey, EncapsulationKey, ML_KEM_1024};
-use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+use aws_lc_rs::rand::SystemRandom;
 use parking_lot::RwLock;
 use rustls::server::ProducesTickets;
 use tracing::{debug, info, warn};
@@ -194,8 +194,9 @@ impl ProducesTickets for PqcTicketer {
         }
 
         let aead = Self::aead_key(shared.as_ref())?;
-        let mut nonce_bytes = [0u8; NONCE_LEN];
-        self.rng.fill(&mut nonce_bytes).ok()?;
+        // Random, from the system RNG; each ticket also has its own AEAD key
+        // (a fresh ML-KEM encapsulation), so the nonce is never reused
+        let nonce_bytes: [u8; NONCE_LEN] = aws_lc_rs::rand::generate(&self.rng).ok()?.expose();
         let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 
         let mut sealed = plain.to_vec();
@@ -305,7 +306,11 @@ mod tests {
         let t = PqcTicketer::new(3600).unwrap();
         assert!(t.decrypt(&[]).is_none());
         assert!(t.decrypt(&[TICKET_VERSION]).is_none());
-        assert!(t.decrypt(&[0xff; 64]).is_none());
+        // Random junk: any 64 bytes must be refused, not one fixed pattern
+        let junk: [u8; 64] = aws_lc_rs::rand::generate(&SystemRandom::new())
+            .unwrap()
+            .expose();
+        assert!(t.decrypt(&junk).is_none());
         let valid = t.encrypt(b"state").unwrap();
         for cut in [1usize, 3, 100, ML_KEM_1024_CIPHERTEXT_LEN, valid.len() - 1] {
             assert!(t.decrypt(&valid[..cut]).is_none(), "cut at {cut}");

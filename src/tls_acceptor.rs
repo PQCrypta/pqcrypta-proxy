@@ -64,11 +64,8 @@ impl ZeroRttNonceStore {
 
     /// Compute a 32-byte nonce from the raw ClientHello bytes (first 64 bytes).
     fn nonce_from_client_hello(data: &[u8]) -> [u8; 32] {
-        let slice = &data[..data.len().min(64)];
-        let digest = Sha256::digest(slice);
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&digest);
-        out
+        // The digest is the nonce: no zeroed buffer stands in for it first
+        Sha256::digest(&data[..data.len().min(64)]).into()
     }
 
     /// Returns `true` if this ClientHello is a replay (nonce seen before);
