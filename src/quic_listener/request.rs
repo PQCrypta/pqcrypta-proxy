@@ -1286,7 +1286,7 @@ impl QuicListener {
         // exactly the transport divergence this proxy exists not to have. The
         // engine truncates to `max_body_scan_bytes` internally, so the whole
         // buffered body is passed by reference.
-        if !body.is_empty() && security.waf_engine.is_some() {
+        if !body.is_empty() && security.waf().is_some() {
             let is_pentest =
                 crate::config::ip_list_contains(&security.config.read().pentest_bypass_ips, &ip);
             let body_query = request.uri().query().unwrap_or("").to_string();

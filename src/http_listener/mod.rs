@@ -3711,18 +3711,40 @@ pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 
     // preventing open-redirect attacks where an attacker supplies Host: evil.com.
     // An empty Vec disables the check (backward-compatible default).
     allowed_domains: Vec<String>,
+    // Reloaded configurations. When present, `redirect_to_https`,
+    // `redirect_status`, `allowed_domains` and the path settings are read from
+    // the latest one on each request; they were fixed at startup, so a reload
+    // that added a domain left its plain-HTTP visitors refused until a restart.
+    config_updates: Option<tokio::sync::watch::Receiver<Arc<ProxyConfig>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let https_port_clone = https_port;
 
     let has_acme = acme_challenges.is_some();
-    let allowed_domains_lower: Vec<String> = allowed_domains
-        .iter()
-        .map(|d| d.to_ascii_lowercase())
-        .collect();
+    let lower = |domains: &[String]| -> Vec<String> {
+        domains.iter().map(|d| d.to_ascii_lowercase()).collect()
+    };
+    let startup_domains = lower(&allowed_domains);
 
     let app = Router::new().fallback(move |Host(host): Host, uri: Uri| {
         let challenges = acme_challenges.clone();
-        let permitted = allowed_domains_lower.clone();
+        let (permitted, redirect_to_https, redirect_status, canon) = match config_updates {
+            Some(ref updates) => {
+                let config = updates.borrow();
+                (
+                    lower(&config.http_redirect.allowed_domains),
+                    config.http_redirect.redirect_to_https,
+                    StatusCode::from_u16(config.http_redirect.redirect_status)
+                        .unwrap_or(StatusCode::PERMANENT_REDIRECT),
+                    Some(crate::path_canon::PathCanon::from(&config.server)),
+                )
+            }
+            None => (
+                startup_domains.clone(),
+                redirect_to_https,
+                redirect_status,
+                None,
+            ),
+        };
         async move {
             let path = uri.path();
 
@@ -3763,7 +3785,15 @@ pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 
                 }
             }
 
-            let path = path.to_ascii_lowercase();
+            // The path the HTTPS listener will route on: dot segments resolved,
+            // slashes merged, and lowercased only where `normalize_paths` says
+            // so. Lowercasing it unconditionally sent case-sensitive paths
+            // (ERPNext's, on a node running normalize_paths = false) to a
+            // different resource.
+            let path = match canon {
+                Some(canon) => crate::path_canon::canonical_path(path, canon).into_owned(),
+                None => path.to_ascii_lowercase(),
+            };
             let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
 
             // Build HTTPS URL

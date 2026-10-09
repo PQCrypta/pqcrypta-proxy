@@ -231,6 +231,7 @@ impl AdminServer {
             global_failure_count: Arc::new(AtomicU32::new(0)),
             global_cooldown_until: Arc::new(RwLock::new(None)),
             global_cooldown_count: Arc::new(AtomicU32::new(0)),
+            config_manager: Some(self.state.config_manager.clone()),
         });
 
         // F-14: Endpoint-level cooldown state to prevent ACME/OCSP quota exhaustion.
@@ -385,6 +386,9 @@ impl AdminServer {
 /// from 5 minutes up to 30 minutes.
 #[derive(Clone)]
 struct AdminAuthState {
+    /// Startup values, the fallback when there is no live config (tests) and,
+    /// for the token, when a reload leaves `auth_token` unset: removing the
+    /// token from the file must never switch authentication off.
     allowed_ips: Vec<String>,
     auth_token: Option<String>,
     /// Proof-of-possession HMAC-SHA256 secret.  When set, every admin request
@@ -404,6 +408,40 @@ struct AdminAuthState {
     /// F-08: Consecutive global cooldown trigger count for exponential back-off.
     /// Resets to 0 on a successful authentication.
     global_cooldown_count: Arc<AtomicU32>,
+    /// The live configuration, for [`AdminAuthState::credentials`].
+    config_manager: Option<Arc<ConfigManager>>,
+}
+
+/// The admin credentials in force for one request.
+struct AdminCredentials {
+    allowed_ips: Vec<String>,
+    auth_token: Option<String>,
+    hmac_secret: Option<String>,
+}
+
+impl AdminAuthState {
+    /// The IP allowlist, token and HMAC secret from the live `[admin]`, so a
+    /// reload that rotates one applies to the next request. They were copied
+    /// once at startup: a token rotated by editing the config and reloading
+    /// stayed valid, and the new one was refused, until the next restart.
+    fn credentials(&self) -> AdminCredentials {
+        match &self.config_manager {
+            Some(manager) => {
+                let config = manager.get();
+                let admin = &config.admin;
+                AdminCredentials {
+                    allowed_ips: admin.allowed_ips.clone(),
+                    auth_token: admin.auth_token.clone().or_else(|| self.auth_token.clone()),
+                    hmac_secret: admin.hmac_secret.clone(),
+                }
+            }
+            None => AdminCredentials {
+                allowed_ips: self.allowed_ips.clone(),
+                auth_token: self.auth_token.clone(),
+                hmac_secret: self.hmac_secret.clone(),
+            },
+        }
+    }
 }
 
 /// F-14: Per-endpoint cooldown state for operations that trigger external network
@@ -447,9 +485,10 @@ async fn auth_middleware(
     next: axum::middleware::Next,
 ) -> impl IntoResponse {
     let client_ip = remote_addr.ip().to_string();
+    let credentials = auth.credentials();
 
     // Check IP whitelist
-    if !auth.allowed_ips.is_empty() && !auth.allowed_ips.contains(&client_ip) {
+    if !credentials.allowed_ips.is_empty() && !credentials.allowed_ips.contains(&client_ip) {
         warn!("Admin API access denied for IP: {}", client_ip);
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -467,7 +506,7 @@ async fn auth_middleware(
     // refuses one shorter than 32 characters, which no request rate
     // enumerates — so what they bound is failure noise, and they now bound
     // only failures.
-    if let Some(ref expected_token) = auth.auth_token {
+    if let Some(ref expected_token) = credentials.auth_token {
         let provided_token = headers
             .get("Authorization")
             .and_then(|v| v.to_str().ok())
@@ -562,7 +601,7 @@ async fn auth_middleware(
     // Proof-of-possession: verify HMAC-SHA256 per-request signature if configured.
     // This runs after bearer-token authorization succeeds so an attacker cannot
     // probe the HMAC path without first holding a valid token.
-    if let Some(ref secret) = auth.hmac_secret {
+    if let Some(ref secret) = credentials.hmac_secret {
         use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
 
@@ -716,7 +755,7 @@ async fn metrics_handler(State(state): State<Arc<AdminState>>) -> String {
 
     // WAF counters. The engine holds its own atomics because SecurityState is
     // built from config and has no metrics handle; this is where they surface.
-    if let Some(waf) = state.security.as_ref().and_then(|s| s.waf_engine.as_ref()) {
+    if let Some(waf) = state.security.as_ref().and_then(|s| s.waf()) {
         let stats = waf.stats();
 
         output.push_str("\n# HELP pqcrypta_waf_requests_total Requests inspected by the WAF\n");
@@ -1891,7 +1930,7 @@ async fn security_status_handler(State(state): State<Arc<AdminState>>) -> AdminJ
     let (city_db, asn_db, tor_exits) = sec.geo_sources();
     let (ips, cidrs) = sec.blocklist_snapshot();
     Ok(Json(serde_json::json!({
-        "waf": { "enabled": config.waf.enabled, "loaded": sec.waf_engine.is_some() },
+        "waf": { "enabled": config.waf.enabled, "loaded": sec.waf().is_some() },
         "fingerprinting": config.fingerprint.enabled,
         "rate_limiting": config.rate_limiting.enabled,
         "advanced_rate_limiting": config.advanced_rate_limiting.enabled,
@@ -1957,7 +1996,7 @@ async fn security_threats_handler(State(state): State<Arc<AdminState>>) -> Admin
     {
         *by_reason.entry(reason.clone()).or_default() += 1;
     }
-    let waf = sec.waf_engine.as_ref().map(|w| {
+    let waf = sec.waf().map(|w| {
         let stats = w.stats();
         let mut rules = stats.rules;
         rules.sort_by_key(|r| std::cmp::Reverse(r.hits));
@@ -2021,7 +2060,7 @@ async fn waf_explain_handler(
         )
     };
     let sec = security_state(&state)?;
-    let Some(waf) = sec.waf_engine.as_ref() else {
+    let Some(waf) = sec.waf() else {
         return Err((
             StatusCode::CONFLICT,
             Json(serde_json::json!({ "error": "the WAF is not enabled on this node" })),
@@ -2088,6 +2127,7 @@ mod auth_tests {
             global_failure_count: Arc::new(AtomicU32::new(0)),
             global_cooldown_until: Arc::new(RwLock::new(None)),
             global_cooldown_count: Arc::new(AtomicU32::new(0)),
+            config_manager: None,
         })
     }
 

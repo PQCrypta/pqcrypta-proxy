@@ -1371,7 +1371,7 @@ impl WafEngine {
         let path_set = build_set(&path_pats, "path");
         let ua_set = build_set(&ua_pats, "user-agent");
 
-        let exclusions = config
+        let exclusions: Vec<CompiledExclusion> = config
             .exclusions
             .iter()
             .filter_map(|e| match Regex::new(&e.path) {
@@ -1394,13 +1394,14 @@ impl WafEngine {
             .collect();
 
         tracing::info!(
-            "WAF engine compiled: {} rules ({} payload, {} path, {} user-agent), threshold {}, mode {}",
+            "WAF engine compiled: {} rules ({} payload, {} path, {} user-agent), threshold {}, mode {}, {} exclusion(s)",
             rules.len(),
             payload_set.len(),
             path_set.len(),
             ua_set.len(),
             config.anomaly_threshold,
             config.mode,
+            exclusions.len(),
         );
 
         Self {
@@ -1419,6 +1420,40 @@ impl WafEngine {
             stats,
             config: config.clone(),
         }
+    }
+
+    /// The engine for `config`, continuing `previous`'s counters.
+    ///
+    /// A config reload rebuilds the engine, and the counters are Prometheus
+    /// counters: starting them again from zero would read as a reset on every
+    /// reload. Totals carry over; per-rule hits carry over by rule identifier,
+    /// since `custom_patterns` can add or remove rules and move indices.
+    pub fn with_counters_from(config: &WafConfig, previous: &WafEngine) -> Self {
+        let engine = Self::new(config);
+        let carry = |to: &AtomicU64, from: &AtomicU64| {
+            to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
+        };
+        carry(&engine.stats.inspected, &previous.stats.inspected);
+        carry(&engine.stats.allowed, &previous.stats.allowed);
+        carry(&engine.stats.blocked, &previous.stats.blocked);
+        carry(&engine.stats.detected, &previous.stats.detected);
+        let old_index: std::collections::HashMap<&str, usize> = previous
+            .rules
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.id.as_str(), i))
+            .collect();
+        for (i, rule) in engine.rules.iter().enumerate() {
+            if let Some(&j) = old_index.get(rule.id.as_str()) {
+                carry(&engine.stats.per_rule[i], &previous.stats.per_rule[j]);
+            }
+        }
+        engine
+    }
+
+    /// The configuration this engine was compiled from.
+    pub fn config(&self) -> &WafConfig {
+        &self.config
     }
 
     /// Counters for the metrics endpoint.

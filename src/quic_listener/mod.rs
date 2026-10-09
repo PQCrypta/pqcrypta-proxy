@@ -386,10 +386,9 @@ fn resolve_route_policy(
         .and_then(|v| v.to_str().ok())
         .map(|h| h.split(':').next().unwrap_or(h).to_ascii_lowercase())
         .or_else(|| request.uri().host().map(str::to_ascii_lowercase));
-    let on_conformance_host =
-        crate::security::is_conformance_host(&security.route_index, host.as_deref());
-    security
-        .route_index
+    let routes = security.route_index.load_full();
+    let on_conformance_host = crate::security::is_conformance_host(&routes, host.as_deref());
+    routes
         .find_route(host.as_deref(), path, false)
         .map(|r| crate::security::RequestPolicy {
             // The conformance vhost has no route entry, so the flag has to be
@@ -834,8 +833,13 @@ impl QuicListener {
                     match event {
                         ConfigReloadEvent::ConfigReloaded(new_config) => {
                             info!("Applying configuration reload");
+                            // New connections take everything from these; the
+                            // fingerprint settings and the backend pool (its
+                            // connect and pool timeouts are fixed when it is
+                            // built) were kept from startup.
+                            self.fingerprint_config = new_config.fingerprint.clone();
+                            self.backend_pool = Arc::new(BackendPool::new(new_config.clone()));
                             self.config = new_config;
-                            // Note: Backend pool is thread-safe and will pick up new config
                         }
                         ConfigReloadEvent::TlsCertsReloaded => {
                             info!("TLS certificates reloaded");

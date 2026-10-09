@@ -91,6 +91,27 @@ pub struct ConfigManager {
     reload_tx: mpsc::Sender<ConfigReloadEvent>,
     /// Configuration file path
     config_path: PathBuf,
+    /// Applied to the file on every load, see [`ConfigOverrides`].
+    overrides: Arc<RwLock<ConfigOverrides>>,
+}
+
+/// What turns the config file into the configuration in force.
+///
+/// The per-environment overlay (`--env`) and the command-line overrides. Every
+/// load applies them -- startup, the file watcher, SIGHUP and the admin API's
+/// reload alike. Until 2026-10-09 only startup did, so the first hot reload
+/// quietly dropped the overlay and undid `--udp-port`, `--admin-port` and
+/// `--no-pqc`.
+#[derive(Debug, Clone, Default)]
+pub struct ConfigOverrides {
+    /// A partial TOML file merged over the base config, its keys winning.
+    pub env_overlay: Option<PathBuf>,
+    /// `--udp-port`
+    pub udp_port: Option<u16>,
+    /// `--admin-port`
+    pub admin_port: Option<u16>,
+    /// `--no-pqc`
+    pub no_pqc: bool,
 }
 
 /// Events emitted on configuration changes
@@ -3255,9 +3276,38 @@ impl ConfigManager {
             watcher: RwLock::new(None),
             reload_tx,
             config_path,
+            overrides: Arc::new(RwLock::new(ConfigOverrides::default())),
         };
 
         Ok((manager, reload_rx))
+    }
+
+    /// Set what every load applies to the file, and reload with it now.
+    pub fn set_overrides(&self, overrides: ConfigOverrides) -> anyhow::Result<()> {
+        let config = Self::load_effective(&self.config_path, &overrides)?;
+        *self.overrides.write() = overrides;
+        self.config.store(Arc::new(config));
+        Ok(())
+    }
+
+    /// The configuration in force: the file, then the overlay, then the
+    /// command-line overrides, validated.
+    fn load_effective(path: &Path, overrides: &ConfigOverrides) -> anyhow::Result<ProxyConfig> {
+        let mut config = Self::load_config(path)?;
+        if let Some(ref overlay) = overrides.env_overlay {
+            config = overlay_config(&config, overlay)?;
+        }
+        if let Some(port) = overrides.udp_port {
+            config.server.udp_port = port;
+        }
+        if let Some(port) = overrides.admin_port {
+            config.admin.port = port;
+        }
+        if overrides.no_pqc {
+            config.pqc.enabled = false;
+        }
+        config.validate()?;
+        Ok(config)
     }
 
     /// Load configuration from TOML file
@@ -3290,6 +3340,106 @@ impl ConfigManager {
         self.config.store(config);
     }
 } // impl ConfigManager
+
+/// Settings the running proxy reads only when it starts.
+///
+/// Listening sockets, QUIC transport parameters, the listener kinds, and
+/// process-wide services (logging, tracing, OCSP, ACME, the response cache, the
+/// conformance suite, the load balancer's global settings). Everything else is
+/// applied by a reload. A reload that changes one of these is applied
+/// everywhere it can be and names these in a warning, rather than reporting
+/// success while they wait for a restart.
+pub const RESTART_BOUND_SETTINGS: &[&str] = &[
+    "server.bind_address",
+    "server.udp_port",
+    "server.additional_ports",
+    "server.enable_ipv6",
+    "server.worker_threads",
+    "server.max_connections",
+    "server.max_streams_per_connection",
+    "server.max_uni_streams_per_connection",
+    "server.keepalive_interval_secs",
+    "server.max_idle_timeout_secs",
+    "server.graceful_shutdown_timeout_secs",
+    "server.enable_quic_migration",
+    "server.enable_ack_frequency",
+    "server.ack_eliciting_threshold",
+    "server.ack_piggyback",
+    "server.quic_send_coalescing",
+    "server.tcp_nodelay",
+    "server.udp_gro",
+    "server.proxy_protocol_trusted",
+    "server.proxy_protocol_timeout_ms",
+    "server.webtransport_port",
+    "server.webtransport_cert_path",
+    "server.webtransport_key_path",
+    "tls.handshake_timeout_secs",
+    "pqc.enabled",
+    "fingerprint.enabled",
+    "fingerprint.tls_layer_capture",
+    "admin.enabled",
+    "admin.bind_address",
+    "admin.port",
+    "admin.require_mtls",
+    "admin.tls_cert_path",
+    "admin.tls_key_path",
+    "admin.client_ca_path",
+    "admin.require_loopback",
+    "http_redirect.enabled",
+    "http_redirect.port",
+    "passthrough_routes",
+    "logging",
+    "otel",
+    "ocsp",
+    "acme",
+    "cache",
+    "conformance",
+    "load_balancer",
+];
+
+/// Which of [`RESTART_BOUND_SETTINGS`] differ between two configurations.
+pub fn restart_bound_changes(old: &ProxyConfig, new: &ProxyConfig) -> Vec<&'static str> {
+    let (Ok(old), Ok(new)) = (serde_json::to_value(old), serde_json::to_value(new)) else {
+        return Vec::new();
+    };
+    let at = |v: &serde_json::Value, path: &str| -> Option<serde_json::Value> {
+        path.split('.').try_fold(v, |v, key| v.get(key)).cloned()
+    };
+    RESTART_BOUND_SETTINGS
+        .iter()
+        .copied()
+        .filter(|path| at(&old, path) != at(&new, path))
+        .collect()
+}
+
+/// Two configuration sections compared by value. The config structs do not
+/// implement `PartialEq` -- some hold types that do not -- but all serialize.
+pub fn same_settings<T: Serialize>(a: &T, b: &T) -> bool {
+    match (serde_json::to_value(a), serde_json::to_value(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// `base` with the partial TOML file at `overlay_path` merged over it: tables
+/// merge recursively and every other value is replaced, so the overlay wins.
+fn overlay_config(base: &ProxyConfig, overlay_path: &Path) -> anyhow::Result<ProxyConfig> {
+    let overlay_str = std::fs::read_to_string(overlay_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read env overlay {:?}: {}", overlay_path, e))?;
+    let base_str = toml::to_string(base)
+        .map_err(|e| anyhow::anyhow!("Failed to serialise base config: {}", e))?;
+    let base_val: toml::Value = toml::from_str(&base_str)
+        .map_err(|e| anyhow::anyhow!("Failed to re-parse base config: {}", e))?;
+    let overlay_val: toml::Value = toml::from_str(&overlay_str)
+        .map_err(|e| anyhow::anyhow!("Failed to parse env overlay {:?}: {}", overlay_path, e))?;
+    let merged_str = toml::to_string(&merge_toml_values(base_val, overlay_val))
+        .map_err(|e| anyhow::anyhow!("Failed to serialise merged config: {}", e))?;
+    let overlay_ignored = parse_config_str(&overlay_str)
+        .map(|(_, ignored)| ignored)
+        .unwrap_or_default();
+    warn_ignored_keys(overlay_path, &overlay_ignored);
+    toml::from_str(&merged_str).map_err(|e| anyhow::anyhow!("Failed to parse merged config: {}", e))
+}
 
 /// Recursively merge two TOML values.
 ///
@@ -3325,7 +3475,8 @@ impl ConfigManager {
 
     /// Manually reload configuration
     pub async fn reload(&self) -> anyhow::Result<()> {
-        match Self::load_config(&self.config_path) {
+        let overrides = self.overrides.read().clone();
+        match Self::load_effective(&self.config_path, &overrides) {
             Ok(new_config) => {
                 let new_config = Arc::new(new_config);
                 self.config.store(new_config.clone());
@@ -3349,40 +3500,13 @@ impl ConfigManager {
         }
     }
 
-    /// Apply an environment-specific TOML overlay on top of the currently loaded config.
-    ///
-    /// The overlay is a partial TOML file whose keys win over the base config.
-    /// Tables are merged recursively; all other value types are replaced.
-    /// After merging, `ProxyConfig::validate()` is called so any conflicts introduced
-    /// by the overlay are caught at startup.
+    /// Apply an environment-specific TOML overlay on top of the config file,
+    /// now and on every later load. The overlay is a partial TOML file whose
+    /// keys win over the base config; see [`overlay_config`].
     pub fn apply_env_overlay(&self, overlay_path: &Path) -> anyhow::Result<()> {
-        let overlay_str = std::fs::read_to_string(overlay_path)
-            .map_err(|e| anyhow::anyhow!("Failed to read env overlay {:?}: {}", overlay_path, e))?;
-
-        // Serialise the live config back to a TOML value so we can merge.
-        let current = self.config.load_full();
-        let base_str = toml::to_string(current.as_ref())
-            .map_err(|e| anyhow::anyhow!("Failed to serialise base config: {}", e))?;
-
-        let base_val: toml::Value = toml::from_str(&base_str)
-            .map_err(|e| anyhow::anyhow!("Failed to re-parse base config: {}", e))?;
-        let overlay_val: toml::Value = toml::from_str(&overlay_str).map_err(|e| {
-            anyhow::anyhow!("Failed to parse env overlay {:?}: {}", overlay_path, e)
-        })?;
-
-        let merged_val = merge_toml_values(base_val, overlay_val);
-        let merged_str = toml::to_string(&merged_val)
-            .map_err(|e| anyhow::anyhow!("Failed to serialise merged config: {}", e))?;
-
-        let overlay_ignored = parse_config_str(&overlay_str)
-            .map(|(_, ignored)| ignored)
-            .unwrap_or_default();
-        warn_ignored_keys(overlay_path, &overlay_ignored);
-        let new_config: ProxyConfig = toml::from_str(&merged_str)
-            .map_err(|e| anyhow::anyhow!("Failed to parse merged config: {}", e))?;
-        new_config.validate()?;
-
-        self.config.store(Arc::new(new_config));
+        let mut overrides = self.overrides.read().clone();
+        overrides.env_overlay = Some(overlay_path.to_path_buf());
+        self.set_overrides(overrides)?;
         info!("Environment overlay applied from {:?}", overlay_path);
         Ok(())
     }
@@ -3399,6 +3523,7 @@ impl ConfigManager {
     pub fn start_watching(&self) -> anyhow::Result<()> {
         let config_path = self.config_path.clone();
         let reload_tx = self.reload_tx.clone();
+        let overrides = Arc::clone(&self.overrides);
         let config = Arc::clone(&self.config.load_full());
 
         // Canonicalise so events (which carry absolute paths) compare equal even
@@ -3451,7 +3576,8 @@ impl ConfigManager {
 
                     if hit_config {
                         debug!("Config file change detected: {:?}", event);
-                        match Self::load_config(&config_path) {
+                        let current_overrides = overrides.read().clone();
+                        match Self::load_effective(&config_path, &current_overrides) {
                             Ok(new_config) => {
                                 let new_config = Arc::new(new_config);
                                 info!("Configuration hot-reloaded");
@@ -4356,6 +4482,35 @@ pub fn ip_list_contains(list: &[String], ip: &std::net::IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every listed setting names a real key: a typo would be a setting that
+    /// silently never reports its change.
+    #[test]
+    fn restart_bound_settings_name_real_keys() {
+        let config = serde_json::to_value(ProxyConfig::default()).unwrap();
+        for path in RESTART_BOUND_SETTINGS {
+            assert!(
+                path.split('.').try_fold(&config, |v, k| v.get(k)).is_some(),
+                "{path} is not a key of the configuration"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reload_names_the_restart_bound_settings_it_changed() {
+        let old = ProxyConfig::default();
+        let mut new = old.clone();
+        assert_eq!(restart_bound_changes(&old, &new), Vec::<&str>::new());
+        new.server.udp_port = old.server.udp_port.wrapping_add(1);
+        new.admin.port = old.admin.port.wrapping_add(1);
+        // Applied live, so not reported.
+        new.waf.anomaly_threshold = old.waf.anomaly_threshold + 1;
+        new.security.blocked_ips.push("192.0.2.7".into());
+        assert_eq!(
+            restart_bound_changes(&old, &new),
+            vec!["server.udp_port", "admin.port"]
+        );
+    }
 
     #[test]
     fn test_default_config() {
