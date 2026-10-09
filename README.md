@@ -119,6 +119,7 @@
 | **Connection Pool** | ✅ | Per-backend connection pool with configurable max idle, max total, acquire timeout, and idle timeout |
 | **Session Affinity Modes** | ✅ | Sticky sessions via IP hash, custom header, or Set-Cookie with configurable SameSite attribute |
 | **Path Regex Routing** | ✅ | Per-route regex pattern matching with ReDoS prevention (pattern size-limited) |
+| **Path Canonicalisation** | ✅ | Every transport routes and forwards on one canonical path: RFC 3986 dot segments resolved, percent-encoded ones included (`resolve_dot_segments`), repeated slashes merged (`merge_slashes`), case folded (`normalize_paths`). The WAF still inspects the raw path, so a traversal attempt is detected as one |
 | **Certificate Compression** | ✅ | RFC 8879 on both stacks: zlib over TCP via OpenSSL's `SSL_CTX_compress_certs`, brotli or zlib over QUIC/HTTP-3 where rustls builds the list from crate features. `certificate_compression = "auto" \| "off"` in `[tls]`, default `auto`. Worth 1,051 bytes off every full handshake on a four-certificate Let's Encrypt chain |
 | **PQC Session Tickets** | ✅ | Each TLS 1.3 ticket carries its own ML-KEM-1024 encapsulation; the resumption state is sealed with an AES-256-GCM key derived from it via HKDF-SHA384 (`pqc_session_tickets`, `session_ticket_lifetime_secs`) |
 | **TLS Key Permission Checks** | ✅ | Validates private key file permissions at startup; configurable strict mode aborts on insecure permissions |
@@ -158,6 +159,7 @@
 - **Per-Route Timeout Overrides**: Independent timeout configuration per route, overriding global defaults
 - **Multiple Listener Ports**: Primary port plus any number of additional ports (`additional_ports`) all supporting QUIC/HTTP3/WebTransport
 - **Path Regex Routing**: Per-route regex pattern matching alongside exact and prefix matching; ReDoS prevention via pattern size limit
+- **Path Canonicalisation**: `/x/../dev/`, `/%2e/dev/` and `//dev/` route as `/dev/` on HTTP/1.1, HTTP/2, HTTP/3 and WebTransport alike, so a route guarding the canonical path cannot be stepped around by spelling it differently. `resolve_dot_segments` and `merge_slashes` in `[server]` (both on by default) are independent of `normalize_paths` (lowercasing); the WAF and HMAC proof-of-possession see the raw request
 
 ### Security
 - **WAF**: Pattern-based injection and traversal inspection — SQLi, XSS, path traversal, NoSQLi, SSRF, command injection, XXE, insecure deserialization; detect or block mode; custom patterns; body scanning; covers OWASP A01/A03/A08/A10 attack patterns; `X-Forwarded-For` headers scanned without SSRF patterns (localhost/RFC1918 IPs in XFF are legitimate proxy hops, not SSRF — prevents false positives for clients behind local reverse proxies)

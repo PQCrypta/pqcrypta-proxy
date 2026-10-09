@@ -2462,11 +2462,13 @@ async fn proxy_handler(
             h.to_string()
         }
     };
-    let path = if state.config.server.normalize_paths {
-        uri.path().to_ascii_lowercase()
-    } else {
-        uri.path().to_string()
-    };
+    // Routed and forwarded on the canonical path (dot segments, repeated
+    // slashes, case); the WAF middleware has already seen the raw one
+    let path = crate::path_canon::canonical_path(
+        uri.path(),
+        crate::path_canon::PathCanon::from(&state.config.server),
+    )
+    .into_owned();
     let method_str = method.to_string();
     let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
     let user_agent = headers
