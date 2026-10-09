@@ -722,6 +722,48 @@ impl QuicListener {
         }
         // ── End speedtest upload handler ───────────────────────────────────────
 
+        // A TCP-only host asked for over QUIC: the browser coalesced it onto an
+        // h3 connection made for another name on this address, or kept an
+        // Alt-Svc from before. These answered 404, so a TCP speedtest's ping or
+        // upload failed outright (13 a day on fortress). 421 Misdirected Request
+        // (RFC 9110 §15.5.20) is the status for exactly this: browsers mark the
+        // alternative broken and retry the same request on a new connection,
+        // which for this host is TCP. Alt-Svc "clear" goes with it.
+        if let Some(h) = host.as_deref() {
+            if config.server.tcp_only_hosts.iter().any(|t| t == h) {
+                debug!("HTTP/3 request for TCP-only host {h}: 421 so the client retries over TCP");
+                log_access(&AccessLogEntry {
+                    ja3: fingerprint.ja3_hash.as_deref(),
+                    ja4: fingerprint.ja4_hash.as_deref(),
+                    backend: None,
+                    remote_addr,
+                    method,
+                    path: &path,
+                    protocol: "HTTP/3",
+                    status: 421,
+                    body_size: 0,
+                    referer,
+                    user_agent,
+                    host: Some(h),
+                    response_time_ms: start_time
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                });
+                metrics
+                    .requests
+                    .request_end_full(421, start_time.elapsed(), 0, 0, Some(&path));
+                let response = http::Response::builder()
+                    .status(http::StatusCode::MISDIRECTED_REQUEST)
+                    .server_header(&config)
+                    .header(header::ALT_SVC, conn_headers.alt_svc(&config, Some(h)))
+                    .body(())?;
+                respond_and_finish(&mut stream, response).await?;
+                return Ok(());
+            }
+        }
+
         // Find route first so we can use per-route CORS config
         let route = match config.find_route(host.as_deref(), &path, false) {
             Some(r) => {

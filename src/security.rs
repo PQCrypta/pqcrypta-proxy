@@ -2455,45 +2455,37 @@ pub async fn security_middleware(
                         waf_enabled: waf_enabled_cl,
                         ..Default::default()
                     };
-                    match security.inspect_body(&body_view, &body_policy, is_pentest_bypass) {
-                        SecurityDecision::WafBlock { ref rule } => {
-                            warn!(
-                                "WAF body block (CL): rule={} ip={} path={}",
-                                rule, ip, waf_path
-                            );
-                            if dos_protection {
-                                security.decrement_connections(ip);
-                            }
-                            if !is_pentest_bypass {
-                                let mut counter = security.request_counts.entry(ip).or_default();
-                                counter.suspicious_patterns += 1;
-                                if counter.suspicious_patterns >= auto_block_threshold {
-                                    drop(counter);
-                                    let block_duration =
-                                        Duration::from_secs(auto_block_duration_secs);
-                                    security.block_ip(
-                                        ip,
-                                        BlockReason::TooManyErrors,
-                                        Some(block_duration),
-                                    );
-                                }
-                            }
-                            let mut resp =
-                                (StatusCode::FORBIDDEN, "Request blocked by security policy")
-                                    .into_response();
-                            resp.headers_mut()
-                                .insert("x-waf-block", HeaderValue::from_static("1"));
-                            return resp;
+                    // Detect mode never comes back as a block: the WAF answers Allow
+                    // and counts the match itself.
+                    if let SecurityDecision::WafBlock { ref rule } =
+                        security.inspect_body(&body_view, &body_policy, is_pentest_bypass)
+                    {
+                        warn!(
+                            "WAF body block (CL): rule={} ip={} path={}",
+                            rule, ip, waf_path
+                        );
+                        if dos_protection {
+                            security.decrement_connections(ip);
                         }
-                        #[allow(unreachable_patterns)]
-                        #[allow(unreachable_patterns)]
-                        SecurityDecision::WafBlock { ref rule } if false => {
-                            warn!(
-                                "WAF body detect (CL): rule={} ip={} path={}",
-                                rule, ip, waf_path
-                            );
+                        if !is_pentest_bypass {
+                            let mut counter = security.request_counts.entry(ip).or_default();
+                            counter.suspicious_patterns += 1;
+                            if counter.suspicious_patterns >= auto_block_threshold {
+                                drop(counter);
+                                let block_duration = Duration::from_secs(auto_block_duration_secs);
+                                security.block_ip(
+                                    ip,
+                                    BlockReason::TooManyErrors,
+                                    Some(block_duration),
+                                );
+                            }
                         }
-                        _ => {}
+                        let mut resp =
+                            (StatusCode::FORBIDDEN, "Request blocked by security policy")
+                                .into_response();
+                        resp.headers_mut()
+                            .insert("x-waf-block", HeaderValue::from_static("1"));
+                        return resp;
                     }
                 }
             }
@@ -2560,45 +2552,31 @@ pub async fn security_middleware(
                     waf_enabled: waf_enabled_cl,
                     ..Default::default()
                 };
-                match security.inspect_body(
+                // Detect mode is the WAF's to log: it answers Allow.
+                if let SecurityDecision::WafBlock { ref rule } = security.inspect_body(
                     &body_view_chunked,
                     &body_policy_chunked,
                     is_pentest_bypass,
                 ) {
-                    SecurityDecision::WafBlock { ref rule } => {
-                        warn!("WAF body block: rule={} ip={} path={}", rule, ip, waf_path);
-                        if dos_protection {
-                            security.decrement_connections(ip);
-                        }
-                        // Same escalation as the header/path WAF block path above.
-                        {
-                            let mut counter = security.request_counts.entry(ip).or_default();
-                            counter.suspicious_patterns += 1;
-                            if counter.suspicious_patterns >= auto_block_threshold {
-                                drop(counter);
-                                let block_duration = Duration::from_secs(auto_block_duration_secs);
-                                security.block_ip(
-                                    ip,
-                                    BlockReason::TooManyErrors,
-                                    Some(block_duration),
-                                );
-                            }
-                        }
-                        let mut resp =
-                            (StatusCode::FORBIDDEN, "Request blocked by security policy")
-                                .into_response();
-                        resp.headers_mut()
-                            .insert("x-waf-block", HeaderValue::from_static("1"));
-                        return resp;
+                    warn!("WAF body block: rule={} ip={} path={}", rule, ip, waf_path);
+                    if dos_protection {
+                        security.decrement_connections(ip);
                     }
-                    #[allow(unreachable_patterns)]
-                    SecurityDecision::WafBlock { ref rule } if false => {
-                        warn!(
-                            "WAF body detect (non-blocking): rule={} ip={} path={}",
-                            rule, ip, waf_path
-                        );
+                    // Same escalation as the header/path WAF block path above.
+                    {
+                        let mut counter = security.request_counts.entry(ip).or_default();
+                        counter.suspicious_patterns += 1;
+                        if counter.suspicious_patterns >= auto_block_threshold {
+                            drop(counter);
+                            let block_duration = Duration::from_secs(auto_block_duration_secs);
+                            security.block_ip(ip, BlockReason::TooManyErrors, Some(block_duration));
+                        }
                     }
-                    _ => {}
+                    let mut resp = (StatusCode::FORBIDDEN, "Request blocked by security policy")
+                        .into_response();
+                    resp.headers_mut()
+                        .insert("x-waf-block", HeaderValue::from_static("1"));
+                    return resp;
                 }
             }
         }

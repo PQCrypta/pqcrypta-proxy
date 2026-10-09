@@ -280,6 +280,7 @@ impl WebTransportServer {
             let session_metrics = metrics.clone();
             let counts_clone = Arc::clone(&origin_counts);
             let security_clone = security.clone();
+            let remote_addr = incoming_session.remote_address();
             tokio::spawn(async move {
                 if let Some(ref m) = session_metrics {
                     m.connections
@@ -294,7 +295,9 @@ impl WebTransportServer {
                 )
                 .await
                 {
-                    error!("❌ Session handler error: {}", e);
+                    // A client that goes quiet or names a host with no certificate
+                    // is ranked as the HTTP/3 listener ranks it, not as an error.
+                    crate::quic_listener::log_quic_end(remote_addr, &e.to_string());
                 }
                 if let Some(ref m) = session_metrics {
                     m.connections.connection_closed();
