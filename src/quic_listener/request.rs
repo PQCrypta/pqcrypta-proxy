@@ -184,16 +184,12 @@ impl QuicListener {
         // then neither of these allocates at all. Before, every request built a
         // `path` String, an (often empty) `query` String, and a third String
         // concatenating them.
-        // Lowercased only when there is something to lowercase: a path that
-        // is already lowercase is the same either way, and copying it was an
-        // allocation on almost every request.
-        let path: Cow<'_, str> = if config.server.normalize_paths
-            && uri.path().bytes().any(|b| b.is_ascii_uppercase())
-        {
-            Cow::Owned(uri.path().to_ascii_lowercase())
-        } else {
-            Cow::Borrowed(uri.path())
-        };
+        // Canonical (dot segments, repeated slashes, case) and borrowed when
+        // the path already is, as almost every path is; see crate::path_canon
+        let path: Cow<'_, str> = crate::path_canon::canonical_path(
+            uri.path(),
+            crate::path_canon::PathCanon::from(&config.server),
+        );
         let path_with_query: Cow<'_, str> = match uri.query() {
             Some(q) => Cow::Owned(format!("{path}?{q}")),
             None => match &path {
@@ -401,11 +397,20 @@ impl QuicListener {
                 .get_or_insert_with(|| resolve_route_policy(&security, &request, &path));
 
             {
+                let raw_path = request.uri().path();
+                let waf_path: Cow<'_, str> = if raw_path.bytes().any(|b| b.is_ascii_uppercase()) {
+                    Cow::Owned(raw_path.to_ascii_lowercase())
+                } else {
+                    Cow::Borrowed(raw_path)
+                };
                 let view = crate::security::SecurityRequestView {
                     ip,
                     peer_port: Some(remote_addr.port()),
                     method,
-                    path: &path,
+                    // The raw path lowercased, exactly what the TCP security
+                    // middleware passes: the canonical one has already resolved
+                    // away the `../` a traversal rule looks for
+                    path: &waf_path,
                     query: request.uri().query().unwrap_or(""),
                     headers: request.headers(),
                     body: None,

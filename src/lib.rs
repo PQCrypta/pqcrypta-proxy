@@ -153,6 +153,7 @@ pub mod log_file;
 pub mod metrics;
 pub mod ocsp;
 pub mod otel;
+pub mod path_canon;
 pub mod pqc_extended;
 pub mod pqc_tickets;
 pub mod pqc_tls;

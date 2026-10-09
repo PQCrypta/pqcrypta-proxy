@@ -1304,11 +1304,11 @@ impl QuicListener {
 
                     let method = request.method().clone();
                     let uri = request.uri().clone();
-                    let path = if config.server.normalize_paths {
-                        uri.path().to_ascii_lowercase()
-                    } else {
-                        uri.path().to_string()
-                    };
+                    let path = crate::path_canon::canonical_path(
+                        uri.path(),
+                        crate::path_canon::PathCanon::from(&config.server),
+                    )
+                    .into_owned();
                     // In HTTP/3, host comes from :authority pseudo-header (in URI) or fallback to host header
                     let host = uri
                         .authority()

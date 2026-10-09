@@ -1033,13 +1033,31 @@ pub struct ServerConfig {
     /// REST APIs, AI chat endpoints, PHP apps that use mixed-case slugs).
     ///
     /// Route matching remains case-insensitive regardless of this setting —
-    /// only the path forwarded to the backend is affected.
+    /// only the path forwarded to the backend is affected. Dot segments and
+    /// repeated slashes are handled by `resolve_dot_segments` and
+    /// `merge_slashes`, independently of this.
     ///
     /// ```toml
     /// normalize_paths = false
     /// ```
     #[serde(default = "default_true")]
     pub normalize_paths: bool,
+
+    /// Remove `.` and `..` segments (literal or percent-encoded) from the path
+    /// before routing and forwarding, as RFC 3986 §5.2.4 resolves them.
+    ///
+    /// Without it `/x/../dev/` and `/%2e/dev/` miss a route on `/dev/` while the
+    /// origin, which resolves them, serves `/dev/`. The WAF still inspects the
+    /// raw path, so traversal attempts are detected either way. See
+    /// [`crate::path_canon`].
+    #[serde(default = "default_true")]
+    pub resolve_dot_segments: bool,
+
+    /// Collapse repeated slashes (`/a//b` → `/a/b`) before routing and
+    /// forwarding, as Apache's `MergeSlashes` does at the origin. Turn it off
+    /// for a backend that gives an empty path segment a meaning.
+    #[serde(default = "default_true")]
+    pub merge_slashes: bool,
 }
 
 impl ServerConfig {
@@ -1119,6 +1137,8 @@ impl Default for ServerConfig {
             webtransport_cert_path: None,
             webtransport_key_path: None,
             normalize_paths: true,
+            resolve_dot_segments: true,
+            merge_slashes: true,
         }
     }
 }
