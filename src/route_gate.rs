@@ -108,11 +108,12 @@ pub struct GateContext<'a> {
 pub fn redirect_target(route: &RouteConfig, path: &str, query: &str) -> Option<(String, bool)> {
     let redirect_to = route.redirect.as_ref()?;
     let new_path = if let Some(ref prefix) = route.path_prefix {
-        // Replace the prefix with the redirect target, keeping the rest.
-        // Compared lowercased because the caller may have normalised the path.
-        let prefix_lower = prefix.to_ascii_lowercase();
-        let suffix = if path.starts_with(&prefix_lower) {
-            &path[prefix_lower.len()..]
+        // Replace the prefix with the redirect target, keeping the rest. The
+        // route matched case-insensitively, so the prefix is compared the same
+        // way. A lowercase-only comparison assumed `normalize_paths` had already
+        // lowercased the path; with it off, `/THREAT_BOT/x` went to `/threat-bot`.
+        let suffix = if crate::config::starts_with_ignore_ascii_case(path, prefix) {
+            &path[prefix.len()..]
         } else {
             ""
         };
@@ -403,6 +404,20 @@ mod tests {
         let (target, permanent) = redirect_target(&r, "/old/deep", "?a=1").expect("a redirect");
         assert_eq!(target, "/new/deep?a=1");
         assert!(!permanent);
+    }
+
+    #[test]
+    fn redirect_keeps_the_suffix_of_a_mixed_case_path() {
+        let mut r = route();
+        r.path_prefix = Some("/threat_bot".to_string());
+        r.redirect = Some("/threat-bot".to_string());
+        let (target, _) = redirect_target(&r, "/THREAT_BOT/x", "").expect("a redirect");
+        assert_eq!(target, "/threat-bot/x");
+        r.path_prefix = Some("/Encryption/Fun/FractalTree".to_string());
+        r.redirect = Some("/fun/fractaltree".to_string());
+        let (target, _) =
+            redirect_target(&r, "/encryption/fun/fractaltree/", "").expect("a redirect");
+        assert_eq!(target, "/fun/fractaltree/");
     }
 
     #[test]
