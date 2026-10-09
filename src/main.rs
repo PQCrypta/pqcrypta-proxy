@@ -382,7 +382,15 @@ async fn run() -> anyhow::Result<()> {
     let (config_manager, mut reload_rx) = ConfigManager::new(&args.config).await?;
     let config_manager = Arc::new(config_manager);
 
-    // STEP 15: Apply per-environment config overlay (--env / PQCRYPTA_ENV).
+    // STEP 15: per-environment overlay (--env / PQCRYPTA_ENV) and the CLI
+    // overrides. The config manager applies them to every load, so a hot reload
+    // keeps them; they used to be applied to this startup copy only.
+    let mut overrides = pqcrypta_proxy::config::ConfigOverrides {
+        udp_port: args.udp_port,
+        admin_port: args.admin_port,
+        no_pqc: args.no_pqc,
+        ..Default::default()
+    };
     if let Some(ref env_name) = args.env {
         let base_path = std::path::Path::new(&args.config);
         let base_dir = base_path
@@ -394,13 +402,11 @@ async fn run() -> anyhow::Result<()> {
             .unwrap_or("config");
         let overlay_path = base_dir.join(format!("{}.{}.toml", base_stem, env_name));
         if overlay_path.exists() {
-            config_manager
-                .apply_env_overlay(&overlay_path)
-                .map_err(|e| anyhow::anyhow!("--env {}: overlay failed: {}", env_name, e))?;
             info!(
-                "✅ Applied env overlay {:?} (--env {})",
+                "✅ Applying env overlay {:?} (--env {})",
                 overlay_path, env_name
             );
+            overrides.env_overlay = Some(overlay_path);
         } else {
             warn!(
                 "--env {}: overlay file {:?} not found — using base config only",
@@ -408,9 +414,20 @@ async fn run() -> anyhow::Result<()> {
             );
         }
     }
+    if let Some(port) = args.udp_port {
+        info!("UDP port overridden to: {}", port);
+    }
+    if let Some(port) = args.admin_port {
+        info!("Admin port overridden to: {}", port);
+    }
+    if args.no_pqc {
+        info!("PQC hybrid key exchange disabled via CLI");
+    }
+    config_manager
+        .set_overrides(overrides)
+        .map_err(|e| anyhow::anyhow!("configuration with overlay and CLI overrides: {e}"))?;
 
-    // Apply CLI overrides
-    let mut config = (*config_manager.get()).clone();
+    let config = (*config_manager.get()).clone();
 
     // UDP_GRO is decided here because the socket layer that reads it is
     // vendored and has no view of this config. Set before any endpoint binds.
@@ -428,23 +445,6 @@ async fn run() -> anyhow::Result<()> {
         info!("UDP_GRO disabled (server.udp_gro = false): ECN readings over throughput");
     }
 
-    if let Some(port) = args.udp_port {
-        config.server.udp_port = port;
-        info!("UDP port overridden to: {}", port);
-    }
-
-    if let Some(port) = args.admin_port {
-        config.admin.port = port;
-        info!("Admin port overridden to: {}", port);
-    }
-
-    if args.no_pqc {
-        config.pqc.enabled = false;
-        info!("PQC hybrid key exchange disabled via CLI");
-    }
-
-    // Validate configuration
-    config.validate()?;
     info!("Configuration validated successfully");
 
     // M-2: Warn loudly for every backend that disables TLS certificate verification,
@@ -846,11 +846,31 @@ async fn run() -> anyhow::Result<()> {
     let reload_security = security_state.clone();
     let reload_rate_limiter = shared_rate_limiter.clone();
 
+    // Create shared load balancer so admin API and all HTTP listeners share state
+    // (canary suspend/resume, weight changes via admin are reflected in live routing)
+    let shared_lb = {
+        let lb_config = Arc::new(config.load_balancer.clone());
+        let lb = Arc::new(LoadBalancer::new(lb_config));
+        for (name, pool_config) in &config.backend_pools {
+            lb.add_pool(pool_config);
+            info!(
+                "⚖️  Added backend pool '{}' with {} servers ({})",
+                name,
+                pool_config.servers.len(),
+                pool_config.algorithm
+            );
+        }
+        lb
+    };
+
+    let reload_lb = shared_lb.clone();
+
     // Spawn config reload handler for hot-reload support
     let reload_tls_provider = tls_provider.clone();
     let reload_pqc_provider = pqc_provider.clone();
     let reload_early_hints = early_hints_state.clone();
     let reload_config_manager = config_manager.clone();
+    let mut applied = config_manager.get();
     tokio::spawn(async move {
         while let Some(event) = reload_rx.recv().await {
             // Every HTTP/3 listener applies it too.
@@ -863,6 +883,10 @@ async fn run() -> anyhow::Result<()> {
             match event {
                 ConfigReloadEvent::ConfigReloaded(new_config) => {
                     info!("Configuration reloaded - applying changes");
+                    // The config this handler last applied. SIGHUP and the admin
+                    // API store theirs in the manager before the event arrives,
+                    // so the manager cannot say what was in force before it.
+                    let previous = std::mem::replace(&mut applied, new_config.clone());
 
                     // Refresh the central config snapshot. The file-watcher emits
                     // the event but does not update the ArcSwap itself, so do it
@@ -894,7 +918,17 @@ async fn run() -> anyhow::Result<()> {
                     // TCP listeners: routes, backends, headers, middleware.
                     let _ = tcp_config_tx.send(new_config.clone());
                     reload_rate_limiter.update_config(new_config.advanced_rate_limiting.clone());
-                    info!("Security and rate-limit configuration updated");
+                    reload_lb.reconcile_pools(&new_config.backend_pools);
+                    info!("Security, rate-limit and load-balancer configuration updated");
+
+                    let restart_bound =
+                        pqcrypta_proxy::config::restart_bound_changes(&previous, &new_config);
+                    if !restart_bound.is_empty() {
+                        warn!(
+                            "Reload applied, but these changed settings take effect only after a restart: {}",
+                            restart_bound.join(", ")
+                        );
+                    }
                 }
                 ConfigReloadEvent::TlsCertsReloaded => {
                     info!("TLS certificates reloaded");
@@ -1071,23 +1105,6 @@ async fn run() -> anyhow::Result<()> {
         None
     };
 
-    // Create shared load balancer so admin API and all HTTP listeners share state
-    // (canary suspend/resume, weight changes via admin are reflected in live routing)
-    let shared_lb = {
-        let lb_config = Arc::new(config.load_balancer.clone());
-        let lb = Arc::new(LoadBalancer::new(lb_config));
-        for (name, pool_config) in &config.backend_pools {
-            lb.add_pool(pool_config);
-            info!(
-                "⚖️  Added backend pool '{}' with {} servers ({})",
-                name,
-                pool_config.servers.len(),
-                pool_config.algorithm
-            );
-        }
-        lb
-    };
-
     let admin_server = AdminServer::new(
         config.admin_resolved(),
         config_manager.clone(),
@@ -1141,6 +1158,7 @@ async fn run() -> anyhow::Result<()> {
         // AUD-02: Pass the allowed_domains list so the redirect server validates
         // the Host header before building the HTTPS URL.
         let redirect_allowed_domains = config.http_redirect.allowed_domains.clone();
+        let redirect_config_updates = tcp_config_rx.clone();
         let redirect_to_https = config.http_redirect.redirect_to_https;
         let redirect_status =
             axum::http::StatusCode::from_u16(config.http_redirect.redirect_status)
@@ -1153,6 +1171,7 @@ async fn run() -> anyhow::Result<()> {
                 redirect_status,
                 challenges,
                 redirect_allowed_domains,
+                Some(redirect_config_updates),
             )
             .await
             {
@@ -1464,6 +1483,7 @@ async fn run() -> anyhow::Result<()> {
         let wt_config = config.clone();
         let wt_backend_pool = Arc::new(BackendPool::new(config.clone()));
         let wt_security = security_state.clone();
+        let wt_config_updates = tcp_config_rx.clone();
         // The WebTransport server uses a single cert (no SNI).  Resolution order:
         //   1. Explicit webtransport_cert_path / webtransport_key_path from config.
         //   2. Auto-detect: look for api.<primary-domain>.crt in the certs directory.
@@ -1526,7 +1546,8 @@ async fn run() -> anyhow::Result<()> {
                     let server = server
                         .with_metrics(wt_metrics)
                         .with_security(wt_security)
-                        .with_shutdown(wt_shutdown_rx);
+                        .with_shutdown(wt_shutdown_rx)
+                        .with_config_updates(wt_config_updates);
                     info!("✅ WebTransport server ready on {}", server.local_addr());
                     if let Err(e) = server.run().await {
                         error!("WebTransport server error: {}", e);

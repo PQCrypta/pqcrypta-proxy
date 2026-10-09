@@ -46,6 +46,8 @@ pub struct WebTransportServer {
     /// open session -- a speed test, a telemetry wall -- held the connection
     /// drain in `main` to its full budget.
     shutdown: Option<tokio::sync::watch::Receiver<()>>,
+    /// Reloaded configurations, the channel the TCP listeners follow.
+    config_updates: Option<tokio::sync::watch::Receiver<Arc<ProxyConfig>>>,
 }
 
 impl WebTransportServer {
@@ -212,6 +214,7 @@ impl WebTransportServer {
             origin_session_counts: Arc::new(DashMap::new()),
             security: None,
             shutdown: None,
+            config_updates: None,
         })
     }
 
@@ -237,15 +240,27 @@ impl WebTransportServer {
         self
     }
 
+    /// Follow reloaded configurations: each new session uses the latest. This
+    /// server was handed the startup config and kept it, so a reload changed
+    /// nothing here -- allowed origins and per-origin session limits included.
+    #[must_use]
+    pub fn with_config_updates(
+        mut self,
+        updates: tokio::sync::watch::Receiver<Arc<ProxyConfig>>,
+    ) -> Self {
+        self.config_updates = Some(updates);
+        self
+    }
+
     /// Get local address
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
     }
 
     /// Run the WebTransport server and accept incoming connections
-    pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let config = self.config.clone();
-        let backend_pool = self.backend_pool.clone();
+    pub async fn run(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut config = self.config.clone();
+        let mut backend_pool = self.backend_pool.clone();
         let metrics = self.metrics.clone();
         let origin_counts = Arc::clone(&self.origin_session_counts);
         let security = self.security.clone();
@@ -273,6 +288,15 @@ impl WebTransportServer {
             };
 
             info!("📨 Received incoming WebTransport session");
+
+            if let Some(updates) = self.config_updates.as_mut() {
+                if updates.has_changed().unwrap_or(false) {
+                    config = updates.borrow_and_update().clone();
+                    // Its connect and pool timeouts are fixed when it is built.
+                    backend_pool = Arc::new(BackendPool::new(config.clone()));
+                    info!("WebTransport server: applying the reloaded configuration");
+                }
+            }
 
             // Spawn task to handle the session
             let config_clone = config.clone();
@@ -868,7 +892,7 @@ async fn proxy_request(
     // HTTP headers on a WT frame, so a minimal header map is synthesised. When
     // no security state is attached (WAF disabled) this is a no-op.
     if let Some(sec) = security {
-        if sec.waf_engine.is_some() {
+        if sec.waf().is_some() {
             let ip = crate::security::canonical_addr(remote_addr).ip();
             let is_pentest =
                 crate::config::ip_list_contains(&sec.config.read().pentest_bypass_ips, &ip);

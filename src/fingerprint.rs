@@ -824,6 +824,7 @@ impl FingerprintExtractor {
         let (classification, client_name) = {
             let from_file = security
                 .ja3_db
+                .load()
                 .classify_pair(&ja3_hash, ja4_hash.as_deref());
             if matches!(from_file, crate::security::FingerprintClass::Suspicious) {
                 self.known_fingerprints

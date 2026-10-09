@@ -264,29 +264,38 @@ pub struct SecurityState {
     /// rate_config and the security config are already held here; matching uses
     /// ProxyConfig::find_route so the route chosen is the same one the proxy
     /// will use downstream.
-    pub route_index: Arc<ProxyConfig>,
+    ///
+    /// Swapped on every config reload. It was a snapshot taken at startup, so
+    /// a reload rerouted requests while the security layer kept judging them
+    /// by the old routes' policy (waf_enabled, waf_mode, skip_bot_blocking,
+    /// allow_credentialed_clients, allowed_ja3, rate-limit overrides).
+    pub route_index: Arc<arc_swap::ArcSwap<ProxyConfig>>,
     /// Circuit breaker configuration
     pub circuit_breaker_config: Arc<RwLock<CircuitBreakerConfig>>,
-    /// Global rate limiter (fallback)
-    pub global_rate_limiter: Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>,
-    /// GeoIP database (optional)
+    /// GeoIP database (optional); reloaded when a reload changes its path.
     #[cfg(feature = "geoip")]
-    pub geoip_db: Option<Arc<GeoIpDb>>,
+    pub geoip_db: Arc<arc_swap::ArcSwapOption<GeoIpDb>>,
     /// Current Tor exit addresses (`security.block_tor_exit_nodes`), swapped
     /// whole on each refresh.
     pub tor_exits: Arc<arc_swap::ArcSwap<std::collections::HashSet<IpAddr>>>,
-    /// JA3/JA4 fingerprint database (advisory-only, never blocks)
-    pub ja3_db: Arc<Ja3Database>,
-    /// WAF engine (None if WAF disabled)
-    pub waf_engine: Option<Arc<WafEngine>>,
-    /// `waf.scanner_ua_exempt_paths`, compiled once.
+    /// JA3/JA4 fingerprint database (advisory-only, never blocks); reloaded
+    /// when a reload changes its path.
+    pub ja3_db: Arc<arc_swap::ArcSwap<Ja3Database>>,
+    /// WAF engine (None if WAF disabled). Read it with [`Self::waf`].
+    ///
+    /// Rebuilt from `[waf]` on every config reload that changes it. It was
+    /// built once at startup, so a reload logged "Configuration hot-reloaded"
+    /// while every `[waf]` edit -- exclusions, threshold, mode, categories,
+    /// custom patterns, even `enabled` -- waited for the next restart.
+    pub waf_engine: Arc<arc_swap::ArcSwapOption<WafEngine>>,
+    /// `waf.scanner_ua_exempt_paths`, compiled at startup and on every reload.
     ///
     /// The bad-bot user-agent rules return 403 to curl, wget, python-requests,
     /// Go's HTTP client and an empty UA alike. That is a reasonable default for
     /// pages and leaves crawling untouched, but it is the wrong answer for paths
     /// whose purpose is programmatic access. Invisible from the server itself:
     /// loopback and the bypass IPs pass, so verify from a node with no bypass.
-    pub scanner_ua_exempt: Arc<regex::RegexSet>,
+    pub scanner_ua_exempt: Arc<arc_swap::ArcSwap<regex::RegexSet>>,
     /// Structured audit logger, when one is configured.
     ///
     /// `AuditLogger` has carried `log_waf_block`/`log_waf_detect` — and the
@@ -299,10 +308,10 @@ pub struct SecurityState {
     /// P2-fix: single-IP parsing previously ignored subnet notation; CIDRs now stored
     /// separately and checked in is_blocked() via cidr_contains_ip().
     pub blocked_cidrs: Arc<RwLock<Vec<(IpNet, BlockedIpInfo)>>>,
-    /// Pre-built Alt-Svc header value derived from config ports at construction.
+    /// Alt-Svc header value for the proxy's own refusals, derived from the
+    /// configured ports and `alt_svc_ports` at startup and on every reload.
     /// P3-fix: previously a hardcoded constant listing ports 443/4433/4434.
-    /// Now reflects the actual configured udp_port and additional_ports.
-    pub alt_svc_header: Arc<str>,
+    pub alt_svc_header: Arc<arc_swap::ArcSwap<String>>,
     /// Forward-confirmed reverse-DNS cache for search-engine crawlers.
     ///
     /// A rendering crawler fetches a document and all its subresources at once,
@@ -311,7 +320,8 @@ pub struct SecurityState {
     /// Search Console report 403 on healthy URLs. Verified crawlers are exempted
     /// from the rate limiters here, the same way pentest_bypass_ips are, and for
     /// the same reason: the limiter is aimed at abuse, not at these clients.
-    pub crawler_verifier: Arc<CrawlerVerifier>,
+    /// Rebuilt when a reload switches `crawler_published_ranges`.
+    pub crawler_verifier: Arc<arc_swap::ArcSwap<CrawlerVerifier>>,
 }
 
 /// Information about a blocked IP
@@ -330,8 +340,11 @@ pub struct BlockedIpInfo {
 /// Reason for IP block
 #[derive(Clone, Debug)]
 pub enum BlockReason {
-    /// Manually configured in config
+    /// Blocked by an operator through the admin API
     Manual,
+    /// Listed in `security.blocked_ips`: added and lifted as the config says,
+    /// at startup and on every reload
+    Configured,
     /// Rate limit exceeded
     RateLimitExceeded,
     /// Too many connections
@@ -806,169 +819,108 @@ impl Default for CircuitBreakerState {
 impl SecurityState {
     /// Create new security state from configuration
     pub fn new(config: &ProxyConfig) -> Self {
-        // Create global rate limiter
-        let rate_per_second = config.rate_limiting.requests_per_second;
-        let burst = config.rate_limiting.burst_size;
-
-        // Safe NonZeroU32 construction - use .max(1) to ensure non-zero, then unwrap_or(MIN) as fallback
-        let rps = NonZeroU32::new(rate_per_second.max(1)).unwrap_or(NonZeroU32::MIN);
-        let burst_nz = NonZeroU32::new(burst.max(1)).unwrap_or(NonZeroU32::MIN);
-        let quota = Quota::per_second(rps).allow_burst(burst_nz);
-
-        let global_rate_limiter = Arc::new(RateLimiter::direct(quota));
-
-        // Pre-populate blocked IPs from config
-        let blocked_ips = Arc::new(DashMap::new());
-        for ip_str in &config.security.blocked_ips {
-            if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                blocked_ips.insert(
-                    ip,
-                    BlockedIpInfo {
-                        blocked_at: Instant::now(),
-                        expires_at: None, // Permanent for manual blocks
-                        reason: BlockReason::Manual,
-                        block_count: 1,
-                    },
-                );
-            }
-        }
-
-        // Load GeoIP database if configured
-        #[cfg(feature = "geoip")]
-        let geoip_db =
-            config
-                .security
-                .geoip_db_path
-                .as_ref()
-                .and_then(|path| match GeoIpDb::new(path) {
-                    Ok(db) => {
-                        info!("✅ GeoIP database loaded from {:?}", path);
-                        let asn = config.security.geoip_asn_db_path.as_ref().and_then(|p| {
-                            match maxminddb::Reader::open_readfile(p) {
-                                Ok(r) => Some(r),
-                                Err(e) => {
-                                    if !config.security.blocked_asns.is_empty() {
-                                        warn!("⚠️ blocked_asns is set but the ASN database {:?} could not load: {}", p, e);
-                                    }
-                                    None
-                                }
-                            }
-                        });
-                        Some(Arc::new(db.with_asn(asn)))
-                    }
-                    Err(e) => {
-                        warn!("⚠️ Failed to load GeoIP database from {:?}: {}", path, e);
-                        None
-                    }
-                });
-
-        // Load JA3/JA4 fingerprint database (advisory-only)
-        let ja3_db = if let Some(ref db_path) = config.fingerprint.fingerprint_db_path {
-            match Ja3Database::load_from_file(db_path) {
-                Ok(db) => {
-                    if db.is_empty() {
-                        warn!(
-                            "JA3 fingerprint database at {:?} is empty - classification will return Suspicious for all hashes",
-                            db_path
-                        );
-                    } else {
-                        info!(
-                            "Loaded {} JA3/JA4 fingerprints from {:?}",
-                            db.len(),
-                            db_path
-                        );
-                    }
-                    db
-                }
-                Err(e) => {
-                    warn!(
-                        "Could not load JA3 fingerprint database from {:?}: {} - continuing with empty DB",
-                        db_path, e
-                    );
-                    Ja3Database::default()
-                }
-            }
-        } else {
-            Ja3Database::default()
-        };
-
-        // Build WAF engine if enabled
-        let waf_engine = if config.waf.enabled {
-            Some(Arc::new(WafEngine::new(&config.waf)))
-        } else {
-            None
-        };
-
-        // The Alt-Svc on the proxy's own refusals (403/429/413): the same value
-        // the TCP listener on `udp_port` advertises, so `server.alt_svc_ports`
-        // and `server.alt_svc_max_age_secs` apply here too. This used to list
-        // `udp_port` plus every additional port, ignoring the override that
-        // exists because a bound port is not necessarily a reachable one.
-        let alt_svc_header: Arc<str> = crate::http_listener::build_alt_svc_header_with_override(
-            config.server.udp_port,
-            &config.server.additional_ports,
-            config.server.alt_svc_ports.as_deref(),
-            config.server.alt_svc_max_age_secs,
-        )
-        .into();
+        let security_config = Arc::new(RwLock::new(config.security.clone()));
+        let tor_exits = Arc::new(arc_swap::ArcSwap::from_pointee(HashSet::new()));
+        // Always running: it reads `block_tor_exit_nodes`, the list URL and the
+        // interval from the live config each round, so a reload can switch it
+        // on, off or elsewhere. It was spawned only when enabled at startup,
+        // with the URL and interval it started with.
+        spawn_tor_exit_refresh(tor_exits.clone(), security_config.clone());
 
         let state = Self {
             ip_rate_limiters: Arc::new(DashMap::new()),
             ip_connections: Arc::new(DashMap::new()),
             connection_rates: Arc::new(DashMap::new()),
-            blocked_ips,
+            blocked_ips: Arc::new(DashMap::new()),
             request_counts: Arc::new(DashMap::new()),
             ja3_cache: Arc::new(DashMap::new()),
-            // Unit tests never fetch the feeds nor read the live cache.
-            crawler_verifier: Arc::new(
-                if config.security.crawler_published_ranges && !cfg!(test) {
-                    CrawlerVerifier::with_published_ranges(std::path::Path::new(
-                        crate::crawler_verify::RANGES_CACHE,
-                    ))
-                } else {
-                    CrawlerVerifier::new()
-                },
-            ),
+            crawler_verifier: Arc::new(arc_swap::ArcSwap::from_pointee(build_crawler_verifier(
+                config.security.crawler_published_ranges,
+            ))),
             circuit_breakers: Arc::new(DashMap::new()),
-            config: Arc::new(RwLock::new(config.security.clone())),
+            config: security_config,
             rate_config: Arc::new(RwLock::new(config.rate_limiting.clone())),
-            route_index: Arc::new(config.clone()),
+            route_index: Arc::new(arc_swap::ArcSwap::from_pointee(config.clone())),
             circuit_breaker_config: Arc::new(RwLock::new(config.circuit_breaker.clone())),
-            global_rate_limiter,
             #[cfg(feature = "geoip")]
-            geoip_db,
-            tor_exits: {
-                let set = Arc::new(arc_swap::ArcSwap::from_pointee(
-                    std::collections::HashSet::new(),
-                ));
-                if config.security.block_tor_exit_nodes {
-                    spawn_tor_exit_refresh(
-                        set.clone(),
-                        config.security.tor_exit_list_url.clone(),
-                        Duration::from_secs(config.security.tor_exit_refresh_secs.max(60)),
-                    );
-                }
-                set
-            },
-            ja3_db: Arc::new(ja3_db),
-            waf_engine,
-            scanner_ua_exempt: Arc::new(
-                regex::RegexSet::new(&config.waf.scanner_ua_exempt_paths).unwrap_or_else(|e| {
-                    // validate() refuses this at load; reaching here means a
-                    // config that skipped it, so fail towards no exemption.
-                    error!("waf.scanner_ua_exempt_paths is invalid, exempting nothing: {e}");
-                    regex::RegexSet::empty()
-                }),
-            ),
+            geoip_db: Arc::new(arc_swap::ArcSwapOption::new(load_geoip(&config.security))),
+            tor_exits,
+            ja3_db: Arc::new(arc_swap::ArcSwap::from_pointee(load_ja3_db(
+                config.fingerprint.fingerprint_db_path.as_deref(),
+            ))),
+            waf_engine: Arc::new(arc_swap::ArcSwapOption::new(
+                config
+                    .waf
+                    .enabled
+                    .then(|| Arc::new(WafEngine::new(&config.waf))),
+            )),
+            scanner_ua_exempt: Arc::new(arc_swap::ArcSwap::from_pointee(compile_scanner_exempt(
+                &config.waf.scanner_ua_exempt_paths,
+            ))),
             audit_logger: None,
             blocked_cidrs: Arc::new(RwLock::new(Vec::new())),
-            alt_svc_header,
+            alt_svc_header: Arc::new(arc_swap::ArcSwap::from_pointee(refusal_alt_svc(config))),
         };
+        state.apply_configured_blocks(&config.security.blocked_ips);
 
         // Spawn background cleanup task
         state.spawn_cleanup_task();
 
         state
+    }
+
+    /// The WAF engine in force, `None` when the WAF is disabled. Load it once
+    /// per request: a reload may swap it, and one request is judged by one
+    /// engine.
+    pub fn waf(&self) -> Option<Arc<WafEngine>> {
+        self.waf_engine.load_full()
+    }
+
+    /// `security.blocked_ips`, addresses and CIDR ranges, as permanent
+    /// `Configured` blocks. Entries no longer listed are lifted; blocks of any
+    /// other kind are left alone. At startup only single addresses were read --
+    /// a CIDR in this list was silently ignored -- and never again after.
+    fn apply_configured_blocks(&self, listed: &[String]) {
+        let mut ips = HashSet::new();
+        let mut nets = Vec::new();
+        for entry in listed {
+            if let Ok(ip) = entry.parse::<IpAddr>() {
+                ips.insert(ip);
+            } else if let Ok(net) = entry.parse::<IpNet>() {
+                nets.push(net);
+            } else {
+                warn!("security.blocked_ips: {entry:?} is neither an address nor a CIDR range, ignored");
+            }
+        }
+        let configured = || BlockedIpInfo {
+            blocked_at: Instant::now(),
+            expires_at: None,
+            reason: BlockReason::Configured,
+            block_count: 1,
+        };
+        self.blocked_ips
+            .retain(|ip, info| !matches!(info.reason, BlockReason::Configured) || ips.contains(ip));
+        for ip in ips {
+            if !self
+                .blocked_ips
+                .get(&ip)
+                .is_some_and(|i| matches!(i.reason, BlockReason::Configured))
+            {
+                self.blocked_ips.insert(ip, configured());
+            }
+        }
+        let mut cidrs = self.blocked_cidrs.write();
+        cidrs.retain(|(net, info)| {
+            !matches!(info.reason, BlockReason::Configured) || nets.contains(net)
+        });
+        for net in nets {
+            if !cidrs
+                .iter()
+                .any(|(n, i)| *n == net && matches!(i.reason, BlockReason::Configured))
+            {
+                cidrs.push((net, configured()));
+            }
+        }
     }
 
     /// Check whether an IP should bypass security checks.
@@ -1010,13 +962,71 @@ impl SecurityState {
         });
     }
 
-    /// Apply a reloaded configuration's `[security]` and `[rate_limiting]`
-    /// sections. Everything read per request picks them up on the next one;
-    /// the WAF rule table, the GeoIP databases and the Tor refresh task are
-    /// built at startup and need a restart.
+    /// Apply a reloaded configuration to everything the security layer holds.
+    ///
+    /// `[security]`, `[rate_limiting]` and `[circuit_breaker]` are read per
+    /// request; the routing snapshot, the refusal Alt-Svc and the configured
+    /// blocks are replaced; the WAF is recompiled when `[waf]` changed, keeping
+    /// its counters; the GeoIP and JA3 databases are reopened when their paths
+    /// changed, and the crawler verifier rebuilt when it was switched. The Tor
+    /// refresher reads the live config itself. Until 2026-10-09 only the first
+    /// two were applied and the rest silently waited for a restart.
     pub fn apply_reloaded_config(&self, config: &ProxyConfig) {
+        let previous = self.route_index.load_full();
         *self.config.write() = config.security.clone();
         *self.rate_config.write() = config.rate_limiting.clone();
+        *self.circuit_breaker_config.write() = config.circuit_breaker.clone();
+        self.route_index.store(Arc::new(config.clone()));
+        self.alt_svc_header.store(Arc::new(refusal_alt_svc(config)));
+        self.apply_configured_blocks(&config.security.blocked_ips);
+
+        let current = self.waf();
+        let waf_unchanged = match current.as_deref() {
+            Some(engine) => {
+                config.waf.enabled && crate::config::same_settings(engine.config(), &config.waf)
+            }
+            None => !config.waf.enabled,
+        };
+        if !waf_unchanged {
+            let rebuilt = config.waf.enabled.then(|| {
+                Arc::new(match current.as_deref() {
+                    Some(engine) => WafEngine::with_counters_from(&config.waf, engine),
+                    None => WafEngine::new(&config.waf),
+                })
+            });
+            info!(
+                "WAF {} from the reloaded [waf]",
+                if rebuilt.is_some() {
+                    "rebuilt"
+                } else {
+                    "disabled"
+                }
+            );
+            self.waf_engine.store(rebuilt);
+        }
+        if previous.waf.scanner_ua_exempt_paths != config.waf.scanner_ua_exempt_paths {
+            self.scanner_ua_exempt
+                .store(Arc::new(compile_scanner_exempt(
+                    &config.waf.scanner_ua_exempt_paths,
+                )));
+        }
+
+        #[cfg(feature = "geoip")]
+        if previous.security.geoip_db_path != config.security.geoip_db_path
+            || previous.security.geoip_asn_db_path != config.security.geoip_asn_db_path
+        {
+            self.geoip_db.store(load_geoip(&config.security));
+        }
+        if previous.fingerprint.fingerprint_db_path != config.fingerprint.fingerprint_db_path {
+            self.ja3_db.store(Arc::new(load_ja3_db(
+                config.fingerprint.fingerprint_db_path.as_deref(),
+            )));
+        }
+        if previous.security.crawler_published_ranges != config.security.crawler_published_ranges {
+            self.crawler_verifier.store(Arc::new(build_crawler_verifier(
+                config.security.crawler_published_ranges,
+            )));
+        }
     }
 
     /// Why `ip` is refused by location or network, if it is: blocked or
@@ -1029,7 +1039,7 @@ impl SecurityState {
             return Some("Tor exit node".to_string());
         }
         #[cfg(feature = "geoip")]
-        if let Some(ref db) = self.geoip_db {
+        if let Some(db) = self.geoip_db.load_full() {
             if !c.blocked_asns.is_empty() {
                 if let Some(asn) = db.asn(*ip) {
                     if c.blocked_asns.contains(&asn) {
@@ -1074,8 +1084,8 @@ impl SecurityState {
     /// Everything the proxy knows about where `ip` is, for `GET /security/geoip/:ip`.
     pub fn geo_report(&self, ip: &IpAddr) -> serde_json::Value {
         #[cfg(feature = "geoip")]
-        let (location, asn) = match self.geoip_db {
-            Some(ref db) => (db.lookup(*ip), db.asn(*ip)),
+        let (location, asn) = match self.geoip_db.load_full() {
+            Some(db) => (db.lookup(*ip), db.asn(*ip)),
             None => (None, None),
         };
         #[cfg(feature = "geoip")]
@@ -1105,7 +1115,7 @@ impl SecurityState {
         #[cfg(feature = "geoip")]
         let (city, asn) = self
             .geoip_db
-            .as_ref()
+            .load_full()
             .map_or((false, false), |db| (true, db.has_asn()));
         #[cfg(not(feature = "geoip"))]
         let (city, asn) = (false, false);
@@ -1448,16 +1458,12 @@ impl SecurityState {
             let c = self.config.read();
             (c.auto_block_threshold, c.auto_block_duration_secs)
         };
-        if let Some(waf) = self
-            .waf_engine
-            .as_ref()
-            .filter(|_| policy.waf_enabled != Some(false))
-        {
+        if let Some(waf) = self.waf().filter(|_| policy.waf_enabled != Some(false)) {
             // `x-health-check-bypass: 1` used to skip these rules for anyone
             // who sent it -- a scanner could add the header and walk past every
             // bad-bot user-agent rule. Our own checks come from the addresses
             // in pentest_bypass_ips, which `is_pentest` covers.
-            let skip_bot_ua = self.scanner_ua_exempt.is_match(view.path)
+            let skip_bot_ua = self.scanner_ua_exempt.load().is_match(view.path)
                 || policy.skip_bot_blocking
                 // pentest_bypass_ips covers the authorized red-team host plus this
                 // server's own egress and loopback. Those addresses run curl-driven
@@ -1608,7 +1614,7 @@ impl SecurityState {
         //
         // WAF, GeoIP and the blocklist all still apply: this exempts a client
         // from volumetric limits only, never from attack inspection.
-        let crawler = self.crawler_verifier.classify(
+        let crawler = self.crawler_verifier.load_full().classify(
             ip,
             view.headers
                 .get(hyper::header::USER_AGENT)
@@ -1861,7 +1867,7 @@ impl SecurityState {
         // never repeat — and this path bans on exactly the same evidence, so
         // exempting only Verified here reopened the hole from the other side.
         if matches!(
-            self.crawler_verifier.cached_verdict(ip),
+            self.crawler_verifier.load().cached_verdict(ip),
             Some(CrawlerVerdict::Verified | CrawlerVerdict::Pending)
         ) {
             return;
@@ -2182,9 +2188,9 @@ pub async fn security_middleware(
             .or_else(|| request.uri().host().map(str::to_owned))
             .map(|h| h.split(':').next().unwrap_or(&h).to_ascii_lowercase());
         let req_path = request.uri().path().to_string();
-        let on_conformance_host = is_conformance_host(&security.route_index, host.as_deref());
-        security
-            .route_index
+        let routes = security.route_index.load_full();
+        let on_conformance_host = is_conformance_host(&routes, host.as_deref());
+        routes
             .find_route(host.as_deref(), &req_path, false)
             .map(|r| RequestPolicy {
                 skip_bot_blocking: r.skip_bot_blocking,
@@ -2269,7 +2275,8 @@ pub async fn security_middleware(
     // the per-route override logic; the middleware keeps no second copy.
 
     // Pre-borrow alt_svc_header for use in all early-return helpers below.
-    let alt_svc = security.alt_svc_header.as_ref();
+    let alt_svc_value = security.alt_svc_header.load_full();
+    let alt_svc: &str = alt_svc_value.as_str();
     // Extract path once here so it's available to both WAF and size checks.
     let request_path = request.uri().path().to_ascii_lowercase();
 
@@ -2338,7 +2345,7 @@ pub async fn security_middleware(
         // A verified crawler is exempt from the *ban*, not from the limit: it
         // still gets 503'd when it exceeds the concurrency cap, but a rendering
         // burst must not cost it a multi-minute blackout.
-        let crawler_exempt = security.crawler_verifier.classify(
+        let crawler_exempt = security.crawler_verifier.load_full().classify(
             ip,
             headers
                 .get(hyper::header::USER_AGENT)
@@ -2409,7 +2416,7 @@ pub async fn security_middleware(
         }
         // WAF body scan for Content-Length requests — previously skipped.
         // Buffer up to max_body_scan_bytes (65 KB) and inspect with WAF.
-        if security.waf_engine.is_some() && route_policy.waf_enabled != Some(false) {
+        if security.waf().is_some() && route_policy.waf_enabled != Some(false) {
             let scan_limit = 65_536usize;
             let (parts, body) = request.into_parts();
             // Collect the ENTIRE body (matching the declared Content-Length) —
@@ -2434,7 +2441,7 @@ pub async fn security_middleware(
                 }
             }
             if !collected_bytes.is_empty() {
-                if security.waf_engine.is_some() && waf_enabled_cl != Some(false) {
+                if security.waf().is_some() && waf_enabled_cl != Some(false) {
                     let waf_path = parts.uri.path().to_string();
                     let waf_query = parts.uri.query().unwrap_or("").to_string();
                     let skip_bot_ua_cl = is_pentest_bypass || route_skip_bot;
@@ -2532,7 +2539,7 @@ pub async fn security_middleware(
         // pass supplies the buffered bytes so that body-embedded payloads
         // (SQLi, XSS, command injection, etc.) are detected.
         if !collected_bytes.is_empty() {
-            if security.waf_engine.is_some() && waf_enabled_cl != Some(false) {
+            if security.waf().is_some() && waf_enabled_cl != Some(false) {
                 let waf_path = parts.uri.path().to_string();
                 let waf_query = parts.uri.query().unwrap_or("").to_string();
                 let skip_bot_ua_body = is_pentest_bypass || route_skip_bot;
@@ -2969,14 +2976,15 @@ mod geoip {
 #[cfg(feature = "geoip")]
 pub use geoip::*;
 
-/// Keep `set` holding the current Tor exit list: fetch now, then every
-/// `every`. A failed fetch keeps the previous list rather than emptying it.
-/// Needs a Tokio runtime; constructed outside one (as in unit tests) it does
-/// nothing.
+/// Keep `set` holding the current Tor exit list while `block_tor_exit_nodes`
+/// is on: fetch now, then every `tor_exit_refresh_secs`. All three settings are
+/// read from the live config each round, so a reload switches the refresher on,
+/// off or to another list. A failed fetch keeps the previous list rather than
+/// emptying it; switching the setting off empties it. Needs a Tokio runtime;
+/// constructed outside one (as in unit tests) it does nothing.
 fn spawn_tor_exit_refresh(
-    set: Arc<arc_swap::ArcSwap<std::collections::HashSet<IpAddr>>>,
-    url: String,
-    every: Duration,
+    set: Arc<arc_swap::ArcSwap<HashSet<IpAddr>>>,
+    config: Arc<RwLock<SecurityConfig>>,
 ) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
@@ -2987,6 +2995,21 @@ fn spawn_tor_exit_refresh(
             .build()
             .unwrap_or_default();
         loop {
+            let (enabled, url, every) = {
+                let c = config.read();
+                (
+                    c.block_tor_exit_nodes,
+                    c.tor_exit_list_url.clone(),
+                    Duration::from_secs(c.tor_exit_refresh_secs.max(60)),
+                )
+            };
+            if !enabled {
+                if !set.load().is_empty() {
+                    set.store(Arc::new(HashSet::new()));
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                continue;
+            }
             match client.get(&url).send().await.and_then(reqwest::Response::error_for_status) {
                 Ok(resp) => match resp.text().await {
                     Ok(body) => {
@@ -3005,6 +3028,105 @@ fn spawn_tor_exit_refresh(
             tokio::time::sleep(every).await;
         }
     });
+}
+
+/// The Alt-Svc on the proxy's own refusals (403/429/413): the same value the
+/// TCP listener on `udp_port` advertises, so `server.alt_svc_ports` and
+/// `server.alt_svc_max_age_secs` apply here too. This used to list `udp_port`
+/// plus every additional port, ignoring the override that exists because a
+/// bound port is not necessarily a reachable one.
+fn refusal_alt_svc(config: &ProxyConfig) -> String {
+    crate::http_listener::build_alt_svc_header_with_override(
+        config.server.udp_port,
+        &config.server.additional_ports,
+        config.server.alt_svc_ports.as_deref(),
+        config.server.alt_svc_max_age_secs,
+    )
+}
+
+/// `waf.scanner_ua_exempt_paths`, compiled.
+fn compile_scanner_exempt(paths: &[String]) -> regex::RegexSet {
+    regex::RegexSet::new(paths).unwrap_or_else(|e| {
+        // validate() refuses this at load; reaching here means a config that
+        // skipped it, so fail towards no exemption.
+        error!("waf.scanner_ua_exempt_paths is invalid, exempting nothing: {e}");
+        regex::RegexSet::empty()
+    })
+}
+
+/// The crawler verifier: published ranges when switched on. Unit tests never
+/// fetch the feeds nor read the live cache.
+fn build_crawler_verifier(published_ranges: bool) -> CrawlerVerifier {
+    if published_ranges && !cfg!(test) {
+        CrawlerVerifier::with_published_ranges(std::path::Path::new(
+            crate::crawler_verify::RANGES_CACHE,
+        ))
+    } else {
+        CrawlerVerifier::new()
+    }
+}
+
+/// The GeoIP city database at `security.geoip_db_path`, with the ASN database
+/// at `geoip_asn_db_path` when that opens.
+#[cfg(feature = "geoip")]
+fn load_geoip(security: &SecurityConfig) -> Option<Arc<GeoIpDb>> {
+    let path = security.geoip_db_path.as_ref()?;
+    match GeoIpDb::new(path) {
+        Ok(db) => {
+            info!("✅ GeoIP database loaded from {:?}", path);
+            let asn = security.geoip_asn_db_path.as_ref().and_then(|p| {
+                match maxminddb::Reader::open_readfile(p) {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        if !security.blocked_asns.is_empty() {
+                            warn!(
+                                "⚠️ blocked_asns is set but the ASN database {:?} could not load: {}",
+                                p, e
+                            );
+                        }
+                        None
+                    }
+                }
+            });
+            Some(Arc::new(db.with_asn(asn)))
+        }
+        Err(e) => {
+            warn!("⚠️ Failed to load GeoIP database from {:?}: {}", path, e);
+            None
+        }
+    }
+}
+
+/// The JA3/JA4 fingerprint database at `path` (advisory-only); empty when
+/// there is none or it does not load.
+fn load_ja3_db(path: Option<&std::path::Path>) -> Ja3Database {
+    let Some(db_path) = path else {
+        return Ja3Database::default();
+    };
+    match Ja3Database::load_from_file(db_path) {
+        Ok(db) => {
+            if db.is_empty() {
+                warn!(
+                    "JA3 fingerprint database at {:?} is empty - classification will return Suspicious for all hashes",
+                    db_path
+                );
+            } else {
+                info!(
+                    "Loaded {} JA3/JA4 fingerprints from {:?}",
+                    db.len(),
+                    db_path
+                );
+            }
+            db
+        }
+        Err(e) => {
+            warn!(
+                "Could not load JA3 fingerprint database from {:?}: {} - continuing with empty DB",
+                db_path, e
+            );
+            Ja3Database::default()
+        }
+    }
 }
 
 /// One address per line; blank lines and `#` comments ignored.
@@ -3868,5 +3990,165 @@ mod decision_rendering_tests {
             .headers
             .iter()
             .any(|(k, v)| *k == "location" && *v == config.geo_block_redirect_url));
+    }
+}
+
+/// A config reload reaches everything the security layer holds. Each of these
+/// was fixed at startup until 2026-10-09 while the reload reported success.
+#[cfg(test)]
+mod hot_reload_tests {
+    use super::*;
+    use crate::config::{RouteConfig, WafExclusion};
+
+    const IP: &str = "203.0.113.77";
+
+    fn body_with_crl_url(security: &SecurityState, path: &'static str) -> SecurityDecision {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "user-agent",
+            "PQCrypta-Discovery-Agent/1.0.45".parse().unwrap(),
+        );
+        headers.insert("content-type", "application/json".parse().unwrap());
+        security.inspect_body(
+            &SecurityRequestView {
+                ip: IP.parse().unwrap(),
+                peer_port: None,
+                method: "POST",
+                path,
+                query: "",
+                headers: &headers,
+                body: Some(br#"{"crl":"ldap:///CN=Root,CN=CDP?certificateRevocationList"}"#),
+            },
+            &RequestPolicy::default(),
+            false,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_reload_rebuilds_the_waf_and_keeps_its_counters() {
+        let mut config = ProxyConfig::default();
+        // As production runs it.
+        config.waf.enabled = true;
+        config.waf.ssrf = true;
+        let security = SecurityState::new(&config);
+        let path = "/crypto-assets/scan/results";
+        assert!(
+            matches!(
+                body_with_crl_url(&security, path),
+                SecurityDecision::WafBlock { .. }
+            ),
+            "without an exclusion the ldap:// URL is refused"
+        );
+        let blocked_before = security.waf().unwrap().stats().blocked;
+        assert!(blocked_before >= 1);
+
+        config.waf.exclusions = vec![WafExclusion {
+            path: "^/crypto-assets/scan/results$".into(),
+            rules: Vec::new(),
+            categories: vec!["ssrf".into()],
+        }];
+        security.apply_reloaded_config(&config);
+        assert!(
+            matches!(body_with_crl_url(&security, path), SecurityDecision::Allow),
+            "the reloaded exclusion applies to the next request"
+        );
+        assert!(
+            security.waf().unwrap().stats().blocked >= blocked_before,
+            "counters carry across the rebuild"
+        );
+        assert!(
+            matches!(
+                body_with_crl_url(&security, "/elsewhere"),
+                SecurityDecision::WafBlock { .. }
+            ),
+            "only on the excluded path"
+        );
+
+        config.waf.enabled = false;
+        security.apply_reloaded_config(&config);
+        assert!(security.waf().is_none(), "a reload can switch the WAF off");
+        config.waf.enabled = true;
+        security.apply_reloaded_config(&config);
+        assert!(security.waf().is_some(), "and on again");
+    }
+
+    #[tokio::test]
+    async fn a_reload_replaces_the_route_policy_the_security_layer_reads() {
+        let mut config = ProxyConfig::default();
+        let security = SecurityState::new(&config);
+        assert!(security
+            .route_index
+            .load()
+            .find_route(Some("reload.example"), "/x", false)
+            .is_none());
+        let route: RouteConfig = toml::from_str(
+            r#"
+            name = "reload-test"
+            host = "reload.example"
+            path_prefix = "/"
+            backend = "apache"
+            [security]
+            waf_enabled = false
+            "#,
+        )
+        .unwrap();
+        config.routes.push(route);
+        security.apply_reloaded_config(&config);
+        let routes = security.route_index.load();
+        let route = routes
+            .find_route(Some("reload.example"), "/x", false)
+            .expect("the route added by the reload");
+        assert_eq!(
+            route.security.as_ref().and_then(|s| s.waf_enabled),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_blocks_follow_the_config_and_leave_operator_blocks_alone() {
+        let mut config = ProxyConfig::default();
+        config.security.blocked_ips = vec!["192.0.2.10".into(), "198.51.100.0/24".into()];
+        let security = SecurityState::new(&config);
+        let listed: IpAddr = "192.0.2.10".parse().unwrap();
+        let in_range: IpAddr = "198.51.100.9".parse().unwrap();
+        let operator: IpAddr = "192.0.2.99".parse().unwrap();
+        assert!(security.is_blocked(&listed).is_some());
+        assert!(
+            security.is_blocked(&in_range).is_some(),
+            "a CIDR in the list blocks too"
+        );
+        security.block_ip(operator, BlockReason::Manual, None);
+
+        config.security.blocked_ips = vec!["192.0.2.11".into()];
+        security.apply_reloaded_config(&config);
+        assert!(
+            security.is_blocked(&listed).is_none(),
+            "lifted with the config"
+        );
+        assert!(security.is_blocked(&in_range).is_none());
+        assert!(security
+            .is_blocked(&"192.0.2.11".parse().unwrap())
+            .is_some());
+        assert!(
+            security.is_blocked(&operator).is_some(),
+            "an operator's block is not the config's to lift"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reload_recompiles_the_scanner_ua_exemptions() {
+        let mut config = ProxyConfig::default();
+        config.waf.scanner_ua_exempt_paths = vec![];
+        let security = SecurityState::new(&config);
+        assert!(!security
+            .scanner_ua_exempt
+            .load()
+            .is_match("/downloads/agent.tar.gz"));
+        config.waf.scanner_ua_exempt_paths = vec!["^/downloads/".into()];
+        security.apply_reloaded_config(&config);
+        assert!(security
+            .scanner_ua_exempt
+            .load()
+            .is_match("/downloads/agent.tar.gz"));
     }
 }

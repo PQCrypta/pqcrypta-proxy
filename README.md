@@ -101,7 +101,7 @@
 | **Admin HMAC Proof-of-Possession** | ✅ | Optional per-request HMAC signature (path+query signed) alongside bearer token; optional `X-Admin-Nonce` for full replay prevention |
 | **`trusted_internal_cidrs` Deprecation** | ✅ | Startup warning directing operators to cert-based trust |
 | **OpenSSL Subprocess Env Sanitisation** | ✅ | All `openssl` subprocesses clear the environment before execution (`env_clear()`) to prevent PATH/LD_PRELOAD injection |
-| **Hot Reload** | ✅ | Configuration and TLS certificates reloaded at runtime without dropping connections or restarting |
+| **Hot Reload** | ✅ | Configuration and TLS certificates reloaded at runtime without dropping connections or restarting: routes, security, the WAF, admin credentials, pools and every listener's per-request settings; a change to a setting bound at startup (ports, listener kinds, process-wide services) is named in a warning |
 | **Log Rotation (SIGHUP)** | ✅ | `SIGHUP` reopens all log file handles in-place; compatible with logrotate `postrotate` — no restart required |
 | **TLS 1.3 Default** | ✅ | TLS 1.3 minimum by default on all listeners (`min_version = "1.3"`); configurable to allow TLS 1.2 via `min_version` in `[tls]` |
 | **Certificate Compression (RFC 8879)** | ✅ | The certificate chain is sent compressed to any client that offers `compress_certificate`. Measured on pqcrypta.com: 3,435 bytes to 2,376 with zlib (1.45:1), about 1&nbsp;KB off every full handshake — which roughly offsets what the X25519MLKEM768 key share adds. Both TLS stacks are covered, and they need different treatment: on the OpenSSL TCP listener it takes `SSL_CTX_set1_cert_comp_preference` **and** `SSL_CTX_compress_certs` (the preference alone reports success and changes nothing on the wire), while rustls on QUIC/HTTP-3 needs only its `brotli`/`zlib` crate features. zlib on TCP because these OpenSSL builds carry `-DZLIB` and nothing else; brotli and zlib on the QUIC side |
@@ -408,14 +408,45 @@ speed test reads the same two database paths.
 ### Configuration reload
 
 `--watch-config` (file edits), `POST /reload`, and SIGHUP (which also reopens
-log files) all trigger the same reload. Every TCP listener rebuilds its routes,
-backend clients, headers, compression, cache and middleware chain from the new
-configuration and swaps them in atomically: the next request on any
-connection, including keep-alive connections already open, uses them, while a
-request in flight finishes on the configuration it started with. HTTP/3
-listeners, TLS and PQC settings, certificates, Early Hints, and the security
-and rate-limit settings are applied too. Bind addresses and ports need a
-restart.
+log files) all trigger the same reload, and every one of them loads the file
+the way startup does: the `--env` overlay and the `--udp-port`,
+`--admin-port` and `--no-pqc` overrides are applied again, so a reload never
+quietly drops them.
+
+What a reload applies:
+
+- **TCP listeners** rebuild their routes, backend clients, headers,
+  compression and middleware chain and swap them in atomically: the next request
+  on any connection, including keep-alive connections already open, uses them,
+  while a request in flight finishes on the configuration it started with.
+- **HTTP/3 listeners** take the new configuration for every new connection,
+  with a rebuilt backend pool and fingerprint settings. The **WebTransport
+  server** and the **HTTP→HTTPS redirect server** follow it too (allowed
+  origins, allowed domains, redirect status, path canonicalisation).
+- **Security**: `[security]`, `[rate_limiting]`, `[advanced_rate_limiting]` and
+  `[circuit_breaker]`; the per-route policy the security layer reads before
+  routing; `security.blocked_ips` (addresses and CIDR ranges, added and lifted
+  as listed, leaving operator and database blocks alone); the **WAF**, recompiled
+  from `[waf]` when it changed — exclusions, threshold, mode, categories,
+  custom patterns, `enabled` — with its counters carried over; the scanner-UA
+  exemptions; the GeoIP and JA3 databases when their paths change; the crawler
+  verifier; and the Tor exit refresher, which reads its settings each round.
+- **Admin API credentials** — `auth_token`, `hmac_secret`, `allowed_ips` — on
+  the next request, so a rotated token takes effect without a restart. A reload
+  that removes `auth_token` keeps the previous one rather than switching
+  authentication off.
+- **Load balancer pools** (`[backend_pools]`) are added, rebuilt or dropped; a
+  server whose settings did not change keeps its health, connections and canary
+  state through a rebuild.
+- TLS and PQC settings, certificates, and Early Hints.
+
+Settings bound when the process starts — listening addresses and ports, QUIC
+transport parameters, the listener kinds (`pqc.enabled`,
+`fingerprint.enabled`), the admin listener, and the process-wide `[logging]`,
+`[otel]`, `[ocsp]`, `[acme]`, `[cache]`, `[conformance]` and `[load_balancer]`
+services — are listed in `RESTART_BOUND_SETTINGS`. A reload that changes one
+applies everything else and logs a warning naming each such setting, instead of
+reporting success while it waits for a restart.
 
 ### PROXY protocol
 
@@ -1059,7 +1090,7 @@ pqcrypta-proxy --config /etc/pqcrypta/proxy-config.toml --env prod
 PQCRYPTA_ENV=prod pqcrypta-proxy --config /etc/pqcrypta/proxy-config.toml
 ```
 
-Overlay values win for all matching keys; unmatched keys from the base are kept. The overlay is re-applied on hot-reload.
+Overlay values win for all matching keys; unmatched keys from the base are kept. The overlay is re-applied on every reload (file watch, `POST /reload`, SIGHUP), as are the command-line overrides.
 
 ### Certificate Transparency Configuration
 

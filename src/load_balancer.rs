@@ -547,6 +547,10 @@ pub struct BackendPool {
     pub canary_config: Option<CanaryPoolConfig>,
     /// Canary sticky-cookie → (server_id, last_access) with TTL eviction.
     canary_sessions: DashMap<String, (String, Instant)>,
+
+    /// The configuration this pool was built from, so a reload can tell
+    /// whether it changed.
+    source: BackendPoolConfig,
 }
 
 /// State for weighted round-robin algorithm
@@ -604,6 +608,7 @@ impl BackendPool {
             wrr_state: RwLock::new(WeightedRoundRobinState::default()),
             canary_config: config.canary.clone(),
             canary_sessions: DashMap::new(),
+            source: config.clone(),
         }
     }
 
@@ -1067,7 +1072,11 @@ impl BackendPool {
     ///
     /// # Arguments
     /// `pool` — the pool wrapped in `Arc` so the spawned task can hold a reference.
-    pub fn start_health_check_task(pool: Arc<Self>) {
+    ///
+    /// The task holds the pool weakly and ends once the pool is dropped, which
+    /// is what happens to a pool a reload replaces or removes. Nothing called
+    /// this until 2026-10-09: `health_aware` pools were never checked.
+    pub fn start_health_check_task(pool: &Arc<Self>) {
         if !pool.health_aware {
             return; // Health-check disabled for this pool
         }
@@ -1075,8 +1084,12 @@ impl BackendPool {
         if interval.is_zero() {
             return;
         }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let pool = Arc::downgrade(pool);
 
-        tokio::spawn(async move {
+        runtime.spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             // Skip the first tick so we don't check immediately on startup
             // (all servers start healthy by default and the first real request
@@ -1086,7 +1099,11 @@ impl BackendPool {
             loop {
                 ticker.tick().await;
 
+                let Some(pool) = pool.upgrade() else {
+                    return; // replaced or removed by a reload
+                };
                 let servers: Vec<Arc<BackendServer>> = { pool.servers.read().clone() };
+                drop(pool);
 
                 for server in servers {
                     let addr = server.address;
@@ -1659,7 +1676,72 @@ impl LoadBalancer {
     /// Add a backend pool from configuration
     pub fn add_pool(&self, pool_config: &BackendPoolConfig) {
         let pool = Arc::new(BackendPool::from_config(pool_config, &self.config));
+        BackendPool::start_health_check_task(&pool);
         self.pools.insert(pool_config.name.clone(), pool);
+    }
+
+    /// Bring the pools in line with `[backend_pools]` after a config reload.
+    ///
+    /// New pools are added and pools no longer configured are dropped. A pool
+    /// whose settings changed is rebuilt, but every server it still lists with
+    /// unchanged settings keeps its live object -- health, open connections,
+    /// counters, slow-start and canary state -- rather than starting over.
+    /// Pools were added once at startup and a reload changed none of them.
+    pub fn reconcile_pools<S: std::hash::BuildHasher>(
+        &self,
+        configured: &std::collections::HashMap<String, BackendPoolConfig, S>,
+    ) {
+        self.pools.retain(|name, _| {
+            let keep = configured.values().any(|c| &c.name == name);
+            if !keep {
+                info!("Backend pool '{}' removed by the reloaded config", name);
+            }
+            keep
+        });
+        for pool_config in configured.values() {
+            let current = self.get_pool(&pool_config.name);
+            if current
+                .as_ref()
+                .is_some_and(|p| crate::config::same_settings(&p.source, pool_config))
+            {
+                continue;
+            }
+            let rebuilt = Arc::new(BackendPool::from_config(pool_config, &self.config));
+            if let Some(old) = current {
+                let old_servers = old.servers.read().clone();
+                let settings_for = |pool: &BackendPoolConfig, addr: SocketAddr| {
+                    pool.servers
+                        .iter()
+                        .find(|c| c.address.parse::<SocketAddr>().ok() == Some(addr))
+                        .cloned()
+                };
+                for slot in rebuilt.servers.write().iter_mut() {
+                    let unchanged = match (
+                        settings_for(&old.source, slot.address),
+                        settings_for(pool_config, slot.address),
+                    ) {
+                        (Some(was), Some(now)) => crate::config::same_settings(&was, &now),
+                        _ => false,
+                    };
+                    if unchanged {
+                        if let Some(live) = old_servers.iter().find(|s| s.address == slot.address) {
+                            *slot = live.clone();
+                        }
+                    }
+                }
+                info!(
+                    "Backend pool '{}' rebuilt from the reloaded config",
+                    pool_config.name
+                );
+            } else {
+                info!(
+                    "Backend pool '{}' added by the reloaded config",
+                    pool_config.name
+                );
+            }
+            BackendPool::start_health_check_task(&rebuilt);
+            self.pools.insert(pool_config.name.clone(), rebuilt);
+        }
     }
 
     /// Check if a pool exists
@@ -1833,6 +1915,81 @@ pub fn extract_cookie_by_name(cookie_header: Option<&str>, name: &str) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pool_config(toml_src: &str) -> BackendPoolConfig {
+        toml::from_str(toml_src).unwrap()
+    }
+
+    /// A reload adds, rebuilds and drops pools, and a server whose settings did
+    /// not change keeps its live state through the rebuild.
+    #[tokio::test]
+    async fn a_reload_reconciles_pools_and_keeps_unchanged_servers_live() {
+        let lb = LoadBalancer::new(Arc::new(LoadBalancerConfig::default()));
+        let mut configured = std::collections::HashMap::new();
+        configured.insert(
+            "api".to_string(),
+            pool_config(
+                r#"
+                name = "api"
+                [[servers]]
+                address = "127.0.0.1:9001"
+                [[servers]]
+                address = "127.0.0.1:9002"
+                "#,
+            ),
+        );
+        lb.reconcile_pools(&configured);
+        let first = lb.get_pool("api").expect("added");
+        let kept = first.servers.read()[0].clone();
+        kept.health.write().healthy = false;
+
+        // One server's weight changes, a third server joins, another pool appears.
+        configured.insert(
+            "api".to_string(),
+            pool_config(
+                r#"
+                name = "api"
+                [[servers]]
+                address = "127.0.0.1:9001"
+                [[servers]]
+                address = "127.0.0.1:9002"
+                weight = 7
+                [[servers]]
+                address = "127.0.0.1:9003"
+                "#,
+            ),
+        );
+        configured.insert(
+            "web".to_string(),
+            pool_config("name = \"web\"\n[[servers]]\naddress = \"127.0.0.1:9100\"\n"),
+        );
+        lb.reconcile_pools(&configured);
+        let rebuilt = lb.get_pool("api").unwrap();
+        assert!(!Arc::ptr_eq(&first, &rebuilt), "a changed pool is rebuilt");
+        let servers = rebuilt.servers.read().clone();
+        assert_eq!(servers.len(), 3);
+        assert!(
+            Arc::ptr_eq(&servers[0], &kept),
+            "an unchanged server keeps its live object"
+        );
+        assert!(!servers[0].health.read().healthy, "and with it its health");
+        assert_eq!(
+            servers[1].weight, 7,
+            "a changed server takes its new settings"
+        );
+        assert!(lb.has_pool("web"), "a new pool is added");
+
+        // Unchanged settings: the pool itself is kept.
+        lb.reconcile_pools(&configured);
+        assert!(Arc::ptr_eq(&rebuilt, &lb.get_pool("api").unwrap()));
+
+        configured.remove("web");
+        lb.reconcile_pools(&configured);
+        assert!(
+            !lb.has_pool("web"),
+            "a pool no longer configured is dropped"
+        );
+    }
 
     fn create_test_server(address: &str, weight: u32) -> Arc<BackendServer> {
         create_test_server_full(address, weight, false, 0)
