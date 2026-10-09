@@ -60,6 +60,41 @@ with open(verified, "w") as v:
 ' "$1" "$2" "$3" "${CRAWLER_RANGES}"
 }
 
+# Our own servers: RISK_OWN_ADDRESSES (addresses or CIDR blocks, comma-
+# separated), the list the API's risk engine treats as ours. Their requests are
+# our own tooling -- health checks, conformance runs, an operator checking that
+# /.git is refused -- not evidence: on 2026-10-09 such a check from the mail
+# host banned that server's IPv6 address on every site for seven days.
+OWN_ADDRESSES=$(sed -n 's/^RISK_OWN_ADDRESSES=//p' /etc/pqcrypta/api.env 2>/dev/null \
+    | tail -n 1 | tr -d "\"' ")
+
+# drop_own_addresses IN OUT: copy the TSV lines of IN (address in the first
+# field) to OUT unless the address is one of OWN_ADDRESSES.
+drop_own_addresses() {
+    python3 -c '
+import ipaddress, sys
+src, out, own = sys.argv[1:4]
+nets = []
+for entry in filter(None, own.split(",")):
+    try:
+        nets.append(ipaddress.ip_network(entry, strict=False))
+    except ValueError:
+        pass
+seen = {}
+with open(src) as f, open(out, "w") as o:
+    for line in f:
+        ip = line.split("\t", 1)[0].strip()
+        if ip not in seen:
+            try:
+                addr = ipaddress.ip_address(ip)
+                seen[ip] = any(addr in n for n in nets if n.version == addr.version)
+            except ValueError:
+                seen[ip] = False
+        if not seen[ip]:
+            o.write(line)
+' "$1" "$2" "${OWN_ADDRESSES}"
+}
+
 # Suspicious path patterns
 PATTERNS='wp-admin|wp-login|wp-content|wp-includes|\.git|\.env|\.sql|\.bak|\.old|backup|admin\.php|phpmyadmin|xmlrpc\.php|eval-stdin|shell|config\.php|\.zip|\.tar|\.gz|setup\.php|install\.php|filemanager|wp_filemanager|rip\.php|c99|r57|wso|alfa|filesman|webshell|\.htaccess|\.htpasswd|passwd|shadow|boot\.ini|win\.ini|phpinfo|adminer|\.svn|\.hg|\.DS_Store|Thumbs\.db|\.idea|\.vscode|node_modules|vendor/|composer\.(json|lock)|package\.json|\.npmrc|id_rsa|id_dsa|\.pem|\.key|credentials|secrets|token'
 
@@ -129,9 +164,29 @@ BEGIN { FS = "\"" }
     print ip "\t" method "\t" substr(path, 1, 500) "\t" substr(qs, 1, 500) "\t" substr(ua, 1, 500) "\t" host;
 }' "${TEMP_DIR}/new_lines.txt" > "${TEMP_DIR}/all_probes.tsv" 2>/dev/null || true
 
+# Our own servers' requests are neither probes nor suspicious, and a honeypot
+# ban already on one is lifted.
+drop_own_addresses "${TEMP_DIR}/all_probes.tsv" "${TEMP_DIR}/foreign_probes.tsv" \
+    || cp "${TEMP_DIR}/all_probes.tsv" "${TEMP_DIR}/foreign_probes.tsv"
+if [ -n "${OWN_ADDRESSES}" ]; then
+    OWN_LIFTED=$(psql -U "${DB_USER}" -d "${DB_NAME}" -q -t -A -v "nets={${OWN_ADDRESSES}}" << 'ENDSQL' 2>>"${LOG_FILE}" || echo "0"
+WITH lifted AS (
+    UPDATE security_blocklist SET is_active = false
+    WHERE is_active AND block_type = 'honeypot_trigger'
+      AND ip_address <<= ANY (:'nets'::inet[])
+    RETURNING 1
+)
+SELECT COUNT(*) FROM lifted;
+ENDSQL
+)
+    OWN_LIFTED=$(printf '%s' "${OWN_LIFTED}" | tr -dc '0-9')
+    [ -n "${OWN_LIFTED}" ] && [ "${OWN_LIFTED}" -gt 0 ] && \
+        log "Lifted ${OWN_LIFTED} honeypot ban(s) on our own servers"
+fi
+
 # Verified crawlers' requests are neither probes nor suspicious
-split_verified_crawlers "${TEMP_DIR}/all_probes.tsv" "${TEMP_DIR}/probes.tsv" "${TEMP_DIR}/crawlers.txt" \
-    || cp "${TEMP_DIR}/all_probes.tsv" "${TEMP_DIR}/probes.tsv"
+split_verified_crawlers "${TEMP_DIR}/foreign_probes.tsv" "${TEMP_DIR}/probes.tsv" "${TEMP_DIR}/crawlers.txt" \
+    || cp "${TEMP_DIR}/foreign_probes.tsv" "${TEMP_DIR}/probes.tsv"
 
 # ...and a ban already on one is lifted: it was earned by following links.
 # Only the automatic edge bans; an operator's own block stands.
