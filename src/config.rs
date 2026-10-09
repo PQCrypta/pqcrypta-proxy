@@ -3633,7 +3633,7 @@ fn validate_backend_address_ssrf(address: &str, allow_internal: bool) -> anyhow:
 }
 
 /// `haystack.starts_with(prefix)`, ASCII-case-insensitively, without allocating.
-fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
+pub(crate) fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
     haystack.len() >= prefix.len()
         && haystack.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
 }
