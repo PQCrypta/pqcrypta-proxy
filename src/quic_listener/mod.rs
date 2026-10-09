@@ -84,11 +84,16 @@ fn is_benign_h3_close<E: std::fmt::Display>(err: &E) -> bool {
         // failure on this side is reported as a "Local error".
         || (msg.contains("Remote error") && msg.contains("closed"))
         // The peer closed cleanly, as quinn prints it: application code 0
-        // (scanners end with "scan complete (code 0)") or H3_NO_ERROR, 0x100.
-        // A peer closing with any other code stays loud: it may be answering
-        // something this side sent.
+        // (": 0" with no reason, "scan complete (code 0)" with one) or
+        // H3_NO_ERROR, 0x100. A peer closing with any other code stays loud: it
+        // may be answering something this side sent. The reasonless code 0 was
+        // missing: the health check's h3 probe ends that way every 15 minutes,
+        // and each one was logged as an error.
         || (msg.contains("closed by peer")
-            && (msg.ends_with("(code 0)") || msg.ends_with(": 256") || msg.ends_with("(code 256)")))
+            && (msg.ends_with(": 0")
+                || msg.ends_with("(code 0)")
+                || msg.ends_with(": 256")
+                || msg.ends_with("(code 256)")))
 }
 
 /// How loudly to report a QUIC connection that ended in an error.
@@ -101,7 +106,14 @@ fn is_benign_h3_close<E: std::fmt::Display>(err: &E) -> bool {
 /// a warning, because it is usually a client asking for a name we never served
 /// but is also what a missing certificate looks like.
 fn log_connection_end(remote_addr: SocketAddr, err: &anyhow::Error) {
-    let msg = format!("{err:#}");
+    log_quic_end(remote_addr, &format!("{err:#}"));
+}
+
+/// `log_connection_end` for a QUIC connection that ended with `msg`, shared by
+/// the HTTP/3 listener and the WebTransport server so the two cannot rank the
+/// same ending differently. They did: a handshake asking for a name with no
+/// certificate was a warning here and an error on the WebTransport port.
+pub(crate) fn log_quic_end(remote_addr: SocketAddr, msg: &str) {
     if is_benign_h3_close(&msg)
         || msg.contains("peer doesn't support any known protocol")
         || msg.contains("received fatal alert")
@@ -1935,6 +1947,8 @@ mod close_classification_tests {
             &"closed by peer: scan complete (code 0)"
         ));
         assert!(is_benign_h3_close(&"closed by peer: 256"));
+        assert!(is_benign_h3_close(&"closed by peer: 0"));
+        assert!(!is_benign_h3_close(&"closed by peer: 10"));
         // A peer closing with an error code may be answering us: stays loud.
         assert!(!is_benign_h3_close(&"closed by peer: 263"));
         assert!(!is_benign_h3_close(&"closed by peer: frame error (code 7)"));
