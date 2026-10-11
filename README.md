@@ -1422,12 +1422,30 @@ x_quantum_resistant = "ML-KEM-1024, ML-DSA-87, X25519MLKEM768"
 x_security_level = "Post-Quantum Ready"
 ```
 
-This set is applied identically on HTTP/1.1, HTTP/2 and HTTP/3, and on cache hits
-as well as origin responses — the TCP listener applies it in an Axum layer, the
-HTTP/3 listener in `apply_response_policy_headers`. `content_security_policy` is
-the one header the origin can override: a CSP sent by the backend (typically one
-carrying per-request script nonces) is forwarded untouched, and the configured
-policy is injected only when the backend sent none.
+This set is applied by the same rules on HTTP/1.1, HTTP/2 and HTTP/3, and on
+cache hits as well as origin responses: one `ResponseHeaderSet`, which the TCP
+listener applies in an Axum layer and the HTTP/3 listener in
+`apply_response_policy_headers`. Most headers replace whatever the backend
+sent. The origin's own value wins for three cross-origin policies
+(`Cross-Origin-Opener-Policy`, `-Embedder-Policy`, `-Resource-Policy`) and for
+`content_security_policy`. The configured value is used only when the backend
+sent none, so a page can make itself cross-origin isolated, and a CSP carrying
+per-request script nonces passes untouched.
+
+A route's own decisions stand over all of it, on every transport. Its
+`headers_override` values replace the backend's value and the global one,
+whatever the header (an `x-frame-options` override included). The headers in
+its `remove_headers` stay removed, and `stripe_compatibility` sends no COOP or
+COEP at all. A header the route removes and also overrides goes out with the
+override.
+
+HTTP/3 forwards the backend's response headers as HTTP/1.1 and HTTP/2 do, every
+one but the hop-by-hop headers. It used to forward only an allowlist. That
+dropped any header not on it, such as a page's cross-origin policies, `Link`,
+`Retry-After` and `WWW-Authenticate`. It also added the security headers on top
+of the backend's and the route's instead of replacing them, so a route with its
+own policies (Grafana) answered over HTTP/3 with two contradictory values of
+each, which a browser treats as none.
 
 Every value is optional: **an empty string omits that header** on every
 transport. `accept_ch`, `nel`, `report_to` and `priority` are empty unless set,

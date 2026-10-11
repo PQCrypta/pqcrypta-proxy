@@ -27,7 +27,7 @@ use crate::otel;
 /// Response from backend proxy
 /// Hop-by-hop headers, forbidden over HTTP/2 and HTTP/3 (RFC 9113 §8.2.2,
 /// RFC 9114 §4.2). Was declared inline in each forwarding function.
-const HOP_BY_HOP: &[&str] = &[
+pub(crate) const HOP_BY_HOP: &[&str] = &[
     "transfer-encoding",
     "connection",
     "keep-alive",

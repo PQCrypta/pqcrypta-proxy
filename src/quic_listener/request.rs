@@ -1437,8 +1437,9 @@ impl QuicListener {
                     // headers a miss gets — including CSP.
                     response_builder = super::apply_response_policy_headers(
                         response_builder,
-                        &config,
-                        &conn_headers.static_headers,
+                        Some(route),
+                        &conn_headers.response_headers,
+                        conn_headers.server.as_ref(),
                         host.as_deref(),
                         &path,
                     );
@@ -1965,52 +1966,31 @@ impl QuicListener {
         // instead of growing from empty one header at a time.
         let mut response_builder = http::Response::builder().status(stream_status);
         if let Some(h) = response_builder.headers_mut() {
-            h.reserve(stream_headers.len() + conn_headers.static_headers.len() + 8);
+            h.reserve(stream_headers.len() + conn_headers.response_headers.len() + 8);
         }
         if let Some((name, id)) = &request_id {
             response_builder = response_builder.header(name, id);
         }
 
-        // Forward selected headers from backend (including CORS if backend sets them)
-        // Note: x-content-type-options excluded from whitelist since proxy adds its own
+        // The origin's headers, forwarded as the TCP listeners forward them:
+        // hop-by-hop headers are already gone (`proxy::HOP_BY_HOP`), the length
+        // is set below from the body, Alt-Svc is this listener's own, and
+        // `server` passes through only when `server.server_header` is empty
+        // (the configured value replaces it). The security headers are applied
+        // over these by their rules (`apply_response_policy_headers`): a
+        // cross-origin policy the origin set is kept, the rest replaced.
+        //
+        // This was an allowlist until 2026-10-11, and HTTP/3 dropped every
+        // header not on it that HTTP/1.1 and HTTP/2 delivered: the
+        // cross-origin policies a page sets to be cross-origin isolated, the
+        // music API's X-Audio-Quality, Link, Retry-After, WWW-Authenticate.
         for (name, value) in &stream_headers {
-            // `HeaderName` is already lowercase; the old loop allocated a
-            // lowercased String per response header to learn that.
-            let lower_name = name.as_str();
-            if matches!(
-                lower_name,
-                "content-type"
-                    | "cache-control"
-                    | "etag"
-                    | "last-modified"
-                    | "content-language"
-                    | "content-encoding"
-                    | "content-range"
-                    | "accept-ranges"
-                    | "content-disposition"
-                    | "vary"
-                    // The origin's CSP carries this response's script nonces, so
-                    // it must survive the hop. Dropping it left every HTTP/3
-                    // response with no CSP at all — see
-                    // `apply_response_policy_headers`, which supplies the
-                    // configured fallback only when the origin sent none.
-                    | "content-security-policy"
-                    | "content-security-policy-report-only"
-                    // RFC 9110 6.6.1: an origin with a clock should send Date.
-                    // Only the TCP path had one, via hyper.
-                    | "date"
-                    | "set-cookie"
-                    | "location"
-                    | "access-control-allow-origin"
-                    | "access-control-allow-methods"
-                    | "access-control-allow-headers"
-                    | "access-control-allow-credentials"
-                    | "access-control-expose-headers"
-                    | "access-control-max-age"
-            ) || (lower_name == "server" && config.server.server_header.is_empty())
-            {
-                // `server` passes through only when `server.server_header` is
-                // empty; otherwise the configured value replaces it.
+            let forwarded = match name.as_str() {
+                "content-length" | "alt-svc" => false,
+                "server" => config.server.server_header.is_empty(),
+                other => !crate::proxy::HOP_BY_HOP.contains(&other),
+            };
+            if forwarded {
                 response_builder = response_builder.header(name, value);
             }
         }
@@ -2046,14 +2026,13 @@ impl QuicListener {
             conn_headers.alt_svc(&config, host.as_deref()),
         );
 
-        // Server, Client-Hints, reporting and security headers: the fixed ones
-        // are built once per connection and applied here by cloning (see
-        // `build_static_response_headers`); CSP depends on the request and on
-        // whether the origin set its own, so it is decided here.
+        // The route's overrides, then the security headers (built once per
+        // connection), by the TCP listeners' rules and in their order
         response_builder = super::apply_response_policy_headers(
             response_builder,
-            &config,
-            &conn_headers.static_headers,
+            Some(route),
+            &conn_headers.response_headers,
+            conn_headers.server.as_ref(),
             host.as_deref(),
             &path,
         );
@@ -2077,11 +2056,6 @@ impl QuicListener {
                 .get("origin")
                 .and_then(|v| v.to_str().ok());
             response_builder = add_cors_headers_to_builder(response_builder, cors, req_origin);
-        }
-
-        // Apply route-specific header overrides (e.g., COEP/COOP for Grafana)
-        for (key, value) in &route.headers_override {
-            response_builder = response_builder.header(key.as_str(), value.as_str());
         }
 
         let response = response_builder.body(())?;

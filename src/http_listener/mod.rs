@@ -73,7 +73,8 @@ use crate::security::{security_middleware, SecurityState};
 
 mod backend_tls;
 mod cors;
-mod layers;
+// Shared with the HTTP/3 path: the security headers (layers::ResponseHeaderSet)
+pub(crate) mod layers;
 mod passthrough;
 mod proxy_protocol;
 mod speedtest_tcp;
@@ -3176,6 +3177,17 @@ async fn proxy_handler(
                         let req_origin = headers.get("origin").and_then(|v| v.to_str().ok());
                         add_cors_headers(&mut parts.headers, cors, req_origin);
                     }
+                    // Strip headers the route does not want forwarded, then
+                    // its overrides, so an override can reinstate one
+                    // deliberately (the two ran the other way round until
+                    // 2026-10-11, against this comment); previously
+                    // routes.remove_headers was parsed and never acted on, so a
+                    // backend header listed there was still sent to the client.
+                    for key in &route.remove_headers {
+                        if let Ok(name) = header::HeaderName::from_bytes(key.as_bytes()) {
+                            parts.headers.remove(&name);
+                        }
+                    }
                     for (key, value) in &route.headers_override {
                         if let (Ok(name), Ok(val)) = (
                             header::HeaderName::from_bytes(key.as_bytes()),
@@ -3184,15 +3196,15 @@ async fn proxy_handler(
                             parts.headers.insert(name, val);
                         }
                     }
-                    // Strip headers the route does not want forwarded. Applied
-                    // after the overrides so an override can reinstate one
-                    // deliberately; previously routes.remove_headers was parsed
-                    // and never acted on, so a backend header listed there was
-                    // still sent to the client.
-                    for key in &route.remove_headers {
-                        if let Ok(name) = header::HeaderName::from_bytes(key.as_bytes()) {
-                            parts.headers.remove(&name);
-                        }
+                    // Stripe compatibility, as on the buffered path below
+                    if route.stripe_compatibility {
+                        parts.headers.remove("cross-origin-embedder-policy");
+                        parts.headers.remove("cross-origin-opener-policy");
+                    }
+                    // The security layer leaves what the route decided alone
+                    let owned = layers::RouteOwnedHeaders::of(route);
+                    if !owned.is_empty() {
+                        parts.extensions.insert(owned);
                     }
                     route.apply_set_cookie_policy(&mut parts.headers);
                     parts.headers.remove("connection");
@@ -3317,20 +3329,19 @@ async fn proxy_handler(
                     }
                 }
 
-                // Add route-specific header overrides
+                // Strip headers the route does not want forwarded, then its
+                // overrides (see above)
+                for key in &route.remove_headers {
+                    if let Ok(name) = header::HeaderName::from_bytes(key.as_bytes()) {
+                        parts.headers.remove(&name);
+                    }
+                }
                 for (key, value) in &route.headers_override {
                     if let (Ok(name), Ok(val)) = (
                         header::HeaderName::from_bytes(key.as_bytes()),
                         HeaderValue::from_str(value),
                     ) {
                         parts.headers.insert(name, val);
-                    }
-                }
-
-                // Strip headers the route does not want forwarded (see above).
-                for key in &route.remove_headers {
-                    if let Ok(name) = header::HeaderName::from_bytes(key.as_bytes()) {
-                        parts.headers.remove(&name);
                     }
                 }
 
@@ -3341,6 +3352,11 @@ async fn proxy_handler(
                 if route.stripe_compatibility {
                     parts.headers.remove("cross-origin-embedder-policy");
                     parts.headers.remove("cross-origin-opener-policy");
+                }
+                // The security layer leaves what the route decided alone
+                let owned = layers::RouteOwnedHeaders::of(route);
+                if !owned.is_empty() {
+                    parts.extensions.insert(owned);
                 }
 
                 // Strip hop-by-hop headers that must not be forwarded (RFC 9110 §7.6.1).

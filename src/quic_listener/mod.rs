@@ -6,7 +6,7 @@
 //! This listener handles QUIC/HTTP3 connections (h3/quinn stack) and runs alongside
 //! `WebTransportServer` (wtransport stack), which handles the dedicated WebTransport port.
 
-use http::header::{self, HeaderMap, HeaderName, HeaderValue};
+use http::header::{self, HeaderName, HeaderValue};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -212,9 +212,12 @@ fn quic_handshake_facts_empty() -> crate::tls_acceptor::HandshakeFacts {
 /// snapshot, the address and the handshake are the connection's — so the
 /// per-request cost bought nothing.
 pub(super) struct H3ConnHeaders {
-    /// Server, Client-Hints, reporting and security headers; see
-    /// `build_static_response_headers`.
-    pub(super) static_headers: HeaderMap,
+    /// Client-Hints, reporting and security headers and the fallback CSP,
+    /// applied by the same rules as on the TCP listeners
+    /// (`apply_response_policy_headers`).
+    pub(super) response_headers: std::sync::Arc<crate::http_listener::layers::ResponseHeaderSet>,
+    /// `server.server_header`; `None` lets the origin's own pass through.
+    pub(super) server: Option<HeaderValue>,
     /// This listener's Alt-Svc value for hosts not in `tcp_only_hosts`.
     alt_svc: Option<HeaderValue>,
     /// The client address as forwarded in `x-forwarded-for` / `x-real-ip`.
@@ -255,7 +258,12 @@ impl H3ConnHeaders {
         let value = |s: Option<&str>| s.and_then(|s| HeaderValue::from_str(s).ok());
         let pqc = handshake.is_post_quantum();
         Self {
-            static_headers: build_static_response_headers(config),
+            response_headers: std::sync::Arc::new(
+                crate::http_listener::layers::ResponseHeaderSet::from_config(&config.headers),
+            ),
+            server: Some(config.server.server_header.as_str())
+                .filter(|s| !s.is_empty())
+                .and_then(|s| HeaderValue::from_str(s).ok()),
             alt_svc: HeaderValue::from_str(&build_alt_svc_header_over_quic(config)).ok(),
             client_ip: HeaderValue::from_str(&remote_addr.ip().to_string()).ok(),
             forwarded_port: HeaderValue::from(local_port),
@@ -413,123 +421,47 @@ fn resolve_route_policy(
         })
 }
 
-fn build_static_response_headers(config: &ProxyConfig) -> HeaderMap {
-    let mut h = HeaderMap::with_capacity(16);
-    // An empty value omits the header, as on the TCP path.
-    let mut put = |name: &'static str, value: &str| {
-        if value.is_empty() {
-            return;
-        }
-        if let Ok(v) = HeaderValue::from_str(value) {
-            h.append(HeaderName::from_static(name), v);
-        }
-    };
-    put("server", &config.server.server_header);
-    if !config.headers.accept_ch.is_empty() {
-        put("accept-ch", &config.headers.accept_ch);
-    }
-    if !config.headers.nel.is_empty() {
-        put("nel", &config.headers.nel);
-    }
-    if !config.headers.report_to.is_empty() {
-        put("report-to", &config.headers.report_to);
-    }
-    if !config.headers.priority.is_empty() {
-        put("priority", &config.headers.priority);
-    }
-    put("strict-transport-security", &config.headers.hsts);
-    put("x-frame-options", &config.headers.x_frame_options);
-    put(
-        "x-content-type-options",
-        &config.headers.x_content_type_options,
-    );
-    put("referrer-policy", &config.headers.referrer_policy);
-    put("permissions-policy", &config.headers.permissions_policy);
-    put(
-        "cross-origin-opener-policy",
-        &config.headers.cross_origin_opener_policy,
-    );
-    put(
-        "cross-origin-embedder-policy",
-        &config.headers.cross_origin_embedder_policy,
-    );
-    put(
-        "cross-origin-resource-policy",
-        &config.headers.cross_origin_resource_policy,
-    );
-    put("x-quantum-resistant", &config.headers.x_quantum_resistant);
-    put("x-security-level", &config.headers.x_security_level);
-    put(
-        "x-permitted-cross-domain-policies",
-        &config.headers.x_permitted_cross_domain_policies,
-    );
-    put("x-download-options", &config.headers.x_download_options);
-    put(
-        "x-dns-prefetch-control",
-        &config.headers.x_dns_prefetch_control,
-    );
-    h
-}
-
-/// Apply the per-connection static header set and the policy headers that
-/// depend on the request itself.
+/// A route's header decisions and then the security headers onto an HTTP/3
+/// response, in the TCP listeners' order: the route's overrides replace what
+/// the origin sent, a Stripe-compatible route drops the cross-origin
+/// policies, and the `[headers]` set goes on by its rules
+/// (`ResponseHeaderSet::apply`) -- a cross-origin policy the origin set is
+/// kept, the fallback CSP only where the origin sent none, and nothing the
+/// route decided is touched; then the configured `Server`.
 ///
-/// The TCP listener's `security_headers_middleware` is an axum layer, so it
-/// never ran for HTTP/3 — and this path's own static set omitted the one header
-/// that matters most. Every HTTP/3 response left here **without a
-/// Content-Security-Policy**: the backend's nonce-bearing CSP is not on the
-/// forwarding allowlist, and nothing injected the configured one. Since the DNS
-/// HTTPS record advertises `alpn="h3"`, a browser's *first* connection is QUIC,
-/// so the strict CSP the site is built around was absent for exactly the
-/// visitors most likely to arrive on it.
-///
-/// Order matters: a CSP already on the builder came from the origin (it carries
-/// the per-request nonces) and always wins over the configured fallback.
+/// Until 2026-10-11 the overrides were appended after the security headers,
+/// so Grafana answered over HTTP/3 with two of each cross-origin policy, and
+/// a cache hit got none of its route's overrides at all (a cached font
+/// without its `access-control-allow-origin: *`).
 pub(super) fn apply_response_policy_headers(
     mut builder: http::response::Builder,
-    config: &ProxyConfig,
-    static_headers: &HeaderMap,
+    route: Option<&crate::config::RouteConfig>,
+    set: &crate::http_listener::layers::ResponseHeaderSet,
+    server: Option<&HeaderValue>,
     host: Option<&str>,
     path: &str,
 ) -> http::response::Builder {
-    // The Outlook add-in surface is framed cross-origin by Office: it must not
-    // get X-Frame-Options: DENY, and it needs its own CSP. Same three config
-    // knobs the TCP path reads, so the two transports agree.
-    let hc = &config.headers;
-    let is_outlook_addin = !hc.addin_csp.is_empty()
-        && !hc.addin_path_prefix.is_empty()
-        && path.starts_with(&hc.addin_path_prefix)
-        && host.is_some_and(|h| {
-            let h = h.split(':').next().unwrap_or(h);
-            hc.addin_hosts.iter().any(|a| a.eq_ignore_ascii_case(h))
-        });
-
     if let Some(h) = builder.headers_mut() {
-        h.reserve(static_headers.len());
-        for (name, value) in static_headers.iter() {
-            if is_outlook_addin && name == header::X_FRAME_OPTIONS {
-                continue;
+        let owned = route.map(crate::http_listener::layers::RouteOwnedHeaders::of);
+        if let Some(route) = route {
+            for (key, value) in &route.headers_override {
+                if let (Ok(name), Ok(val)) = (
+                    HeaderName::from_bytes(key.as_bytes()),
+                    HeaderValue::from_str(value),
+                ) {
+                    h.insert(name, val);
+                }
             }
-            h.append(name.clone(), value.clone());
-        }
-    }
-
-    let has_csp = builder
-        .headers_ref()
-        .is_some_and(|h| h.contains_key(header::CONTENT_SECURITY_POLICY));
-    if !has_csp {
-        let csp = if is_outlook_addin {
-            hc.addin_csp.as_str()
-        } else {
-            hc.content_security_policy.as_str()
-        };
-        if !csp.is_empty() {
-            if let Ok(v) = HeaderValue::from_str(csp) {
-                builder = builder.header(header::CONTENT_SECURITY_POLICY, v);
+            if route.stripe_compatibility {
+                h.remove("cross-origin-embedder-policy");
+                h.remove("cross-origin-opener-policy");
             }
         }
+        set.apply(h, set.is_addin(host, path), owned.as_ref());
+        if let Some(server) = server {
+            h.insert(header::SERVER, server.clone());
+        }
     }
-
     builder
 }
 
@@ -1796,6 +1728,136 @@ impl QuicListener {
     /// Get local address
     pub fn local_addr(&self) -> anyhow::Result<SocketAddr> {
         Ok(self.endpoint.local_addr()?)
+    }
+}
+
+#[cfg(test)]
+mod response_header_tests {
+    use super::*;
+    use crate::config::{HeadersConfig, RouteConfig};
+    use http::HeaderMap;
+
+    /// A route with nothing set but its backend (as config.rs's tests make one)
+    fn route() -> RouteConfig {
+        serde_json::from_str(r#"{"backend":"b"}"#).expect("minimal route")
+    }
+    use crate::http_listener::layers::ResponseHeaderSet;
+
+    fn headers_of(builder: http::response::Builder) -> HeaderMap {
+        builder.body(()).unwrap().headers().clone()
+    }
+
+    /// An HTTP/3 response gets the security headers by the TCP listeners'
+    /// rules: an origin's cross-origin policies stand (and are not doubled),
+    /// the always-set headers replace the origin's, the origin's CSP is kept,
+    /// and the configured Server replaces the origin's.
+    #[test]
+    fn http3_applies_the_tcp_listeners_rules() {
+        let config = HeadersConfig {
+            cross_origin_embedder_policy: "unsafe-none".into(),
+            ..HeadersConfig::default()
+        };
+        let set = ResponseHeaderSet::from_config(&config);
+        let server = HeaderValue::from_static("pqcrypta-proxy");
+        let builder = http::Response::builder()
+            .header("cross-origin-embedder-policy", "require-corp")
+            .header("cross-origin-opener-policy", "same-origin")
+            .header(header::X_FRAME_OPTIONS, "SAMEORIGIN")
+            .header(
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'self' 'nonce-abc'",
+            )
+            .header(header::SERVER, "Apache");
+        let h = headers_of(apply_response_policy_headers(
+            builder,
+            None,
+            &set,
+            Some(&server),
+            Some("pqcrypta.com"),
+            "/encryption/",
+        ));
+        let all = |name: &str| -> Vec<&str> {
+            h.get_all(name)
+                .iter()
+                .map(|v| v.to_str().unwrap())
+                .collect()
+        };
+        assert_eq!(all("cross-origin-embedder-policy"), ["require-corp"]);
+        assert_eq!(all("cross-origin-opener-policy"), ["same-origin"]);
+        assert_eq!(all("x-frame-options"), [config.x_frame_options.as_str()]);
+        assert_eq!(
+            all("content-security-policy"),
+            ["default-src 'self' 'nonce-abc'"]
+        );
+        assert_eq!(all("server"), ["pqcrypta-proxy"]);
+        // Where the origin set none, the configured defaults
+        let bare = headers_of(apply_response_policy_headers(
+            http::Response::builder(),
+            None,
+            &set,
+            None,
+            Some("pqcrypta.com"),
+            "/",
+        ));
+        assert_eq!(
+            bare.get("cross-origin-embedder-policy").unwrap(),
+            "unsafe-none"
+        );
+        assert_eq!(
+            bare.get(header::CONTENT_SECURITY_POLICY).unwrap(),
+            config.content_security_policy.as_str()
+        );
+    }
+
+    /// What a route decided stands: its overrides replace the origin's value
+    /// and the global one, even for an always-set header, and a
+    /// Stripe-compatible route goes out with no COOP or COEP at all.
+    #[test]
+    fn a_routes_headers_stand() {
+        let config = HeadersConfig::default();
+        let set = ResponseHeaderSet::from_config(&config);
+        let mut grafana = route();
+        for (k, v) in [
+            ("cross-origin-opener-policy", "unsafe-none"),
+            ("cross-origin-resource-policy", "cross-origin"),
+            ("x-frame-options", "SAMEORIGIN"),
+        ] {
+            grafana.headers_override.insert(k.into(), v.into());
+        }
+        let h = headers_of(apply_response_policy_headers(
+            http::Response::builder().header("cross-origin-opener-policy", "same-origin"),
+            Some(&grafana),
+            &set,
+            None,
+            None,
+            "/grafana/login",
+        ));
+        let all = |h: &HeaderMap, name: &str| -> Vec<String> {
+            h.get_all(name)
+                .iter()
+                .map(|v| v.to_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(all(&h, "cross-origin-opener-policy"), ["unsafe-none"]);
+        assert_eq!(all(&h, "cross-origin-resource-policy"), ["cross-origin"]);
+        assert_eq!(all(&h, "x-frame-options"), ["SAMEORIGIN"]);
+
+        let mut billing = route();
+        billing.stripe_compatibility = true;
+        let h = headers_of(apply_response_policy_headers(
+            http::Response::builder().header("cross-origin-opener-policy", "same-origin"),
+            Some(&billing),
+            &set,
+            None,
+            None,
+            "/dashboard/billing/",
+        ));
+        assert!(h.get("cross-origin-opener-policy").is_none());
+        assert!(h.get("cross-origin-embedder-policy").is_none());
+        assert_eq!(
+            all(&h, "x-frame-options"),
+            [config.x_frame_options.as_str()]
+        );
     }
 }
 

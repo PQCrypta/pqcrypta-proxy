@@ -1,0 +1,25 @@
+# Secret scanning for this repository, on the same terms as pqcrypta-platform's
+# (.gitleaks.toml there): every exemption names what it exempts and why, and a
+# directory is exempt only when, by its nature, what it holds is not a
+# credential of ours.
+#
+# Run it the way the push gate does:
+#   gitleaks dir . --config .gitleaks.toml --redact
+#   gitleaks git . --config .gitleaks.toml --redact   # includes history
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Paths that hold no credential of ours"
+
+paths = [
+  # Attack payloads, written to be attack payloads: an alg:none forgery,
+  # crafted HS256 tokens, RFC 6455's sample WebSocket key, bearer tokens no
+  # server issued. The platform repo exempts its copy of these scripts too.
+  '''^pentests/scripts/''',
+  # Vendored dependencies carry their own test fixtures: vendor/rustls-fixed
+  # holds RFC 9180's published HPKE test vectors, which the ECH tests read.
+  '''(^|/)vendor/''',
+  '''(^|/)target/''',
+]
