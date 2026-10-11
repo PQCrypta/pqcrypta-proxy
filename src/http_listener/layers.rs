@@ -167,15 +167,54 @@ pub(super) async fn alt_svc_middleware(
 
 /// How one precomputed response header is applied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum HeaderRule {
+pub(crate) enum HeaderRule {
     /// Always set, replacing whatever the backend sent.
     Always,
     /// Always set, except on the Outlook add-in surface, which Office frames
     /// cross-origin (framing there is governed by the add-in CSP instead).
     UnlessAddin,
-    /// Set only when the response does not already carry it, so a route's
-    /// `headers_override` or the backend's own value wins.
+    /// Set only when the response does not already carry it, so the
+    /// backend's own value wins.
     IfAbsent,
+}
+
+/// The response headers a route decided itself: the names in its
+/// `headers_override` and `remove_headers`, and for `stripe_compatibility` the
+/// two cross-origin policies it drops. The `[headers]` set leaves each as the
+/// route left it, whatever its rule (`ResponseHeaderSet::apply`).
+///
+/// Until 2026-10-11 the TCP security layer, which runs outside the route,
+/// set its Always headers over a route's overrides (a route's
+/// `x-frame-options` never went out) and put back the cross-origin policies a
+/// route had dropped -- the billing pages, `stripe_compatibility = true`,
+/// answered with `cross-origin-opener-policy: same-origin`, which breaks the
+/// popups Stripe's card authentication opens. The TCP handler hands this to
+/// that layer as a response extension.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RouteOwnedHeaders(Vec<HeaderName>);
+
+impl RouteOwnedHeaders {
+    pub(crate) fn of(route: &crate::config::RouteConfig) -> Self {
+        let mut names: Vec<HeaderName> = route
+            .headers_override
+            .keys()
+            .chain(&route.remove_headers)
+            .filter_map(|k| HeaderName::from_bytes(k.as_bytes()).ok())
+            .collect();
+        if route.stripe_compatibility {
+            names.push(HeaderName::from_static("cross-origin-embedder-policy"));
+            names.push(HeaderName::from_static("cross-origin-opener-policy"));
+        }
+        Self(names)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn owns(&self, name: &HeaderName) -> bool {
+        self.0.contains(name)
+    }
 }
 
 /// The `[headers]` section, validated once at startup.
@@ -200,7 +239,7 @@ pub(crate) struct ResponseHeaderSet {
 }
 
 impl ResponseHeaderSet {
-    pub(super) fn from_config(config: &crate::config::HeadersConfig) -> Self {
+    pub(crate) fn from_config(config: &crate::config::HeadersConfig) -> Self {
         fn value(name: &str, raw: &str) -> Option<HeaderValue> {
             if raw.is_empty() {
                 return None;
@@ -336,18 +375,84 @@ impl ResponseHeaderSet {
     }
 
     fn is_addin_request(&self, request: &Request<Body>) -> bool {
-        if self.addin_csp.is_none() || !request.uri().path().starts_with(&self.addin_path_prefix) {
-            return false;
-        }
         let host = request
             .headers()
             .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+            .and_then(|v| v.to_str().ok());
+        self.is_addin(host, request.uri().path())
+    }
+
+    /// Whether a request for `host` and `path` is on the Outlook add-in
+    /// surface (see `apply`).
+    pub(crate) fn is_addin(&self, host: Option<&str>, path: &str) -> bool {
+        if self.addin_csp.is_none() || !path.starts_with(&self.addin_path_prefix) {
+            return false;
+        }
+        let host = host.unwrap_or("");
         let host = host.split(':').next().unwrap_or("");
         self.addin_hosts
             .iter()
             .any(|h| h.eq_ignore_ascii_case(host))
+    }
+
+    /// The security headers onto a response's `headers`, each by its rule, and
+    /// the fallback CSP when the response carries none -- except the headers
+    /// the route decided itself (`owned`), which stay as it left them.
+    ///
+    /// Both transports apply them here. The HTTP/3 path appended every header
+    /// to whatever the backend or a route override had set until 2026-10-11,
+    /// so a route that set its own COOP/COEP/CORP (Grafana's) answered over
+    /// HTTP/3 with two contradictory values of each -- which a browser treats
+    /// as none -- while HTTP/1.1 and HTTP/2 sent the route's alone.
+    pub(crate) fn apply(
+        &self,
+        headers: &mut HeaderMap,
+        is_outlook_addin: bool,
+        owned: Option<&RouteOwnedHeaders>,
+    ) {
+        let owned = |name: &HeaderName| owned.is_some_and(|o| o.owns(name));
+        for (name, value, rule) in &self.entries {
+            if owned(name) {
+                continue;
+            }
+            match rule {
+                HeaderRule::Always => {
+                    headers.insert(name.clone(), value.clone());
+                }
+                HeaderRule::UnlessAddin => {
+                    if !is_outlook_addin {
+                        headers.insert(name.clone(), value.clone());
+                    }
+                }
+                // Cross-Origin headers -- conditional so the backend's own
+                // value takes precedence over the global default.
+                HeaderRule::IfAbsent => {
+                    if !headers.contains_key(name) {
+                        headers.insert(name.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        // SEC-07: Content-Security-Policy.
+        // Outlook add-in surface gets a dedicated CSP (frame-ancestors for the Office
+        // hosts, allows the office.js CDN and api.pqpdf.com). Otherwise inject the global
+        // CSP only when the backend did not set one (preserves PHP nonce-based CSPs).
+        if !owned(&header::CONTENT_SECURITY_POLICY) {
+            if is_outlook_addin {
+                if let Some(v) = &self.addin_csp {
+                    headers.insert(header::CONTENT_SECURITY_POLICY, v.clone());
+                }
+            } else if let Some(v) = &self.csp {
+                if !headers.contains_key(header::CONTENT_SECURITY_POLICY) {
+                    headers.insert(header::CONTENT_SECURITY_POLICY, v.clone());
+                }
+            }
+        }
+    }
+
+    /// How many headers `apply` may add, for sizing a header map.
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len() + 1
     }
 }
 
@@ -381,41 +486,9 @@ pub(super) async fn security_headers_middleware(
     let is_outlook_addin = set.is_addin_request(&request);
 
     let mut response = next.run(request).await;
+    let owned = response.extensions_mut().remove::<RouteOwnedHeaders>();
     let headers = response.headers_mut();
-
-    for (name, value, rule) in &set.entries {
-        match rule {
-            HeaderRule::Always => {
-                headers.insert(name.clone(), value.clone());
-            }
-            HeaderRule::UnlessAddin => {
-                if !is_outlook_addin {
-                    headers.insert(name.clone(), value.clone());
-                }
-            }
-            // Cross-Origin headers — conditional so route-level headers_override
-            // takes precedence over the global default.
-            HeaderRule::IfAbsent => {
-                if !headers.contains_key(name) {
-                    headers.insert(name.clone(), value.clone());
-                }
-            }
-        }
-    }
-
-    // SEC-07: Content-Security-Policy.
-    // Outlook add-in surface gets a dedicated CSP (frame-ancestors for the Office
-    // hosts, allows the office.js CDN and api.pqpdf.com). Otherwise inject the global
-    // CSP only when the backend did not set one (preserves PHP nonce-based CSPs).
-    if is_outlook_addin {
-        if let Some(v) = &set.addin_csp {
-            headers.insert(header::CONTENT_SECURITY_POLICY, v.clone());
-        }
-    } else if let Some(v) = &set.csp {
-        if !headers.contains_key(header::CONTENT_SECURITY_POLICY) {
-            headers.insert(header::CONTENT_SECURITY_POLICY, v.clone());
-        }
-    }
+    set.apply(headers, is_outlook_addin, owned.as_ref());
 
     // Server-Timing header - Performance metrics
     // Format: metric;dur=<ms>;desc="description"
