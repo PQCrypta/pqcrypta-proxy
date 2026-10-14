@@ -15,8 +15,8 @@ default = ["pqc", "pqc-signatures", "metrics", "admin-api", "geoip", "acme"]
 # Enable PQC hybrid key exchange via OpenSSL 3.5+ (native ML-KEM)
 # Also enables extended algorithm detection and configuration
 pqc = ["openssl", "openssl-sys", "openssl-probe", "foreign-types"]
-# Extended PQC with ML-DSA signatures (unstable aws-lc-rs API)
-pqc-signatures = ["aws-lc-rs/unstable"]
+# ML-DSA-87 certificate signatures (aws-lc-rs's stable signature module, FIPS builds included)
+pqc-signatures = []
 # Prometheus metrics endpoint
 metrics = ["prometheus"]
 # Count allocations, for answering "how many per request" rather than inferring
@@ -46,12 +46,11 @@ legacy-pqc = []
 geoip = ["maxminddb"]
 # FIPS mode for aws-lc-rs (requires FIPS-validated build)
 #
-# `rustls/fips` is part of it, not an extra. Without it the vendored rustls
-# was built non-FIPS against a FIPS backend -- and, concretely, kept compiling
-# in an ML-DSA-87 verifier that calls `aws_lc_rs::unstable::signature`, a
-# module aws-lc-rs deletes under FIPS. `cargo {clippy,test,doc} --all-features`
-# turns on every feature at once, so CI met that combination on every push and
-# failed three jobs on it for two days.
+# `rustls/fips` is part of it, not an extra: without it the vendored rustls
+# is built non-FIPS against a FIPS backend. `cargo {clippy,test,doc}
+# --all-features` turns every feature on at once, so CI builds this
+# combination on every push. ML-DSA signing and verification work here too:
+# aws-lc-rs 1.18 has them in its stable signature module.
 fips = ["aws-lc-rs/fips", "rustls/fips"]
 
 [dependencies]
@@ -116,8 +115,9 @@ openssl-sys = { version = "0.9", optional = true }
 foreign-types = { version = "0.3", optional = true }
 openssl-probe = { version = "0.1", optional = true }
 
-# aws-lc-rs for extended PQC (ML-KEM direct, ML-DSA when unstable enabled)
-aws-lc-rs = "1.16"
+# aws-lc-rs for extended PQC (ML-KEM direct, ML-DSA signing): 1.18 is the
+# first with ML-DSA in its stable signature module
+aws-lc-rs = "1.18"
 
 # Configuration
 serde = { version = "1.0", features = ["derive"] }
