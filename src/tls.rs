@@ -439,8 +439,8 @@ mod mldsa {
 
     #[cfg(test)]
     mod tests {
-        use aws_lc_rs::signature::{KeyPair, UnparsedPublicKey};
         use aws_lc_rs::signature::ML_DSA_87;
+        use aws_lc_rs::signature::{KeyPair, UnparsedPublicKey};
 
         use super::*;
 
