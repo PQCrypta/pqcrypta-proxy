@@ -446,7 +446,7 @@ mod mldsa {
         #[test]
         fn pkcs8_roundtrip_sign_verify() {
             let generated = PqdsaKeyPair::generate(&ML_DSA_87_SIGNING).unwrap();
-            let pkcs8 = generated.to_pkcs8().unwrap();
+            let pkcs8 = generated.to_pkcs8v1().unwrap();
             assert!(is_ml_dsa_87_pkcs8(pkcs8.as_ref()));
 
             let key = MlDsa87SigningKey::load(pkcs8.as_ref()).unwrap();
@@ -465,7 +465,7 @@ mod mldsa {
         #[test]
         fn refuses_without_mldsa_offer() {
             let generated = PqdsaKeyPair::generate(&ML_DSA_87_SIGNING).unwrap();
-            let pkcs8 = generated.to_pkcs8().unwrap();
+            let pkcs8 = generated.to_pkcs8v1().unwrap();
             let key = MlDsa87SigningKey::load(pkcs8.as_ref()).unwrap();
             assert!(key
                 .choose_scheme(&[
