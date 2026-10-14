@@ -19,6 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context as _};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::CertificateDer;
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
@@ -116,8 +118,7 @@ async fn get(url: &str) -> anyhow::Result<u16> {
     ] {
         match std::fs::read(pq_root) {
             Ok(pem) => {
-                let mut rd = std::io::BufReader::new(std::io::Cursor::new(pem));
-                for cert in rustls_pemfile::certs(&mut rd).flatten() {
+                for cert in CertificateDer::pem_slice_iter(&pem).flatten() {
                     if let Err(e) = roots.add(cert) {
                         eprintln!("h3-get: ignoring {pq_root}: {e}");
                     }

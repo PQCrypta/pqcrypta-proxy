@@ -98,7 +98,6 @@ bytes = "1.9"
 # listed because the client picks: brotli compresses better, zlib is what some
 # clients offer alone.
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "prefer-post-quantum", "brotli", "zlib"] }
-rustls-pemfile = "2.2"
 rustls-pki-types = { version = "1.9", features = ["alloc"] }
 rustls-native-certs = "0.8"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
@@ -137,7 +136,7 @@ tracing-opentelemetry = "0.34"
 
 # Admin API and HTTP listener
 axum = { version = "0.7", features = ["macros"] }
-axum-server = { version = "0.7", features = ["tls-rustls", "tls-openssl"] }
+axum-server = { version = "0.8", features = ["tls-rustls", "tls-openssl"] }
 tower = "0.5"
 # Async OpenSSL for TLS connections with PQC
 tokio-openssl = "0.6"
@@ -165,14 +164,14 @@ dns-lookup = "3.0"
 arc-swap = "1.7"
 
 # Hot reload - file watching
-notify = "7.0"
+notify = "8.2"
 
 # Rate limiting
 governor = "0.7"
 nonzero_ext = "0.3"
 
-# Distributed rate limiting (Redis backend)
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
+# Distributed rate limiting (Redis backend); rediss:// over the vendored rustls
+redis = { version = "1.7", default-features = false, features = ["tokio-comp", "tokio-rustls-comp", "connection-manager", "script"] }
 
 # Compression
 async-compression = { version = "0.4", features = ["tokio", "brotli", "zstd", "gzip", "zlib"] }
@@ -247,7 +246,6 @@ signal-hook = "0.4"
 signal-hook-tokio = { version = "0.4", features = ["futures-v0_3"] }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["async_tokio"] }
 tokio-test = "0.4"
 assert_matches = "1.5"
 rcgen = "0.14"
