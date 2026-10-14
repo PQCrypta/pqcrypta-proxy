@@ -314,7 +314,7 @@ pub(super) struct ExpectClientHello {
     pub(super) session_id: SessionId,
     #[cfg(feature = "tls12")]
     pub(super) using_ems: bool,
-    pub(super) done_retry: bool,
+    pub(super) previous_hello: Option<PreviousClientHello>,
     pub(super) send_tickets: usize,
 }
 
@@ -337,7 +337,7 @@ impl ExpectClientHello {
             session_id: SessionId::empty(),
             #[cfg(feature = "tls12")]
             using_ems: false,
-            done_retry: false,
+            previous_hello: None,
             send_tickets: 0,
         }
     }
@@ -352,10 +352,11 @@ impl ExpectClientHello {
     ) -> NextStateOrError<'static> {
         let tls13_enabled = self
             .config
-            .supports_version(ProtocolVersion::TLSv1_3);
+            .supports_version(ProtocolVersion::TLSv1_3, cx.common.protocol);
         let tls12_enabled = self
             .config
-            .supports_version(ProtocolVersion::TLSv1_2);
+            .supports_version(ProtocolVersion::TLSv1_2, cx.common.protocol)
+            && !self.previous_hello.is_some();
 
         // Are we doing TLS1.3?
         let version = if let Some(versions) = &client_hello.supported_versions {
@@ -379,15 +380,15 @@ impl ExpectClientHello {
                 AlertDescription::ProtocolVersion,
                 PeerIncompatible::Tls12NotOffered,
             ));
-        } else if !tls12_enabled && tls13_enabled {
-            return Err(cx.common.send_fatal_alert(
-                AlertDescription::ProtocolVersion,
-                PeerIncompatible::SupportedVersionsExtensionRequired,
-            ));
         } else if cx.common.is_quic() {
             return Err(cx.common.send_fatal_alert(
                 AlertDescription::ProtocolVersion,
                 PeerIncompatible::Tls13RequiredForQuic,
+            ));
+        } else if !tls12_enabled && tls13_enabled {
+            return Err(cx.common.send_fatal_alert(
+                AlertDescription::ProtocolVersion,
+                PeerIncompatible::SupportedVersionsExtensionRequired,
             ));
         } else {
             ProtocolVersion::TLSv1_2
@@ -478,6 +479,21 @@ impl ExpectClientHello {
                     .send_fatal_alert(AlertDescription::HandshakeFailure, incompat)
             })?;
 
+        // RFC 9846 section 4.2.4: the server must negotiate the same cipher suite it
+        // named in its HelloRetryRequest
+        if let Some(PreviousClientHello {
+            suite: before_retry,
+            ..
+        }) = self.previous_hello
+        {
+            if before_retry != suite.suite() {
+                return Err(cx.common.send_fatal_alert(
+                    AlertDescription::IllegalParameter,
+                    PeerMisbehaved::CipherSuiteDifferedOnRetry,
+                ));
+            }
+        }
+
         debug!("decided upon suite {suite:?}");
         cx.common.suite = Some(suite);
         cx.common.kx_state = KxState::Start(skxg);
@@ -510,7 +526,7 @@ impl ExpectClientHello {
                 transcript,
                 suite,
                 randoms,
-                done_retry: self.done_retry,
+                previous_hello: self.previous_hello,
                 send_tickets: self.send_tickets,
                 extra_exts: self.extra_exts,
             }
@@ -671,6 +687,11 @@ impl ExpectClientHello {
     }
 }
 
+pub(super) struct PreviousClientHello {
+    pub(super) offered_psk: bool,
+    pub(super) suite: CipherSuite,
+}
+
 impl ExpectClientHello {
     /// The group `ServerConfig::kx_group_tuples` chooses: in the first tuple
     /// holding a group both sides support, a group the client sent a key share
@@ -797,13 +818,14 @@ impl State<ServerConnectionData> for ExpectClientHello {
         // Skipped on a HelloRetryRequest second flight so the stored value stays
         // the client's initial offer — the retry hello is a response to our
         // constraint, not an independent expression of what the client supports.
-        if !self.done_retry {
+        if self.previous_hello.is_none() {
             if let MessagePayload::Handshake { encoded, .. } = &m.payload {
                 cx.data.client_hello_wire = Some(encoded.bytes().to_vec());
             }
         }
 
-        let (client_hello, sig_schemes) = process_client_hello(&m, self.done_retry, cx)?;
+        let (client_hello, sig_schemes) =
+            process_client_hello(&m, self.previous_hello.is_some(), cx)?;
         self.with_certified_key(sig_schemes, client_hello, &m, cx)
     }
 
