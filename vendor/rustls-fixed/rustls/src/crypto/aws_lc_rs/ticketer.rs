@@ -381,8 +381,12 @@ mod tests {
     #[test]
     fn refuses_decrypt_truncated_ciphertext() {
         let t = make_ticket_generator().unwrap();
-        let cipher = t.encrypt(b"hello world").unwrap();
-        assert_eq!(t.decrypt(&cipher), Some(b"hello world".to_vec()));
+        // Random state, so no fixed pattern stands in for the ticket
+        let state: [u8; 11] = aws_lc_rs::rand::generate(&SystemRandom::new())
+            .unwrap()
+            .expose();
+        let cipher = t.encrypt(&state).unwrap();
+        assert_eq!(t.decrypt(&cipher), Some(state.to_vec()));
 
         // a truncation is rejected at any length; lengths that leave fewer
         // bytes than the trailing tag after the key_name and iv prefix

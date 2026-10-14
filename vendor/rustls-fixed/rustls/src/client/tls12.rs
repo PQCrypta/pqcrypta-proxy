@@ -399,8 +399,8 @@ impl State<ClientConnectionData> for ExpectCertificateStatus<'_> {
         .into_inner();
 
         trace!(
-            "Server stapled OCSP response is {:?}",
-            server_cert_ocsp_response
+            "Server stapled an OCSP response of {} bytes",
+            server_cert_ocsp_response.len()
         );
 
         let server_cert = ServerCertDetails::new(self.server_cert_chain, server_cert_ocsp_response);
