@@ -280,7 +280,7 @@ pub fn ml_dsa_signing_enabled() -> bool {
 mod mldsa {
     use std::sync::Arc;
 
-    use aws_lc_rs::unstable::signature::{PqdsaKeyPair, ML_DSA_87_SIGNING};
+    use aws_lc_rs::signature::{PqdsaKeyPair, ML_DSA_87_SIGNING};
     use rustls::sign::{Signer, SigningKey};
     use rustls::{SignatureAlgorithm, SignatureScheme};
 
@@ -439,7 +439,7 @@ mod mldsa {
     #[cfg(test)]
     mod tests {
         use aws_lc_rs::signature::{KeyPair, UnparsedPublicKey};
-        use aws_lc_rs::unstable::signature::ML_DSA_87;
+        use aws_lc_rs::signature::ML_DSA_87;
 
         use super::*;
 
