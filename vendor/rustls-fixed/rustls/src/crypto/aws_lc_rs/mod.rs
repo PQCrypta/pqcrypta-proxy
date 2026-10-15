@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 pub(crate) use aws_lc_rs as ring_like;
 use pki_types::PrivateKeyDer;
 use webpki::aws_lc_rs as webpki_algs;
+use zeroize::Zeroizing;
 
 use crate::crypto::{CryptoProvider, KeyProvider, SecureRandom, SupportedKxGroup};
 use crate::enums::SignatureScheme;
@@ -86,7 +87,7 @@ impl KeyProvider for AwsLcRs {
         &self,
         key_der: PrivateKeyDer<'static>,
     ) -> Result<Arc<dyn SigningKey>, Error> {
-        sign::any_supported_type(&key_der)
+        sign::any_supported_type(&Zeroizing::new(key_der))
     }
 
     fn fips(&self) -> bool {
@@ -176,12 +177,11 @@ static SUPPORTED_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms
         webpki_algs::RSA_PKCS1_2048_8192_SHA256_ABSENT_PARAMS,
         webpki_algs::RSA_PKCS1_2048_8192_SHA384_ABSENT_PARAMS,
         webpki_algs::RSA_PKCS1_2048_8192_SHA512_ABSENT_PARAMS,
-        #[cfg(not(feature = "fips"))]
-        ML_DSA_87_VERIFY,
+        webpki_algs::ML_DSA_44,
+        webpki_algs::ML_DSA_65,
+        webpki_algs::ML_DSA_87,
     ],
     mapping: &[
-        #[cfg(not(feature = "fips"))]
-        (SignatureScheme::ML_DSA_87, &[ML_DSA_87_VERIFY]),
         // Note: for TLS1.2 the curve is not fixed by SignatureScheme. For TLS1.3 it is.
         (
             SignatureScheme::ECDSA_NISTP384_SHA384,
@@ -232,6 +232,9 @@ static SUPPORTED_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms
             SignatureScheme::RSA_PKCS1_SHA256,
             &[webpki_algs::RSA_PKCS1_2048_8192_SHA256],
         ),
+        (SignatureScheme::ML_DSA_44, &[webpki_algs::ML_DSA_44]),
+        (SignatureScheme::ML_DSA_65, &[webpki_algs::ML_DSA_65]),
+        (SignatureScheme::ML_DSA_87, &[webpki_algs::ML_DSA_87]),
     ],
 };
 
@@ -358,59 +361,3 @@ mod tests {
     }
 }
 
-/// ML-DSA-87 (FIPS 204) certificate verification.
-///
-/// rustls knows the `ML_DSA_87` signature scheme codepoint and aws-lc-rs ships
-/// the verification algorithm, but nothing joined them -- so a client built on
-/// this provider advertised no `signature_algorithms` entry that could verify
-/// an ML-DSA-87 chain, and a server offering one was refused before the
-/// certificate was sent. Our own conformance suite recorded that against our
-/// own client as `t-cert-compression-pq: unsupported`, which for a
-/// post-quantum stack is the wrong answer to be giving.
-///
-/// The signing half already exists outside this crate, built on the same
-/// `PqdsaKeyPair`. This is the half that was missing.
-///
-/// Absent under `fips`, because aws-lc-rs's own `unstable` module is:
-/// `#[cfg(not(feature = "fips"))] pub mod signature;`. ML-DSA there is not
-/// part of the validated boundary, so a FIPS build has no ML-DSA-87 to call
-/// and this endpoint must not claim the scheme it cannot verify. Same gate
-/// the proxy's signing half carries, for the same reason.
-#[cfg(not(feature = "fips"))]
-#[derive(Debug)]
-struct MlDsa87Verify;
-
-/// DER of the AlgorithmIdentifier contents for id-ml-dsa-87
-/// (OID 2.16.840.1.101.3.4.3.19), parameters absent.
-#[cfg(not(feature = "fips"))]
-const ML_DSA_87_ALG_ID: &[u8] = &[
-    0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x13,
-];
-
-#[cfg(not(feature = "fips"))]
-impl pki_types::SignatureVerificationAlgorithm for MlDsa87Verify {
-    fn public_key_alg_id(&self) -> pki_types::AlgorithmIdentifier {
-        pki_types::AlgorithmIdentifier::from_slice(ML_DSA_87_ALG_ID)
-    }
-
-    fn signature_alg_id(&self) -> pki_types::AlgorithmIdentifier {
-        pki_types::AlgorithmIdentifier::from_slice(ML_DSA_87_ALG_ID)
-    }
-
-    fn verify_signature(
-        &self,
-        public_key: &[u8],
-        message: &[u8],
-        signature: &[u8],
-    ) -> Result<(), pki_types::InvalidSignature> {
-        aws_lc_rs::signature::UnparsedPublicKey::new(
-            &aws_lc_rs::unstable::signature::ML_DSA_87,
-            public_key,
-        )
-        .verify(message, signature)
-        .map_err(|_| pki_types::InvalidSignature)
-    }
-}
-
-#[cfg(not(feature = "fips"))]
-static ML_DSA_87_VERIFY: &dyn pki_types::SignatureVerificationAlgorithm = &MlDsa87Verify;

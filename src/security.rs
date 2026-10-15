@@ -524,6 +524,9 @@ pub struct TlsFingerprint {
     pub ja3_hash: String,
     /// JA4 hash (if available)
     pub ja4_hash: Option<String>,
+    /// JA4_r, the JA4 inputs before hashing: with it a stored JA4 can be
+    /// checked or recomputed, which the hash alone never allows.
+    pub ja4_raw: Option<String>,
     /// The pre-hash JA3 input:
     /// `version,ciphers,extensions,curves,point_formats`.
     ///
@@ -566,6 +569,8 @@ pub struct ObservedFingerprint {
     pub ja3_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ja4_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ja4_raw: Option<String>,
     #[serde(default)]
     pub ja3_string: String,
     pub classification: String,
@@ -631,6 +636,7 @@ impl SecurityState {
                 ObservedFingerprint {
                     ja3_hash: v.ja3_hash.clone(),
                     ja4_hash: v.ja4_hash.clone(),
+                    ja4_raw: v.ja4_raw.clone(),
                     ja3_string: v.ja3_string.clone(),
                     classification: format!("{:?}", v.classification),
                     transport: v.transport,
@@ -728,6 +734,7 @@ impl SecurityState {
                 TlsFingerprint {
                     ja3_hash: r.ja3_hash,
                     ja4_hash: r.ja4_hash,
+                    ja4_raw: r.ja4_raw,
                     ja3_string: r.ja3_string,
                     classification: FingerprintClass::from_label(&r.classification),
                     transport: r.transport,

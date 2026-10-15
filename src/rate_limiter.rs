@@ -22,7 +22,7 @@ use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
 use parking_lot::RwLock;
-use redis::aio::ConnectionManager;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -730,14 +730,17 @@ impl RedisBackend {
     /// Establish a `ConnectionManager` to Redis.
     pub async fn connect(config: &RedisConfig) -> Result<Self, redis::RedisError> {
         let client = redis::Client::open(config.url.as_str())?;
+        // redis 1.x gives async connections deadlines of its own (1 s to
+        // connect, 500 ms per response); the configured ones are what apply.
+        let manager_config = ConnectionManagerConfig::new()
+            .set_connection_timeout(Some(Duration::from_millis(config.connect_timeout_ms)))
+            .set_response_timeout(Some(Duration::from_millis(config.command_timeout_ms)));
         let conn = tokio::time::timeout(
             Duration::from_millis(config.connect_timeout_ms),
-            ConnectionManager::new(client),
+            ConnectionManager::new_with_config(client, manager_config),
         )
         .await
-        .map_err(|_| {
-            redis::RedisError::from((redis::ErrorKind::IoError, "Redis connect timeout"))
-        })??;
+        .map_err(|_| redis::RedisError::from((redis::ErrorKind::Io, "Redis connect timeout")))??;
 
         Ok(Self {
             conn,

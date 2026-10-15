@@ -629,8 +629,8 @@ impl FingerprintExtractor {
         // JA3 in the curated database.
         let ja4_version = supported_versions_max.unwrap_or(ch_version);
 
-        // Also calculate JA4 fingerprint
-        let ja4_hash = self.calculate_ja4(
+        // Also calculate JA4 fingerprint, and its raw form
+        let (ja4, ja4_raw) = ja4_with_raw(
             ja4_version,
             &ciphers,
             &extensions,
@@ -639,11 +639,13 @@ impl FingerprintExtractor {
             sni.is_some(),
             transport,
         );
+        let ja4_hash = Some(ja4);
 
         Some(Ja3Fingerprint {
             ja3_string,
             ja3_hash,
             ja4_hash,
+            ja4_raw: Some(ja4_raw),
             tls_version: ch_version,
             ciphers,
             extensions,
@@ -657,19 +659,9 @@ impl FingerprintExtractor {
         })
     }
 
-    /// Calculate JA4 fingerprint (newer, more detailed format)
-    ///
-    /// JA4 format: t13d1516h2_8daaf6152771_b186095e22b6
-    ///   - t = TLS, q = QUIC
-    ///   - 13 = TLS 1.3
-    ///   - d = domain SNI (i = IP)
-    ///   - 15 = number of ciphers
-    ///   - 16 = number of extensions
-    ///   - h2 = first ALPN
-    ///   - _ = separator
-    ///   - 8daaf6152771 = truncated SHA256 of sorted ciphers
-    ///   - _ = separator
-    ///   - b186095e22b6 = truncated SHA256 of sorted extensions + signature algorithms
+    /// The JA4 alone (see ja4_with_raw for the format), for the tests written
+    /// against the extractor; the extractor takes JA4 and JA4_r together.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn calculate_ja4(
         &self,
@@ -681,73 +673,18 @@ impl FingerprintExtractor {
         has_sni: bool,
         transport: Ja4Transport,
     ) -> Option<String> {
-        // Protocol type. This was hardcoded to "t", which meant a QUIC client
-        // produced a JA4 claiming it arrived over TCP — colliding with the TCP
-        // fingerprint of the same client build and losing the one bit that
-        // distinguishes them.
-        let proto = transport.marker();
-
-        // TLS version
-        let version = match tls_version {
-            0x0304 => "13",
-            0x0303 => "12",
-            0x0302 => "11",
-            0x0301 => "10",
-            _ => "00",
-        };
-
-        // SNI type
-        let sni_type = if has_sni { "d" } else { "i" };
-
-        // Counts
-        let cipher_count = format!("{:02}", ciphers.len().min(99));
-        let ext_count = format!("{:02}", extensions.len().min(99));
-
-        let alpn_str = ja4_alpn(alpn.first().map(Vec::as_slice));
-
-        // Hash of sorted ciphers (truncated to 12 hex chars)
-        let mut sorted_ciphers = ciphers.to_vec();
-        sorted_ciphers.sort_unstable();
-        let cipher_str: String = sorted_ciphers
-            .iter()
-            .map(|c| format!("{:04x}", c))
-            .collect::<Vec<_>>()
-            .join(",");
-        let mut hasher = Sha256::new();
-        hasher.update(cipher_str.as_bytes());
-        let cipher_hash = hex::encode(hasher.finalize());
-        let cipher_hash_trunc = &cipher_hash[..12];
-
-        // Hash of sorted extensions + signature algorithms
-        let mut sorted_exts = extensions.to_vec();
-        sorted_exts.sort_unstable();
-        let ext_str: String = sorted_exts
-            .iter()
-            .map(|e| format!("{:04x}", e))
-            .collect::<Vec<_>>()
-            .join(",");
-        let sig_str: String = sig_algs
-            .iter()
-            .map(|s| format!("{:04x}", s))
-            .collect::<Vec<_>>()
-            .join(",");
-        let combined = format!("{}_{}", ext_str, sig_str);
-        let mut hasher = Sha256::new();
-        hasher.update(combined.as_bytes());
-        let ext_hash = hex::encode(hasher.finalize());
-        let ext_hash_trunc = &ext_hash[..12];
-
-        Some(format!(
-            "{}{}{}{}{}{}_{}_{}",
-            proto,
-            version,
-            sni_type,
-            cipher_count,
-            ext_count,
-            alpn_str,
-            cipher_hash_trunc,
-            ext_hash_trunc
-        ))
+        Some(
+            ja4_with_raw(
+                tls_version,
+                ciphers,
+                extensions,
+                alpn,
+                sig_algs,
+                has_sni,
+                transport,
+            )
+            .0,
+        )
     }
 
     /// Process a ClientHello from a TLS record and update security state.
@@ -895,10 +832,17 @@ impl FingerprintExtractor {
                 // so take the current verdict rather than the one from first
                 // sighting.
                 existing.classification = classification.clone();
+                // The JA4 a JA3 maps to is recomputed on every sighting, so a
+                // row first stored under an earlier computation (before
+                // 2026-10-15 SNI and ALPN were hashed into part c) takes the
+                // current one when its client comes back.
+                existing.ja4_hash = ja4_hash.clone();
+                existing.ja4_raw = fingerprint.ja4_raw.clone();
             })
             .or_insert_with(|| TlsFingerprint {
                 ja3_hash: ja3_hash.clone(),
                 ja4_hash: ja4_hash.clone(),
+                ja4_raw: fingerprint.ja4_raw.clone(),
                 ja3_string: fingerprint.ja3_string.clone(),
                 classification: classification.clone(),
                 transport,
@@ -1054,6 +998,8 @@ pub struct Ja3Fingerprint {
     pub ja3_string: String,
     pub ja3_hash: String,
     pub ja4_hash: Option<String>,
+    /// JA4_r: the JA4 inputs before hashing (FoxIO's raw form).
+    pub ja4_raw: Option<String>,
     pub tls_version: u16,
     pub ciphers: Vec<u16>,
     pub extensions: Vec<u16>,
@@ -1344,6 +1290,102 @@ fn is_grease(value: u16) -> bool {
     let hi = (value >> 8) as u8;
     let lo = (value & 0xff) as u8;
     hi == lo && (hi & 0x0f) == 0x0a
+}
+
+/// JA4 and its raw form (FoxIO JA4 spec), as `(ja4, ja4_r)`.
+///
+/// JA4 is `a_b_c`:
+/// - a: transport, TLS version, SNI (d/i), cipher and extension counts
+///   (GREASE excluded, SNI and ALPN included), first/last ALPN characters;
+/// - b: SHA-256 of the sorted cipher list, first 12 hex characters;
+/// - c: SHA-256 of the sorted extension list, then `_` and the signature
+///   algorithms in the order sent, first 12 hex characters. SNI (0000) and
+///   ALPN (0010) are left out of this list: part a already carries them. With
+///   no signature algorithms there is no `_`.
+///
+/// An empty list hashes to `000000000000`. JA4_r is the same three parts with
+/// the lists written out instead of hashed, which is what lets a stored
+/// fingerprint be checked or recomputed later.
+///
+/// Until 2026-10-15 SNI and ALPN went into part c, and an empty signature
+/// list still added the `_`: every JA4 from a client sending SNI or ALPN
+/// (nearly all) disagreed with every other JA4 implementation.
+fn ja4_with_raw(
+    tls_version: u16,
+    ciphers: &[u16],
+    extensions: &[u16],
+    alpn: &[Vec<u8>],
+    sig_algs: &[u16],
+    has_sni: bool,
+    transport: Ja4Transport,
+) -> (String, String) {
+    // Protocol type. This was hardcoded to "t", which meant a QUIC client
+    // produced a JA4 claiming it arrived over TCP — colliding with the TCP
+    // fingerprint of the same client build and losing the one bit that
+    // distinguishes them.
+    let proto = transport.marker();
+
+    let version = match tls_version {
+        0x0304 => "13",
+        0x0303 => "12",
+        0x0302 => "11",
+        0x0301 => "10",
+        _ => "00",
+    };
+    let sni_type = if has_sni { "d" } else { "i" };
+    let part_a = format!(
+        "{}{}{}{:02}{:02}{}",
+        proto,
+        version,
+        sni_type,
+        ciphers.len().min(99),
+        extensions.len().min(99),
+        ja4_alpn(alpn.first().map(Vec::as_slice))
+    );
+
+    let hex_list = |values: &[u16]| {
+        values
+            .iter()
+            .map(|v| format!("{v:04x}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let truncated_sha256 =
+        |input: &str| hex::encode(Sha256::digest(input.as_bytes()))[..12].to_string();
+
+    let mut sorted_ciphers = ciphers.to_vec();
+    sorted_ciphers.sort_unstable();
+    let cipher_list = hex_list(&sorted_ciphers);
+
+    let mut sorted_exts: Vec<u16> = extensions
+        .iter()
+        .copied()
+        .filter(|&e| e != 0x0000 && e != 0x0010)
+        .collect();
+    sorted_exts.sort_unstable();
+    let ext_list = hex_list(&sorted_exts);
+    let sig_list = hex_list(sig_algs);
+    let ext_input = if sig_algs.is_empty() {
+        ext_list.clone()
+    } else {
+        format!("{ext_list}_{sig_list}")
+    };
+
+    let part_b = if sorted_ciphers.is_empty() {
+        "000000000000".to_string()
+    } else {
+        truncated_sha256(&cipher_list)
+    };
+    let part_c = if sorted_exts.is_empty() {
+        "000000000000".to_string()
+    } else {
+        truncated_sha256(&ext_input)
+    };
+
+    (
+        format!("{part_a}_{part_b}_{part_c}"),
+        format!("{part_a}_{cipher_list}_{ext_input}"),
+    )
 }
 
 /// Parse SNI extension
@@ -1882,6 +1924,103 @@ mod tests {
         assert!(result1.is_some());
         assert!(result2.is_some());
         assert_eq!(result1.unwrap().ja3_hash, result2.unwrap().ja3_hash);
+    }
+
+    /// FoxIO's published example (JA4 README): JA4 and JA4_r for the same
+    /// hello. The 16 extensions counted in part a include SNI and ALPN; the 14
+    /// hashed in part c do not.
+    #[test]
+    fn ja4_matches_the_foxio_example() {
+        let ciphers = [
+            0x002f, 0x0035, 0x009c, 0x009d, 0x1301, 0x1302, 0x1303, 0xc013, 0xc014, 0xc02b, 0xc02c,
+            0xc02f, 0xc030, 0xcca8, 0xcca9,
+        ];
+        let extensions = [
+            0x0000, 0x0005, 0x000a, 0x000b, 0x000d, 0x0010, 0x0012, 0x0015, 0x0017, 0x001b, 0x0023,
+            0x002b, 0x002d, 0x0033, 0x4469, 0xff01,
+        ];
+        let sig_algs = [
+            0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
+        ];
+        let (ja4, ja4_r) = ja4_with_raw(
+            0x0304,
+            &ciphers,
+            &extensions,
+            &[b"h2".to_vec()],
+            &sig_algs,
+            true,
+            Ja4Transport::Tcp,
+        );
+        assert_eq!(ja4, "t13d1516h2_8daaf6152771_e5627efa2ab1");
+        assert_eq!(
+            ja4_r,
+            "t13d1516h2_002f,0035,009c,009d,1301,1302,1303,c013,c014,c02b,c02c,c02f,c030,cca8,cca9_\
+             0005,000a,000b,000d,0012,0015,0017,001b,0023,002b,002d,0033,4469,ff01_\
+             0403,0804,0401,0503,0805,0501,0806,0601"
+        );
+    }
+
+    /// Chrome 142 as this proxy recorded it (extension order from its JA3
+    /// string): the JA4 every other implementation gives for current Chrome.
+    /// The old computation produced ..._db113fc12e09 for the same hello.
+    #[test]
+    fn ja4_matches_chrome_142() {
+        let ciphers = [
+            4865, 4866, 4867, 49195, 49199, 49196, 49200, 52393, 52392, 49171, 49172, 156, 157, 47,
+            53,
+        ];
+        let extensions = [
+            23, 0, 65281, 16, 5, 18, 35, 11, 51, 65037, 27, 13, 17613, 43, 10, 45,
+        ];
+        let sig_algs = [
+            0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
+        ];
+        let (ja4, _) = ja4_with_raw(
+            0x0304,
+            &ciphers,
+            &extensions,
+            &[b"h2".to_vec(), b"http/1.1".to_vec()],
+            &sig_algs,
+            true,
+            Ja4Transport::Tcp,
+        );
+        assert_eq!(ja4, "t13d1516h2_8daaf6152771_d8a2da3f94cd");
+    }
+
+    /// No signature algorithms: part c hashes the extension list alone, with
+    /// no trailing underscore. An empty list is 000000000000.
+    #[test]
+    fn ja4_edge_cases_follow_the_spec() {
+        let (ja4, ja4_r) = ja4_with_raw(
+            0x0303,
+            &[0x002f],
+            &[0x0000, 0x000a, 0x0010],
+            &[],
+            &[],
+            false,
+            Ja4Transport::Tcp,
+        );
+        assert_eq!(ja4_r, "t12i010300_002f_000a");
+        assert_eq!(
+            ja4,
+            format!("t12i010300_{}_{}", sha12("002f"), sha12("000a"))
+        );
+
+        // Only SNI and ALPN, no ciphers: both hashed lists are empty
+        let (ja4, _) = ja4_with_raw(
+            0x0304,
+            &[],
+            &[0x0000, 0x0010],
+            &[b"h2".to_vec()],
+            &[0x0403],
+            true,
+            Ja4Transport::Quic,
+        );
+        assert_eq!(ja4, "q13d0002h2_000000000000_000000000000");
+    }
+
+    fn sha12(input: &str) -> String {
+        hex::encode(Sha256::digest(input.as_bytes()))[..12].to_string()
     }
 
     #[test]

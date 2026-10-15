@@ -214,8 +214,9 @@ pub fn load_certified_key(
 
     // ML-DSA-87 keys (FIPS 204) are not handled by the aws-lc-rs provider's
     // key loader — route them through the dedicated PQC signing key instead.
-    // aws-lc-rs gates `unstable` (PQDSA) out of FIPS builds — mirror that here
-    #[cfg(all(feature = "pqc-signatures", not(feature = "fips")))]
+    // FIPS builds included: aws-lc-rs 1.18 has ML-DSA in its stable
+    // signature module (it was `unstable`, which FIPS builds left out).
+    #[cfg(feature = "pqc-signatures")]
     if let PrivateKeyDer::Pkcs8(ref k) = private_key {
         if mldsa::is_ml_dsa_87_pkcs8(k.secret_pkcs8_der()) {
             if !ml_dsa_signing_enabled() {
@@ -276,11 +277,11 @@ pub fn ml_dsa_signing_enabled() -> bool {
 /// [`rustls::sign::SigningKey`] backed by aws-lc-rs's PQDSA implementation.
 /// A handshake completes only when the client offers `mldsa87` (0x0906) in its
 /// `signature_algorithms` extension (e.g. `openssl s_client -sigalgs mldsa87`).
-#[cfg(all(feature = "pqc-signatures", not(feature = "fips")))]
+#[cfg(feature = "pqc-signatures")]
 mod mldsa {
     use std::sync::Arc;
 
-    use aws_lc_rs::unstable::signature::{PqdsaKeyPair, ML_DSA_87_SIGNING};
+    use aws_lc_rs::signature::{PqdsaKeyPair, ML_DSA_87_SIGNING};
     use rustls::sign::{Signer, SigningKey};
     use rustls::{SignatureAlgorithm, SignatureScheme};
 
@@ -438,15 +439,15 @@ mod mldsa {
 
     #[cfg(test)]
     mod tests {
+        use aws_lc_rs::signature::ML_DSA_87;
         use aws_lc_rs::signature::{KeyPair, UnparsedPublicKey};
-        use aws_lc_rs::unstable::signature::ML_DSA_87;
 
         use super::*;
 
         #[test]
         fn pkcs8_roundtrip_sign_verify() {
             let generated = PqdsaKeyPair::generate(&ML_DSA_87_SIGNING).unwrap();
-            let pkcs8 = generated.to_pkcs8().unwrap();
+            let pkcs8 = generated.to_pkcs8v1().unwrap();
             assert!(is_ml_dsa_87_pkcs8(pkcs8.as_ref()));
 
             let key = MlDsa87SigningKey::load(pkcs8.as_ref()).unwrap();
@@ -465,7 +466,7 @@ mod mldsa {
         #[test]
         fn refuses_without_mldsa_offer() {
             let generated = PqdsaKeyPair::generate(&ML_DSA_87_SIGNING).unwrap();
-            let pkcs8 = generated.to_pkcs8().unwrap();
+            let pkcs8 = generated.to_pkcs8v1().unwrap();
             let key = MlDsa87SigningKey::load(pkcs8.as_ref()).unwrap();
             assert!(key
                 .choose_scheme(&[
@@ -725,15 +726,9 @@ mod chain_size_tests {
     }
 
     /// The deployed fixture, when this box has it: the size a verdict quotes
-    /// is the one on disk.
-    ///
-    /// Not under `fips`: that build has no ML-DSA signing at all (aws-lc-rs
-    /// removes the module), so the fixture's ML-DSA-87 key cannot load there
-    /// by design. CI never saw it -- its runners have no fixture, and the test
-    /// returns early -- but `cargo test --all-features` failed on every node
-    /// that serves the chain.
+    /// is the one on disk. FIPS builds too: aws-lc-rs 1.18 signs ML-DSA-87
+    /// there, so the fixture's key loads under `--all-features` as well.
     #[test]
-    #[cfg(not(feature = "fips"))]
     fn measures_the_fixture_it_loads() {
         let cert = std::path::Path::new("/etc/pqcrypta/pqc-certs/conformance/fullchain.pem");
         let key = std::path::Path::new("/etc/pqcrypta/pqc-certs/conformance/server.key");
