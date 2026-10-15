@@ -325,7 +325,7 @@ fn index(conformance: &Arc<Conformance>) -> Response<Body> {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>HTTP/3 &amp; QUIC Client Conformance Suite</title>
 <meta name="description" content="{desc}">
-<meta name="keywords" content="HTTP/3 conformance, QUIC conformance, h3 client testing, QUIC interop, RFC 9114, RFC 9000, RFC 9204, QPACK, GREASE, protocol conformance suite, quic-go, aioquic, ngtcp2, quiche">
+<meta name="keywords" content="HTTP/3 conformance, QUIC conformance, h3 client testing, QUIC interop, RFC 9114, RFC 9000, RFC 9204, QPACK, GREASE, protocol conformance suite, quic-go, aioquic, ngtcp2, quiche, quico">
 <meta name="author" content="Allan Riddel, PQ Crypta">
 <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
 <link rel="canonical" href="https://{host}/">
