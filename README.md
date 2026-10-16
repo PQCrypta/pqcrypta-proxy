@@ -1684,8 +1684,8 @@ openssl s_client -connect pqc.pqcrypta.com:443 -sigalgs mldsa87 \
 [pqc]
 enabled = true
 provider = "openssl3.5"
-openssl_path = "/usr/local/openssl-pq/bin/openssl"
-openssl_lib_path = "/usr/local/openssl-pq/lib64"
+openssl_path = "/usr/local/openssl-4.0.3/bin/openssl"
+openssl_lib_path = "/usr/local/openssl-4.0.3/lib64"
 preferred_kem = "X25519MLKEM768"
 fallback_to_classical = true   # offer P-384 so non-ML-KEM clients can connect
 require_pqc_provider = true    # refuse to start if our own PQC provider is broken
@@ -1707,6 +1707,18 @@ Until 2026-09-24 the OpenSSL listener logged the group list these settings produ
 Whichever setting removes the classical group, the proxy now logs a warning saying so. It used to warn for `require_hybrid` and stay silent for `fallback_to_classical = false`, so the more obscure route to a client lockout was also the quieter one.
 
 > **Important**: `openssl_path` must point to an OpenSSL 3.5+ binary built with ML-KEM support. The proxy checks this path at startup to decide whether the PQC TCP listener is available. With `require_pqc_provider = true` (the default) a wrong or missing path stops startup; with it false the proxy falls back to a standard rustls listener that accepts TLS 1.2 and does not negotiate X25519MLKEM768. Verify the path before deploying either way.
+
+**OpenSSL 4.0.** The deployment's TCP listener links OpenSSL 4.0.3, with
+liboqs 0.16.0 and oqs-provider 0.12.0 for the FrodoKEM and HQC groups, from its
+own prefix, `/usr/local/openssl-4.0.3`. 4.0 is what adds curveSM2MLKEM768 to
+TCP (QUIC has it through the vendored rustls). 4.0's library soname is
+`libssl.so.4`, so the binary carries the prefix as `DT_RPATH`
+(`RUSTFLAGS="-C link-arg=-Wl,--disable-new-dtags,-rpath,/usr/local/openssl-4.0.3/lib64"`
+with `OPENSSL_DIR` pointing at the prefix) and loads it whatever
+`LD_LIBRARY_PATH` says. That leaves the system's OpenSSL 3, and everything
+else linked against it, as it was. The `openssl` crate has to be 0.10.81 or
+later: 4.0 made many X509 functions take and return const pointers, and older
+releases do not compile against it.
 
 ## ACME Certificate Automation
 
