@@ -706,7 +706,11 @@ async fn run() -> anyhow::Result<()> {
     // question an operator actually has before a deployment: not "does this file
     // parse" but "will this host give me the security boundary I am claiming". It
     // needs no ports and no privileges, so it can be run on a candidate host ahead of
-    // any traffic — and it fails the same way a real start would.
+    // any traffic — and it fails the same way a real start would. The security
+    // checks (key permissions, the OpenSSL provider, PQC support) are part of
+    // that: they ran after this exit, so `--validate` passed a binary that then
+    // refused to start ("OpenSSL 4.0.3 ... Requires 3.5+", on api3).
+    perform_security_checks(&config).await?;
     if args.validate {
         info!("Configuration validation successful, exiting");
         return Ok(());
@@ -760,11 +764,6 @@ async fn run() -> anyhow::Result<()> {
             config.logging.access_log_file
         );
     }
-
-    // =========================================================================
-    // Security Checks (Key Permissions, Provider Verification)
-    // =========================================================================
-    perform_security_checks(&config).await?;
 
     // Publish the ML-DSA certificate-signing switch before anything loads a
     // certificate — the SNI resolver reads it per host as keys come in.
@@ -2313,7 +2312,7 @@ async fn perform_security_checks(config: &ProxyConfig) -> anyhow::Result<()> {
         match verify_pqc_support(&config.pqc) {
             Ok(status) => {
                 info!(
-                    "  ✅ PQC Support: OpenSSL {} with {} KEMs",
+                    "  ✅ PQC Support: {} with {} KEMs",
                     status.openssl_version,
                     status.available_kems.len()
                 );

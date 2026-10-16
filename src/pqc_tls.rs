@@ -198,6 +198,36 @@ pub fn check_experimental_group(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether `openssl version` output names an OpenSSL with native ML-KEM:
+/// 3.5 or later, read as numbers.
+///
+/// This was three copies of `contains("3.5") || contains("3.6") ||
+/// contains("3.7")`, which refused OpenSSL 4.0.3 as "requires 3.5+" (and with
+/// `require_pqc_provider` the proxy would not start on it), would have refused
+/// 3.8 and every later release the same way, and matched a "3.5" anywhere in
+/// the line. When the binary and its library differ ("OpenSSL 3.0.13 ...
+/// (Library: OpenSSL 3.5.5 ...)"), the library is what provides the KEMs, so
+/// its version is the one read. LibreSSL and other forks print their own name
+/// and are not OpenSSL.
+pub fn openssl_has_native_mlkem(version_output: &str) -> bool {
+    let line = version_output.trim();
+    let reported = match line.find("(Library: ") {
+        Some(at) => &line[at + "(Library: ".len()..],
+        None => line,
+    };
+    let Some(rest) = reported.strip_prefix("OpenSSL ") else {
+        return false;
+    };
+    let mut parts = rest
+        .split(|c: char| !c.is_ascii_digit())
+        .take(2)
+        .map(|n| n.parse::<u32>().ok());
+    match (parts.next().flatten(), parts.next().flatten()) {
+        (Some(major), Some(minor)) => (major, minor) >= (3, 5),
+        _ => false,
+    }
+}
+
 /// PQC TLS Provider
 pub struct PqcTlsProvider {
     /// PQC configuration
@@ -464,10 +494,9 @@ impl PqcTlsProvider {
             .trim()
             .to_string();
 
-        // Verify it's 3.5+
-        if !version.contains("3.5") && !version.contains("3.6") && !version.contains("3.7") {
+        if !openssl_has_native_mlkem(&version) {
             return Err(format!(
-                "OpenSSL version {} does not support native ML-KEM (requires 3.5+)",
+                "OpenSSL version {} does not support native ML-KEM (requires 3.5 or later)",
                 version
             ));
         }
@@ -1505,6 +1534,37 @@ pub fn verify_pqc_support(config: &PqcConfig) -> Result<PqcStatus, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Native ML-KEM is OpenSSL 3.5 or later, compared as numbers: 4.0 and
+    /// later lines included, which the old substring test refused.
+    #[test]
+    fn native_mlkem_is_openssl_3_5_or_later() {
+        for has in [
+            "OpenSSL 3.5.5 27 Jan 2026 (Library: OpenSSL 3.5.5 27 Jan 2026)",
+            "OpenSSL 3.5.9 30 Sep 2026",
+            "OpenSSL 3.6.0 1 Oct 2025",
+            "OpenSSL 4.0.3 29 Sep 2026 (Library: OpenSSL 4.0.3 29 Sep 2026)",
+            "OpenSSL 3.8.0-alpha1 1 Jan 2027",
+            "OpenSSL 10.0.0 1 Jan 2040",
+            // An old binary over a 3.5 library: the library provides the KEMs
+            "OpenSSL 3.0.13 30 Jan 2024 (Library: OpenSSL 3.5.5 27 Jan 2026)",
+        ] {
+            assert!(openssl_has_native_mlkem(has), "{has}");
+        }
+        for lacks in [
+            "OpenSSL 3.0.13 30 Jan 2024 (Library: OpenSSL 3.0.13 30 Jan 2024)",
+            "OpenSSL 3.4.1 11 Feb 2025",
+            "OpenSSL 1.1.1w  11 Sep 2023",
+            // A 3.5 binary over a 3.0 library
+            "OpenSSL 3.5.5 27 Jan 2026 (Library: OpenSSL 3.0.13 30 Jan 2024)",
+            // "3.5" elsewhere in the line is not a version
+            "OpenSSL 3.0.15 3 Sep 2024 3.5",
+            "LibreSSL 4.0.0",
+            "",
+        ] {
+            assert!(!openssl_has_native_mlkem(lacks), "{lacks}");
+        }
+    }
 
     /// Post-quantum tuples by NIST level, hybrids first, the classical
     /// fallback last: a client that lists P-384 first still gets ML-KEM.
