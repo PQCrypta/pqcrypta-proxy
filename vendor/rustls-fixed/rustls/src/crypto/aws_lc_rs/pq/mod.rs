@@ -76,6 +76,24 @@ pub static SECP384R1MLKEM1024: &dyn SupportedKxGroup = &hybrid::Hybrid {
     },
 };
 
+/// This is the [curveSM2MLKEM768] key exchange: curveSM2 ECDHE and ML-KEM-768,
+/// the ECDH share first in both shares and in the secret (65 + 1184 bytes from
+/// the client, 65 + 1088 from the server, a 64-byte secret).
+///
+/// [curveSM2MLKEM768]: <https://datatracker.ietf.org/doc/draft-yang-tls-hybrid-sm2-mlkem/>
+#[cfg(feature = "sm2")]
+pub static CURVESM2MLKEM768: &dyn SupportedKxGroup = &hybrid::Hybrid {
+    classical: crate::crypto::aws_lc_rs::sm2::CURVE_SM2,
+    post_quantum: MLKEM768,
+    name: NamedGroup::curveSM2MLKEM768,
+    layout: hybrid::Layout {
+        classical_share_len: crate::crypto::aws_lc_rs::sm2::CURVE_SM2_LEN,
+        post_quantum_client_share_len: MLKEM768_ENCAP_LEN,
+        post_quantum_server_share_len: MLKEM768_CIPHERTEXT_LEN,
+        post_quantum_first: false,
+    },
+};
+
 const INVALID_KEY_SHARE: Error = Error::PeerMisbehaved(PeerMisbehaved::InvalidKeyShare);
 
 const X25519_LEN: usize = 32;

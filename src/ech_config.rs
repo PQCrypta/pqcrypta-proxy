@@ -11,13 +11,55 @@
 //! is picked up on the next hot-reload without a proxy restart.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-use rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES;
+use rustls::crypto::hpke::Hpke;
 use rustls::server::{ServerEchConfig, ServerEchConfigs};
 use tracing::{info, warn};
 
 pub const ECH_CONFIG_DIR: &str = "/etc/pqcrypta/ech-configs";
+
+/// Every HPKE suite a config can be opened with: the post-quantum ones
+/// (X-Wing, ML-KEM-768, ML-KEM-1024) and rustls's RFC 9180 DH ones. A config
+/// whose KEM is in neither is refused at load, as before.
+pub fn suites() -> &'static [&'static dyn Hpke] {
+    static SUITES: LazyLock<Vec<&'static dyn Hpke>> = LazyLock::new(|| {
+        pqcrypta_hpke_pq::ALL_SUPPORTED_SUITES
+            .iter()
+            .chain(rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES)
+            .copied()
+            .collect()
+    });
+    &SUITES
+}
+
+/// The HPKE KEM an encoded `ECHConfig` (version, length, then its
+/// HpkeKeyConfig: config_id, kem_id, ...) is keyed for.
+pub fn kem_id(ech_config: &[u8]) -> Option<u16> {
+    ech_config
+        .get(5..7)
+        .map(|b| u16::from_be_bytes([b[0], b[1]]))
+}
+
+/// Whether a KEM resists a quantum adversary: everything but the RFC 9180
+/// Diffie-Hellman KEMs (P-256, P-384, P-521, X25519, X448).
+pub fn is_post_quantum_kem(kem_id: u16) -> bool {
+    !matches!(kem_id, 0x0010 | 0x0011 | 0x0012 | 0x0020 | 0x0021)
+}
+
+/// The order configs are published and offered in: post-quantum first, then
+/// newest first.
+///
+/// A client uses the first config it implements, so a
+/// post-quantum client gets the config a quantum computer cannot open, and a
+/// browser (X25519 only today) skips it and uses the newest X25519 one. The
+/// list had been oldest first, which handed every client the stalest key.
+pub fn publication_order(
+    kem_id: u16,
+    modified: std::time::SystemTime,
+) -> (bool, std::cmp::Reverse<std::time::SystemTime>) {
+    (!is_post_quantum_kem(kem_id), std::cmp::Reverse(modified))
+}
 
 /// Load every retained `<id>.key`/`<id>.ech` pair from [`ECH_CONFIG_DIR`].
 ///
@@ -34,6 +76,7 @@ fn load_from(dir: &Path) -> Option<Arc<ServerEchConfigs>> {
     let entries = std::fs::read_dir(dir).ok()?;
 
     let mut configs = Vec::new();
+    let mut order = Vec::new();
     for entry in entries.filter_map(Result::ok) {
         let ech_path = entry.path();
         if ech_path.extension().and_then(|s| s.to_str()) != Some("ech") {
@@ -56,8 +99,15 @@ fn load_from(dir: &Path) -> Option<Arc<ServerEchConfigs>> {
             }
         };
 
-        match ServerEchConfig::new(&ech_bytes, key_bytes.into(), ALL_SUPPORTED_SUITES) {
-            Ok(config) => configs.push(config),
+        let modified = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        match ServerEchConfig::new(&ech_bytes, key_bytes.into(), suites()) {
+            Ok(config) => {
+                order.push(publication_order(kem_id(&ech_bytes).unwrap_or(0), modified));
+                configs.push(config);
+            }
             Err(e) => warn!(
                 "ECH: failed to parse config at {}: {}",
                 ech_path.display(),
@@ -69,6 +119,11 @@ fn load_from(dir: &Path) -> Option<Arc<ServerEchConfigs>> {
     if configs.is_empty() {
         return None;
     }
+    // read_dir has no order: the publication order, so retry_configs lists
+    // the post-quantum config first exactly as DNS does
+    let mut ordered: Vec<_> = order.into_iter().zip(configs).collect();
+    ordered.sort_by_key(|(key, _)| *key);
+    let configs: Vec<ServerEchConfig> = ordered.into_iter().map(|(_, c)| c).collect();
 
     let count = configs.len();
     match ServerEchConfigs::new(configs) {
@@ -234,5 +289,240 @@ mod ech_routing_tests {
         std::fs::write(dir.join("65.ech"), [0xfe, 0x0d, 0, 10, 0x65, 0, 0x20]).unwrap();
         assert_eq!(config_ids_from(&dir), vec![0x64]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+/// Encrypted Client Hello end to end, in memory: configs written to a
+/// directory the way `ech-keygen` writes them, loaded by `load_from`, served
+/// by the rustls fork, and offered by a rustls client.
+#[cfg(test)]
+mod pq_ech_tests {
+    use super::{is_post_quantum_kem, kem_id, load_from, suites};
+    use rustls::client::{EchConfig, EchMode, EchStatus};
+    use rustls::crypto::hpke::Hpke;
+    use rustls::internal::msgs::base::PayloadU16;
+    use rustls::internal::msgs::codec::Codec;
+    use rustls::internal::msgs::enums::{HpkeAead, HpkeKdf, HpkeKem};
+    use rustls::internal::msgs::handshake::{
+        EchConfigContents, EchConfigPayload, HpkeKeyConfig, HpkeSymmetricCipherSuite,
+    };
+    use rustls::pki_types::{
+        CertificateDer, DnsName, EchConfigListBytes, PrivateKeyDer, ServerName,
+    };
+    use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    const INNER: &str = "pq.example";
+    const OUTER: &str = "public.example";
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pq-ech-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Write one `<id>.key` / `<id>.ech` pair for `suite`, as ech-keygen does;
+    /// returns the encoded ECHConfig.
+    fn write_config(dir: &std::path::Path, id: u8, suite: &'static dyn Hpke) -> Vec<u8> {
+        let (public_key, private_key) = suite.generate_key_pair().unwrap();
+        let s = suite.suite();
+        let contents = EchConfigContents {
+            key_config: HpkeKeyConfig {
+                config_id: id,
+                kem_id: s.kem,
+                public_key: PayloadU16::new(public_key.0),
+                symmetric_cipher_suites: vec![HpkeSymmetricCipherSuite {
+                    kdf_id: s.sym.kdf_id,
+                    aead_id: s.sym.aead_id,
+                }],
+            },
+            maximum_name_length: 32,
+            public_name: DnsName::try_from(OUTER.to_string()).unwrap(),
+            extensions: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        EchConfigPayload::V18(contents).encode(&mut bytes);
+        std::fs::write(
+            dir.join(format!("{id:02x}.key")),
+            private_key.secret_bytes(),
+        )
+        .unwrap();
+        std::fs::write(dir.join(format!("{id:02x}.ech")), &bytes).unwrap();
+        bytes
+    }
+
+    fn list(configs: &[&[u8]]) -> Vec<u8> {
+        let body: Vec<u8> = configs.concat();
+        let mut out = u16::try_from(body.len()).unwrap().to_be_bytes().to_vec();
+        out.extend(body);
+        out
+    }
+
+    fn certificate() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+        let key = rcgen::generate_simple_self_signed(vec![INNER.into(), OUTER.into()]).unwrap();
+        (
+            key.cert.der().clone(),
+            PrivateKeyDer::Pkcs8(key.signing_key.serialize_der().into()),
+        )
+    }
+
+    fn handshake(client: &mut ClientConnection, server: &mut ServerConnection) {
+        for _ in 0..16 {
+            let mut buf = Vec::new();
+            while client.wants_write() {
+                client.write_tls(&mut buf).unwrap();
+            }
+            let mut rd = &buf[..];
+            while !rd.is_empty() {
+                server.read_tls(&mut rd).unwrap();
+                server.process_new_packets().unwrap();
+            }
+            let mut buf = Vec::new();
+            while server.wants_write() {
+                server.write_tls(&mut buf).unwrap();
+            }
+            let mut rd = &buf[..];
+            while !rd.is_empty() {
+                client.read_tls(&mut rd).unwrap();
+                client.process_new_packets().unwrap();
+            }
+            if !client.is_handshaking() && !server.is_handshaking() {
+                return;
+            }
+        }
+        panic!("handshake did not complete");
+    }
+
+    /// One handshake offering ECH with `published`, using `client_suites`;
+    /// returns the client's ECH status and the name the server answered for.
+    fn connect(
+        dir: &std::path::Path,
+        published: &[u8],
+        client_suites: &[&'static dyn Hpke],
+    ) -> (EchStatus, Option<String>) {
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let (cert, key) = certificate();
+        let mut server_config = ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .unwrap();
+        server_config.ech = load_from(dir);
+        assert!(server_config.ech.is_some());
+        let mut roots = RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let ech =
+            EchConfig::new(EchConfigListBytes::from(published.to_vec()), client_suites).unwrap();
+        let client_config = ClientConfig::builder_with_provider(provider)
+            .with_ech(EchMode::Enable(ech))
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut client = ClientConnection::new(
+            Arc::new(client_config),
+            ServerName::try_from(INNER).unwrap(),
+        )
+        .unwrap();
+        let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
+        handshake(&mut client, &mut server);
+        (
+            client.ech_status(),
+            server.server_name().map(str::to_string),
+        )
+    }
+
+    #[test]
+    fn an_x_wing_config_is_accepted_and_hides_the_real_name() {
+        let dir = scratch("xwing");
+        let x_wing = write_config(&dir, 0x11, &pqcrypta_hpke_pq::X_WING_HKDF_SHA256_AES_256);
+        let (status, name) = connect(
+            &dir,
+            &list(&[&x_wing]),
+            &pqcrypta_hpke_pq::ALL_SUPPORTED_SUITES,
+        );
+        assert_eq!(status, EchStatus::Accepted);
+        // The server answered for the inner name, which only the sealed hello carried
+        assert_eq!(name.as_deref(), Some(INNER));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ml_kem_configs_are_accepted() {
+        let ml_kem: [(u8, &'static dyn Hpke); 2] = [
+            (0x21, &pqcrypta_hpke_pq::ML_KEM_768_HKDF_SHA256_AES_256),
+            (0x22, &pqcrypta_hpke_pq::ML_KEM_1024_HKDF_SHA384_AES_256),
+        ];
+        for (id, suite) in ml_kem {
+            let dir = scratch("mlkem");
+            let config = write_config(&dir, id, suite);
+            let (status, name) = connect(
+                &dir,
+                &list(&[&config]),
+                &pqcrypta_hpke_pq::ALL_SUPPORTED_SUITES,
+            );
+            assert_eq!(
+                status,
+                EchStatus::Accepted,
+                "KEM 0x{:04X}",
+                u16::from(suite.suite().kem)
+            );
+            assert_eq!(name.as_deref(), Some(INNER));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// The published list as ech-keygen orders it, X-Wing first: a client with
+    /// the post-quantum suites uses the X-Wing config, and one with only
+    /// rustls's DH suites (a browser's position today) skips it and still gets
+    /// ECH through the X25519 config.
+    #[test]
+    fn both_kinds_of_client_get_ech_from_one_list() {
+        let dir = scratch("both");
+        // The classical config a browser uses: X25519, or P-256 in a FIPS build,
+        // whose HPKE suites leave X25519 out. Either is a Diffie-Hellman KEM,
+        // which is the case under test.
+        let classical_suite = |kem: HpkeKem| {
+            rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES
+                .iter()
+                .copied()
+                .find(|h| {
+                    h.suite().kem == kem
+                        && h.suite().sym.kdf_id == HpkeKdf::HKDF_SHA256
+                        && h.suite().sym.aead_id == HpkeAead::AES_128_GCM
+                })
+        };
+        let x25519 = classical_suite(HpkeKem::DHKEM_X25519_HKDF_SHA256)
+            .or_else(|| classical_suite(HpkeKem::DHKEM_P256_HKDF_SHA256))
+            .unwrap();
+        let x_wing = write_config(&dir, 0x31, &pqcrypta_hpke_pq::X_WING_HKDF_SHA256_AES_256);
+        let classical = write_config(&dir, 0x32, x25519);
+        let published = list(&[&x_wing, &classical]);
+        assert!(is_post_quantum_kem(kem_id(&x_wing).unwrap()));
+        assert!(!is_post_quantum_kem(kem_id(&classical).unwrap()));
+
+        let (status, name) = connect(&dir, &published, suites());
+        assert_eq!(
+            (status, name.as_deref()),
+            (EchStatus::Accepted, Some(INNER))
+        );
+        let (status, name) = connect(
+            &dir,
+            &published,
+            rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES,
+        );
+        assert_eq!(
+            (status, name.as_deref()),
+            (EchStatus::Accepted, Some(INNER))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

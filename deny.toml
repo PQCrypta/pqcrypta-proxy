@@ -65,10 +65,6 @@ skip = [
     { name = "ipnetwork", reason = "multiple transitive versions from sqlx and network crate sub-trees" },
     # openssl-probe — version split between openssl-related crate trees
     { name = "openssl-probe", reason = "multiple transitive versions from openssl/rustls bridging crates" },
-    # redox_syscall — 0.5 via parking_lot_core, 0.7 via libredox/filetime/notify.
-    # Both are Redox-OS-only target dependencies; cargo-deny 0.20 (as CI runs it)
-    # evaluates every target and reports the pair, 0.19 did not.
-    { name = "redox_syscall", reason = "0.5 via parking_lot_core; 0.7 via libredox/filetime/notify; Redox target only" },
     # syn — wasm-bindgen 0.2.129 (wasm32 only, via chrono/js-sys) moved its macro
     # crate to syn 3; every other proc macro in the graph is still on syn 2.
     { name = "syn", reason = "3.x via wasm-bindgen-macro-support (wasm32 only); 2.x via every other proc macro" },
@@ -85,7 +81,6 @@ skip = [
     # hash crates disagree on these two, and nothing here can force convergence
     # without pinning one half to versions the other half will not accept.
     { name = "cpufeatures", reason = "0.2 pulled by aes/polyval; 0.3 by sha1/sha2/chacha20; RustCrypto migration ongoing" },
-    { name = "crypto-common", reason = "0.1 pulled by aead/cipher/universal-hash; 0.2 by digest 0.11; RustCrypto migration ongoing" },
     # rustls-platform-verifier — hyper-rustls 0.27 pins 0.6, the vendored noq-proto
     # (multipath QUIC fork) pins 0.7. Resolves when hyper-rustls moves to 0.7.
     { name = "rustls-platform-verifier", reason = "0.6 pulled by hyper-rustls 0.27; 0.7 by vendored noq-proto; awaiting hyper-rustls bump" },

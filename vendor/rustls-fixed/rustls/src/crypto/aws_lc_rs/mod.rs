@@ -31,6 +31,8 @@ pub(crate) mod hash;
 pub(crate) mod hmac;
 #[path = "../ring/kx.rs"]
 pub(crate) mod kx;
+#[cfg(feature = "sm2")]
+pub(crate) mod sm2;
 #[path = "../ring/quic.rs"]
 pub(crate) mod quic;
 #[cfg(feature = "std")]
@@ -247,6 +249,10 @@ pub mod kx_group {
     pub use super::pq::{
         MLKEM512, MLKEM768, MLKEM1024, SECP256R1MLKEM768, SECP384R1MLKEM1024, X25519MLKEM768,
     };
+    #[cfg(feature = "sm2")]
+    pub use super::pq::CURVESM2MLKEM768;
+    #[cfg(feature = "sm2")]
+    pub use super::sm2::CURVE_SM2;
 }
 
 /// A list of the default key exchange groups supported by this provider.
@@ -271,6 +277,8 @@ pub static ALL_KX_GROUPS: &[&dyn SupportedKxGroup] = &[
     kx_group::SECP256R1MLKEM768,
     #[cfg(feature = "prefer-post-quantum")]
     kx_group::SECP384R1MLKEM1024,
+    #[cfg(all(feature = "prefer-post-quantum", feature = "sm2"))]
+    kx_group::CURVESM2MLKEM768,
     kx_group::X25519,
     kx_group::SECP256R1,
     kx_group::SECP384R1,
@@ -280,6 +288,8 @@ pub static ALL_KX_GROUPS: &[&dyn SupportedKxGroup] = &[
     kx_group::SECP256R1MLKEM768,
     #[cfg(not(feature = "prefer-post-quantum"))]
     kx_group::SECP384R1MLKEM1024,
+    #[cfg(all(not(feature = "prefer-post-quantum"), feature = "sm2"))]
+    kx_group::CURVESM2MLKEM768,
     kx_group::MLKEM512,
     kx_group::MLKEM768,
     kx_group::MLKEM1024,

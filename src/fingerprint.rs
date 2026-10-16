@@ -1366,7 +1366,7 @@ fn ja4_with_raw(
     let ext_list = hex_list(&sorted_exts);
     let sig_list = hex_list(sig_algs);
     let ext_input = if sig_algs.is_empty() {
-        ext_list.clone()
+        ext_list
     } else {
         format!("{ext_list}_{sig_list}")
     };

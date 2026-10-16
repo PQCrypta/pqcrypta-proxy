@@ -29,6 +29,9 @@ pub enum PqcKemAlgorithm {
     SecP384r1MlKem1024,
     /// X448 + ML-KEM-1024 hybrid
     X448MlKem1024,
+    /// curveSM2 + ML-KEM-768 hybrid (draft-yang-tls-hybrid-sm2-mlkem, 0x11EE).
+    /// OpenSSL has it from 4.0; rustls through the vendored fork's `sm2`.
+    CurveSm2MlKem768,
     /// Pure ML-KEM-512 (NIST Level 1)
     MlKem512,
     /// Pure ML-KEM-768 (NIST Level 3)
@@ -55,6 +58,7 @@ impl PqcKemAlgorithm {
             Self::SecP256r1MlKem768 => "SecP256r1MLKEM768",
             Self::SecP384r1MlKem1024 => "SecP384r1MLKEM1024",
             Self::X448MlKem1024 => "X448MLKEM1024",
+            Self::CurveSm2MlKem768 => "curveSM2MLKEM768",
             // OpenSSL's TLS group names. "ML-KEM-1024" is its algorithm name,
             // which set_groups_list rejects, so a pure ML-KEM preference was
             // silently not offered.
@@ -72,7 +76,10 @@ impl PqcKemAlgorithm {
     pub fn security_level(&self) -> u8 {
         match self {
             Self::MlKem512 => 1,
-            Self::X25519MlKem768 | Self::SecP256r1MlKem768 | Self::MlKem768 => 3,
+            Self::X25519MlKem768
+            | Self::SecP256r1MlKem768
+            | Self::CurveSm2MlKem768
+            | Self::MlKem768 => 3,
             #[cfg(feature = "legacy-pqc")]
             Self::Kyber768 | Self::X25519Kyber768 => 3,
             Self::SecP384r1MlKem1024 | Self::X448MlKem1024 | Self::MlKem1024 => 5,
@@ -85,7 +92,8 @@ impl PqcKemAlgorithm {
             Self::X25519MlKem768
             | Self::SecP256r1MlKem768
             | Self::SecP384r1MlKem1024
-            | Self::X448MlKem1024 => true,
+            | Self::X448MlKem1024
+            | Self::CurveSm2MlKem768 => true,
             #[cfg(feature = "legacy-pqc")]
             Self::X25519Kyber768 => true,
             _ => false,
@@ -99,6 +107,7 @@ impl PqcKemAlgorithm {
             "secp256r1mlkem768" | "p256mlkem768" => Some(Self::SecP256r1MlKem768),
             "secp384r1mlkem1024" | "p384mlkem1024" => Some(Self::SecP384r1MlKem1024),
             "x448mlkem1024" => Some(Self::X448MlKem1024),
+            "curvesm2mlkem768" | "sm2mlkem768" => Some(Self::CurveSm2MlKem768),
             "mlkem512" => Some(Self::MlKem512),
             "mlkem768" => Some(Self::MlKem768),
             "mlkem1024" => Some(Self::MlKem1024),
@@ -132,6 +141,7 @@ impl PqcKemAlgorithm {
             Self::SecP256r1MlKem768,  // NIST curve variant
             Self::SecP384r1MlKem1024, // Higher security
             Self::X448MlKem1024,      // Maximum security
+            Self::CurveSm2MlKem768,   // SM2 deployments (OpenSSL 4.0+, rustls fork)
         ]
     }
 }

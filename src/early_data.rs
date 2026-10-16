@@ -132,7 +132,7 @@ pub struct EarlyRustls<IO> {
     done: HandshakeDone,
     /// The transport has reported end of stream.
     eof: bool,
-    /// How long a close waits for the handshake; see [`ShutdownWait`].
+    /// How long a close waits for the handshake; see `ShutdownWait`.
     shutdown: ShutdownWait,
 }
 
@@ -141,7 +141,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> EarlyRustls<IO> {
     /// or early data accepted with the server's flight on the wire.
     ///
     /// `handshake_timeout` (`tls.handshake_timeout_secs`) also bounds how long
-    /// a close waits for the client's Finished; see [`ShutdownWait`].
+    /// a close waits for the client's Finished; see `ShutdownWait`.
     pub async fn accept(
         config: Arc<rustls::ServerConfig>,
         io: IO,
@@ -409,7 +409,7 @@ mod openssl_driver {
         /// Early data read while accepting, served before any more is read.
         first: Vec<u8>,
         pos: usize,
-        /// How long a close waits for the handshake; see [`ShutdownWait`].
+        /// How long a close waits for the handshake; see `ShutdownWait`.
         shutdown: ShutdownWait,
     }
 
@@ -423,7 +423,7 @@ mod openssl_driver {
         /// the stream is returned with it and the handshake still open.
         ///
         /// `handshake_timeout` also bounds how long a close waits for the
-        /// client's Finished; see [`ShutdownWait`].
+        /// client's Finished; see `ShutdownWait`.
         pub async fn accept(
             ssl: Ssl,
             io: S,

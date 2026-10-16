@@ -1,6 +1,6 @@
 use std::{any::Any, io, str, sync::Arc};
 
-use aes_gcm::{KeyInit, aead::AeadMutInPlace};
+use aes_gcm::{KeyInit, aead::AeadInOut};
 use bytes::BytesMut;
 pub use rustls::Error;
 use rustls::{
@@ -207,11 +207,10 @@ impl crypto::Session for TlsSession {
         };
 
         // This implements https://www.rfc-editor.org/rfc/rfc9001#name-retry-packet-integrity
-        let key = aes_gcm::Key::<aes_gcm::Aes128Gcm>::from_slice(key);
-        let nonce = aes_gcm::Nonce::from_slice(nonce);
-        let tag = aes_gcm::Tag::from_slice(tag);
-        aes_gcm::Aes128Gcm::new(key)
-            .decrypt_in_place_detached(nonce, aad, &mut [], tag)
+        // An empty in-out buffer: the Retry tag authenticates the pseudo-packet
+        // as associated data and encrypts nothing
+        aes_gcm::Aes128Gcm::new(key.into())
+            .decrypt_inout_detached(nonce.into(), aad, (&mut [0u8; 0][..]).into(), tag.into())
             .is_ok()
     }
 
@@ -640,10 +639,8 @@ impl crypto::ServerConfig for QuicServerConfig {
         pseudo_packet.extend_from_slice(&orig_dst_cid);
         pseudo_packet.extend_from_slice(packet);
 
-        let nonce = aes_gcm::Nonce::from_slice(nonce);
-        let key = aes_gcm::Key::<aes_gcm::Aes128Gcm>::from_slice(key);
-        let tag = aes_gcm::Aes128Gcm::new(key)
-            .encrypt_in_place_detached(nonce, &pseudo_packet, &mut [])
+        let tag = aes_gcm::Aes128Gcm::new(key.into())
+            .encrypt_inout_detached(nonce.into(), &pseudo_packet, (&mut [0u8; 0][..]).into())
             .unwrap();
         tag.into()
     }

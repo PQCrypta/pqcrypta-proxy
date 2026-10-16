@@ -25,8 +25,9 @@
 //!
 //! # Engine design
 //!
-//! Every rule lives in one static table ([`RULES`]) carrying a stable identifier
-//! (`PQW-<CATEGORY>-<NNN>`), a category, a severity and the target it applies to.
+//! Every rule lives in one of three static tables, by what it inspects
+//! (`PAYLOAD_RULES`, `PATH_RULES`, `UA_RULES`), each entry carrying a stable
+//! identifier (`PQW-<CATEGORY>-<NNN>`), a category, a severity and its target.
 //! Identifiers are what appear in logs, audit records and metrics — the engine
 //! used to name a rule by the first 40 characters of its own regex source, which
 //! made every log line unstable against pattern edits and leaked the ruleset to

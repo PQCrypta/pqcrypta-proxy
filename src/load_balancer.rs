@@ -228,7 +228,7 @@ pub struct DrainingState {
 }
 
 impl BackendServer {
-    /// This pool member as a [`BackendConfig`], for the backend client.
+    /// This pool member as a [`BackendConfig`](crate::config::BackendConfig), for the backend client.
     ///
     /// One definition for both transports; each built its own, and they
     /// disagreed on nothing only by luck.

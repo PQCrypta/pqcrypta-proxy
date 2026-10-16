@@ -3502,7 +3502,7 @@ impl ConfigManager {
 
     /// Apply an environment-specific TOML overlay on top of the config file,
     /// now and on every later load. The overlay is a partial TOML file whose
-    /// keys win over the base config; see [`overlay_config`].
+    /// keys win over the base config; see `overlay_config`.
     pub fn apply_env_overlay(&self, overlay_path: &Path) -> anyhow::Result<()> {
         let mut overrides = self.overrides.read().clone();
         overrides.env_overlay = Some(overlay_path.to_path_buf());
