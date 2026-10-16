@@ -865,6 +865,35 @@ mod server_policy_tests {
         assert_eq!(group, NamedGroup::secp384r1);
     }
 
+    /// A client that offers only curveSM2MLKEM768 (an SM2 deployment) gets it,
+    /// in the level-3 tuple beside the other 768 hybrids, and one that also
+    /// offers X25519MLKEM768 with its share gets that, as before.
+    #[test]
+    fn an_sm2_client_gets_curve_sm2_mlkem768() {
+        use rustls::crypto::aws_lc_rs::kx_group::{CURVESM2MLKEM768, X25519MLKEM768};
+        let policy = ServerTlsPolicy::from_config(
+            &tls("1.3"),
+            &PqcConfig::default(),
+            true,
+            ClientAuth::None,
+        )
+        .unwrap();
+        let tuples = super::group_tuples(&policy.provider);
+        assert!(
+            tuples
+                .iter()
+                .any(|t| t.contains(&NamedGroup::curveSM2MLKEM768)
+                    && t.contains(&NamedGroup::X25519MLKEM768)),
+            "{tuples:?}"
+        );
+        let (group, _) = negotiate_offering(&policy, TLS13, Some(vec![CURVESM2MLKEM768])).unwrap();
+        assert_eq!(group, NamedGroup::curveSM2MLKEM768);
+        let (group, _) =
+            negotiate_offering(&policy, TLS13, Some(vec![X25519MLKEM768, CURVESM2MLKEM768]))
+                .unwrap();
+        assert_eq!(group, NamedGroup::X25519MLKEM768);
+    }
+
     /// With pure ML-KEM-1024 offered, a CNSA 2.0 client -- ML-KEM-1024 listed
     /// first, its key share for it -- gets ML-KEM-1024, not the hybrid.
     #[test]
@@ -1448,10 +1477,15 @@ pub fn is_post_quantum_group(group: rustls::NamedGroup) -> bool {
 }
 
 /// True for a hybrid: ML-KEM combined with an elliptic-curve exchange, so a
-/// break of either alone is not enough.
+/// break of either alone is not enough. curveSM2MLKEM768 is one: matching
+/// X25519 and SECP alone read it as pure ML-KEM, which is offered only when
+/// named, so the hybrid was silently left out.
 fn is_hybrid_group(group: rustls::NamedGroup) -> bool {
     let name = format!("{group:?}").to_ascii_uppercase();
-    name.contains("MLKEM") && (name.contains("X25519") || name.contains("SECP"))
+    name.contains("MLKEM")
+        && ["X25519", "X448", "SECP", "SM2"]
+            .iter()
+            .any(|curve| name.contains(curve))
 }
 
 /// The server provider for a listener: every group this build implements,

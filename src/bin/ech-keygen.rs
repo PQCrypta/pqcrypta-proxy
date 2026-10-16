@@ -35,6 +35,18 @@ use rustls::internal::msgs::handshake::{
 };
 use rustls::pki_types::DnsName;
 
+use pqcrypta_proxy::ech_config::{kem_id, publication_order};
+
+/// The KEM a new config's key is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Kem {
+    /// X-Wing (ML-KEM-768 + X25519, 0x647A): post-quantum, published first.
+    XWing,
+    /// DHKEM(X25519, HKDF-SHA256) (0x0020): what every ECH client implements
+    /// today, browsers included.
+    X25519,
+}
+
 #[derive(Parser)]
 struct Args {
     /// Directory holding one `<config_id>.key` (private, mode 600) and
@@ -63,24 +75,63 @@ struct Args {
     /// couple of real rotation intervals.
     #[arg(long, default_value_t = 3)]
     retain: usize,
+
+    /// The KEM the new config's key is for. Run once per KEM: the published
+    /// list carries the post-quantum config first and the X25519 one after it,
+    /// and a client uses the first it implements, so browsers keep ECH while a
+    /// post-quantum client seals its inner `ClientHello` to a key a quantum
+    /// computer cannot open. `--retain` counts each KEM's generations
+    /// separately, so rotating one never prunes the other.
+    #[arg(long, value_enum, default_value_t = Kem::XWing)]
+    kem: Kem,
+}
+
+const fn sym(kdf_id: HpkeKdf, aead_id: HpkeAead) -> HpkeSymmetricCipherSuite {
+    HpkeSymmetricCipherSuite { kdf_id, aead_id }
 }
 
 fn main() {
     let args = Args::parse();
 
-    let suite: &'static dyn Hpke = *ALL_SUPPORTED_SUITES
-        .iter()
-        .find(|h| {
-            h.suite()
-                == HpkeSuite {
-                    kem: HpkeKem::DHKEM_X25519_HKDF_SHA256,
-                    sym: HpkeSymmetricCipherSuite {
-                        kdf_id: HpkeKdf::HKDF_SHA256,
-                        aead_id: HpkeAead::AES_128_GCM,
-                    },
-                }
-        })
-        .expect("aws-lc-rs must support the mandatory-to-implement X25519/HKDF-SHA256/AES-128-GCM HPKE suite");
+    // The suite the key is generated with, the KEM the config names, and the
+    // symmetric suites it advertises (the server can open every one of them:
+    // `ech_config::suites` registers them all). The order is the server's
+    // preference hint.
+    let (suite, config_kem, symmetric): (&'static dyn Hpke, HpkeKem, Vec<HpkeSymmetricCipherSuite>) =
+        match args.kem {
+            Kem::XWing => (
+                &pqcrypta_hpke_pq::X_WING_HKDF_SHA256_AES_256,
+                HpkeKem::from(pqcrypta_hpke_pq::X_WING_HKDF_SHA256_AES_256.kem_id()),
+                // AES-256 first: Grover halves a symmetric key, and a
+                // post-quantum config should not stop at 64 bits of it
+                vec![
+                    sym(HpkeKdf::HKDF_SHA256, HpkeAead::AES_256_GCM),
+                    sym(HpkeKdf::HKDF_SHA256, HpkeAead::AES_128_GCM),
+                    sym(HpkeKdf::HKDF_SHA256, HpkeAead::CHACHA20_POLY_1305),
+                ],
+            ),
+            Kem::X25519 => (
+                *ALL_SUPPORTED_SUITES
+                    .iter()
+                    .find(|h| {
+                        h.suite()
+                            == HpkeSuite {
+                                kem: HpkeKem::DHKEM_X25519_HKDF_SHA256,
+                                sym: sym(HpkeKdf::HKDF_SHA256, HpkeAead::AES_128_GCM),
+                            }
+                    })
+                    .expect("aws-lc-rs must support the mandatory-to-implement X25519/HKDF-SHA256/AES-128-GCM HPKE suite"),
+                HpkeKem::DHKEM_X25519_HKDF_SHA256,
+                // Both AEADs the server can decrypt with. AES-128-GCM first: it
+                // is the mandatory-to-implement suite. ChaCha20-Poly1305 for
+                // clients on hardware without AES acceleration, where it is the
+                // faster and more constant-time choice.
+                vec![
+                    sym(HpkeKdf::HKDF_SHA256, HpkeAead::AES_128_GCM),
+                    sym(HpkeKdf::HKDF_SHA256, HpkeAead::CHACHA20_POLY_1305),
+                ],
+            ),
+        };
 
     let (public_key, private_key) = suite
         .generate_key_pair()
@@ -92,26 +143,9 @@ fn main() {
     let contents = EchConfigContents {
         key_config: HpkeKeyConfig {
             config_id,
-            kem_id: HpkeKem::DHKEM_X25519_HKDF_SHA256,
+            kem_id: config_kem,
             public_key: PayloadU16::new(public_key.0),
-            // Advertise both AEADs the server can actually decrypt with.
-            // `ech_config::load` registers ALL_SUPPORTED_SUITES on the accepting
-            // side, so ChaCha20-Poly1305 already works there; offering only
-            // AES-128-GCM here forced it on every client, including those on
-            // hardware without AES acceleration where ChaCha20 is the faster and
-            // more constant-time choice. AES-128-GCM stays first: it is the
-            // mandatory-to-implement suite, and the ordering is the server's
-            // preference hint.
-            symmetric_cipher_suites: vec![
-                HpkeSymmetricCipherSuite {
-                    kdf_id: HpkeKdf::HKDF_SHA256,
-                    aead_id: HpkeAead::AES_128_GCM,
-                },
-                HpkeSymmetricCipherSuite {
-                    kdf_id: HpkeKdf::HKDF_SHA256,
-                    aead_id: HpkeAead::CHACHA20_POLY_1305,
-                },
-            ],
+            symmetric_cipher_suites: symmetric,
         },
         maximum_name_length: args.max_name_length,
         public_name: DnsName::try_from(args.public_name.clone())
@@ -174,32 +208,42 @@ fn pick_unused_config_id(out_dir: &std::path::Path) -> u8 {
     }
 }
 
-/// Delete all but the `retain` most-recently-generated `.key`/`.ech` pairs
-/// (by file mtime), then rebuild `ech-config-list.{bin,b64}` - the real
-/// `ECHConfigList` structure (a 2-byte total length, then each retained
+/// Delete all but the `retain` most recently generated `.key`/`.ech` pairs of
+/// each KEM (by file mtime), then rebuild `ech-config-list.{bin,b64}`: the
+/// real `ECHConfigList` structure (a 2-byte total length, then each retained
 /// entry's already-encoded bytes back to back) to publish as a DNS HTTPS
-/// record's `ech=` `SvcParam`.
+/// record's `ech=` `SvcParam`, in publication order (post-quantum first, then
+/// newest first; see `ech_config::publication_order`).
 fn prune_and_rebuild_list(out_dir: &std::path::Path, retain: usize) {
-    let mut entries: Vec<(std::time::SystemTime, PathBuf)> = fs::read_dir(out_dir)
+    let mut entries: Vec<(std::time::SystemTime, PathBuf, u16)> = fs::read_dir(out_dir)
         .expect("failed to read --out-dir")
         .filter_map(Result::ok)
         .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("ech"))
-        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .filter_map(|e| {
+            let kem = kem_id(&fs::read(e.path()).ok()?)?;
+            Some((e.metadata().ok()?.modified().ok()?, e.path(), kem))
+        })
         .collect();
-    entries.sort_by_key(|(mtime, _)| *mtime);
+    entries.sort_by_key(|(mtime, _, kem)| publication_order(*kem, *mtime));
 
-    while entries.len() > retain {
-        let (_, ech_path) = entries.remove(0);
+    let mut kept_per_kem: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
+    entries.retain(|(_, ech_path, kem)| {
+        let kept = kept_per_kem.entry(*kem).or_default();
+        if *kept < retain {
+            *kept += 1;
+            return true;
+        }
         let key_path = ech_path.with_extension("key");
         println!("pruning expired config: {}", ech_path.display());
-        let _ = fs::remove_file(&ech_path);
+        let _ = fs::remove_file(ech_path);
         let _ = fs::remove_file(&key_path);
-    }
+        false
+    });
 
     let mut list_bytes = Vec::new();
     let entries_bytes: Vec<Vec<u8>> = entries
         .iter()
-        .map(|(_, path)| fs::read(path).expect("failed to read retained ECHConfig entry"))
+        .map(|(_, path, _)| fs::read(path).expect("failed to read retained ECHConfig entry"))
         .collect();
     let total_len: usize = entries_bytes.iter().map(Vec::len).sum();
     let total_len =

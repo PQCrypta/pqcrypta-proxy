@@ -65,8 +65,15 @@ if [[ ! -x "$BIN" ]]; then
     exit 1
 fi
 
-log "Rotating ECH config in $OUT_DIR"
-"$BIN" --out-dir "$OUT_DIR" --public-name pqcrypta.com --max-name-length 32 --retain 3 >>"$LOG_FILE" 2>&1
+# One generation per KEM: X-Wing, which a quantum computer cannot open, and
+# X25519, which is all browsers implement today. ech-keygen keeps --retain of
+# each and writes the list X-Wing first, so a client uses the post-quantum
+# config when it can and the classical one otherwise. The X25519 run comes
+# second so the list written last is the complete one.
+for kem in x-wing x25519; do
+    log "Rotating the $kem ECH config in $OUT_DIR"
+    "$BIN" --out-dir "$OUT_DIR" --public-name pqcrypta.com --max-name-length 32 --retain 3 --kem "$kem" >>"$LOG_FILE" 2>&1
+done
 
 if [[ "$RESTART_PROXY" == "1" ]]; then
     log "Restarting pqcrypta-proxy so the TCP+TLS listeners pick up the rotated config"

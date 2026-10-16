@@ -256,6 +256,8 @@ enum_builder! {
         secp256r1MLKEM768 => 0x11eb,
         X25519MLKEM768 => 0x11ec,
         secp384r1MLKEM1024 => 0x11ed,
+        curveSM2 => 0x0029,
+        curveSM2MLKEM768 => 0x11ee,
     }
 }
 

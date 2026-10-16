@@ -1,0 +1,22 @@
+[package]
+name = "pqcrypta-hpke-pq"
+version = "1.0.0"
+edition = "2021"
+authors = ["PQCrypta <contact@pqcrypta.com>"]
+license = "MIT"
+description = "Post-quantum HPKE (RFC 9180) suites for rustls: X-Wing and ML-KEM, so Encrypted Client Hello can seal the inner ClientHello to a key a quantum computer cannot open. Shared by the proxy (opening) and the discovery agent (sealing)."
+
+# Copied verbatim into the agent's CI mirror and the proxy's vendor/, neither of
+# which has this workspace to inherit from: versions are written out here.
+[dependencies]
+rustls = { version = "0.23.46", default-features = false, features = ["std"] }
+# RustCrypto's HPKE, over the same ml-kem and x-wing crates the rest of this
+# workspace's post-quantum code uses, so the suites add no second ML-KEM to
+# the supply chain. Checked against the HPKE working group's published test
+# vectors (tests/vectors), not against itself.
+hpke = { version = "0.14", default-features = false, features = ["mlkem", "x25519", "aes", "chacha", "hkdfsha2", "alloc", "getrandom"] }
+
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+hex = "0.4"

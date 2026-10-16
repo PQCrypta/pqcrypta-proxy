@@ -82,6 +82,11 @@ fips = [
     "webpki/aws-lc-rs-fips",
 ]
 logging = ["log"]
+sm2 = [
+    "dep:sm2",
+    "dep:elliptic-curve",
+    "aws_lc_rs",
+]
 prefer-post-quantum = ["aws_lc_rs"]
 read_buf = [
     "rustversion",
@@ -115,6 +120,18 @@ required-features = ["ring"]
 
 [dependencies.aws-lc-rs]
 version = "1.18"
+optional = true
+default-features = false
+
+[dependencies.sm2]
+version = "0.14"
+features = ["arithmetic"]
+optional = true
+default-features = false
+
+[dependencies.elliptic-curve]
+version = "0.14"
+features = ["ecdh", "sec1", "arithmetic"]
 optional = true
 default-features = false
 

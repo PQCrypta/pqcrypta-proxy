@@ -97,8 +97,14 @@ bytes = "1.9"
 # carrying an ~1.1 KB ML-KEM key share for X25519MLKEM768. Both algorithms are
 # listed because the client picks: brotli compresses better, zlib is what some
 # clients offer alone.
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "prefer-post-quantum", "brotli", "zlib"] }
+# `sm2`: curveSM2 ECDHE and the curveSM2MLKEM768 hybrid (draft-yang-tls-hybrid-
+# sm2-mlkem), in the fork beside the other ML-KEM hybrids.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "prefer-post-quantum", "brotli", "zlib", "sm2"] }
 rustls-pki-types = { version = "1.9", features = ["alloc"] }
+# Post-quantum HPKE suites (X-Wing, ML-KEM) under rustls's Hpke trait, so an
+# ECH config can seal the inner ClientHello to a key a quantum computer cannot
+# open. Canonical source in pqcrypta-platform (public/ent/hpke-pq).
+pqcrypta-hpke-pq = { path = "vendor/pqcrypta-hpke-pq" }
 rustls-native-certs = "0.8"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 webpki-roots = "1.0"
@@ -291,6 +297,9 @@ debug = true
 # handshake pipeline. See vendor/rustls-fixed/rustls/src/server/ech.rs.
 [patch.crates-io]
 rustls = { path = "vendor/rustls-fixed/rustls" }
+# ml-kem at RustCrypto's sha3 0.12 bump (vendor/ml-kem/VENDORED.md): the
+# released 0.3.2 is on sha3 0.11 while x-wing and hpke are on 0.12.
+ml-kem = { path = "vendor/ml-kem" }
 # h3: forked to fix the QPACK string encoder. Upstream always sets the Huffman
 # bit and never checks whether Huffman actually shrinks the value, copies the
 # input before encoding, grows the output a byte at a time, and copies it out a
