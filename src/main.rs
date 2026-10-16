@@ -902,8 +902,13 @@ async fn run() -> anyhow::Result<()> {
                         info!("TLS configuration updated successfully");
                     }
 
-                    // Update PQC provider with new config
+                    // Update PQC provider with new config: its groups from
+                    // [pqc], its versions, ciphers and client authentication
+                    // from [tls]. The OpenSSL listeners rebuild their contexts
+                    // from it once tcp_config_tx below tells them.
                     reload_pqc_provider.update_config(&new_config.pqc);
+                    reload_pqc_provider
+                        .update_tls_settings(&new_config.tls, new_config.client_auth());
                     info!("PQC configuration updated");
 
                     // Update HTTP/3 Early Hints (103) rules live — preconnect

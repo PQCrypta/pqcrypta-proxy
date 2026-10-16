@@ -1220,6 +1220,91 @@ pub async fn run_http_listener(
     Ok(())
 }
 
+/// The settings a PQC listener's OpenSSL contexts are built from: `[pqc]`
+/// (groups, the OQS groups, the provider), `[tls]` (versions, ciphers, client
+/// authentication, 0-RTT, the certificates) and `server.http11_only_hosts`
+/// (the SNI contexts that offer only HTTP/1.1). A reload that leaves these as
+/// they were has nothing to rebuild.
+#[cfg(feature = "pqc")]
+fn pqc_tls_identity(config: &ProxyConfig) -> String {
+    serde_json::to_string(&(&config.pqc, &config.tls, &config.server.http11_only_hosts))
+        .unwrap_or_default()
+}
+
+/// Rebuild a PQC listener's OpenSSL acceptor, and the per-SNI contexts its
+/// servername callback switches to, whenever a reloaded configuration changes
+/// its TLS settings, and hand each new acceptor to `install`.
+///
+/// `--watch-config` applied a changed `[pqc]` to nothing: the log said
+/// "Configuration hot-reloaded", while the acceptor kept the groups it was
+/// built with at startup, so adding HQC to `experimental_groups` took effect
+/// only after a restart. The reload handler updates the shared provider
+/// (`update_config`, `update_tls_settings`) before it sends the configuration
+/// here, so this rebuilds from it; the ACME handler's SNI rebuilds use the
+/// same provider and so keep the new settings. The build runs off the runtime
+/// (it loads every certificate). A build that fails keeps the previous
+/// acceptor and says so.
+#[cfg(feature = "pqc")]
+fn spawn_pqc_tls_reload(
+    mut updates: watch::Receiver<Arc<ProxyConfig>>,
+    initial: &ProxyConfig,
+    cert_path: &str,
+    key_path: &str,
+    pqc_provider: Arc<PqcTlsProvider>,
+    sni_map: openssl_pqc::PqcSniMap,
+    install: impl Fn(openssl::ssl::SslAcceptor) + Send + 'static,
+) {
+    let mut applied = pqc_tls_identity(initial);
+    let (cert_path, key_path) = (cert_path.to_string(), key_path.to_string());
+    tokio::spawn(async move {
+        while updates.changed().await.is_ok() {
+            let config = updates.borrow_and_update().clone();
+            let identity = pqc_tls_identity(&config);
+            if identity == applied {
+                continue;
+            }
+            let (cert, key) = (cert_path.clone(), key_path.clone());
+            let (provider, map) = (Arc::clone(&pqc_provider), sni_map.clone());
+            let built = tokio::task::spawn_blocking(move || {
+                let certs_dir = config
+                    .tls
+                    .cert_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("/etc/pqcrypta/certs"))
+                    .to_path_buf();
+                openssl_pqc::reload_sni_map(
+                    &map,
+                    &certs_dir,
+                    &provider,
+                    &config.server.http11_only_hosts,
+                );
+                openssl_pqc::create_pqc_acceptor_with_sni(
+                    std::path::Path::new(&cert),
+                    std::path::Path::new(&key),
+                    &provider,
+                    map,
+                )
+            })
+            .await;
+            match built {
+                Ok(Ok(acceptor)) => {
+                    install(acceptor);
+                    applied = identity;
+                    info!(
+                        "🔒 OpenSSL listener rebuilt from the reloaded [pqc] and [tls]: groups {}",
+                        pqc_provider.groups_string()
+                    );
+                }
+                Ok(Err(e)) => warn!(
+                    "TLS settings not reloaded, keeping the previous ones: {}",
+                    e
+                ),
+                Err(e) => warn!("TLS reload did not run: {}", e),
+            }
+        }
+    });
+}
+
 /// Create and run the HTTP listener with PQC-enabled OpenSSL TLS
 /// Uses OpenSSL 3.5+ with ML-KEM hybrid key exchange for quantum-resistant connections
 #[cfg(feature = "pqc")]
@@ -1257,6 +1342,7 @@ pub async fn run_http_listener_pqc(
     // Create HTTP client for plain backend connections (terminate mode)
     // Using configurable connection pool settings
     let fingerprint_extractor = Arc::new(FingerprintExtractor::new());
+    let tls_updates = config_updates.clone();
     let app = reloadable_app(
         &config,
         AppParts {
@@ -1290,7 +1376,7 @@ pub async fn run_http_listener_pqc(
         cert_path_buf,
         key_path_buf,
         &pqc_provider,
-        sni_map,
+        sni_map.clone(),
     )
     .map_err(|e| format!("Failed to create PQC SSL acceptor: {}", e))?;
 
@@ -1341,7 +1427,20 @@ pub async fn run_http_listener_pqc(
         axum_server::bind(addr)
             .acceptor(ConnectionHeadersAcceptor::new(
                 EarlyOpensslAcceptor::new(
-                    ssl_acceptor,
+                    {
+                        let current = Arc::new(arc_swap::ArcSwap::from(ssl_acceptor));
+                        let swap = Arc::clone(&current);
+                        spawn_pqc_tls_reload(
+                            tls_updates,
+                            &config,
+                            cert_path,
+                            key_path,
+                            Arc::clone(&pqc_provider),
+                            sni_map,
+                            move |acceptor| swap.store(Arc::new(acceptor)),
+                        );
+                        current
+                    },
                     TcpAcceptor::new(&config),
                     handshake_timeout,
                     crate::tls_acceptor::ZeroRttReplayGuard::from_config(
@@ -1356,9 +1455,22 @@ pub async fn run_http_listener_pqc(
     } else {
         axum_server::bind(addr)
             .acceptor(ConnectionHeadersAcceptor::new(
-                OpenSSLAcceptor::new(OpenSSLConfig::from_acceptor(ssl_acceptor))
-                    .handshake_timeout(handshake_timeout)
-                    .acceptor(TcpAcceptor::new(&config)),
+                OpenSSLAcceptor::new({
+                    let openssl_config = OpenSSLConfig::from_acceptor(ssl_acceptor);
+                    let reload = openssl_config.clone();
+                    spawn_pqc_tls_reload(
+                        tls_updates,
+                        &config,
+                        cert_path,
+                        key_path,
+                        Arc::clone(&pqc_provider),
+                        sni_map,
+                        move |acceptor| reload.reload_from_acceptor(Arc::new(acceptor)),
+                    );
+                    openssl_config
+                })
+                .handshake_timeout(handshake_timeout)
+                .acceptor(TcpAcceptor::new(&config)),
                 Arc::clone(&metrics),
             ))
             .serve(make_service)
@@ -1841,6 +1953,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     // Create HTTP client for plain backend connections
     let fingerprint_extractor = Arc::new(FingerprintExtractor::new());
     let conn_metrics = metrics.clone();
+    let tls_updates = config_updates.clone();
     let app = reloadable_app(
         &config,
         AppParts {
@@ -1885,13 +1998,28 @@ pub async fn run_http_listener_pqc_with_fingerprint(
         cert_path_buf,
         key_path_buf,
         &pqc_provider,
-        sni_map,
+        sni_map.clone(),
     )
     .map_err(|e| format!("Failed to create PQC SSL acceptor: {}", e))?;
 
     // Get SSL context for creating new SSL instances
     let ssl_context: SslContext = ssl_acceptor.into_context();
-    let ssl_context = Arc::new(ssl_context);
+    // The current context: a reloaded configuration that changes the TLS
+    // settings swaps in a rebuilt one, and each connection takes whichever is
+    // current when it arrives
+    let ssl_context = Arc::new(arc_swap::ArcSwap::from_pointee(ssl_context));
+    {
+        let swap = Arc::clone(&ssl_context);
+        spawn_pqc_tls_reload(
+            tls_updates,
+            &config,
+            cert_path,
+            key_path,
+            Arc::clone(&pqc_provider),
+            sni_map,
+            move |acceptor| swap.store(Arc::new(acceptor.into_context())),
+        );
+    }
 
     // Get PQC status for logging
     let pqc_status = pqc_provider.status();
@@ -1943,7 +2071,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
                 }
 
                 // Clone resources for spawned task
-                let ssl_ctx = ssl_context.clone();
+                let ssl_ctx = ssl_context.load_full();
                 let fp_extractor = fingerprint_extractor.clone();
                 let sec_state = security_state.clone();
                 let fp_config = config.fingerprint.clone();
@@ -3917,6 +4045,121 @@ mod forwarding_tests {
         assert!(
             h.get("x-tls-early-data").is_none(),
             "the internal tag stays inside"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "pqc"))]
+mod pqc_reload_tests {
+    use super::*;
+    use openssl::ssl::{SslAcceptor, SslConnector, SslMethod, SslVerifyMode, SslVersion};
+    use std::os::unix::net::UnixStream;
+
+    /// Whether a TLS 1.2-only client completes a handshake with `acceptor`.
+    fn tls12_client_accepted(acceptor: &SslAcceptor) -> bool {
+        let (server_end, client_end) = UnixStream::pair().expect("socket pair");
+        let server_acceptor = acceptor.clone();
+        let server = std::thread::spawn(move || server_acceptor.accept(server_end).is_ok());
+        let mut connector = SslConnector::builder(SslMethod::tls_client()).expect("connector");
+        connector.set_verify(SslVerifyMode::NONE);
+        connector
+            .set_max_proto_version(Some(SslVersion::TLS1_2))
+            .expect("max version");
+        let client = connector
+            .build()
+            .configure()
+            .expect("client config")
+            .verify_hostname(false)
+            .connect("reload.test", client_end)
+            .is_ok();
+        let server = server.join().expect("server thread");
+        client && server
+    }
+
+    /// A reloaded `[tls]` reaches the OpenSSL listener: allowing TLS 1.2 lets a
+    /// 1.2-only client in that the startup acceptor (TLS 1.3 only) refused,
+    /// with no restart. Before, `--watch-config` logged the reload and the
+    /// acceptor kept its startup settings, `[pqc]` groups included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reloaded_tls_settings_rebuild_the_openssl_acceptor() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cert = rcgen::generate_simple_self_signed(vec!["reload.test".to_string()])
+            .expect("self-signed certificate");
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, cert.cert.pem()).expect("write certificate");
+        std::fs::write(&key_path, cert.signing_key.serialize_pem()).expect("write key");
+
+        let mut config = ProxyConfig::default();
+        // Classical groups only: the test needs no ML-KEM openssl binary
+        config.pqc.enabled = false;
+        config.tls.min_version = "1.3".to_string();
+        config.tls.cert_path = cert_path.clone();
+        config.tls.key_path = key_path.clone();
+
+        let provider = Arc::new(
+            PqcTlsProvider::new(&config.pqc).with_tls_settings(&config.tls, config.client_auth()),
+        );
+        let sni_map =
+            openssl_pqc::build_sni_map(dir.path(), &provider, &config.server.http11_only_hosts);
+        let startup = openssl_pqc::create_pqc_acceptor_with_sni(
+            &cert_path,
+            &key_path,
+            &provider,
+            sni_map.clone(),
+        )
+        .expect("startup acceptor");
+        let current = Arc::new(arc_swap::ArcSwap::from_pointee(startup));
+        assert!(
+            !tls12_client_accepted(&current.load()),
+            "the startup acceptor is TLS 1.3 only"
+        );
+
+        let (tx, rx) = watch::channel(Arc::new(config.clone()));
+        let (installed_tx, mut installed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let swap = Arc::clone(&current);
+        spawn_pqc_tls_reload(
+            rx,
+            &config,
+            cert_path.to_str().expect("utf-8 path"),
+            key_path.to_str().expect("utf-8 path"),
+            Arc::clone(&provider),
+            sni_map,
+            move |acceptor| {
+                swap.store(Arc::new(acceptor));
+                let _ = installed_tx.send(());
+            },
+        );
+
+        // A reload that leaves the TLS settings alone rebuilds nothing
+        let mut unrelated = config.clone();
+        unrelated.server.max_connections += 1;
+        tx.send(Arc::new(unrelated)).expect("send");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), installed_rx.recv())
+                .await
+                .is_err(),
+            "nothing rebuilt for a reload outside [pqc], [tls] and http11_only_hosts"
+        );
+
+        // As main's reload handler does: the shared provider first, then the
+        // configuration to the listeners
+        let mut reloaded = config.clone();
+        reloaded.tls.min_version = "1.2".to_string();
+        provider.update_tls_settings(&reloaded.tls, reloaded.client_auth());
+        tx.send(Arc::new(reloaded)).expect("send");
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), installed_rx.recv())
+            .await
+            .expect("the reload rebuilt the acceptor")
+            .expect("install channel open");
+        assert!(
+            installed_rx.try_recv().is_err(),
+            "one rebuild, for the one reload that changed the TLS settings"
+        );
+        assert!(
+            tls12_client_accepted(&current.load()),
+            "the rebuilt acceptor allows TLS 1.2"
         );
     }
 }
