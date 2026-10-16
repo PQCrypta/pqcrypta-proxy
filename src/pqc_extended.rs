@@ -425,18 +425,20 @@ impl PqcCapabilities {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
 
-            // Check OpenSSL version
-            let version_output = Command::new(&openssl_bin)
-                .arg("version")
-                .env("LD_LIBRARY_PATH", &lib_path)
-                .output();
+            // Check OpenSSL version (SEC-10: a cleared environment, as
+            // pqc_tls runs it, so nothing inherited can preload a library)
+            let mut version_cmd = Command::new(&openssl_bin);
+            version_cmd.env_clear().env("PATH", "/usr/bin:/bin");
+            if !lib_path.is_empty() {
+                version_cmd.env("LD_LIBRARY_PATH", &lib_path);
+            }
+            let version_output = version_cmd.arg("version").output();
 
             match version_output {
                 Ok(output) if output.status.success() => {
                     let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-                    if version.contains("3.5") || version.contains("3.6") || version.contains("3.7")
-                    {
+                    if crate::pqc_tls::openssl_has_native_mlkem(&version) {
                         self.openssl_available = true;
                         self.openssl_version = Some(version.clone());
 
@@ -460,7 +462,7 @@ impl PqcCapabilities {
                         );
                     } else {
                         self.warnings.push(format!(
-                            "OpenSSL {} detected but 3.5+ required for native ML-KEM",
+                            "OpenSSL {} detected but 3.5 or later required for native ML-KEM",
                             version
                         ));
                     }
@@ -648,10 +650,14 @@ pub fn verify_openssl_provider(config: &ExtendedPqcConfig) -> Result<(), String>
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    // Verify version
-    let output = Command::new(&openssl_bin)
+    // Verify version (SEC-10: a cleared environment)
+    let mut version_cmd = Command::new(&openssl_bin);
+    version_cmd.env_clear().env("PATH", "/usr/bin:/bin");
+    if !lib_path.is_empty() {
+        version_cmd.env("LD_LIBRARY_PATH", &lib_path);
+    }
+    let output = version_cmd
         .arg("version")
-        .env("LD_LIBRARY_PATH", &lib_path)
         .output()
         .map_err(|e| format!("Failed to execute OpenSSL: {}", e))?;
 
@@ -664,18 +670,21 @@ pub fn verify_openssl_provider(config: &ExtendedPqcConfig) -> Result<(), String>
 
     let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-    // Verify it's 3.5+
-    if !version.contains("3.5") && !version.contains("3.6") && !version.contains("3.7") {
+    if !crate::pqc_tls::openssl_has_native_mlkem(&version) {
         return Err(format!(
-            "OpenSSL version {} is not supported. Requires 3.5+ for native ML-KEM.",
+            "OpenSSL version {} is not supported. Requires 3.5 or later for native ML-KEM.",
             version
         ));
     }
 
     // Verify provider self-tests
-    let selftest = Command::new(&openssl_bin)
+    let mut selftest_cmd = Command::new(&openssl_bin);
+    selftest_cmd.env_clear().env("PATH", "/usr/bin:/bin");
+    if !lib_path.is_empty() {
+        selftest_cmd.env("LD_LIBRARY_PATH", &lib_path);
+    }
+    let selftest = selftest_cmd
         .args(["list", "-providers"])
-        .env("LD_LIBRARY_PATH", &lib_path)
         .output()
         .map_err(|e| format!("Failed to list providers: {}", e))?;
 
