@@ -207,7 +207,8 @@ pub struct PqcTlsProvider {
     /// Configured groups string for OpenSSL
     groups_string: RwLock<String>,
     /// `[tls]` settings the OpenSSL contexts apply; see [`OpensslTlsSettings`].
-    tls_settings: OpensslTlsSettings,
+    /// Behind a lock so a reloaded `[tls]` reaches the contexts rebuilt from it.
+    tls_settings: RwLock<OpensslTlsSettings>,
 }
 
 /// The `[tls]` settings every OpenSSL context this provider builds applies.
@@ -274,7 +275,7 @@ impl PqcTlsProvider {
                 error: None,
             }),
             groups_string: RwLock::new(String::new()),
-            tls_settings: OpensslTlsSettings::default(),
+            tls_settings: RwLock::new(OpensslTlsSettings::default()),
         };
 
         // Initialize and check availability
@@ -284,14 +285,21 @@ impl PqcTlsProvider {
 
     /// Apply the `[tls]` settings to every context this provider builds.
     #[must_use]
-    pub fn with_tls_settings(mut self, tls: &TlsConfig, client_auth: ClientAuth) -> Self {
-        self.tls_settings = OpensslTlsSettings::from_config(tls, client_auth);
+    pub fn with_tls_settings(self, tls: &TlsConfig, client_auth: ClientAuth) -> Self {
+        self.update_tls_settings(tls, client_auth);
         self
     }
 
+    /// Replace the `[tls]` settings, for contexts built from now on: a reloaded
+    /// configuration, which the OpenSSL listeners then rebuild their contexts
+    /// from.
+    pub fn update_tls_settings(&self, tls: &TlsConfig, client_auth: ClientAuth) {
+        *self.tls_settings.write() = OpensslTlsSettings::from_config(tls, client_auth);
+    }
+
     /// The `[tls]` settings the OpenSSL contexts apply.
-    pub fn tls_settings(&self) -> &OpensslTlsSettings {
-        &self.tls_settings
+    pub fn tls_settings(&self) -> OpensslTlsSettings {
+        self.tls_settings.read().clone()
     }
 
     /// Initialize the PQC provider

@@ -170,7 +170,10 @@ where
 #[cfg(feature = "pqc")]
 #[derive(Clone)]
 pub(super) struct EarlyOpensslAcceptor<A> {
-    acceptor: std::sync::Arc<openssl::ssl::SslAcceptor>,
+    /// The current acceptor: a reloaded configuration swaps a rebuilt one in
+    /// (see `spawn_pqc_tls_reload`), and each connection takes whichever is
+    /// current when it arrives.
+    acceptor: std::sync::Arc<arc_swap::ArcSwap<openssl::ssl::SslAcceptor>>,
     inner: A,
     handshake_timeout: std::time::Duration,
     replay: crate::tls_acceptor::ZeroRttReplayGuard,
@@ -179,7 +182,7 @@ pub(super) struct EarlyOpensslAcceptor<A> {
 #[cfg(feature = "pqc")]
 impl<A> EarlyOpensslAcceptor<A> {
     pub(super) fn new(
-        acceptor: std::sync::Arc<openssl::ssl::SslAcceptor>,
+        acceptor: std::sync::Arc<arc_swap::ArcSwap<openssl::ssl::SslAcceptor>>,
         inner: A,
         handshake_timeout: std::time::Duration,
         replay: crate::tls_acceptor::ZeroRttReplayGuard,
@@ -210,7 +213,7 @@ where
 
     fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
         let inner = self.inner.accept(stream, service);
-        let acceptor = std::sync::Arc::clone(&self.acceptor);
+        let acceptor = self.acceptor.load_full();
         let timeout = self.handshake_timeout;
         let replay = self.replay.clone();
         Box::pin(async move {

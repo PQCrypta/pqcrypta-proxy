@@ -438,7 +438,14 @@ What a reload applies:
 - **Load balancer pools** (`[backend_pools]`) are added, rebuilt or dropped; a
   server whose settings did not change keeps its health, connections and canary
   state through a rebuild.
-- TLS and PQC settings, certificates, and Early Hints.
+- **TLS and PQC settings** (`[tls]`, `[pqc]`, `server.http11_only_hosts`):
+  the OpenSSL (TCP) listener rebuilds its acceptor and every per-SNI context
+  from them and swaps them in, so the next handshake offers the new groups
+  (an added `experimental_groups` entry, a changed `preferred_kem`), versions
+  and client authentication; a handshake already under way finishes on the
+  context it started with, and a rebuild that fails keeps the previous one and
+  logs why. The rustls listeners take them through the TLS provider.
+  Certificates, and Early Hints.
 
 Settings bound when the process starts — listening addresses and ports, QUIC
 transport parameters, the listener kinds (`pqc.enabled`,
