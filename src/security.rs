@@ -272,15 +272,20 @@ pub struct SecurityState {
     pub route_index: Arc<arc_swap::ArcSwap<ProxyConfig>>,
     /// Circuit breaker configuration
     pub circuit_breaker_config: Arc<RwLock<CircuitBreakerConfig>>,
-    /// GeoIP database (optional); reloaded when a reload changes its path.
+    /// GeoIP database (optional); reloaded when a reload changes its path or
+    /// finds either database file changed.
     #[cfg(feature = "geoip")]
     pub geoip_db: Arc<arc_swap::ArcSwapOption<GeoIpDb>>,
     /// Current Tor exit addresses (`security.block_tor_exit_nodes`), swapped
     /// whole on each refresh.
     pub tor_exits: Arc<arc_swap::ArcSwap<std::collections::HashSet<IpAddr>>>,
     /// JA3/JA4 fingerprint database (advisory-only, never blocks); reloaded
-    /// when a reload changes its path.
+    /// when a reload changes its path or finds the file changed.
     pub ja3_db: Arc<arc_swap::ArcSwap<Ja3Database>>,
+    /// The identity of each data file as last loaded (GeoIP City and ASN,
+    /// JA3/JA4), which a reload compares with the files now on disk; see
+    /// [`crate::data_file`].
+    data_stamps: Arc<parking_lot::Mutex<DataStamps>>,
     /// WAF engine (None if WAF disabled). Read it with [`Self::waf`].
     ///
     /// Rebuilt from `[waf]` on every config reload that changes it. It was
@@ -855,6 +860,7 @@ impl SecurityState {
             ja3_db: Arc::new(arc_swap::ArcSwap::from_pointee(load_ja3_db(
                 config.fingerprint.fingerprint_db_path.as_deref(),
             ))),
+            data_stamps: Arc::new(parking_lot::Mutex::new(DataStamps::of(config))),
             waf_engine: Arc::new(arc_swap::ArcSwapOption::new(
                 config
                     .waf
@@ -1018,17 +1024,30 @@ impl SecurityState {
                 )));
         }
 
+        // The data files: reloaded when the path changed, and when the file at
+        // the same path did (the weekly refresh replaces them in place and
+        // sends SIGHUP rather than restarting the proxy).
+        let now = DataStamps::of(config);
+        let mut loaded = self.data_stamps.lock();
         #[cfg(feature = "geoip")]
         if previous.security.geoip_db_path != config.security.geoip_db_path
             || previous.security.geoip_asn_db_path != config.security.geoip_asn_db_path
+            || loaded.geoip_city != now.geoip_city
+            || loaded.geoip_asn != now.geoip_asn
         {
             self.geoip_db.store(load_geoip(&config.security));
+            info!("GeoIP databases reloaded");
         }
-        if previous.fingerprint.fingerprint_db_path != config.fingerprint.fingerprint_db_path {
+        if previous.fingerprint.fingerprint_db_path != config.fingerprint.fingerprint_db_path
+            || loaded.ja3 != now.ja3
+        {
             self.ja3_db.store(Arc::new(load_ja3_db(
                 config.fingerprint.fingerprint_db_path.as_deref(),
             )));
+            info!("JA3/JA4 fingerprint database reloaded");
         }
+        *loaded = now;
+        drop(loaded);
         if previous.security.crawler_published_ranges != config.security.crawler_published_ranges {
             self.crawler_verifier.store(Arc::new(build_crawler_verifier(
                 config.security.crawler_published_ranges,
@@ -3073,6 +3092,25 @@ fn build_crawler_verifier(published_ranges: bool) -> CrawlerVerifier {
     }
 }
 
+/// The identity of each data file the security layer loads, as of one moment.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DataStamps {
+    geoip_city: Option<crate::data_file::FileStamp>,
+    geoip_asn: Option<crate::data_file::FileStamp>,
+    ja3: Option<crate::data_file::FileStamp>,
+}
+
+impl DataStamps {
+    fn of(config: &ProxyConfig) -> Self {
+        let stamp = |p: Option<&std::path::Path>| p.and_then(crate::data_file::file_stamp);
+        Self {
+            geoip_city: stamp(config.security.geoip_db_path.as_deref()),
+            geoip_asn: stamp(config.security.geoip_asn_db_path.as_deref()),
+            ja3: stamp(config.fingerprint.fingerprint_db_path.as_deref()),
+        }
+    }
+}
+
 /// The GeoIP city database at `security.geoip_db_path`, with the ASN database
 /// at `geoip_asn_db_path` when that opens.
 #[cfg(feature = "geoip")]
@@ -3184,6 +3222,55 @@ mod tests {
         );
         assert!(!ip_list_contains(&list, &"203.0.113.6".parse().unwrap()));
         assert!(!ip_list_contains(&list, &"::1".parse().unwrap()));
+    }
+
+    /// A reload whose configuration is unchanged still picks up a JA3/JA4
+    /// database replaced at the same path (the weekly refresh renames a new
+    /// file into place and sends SIGHUP, rather than restarting the proxy),
+    /// and one that finds the file unchanged leaves the loaded database alone.
+    #[tokio::test]
+    async fn a_reload_picks_up_a_replaced_fingerprint_database() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("ja3.json");
+        let entry = |hash: &str| {
+            format!(r#"{{"hash":"{hash}","classification":"api_client","description":"test"}}"#)
+        };
+        std::fs::write(
+            &path,
+            format!("[{}]", entry("61d50e7771aee7f2f4b89a7200b4d45e")),
+        )
+        .expect("write");
+        let mut config = ProxyConfig::default();
+        config.fingerprint.fingerprint_db_path = Some(path.clone());
+        config.security.geoip_db_path = None;
+        config.security.geoip_asn_db_path = None;
+        let security = SecurityState::new(&config);
+        assert_eq!(security.ja3_db.load().len(), 1);
+
+        let before = security.ja3_db.load_full();
+        security.apply_reloaded_config(&config);
+        assert!(
+            Arc::ptr_eq(&before, &security.ja3_db.load_full()),
+            "an unchanged file is not loaded again"
+        );
+
+        let staged = dir.path().join("ja3.json.new");
+        std::fs::write(
+            &staged,
+            format!(
+                "[{},{}]",
+                entry("61d50e7771aee7f2f4b89a7200b4d45e"),
+                entry("49a6cf42956937669a01438f26e7c609")
+            ),
+        )
+        .expect("write");
+        std::fs::rename(&staged, &path).expect("rename");
+        security.apply_reloaded_config(&config);
+        assert_eq!(
+            security.ja3_db.load().len(),
+            2,
+            "the replaced file is loaded"
+        );
     }
 
     /// Regression: `pentest_bypass_ips` must survive the error-rate heuristic.

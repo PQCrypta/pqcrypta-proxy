@@ -371,6 +371,13 @@ them current: run weekly from cron, it calls `geoipupdate` with `/etc/GeoIP.conf
 by rename only when it changed, and pushes it to the other proxy nodes. It is the only scheduler
 for `geoipupdate`; disable the Ubuntu package's own `geoipupdate.timer`.
 
+A changed database reaches the running proxy by a reload (`systemctl reload pqcrypta-proxy`,
+SIGHUP), not a restart: a reload compares each data file (both GeoLite2 databases, the JA3/JA4
+database) with the one it loaded, by inode, size and modification time, and loads what changed,
+and the speed test's readers do the same on their next lookup. The unit needs
+`ExecReload=/bin/kill -HUP $MAINPID` for `systemctl reload`. The script restarted the proxy, on
+every node, every week; each restart refused connections while the old process drained.
+
 ### Trusted Internal CIDRs
 
 Only loopback (`127.0.0.0/8` / `::1`) is trusted by default (SEC-A05). RFC1918 private ranges
