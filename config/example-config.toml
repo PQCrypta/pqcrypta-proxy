@@ -1459,7 +1459,9 @@ priority = 1000
 #
 # Special Modes:
 #   - allow_http11: Allow HTTP/1.1 for search bots (Googlebot doesn't support HTTP/3)
-#   - skip_bot_blocking: Don't apply bot protection to this route
+#   - skip_bot_blocking: Don't apply bot protection to this route (every UA rule, attack tools included)
+#   - allow_credentialed_clients: curl/SDK user agents pass when they carry X-API-Key or a Bearer token
+#   - allow_programmatic_clients: curl/SDK user agents pass without one; scanners stay blocked either way
 #   - stripe_compatibility: Removes COEP/COOP headers that break Stripe.js
 #   - timeout_override_ms: Custom timeout for slow endpoints
 #

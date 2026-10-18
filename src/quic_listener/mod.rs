@@ -403,6 +403,7 @@ fn resolve_route_policy(
             // OR'd in rather than read from one.
             skip_bot_blocking: r.skip_bot_blocking || on_conformance_host,
             credentialed_clients: r.allow_credentialed_clients,
+            programmatic_clients: r.allow_programmatic_clients,
             allowed_ja3: r.security.as_ref().and_then(|s| s.allowed_ja3.clone()),
             waf_enabled: r.security.as_ref().and_then(|s| s.waf_enabled),
             waf_mode: r.security.as_ref().and_then(|s| s.waf_mode.clone()),

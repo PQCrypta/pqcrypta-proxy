@@ -1022,6 +1022,20 @@ scanner_ua_exempt_paths = ['^/robots\.txt$', '^/\.well-known/', '^/downloads/']
 
 A route can declare the same exemption instead: `skip_bot_blocking = true` on a `[[routes]]` entry turns off the scanner/bot User-Agent check for that route only, on both the TCP and HTTP/3 paths. Prefer it over adding hardcoded prefixes.
 
+Two narrower flags admit scripts without admitting scanners. Both lift only the generic-client rules (curl, Wget, python-requests, python-urllib, Go, Java, and a missing or blank User-Agent); attack tools such as sqlmap and nikto, scrapers and headless browsers stay blocked whatever the request carries, where `skip_bot_blocking` lets them through too:
+
+- `allow_credentialed_clients = true` admits those clients when the request carries `X-API-Key` or `Authorization: Bearer`. The backend must refuse an invalid credential even on endpoints that need none, or a made-up key becomes the way past the rules.
+- `allow_programmatic_clients = true` admits them with or without a credential, for public endpoints documented for scripts: a published dataset, a scanner's timeline.
+
+```toml
+[[routes]]
+name = "public-dataset"
+host = "api.example.com"
+path_prefix = "/dataset"
+backend = "api"
+allow_programmatic_clients = true
+```
+
 Route-level WAF override:
 ```toml
 [[routes]]

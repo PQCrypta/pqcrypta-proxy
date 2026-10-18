@@ -761,8 +761,9 @@ const ANOMALY_RULES: &[(&str, Severity, &str)] = &[
 /// The user-agent rules that name generic programmatic HTTP clients rather
 /// than attack tools: a script calling a documented API looks exactly like
 /// this. A route with `allow_credentialed_clients` lets these through when the
-/// request carries a credential; scanners (PQW-BOT-001..038), scrapers and
-/// headless browsers stay blocked whatever the request carries.
+/// request carries a credential, and one with `allow_programmatic_clients`
+/// whether or not it does; scanners (PQW-BOT-001..038), scrapers and headless
+/// browsers stay blocked whatever the request carries.
 const PROGRAMMATIC_CLIENT_UA_RULES: &[&str] = &[
     "PQW-BOT-054", // python-urllib
     "PQW-BOT-055", // python-requests
@@ -1143,10 +1144,11 @@ pub struct WafRequest<'a> {
     pub body: Option<&'a [u8]>,
     /// Skip bot UA pattern check (set true for routes that allow automated clients)
     pub skip_bot_ua_check: bool,
-    /// The route lets credentialed programmatic clients through and this
-    /// request carries a credential: the generic-client user-agent rules
-    /// (`PROGRAMMATIC_CLIENT_UA_RULES`) are skipped, the rest still apply.
-    pub credentialed_client: bool,
+    /// The generic-client user-agent rules (`PROGRAMMATIC_CLIENT_UA_RULES`)
+    /// are skipped and the rest still apply: the route admits programmatic
+    /// clients (`allow_programmatic_clients`), or admits credentialed ones
+    /// (`allow_credentialed_clients`) and this request carries a credential.
+    pub generic_client_allowed: bool,
     /// Per-route override of `waf.mode` ("block" | "detect"). None uses the
     /// global mode. Lets one route be tuned in detect mode while the rest of
     /// the site stays blocking.
@@ -2058,7 +2060,7 @@ impl WafEngine {
 
     /// Whether a credentialed programmatic client passes user-agent rule `idx`.
     fn lets_through(&self, req: &WafRequest<'_>, idx: usize) -> bool {
-        req.credentialed_client && self.programmatic_client[idx]
+        req.generic_client_allowed && self.programmatic_client[idx]
     }
 
     /// Scan request headers.
@@ -2369,7 +2371,7 @@ mod tests {
                 headers: &headers,
                 body: Some(body.as_bytes()),
                 skip_bot_ua_check: false,
-                credentialed_client: false,
+                generic_client_allowed: false,
                 mode_override: None,
             });
             assert!(!matches!(verdict, WafVerdict::Allow), "{payload}: {verdict:?}");
@@ -2411,7 +2413,7 @@ mod tests {
                 headers: &headers,
                 body: Some(body.as_bytes()),
                 skip_bot_ua_check: false,
-                credentialed_client: false,
+                generic_client_allowed: false,
                 mode_override: None,
             });
             assert!(
@@ -2469,7 +2471,7 @@ mod tests {
             headers,
             body: None,
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         }
     }
@@ -2519,7 +2521,7 @@ mod tests {
 
     fn credentialed(headers: &HeaderMap, route_allows: bool) -> WafVerdict {
         engine().inspect(&WafRequest {
-            credentialed_client: route_allows && carries_credential(headers),
+            generic_client_allowed: route_allows && carries_credential(headers),
             ..req("GET", "/info/classical", headers)
         })
     }
@@ -2580,6 +2582,49 @@ mod tests {
                 blocked(&credentialed(&headers, true)),
                 "{ua} must stay blocked"
             );
+        }
+    }
+
+    /// A route admitting programmatic clients (allow_programmatic_clients, the
+    /// scanner APIs' published datasets and timelines) lets curl, the Python
+    /// clients and an SDK sending no User-Agent through without a key, and
+    /// keeps blocking attack tools, scrapers and headless browsers, which
+    /// skip_bot_blocking let through as well.
+    #[test]
+    fn programmatic_routes_admit_scripts_and_not_scanners() {
+        let open = |headers: &HeaderMap| {
+            engine().inspect(&WafRequest {
+                generic_client_allowed: true,
+                ..req("GET", "/pqc-scanner/corpus", headers)
+            })
+        };
+        for ua in [
+            "curl/8.5.0",
+            "python-requests/2.32.3",
+            "Python-urllib/3.12",
+            "Wget/1.24.5",
+            "Go-http-client/2.0",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("user-agent", ua.parse().unwrap());
+            assert!(
+                matches!(open(&headers), WafVerdict::Allow),
+                "{ua} must pass"
+            );
+        }
+        assert!(
+            matches!(open(&HeaderMap::new()), WafVerdict::Allow),
+            "no User-Agent must pass"
+        );
+        for ua in [
+            "sqlmap/1.8#stable",
+            "Mozilla/5.00 (Nikto/2.5.0)",
+            "Scrapy/2.11",
+            "HeadlessChrome/120",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("user-agent", ua.parse().unwrap());
+            assert!(blocked(&open(&headers)), "{ua} must stay blocked");
         }
     }
 
@@ -2657,7 +2702,7 @@ mod tests {
             headers: &headers,
             body: None,
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(
@@ -2763,7 +2808,7 @@ mod tests {
             headers: &headers,
             body: Some(body),
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(
@@ -2789,7 +2834,7 @@ mod tests {
             headers: &headers,
             body: None,
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(blocked(&v), "double-encoded XSS must be blocked");
@@ -2813,7 +2858,7 @@ mod tests {
             headers: &headers,
             body: Some(&body),
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(
@@ -2835,7 +2880,7 @@ mod tests {
             headers: &headers,
             body: Some(&body),
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(blocked(&v), "a non-UTF-8 body must still be inspected");
@@ -2855,7 +2900,7 @@ mod tests {
             headers: &headers,
             body: Some(&body),
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(blocked(&v), "Java serialised object body must be blocked");
@@ -2879,7 +2924,7 @@ mod tests {
             headers: &headers,
             body: Some(body),
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(blocked(&v), "JSON-escaped XSS in a body must be blocked");
@@ -2911,7 +2956,7 @@ mod tests {
             headers: &headers,
             body: None,
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(blocked(&v), "entity-encoded XSS must be blocked");
@@ -2950,7 +2995,7 @@ mod tests {
                 headers: &headers,
                 body: None,
                 skip_bot_ua_check: false,
-                credentialed_client: false,
+                generic_client_allowed: false,
                 mode_override: None,
             });
             assert!(blocked(&v), "SSTI payload {query:?} must be blocked");
@@ -2972,7 +3017,7 @@ mod tests {
                 headers: &headers,
                 body: None,
                 skip_bot_ua_check: false,
-                credentialed_client: false,
+                generic_client_allowed: false,
                 mode_override: None,
             });
             assert!(blocked(&v), "LFI payload {query:?} must be blocked");
@@ -2990,7 +3035,7 @@ mod tests {
             headers: &headers,
             body: Some(body),
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(blocked(&v), "prototype pollution must be blocked");
@@ -3006,7 +3051,7 @@ mod tests {
             headers: &headers,
             body: None,
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(blocked(&v), "CRLF response splitting must be blocked");
@@ -3093,7 +3138,7 @@ mod tests {
             headers: &headers,
             body: None,
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(
@@ -3117,7 +3162,7 @@ mod tests {
             headers: &headers,
             body: None,
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(
@@ -3141,7 +3186,7 @@ mod tests {
             headers: &headers,
             body: None,
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(
@@ -3170,7 +3215,7 @@ mod tests {
             headers: &headers,
             body: None,
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(
@@ -3197,7 +3242,7 @@ mod tests {
             headers: &headers,
             body: None,
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(matches!(v, WafVerdict::Detect { .. }), "expected Detect");
@@ -3213,7 +3258,7 @@ mod tests {
             headers: &headers,
             body: None,
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: Some("detect"),
         });
         assert!(matches!(v, WafVerdict::Detect { .. }));
@@ -3240,7 +3285,7 @@ mod tests {
             headers: &headers,
             body: None,
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(
@@ -3256,7 +3301,7 @@ mod tests {
             headers: &headers,
             body: None,
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(
@@ -3282,7 +3327,7 @@ mod tests {
             headers: &headers,
             body: None,
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(
@@ -3353,7 +3398,7 @@ mod tests {
             headers: &headers,
             body: None,
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(
@@ -3413,7 +3458,7 @@ mod tests {
                 headers: &headers,
                 body: None,
                 skip_bot_ua_check: false,
-                credentialed_client: false,
+                generic_client_allowed: false,
                 mode_override: None,
             });
             assert!(blocked(&v), "command substitution {q:?} must block");
@@ -3437,7 +3482,7 @@ mod tests {
                 headers: &headers,
                 body: None,
                 skip_bot_ua_check: false,
-                credentialed_client: false,
+                generic_client_allowed: false,
                 mode_override: None,
             });
             assert!(blocked(&v), "PHP-family SSTI {q:?} must block");
@@ -3456,7 +3501,7 @@ mod tests {
             headers: &headers,
             body: None,
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(blocked(&v), "fullwidth-encoded XSS must block");
@@ -3473,7 +3518,7 @@ mod tests {
             headers: &headers,
             body: None,
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(blocked(&v), "%u-encoded XSS must block");
@@ -3508,7 +3553,7 @@ mod tests {
             headers: &headers,
             body: Some(&gz),
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(
@@ -3538,7 +3583,7 @@ mod tests {
             headers: &headers,
             body: Some(&z),
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(blocked(&v), "deflate'd SQLi body must be blocked");
@@ -3563,7 +3608,7 @@ mod tests {
             headers: &headers,
             body: Some(&gz),
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(
@@ -3628,7 +3673,7 @@ mod tests {
             headers: &headers,
             body: None,
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(
@@ -3653,7 +3698,7 @@ mod tests {
             headers: &headers,
             body: None,
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(blocked(&v), "a file:// SSRF vector must block");
@@ -3670,7 +3715,7 @@ mod tests {
             headers: &headers,
             body: None,
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(
@@ -3744,7 +3789,7 @@ mod tests {
             headers: &headers,
             body: Some(&body),
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(
@@ -3774,7 +3819,7 @@ mod tests {
             headers: &headers,
             body: Some(&body),
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(blocked(&v), "injection in a text field must still block");
@@ -3797,7 +3842,7 @@ mod tests {
             headers: &headers,
             body: Some(&body),
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(blocked(&v), "a traversal filename must still block");
@@ -3820,7 +3865,7 @@ mod tests {
             headers: &headers,
             body: Some(&body),
             skip_bot_ua_check: false,
-            credentialed_client: false,
+            generic_client_allowed: false,
             mode_override: None,
         });
         assert!(blocked(&v), "a text/* file part must still be scanned");

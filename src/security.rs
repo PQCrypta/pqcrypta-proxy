@@ -268,7 +268,8 @@ pub struct SecurityState {
     /// Swapped on every config reload. It was a snapshot taken at startup, so
     /// a reload rerouted requests while the security layer kept judging them
     /// by the old routes' policy (waf_enabled, waf_mode, skip_bot_blocking,
-    /// allow_credentialed_clients, allowed_ja3, rate-limit overrides).
+    /// allow_credentialed_clients, allow_programmatic_clients, allowed_ja3,
+    /// rate-limit overrides).
     pub route_index: Arc<arc_swap::ArcSwap<ProxyConfig>>,
     /// Circuit breaker configuration
     pub circuit_breaker_config: Arc<RwLock<CircuitBreakerConfig>>,
@@ -473,6 +474,15 @@ pub fn is_conformance_host(config: &ProxyConfig, host: Option<&str>) -> bool {
         })
 }
 
+/// Whether a request is let past the generic-client user-agent rules (curl,
+/// Wget, python-requests and kin; never a scanner's): its route admits
+/// programmatic clients outright, or admits credentialed ones and the request
+/// carries a credential.
+fn generic_client_allowed(policy: &RequestPolicy, headers: &axum::http::HeaderMap) -> bool {
+    policy.programmatic_clients
+        || (policy.credentialed_clients && crate::waf::carries_credential(headers))
+}
+
 /// Per-route security settings resolved for a single request.
 ///
 /// Flattened out of `RouteConfig` and `RouteSecurityPolicy` so the middleware
@@ -484,6 +494,9 @@ pub struct RequestPolicy {
     /// Route lets credentialed programmatic clients past the generic-client
     /// user-agent rules (`RouteConfig::allow_credentialed_clients`)
     pub credentialed_clients: bool,
+    /// Route lets programmatic clients past those rules with or without a
+    /// credential (`RouteConfig::allow_programmatic_clients`)
+    pub programmatic_clients: bool,
     /// Only these JA3 hashes may reach this route
     pub allowed_ja3: Option<Vec<String>>,
     /// Per-route WAF on/off, overriding waf.enabled
@@ -1505,8 +1518,7 @@ impl SecurityState {
                 headers: view.headers,
                 body: view.body,
                 skip_bot_ua_check: skip_bot_ua,
-                credentialed_client: policy.credentialed_clients
-                    && crate::waf::carries_credential(view.headers),
+                generic_client_allowed: generic_client_allowed(policy, view.headers),
                 mode_override: policy.waf_mode.as_deref(),
             };
             match waf.inspect(&waf_req) {
@@ -2221,6 +2233,7 @@ pub async fn security_middleware(
             .map(|r| RequestPolicy {
                 skip_bot_blocking: r.skip_bot_blocking,
                 credentialed_clients: r.allow_credentialed_clients,
+                programmatic_clients: r.allow_programmatic_clients,
                 allowed_ja3: r.security.as_ref().and_then(|s| s.allowed_ja3.clone()),
                 waf_enabled: r.security.as_ref().and_then(|s| s.waf_enabled),
                 waf_mode: r.security.as_ref().and_then(|s| s.waf_mode.clone()),
@@ -2246,6 +2259,7 @@ pub async fn security_middleware(
     let waf_mode_body = route_policy.waf_mode.clone();
     let route_skip_bot = route_policy.skip_bot_blocking;
     let route_credentialed = route_policy.credentialed_clients;
+    let route_programmatic = route_policy.programmatic_clients;
 
     // Fast path: skip all security checks for trusted IPs (loopback, or CIDRs listed in
     // security.trusted_internal_cidrs). RFC1918 ranges are no longer implicitly trusted
@@ -2484,6 +2498,7 @@ pub async fn security_middleware(
                     let body_policy = RequestPolicy {
                         skip_bot_blocking: skip_bot_ua_cl,
                         credentialed_clients: route_credentialed,
+                        programmatic_clients: route_programmatic,
                         waf_mode: waf_mode_cl.clone(),
                         waf_enabled: waf_enabled_cl,
                         ..Default::default()
@@ -2581,6 +2596,7 @@ pub async fn security_middleware(
                 let body_policy_chunked = RequestPolicy {
                     skip_bot_blocking: skip_bot_ua_body,
                     credentialed_clients: route_credentialed,
+                    programmatic_clients: route_programmatic,
                     waf_mode: waf_mode_body.clone(),
                     waf_enabled: waf_enabled_cl,
                     ..Default::default()
@@ -3186,6 +3202,29 @@ fn parse_address_list(body: &str) -> std::collections::HashSet<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A route documented for scripts admits curl without a key; one that
+    /// admits only credentialed clients still wants the key; a plain route
+    /// admits neither.
+    #[test]
+    fn programmatic_routes_admit_generic_clients_without_a_credential() {
+        let none = axum::http::HeaderMap::new();
+        let mut keyed = axum::http::HeaderMap::new();
+        keyed.insert("x-api-key", "k".parse().unwrap());
+        let programmatic = RequestPolicy {
+            programmatic_clients: true,
+            ..RequestPolicy::default()
+        };
+        let credentialed = RequestPolicy {
+            credentialed_clients: true,
+            ..RequestPolicy::default()
+        };
+        assert!(generic_client_allowed(&programmatic, &none));
+        assert!(generic_client_allowed(&programmatic, &keyed));
+        assert!(!generic_client_allowed(&credentialed, &none));
+        assert!(generic_client_allowed(&credentialed, &keyed));
+        assert!(!generic_client_allowed(&RequestPolicy::default(), &keyed));
+    }
 
     /// Regression: the bypass list must match ADDRESSES, not their spelling.
     ///

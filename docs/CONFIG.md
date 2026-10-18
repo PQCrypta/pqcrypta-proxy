@@ -794,7 +794,9 @@ Route configuration for request matching and forwarding.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `allow_http11` | bool | `false` | Allow HTTP/1.1 for this route (for search bots) |
-| `skip_bot_blocking` | bool | `false` | Skip bot protection for this route |
+| `skip_bot_blocking` | bool | `false` | Skip bot protection for this route: every User-Agent rule, attack tools included |
+| `allow_credentialed_clients` | bool | `false` | Let curl, Wget, python-requests, python-urllib, Go, Java and empty User-Agents through when the request carries `X-API-Key` or `Authorization: Bearer`; scanners, scrapers and headless browsers stay blocked |
+| `allow_programmatic_clients` | bool | `false` | The same clients with or without a credential, for public endpoints documented for scripts; scanners, scrapers and headless browsers stay blocked |
 | `stripe_compatibility` | bool | `false` | Remove COEP/COOP headers (for Stripe.js) |
 | `timeout_override_ms` | u64? | `null` | Custom timeout for this route |
 
