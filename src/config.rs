@@ -248,6 +248,16 @@ pub struct WafConfig {
     /// used to be compiled in, and named one site's pages.
     #[serde(default = "default_scanner_ua_exempt_paths")]
     pub scanner_ua_exempt_paths: Vec<String>,
+    /// Paths where programmatic HTTP clients (curl, Wget, python-requests,
+    /// python-urllib, Go, Java, no User-Agent) pass the user-agent rules and
+    /// scanners, scrapers and headless browsers do not: the path form of a
+    /// route's `allow_programmatic_clients`, for downloads and APIs a page
+    /// tells people to fetch with a script. `scanner_ua_exempt_paths` lifts
+    /// every user-agent rule, which files read by every kind of crawler
+    /// (robots.txt, /.well-known/) need and a download does not. Regular
+    /// expressions over the lowercased path, like that list.
+    #[serde(default)]
+    pub programmatic_client_paths: Vec<String>,
     /// OWASP A03: OS command injection detection
     #[serde(default = "default_true")]
     pub cmd_injection: bool,
@@ -373,6 +383,7 @@ impl Default for WafConfig {
             scanner_probe: true,
             block_scanner_uas: true,
             scanner_ua_exempt_paths: default_scanner_ua_exempt_paths(),
+            programmatic_client_paths: Vec::new(),
             cmd_injection: true,
             xxe: true,
             deserialization: true,
@@ -3918,6 +3929,9 @@ impl ProxyConfig {
 
         if let Err(e) = regex::RegexSet::new(&self.waf.scanner_ua_exempt_paths) {
             return Err(anyhow::anyhow!("waf.scanner_ua_exempt_paths: {e}"));
+        }
+        if let Err(e) = regex::RegexSet::new(&self.waf.programmatic_client_paths) {
+            return Err(anyhow::anyhow!("waf.programmatic_client_paths: {e}"));
         }
 
         // `headers_override` takes literal header names, while `[headers]` spells

@@ -302,6 +302,10 @@ pub struct SecurityState {
     /// whose purpose is programmatic access. Invisible from the server itself:
     /// loopback and the bypass IPs pass, so verify from a node with no bypass.
     pub scanner_ua_exempt: Arc<arc_swap::ArcSwap<regex::RegexSet>>,
+    /// `waf.programmatic_client_paths`, compiled at startup and on every
+    /// reload: paths where the generic-client user-agent rules are lifted and
+    /// the scanner, scraper and headless-browser rules are not.
+    pub programmatic_client_paths: Arc<arc_swap::ArcSwap<regex::RegexSet>>,
     /// Structured audit logger, when one is configured.
     ///
     /// `AuditLogger` has carried `log_waf_block`/`log_waf_detect` — and the
@@ -880,8 +884,13 @@ impl SecurityState {
                     .enabled
                     .then(|| Arc::new(WafEngine::new(&config.waf))),
             )),
-            scanner_ua_exempt: Arc::new(arc_swap::ArcSwap::from_pointee(compile_scanner_exempt(
+            scanner_ua_exempt: Arc::new(arc_swap::ArcSwap::from_pointee(compile_path_set(
+                "waf.scanner_ua_exempt_paths",
                 &config.waf.scanner_ua_exempt_paths,
+            ))),
+            programmatic_client_paths: Arc::new(arc_swap::ArcSwap::from_pointee(compile_path_set(
+                "waf.programmatic_client_paths",
+                &config.waf.programmatic_client_paths,
             ))),
             audit_logger: None,
             blocked_cidrs: Arc::new(RwLock::new(Vec::new())),
@@ -1031,9 +1040,16 @@ impl SecurityState {
             self.waf_engine.store(rebuilt);
         }
         if previous.waf.scanner_ua_exempt_paths != config.waf.scanner_ua_exempt_paths {
-            self.scanner_ua_exempt
-                .store(Arc::new(compile_scanner_exempt(
-                    &config.waf.scanner_ua_exempt_paths,
+            self.scanner_ua_exempt.store(Arc::new(compile_path_set(
+                "waf.scanner_ua_exempt_paths",
+                &config.waf.scanner_ua_exempt_paths,
+            )));
+        }
+        if previous.waf.programmatic_client_paths != config.waf.programmatic_client_paths {
+            self.programmatic_client_paths
+                .store(Arc::new(compile_path_set(
+                    "waf.programmatic_client_paths",
+                    &config.waf.programmatic_client_paths,
                 )));
         }
 
@@ -1518,7 +1534,8 @@ impl SecurityState {
                 headers: view.headers,
                 body: view.body,
                 skip_bot_ua_check: skip_bot_ua,
-                generic_client_allowed: generic_client_allowed(policy, view.headers),
+                generic_client_allowed: generic_client_allowed(policy, view.headers)
+                    || self.programmatic_client_paths.load().is_match(view.path),
                 mode_override: policy.waf_mode.as_deref(),
             };
             match waf.inspect(&waf_req) {
@@ -3086,12 +3103,12 @@ fn refusal_alt_svc(config: &ProxyConfig) -> String {
     )
 }
 
-/// `waf.scanner_ua_exempt_paths`, compiled.
-fn compile_scanner_exempt(paths: &[String]) -> regex::RegexSet {
+/// A `[waf]` path list (`key`), compiled.
+fn compile_path_set(key: &str, paths: &[String]) -> regex::RegexSet {
     regex::RegexSet::new(paths).unwrap_or_else(|e| {
         // validate() refuses this at load; reaching here means a config that
         // skipped it, so fail towards no exemption.
-        error!("waf.scanner_ua_exempt_paths is invalid, exempting nothing: {e}");
+        error!("{key} is invalid, exempting nothing: {e}");
         regex::RegexSet::empty()
     })
 }
@@ -4266,6 +4283,64 @@ mod hot_reload_tests {
             security.is_blocked(&operator).is_some(),
             "an operator's block is not the config's to lift"
         );
+    }
+
+    /// A path in `waf.programmatic_client_paths` lets curl through and keeps
+    /// sqlmap out, where `scanner_ua_exempt_paths` let both through
+    /// (pqc.pqcrypta.com/pqc/root-ca.crt answered sqlmap with 200). Other paths
+    /// keep blocking curl.
+    #[tokio::test]
+    async fn programmatic_client_paths_admit_scripts_and_not_scanners() {
+        let ip: IpAddr = "203.0.113.44".parse().unwrap();
+        let mut config = ProxyConfig::default();
+        config.waf.enabled = true;
+        config.waf.block_scanner_uas = true;
+        config.rate_limiting.enabled = false;
+        config.security.auto_block_threshold = u32::MAX;
+        config.waf.programmatic_client_paths = vec![r"^/pqc/.*\.(pem|crt)$".to_string()];
+        let security = SecurityState::new(&config);
+        let policy = RequestPolicy::default();
+        let decide = |ua: &str, path: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("user-agent", ua.parse().unwrap());
+            let view = SecurityRequestView {
+                ip,
+                peer_port: None,
+                method: "GET",
+                path,
+                query: "",
+                headers: &headers,
+                body: None,
+            };
+            matches!(security.evaluate(&view, &policy), SecurityDecision::Allow)
+        };
+        assert!(decide("curl/8.5.0", "/pqc/root-ca.crt"));
+        assert!(decide("Wget/1.24.5", "/pqc/ca-chain.pem"));
+        assert!(
+            !decide("sqlmap/1.8#stable", "/pqc/root-ca.crt"),
+            "a scanner stays blocked"
+        );
+        assert!(!decide("HeadlessChrome/120", "/pqc/root-ca.crt"));
+        assert!(
+            !decide("curl/8.5.0", "/pqc/index.php"),
+            "only the listed paths"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reload_recompiles_the_programmatic_client_paths() {
+        let mut config = ProxyConfig::default();
+        let security = SecurityState::new(&config);
+        assert!(!security
+            .programmatic_client_paths
+            .load()
+            .is_match("/downloads/agent.tar.gz"));
+        config.waf.programmatic_client_paths = vec!["^/downloads/".into()];
+        security.apply_reloaded_config(&config);
+        assert!(security
+            .programmatic_client_paths
+            .load()
+            .is_match("/downloads/agent.tar.gz"));
     }
 
     #[tokio::test]
