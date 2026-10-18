@@ -1899,6 +1899,14 @@ pub struct RouteConfig {
     /// even on endpoints that need none, or this is a way around the rules.
     #[serde(default)]
     pub allow_credentialed_clients: bool,
+    /// Let the same programmatic HTTP clients through the user-agent rules
+    /// with or without a credential: for an API whose public endpoints are
+    /// documented for scripts, such as a published dataset or a scanner's
+    /// timeline. Scanner, scraper and headless-browser user agents stay
+    /// blocked, which is the difference from `skip_bot_blocking`: that lifts
+    /// every user-agent rule, sqlmap and nikto included.
+    #[serde(default)]
+    pub allow_programmatic_clients: bool,
     /// Stripe.js compatibility (removes COEP/COOP headers)
     #[serde(default)]
     pub stripe_compatibility: bool,

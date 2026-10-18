@@ -2095,7 +2095,7 @@ async fn waf_explain_handler(
         body: body.as_deref(),
         skip_bot_ua_check: false,
         // No route here to say whether it lets credentialed clients through
-        credentialed_client: false,
+        generic_client_allowed: false,
         mode_override: None,
     });
     Ok(Json(serde_json::json!({
