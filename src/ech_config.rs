@@ -8,7 +8,9 @@
 //!
 //! [`load`] is called from every place a `rustls::ServerConfig` gets built,
 //! the same way certificate loading already is, so a fresh `ech-keygen` run
-//! is picked up on the next hot-reload without a proxy restart.
+//! is picked up on the next hot-reload without a proxy restart: the QUIC
+//! listener's config is rebuilt in `TlsProvider::reload_certificates`, and
+//! every TCP listener rebuilds its own when [`reloads`] moves.
 
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
@@ -18,6 +20,25 @@ use rustls::server::{ServerEchConfig, ServerEchConfigs};
 use tracing::{info, warn};
 
 pub const ECH_CONFIG_DIR: &str = "/etc/pqcrypta/ech-configs";
+
+/// Counts the proxy's TLS reloads (`TlsProvider::reload_certificates`, run
+/// when the certificates directory or [`ECH_CONFIG_DIR`] changes, on an ACME
+/// renewal, or from the admin API). Each TCP listener holds a rustls config
+/// of its own with the ECH configs built in and rebuilds it when this moves:
+/// without that, a rotated ECH key that DNS already publishes was accepted
+/// over QUIC only, and every TCP client's ECH failed until a restart.
+static TLS_RELOADS: LazyLock<tokio::sync::watch::Sender<u64>> =
+    LazyLock::new(|| tokio::sync::watch::channel(0).0);
+
+/// A receiver that changes once per TLS reload.
+pub fn reloads() -> tokio::sync::watch::Receiver<u64> {
+    TLS_RELOADS.subscribe()
+}
+
+/// Tell the TCP listeners the TLS material has reloaded.
+pub(crate) fn note_reload() {
+    TLS_RELOADS.send_modify(|n| *n = n.wrapping_add(1));
+}
 
 /// Every HPKE suite a config can be opened with: the post-quantum ones
 /// (X-Wing, ML-KEM-768, ML-KEM-1024) and rustls's RFC 9180 DH ones. A config
