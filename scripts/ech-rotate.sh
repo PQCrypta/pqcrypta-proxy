@@ -1,69 +1,50 @@
 #!/usr/bin/env bash
-# ech-rotate.sh — Rotate the server-side Encrypted Client Hello (ECH) keypair
+# ech-rotate.sh — Rotate the server-side Encrypted Client Hello (ECH) keypairs
+# and publish the new ECHConfigList in DNS.
 #
-# Runs `ech-keygen` (built from this same crate, `src/bin/ech-keygen.rs`) to
-# generate a fresh HPKE keypair + ECHConfig, prune expired ones, and
-# reassemble the ECHConfigList to publish via DNS.
-#
-# The QUIC/HTTP3 listener picks up the new config automatically, with zero
-# downtime, via the proxy's existing certificate-reload poller (which now
-# also watches the ECH configs directory — see `TlsProvider::needs_reload`
-# in src/tls.rs). The plain TCP+TLS (HTTP/1.1, HTTP/2) listeners built in
-# src/http_listener.rs currently only pick up a new ECH config when they are
-# next (re)built — in practice, on proxy restart. Pass --restart-proxy to
-# have this script trigger that restart itself; left off by default so a
-# routine rotation never causes a connection-dropping restart on its own.
+# 1. `ech-keygen` (built from this crate, `src/bin/ech-keygen.rs`) generates a
+#    fresh HPKE keypair and ECHConfig per KEM, keeps the previous ones (so a
+#    client holding a cached DNS record still completes), prunes older ones
+#    and writes the list to publish, X-Wing first.
+# 2. The proxy reloads its TLS material: QUIC and every TCP listener rebuild
+#    their rustls configs with the new configs (`ech_config::reloads`), no
+#    restart, no dropped connection. Asked for through the admin API when it
+#    is enabled; otherwise the certificate-reload poller notices the changed
+#    ECH directory within `tls.cert_reload_interval_secs`, and this waits that
+#    long.
+# 3. Only then is the list published: `pqcrypta-ech-publish` (pqcrypta-configs
+#    dns/tools/ech-publish) writes the HTTPS records for every name that
+#    carries this server's key, has the DNS signer sign them, and waits until
+#    ns1, ns2 and ns3 all serve them. Publishing before the proxy holds the key
+#    would send clients to a config it cannot open.
 #
 # Setup:
 #   1. cp ech-rotate.sh /usr/local/bin/pqcrypta-ech-rotate
 #   2. chmod +x /usr/local/bin/pqcrypta-ech-rotate
 #   3. cp ech-rotate.service ech-rotate.timer /etc/systemd/system/
-#   4. systemctl enable --now pqcrypta-ech-rotate.timer
+#   4. systemctl enable --now ech-rotate.timer
 #
-# Does NOT publish the resulting ECHConfigList to DNS itself, and on GoDaddy
-# it cannot: their DNS API has no HTTPS/SVCB record type at all. Verified
-# 2026-07-29 against api.godaddy.com/v1/domains/pqcrypta.com/records/:
-#
-#   HTTPS | SVCB | TYPE65  ->  422 INVALID_VALUE_ENUM
-#     "type not any of: A, AAAA, CAA, CNAME, MX, NS, SOA, SRV, TXT"
-#   A (control)            ->  200
-#
-# So the `ech=` SvcParam can only be edited by hand in GoDaddy's web UI —
-# which is also what corrupts commas in multi-value SvcParams (the reason
-# our alpn= lists h3 only; see public/http3-quic/DNS_HTTPS_RECORDS.md for
-# the RFC 9460 §7.1.1 `key1="\002h3\002h2"` comma-free workaround).
-#
-# This is why ech-rotate.timer is deliberately NOT installed: rotating a key
-# that cannot be published to DNS breaks ECH instead of strengthening it.
-# After each manual run, copy ech-config-list.b64 into the record by hand.
-#
-# To make rotation automatic, move DNS hosting to a provider whose API
-# supports type 65 (deSEC, Cloudflare, Route 53, Bunny, DNSimple, Gandi
-# LiveDNS) — repointing NS is enough, no domain transfer — then publish
-# ech-config-list.b64 from here and enable the timer.
+# The DNS side runs on the host with the DNS signer (web1). A proxy node whose
+# names are not in the signer's https-records.conf rotates nothing here.
 
 set -euo pipefail
 
 OUT_DIR="${ECH_CONFIG_DIR:-/etc/pqcrypta/ech-configs}"
 BIN="${ECH_KEYGEN_BIN:-/usr/local/bin/pqcrypta-ech-keygen}"
+PUBLISH="${ECH_PUBLISH_BIN:-/usr/local/bin/pqcrypta-ech-publish}"
+PROXY_CONFIG="${PROXY_CONFIG:-/etc/pqcrypta/proxy-config.toml}"
 LOG_FILE="${LOG_FILE:-/var/log/pqcrypta/ech-rotate.log}"
-RESTART_PROXY=0
-
-for arg in "$@"; do
-    case "$arg" in
-        --restart-proxy) RESTART_PROXY=1 ;;
-        *) echo "unknown argument: $arg" >&2; exit 1 ;;
-    esac
-done
 
 log() { echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') $*" | tee -a "$LOG_FILE"; }
 
 mkdir -p "$OUT_DIR" "$(dirname "$LOG_FILE")"
 
-if [[ ! -x "$BIN" ]]; then
-    log "ERROR: $BIN not found or not executable. Build with: cargo build --release --bin ech-keygen && install -m755 target/release/ech-keygen $BIN"
-    exit 1
-fi
+for tool in "$BIN" "$PUBLISH"; do
+    if [[ ! -x "$tool" ]]; then
+        log "ERROR: $tool not found or not executable"
+        exit 1
+    fi
+done
 
 # One generation per KEM: X-Wing, which a quantum computer cannot open, and
 # X25519, which is all browsers implement today. ech-keygen keeps --retain of
@@ -75,9 +56,30 @@ for kem in x-wing x25519; do
     "$BIN" --out-dir "$OUT_DIR" --public-name pqcrypta.com --max-name-length 32 --retain 3 --kem "$kem" >>"$LOG_FILE" 2>&1
 done
 
-if [[ "$RESTART_PROXY" == "1" ]]; then
-    log "Restarting pqcrypta-proxy so the TCP+TLS listeners pick up the rotated config"
-    systemctl restart pqcrypta-proxy
+# [admin] enabled / bind_address / port / auth_token, and the poller interval.
+read -r admin_enabled admin_url poll_secs < <(python3 -I - "$PROXY_CONFIG" <<'EOF'
+import sys, tomllib
+c = tomllib.load(open(sys.argv[1], 'rb'))
+a = c.get('admin', {})
+print('yes' if a.get('enabled') and a.get('auth_token') else 'no',
+      'http://%s:%s/reload' % (a.get('bind_address', '127.0.0.1'), a.get('port', 8082)),
+      c.get('tls', {}).get('cert_reload_interval_secs', 300))
+EOF
+)
+if [[ "$admin_enabled" == "yes" ]]; then
+    # The token goes to curl on stdin (-K -), never on a command line.
+    reply=$(python3 -I -c 'import sys, tomllib; print("header = \"Authorization: Bearer %s\"" % tomllib.load(open(sys.argv[1], "rb"))["admin"]["auth_token"])' "$PROXY_CONFIG" \
+        | curl -sS --max-time 30 -K - -H 'Content-Type: application/json' -d '{"tls_only": true}' "$admin_url")
+    if ! grep -q '"success":true' <<<"$reply"; then
+        log "ERROR: the proxy did not reload its TLS material: $reply"
+        exit 1
+    fi
+    log "Proxy reloaded its TLS material; every listener holds the new ECH configs"
+else
+    log "Admin API off: waiting ${poll_secs}s for the proxy's reload poller"
+    sleep "$((poll_secs + 10))"
 fi
 
+log "Publishing the new ECHConfigList in DNS"
+"$PUBLISH" 2>&1 | tee -a "$LOG_FILE"
 log "ECH rotation complete"

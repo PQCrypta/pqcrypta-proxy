@@ -1,5 +1,5 @@
 [Unit]
-Description=PQCrypta ECH Rotate — generate a fresh Encrypted Client Hello keypair
+Description=PQCrypta ECH Rotate — new Encrypted Client Hello keys, loaded by the proxy, then published in DNS
 After=network.target
 
 [Service]
