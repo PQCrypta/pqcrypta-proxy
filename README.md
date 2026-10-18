@@ -1013,11 +1013,18 @@ full rule table.
 
 `block_scanner_uas` matches against a built-in regex set covering common attack tools. It operates independently from path/payload pattern matching — a request can be blocked purely by its User-Agent even if the body is clean. Disable per-route via `waf_mode = "detect"` if you need to allow scanner tools from specific paths (e.g., an internal security tooling endpoint).
 
-The scanner-UA check also matches the default `curl/N` and `Wget/N` User-Agents, which are the expected clients for artefacts a site publishes for programmatic access (install scripts, datasets, certificate chains). `scanner_ua_exempt_paths` in `[waf]` lists them as regular expressions over the lowercased path; injection and path-traversal scanning still runs on them. The default covers only files that exist for tools by convention (`/robots.txt`, `/sitemap.xml`, `/llms.txt`, `/.well-known/`); a site adds its own, and setting the key replaces the default, so list those too. An invalid pattern is refused at load.
+The scanner-UA check also matches the default `curl/N` and `Wget/N` User-Agents, which are the expected clients for artefacts a site publishes for programmatic access (install scripts, datasets, certificate chains). `scanner_ua_exempt_paths` in `[waf]` lists paths exempt from it altogether as regular expressions over the lowercased path; injection and path-traversal scanning still runs on them. The default covers only files that exist for tools by convention (`/robots.txt`, `/sitemap.xml`, `/llms.txt`, `/.well-known/`); a site adds its own, and setting the key replaces the default, so list those too. An invalid pattern is refused at load.
 
 ```toml
 [waf]
-scanner_ua_exempt_paths = ['^/robots\.txt$', '^/\.well-known/', '^/downloads/']
+scanner_ua_exempt_paths = ['^/robots\.txt$', '^/sitemap\.xml$', '^/\.well-known/']
+```
+
+`programmatic_client_paths` in `[waf]` is the narrower list for downloads and APIs: on those paths curl, Wget, python-requests, python-urllib, Go, Java and a missing User-Agent pass, and attack tools, scrapers and headless browsers are still refused. `scanner_ua_exempt_paths` lifts every user-agent rule, which files read by every kind of crawler need (robots.txt, `/.well-known/`) and a download does not.
+
+```toml
+[waf]
+programmatic_client_paths = ['^/downloads/', '^/api/dataset\.json$']
 ```
 
 A route can declare the same exemption instead: `skip_bot_blocking = true` on a `[[routes]]` entry turns off the scanner/bot User-Agent check for that route only, on both the TCP and HTTP/3 paths. Prefer it over adding hardcoded prefixes.

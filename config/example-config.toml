@@ -719,6 +719,13 @@ request_anomaly = true
 scanner_probe = true
 # Block known malicious scanner/bot user-agents (sqlmap, nikto, masscan, curl, etc.)
 block_scanner_uas = true
+# Paths exempt from every user-agent rule, as regexes over the lowercased path:
+# files read by every kind of crawler. Setting this replaces the default.
+# scanner_ua_exempt_paths = ['^/robots\.txt$', '^/sitemap\.xml$', '^/llms\.txt$', '^/\.well-known/']
+# Paths where curl, Wget, python-requests, Go, Java and an empty User-Agent pass
+# and scanners, scrapers and headless browsers are still refused: downloads and
+# APIs a page tells people to fetch with a script.
+# programmatic_client_paths = ['^/downloads/']
 # Scan request bodies, decoding JSON string escapes
 scan_json_body = true
 # Maximum body bytes to scan (64KB — covers all form submissions)
