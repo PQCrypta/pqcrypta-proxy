@@ -98,11 +98,7 @@ pub fn configure_geoip(city: Option<std::path::PathBuf>, asn: Option<std::path::
 }
 
 #[cfg(feature = "geoip")]
-fn open_geoip(
-    which: &str,
-    path: Option<&std::path::PathBuf>,
-) -> Option<maxminddb::Reader<Vec<u8>>> {
-    let path = path?;
+fn open_geoip(which: &str, path: &std::path::Path) -> Option<maxminddb::Reader<Vec<u8>>> {
     match maxminddb::Reader::open_readfile(path) {
         Ok(r) => Some(r),
         Err(e) => {
@@ -112,13 +108,19 @@ fn open_geoip(
     }
 }
 
-// ─── GeoIP readers (lazy, loaded once) ────────────────────────────────────
+// ─── GeoIP readers (lazy, reloaded when the file changes) ─────────────────
+//
+// They were loaded once, so after the weekly refresh replaced the databases a
+// speed test went on annotating from last week's until the proxy restarted;
+// see `crate::data_file`.
 
 #[cfg(feature = "geoip")]
-static CITY_READER: OnceLock<Option<maxminddb::Reader<Vec<u8>>>> = OnceLock::new();
+static CITY_READER: crate::data_file::Reloadable<maxminddb::Reader<Vec<u8>>> =
+    crate::data_file::Reloadable::new();
 
 #[cfg(feature = "geoip")]
-static ASN_READER: OnceLock<Option<maxminddb::Reader<Vec<u8>>>> = OnceLock::new();
+static ASN_READER: crate::data_file::Reloadable<maxminddb::Reader<Vec<u8>>> =
+    crate::data_file::Reloadable::new();
 
 // ─── GeoInfo ──────────────────────────────────────────────────────────────
 
@@ -139,8 +141,9 @@ fn lookup_geoip(ip: IpAddr) -> GeoInfo {
     #[cfg(feature = "geoip")]
     {
         // ── City ─────────────────────────────────────────────────────────
-        let city_slot = CITY_READER
-            .get_or_init(|| open_geoip("City", GEOIP_PATHS.get().and_then(|p| p.0.as_ref())));
+        let city_slot = CITY_READER.get(GEOIP_PATHS.get().and_then(|p| p.0.as_deref()), |path| {
+            open_geoip("City", path)
+        });
         if let Some(reader) = city_slot {
             if let Ok(result) = reader.lookup(ip) {
                 if let Ok(Some(city)) = result.decode::<maxminddb::geoip2::City>() {
@@ -154,8 +157,9 @@ fn lookup_geoip(ip: IpAddr) -> GeoInfo {
         }
 
         // ── ASN ──────────────────────────────────────────────────────────
-        let asn_slot = ASN_READER
-            .get_or_init(|| open_geoip("ASN", GEOIP_PATHS.get().and_then(|p| p.1.as_ref())));
+        let asn_slot = ASN_READER.get(GEOIP_PATHS.get().and_then(|p| p.1.as_deref()), |path| {
+            open_geoip("ASN", path)
+        });
         if let Some(reader) = asn_slot {
             if let Ok(result) = reader.lookup(ip) {
                 if let Ok(Some(asn)) = result.decode::<maxminddb::geoip2::Asn>() {

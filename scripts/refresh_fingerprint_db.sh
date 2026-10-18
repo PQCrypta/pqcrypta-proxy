@@ -101,22 +101,30 @@ FLEET_DATA_FILES=(
 )
 
 mkdir -p "$(dirname "${LOG_FILE}")"
-TS=$(date '+%Y-%m-%d %H:%M:%S')
 
-log() { echo "[${TS}] $1" >> "${LOG_FILE}"; }
+# Each line's own time. One timestamp taken at the start stamped every line
+# with it, so a restart that ran from 03:15:04 to 03:15:38 was logged as done
+# at 03:15:01, the second the script started.
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "${LOG_FILE}"; }
 
-LOCAL_RESTARTED=0
+LOCAL_RELOADED=0
 GEOIP_CHANGED=0
 
-# Restart the local proxy at most once per run, however many databases changed.
-restart_local() {
-    [ "${LOCAL_RESTARTED}" -eq 1 ] && return
-    LOCAL_RESTARTED=1
-    systemctl restart pqcrypta-proxy 2>&1
-    if [ "$?" -eq 0 ]; then
-        log "pqcrypta-proxy restarted successfully"
+# Make the local proxy load the new files, at most once per run however many
+# changed. A reload (SIGHUP, the unit's ExecReload), not a restart: the proxy
+# compares each data file with the one it loaded and reloads what changed
+# (src/data_file.rs). The restart this replaces stopped every listener while
+# the old process drained, every Sunday on every node (34 s on web1 on
+# 2026-10-18). A proxy that cannot reload is restarted instead, and says so.
+reload_local() {
+    [ "${LOCAL_RELOADED}" -eq 1 ] && return
+    LOCAL_RELOADED=1
+    if systemctl reload pqcrypta-proxy 2>/dev/null; then
+        log "pqcrypta-proxy reloaded: new data files loaded without a restart"
+    elif systemctl restart pqcrypta-proxy 2>&1; then
+        log "WARNING: pqcrypta-proxy could not reload — restarted to load the new data files"
     else
-        log "WARNING: local restart failed — new data will be loaded on next restart"
+        log "WARNING: local reload and restart failed — new data will be loaded on next restart"
     fi
 }
 
@@ -215,12 +223,12 @@ sync_fleet() {
 
     for NODE in "${FLEET_NODES[@]}"; do
         TARGET="${NODE%%|*}"
-        SSH_OPTS="${NODE#*|}"
+        # The node's ssh options, one word each
+        read -r -a SSH_ARGS <<< "${NODE#*|}"
 
         # The trailing `:` forces a zero exit so a missing FILE is not mistaken
         # for an unreachable NODE.
-        # shellcheck disable=SC2086
-        PROBE_OUT=$(ssh ${SSH_OPTS} -o BatchMode=yes -o ConnectTimeout=15 "${TARGET}" \
+        PROBE_OUT=$(ssh "${SSH_ARGS[@]}" -o BatchMode=yes -o ConnectTimeout=15 "${TARGET}" \
             "${PROBE} :" 2>/dev/null)
         if [ "$?" -ne 0 ]; then
             log "WARNING: ${TARGET} unreachable — left on its previous data files"
@@ -248,8 +256,7 @@ sync_fleet() {
             LOCAL_SUM=$(sha256sum "${SRC}" | awk '{print $1}')
             [ "${LOCAL_SUM}" = "${REMOTE_SUM}" ] && continue
 
-            # shellcheck disable=SC2086
-            if ! scp -q -C ${SSH_OPTS} -o BatchMode=yes -o ConnectTimeout=15 \
+            if ! scp -q -C "${SSH_ARGS[@]}" -o BatchMode=yes -o ConnectTimeout=15 \
                     "${SRC}" "${TARGET}:${DEST}" 2>/dev/null; then
                 log "WARNING: could not copy $(basename "${SRC}") to ${TARGET}:${DEST} — node left on its previous copy"
                 continue
@@ -263,14 +270,14 @@ sync_fleet() {
         done
 
         if [ -z "${CHANGED}" ]; then
-            log "${TARGET} already in sync — not restarted"
+            log "${TARGET} already in sync — not reloaded"
             continue
         fi
 
-        # shellcheck disable=SC2086
-        NODE_OUT=$(ssh ${SSH_OPTS} -o BatchMode=yes -o ConnectTimeout=60 "${TARGET}" \
+        # Reload, as locally (reload_local); restart only a proxy that cannot
+        NODE_OUT=$(ssh "${SSH_ARGS[@]}" -o BatchMode=yes -o ConnectTimeout=60 "${TARGET}" \
             "RU=\$(systemctl show pqcrypta-proxy -p User --value);${FIXUPS} \
-             systemctl restart pqcrypta-proxy; \
+             systemctl reload pqcrypta-proxy 2>/dev/null || systemctl restart pqcrypta-proxy; \
              for i in \$(seq 1 15); do \
                  S=\$(systemctl is-active pqcrypta-proxy); \
                  [ \"\$S\" = active ] && break; sleep 2; \
@@ -315,8 +322,8 @@ check_config_drift() {
         if [ "${NODE}" = "local" ]; then
             cp "${LIVE_CONFIG}" "${TMP}" 2>/dev/null
         else
-            # shellcheck disable=SC2086
-            ssh ${NODE#*|} -o ConnectTimeout=10 -o BatchMode=yes "${TARGET}" \
+            read -r -a SSH_ARGS <<< "${NODE#*|}"
+            ssh "${SSH_ARGS[@]}" -o ConnectTimeout=10 -o BatchMode=yes "${TARGET}" \
                 "cat ${LIVE_CONFIG}" > "${TMP}" 2>/dev/null
         fi
         if [ ! -s "${TMP}" ]; then
@@ -410,11 +417,16 @@ check_app_config_drift() {
 check_apache_drift() {
     local DIR="${CONFIG_REPO}/local/apache"
     local SRC="/etc/apache2/sites-enabled"
+    # Apache's listening ports: not a vhost, so not in sites-enabled, but
+    # included by apache2.conf and as security-relevant as any vhost. It was
+    # tracked, and reported every week as "no longer enabled" because only
+    # sites-enabled was compared.
+    local PORTS="/etc/apache2/ports.conf"
     [ -d "${SRC}" ] || return 0
     [ -d "${DIR}" ] || { log "apache drift: ${DIR} not tracked yet"; return 1; }
 
     local DRIFTED=0 F NAME TMP
-    for F in "${SRC}"/*.conf; do
+    for F in "${SRC}"/*.conf "${PORTS}"; do
         [ -e "${F}" ] || continue
         NAME=$(basename "${F}")
         TMP=$(mktemp /tmp/apadrift_XXXXXX.conf)
@@ -448,6 +460,9 @@ check_apache_drift() {
     for F in "${DIR}"/*.conf; do
         [ -e "${F}" ] || continue
         NAME=$(basename "${F}")
+        if [ "${NAME}" = "$(basename "${PORTS}")" ] && [ -e "${PORTS}" ]; then
+            continue
+        fi
         if [ ! -e "${SRC}/${NAME}" ]; then
             log "apache drift: ${NAME} is tracked but no longer enabled — remove it from the repo"
             DRIFTED=1
@@ -462,7 +477,7 @@ check_apache_drift() {
 # reconciled even when the JA3 fetch failed and the local database was left
 # untouched.
 finish() {
-    [ "${GEOIP_CHANGED}" -eq 1 ] && restart_local
+    [ "${GEOIP_CHANGED}" -eq 1 ] && reload_local
     sync_fleet
     check_config_drift
     log "Refresh complete"
@@ -595,7 +610,7 @@ if [ -z "${ENTRY_COUNT}" ] || [ "${ENTRY_COUNT}" -lt 10 ]; then
     finish
 fi
 
-# Compare checksums — skip restart if nothing changed
+# Compare checksums — skip the reload if nothing changed
 NEW_SUM=$(sha256sum "${TMP_JSON}" | awk '{print $1}')
 OLD_SUM=""
 if [ -f "${DEST_FILE}" ]; then
@@ -612,7 +627,7 @@ chmod 0600 "${TMP_JSON}"
 mv "${TMP_JSON}" "${DEST_FILE}"
 log "Updated JA3 database: ${ENTRY_COUNT} entries (was: $([ -n "${OLD_SUM}" ] && echo 'different' || echo 'new'))"
 
-# Reload service to pick up new DB (fast: proxy starts in < 2s)
-restart_local
+# The proxy loads the new database on reload
+reload_local
 
 finish
