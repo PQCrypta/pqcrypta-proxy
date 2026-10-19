@@ -6,7 +6,9 @@
       "release-type": "rust",
       "package-name": "pqcrypta-proxy",
       "changelog-path": "CHANGELOG.md",
-      "include-component-in-tag": false
+      "include-component-in-tag": false,
+      "draft": true,
+      "force-tag-creation": true
     }
   }
 }

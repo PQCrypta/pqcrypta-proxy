@@ -3,12 +3,14 @@ name: Release Please
 on:
   push:
     branches: [main]
-  # Builds the binary for a release that already exists and attaches it: for a
-  # release whose own build failed (v0.3.0's did), or to rebuild one.
+  # Builds the binary for a draft release that already exists, attaches it and
+  # publishes the release: for a draft whose own build failed. Releases are
+  # immutable once published (no asset can be added then, which is how v0.3.0
+  # went out without one), so this only works on a draft.
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to build and attach the binary to (for example v0.3.0)
+        description: Tag of the draft release to build, attach the binary to and publish
         required: true
 
 permissions:
@@ -35,7 +37,9 @@ jobs:
   # runner's OpenSSL 3.0 lacks the 3.2+ symbols the proxy links
   # (SSL_get0_group_name, SSL_CTX_compress_certs) and the release build failed
   # to link against it. Linked statically, so that a downloaded binary runs
-  # without OpenSSL 3.5 installed.
+  # without OpenSSL 3.5 installed. release-please creates the release as a
+  # draft (release-please-config.json): the asset goes up, then the release is
+  # published, as immutable releases require.
   binary:
     name: Release binary
     needs: release-please
@@ -58,8 +62,14 @@ jobs:
           OPENSSL_STATIC: "1"
         run: cargo build --release --locked
 
-      - name: Upload binary to release
+      - name: Upload binary to the draft release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           tag_name: ${{ env.TAG }}
+          draft: true
           files: target/release/pqcrypta-proxy
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$TAG" --draft=false
