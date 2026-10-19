@@ -7,6 +7,13 @@ updates:
       day: "monday"
     commit-message:
       prefix: "ci"
+    groups:
+      # init, autobuild, analyze and upload-sarif must run the same release:
+      # CodeQL refuses a configuration written by another one, and one PR per
+      # step left every one of them failing (#75, #76, #77).
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
 
   - package-ecosystem: "cargo"
     directory: "/"
