@@ -88,7 +88,9 @@ pub(super) fn build_rustls_server_config(
 /// keeps `axum_server`'s own acceptor.
 #[derive(Clone)]
 pub(super) struct EarlyRustlsAcceptor<A> {
-    config: std::sync::Arc<rustls::ServerConfig>,
+    /// The current configuration: rebuilt after every TLS reload for its ECH
+    /// configs (see `refresh_on_tls_reload`), and taken per connection.
+    config: std::sync::Arc<arc_swap::ArcSwap<rustls::ServerConfig>>,
     inner: A,
     handshake_timeout: std::time::Duration,
     replay: crate::tls_acceptor::ZeroRttReplayGuard,
@@ -96,7 +98,7 @@ pub(super) struct EarlyRustlsAcceptor<A> {
 
 impl<A> EarlyRustlsAcceptor<A> {
     pub(super) fn new(
-        config: std::sync::Arc<rustls::ServerConfig>,
+        config: std::sync::Arc<arc_swap::ArcSwap<rustls::ServerConfig>>,
         inner: A,
         handshake_timeout: std::time::Duration,
         replay: crate::tls_acceptor::ZeroRttReplayGuard,
@@ -148,7 +150,7 @@ where
 
     fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
         let inner = self.inner.accept(stream, service);
-        let config = std::sync::Arc::clone(&self.config);
+        let config = self.config.load_full();
         let timeout = self.handshake_timeout;
         let replay = self.replay.clone();
         Box::pin(async move {

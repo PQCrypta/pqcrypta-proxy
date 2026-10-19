@@ -1164,8 +1164,9 @@ pub async fn run_http_listener(
         config.pqc.enabled,
         config.client_auth(),
     )?;
+    let resolver = private_resolver(cert_path)?;
     let rustls_server_config = Arc::new(
-        build_rustls_server_config(&policy, private_resolver(cert_path)?, ALPN_H2_HTTP11).map_err(
+        build_rustls_server_config(&policy, Arc::clone(&resolver), ALPN_H2_HTTP11).map_err(
             |e| {
                 error!("❌ TLS configuration error: {}", e);
                 e
@@ -1173,6 +1174,33 @@ pub async fn run_http_listener(
         )?,
     );
     let handshake_timeout = std::time::Duration::from_secs(config.tls.handshake_timeout_secs);
+    // The configuration each handshake takes: the 0-RTT acceptor reads `current`,
+    // axum_server's acceptor its `RustlsConfig`; a TLS reload rebuilds both.
+    let current = Arc::new(arc_swap::ArcSwap::new(Arc::clone(&rustls_server_config)));
+    let rustls_config = RustlsConfig::from_config(rustls_server_config);
+    {
+        let (current, rustls_config) = (Arc::clone(&current), rustls_config.clone());
+        refresh_on_tls_reload(
+            "HTTPS listener",
+            &config,
+            Arc::clone(&resolver),
+            true,
+            move |config, resolver| {
+                let policy = crate::tls::ServerTlsPolicy::from_config(
+                    &config.tls,
+                    &config.pqc,
+                    config.pqc.enabled,
+                    config.client_auth(),
+                )?;
+                build_rustls_server_config(&policy, Arc::clone(resolver), ALPN_H2_HTTP11)
+                    .map(Arc::new)
+            },
+            move |server_config| {
+                current.store(Arc::clone(&server_config));
+                rustls_config.reload_from_config(server_config);
+            },
+        );
+    }
 
     info!("✅ TLS configured for HTTP listener (SNI per-domain resolver)");
     info!("🔒 HTTPS reverse proxy ready on port {} (TCP)", port);
@@ -1193,7 +1221,7 @@ pub async fn run_http_listener(
         axum_server::bind(addr)
             .acceptor(ConnectionHeadersAcceptor::new(
                 EarlyRustlsAcceptor::new(
-                    rustls_server_config,
+                    current,
                     TcpAcceptor::new(&config),
                     handshake_timeout,
                     crate::tls_acceptor::ZeroRttReplayGuard::from_config(
@@ -1208,7 +1236,7 @@ pub async fn run_http_listener(
     } else {
         axum_server::bind(addr)
             .acceptor(ConnectionHeadersAcceptor::new(
-                RustlsAcceptor::new(RustlsConfig::from_config(rustls_server_config))
+                RustlsAcceptor::new(rustls_config)
                     .handshake_timeout(handshake_timeout)
                     .acceptor(TcpAcceptor::new(&config)),
                 Arc::clone(&metrics),
@@ -1599,9 +1627,9 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
     // Use the shared resolver when provided so ACME-issued certs are hot-reloaded
     // without restarting the listener; fall back to a private resolver otherwise.
     let _ = key_path; // keys are resolved per domain from the certificate directory
-    let resolver = match shared_resolver {
-        Some(ref resolver) => std::sync::Arc::clone(resolver),
-        None => private_resolver(cert_path)?,
+    let (resolver, owns_resolver) = match shared_resolver {
+        Some(ref resolver) => (std::sync::Arc::clone(resolver), false),
+        None => (private_resolver(cert_path)?, true),
     };
     let fingerprinting_acceptor = Arc::new(build_fingerprinting_acceptor(
         &config,
@@ -1609,6 +1637,17 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
         fingerprint_extractor,
         security_state,
     )?);
+    {
+        let acceptor = Arc::clone(&fingerprinting_acceptor);
+        refresh_on_tls_reload(
+            "fingerprinting HTTPS listener",
+            &config,
+            Arc::clone(&resolver),
+            owns_resolver,
+            fingerprinting_configs,
+            move |(main, http11_only)| acceptor.replace_configs(main, http11_only),
+        );
+    }
 
     // Bind TCP listener
     let listener = TcpListener::bind(addr).await?;
@@ -1682,34 +1721,90 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
 /// timeout and the HTTP/1.1-only hosts. The rustls listener serves every
 /// connection through it; the OpenSSL listener, which cannot do ECH, hands
 /// it the connections that offer one of this server's ECH configs.
-fn build_fingerprinting_acceptor(
+/// The rustls configurations a fingerprinting acceptor serves: the default one
+/// (h2 and HTTP/1.1) and, when `server.http11_only_hosts` names any, the
+/// HTTP/1.1-only one, so browsers that negotiate http/1.1 open independent TCP
+/// connections per stream (up to 6 per origin) instead of coalescing them on
+/// one HTTP/2 pipe. Both carry the current ECH configs.
+#[allow(clippy::type_complexity)]
+fn fingerprinting_configs(
     config: &ProxyConfig,
     resolver: &std::sync::Arc<crate::tls::MultiDomainCertResolver>,
-    fingerprint_extractor: Arc<FingerprintExtractor>,
-    security_state: SecurityState,
-) -> Result<FingerprintingTlsAcceptor, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<
+    (Arc<rustls::ServerConfig>, Option<Arc<rustls::ServerConfig>>),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     let policy = crate::tls::ServerTlsPolicy::from_config(
         &config.tls,
         &config.pqc,
         config.pqc.enabled,
         config.client_auth(),
     )?;
-    let rustls_config = Arc::new(build_rustls_server_config(
+    let main = Arc::new(build_rustls_server_config(
         &policy,
         std::sync::Arc::clone(resolver),
         ALPN_H2_HTTP11,
     )?);
-
-    // Build HTTP/1.1-only config for SNI-selected hosts that must not use HTTP/2.
-    // Browsers that negotiate http/1.1 open independent TCP connections per stream
-    // (up to 6 per origin) instead of coalescing all streams on one HTTP/2 pipe.
-    let http11_only_config = if !config.server.http11_only_hosts.is_empty() {
-        let cfg =
-            build_rustls_server_config(&policy, std::sync::Arc::clone(resolver), ALPN_HTTP11)?;
-        Some(Arc::new(cfg))
-    } else {
+    let http11_only = if config.server.http11_only_hosts.is_empty() {
         None
+    } else {
+        Some(Arc::new(build_rustls_server_config(
+            &policy,
+            std::sync::Arc::clone(resolver),
+            ALPN_HTTP11,
+        )?))
     };
+    Ok((main, http11_only))
+}
+
+/// Rebuild a TCP listener's rustls configuration after every TLS reload
+/// (`ech_config::reloads`) and hand it to `install`. The configuration carries
+/// the ECH configs: without this, a rotated ECH key that DNS already published
+/// was accepted over QUIC only, and TCP clients' ECH failed until a restart.
+/// A listener with a certificate resolver of its own (`owns_resolver`) reloads
+/// it first; the shared one is reloaded by the TLS provider, which signals.
+fn refresh_on_tls_reload<T: Send + 'static>(
+    what: &'static str,
+    config: &Arc<ProxyConfig>,
+    resolver: std::sync::Arc<crate::tls::MultiDomainCertResolver>,
+    owns_resolver: bool,
+    rebuild: impl Fn(
+            &ProxyConfig,
+            &std::sync::Arc<crate::tls::MultiDomainCertResolver>,
+        ) -> Result<T, Box<dyn std::error::Error + Send + Sync>>
+        + Send
+        + 'static,
+    install: impl Fn(T) + Send + 'static,
+) {
+    let config = Arc::clone(config);
+    let mut reloads = crate::ech_config::reloads();
+    tokio::spawn(async move {
+        while reloads.changed().await.is_ok() {
+            if owns_resolver {
+                if let Err(e) = resolver.reload() {
+                    warn!("{what}: certificates not reloaded: {e}");
+                }
+            }
+            match rebuild(&config, &resolver) {
+                Ok(built) => {
+                    install(built);
+                    info!("🔏 {what}: TLS configuration rebuilt with the current ECH configs and certificates");
+                }
+                Err(e) => warn!(
+                    "{what}: TLS configuration not rebuilt after a TLS reload, keeping the previous one: {e}"
+                ),
+            }
+        }
+    });
+}
+
+fn build_fingerprinting_acceptor(
+    config: &ProxyConfig,
+    resolver: &std::sync::Arc<crate::tls::MultiDomainCertResolver>,
+    fingerprint_extractor: Arc<FingerprintExtractor>,
+    security_state: SecurityState,
+) -> Result<FingerprintingTlsAcceptor, Box<dyn std::error::Error + Send + Sync>> {
+    let (rustls_config, http11_only_config) = fingerprinting_configs(config, resolver)?;
 
     // Create fingerprinting TLS acceptor
     let mut acceptor_builder = FingerprintingTlsAcceptor::new(
@@ -1973,21 +2068,44 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     // HTTP/3 (rustls) accepted it. A connection whose ClientHello names one
     // of this server's ECH configs goes to the rustls acceptor instead --
     // ECH, the same groups and certificates, fingerprinting and 0-RTT guard.
-    let ech_ids: Arc<[u8]> = crate::ech_config::config_ids().into();
-    let ech_acceptor = if !ech_ids.is_empty() && crate::ech_config::load().is_some() {
-        info!(
-            "🔏 ECH over TCP: ClientHellos naming ECH config(s) {:02x?} are served by rustls",
-            ech_ids
+    //
+    // The route is current, not fixed at start-up: after every TLS reload
+    // (`ech_config::reloads`) the config ids are read again and the rustls
+    // acceptor's configurations rebuilt, so a key `ech-keygen` rotates in is
+    // routed here as soon as the proxy notices it. A route read once at start
+    // left a client using the newly published key on the OpenSSL path, which
+    // cannot open ECH, until a restart.
+    let ech_routes: Arc<arc_swap::ArcSwapOption<EchRoute>> =
+        Arc::new(arc_swap::ArcSwapOption::from(
+            current_ech_route(
+                None,
+                &config,
+                &rustls_resolver,
+                &fingerprint_extractor,
+                &security_state,
+            )?
+            .map(Arc::new),
+        ));
+    {
+        let (routes, config, resolver) = (
+            Arc::clone(&ech_routes),
+            Arc::clone(&config),
+            Arc::clone(&rustls_resolver),
         );
-        Some(Arc::new(build_fingerprinting_acceptor(
-            &config,
-            &rustls_resolver,
-            fingerprint_extractor.clone(),
-            security_state.clone(),
-        )?))
-    } else {
-        None
-    };
+        let (extractor, state) = (fingerprint_extractor.clone(), security_state.clone());
+        let mut reloads = crate::ech_config::reloads();
+        tokio::spawn(async move {
+            while reloads.changed().await.is_ok() {
+                let previous = routes.load_full();
+                match current_ech_route(previous.as_deref(), &config, &resolver, &extractor, &state) {
+                    Ok(route) => routes.store(route.map(Arc::new)),
+                    Err(e) => warn!(
+                        "ECH over TCP: route not rebuilt after a TLS reload, keeping the previous one: {e}"
+                    ),
+                }
+            }
+        });
+    }
 
     // Create OpenSSL PQC acceptor with SNI multi-domain support.
     // The `sni_map` was pre-built by the caller and is shared with the ACME
@@ -2080,9 +2198,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
                 let proxy_trusted = proxy_trusted.clone();
                 let zero_rtt = zero_rtt.clone();
                 let conn_shutdown = shutdown_rx.clone();
-                let ech_route = ech_acceptor
-                    .clone()
-                    .map(|acceptor| EchRoute { acceptor, config_ids: ech_ids.clone() });
+                let ech_route = ech_routes.load_full().map(|route| EchRoute::clone(&route));
 
                 tokio::spawn(async move {
                     let mut stream = stream;
@@ -2153,6 +2269,49 @@ fn pqc_handshake_facts(ssl: &openssl::ssl::SslRef) -> crate::tls_acceptor::Hands
 struct EchRoute {
     acceptor: Arc<FingerprintingTlsAcceptor>,
     config_ids: Arc<[u8]>,
+}
+
+/// The ECH route for the configs now on disk: none when there are none; else
+/// `previous`'s acceptor with rebuilt configurations (its 0-RTT replay guard
+/// and the rest of its state carry on), or a new acceptor when there was none.
+#[cfg(feature = "pqc")]
+fn current_ech_route(
+    previous: Option<&EchRoute>,
+    config: &Arc<ProxyConfig>,
+    resolver: &std::sync::Arc<crate::tls::MultiDomainCertResolver>,
+    fingerprint_extractor: &Arc<FingerprintExtractor>,
+    security_state: &SecurityState,
+) -> Result<Option<EchRoute>, Box<dyn std::error::Error + Send + Sync>> {
+    let config_ids: Arc<[u8]> = crate::ech_config::config_ids().into();
+    if config_ids.is_empty() || crate::ech_config::load().is_none() {
+        if previous.is_some() {
+            info!("🔏 ECH over TCP: no ECH configs any more; every ClientHello stays on OpenSSL");
+        }
+        return Ok(None);
+    }
+    let acceptor = match previous {
+        Some(route) => {
+            let (main, http11_only) = fingerprinting_configs(config, resolver)?;
+            route.acceptor.replace_configs(main, http11_only);
+            Arc::clone(&route.acceptor)
+        }
+        None => Arc::new(build_fingerprinting_acceptor(
+            config,
+            resolver,
+            fingerprint_extractor.clone(),
+            security_state.clone(),
+        )?),
+    };
+    if previous.map(|r| &*r.config_ids) != Some(&*config_ids) {
+        info!(
+            "🔏 ECH over TCP: ClientHellos naming ECH config(s) {:02x?} are served by rustls",
+            config_ids
+        );
+    }
+    Ok(Some(EchRoute {
+        acceptor,
+        config_ids,
+    }))
 }
 
 /// Peek the ClientHello's TLS record until it is whole (its length is in the

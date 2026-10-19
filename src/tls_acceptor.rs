@@ -623,7 +623,11 @@ impl<S: AsyncWrite> AsyncWrite for FingerprintedTlsStream<S> {
 
 /// TLS acceptor that captures ClientHello for fingerprinting
 pub struct FingerprintingTlsAcceptor {
-    tls_acceptor: tokio_rustls::TlsAcceptor,
+    /// The TLS configuration, which carries the ECH configs: swapped for a
+    /// rebuilt one when the TLS material reloads ([`Self::replace_configs`]),
+    /// so a rotated ECH key is accepted without a restart, while the replay
+    /// guard and the rest of this acceptor's state carry on.
+    tls_acceptor: arc_swap::ArcSwap<tokio_rustls::TlsAcceptor>,
     fingerprint_extractor: Arc<FingerprintExtractor>,
     security_state: SecurityState,
     fingerprint_config: FingerprintConfig,
@@ -639,7 +643,7 @@ pub struct FingerprintingTlsAcceptor {
     /// HTTP/1.1-only TLS acceptor used when the SNI matches http11_only_hosts.
     /// Advertises only "http/1.1" in ALPN so browsers open independent TCP
     /// connections per fetch() stream instead of coalescing into one HTTP/2 pipe.
-    http11_only_tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
+    http11_only_tls_acceptor: Option<arc_swap::ArcSwap<tokio_rustls::TlsAcceptor>>,
     /// Hostnames for which only HTTP/1.1 ALPN is advertised (no h2).
     http11_only_hosts: Vec<String>,
 }
@@ -653,7 +657,7 @@ impl FingerprintingTlsAcceptor {
         zero_rtt_enabled: bool,
     ) -> Self {
         Self {
-            tls_acceptor: tokio_rustls::TlsAcceptor::from(config),
+            tls_acceptor: arc_swap::ArcSwap::from_pointee(tokio_rustls::TlsAcceptor::from(config)),
             fingerprint_extractor,
             security_state,
             fingerprint_config,
@@ -677,9 +681,26 @@ impl FingerprintingTlsAcceptor {
         config: Arc<rustls::ServerConfig>,
         hosts: Vec<String>,
     ) -> Self {
-        self.http11_only_tls_acceptor = Some(Arc::new(tokio_rustls::TlsAcceptor::from(config)));
+        self.http11_only_tls_acceptor = Some(arc_swap::ArcSwap::from_pointee(
+            tokio_rustls::TlsAcceptor::from(config),
+        ));
         self.http11_only_hosts = hosts;
         self
+    }
+
+    /// Serve new connections from rebuilt TLS configurations (the default one
+    /// and, when this acceptor has one, the HTTP/1.1-only one). Connections
+    /// already accepted keep theirs.
+    pub fn replace_configs(
+        &self,
+        config: Arc<rustls::ServerConfig>,
+        http11_only: Option<Arc<rustls::ServerConfig>>,
+    ) {
+        self.tls_acceptor
+            .store(Arc::new(tokio_rustls::TlsAcceptor::from(config)));
+        if let (Some(slot), Some(config)) = (&self.http11_only_tls_acceptor, http11_only) {
+            slot.store(Arc::new(tokio_rustls::TlsAcceptor::from(config)));
+        }
     }
 
     /// Configure 0-RTT replay protection mode and nonce window.
@@ -889,9 +910,9 @@ impl FingerprintingTlsAcceptor {
                     sni,
                     remote_addr
                 );
-                h11_acceptor.as_ref()
+                h11_acceptor.load_full()
             }
-            _ => &self.tls_acceptor,
+            _ => self.tls_acceptor.load_full(),
         };
         let tls_stream = if self.zero_rtt_enabled {
             crate::early_data::EarlyRustls::accept(

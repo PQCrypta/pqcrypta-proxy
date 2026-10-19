@@ -84,6 +84,11 @@ struct Args {
     /// separately, so rotating one never prunes the other.
     #[arg(long, value_enum, default_value_t = Kem::XWing)]
     kem: Kem,
+
+    /// Generate nothing: prune to `--retain` and rebuild
+    /// `ech-config-list.{bin,b64}` from the configs already in `--out-dir`.
+    #[arg(long)]
+    list_only: bool,
 }
 
 const fn sym(kdf_id: HpkeKdf, aead_id: HpkeAead) -> HpkeSymmetricCipherSuite {
@@ -92,6 +97,10 @@ const fn sym(kdf_id: HpkeKdf, aead_id: HpkeAead) -> HpkeSymmetricCipherSuite {
 
 fn main() {
     let args = Args::parse();
+    if args.list_only {
+        prune_and_rebuild_list(&args.out_dir, args.retain);
+        return;
+    }
 
     // The suite the key is generated with, the KEM the config names, and the
     // symmetric suites it advertises (the server can open every one of them:
@@ -210,10 +219,17 @@ fn pick_unused_config_id(out_dir: &std::path::Path) -> u8 {
 
 /// Delete all but the `retain` most recently generated `.key`/`.ech` pairs of
 /// each KEM (by file mtime), then rebuild `ech-config-list.{bin,b64}`: the
-/// real `ECHConfigList` structure (a 2-byte total length, then each retained
-/// entry's already-encoded bytes back to back) to publish as a DNS HTTPS
-/// record's `ech=` `SvcParam`, in publication order (post-quantum first, then
-/// newest first; see `ech_config::publication_order`).
+/// real `ECHConfigList` structure (a 2-byte total length, then each entry's
+/// already-encoded bytes back to back) to publish as a DNS HTTPS record's
+/// `ech=` `SvcParam`, holding the newest config of each KEM in publication
+/// order (post-quantum first; see `ech_config::publication_order`).
+///
+/// Only the newest of each KEM is published. The older retained ones stay on
+/// disk, so the server still opens a `ClientHello` from a client holding a
+/// cached DNS record, but a client uses the first config it implements, so
+/// publishing them would only grow every HTTPS answer: an X-Wing config is
+/// about 1.3 KB, and the list already takes the answer past a 1,232-byte UDP
+/// response with one.
 fn prune_and_rebuild_list(out_dir: &std::path::Path, retain: usize) {
     let mut entries: Vec<(std::time::SystemTime, PathBuf, u16)> = fs::read_dir(out_dir)
         .expect("failed to read --out-dir")
@@ -240,8 +256,14 @@ fn prune_and_rebuild_list(out_dir: &std::path::Path, retain: usize) {
         false
     });
 
+    let mut published_kems = std::collections::HashSet::new();
+    let published: Vec<&(std::time::SystemTime, PathBuf, u16)> = entries
+        .iter()
+        .filter(|(_, _, kem)| published_kems.insert(*kem))
+        .collect();
+
     let mut list_bytes = Vec::new();
-    let entries_bytes: Vec<Vec<u8>> = entries
+    let entries_bytes: Vec<Vec<u8>> = published
         .iter()
         .map(|(_, path, _)| fs::read(path).expect("failed to read retained ECHConfig entry"))
         .collect();
@@ -271,8 +293,9 @@ fn prune_and_rebuild_list(out_dir: &std::path::Path, retain: usize) {
         .expect("failed to write ech-config-list.b64");
 
     println!(
-        "retained {} config(s); ECHConfigList ({} bytes) -> {}",
+        "retained {} config(s) on disk; publishing the newest of each KEM, {} config(s): ECHConfigList ({} bytes) -> {}",
         entries.len(),
+        published.len(),
         list_bytes.len(),
         out_dir.join("ech-config-list.b64").display()
     );

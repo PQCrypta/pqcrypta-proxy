@@ -1944,6 +1944,8 @@ impl TlsProvider {
             .map_err(|e| anyhow::anyhow!("Failed to create QUIC server config: {}", e))?;
 
         self.server_config.store(Arc::new(quic_config));
+        // And every TCP listener, whose rustls configs carry the ECH configs.
+        crate::ech_config::note_reload();
 
         // Update the watched directory mtime (certs + ECH configs)
         let certs_dir = tls_config
