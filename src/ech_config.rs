@@ -618,13 +618,14 @@ mod pq_ech_tests {
     /// generations still open offers sealed to them, and are never offered.
     #[test]
     fn retry_configs_are_the_published_configs() {
-        let x25519 = *rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES
+        // P-256: a FIPS build (--all-features) has no X25519 HPKE suite
+        let p256 = *rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES
             .iter()
-            .find(|h| h.suite().kem == HpkeKem::DHKEM_X25519_HKDF_SHA256)
+            .find(|h| h.suite().kem == HpkeKem::DHKEM_P256_HKDF_SHA256)
             .unwrap();
         let dir = scratch("current");
-        let old = write_config(&dir, 0x10, x25519);
-        let new = write_config(&dir, 0x11, x25519);
+        let old = write_config(&dir, 0x10, p256);
+        let new = write_config(&dir, 0x11, p256);
         // ech-keygen's order: the older generation's file is older
         let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
         std::fs::File::options()
