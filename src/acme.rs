@@ -396,7 +396,15 @@ impl AcmeService {
 
         tokio::spawn(async move {
             let check_interval = Duration::from_secs(config.check_interval_hours as u64 * 3600);
-            let mut interval = tokio::time::interval(check_interval);
+            // The first scheduled check one interval after the initial one: a
+            // plain interval() completes its first tick at once, so every
+            // start ran the whole check twice in a row, and a refused order
+            // was placed again straight away, spending the CA's
+            // failed-validation allowance (5 an hour per name) twice as fast.
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + check_interval,
+                check_interval,
+            );
 
             // Initial check
             *last_check.write() = Some(SystemTime::now());
@@ -542,17 +550,31 @@ impl AcmeService {
 
     /// Force immediate certificate check/renewal
     pub async fn force_renewal(&self) -> anyhow::Result<()> {
-        if !self.config.enabled {
-            return Err(anyhow::anyhow!("ACME service is disabled"));
-        }
+        self.renewal_task().await
+    }
 
-        check_and_renew_certificates(
-            &self.config,
-            &self.pending_challenges,
-            &self.cert_update_tx,
-            &self.cert_status,
-        )
-        .await
+    /// The check and renewal `force_renewal` runs, as a future owning what it
+    /// needs, so a caller that reaches the service through a lock can spawn it
+    /// (the admin API's /acme/renew).
+    pub fn renewal_task(
+        &self,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static {
+        let config = self.config.clone();
+        let pending_challenges = self.pending_challenges.clone();
+        let cert_update_tx = self.cert_update_tx.clone();
+        let cert_status = self.cert_status.clone();
+        async move {
+            if !config.enabled {
+                return Err(anyhow::anyhow!("ACME service is disabled"));
+            }
+            check_and_renew_certificates(
+                &config,
+                &pending_challenges,
+                &cert_update_tx,
+                &cert_status,
+            )
+            .await
+        }
     }
 
     /// Get certificate paths for a domain.
@@ -757,6 +779,36 @@ async fn check_and_renew_certificates(
     Ok(())
 }
 
+/// Why the CA refused an order: the order's own problem and each failed
+/// challenge's, whose detail says what the validators saw (a timeout, a wrong
+/// response, a CAA record, a DNS failure). Without it every refusal read the
+/// same, whatever caused it.
+#[cfg(feature = "acme")]
+async fn invalid_order_reasons(order: &mut instant_acme::Order) -> String {
+    let mut reasons = Vec::new();
+    if let Some(problem) = &order.state().error {
+        reasons.push(problem.to_string());
+    }
+    let mut authorizations = order.authorizations();
+    while let Some(result) = authorizations.next().await {
+        match result {
+            Ok(authz) => {
+                for challenge in &authz.challenges {
+                    if let Some(problem) = &challenge.error {
+                        reasons.push(format!("{}: {}", authz.identifier(), problem));
+                    }
+                }
+            }
+            Err(e) => reasons.push(format!("an authorization could not be read: {e}")),
+        }
+    }
+    if reasons.is_empty() {
+        "the CA gave no reason".to_string()
+    } else {
+        reasons.join("; ")
+    }
+}
+
 /// Request a SAN certificate covering multiple domains via ACME protocol.
 /// Single order, single cert, all domains as Subject Alternative Names.
 #[cfg(feature = "acme")]
@@ -852,7 +904,10 @@ async fn request_san_certificate(
     match ready_status {
         OrderStatus::Ready => {}
         OrderStatus::Invalid => {
-            return Err(anyhow::anyhow!("Order became invalid during validation"))
+            return Err(anyhow::anyhow!(
+                "Order became invalid during validation: {}",
+                invalid_order_reasons(&mut order).await
+            ))
         }
         other => {
             return Err(anyhow::anyhow!(
