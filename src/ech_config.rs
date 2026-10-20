@@ -690,15 +690,25 @@ mod pq_ech_tests {
             quinn::Endpoint::server(template.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = server.local_addr().unwrap();
         let accepting = server.clone();
+        // The name each handshake was answered for, read once the server has
+        // processed the ClientHello (as the listener reads it): the client
+        // closes as soon as it is done, so a completed connection may never
+        // be seen from this side
         let names = tokio::spawn(async move {
             let mut names = Vec::new();
             while let Some(incoming) = accepting.accept().await {
-                names.push(incoming.await.ok().and_then(|conn| {
-                    conn.handshake_data()?
-                        .downcast::<HandshakeData>()
-                        .ok()?
-                        .server_name
-                }));
+                let Ok(mut connecting) = incoming.accept() else {
+                    names.push(None);
+                    continue;
+                };
+                names.push(
+                    connecting
+                        .handshake_data()
+                        .await
+                        .ok()
+                        .and_then(|data| data.downcast::<HandshakeData>().ok()?.server_name),
+                );
+                tokio::spawn(connecting);
             }
             names
         });
@@ -716,7 +726,7 @@ mod pq_ech_tests {
             .with_root_certificates(roots)
             .with_no_client_auth();
         client_crypto.alpn_protocols = vec![b"h3".to_vec()];
-        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         client.set_default_client_config(quinn::ClientConfig::new(Arc::new(
             QuicClientConfig::try_from(client_crypto).unwrap(),
         )));
@@ -733,10 +743,13 @@ mod pq_ech_tests {
 
         server.close(0u32.into(), b"");
         client.wait_idle().await;
-        let names = names.await.unwrap();
-        // The refused handshake never completed; the accepted one was for the
-        // name ECH carried encrypted
-        assert_eq!(names.last(), Some(&Some(INNER.to_string())));
+        // Refused, the server answered for the cover name (and the client,
+        // finding no retry it could use, gave up); accepted, for the name ECH
+        // carried encrypted
+        assert_eq!(
+            names.await.unwrap(),
+            [Some(OUTER.to_string()), Some(INNER.to_string())]
+        );
         std::fs::remove_dir_all(&before).unwrap();
         std::fs::remove_dir_all(&after).unwrap();
     }
