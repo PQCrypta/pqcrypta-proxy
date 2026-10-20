@@ -325,6 +325,16 @@ pub struct QuicListener {
     endpoint: Endpoint,
     /// TLS provider
     tls_provider: Arc<TlsProvider>,
+    /// The endpoint's server configuration as built at startup. A TLS reload
+    /// (rotated ECH keys, renewed certificates, the admin API) rebuilds the
+    /// provider's rustls config; [`Self::install_tls_config`] puts it into a
+    /// copy of this and installs that on the endpoint. The endpoint keeps the
+    /// config it was given until then: before it did this, a rotated ECH key
+    /// reached every TCP listener and no QUIC one, and HTTP/3 refused the
+    /// configs DNS published until a restart.
+    server_config: QuinnServerConfig,
+    /// Moves once per TLS reload (`ech_config::reloads`)
+    tls_reloads: tokio::sync::watch::Receiver<u64>,
     /// Backend connection pool
     backend_pool: Arc<BackendPool>,
     /// Configuration
@@ -362,6 +372,18 @@ pub struct QuicListener {
     /// Fingerprint policy (blocking toggles, cache TTL) — same config the TCP
     /// listeners read, so one setting governs both transports.
     fingerprint_config: crate::config::FingerprintConfig,
+}
+
+/// `template` with `crypto` as its TLS configuration, installed on `endpoint`
+/// for the connections that arrive from now on.
+pub(crate) fn install_crypto(
+    endpoint: &Endpoint,
+    template: &QuinnServerConfig,
+    crypto: Arc<quinn::crypto::rustls::QuicServerConfig>,
+) {
+    let mut next = template.clone();
+    next.crypto = crypto;
+    endpoint.set_server_config(Some(next));
 }
 
 /// Response headers that are identical on every response until the config is
@@ -563,7 +585,9 @@ impl QuicListener {
             info!("QUIC multipath disabled by configuration (max_concurrent_multipath_paths = 0)");
         }
 
-        // Create QUIC server configuration
+        // Create QUIC server configuration. Subscribed first, so a reload
+        // between taking the provider's config and running is installed too.
+        let tls_reloads = crate::ech_config::reloads();
         let mut server_config =
             QuinnServerConfig::with_crypto(tls_provider.get_quic_server_config());
         server_config.transport = Arc::new(transport_config);
@@ -622,7 +646,12 @@ impl QuicListener {
             .ok_or_else(|| anyhow::anyhow!("no async runtime found for QUIC endpoint"))?;
         let mut endpoint_config = quinn::EndpointConfig::default();
         endpoint_config.supported_versions(vec![0x0000_0001, 0x6b33_43cf]); // QUIC v1 (RFC 9000) + v2 (RFC 9369)
-        let endpoint = Endpoint::new(endpoint_config, Some(server_config), socket, runtime)?;
+        let endpoint = Endpoint::new(
+            endpoint_config,
+            Some(server_config.clone()),
+            socket,
+            runtime,
+        )?;
 
         info!("QUIC endpoint created on {}", addr);
         info!("ALPN protocols: {:?}", config.tls.alpn_protocols);
@@ -643,6 +672,8 @@ impl QuicListener {
         Ok(Self {
             endpoint,
             tls_provider,
+            server_config,
+            tls_reloads,
             backend_pool,
             config,
             shutdown_rx,
@@ -656,6 +687,24 @@ impl QuicListener {
             fingerprint_extractor: Arc::new(FingerprintExtractor::new()),
             fingerprint_config: config_for_fingerprints,
         })
+    }
+
+    /// Install the TLS provider's current rustls config on the endpoint, for
+    /// the connections that arrive from now on (those open keep theirs). The
+    /// rest of the server config is the startup one, so the transport settings
+    /// and the key validating Retry tokens already handed out stay as they were.
+    fn install_tls_config(&self) {
+        install_crypto(
+            &self.endpoint,
+            &self.server_config,
+            self.tls_provider.get_quic_server_config(),
+        );
+        info!(
+            "🔏 QUIC {}: TLS configuration installed with the current ECH configs and certificates",
+            self.endpoint
+                .local_addr()
+                .map_or_else(|_| "listener".to_string(), |a| a.to_string())
+        );
     }
 
     /// Run the QUIC listener
@@ -774,17 +823,20 @@ impl QuicListener {
                             self.backend_pool = Arc::new(BackendPool::new(new_config.clone()));
                             self.config = new_config;
                         }
-                        ConfigReloadEvent::TlsCertsReloaded => {
-                            info!("TLS certificates reloaded");
-                            // TLS provider handles cert reload internally
-                            if let Err(e) = self.tls_provider.reload_certificates() {
-                                error!("Failed to reload TLS certificates: {}", e);
-                            }
-                        }
+                        // main reloads the shared TLS provider, once, and
+                        // the reload is installed below (`tls_reloads`).
+                        // Reloading it here too rebuilt it once more per
+                        // QUIC listener, and none of them reached an endpoint.
+                        ConfigReloadEvent::TlsCertsReloaded => {}
                         ConfigReloadEvent::ReloadFailed(msg) => {
                             error!("Configuration reload failed: {}", msg);
                         }
                     }
+                }
+
+                // A TLS reload: new connections get the rebuilt config
+                Ok(()) = self.tls_reloads.changed() => {
+                    self.install_tls_config();
                 }
 
                 // Handle shutdown

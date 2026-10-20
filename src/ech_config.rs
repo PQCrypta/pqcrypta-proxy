@@ -9,8 +9,9 @@
 //! [`load`] is called from every place a `rustls::ServerConfig` gets built,
 //! the same way certificate loading already is, so a fresh `ech-keygen` run
 //! is picked up on the next hot-reload without a proxy restart: the QUIC
-//! listener's config is rebuilt in `TlsProvider::reload_certificates`, and
-//! every TCP listener rebuilds its own when [`reloads`] moves.
+//! config is rebuilt in `TlsProvider::reload_certificates`, and when
+//! [`reloads`] moves every QUIC listener installs it on its endpoint and every
+//! TCP listener rebuilds its own.
 
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
@@ -23,10 +24,11 @@ pub const ECH_CONFIG_DIR: &str = "/etc/pqcrypta/ech-configs";
 
 /// Counts the proxy's TLS reloads (`TlsProvider::reload_certificates`, run
 /// when the certificates directory or [`ECH_CONFIG_DIR`] changes, on an ACME
-/// renewal, or from the admin API). Each TCP listener holds a rustls config
-/// of its own with the ECH configs built in and rebuilds it when this moves:
-/// without that, a rotated ECH key that DNS already publishes was accepted
-/// over QUIC only, and every TCP client's ECH failed until a restart.
+/// renewal, or from the admin API). Every listener's rustls config has the
+/// ECH configs built in, and a QUIC endpoint or TCP listener keeps the one it
+/// was given: each installs the rebuilt one when this moves. Without that, a
+/// rotated ECH key that DNS already published was refused by every listener
+/// that had not, until a restart (TCP until 2026-10, QUIC until 2026-10-20).
 static TLS_RELOADS: LazyLock<tokio::sync::watch::Sender<u64>> =
     LazyLock::new(|| tokio::sync::watch::channel(0).0);
 
@@ -653,5 +655,102 @@ mod pq_ech_tests {
         std::fs::write(dir.join("ech-config-list.bin"), list(&[&new, &old])).unwrap();
         assert_eq!(ids(&dir), vec![0x11, 0x10]);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The QUIC side of a rotation: an endpoint holding the configs it
+    /// started with refuses one rotated in after, and accepts it once the
+    /// rebuilt TLS config is installed (`quic_listener::install_crypto`, what
+    /// every QUIC listener runs on a TLS reload). Until 2026-10-20 nothing
+    /// installed it: HTTP/3 refused the configs DNS published until a restart.
+    #[tokio::test]
+    async fn a_rotated_config_reaches_a_running_quic_endpoint() {
+        use quinn::crypto::rustls::{HandshakeData, QuicClientConfig, QuicServerConfig};
+
+        let (cert, key) = certificate();
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let quic_crypto = |dir: &std::path::Path| {
+            let mut config = ServerConfig::builder_with_provider(provider.clone())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert.clone()], key.clone_key())
+                .unwrap();
+            config.alpn_protocols = vec![b"h3".to_vec()];
+            config.ech = load_from(dir);
+            assert!(config.ech.is_some());
+            Arc::new(QuicServerConfig::try_from(config).unwrap())
+        };
+        let before = scratch("quic-before");
+        write_config(&before, 0x41, &pqcrypta_hpke_pq::X_WING_HKDF_SHA256_AES_256);
+        let after = scratch("quic-after");
+        let rotated = write_config(&after, 0x42, &pqcrypta_hpke_pq::X_WING_HKDF_SHA256_AES_256);
+
+        let template = quinn::ServerConfig::with_crypto(quic_crypto(&before));
+        let server =
+            quinn::Endpoint::server(template.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let accepting = server.clone();
+        // The name each handshake was answered for, read once the server has
+        // processed the ClientHello (as the listener reads it): the client
+        // closes as soon as it is done, so a completed connection may never
+        // be seen from this side
+        let names = tokio::spawn(async move {
+            let mut names = Vec::new();
+            while let Some(incoming) = accepting.accept().await {
+                let Ok(mut connecting) = incoming.accept() else {
+                    names.push(None);
+                    continue;
+                };
+                names.push(
+                    connecting
+                        .handshake_data()
+                        .await
+                        .ok()
+                        .and_then(|data| data.downcast::<HandshakeData>().ok()?.server_name),
+                );
+                tokio::spawn(connecting);
+            }
+            names
+        });
+
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.clone()).unwrap();
+        let ech = EchConfig::new(
+            EchConfigListBytes::from(list(&[&rotated])),
+            &pqcrypta_hpke_pq::ALL_SUPPORTED_SUITES,
+        )
+        .unwrap();
+        let mut client_crypto = ClientConfig::builder_with_provider(provider.clone())
+            .with_ech(EchMode::Enable(ech))
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client_crypto.alpn_protocols = vec![b"h3".to_vec()];
+        let client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            QuicClientConfig::try_from(client_crypto).unwrap(),
+        )));
+        let connect = || async {
+            let conn = client.connect(addr, INNER).unwrap().await.ok()?;
+            conn.close(0u32.into(), b"");
+            Some(())
+        };
+
+        // The startup configs: config 0x42 is unknown here, ECH is refused
+        assert!(connect().await.is_none());
+        crate::quic_listener::install_crypto(&server, &template, quic_crypto(&after));
+        assert!(connect().await.is_some());
+
+        server.close(0u32.into(), b"");
+        client.wait_idle().await;
+        // Refused, the server answered for the cover name (and the client,
+        // finding no retry it could use, gave up); accepted, for the name ECH
+        // carried encrypted
+        assert_eq!(
+            names.await.unwrap(),
+            [Some(OUTER.to_string()), Some(INNER.to_string())]
+        );
+        std::fs::remove_dir_all(&before).unwrap();
+        std::fs::remove_dir_all(&after).unwrap();
     }
 }
