@@ -884,9 +884,11 @@ async fn reload_handler(
         // Reload TLS certificates only
         match state.tls_provider.reload_certificates() {
             Ok(()) => {
+                // Every listener installs the reloaded configuration from
+                // the reload watch (ech_config::reloads). A TlsCertsReloaded
+                // event here as well had main reload the provider a second
+                // time for each request.
                 info!("TLS certificates reloaded via admin API");
-                // Notify other components
-                state.config_manager.notify_tls_reload().await;
                 if let Some(ref logger) = state.audit_logger {
                     logger.log(AuditEvent::AdminAction {
                         ip: remote_addr.ip().to_string(),

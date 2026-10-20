@@ -3484,14 +3484,6 @@ fn merge_toml_values(base: toml::Value, overlay: toml::Value) -> toml::Value {
 impl ConfigManager {
     // re-open for remaining methods
 
-    /// Notify listeners that TLS certificates were reloaded
-    pub async fn notify_tls_reload(&self) {
-        let _ = self
-            .reload_tx
-            .send(ConfigReloadEvent::TlsCertsReloaded)
-            .await;
-    }
-
     /// Manually reload configuration
     pub async fn reload(&self) -> anyhow::Result<()> {
         let overrides = self.overrides.read().clone();
