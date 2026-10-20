@@ -34,6 +34,12 @@ BIN="${ECH_KEYGEN_BIN:-/usr/local/bin/pqcrypta-ech-keygen}"
 PUBLISH="${ECH_PUBLISH_BIN:-/usr/local/bin/pqcrypta-ech-publish}"
 PROXY_CONFIG="${PROXY_CONFIG:-/etc/pqcrypta/proxy-config.toml}"
 LOG_FILE="${LOG_FILE:-/var/log/pqcrypta/ech-rotate.log}"
+# The configs' public_name, ECH's cover name: what a client sends in clear while
+# the real name travels encrypted, and the name whose certificate it checks a
+# rejection against before it retries (RFC 9849 6.1.6-6.1.7). A name of its
+# own, so the outer ClientHello names no site; it has its records and
+# certificate on web1 (pqcrypta-configs: dns/zones, [acme] domains).
+PUBLIC_NAME="${ECH_PUBLIC_NAME:-ech.pqcrypta.com}"
 
 log() { echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') $*" | tee -a "$LOG_FILE"; }
 
@@ -53,7 +59,7 @@ done
 # second so the list written last is the complete one.
 for kem in x-wing x25519; do
     log "Rotating the $kem ECH config in $OUT_DIR"
-    "$BIN" --out-dir "$OUT_DIR" --public-name pqcrypta.com --max-name-length 32 --retain 3 --kem "$kem" >>"$LOG_FILE" 2>&1
+    "$BIN" --out-dir "$OUT_DIR" --public-name "$PUBLIC_NAME" --max-name-length 32 --retain 3 --kem "$kem" >>"$LOG_FILE" 2>&1
 done
 
 # [admin] enabled / bind_address / port / auth_token, and the poller interval.
