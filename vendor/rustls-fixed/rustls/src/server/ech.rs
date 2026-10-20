@@ -20,7 +20,10 @@ use crate::{EncryptedClientHelloError, Error};
 #[derive(Clone, Debug)]
 pub struct ServerEchConfig {
     pub(crate) contents: EchConfigContents,
-    pub(crate) suite: &'static dyn Hpke,
+    /// An HPKE suite for each of the config's symmetric suites the provider
+    /// implements, in the config's order: the client picks one of them
+    /// (RFC 9849 6.1), and the offer is opened with the one it picked.
+    pub(crate) suites: Vec<&'static dyn Hpke>,
     pub(crate) private_key: HpkePrivateKey,
 }
 
@@ -56,20 +59,29 @@ impl ServerEchConfig {
         };
 
         let kem_id = contents.key_config.kem_id;
-        let suite = contents
+        // Every symmetric suite the config offers that can be opened here. A
+        // single suite (the first) was kept before, and an offer sealed with
+        // any other of the config's suites - ChaCha20-Poly1305 from a client
+        // without AES hardware, say - failed to open, was rejected, failed
+        // again on the retry and fell back to a cleartext ClientHello.
+        let suites: Vec<&'static dyn Hpke> = contents
             .key_config
             .symmetric_cipher_suites
             .iter()
-            .find_map(|sym| {
+            .filter_map(|sym| {
                 hpke_suites
                     .iter()
                     .find(|hpke| hpke.suite().kem == kem_id && hpke.suite().sym == *sym)
+                    .copied()
             })
-            .ok_or(EncryptedClientHelloError::NoCompatibleConfig)?;
+            .collect();
+        if suites.is_empty() {
+            return Err(EncryptedClientHelloError::NoCompatibleConfig.into());
+        }
 
         Ok(Self {
             contents,
-            suite: *suite,
+            suites,
             private_key,
         })
     }
@@ -275,15 +287,15 @@ pub(crate) fn resolve(
     let candidates = configs.0.iter().filter(|c| c.config_id() == ext.config_id);
 
     for config in candidates {
-        if !config
-            .contents
-            .key_config
-            .symmetric_cipher_suites
-            .contains(&ext.cipher_suite)
-        {
+        // The suite the client sealed with, if the config offers it
+        let Some(suite) = config
+            .suites
+            .iter()
+            .find(|hpke| hpke.suite().sym == ext.cipher_suite)
+        else {
             continue;
-        }
-        let Ok(decrypted) = config.suite.open(
+        };
+        let Ok(decrypted) = suite.open(
             &crate::crypto::hpke::EncapsulatedSecret(ext.enc.0.clone()),
             &config.hpke_info(),
             &aad,
@@ -539,6 +551,15 @@ mod tests {
     }
 
     fn make_ech_keypair(config_id: u8, public_name: &str) -> TestEchKeypair {
+        make_ech_keypair_with(config_id, public_name, &[HpkeAead::AES_128_GCM])
+    }
+
+    /// An X25519 config offering `aeads` (with HKDF-SHA256), in that order.
+    fn make_ech_keypair_with(
+        config_id: u8,
+        public_name: &str,
+        aeads: &[HpkeAead],
+    ) -> TestEchKeypair {
         let suite: &'static dyn Hpke = *ALL_SUPPORTED_SUITES
             .iter()
             .find(|h| {
@@ -561,10 +582,13 @@ mod tests {
                 config_id,
                 kem_id: HpkeKem::DHKEM_X25519_HKDF_SHA256,
                 public_key: crate::msgs::base::PayloadU16::new(public_key.0),
-                symmetric_cipher_suites: vec![HpkeSymmetricCipherSuite {
-                    kdf_id: HpkeKdf::HKDF_SHA256,
-                    aead_id: HpkeAead::AES_128_GCM,
-                }],
+                symmetric_cipher_suites: aeads
+                    .iter()
+                    .map(|aead_id| HpkeSymmetricCipherSuite {
+                        kdf_id: HpkeKdf::HKDF_SHA256,
+                        aead_id: *aead_id,
+                    })
+                    .collect(),
             },
             maximum_name_length: 0,
             public_name: DnsName::try_from(public_name)
@@ -579,7 +603,8 @@ mod tests {
         let mut list_bytes = Vec::new();
         vec![EchConfigPayload::V18(contents)].encode(&mut list_bytes);
 
-        let server_config = ServerEchConfig::new(&single_config_bytes, private_key, &[suite])
+        let server_config =
+            ServerEchConfig::new(&single_config_bytes, private_key, ALL_SUPPORTED_SUITES)
             .expect("constructing ServerEchConfig from our own freshly-generated config must succeed");
 
         TestEchKeypair {
@@ -961,5 +986,65 @@ mod tests {
             },
             other => panic!("expected a rejection with retry_configs, got {other:?}"),
         }
+    }
+
+    /// The client picks one of the config's symmetric suites (RFC 9849 6.1),
+    /// not necessarily the first: one that implements only the second must
+    /// still have its offer opened.
+    #[test]
+    fn an_offer_sealed_with_any_of_the_configs_suites_is_opened() {
+        let keypair = make_ech_keypair_with(
+            0x07,
+            "second.testserver.com",
+            &[HpkeAead::AES_256_GCM, HpkeAead::CHACHA20_POLY_1305],
+        );
+
+        let (chain, key) = test_cert_and_key();
+        let signing_key = crate::crypto::aws_lc_rs::default_provider()
+            .key_provider
+            .load_private_key(key)
+            .unwrap();
+        let resolver = Arc::new(RecordingResolver {
+            key: Arc::new(CertifiedKey::new(chain, signing_key)),
+            seen_sni: Arc::new(Mutex::new(None)),
+        });
+        let mut server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(resolver);
+        server_config.ech = Some(Arc::new(
+            ServerEchConfigs::new(vec![keypair.server_config]).unwrap(),
+        ));
+
+        // A client whose only HPKE suite is the config's second
+        let chacha: &'static dyn Hpke = *ALL_SUPPORTED_SUITES
+            .iter()
+            .find(|h| {
+                h.suite()
+                    == HpkeSuite {
+                        kem: HpkeKem::DHKEM_X25519_HKDF_SHA256,
+                        sym: HpkeSymmetricCipherSuite {
+                            kdf_id: HpkeKdf::HKDF_SHA256,
+                            aead_id: HpkeAead::CHACHA20_POLY_1305,
+                        },
+                    }
+            })
+            .unwrap();
+        let ech_config = EchConfig::new(keypair.client_config_list, &[chacha]).unwrap();
+        let client_config = ClientConfig::builder_with_provider(Arc::new(
+            crate::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_ech(EchMode::Enable(ech_config))
+        .unwrap()
+        .with_root_certificates(test_roots())
+        .with_no_client_auth();
+        let mut client = ClientConnection::new(
+            Arc::new(client_config),
+            ServerName::try_from("testserver.com").unwrap(),
+        )
+        .unwrap();
+        let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
+
+        assert!(client_error(&mut client, &mut server).is_none());
+        assert_eq!(client.ech_status(), ClientEchStatus::Accepted);
     }
 }

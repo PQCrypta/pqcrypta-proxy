@@ -131,11 +131,15 @@ fn main() {
                     })
                     .expect("aws-lc-rs must support the mandatory-to-implement X25519/HKDF-SHA256/AES-128-GCM HPKE suite"),
                 HpkeKem::DHKEM_X25519_HKDF_SHA256,
-                // Both AEADs the server can decrypt with. AES-128-GCM first: it
-                // is the mandatory-to-implement suite. ChaCha20-Poly1305 for
-                // clients on hardware without AES acceleration, where it is the
-                // faster and more constant-time choice.
+                // Every AEAD the server can open, AES-256-GCM first as in the
+                // X-Wing config: the client picks one it implements (RFC 9849
+                // 6.1), and the server opens the offer with the one it picked.
+                // AES-128-GCM is the mandatory-to-implement suite;
+                // ChaCha20-Poly1305 serves clients on hardware without AES
+                // acceleration, where it is the faster and more constant-time
+                // choice.
                 vec![
+                    sym(HpkeKdf::HKDF_SHA256, HpkeAead::AES_256_GCM),
                     sym(HpkeKdf::HKDF_SHA256, HpkeAead::AES_128_GCM),
                     sym(HpkeKdf::HKDF_SHA256, HpkeAead::CHACHA20_POLY_1305),
                 ],
