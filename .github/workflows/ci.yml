@@ -146,6 +146,29 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: cargo test -- --nocapture
 
+  # The vendored rustls fork's own tests: server-side ECH (config_id matching,
+  # retry_configs, the accept and reject round trips) and every upstream test
+  # it carries. They need upstream's test keys and CRLs, which are not
+  # committed; the script fetches them from the release the fork is based on.
+  rustls-fork:
+    name: rustls fork tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: rustls-fork
+          workspaces: vendor/rustls-fixed/rustls
+
+      - name: Upstream test PKI
+        run: vendor/rustls-fixed/fetch-test-ca.sh
+
+      - name: Run the fork's tests
+        run: cargo test --manifest-path vendor/rustls-fixed/rustls/Cargo.toml --lib
+
   # =============================================================================
   # Integration Tests
   # =============================================================================

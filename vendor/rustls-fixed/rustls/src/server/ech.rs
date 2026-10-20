@@ -106,26 +106,41 @@ impl ServerEchConfig {
     }
 }
 
-/// The full set of ECH configurations a server is willing to accept.
+/// The full set of ECH configurations a server is willing to accept, and
+/// which of them are current: the ones a rejection offers as
+/// `retry_configs`.
 #[derive(Clone, Debug, Default)]
-pub struct ServerEchConfigs(pub(crate) Vec<ServerEchConfig>);
+pub struct ServerEchConfigs(pub(crate) Vec<ServerEchConfig>, Vec<usize>);
 
 impl ServerEchConfigs {
-    /// Construct from one or more [`ServerEchConfig`]s. The first is treated
-    /// as the "current" config for the purposes of building `retry_configs`.
+    /// Construct from one or more [`ServerEchConfig`]s, every one of them
+    /// current.
     pub fn new(configs: Vec<ServerEchConfig>) -> Result<Self, Error> {
-        if configs.is_empty() {
+        let all = (0..configs.len()).collect();
+        Self::with_current(configs, all)
+    }
+
+    /// Construct from one or more [`ServerEchConfig`]s, of which those at
+    /// `current` (in that order) are the up-to-date ones: what DNS publishes,
+    /// and what a rejection offers as `retry_configs` (RFC 9849 section 7.1:
+    /// "one or more ECHConfig structures with up-to-date keys"). The others
+    /// are retained only to open offers sealed to an older config a resolver
+    /// still caches; offering them again would hand a client a key on its way
+    /// out, and every rejection - a GREASE extension included - would carry
+    /// each retained generation's public key.
+    pub fn with_current(configs: Vec<ServerEchConfig>, current: Vec<usize>) -> Result<Self, Error> {
+        if configs.is_empty() || current.is_empty() || current.iter().any(|i| *i >= configs.len()) {
             return Err(EncryptedClientHelloError::NoCompatibleConfig.into());
         }
-        Ok(Self(configs))
+        Ok(Self(configs, current))
     }
 
     /// The `EchConfigPayload`s to advertise in `retry_configs` when ECH
     /// wasn't successfully used - i.e. the real, current, up-to-date configs.
-    pub(crate) fn retry_configs(&self) -> Vec<EchConfigPayload> {
-        self.0
+    pub fn retry_configs(&self) -> Vec<EchConfigPayload> {
+        self.1
             .iter()
-            .map(ServerEchConfig::to_ech_config_payload)
+            .map(|i| self.0[*i].to_ech_config_payload())
             .collect()
     }
 }
@@ -816,6 +831,71 @@ mod tests {
             }
         }
         None
+    }
+
+    /// A rejection offers the current configs only: a retained older one
+    /// still opens offers sealed to it, but is never handed out again.
+    #[test]
+    fn retry_configs_are_the_current_configs_only() {
+        let current = make_ech_keypair(0x01, "second.testserver.com");
+        let retained = make_ech_keypair(0x02, "second.testserver.com");
+        let stranger = make_ech_keypair(0x03, "second.testserver.com");
+
+        let (chain, key) = test_cert_and_key();
+        let signing_key = crate::crypto::aws_lc_rs::default_provider()
+            .key_provider
+            .load_private_key(key)
+            .unwrap();
+        let resolver = Arc::new(RecordingResolver {
+            key: Arc::new(CertifiedKey::new(chain, signing_key)),
+            seen_sni: Arc::new(Mutex::new(None)),
+        });
+        let mut server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(resolver);
+        server_config.ech = Some(Arc::new(
+            ServerEchConfigs::with_current(
+                vec![retained.server_config, current.server_config],
+                vec![1],
+            )
+            .unwrap(),
+        ));
+        let server_config = Arc::new(server_config);
+
+        let client = |list: EchConfigListBytes<'static>| {
+            let ech_config = EchConfig::new(list, ALL_SUPPORTED_SUITES).unwrap();
+            let config = ClientConfig::builder_with_provider(Arc::new(
+                crate::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_ech(EchMode::Enable(ech_config))
+            .unwrap()
+            .with_root_certificates(test_roots())
+            .with_no_client_auth();
+            ClientConnection::new(
+                Arc::new(config),
+                ServerName::try_from("testserver.com").unwrap(),
+            )
+            .unwrap()
+        };
+
+        // Sealed to a config the server does not hold: the current one back
+        let mut c = client(stranger.client_config_list);
+        let mut s = ServerConnection::new(server_config.clone()).unwrap();
+        match client_error(&mut c, &mut s) {
+            Some(crate::Error::PeerIncompatible(
+                crate::PeerIncompatible::ServerRejectedEncryptedClientHello(Some(retry_configs)),
+            )) => match retry_configs.as_slice() {
+                [EchConfigPayload::V18(config)] => assert_eq!(config.key_config.config_id, 0x01),
+                other => panic!("expected the current config alone, got {other:?}"),
+            },
+            other => panic!("expected a rejection with retry_configs, got {other:?}"),
+        }
+
+        // Sealed to the retained one: still opened
+        let mut c = client(retained.client_config_list);
+        let mut s = ServerConnection::new(server_config).unwrap();
+        assert!(client_error(&mut c, &mut s).is_none());
+        assert_eq!(c.ech_status(), ClientEchStatus::Accepted);
     }
 
     /// An offer is opened only with the config its config_id names (RFC 9849
