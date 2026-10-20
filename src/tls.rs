@@ -1944,7 +1944,8 @@ impl TlsProvider {
             .map_err(|e| anyhow::anyhow!("Failed to create QUIC server config: {}", e))?;
 
         self.server_config.store(Arc::new(quic_config));
-        // And every TCP listener, whose rustls configs carry the ECH configs.
+        // Every QUIC listener installs it on its endpoint, and every TCP
+        // listener rebuilds its own, when this moves.
         crate::ech_config::note_reload();
 
         // Update the watched directory mtime (certs + ECH configs)
@@ -1954,7 +1955,7 @@ impl TlsProvider {
             .unwrap_or_else(|| Path::new("/etc/pqcrypta/certs"));
         *self.last_cert_modified.write() = Self::combined_watched_mtime(certs_dir);
 
-        info!("TLS certificates reloaded (SNI resolver + QUIC config refreshed)");
+        info!("TLS material reloaded (certificates and ECH configs); every listener installs it");
         Ok(())
     }
 
