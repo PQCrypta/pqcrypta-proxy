@@ -1245,14 +1245,23 @@ async fn acme_renew_handler_with_cooldown(
 
     match &state.acme_service {
         Some(service) => {
-            let renewal_result = {
+            // It used to answer "triggered" and only read the status: nothing
+            // was checked or renewed. The check runs in the background (an
+            // order takes seconds to minutes) and logs its outcome.
+            let (task, status) = {
                 let svc = service.read();
-                svc.get_status()
+                (svc.renewal_task(), svc.get_status())
             };
+            tokio::spawn(async move {
+                match task.await {
+                    Ok(()) => info!("Admin API: ACME check and renewal finished"),
+                    Err(e) => error!("Admin API: ACME check and renewal failed: {}", e),
+                }
+            });
             Json(AcmeRenewResponse {
                 success: true,
-                message: "Certificate renewal check triggered".to_string(),
-                status: Some(renewal_result),
+                message: "Certificate check and renewal started; the outcome is logged".to_string(),
+                status: Some(status),
             })
         }
         None => Json(AcmeRenewResponse {
