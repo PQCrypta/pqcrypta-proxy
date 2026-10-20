@@ -192,7 +192,7 @@ async fn quic(
     } else {
         "[::]:0".parse()?
     };
-    let mut endpoint = quinn::Endpoint::client(bind)?;
+    let endpoint = quinn::Endpoint::client(bind)?;
     endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
     let connecting = endpoint.connect(addr, &name.to_str())?;
     let outcome = match tokio::time::timeout(within, connecting).await {
