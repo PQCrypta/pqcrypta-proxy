@@ -824,6 +824,9 @@ fn sample_server_hello_payload() -> ServerHelloPayload {
         compression_method: Compression::Null,
         extensions: Box::new(ServerExtensions {
             ec_point_formats: Some(SupportedEcPointFormats::default()),
+            // The fork's supported_groups in EncryptedExtensions, a GREASE
+            // value (RFC 8701) among them, as t-grease-group sends it
+            named_groups: Some(vec![NamedGroup::X25519, NamedGroup::from(0x0a0a)]),
             server_name_ack: Some(()),
             session_ticket_ack: Some(()),
             renegotiation_info: Some(PayloadU8::new(vec![0])),
