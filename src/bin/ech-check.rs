@@ -73,18 +73,16 @@ async fn run(args: &Args) -> anyhow::Result<bool> {
         let single = single_list(config);
         let id = config.get(4).copied().unwrap_or_default();
         let kem = pqcrypta_proxy::ech_config::kem_id(config).unwrap_or_default();
-        let tcp = tcp(addr, &name, &single, within)
-            .await
-            .unwrap_or_else(|e| format!("refused ({e:#})"));
-        let quic = quic(addr, &name, &single, within)
-            .await
-            .unwrap_or_else(|e| format!("refused ({e:#})"));
-        let ok = tcp == "accepted" && quic == "accepted";
+        let tcp = tcp(addr, &name, &single, within).await;
+        let quic = quic(addr, &name, &single, within).await;
+        let ok = tcp == Outcome::Accepted && quic == Outcome::Accepted;
         all &= ok;
         println!(
-            "{} config {id:02x} (KEM 0x{kem:04x}) for {}: TCP {tcp}, QUIC {quic}",
+            "{} config {id:02x} (KEM 0x{kem:04x}) for {}: TCP {}, QUIC {}",
             if ok { "✅" } else { "❌" },
-            args.name
+            args.name,
+            tcp.describe(),
+            quic.describe()
         );
     }
     Ok(all)
@@ -148,34 +146,108 @@ fn client(list: &[u8], alpn: &[&[u8]]) -> anyhow::Result<rustls::ClientConfig> {
     Ok(config)
 }
 
+/// What one handshake came to. Told in this program's own words: the
+/// libraries' error text is built from what their configuration holds, the
+/// client's certificate resolver among it (code scanning, `rust/cleartext-logging`),
+/// and a fixed word is what the rotation log needs anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    /// The server opened the inner `ClientHello`
+    Accepted,
+    /// The server answered for the cover name: it holds no key for the config
+    Rejected,
+    /// The handshake failed otherwise (certificate, protocol, a closed
+    /// connection)
+    Failed,
+    /// No connection: refused, unreachable, or nothing to connect with
+    Unreachable,
+    /// No answer within the time allowed
+    TimedOut,
+}
+
+impl Outcome {
+    const fn describe(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected (the server answered for the cover name)",
+            Self::Failed => "failed (the handshake did not complete)",
+            Self::Unreachable => "unreachable",
+            Self::TimedOut => "no answer in time",
+        }
+    }
+
+    /// A TLS handshake's failure: the ECH rejection rustls reports as
+    /// `PeerIncompatible::ServerRejectedEncryptedClientHello`, or another.
+    const fn of_tls(e: &rustls::Error) -> Self {
+        match e {
+            rustls::Error::PeerIncompatible(
+                rustls::PeerIncompatible::ServerRejectedEncryptedClientHello(_),
+            ) => Self::Rejected,
+            _ => Self::Failed,
+        }
+    }
+
+    /// A TCP connection's or TLS-over-TCP handshake's I/O failure.
+    fn of_io(e: &std::io::Error) -> Self {
+        if let Some(tls) = e
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+        {
+            return Self::of_tls(tls);
+        }
+        match e.kind() {
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => Self::TimedOut,
+            std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::AddrNotAvailable => Self::Unreachable,
+            _ => Self::Failed,
+        }
+    }
+}
+
 /// One TLS handshake over TCP offering `list`.
 async fn tcp(
     addr: SocketAddr,
     name: &ServerName<'static>,
     list: &[u8],
     within: Duration,
-) -> anyhow::Result<String> {
-    let config = Arc::new(client(list, &[b"h2", b"http/1.1"])?);
+) -> Outcome {
+    let Ok(config) = client(list, &[b"h2", b"http/1.1"]) else {
+        return Outcome::Failed;
+    };
+    let config = Arc::new(config);
     let name = name.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut sock = TcpStream::connect_timeout(&addr, within).context("connecting")?;
-        sock.set_read_timeout(Some(within))?;
-        sock.set_write_timeout(Some(within))?;
-        let mut conn = rustls::ClientConnection::new(config, name)?;
+    let handshake = tokio::task::spawn_blocking(move || {
+        let mut sock = match TcpStream::connect_timeout(&addr, within) {
+            Ok(sock) => sock,
+            Err(e) => return Outcome::of_io(&e),
+        };
+        if sock.set_read_timeout(Some(within)).is_err()
+            || sock.set_write_timeout(Some(within)).is_err()
+        {
+            return Outcome::Failed;
+        }
+        let Ok(mut conn) = rustls::ClientConnection::new(config, name) else {
+            return Outcome::Failed;
+        };
         while conn.is_handshaking() {
-            conn.complete_io(&mut sock)?;
+            if let Err(e) = conn.complete_io(&mut sock) {
+                return Outcome::of_io(&e);
+            }
         }
         let status = conn.ech_status();
         // A close_notify, so the proxy sees a finished connection
         conn.send_close_notify();
         let _ = conn.write_tls(&mut sock);
         let _ = sock.flush();
-        Ok(match status {
-            EchStatus::Accepted => "accepted".to_string(),
-            other => format!("not accepted ({other:?})"),
-        })
-    })
-    .await?
+        if status == EchStatus::Accepted {
+            Outcome::Accepted
+        } else {
+            Outcome::Rejected
+        }
+    });
+    handshake.await.unwrap_or(Outcome::Failed)
 }
 
 /// One QUIC handshake offering `list`. rustls fails a handshake whose ECH
@@ -185,23 +257,38 @@ async fn quic(
     name: &ServerName<'static>,
     list: &[u8],
     within: Duration,
-) -> anyhow::Result<String> {
-    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(client(list, &[b"h3"])?)?;
-    let bind: SocketAddr = if addr.is_ipv4() {
-        "0.0.0.0:0".parse()?
-    } else {
-        "[::]:0".parse()?
+) -> Outcome {
+    let Ok(Ok(crypto)) =
+        client(list, &[b"h3"]).map(quinn::crypto::rustls::QuicClientConfig::try_from)
+    else {
+        return Outcome::Failed;
     };
-    let endpoint = quinn::Endpoint::client(bind)?;
+    let bind = if addr.is_ipv4() {
+        SocketAddr::from(([0, 0, 0, 0], 0))
+    } else {
+        SocketAddr::from(([0u16; 8], 0))
+    };
+    let Ok(endpoint) = quinn::Endpoint::client(bind) else {
+        return Outcome::Unreachable;
+    };
     endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
-    let connecting = endpoint.connect(addr, &name.to_str())?;
+    let Ok(connecting) = endpoint.connect(addr, &name.to_str()) else {
+        return Outcome::Unreachable;
+    };
     let outcome = match tokio::time::timeout(within, connecting).await {
         Ok(Ok(conn)) => {
             conn.close(0u32.into(), b"");
-            Ok("accepted".to_string())
+            Outcome::Accepted
         }
-        Ok(Err(e)) => Err(anyhow!(e)),
-        Err(_) => Err(anyhow!("no answer in {}s", within.as_secs())),
+        // A TLS failure ends the handshake as a CRYPTO_ERROR transport error;
+        // rustls names the ECH rejection in its reason
+        Ok(Err(quinn::ConnectionError::TransportError(te)))
+            if te.reason.contains("ServerRejectedEncryptedClientHello") =>
+        {
+            Outcome::Rejected
+        }
+        Ok(Err(quinn::ConnectionError::TimedOut)) | Err(_) => Outcome::TimedOut,
+        Ok(Err(_)) => Outcome::Failed,
     };
     endpoint.wait_idle().await;
     outcome
