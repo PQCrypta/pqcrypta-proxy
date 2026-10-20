@@ -12,7 +12,14 @@
 #    is enabled; otherwise the certificate-reload poller notices the changed
 #    ECH directory within `tls.cert_reload_interval_secs`, and this waits that
 #    long.
-# 3. Only then is the list published: `pqcrypta-ech-publish` (pqcrypta-configs
+# 3. `pqcrypta-ech-check` (src/bin/ech-check.rs) offers each config of the
+#    new list on its own to this proxy, over TCP and over QUIC, as a browser
+#    does, and every handshake must be accepted. A reload is not a handshake:
+#    on 2026-10-20 the proxy reloaded, QUIC kept the configs it started with,
+#    and DNS published configs HTTP/3 refused. A refusal stops the rotation
+#    here; DNS keeps the list it has, whose configs the proxy still holds
+#    (`--retain 3`).
+# 4. Only then is the list published: `pqcrypta-ech-publish` (pqcrypta-configs
 #    dns/tools/ech-publish) writes the HTTPS records for every name that
 #    carries this server's key, has the DNS signer sign them, and waits until
 #    ns1, ns2 and ns3 all serve them. Publishing before the proxy holds the key
@@ -32,6 +39,10 @@ set -euo pipefail
 OUT_DIR="${ECH_CONFIG_DIR:-/etc/pqcrypta/ech-configs}"
 BIN="${ECH_KEYGEN_BIN:-/usr/local/bin/pqcrypta-ech-keygen}"
 PUBLISH="${ECH_PUBLISH_BIN:-/usr/local/bin/pqcrypta-ech-publish}"
+CHECK="${ECH_CHECK_BIN:-/usr/local/bin/pqcrypta-ech-check}"
+# A name this proxy serves with this list, and where it listens (TCP and UDP)
+CHECK_NAME="${ECH_CHECK_NAME:-pqcrypta.com}"
+CHECK_ADDR="${ECH_CHECK_ADDR:-127.0.0.1:443}"
 PROXY_CONFIG="${PROXY_CONFIG:-/etc/pqcrypta/proxy-config.toml}"
 LOG_FILE="${LOG_FILE:-/var/log/pqcrypta/ech-rotate.log}"
 # The configs' public_name, ECH's cover name: what a client sends in clear while
@@ -45,7 +56,7 @@ log() { echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') $*" | tee -a "$LOG_FILE"; }
 
 mkdir -p "$OUT_DIR" "$(dirname "$LOG_FILE")"
 
-for tool in "$BIN" "$PUBLISH"; do
+for tool in "$BIN" "$CHECK" "$PUBLISH"; do
     if [[ ! -x "$tool" ]]; then
         log "ERROR: $tool not found or not executable"
         exit 1
@@ -80,10 +91,16 @@ if [[ "$admin_enabled" == "yes" ]]; then
         log "ERROR: the proxy did not reload its TLS material: $reply"
         exit 1
     fi
-    log "Proxy reloaded its TLS material; every listener holds the new ECH configs"
+    log "Proxy reloaded its TLS material"
 else
     log "Admin API off: waiting ${poll_secs}s for the proxy's reload poller"
     sleep "$((poll_secs + 10))"
+fi
+
+log "Offering each new config to the proxy over TCP and QUIC ($CHECK_NAME at $CHECK_ADDR)"
+if ! "$CHECK" "$CHECK_NAME" --addr "$CHECK_ADDR" --list "$OUT_DIR/ech-config-list.bin" 2>&1 | tee -a "$LOG_FILE"; then
+    log "ERROR: the proxy refused a new ECH config; not publishing (DNS keeps the configs it has, which the proxy still holds)"
+    exit 1
 fi
 
 log "Publishing the new ECHConfigList in DNS"
