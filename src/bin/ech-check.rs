@@ -1,4 +1,4 @@
-//! Offers every config of an ECHConfigList to a running proxy, over TCP and
+//! Offers every config of an `ECHConfigList` to a running proxy, over TCP and
 //! over QUIC, one config at a time, and exits non-zero unless each handshake
 //! was accepted: the check `ech-rotate.sh` makes before it publishes a list.
 //!
@@ -11,8 +11,8 @@
 //! published must open, on each transport the HTTPS record advertises.
 //!
 //! The certificate is verified as a browser verifies it, against the public
-//! roots, for the name the encrypted ClientHello carries: accepted ECH means
-//! the server opened the inner ClientHello and answered for that name.
+//! roots, for the name the encrypted `ClientHello` carries: accepted ECH means
+//! the server opened the inner `ClientHello` and answered for that name.
 
 use std::io::Write as _;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs as _};
@@ -27,13 +27,13 @@ use rustls::pki_types::{EchConfigListBytes, ServerName};
 #[derive(Parser)]
 #[command(about = "Offer each published ECH config to a proxy over TCP and QUIC")]
 struct Args {
-    /// The name to ask for inside the encrypted ClientHello, one the proxy
+    /// The name to ask for inside the encrypted `ClientHello`, one the proxy
     /// serves with this list (pqcrypta.com)
     name: String,
     /// Where the proxy listens, TCP and UDP
     #[arg(long, default_value = "127.0.0.1:443")]
     addr: String,
-    /// The ECHConfigList to offer (what is about to be published)
+    /// The `ECHConfigList` to offer (what is about to be published)
     #[arg(long, default_value = "/etc/pqcrypta/ech-configs/ech-config-list.bin")]
     list: std::path::PathBuf,
     /// Seconds each handshake may take
@@ -90,7 +90,7 @@ async fn run(args: &Args) -> anyhow::Result<bool> {
     Ok(all)
 }
 
-/// The ECHConfigs of an ECHConfigList (RFC 9849 §4: a two-byte length, then
+/// The `ECHConfigs` of an `ECHConfigList` (RFC 9849 §4: a two-byte length, then
 /// each config's version, two-byte length and contents), each as encoded.
 fn entries(list: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
     let (len, mut rest) = list
@@ -117,7 +117,7 @@ fn entries(list: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
     Ok(out)
 }
 
-/// An ECHConfigList of the one config.
+/// An `ECHConfigList` of the one config.
 fn single_list(config: &[u8]) -> Vec<u8> {
     let mut list = u16::try_from(config.len())
         .expect("a config fits in its list")
