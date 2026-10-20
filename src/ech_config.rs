@@ -98,6 +98,7 @@ fn load_from(dir: &Path) -> Option<Arc<ServerEchConfigs>> {
 
     let mut configs = Vec::new();
     let mut order = Vec::new();
+    let mut loaded = Vec::new();
     for entry in entries.filter_map(Result::ok) {
         let ech_path = entry.path();
         if ech_path.extension().and_then(|s| s.to_str()) != Some("ech") {
@@ -127,6 +128,7 @@ fn load_from(dir: &Path) -> Option<Arc<ServerEchConfigs>> {
         match ServerEchConfig::new(&ech_bytes, key_bytes.into(), suites()) {
             Ok(config) => {
                 order.push(publication_order(kem_id(&ech_bytes).unwrap_or(0), modified));
+                loaded.push(ech_bytes);
                 configs.push(config);
             }
             Err(e) => warn!(
@@ -142,14 +144,25 @@ fn load_from(dir: &Path) -> Option<Arc<ServerEchConfigs>> {
     }
     // read_dir has no order: the publication order, so retry_configs lists
     // the post-quantum config first exactly as DNS does
-    let mut ordered: Vec<_> = order.into_iter().zip(configs).collect();
+    let mut ordered: Vec<_> = order
+        .into_iter()
+        .zip(loaded.into_iter().zip(configs))
+        .collect();
     ordered.sort_by_key(|(key, _)| *key);
-    let configs: Vec<ServerEchConfig> = ordered.into_iter().map(|(_, c)| c).collect();
+    let (loaded, configs): (Vec<Vec<u8>>, Vec<ServerEchConfig>) =
+        ordered.into_iter().map(|(_, pair)| pair).unzip();
+    let current = current_configs(dir, &loaded);
 
     let count = configs.len();
-    match ServerEchConfigs::new(configs) {
+    let offered = current.len();
+    match ServerEchConfigs::with_current(configs, current) {
         Ok(configs) => {
-            info!("ECH: loaded {} config(s) from {}", count, dir.display());
+            info!(
+                "ECH: loaded {} config(s) from {}, {} of them current (offered as retry_configs)",
+                count,
+                dir.display(),
+                offered
+            );
             Some(Arc::new(configs))
         }
         Err(e) => {
@@ -157,6 +170,59 @@ fn load_from(dir: &Path) -> Option<Arc<ServerEchConfigs>> {
             None
         }
     }
+}
+
+/// Which of `loaded` (encoded ECHConfigs, in publication order) are current:
+/// the ones `ech-config-list.bin` holds, which is what DNS publishes. A
+/// rejection offers only those as retry_configs (RFC 9849 section 7.1: "with
+/// up-to-date keys"); the others are retained to open offers sealed to an
+/// older config that a resolver still caches. Without a list, or with one
+/// naming none of them, the newest of each KEM, which is what `ech-keygen`
+/// publishes.
+fn current_configs(dir: &Path, loaded: &[Vec<u8>]) -> Vec<usize> {
+    let published = std::fs::read(dir.join("ech-config-list.bin"))
+        .map(|list| list_entries(&list))
+        .unwrap_or_default();
+    let listed: Vec<usize> = (0..loaded.len())
+        .filter(|i| published.contains(&loaded[*i]))
+        .collect();
+    if !listed.is_empty() {
+        return listed;
+    }
+    let mut kems = Vec::new();
+    (0..loaded.len())
+        .filter(|i| {
+            let kem = kem_id(&loaded[*i]);
+            let first = !kems.contains(&kem);
+            kems.push(kem);
+            first
+        })
+        .collect()
+}
+
+/// The encoded ECHConfigs of an ECHConfigList: a 2-octet length, then each
+/// config's version, 2-octet length and contents.
+fn list_entries(list: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let Some(body) = list
+        .get(..2)
+        .map(|n| usize::from(u16::from_be_bytes([n[0], n[1]])))
+        .and_then(|n| list.get(2..2 + n))
+    else {
+        return out;
+    };
+    let mut at = 0;
+    while let Some(len) = body
+        .get(at + 2..at + 4)
+        .map(|n| usize::from(u16::from_be_bytes([n[0], n[1]])))
+    {
+        let Some(entry) = body.get(at..at + 4 + len) else {
+            break;
+        };
+        out.push(entry.to_vec());
+        at += 4 + len;
+    }
+    out
 }
 
 /// The `config_id` of every retained ECHConfig in [`ECH_CONFIG_DIR`].
@@ -544,6 +610,47 @@ mod pq_ech_tests {
             (status, name.as_deref()),
             (EchStatus::Accepted, Some(INNER))
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A rejection offers what DNS publishes: the configs in
+    /// ech-config-list.bin, or without one the newest of each KEM. The older
+    /// generations still open offers sealed to them, and are never offered.
+    #[test]
+    fn retry_configs_are_the_published_configs() {
+        let x25519 = *rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES
+            .iter()
+            .find(|h| h.suite().kem == HpkeKem::DHKEM_X25519_HKDF_SHA256)
+            .unwrap();
+        let dir = scratch("current");
+        let old = write_config(&dir, 0x10, x25519);
+        let new = write_config(&dir, 0x11, x25519);
+        // ech-keygen's order: the older generation's file is older
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join("10.ech"))
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+        let ids = |dir: &std::path::Path| -> Vec<u8> {
+            load_from(dir)
+                .unwrap()
+                .retry_configs()
+                .iter()
+                .map(|c| match c {
+                    EchConfigPayload::V18(c) => c.key_config.config_id,
+                    EchConfigPayload::Unknown { version, .. } => {
+                        panic!("expected a V18 config, got version {version:?}")
+                    }
+                })
+                .collect()
+        };
+        assert_eq!(ids(&dir), vec![0x11], "no list: the newest of the KEM");
+        std::fs::write(dir.join("ech-config-list.bin"), list(&[&old])).unwrap();
+        assert_eq!(ids(&dir), vec![0x10], "the list decides");
+        std::fs::write(dir.join("ech-config-list.bin"), list(&[&new, &old])).unwrap();
+        assert_eq!(ids(&dir), vec![0x11, 0x10]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
