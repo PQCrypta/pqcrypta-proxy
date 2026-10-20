@@ -2065,9 +2065,10 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     // ECH over TCP. OpenSSL 3.5 has no server-side ECH, so this listener
     // rejected every encrypted ClientHello: a browser reconnected without
     // ECH and sent the hostname in clear, while DNS advertised ECH and only
-    // HTTP/3 (rustls) accepted it. A connection whose ClientHello names one
-    // of this server's ECH configs goes to the rustls acceptor instead --
-    // ECH, the same groups and certificates, fingerprinting and 0-RTT guard.
+    // HTTP/3 (rustls) accepted it. A connection whose ClientHello offers
+    // ECH goes to the rustls acceptor instead -- ECH, the same groups and
+    // certificates, fingerprinting and 0-RTT guard -- which opens a held
+    // config and answers any other with retry_configs.
     //
     // The route is current, not fixed at start-up: after every TLS reload
     // (`ech_config::reloads`) the config ids are read again and the rustls
@@ -2264,7 +2265,7 @@ fn pqc_handshake_facts(ssl: &openssl::ssl::SslRef) -> crate::tls_acceptor::Hands
 }
 
 /// The rustls acceptor the OpenSSL listener hands ECH connections to, and
-/// the config ids that select them.
+/// the config ids it holds keys for.
 #[derive(Clone)]
 struct EchRoute {
     acceptor: Arc<FingerprintingTlsAcceptor>,
@@ -2304,7 +2305,7 @@ fn current_ech_route(
     };
     if previous.map(|r| &*r.config_ids) != Some(&*config_ids) {
         info!(
-            "🔏 ECH over TCP: ClientHellos naming ECH config(s) {:02x?} are served by rustls",
+            "🔏 ECH over TCP: ClientHellos offering ECH are served by rustls (config(s) {:02x?} held; any other answered with retry_configs)",
             config_ids
         );
     }
@@ -2393,13 +2394,18 @@ async fn handle_pqc_fingerprinted_connection<S>(
     };
     let peek_len = peeked.as_ref().map(|n| *n).unwrap_or(0);
 
-    // A ClientHello for one of this server's ECH configs: rustls serves the
-    // connection (and fingerprints it, once). GREASE ECH names a random
-    // config_id and stays here.
+    // A ClientHello offering ECH: rustls serves the connection (and
+    // fingerprints it, once), whatever config it names. One sealed to a held
+    // config is opened; one naming a config this server no longer holds (a
+    // resolver still serving an old HTTPS record) or a GREASE one is answered
+    // with retry_configs, which RFC 9849 section 7.1 requires of a server
+    // configured with ECH and a real client reconnects with. Left on OpenSSL,
+    // which cannot do ECH, a stale config got a bare rejection and the
+    // client fell back to a cleartext ClientHello. A GREASE client ignores
+    // the retry_configs (section 6.2), and costs no decryption: only the
+    // config an offer names is tried.
     if let Some(route) = ech_route {
-        if crate::ech_config::offered_config_id(&peek_buf[..peek_len])
-            .is_some_and(|id| route.config_ids.contains(&id))
-        {
+        if crate::ech_config::offered_config_id(&peek_buf[..peek_len]).is_some() {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             handle_fingerprinted_connection(
                 stream,
@@ -2414,8 +2420,11 @@ async fn handle_pqc_fingerprinted_connection<S>(
             return;
         }
     }
+    // Fingerprinting off: this listener serves for ECH alone, and judges no
+    // ClientHello
+    let capture = fingerprint_config.enabled && fingerprint_config.tls_layer_capture;
     let fingerprint_result = match peeked {
-        Ok(n) if n > 0 => {
+        Ok(n) if n > 0 && capture => {
             trace!("Peeked {} bytes of ClientHello from {}", n, remote_addr);
             fingerprint_extractor.process_client_hello(
                 &peek_buf[..n],
@@ -2424,6 +2433,13 @@ async fn handle_pqc_fingerprinted_connection<S>(
                 &fingerprint_config,
             )
         }
+        Ok(_) if !capture => crate::fingerprint::FingerprintResult {
+            allowed: true,
+            ja3_hash: None,
+            ja4_hash: None,
+            classification: None,
+            client_name: None,
+        },
         Ok(_) => {
             debug!("Empty peek from {}", remote_addr);
             crate::fingerprint::FingerprintResult {

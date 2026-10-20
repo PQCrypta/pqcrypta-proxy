@@ -1206,6 +1206,13 @@ async fn run() -> anyhow::Result<()> {
     let use_pqc_listener = pqc_status.available && config.pqc.enabled;
     let use_fingerprint_listener =
         config.fingerprint.enabled && config.fingerprint.tls_layer_capture;
+    // ECH over TCP needs the PQC listener that reads the ClientHello before
+    // OpenSSL does (OpenSSL cannot open ECH, so that listener hands ECH
+    // ClientHellos to rustls). With ECH keys on the node it serves even with
+    // fingerprinting off, and classifies nothing then: the plain OpenSSL
+    // listener answered every ECH offer with a bare rejection.
+    #[cfg(feature = "pqc")]
+    let use_ech_over_tcp = use_pqc_listener && pqcrypta_proxy::ech_config::load().is_some();
 
     // Create shutdown channels for fingerprinting listeners (supports graceful shutdown)
     let mut http_shutdown_senders: Vec<tokio::sync::watch::Sender<()>> = Vec::new();
@@ -1227,7 +1234,7 @@ async fn run() -> anyhow::Result<()> {
         // Priority 1: PQC + TLS-layer fingerprinting (OpenSSL with ClientHello capture)
         // Combines post-quantum cryptography with early fingerprint blocking
         #[cfg(feature = "pqc")]
-        if use_pqc_listener && use_fingerprint_listener {
+        if use_pqc_listener && (use_fingerprint_listener || use_ech_over_tcp) {
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
             http_shutdown_senders.push(shutdown_tx);
             let http_pqc_provider = pqc_provider.clone();
