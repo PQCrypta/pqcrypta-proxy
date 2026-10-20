@@ -248,18 +248,16 @@ pub(crate) fn resolve(
         aad
     };
 
-    // Trial decryption: try the config whose config_id matches first (the
-    // spec's recommended method, since it's the only way this scales), but
-    // fall through to trying every other configured key too - a stale
-    // client-cached DNS record could carry an ID that no longer exists
-    // locally, and there is nothing more we can do at that point anyway
-    // except correctly reject.
-    let mut candidates: Vec<&ServerEchConfig> = configs
-        .0
-        .iter()
-        .filter(|c| c.config_id() == ext.config_id)
-        .collect();
-    candidates.extend(configs.0.iter().filter(|c| c.config_id() != ext.config_id));
+    // The candidates are the configs the offer's config_id names (RFC 9849
+    // section 7.1: "Unless specified by the application profile or otherwise
+    // externally configured, implementations MUST use the first method").
+    // Trying every other key too was trial decryption, the method a
+    // deployment has to opt into: it opens nothing a stale config sealed (the
+    // key behind a retired id is gone), and every GREASE ClientHello - every
+    // Chrome's - cost an HPKE decapsulation per held key (section 10.4: it
+    // "may exacerbate DoS attacks"). An id this server does not hold is
+    // rejected at once, with retry_configs.
+    let candidates = configs.0.iter().filter(|c| c.config_id() == ext.config_id);
 
     for config in candidates {
         if !config
@@ -505,7 +503,7 @@ mod tests {
     use crate::client::{EchConfig, EchMode, EchStatus as ClientEchStatus};
     use crate::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES;
     use crate::crypto::hpke::{Hpke, HpkeSuite};
-    use crate::msgs::codec::Codec;
+    use crate::msgs::codec::{Codec, Reader};
     use crate::msgs::enums::{HpkeAead, HpkeKdf, HpkeKem};
     use crate::msgs::handshake::{
         EchConfigContents, EchConfigPayload, HpkeKeyConfig, HpkeSymmetricCipherSuite,
@@ -767,34 +765,7 @@ mod tests {
         .unwrap();
         let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
 
-        // Drive the handshake manually (rather than via `do_handshake`,
-        // which asserts success): the server completes its flight, but the
-        // client is expected to hard-error partway through processing it.
-        let mut buf = Vec::new();
-        let mut client_err = None;
-        for _ in 0..20 {
-            if client_err.is_some() || (!client.is_handshaking() && !server.is_handshaking()) {
-                break;
-            }
-
-            buf.clear();
-            client.write_tls(&mut buf).unwrap();
-            if !buf.is_empty() {
-                server.read_tls(&mut &buf[..]).unwrap();
-                server.process_new_packets().unwrap();
-            }
-
-            buf.clear();
-            server.write_tls(&mut buf).unwrap();
-            if !buf.is_empty() {
-                client.read_tls(&mut &buf[..]).unwrap();
-                if let Err(e) = client.process_new_packets() {
-                    client_err = Some(e);
-                }
-            }
-        }
-
-        match client_err {
+        match client_error(&mut client, &mut server) {
             Some(crate::Error::PeerIncompatible(
                 crate::PeerIncompatible::ServerRejectedEncryptedClientHello(Some(retry_configs)),
             )) => {
@@ -813,5 +784,102 @@ mod tests {
             Some("second.testserver.com"),
             "on fallback, cert resolution must see the outer public_name, not the (undeliverable) real inner SNI"
         );
+    }
+
+    /// Drive a handshake by hand (rather than via `do_handshake`, which
+    /// asserts success): the server completes its flight, and the client's
+    /// error, when it hard-errors processing it, is returned.
+    fn client_error(
+        client: &mut ClientConnection,
+        server: &mut ServerConnection,
+    ) -> Option<crate::Error> {
+        let mut buf = Vec::new();
+        for _ in 0..20 {
+            if !client.is_handshaking() && !server.is_handshaking() {
+                return None;
+            }
+
+            buf.clear();
+            client.write_tls(&mut buf).unwrap();
+            if !buf.is_empty() {
+                server.read_tls(&mut &buf[..]).unwrap();
+                server.process_new_packets().unwrap();
+            }
+
+            buf.clear();
+            server.write_tls(&mut buf).unwrap();
+            if !buf.is_empty() {
+                client.read_tls(&mut &buf[..]).unwrap();
+                if let Err(e) = client.process_new_packets() {
+                    return Some(e);
+                }
+            }
+        }
+        None
+    }
+
+    /// An offer is opened only with the config its config_id names (RFC 9849
+    /// section 7.1). Sealed to the server's own key under an id the server
+    /// does not use, it is rejected with retry_configs rather than trial
+    /// decrypted - the same answer a GREASE extension or a stale config gets,
+    /// at no HPKE cost.
+    #[test]
+    fn ech_offer_is_opened_only_with_the_config_its_id_names() {
+        let server_keypair = make_ech_keypair(0x01, "second.testserver.com");
+        // The server's own public key, under config_id 0x02
+        let mut relabelled =
+            Vec::<EchConfigPayload>::read(&mut Reader::init(&*server_keypair.client_config_list))
+                .unwrap();
+        match &mut relabelled[0] {
+            EchConfigPayload::V18(contents) => contents.key_config.config_id = 0x02,
+            other => panic!("expected a V18 config, got {other:?}"),
+        }
+        let mut list_bytes = Vec::new();
+        relabelled.encode(&mut list_bytes);
+
+        let (chain, key) = test_cert_and_key();
+        let signing_key = crate::crypto::aws_lc_rs::default_provider()
+            .key_provider
+            .load_private_key(key)
+            .unwrap();
+        let resolver = Arc::new(RecordingResolver {
+            key: Arc::new(CertifiedKey::new(chain, signing_key)),
+            seen_sni: Arc::new(Mutex::new(None)),
+        });
+        let mut server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(resolver);
+        server_config.ech = Some(Arc::new(
+            ServerEchConfigs::new(vec![server_keypair.server_config]).unwrap(),
+        ));
+
+        let ech_config =
+            EchConfig::new(EchConfigListBytes::from(list_bytes), ALL_SUPPORTED_SUITES).unwrap();
+        let client_config = ClientConfig::builder_with_provider(Arc::new(
+            crate::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_ech(EchMode::Enable(ech_config))
+        .unwrap()
+        .with_root_certificates(test_roots())
+        .with_no_client_auth();
+
+        let mut client = ClientConnection::new(
+            Arc::new(client_config),
+            ServerName::try_from("testserver.com").unwrap(),
+        )
+        .unwrap();
+        let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
+
+        match client_error(&mut client, &mut server) {
+            Some(crate::Error::PeerIncompatible(
+                crate::PeerIncompatible::ServerRejectedEncryptedClientHello(Some(retry_configs)),
+            )) => match retry_configs.as_slice() {
+                [EchConfigPayload::V18(current)] => {
+                    assert_eq!(current.key_config.config_id, 0x01)
+                }
+                other => panic!("expected the server's one config, got {other:?}"),
+            },
+            other => panic!("expected a rejection with retry_configs, got {other:?}"),
+        }
     }
 }
