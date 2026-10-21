@@ -33,6 +33,10 @@ struct Args {
     /// Where the proxy listens, TCP and UDP
     #[arg(long, default_value = "127.0.0.1:443")]
     addr: String,
+    /// The UDP port HTTP/3 answers on, where it is not `--addr`'s (the
+    /// HTTPS record then names it: `alpn="h3" port=4434`)
+    #[arg(long)]
+    quic_port: Option<u16>,
     /// The `ECHConfigList` to offer (what is about to be published)
     #[arg(long, default_value = "/etc/pqcrypta/ech-configs/ech-config-list.bin")]
     list: std::path::PathBuf,
@@ -67,6 +71,7 @@ async fn run(args: &Args) -> anyhow::Result<bool> {
         .ok_or_else(|| anyhow!("{} names no address", args.addr))?;
     let name = ServerName::try_from(args.name.clone()).context("the name to ask for")?;
     let within = Duration::from_secs(args.timeout);
+    let quic_port = args.quic_port.unwrap_or_else(|| addr.port());
 
     let mut all = true;
     for config in &configs {
@@ -74,7 +79,8 @@ async fn run(args: &Args) -> anyhow::Result<bool> {
         let id = config.get(4).copied().unwrap_or_default();
         let kem = pqcrypta_proxy::ech_config::kem_id(config).unwrap_or_default();
         let tcp = tcp(addr, &name, &single, within).await;
-        let quic = quic(addr, &name, &single, within).await;
+        let quic_addr = SocketAddr::new(addr.ip(), quic_port);
+        let quic = quic(quic_addr, &name, &single, within).await;
         let ok = tcp == Outcome::Accepted && quic == Outcome::Accepted;
         all &= ok;
         println!(

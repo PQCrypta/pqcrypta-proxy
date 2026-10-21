@@ -1208,11 +1208,14 @@ async fn run() -> anyhow::Result<()> {
         config.fingerprint.enabled && config.fingerprint.tls_layer_capture;
     // ECH over TCP needs the PQC listener that reads the ClientHello before
     // OpenSSL does (OpenSSL cannot open ECH, so that listener hands ECH
-    // ClientHellos to rustls). With ECH keys on the node it serves even with
-    // fingerprinting off, and classifies nothing then: the plain OpenSSL
-    // listener answered every ECH offer with a bare rejection.
+    // ClientHellos to rustls). It serves even with fingerprinting off, and
+    // classifies nothing then: the plain OpenSSL listener answered every ECH
+    // offer with a bare rejection. Chosen whether or not the node holds ECH
+    // keys yet: the route is built on every TLS reload (ech_route_for) and
+    // stays empty until configs exist, so a node's first keys, from
+    // ech-rotate, are served at the reload rather than at the next restart.
     #[cfg(feature = "pqc")]
-    let use_ech_over_tcp = use_pqc_listener && pqcrypta_proxy::ech_config::load().is_some();
+    let use_ech_over_tcp = use_pqc_listener;
 
     // Create shutdown channels for fingerprinting listeners (supports graceful shutdown)
     let mut http_shutdown_senders: Vec<tokio::sync::watch::Sender<()>> = Vec::new();

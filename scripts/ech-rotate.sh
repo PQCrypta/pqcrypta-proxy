@@ -55,11 +55,16 @@ CHECK="${ECH_CHECK_BIN:-/usr/local/bin/pqcrypta-ech-check}"
 # A name this proxy serves with this list, and where it listens (TCP and UDP)
 CHECK_NAME="${ECH_CHECK_NAME:-pqcrypta.com}"
 CHECK_ADDR="${ECH_CHECK_ADDR:-127.0.0.1:443}"
+# The UDP port HTTP/3 answers on, where it is not CHECK_ADDR's: the mail
+# host's provider drops UDP 443, so its HTTP/3 is on 4434 and its HTTPS
+# records name that port
+CHECK_QUIC_PORT="${ECH_CHECK_QUIC_PORT:-}"
 PROXY_CONFIG="${PROXY_CONFIG:-/etc/pqcrypta/proxy-config.toml}"
 # "no" on a node the signer's host rotates: stop once the configs are checked
 PUBLISH_HERE="${ECH_PUBLISH:-yes}"
-# The nodes rotated from here, NODE=NAME: an ssh host, and a name it serves
-# with its key ("api3=philibertsecurity.com")
+# The nodes rotated from here, NODE=NAME[@QUICPORT]: an ssh host, a name it
+# serves with its key, and the UDP port of its HTTP/3 where it is not 443
+# ("api3=philibertsecurity.com mail=core.fated.org@4434")
 REMOTE_NODES="${ECH_REMOTE_NODES:-}"
 RECORDS_CONF="${ECH_RECORDS_CONF:-/etc/knot-signer/ech/https-records.conf}"
 LOG_FILE="${LOG_FILE:-/var/log/pqcrypta/ech-rotate.log}"
@@ -118,8 +123,10 @@ else
     sleep "$((poll_secs + 10))"
 fi
 
-log "Offering each new config to the proxy over TCP and QUIC ($CHECK_NAME at $CHECK_ADDR)"
-if ! "$CHECK" "$CHECK_NAME" --addr "$CHECK_ADDR" --list "$OUT_DIR/ech-config-list.bin" 2>&1 | tee -a "$LOG_FILE"; then
+log "Offering each new config to the proxy over TCP and QUIC ($CHECK_NAME at $CHECK_ADDR${CHECK_QUIC_PORT:+, QUIC on $CHECK_QUIC_PORT})"
+quic_port_arg=()
+[[ -n "$CHECK_QUIC_PORT" ]] && quic_port_arg=(--quic-port "$CHECK_QUIC_PORT")
+if ! "$CHECK" "$CHECK_NAME" --addr "$CHECK_ADDR" "${quic_port_arg[@]}" --list "$OUT_DIR/ech-config-list.bin" 2>&1 | tee -a "$LOG_FILE"; then
     log "ERROR: the proxy refused a new ECH config; not publishing (DNS keeps the configs it has, which the proxy still holds)"
     exit 1
 fi
@@ -135,6 +142,11 @@ remote_failed=0
 for entry in $REMOTE_NODES; do
     node=${entry%%=*}
     name=${entry#*=}
+    quic_port=""
+    if [[ "$name" == *@* ]]; then
+        quic_port=${name#*@}
+        name=${name%@*}
+    fi
     key_file=$(awk -v n="$node" '$1 == "key" && $2 == n { print $3 }' "$RECORDS_CONF")
     if [[ -z "$key_file" || "$name" == "$entry" ]]; then
         log "ERROR: $entry: no key line for $node in $RECORDS_CONF, or no name to check"
@@ -144,7 +156,7 @@ for entry in $REMOTE_NODES; do
     log "Rotating $node's ECH configs"
     # The name goes through as an argument to printf %q, never as shell text
     if ! ssh -o BatchMode=yes -o ConnectTimeout=15 "$node" \
-        "ECH_PUBLISH=no ECH_CHECK_NAME=$(printf %q "$name") /usr/local/bin/pqcrypta-ech-rotate" 2>&1 | tee -a "$LOG_FILE"; then
+        "ECH_PUBLISH=no ECH_CHECK_NAME=$(printf %q "$name") ECH_CHECK_QUIC_PORT=$(printf %q "$quic_port") /usr/local/bin/pqcrypta-ech-rotate" 2>&1 | tee -a "$LOG_FILE"; then
         log "ERROR: $node's rotation failed; DNS keeps the configs it has for $node"
         remote_failed=1
         continue
@@ -153,7 +165,7 @@ for entry in $REMOTE_NODES; do
     addr=$(getent ahostsv4 "$name" | awk 'NR == 1 { print $1 }')
     if ssh -o BatchMode=yes -o ConnectTimeout=15 "$node" cat /etc/pqcrypta/ech-configs/ech-config-list.bin > "$list" \
         && [[ -n "$addr" ]] \
-        && "$CHECK" "$name" --addr "$addr:443" --list "$list" 2>&1 | tee -a "$LOG_FILE"; then
+        && "$CHECK" "$name" --addr "$addr:443" ${quic_port:+--quic-port "$quic_port"} --list "$list" 2>&1 | tee -a "$LOG_FILE"; then
         base64 -w0 "$list" > "$key_file.new"
         chmod --reference="$key_file" "$key_file.new"
         chown --reference="$key_file" "$key_file.new"
