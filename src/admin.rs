@@ -1672,7 +1672,7 @@ struct UnblockResponse {
 #[derive(Debug, Serialize)]
 struct CachePurgeResponse {
     success: bool,
-    /// What was purged: "all", "host", "prefix" or "url".
+    /// What was purged: "all", "host", "prefix", "host-prefix" or "url".
     scope: String,
     /// The host / prefix / URL selected, absent for a full purge.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1720,6 +1720,7 @@ async fn cache_stats_handler(State(state): State<Arc<AdminState>>) -> Json<Cache
 /// POST /cache/purge                          everything
 /// POST /cache/purge?host=example.com         one host
 /// POST /cache/purge?prefix=/sitemaps/        one path prefix, any host
+/// POST /cache/purge?host=x&prefix=/entropy/  one path prefix on one host
 /// POST /cache/purge?host=x&path=/robots.txt  one exact URL
 /// ```
 ///
@@ -1760,12 +1761,31 @@ async fn cache_purge_handler(
         ));
     }
 
-    // Narrowest selector wins. Written as a chain rather than a tuple match so
+    // path= is one URL and prefix= many: given both, one would be ignored.
+    if path.is_some() && prefix.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "path= (one URL) and prefix= (every path under it) select different \
+                          things; give one of them"
+            })),
+        ));
+    }
+
+    // Narrowest selector wins. host= with prefix= was purged as host= alone:
+    // a request for one page's entries emptied the whole site. Written as a chain rather than a tuple match so
     // that "path without host" — already rejected above — is not a state this
     // has to invent an answer for; a purge route is the wrong place to reach
     // for unreachable!().
     let (scope, target, removed) = if let (Some(h), Some(p)) = (host, path) {
         ("url", Some(format!("{h}{p}")), cache.purge_url(h, p))
+    } else if let (Some(h), Some(pre)) = (host, prefix) {
+        (
+            "host-prefix",
+            Some(format!("{h}{pre}")),
+            cache.purge_host_prefix(h, pre),
+        )
     } else if let Some(h) = host {
         ("host", Some(h.to_string()), cache.purge_host(h))
     } else if let Some(pre) = prefix {
