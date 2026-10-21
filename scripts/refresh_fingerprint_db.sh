@@ -422,11 +422,15 @@ check_apache_drift() {
     # tracked, and reported every week as "no longer enabled" because only
     # sites-enabled was compared.
     local PORTS="/etc/apache2/ports.conf"
+    # Our own server-wide confs (pqcrypta-remoteip.conf: REMOTE_ADDR from the
+    # proxy's X-Real-IP), enabled from conf-available: as security-relevant
+    # as a vhost, and tracked beside them
+    local CONFS="/etc/apache2/conf-enabled"
     [ -d "${SRC}" ] || return 0
     [ -d "${DIR}" ] || { log "apache drift: ${DIR} not tracked yet"; return 1; }
 
     local DRIFTED=0 F NAME TMP
-    for F in "${SRC}"/*.conf "${PORTS}"; do
+    for F in "${SRC}"/*.conf "${PORTS}" "${CONFS}"/pqcrypta-*.conf; do
         [ -e "${F}" ] || continue
         NAME=$(basename "${F}")
         TMP=$(mktemp /tmp/apadrift_XXXXXX.conf)
@@ -461,6 +465,9 @@ check_apache_drift() {
         [ -e "${F}" ] || continue
         NAME=$(basename "${F}")
         if [ "${NAME}" = "$(basename "${PORTS}")" ] && [ -e "${PORTS}" ]; then
+            continue
+        fi
+        if [ -e "${CONFS}/${NAME}" ]; then
             continue
         fi
         if [ ! -e "${SRC}/${NAME}" ]; then
