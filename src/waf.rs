@@ -240,8 +240,9 @@ const PAYLOAD_RULES: &[RuleDef] = &[
     // ---------------------------------------------------------------------
     RuleDef::payload("PQW-SQLI-001", Category::Sqli, Severity::High,
         r"(?i)(\b(union\s+select|select\s+.*\s+from|insert\s+into|delete\s+from|drop\s+(table|database)|alter\s+table|exec(\s|\()|execute\s*\()\b)"),
+    // A quoted break-out into a tautology: ' OR 1=1, ' or (((0x67=0x67)))
     RuleDef::payload("PQW-SQLI-002", Category::Sqli, Severity::High,
-        r#"(?i)('|")\s*(or|and)\s+('|")?\d+('|")?\s*=\s*('|")?\d+"#),
+        r#"(?i)('|")\s*(or|and)\s+\(*\s*('|")?(0x[0-9a-f]+|\d+)('|")?\s*\)*\s*=\s*\(*\s*('|")?(0x[0-9a-f]+|\d+)"#),
     RuleDef::payload("PQW-SQLI-003", Category::Sqli, Severity::High,
         r"(?i)\bor\s+1\s*=\s*1"),
     RuleDef::payload("PQW-SQLI-004", Category::Sqli, Severity::High,
@@ -267,9 +268,10 @@ const PAYLOAD_RULES: &[RuleDef] = &[
     // SQL comment evasion: OR/AND separated by /**/ or /*!...*/ or + (MySQL)
     RuleDef::payload("PQW-SQLI-011", Category::Sqli, Severity::High,
         r"(?i)'\s*(/\*.*?\*/|/\*!.*?\*/|\+)\s*(or|and)\s*(/\*.*?\*/|\+)?\s*['\d]"),
-    // MySQL conditional comments executing SQL keywords: /*!OR*/ /*!UNION*/ etc.
+    // MySQL executable comments carrying SQL keywords, with or without the
+    // server version: /*!OR*/ /*!50000UNION*/ /*!12345SELECT 1*/
     RuleDef::payload("PQW-SQLI-012", Category::Sqli, Severity::High,
-        r"(?i)/\*!\s*(or|and|union|select|insert|delete|drop|update|exec|execute)\s*\*/"),
+        r"(?i)/\*!\d*\s*(or|and|union|select|insert|delete|drop|update|exec|execute|sleep|benchmark)\b"),
     // Encoded whitespace (newline/tab) as SQL token separator: 1'%0aOR%0a1=1
     RuleDef::payload("PQW-SQLI-013", Category::Sqli, Severity::High,
         r"(?i)'(%0[ad]|%09|\s)+(or|and)(%0[ad]|%09|\s)+['\d]"),
@@ -1072,6 +1074,41 @@ fn fold_fullwidth(input: &str) -> String {
         .collect()
 }
 
+/// SQL comments read the way MySQL reads them: an executable comment
+/// (`/*!body*/`, `/*!50000body*/` with the server version the body needs)
+/// becomes its body, and any other `/* ... */` becomes a space. sqlmap's
+/// versionedkeywords, versionedmorekeywords, halfversionedmorekeywords and
+/// space2comment tamper scripts hide keywords this way, and a pattern written
+/// for the plain keyword does not see `' /*!50000oR*/ (((0x67=0x67)))-- -`
+/// (2026-10-20, a POST to /admin/ that reached the application). The rules
+/// then run on the text the database would execute.
+fn sql_comment_normalize(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("*/") else {
+            // An unterminated comment runs to the end; MySQL rejects it, so
+            // keep the text as it is for the other rules
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let inner = &after[..end];
+        if let Some(body) = inner.strip_prefix('!') {
+            let body = body.trim_start_matches(|c: char| c.is_ascii_digit());
+            out.push(' ');
+            out.push_str(body);
+            out.push(' ');
+        } else {
+            out.push(' ');
+        }
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn decode_variants(raw: &str, max_passes: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(4);
     out.push(raw.to_string());
@@ -1098,6 +1135,18 @@ fn decode_variants(raw: &str, max_passes: usize) -> Vec<String> {
     }
     if !pct.is_ascii() {
         add(fold_fullwidth(&pct), &mut out);
+    }
+    if pct.contains("/*") {
+        add(sql_comment_normalize(&pct), &mut out);
+        if raw.contains('+') {
+            add(
+                sql_comment_normalize(&percent_decode_iterative(
+                    &raw.replace('+', " "),
+                    max_passes,
+                )),
+                &mut out,
+            );
+        }
     }
 
     out
@@ -2340,6 +2389,76 @@ mod tests {
 
     fn engine() -> WafEngine {
         WafEngine::new(&config())
+    }
+
+    /// SQL keywords hidden in comments, as sqlmap's tamper scripts hide them,
+    /// are blocked in a form body at the production threshold: the first is
+    /// the request that reached /admin/ on 2026-10-21 (06:39 UTC, an automated
+    /// scanner), form-encoded as a browser posts it. Ordinary form posts that
+    /// carry comments, "or" and "select" still pass.
+    #[test]
+    fn sql_keywords_hidden_in_comments_are_blocked() {
+        let engine = WafEngine::new(&WafConfig {
+            enabled: true,
+            anomaly_threshold: 5,
+            ..Default::default()
+        });
+        let mut headers = browser_headers();
+        headers.insert(
+            "content-type",
+            "application/x-www-form-urlencoded".parse().unwrap(),
+        );
+        let post = |body: &str| {
+            engine.inspect(&WafRequest {
+                method: "POST",
+                path: "/admin/",
+                query: "",
+                headers: &headers,
+                body: Some(body.as_bytes()),
+                skip_bot_ua_check: false,
+                generic_client_allowed: false,
+                mode_override: None,
+            })
+        };
+        for body in [
+            // As sent: versionedmorekeywords around OR, a hex tautology
+            "csrf_token=abc&username=%27+%2F*%2150000oR*%2F+%28%28%280x67%3D0x67%29%29%29--+-&password=x",
+            "csrf_token=abc&username=%27+%2F%2A%2150000oR%2A%2F+%28%28%280x67%3D0x67%29%29%29--+-&password=x",
+            // versionedkeywords
+            "q=1+%2F*%21UNION*%2F+%2F*%21SELECT*%2F+1%2C2%2C3",
+            // versionedmorekeywords
+            "q=1+%2F*%2150000UNION*%2F+%2F*%2150000SELECT*%2F+1%2C2",
+            // space2comment
+            "q=1%2F**%2FUNION%2F**%2FSELECT%2F**%2Fpassword%2F**%2FFROM%2F**%2Fusers",
+            // halfversionedmorekeywords
+            "q=%27+%2F*%210OR*%2F+1%3D1--+-",
+        ] {
+            let v = post(body);
+            assert!(blocked(&v), "{body}: {v:?}");
+        }
+        for body in [
+            "username=jane&password=correct+horse+battery+staple",
+            "comment=I+said+%2F*+nothing+*%2F+about+it%2C+or+did+I%3F",
+            "q=select+your+plan+or+call+us",
+            "code=int+a+%3D+1%3B+%2F*+note+*%2F+return+a%3B",
+        ] {
+            let v = post(body);
+            assert!(!blocked(&v), "{body}: {v:?}");
+        }
+    }
+
+    #[test]
+    fn sql_comments_read_as_mysql_reads_them() {
+        assert_eq!(
+            sql_comment_normalize("' /*!50000oR*/ (((0x67=0x67)))-- -"),
+            "'  oR  (((0x67=0x67)))-- -"
+        );
+        assert_eq!(
+            sql_comment_normalize("1/**/UNION/**/SELECT"),
+            "1 UNION SELECT"
+        );
+        assert_eq!(sql_comment_normalize("a /* open"), "a /* open");
+        assert_eq!(sql_comment_normalize("no comments"), "no comments");
     }
 
     /// PQW-JNDI-007 still catches OGNL as it is actually sent, with the
