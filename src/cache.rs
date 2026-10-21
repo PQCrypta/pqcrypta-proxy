@@ -615,6 +615,21 @@ impl ResponseCache {
         n
     }
 
+    /// Drop one host's entries whose path starts with `prefix`: a page and
+    /// what hangs off it on one site, leaving every other host warm.
+    pub fn purge_host_prefix(&self, host: &str, prefix: &str) -> usize {
+        let host = host.to_lowercase();
+        let n = self.purge_where(|key| {
+            // key is METHOD|host|path
+            let mut parts = key.splitn(3, '|');
+            parts.next();
+            parts.next() == Some(host.as_str())
+                && parts.next().is_some_and(|path| path.starts_with(prefix))
+        });
+        info!("Cache purged for {host}{prefix}*: {n} entries");
+        n
+    }
+
     /// Drop one host's entry for one exact path, across every method.
     pub fn purge_url(&self, host: &str, path: &str) -> usize {
         let needle = format!("|{}|{}", host.to_lowercase(), path);
@@ -1012,6 +1027,26 @@ mod purge_tests {
         assert_eq!(c.purge_prefix("/sitemaps/"), 3);
         let (left, _) = c.stats();
         assert_eq!(left, 3, "only the robots.txt entries remain");
+    }
+
+    #[test]
+    fn a_host_prefix_purge_takes_that_path_on_that_host_only() {
+        let c = cache();
+        seed_a_few(&c);
+        // pqcrypta.com's two sitemaps; pqpdf.com's sitemap and every
+        // robots.txt stay cached.
+        assert_eq!(c.purge_host_prefix("PQCrypta.com", "/sitemaps/"), 2);
+        assert_eq!(c.stats().0, 4);
+        assert_eq!(c.purge_url("pqpdf.com", "/sitemaps/sitemap.xml"), 1);
+    }
+
+    #[test]
+    fn a_host_prefix_purge_does_not_take_a_host_that_ends_the_same() {
+        let c = cache();
+        seed(&c, "GET", "pqcrypta.com", "/entropy/");
+        seed(&c, "GET", "api.pqcrypta.com", "/entropy/generate");
+        assert_eq!(c.purge_host_prefix("pqcrypta.com", "/entropy/"), 1);
+        assert_eq!(c.stats().0, 1, "api.pqcrypta.com is another host");
     }
 
     #[test]
