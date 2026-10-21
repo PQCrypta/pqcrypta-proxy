@@ -167,8 +167,14 @@ for entry in $REMOTE_NODES; do
         && [[ -n "$addr" ]] \
         && "$CHECK" "$name" --addr "$addr:443" ${quic_port:+--quic-port "$quic_port"} --list "$list" 2>&1 | tee -a "$LOG_FILE"; then
         base64 -w0 "$list" > "$key_file.new"
-        chmod --reference="$key_file" "$key_file.new"
-        chown --reference="$key_file" "$key_file.new"
+        if [[ -e "$key_file" ]]; then
+            chmod --reference="$key_file" "$key_file.new"
+            chown --reference="$key_file" "$key_file.new"
+        else
+            # A node's first keys: the signer reads the copy (root:knot-signer)
+            chmod 0640 "$key_file.new"
+            chown root:knot-signer "$key_file.new"
+        fi
         mv "$key_file.new" "$key_file"
         log "$node's new configs open from here; publishing them"
     else
