@@ -83,6 +83,8 @@ pub enum LinkHint {
         href: String,
         as_type: String,
         crossorigin: Option<String>,
+        /// The href's `?v=` comes from this file's mtime (`version_file`)
+        version_file: Option<String>,
     },
     /// Preconnect to an origin
     Preconnect {
@@ -97,7 +99,42 @@ pub enum LinkHint {
     ModulePreload {
         href: String,
         crossorigin: Option<String>,
+        /// The href's `?v=` comes from this file's mtime (`version_file`)
+        version_file: Option<String>,
     },
+}
+
+/// `href` with `v=<mtime of file>` added, as PHP's `filemtime` gives it, or
+/// None when the file cannot be read: a hint for a URL the page does not
+/// link is a wasted download, so none is sent.
+fn versioned_href(href: &str, file: Option<&str>) -> Option<String> {
+    let Some(file) = file else {
+        return Some(href.to_string());
+    };
+    let mtime = std::fs::metadata(file)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    let Some(mtime) = mtime else {
+        debug!("Early hint for {href}: version_file {file} unreadable, hint left out");
+        return None;
+    };
+    let sep = if href.contains('?') { '&' } else { '?' };
+    Some(format!("{href}{sep}v={mtime}"))
+}
+
+/// How long compiled hints that carry a `version_file` version are reused
+/// before the files are looked at again.
+const VERSIONED_HINTS_TTL: Duration = Duration::from_secs(5);
+
+/// Compiled Link headers for one host and path.
+#[derive(Debug, Clone)]
+pub struct CachedHints {
+    pub headers: Vec<String>,
+    built: Instant,
+    /// Some header carries a `version_file` version, so it can go stale
+    versioned: bool,
 }
 
 impl LinkHint {
@@ -106,8 +143,13 @@ impl LinkHint {
     pub fn from_config(res: &crate::config::PreloadResourceConfig) -> Self {
         let href = res.href.clone();
         let crossorigin = res.crossorigin.clone();
+        let version_file = res.version_file.clone();
         match res.rel.as_str() {
-            "modulepreload" => LinkHint::ModulePreload { href, crossorigin },
+            "modulepreload" => LinkHint::ModulePreload {
+                href,
+                crossorigin,
+                version_file,
+            },
             "preconnect" => LinkHint::Preconnect { href, crossorigin },
             "dns-prefetch" => LinkHint::DnsPrefetch { href },
             "prerender" => LinkHint::Prerender { href },
@@ -115,18 +157,36 @@ impl LinkHint {
                 href,
                 as_type: res.as_type.clone(),
                 crossorigin,
+                version_file,
             },
         }
     }
 
-    /// Convert to Link header value
-    pub fn to_link_header(&self) -> String {
-        match self {
+    /// Whether the header depends on a file's mtime (and so can go stale).
+    pub const fn is_versioned(&self) -> bool {
+        matches!(
+            self,
+            LinkHint::Preload {
+                version_file: Some(_),
+                ..
+            } | LinkHint::ModulePreload {
+                version_file: Some(_),
+                ..
+            }
+        )
+    }
+
+    /// Convert to Link header value; None for a versioned hint whose file
+    /// cannot be read.
+    pub fn to_link_header(&self) -> Option<String> {
+        Some(match self {
             LinkHint::Preload {
                 href,
                 as_type,
                 crossorigin,
+                version_file,
             } => {
+                let href = versioned_href(href, version_file.as_deref())?;
                 let mut link = format!("<{}>; rel=preload; as={}", href, as_type);
                 if let Some(co) = crossorigin {
                     link.push_str(&format!("; crossorigin={}", co));
@@ -146,14 +206,19 @@ impl LinkHint {
             LinkHint::Prerender { href } => {
                 format!("<{}>; rel=prerender", href)
             }
-            LinkHint::ModulePreload { href, crossorigin } => {
+            LinkHint::ModulePreload {
+                href,
+                crossorigin,
+                version_file,
+            } => {
+                let href = versioned_href(href, version_file.as_deref())?;
                 let mut link = format!("<{}>; rel=modulepreload", href);
                 if let Some(co) = crossorigin {
                     link.push_str(&format!("; crossorigin={}", co));
                 }
                 link
             }
-        }
+        })
     }
 }
 
@@ -161,8 +226,8 @@ impl LinkHint {
 #[derive(Clone)]
 pub struct EarlyHintsState {
     pub config: Arc<RwLock<EarlyHintsConfig>>,
-    /// Cache of path -> compiled hints
-    pub hints_cache: Arc<DashMap<String, Vec<String>>>,
+    /// Cache of host:path -> compiled hints
+    pub hints_cache: Arc<DashMap<String, CachedHints>>,
 }
 
 impl Default for EarlyHintsState {
@@ -236,11 +301,14 @@ impl EarlyHintsState {
         // Cache key includes host so per-domain rules don't bleed across domains
         let cache_key = format!("{}:{}", host, path);
         if let Some(cached) = self.hints_cache.get(&cache_key) {
-            return cached.clone();
+            if !cached.versioned || cached.built.elapsed() < VERSIONED_HINTS_TTL {
+                return cached.headers.clone();
+            }
         }
 
         let config = self.config.read();
         let mut hints = Vec::new();
+        let mut versioned = false;
 
         // Add preconnect hints (global — no per-host filtering needed)
         for origin in &config.preconnect_origins {
@@ -260,14 +328,22 @@ impl EarlyHintsState {
             };
             if host_matches && path_matches {
                 for hint in &rule.hints {
-                    hints.push(hint.to_link_header());
+                    versioned |= hint.is_versioned();
+                    hints.extend(hint.to_link_header());
                 }
             }
         }
 
-        // Cache the result
-        if !hints.is_empty() {
-            self.hints_cache.insert(cache_key, hints.clone());
+        // Cache the result (a versioned one is rebuilt after VERSIONED_HINTS_TTL)
+        if !hints.is_empty() || versioned {
+            self.hints_cache.insert(
+                cache_key,
+                CachedHints {
+                    headers: hints.clone(),
+                    built: Instant::now(),
+                    versioned,
+                },
+            );
         }
 
         hints
@@ -910,8 +986,13 @@ mod tests {
             as_type: as_type.into(),
             crossorigin: None,
             exact: false,
+            version_file: None,
         };
-        let h = |rel, as_type| LinkHint::from_config(&res(rel, as_type)).to_link_header();
+        let h = |rel, as_type| {
+            LinkHint::from_config(&res(rel, as_type))
+                .to_link_header()
+                .unwrap()
+        };
         assert_eq!(h("preload", "script"), "</m.js>; rel=preload; as=script");
         assert_eq!(h("modulepreload", ""), "</m.js>; rel=modulepreload");
         assert_eq!(h("preconnect", ""), "</m.js>; rel=preconnect");
@@ -925,16 +1006,135 @@ mod tests {
         assert!(c.validate().unwrap_err().to_string().contains("as_type"));
     }
 
+    /// A file with a known mtime, as PHP's filemtime would report it.
+    fn file_with_mtime(name: &str, secs: u64) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("pqcrypta-hint-{}-{name}", std::process::id()));
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap();
+        path
+    }
+
+    fn versioned_preload(href: &str, file: &std::path::Path) -> LinkHint {
+        LinkHint::Preload {
+            href: href.to_string(),
+            as_type: "style".to_string(),
+            crossorigin: None,
+            version_file: Some(file.to_string_lossy().into_owned()),
+        }
+    }
+
+    #[test]
+    fn a_versioned_hint_names_the_url_the_page_links() {
+        let css = file_with_mtime("pdf.css", 1_791_254_711);
+        let hint = versioned_preload("/css/pdf.css", &css);
+        assert!(hint.is_versioned());
+        assert_eq!(
+            hint.to_link_header().as_deref(),
+            Some("</css/pdf.css?v=1791254711>; rel=preload; as=style")
+        );
+        // A query of its own keeps it: the version is added with &
+        assert_eq!(
+            versioned_preload("/css/pdf.css?theme=dark", &css)
+                .to_link_header()
+                .as_deref(),
+            Some("</css/pdf.css?theme=dark&v=1791254711>; rel=preload; as=style")
+        );
+        // The file changes, the hint follows
+        std::fs::File::options()
+            .write(true)
+            .open(&css)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_792_000_000))
+            .unwrap();
+        assert_eq!(
+            hint.to_link_header().as_deref(),
+            Some("</css/pdf.css?v=1792000000>; rel=preload; as=style")
+        );
+        std::fs::remove_file(&css).unwrap();
+        // No file, no hint: a URL no page links is a wasted download
+        assert_eq!(hint.to_link_header(), None);
+    }
+
+    #[test]
+    fn versioned_hints_are_rebuilt_once_stale() {
+        let css = file_with_mtime("site.css", 1_700_000_000);
+        let mut c = crate::config::Http3Config::default();
+        c.preconnect_origins.clear();
+        c.preload_resources = vec![crate::config::PreloadResourceConfig {
+            host: Some("example.com".into()),
+            path: "/".into(),
+            href: "/css/site.css".into(),
+            rel: "preload".into(),
+            as_type: "style".into(),
+            crossorigin: None,
+            exact: true,
+            version_file: Some(css.to_string_lossy().into_owned()),
+        }];
+        let state = EarlyHintsState::from_http3_config(&c);
+        assert_eq!(
+            state.get_hints_for_request("example.com", "/"),
+            vec!["</css/site.css?v=1700000000>; rel=preload; as=style".to_string()]
+        );
+        std::fs::File::options()
+            .write(true)
+            .open(&css)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_999))
+            .unwrap();
+        // Within the TTL the cached headers are served
+        assert!(state.get_hints_for_request("example.com", "/")[0].contains("v=1700000000"));
+        // Past it, the file is looked at again
+        if let Some(mut cached) = state.hints_cache.get_mut("example.com:/") {
+            cached.built = Instant::now()
+                .checked_sub(VERSIONED_HINTS_TTL + Duration::from_secs(1))
+                .expect("the clock reaches back past one TTL");
+        }
+        assert!(state.get_hints_for_request("example.com", "/")[0].contains("v=1700000999"));
+        std::fs::remove_file(&css).unwrap();
+    }
+
+    #[test]
+    fn version_file_is_checked_at_load() {
+        let res = |href: &str, rel: &str, file: &str| crate::config::PreloadResourceConfig {
+            host: None,
+            path: "/".into(),
+            href: href.into(),
+            rel: rel.into(),
+            as_type: "style".into(),
+            crossorigin: None,
+            exact: false,
+            version_file: Some(file.into()),
+        };
+        let err = |r| {
+            let mut c = crate::config::ProxyConfig::default();
+            c.http3.preload_resources = vec![r];
+            c.validate().err().map(|e| e.to_string())
+        };
+        assert!(err(res("/a.css", "preload", "css/a.css"))
+            .unwrap()
+            .contains("absolute"));
+        assert!(err(res("/a.css?v=1", "preload", "/srv/a.css"))
+            .unwrap()
+            .contains("v="));
+        assert!(err(res("https://cdn.example", "preconnect", "/srv/a.css"))
+            .unwrap()
+            .contains("preload and modulepreload"));
+        assert_eq!(err(res("/a.css", "preload", "/srv/a.css")), None);
+    }
+
     #[test]
     fn test_link_hint_to_header() {
         let preload = LinkHint::Preload {
             href: "/css/main.css".to_string(),
             as_type: "style".to_string(),
             crossorigin: None,
+            version_file: None,
         };
         assert_eq!(
-            preload.to_link_header(),
-            "</css/main.css>; rel=preload; as=style"
+            preload.to_link_header().as_deref(),
+            Some("</css/main.css>; rel=preload; as=style")
         );
 
         let preconnect = LinkHint::Preconnect {
@@ -942,8 +1142,8 @@ mod tests {
             crossorigin: Some("anonymous".to_string()),
         };
         assert_eq!(
-            preconnect.to_link_header(),
-            "<https://fonts.googleapis.com>; rel=preconnect; crossorigin=anonymous"
+            preconnect.to_link_header().as_deref(),
+            Some("<https://fonts.googleapis.com>; rel=preconnect; crossorigin=anonymous")
         );
     }
 

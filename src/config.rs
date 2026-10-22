@@ -452,6 +452,16 @@ pub struct PreloadResourceConfig {
     pub path: String,
     /// Resource href (e.g. "/css/style.css")
     pub href: String,
+    /// The file whose modification time is the href's `?v=` cache-buster, as
+    /// the page computes it (PHP `filemtime`), e.g.
+    /// "/var/www/pqpdf/css/pdf.css" for `href = "/css/pdf.css"`. A hint is
+    /// used only when its URL is byte-for-byte the one the page links, and
+    /// pinned `?v=` values went stale with every edit of the file: 10 of the
+    /// 20 hints on web1 named a version no page linked (2026-10-22), so each
+    /// of those files was fetched twice. Absolute; the href then carries no
+    /// `v=` of its own.
+    #[serde(default)]
+    pub version_file: Option<String>,
     /// Link relation: "preload" (default), "modulepreload", "preconnect",
     /// "dns-prefetch" or "prerender".
     #[serde(default = "default_preload_rel")]
@@ -3893,6 +3903,30 @@ impl ProxyConfig {
                     return Err(anyhow::anyhow!(
                         "http3.preload_resources[{i}] ({}): rel {other:?} is not one of \
                          preload, modulepreload, preconnect, dns-prefetch, prerender",
+                        r.href
+                    ));
+                }
+            }
+            if let Some(file) = &r.version_file {
+                if !std::path::Path::new(file).is_absolute() {
+                    return Err(anyhow::anyhow!(
+                        "http3.preload_resources[{i}] ({}): version_file {file:?} must be an absolute path",
+                        r.href
+                    ));
+                }
+                if r.href
+                    .split_once('?')
+                    .is_some_and(|(_, q)| q.split('&').any(|p| p.starts_with("v=")))
+                {
+                    return Err(anyhow::anyhow!(
+                        "http3.preload_resources[{i}] ({}): the href has its own v= and version_file adds one; \
+                         drop the pinned ?v=",
+                        r.href
+                    ));
+                }
+                if !matches!(r.rel.as_str(), "preload" | "modulepreload") {
+                    return Err(anyhow::anyhow!(
+                        "http3.preload_resources[{i}] ({}): version_file applies to preload and modulepreload only",
                         r.href
                     ));
                 }
