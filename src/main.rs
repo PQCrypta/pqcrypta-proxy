@@ -1491,6 +1491,20 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
+    // DNS over HTTPS for the name server on this host: a loopback backend that
+    // routes reach like any other, so DoH is served over every transport the
+    // proxy speaks. A gateway that cannot bind is logged and the proxy carries
+    // on; its routes then answer 502 while every other site is unaffected.
+    if config.doh.enabled {
+        match pqcrypta_proxy::doh::spawn(&config.doh).await {
+            Ok(addr) => info!(
+                "DNS over HTTPS gateway on {} for name server {}",
+                addr, config.doh.upstream
+            ),
+            Err(e) => error!("DNS over HTTPS gateway not started: {}", e),
+        }
+    }
+
     // Start dedicated WebTransport server on port 4433
     // This uses wtransport crate for proper WebTransport protocol support
     {

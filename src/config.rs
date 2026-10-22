@@ -206,10 +206,81 @@ pub struct ProxyConfig {
     /// HTTP/3 + QUIC client conformance suite
     #[serde(default)]
     pub conformance: ConformanceConfig,
+    /// DNS over HTTPS (RFC 8484) for a name server on this host
+    #[serde(default)]
+    pub doh: DohConfig,
 }
 
 /// Current config schema version supported by this binary
 pub const CURRENT_CONFIG_VERSION: u32 = 1;
+
+/// DNS over HTTPS (RFC 8484) for an authoritative name server on this host.
+///
+/// Off by default. When on, the proxy runs the gateway in [`crate::doh`] on
+/// `listen`, which a `[backends]` entry of type "http1" names as its address,
+/// so routes send DoH there like any other request; the gateway asks
+/// `upstream` over TCP.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DohConfig {
+    /// Master switch. Default: false.
+    pub enabled: bool,
+    /// Address the gateway listens on, `ip:port`. Loopback only, which is
+    /// checked at load: the gateway applies no rate limits or WAF rules of its
+    /// own, and a client reaching it directly would skip the route's.
+    /// Default: "127.0.0.1:8053".
+    pub listen: String,
+    /// The name server, `ip:port`, asked over TCP. Default: "127.0.0.1:53".
+    pub upstream: String,
+    /// The path of the URI template the gateway serves, `{path}{?dns}`.
+    /// Default: "/dns-query".
+    pub path: String,
+    /// Time allowed for the name server's answer, in milliseconds; past it the
+    /// client gets 504. Default: 3000.
+    pub timeout_ms: u64,
+}
+
+impl Default for DohConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: "127.0.0.1:8053".to_string(),
+            upstream: "127.0.0.1:53".to_string(),
+            path: "/dns-query".to_string(),
+            timeout_ms: 3000,
+        }
+    }
+}
+
+impl DohConfig {
+    /// The checks `ProxyConfig::validate` runs when the gateway is on.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let listen: std::net::SocketAddr = self
+            .listen
+            .parse()
+            .map_err(|e| anyhow::anyhow!("doh.listen {:?} is not ip:port: {}", self.listen, e))?;
+        if !listen.ip().is_loopback() {
+            return Err(anyhow::anyhow!(
+                "doh.listen {} is not a loopback address: the gateway applies no rate limits \
+                 or WAF rules of its own, so it must be reachable only through a route",
+                listen
+            ));
+        }
+        self.upstream.parse::<std::net::SocketAddr>().map_err(|e| {
+            anyhow::anyhow!("doh.upstream {:?} is not ip:port: {}", self.upstream, e)
+        })?;
+        if !self.path.starts_with('/') || self.path.contains(['?', '#']) {
+            return Err(anyhow::anyhow!(
+                "doh.path {:?} must be an absolute path with no query or fragment",
+                self.path
+            ));
+        }
+        if self.timeout_ms == 0 {
+            return Err(anyhow::anyhow!("doh.timeout_ms must be more than 0"));
+        }
+        Ok(())
+    }
+}
 
 /// Web Application Firewall configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -559,6 +630,7 @@ impl Default for ProxyConfig {
             otel: OtelConfig::default(),
             masque: MasqueConfig::default(),
             conformance: ConformanceConfig::default(),
+            doh: DohConfig::default(),
         }
     }
 }
@@ -3423,6 +3495,7 @@ pub const RESTART_BOUND_SETTINGS: &[&str] = &[
     "acme",
     "cache",
     "conformance",
+    "doh",
     "load_balancer",
 ];
 
@@ -4138,6 +4211,10 @@ impl ProxyConfig {
                  Every CONNECT-UDP request will be rejected with 403. \
                  Add entries like \"host:port\" (host/port may be \"*\")."
             );
+        }
+
+        if self.doh.enabled {
+            self.doh.validate()?;
         }
 
         // PQC passthrough conflict

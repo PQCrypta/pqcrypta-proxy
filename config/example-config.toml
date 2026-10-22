@@ -114,6 +114,24 @@ session_idle_timeout_secs = 60
 max_sessions_per_connection = 8
 
 # =============================
+# DNS over HTTPS (RFC 8484)
+# =============================
+# A gateway for an authoritative name server on this host. It listens on a
+# loopback address that a backend points at (see [backends.doh] and the "doh"
+# route below), and asks the name server over TCP. Disabled by default.
+[doh]
+enabled = false
+# Loopback only: a client must reach the gateway through a route, which
+# carries the rate limits.
+listen = "127.0.0.1:8053"
+# The name server, asked over TCP.
+upstream = "127.0.0.1:53"
+# The URI template path: {path}{?dns}
+path = "/dns-query"
+# Time allowed for the name server's answer (ms); past it the client gets 504.
+timeout_ms = 3000
+
+# =============================
 # TLS Configuration
 # =============================
 [tls]
@@ -1120,6 +1138,14 @@ max_connections = 50
 health_check = "/api/health"
 health_check_interval_secs = 30
 
+# The DNS over HTTPS gateway ([doh] listen). Used only when [doh] is enabled.
+[backends.doh]
+name = "doh"
+type = "http1"
+address = "127.0.0.1:8053"
+timeout_ms = 5000
+max_connections = 100
+
 # Prometheus metrics server
 # Required Prometheus configuration in /etc/default/prometheus:
 #   ARGS="--web.external-url=https://example.com/prometheus --web.route-prefix=/prometheus"
@@ -1389,6 +1415,21 @@ priority = 20
 [routes.add_headers]
 X-Forwarded-Proto = "https"
 X-Forwarded-Host = "example.com"
+
+# DNS over HTTPS for the name server ns1.example.com, through the [doh]
+# gateway. DNS clients are not browsers, so the user-agent rules do not apply,
+# and a base64url DNS message is not form input for the WAF to read.
+[[routes]]
+name = "doh"
+host = "ns1.example.com"
+path_exact = "/dns-query"
+backend = "doh"
+allow_http11 = true
+skip_bot_blocking = true
+priority = 1
+
+[routes.security]
+waf_enabled = false
 
 # Wildcard catch-all route
 [[routes]]
