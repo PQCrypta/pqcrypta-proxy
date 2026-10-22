@@ -112,18 +112,27 @@ the 103 response for matching requests.
 | `host` | string | optional | Hostname this rule applies to. Omit = all hosts |
 | `path` | string | required | Path prefix that triggers the preload (`/` matches every page) |
 | `href` | string | required | Resource URL to preload |
-| `as_type` | string | required | `as=` attribute: `style`, `script`, `font`, `image`, … |
+| `rel` | string | optional | `preload` (default), `modulepreload`, `preconnect`, `dns-prefetch` or `prerender` |
+| `as_type` | string | for `preload` | `as=` attribute: `style`, `script`, `font`, `image`, … |
 | `crossorigin` | string | optional | `crossorigin` attribute value (e.g. `anonymous`) |
+| `exact` | bool | optional | Match `path` exactly instead of as a prefix (default `false`) |
+| `version_file` | path | optional | Absolute path of the file whose mtime is the href's `?v=` cache-buster (`preload` and `modulepreload` only) |
 
 > **Note:** a browser only *uses* a preload whose `href` byte-matches the URL in
-> the page HTML — including any `?v=` cache-buster. Pin versioned assets to their
-> current value (and re-pin when the file changes), or serve them unversioned.
+> the page HTML — including any `?v=` cache-buster. For a page that versions an
+> asset by its modification time (PHP `filemtime`), give the file as
+> `version_file` and leave `?v=` out of `href`: the proxy adds `v=<mtime>`, and
+> looks at the file again at most every 5 seconds, so the hint follows every
+> edit. A pinned `?v=` goes stale with the next one, and the browser then fetches
+> the file twice. If the file cannot be read, that hint is not sent.
 
 ```toml
 [[http3.preload_resources]]
 host = "example.com"
 path = "/"
+exact = true
 href = "/css/style.css"
+version_file = "/var/www/example/css/style.css"
 as_type = "style"
 ```
 
