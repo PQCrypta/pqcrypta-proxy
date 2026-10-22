@@ -105,7 +105,11 @@ it does not offer the obsolete `draft-29..34` versions.
 ### Preload Resources (103 Early Hints)
 
 Each `[[http3.preload_resources]]` entry adds a `Link: …; rel=preload` header to
-the 103 response for matching requests.
+the 103 response for matching requests. A 103 goes only with a page load
+(`Sec-Fetch-Dest: document` or `iframe`, or, from a client without Fetch
+Metadata, an `Accept` that asks for `text/html`), never with the page's own
+stylesheet, script or image fetches, so `path = "/"` does not repeat a page's
+hints on every request it makes.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
