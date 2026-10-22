@@ -182,9 +182,9 @@ pub use fingerprint::{
     FingerprintResult, FingerprintStats, Ja3Fingerprint,
 };
 pub use http3_features::{
-    early_hints_middleware, http3_features_middleware, CoalescingConfig, CoalescingState,
-    EarlyHintsConfig, EarlyHintsState, Http3FeaturesState, LinkHint, PreloadRule, PriorityConfig,
-    PriorityState, ResourcePriority,
+    http3_features_middleware, CoalescingConfig, CoalescingState, EarlyHintsConfig,
+    EarlyHintsState, Http3FeaturesState, LinkHint, PreloadRule, PriorityConfig, PriorityState,
+    ResourcePriority,
 };
 pub use http_listener::{
     run_http_listener, run_http_listener_with_fingerprint,

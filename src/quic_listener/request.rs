@@ -463,8 +463,12 @@ impl QuicListener {
 
         // Send 103 Early Hints if enabled and we have hints for this path
         // This is a key HTTP/3 optimization - send resource hints before proxying to backend
-        // Only send for GET/HEAD requests - 103 on POST/PUT/DELETE can break cookie handling
-        if early_hints_state.is_enabled() && (method == "GET" || method == "HEAD") {
+        // Only send for GET/HEAD requests - 103 on POST/PUT/DELETE can break cookie handling -
+        // and only for page loads: a page's own stylesheet and script fetches got them too
+        if early_hints_state.is_enabled()
+            && (method == "GET" || method == "HEAD")
+            && crate::http3_features::is_page_load(request.headers())
+        {
             let hints =
                 early_hints_state.get_hints_for_request(host.as_deref().unwrap_or(""), &path);
             if !hints.is_empty() {

@@ -350,6 +350,23 @@ impl EarlyHintsState {
     }
 }
 
+/// Whether a request loads a page, the only kind Early Hints are for.
+///
+/// The browser's own `Sec-Fetch-Dest` (document, iframe, frame) decides, or,
+/// from a client without Fetch Metadata, an `Accept` that asks for HTML. A 103
+/// went with every request whose path a rule matched, so with `path = "/"`
+/// each stylesheet, script and image fetch carried the page's hints again:
+/// fated.org's two were sent nine times per page load (2026-10-22).
+pub fn is_page_load(headers: &HeaderMap) -> bool {
+    if let Some(dest) = headers.get("sec-fetch-dest").and_then(|v| v.to_str().ok()) {
+        return matches!(dest, "document" | "iframe" | "frame");
+    }
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|accept| accept.contains("text/html"))
+}
+
 /// Build a 103 Early Hints response
 pub fn build_early_hints_response(hints: &[String]) -> Response<Body> {
     let mut response = Response::new(Body::empty());
@@ -928,50 +945,6 @@ pub async fn http3_features_middleware(
     response
 }
 
-/// Early Hints middleware (sends 103 before main response)
-///
-/// Note: This requires special handling as we need to send
-/// the 103 response before the actual response. In practice,
-/// this is handled at the HTTP/3 layer.
-pub async fn early_hints_middleware(
-    State(state): State<EarlyHintsState>,
-    request: Request<Body>,
-    next: Next,
-) -> Response<Body> {
-    let host = request
-        .headers()
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let path = request.uri().path().to_string();
-    let config = state.config.read().clone();
-
-    if config.enabled {
-        let hints = state.get_hints_for_request(&host, &path);
-
-        if !hints.is_empty() {
-            trace!("Would send Early Hints for {}{}: {:?}", host, path, hints);
-            // Note: Actually sending 103 requires low-level HTTP/3 access
-            // For now, we add Link headers to the final response as fallback
-        }
-    }
-
-    let mut response = next.run(request).await;
-
-    // Add Link headers as fallback (for preload)
-    if config.enabled {
-        let hints = state.get_hints_for_request(&host, &path);
-        for hint in hints {
-            if let Ok(value) = HeaderValue::from_str(&hint) {
-                response.headers_mut().append(header::LINK, value);
-            }
-        }
-    }
-
-    response
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1122,6 +1095,38 @@ mod tests {
             .unwrap()
             .contains("preload and modulepreload"));
         assert_eq!(err(res("/a.css", "preload", "/srv/a.css")), None);
+    }
+
+    #[test]
+    fn early_hints_go_to_page_loads_only() {
+        let h = |pairs: &[(&'static str, &'static str)]| {
+            let mut m = HeaderMap::new();
+            for (k, v) in pairs {
+                m.insert(*k, HeaderValue::from_static(v));
+            }
+            is_page_load(&m)
+        };
+        assert!(h(&[
+            ("sec-fetch-dest", "document"),
+            ("accept", "text/html")
+        ]));
+        assert!(h(&[("sec-fetch-dest", "iframe")]));
+        // The page's own stylesheet, script and image fetches
+        assert!(!h(&[
+            ("sec-fetch-dest", "style"),
+            ("accept", "text/css,*/*;q=0.1")
+        ]));
+        assert!(!h(&[("sec-fetch-dest", "script"), ("accept", "*/*")]));
+        assert!(!h(&[
+            ("sec-fetch-dest", "image"),
+            ("accept", "image/avif,image/webp,*/*")
+        ]));
+        // Fetch Metadata says it is not a page even if Accept would
+        assert!(!h(&[("sec-fetch-dest", "empty"), ("accept", "text/html")]));
+        // No Fetch Metadata: Accept decides
+        assert!(h(&[("accept", "text/html,application/xhtml+xml")]));
+        assert!(!h(&[("accept", "*/*")]));
+        assert!(!h(&[]));
     }
 
     #[test]
