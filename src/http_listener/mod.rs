@@ -2750,22 +2750,7 @@ async fn proxy_handler(
     // Strip port from host if present — axum's Host extractor includes the port
     // for non-standard ports (e.g. "tcp2.pqcrypta.com:4433"). All subsequent host
     // comparisons (tcp_only_hosts, route matching, etc.) expect bare hostnames.
-    let host: String = {
-        let h: &str = &host;
-        if !h.starts_with('[') {
-            if let Some(colon) = h.rfind(':') {
-                if h[colon + 1..].bytes().all(|b| b.is_ascii_digit()) {
-                    h[..colon].to_string()
-                } else {
-                    h.to_string()
-                }
-            } else {
-                h.to_string()
-            }
-        } else {
-            h.to_string()
-        }
-    };
+    let host: String = host_without_port(&host).to_string();
     // Routed and forwarded on the canonical path (dot segments, repeated
     // slashes, case); the WAF middleware has already seen the raw one
     let path = crate::path_canon::canonical_path(
@@ -4008,6 +3993,24 @@ fn spawn_shadow_request(
     });
 }
 
+/// A request's host with any port removed, matched against route hosts.
+///
+/// An IPv6 literal keeps its brackets, `[2001:db8::1]`, which is what the
+/// HTTP/3 path's `Authority::host` gives for the same authority. The port used
+/// to stay on a bracketed literal, so `Host: [2001:db8::1]:443` matched no
+/// route over TCP while the same request over HTTP/3 did.
+fn host_without_port(host: &str) -> &str {
+    match host.rfind(':') {
+        Some(colon)
+            if host[colon + 1..].bytes().all(|b| b.is_ascii_digit())
+                && (!host.starts_with('[') || host[..colon].ends_with(']')) =>
+        {
+            &host[..colon]
+        }
+        _ => host,
+    }
+}
+
 /// Run HTTP redirect server (port 80 → HTTPS) with ACME HTTP-01 challenge support
 pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 'static>(
     port: u16,
@@ -4167,6 +4170,21 @@ pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 
 
 #[cfg(test)]
 mod forwarding_tests {
+
+    #[test]
+    fn the_port_is_removed_from_names_and_bracketed_ipv6_literals() {
+        assert_eq!(super::host_without_port("example.com"), "example.com");
+        assert_eq!(super::host_without_port("example.com:8443"), "example.com");
+        assert_eq!(super::host_without_port("66.179.95.51:443"), "66.179.95.51");
+        assert_eq!(super::host_without_port("[2001:db8::1]"), "[2001:db8::1]");
+        assert_eq!(
+            super::host_without_port("[2001:db8::1]:443"),
+            "[2001:db8::1]"
+        );
+        assert_eq!(super::host_without_port("[::1]"), "[::1]");
+        assert_eq!(super::host_without_port("[2001:db8::]"), "[2001:db8::]");
+    }
+
     use super::copy_forwardable_headers;
     use http::{HeaderMap, HeaderValue};
 

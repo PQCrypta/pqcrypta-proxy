@@ -161,7 +161,15 @@ impl Gateway {
         }
         let query = match read_query(req).await {
             Ok(query) => query,
-            Err(response) => return response,
+            Err((status, text)) => {
+                let mut response = plain(status, text);
+                if status == StatusCode::METHOD_NOT_ALLOWED {
+                    response
+                        .headers_mut()
+                        .insert(ALLOW, HeaderValue::from_static("GET, HEAD, POST"));
+                }
+                return response;
+            }
         };
         let Some(info) = inspect(&query) else {
             return plain(StatusCode::BAD_REQUEST, "malformed DNS query");
@@ -197,21 +205,21 @@ impl Gateway {
 }
 
 /// The DNS query a request carries: the `dns` parameter of a GET or HEAD, the
-/// body of a POST (RFC 8484 §4.1). Or the response that refuses it.
-async fn read_query(req: Request<Incoming>) -> Result<Vec<u8>, Response<Full<Bytes>>> {
+/// body of a POST (RFC 8484 §4.1). Or the status and reason that refuse it.
+async fn read_query(req: Request<Incoming>) -> Result<Vec<u8>, (StatusCode, &'static str)> {
     match *req.method() {
         Method::GET | Method::HEAD => {
             let Some(encoded) = req.uri().query().and_then(dns_parameter) else {
-                return Err(plain(
+                return Err((
                     StatusCode::BAD_REQUEST,
                     "a GET request carries the query in the dns parameter",
                 ));
             };
             let query = BASE64URL
                 .decode(encoded.as_bytes())
-                .map_err(|_| plain(StatusCode::BAD_REQUEST, "dns is not base64url"))?;
+                .map_err(|_| (StatusCode::BAD_REQUEST, "dns is not base64url"))?;
             if query.len() > MAX_MESSAGE {
-                return Err(plain(StatusCode::PAYLOAD_TOO_LARGE, "query too large"));
+                return Err((StatusCode::PAYLOAD_TOO_LARGE, "query too large"));
             }
             Ok(query)
         }
@@ -223,7 +231,7 @@ async fn read_query(req: Request<Incoming>) -> Result<Vec<u8>, Response<Full<Byt
                 .and_then(|v| v.split(';').next())
                 .map(str::trim);
             if !media_type.is_some_and(|t| t.eq_ignore_ascii_case(MEDIA_TYPE)) {
-                return Err(plain(
+                return Err((
                     StatusCode::UNSUPPORTED_MEDIA_TYPE,
                     "a POST request carries an application/dns-message body",
                 ));
@@ -231,18 +239,12 @@ async fn read_query(req: Request<Incoming>) -> Result<Vec<u8>, Response<Full<Byt
             match Limited::new(req.into_body(), MAX_MESSAGE).collect().await {
                 Ok(body) => Ok(body.to_bytes().to_vec()),
                 Err(e) if e.is::<http_body_util::LengthLimitError>() => {
-                    Err(plain(StatusCode::PAYLOAD_TOO_LARGE, "query too large"))
+                    Err((StatusCode::PAYLOAD_TOO_LARGE, "query too large"))
                 }
-                Err(_) => Err(plain(StatusCode::BAD_REQUEST, "unreadable body")),
+                Err(_) => Err((StatusCode::BAD_REQUEST, "unreadable body")),
             }
         }
-        _ => {
-            let mut response = plain(StatusCode::METHOD_NOT_ALLOWED, "GET, HEAD or POST");
-            response
-                .headers_mut()
-                .insert(ALLOW, HeaderValue::from_static("GET, HEAD, POST"));
-            Err(response)
-        }
+        _ => Err((StatusCode::METHOD_NOT_ALLOWED, "GET, HEAD or POST")),
     }
 }
 
@@ -759,15 +761,15 @@ mod tests {
         let q = query(252, 0, true, false);
         let info = inspect(&q).unwrap();
         let r = refusal(&q, &info);
-        let layout = layout(&r).expect("refusal parses");
+        let parsed = layout(&r).expect("refusal parses");
         assert_eq!(rcode(&r), 5);
         assert_eq!(r[2] & 0x80, 0x80, "QR");
         assert_eq!(&r[..2], &q[..2], "ID");
         assert_eq!(
-            &r[HEADER_LEN..layout.question_end],
+            &r[HEADER_LEN..parsed.question_end],
             &q[HEADER_LEN..info.question_end]
         );
-        let opt = layout
+        let opt = parsed
             .additional
             .iter()
             .find(|r| r.rtype == TYPE_OPT)
@@ -802,8 +804,8 @@ mod tests {
         let a = answer(&q, 300);
         let p = padded(&a).expect("has an OPT record");
         assert_eq!(p.len() % RESPONSE_BLOCK, 0);
-        let layout = layout(&p).expect("padded message parses");
-        let opt = layout
+        let parsed = layout(&p).expect("padded message parses");
+        let opt = parsed
             .additional
             .iter()
             .find(|r| r.rtype == TYPE_OPT)
