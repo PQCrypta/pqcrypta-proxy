@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.4.0...v0.4.1) (2026-10-23)
+
+
+### Bug Fixes
+
+* **deps:** ctutils 0.4.5 (RUSTSEC-2026-0385) ([2ce9390](https://github.com/PQCrypta/pqcrypta-proxy/commit/2ce9390af697074d535d7d5a68819f0594b7bfc3))
+
 ## [0.4.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.3.0...v0.4.0) (2026-10-23)
 
 
