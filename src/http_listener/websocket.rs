@@ -51,10 +51,12 @@ pub(super) async fn handle_websocket_tunnel(
         }
     };
 
-    let sni_host = backend_address
-        .split(':')
-        .next()
-        .unwrap_or(host)
+    // The backend's host without its port, and an IPv6 literal without its
+    // brackets, which is the form `ServerName` parses as an address. Cutting at
+    // the first colon left "[2001" of an IPv6 backend.
+    let sni_host = crate::config::host_without_port(backend_address)
+        .trim_start_matches('[')
+        .trim_end_matches(']')
         .to_string();
 
     if use_https {

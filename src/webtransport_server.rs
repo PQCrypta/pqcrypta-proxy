@@ -77,13 +77,15 @@ impl WebTransportServer {
         let certs_dir = std::path::Path::new(cert_path)
             .parent()
             .unwrap_or_else(|| std::path::Path::new("/etc/pqcrypta/certs"));
-        let resolver = Arc::new(MultiDomainCertResolver::new(certs_dir).map_err(|e| {
-            error!(
-                "❌ WebTransport SNI resolver build failed from {:?}: {}",
-                certs_dir, e
-            );
-            e
-        })?);
+        let resolver = Arc::new(
+            MultiDomainCertResolver::for_primary(std::path::Path::new(cert_path)).map_err(|e| {
+                error!(
+                    "❌ WebTransport SNI resolver build failed from {:?}: {}",
+                    certs_dir, e
+                );
+                e
+            })?,
+        );
         let rustls_config = TlsProvider::create_rustls_config_with_resolver(
             &config.tls,
             &config.pqc,

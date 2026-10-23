@@ -472,10 +472,8 @@ pub struct SecurityRequestView<'a> {
 pub fn is_conformance_host(config: &ProxyConfig, host: Option<&str>) -> bool {
     let conf = &config.conformance;
     conf.enabled
-        && host.is_some_and(|h| {
-            let h = h.split(':').next().unwrap_or(h);
-            h.eq_ignore_ascii_case(&conf.host)
-        })
+        && host
+            .is_some_and(|h| crate::config::host_without_port(h).eq_ignore_ascii_case(&conf.host))
 }
 
 /// Whether a request is let past the generic-client user-agent rules (curl,
@@ -2241,7 +2239,7 @@ pub async fn security_middleware(
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned)
             .or_else(|| request.uri().host().map(str::to_owned))
-            .map(|h| h.split(':').next().unwrap_or(&h).to_ascii_lowercase());
+            .map(|h| crate::config::host_without_port(&h).to_ascii_lowercase());
         let req_path = request.uri().path().to_string();
         let routes = security.route_index.load_full();
         let on_conformance_host = is_conformance_host(&routes, host.as_deref());

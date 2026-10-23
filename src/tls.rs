@@ -76,6 +76,10 @@ pub struct MultiDomainCertResolver {
     certs: RwLock<HashMap<String, DomainCerts>>,
     /// Directory containing `{domain}.crt` / `{domain}.key` files
     certs_dir: PathBuf,
+    /// The domain whose certificate answers a ClientHello with no server name:
+    /// `tls.cert_path`'s, the certificate the OpenSSL TCP listener presents
+    /// then. See [`Self::for_primary`].
+    default_domain: Option<String>,
 }
 
 impl MultiDomainCertResolver {
@@ -84,8 +88,29 @@ impl MultiDomainCertResolver {
         let resolver = Self {
             certs: RwLock::new(HashMap::new()),
             certs_dir: certs_dir.to_path_buf(),
+            default_domain: None,
         };
         resolver.reload()?;
+        Ok(resolver)
+    }
+
+    /// A resolver over the directory of `cert_path`, the configured primary
+    /// certificate, which also answers a ClientHello that names no server.
+    ///
+    /// A client connecting by address sends no server name (RFC 6066 §3 has
+    /// no form for an IP address). The OpenSSL TCP listener answers it with
+    /// the primary certificate; this resolver answered nothing, so every
+    /// rustls handshake by address failed, HTTP/3 to an IP among them. A name
+    /// the resolver holds no certificate for still ends the handshake.
+    pub fn for_primary(cert_path: &Path) -> anyhow::Result<Self> {
+        let certs_dir = cert_path
+            .parent()
+            .unwrap_or_else(|| Path::new("/etc/pqcrypta/certs"));
+        let mut resolver = Self::new(certs_dir)?;
+        resolver.default_domain = cert_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_ascii_lowercase);
         Ok(resolver)
     }
 
@@ -168,9 +193,11 @@ impl rustls::server::ResolvesServerCert for MultiDomainCertResolver {
         &self,
         client_hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        let sni = client_hello.server_name()?;
         let certs = self.certs.read();
-        let domain = certs.get(sni)?;
+        let domain = match client_hello.server_name() {
+            Some(sni) => certs.get(sni)?,
+            None => certs.get(self.default_domain.as_deref()?)?,
+        };
         Some(choose_certified_key(
             domain,
             client_hello.signature_schemes(),
@@ -1296,6 +1323,62 @@ mod server_policy_tests {
         }
     }
 
+    /// A client connecting by address sends no server name, and gets the
+    /// primary certificate, as from the OpenSSL TCP listener. Without a
+    /// primary the handshake fails, as every HTTP/3 connection by address did.
+    #[test]
+    fn a_client_hello_without_a_server_name_gets_the_primary_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ders = Vec::new();
+        for name in ["primary.example", "other.example"] {
+            let cert =
+                rcgen::generate_simple_self_signed(vec![name.to_string(), "127.0.0.1".to_string()])
+                    .unwrap();
+            std::fs::write(dir.path().join(format!("{name}.crt")), cert.cert.pem()).unwrap();
+            std::fs::write(
+                dir.path().join(format!("{name}.key")),
+                cert.signing_key.serialize_pem(),
+            )
+            .unwrap();
+            ders.push(rustls::pki_types::CertificateDer::from(
+                cert.cert.der().to_vec(),
+            ));
+        }
+        let handshake = |resolver: super::MultiDomainCertResolver| {
+            let server = super::TlsProvider::create_rustls_config_with_resolver(
+                &tls("1.3"),
+                &PqcConfig::default(),
+                true,
+                ClientAuth::None,
+                Arc::new(resolver),
+            )
+            .unwrap();
+            let mut roots = RootCertStore::empty();
+            for der in &ders {
+                roots.add(der.clone()).unwrap();
+            }
+            let client =
+                ClientConfig::builder_with_provider(Arc::new(rustls_post_quantum::provider()))
+                    .with_protocol_versions(TLS13)
+                    .unwrap()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth();
+            // By address: rustls sends no server name for an IP.
+            let address = ServerName::from(std::net::IpAddr::from([127, 0, 0, 1]));
+            let mut client = ClientConnection::new(Arc::new(client), address).unwrap();
+            let mut server = rustls::ServerConnection::new(Arc::new(server)).unwrap();
+            pump_handshake(&mut client, &mut server)?;
+            assert!(server.server_name().is_none(), "no server name was sent");
+            Ok::<_, anyhow::Error>(client.peer_certificates().unwrap()[0].clone().into_owned())
+        };
+        let primary =
+            super::MultiDomainCertResolver::for_primary(&dir.path().join("primary.example.crt"))
+                .unwrap();
+        assert_eq!(handshake(primary).unwrap(), ders[0]);
+        let no_primary = super::MultiDomainCertResolver::new(dir.path()).unwrap();
+        assert!(handshake(no_primary).is_err());
+    }
+
     /// `require_client_cert` refuses a client that presents none. The rustls
     /// TCP listeners used to build with no client authentication at all.
     #[test]
@@ -1826,7 +1909,7 @@ impl TlsProvider {
             .cert_path
             .parent()
             .unwrap_or_else(|| Path::new("/etc/pqcrypta/certs"));
-        let resolver = Arc::new(MultiDomainCertResolver::new(certs_dir)?);
+        let resolver = Arc::new(MultiDomainCertResolver::for_primary(&tls_config.cert_path)?);
 
         // Create initial QUIC server config using the resolver
         let rustls_config = Self::create_rustls_config_with_resolver(

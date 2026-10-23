@@ -414,7 +414,7 @@ fn resolve_route_policy(
         .headers()
         .get(hyper::header::HOST)
         .and_then(|v| v.to_str().ok())
-        .map(|h| h.split(':').next().unwrap_or(h).to_ascii_lowercase())
+        .map(|h| crate::config::host_without_port(h).to_ascii_lowercase())
         .or_else(|| request.uri().host().map(str::to_ascii_lowercase));
     let routes = security.route_index.load_full();
     let on_conformance_host = crate::security::is_conformance_host(&routes, host.as_deref());

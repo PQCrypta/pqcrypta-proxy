@@ -518,7 +518,7 @@ impl ResponseCache {
     /// Matches exact hostname or any subdomain of an entry that starts with `.`
     /// (e.g., ".example.com" excludes "api.example.com" and "www.example.com").
     pub fn is_excluded_host(&self, host: &str) -> bool {
-        let host = host.split(':').next().unwrap_or(host); // strip port
+        let host = crate::config::host_without_port(host);
         self.config.excluded_hosts.iter().any(|h| {
             if h.starts_with('.') {
                 host.ends_with(h.as_str()) || host == &h[1..]
@@ -740,7 +740,7 @@ pub async fn cache_middleware(
                 .headers()
                 .get("host")
                 .and_then(|v| v.to_str().ok())
-                .map(|h| h.split(':').next().unwrap_or(h).to_ascii_lowercase())
+                .map(|h| crate::config::host_without_port(h).to_ascii_lowercase())
         })
         .unwrap_or_default();
 
