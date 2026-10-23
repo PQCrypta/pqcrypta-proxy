@@ -228,8 +228,7 @@ impl Conformance {
     /// The vhost serves the catalogue, reports and badge. It does not select
     /// tests — that is what the per-test ports are for.
     pub fn owns_host(&self, host: &str) -> bool {
-        let host = host.split(':').next().unwrap_or(host);
-        host.eq_ignore_ascii_case(&self.config.host)
+        crate::config::host_without_port(host).eq_ignore_ascii_case(&self.config.host)
     }
 }
 

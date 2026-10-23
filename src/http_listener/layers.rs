@@ -388,8 +388,7 @@ impl ResponseHeaderSet {
         if self.addin_csp.is_none() || !path.starts_with(&self.addin_path_prefix) {
             return false;
         }
-        let host = host.unwrap_or("");
-        let host = host.split(':').next().unwrap_or("");
+        let host = crate::config::host_without_port(host.unwrap_or(""));
         self.addin_hosts
             .iter()
             .any(|h| h.eq_ignore_ascii_case(host))

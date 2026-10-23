@@ -4586,6 +4586,25 @@ impl ProxyConfig {
     }
 }
 
+/// A request's host with any port removed, as route hosts are written.
+///
+/// An IPv6 literal keeps its brackets, `[2001:db8::1]`, which is how
+/// `http::uri::Authority::host` gives it. Every caller used to cut the host at
+/// its first colon, which left `[2001` of an IPv6 literal: such a request
+/// matched no route, so the security layer applied the default policy instead
+/// of the route's, and the TCP listener kept the port on a bracketed literal.
+pub fn host_without_port(host: &str) -> &str {
+    match host.rfind(':') {
+        Some(colon)
+            if host[colon + 1..].bytes().all(|b| b.is_ascii_digit())
+                && (!host.starts_with('[') || host[..colon].ends_with(']')) =>
+        {
+            &host[..colon]
+        }
+        _ => host,
+    }
+}
+
 /// Does `ip` appear in a `pentest_bypass_ips`-style list?
 ///
 /// Compares PARSED addresses, not strings. `IpAddr::to_string()` emits the
@@ -4762,6 +4781,39 @@ mod tests {
         assert!(c.find_route(None, "/api/v1/thing", false).is_some());
         assert!(c.find_route(None, "/ApI/v1", false).is_some());
         assert!(c.find_route(None, "/other", false).is_none());
+    }
+
+    #[test]
+    fn the_port_is_removed_from_names_and_bracketed_ipv6_literals() {
+        assert_eq!(host_without_port("example.com"), "example.com");
+        assert_eq!(host_without_port("example.com:8443"), "example.com");
+        assert_eq!(host_without_port("66.179.95.51:443"), "66.179.95.51");
+        assert_eq!(host_without_port("[2001:db8::1]"), "[2001:db8::1]");
+        assert_eq!(host_without_port("[2001:db8::1]:443"), "[2001:db8::1]");
+        assert_eq!(host_without_port("[::1]"), "[::1]");
+        assert_eq!(host_without_port("[2001:db8::]"), "[2001:db8::]");
+        // The HTTP/3 and HTTP/2 paths take the host from the URI's authority,
+        // which keeps the brackets: route hosts are written the same way.
+        let uri: http::Uri = "https://[2001:db8::1]:443/dns-query".parse().unwrap();
+        assert_eq!(uri.host(), Some("[2001:db8::1]"));
+    }
+
+    #[test]
+    fn an_ipv6_literal_host_finds_its_route() {
+        let c = config_with(vec![route(
+            Some("[2001:db8::1]"),
+            None,
+            Some("/dns-query"),
+            None,
+            1,
+        )]);
+        for host in ["[2001:db8::1]", "[2001:db8::1]:443"] {
+            assert!(
+                c.find_route(Some(host_without_port(host)), "/dns-query", false)
+                    .is_some(),
+                "{host}"
+            );
+        }
     }
 
     #[test]

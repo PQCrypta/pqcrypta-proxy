@@ -509,8 +509,10 @@ impl BackendPool {
         .map_err(|e| anyhow::anyhow!("Failed to create endpoint: {}", e))?;
         endpoint.set_default_client_config(client_config);
 
-        // Extract host for SNI
-        let host = backend.address.split(':').next().unwrap_or("localhost");
+        // Extract host for SNI: an IPv6 literal goes without its brackets
+        let host = crate::config::host_without_port(&backend.address)
+            .trim_start_matches('[')
+            .trim_end_matches(']');
 
         // Connect to backend
         let connection = endpoint
