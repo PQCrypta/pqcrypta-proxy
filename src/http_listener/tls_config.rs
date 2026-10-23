@@ -48,15 +48,13 @@ pub(super) fn private_resolver(
 > {
     use std::path::Path;
 
-    let certs_dir = Path::new(cert_path)
-        .parent()
-        .unwrap_or_else(|| Path::new("/etc/pqcrypta/certs"));
-    let resolver = crate::tls::MultiDomainCertResolver::new(certs_dir).map_err(|e| {
-        format!(
-            "Failed to build SNI cert resolver from {:?}: {}",
-            certs_dir, e
-        )
-    })?;
+    let resolver =
+        crate::tls::MultiDomainCertResolver::for_primary(Path::new(cert_path)).map_err(|e| {
+            format!(
+                "Failed to build SNI cert resolver for {:?}: {}",
+                cert_path, e
+            )
+        })?;
     Ok(std::sync::Arc::new(resolver))
 }
 
