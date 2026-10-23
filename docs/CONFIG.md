@@ -80,6 +80,63 @@ session is established.
 
 ---
 
+## DNS over HTTPS
+
+```toml
+[doh]
+```
+
+DNS over HTTPS (RFC 8484) for an authoritative name server on the same host.
+The proxy runs a gateway on a loopback address. A backend of type `http1`
+points at that address, and routes send DoH requests there like any other
+request. The gateway then gets HTTP/2, HTTP/3, post-quantum key exchange, ECH,
+rate limits and the access log from the proxy, and asks the name server over
+TCP (RFC 7766).
+
+The gateway accepts GET and HEAD with the base64url `dns` parameter, and POST
+with an `application/dns-message` body. It returns the name server's answer
+with `Cache-Control: max-age` set from the answer's TTLs (RFC 8484 §5.1).
+When the query carries the EDNS Padding option, the answer is padded to a
+multiple of 468 octets (RFC 7830, RFC 8467 §4.1). Only standard queries reach
+the name server. Zone transfers and every other opcode are answered with
+REFUSED and Extended DNS Error 21, "Not Supported" (RFC 8914).
+
+**Disabled by default.** Changes take effect on restart.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `false` | Run the gateway |
+| `listen` | string | `"127.0.0.1:8053"` | Gateway address, `ip:port`. Must be loopback: the gateway applies no limits of its own, so a client must reach it only through a route |
+| `upstream` | string | `"127.0.0.1:53"` | The name server, `ip:port`, asked over TCP |
+| `path` | string | `"/dns-query"` | The URI template path, `{path}{?dns}` |
+| `timeout_ms` | u64 | `3000` | Time allowed for the name server's answer; past it the client gets 504 |
+
+A route for it (see the example config):
+
+```toml
+[backends.doh]
+name = "doh"
+type = "http1"
+address = "127.0.0.1:8053"
+
+[[routes]]
+name = "doh"
+host = "ns1.example.com"
+path_exact = "/dns-query"
+backend = "doh"
+allow_http11 = true        # RFC 8484 recommends HTTP/2 but does not require it
+skip_bot_blocking = true   # DNS clients, not browsers: user-agent rules do not apply
+priority = 1
+
+[routes.security]
+waf_enabled = false        # base64url DNS messages are not form input
+```
+
+Also add `path` to `[cache] excluded_paths`: an authoritative answer must come
+from the zone as it stands, not from a cached copy.
+
+---
+
 ## HTTP/3 Advanced Features
 
 ```toml
