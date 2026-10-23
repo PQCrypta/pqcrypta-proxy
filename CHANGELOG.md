@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.3.0...v0.4.0) (2026-10-23)
+
+
+### Features
+
+* **doh:** DNS over HTTPS gateway for a name server on this host ([a5fb93b](https://github.com/PQCrypta/pqcrypta-proxy/commit/a5fb93bcb9c2ecdbf858d9f172127b4efbec4904))
+
+
+### Bug Fixes
+
+* **routing:** IPv6 literal hosts get their route's policy ([912285c](https://github.com/PQCrypta/pqcrypta-proxy/commit/912285c548d0dba671ae4be94ffa8c8c70f0ac1c))
+* **routing:** match a bracketed IPv6 host with a port over TCP ([99d2fa6](https://github.com/PQCrypta/pqcrypta-proxy/commit/99d2fa6b648fe520ca58147d85cfb751bdb64217))
+* **tls:** answer a ClientHello with no server name with the primary certificate ([aa9a475](https://github.com/PQCrypta/pqcrypta-proxy/commit/aa9a4751f7a5087e96d3affecbe8d7cc4d54c0eb))
+
 ## [0.3.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.2.2...v0.3.0) (2026-10-19)
 
 
