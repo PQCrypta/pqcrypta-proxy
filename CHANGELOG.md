@@ -6,7 +6,6 @@
 ### Bug Fixes
 
 * **deps:** ctutils 0.4.5 (RUSTSEC-2026-0385) ([2ce9390](https://github.com/PQCrypta/pqcrypta-proxy/commit/2ce9390af697074d535d7d5a68819f0594b7bfc3))
-* **deps:** ctutils 0.4.5 (RUSTSEC-2026-0385) ([b486251](https://github.com/PQCrypta/pqcrypta-proxy/commit/b4862511f1f4ec1ca84a4f688875227179ffc1d4))
 
 ## [0.4.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.3.0...v0.4.0) (2026-10-23)
 
