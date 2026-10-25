@@ -1,8 +1,9 @@
-//! DNS-based ACME challenges: dns-01 (RFC 8555 §8.4) and dns-account-01
-//! (draft-ietf-acme-dns-account-label), whose TXT record is published and
-//! removed by DNS UPDATE (RFC 2136) signed with TSIG (RFC 8945), and waited
-//! for at every authoritative server of its zone before the CA is told to
-//! look.
+//! DNS-based ACME challenges: dns-01 (RFC 8555 §8.4) and dns-account-01.
+//!
+//! The TXT record a challenge asks for (draft-ietf-acme-dns-account-label
+//! names dns-account-01's) is published and removed by DNS UPDATE (RFC 2136)
+//! signed with TSIG (RFC 8945), and waited for at every authoritative server
+//! of its zone before the CA is told to look.
 //!
 //! The update goes to one server, the zone's primary or a secondary that
 //! forwards it there (Knot DNS forwards an update to the zone's primary and
@@ -151,8 +152,9 @@ pub fn dns01_owner(domain: &str) -> String {
     format!("_acme-challenge.{}", domain.trim_end_matches('.'))
 }
 
-/// The owner of a dns-account-01 record for `domain` and the account at
-/// `account_url` (draft-ietf-acme-dns-account-label §3.1): "_" and the
+/// The owner of a dns-account-01 record for `domain` and an account.
+///
+/// draft-ietf-acme-dns-account-label §3.1, for the account at `account_url`: "_" and the
 /// lowercase base32 of the first 10 octets of SHA-256(account URL), then
 /// `_acme-challenge`. Each account has its own record, so several ACME
 /// clients (one per node) validate the same name at once without
@@ -363,7 +365,7 @@ impl DnsUpdater {
             return false;
         };
         match exchange(server, &query).await {
-            Ok(response) => txt_values(&response).iter().any(|v| *v == record.value),
+            Ok(response) => txt_values(&response).contains(&record.value),
             Err(e) => {
                 debug!("ACME DNS: {server} not asked for {}: {e}", record.owner);
                 false
@@ -803,7 +805,10 @@ mod tests {
         let zone_end = crate::dns_wire::name_end(&request, HEADER_LEN).unwrap() + 4;
         response.extend_from_slice(&request[HEADER_LEN..zone_end]);
         // Signed by "the server": request MAC, response, variables
-        let mut input = (request_mac.len() as u16).to_be_bytes().to_vec();
+        let mut input = u16::try_from(request_mac.len())
+            .unwrap()
+            .to_be_bytes()
+            .to_vec();
         input.extend(&request_mac);
         input.extend(&response);
         input.extend(tsig_variables(&key(), 1001, 0, &[]).unwrap());
@@ -811,7 +816,7 @@ mod tests {
         let mut rdata = encode_name("hmac-sha256").unwrap();
         rdata.extend(&1001u64.to_be_bytes()[2..]);
         rdata.extend(&FUDGE.to_be_bytes());
-        rdata.extend(&(server_mac.len() as u16).to_be_bytes());
+        rdata.extend(&u16::try_from(server_mac.len()).unwrap().to_be_bytes());
         rdata.extend(&server_mac);
         rdata.extend(&7u16.to_be_bytes());
         rdata.extend([0, 0, 0, 0]);
@@ -820,7 +825,7 @@ mod tests {
         signed.extend(TYPE_TSIG.to_be_bytes());
         signed.extend(CLASS_ANY.to_be_bytes());
         signed.extend(0u32.to_be_bytes());
-        signed.extend((rdata.len() as u16).to_be_bytes());
+        signed.extend(u16::try_from(rdata.len()).unwrap().to_be_bytes());
         signed.extend(&rdata);
         signed[10..12].copy_from_slice(&1u16.to_be_bytes());
 

@@ -1,7 +1,8 @@
-//! The DNS message format (RFC 1035 §4), as far as the proxy reads and
-//! writes it: the DoH gateway (doh.rs) and the ACME DNS challenges'
-//! updates (acme_dns.rs). Every read is bounds-checked: these bytes come
-//! from the network, and a release build aborts the whole process on a panic.
+//! The DNS message format (RFC 1035 §4), as far as the proxy reads and writes it.
+//!
+//! Used by the DoH gateway (doh.rs) and the ACME DNS challenges' updates
+//! (acme_dns.rs). Every read is bounds-checked: these bytes come from the
+//! network, and a release build aborts the whole process on a panic.
 
 /// A DNS message header's length
 pub(crate) const HEADER_LEN: usize = 12;
