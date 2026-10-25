@@ -130,6 +130,7 @@
 
 pub mod access_logger;
 pub mod acme;
+pub mod acme_dns;
 pub mod admin;
 pub mod audit_logger;
 pub mod backend_client;
@@ -141,6 +142,7 @@ pub mod conformance;
 pub mod connect_udp;
 pub mod crawler_verify;
 pub mod data_file;
+pub mod dns_wire;
 pub mod doh;
 pub mod early_data;
 pub mod ech_config;

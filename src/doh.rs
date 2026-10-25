@@ -43,13 +43,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, warn};
 
 use crate::config::DohConfig;
+use crate::dns_wire::{layout, u16_at, u32_at, Record, HEADER_LEN};
 
 /// The media type of a DNS message in wire format (RFC 8484 §6).
 pub const MEDIA_TYPE: &str = "application/dns-message";
 
 /// Largest DNS message: its TCP length prefix is two octets.
 const MAX_MESSAGE: usize = 65_535;
-const HEADER_LEN: usize = 12;
 /// RFC 8467 §4.1: pad responses to a multiple of 468 octets.
 const RESPONSE_BLOCK: usize = 468;
 
@@ -369,112 +369,6 @@ impl Upstream {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The DNS message format (RFC 1035 §4), as far as the gateway reads it. Every
-// read is bounds-checked: these bytes come from the client, and a release
-// build aborts the whole process on a panic.
-// ---------------------------------------------------------------------------
-
-fn u16_at(msg: &[u8], at: usize) -> Option<u16> {
-    let b = msg.get(at..at.checked_add(2)?)?;
-    Some(u16::from_be_bytes([b[0], b[1]]))
-}
-
-fn u32_at(msg: &[u8], at: usize) -> Option<u32> {
-    let b = msg.get(at..at.checked_add(4)?)?;
-    Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
-}
-
-/// One past the last octet of the name that starts at `at`. A compression
-/// pointer ends a name and is not followed, so a pointer loop cannot spin.
-fn name_end(msg: &[u8], mut at: usize) -> Option<usize> {
-    loop {
-        let length = *msg.get(at)?;
-        match length & 0xC0 {
-            0x00 if length == 0 => return Some(at + 1),
-            0x00 => at = at.checked_add(1 + usize::from(length))?,
-            0xC0 => {
-                msg.get(at + 1)?;
-                return Some(at + 2);
-            }
-            // 0x40 and 0x80: label types RFC 6891 §5 retired.
-            _ => return None,
-        }
-    }
-}
-
-/// Where one resource record's parts sit in a message.
-#[derive(Clone, Copy, Debug)]
-struct Record {
-    rtype: u16,
-    ttl: u32,
-    /// Offset of the RDATA; its two-octet length sits just before it.
-    rdata: usize,
-    rdlength: usize,
-    end: usize,
-}
-
-fn record_at(msg: &[u8], at: usize) -> Option<Record> {
-    let fixed = name_end(msg, at)?;
-    let rtype = u16_at(msg, fixed)?;
-    let ttl = u32_at(msg, fixed + 4)?;
-    let rdlength = usize::from(u16_at(msg, fixed + 8)?);
-    let rdata = fixed + 10;
-    let end = rdata + rdlength;
-    (end <= msg.len()).then_some(Record {
-        rtype,
-        ttl,
-        rdata,
-        rdlength,
-        end,
-    })
-}
-
-/// A message's sections. `None` when any of them runs past the end.
-#[derive(Debug)]
-struct Layout {
-    questions: usize,
-    question_end: usize,
-    answer: Vec<Record>,
-    authority: Vec<Record>,
-    additional: Vec<Record>,
-}
-
-fn layout(msg: &[u8]) -> Option<Layout> {
-    if msg.len() < HEADER_LEN {
-        return None;
-    }
-    let count = |i: usize| u16_at(msg, 4 + 2 * i).map(usize::from);
-    let questions = count(0)?;
-    let mut at = HEADER_LEN;
-    for _ in 0..questions {
-        at = name_end(msg, at)? + 4;
-        if at > msg.len() {
-            return None;
-        }
-    }
-    let question_end = at;
-    let mut section = |n: usize| -> Option<Vec<Record>> {
-        let mut records = Vec::with_capacity(n.min(64));
-        for _ in 0..n {
-            let record = record_at(msg, at)?;
-            at = record.end;
-            records.push(record);
-        }
-        Some(records)
-    };
-    let answer = section(count(1)?)?;
-    let authority = section(count(2)?)?;
-    let additional = section(count(3)?)?;
-    Some(Layout {
-        questions,
-        question_end,
-        answer,
-        authority,
-        additional,
-    })
-}
-
 /// The options in an OPT record's RDATA as (code, offset, end of option).
 /// `None` when they do not exactly fill it.
 fn options(msg: &[u8], opt: &Record) -> Option<Vec<(u16, usize, usize)>> {
@@ -652,6 +546,7 @@ fn freshness(msg: &[u8]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dns_wire::name_end;
     use http_body_util::Empty;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
