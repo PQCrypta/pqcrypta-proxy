@@ -16,7 +16,7 @@
 - **Post-Quantum Ready**: Hybrid PQC key exchange (X25519MLKEM768) via OpenSSL 3.5+ with native ML-KEM; RFC 8879 certificate compression to claw back the handshake bytes ML-KEM adds; ML-DSA-87 (FIPS 204) server certificates per SNI; PQC downgrade detection reading the negotiated group off the connection
 - **Encrypted Client Hello**: Server-side ECH (RFC 9849) on TCP and QUIC, with rotating HPKE keys published in the DNS HTTPS record: a post-quantum X-Wing config first, so the inner ClientHello is not exposed to harvest-now-decrypt-later, and an X25519 one for the clients that implement only that
 - **Zero Downtime**: Hot reload configuration and TLS certificates; environment-specific config overlay (`--env`)
-- **ACME Automation**: Automatic Let's Encrypt certificate provisioning, renewal, and Certificate Transparency log submission
+- **ACME Automation**: Automatic Let's Encrypt certificate provisioning, renewal timed by the CA's renewal information (ARI, RFC 9773), IP address identifiers (RFC 8738) so a client connecting by address can authenticate it, and Certificate Transparency log submission
 - **OCSP Stapling**: Automated OCSP response fetching and stapling
 - **Prometheus Metrics**: Comprehensive metrics for TLS, connections, requests, backends, and WAF blocks
 - **WAF**: Pattern-based request inspection for injection and traversal attacks (SQLi, XSS, path traversal, NoSQLi, SSRF, CMDi, XXE, deserialization) in detect or block mode — covers OWASP A01/A03/A08/A10 attack patterns; categories requiring architectural or supply-chain controls (A02, A04, A05, A06, A09) are handled at other layers. Scanner/reconnaissance probe paths (`.git`, `.env`, `.aws`, `wp-login.php`, terraform state, SSH keys, CI/CD files, etc.) are blocked at path level before pattern scanning, preventing automated scanner traffic from reaching backends and polluting error-rate metrics
@@ -48,7 +48,7 @@
 | Alt-Svc by transport | ✅ | RFC 7838: Alt-Svc names alternatives *to the connection it arrives on*. Over TCP the proxy advertises `h3` on every configured UDP port; over QUIC it advertises `h2` on the same port plus any *other* h3 port, never the connection in use |
 | PQC TLS | ✅ | X25519MLKEM768 hybrid key exchange (NIST Level 3) + ML-DSA-87 server certificates (NIST Level 5, FIPS 204) |
 | Background Cleanup | ✅ | Auto-cleanup of expired entries |
-| **ACME Automation** | ✅ | Let's Encrypt HTTP-01/DNS-01; one individual cert per domain with atomic writes and immediate hot-reload |
+| **ACME Automation** | ✅ | Let's Encrypt HTTP-01/DNS-01; one individual cert per domain with atomic writes and immediate hot-reload; IP addresses beside a domain (RFC 8738, `shortlived` profile); renewal in the CA's ARI window (RFC 9773) with `replaces` |
 | **OCSP Stapling** | ✅ | Automated OCSP response fetching with caching |
 | **Prometheus Metrics** | ✅ | TLS, connection, request, backend, and error metrics |
 | PROXY Protocol v2 | ✅ | Client IP preservation for downstream proxies |
@@ -75,7 +75,7 @@
 | **Per-Backend Circuit Breaker** | ✅ | Per-backend overrides for failure threshold, half-open delay, and success threshold |
 | **0-RTT Replay Protection** | ✅ | Nonce store (strict/session/none); rejects replayed early-data nonces |
 | **QUIC Retry** | ✅ | Optional RFC 9000 source-address validation (`enable_quic_retry`); Retry token echoed before handshake, anti-spoofing at +1 RTT |
-| **Certificate Transparency** | ✅ | Submits new certs to CT logs via `POST /ct/v1/add-chain` after ACME issuance |
+| **Certificate Transparency** | ✅ | Submits new certs via `POST /ct/v1/add-chain` after ACME issuance, to logs chosen from the live CT log list: one per operator whose shard holds the expiry |
 | **QUIC Connection Migration** | ✅ | Configurable enable/disable of QUIC connection migration (`enable_quic_migration`) |
 | **Per-Route Security Policy** | ✅ | Per-route mTLS requirement, JA3 allowlist, rate limit override, WAF mode, 0-RTT control |
 | **Body Size Limit** | ✅ | Global `max_request_body_bytes` enforced (default 50 MB); 413 on excess |
@@ -252,7 +252,7 @@
 - **Log Rotation via SIGHUP**: Sending `SIGHUP` to the proxy reopens all log file handles without dropping connections or restarting — compatible with standard logrotate `postrotate` hooks (`systemctl kill -s HUP pqcrypta-proxy`)
 - **Admin API**: Health checks, Prometheus metrics, config reload, graceful shutdown, QUIC health, WebTransport health, canary status and live weight/suspend/resume control, live blocklist inspection (`GET /blocklist`), manual block (`POST /blocklist/block/:ip?duration_secs=N`) and immediate unblock (`POST /blocklist/unblock/:ip`); `GET /security/status`, `/security/geoip/:ip`, `/security/fingerprints` and `/security/threats`; rate-limit statistics (`GET /ratelimit`) and per-client reset (`POST /ratelimit/reset/:key`) against the one advanced rate limiter every listener, port and protocol shares; loopback enforcement prevents plain-HTTP token exposure on non-loopback interfaces; ephemeral session tokens use `OsRng` for cryptographic security; per-IP and global lockout of failing callers with exponential back-off; the token is checked first, so a correct token is never refused by it (a client left on a stale token cannot lock out the rest)
 - **Graceful Shutdown Drain**: Configurable drain timeout polls active connections at 100 ms intervals and exits as soon as they reach zero — no unnecessary delay on idle restarts
-- **Certificate Transparency**: New ACME-issued certs submitted to configured CT logs via `POST /ct/v1/add-chain` for public auditability
+- **Certificate Transparency**: New ACME-issued certs submitted via `POST /ct/v1/add-chain` for public auditability, to the configured logs or, by default, to one log per operator from the live CT log list whose temporal shard holds the certificate's expiry
 - **Per-Backend Retry**: Configurable retry count and exponential backoff per backend; retry on 5xx responses, connect failures, or timeouts
 - **Cross-Platform**: Linux, macOS, and Windows support
 
@@ -1134,10 +1134,12 @@ Overlay values win for all matching keys; unmatched keys from the base are kept.
 [acme]
 enabled = true
 certificate_transparency = true
-ct_logs = [
-    "https://ct.googleapis.com/logs/xenon2025h1/",
-    "https://yeti2025.ct.digicert.com/log/",
-]
+# Empty (the default): one log per operator from the CT log list, the one
+# whose temporal shard holds the certificate's expiry. A log takes only
+# certificates expiring inside its shard (half a year), so a fixed list goes
+# stale: the Xenon 2025H1 shard this example used to name now answers 404.
+ct_logs = []
+ct_log_list = "https://www.gstatic.com/ct/log_list/v3/log_list.json"
 ```
 
 ### Conformance Suite Configuration
@@ -1667,7 +1669,7 @@ src/
 ├── tls.rs               # TLS configuration; PQC session tickets
 ├── pqc_tls.rs           # Post-Quantum TLS provider; downgrade detection
 ├── pqc_extended.rs      # Extended PQC configuration and capabilities
-├── acme.rs              # ACME certificate automation; Certificate Transparency log submission; domain path validation
+├── acme.rs              # ACME certificate automation (DNS and IP identifiers, ARI renewal); Certificate Transparency log submission; domain path validation
 ├── ocsp.rs              # OCSP stapling automation
 ├── metrics.rs           # Prometheus metrics registry
 ├── rate_limiter.rs      # Advanced multi-dimensional rate limiting; JWT HMAC verification
@@ -1758,15 +1760,19 @@ releases do not compile against it.
 
 ## ACME Certificate Automation
 
-Automatic Let's Encrypt certificate provisioning and renewal. Issues one **individual certificate per domain** — each domain gets its own `{domain}.crt` / `{domain}.key` pair written atomically (write-to-`.tmp`-then-rename) to prevent corruption on concurrent renewal. Uses ECDSA P-256 keys for smaller certs and faster TLS handshakes.
+Automatic Let's Encrypt certificate provisioning and renewal. Issues one **individual certificate per domain** — each domain gets its own `{domain}.crt` / `{domain}.key` pair written atomically (write-to-`.tmp`-then-rename) to prevent corruption on concurrent renewal. With `use_ecdsa`, keys are ECDSA P-384 by default (`ecdsa_curve = "P-256"` for smaller certificates).
 
 SNI-based cert selection is handled by `MultiDomainCertResolver` (rustls/QUIC) and `create_pqc_acceptor_with_sni` (OpenSSL/TCP), both loading all cert pairs from the certs directory at startup and on every ACME renewal.
 
+### Certificates for IP addresses
+
+A domain's certificate can also name IP addresses (`ip_addresses`, RFC 8738 identifiers): the order carries them beside the domain, under the CA's profile for addresses (`ip_profile`; Let's Encrypt issues them only under `shortlived`, 160-hour certificates), and the HTTP-01 challenge is answered on port 80 of each address. A client that connects by address sends no server name (RFC 6066 has no form for one) and verifies the certificate against the address it dialled (RFC 9525 §6.2.1); both TLS stacks give such a ClientHello the certificate that names the host's addresses, and fall back to `tls.cert_path` where none does. A name server's DNS over HTTPS reached by its IP — as `dnspython`'s `dns.query.https()` reaches it, verifying the address — is the case this exists for: with a certificate naming only `ns1.example.com`, that client aborts the handshake.
+
 ### How It Works
 
-1. **Daily check** reads each domain's cert file to check expiry (zero network cost)
-2. **Renewal triggers** per-domain when cert is within 30 days of expiry (~day 60 of 90-day cert)
-3. **ACME protocol** runs only during actual renewal (~once every 60 days per domain)
+1. **Each check** reads each domain's cert file, and asks the CA for its suggested renewal window (ARI, RFC 9773: one unauthenticated GET, repeated only after the CA's Retry-After)
+2. **Renewal triggers** per-domain at a point in that window (a hash of the serial picks it, so certificates spread over the window); without ARI, `renewal_days` before expiry or a third of the lifetime before, whichever is less (~day 60 of a 90-day cert, ~hour 107 of a 160-hour one). A certificate whose names or addresses differ from the configuration is reissued at once
+3. **ACME protocol** runs only during actual renewal; the order names the certificate it `replaces` (RFC 9773 §5), which Let's Encrypt exempts from its rate limits. The next check comes at `check_interval_hours`, or sooner when a renewal falls due first
 4. **HTTP-01 challenges** served on port 80 before HTTPS redirect kicks in
 5. **Exponential backoff** on challenge polling (2s → 4s → 8s → 16s cap)
 6. **Hot reload** — ACME notifies the TLS provider immediately after each cert is written; no restart required
@@ -1783,10 +1789,16 @@ directory_url = "https://acme-v02.api.letsencrypt.org/directory"  # Production
 challenge_type = "http-01"
 certs_path = "/etc/pqcrypta/certs"
 account_path = "/etc/pqcrypta/acme/account.json"
-renewal_days = 30           # Renew 30 days before expiry
-check_interval_hours = 24   # Once daily (local check only, no network cost)
-use_ecdsa = true            # ECDSA P-256 (smaller keys, faster handshakes)
+renewal_days = 30           # Without ARI: 30 days before expiry, or a third of the lifetime if less
+check_interval_hours = 24   # Once daily, sooner when a renewal falls due first
+use_ecdsa = true            # ECDSA, P-384 unless ecdsa_curve = "P-256"
 accept_tos = true
+
+# A domain's certificate can also name its host's addresses (RFC 8738): a
+# client connecting by address authenticates it, and gets it when it sends
+# no server name. The domain must be in `domains`.
+ip_addresses = { "api.example.com" = ["192.0.2.10", "2001:db8::10"] }  # its public addresses
+ip_profile = "shortlived"   # Let's Encrypt issues addresses only under this profile
 
 # External Account Binding (required by ZeroSSL, optional for Let's Encrypt)
 # eab_kid = "your-kid"
