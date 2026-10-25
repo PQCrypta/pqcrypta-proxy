@@ -1356,6 +1356,23 @@ where
         self.stream.reset(code.into());
     }
 
+    /// The connection's one GREASE frame (RFC 9114 7.2.8), now if it has not
+    /// been sent. A server sends it ahead of its response's HEADERS frame
+    /// (`server::RequestStream::send_response`), so it is never the last
+    /// frame on the stream: RFC 9114 4.1 lets an unknown frame go anywhere,
+    /// but aioquic before 1.6 loses the end of a stream whose last frame is
+    /// one it ignores, and its clients (dnspython's DNS over HTTPS among
+    /// them) waited out their timeout for a response they had received.
+    pub(crate) async fn send_grease_frame_now(&mut self) -> Result<(), StreamError> {
+        if self.send_grease_frame {
+            stream::write(&mut self.stream, Frame::Grease)
+                .await
+                .map_err(|e| self.handle_quic_stream_error(e))?;
+            self.send_grease_frame = false;
+        }
+        Ok(())
+    }
+
     #[allow(missing_docs)]
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn finish(&mut self) -> Result<(), StreamError> {
