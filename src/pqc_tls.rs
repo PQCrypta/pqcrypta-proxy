@@ -848,12 +848,25 @@ pub mod openssl_pqc {
         }
 
         /// The context for a ClientHello's server name, or for one without.
+        ///
+        /// An address in the server name is a client connecting by address:
+        /// RFC 6066 3 does not allow one there, but GnuTLS clients such as
+        /// kdig send it, and rustls (the QUIC listener) ignores it, so both
+        /// listeners answer it as they answer no server name.
         fn for_server_name(&self, sni: Option<&str>) -> Option<Arc<openssl::ssl::SslContext>> {
             match sni {
-                Some(name) => self.by_name.get(name).cloned(),
-                None => self.by_address.clone(),
+                Some(name) if !is_address_literal(name) => self.by_name.get(name).cloned(),
+                _ => self.by_address.clone(),
             }
         }
+    }
+
+    /// Whether a server name is an IPv4 or IPv6 address, bracketed or not
+    fn is_address_literal(name: &str) -> bool {
+        name.trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok()
     }
 
     /// Build a fresh `PqcSniMap` from all cert/key pairs in `certs_dir`.

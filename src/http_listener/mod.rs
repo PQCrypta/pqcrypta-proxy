@@ -4278,7 +4278,13 @@ mod pqc_reload_tests {
         // Each handshake trusts only the certificate it should get: the two
         // self-signed certificates share rcgen's subject name, and OpenSSL
         // finds a trusted certificate by subject
-        let received = |server_name: Option<&str>, expected: &[u8]| {
+        // Each handshake trusts only the certificate it should get: the two
+        // self-signed certificates share rcgen's subject name, and OpenSSL
+        // finds a trusted certificate by subject. By address, the client
+        // verifies 127.0.0.1 and sends `sni` as the server name if given (the
+        // crate's connect() never sends an address, as RFC 6066 3 asks; a
+        // GnuTLS client such as kdig does).
+        let received = |sni: Option<&str>, by_address: bool, expected: &[u8]| {
             let (server_end, client_end) = UnixStream::pair().expect("socket pair");
             let server_acceptor = acceptor.clone();
             let server = std::thread::spawn(move || server_acceptor.accept(server_end).is_ok());
@@ -4289,17 +4295,19 @@ mod pqc_reload_tests {
                 .expect("trust");
             connector.set_verify(SslVerifyMode::PEER);
             let mut client = connector.build().configure().expect("client config");
-            let stream = match server_name {
-                Some(name) => client.connect(name, client_end),
-                None => {
-                    client.set_use_server_name_indication(false);
-                    client.set_verify_hostname(false);
-                    client
-                        .param_mut()
-                        .set_ip(std::net::IpAddr::from([127, 0, 0, 1]))
-                        .expect("verify the address");
-                    client.connect("127.0.0.1", client_end)
+            let stream = if by_address {
+                client.set_use_server_name_indication(false);
+                client.set_verify_hostname(false);
+                client
+                    .param_mut()
+                    .set_ip(std::net::IpAddr::from([127, 0, 0, 1]))
+                    .expect("verify the address");
+                if let Some(name) = sni {
+                    client.set_hostname(name).expect("server name");
                 }
+                client.connect("127.0.0.1", client_end)
+            } else {
+                client.connect(sni.expect("a name"), client_end)
             }
             .expect("handshake verified");
             assert!(server.join().expect("server thread"));
@@ -4310,14 +4318,21 @@ mod pqc_reload_tests {
                 .to_der()
                 .expect("der")
         };
-        assert_eq!(received(None, &ders[1]), ders[1], "by address");
+        assert_eq!(received(None, true, &ders[1]), ders[1], "by address");
+        for literal in ["127.0.0.1", "::1", "[::1]"] {
+            assert_eq!(
+                received(Some(literal), true, &ders[1]),
+                ders[1],
+                "by address, {literal} sent as the server name"
+            );
+        }
         assert_eq!(
-            received(Some("primary.example"), &ders[0]),
+            received(Some("primary.example"), false, &ders[0]),
             ders[0],
             "by name"
         );
         assert_eq!(
-            received(Some("ns.example"), &ders[1]),
+            received(Some("ns.example"), false, &ders[1]),
             ders[1],
             "by its own name"
         );
