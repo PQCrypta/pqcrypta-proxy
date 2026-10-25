@@ -143,9 +143,17 @@ pub struct AcmeConfig {
     #[serde(default = "default_true")]
     pub accept_tos: bool,
 
-    /// Challenge type (http-01 or dns-01)
+    /// Challenge type for domain names: http-01, or dns-01, whose TXT record
+    /// is published by DNS UPDATE through `dns_update` (dns-account-01 where
+    /// the CA offers it, so each node's account has its own record). An IP
+    /// address is always validated by HTTP-01: RFC 8738 §7 allows no DNS
+    /// challenge for one.
     #[serde(default = "default_challenge_type")]
     pub challenge_type: ChallengeType,
+
+    /// Where dns-01 records are published: an UPDATE server and a TSIG key
+    #[serde(default)]
+    pub dns_update: Option<crate::acme_dns::DnsUpdateConfig>,
 
     /// HTTP-01 challenge port (usually 80)
     #[serde(default = "default_http_port")]
@@ -255,6 +263,7 @@ impl Default for AcmeConfig {
             staging: false,
             accept_tos: true,
             challenge_type: default_challenge_type(),
+            dns_update: None,
             http_port: default_http_port(),
             eab_kid: None,
             eab_hmac_key: None,
@@ -285,7 +294,8 @@ pub enum ChallengeType {
     /// HTTP-01 challenge (requires port 80)
     #[serde(rename = "http-01")]
     Http01,
-    /// DNS-01 challenge (requires DNS API access)
+    /// DNS-01 (or dns-account-01) challenge: a TXT record published by
+    /// signed DNS UPDATE (`dns_update`)
     #[serde(rename = "dns-01")]
     Dns01,
 }
@@ -1178,6 +1188,112 @@ async fn invalid_order_reasons(order: &mut instant_acme::Order) -> String {
     }
 }
 
+/// Answers each pending authorization of `order`: HTTP-01 by the responses
+/// the port-80 listener serves, or for a domain name with `dns_updater`
+/// set, a DNS challenge by its TXT record, published and waited for at
+/// every name server of its zone before the CA is told to look.
+/// dns-account-01 is taken where the CA offers it, dns-01 otherwise.
+#[cfg(feature = "acme")]
+async fn answer_challenges(
+    order: &mut instant_acme::Order,
+    account: &Account,
+    dns_updater: Option<&crate::acme_dns::DnsUpdater>,
+    pending_challenges: &Arc<RwLock<HashMap<String, PendingChallenge>>>,
+    registered_tokens: &mut Vec<String>,
+    published: &mut Vec<crate::acme_dns::ChallengeRecord>,
+) -> anyhow::Result<()> {
+    let mut authorizations = order.authorizations();
+    while let Some(result) = authorizations.next().await {
+        let mut authz = result?;
+        let authz_domain = authz.identifier().to_string();
+
+        match authz.status {
+            AuthorizationStatus::Pending => {}
+            AuthorizationStatus::Valid => {
+                debug!("Authorization already valid for {}", authz_domain);
+                continue;
+            }
+            ref other => {
+                return Err(anyhow::anyhow!(
+                    "Unexpected authorization status for {}: {:?}",
+                    authz_domain,
+                    other
+                ));
+            }
+        }
+
+        if let (Some(updater), Identifier::Dns(name)) = (dns_updater, authz.identifier().identifier)
+        {
+            let name = name.clone();
+            let account_label = AcmeChallengeType::Unknown("dns-account-01".to_string());
+            let (kind, owner) = if authz.challenges.iter().any(|c| c.r#type == account_label) {
+                (
+                    account_label,
+                    crate::acme_dns::dns_account01_owner(&name, account.id()),
+                )
+            } else {
+                (
+                    AcmeChallengeType::Dns01,
+                    crate::acme_dns::dns01_owner(&name),
+                )
+            };
+            let kind_name = match &kind {
+                AcmeChallengeType::Dns01 => "dns-01",
+                _ => "dns-account-01",
+            };
+            let mut challenge = authz.challenge(kind).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No DNS challenge (dns-account-01 or dns-01) offered for {}",
+                    authz_domain
+                )
+            })?;
+            let value = challenge.key_authorization().dns_value();
+            let record = updater.record(&owner, &value).await?;
+            updater.publish(&record).await?;
+            published.push(record.clone());
+            updater.await_published(&record).await?;
+            info!(
+                "{} challenge ready for {} ({})",
+                kind_name, authz_domain, owner
+            );
+            challenge.set_ready().await?;
+            continue;
+        }
+
+        let mut challenge = authz
+            .challenge(AcmeChallengeType::Http01)
+            .ok_or_else(|| anyhow::anyhow!("No HTTP-01 challenge found for {}", authz_domain))?;
+
+        let key_auth = challenge.key_authorization();
+        let challenge_token = challenge.token.clone();
+        let challenge_url = challenge.url.clone();
+
+        {
+            let mut challenges = pending_challenges.write();
+            challenges.insert(
+                challenge_token.clone(),
+                PendingChallenge {
+                    token: challenge_token.clone(),
+                    key_authorization: key_auth.as_str().to_string(),
+                    domain: authz_domain.clone(),
+                    challenge_url,
+                    expires: SystemTime::now() + Duration::from_mins(5),
+                },
+            );
+        }
+
+        info!(
+            "HTTP-01 challenge ready for {} (token: {}...)",
+            authz_domain,
+            &challenge_token[..challenge_token.len().min(12)]
+        );
+
+        challenge.set_ready().await?;
+        registered_tokens.push(challenge_token);
+    }
+    Ok(())
+}
+
 /// An order for `identifiers`, under `profile` if one is given, replacing
 /// the certificate `replaces` identifies if one is given.
 #[cfg(feature = "acme")]
@@ -1246,75 +1362,58 @@ async fn request_san_certificate(
         }
     };
 
-    // Register the HTTP-01 response for every pending authorization, then mark
-    // each challenge ready. Tokens are tracked so they can be cleared once the
-    // order finishes validating.
+    // DNS challenges' records, for domain names when challenge_type is dns-01
+    let dns_updater = match config.challenge_type {
+        ChallengeType::Dns01 => Some(crate::acme_dns::DnsUpdater::from_config(
+            config.dns_update.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("acme.challenge_type is dns-01 but acme.dns_update is not set")
+            })?,
+        )?),
+        ChallengeType::Http01 => None,
+    };
+
+    // Answer every pending authorization's challenge, then wait for the
+    // order to validate. The HTTP-01 responses served and the DNS records
+    // published are tracked so they are removed whichever way it ends.
     let mut registered_tokens: Vec<String> = Vec::new();
+    let mut published: Vec<crate::acme_dns::ChallengeRecord> = Vec::new();
+    let validated = match answer_challenges(
+        &mut order,
+        account,
+        dns_updater.as_ref(),
+        pending_challenges,
+        &mut registered_tokens,
+        &mut published,
+    )
+    .await
     {
-        let mut authorizations = order.authorizations();
-        while let Some(result) = authorizations.next().await {
-            let mut authz = result?;
-            let authz_domain = authz.identifier().to_string();
+        // RetryPolicy provides the exponential backoff the manual loop used to do.
+        Ok(()) => order
+            .poll_ready(&RetryPolicy::default())
+            .await
+            .map_err(anyhow::Error::from),
+        Err(e) => Err(e),
+    };
 
-            match authz.status {
-                AuthorizationStatus::Pending => {}
-                AuthorizationStatus::Valid => {
-                    debug!("Authorization already valid for {}", authz_domain);
-                    continue;
-                }
-                ref other => {
-                    return Err(anyhow::anyhow!(
-                        "Unexpected authorization status for {}: {:?}",
-                        authz_domain,
-                        other
-                    ));
-                }
-            }
-
-            let mut challenge = authz.challenge(AcmeChallengeType::Http01).ok_or_else(|| {
-                anyhow::anyhow!("No HTTP-01 challenge found for {}", authz_domain)
-            })?;
-
-            let key_auth = challenge.key_authorization();
-            let challenge_token = challenge.token.clone();
-            let challenge_url = challenge.url.clone();
-
-            {
-                let mut challenges = pending_challenges.write();
-                challenges.insert(
-                    challenge_token.clone(),
-                    PendingChallenge {
-                        token: challenge_token.clone(),
-                        key_authorization: key_auth.as_str().to_string(),
-                        domain: authz_domain.clone(),
-                        challenge_url,
-                        expires: SystemTime::now() + Duration::from_mins(5),
-                    },
-                );
-            }
-
-            info!(
-                "HTTP-01 challenge ready for {} (token: {}...)",
-                authz_domain,
-                &challenge_token[..challenge_token.len().min(12)]
-            );
-
-            challenge.set_ready().await?;
-            registered_tokens.push(challenge_token);
-        }
-    }
-
-    // Poll the whole order until every authorization validates (or one fails).
-    // RetryPolicy provides the exponential backoff the manual loop used to do.
-    let ready_status = order.poll_ready(&RetryPolicy::default()).await?;
-
-    // Validation is complete (success or failure) — drop the served responses.
+    // Validation is complete (success or failure) — drop the served responses
+    // and the records.
     {
         let mut challenges = pending_challenges.write();
         for token in &registered_tokens {
             challenges.remove(token);
         }
     }
+    if let Some(updater) = &dns_updater {
+        for record in &published {
+            if let Err(e) = updater.withdraw(record).await {
+                warn!(
+                    "[{}] ACME DNS: {} TXT not removed: {}",
+                    domain, record.owner, e
+                );
+            }
+        }
+    }
+    let ready_status = validated?;
 
     match ready_status {
         OrderStatus::Ready => {}

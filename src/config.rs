@@ -3770,6 +3770,15 @@ pub fn validate_acme_domain(domain: &str) -> Result<(), String> {
 /// file name, and every address on a configured domain's certificate and one
 /// a public CA can certify.
 fn validate_acme(acme: &AcmeConfig) -> anyhow::Result<()> {
+    if acme.challenge_type == crate::acme::ChallengeType::Dns01 {
+        let update = acme.dns_update.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "acme.challenge_type is dns-01 but acme.dns_update (the UPDATE server and \
+                 TSIG key that publish the TXT records) is not set"
+            )
+        })?;
+        crate::acme_dns::DnsUpdater::from_config(update)?;
+    }
     for domain in &acme.domains {
         validate_acme_domain(domain)
             .map_err(|e| anyhow::anyhow!("Invalid ACME domain '{}': {}", domain, e))?;
