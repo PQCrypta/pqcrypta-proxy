@@ -8,6 +8,7 @@
 //! ```text
 //! GET  /                     what this is, and how to run it
 //! POST /session              start a session, returns its id
+//! POST /session/<id>/address  file this address's connections under it too
 //! GET  /catalog.json         every test, its port, and the clause it exercises
 //! GET  /report/<id>.json     results, for CI
 //! GET  /report/<id>          results, for a person
@@ -67,6 +68,9 @@ pub fn route(
         }
         (&Method::GET, "/robots.txt") => Some(robots(conformance)),
         (&Method::GET, "/sitemap.xml") => Some(sitemap(conformance)),
+        (&Method::POST, p) if p.starts_with("/session/") && p.ends_with("/address") => {
+            Some(add_address(conformance, p, client_ip))
+        }
         (&Method::POST, p) if p.starts_with("/client-exit/") => Some(client_exit(conformance, p)),
         (&Method::GET, p) if p.starts_with("/report/") => Some(report_for(conformance, p)),
         (&Method::GET, p) if p.starts_with("/badge/") => Some(badge_for(conformance, p)),
@@ -473,7 +477,10 @@ new session to refresh it.</p>
 why the walk above needs nothing special. If your tests run from several machines, or
 from behind a shared address, connect with the server name
 <code>&lt;session&gt;.{host}</code> instead &mdash; the session travels in the SNI,
-and results follow it rather than the address.</p>
+and results follow it rather than the address. A test that ends before a server name
+is sent can only follow an address: <code>POST /session/&lt;id&gt;/address</code> from
+your other address family files that one under the session too. <code>h3-conformance</code>
+does both for you.</p>
 <p>A session expires an hour after it was <em>created</em>, not an hour after its last
 result: activity does not extend it. Start the session at the beginning of the walk
 rather than long before, and fetch the report while the run is fresh; nothing is
@@ -628,6 +635,38 @@ fn new_session(conformance: &Arc<Conformance>, client_ip: std::net::IpAddr) -> R
          \"badge\": \"https://{host}/badge/{id}.svg\"\n}}\n"
     );
     text(StatusCode::OK, "application/json; charset=utf-8", body)
+}
+
+/// `POST /session/<id>/address`: file the caller's address's connections
+/// under an existing session as well.
+///
+/// A test that ends before the client sends a server name can only be
+/// attributed by address, and a dual-stack host has two: a driver that
+/// started its session over IPv6 adds its IPv4 address here (and the other way
+/// round), so a client that dials the other family is measured too. Knowing
+/// the id is the whole authority, as it already is for the session's own
+/// server name.
+fn add_address(
+    conformance: &Arc<Conformance>,
+    path: &str,
+    client_ip: std::net::IpAddr,
+) -> Response<Body> {
+    let id = path
+        .trim_start_matches("/session/")
+        .trim_end_matches("/address");
+    if !conformance.sessions.exists(id) {
+        return text(
+            StatusCode::NOT_FOUND,
+            "text/plain; charset=utf-8",
+            "no such session\n".to_string(),
+        );
+    }
+    conformance.sessions.associate(client_ip, id);
+    text(
+        StatusCode::OK,
+        "application/json; charset=utf-8",
+        format!("{{\n  \"id\": \"{id}\",\n  \"address\": \"{client_ip}\"\n}}\n"),
+    )
 }
 
 /// The driver telling us its client process has exited.
@@ -946,6 +985,26 @@ mod tests {
         // Anything else falls through to normal routing.
         assert!(route(&c, &Method::GET, "/favicon.ico", ip).is_none());
         assert!(route(&c, &Method::GET, "/session", ip).is_none());
+    }
+
+    /// A session takes a second address only when it exists, and connections
+    /// from that address then find it.
+    #[test]
+    fn a_session_takes_its_other_address() {
+        let c = conf();
+        let v6: std::net::IpAddr = "2001:db8::7".parse().unwrap();
+        let v4: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+        let id = c.sessions.create();
+        c.sessions.associate(v6, &id);
+
+        let unknown = route(&c, &Method::POST, "/session/0123/address", v4).unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert_eq!(c.sessions.for_source(v4), None);
+
+        let added = route(&c, &Method::POST, &format!("/session/{id}/address"), v4).unwrap();
+        assert_eq!(added.status(), StatusCode::OK);
+        assert_eq!(c.sessions.for_source(v4).as_deref(), Some(id.as_str()));
+        assert_eq!(c.sessions.for_source(v6).as_deref(), Some(id.as_str()));
     }
 
     #[test]
