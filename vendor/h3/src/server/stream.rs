@@ -163,6 +163,9 @@ where
             });
         }
 
+        // Before the HEADERS frame, not last on the stream (see
+        // `send_grease_frame_now`)
+        self.inner.send_grease_frame_now().await?;
         stream::write(&mut self.inner.stream, Frame::Headers(block.freeze()))
             .await
             .map_err(|e| self.handle_quic_stream_error(e))?;
