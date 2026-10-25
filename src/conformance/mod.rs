@@ -227,8 +227,13 @@ impl Conformance {
     ///
     /// The vhost serves the catalogue, reports and badge. It does not select
     /// tests — that is what the per-test ports are for.
+    ///
+    /// Its own name, or a session's (`<session>.<host>`): a client given the
+    /// session's name reaches the same pages and reports under it.
     pub fn owns_host(&self, host: &str) -> bool {
-        crate::config::host_without_port(host).eq_ignore_ascii_case(&self.config.host)
+        let host = crate::config::host_without_port(host);
+        host.eq_ignore_ascii_case(&self.config.host)
+            || listener::session_from_sni(&host.to_ascii_lowercase(), &self.config.host).is_some()
     }
 }
 

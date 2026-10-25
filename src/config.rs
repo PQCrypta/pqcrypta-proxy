@@ -3752,11 +3752,12 @@ pub fn validate_acme_domain(domain: &str) -> Result<(), String> {
     if domain.contains('\0') {
         return Err("domain name contains a null byte".to_string());
     }
-    // Only allow RFC 1035 characters: letters, digits, hyphens, dots, and leading '*' for wildcards
-    let valid = domain
+    // Only RFC 1035 characters: letters, digits, hyphens and dots, and a
+    // wildcard only as the whole left-most label ("*.example.org")
+    let name = domain.strip_prefix("*.").unwrap_or(domain);
+    let valid = name
         .chars()
-        .enumerate()
-        .all(|(i, c)| c.is_ascii_alphanumeric() || c == '-' || c == '.' || (c == '*' && i == 0));
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
     if !valid {
         return Err(format!(
             "domain name '{}' contains characters not permitted by RFC 1035",
@@ -3782,6 +3783,12 @@ fn validate_acme(acme: &AcmeConfig) -> anyhow::Result<()> {
     for domain in &acme.domains {
         validate_acme_domain(domain)
             .map_err(|e| anyhow::anyhow!("Invalid ACME domain '{}': {}", domain, e))?;
+        if domain.starts_with("*.") && acme.dns_update.is_none() {
+            anyhow::bail!(
+                "acme.domains has the wildcard '{domain}', which only a DNS challenge can \
+                 validate: set acme.dns_update"
+            );
+        }
     }
     for (domain, addresses) in &acme.ip_addresses {
         if !acme.domains.iter().any(|d| d.eq_ignore_ascii_case(domain)) {
@@ -4824,6 +4831,32 @@ mod tests {
             .insert("ns1.example.com".into(), vec!["10.0.0.1".parse().unwrap()]);
         let err = validate_acme(&private.acme).unwrap_err().to_string();
         assert!(err.contains("not a globally routable address"), "{err}");
+    }
+
+    /// A wildcard is the whole left-most label, and only a DNS challenge can
+    /// validate one, so it needs the DNS UPDATE settings.
+    #[test]
+    fn acme_wildcards_are_one_label_and_need_dns_update() {
+        assert!(validate_acme_domain("*.conformance.example.org").is_ok());
+        for bad in [
+            "*example.org",
+            "a.*.example.org",
+            "**.example.org",
+            "*.*.example.org",
+        ] {
+            assert!(validate_acme_domain(bad).is_err(), "{bad}");
+        }
+
+        let config: ProxyConfig = toml::from_str(
+            r#"
+            [acme]
+            enabled = true
+            domains = ["conformance.example.org", "*.conformance.example.org"]
+            "#,
+        )
+        .unwrap();
+        let err = validate_acme(&config.acme).unwrap_err().to_string();
+        assert!(err.contains("only a DNS challenge"), "{err}");
     }
 
     #[test]

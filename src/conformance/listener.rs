@@ -2303,16 +2303,17 @@ fn resolve_session(
 ) -> String {
     sni.and_then(|sni| session_from_sni(sni, &conformance.config.host))
         .filter(|id| conformance.sessions.exists(id))
-        // SNI only works with a wildcard certificate for the session
-        // subdomain; without one the handshake fails before a test can run.
-        // The address that started the session is the channel that always
-        // works.
+        // A client given the session's name files under it from any address.
+        // One without a name for it (a test that ends before the server name
+        // is read, or a suite whose session names have no DNS name or
+        // wildcard certificate) files under the address that started the
+        // session.
         .or_else(|| conformance.sessions.for_source(peer_ip))
         .unwrap_or_else(|| conformance.sessions.create())
 }
 
 /// The leading label of `<session>.<conformance-host>`, when that is the shape.
-fn session_from_sni(sni: &str, host: &str) -> Option<String> {
+pub(crate) fn session_from_sni(sni: &str, host: &str) -> Option<String> {
     let suffix = format!(".{host}");
     let label = sni.strip_suffix(&suffix)?;
     // A session id is 32 hex characters; anything else is somebody else's

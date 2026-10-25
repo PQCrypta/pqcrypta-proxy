@@ -847,7 +847,8 @@ pub mod openssl_pqc {
             self.by_name.is_empty()
         }
 
-        /// The context for a ClientHello's server name, or for one without.
+        /// The context for a ClientHello's server name (its own, or the
+        /// wildcard's that covers it), or for one without.
         ///
         /// An address in the server name is a client connecting by address:
         /// RFC 6066 3 does not allow one there, but GnuTLS clients such as
@@ -855,7 +856,9 @@ pub mod openssl_pqc {
         /// listeners answer it as they answer no server name.
         fn for_server_name(&self, sni: Option<&str>) -> Option<Arc<openssl::ssl::SslContext>> {
             match sni {
-                Some(name) if !is_address_literal(name) => self.by_name.get(name).cloned(),
+                Some(name) if !is_address_literal(name) => {
+                    crate::tls::covering_name(&self.by_name, name).cloned()
+                }
                 _ => self.by_address.clone(),
             }
         }
