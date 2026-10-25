@@ -721,21 +721,18 @@ mod tests {
         }
     }
 
-    /// The draft's example: SHA-256 of the account URL, first 10 octets,
-    /// base32 lowercase, 16 characters.
+    /// The draft's example account: SHA-256 of the account URL, first 10
+    /// octets, base32 lowercase. The expected owner was computed apart, with
+    /// Python's hashlib and base64.b32encode.
     #[test]
     fn the_dns_account_01_label_is_base32_of_the_account_hash() {
-        let owner = dns_account01_owner(
-            "example.org.",
-            "https://example.com/acme/acct/ExampleAccount",
+        assert_eq!(
+            dns_account01_owner(
+                "example.org.",
+                "https://example.com/acme/acct/ExampleAccount"
+            ),
+            "_ujmmovf2vn55tgye._acme-challenge.example.org"
         );
-        let label = owner.split('.').next().unwrap();
-        assert_eq!(label.len(), 17, "{owner}");
-        assert!(label.starts_with('_'));
-        assert!(label[1..]
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)));
-        assert!(owner.ends_with("._acme-challenge.example.org"), "{owner}");
         assert_eq!(dns01_owner("example.org."), "_acme-challenge.example.org");
         // RFC 4648 §10 vectors, lowercase and unpadded
         assert_eq!(base32_lower(b"f"), "my");
