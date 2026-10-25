@@ -111,6 +111,18 @@ const SETTLE_POLL: Duration = Duration::from_millis(500);
 #[derive(Deserialize)]
 struct Session {
     id: String,
+    /// The session's own host name, `<session>.<host>`
+    #[serde(default)]
+    sni: Option<String>,
+}
+
+/// One run's session, as the tests reach it.
+struct Target<'a> {
+    /// The suite's own origin, for its reports and the driver's notes
+    base: &'a str,
+    session_id: &'a str,
+    /// The host name in every test's URL
+    host: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -269,6 +281,13 @@ async fn run(args: &Args) -> i32 {
         }
     };
 
+    let host = test_host(&http, args, &session).await;
+    let target = Target {
+        base: &base,
+        session_id: &session.id,
+        host: &host,
+    };
+
     // ── Catalogue ───────────────────────────────────────────────────────
     let catalog: Catalog = match get_json(&http, &format!("{base}/catalog.json")).await {
         Ok(c) => c,
@@ -295,13 +314,13 @@ async fn run(args: &Args) -> i32 {
     }
 
     if !args.quiet && !args.json {
-        println!("Running {} tests against {}", selected.len(), args.host);
+        println!("Running {} tests against {}", selected.len(), target.host);
         println!("Client: {}\n", args.client);
     }
 
     // ── Drive the client, once per test ─────────────────────────────────
     for (i, test) in selected.iter().enumerate() {
-        drive(args, &http, &base, &session.id, test, i + 1, selected.len()).await;
+        drive(args, &http, &target, test, i + 1, selected.len()).await;
     }
 
     // ── Let the server finish deciding ──────────────────────────────────
@@ -331,18 +350,7 @@ async fn run(args: &Args) -> i32 {
     };
 
     // ── Again, for what came back inconclusive ──────────────────────────
-    body = match retry_inconclusive(
-        args,
-        &http,
-        &base,
-        &session.id,
-        &selected,
-        &url,
-        &driven,
-        body,
-    )
-    .await
-    {
+    body = match retry_inconclusive(args, &http, &target, &selected, &url, &driven, body).await {
         Ok(body) => body,
         Err(code) => return code,
     };
@@ -380,12 +388,10 @@ async fn run(args: &Args) -> i32 {
 /// The next attempt usually does put it there. Evidence from a later attempt
 /// can only replace an inconclusive one, never a verdict, so a retry cannot
 /// turn a result the client earned into a different one.
-#[allow(clippy::too_many_arguments)]
 async fn retry_inconclusive(
     args: &Args,
     http: &reqwest::Client,
-    base: &str,
-    session_id: &str,
+    target: &Target<'_>,
     selected: &[&CatalogEntry],
     url: &str,
     driven: &std::collections::BTreeSet<&str>,
@@ -416,7 +422,7 @@ async fn retry_inconclusive(
             );
         }
         for (i, test) in again.iter().enumerate() {
-            drive(args, http, base, session_id, test, i + 1, again.len()).await;
+            drive(args, http, target, test, i + 1, again.len()).await;
         }
         let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
         body = collect_report(http, url, driven, deadline, args.json).await?;
@@ -429,14 +435,14 @@ async fn retry_inconclusive(
 async fn drive(
     args: &Args,
     http: &reqwest::Client,
-    base: &str,
-    session_id: &str,
+    target: &Target<'_>,
     test: &CatalogEntry,
     n: usize,
     of: usize,
 ) {
     let port = test.port.expect("only tests with a port are driven");
-    let url = format!("https://{}:{}/", args.host, port);
+    let url = format!("https://{}:{}/", target.host, port);
+    let (base, session_id) = (target.base, target.session_id);
     if !args.quiet && !args.json {
         println!("  [{:>2}/{}] {:<28} {}", n, of, test.id, test.title);
     }
@@ -683,6 +689,32 @@ fn render(report: &Report, quiet: bool, base: &str, session: &str) {
 
     println!("\nFull report: {base}/report/{session}");
     println!("Badge:       {base}/badge/{session}.svg");
+}
+
+/// The host name the tests reach the suite by: the session's own
+/// (`<session>.<host>`) where the suite serves it, so each connection's
+/// server name files its result under this session from whatever address it
+/// comes; the suite's name otherwise, under which results are filed by the
+/// address that started the session.
+///
+/// Served is checked, not assumed: the session's name must resolve and
+/// present a certificate that verifies for it, which a request for the
+/// catalogue under that name proves. A client handed a name that does
+/// neither would fail every test before the test began.
+async fn test_host(http: &reqwest::Client, args: &Args, session: &Session) -> String {
+    let Some(name) = session.sni.as_deref() else {
+        return args.host.clone();
+    };
+    match get_json::<Catalog>(http, &format!("https://{name}/catalog.json")).await {
+        Ok(_) => name.to_string(),
+        Err(e) => {
+            eprintln!(
+                "the session's name {name} is not served ({e}); results are filed by this \
+                 host's address, so run one session at a time from it"
+            );
+            args.host.clone()
+        }
+    }
 }
 
 async fn get_json<T: for<'de> Deserialize<'de>>(

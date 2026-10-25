@@ -1166,6 +1166,15 @@ pq_chain_cert = "/etc/pqcrypta/pqc-certs/conformance/fullchain.pem"
 pq_chain_key  = "/etc/pqcrypta/pqc-certs/conformance/server.key"
 ```
 
+A session has its own host name, `<session>.<host>` (the `sni` in `POST /session`'s
+answer). A connection whose server name is a session's is filed under that session
+from any address; one without (a test that ends before the server name is read)
+under the address that started the session. The name needs a DNS name covering it
+(`*.<host>`) and a wildcard certificate (`*.<host>` in `[acme] domains`, validated
+by DNS challenge). `h3-conformance` gives its client the session's name when the
+suite serves it, checked by fetching the catalogue under that name, and the suite's
+own name otherwise, where only one session at a time can run from one address.
+
 ### WebTransport Rate Limiting Configuration
 
 ```toml
@@ -1765,7 +1774,7 @@ releases do not compile against it.
 
 Automatic Let's Encrypt certificate provisioning and renewal. Issues one **individual certificate per domain** — each domain gets its own `{domain}.crt` / `{domain}.key` pair written atomically (write-to-`.tmp`-then-rename) to prevent corruption on concurrent renewal. With `use_ecdsa`, keys are ECDSA P-384 by default (`ecdsa_curve = "P-256"` for smaller certificates).
 
-SNI-based cert selection is handled by `MultiDomainCertResolver` (rustls/QUIC) and `create_pqc_acceptor_with_sni` (OpenSSL/TCP), both loading all cert pairs from the certs directory at startup and on every ACME renewal.
+SNI-based cert selection is handled by `MultiDomainCertResolver` (rustls/QUIC) and `create_pqc_acceptor_with_sni` (OpenSSL/TCP), both loading all cert pairs from the certs directory at startup and on every ACME renewal. A server name gets its own certificate, or the wildcard one that covers it (`*.example.com.crt` for `a.example.com`): the wildcard is the whole left-most label and stands for exactly one label (RFC 9525 §6.3).
 
 ### Certificates for IP addresses
 
@@ -1803,7 +1812,8 @@ accept_tos = true
 ip_addresses = { "api.example.com" = ["192.0.2.10", "2001:db8::10"] }  # its public addresses
 ip_profile = "shortlived"   # Let's Encrypt issues addresses only under this profile
 
-# DNS challenges instead of HTTP-01 (challenge_type = "dns-01")
+# DNS challenges instead of HTTP-01 (challenge_type = "dns-01"), and for any
+# wildcard in `domains` ("*.example.com") whatever challenge_type says
 # [acme.dns_update]
 # server = "127.0.0.1:53"                     # takes the UPDATE (primary, or a forwarding secondary)
 # key_name = "acme-node1"                     # TSIG key, as that server knows it
@@ -1823,7 +1833,7 @@ ip_profile = "shortlived"   # Let's Encrypt issues addresses only under this pro
 | `http-01` | HTTP validation on port 80 | Port 80 accessible, served by redirect server |
 | `dns-01` | A TXT record, published by DNS UPDATE (RFC 2136) signed with TSIG (RFC 8945, HMAC-SHA256 or -SHA512), waited for at every name server of its zone, removed after validation; dns-account-01 (draft-ietf-acme-dns-account-label, one record name per ACME account, so several nodes validate one name at once) where the CA offers it | `[acme.dns_update]`: a server that takes the update (the zone's primary, or a secondary that forwards it, as Knot DNS does) and a TSIG key |
 
-An IP address identifier is always validated by HTTP-01, whatever `challenge_type` says: RFC 8738 §7 allows no DNS challenge for one.
+An IP address identifier is always validated by HTTP-01, whatever `challenge_type` says: RFC 8738 §7 allows no DNS challenge for one. A wildcard (`*.example.com` in `domains`) is always validated by a DNS challenge, the only kind a CA offers for one, so a configuration with a wildcard and no `[acme.dns_update]` is refused at load.
 
 ### Supported CAs
 

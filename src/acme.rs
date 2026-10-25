@@ -32,7 +32,7 @@ use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "acme")]
 use instant_acme::{
-    Account, AccountCredentials, AuthorizationStatus, CertificateIdentifier,
+    Account, AccountCredentials, AuthorizationStatus, AuthorizedIdentifier, CertificateIdentifier,
     ChallengeType as AcmeChallengeType, ExternalAccountKey, Identifier, NewAccount, NewOrder,
     OrderStatus, RetryPolicy,
 };
@@ -1188,16 +1188,25 @@ async fn invalid_order_reasons(order: &mut instant_acme::Order) -> String {
     }
 }
 
+/// Whether a domain name's authorization is answered by a DNS challenge
+/// rather than HTTP-01: always for a wildcard, which only a DNS challenge can
+/// validate, and for every name when the node's challenge type is dns-01.
+/// Addresses are HTTP-01 throughout.
+const fn wants_dns_challenge(wildcard: bool, prefer_dns: bool) -> bool {
+    wildcard || prefer_dns
+}
+
 /// Answers each pending authorization of `order`: HTTP-01 by the responses
-/// the port-80 listener serves, or for a domain name with `dns_updater`
-/// set, a DNS challenge by its TXT record, published and waited for at
-/// every name server of its zone before the CA is told to look.
-/// dns-account-01 is taken where the CA offers it, dns-01 otherwise.
+/// the port-80 listener serves, or where [`wants_dns_challenge`] says so, a
+/// DNS challenge by its TXT record, published through `dns_updater` and
+/// waited for at every name server of its zone before the CA is told to
+/// look. dns-account-01 is taken where the CA offers it, dns-01 otherwise.
 #[cfg(feature = "acme")]
 async fn answer_challenges(
     order: &mut instant_acme::Order,
     account: &Account,
     dns_updater: Option<&crate::acme_dns::DnsUpdater>,
+    prefer_dns: bool,
     pending_challenges: &Arc<RwLock<HashMap<String, PendingChallenge>>>,
     registered_tokens: &mut Vec<String>,
     published: &mut Vec<crate::acme_dns::ChallengeRecord>,
@@ -1222,9 +1231,20 @@ async fn answer_challenges(
             }
         }
 
-        if let (Some(updater), Identifier::Dns(name)) = (dns_updater, authz.identifier().identifier)
-        {
-            let name = name.clone();
+        let dns_name = match authz.identifier() {
+            AuthorizedIdentifier {
+                identifier: Identifier::Dns(name),
+                wildcard,
+                ..
+            } if wants_dns_challenge(wildcard, prefer_dns) => Some(name.clone()),
+            _ => None,
+        };
+        if let Some(name) = dns_name {
+            let updater = dns_updater.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{authz_domain} needs a DNS challenge and acme.dns_update is not set"
+                )
+            })?;
             let account_label = AcmeChallengeType::Unknown("dns-account-01".to_string());
             let (kind, owner) = if authz.challenges.iter().any(|c| c.r#type == account_label) {
                 (
@@ -1362,15 +1382,14 @@ async fn request_san_certificate(
         }
     };
 
-    // DNS challenges' records, for domain names when challenge_type is dns-01
-    let dns_updater = match config.challenge_type {
-        ChallengeType::Dns01 => Some(crate::acme_dns::DnsUpdater::from_config(
-            config.dns_update.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("acme.challenge_type is dns-01 but acme.dns_update is not set")
-            })?,
-        )?),
-        ChallengeType::Http01 => None,
-    };
+    // DNS challenges' records: every domain name's when challenge_type is
+    // dns-01, a wildcard's whatever it is
+    let prefer_dns = config.challenge_type == ChallengeType::Dns01;
+    let dns_updater = config
+        .dns_update
+        .as_ref()
+        .map(crate::acme_dns::DnsUpdater::from_config)
+        .transpose()?;
 
     // Answer every pending authorization's challenge, then wait for the
     // order to validate. The HTTP-01 responses served and the DNS records
@@ -1381,6 +1400,7 @@ async fn request_san_certificate(
         &mut order,
         account,
         dns_updater.as_ref(),
+        prefer_dns,
         pending_challenges,
         &mut registered_tokens,
         &mut published,
@@ -1834,6 +1854,16 @@ fn extract_pem_base64_blocks(cert_pem: &str, chain_pem: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wildcard is validated by DNS whatever the challenge type; every
+    /// other name by DNS only when the node asks for it.
+    #[test]
+    fn wildcards_take_a_dns_challenge() {
+        assert!(wants_dns_challenge(true, false));
+        assert!(wants_dns_challenge(true, true));
+        assert!(wants_dns_challenge(false, true));
+        assert!(!wants_dns_challenge(false, false));
+    }
 
     #[test]
     fn test_acme_config_defaults() {

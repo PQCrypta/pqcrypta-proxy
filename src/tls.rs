@@ -129,6 +129,29 @@ pub fn certificate_file_ip_addresses(cert_path: &Path) -> Vec<std::net::IpAddr> 
     }
 }
 
+/// The entry of `by_name` that serves the server name `sni`: its own, or
+/// the wildcard one that covers it (`*.example.org` for `a.example.org`).
+///
+/// As RFC 9525 §6.3 has it, the wildcard is the whole left-most label and
+/// stands for exactly one label, so `*.example.org` covers neither
+/// `example.org` nor `a.b.example.org`; and none is taken for a name one
+/// label below a top-level domain. Names compare without regard to case or
+/// a trailing dot.
+pub fn covering_name<'a, V, S: std::hash::BuildHasher>(
+    by_name: &'a HashMap<String, V, S>,
+    sni: &str,
+) -> Option<&'a V> {
+    let name = sni.trim_end_matches('.').to_ascii_lowercase();
+    if let Some(entry) = by_name.get(&name) {
+        return Some(entry);
+    }
+    let (label, parent) = name.split_once('.')?;
+    if label.is_empty() || label.contains('*') || !parent.contains('.') {
+        return None;
+    }
+    by_name.get(&format!("*.{parent}"))
+}
+
 /// Which domain's certificate answers a client that connects by address,
 /// from the domains whose certificates name an IP address.
 ///
@@ -282,7 +305,7 @@ impl rustls::server::ResolvesServerCert for MultiDomainCertResolver {
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
         let certs = self.certs.read();
         let domain = match client_hello.server_name() {
-            Some(sni) => certs.by_name.get(sni)?,
+            Some(sni) => covering_name(&certs.by_name, sni)?,
             None => {
                 let by_address = certs.by_address.as_deref();
                 certs
@@ -822,6 +845,36 @@ impl std::fmt::Display for ChainSize {
             grouped.push(c);
         }
         write!(f, "{}-certificate, {grouped}-byte", self.certificates)
+    }
+}
+
+#[cfg(test)]
+mod covering_name_tests {
+    use std::collections::HashMap;
+
+    use super::covering_name;
+
+    /// RFC 9525 §6.3: the wildcard stands for exactly one left-most label.
+    #[test]
+    fn a_wildcard_covers_one_label() {
+        let by_name: HashMap<String, &str> = [
+            ("conformance.example.org", "base"),
+            ("*.conformance.example.org", "wildcard"),
+            ("*.org", "too broad"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let pick = |sni| covering_name(&by_name, sni).copied();
+        assert_eq!(pick("conformance.example.org"), Some("base"));
+        assert_eq!(pick("Conformance.Example.ORG."), Some("base"));
+        assert_eq!(pick("0123abcd.conformance.example.org"), Some("wildcard"));
+        assert_eq!(pick("ABC.conformance.example.org"), Some("wildcard"));
+        assert_eq!(pick("a.b.conformance.example.org"), None);
+        assert_eq!(pick("example.org"), None);
+        assert_eq!(pick(".conformance.example.org"), None);
+        assert_eq!(pick("*.conformance.example.org"), Some("wildcard"));
+        assert_eq!(pick("x.*.conformance.example.org"), None);
     }
 }
 
