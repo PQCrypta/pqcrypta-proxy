@@ -43,7 +43,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, warn};
 
 use crate::config::DohConfig;
-use crate::dns_wire::{layout, name_end, u16_at, u32_at, Record, HEADER_LEN};
+use crate::dns_wire::{layout, u16_at, u32_at, Record, HEADER_LEN};
 
 /// The media type of a DNS message in wire format (RFC 8484 §6).
 pub const MEDIA_TYPE: &str = "application/dns-message";
@@ -546,6 +546,7 @@ fn freshness(msg: &[u8]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dns_wire::name_end;
     use http_body_util::Empty;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
