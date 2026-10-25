@@ -5,7 +5,7 @@
 //! aioquic before 1.6 loses the end of a stream whose last frame is one it
 //! ignores: dnspython's DNS over HTTPS (HTTP/3 when `httpx` is absent) then
 //! waits out its timeout for a response it has already received, which
-//! dnsscanner.net reported as "DoH not supported".
+//! dnsscanner.net reported as no DNS over HTTPS at all.
 //!
 //! A real QUIC server runs the vendored h3 with its defaults (GREASE on), and a
 //! raw QUIC client reads the response stream's frames as they are on the wire.
