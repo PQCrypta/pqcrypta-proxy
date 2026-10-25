@@ -3,7 +3,7 @@
 //!
 //! RFC 9114 4.1 lets an unknown frame go anywhere on a request stream, but
 //! aioquic before 1.6 loses the end of a stream whose last frame is one it
-//! ignores: dnspython's DNS over HTTPS (HTTP/3 when httpx is absent) then
+//! ignores: dnspython's DNS over HTTPS (HTTP/3 when `httpx` is absent) then
 //! waits out its timeout for a response it has already received, which
 //! dnsscanner.net reported as "DoH not supported".
 //!
@@ -79,8 +79,8 @@ fn varint(buf: &[u8], at: &mut usize) -> u64 {
 }
 
 /// A reserved frame type, 0x1f * N + 0x21 (RFC 9114 7.2.8)
-fn reserved(frame_type: u64) -> bool {
-    frame_type >= 0x21 && (frame_type - 0x21) % 0x1f == 0
+const fn reserved(frame_type: u64) -> bool {
+    frame_type >= 0x21 && (frame_type - 0x21).is_multiple_of(0x1f)
 }
 
 #[tokio::test]
@@ -131,7 +131,7 @@ async fn the_grease_frame_is_not_the_last_on_a_response_stream() {
         .with_custom_certificate_verifier(Arc::new(SkipVerify(provider)))
         .with_no_client_auth();
     client_crypto.alpn_protocols = vec![b"h3".to_vec()];
-    let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
     client.set_default_client_config(ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(client_crypto).unwrap(),
     )));
@@ -148,7 +148,7 @@ async fn the_grease_frame_is_not_the_last_on_a_response_stream() {
     // GET https://localhost/ with static QPACK references only (RFC 9204
     // Appendix A): :method GET (17), :scheme https (23), :path / (1), and
     // :authority (0) with a literal value
-    let mut block = vec![0x00, 0x00, 0xc0 | 17, 0xc0 | 23, 0xc0 | 1, 0x50, 9];
+    let mut block = vec![0x00, 0x00, 0xc0 | 0x11, 0xc0 | 0x17, 0xc0 | 0x01, 0x50, 9];
     block.extend_from_slice(b"localhost");
     let mut request = vec![0x01, u8::try_from(block.len()).unwrap()];
     request.extend_from_slice(&block);
