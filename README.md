@@ -1671,6 +1671,8 @@ src/
 ├── pqc_tls.rs           # Post-Quantum TLS provider; downgrade detection
 ├── pqc_extended.rs      # Extended PQC configuration and capabilities
 ├── acme.rs              # ACME certificate automation (DNS and IP identifiers, ARI renewal); Certificate Transparency log submission; domain path validation
+├── acme_dns.rs          # ACME dns-01 / dns-account-01: TXT records by TSIG-signed DNS UPDATE, waited for at every name server
+├── dns_wire.rs          # DNS message reading and writing shared by the DoH gateway and acme_dns
 ├── ocsp.rs              # OCSP stapling automation
 ├── metrics.rs           # Prometheus metrics registry
 ├── rate_limiter.rs      # Advanced multi-dimensional rate limiting; JWT HMAC verification
@@ -1801,6 +1803,14 @@ accept_tos = true
 ip_addresses = { "api.example.com" = ["192.0.2.10", "2001:db8::10"] }  # its public addresses
 ip_profile = "shortlived"   # Let's Encrypt issues addresses only under this profile
 
+# DNS challenges instead of HTTP-01 (challenge_type = "dns-01")
+# [acme.dns_update]
+# server = "127.0.0.1:53"                     # takes the UPDATE (primary, or a forwarding secondary)
+# key_name = "acme-node1"                     # TSIG key, as that server knows it
+# algorithm = "hmac-sha256"                   # or "hmac-sha512"
+# secret_file = "/etc/pqcrypta/acme/dns-update.key"   # its secret, base64, 0600
+# propagation_timeout_secs = 120              # every name server must serve the record by then
+
 # External Account Binding (required by ZeroSSL, optional for Let's Encrypt)
 # eab_kid = "your-kid"
 # eab_hmac_key = "your-hmac-key"
@@ -1811,7 +1821,9 @@ ip_profile = "shortlived"   # Let's Encrypt issues addresses only under this pro
 | Type | Description | Requirements |
 |------|-------------|--------------|
 | `http-01` | HTTP validation on port 80 | Port 80 accessible, served by redirect server |
-| `dns-01` | DNS TXT record | DNS API access |
+| `dns-01` | A TXT record, published by DNS UPDATE (RFC 2136) signed with TSIG (RFC 8945, HMAC-SHA256 or -SHA512), waited for at every name server of its zone, removed after validation; dns-account-01 (draft-ietf-acme-dns-account-label, one record name per ACME account, so several nodes validate one name at once) where the CA offers it | `[acme.dns_update]`: a server that takes the update (the zone's primary, or a secondary that forwards it, as Knot DNS does) and a TSIG key |
+
+An IP address identifier is always validated by HTTP-01, whatever `challenge_type` says: RFC 8738 §7 allows no DNS challenge for one.
 
 ### Supported CAs
 
