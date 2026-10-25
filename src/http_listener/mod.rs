@@ -4237,6 +4237,92 @@ mod pqc_reload_tests {
         client && server
     }
 
+    /// A client connecting by address sends no server name and verifies the
+    /// certificate against the address. The OpenSSL listener gives it the
+    /// certificate naming the address, not the acceptor's default; a name
+    /// still gets its own.
+    #[test]
+    fn a_client_connecting_by_address_gets_the_certificate_naming_the_address() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut ders = Vec::new();
+        for (name, names) in [
+            ("primary.example", vec!["primary.example"]),
+            ("ns.example", vec!["ns.example", "127.0.0.1"]),
+        ] {
+            let cert = rcgen::generate_simple_self_signed(
+                names.into_iter().map(str::to_string).collect::<Vec<_>>(),
+            )
+            .expect("self-signed certificate");
+            std::fs::write(dir.path().join(format!("{name}.crt")), cert.cert.pem()).expect("crt");
+            std::fs::write(
+                dir.path().join(format!("{name}.key")),
+                cert.signing_key.serialize_pem(),
+            )
+            .expect("key");
+            ders.push(cert.cert.der().to_vec());
+        }
+        let mut config = ProxyConfig::default();
+        // Classical groups only: the test needs no ML-KEM openssl binary
+        config.pqc.enabled = false;
+        let provider =
+            PqcTlsProvider::new(&config.pqc).with_tls_settings(&config.tls, config.client_auth());
+        let sni_map = openssl_pqc::build_sni_map(dir.path(), &provider, &[]);
+        let acceptor = openssl_pqc::create_pqc_acceptor_with_sni(
+            &dir.path().join("primary.example.crt"),
+            &dir.path().join("primary.example.key"),
+            &provider,
+            sni_map,
+        )
+        .expect("acceptor");
+
+        // Each handshake trusts only the certificate it should get: the two
+        // self-signed certificates share rcgen's subject name, and OpenSSL
+        // finds a trusted certificate by subject
+        let received = |server_name: Option<&str>, expected: &[u8]| {
+            let (server_end, client_end) = UnixStream::pair().expect("socket pair");
+            let server_acceptor = acceptor.clone();
+            let server = std::thread::spawn(move || server_acceptor.accept(server_end).is_ok());
+            let mut connector = SslConnector::builder(SslMethod::tls_client()).expect("connector");
+            connector
+                .cert_store_mut()
+                .add_cert(openssl::x509::X509::from_der(expected).expect("der"))
+                .expect("trust");
+            connector.set_verify(SslVerifyMode::PEER);
+            let mut client = connector.build().configure().expect("client config");
+            let stream = match server_name {
+                Some(name) => client.connect(name, client_end),
+                None => {
+                    client.set_use_server_name_indication(false);
+                    client.set_verify_hostname(false);
+                    client
+                        .param_mut()
+                        .set_ip(std::net::IpAddr::from([127, 0, 0, 1]))
+                        .expect("verify the address");
+                    client.connect("127.0.0.1", client_end)
+                }
+            }
+            .expect("handshake verified");
+            assert!(server.join().expect("server thread"));
+            stream
+                .ssl()
+                .peer_certificate()
+                .expect("a certificate")
+                .to_der()
+                .expect("der")
+        };
+        assert_eq!(received(None, &ders[1]), ders[1], "by address");
+        assert_eq!(
+            received(Some("primary.example"), &ders[0]),
+            ders[0],
+            "by name"
+        );
+        assert_eq!(
+            received(Some("ns.example"), &ders[1]),
+            ders[1],
+            "by its own name"
+        );
+    }
+
     /// A reloaded `[tls]` reaches the OpenSSL listener: allowing TLS 1.2 lets a
     /// 1.2-only client in that the startup acceptor (TLS 1.3 only) refused,
     /// with no restart. Before, `--watch-config` logged the reload and the

@@ -3766,6 +3766,77 @@ pub fn validate_acme_domain(domain: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The `[acme]` checks of [`ProxyConfig::validate`]: every domain safe as a
+/// file name, and every address on a configured domain's certificate and one
+/// a public CA can certify.
+fn validate_acme(acme: &AcmeConfig) -> anyhow::Result<()> {
+    for domain in &acme.domains {
+        validate_acme_domain(domain)
+            .map_err(|e| anyhow::anyhow!("Invalid ACME domain '{}': {}", domain, e))?;
+    }
+    for (domain, addresses) in &acme.ip_addresses {
+        if !acme.domains.iter().any(|d| d.eq_ignore_ascii_case(domain)) {
+            return Err(anyhow::anyhow!(
+                "acme.ip_addresses names '{}', which is not in acme.domains: \
+                 its certificate is never ordered",
+                domain
+            ));
+        }
+        for address in addresses {
+            validate_acme_ip(*address)
+                .map_err(|e| anyhow::anyhow!("Invalid ACME address for '{}': {}", domain, e))?;
+        }
+    }
+    Ok(())
+}
+
+/// An IP address a public CA can certify (RFC 8738).
+///
+/// A globally routable unicast address. The IANA special-purpose ranges -- loopback, private,
+/// shared (100.64.0.0/10), link-local, unique local, documentation,
+/// multicast, reserved, IPv4-mapped -- are refused by the CA, so they are
+/// refused here, at load, rather than in a failed order.
+pub fn validate_acme_ip(address: std::net::IpAddr) -> Result<(), String> {
+    use std::net::IpAddr;
+    let special = match address {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            v4.is_unspecified()
+                || v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_multicast()
+                || a == 0
+                || a >= 240
+                || (a == 100 && (b & 0xc0) == 64)
+                || (a == 192 && b == 0 && v4.octets()[2] == 0)
+                || (a == 198 && (b & 0xfe) == 18)
+        }
+        IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            v6.is_unspecified()
+                || v6.is_loopback()
+                || v6.is_multicast()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6.to_ipv4_mapped().is_some()
+                // documentation 2001:db8::/32, NAT64 64:ff9b::/32, discard 100::/64
+                || segments[..2] == [0x2001, 0x0db8]
+                || segments[..2] == [0x0064, 0xff9b]
+                || segments[..4] == [0x0100, 0, 0, 0]
+        }
+    };
+    if special {
+        Err(format!(
+            "{address} is not a globally routable address, which a public CA can certify"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// SEC-009 / F-01: Validate a backend address against dangerous IP ranges to
 /// prevent Server-Side Request Forgery (SSRF) attacks.
 ///
@@ -4484,10 +4555,7 @@ impl ProxyConfig {
         // Domain names are used directly in PathBuf::join(); a domain like "../etc/cron.d/evil"
         // would result in arbitrary file writes.
         if self.acme.enabled {
-            for domain in &self.acme.domains {
-                validate_acme_domain(domain)
-                    .map_err(|e| anyhow::anyhow!("Invalid ACME domain '{}': {}", domain, e))?;
-            }
+            validate_acme(&self.acme)?;
         }
 
         Ok(())
@@ -4663,6 +4731,90 @@ mod tests {
         assert!(config.server.udp_port > 0);
         assert!(config.admin.port > 0);
         assert!(config.pqc.enabled);
+    }
+
+    /// An address a public CA can certify passes; the special-purpose ranges
+    /// the CA refuses are refused at load.
+    #[test]
+    fn acme_addresses_must_be_globally_routable() {
+        for ok in [
+            "1.1.1.1",
+            "66.179.95.51",
+            "2606:4700:4700::1111",
+            "2607:f1c0:f064:5800::1",
+        ] {
+            assert!(validate_acme_ip(ok.parse().unwrap()).is_ok(), "{ok}");
+        }
+        for refused in [
+            "0.0.0.0",
+            "10.1.2.3",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "172.16.0.1",
+            "192.0.0.8",
+            "192.0.2.1",
+            "192.168.1.1",
+            "198.18.0.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "::ffff:1.1.1.1",
+            "64:ff9b::101:101",
+            "100::1",
+            "2001:db8::1",
+            "fd00::1",
+            "fe80::1",
+            "ff02::1",
+        ] {
+            assert!(
+                validate_acme_ip(refused.parse().unwrap()).is_err(),
+                "{refused}"
+            );
+        }
+    }
+
+    /// Addresses belong to a configured domain's certificate: addresses for
+    /// a domain never ordered, or a private address, fail the load.
+    #[test]
+    fn acme_ip_addresses_need_their_domain_and_a_public_address() {
+        let config: ProxyConfig = toml::from_str(
+            r#"
+            [acme]
+            enabled = true
+            domains = ["ns1.example.com"]
+            ip_addresses = { "NS1.example.com" = ["1.1.1.1", "2606:4700:4700::1111"] }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.acme.ip_profile, "shortlived");
+        assert_eq!(
+            config.acme.ip_addresses_for("ns1.example.com"),
+            vec![
+                "1.1.1.1".parse::<std::net::IpAddr>().unwrap(),
+                "2606:4700:4700::1111".parse().unwrap()
+            ]
+        );
+        assert_eq!(
+            config.acme.ip_addresses_for("other.example.com"),
+            Vec::<std::net::IpAddr>::new()
+        );
+        validate_acme(&config.acme).unwrap();
+
+        let mut unordered = config.clone();
+        unordered.acme.domains = vec!["ns2.example.com".into()];
+        let err = validate_acme(&unordered.acme).unwrap_err().to_string();
+        assert!(err.contains("not in acme.domains"), "{err}");
+
+        let mut private = config;
+        private
+            .acme
+            .ip_addresses
+            .insert("ns1.example.com".into(), vec!["10.0.0.1".parse().unwrap()]);
+        let err = validate_acme(&private.acme).unwrap_err().to_string();
+        assert!(err.contains("not a globally routable address"), "{err}");
     }
 
     #[test]

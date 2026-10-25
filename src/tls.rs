@@ -72,21 +72,89 @@ pub fn choose_certified_key(
 /// `Arc` immediately serve the refreshed certificate after a call to `reload()`.
 #[derive(Debug)]
 pub struct MultiDomainCertResolver {
-    /// domain → its certificates, updated atomically on reload
-    certs: RwLock<HashMap<String, DomainCerts>>,
+    /// The certificates by domain, and the one for a client connecting by
+    /// address, swapped together on reload
+    certs: RwLock<LoadedCerts>,
     /// Directory containing `{domain}.crt` / `{domain}.key` files
     certs_dir: PathBuf,
-    /// The domain whose certificate answers a ClientHello with no server name:
-    /// `tls.cert_path`'s, the certificate the OpenSSL TCP listener presents
-    /// then. See [`Self::for_primary`].
+    /// The domain whose certificate answers a ClientHello with no server name
+    /// when no certificate names this host's addresses: `tls.cert_path`'s.
+    /// See [`Self::for_primary`].
     default_domain: Option<String>,
+}
+
+/// What a reload of the certs directory found.
+#[derive(Debug, Default)]
+struct LoadedCerts {
+    /// domain → its certificates
+    by_name: HashMap<String, DomainCerts>,
+    /// The domain whose certificate also names this host's IP addresses
+    /// (see [`address_domain`]), for a ClientHello with no server name
+    by_address: Option<String>,
+}
+
+/// The IP addresses a DER certificate names in its subjectAltName (RFC 5280
+/// iPAddress entries, which an ACME order with IP identifiers produces).
+pub fn certificate_ip_addresses(der: &[u8]) -> Vec<std::net::IpAddr> {
+    use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
+    let Ok((_, cert)) = X509Certificate::from_der(der) else {
+        return Vec::new();
+    };
+    let Ok(Some(san)) = cert.subject_alternative_name() else {
+        return Vec::new();
+    };
+    san.value
+        .general_names
+        .iter()
+        .filter_map(|name| match name {
+            GeneralName::IPAddress(octets) => match octets.len() {
+                4 => <[u8; 4]>::try_from(*octets)
+                    .ok()
+                    .map(std::net::IpAddr::from),
+                16 => <[u8; 16]>::try_from(*octets)
+                    .ok()
+                    .map(std::net::IpAddr::from),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// The IP addresses the leaf of a PEM certificate file names.
+pub fn certificate_file_ip_addresses(cert_path: &Path) -> Vec<std::net::IpAddr> {
+    match CertificateDer::pem_file_iter(cert_path).map(|mut certs| certs.next()) {
+        Ok(Some(Ok(leaf))) => certificate_ip_addresses(&leaf),
+        _ => Vec::new(),
+    }
+}
+
+/// Which domain's certificate answers a client that connects by address,
+/// from the domains whose certificates name an IP address.
+///
+/// Such a client sends no server name (RFC 6066 §3 has no form for an
+/// address) and verifies the certificate against the address it dialled
+/// (RFC 9525 §6.4 matches it to an iPAddress entry), as a DNS over HTTPS
+/// client given a name server's address does. One certificate is expected,
+/// the host's name server's, which names all its addresses; with more, the
+/// first by name is chosen, so every listener and every reload choose alike.
+pub fn address_domain(mut candidates: Vec<String>) -> Option<String> {
+    candidates.sort();
+    if candidates.len() > 1 {
+        warn!(
+            "Several certificates name IP addresses ({}): '{}' answers clients that connect by address",
+            candidates.join(", "),
+            candidates[0]
+        );
+    }
+    candidates.into_iter().next()
 }
 
 impl MultiDomainCertResolver {
     /// Build a resolver from all cert/key pairs found in `certs_dir`.
     pub fn new(certs_dir: &Path) -> anyhow::Result<Self> {
         let resolver = Self {
-            certs: RwLock::new(HashMap::new()),
+            certs: RwLock::new(LoadedCerts::default()),
             certs_dir: certs_dir.to_path_buf(),
             default_domain: None,
         };
@@ -95,13 +163,16 @@ impl MultiDomainCertResolver {
     }
 
     /// A resolver over the directory of `cert_path`, the configured primary
-    /// certificate, which also answers a ClientHello that names no server.
+    /// certificate, which also answers a ClientHello that names no server
+    /// when no certificate in the directory names this host's addresses.
     ///
     /// A client connecting by address sends no server name (RFC 6066 §3 has
-    /// no form for an IP address). The OpenSSL TCP listener answers it with
-    /// the primary certificate; this resolver answered nothing, so every
-    /// rustls handshake by address failed, HTTP/3 to an IP among them. A name
-    /// the resolver holds no certificate for still ends the handshake.
+    /// no form for an IP address). It gets the certificate that names the
+    /// address, where there is one (see [`address_domain`]), and otherwise
+    /// the primary certificate, as from the OpenSSL TCP listener. Without
+    /// either, every rustls handshake by address failed, HTTP/3 to an IP
+    /// among them. A name the resolver holds no certificate for still ends
+    /// the handshake.
     pub fn for_primary(cert_path: &Path) -> anyhow::Result<Self> {
         let certs_dir = cert_path
             .parent()
@@ -118,6 +189,7 @@ impl MultiDomainCertResolver {
     /// Existing entries are replaced; domains whose files disappeared are removed.
     pub fn reload(&self) -> anyhow::Result<()> {
         let mut new_certs = HashMap::new();
+        let mut naming_addresses = Vec::new();
 
         let read_dir = std::fs::read_dir(&self.certs_dir).map_err(|e| {
             anyhow::anyhow!("Cannot read certs directory {:?}: {}", self.certs_dir, e)
@@ -169,6 +241,13 @@ impl MultiDomainCertResolver {
                 None
             };
             debug!("SNI resolver loaded cert for '{}'", domain);
+            if primary
+                .cert
+                .first()
+                .is_some_and(|leaf| !certificate_ip_addresses(leaf).is_empty())
+            {
+                naming_addresses.push(domain.clone());
+            }
             new_certs.insert(
                 domain.clone(),
                 DomainCerts {
@@ -178,12 +257,20 @@ impl MultiDomainCertResolver {
             );
         }
 
+        let by_address = address_domain(naming_addresses);
         info!(
-            "SNI cert resolver reloaded: {} domains ({})",
+            "SNI cert resolver reloaded: {} domains ({}){}",
             new_certs.len(),
-            new_certs.keys().cloned().collect::<Vec<_>>().join(", ")
+            new_certs.keys().cloned().collect::<Vec<_>>().join(", "),
+            by_address
+                .as_deref()
+                .map(|d| format!("; clients connecting by address get '{d}'"))
+                .unwrap_or_default()
         );
-        *self.certs.write() = new_certs;
+        *self.certs.write() = LoadedCerts {
+            by_name: new_certs,
+            by_address,
+        };
         Ok(())
     }
 }
@@ -195,8 +282,13 @@ impl rustls::server::ResolvesServerCert for MultiDomainCertResolver {
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
         let certs = self.certs.read();
         let domain = match client_hello.server_name() {
-            Some(sni) => certs.get(sni)?,
-            None => certs.get(self.default_domain.as_deref()?)?,
+            Some(sni) => certs.by_name.get(sni)?,
+            None => {
+                let by_address = certs.by_address.as_deref();
+                certs
+                    .by_name
+                    .get(by_address.or(self.default_domain.as_deref())?)?
+            }
         };
         Some(choose_certified_key(
             domain,
@@ -1323,17 +1415,21 @@ mod server_policy_tests {
         }
     }
 
-    /// A client connecting by address sends no server name, and gets the
-    /// primary certificate, as from the OpenSSL TCP listener. Without a
-    /// primary the handshake fails, as every HTTP/3 connection by address did.
-    #[test]
-    fn a_client_hello_without_a_server_name_gets_the_primary_certificate() {
+    /// A certs directory holding a self-signed pair per `(file name, subject
+    /// alternative names)`, and each certificate's DER in the same order.
+    fn certs_dir(
+        pairs: &[(&str, &[&str])],
+    ) -> (
+        tempfile::TempDir,
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let mut ders = Vec::new();
-        for name in ["primary.example", "other.example"] {
-            let cert =
-                rcgen::generate_simple_self_signed(vec![name.to_string(), "127.0.0.1".to_string()])
-                    .unwrap();
+        for (name, names) in pairs {
+            let cert = rcgen::generate_simple_self_signed(
+                names.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+            )
+            .unwrap();
             std::fs::write(dir.path().join(format!("{name}.crt")), cert.cert.pem()).unwrap();
             std::fs::write(
                 dir.path().join(format!("{name}.key")),
@@ -1344,39 +1440,118 @@ mod server_policy_tests {
                 cert.cert.der().to_vec(),
             ));
         }
-        let handshake = |resolver: super::MultiDomainCertResolver| {
-            let server = super::TlsProvider::create_rustls_config_with_resolver(
-                &tls("1.3"),
-                &PqcConfig::default(),
-                true,
-                ClientAuth::None,
-                Arc::new(resolver),
+        (dir, ders)
+    }
+
+    /// A handshake with no server name in the ClientHello, verified against
+    /// `verify_as`, and the certificate the client received.
+    fn handshake_without_server_name(
+        resolver: super::MultiDomainCertResolver,
+        ders: &[rustls::pki_types::CertificateDer<'static>],
+        verify_as: ServerName<'static>,
+    ) -> anyhow::Result<rustls::pki_types::CertificateDer<'static>> {
+        let server = super::TlsProvider::create_rustls_config_with_resolver(
+            &tls("1.3"),
+            &PqcConfig::default(),
+            true,
+            ClientAuth::None,
+            Arc::new(resolver),
+        )
+        .unwrap();
+        let mut roots = RootCertStore::empty();
+        for der in ders {
+            roots.add(der.clone()).unwrap();
+        }
+        let mut client =
+            ClientConfig::builder_with_provider(Arc::new(rustls_post_quantum::provider()))
+                .with_protocol_versions(TLS13)
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+        // rustls sends no server name for an address anyway
+        client.enable_sni = false;
+        let mut client = ClientConnection::new(Arc::new(client), verify_as).unwrap();
+        let mut server = rustls::ServerConnection::new(Arc::new(server)).unwrap();
+        pump_handshake(&mut client, &mut server)?;
+        assert!(server.server_name().is_none(), "no server name was sent");
+        Ok(client.peer_certificates().unwrap()[0].clone().into_owned())
+    }
+
+    /// A client connecting by address sends no server name and verifies the
+    /// certificate against the address (a DNS over HTTPS client given a name
+    /// server's IP). It gets the certificate naming the address, though the
+    /// primary is another.
+    #[test]
+    fn a_client_connecting_by_address_gets_the_certificate_naming_the_address() {
+        let (dir, ders) = certs_dir(&[
+            ("primary.example", &["primary.example"]),
+            ("ns.example", &["ns.example", "127.0.0.1", "::1"]),
+        ]);
+        let resolver =
+            super::MultiDomainCertResolver::for_primary(&dir.path().join("primary.example.crt"))
+                .unwrap();
+        for address in [
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            std::net::IpAddr::from(std::net::Ipv6Addr::LOCALHOST),
+        ] {
+            let resolver = super::MultiDomainCertResolver::for_primary(
+                &dir.path().join("primary.example.crt"),
             )
             .unwrap();
-            let mut roots = RootCertStore::empty();
-            for der in &ders {
-                roots.add(der.clone()).unwrap();
-            }
-            let client =
-                ClientConfig::builder_with_provider(Arc::new(rustls_post_quantum::provider()))
-                    .with_protocol_versions(TLS13)
-                    .unwrap()
-                    .with_root_certificates(roots)
-                    .with_no_client_auth();
-            // By address: rustls sends no server name for an IP.
-            let address = ServerName::from(std::net::IpAddr::from([127, 0, 0, 1]));
-            let mut client = ClientConnection::new(Arc::new(client), address).unwrap();
-            let mut server = rustls::ServerConnection::new(Arc::new(server)).unwrap();
-            pump_handshake(&mut client, &mut server)?;
-            assert!(server.server_name().is_none(), "no server name was sent");
-            Ok::<_, anyhow::Error>(client.peer_certificates().unwrap()[0].clone().into_owned())
-        };
+            let got = handshake_without_server_name(resolver, &ders, ServerName::from(address))
+                .unwrap_or_else(|e| panic!("by {address}: {e}"));
+            assert_eq!(got, ders[1], "by {address}");
+        }
+        // A name still gets its own certificate
+        assert!(resolver
+            .certs
+            .read()
+            .by_name
+            .contains_key("primary.example"));
+        assert_eq!(
+            resolver.certs.read().by_address.as_deref(),
+            Some("ns.example")
+        );
+        assert_eq!(
+            super::certificate_file_ip_addresses(&dir.path().join("ns.example.crt")),
+            vec![
+                std::net::IpAddr::from([127, 0, 0, 1]),
+                std::net::IpAddr::from(std::net::Ipv6Addr::LOCALHOST)
+            ]
+        );
+    }
+
+    /// With no certificate naming an address, a ClientHello without a server
+    /// name gets the primary certificate, as from the OpenSSL TCP listener.
+    /// Without a primary the handshake fails, as every HTTP/3 connection by
+    /// address did.
+    #[test]
+    fn a_client_hello_without_a_server_name_gets_the_primary_certificate() {
+        let (dir, ders) = certs_dir(&[
+            ("primary.example", &["primary.example"]),
+            ("other.example", &["other.example"]),
+        ]);
         let primary =
             super::MultiDomainCertResolver::for_primary(&dir.path().join("primary.example.crt"))
                 .unwrap();
-        assert_eq!(handshake(primary).unwrap(), ders[0]);
+        let primary_name = ServerName::try_from("primary.example").unwrap();
+        assert_eq!(
+            handshake_without_server_name(primary, &ders, primary_name.clone()).unwrap(),
+            ders[0]
+        );
         let no_primary = super::MultiDomainCertResolver::new(dir.path()).unwrap();
-        assert!(handshake(no_primary).is_err());
+        assert!(handshake_without_server_name(no_primary, &ders, primary_name).is_err());
+    }
+
+    /// Several certificates naming addresses: the first by name answers, the
+    /// same on every reload.
+    #[test]
+    fn the_address_certificate_is_the_first_by_name() {
+        assert_eq!(
+            super::address_domain(vec!["ns2.example".into(), "ns1.example".into()]).as_deref(),
+            Some("ns1.example")
+        );
+        assert_eq!(super::address_domain(Vec::new()), None);
     }
 
     /// `require_client_cert` refuses a client that presents none. The rustls
