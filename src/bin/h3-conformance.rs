@@ -281,6 +281,7 @@ async fn run(args: &Args) -> i32 {
         }
     };
 
+    add_addresses(&args.host, &base, &session.id).await;
     let host = test_host(&http, args, &session).await;
     let target = Target {
         base: &base,
@@ -689,6 +690,54 @@ fn render(report: &Report, quiet: bool, base: &str, session: &str) {
 
     println!("\nFull report: {base}/report/{session}");
     println!("Badge:       {base}/badge/{session}.svg");
+}
+
+/// Adds this host's address in each family the suite resolves to, so a test
+/// that ends before the client sends a server name (version negotiation, a
+/// handshake refused at the `ClientHello`) is filed under this session whichever
+/// family the client dials. The session was started over one of them; each
+/// request here is pinned to one address of the suite's, so it leaves this
+/// host from the matching family. A family this host cannot reach the suite
+/// over is skipped: those tests then follow the family that started it.
+async fn add_addresses(host: &str, base: &str, session_id: &str) {
+    let (name, port) = match host.rsplit_once(':') {
+        Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) => {
+            (name, port.parse().unwrap_or(443))
+        }
+        _ => (host, 443),
+    };
+    let Ok(addrs) = tokio::net::lookup_host((name, port)).await else {
+        return;
+    };
+    let (mut v4, mut v6) = (false, false);
+    for addr in addrs {
+        let seen = if addr.is_ipv4() { &mut v4 } else { &mut v6 };
+        if std::mem::replace(seen, true) {
+            continue;
+        }
+        let Ok(client) = reqwest::Client::builder()
+            .resolve(name, addr)
+            .timeout(Duration::from_secs(10))
+            .build()
+        else {
+            continue;
+        };
+        let url = format!("{base}/session/{session_id}/address");
+        match client
+            .post(&url)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+        {
+            // No route over that family from here, which is what skipping it means
+            Err(e) if !e.is_connect() && !e.is_timeout() => {
+                eprintln!(
+                    "session {session_id}: not filed under this host's address toward {addr}: {e}"
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The host name the tests reach the suite by: the session's own

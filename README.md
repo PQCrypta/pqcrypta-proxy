@@ -1171,9 +1171,12 @@ answer). A connection whose server name is a session's is filed under that sessi
 from any address; one without (a test that ends before the server name is read)
 under the address that started the session. The name needs a DNS name covering it
 (`*.<host>`) and a wildcard certificate (`*.<host>` in `[acme] domains`, validated
-by DNS challenge). `h3-conformance` gives its client the session's name when the
-suite serves it, checked by fetching the catalogue under that name, and the suite's
-own name otherwise, where only one session at a time can run from one address.
+by DNS challenge). `POST /session/<id>/address` files the caller's address under an
+existing session too: a dual-stack host's tests that end before a server name is sent
+then find the session over either family. `h3-conformance` adds its host's address in
+each family the suite resolves to, and gives its client the session's name when the
+suite serves it (checked by fetching the catalogue under that name), the suite's own
+name otherwise, where only one session at a time can run from one address.
 
 ### WebTransport Rate Limiting Configuration
 
