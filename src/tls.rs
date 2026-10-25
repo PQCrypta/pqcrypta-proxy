@@ -134,7 +134,7 @@ pub fn certificate_file_ip_addresses(cert_path: &Path) -> Vec<std::net::IpAddr> 
 ///
 /// Such a client sends no server name (RFC 6066 §3 has no form for an
 /// address) and verifies the certificate against the address it dialled
-/// (RFC 9525 §6.2.1 matches it to an iPAddress entry), as a DNS over HTTPS
+/// (RFC 9525 §6.4 matches it to an iPAddress entry), as a DNS over HTTPS
 /// client given a name server's address does. One certificate is expected,
 /// the host's name server's, which names all its addresses; with more, the
 /// first by name is chosen, so every listener and every reload choose alike.
