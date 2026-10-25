@@ -820,9 +820,41 @@ pub mod openssl_pqc {
     ///
     /// `Arc<RwLock<...>>` is shared between the SNI servername callback (reader)
     /// and the ACME cert-update handler (writer).  A reload atomically replaces
-    /// the entire `HashMap`, so in-flight handshakes complete against the old
-    /// contexts while new handshakes immediately use the fresh certificates.
-    pub type PqcSniMap = Arc<RwLock<HashMap<String, Arc<openssl::ssl::SslContext>>>>;
+    /// the whole [`SniContexts`], so in-flight handshakes complete against the
+    /// old contexts while new handshakes immediately use the fresh certificates.
+    pub type PqcSniMap = Arc<RwLock<SniContexts>>;
+
+    /// The per-domain contexts, and the one for a client connecting by address.
+    #[derive(Default)]
+    pub struct SniContexts {
+        /// domain → its context
+        by_name: HashMap<String, Arc<openssl::ssl::SslContext>>,
+        /// The context of the certificate that names this host's IP addresses
+        /// ([`crate::tls::address_domain`]), for a ClientHello with no server
+        /// name. Without one, such a client keeps the acceptor's default
+        /// certificate, `tls.cert_path`.
+        by_address: Option<Arc<openssl::ssl::SslContext>>,
+    }
+
+    impl SniContexts {
+        /// The number of domain contexts
+        pub fn len(&self) -> usize {
+            self.by_name.len()
+        }
+
+        /// Whether no domain has a context
+        pub fn is_empty(&self) -> bool {
+            self.by_name.is_empty()
+        }
+
+        /// The context for a ClientHello's server name, or for one without.
+        fn for_server_name(&self, sni: Option<&str>) -> Option<Arc<openssl::ssl::SslContext>> {
+            match sni {
+                Some(name) => self.by_name.get(name).cloned(),
+                None => self.by_address.clone(),
+            }
+        }
+    }
 
     /// Build a fresh `PqcSniMap` from all cert/key pairs in `certs_dir`.
     pub fn build_sni_map(
@@ -852,13 +884,15 @@ pub mod openssl_pqc {
         info!("OpenSSL SNI map reloaded: {} domain context(s)", n);
     }
 
-    /// Scan `certs_dir` and return a populated `HashMap` of domain → `SslContext`.
+    /// Scan `certs_dir` and return each domain's `SslContext`, and which
+    /// answers a client connecting by address.
     fn build_sni_hashmap(
         certs_dir: &Path,
         pqc_provider: &PqcTlsProvider,
         http11_only_hosts: &[String],
-    ) -> HashMap<String, Arc<openssl::ssl::SslContext>> {
+    ) -> SniContexts {
         let mut map = HashMap::new();
+        let mut naming_addresses = Vec::new();
         if let Ok(entries) = std::fs::read_dir(certs_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -888,6 +922,9 @@ pub mod openssl_pqc {
                 };
                 match build_result {
                     Ok(ctx) => {
+                        if !crate::tls::certificate_file_ip_addresses(&path).is_empty() {
+                            naming_addresses.push(domain.clone());
+                        }
                         map.insert(domain.clone(), Arc::new(ctx));
                     }
                     Err(e) => {
@@ -896,7 +933,14 @@ pub mod openssl_pqc {
                 }
             }
         }
-        map
+        let by_address = crate::tls::address_domain(naming_addresses).and_then(|domain| {
+            info!("SNI: clients connecting by address get '{}'", domain);
+            map.get(&domain).cloned()
+        });
+        SniContexts {
+            by_name: map,
+            by_address,
+        }
     }
 
     /// Create an OpenSSL SSL acceptor with PQC hybrid key exchange
@@ -1125,13 +1169,12 @@ pub mod openssl_pqc {
         // SNI callback: read the live map on every handshake so certificates issued
         // by ACME after startup are picked up without restarting the listener.
         // `sni_map` is an Arc<RwLock<...>>; the read lock is held only long enough
-        // to clone the Arc<SslContext>, keeping contention near zero.
+        // to clone the Arc<SslContext>, keeping contention near zero. OpenSSL
+        // calls it for a ClientHello without a server name too: a client
+        // connecting by address, which gets the certificate naming the address.
         builder.set_servername_callback(move |ssl, _alert| {
-            let sni = match ssl.servername(NameType::HOST_NAME) {
-                Some(s) => s.to_string(),
-                None => return Ok(()),
-            };
-            let ctx = sni_map.read().get(&sni).cloned();
+            let sni = ssl.servername(NameType::HOST_NAME).map(str::to_string);
+            let ctx = sni_map.read().for_server_name(sni.as_deref());
             if let Some(ctx) = ctx {
                 ssl.set_ssl_context(&ctx)
                     .map_err(|_| openssl::ssl::SniError::ALERT_FATAL)?;

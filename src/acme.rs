@@ -10,13 +10,16 @@
 //!
 //! Features:
 //! - HTTP-01 challenge support
-//! - Automatic certificate renewal before expiration
+//! - IP address identifiers (RFC 8738) beside a domain, under an ACME profile
+//! - Renewal when the CA's renewal information says (ARI, RFC 9773), else by
+//!   the certificate's lifetime
 //! - Account persistence and reuse
 //! - Certificate storage with configurable paths
 //! - Integration with TLS provider hot-reload
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -29,8 +32,9 @@ use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "acme")]
 use instant_acme::{
-    Account, AccountCredentials, AuthorizationStatus, ChallengeType as AcmeChallengeType,
-    ExternalAccountKey, Identifier, NewAccount, NewOrder, OrderStatus, RetryPolicy,
+    Account, AccountCredentials, AuthorizationStatus, CertificateIdentifier,
+    ChallengeType as AcmeChallengeType, ExternalAccountKey, Identifier, NewAccount, NewOrder,
+    OrderStatus, RetryPolicy,
 };
 
 /// M-3: Validate a domain name for safe use in file-system paths.
@@ -95,6 +99,21 @@ pub struct AcmeConfig {
     #[serde(default)]
     pub domains: Vec<String>,
 
+    /// IP addresses a domain's certificate also names (RFC 8738 identifiers),
+    /// keyed by that domain, which must be in `domains`. A client connecting
+    /// by address -- a DNS over HTTPS client given a name server's IP --
+    /// verifies the certificate against the address, and both TLS stacks
+    /// present a certificate that names addresses to a ClientHello with no
+    /// server name. A CA validates an address by HTTP-01 or TLS-ALPN-01 only.
+    #[serde(default)]
+    pub ip_addresses: BTreeMap<String, Vec<IpAddr>>,
+
+    /// ACME profile (draft-ietf-acme-profiles) for an order that carries IP
+    /// addresses: Let's Encrypt issues them only under "shortlived", whose
+    /// certificates last 160 hours.
+    #[serde(default = "default_ip_profile")]
+    pub ip_profile: String,
+
     /// Path to store ACME account credentials
     #[serde(default = "default_account_path")]
     pub account_path: PathBuf,
@@ -103,11 +122,16 @@ pub struct AcmeConfig {
     #[serde(default = "default_certs_path")]
     pub certs_path: PathBuf,
 
-    /// Renewal threshold in days (renew when cert expires within this many days)
+    /// Renewal threshold in days: renew when the certificate expires within
+    /// this many days or within a third of its lifetime, whichever is less
+    /// (a 160-hour certificate renews 53 hours early). Where the CA publishes
+    /// renewal information (ARI, RFC 9773), its suggested window sets the time
+    /// instead.
     #[serde(default = "default_renewal_days")]
     pub renewal_days: u32,
 
-    /// Check interval for certificate renewal (in hours)
+    /// Check interval for certificate renewal (in hours); a certificate whose
+    /// renewal time comes sooner is checked then
     #[serde(default = "default_check_interval_hours")]
     pub check_interval_hours: u32,
 
@@ -154,14 +178,25 @@ pub struct AcmeConfig {
     #[serde(default = "default_true")]
     pub certificate_transparency: bool,
 
-    /// CT log submission endpoints (POST /ct/v1/add-chain).
-    /// Default: Google Xenon 2025H1 log.
-    #[serde(default = "default_ct_logs")]
+    /// CT logs to submit to (RFC 6962 base URLs, POST /ct/v1/add-chain).
+    /// Empty (the default): from `ct_log_list`, one log per operator that
+    /// accepts the certificate's expiry. A log takes only certificates that
+    /// expire in its temporal interval, half a year a shard, so a fixed list
+    /// goes stale: the Xenon 2025H1 shard that was the default answered 404.
+    #[serde(default)]
     pub ct_logs: Vec<String>,
+
+    /// The CT log list (v3 schema) that an empty `ct_logs` draws from
+    #[serde(default = "default_ct_log_list")]
+    pub ct_log_list: String,
 }
 
-fn default_ct_logs() -> Vec<String> {
-    vec!["https://ct.googleapis.com/logs/xenon2025h1/".to_string()]
+fn default_ct_log_list() -> String {
+    "https://www.gstatic.com/ct/log_list/v3/log_list.json".to_string()
+}
+
+fn default_ip_profile() -> String {
+    "shortlived".to_string()
 }
 
 fn default_directory_url() -> String {
@@ -211,6 +246,8 @@ impl Default for AcmeConfig {
             directory_url: default_directory_url(),
             email: None,
             domains: Vec::new(),
+            ip_addresses: BTreeMap::new(),
+            ip_profile: default_ip_profile(),
             account_path: default_account_path(),
             certs_path: default_certs_path(),
             renewal_days: default_renewal_days(),
@@ -225,8 +262,20 @@ impl Default for AcmeConfig {
             use_ecdsa: false,
             ecdsa_curve: default_ecdsa_curve(),
             certificate_transparency: true,
-            ct_logs: default_ct_logs(),
+            ct_logs: Vec::new(),
+            ct_log_list: default_ct_log_list(),
         }
+    }
+}
+
+impl AcmeConfig {
+    /// The IP addresses `domain`'s certificate names besides the domain
+    pub fn ip_addresses_for(&self, domain: &str) -> Vec<IpAddr> {
+        self.ip_addresses
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(domain))
+            .map(|(_, addresses)| addresses.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -282,8 +331,168 @@ pub struct AcmeService {
     cert_update_tx: Option<mpsc::Sender<CertificateUpdate>>,
     /// Last check timestamp
     last_check: Arc<RwLock<Option<SystemTime>>>,
+    /// When the next scheduled check runs
+    next_check: Arc<RwLock<Option<SystemTime>>>,
     /// Certificate status cache
     cert_status: Arc<RwLock<HashMap<String, CertificateStatus>>>,
+    /// The CA's suggested renewal windows, by certificate
+    renewal_windows: RenewalWindows,
+}
+
+/// A CA's suggested renewal window for one certificate (RFC 9773 §4.2), kept
+/// until the CA's Retry-After says to ask again.
+#[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "acme"), allow(dead_code))]
+struct RenewalWindow {
+    /// Unix time the window opens
+    start: i64,
+    /// Unix time it closes
+    end: i64,
+    /// When to fetch it again
+    refresh_after: SystemTime,
+}
+
+/// Suggested renewal windows by ARI certificate identifier (`aki.serial`)
+type RenewalWindows = Arc<RwLock<HashMap<String, RenewalWindow>>>;
+
+/// When a certificate renews.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RenewalPlan {
+    /// Unix time it renews at
+    at: i64,
+    /// The CA's suggested window `at` falls in (ARI); none when the time
+    /// comes from the certificate's lifetime
+    window: Option<(i64, i64)>,
+}
+
+impl RenewalPlan {
+    /// What set the time, for the status and the log
+    fn basis(&self) -> &'static str {
+        if self.window.is_some() {
+            "ari"
+        } else {
+            "lifetime"
+        }
+    }
+}
+
+/// Unix time a certificate valid from `not_before` to `not_after` renews at
+/// without the CA's renewal information: `renewal_days` before it expires or
+/// a third of its lifetime before, whichever is less. A 90-day certificate
+/// renews 30 days early, a 160-hour one 53 hours early: renewing a 160-hour
+/// certificate at every check, as a fixed 30 days would, spends the CA's
+/// duplicate-certificate allowance (5 a week for one set of names).
+fn lifetime_renewal_at(not_before: i64, not_after: i64, renewal_days: u32) -> i64 {
+    let lifetime = not_after.saturating_sub(not_before).max(0);
+    let lead = (lifetime / 3).min(i64::from(renewal_days) * 86_400);
+    not_after - lead
+}
+
+/// The point in a suggested window `[start, end]` a certificate renews at.
+/// RFC 9773 §4.2 has the client choose a uniformly random time in the window;
+/// a hash of the certificate's serial chooses it, so certificates spread over
+/// the window and each keeps its point across checks and restarts.
+fn point_in_window(start: i64, end: i64, serial: &[u8]) -> i64 {
+    use sha2::{Digest, Sha256};
+    let Ok(span) = u64::try_from(end.saturating_sub(start)) else {
+        return start;
+    };
+    if span == 0 {
+        return start;
+    }
+    let digest = Sha256::digest(serial);
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&digest[..8]);
+    start + i64::try_from(u64::from_be_bytes(first) % span).unwrap_or(0)
+}
+
+/// How long until the next certificate check: the check interval, or less
+/// when a certificate's renewal time comes first (a 160-hour certificate's
+/// window can open and close inside a 12-hour interval).
+fn next_check_wait(
+    interval: Duration,
+    next_renewal: Option<SystemTime>,
+    now: SystemTime,
+) -> Duration {
+    match next_renewal {
+        Some(at) => at
+            .duration_since(now)
+            .unwrap_or(Duration::ZERO)
+            .min(interval),
+        None => interval,
+    }
+}
+
+/// A Unix time as the status and the log show it
+fn utc(timestamp: i64) -> String {
+    chrono::DateTime::from_timestamp(timestamp, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// What renewal reads from an issued certificate.
+#[derive(Debug, Clone)]
+struct IssuedCertificate {
+    /// Unix time it became valid
+    not_before: i64,
+    /// Unix time it expires
+    not_after: i64,
+    /// The DNS names it covers
+    dns_names: Vec<String>,
+    /// The IP addresses it covers
+    ip_addresses: Vec<IpAddr>,
+    /// The leaf, DER: its ARI identifier comes from its AKI and serial
+    der: Vec<u8>,
+    /// The serial number's octets
+    serial: Vec<u8>,
+}
+
+impl IssuedCertificate {
+    /// The leaf of a PEM certificate file
+    fn read(cert_path: &Path) -> anyhow::Result<Self> {
+        use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
+        let pem_bytes = fs::read(cert_path)?;
+        let (_, pem) = x509_parser::pem::parse_x509_pem(&pem_bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to parse PEM: {:?}", e))?;
+        let (_, cert) = X509Certificate::from_der(&pem.contents)
+            .map_err(|e| anyhow::anyhow!("Failed to parse certificate: {:?}", e))?;
+        let dns_names = match cert.subject_alternative_name() {
+            Ok(Some(san)) => san
+                .value
+                .general_names
+                .iter()
+                .filter_map(|name| match name {
+                    GeneralName::DNSName(dns) => Some(dns.to_ascii_lowercase()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        Ok(Self {
+            not_before: cert.validity().not_before.timestamp(),
+            not_after: cert.validity().not_after.timestamp(),
+            dns_names,
+            ip_addresses: crate::tls::certificate_ip_addresses(&pem.contents),
+            serial: cert.raw_serial().to_vec(),
+            der: pem.contents.clone(),
+        })
+    }
+
+    /// Whether it names `domain` and exactly the addresses configured for
+    /// it: an address added to the configuration, or one taken out, is a
+    /// reason to reissue now rather than at the next renewal.
+    fn covers(&self, domain: &str, addresses: &[IpAddr]) -> bool {
+        let mut held = self.ip_addresses.clone();
+        let mut wanted = addresses.to_vec();
+        held.sort();
+        held.dedup();
+        wanted.sort();
+        wanted.dedup();
+        self.dns_names
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(domain))
+            && held == wanted
+    }
 }
 
 /// Certificate update notification
@@ -335,10 +544,41 @@ pub struct CertificateStatus {
     pub days_remaining: Option<i64>,
     /// Whether renewal is needed
     pub needs_renewal: bool,
+    /// IP addresses the certificate names besides its domain
+    pub ip_addresses: Vec<String>,
+    /// When it renews
+    pub renews_at: Option<String>,
+    /// What set that time: "ari" (the CA's suggested window, RFC 9773) or
+    /// "lifetime" (renewal_days or a third of the lifetime before expiry)
+    pub renewal_basis: Option<String>,
     /// Last renewal time
     pub last_renewed: Option<String>,
     /// Last error (if any)
     pub last_error: Option<String>,
+}
+
+impl CertificateStatus {
+    /// The status of a certificate on disk that renews by `plan`
+    fn of(
+        domain: &str,
+        cert: &IssuedCertificate,
+        plan: RenewalPlan,
+        now: i64,
+        last_renewed: Option<String>,
+    ) -> Self {
+        Self {
+            domain: domain.to_string(),
+            exists: true,
+            expires: Some(utc(cert.not_after)),
+            days_remaining: Some((cert.not_after - now) / 86_400),
+            needs_renewal: plan.at <= now,
+            ip_addresses: cert.ip_addresses.iter().map(IpAddr::to_string).collect(),
+            renews_at: Some(utc(plan.at)),
+            renewal_basis: Some(plan.basis().to_string()),
+            last_renewed,
+            last_error: None,
+        }
+    }
 }
 
 impl AcmeService {
@@ -351,7 +591,9 @@ impl AcmeService {
             running: Arc::new(RwLock::new(false)),
             cert_update_tx: None,
             last_check: Arc::new(RwLock::new(None)),
+            next_check: Arc::new(RwLock::new(None)),
             cert_status: Arc::new(RwLock::new(HashMap::new())),
+            renewal_windows: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -392,50 +634,42 @@ impl AcmeService {
         let pending_challenges = self.pending_challenges.clone();
         let cert_update_tx = self.cert_update_tx.clone();
         let last_check = self.last_check.clone();
+        let next_check = self.next_check.clone();
         let cert_status = self.cert_status.clone();
+        let renewal_windows = self.renewal_windows.clone();
 
         tokio::spawn(async move {
             let check_interval = Duration::from_secs(config.check_interval_hours as u64 * 3600);
-            // The first scheduled check one interval after the initial one: a
-            // plain interval() completes its first tick at once, so every
-            // start ran the whole check twice in a row, and a refused order
-            // was placed again straight away, spending the CA's
-            // failed-validation allowance (5 an hour per name) twice as fast.
-            let mut interval = tokio::time::interval_at(
-                tokio::time::Instant::now() + check_interval,
-                check_interval,
-            );
-
-            // Initial check
-            *last_check.write() = Some(SystemTime::now());
-            if let Err(e) = check_and_renew_certificates(
-                &config,
-                &pending_challenges,
-                &cert_update_tx,
-                &cert_status,
-            )
-            .await
-            {
-                error!("Initial certificate check failed: {}", e);
-            }
-
             loop {
+                *last_check.write() = Some(SystemTime::now());
+                // A refused order waits a whole interval before it is placed
+                // again: the CA allows 5 failed validations an hour per name.
+                // Only certificates not yet due bring the next check forward.
+                let next_renewal = match check_and_renew_certificates(
+                    &config,
+                    &pending_challenges,
+                    &cert_update_tx,
+                    &cert_status,
+                    &renewal_windows,
+                )
+                .await
+                {
+                    Ok(next_renewal) => next_renewal,
+                    Err(e) => {
+                        error!("Certificate check/renewal failed: {}", e);
+                        None
+                    }
+                };
+                let now = SystemTime::now();
+                let wait = next_check_wait(check_interval, next_renewal, now);
+                *next_check.write() = Some(now + wait);
+
                 tokio::select! {
-                    _ = interval.tick() => {
+                    _ = tokio::time::sleep(wait) => {
                         if !*running.read() {
                             break;
                         }
-
                         info!("Running scheduled certificate check");
-                        *last_check.write() = Some(SystemTime::now());
-                        if let Err(e) = check_and_renew_certificates(
-                            &config,
-                            &pending_challenges,
-                            &cert_update_tx,
-                            &cert_status,
-                        ).await {
-                            error!("Certificate check/renewal failed: {}", e);
-                        }
                     }
                     _ = shutdown_rx.recv() => {
                         info!("ACME service shutting down");
@@ -484,54 +718,48 @@ impl AcmeService {
                     let safe_domain = validate_domain_for_path(domain)
                         .unwrap_or_else(|_| "invalid-domain".to_string());
                     let cert_path = self.config.certs_path.join(format!("{}.crt", safe_domain));
-                    let (exists, expires, days_remaining) = if cert_path.exists() {
-                        match read_certificate_expiry(&cert_path) {
-                            Ok((exp, days)) => (true, Some(exp), Some(days)),
-                            Err(_) => (true, None, None),
+                    let now = chrono::Utc::now().timestamp();
+                    match IssuedCertificate::read(&cert_path) {
+                        // Before the first check: by lifetime, as the check
+                        // decides where the CA publishes no window
+                        Ok(cert) => {
+                            let plan = RenewalPlan {
+                                at: lifetime_renewal_at(
+                                    cert.not_before,
+                                    cert.not_after,
+                                    self.config.renewal_days,
+                                ),
+                                window: None,
+                            };
+                            let mut status = CertificateStatus::of(domain, &cert, plan, now, None);
+                            status.needs_renewal |=
+                                !cert.covers(domain, &self.config.ip_addresses_for(domain));
+                            status
                         }
-                    } else {
-                        (false, None, None)
-                    };
-
-                    let needs_renewal = days_remaining
-                        .map(|d| d < self.config.renewal_days as i64)
-                        .unwrap_or(true);
-
-                    CertificateStatus {
-                        domain: domain.clone(),
-                        exists,
-                        expires,
-                        days_remaining,
-                        needs_renewal,
-                        last_renewed: None,
-                        last_error: None,
+                        Err(_) => CertificateStatus {
+                            domain: domain.clone(),
+                            exists: cert_path.exists(),
+                            expires: None,
+                            days_remaining: None,
+                            needs_renewal: true,
+                            ip_addresses: Vec::new(),
+                            renews_at: None,
+                            renewal_basis: None,
+                            last_renewed: None,
+                            last_error: None,
+                        },
                     }
                 }
             })
             .collect();
 
-        let last_check_str = self.last_check.read().map(|t| {
+        let as_utc = |t: SystemTime| {
             t.duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| {
-                    let secs = i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
-                    chrono::DateTime::from_timestamp(secs, 0)
-                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                        .unwrap_or_else(|| "unknown".to_string())
-                })
+                .map(|d| utc(i64::try_from(d.as_secs()).unwrap_or(i64::MAX)))
                 .unwrap_or_else(|_| "unknown".to_string())
-        });
-
-        let next_check_str = self.last_check.read().map(|t| {
-            let next = t + Duration::from_secs(u64::from(self.config.check_interval_hours) * 3600);
-            next.duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| {
-                    let secs = i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
-                    chrono::DateTime::from_timestamp(secs, 0)
-                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                        .unwrap_or_else(|| "unknown".to_string())
-                })
-                .unwrap_or_else(|_| "unknown".to_string())
-        });
+        };
+        let last_check_str = self.last_check.read().map(as_utc);
+        let next_check_str = self.next_check.read().map(as_utc);
 
         AcmeStatusInfo {
             enabled: self.config.enabled,
@@ -563,6 +791,7 @@ impl AcmeService {
         let pending_challenges = self.pending_challenges.clone();
         let cert_update_tx = self.cert_update_tx.clone();
         let cert_status = self.cert_status.clone();
+        let renewal_windows = self.renewal_windows.clone();
         async move {
             if !config.enabled {
                 return Err(anyhow::anyhow!("ACME service is disabled"));
@@ -572,8 +801,10 @@ impl AcmeService {
                 &pending_challenges,
                 &cert_update_tx,
                 &cert_status,
+                &renewal_windows,
             )
             .await
+            .map(|_| ())
         }
     }
 
@@ -611,19 +842,22 @@ fn write_atomic(path: &std::path::Path, content: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Check and renew certificates as needed.
-/// Issues one individual certificate per domain — no SAN bundling.
-/// Each domain gets its own `{domain}.crt` / `{domain}.key` pair written
-/// atomically so concurrent renewal of different domains cannot corrupt each other.
+/// Check and renew certificates as needed, and say when the next renewal
+/// falls due (the earliest renewal time of a certificate not yet due).
+/// Issues one individual certificate per domain — no SAN bundling — naming
+/// the domain and any IP addresses configured for it. Each domain gets its
+/// own `{domain}.crt` / `{domain}.key` pair written atomically so concurrent
+/// renewal of different domains cannot corrupt each other.
 #[cfg(feature = "acme")]
 async fn check_and_renew_certificates(
     config: &AcmeConfig,
     pending_challenges: &Arc<RwLock<HashMap<String, PendingChallenge>>>,
     cert_update_tx: &Option<mpsc::Sender<CertificateUpdate>>,
     cert_status: &Arc<RwLock<HashMap<String, CertificateStatus>>>,
-) -> anyhow::Result<()> {
+    renewal_windows: &RenewalWindows,
+) -> anyhow::Result<Option<SystemTime>> {
     if config.domains.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     // M-3: Validate all domains before touching the file system.
@@ -638,145 +872,280 @@ async fn check_and_renew_certificates(
         }
     }
 
+    // Loaded on first use: ARI and orders need it, a check with nothing due
+    // and a CA without ARI does not
+    let mut account: Option<Account> = None;
+    let mut next_renewal: Option<i64> = None;
+    let mut current_windows = HashSet::new();
+
     // Issue one certificate per domain independently.
     for domain in &config.domains {
         let cert_path = config.certs_path.join(format!("{}.crt", domain));
         let key_path = config.certs_path.join(format!("{}.key", domain));
+        let addresses = config.ip_addresses_for(domain);
+        let now = chrono::Utc::now().timestamp();
 
-        // Check if this domain's cert needs renewal
-        let (needs_renewal, days_remaining) = if cert_path.exists() {
-            match read_certificate_expiry(&cert_path) {
-                Ok((_, days)) => {
-                    if days < config.renewal_days as i64 {
-                        info!(
-                            "[{}] Certificate expires in {} days (threshold: {}), renewal needed",
-                            domain, days, config.renewal_days
-                        );
-                        (true, Some(days))
-                    } else {
-                        info!(
-                            "[{}] Certificate valid for {} more days, no renewal needed",
-                            domain, days
-                        );
-                        cert_status.write().insert(
-                            domain.clone(),
-                            CertificateStatus {
-                                domain: domain.clone(),
-                                exists: true,
-                                expires: Some(format!("{} days", days)),
-                                days_remaining: Some(days),
-                                needs_renewal: false,
-                                last_renewed: None,
-                                last_error: None,
-                            },
-                        );
-                        (false, Some(days))
-                    }
-                }
+        let existing = if cert_path.exists() {
+            match IssuedCertificate::read(&cert_path) {
+                Ok(cert) => Some(cert),
                 Err(e) => {
-                    warn!("[{}] Failed to read certificate expiry: {}", domain, e);
-                    (true, None)
+                    warn!("[{}] Failed to read certificate: {}", domain, e);
+                    None
                 }
             }
         } else {
             info!("[{}] No certificate found, requesting new one", domain);
-            (true, None)
+            None
         };
 
-        if needs_renewal {
-            // Request individual cert for this domain only
-            match request_san_certificate(config, std::slice::from_ref(&domain), pending_challenges)
+        // The certificate this order replaces, where the CA has renewal information
+        let mut replaces = None;
+        if let Some(cert) = &existing {
+            let (plan, identifier) =
+                renewal_plan(config, &mut account, renewal_windows, cert).await;
+            if let Some(identifier) = &identifier {
+                current_windows.insert(identifier.to_string());
+            }
+            let window = plan
+                .window
+                .map(|(start, end)| format!(", window {} to {}", utc(start), utc(end)))
+                .unwrap_or_default();
+            if !cert.covers(domain, &addresses) {
+                info!(
+                    "[{}] Certificate names {:?} {:?}, configured {:?}: reissuing",
+                    domain, cert.dns_names, cert.ip_addresses, addresses
+                );
+            } else if plan.at <= now {
+                info!(
+                    "[{}] Certificate expires {}, renewal due since {} ({}{}), renewing",
+                    domain,
+                    utc(cert.not_after),
+                    utc(plan.at),
+                    plan.basis(),
+                    window
+                );
+            } else {
+                info!(
+                    "[{}] Certificate valid until {}, renews at {} ({}{})",
+                    domain,
+                    utc(cert.not_after),
+                    utc(plan.at),
+                    plan.basis(),
+                    window
+                );
+                next_renewal = Some(next_renewal.map_or(plan.at, |n| n.min(plan.at)));
+                cert_status.write().insert(
+                    domain.clone(),
+                    CertificateStatus::of(domain, cert, plan, now, None),
+                );
+                continue;
+            }
+            // An expired certificate is renewed, not replaced
+            if cert.not_after > now {
+                replaces = identifier;
+            }
+        }
+
+        let ordered = match loaded_account(config, &mut account).await {
+            Ok(acct) => {
+                request_san_certificate(
+                    config,
+                    acct,
+                    domain,
+                    &addresses,
+                    replaces,
+                    pending_challenges,
+                )
                 .await
-            {
-                Ok((cert_pem, key_pem, chain_pem)) => {
-                    let full_chain = if chain_pem.is_empty() {
-                        cert_pem.clone()
-                    } else {
-                        // Ensure a clean newline between cert and chain
-                        let sep = if cert_pem.ends_with('\n') { "" } else { "\n" };
-                        format!("{}{}{}", cert_pem, sep, chain_pem)
-                    };
+            }
+            Err(e) => Err(e),
+        };
+        match ordered {
+            Ok((cert_pem, key_pem, chain_pem)) => {
+                let full_chain = if chain_pem.is_empty() {
+                    cert_pem.clone()
+                } else {
+                    // Ensure a clean newline between cert and chain
+                    let sep = if cert_pem.ends_with('\n') { "" } else { "\n" };
+                    format!("{}{}{}", cert_pem, sep, chain_pem)
+                };
 
-                    // Atomic write: write to .tmp then rename — prevents partial reads
-                    write_atomic(&cert_path, &full_chain).map_err(|e| {
-                        anyhow::anyhow!("Failed to write cert for {}: {}", domain, e)
-                    })?;
-                    write_atomic(&key_path, &key_pem).map_err(|e| {
-                        anyhow::anyhow!("Failed to write key for {}: {}", domain, e)
-                    })?;
+                // Atomic write: write to .tmp then rename — prevents partial reads
+                write_atomic(&cert_path, &full_chain)
+                    .map_err(|e| anyhow::anyhow!("Failed to write cert for {}: {}", domain, e))?;
+                write_atomic(&key_path, &key_pem)
+                    .map_err(|e| anyhow::anyhow!("Failed to write key for {}: {}", domain, e))?;
 
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600));
-                    }
-
-                    if let Err(e) = submit_to_ct_logs(&cert_pem, &chain_pem, config).await {
-                        warn!("[{}] CT log submission failed (non-fatal): {}", domain, e);
-                    }
-
-                    info!(
-                        "[{}] Individual certificate obtained from {}",
-                        domain, config.directory_url
-                    );
-
-                    let (expires, days) = read_certificate_expiry(&cert_path)
-                        .unwrap_or_else(|_| ("90 days".to_string(), 90));
-
-                    let now_str = chrono::Utc::now()
-                        .format("%Y-%m-%d %H:%M:%S UTC")
-                        .to_string();
-                    cert_status.write().insert(
-                        domain.clone(),
-                        CertificateStatus {
-                            domain: domain.clone(),
-                            exists: true,
-                            expires: Some(expires),
-                            days_remaining: Some(days),
-                            needs_renewal: false,
-                            last_renewed: Some(now_str),
-                            last_error: None,
-                        },
-                    );
-
-                    // Notify listeners so they can reload the SNI cert resolver
-                    if let Some(tx) = cert_update_tx {
-                        let expires_time = SystemTime::now()
-                            + Duration::from_secs(u64::try_from(days.max(0)).unwrap_or(0) * 86400);
-                        let _ = tx
-                            .send(CertificateUpdate {
-                                domain: domain.clone(),
-                                cert_path: cert_path.clone(),
-                                key_path: key_path.clone(),
-                                expires: expires_time,
-                            })
-                            .await;
-                    }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600));
                 }
-                Err(e) => {
-                    error!("[{}] Failed to obtain certificate: {}", domain, e);
-                    cert_status.write().insert(
-                        domain.clone(),
-                        CertificateStatus {
-                            domain: domain.clone(),
-                            exists: cert_path.exists(),
-                            expires: days_remaining.map(|d| format!("{} days", d)),
-                            days_remaining,
-                            needs_renewal: true,
-                            last_renewed: None,
-                            last_error: Some(e.to_string()),
-                        },
-                    );
+
+                let issued = IssuedCertificate::read(&cert_path)?;
+                if let Err(e) =
+                    submit_to_ct_logs(&cert_pem, &chain_pem, config, issued.not_after).await
+                {
+                    warn!("[{}] CT log submission failed (non-fatal): {}", domain, e);
                 }
+
+                info!(
+                    "[{}] Individual certificate obtained from {}, valid until {}",
+                    domain,
+                    config.directory_url,
+                    utc(issued.not_after)
+                );
+
+                // Until the CA's window for it is known, at the next check
+                let plan = RenewalPlan {
+                    at: lifetime_renewal_at(
+                        issued.not_before,
+                        issued.not_after,
+                        config.renewal_days,
+                    ),
+                    window: None,
+                };
+                next_renewal = Some(next_renewal.map_or(plan.at, |n| n.min(plan.at)));
+                let now = chrono::Utc::now().timestamp();
+                cert_status.write().insert(
+                    domain.clone(),
+                    CertificateStatus::of(domain, &issued, plan, now, Some(utc(now))),
+                );
+
+                // Notify listeners so they can reload the SNI cert resolver
+                if let Some(tx) = cert_update_tx {
+                    let expires = SystemTime::UNIX_EPOCH
+                        + Duration::from_secs(u64::try_from(issued.not_after).unwrap_or(0));
+                    let _ = tx
+                        .send(CertificateUpdate {
+                            domain: domain.clone(),
+                            cert_path: cert_path.clone(),
+                            key_path: key_path.clone(),
+                            expires,
+                        })
+                        .await;
+                }
+            }
+            Err(e) => {
+                error!("[{}] Failed to obtain certificate: {}", domain, e);
+                let now = chrono::Utc::now().timestamp();
+                cert_status.write().insert(
+                    domain.clone(),
+                    CertificateStatus {
+                        domain: domain.clone(),
+                        exists: cert_path.exists(),
+                        expires: existing.as_ref().map(|c| utc(c.not_after)),
+                        days_remaining: existing.as_ref().map(|c| (c.not_after - now) / 86_400),
+                        needs_renewal: true,
+                        ip_addresses: existing
+                            .as_ref()
+                            .map(|c| c.ip_addresses.iter().map(IpAddr::to_string).collect())
+                            .unwrap_or_default(),
+                        renews_at: None,
+                        renewal_basis: None,
+                        last_renewed: None,
+                        last_error: Some(e.to_string()),
+                    },
+                );
             }
         }
     } // end per-domain loop
+
+    // Windows of certificates since replaced are not asked for again
+    renewal_windows
+        .write()
+        .retain(|identifier, _| current_windows.contains(identifier));
 
     // Clean up expired challenges
     let now = SystemTime::now();
     pending_challenges.write().retain(|_, c| c.expires > now);
 
-    Ok(())
+    Ok(next_renewal
+        .map(|at| SystemTime::UNIX_EPOCH + Duration::from_secs(u64::try_from(at).unwrap_or(0))))
+}
+
+/// The ACME account, loaded into `slot` on first use.
+#[cfg(feature = "acme")]
+async fn loaded_account<'a>(
+    config: &AcmeConfig,
+    slot: &'a mut Option<Account>,
+) -> anyhow::Result<&'a Account> {
+    if slot.is_none() {
+        *slot = Some(get_or_create_account(config).await?);
+    }
+    slot.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("the ACME account was not loaded"))
+}
+
+/// When `cert` renews: at its point in the CA's suggested window where the
+/// CA publishes renewal information (ARI, RFC 9773), otherwise by its
+/// lifetime. With the window comes the certificate's ARI identifier, for the
+/// replacement order's `replaces` (RFC 9773 §5): the CA then knows the order
+/// renews it, and Let's Encrypt exempts such an order from its rate limits.
+/// A window is fetched again only once the CA's Retry-After has passed.
+#[cfg(feature = "acme")]
+async fn renewal_plan(
+    config: &AcmeConfig,
+    account: &mut Option<Account>,
+    windows: &RenewalWindows,
+    cert: &IssuedCertificate,
+) -> (RenewalPlan, Option<CertificateIdentifier<'static>>) {
+    let by_lifetime = RenewalPlan {
+        at: lifetime_renewal_at(cert.not_before, cert.not_after, config.renewal_days),
+        window: None,
+    };
+    let der = rustls::pki_types::CertificateDer::from(cert.der.as_slice());
+    let identifier = match CertificateIdentifier::try_from(&der) {
+        Ok(identifier) => identifier.into_owned(),
+        Err(e) => {
+            debug!("ARI: the certificate has no identifier ({e}); renewing by lifetime");
+            return (by_lifetime, None);
+        }
+    };
+    let key = identifier.to_string();
+    let cached = windows
+        .read()
+        .get(&key)
+        .filter(|w| w.refresh_after > SystemTime::now())
+        .cloned();
+    let window = match cached {
+        Some(window) => window,
+        None => {
+            let acct = match loaded_account(config, account).await {
+                Ok(acct) => acct,
+                Err(e) => {
+                    warn!("ARI: no ACME account ({e}); renewing by lifetime");
+                    return (by_lifetime, None);
+                }
+            };
+            match acct.renewal_info(&identifier).await {
+                Ok((info, retry_after)) => {
+                    let window = RenewalWindow {
+                        start: info.suggested_window.start.unix_timestamp(),
+                        end: info.suggested_window.end.unix_timestamp(),
+                        refresh_after: SystemTime::now() + retry_after,
+                    };
+                    if let Some(why) = &info.explanation_url {
+                        info!("ARI: the CA explains its window for {key} at {why}");
+                    }
+                    windows.write().insert(key, window.clone());
+                    window
+                }
+                Err(instant_acme::Error::Unsupported(_)) => return (by_lifetime, None),
+                Err(e) => {
+                    warn!("ARI: renewal information not fetched ({e}); renewing by lifetime");
+                    return (by_lifetime, None);
+                }
+            }
+        }
+    };
+    (
+        RenewalPlan {
+            at: point_in_window(window.start, window.end, &cert.serial),
+            window: Some((window.start, window.end)),
+        },
+        Some(identifier),
+    )
 }
 
 /// Why the CA refused an order: the order's own problem and each failed
@@ -809,27 +1178,73 @@ async fn invalid_order_reasons(order: &mut instant_acme::Order) -> String {
     }
 }
 
-/// Request a SAN certificate covering multiple domains via ACME protocol.
-/// Single order, single cert, all domains as Subject Alternative Names.
+/// An order for `identifiers`, under `profile` if one is given, replacing
+/// the certificate `replaces` identifies if one is given.
+#[cfg(feature = "acme")]
+fn new_order<'a>(
+    identifiers: &'a [Identifier],
+    profile: Option<&'a str>,
+    replaces: Option<CertificateIdentifier<'a>>,
+) -> NewOrder<'a> {
+    let mut order = NewOrder::new(identifiers);
+    if let Some(profile) = profile {
+        order = order.profile(profile);
+    }
+    if let Some(replaces) = replaces {
+        order = order.replaces(replaces);
+    }
+    order
+}
+
+/// Request a certificate for `domain` and `addresses` via ACME: one order,
+/// the domain and each address (RFC 8738) as identifiers and as Subject
+/// Alternative Names. An order with addresses is placed under
+/// `config.ip_profile`. `replaces` names the certificate it renews (RFC 9773
+/// §5); a CA that refuses the order on that account (the certificate already
+/// replaced, say) gets it again without.
 #[cfg(feature = "acme")]
 async fn request_san_certificate(
     config: &AcmeConfig,
-    domains: &[String],
+    account: &Account,
+    domain: &str,
+    addresses: &[IpAddr],
+    replaces: Option<CertificateIdentifier<'static>>,
     pending_challenges: &Arc<RwLock<HashMap<String, PendingChallenge>>>,
 ) -> anyhow::Result<(String, String, String)> {
     use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 
     info!(
-        "Requesting SAN certificate for {:?} from {}",
-        domains, config.directory_url
+        "Requesting a certificate for {} {:?} from {}",
+        domain, addresses, config.directory_url
     );
 
-    let account = get_or_create_account(config).await?;
+    let mut identifiers = vec![Identifier::Dns(domain.to_string())];
+    identifiers.extend(addresses.iter().copied().map(Identifier::Ip));
+    let profile = (!addresses.is_empty()).then_some(config.ip_profile.as_str());
 
-    // Create a single order with all domains as identifiers
-    let identifiers: Vec<Identifier> = domains.iter().map(|d| Identifier::Dns(d.clone())).collect();
-
-    let mut order = account.new_order(&NewOrder::new(&identifiers)).await?;
+    let mut order = match replaces {
+        Some(replaced) => {
+            let replacing = new_order(&identifiers, profile, Some(replaced));
+            match account.new_order(&replacing).await {
+                Ok(order) => order,
+                Err(e) => {
+                    warn!(
+                        "[{}] The CA refused the order replacing the current certificate ({}); \
+                         ordering without `replaces`",
+                        domain, e
+                    );
+                    account
+                        .new_order(&new_order(&identifiers, profile, None))
+                        .await?
+                }
+            }
+        }
+        None => {
+            account
+                .new_order(&new_order(&identifiers, profile, None))
+                .await?
+        }
+    };
 
     // Register the HTTP-01 response for every pending authorization, then mark
     // each challenge ready. Tokens are tracked so they can be cleared once the
@@ -934,9 +1349,11 @@ async fn request_san_certificate(
         KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)?
     };
 
-    // Create CSR with all domains as SANs
-    let domain_strings: Vec<String> = domains.to_vec();
-    let mut params = CertificateParams::new(domain_strings)?;
+    // The CSR names the domain and each address (rcgen reads an address as
+    // an iPAddress SAN)
+    let mut names = vec![domain.to_string()];
+    names.extend(addresses.iter().map(IpAddr::to_string));
+    let mut params = CertificateParams::new(names)?;
     params.distinguished_name = DistinguishedName::new();
 
     let csr = params.serialize_request(&key_pair)?;
@@ -973,8 +1390,9 @@ async fn request_san_certificate(
     let key_pem = key_pair.serialize_pem();
 
     info!(
-        "SAN certificate obtained for {:?} ({} intermediates)",
-        domains,
+        "Certificate obtained for {} {:?} ({} intermediates)",
+        domain,
+        addresses,
         certs.len().saturating_sub(1)
     );
 
@@ -1094,7 +1512,8 @@ async fn check_and_renew_certificates(
     _pending_challenges: &Arc<RwLock<HashMap<String, PendingChallenge>>>,
     _cert_update_tx: &Option<mpsc::Sender<CertificateUpdate>>,
     cert_status: &Arc<RwLock<HashMap<String, CertificateStatus>>>,
-) -> anyhow::Result<()> {
+    _renewal_windows: &RenewalWindows,
+) -> anyhow::Result<Option<SystemTime>> {
     warn!("ACME feature not enabled at compile time. Enable with --features acme");
 
     // Still check existing certificates
@@ -1111,69 +1530,34 @@ async fn check_and_renew_certificates(
             }
         };
         let cert_path = config.certs_path.join(format!("{}.crt", safe_domain));
-        let (exists, expires, days_remaining) = if cert_path.exists() {
-            match read_certificate_expiry(&cert_path) {
-                Ok((exp, days)) => (true, Some(exp), Some(days)),
-                Err(_) => (true, None, None),
+        let now = chrono::Utc::now().timestamp();
+        let status = match IssuedCertificate::read(&cert_path) {
+            Ok(cert) => {
+                let plan = RenewalPlan {
+                    at: lifetime_renewal_at(cert.not_before, cert.not_after, config.renewal_days),
+                    window: None,
+                };
+                let mut status = CertificateStatus::of(domain, &cert, plan, now, None);
+                status.needs_renewal |= !cert.covers(domain, &config.ip_addresses_for(domain));
+                status
             }
-        } else {
-            (false, None, None)
-        };
-
-        let needs_renewal = days_remaining
-            .map(|d| d < config.renewal_days as i64)
-            .unwrap_or(true);
-
-        let mut status = cert_status.write();
-        status.insert(
-            domain.clone(),
-            CertificateStatus {
+            Err(_) => CertificateStatus {
                 domain: domain.clone(),
-                exists,
-                expires,
-                days_remaining,
-                needs_renewal,
+                exists: cert_path.exists(),
+                expires: None,
+                days_remaining: None,
+                needs_renewal: true,
+                ip_addresses: Vec::new(),
+                renews_at: None,
+                renewal_basis: None,
                 last_renewed: None,
-                last_error: if needs_renewal && !exists {
-                    Some("ACME feature not enabled".to_string())
-                } else {
-                    None
-                },
+                last_error: (!cert_path.exists()).then(|| "ACME feature not enabled".to_string()),
             },
-        );
+        };
+        cert_status.write().insert(domain.clone(), status);
     }
 
-    Ok(())
-}
-
-/// Read certificate expiry from a PEM file
-fn read_certificate_expiry(cert_path: &Path) -> anyhow::Result<(String, i64)> {
-    use x509_parser::prelude::*;
-
-    let cert_pem = fs::read(cert_path)?;
-
-    // Parse PEM
-    let (_, pem) = x509_parser::pem::parse_x509_pem(&cert_pem)
-        .map_err(|e| anyhow::anyhow!("Failed to parse PEM: {:?}", e))?;
-
-    // Parse certificate
-    let (_, cert) = X509Certificate::from_der(&pem.contents)
-        .map_err(|e| anyhow::anyhow!("Failed to parse certificate: {:?}", e))?;
-
-    // Get expiration time
-    let not_after = cert.validity().not_after;
-    let expiry_time = not_after.timestamp();
-
-    // Calculate days remaining
-    let now = chrono::Utc::now().timestamp();
-    let days_remaining = (expiry_time - now) / 86400;
-
-    // Format expiry date
-    let expiry_str = chrono::DateTime::from_timestamp(expiry_time, 0)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    Ok((expiry_str, days_remaining))
+    Ok(None)
 }
 
 /// HTTP-01 challenge handler for ACME validation
@@ -1191,12 +1575,16 @@ pub fn handle_acme_challenge(acme_service: &AcmeService, token: &str) -> Option<
 ///
 /// Failures are non-fatal: operators can still use the certificate even if
 /// CT submission fails.  Errors are logged as warnings.
+///
+/// The logs are `config.ct_logs`, or when that is empty the ones the CT log
+/// list has for the certificate's expiry, `not_after` ([`ct_logs_for_expiry`]).
 async fn submit_to_ct_logs(
     cert_pem: &str,
     chain_pem: &str,
     config: &AcmeConfig,
+    not_after: i64,
 ) -> anyhow::Result<()> {
-    if !config.certificate_transparency || config.ct_logs.is_empty() {
+    if !config.certificate_transparency {
         return Ok(());
     }
 
@@ -1213,7 +1601,29 @@ async fn submit_to_ct_logs(
         .build()
         .map_err(|e| anyhow::anyhow!("CT: failed to build HTTP client: {}", e))?;
 
-    for log_url in &config.ct_logs {
+    let logs = if config.ct_logs.is_empty() {
+        let list: CtLogList = client
+            .get(&config.ct_log_list)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|e| anyhow::anyhow!("CT: log list {} not fetched: {}", config.ct_log_list, e))?
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("CT: log list {} not read: {}", config.ct_log_list, e))?;
+        let logs = ct_logs_for_expiry(&list, not_after);
+        if logs.is_empty() {
+            warn!(
+                "CT: the log list has no log accepting an expiry of {}",
+                utc(not_after)
+            );
+        }
+        logs
+    } else {
+        config.ct_logs.clone()
+    };
+
+    for log_url in &logs {
         let submit_url = {
             let base = log_url.trim_end_matches('/');
             format!("{}/ct/v1/add-chain", base)
@@ -1247,6 +1657,57 @@ async fn submit_to_ct_logs(
     }
 
     Ok(())
+}
+
+/// The CT log list (the v3 schema Google and Apple publish), as far as
+/// choosing a log needs.
+#[derive(Debug, Deserialize)]
+struct CtLogList {
+    operators: Vec<CtOperator>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CtOperator {
+    /// RFC 6962 logs. The list's `tiled_logs` (the static CT API) take no
+    /// add-chain, so they are not read.
+    #[serde(default)]
+    logs: Vec<CtLog>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CtLog {
+    url: String,
+    /// One key naming the state: usable, qualified, readonly, retired, ...
+    #[serde(default)]
+    state: HashMap<String, serde_json::Value>,
+    temporal_interval: Option<CtTemporalInterval>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CtTemporalInterval {
+    start_inclusive: chrono::DateTime<chrono::Utc>,
+    end_exclusive: chrono::DateTime<chrono::Utc>,
+}
+
+/// The logs in `list` that take a certificate expiring at `not_after`: per
+/// operator, the first that accepts submissions (usable, or qualified and
+/// on its way to usable) and whose temporal interval holds the expiry.
+fn ct_logs_for_expiry(list: &CtLogList, not_after: i64) -> Vec<String> {
+    list.operators
+        .iter()
+        .filter_map(|operator| {
+            operator.logs.iter().find(|log| {
+                let accepting =
+                    log.state.contains_key("usable") || log.state.contains_key("qualified");
+                let holds_expiry = log.temporal_interval.as_ref().is_none_or(|interval| {
+                    interval.start_inclusive.timestamp() <= not_after
+                        && not_after < interval.end_exclusive.timestamp()
+                });
+                accepting && holds_expiry
+            })
+        })
+        .map(|log| log.url.clone())
+        .collect()
 }
 
 /// Extract base64-encoded DER blocks from one or more PEM certificate strings.
@@ -1363,6 +1824,195 @@ mod tests {
         let (cert, key) = service.get_cert_paths("../etc/cron.d/evil");
         assert_eq!(cert, PathBuf::from("/etc/certs/invalid-domain.crt"));
         assert_eq!(key, PathBuf::from("/etc/certs/invalid-domain.key"));
+    }
+
+    /// Without the CA's window: 30 days early for a 90-day certificate, a
+    /// third of the lifetime early for a 160-hour one, never later than
+    /// renewal_days before expiry.
+    #[test]
+    fn a_certificate_renews_by_its_lifetime_without_ari() {
+        let day = 86_400;
+        assert_eq!(lifetime_renewal_at(0, 90 * day, 30), 60 * day);
+        let hours_160 = 160 * 3600;
+        assert_eq!(
+            lifetime_renewal_at(0, hours_160, 30),
+            hours_160 - hours_160 / 3
+        );
+        assert_eq!(lifetime_renewal_at(0, 90 * day, 1), 89 * day);
+        // A malformed validity (not_after first) renews at expiry
+        assert_eq!(lifetime_renewal_at(10, 5, 30), 5);
+    }
+
+    /// The point is inside the window, the same for the same serial, and
+    /// different serials spread over it.
+    #[test]
+    fn the_renewal_point_falls_in_the_window() {
+        let (start, end) = (1_000_000, 1_086_400);
+        let mut points = HashSet::new();
+        for serial in 0u32..64 {
+            let at = point_in_window(start, end, &serial.to_be_bytes());
+            assert!((start..end).contains(&at), "{at}");
+            assert_eq!(at, point_in_window(start, end, &serial.to_be_bytes()));
+            points.insert(at);
+        }
+        assert!(points.len() > 60, "spread: {} distinct of 64", points.len());
+        assert_eq!(point_in_window(start, start, b"x"), start);
+        assert_eq!(point_in_window(end, start, b"x"), end);
+    }
+
+    /// The next check comes at the interval, or sooner for a renewal point
+    /// inside it; a point already past is checked at once.
+    #[test]
+    fn a_renewal_inside_the_interval_brings_the_check_forward() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let interval = Duration::from_hours(12);
+        assert_eq!(next_check_wait(interval, None, now), interval);
+        let soon = now + Duration::from_hours(1);
+        assert_eq!(
+            next_check_wait(interval, Some(soon), now),
+            Duration::from_hours(1)
+        );
+        let later = now + Duration::from_hours(48);
+        assert_eq!(next_check_wait(interval, Some(later), now), interval);
+        let past = now - Duration::from_mins(1);
+        assert_eq!(next_check_wait(interval, Some(past), now), Duration::ZERO);
+    }
+
+    /// A certificate's names and addresses are read back, and it covers a
+    /// configuration only when the addresses match exactly.
+    #[test]
+    fn an_issued_certificate_covers_its_domain_and_exactly_its_addresses() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("ns1.example.com.crt");
+        let cert = rcgen::generate_simple_self_signed(vec![
+            "ns1.example.com".to_string(),
+            "1.1.1.1".to_string(),
+            "2606:4700:4700::1111".to_string(),
+        ])
+        .expect("self-signed");
+        fs::write(&path, cert.cert.pem()).expect("write");
+        let issued = IssuedCertificate::read(&path).expect("read");
+        assert_eq!(issued.dns_names, vec!["ns1.example.com"]);
+        let v4: IpAddr = "1.1.1.1".parse().unwrap();
+        let v6: IpAddr = "2606:4700:4700::1111".parse().unwrap();
+        assert_eq!(issued.ip_addresses, vec![v4, v6]);
+        assert!(issued.not_after > issued.not_before);
+        assert_ne!(issued.serial, Vec::<u8>::new());
+
+        assert!(issued.covers("ns1.example.com", &[v6, v4]));
+        assert!(issued.covers("NS1.example.com", &[v4, v6, v4]));
+        assert!(
+            !issued.covers("ns1.example.com", &[v4]),
+            "an address taken out"
+        );
+        let extra: IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(
+            !issued.covers("ns1.example.com", &[v4, v6, extra]),
+            "one added"
+        );
+        assert!(!issued.covers("ns2.example.com", &[v4, v6]), "another name");
+
+        let plain = rcgen::generate_simple_self_signed(vec!["www.example.com".to_string()])
+            .expect("self-signed");
+        let plain_path = dir.path().join("www.example.com.crt");
+        fs::write(&plain_path, plain.cert.pem()).expect("write");
+        let plain = IssuedCertificate::read(&plain_path).expect("read");
+        assert!(plain.covers("www.example.com", &[]));
+        assert!(
+            !plain.covers("www.example.com", &[v4]),
+            "addresses configured since"
+        );
+    }
+
+    /// An order with addresses carries them as IP identifiers under the
+    /// profile, and names the certificate it replaces.
+    #[cfg(feature = "acme")]
+    #[test]
+    fn an_order_carries_the_addresses_profile_and_replaced_certificate() {
+        let identifiers = vec![
+            Identifier::Dns("ns1.example.com".to_string()),
+            Identifier::Ip("1.1.1.1".parse().unwrap()),
+            Identifier::Ip("2606:4700:4700::1111".parse().unwrap()),
+        ];
+        let replaced = CertificateIdentifier::new(
+            rustls::pki_types::Der::from_slice(&[1, 2, 3]),
+            rustls::pki_types::Der::from_slice(&[4, 5]),
+        );
+        let order =
+            serde_json::to_value(new_order(&identifiers, Some("shortlived"), Some(replaced)))
+                .expect("serialize");
+        assert_eq!(
+            order,
+            serde_json::json!({
+                "identifiers": [
+                    {"type": "dns", "value": "ns1.example.com"},
+                    {"type": "ip", "value": "1.1.1.1"},
+                    {"type": "ip", "value": "2606:4700:4700::1111"},
+                ],
+                "profile": "shortlived",
+                "replaces": "AQID.BAU",
+            })
+        );
+        let plain = serde_json::to_value(new_order(&identifiers[..1], None, None)).unwrap();
+        assert_eq!(
+            plain,
+            serde_json::json!({"identifiers": [{"type": "dns", "value": "ns1.example.com"}]})
+        );
+    }
+
+    /// From the log list: per operator, the first log that accepts
+    /// submissions and whose shard holds the expiry; read-only, retired and
+    /// other shards are passed over, and tiled logs are not read.
+    #[test]
+    fn ct_logs_are_chosen_for_the_certificate_expiry() {
+        let list: CtLogList = serde_json::from_value(serde_json::json!({
+            "version": "1",
+            "operators": [
+                {
+                    "name": "A",
+                    "logs": [
+                        {"url": "https://a/2025h1/", "state": {"retired": {}},
+                         "temporal_interval": {"start_inclusive": "2025-01-01T00:00:00Z", "end_exclusive": "2025-07-01T00:00:00Z"}},
+                        {"url": "https://a/2026h2/", "state": {"usable": {}},
+                         "temporal_interval": {"start_inclusive": "2026-07-01T00:00:00Z", "end_exclusive": "2027-01-01T00:00:00Z"}},
+                        {"url": "https://a/2027h1/", "state": {"usable": {}},
+                         "temporal_interval": {"start_inclusive": "2027-01-01T00:00:00Z", "end_exclusive": "2027-07-01T00:00:00Z"}}
+                    ],
+                    "tiled_logs": [{"submission_url": "https://a/tiled/", "state": {"usable": {}}}]
+                },
+                {
+                    "name": "B",
+                    "logs": [
+                        {"url": "https://b/readonly/", "state": {"readonly": {}},
+                         "temporal_interval": {"start_inclusive": "2026-01-01T00:00:00Z", "end_exclusive": "2027-01-01T00:00:00Z"}},
+                        {"url": "https://b/qualified/", "state": {"qualified": {}},
+                         "temporal_interval": {"start_inclusive": "2026-01-01T00:00:00Z", "end_exclusive": "2027-01-01T00:00:00Z"}}
+                    ]
+                },
+                {"name": "C", "logs": [{"url": "https://c/any/", "state": {"usable": {}}}]},
+                {"name": "D", "logs": []}
+            ]
+        }))
+        .expect("log list");
+        let nov_2026 = chrono::DateTime::parse_from_rfc3339("2026-11-01T00:00:00Z")
+            .unwrap()
+            .timestamp();
+        assert_eq!(
+            ct_logs_for_expiry(&list, nov_2026),
+            vec![
+                "https://a/2026h2/",
+                "https://b/qualified/",
+                "https://c/any/"
+            ]
+        );
+        let jan_2027 = chrono::DateTime::parse_from_rfc3339("2027-01-01T00:00:00Z")
+            .unwrap()
+            .timestamp();
+        assert_eq!(
+            ct_logs_for_expiry(&list, jan_2027),
+            vec!["https://a/2027h1/", "https://c/any/"],
+            "end_exclusive: 2027-01-01 belongs to the next shard"
+        );
     }
 
     #[test]
