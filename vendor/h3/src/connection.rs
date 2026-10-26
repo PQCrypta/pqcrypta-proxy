@@ -1556,13 +1556,18 @@ where
                 conn_state: self.conn_state.clone(),
                 max_field_section_size: 0,
                 send_grease_frame: self.send_grease_frame,
+                content_length: None,
+                data_received: 0,
             },
+            // The body is read on this half, so the count goes with it
             RequestStream {
                 stream: recv,
                 trailers: self.trailers,
                 conn_state: self.conn_state,
                 max_field_section_size: self.max_field_section_size,
                 send_grease_frame: self.send_grease_frame,
+                content_length: self.content_length,
+                data_received: self.data_received,
             },
         )
     }

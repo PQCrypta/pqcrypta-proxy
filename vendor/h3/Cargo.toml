@@ -144,4 +144,3 @@ default-features = false
 # the fork is a dependency of the proxy, whose own patches apply.
 [patch.crates-io]
 rustls = { path = "../rustls-fixed/rustls" }
-ml-kem = { path = "../ml-kem" }
