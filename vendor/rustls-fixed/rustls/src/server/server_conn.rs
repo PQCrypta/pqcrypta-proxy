@@ -1444,6 +1444,10 @@ pub struct ServerConnectionData {
     pub(super) resumption_data: Vec<u8>,
     pub(super) early_data: EarlyDataState,
     pub(super) ech_status: super::ech::EchStatus,
+    /// The HPKE context of an ECH offer the first ClientHello carried and the
+    /// server accepted, kept until a HelloRetryRequest's second ClientHello
+    /// is opened with it, or the handshake goes on without one.
+    pub(super) ech_retry: Option<super::ech::EchRetryContext>,
     /// The ClientHello exactly as it arrived on the wire (handshake header
     /// included, record layer not — QUIC has no record layer).
     ///

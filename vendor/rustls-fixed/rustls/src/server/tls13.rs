@@ -243,12 +243,22 @@ mod client_hello {
                     ));
                 }
 
+                // An accepted ECH offer is confirmed in the HelloRetryRequest
+                // too (RFC 9849 section 7.2.1), or the client reads it as
+                // rejected
+                let ech_inner_random = match cx.data.ech_status {
+                    crate::server::ech::EchStatus::Accepted {
+                        client_hello_inner_random,
+                    } => Some(client_hello_inner_random),
+                    _ => None,
+                };
                 emit_hello_retry_request(
                     &mut self.transcript,
                     self.suite,
                     client_hello.session_id,
                     cx.common,
                     selected_kxg.name(),
+                    ech_inner_random,
                 );
                 emit_fake_ccs(cx.common);
 
@@ -280,6 +290,10 @@ mod client_hello {
                     Ok(next)
                 };
             };
+
+            // Answered with a ServerHello: no second ClientHello will need the
+            // ECH offer's HPKE context
+            cx.data.ech_retry = None;
 
             let mut chosen_psk_index = None;
             let mut resumedata = None;
@@ -595,9 +609,7 @@ mod client_hello {
             // `supported_groups` in EncryptedExtensions, not on the key_share.
             // A GREASE value here would be a group the client never offered,
             // which §4.1.3 makes illegal and every correct client rejects.
-            Some(KeyShareImpairment::GreaseGroup(_)) => {
-                KeyShareEntry::new(ckx.group, ckx.pub_key)
-            }
+            Some(KeyShareImpairment::GreaseGroup(_)) => KeyShareEntry::new(ckx.group, ckx.pub_key),
         };
 
         let extensions = Box::new(ServerExtensions {
@@ -665,13 +677,10 @@ mod client_hello {
                 unreachable!("sh is always constructed as a Handshake message above");
             };
             let mut zeroed_encoding = encoded.bytes().to_vec();
-            zeroed_encoding[crate::msgs::handshake::SERVER_HELLO_ECH_CONFIRMATION_SPAN]
-                .fill(0x00);
+            zeroed_encoding[crate::msgs::handshake::SERVER_HELLO_ECH_CONFIRMATION_SPAN].fill(0x00);
             let confirmation_hash = transcript.hash_given(&zeroed_encoding);
-            let confirmation = key_schedule.server_ech_confirmation_secret(
-                &client_hello_inner_random,
-                confirmation_hash,
-            );
+            let confirmation = key_schedule
+                .server_ech_confirmation_secret(&client_hello_inner_random, confirmation_hash);
 
             let HandshakePayload::ServerHello(server_hello) = &mut parsed.0 else {
                 unreachable!("sh is always constructed as a ServerHello message above");
@@ -715,8 +724,9 @@ mod client_hello {
         session_id: SessionId,
         common: &mut CommonState,
         group: NamedGroup,
+        ech_inner_random: Option<[u8; 32]>,
     ) {
-        let req = HelloRetryRequest {
+        let mut req = HelloRetryRequest {
             legacy_version: ProtocolVersion::TLSv1_2,
             session_id,
             cipher_suite: suite.common.suite,
@@ -726,6 +736,36 @@ mod client_hello {
                 ..Default::default()
             },
         };
+
+        // hrr_accept_confirmation (RFC 9849 section 7.2.1): HKDF-Expand-Label
+        // of ClientHelloInner1's random over the transcript of the inner
+        // hello, rolled up, and this HelloRetryRequest with the confirmation
+        // zeroed, which is how the client checks it
+        if let Some(inner_random) = ech_inner_random {
+            req.extensions.encrypted_client_hello = Some(Payload::new(vec![0u8; 8]));
+            let parsed = HandshakeMessagePayload(HandshakePayload::HelloRetryRequest(req.clone()));
+            let mut zeroed = Vec::new();
+            parsed.payload_encode(
+                &mut zeroed,
+                crate::msgs::handshake::Encoding::EchConfirmation,
+            );
+            let zeroed_message = Message {
+                version: ProtocolVersion::TLSv1_3,
+                payload: MessagePayload::Handshake {
+                    encoded: Payload::new(zeroed),
+                    parsed,
+                },
+            };
+            let mut confirmation_transcript = transcript.clone();
+            confirmation_transcript.rollup_for_hrr();
+            confirmation_transcript.add_message(&zeroed_message);
+            let confirmation = crate::tls13::key_schedule::server_ech_hrr_confirmation_secret(
+                suite.hkdf_provider,
+                &inner_random,
+                confirmation_transcript.current_hash(),
+            );
+            req.extensions.encrypted_client_hello = Some(Payload::new(confirmation.to_vec()));
+        }
 
         let m = Message {
             version: ProtocolVersion::TLSv1_2,
@@ -845,11 +885,10 @@ mod client_hello {
         if let (crate::server::ech::EchStatus::Rejected, Some(ech_configs)) =
             (cx.data.ech_status, &config.ech)
         {
-            ep.extensions.encrypted_client_hello_ack = Some(
-                crate::msgs::handshake::ServerEncryptedClientHello {
+            ep.extensions.encrypted_client_hello_ack =
+                Some(crate::msgs::handshake::ServerEncryptedClientHello {
                     retry_configs: ech_configs.retry_configs(),
-                },
-            );
+                });
         }
 
         // The conformance suite's `t-grease-group`, and the only thing in this

@@ -249,6 +249,15 @@ pub enum PeerMisbehaved {
     EarlyDataExtensionWithoutResumption,
     EarlyDataOfferedWithVariedCipherSuite,
     EchAcceptanceVariedAfterRetry,
+    /// The second ClientHello of an accepted ECH handshake has no
+    /// `encrypted_client_hello` extension (RFC 9849 section 7.1.1).
+    EchMissingInSecondClientHello,
+    /// The second ClientHello's ECH offer names another config or suite, or
+    /// carries an `enc` (RFC 9849 section 7.1.1).
+    EchVariedInSecondClientHello,
+    /// The second ClientHello's ECH payload did not open with the first's
+    /// HPKE context (RFC 9849 section 7.1.1).
+    EchUndecryptableInSecondClientHello,
     HandshakeHashVariedAfterRetry,
     IllegalHelloRetryRequestWithEmptyCookie,
     IllegalHelloRetryRequestWithNoChanges,
