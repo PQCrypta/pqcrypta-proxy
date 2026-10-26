@@ -136,13 +136,13 @@ optional = true
 default-features = false
 
 [dependencies.brotli]
-version = "8"
+version = "9"
 features = ["std"]
 optional = true
 default-features = false
 
 [dependencies.brotli-decompressor]
-version = "5.0.0"
+version = "6.2.0"
 optional = true
 
 [dependencies.hashbrown]
