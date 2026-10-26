@@ -51,12 +51,10 @@ mod webtransport;
 
 #[allow(dead_code)]
 mod qpack;
-// VENDORED FORK: this module is `#[path]`-included from a sibling `h3-quinn`
-// crate that only exists in upstream's workspace, so it cannot compile from a
-// vendored copy. Gated off behind a feature that is never enabled here, which
-// keeps the source intact for diffing against upstream while letting the
-// crate's own unit tests -- including the qpack ones this fork changes -- run.
-#[cfg(all(test, feature = "upstream-integration-tests"))]
+// VENDORED FORK: the integration tests run over noq, the proxy's QUIC stack,
+// through the vendored h3-noq adapter, which `tests/mod.rs` includes by path
+// where upstream includes h3-quinn.
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 extern crate self as h3;

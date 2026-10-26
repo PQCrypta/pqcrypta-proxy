@@ -41,8 +41,6 @@ license = "MIT"
 repository = "https://github.com/hyperium/h3"
 
 [features]
-# Never enabled: see the gate on `mod tests` in lib.rs.
-upstream-integration-tests = []
 i-implement-a-third-party-backend-and-opt-into-breaking-changes = []
 tracing = ["dep:tracing"]
 
