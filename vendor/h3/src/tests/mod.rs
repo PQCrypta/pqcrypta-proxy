@@ -5,7 +5,7 @@
 // Having a dev-dependency on h3_quinn would work as far as cargo is
 // concerned, but quic traits wouldn't match between the "h3" crate that
 // comes before h3_quinn and the one that comes after and runs the tests
-#[path = "../../../h3-quinn/src/lib.rs"]
+#[path = "../../../h3-noq/src/lib.rs"]
 mod h3_quinn;
 
 mod connection;
@@ -20,11 +20,11 @@ use std::{
 
 use bytes::{Buf, Bytes};
 use http::Request;
-use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+use noq::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::quic;
-use h3_quinn::{quinn::TransportConfig, Connection};
+use h3_quinn::{noq::TransportConfig, Connection};
 
 pub fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -86,12 +86,12 @@ impl Pair {
         crypto.max_early_data_size = u32::MAX;
         crypto.alpn_protocols = vec![b"h3".to_vec()];
 
-        let mut server_config = h3_quinn::quinn::ServerConfig::with_crypto(Arc::new(
+        let mut server_config = h3_quinn::noq::ServerConfig::with_crypto(Arc::new(
             QuicServerConfig::try_from(crypto).unwrap(),
         ));
         server_config.transport = self.config.clone();
         let endpoint =
-            h3_quinn::quinn::Endpoint::server(server_config, "[::]:0".parse().unwrap()).unwrap();
+            h3_quinn::noq::Endpoint::server(server_config, "[::]:0".parse().unwrap()).unwrap();
 
         self.port = endpoint.local_addr().unwrap().port();
 
@@ -103,7 +103,7 @@ impl Pair {
         Server { endpoint }
     }
 
-    pub async fn client_inner(&self) -> quinn::Connection {
+    pub async fn client_inner(&self) -> noq::Connection {
         let addr = (Ipv6Addr::LOCALHOST, self.port)
             .to_socket_addrs()
             .unwrap()
@@ -122,12 +122,11 @@ impl Pair {
         crypto.enable_early_data = true;
         crypto.alpn_protocols = vec![b"h3".to_vec()];
 
-        let client_config = h3_quinn::quinn::ClientConfig::new(Arc::new(
-            QuicClientConfig::try_from(crypto).unwrap(),
-        ));
+        let client_config =
+            h3_quinn::noq::ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto).unwrap()));
 
         let mut client_endpoint =
-            h3_quinn::quinn::Endpoint::client("[::]:0".parse().unwrap()).unwrap();
+            h3_quinn::noq::Endpoint::client("[::]:0".parse().unwrap()).unwrap();
         client_endpoint.set_default_client_config(client_config);
         client_endpoint
             .connect(addr, "localhost")
