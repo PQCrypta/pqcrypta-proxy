@@ -214,6 +214,13 @@ where
         }
         self.accepts_since_aux = 0;
 
+        // The control stream first: polling it is what accepts the peer's
+        // unidirectional streams, so a QPACK stream that arrives now -- its
+        // first instructions often in the same packet as its type -- is read
+        // on this poll. Read before it, a stream accepted after waited for an
+        // unrelated wakeup, and an Insert Count Increment of zero or a Section
+        // Acknowledgment for nothing went unanswered until a request came.
+        let _ = self.poll_control(cx)?;
         if let Poll::Ready(err) = self.inner.poll_qpack_encoder(cx) {
             return Poll::Ready(Err(err));
         }
@@ -222,7 +229,6 @@ where
         }
         self.inner.poll_qpack_decoder_send(cx);
 
-        let _ = self.poll_control(cx)?;
         loop {
             let conn = self.inner.poll_accept_bi(cx)?;
             return match conn {

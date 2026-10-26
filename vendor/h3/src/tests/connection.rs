@@ -392,12 +392,9 @@ async fn client_error_on_bidi_recv() {
         let (mut send, _recv) = connection.open_bi().await.unwrap();
         for _ in 0..100 {
             match send.write(b"I'm not really a server").await {
-                Err(noq::WriteError::ConnectionLost(
-                    noq::ConnectionError::ApplicationClosed(noq::ApplicationClose {
-                        error_code,
-                        ..
-                    }),
-                )) if Code::H3_STREAM_CREATION_ERROR == error_code.into_inner() => return,
+                Err(noq::WriteError::ConnectionLost(noq::ConnectionError::ApplicationClosed(
+                    noq::ApplicationClose { error_code, .. },
+                ))) if Code::H3_STREAM_CREATION_ERROR == error_code.into_inner() => return,
                 Err(e) => panic!("got err: {}", e),
                 Ok(_) => (),
             }
@@ -484,8 +481,7 @@ async fn control_close_send_error() {
 
         let err_code = match connection_error {
             noq::ConnectionError::ApplicationClosed(noq::ApplicationClose {
-                error_code,
-                ..
+                error_code, ..
             }) => error_code.into_inner(),
             e => panic!("unexpected error: {:?}", e),
         };

@@ -122,9 +122,8 @@ impl Pair {
         crypto.enable_early_data = true;
         crypto.alpn_protocols = vec![b"h3".to_vec()];
 
-        let client_config = h3_quinn::noq::ClientConfig::new(Arc::new(
-            QuicClientConfig::try_from(crypto).unwrap(),
-        ));
+        let client_config =
+            h3_quinn::noq::ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto).unwrap()));
 
         let mut client_endpoint =
             h3_quinn::noq::Endpoint::client("[::]:0".parse().unwrap()).unwrap();
