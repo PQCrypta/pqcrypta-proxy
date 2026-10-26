@@ -612,6 +612,7 @@ impl PathData {
         let metrics = self.congestion.metrics();
         self.pacing.delay(
             smoothed_rtt,
+            self.rtt.has_sample(),
             bytes_to_send,
             self.current_mtu(),
             metrics.congestion_window,
@@ -809,6 +810,11 @@ impl RttEstimator {
     /// The current best RTT estimation.
     pub fn get(&self) -> Duration {
         self.smoothed.unwrap_or(self.latest)
+    }
+
+    /// Whether an RTT has been measured, or [`Self::get`] is still the initial RTT
+    pub(crate) fn has_sample(&self) -> bool {
+        self.smoothed.is_some()
     }
 
     /// Conservative estimate of RTT

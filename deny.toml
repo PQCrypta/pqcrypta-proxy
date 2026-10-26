@@ -5,9 +5,7 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # "vulnerability", "notice" keys removed in cargo-deny 0.16+
 unmaintained = "workspace"
 yanked = "warn"
-ignore = [
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile deprecated but not a vulnerability; upstream recommends rustls-pki-types which is already in use" },
-]
+ignore = []
 
 [licenses]
 # "version", "unlicensed", "copyleft" keys removed in cargo-deny 0.16+
@@ -51,9 +49,6 @@ skip = [
     { name = "getrandom", reason = "multiple versions due to rand/crypto crate ecosystem transition" },
     # bitflags — 1.x → 2.x migration ongoing; many crates still on 1.x
     { name = "bitflags", reason = "1.3 retained by notify/kqueue; 2.x used by majority; migration tracked" },
-    # brotli — main crate and decompressor sub-crate both have version splits
-    { name = "brotli", reason = "7.x and 8.x due to async-compression version pinning" },
-    { name = "brotli-decompressor", reason = "version-mirrors brotli; same async-compression pin as parent" },
     # hashbrown — std uses 0.14 internally; external crates use 0.15
     { name = "hashbrown", reason = "0.14 used by std/indexmap internals; 0.15 used by direct crates" },
     # thiserror — 1.x → 2.x migration; older transitive crates not yet updated
