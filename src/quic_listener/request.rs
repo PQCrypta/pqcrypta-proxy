@@ -1280,10 +1280,7 @@ impl QuicListener {
                         0,
                         Some(&path),
                     );
-                    if let Ok(response) = http::Response::builder()
-                        .status(status)
-                        .body(())
-                    {
+                    if let Ok(response) = http::Response::builder().status(status).body(()) {
                         let _ = stream.send_response(response).await;
                         let _ = stream.finish().await;
                     }
