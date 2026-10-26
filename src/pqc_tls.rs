@@ -624,8 +624,15 @@ impl PqcTlsProvider {
             }
         }
 
-        // Classical fallback: P-384 only (secp384r1, 192-bit = 100% SSL Labs score).
-        // P-256 and X25519 are excluded — both 128-bit, both score 90% on SSL Labs.
+        // Classical fallback: P-384, then P-256 in a tuple of its own. A client
+        // that supports P-384 gets it, asked with a HelloRetryRequest when its
+        // key share is for P-256 (SSL Labs' client: 192-bit, 100%, not P-256's
+        // 90%). One whose only classical group is P-256, the group RFC 8446
+        // section 9.1 makes every TLS 1.3 implementation support (picotls's QUIC
+        // offers nothing else classical), still connects, as it does over QUIC:
+        // both transports take the same groups in the same order, so a DNS
+        // HTTPS record's tls-supported-groups can state one list for both.
+        // X25519 is offered on no listener (128-bit, 90%).
         //
         // require_hybrid wins over fallback_to_classical: offering P-384 is what
         // lets a client with no PQC support complete a handshake, so leaving it
@@ -648,6 +655,7 @@ impl PqcTlsProvider {
 
         if config.fallback_to_classical && !config.require_hybrid {
             tuples.push("P-384".to_string());
+            tuples.push("P-256".to_string());
         } else {
             // Warn whichever setting caused it. `require_hybrid` used to warn and
             // `fallback_to_classical = false` did not, so the more obscure of the
@@ -1340,12 +1348,12 @@ pub mod openssl_pqc {
     /// Apply PQC group list and 256-bit-only TLS 1.3 cipher restriction to an SslContextBuilder.
     ///
     /// Named groups: post-quantum tuples by NIST level (ML-KEM-1024, then ML-KEM-768), then
-    /// P-384 (secp384r1, 192-bit = 100% key exchange); see `build_groups_string`.
-    /// P-256 (secp256r1) is intentionally excluded: if it were present SSL Labs' test client
-    /// (which sends a secp256r1 key_share) would negotiate secp256r1 (128-bit = 90%) instead of
-    /// being sent HelloRetryRequest for secp384r1. All TLS 1.3 clients that support secp256r1
-    /// also support secp384r1, so removing secp256r1 only adds one HRR round-trip.
-    /// X25519 is also excluded for the same 128-bit reason.
+    /// P-384 (secp384r1, 192-bit = 100% key exchange), then P-256 in a tuple of its own; see
+    /// `build_groups_string`. OpenSSL takes the first tuple holding a group the client supports,
+    /// so SSL Labs' test client (a secp256r1 key_share, secp384r1 listed) is sent a
+    /// HelloRetryRequest for secp384r1 rather than negotiating secp256r1 (128-bit = 90%), while a
+    /// client whose only classical group is secp256r1 (RFC 8446's must-support group) connects.
+    /// X25519 is excluded (128-bit, 90%).
     ///
     /// Cipher suites: TLS_AES_256_GCM_SHA384 + TLS_CHACHA20_POLY1305_SHA256 only.
     /// TLS_AES_128_GCM_SHA256 is excluded (128-bit → 90% SSL Labs cipher strength score).
@@ -1363,8 +1371,9 @@ pub mod openssl_pqc {
         // accepts it, so a group the probe binary knows and the library does
         // not is dropped rather than failing the whole list -- and no fallback
         // can quietly put back a classical group require_hybrid removed.
-        // X25519 and P-256 are never offered here (128-bit; 90% on SSL Labs).
-        // The list comes in tuples ("/"); see `build_groups_string`.
+        // X25519 is never offered here (128-bit; 90% on SSL Labs), and P-256
+        // only after P-384, in a tuple of its own. The list comes in tuples
+        // ("/"); see `build_groups_string`.
         let configured = pqc_provider.groups_string();
         let mut accepted: Vec<String> = Vec::new();
         if pqc_provider.is_available() && !configured.is_empty() {
@@ -1386,7 +1395,7 @@ pub mod openssl_pqc {
             }
         }
         let groups = if accepted.is_empty() {
-            "P-384".to_string()
+            "P-384/P-256".to_string()
         } else {
             accepted.join("/")
         };
@@ -1626,7 +1635,8 @@ mod tests {
     }
 
     /// Post-quantum tuples by NIST level, hybrids first, the classical
-    /// fallback last: a client that lists P-384 first still gets ML-KEM.
+    /// fallback last, P-384 ahead of P-256: a client that lists P-384 first
+    /// still gets ML-KEM, and one with P-256 alone still connects.
     #[test]
     fn groups_come_in_tuples_strongest_first() {
         let all: Vec<String> = [
@@ -1650,7 +1660,7 @@ mod tests {
         );
         assert_eq!(
             groups,
-            "MLKEM1024:SecP384r1MLKEM1024/X25519MLKEM768:SecP256r1MLKEM768:MLKEM768/P-384"
+            "MLKEM1024:SecP384r1MLKEM1024/X25519MLKEM768:SecP256r1MLKEM768:MLKEM768/P-384/P-256"
         );
 
         // require_hybrid: no pure ML-KEM and no classical tuple
@@ -1691,7 +1701,7 @@ mod tests {
         assert_eq!(
             PqcTlsProvider::build_groups_string(&config, &all, x25519),
             "MLKEM1024:SecP384r1MLKEM1024/X25519MLKEM768:SecP256r1MLKEM768:MLKEM768/\
-             frodo1344shake:p384_frodo976shake/P-384"
+             frodo1344shake:p384_frodo976shake/P-384/P-256"
         );
         let hybrid_only = PqcConfig {
             require_hybrid: true,

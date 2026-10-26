@@ -1812,10 +1812,11 @@ fn is_hybrid_group(group: rustls::NamedGroup) -> bool {
 /// - The classical fallback stays unless `require_hybrid` is set or
 ///   `fallback_to_classical` is false.
 ///
-/// Classical means secp384r1 and secp256r1. X25519 is not offered on any
-/// listener. secp256r1 is kept here although the OpenSSL listener refuses it:
-/// RFC 8446 makes it the one group every TLS 1.3 implementation must support,
-/// and QUIC stacks such as picotls offer nothing else classical.
+/// Classical means secp384r1 and secp256r1, as on the OpenSSL listener (P-384,
+/// then P-256 in a tuple of its own), so both transports take the same groups
+/// in the same order. X25519 is not offered on any listener. secp256r1 is
+/// RFC 8446's one group every TLS 1.3 implementation must support, and QUIC
+/// stacks such as picotls offer nothing else classical.
 ///
 /// Before this read `[pqc]` at all, `preferred_kem`, `require_hybrid` and
 /// `fallback_to_classical` shaped a group list the OpenSSL listener logged and

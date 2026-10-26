@@ -1652,7 +1652,7 @@ pub struct PqcConfig {
     pub openssl_lib_path: Option<PathBuf>,
     /// Preferred KEM algorithm for key exchange
     pub preferred_kem: String,
-    /// Offer a classical key-exchange group (P-384) alongside the hybrid PQC
+    /// Offer the classical key-exchange groups (P-384, then P-256) after the hybrid PQC
     /// groups, so a client with no ML-KEM support can still complete a
     /// handshake. This is a CLIENT COMPATIBILITY switch, not a statement about
     /// our own posture: with it off, such clients cannot connect at all.
