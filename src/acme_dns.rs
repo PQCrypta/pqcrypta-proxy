@@ -772,7 +772,7 @@ mod tests {
         let tsig = parsed.additional[0];
         assert_eq!(tsig.rtype, TYPE_TSIG);
         // MAC input recomputed by hand: message, then the variables
-        let mut input = msg.clone();
+        let mut input = msg;
         input.extend(b"\x09acme-test\x00\x00\xff\x00\x00\x00\x00\x0bhmac-sha256\x00");
         input.extend(&time.to_be_bytes()[2..]);
         input.extend(b"\x01\x2c\x00\x00\x00\x00");
