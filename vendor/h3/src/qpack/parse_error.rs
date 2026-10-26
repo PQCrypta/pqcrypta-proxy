@@ -6,6 +6,9 @@ pub enum ParseError {
     String(prefix_string::Error),
     InvalidPrefix(u8),
     InvalidBase(isize),
+    /// An Encoded Insert Count no conformant encoder can produce (RFC 9204
+    /// section 4.5.1.1)
+    InvalidInsertCount(usize),
 }
 
 impl From<prefix_int::Error> for ParseError {

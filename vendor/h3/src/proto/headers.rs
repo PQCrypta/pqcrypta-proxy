@@ -91,6 +91,17 @@ impl Header {
     pub fn into_request_parts(
         self,
     ) -> Result<(Method, Uri, Option<Protocol>, HeaderMap), HeaderError> {
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+        //# Pseudo-header fields defined for requests MUST NOT appear
+        //# in responses; pseudo-header fields defined for responses MUST NOT
+        //# appear in requests.
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+        //# Endpoints MUST treat a request or response that contains undefined or
+        //# invalid pseudo-header fields as malformed.
+        if self.pseudo.status.is_some() {
+            return Err(HeaderError::MisplacedPseudoHeader(":status"));
+        }
         let mut uri = Uri::builder();
 
         if let Some(path) = self.pseudo.path {
@@ -137,6 +148,18 @@ impl Header {
     }
 
     pub fn into_response_parts(self) -> Result<(StatusCode, HeaderMap), HeaderError> {
+        // The request pseudo-header fields, in a response (section 4.3)
+        for (present, name) in [
+            (self.pseudo.method.is_some(), ":method"),
+            (self.pseudo.scheme.is_some(), ":scheme"),
+            (self.pseudo.authority.is_some(), ":authority"),
+            (self.pseudo.path.is_some(), ":path"),
+            (self.pseudo.protocol.is_some(), ":protocol"),
+        ] {
+            if present {
+                return Err(HeaderError::MisplacedPseudoHeader(name));
+            }
+        }
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.2
         //= type=implication
         //# For responses, a single ":status" pseudo-header field is defined that
@@ -239,37 +262,65 @@ impl TryFrom<Vec<HeaderField>> for Header {
         let mut fields = HeaderMap::with_capacity(headers.len());
         let mut pseudo = Pseudo::default();
 
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+        //# All pseudo-header fields MUST appear in the header section before
+        //# regular header fields.  Any request or response that contains a
+        //# pseudo-header field that appears in a header section after a regular
+        //# header field MUST be treated as malformed.
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+        //# All HTTP/3 requests MUST include exactly one value for the :method,
+        //# :scheme, and :path pseudo-header fields, unless the request is a
+        //# CONNECT request; see Section 4.4.
+        //
+        // A pseudo-header given twice, or after a regular field, was taken:
+        // the later value replaced the earlier one and the request went on.
+        fn once<T>(slot: &mut Option<T>, value: T, name: &'static str) -> Result<(), HeaderError> {
+            if slot.replace(value).is_some() {
+                return Err(HeaderError::RepeatedPseudoHeader(name));
+            }
+            Ok(())
+        }
         for field in headers.into_iter() {
             let (name, value) = field.into_inner();
-            match Field::parse(name, value)? {
-                Field::Method(m) => {
-                    pseudo.method = Some(m);
-                    pseudo.len += 1;
-                }
-                Field::Scheme(s) => {
-                    pseudo.scheme = Some(s);
-                    pseudo.len += 1;
-                }
-                Field::Authority(a) => {
-                    pseudo.authority = Some(a);
-                    pseudo.len += 1;
-                }
-                Field::Path(p) => {
-                    pseudo.path = Some(p);
-                    pseudo.len += 1;
-                }
-                Field::Status(s) => {
-                    pseudo.status = Some(s);
-                    pseudo.len += 1;
-                }
+            let field = Field::parse(name, value)?;
+            if !matches!(field, Field::Header(_)) && !fields.is_empty() {
+                return Err(HeaderError::PseudoHeaderAfterField);
+            }
+            match field {
+                Field::Method(m) => once(&mut pseudo.method, m, ":method")?,
+                Field::Scheme(s) => once(&mut pseudo.scheme, s, ":scheme")?,
+                Field::Authority(a) => once(&mut pseudo.authority, a, ":authority")?,
+                Field::Path(p) => once(&mut pseudo.path, p, ":path")?,
+                Field::Status(s) => once(&mut pseudo.status, s, ":status")?,
+                Field::Protocol(p) => once(&mut pseudo.protocol, p, ":protocol")?,
                 Field::Header((n, v)) => {
+                    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2
+                    //# An endpoint MUST NOT generate an HTTP/3 field section containing
+                    //# connection-specific fields; any message containing connection-
+                    //# specific fields MUST be treated as malformed.
+                    //
+                    //# The only exception to this is the TE header field, which MAY be
+                    //# present in an HTTP/3 request header; when it is, it MUST NOT
+                    //# contain any value other than "trailers".
+                    let connection_specific = [
+                        http::header::CONNECTION,
+                        HeaderName::from_static("keep-alive"),
+                        HeaderName::from_static("proxy-connection"),
+                        http::header::TRANSFER_ENCODING,
+                        http::header::UPGRADE,
+                    ]
+                    .contains(&n)
+                        || (n == http::header::TE
+                            && !v.as_bytes().eq_ignore_ascii_case(b"trailers"));
+                    if connection_specific {
+                        return Err(HeaderError::ConnectionSpecificField(n.to_string()));
+                    }
                     fields.append(n, v);
-                }
-                Field::Protocol(p) => {
-                    pseudo.protocol = Some(p);
-                    pseudo.len += 1;
+                    continue;
                 }
             }
+            pseudo.len += 1;
         }
 
         Ok(Header { pseudo, fields })
@@ -357,6 +408,28 @@ where
 /// request, and ':status' in a response. They must be placed before all other fields,
 /// start with ':', and be lowercase.
 /// See RFC7540 section 8.1.2.1. for more details.
+/// A message's Content-Length: None when it has none, Err when its values do
+/// not name one length (RFC 9110 section 8.6 allows a list only of one value
+/// repeated).
+pub fn content_length(fields: &HeaderMap) -> Result<Option<u64>, HeaderError> {
+    let mut length = None;
+    for value in fields.get_all(header::CONTENT_LENGTH) {
+        let text = value
+            .to_str()
+            .map_err(|_| HeaderError::InvalidContentLength)?;
+        for part in text.split(',') {
+            let n: u64 = part
+                .trim()
+                .parse()
+                .map_err(|_| HeaderError::InvalidContentLength)?;
+            if length.replace(n).is_some_and(|m| m != n) {
+                return Err(HeaderError::InvalidContentLength);
+            }
+        }
+    }
+    Ok(length)
+}
+
 #[derive(Debug, Default)]
 #[cfg_attr(test, derive(PartialEq, Clone))]
 struct Pseudo {
@@ -470,6 +543,17 @@ pub enum HeaderError {
     MissingStatus,
     MissingAuthority,
     ContradictedAuthority,
+    /// A pseudo-header field more than once (RFC 9114 section 4.3.1)
+    RepeatedPseudoHeader(&'static str),
+    /// A pseudo-header field after a regular field (section 4.3)
+    PseudoHeaderAfterField,
+    /// A request's pseudo-header field in a response, or a response's in a
+    /// request (section 4.3)
+    MisplacedPseudoHeader(&'static str),
+    /// A connection-specific field, or TE other than "trailers" (section 4.2)
+    ConnectionSpecificField(String),
+    /// Content-Length that is not one non-negative integer
+    InvalidContentLength,
 }
 
 impl HeaderError {
@@ -504,6 +588,17 @@ impl fmt::Display for HeaderError {
             HeaderError::MissingMethod => write!(f, "missing method in request headers"),
             HeaderError::MissingStatus => write!(f, "missing status in response headers"),
             HeaderError::MissingAuthority => write!(f, "missing authority"),
+            HeaderError::RepeatedPseudoHeader(n) => write!(f, "pseudo-header {n} given twice"),
+            HeaderError::PseudoHeaderAfterField => {
+                write!(f, "pseudo-header field after a regular field")
+            }
+            HeaderError::MisplacedPseudoHeader(n) => {
+                write!(f, "pseudo-header {n} where the message cannot carry it")
+            }
+            HeaderError::ConnectionSpecificField(n) => {
+                write!(f, "connection-specific field {n}")
+            }
+            HeaderError::InvalidContentLength => write!(f, "content-length is not one length"),
             HeaderError::ContradictedAuthority => {
                 write!(f, "uri and authority field are in contradiction")
             }
@@ -515,6 +610,106 @@ impl fmt::Display for HeaderError {
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
+
+    fn fields(list: &[(&str, &str)]) -> Vec<HeaderField> {
+        list.iter()
+            .map(|(n, v)| HeaderField::new(n.as_bytes().to_vec(), v.as_bytes().to_vec()))
+            .collect()
+    }
+
+    fn request(list: &[(&str, &str)]) -> Result<(), HeaderError> {
+        Header::try_from(fields(list))?
+            .into_request_parts()
+            .map(|_| ())
+    }
+
+    const GET: [(&str, &str); 4] = [
+        (":method", "GET"),
+        (":scheme", "https"),
+        (":authority", "example.com"),
+        (":path", "/"),
+    ];
+
+    /// RFC 9114 sections 4.2 and 4.3: what makes a request malformed.
+    #[test]
+    fn malformed_requests_are_refused() {
+        assert_matches!(request(&GET), Ok(()));
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let mut list = GET.to_vec();
+            list.extend_from_slice(extra);
+            request(&list)
+        };
+        assert_matches!(
+            with(&[(":path", "/again")]),
+            Err(HeaderError::RepeatedPseudoHeader(":path"))
+        );
+        assert_matches!(
+            request(&[
+                (":method", "GET"),
+                (":scheme", "https"),
+                ("user-agent", "x"),
+                (":authority", "example.com"),
+                (":path", "/"),
+            ]),
+            Err(HeaderError::PseudoHeaderAfterField)
+        );
+        assert_matches!(
+            with(&[(":status", "200")]),
+            Err(HeaderError::MisplacedPseudoHeader(":status"))
+        );
+        for name in [
+            "connection",
+            "keep-alive",
+            "proxy-connection",
+            "transfer-encoding",
+            "upgrade",
+        ] {
+            assert_matches!(
+                with(&[(name, "x")]),
+                Err(HeaderError::ConnectionSpecificField(n)) if n == name,
+                "{name}"
+            );
+        }
+        assert_matches!(
+            with(&[("te", "trailers")]),
+            Ok(()),
+            "TE: trailers is the exception"
+        );
+        assert_matches!(
+            with(&[("te", "gzip")]),
+            Err(HeaderError::ConnectionSpecificField(n)) if n == "te"
+        );
+    }
+
+    #[test]
+    fn a_response_carries_no_request_pseudo_header() {
+        let response = |list: &[(&str, &str)]| {
+            Header::try_from(fields(list)).and_then(|h| h.into_response_parts().map(|_| ()))
+        };
+        assert_matches!(response(&[(":status", "200")]), Ok(()));
+        assert_matches!(
+            response(&[(":status", "200"), (":path", "/")]),
+            Err(HeaderError::MisplacedPseudoHeader(":path"))
+        );
+    }
+
+    #[test]
+    fn content_length_is_one_length() {
+        let length = |values: &[&str]| {
+            let mut map = HeaderMap::new();
+            for v in values {
+                map.append(header::CONTENT_LENGTH, HeaderValue::from_str(v).unwrap());
+            }
+            content_length(&map)
+        };
+        assert_matches!(length(&[]), Ok(None));
+        assert_matches!(length(&["10"]), Ok(Some(10)));
+        assert_matches!(length(&["10, 10"]), Ok(Some(10)), "one value repeated");
+        assert_matches!(length(&["10", "10"]), Ok(Some(10)));
+        assert_matches!(length(&["10, 11"]), Err(HeaderError::InvalidContentLength));
+        assert_matches!(length(&["-1"]), Err(HeaderError::InvalidContentLength));
+        assert_matches!(length(&["ten"]), Err(HeaderError::InvalidContentLength));
+    }
 
     #[test]
     fn request_has_no_authority_nor_host() {

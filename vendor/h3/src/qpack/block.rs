@@ -128,25 +128,41 @@ impl HeaderPrefix {
         total_inserted: usize,
         max_table_size: usize,
     ) -> Result<(usize, usize), ParseError> {
-        if max_table_size == 0 {
-            return Ok((0, 0));
-        }
-
-        // 4.5.1.1. Required Insert Count
+        //= https://www.rfc-editor.org/rfc/rfc9204#section-4.5.1.1
+        //# If the decoder encounters a value of EncodedInsertCount that could
+        //# not have been produced by a conformant encoder, it MUST treat this as
+        //# a connection error of type QPACK_DECOMPRESSION_FAILED.
+        //
+        // The section's own algorithm. A table of capacity zero answered
+        // (0, 0) whatever the count said, and the wrap arithmetic before it
+        // refused no count: a field section with an Encoded Insert Count no
+        // encoder could write decoded as if it had none.
+        let max_entries = max_table_size / 32;
+        let full_range = 2 * max_entries;
+        let invalid = || ParseError::InvalidInsertCount(self.encoded_insert_count);
         let required = if self.encoded_insert_count == 0 {
             0
         } else {
-            let mut insert_count = self.encoded_insert_count - 1;
-            let max_entries = max_table_size / 32;
-            let mut wrapped = total_inserted % (2 * max_entries);
-
-            if wrapped >= insert_count + max_entries {
-                insert_count += 2 * max_entries;
-            } else if wrapped + max_entries < insert_count {
-                wrapped += 2 * max_entries;
+            if self.encoded_insert_count > full_range {
+                return Err(invalid());
             }
-
-            insert_count + total_inserted - wrapped
+            let max_value = total_inserted + max_entries;
+            // The largest possible Required Insert Count that is 0 modulo
+            // FullRange
+            let max_wrapped = max_value / full_range * full_range;
+            let mut required = max_wrapped + self.encoded_insert_count - 1;
+            // Above MaxValue, the encoder's count wrapped one time fewer
+            if required > max_value {
+                if required <= full_range {
+                    return Err(invalid());
+                }
+                required -= full_range;
+            }
+            // A Required Insert Count of 0 is encoded as 0
+            if required == 0 {
+                return Err(invalid());
+            }
+            required
         };
 
         let base = if required == 0 {
@@ -500,6 +516,47 @@ mod test {
     #[test]
     fn header_prefix_table_size_0() {
         HeaderPrefix::new(10, 5, 12, 0).get(1, 0).unwrap();
+    }
+
+    /// RFC 9204 section 4.5.1.1: a count no conformant encoder can produce.
+    #[test]
+    fn impossible_insert_counts_are_refused() {
+        let prefix = |encoded| HeaderPrefix {
+            encoded_insert_count: encoded,
+            sign_negative: false,
+            delta_base: 0,
+        };
+        // A table of capacity zero holds nothing: any count but 0
+        assert_eq!(prefix(1).get(0, 0), Err(ParseError::InvalidInsertCount(1)));
+        let full_range = 2 * (TABLE_SIZE / 32);
+        assert_eq!(
+            prefix(full_range + 1).get(0, TABLE_SIZE),
+            Err(ParseError::InvalidInsertCount(full_range + 1))
+        );
+        assert_eq!(prefix(0).get(0, 0), Ok((0, 0)));
+    }
+
+    /// Every Required Insert Count an encoder can write, from MaxEntries
+    /// behind the decoder's insert count to MaxEntries ahead of it, decodes
+    /// to itself.
+    #[test]
+    fn required_insert_count_round_trips() {
+        let max_entries = TABLE_SIZE / 32;
+        for decoder_inserted in 0..3 * max_entries {
+            let low = (decoder_inserted + 1).saturating_sub(max_entries).max(1);
+            for required in low..=decoder_inserted + max_entries {
+                let prefix = HeaderPrefix {
+                    encoded_insert_count: required % (2 * max_entries) + 1,
+                    sign_negative: false,
+                    delta_base: 0,
+                };
+                assert_eq!(
+                    prefix.get(decoder_inserted, TABLE_SIZE).map(|(r, _)| r),
+                    Ok(required),
+                    "required {required}, decoder at {decoder_inserted}"
+                );
+            }
+        }
     }
 
     #[test]

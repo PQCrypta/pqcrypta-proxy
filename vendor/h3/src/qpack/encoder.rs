@@ -288,6 +288,55 @@ impl Action {
     }
 }
 
+/// What a peer's decoder stream may not say to an encoder that inserts
+/// nothing (`encode_stateless`), whose every field section has Required
+/// Insert Count 0.
+#[derive(Debug, PartialEq)]
+pub enum DecoderStreamError {
+    /// RFC 9204 section 4.4.3: an increment of zero, or one that takes the
+    /// Known Received Count past the inserts sent, which with none sent is
+    /// every increment
+    InsertCountIncrement(usize),
+    /// Section 4.4.1: an acknowledgment for a stream with no field section
+    /// outstanding with a non-zero Required Insert Count, which is every
+    /// stream
+    SectionAcknowledgment(u64),
+    Malformed(EncoderError),
+}
+
+impl std::fmt::Display for DecoderStreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InsertCountIncrement(n) => {
+                write!(f, "Insert Count Increment {n} with no insert ever sent")
+            }
+            Self::SectionAcknowledgment(id) => write!(
+                f,
+                "Section Acknowledgment for stream {id}, which has no section to acknowledge"
+            ),
+            Self::Malformed(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Apply the decoder instructions in `read` for an encoder that inserts
+/// nothing: Stream Cancellation is all a decoder can rightly send it.
+/// Complete instructions are consumed; a partial one is left for more data.
+pub fn on_decoder_recv_stateless<R: Buf>(read: &mut R) -> Result<(), DecoderStreamError> {
+    while let Some(action) = Action::parse(read).map_err(DecoderStreamError::Malformed)? {
+        match action {
+            Action::ReceivedRefIncrement(n) => {
+                return Err(DecoderStreamError::InsertCountIncrement(n))
+            }
+            Action::Untrack(stream_id) => {
+                return Err(DecoderStreamError::SectionAcknowledgment(stream_id))
+            }
+            Action::StreamCancel(_) => {}
+        }
+    }
+    Ok(())
+}
+
 pub fn set_dynamic_table_size<W: BufMut>(
     table: &mut DynamicTable,
     encoder: &mut W,
@@ -324,6 +373,31 @@ impl From<ParseError> for EncoderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An encoder that inserts nothing takes Stream Cancellation and nothing
+    /// else from a decoder stream (RFC 9204 sections 4.4.1 and 4.4.3).
+    #[test]
+    fn a_stateless_encoder_takes_only_stream_cancellation() {
+        let mut cancel = Cursor::new(vec![0x40, 0x41]);
+        assert_eq!(on_decoder_recv_stateless(&mut cancel), Ok(()));
+        assert!(!cancel.has_remaining(), "both cancellations consumed");
+        assert_eq!(
+            on_decoder_recv_stateless(&mut Cursor::new(vec![0x80])),
+            Err(DecoderStreamError::SectionAcknowledgment(0))
+        );
+        assert_eq!(
+            on_decoder_recv_stateless(&mut Cursor::new(vec![0x00])),
+            Err(DecoderStreamError::InsertCountIncrement(0))
+        );
+        assert_eq!(
+            on_decoder_recv_stateless(&mut Cursor::new(vec![0x01])),
+            Err(DecoderStreamError::InsertCountIncrement(1))
+        );
+        // A Stream Cancellation whose 6-bit prefix is full needs a byte more
+        let mut partial = Cursor::new(vec![0x7f]);
+        assert_eq!(on_decoder_recv_stateless(&mut partial), Ok(()));
+        assert_eq!(partial.remaining(), 1, "left for more data");
+    }
 
     use crate::qpack::tests::helpers::{build_table, TABLE_SIZE};
 

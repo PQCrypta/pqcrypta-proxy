@@ -136,6 +136,7 @@ impl Builder {
             sent_closing: None,
             recv_closing: None,
             last_accepted_stream: None,
+            max_push_id: None,
         })
     }
 }

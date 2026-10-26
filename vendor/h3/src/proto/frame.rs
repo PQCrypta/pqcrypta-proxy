@@ -112,11 +112,36 @@ impl Frame<PayloadLen> {
 
         let frame = match ty {
             FrameType::HEADERS => Ok(Frame::Headers(payload.copy_to_bytes(len as usize))),
-            FrameType::SETTINGS => Ok(Frame::Settings(Settings::decode(&mut payload)?)),
-            FrameType::CANCEL_PUSH => Ok(Frame::CancelPush(payload.get_var()?.try_into()?)),
-            FrameType::PUSH_PROMISE => Ok(Frame::PushPromise(PushPromise::decode(&mut payload)?)),
-            FrameType::GOAWAY => Ok(Frame::Goaway(VarInt::decode(&mut payload)?)),
-            FrameType::MAX_PUSH_ID => Ok(Frame::MaxPushId(payload.get_var()?.try_into()?)),
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.1
+            //# A frame payload that contains additional bytes
+            //# after the identified fields or a frame payload that terminates before
+            //# the end of the identified fields MUST be treated as a connection
+            //# error of type H3_FRAME_ERROR.
+            //
+            // The whole payload is here (checked above), so a field that runs
+            // past it is a malformed frame, not one still arriving: decoded
+            // as Incomplete, a CANCEL_PUSH, GOAWAY or MAX_PUSH_ID cut short
+            // left the stream waiting for bytes the frame's length said would
+            // never come, and bytes after the field were ignored. A truncated
+            // SETTINGS was answered H3_SETTINGS_ERROR.
+            FrameType::SETTINGS => {
+                Settings::decode(&mut payload)
+                    .map(Frame::Settings)
+                    .map_err(|e| match e {
+                        SettingsError::Malformed => FrameError::Malformed,
+                        e => e.into(),
+                    })
+            }
+            FrameType::CANCEL_PUSH => exactly(&mut payload, |p| {
+                Ok(Frame::CancelPush(p.get_var()?.try_into()?))
+            }),
+            FrameType::PUSH_PROMISE => exactly(&mut payload, |p| {
+                Ok(Frame::PushPromise(PushPromise::decode(p)?))
+            }),
+            FrameType::GOAWAY => exactly(&mut payload, |p| Ok(Frame::Goaway(VarInt::decode(p)?))),
+            FrameType::MAX_PUSH_ID => exactly(&mut payload, |p| {
+                Ok(Frame::MaxPushId(p.get_var()?.try_into()?))
+            }),
             //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
             //# These frame
             //# types MUST NOT be sent, and their receipt MUST be treated as a
@@ -146,6 +171,22 @@ impl Frame<PayloadLen> {
         }
         frame
     }
+}
+
+/// Decode a frame whose payload holds exactly its fields: running out of the
+/// payload, or bytes left after the fields, is `Malformed`.
+fn exactly<P: Buf, F>(
+    payload: &mut P,
+    fields: impl FnOnce(&mut P) -> Result<F, FrameError>,
+) -> Result<F, FrameError> {
+    let frame = fields(payload).map_err(|e| match e {
+        FrameError::Incomplete(_) => FrameError::Malformed,
+        e => e,
+    })?;
+    if payload.has_remaining() {
+        return Err(FrameError::Malformed);
+    }
+    Ok(frame)
 }
 
 impl<B> Encode for Frame<B>
@@ -637,6 +678,52 @@ mod tests {
     use super::*;
     use assert_matches::assert_matches;
     use std::io::Cursor;
+
+    /// RFC 9114 section 7.1: a payload with a byte after its fields, or one
+    /// that ends inside them, is malformed, for every frame with fixed fields.
+    #[test]
+    fn frames_hold_exactly_their_fields() {
+        for ty in [
+            FrameType::CANCEL_PUSH,
+            FrameType::GOAWAY,
+            FrameType::MAX_PUSH_ID,
+        ] {
+            // An ID and one byte more
+            let mut extra = Vec::new();
+            ty.encode(&mut extra);
+            extra.extend_from_slice(&[0x02, 0x00, 0x00]);
+            assert_eq!(
+                Frame::decode(&mut Cursor::new(&extra)),
+                Err(FrameError::Malformed),
+                "{ty:?} with a trailing byte"
+            );
+            // A two-byte varint ID whose second byte the length leaves out
+            let mut short = Vec::new();
+            ty.encode(&mut short);
+            short.extend_from_slice(&[0x01, 0x40]);
+            assert_eq!(
+                Frame::decode(&mut Cursor::new(&short)),
+                Err(FrameError::Malformed),
+                "{ty:?} cut short inside its ID"
+            );
+        }
+        // SETTINGS with an identifier and no value
+        let mut settings = Vec::new();
+        FrameType::SETTINGS.encode(&mut settings);
+        settings.extend_from_slice(&[0x01, 0x06]);
+        assert_eq!(
+            Frame::decode(&mut Cursor::new(&settings)),
+            Err(FrameError::Malformed)
+        );
+        // A frame not all here yet is still Incomplete
+        let mut partial = Vec::new();
+        FrameType::GOAWAY.encode(&mut partial);
+        partial.extend_from_slice(&[0x02, 0x40]);
+        assert_matches!(
+            Frame::decode(&mut Cursor::new(&partial)),
+            Err(FrameError::Incomplete(_))
+        );
+    }
 
     #[test]
     fn unknown_frame_type() {
