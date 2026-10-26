@@ -286,6 +286,19 @@ where
                         max_size: self.inner.max_field_section_size,
                     });
                 }
+                // The stateful decoder takes no limit, as the stateless one
+                // did: since responses are decoded with it, a section over
+                // our own SETTINGS_MAX_FIELD_SECTION_SIZE was accepted. The
+                // crate's header_too_big_discard_from_client found it once
+                // its tests ran.
+                Ok(decoded) if decoded.mem_size > self.inner.max_field_section_size => {
+                    self.cancel_qpack_stream();
+                    self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
+                    return Err(StreamError::HeaderTooBig {
+                        actual_size: decoded.mem_size,
+                        max_size: self.inner.max_field_section_size,
+                    });
+                }
                 Ok(decoded) => decoded,
                 Err(_e) => {
                     return Err(

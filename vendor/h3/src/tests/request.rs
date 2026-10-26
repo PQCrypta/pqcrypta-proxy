@@ -1403,6 +1403,85 @@ async fn request_invalid_data_frame_length_too_short() {
     .await;
 }
 
+/// A POST with this content-length and body, and what the server's read of
+/// the body ends in.
+async fn body_against_content_length(
+    content_length: &'static str,
+    body: &'static [u8],
+) -> Result<(), StreamError> {
+    init_tracing();
+    let mut pair = Pair::default();
+    let mut server = pair.server();
+
+    let client_fut = async {
+        let connection = pair.client_inner().await;
+        let (mut driver, _send) = client::new(h3_quinn::Connection::new(connection.clone()))
+            .await
+            .unwrap();
+        let (mut req_send, _req_recv) = connection.open_bi().await.unwrap();
+        let mut buf = BytesMut::new();
+        request_encode(
+            &mut buf,
+            Request::post("http://localhost/salut")
+                .header("content-length", content_length)
+                .body(())
+                .unwrap(),
+        );
+        Frame::Data(Bytes::from_static(body)).encode_with_payload(&mut buf);
+        req_send.write_all(&buf[..]).await.unwrap();
+        req_send.finish().unwrap();
+        let _ = future::poll_fn(|cx| driver.poll_close(cx)).await;
+    };
+
+    let server_fut = async {
+        let conn = server.next().await;
+        let mut incoming = server::Connection::new(conn).await.unwrap();
+        let resolver = incoming
+            .accept()
+            .await
+            .unwrap()
+            .expect("request stream end unexpected");
+        let (_, mut stream) = resolver.resolve_request().await?;
+        while stream.recv_data().await?.is_some() {}
+        Ok(())
+    };
+
+    tokio::select! { result = server_fut => result, _ = client_fut => panic!("client resolved first") }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+//= type=test
+//# A request or response that is defined as having content when it
+//# contains a Content-Length header field (Section 8.6 of [HTTP]) is
+//# malformed if the value of the Content-Length header field does not
+//# equal the sum of the DATA frame lengths received.
+#[tokio::test]
+async fn body_shorter_than_its_content_length() {
+    assert_matches!(
+        body_against_content_length("10", b"abcd").await,
+        Err(StreamError::StreamError {
+            code: Code::H3_MESSAGE_ERROR,
+            ..
+        })
+    );
+}
+
+#[tokio::test]
+async fn body_longer_than_its_content_length() {
+    assert_matches!(
+        body_against_content_length("2", b"abcd").await,
+        Err(StreamError::StreamError {
+            code: Code::H3_MESSAGE_ERROR,
+            ..
+        })
+    );
+}
+
+#[tokio::test]
+async fn body_as_long_as_its_content_length() {
+    assert_matches!(body_against_content_length("4", b"abcd").await, Ok(()));
+}
+
 // Helpers
 
 fn request_encode<B: BufMut>(buf: &mut B, req: http::Request<()>) {
@@ -1498,7 +1577,7 @@ where
             // drop the SendRequest to let driver know there will be no more requests
             drop(send);
 
-            Result::<(), quinn::ReadError>::Ok(())
+            Result::<(), noq::ReadError>::Ok(())
         };
 
         let driver = async {
@@ -1546,7 +1625,7 @@ where
     if let Err(err) = client_result_stream {
         // we have no influence wether the quinn returns the connection error to the stream api
         // but if it returns an error it needs to be the expected one
-        assert_matches!(err, quinn::ReadError::ConnectionLost(quinn::ConnectionError::ApplicationClosed(code))
+        assert_matches!(err, noq::ReadError::ConnectionLost(noq::ConnectionError::ApplicationClosed(code))
             if code.error_code.into_inner() == expected_error_code.expect("If this is a error an error was expected").value());
     }
 

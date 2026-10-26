@@ -392,12 +392,9 @@ async fn client_error_on_bidi_recv() {
         let (mut send, _recv) = connection.open_bi().await.unwrap();
         for _ in 0..100 {
             match send.write(b"I'm not really a server").await {
-                Err(quinn::WriteError::ConnectionLost(
-                    quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
-                        error_code,
-                        ..
-                    }),
-                )) if Code::H3_STREAM_CREATION_ERROR == error_code.into_inner() => return,
+                Err(noq::WriteError::ConnectionLost(noq::ConnectionError::ApplicationClosed(
+                    noq::ApplicationClose { error_code, .. },
+                ))) if Code::H3_STREAM_CREATION_ERROR == error_code.into_inner() => return,
                 Err(e) => panic!("got err: {}", e),
                 Ok(_) => (),
             }
@@ -483,9 +480,8 @@ async fn control_close_send_error() {
         };
 
         let err_code = match connection_error {
-            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
-                error_code,
-                ..
+            noq::ConnectionError::ApplicationClosed(noq::ApplicationClose {
+                error_code, ..
             }) => error_code.into_inner(),
             e => panic!("unexpected error: {:?}", e),
         };
@@ -911,7 +907,7 @@ async fn server_not_blocking_on_idle_request() {
             .expect("connection should error after sending wrong data on control stream");
 
         assert_matches!(err,
-        quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose { error_code, .. })
+        noq::ConnectionError::ApplicationClosed(noq::ApplicationClose { error_code, .. })
             if error_code.into_inner() == Code::H3_FRAME_UNEXPECTED.value()
         );
     };
@@ -981,4 +977,189 @@ where
         .await
         .unwrap();
     stream.finish().await.unwrap();
+}
+
+/// A client that opens raw unidirectional streams -- each a type, its bytes,
+/// and whether it is finished -- and a server that must close the connection
+/// with `code`.
+async fn server_closes_with(streams: Vec<(StreamType, Vec<u8>, bool)>, code: Code) {
+    init_tracing();
+    let mut pair = Pair::default();
+    let mut server = pair.server();
+
+    let client_fut = async {
+        let connection = pair.client_inner().await;
+        let mut held = Vec::new();
+        for (ty, bytes, fin) in streams {
+            let mut stream = connection.open_uni().await.unwrap();
+            let mut buf = BytesMut::new();
+            ty.encode(&mut buf);
+            buf.extend_from_slice(&bytes);
+            stream.write_all(&buf[..]).await.unwrap();
+            if fin {
+                stream.finish().unwrap();
+            }
+            held.push(stream);
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        drop(held);
+    };
+
+    let server_fut = async {
+        let conn = server.next().await;
+        let mut incoming = server::Connection::new(conn).await.unwrap();
+        let error = incoming.accept().await.map(|_| ()).unwrap_err();
+        assert_matches!(
+            error,
+            ConnectionError::Local {
+                error: LocalError::Application { code: c, .. }
+            } if c == code,
+            "expected {code:?}"
+        );
+    };
+
+    tokio::select! { _ = server_fut => (), _ = client_fut => panic!("client resolved first") };
+}
+
+fn settings_then(frames: &[Frame<Bytes>]) -> Vec<u8> {
+    let mut buf = BytesMut::new();
+    Frame::Settings::<Bytes>(Settings::default()).encode(&mut buf);
+    for frame in frames {
+        frame.encode(&mut buf);
+    }
+    buf.to_vec()
+}
+
+#[tokio::test]
+async fn client_push_stream() {
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.2
+    //= type=test
+    //# Only servers can push; if a server receives a client-initiated push
+    //# stream, this MUST be treated as a connection error of type
+    //# H3_STREAM_CREATION_ERROR.
+    server_closes_with(
+        vec![
+            (StreamType::CONTROL, settings_then(&[]), false),
+            (StreamType::PUSH, vec![0x00], false),
+        ],
+        Code::H3_STREAM_CREATION_ERROR,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn cancel_push_never_promised() {
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
+    //= type=test
+    //# If a server receives a CANCEL_PUSH frame for a push
+    //# ID that has not yet been mentioned by a PUSH_PROMISE frame, this MUST
+    //# be treated as a connection error of type H3_ID_ERROR.
+    server_closes_with(
+        vec![(
+            StreamType::CONTROL,
+            settings_then(&[Frame::CancelPush(PushId(0))]),
+            false,
+        )],
+        Code::H3_ID_ERROR,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn max_push_id_reduced() {
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.7
+    //= type=test
+    //# A MAX_PUSH_ID frame cannot reduce the maximum push
+    //# ID; receipt of a MAX_PUSH_ID frame that contains a smaller value than
+    //# previously received MUST be treated as a connection error of type
+    //# H3_ID_ERROR.
+    server_closes_with(
+        vec![(
+            StreamType::CONTROL,
+            settings_then(&[Frame::MaxPushId(PushId(10)), Frame::MaxPushId(PushId(5))]),
+            false,
+        )],
+        Code::H3_ID_ERROR,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn goaway_with_a_trailing_byte() {
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.1
+    //= type=test
+    //# A frame payload that contains additional bytes
+    //# after the identified fields or a frame payload that terminates before
+    //# the end of the identified fields MUST be treated as a connection
+    //# error of type H3_FRAME_ERROR.
+    let mut control = settings_then(&[]);
+    control.extend_from_slice(&[0x07, 0x02, 0x00, 0x00]);
+    server_closes_with(
+        vec![(StreamType::CONTROL, control, false)],
+        Code::H3_FRAME_ERROR,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn settings_cut_short() {
+    // SETTINGS whose payload is an identifier with no value (section 7.1)
+    server_closes_with(
+        vec![(StreamType::CONTROL, vec![0x04, 0x01, 0x06], false)],
+        Code::H3_FRAME_ERROR,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn section_acknowledgment_with_nothing_to_acknowledge() {
+    //= https://www.rfc-editor.org/rfc/rfc9204#section-4.4.1
+    //= type=test
+    //# If an encoder receives a Section Acknowledgment instruction
+    //# referring to a stream on which every encoded field section with a
+    //# non-zero Required Insert Count has already been acknowledged, this
+    //# MUST be treated as a connection error of type
+    //# QPACK_DECODER_STREAM_ERROR.
+    server_closes_with(
+        vec![
+            (StreamType::CONTROL, settings_then(&[]), false),
+            (StreamType::DECODER, vec![0x80], false),
+        ],
+        Code::QPACK_DECODER_STREAM_ERROR,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn insert_count_increment_of_zero() {
+    //= https://www.rfc-editor.org/rfc/rfc9204#section-4.4.3
+    //= type=test
+    //# An encoder that receives an Increment field equal to zero, or one
+    //# that increases the Known Received Count beyond what the encoder has
+    //# sent, MUST treat this as a connection error of type
+    //# QPACK_DECODER_STREAM_ERROR.
+    server_closes_with(
+        vec![
+            (StreamType::CONTROL, settings_then(&[]), false),
+            (StreamType::DECODER, vec![0x00], false),
+        ],
+        Code::QPACK_DECODER_STREAM_ERROR,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn decoder_stream_closed() {
+    //= https://www.rfc-editor.org/rfc/rfc9204#section-4.2
+    //= type=test
+    //# Closure of either unidirectional stream type MUST be treated as a
+    //# connection error of type H3_CLOSED_CRITICAL_STREAM.
+    server_closes_with(
+        vec![
+            (StreamType::CONTROL, settings_then(&[]), false),
+            (StreamType::DECODER, Vec::new(), true),
+        ],
+        Code::H3_CLOSED_CRITICAL_STREAM,
+    )
+    .await;
 }

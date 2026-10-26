@@ -294,7 +294,6 @@ pub(super) struct AcceptRecvStream<S, B> {
     ty: Option<StreamType>,
     /// push_id or session_id
     id: Option<VarInt>,
-    expected: Option<usize>,
 }
 
 impl<S, B> AcceptRecvStream<S, B>
@@ -307,7 +306,6 @@ where
             stream: BufRecvStream::new(stream),
             ty: None,
             id: None,
-            expected: None,
         }
     }
 
@@ -334,6 +332,23 @@ where
         let mut stream_stopped = None;
 
         loop {
+            // What is buffered first. A varint that arrived with the one
+            // before it -- a push ID or a WebTransport session ID, which leave
+            // with their stream type -- is already here: reading the stream
+            // first waited for data that need never come, and a push stream
+            // whose ID came with its type was never resolved. Each varint is
+            // sized by its own first byte; the size of the first one was kept
+            // and used for the second.
+            let buf = self.stream.buf_mut();
+            if buf.remaining() >= 1 && buf.remaining() >= VarInt::encoded_size(buf.chunk()[0]) {
+                let varint = VarInt::decode(buf).map_err(|_| {
+                    PollTypeError::InternalError(InternalConnectionError::new(
+                        Code::H3_INTERNAL_ERROR,
+                        "Unexpected end parsing varint".to_string(),
+                    ))
+                })?;
+                return Poll::Ready(Ok((varint, stream_stopped)));
+            }
             if stream_stopped.is_some() {
                 return Poll::Ready(Err(PollTypeError::EndOfStream));
             }
@@ -360,28 +375,6 @@ where
                     Some(StreamEnd::Other)
                 }
             };
-
-            let mut buf = self.stream.buf_mut();
-            if self.expected.is_none() && buf.remaining() >= 1 {
-                self.expected = Some(VarInt::encoded_size(buf.chunk()[0]));
-            }
-
-            if let Some(expected) = self.expected {
-                if buf.remaining() < expected {
-                    continue;
-                }
-            } else {
-                continue;
-            }
-
-            let reult = VarInt::decode(&mut buf).map_err(|_| {
-                PollTypeError::InternalError(InternalConnectionError::new(
-                    Code::H3_INTERNAL_ERROR,
-                    "Unexpected end parsing varint".to_string(),
-                ))
-            })?;
-
-            return Poll::Ready(Ok((reult, stream_stopped)));
         }
     }
 

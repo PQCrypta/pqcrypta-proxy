@@ -169,6 +169,27 @@ jobs:
       - name: Run the fork's tests
         run: cargo test --manifest-path vendor/rustls-fixed/rustls/Cargo.toml --lib
 
+  # The vendored h3 fork's own tests, upstream's integration suite with them:
+  # they run over noq, the QUIC stack the proxy uses, through the vendored
+  # h3-noq adapter (vendor/h3/src/tests/mod.rs), and the fork's manifest
+  # repeats the proxy's rustls patch so noq-proto sees the rustls fork. They
+  # need the third-party-backend feature, which the integration tests use.
+  h3-fork:
+    name: h3 fork tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: h3-fork
+          workspaces: vendor/h3
+
+      - name: Run the fork's tests
+        run: cargo test --manifest-path vendor/h3/Cargo.toml --lib --all-features
+
   # =============================================================================
   # Integration Tests
   # =============================================================================

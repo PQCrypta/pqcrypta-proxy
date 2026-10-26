@@ -40,6 +40,8 @@ pub enum DecoderError {
     BufSize(TryFromIntError),
     /// The encoder asked for a table larger than we advertised.
     CapacityExceedsAdvertised(usize),
+    /// An Encoded Insert Count no conformant encoder can produce.
+    InvalidInsertCount(usize),
 }
 
 impl std::error::Error for DecoderError {}
@@ -63,6 +65,9 @@ impl std::fmt::Display for DecoderError {
                 "requested dynamic table capacity {} exceeds the advertised maximum",
                 size
             ),
+            DecoderError::InvalidInsertCount(n) => {
+                write!(f, "encoded insert count {} no encoder can produce", n)
+            }
         }
     }
 }
@@ -393,6 +398,7 @@ impl From<ParseError> for DecoderError {
             ParseError::String(x) => DecoderError::InvalidString(x),
             ParseError::InvalidPrefix(p) => DecoderError::UnknownPrefix(p),
             ParseError::InvalidBase(b) => DecoderError::BadBaseIndex(b),
+            ParseError::InvalidInsertCount(n) => DecoderError::InvalidInsertCount(n),
         }
     }
 }

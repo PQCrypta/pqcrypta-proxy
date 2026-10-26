@@ -212,13 +212,20 @@ where
         };
 
         // Parse the request headers
-        let result = match Header::try_from(fields) {
-            Ok(header) => match header.into_request_parts() {
-                Ok(parts) => Ok(parts),
-                Err(err) => Err(err),
-            },
-            Err(err) => Err(err),
-        };
+        let result = Header::try_from(fields)
+            .and_then(Header::into_request_parts)
+            .and_then(|parts| {
+                crate::proto::headers::content_length(&parts.3).map(|length| (length, parts))
+            });
+        let result = result.map(|(length, parts)| {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+            //# A request or response that is defined as having content when it
+            //# contains a Content-Length header field (Section 8.6 of [HTTP]) is
+            //# malformed if the value of the Content-Length header field does not
+            //# equal the sum of the DATA frame lengths received.
+            self.request_stream.inner.expect_content_length(length);
+            parts
+        });
         let (method, uri, protocol, headers) = match result {
             Ok(parts) => parts,
             Err(err) => {

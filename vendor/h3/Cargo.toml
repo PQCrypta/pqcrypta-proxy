@@ -41,8 +41,6 @@ license = "MIT"
 repository = "https://github.com/hyperium/h3"
 
 [features]
-# Never enabled: see the gate on `mod tests` in lib.rs.
-upstream-integration-tests = []
 i-implement-a-third-party-backend-and-opt-into-breaking-changes = []
 tracing = ["dep:tracing"]
 
@@ -90,17 +88,16 @@ default-features = false
 [dev-dependencies.proptest]
 version = "1"
 
-[dev-dependencies.quinn]
-version = "0.11"
+# The fork's tests run over noq, the QUIC stack the proxy uses, through the
+# vendored h3-noq adapter (src/tests/mod.rs); upstream's ran over quinn
+[dev-dependencies.noq]
+path = "../noq/noq"
 features = [
     "runtime-tokio",
     "rustls",
     "ring",
+    "bloom",
 ]
-default-features = false
-
-[dev-dependencies.quinn-proto]
-version = "0.11"
 default-features = false
 
 [dev-dependencies.rcgen]
@@ -122,6 +119,7 @@ features = [
     "macros",
     "io-util",
     "io-std",
+    "time",
 ]
 
 [dev-dependencies.tokio-util]
@@ -137,3 +135,10 @@ features = [
     "tracing-log",
 ]
 default-features = false
+
+# A standalone build of the fork (its tests) sees the patches the proxy's
+# manifest applies only when it repeats them: noq-proto uses the rustls fork's
+# additions (EchAcceptance, client_hello_wire). Cargo ignores this section when
+# the fork is a dependency of the proxy, whose own patches apply.
+[patch.crates-io]
+rustls = { path = "../rustls-fixed/rustls" }

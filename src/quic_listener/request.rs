@@ -1246,9 +1246,21 @@ impl QuicListener {
                     }
                 }
                 Err(e) => {
-                    // Stream-level error (flow-control, reset, etc.) — respond 500
-                    // and return Ok so the QUIC connection stays alive for other streams.
+                    // Stream-level error (flow-control, reset, etc.) — respond
+                    // and return Ok so the QUIC connection stays alive for other
+                    // streams. A malformed body (DATA that does not add up to
+                    // its content-length, RFC 9114 section 4.1.2) is the
+                    // client's: 400, which the section lets a server send
+                    // before closing the stream. Anything else is ours: 500.
                     debug!("QUIC recv_data error on {} {}: {}", method, path, e);
+                    let status = match &e {
+                        h3::error::StreamError::StreamError { code, .. }
+                            if *code == h3::error::Code::H3_MESSAGE_ERROR =>
+                        {
+                            http::StatusCode::BAD_REQUEST
+                        }
+                        _ => http::StatusCode::INTERNAL_SERVER_ERROR,
+                    };
                     log_h3_refusal(
                         remote_addr,
                         method,
@@ -1259,19 +1271,16 @@ impl QuicListener {
                         fingerprint.ja3_hash.as_deref(),
                         fingerprint.ja4_hash.as_deref(),
                         start_time,
-                        500,
+                        status.as_u16(),
                     );
                     metrics.requests.request_end_full(
-                        500,
+                        status.as_u16(),
                         start_time.elapsed(),
                         body.len() as u64,
                         0,
                         Some(&path),
                     );
-                    if let Ok(response) = http::Response::builder()
-                        .status(http::StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(())
-                    {
+                    if let Ok(response) = http::Response::builder().status(status).body(()) {
                         let _ = stream.send_response(response).await;
                         let _ = stream.finish().await;
                     }

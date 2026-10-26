@@ -492,12 +492,23 @@ where
                 // silence. Our own conformance suite scored that as accepting
                 // the violation, which is what it was.
                 //
-                // Clients only: a server receiving one of these is a
-                // different fault, and the catch-all still covers it.
+                // Clients only: a server receiving one is the fault below.
                 AcceptedRecvStream::Push(_) if self.shared.is_client() => {
                     return Err(self.handle_connection_error(InternalConnectionError::new(
                         Code::H3_ID_ERROR,
                         "received a push stream when no MAX_PUSH_ID has been sent".to_string(),
+                    )));
+                }
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.2
+                //# Only servers can push; if a server receives a client-initiated push
+                //# stream, this MUST be treated as a connection error of type
+                //# H3_STREAM_CREATION_ERROR.
+                //
+                // It fell to the catch-all below and was discarded.
+                AcceptedRecvStream::Push(_) => {
+                    return Err(self.handle_connection_error(InternalConnectionError::new(
+                        Code::H3_STREAM_CREATION_ERROR,
+                        "received a push stream from the client".to_string(),
                     )));
                 }
                 AcceptedRecvStream::WebTransportUni(id, s)
@@ -705,6 +716,89 @@ where
                     // will flush with everything else.
                     let _ = send.send_data(WriteBuf::<B>::from_raw(&out));
                 }
+            }
+        }
+    }
+
+    /// Read whatever the peer has put on its QPACK decoder stream.
+    ///
+    /// The stream was accepted and never read, so nothing on it was judged:
+    /// an Insert Count Increment of zero and a Section Acknowledgment with
+    /// nothing to acknowledge kept the connection up, and so did the peer
+    /// closing the stream. This side encodes every field section statelessly
+    /// (Required Insert Count 0, no inserts), so Stream Cancellation is the
+    /// only instruction a decoder can rightly send it.
+    pub(crate) fn poll_qpack_decoder(&mut self, cx: &mut Context<'_>) -> Poll<ConnectionError> {
+        // Apply what the stream already holds first, as poll_qpack_encoder
+        // does: instructions that came with the type byte are buffered.
+        let mut read_first = !matches!(
+            self.qpack_streams.decoder_recv.as_mut(),
+            Some(AcceptedRecvStream::Decoder(decoder)) if bytes::Buf::has_remaining(decoder.buf())
+        );
+        loop {
+            let Some(AcceptedRecvStream::Decoder(decoder)) =
+                self.qpack_streams.decoder_recv.as_mut()
+            else {
+                return Poll::Pending;
+            };
+            let read = if read_first {
+                ready!(decoder.poll_read(cx))
+            } else {
+                Ok(false)
+            };
+            read_first = true;
+            match read {
+                Ok(true) => {
+                    //= https://www.rfc-editor.org/rfc/rfc9204#section-4.2
+                    //# Closure of either unidirectional stream type MUST be treated as a
+                    //# connection error of type H3_CLOSED_CRITICAL_STREAM.
+                    return Poll::Ready(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_CLOSED_CRITICAL_STREAM,
+                            "the peer closed its QPACK decoder stream".to_string(),
+                        ),
+                    ));
+                }
+                Ok(false) => {}
+                Err(
+                    e @ (StreamErrorIncoming::StreamTerminated { .. }
+                    | StreamErrorIncoming::Unknown(_)),
+                ) => {
+                    return Poll::Ready(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_CLOSED_CRITICAL_STREAM,
+                            format!("the QPACK decoder stream failed: {e}"),
+                        ),
+                    ));
+                }
+                // The connection's own error, not the stream's: see
+                // poll_qpack_encoder
+                Err(StreamErrorIncoming::ConnectionErrorIncoming { connection_error }) => {
+                    return Poll::Ready(self.handle_connection_error(connection_error));
+                }
+            }
+            let Some(AcceptedRecvStream::Decoder(decoder)) =
+                self.qpack_streams.decoder_recv.as_mut()
+            else {
+                return Poll::Pending;
+            };
+            if let Err(e) = qpack::on_decoder_recv_stateless(decoder.buf_mut()) {
+                //= https://www.rfc-editor.org/rfc/rfc9204#section-4.4.1
+                //# If an encoder receives a Section Acknowledgment instruction
+                //# referring to a stream on which every encoded field section with a
+                //# non-zero Required Insert Count has already been acknowledged, this
+                //# MUST be treated as a connection error of type
+                //# QPACK_DECODER_STREAM_ERROR.
+
+                //= https://www.rfc-editor.org/rfc/rfc9204#section-4.4.3
+                //# An encoder that receives an Increment field equal to zero, or one
+                //# that increases the Known Received Count beyond what the encoder has
+                //# sent, MUST treat this as a connection error of type
+                //# QPACK_DECODER_STREAM_ERROR.
+                return Poll::Ready(self.handle_connection_error(InternalConnectionError::new(
+                    Code::QPACK_DECODER_STREAM_ERROR,
+                    format!("invalid QPACK decoder instruction: {e}"),
+                )));
             }
         }
     }
@@ -1054,6 +1148,9 @@ pub struct RequestStream<S, B> {
     pub(super) conn_state: Arc<SharedState>,
     pub(super) max_field_section_size: u64,
     send_grease_frame: bool,
+    // The message's Content-Length, and the DATA received against it
+    content_length: Option<u64>,
+    data_received: u64,
 }
 
 impl<S, B> RequestStream<S, B> {
@@ -1070,7 +1167,15 @@ impl<S, B> RequestStream<S, B> {
             max_field_section_size,
             trailers: None,
             send_grease_frame: grease,
+            content_length: None,
+            data_received: 0,
         }
+    }
+
+    /// Hold the DATA that follows to this Content-Length (RFC 9114 section
+    /// 4.1.2); None holds it to nothing.
+    pub(crate) fn expect_content_length(&mut self, length: Option<u64>) {
+        self.content_length = length;
     }
 }
 
@@ -1086,6 +1191,31 @@ impl<S, B> RequestStream<S, B>
 where
     S: quic::RecvStream,
 {
+    /// The body ended: malformed when it fell short of its Content-Length.
+    fn body_end(&mut self) -> Result<(), StreamError> {
+        match self.content_length {
+            Some(length) if self.data_received != length => Err(self.malformed_body(format!(
+                "content-length {length}, and the body ended after {} bytes",
+                self.data_received
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+    //# Malformed requests or responses that are
+    //# detected MUST be treated as a stream error of type H3_MESSAGE_ERROR.
+    //
+    // This half can stop the peer sending; resetting the other half is its
+    // owner's, which is told by the code.
+    fn malformed_body(&mut self, reason: String) -> StreamError {
+        self.stream.stop_sending(Code::H3_MESSAGE_ERROR);
+        StreamError::StreamError {
+            code: Code::H3_MESSAGE_ERROR,
+            reason,
+        }
+    }
+
     /// Receive some of the request body.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn poll_recv_data(
@@ -1099,11 +1229,11 @@ where
                         self.handle_frame_stream_error_on_request_stream(frame_stream_error)
                     ))
                 }
-                Ok(None) => return Poll::Ready(Ok(None)),
+                Ok(None) => return Poll::Ready(self.body_end().map(|()| None)),
                 Ok(Some(Frame::Headers(encoded))) => {
                     self.trailers = Some(encoded);
                     // Received trailers, no more data expected
-                    return Poll::Ready(Ok(None));
+                    return Poll::Ready(self.body_end().map(|()| None));
                 }
                 Ok(Some(Frame::Data { .. })) => (),
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
@@ -1163,9 +1293,18 @@ where
             };
         }
 
-        self.stream
-            .poll_data(cx)
-            .map_err(|error| self.handle_frame_stream_error_on_request_stream(error))
+        let data = ready!(self.stream.poll_data(cx))
+            .map_err(|error| self.handle_frame_stream_error_on_request_stream(error))?;
+        if let Some(data) = &data {
+            self.data_received += data.remaining() as u64;
+            if let Some(length) = self.content_length.filter(|l| self.data_received > *l) {
+                return Poll::Ready(Err(self.malformed_body(format!(
+                    "content-length {length}, and {} bytes of body so far",
+                    self.data_received
+                ))));
+            }
+        }
+        Poll::Ready(Ok(data))
     }
 
     /// Poll receive trailers.
@@ -1417,13 +1556,18 @@ where
                 conn_state: self.conn_state.clone(),
                 max_field_section_size: 0,
                 send_grease_frame: self.send_grease_frame,
+                content_length: None,
+                data_received: 0,
             },
+            // The body is read on this half, so the count goes with it
             RequestStream {
                 stream: recv,
                 trailers: self.trailers,
                 conn_state: self.conn_state,
                 max_field_section_size: self.max_field_section_size,
                 send_grease_frame: self.send_grease_frame,
+                content_length: self.content_length,
+                data_received: self.data_received,
             },
         )
     }

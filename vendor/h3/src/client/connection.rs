@@ -406,6 +406,9 @@ where
         if let Poll::Ready(err) = self.inner.poll_qpack_encoder(cx) {
             return Poll::Ready(err);
         }
+        if let Poll::Ready(err) = self.inner.poll_qpack_decoder(cx) {
+            return Poll::Ready(err);
+        }
 
         while let Poll::Ready(result) = self.inner.poll_control(cx) {
             match result {
@@ -519,6 +522,9 @@ where
         // decoder that had been taught to object and was never given the
         // bytes.
         if let Poll::Ready(err) = self.inner.poll_qpack_encoder(cx) {
+            return Poll::Ready(err);
+        }
+        if let Poll::Ready(err) = self.inner.poll_qpack_decoder(cx) {
             return Poll::Ready(err);
         }
 
