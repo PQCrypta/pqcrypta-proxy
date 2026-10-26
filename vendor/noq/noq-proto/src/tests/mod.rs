@@ -1721,6 +1721,31 @@ fn migration() {
     );
 }
 
+/// RFC 9000 section 9.3: after verifying a client's new address, the server
+/// sends it new address validation tokens.
+#[test]
+fn new_token_after_migration() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    pair.drive();
+    let sent_after_connect = pair.server_conn_mut(server_ch).stats().frame_tx.new_token;
+    let received_after_connect = pair.client_conn_mut(client_ch).stats().frame_rx.new_token;
+
+    pair.routes.as_basic_mut().passive_migration(Client);
+    pair.client_conn_mut(client_ch).ping();
+    pair.drive();
+
+    let sent = pair.server_conn_mut(server_ch).stats().frame_tx.new_token - sent_after_connect;
+    let received =
+        pair.client_conn_mut(client_ch).stats().frame_rx.new_token - received_after_connect;
+    assert!(
+        sent > 0,
+        "the server sent no NEW_TOKEN for the client's new address"
+    );
+    assert_eq!(received, sent, "every token reached the client");
+}
+
 /// Regression test: handle sent challenges that are waiting for a response while a passive
 /// migration occurs.
 ///
