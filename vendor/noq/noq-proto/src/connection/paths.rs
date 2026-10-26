@@ -534,7 +534,8 @@ impl PathData {
                 // the path as validated though, because for a change in local_ip only we do
                 // not need to re-validate the path.
                 let sent_instant = info.sent_instant;
-                if !std::mem::replace(&mut self.validated, true) {
+                let newly_validated = !std::mem::replace(&mut self.validated, true);
+                if newly_validated {
                     trace!("new path validated");
                 }
                 // Clear any other on-path sent challenges and stop sending new ones.
@@ -545,7 +546,7 @@ impl PathData {
                 let rtt = now.saturating_duration_since(sent_instant);
                 self.rtt.reset_initial_rtt(rtt);
 
-                OnPathResponseReceived::OnPath
+                OnPathResponseReceived::OnPath { newly_validated }
             }
             // Response to an on-path PathChallenge that does not validate this path.
             Some(info) => {
@@ -670,8 +671,9 @@ impl PathData {
 }
 
 pub(super) enum OnPathResponseReceived {
-    /// This response validates the path on its current remote address.
-    OnPath,
+    /// This response validates the path on its current remote address;
+    /// `newly_validated` when the path had not been validated before.
+    OnPath { newly_validated: bool },
     /// The received token is unknown.
     Unknown,
     /// The response is valid but it's not usable for path validation.

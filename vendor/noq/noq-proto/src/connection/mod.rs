@@ -5718,8 +5718,12 @@ impl Connection {
             .paths
             .get_mut(&path_id)
             .expect("payload is processed only after the path becomes known");
+        let mut validated_now = false;
         match path.data.on_path_response_received(now, response.0) {
-            paths::OnPathResponseReceived::OnPath if !self.abandoned_paths.contains(&path_id) => {
+            paths::OnPathResponseReceived::OnPath { newly_validated }
+                if !self.abandoned_paths.contains(&path_id) =>
+            {
+                validated_now = newly_validated;
                 let qlog = self.qlog.with_time(now);
                 self.timers.stop(
                     Timer::PerPath(path_id, PathTimer::PathValidationFailed),
@@ -5756,7 +5760,7 @@ impl Connection {
                     prev.reset_on_path_challenges();
                 }
             }
-            paths::OnPathResponseReceived::OnPath => {
+            paths::OnPathResponseReceived::OnPath { .. } => {
                 trace!(
                     %response,
                     "ignoring PATH_RESPONSE received after path is abandoned"
@@ -5771,6 +5775,18 @@ impl Connection {
             } => {
                 debug!(%sent_on, %current_path, %response, "ignoring valid PATH_RESPONSE");
             }
+        }
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-9.3
+        //# After verifying a new client address, the server SHOULD send new
+        //# address validation tokens (Section 8) to the client.
+        //
+        // A path validated by PATH_RESPONSE -- a client's new address after a
+        // migration or a NAT rebinding -- was marked validated and nothing
+        // more; only the handshake's path went through `on_path_validated`, so
+        // the tokens it queues were never sent for an address the client moved
+        // to.
+        if validated_now {
+            self.on_path_validated(path_id);
         }
     }
 
