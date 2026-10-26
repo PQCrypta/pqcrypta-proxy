@@ -662,7 +662,8 @@ impl ExpectClientHello {
             });
 
         if selected_version == ProtocolVersion::TLSv1_3 {
-            if let Some(skxg) = self.tuple_kx_group(selected_version, client_groups, client_shares) {
+            if let Some(skxg) = self.tuple_kx_group(selected_version, client_groups, client_shares)
+            {
                 return Ok((*suite, skxg));
             }
             // This unwrap is structurally guaranteed by the early return for `!ffdhe_possible && !ecdhe_possible`
@@ -739,9 +740,19 @@ impl ExpectClientHello {
     /// Per draft-ietf-tls-esni-25 section 7.1, a decrypt failure is not a
     /// protocol error: the handshake continues using the (unmodified)
     /// ClientHelloOuter, exactly as if this extension were absent.
-    fn resolve_ech<'m>(&self, cx: &mut ServerContext<'_>, m: Message<'m>) -> Message<'m> {
+    ///
+    /// The second ClientHello after a HelloRetryRequest is the exception
+    /// (RFC 9849 section 7.1.1): where the first's offer was accepted, the
+    /// second's is opened with the same HPKE context, and one that is missing,
+    /// changed or does not open aborts the handshake. Where the first's was
+    /// rejected, the second's is ignored.
+    fn resolve_ech<'m>(
+        &self,
+        cx: &mut ServerContext<'_>,
+        m: Message<'m>,
+    ) -> Result<Message<'m>, Error> {
         let Some(ech_configs) = &self.config.ech else {
-            return m;
+            return Ok(m);
         };
 
         let MessagePayload::Handshake {
@@ -749,7 +760,7 @@ impl ExpectClientHello {
             encoded,
         } = &m.payload
         else {
-            return m;
+            return Ok(m);
         };
 
         // `encoded` is the full encoded handshake message (1-byte type +
@@ -758,43 +769,54 @@ impl ExpectClientHello {
         // the AAD scope for HPKE decryption.
         let raw_body = match encoded.bytes() {
             [_typ, _l0, _l1, _l2, body @ ..] => body,
-            _ => return m,
+            _ => return Ok(m),
         };
 
-        match super::ech::resolve(ech_configs, outer, raw_body) {
-            super::ech::EchResolution::NotOffered => m,
-            super::ech::EchResolution::Rejected => {
-                cx.data.ech_status = super::ech::EchStatus::Rejected;
-                m
+        let (inner, wire) = if self.previous_hello.is_some() {
+            let Some(mut context) = cx.data.ech_retry.take() else {
+                return Ok(m);
+            };
+            match super::ech::resolve_retry(&mut context, outer, raw_body) {
+                Ok(resolved) => resolved,
+                Err((alert, why)) => return Err(cx.common.send_fatal_alert(alert, why)),
             }
-            super::ech::EchResolution::Accepted(inner, wire) => {
-                cx.data.ech_status = super::ech::EchStatus::Accepted {
-                    client_hello_inner_random: inner.random.0,
-                };
-                // Build `encoded` directly from the reconstructed wire bytes
-                // (header + exact body) rather than via
-                // `MessagePayload::handshake()`'s `parsed.get_encoding()`,
-                // which would re-derive the encoding from `inner` and can
-                // reorder extensions (see `ech::EchResolution::Accepted`'s
-                // doc comment) - the transcript this feeds into must match
-                // the client's own bytes exactly.
-                let mut full_encoded = Vec::with_capacity(4 + wire.len());
-                HandshakeType::ClientHello.encode(&mut full_encoded);
-                let len = wire.len() as u32;
-                full_encoded.push((len >> 16) as u8);
-                full_encoded.push((len >> 8) as u8);
-                full_encoded.push(len as u8);
-                full_encoded.extend_from_slice(&wire);
-
-                Message {
-                    version: m.version,
-                    payload: MessagePayload::Handshake {
-                        parsed: HandshakeMessagePayload(HandshakePayload::ClientHello(inner)),
-                        encoded: crate::msgs::base::Payload::Owned(full_encoded),
-                    },
+        } else {
+            match super::ech::resolve(ech_configs, outer, raw_body) {
+                super::ech::EchResolution::NotOffered => return Ok(m),
+                super::ech::EchResolution::Rejected => {
+                    cx.data.ech_status = super::ech::EchStatus::Rejected;
+                    return Ok(m);
+                }
+                super::ech::EchResolution::Accepted(inner, wire, context) => {
+                    cx.data.ech_retry = Some(context);
+                    (inner, wire)
                 }
             }
-        }
+        };
+        cx.data.ech_status = super::ech::EchStatus::Accepted {
+            client_hello_inner_random: inner.random.0,
+        };
+        // Build `encoded` directly from the reconstructed wire bytes (header
+        // + exact body) rather than via `MessagePayload::handshake()`'s
+        // `parsed.get_encoding()`, which would re-derive the encoding from
+        // `inner` and can reorder extensions (see `ech::EchResolution::Accepted`'s
+        // doc comment) - the transcript this feeds into must match the
+        // client's own bytes exactly.
+        let mut full_encoded = Vec::with_capacity(4 + wire.len());
+        HandshakeType::ClientHello.encode(&mut full_encoded);
+        let len = wire.len() as u32;
+        full_encoded.push((len >> 16) as u8);
+        full_encoded.push((len >> 8) as u8);
+        full_encoded.push(len as u8);
+        full_encoded.extend_from_slice(&wire);
+
+        Ok(Message {
+            version: m.version,
+            payload: MessagePayload::Handshake {
+                parsed: HandshakeMessagePayload(HandshakePayload::ClientHello(inner)),
+                encoded: crate::msgs::base::Payload::Owned(full_encoded),
+            },
+        })
     }
 }
 
@@ -807,7 +829,7 @@ impl State<ServerConnectionData> for ExpectClientHello {
     where
         Self: 'm,
     {
-        let m = self.resolve_ech(cx, m);
+        let m = self.resolve_ech(cx, m)?;
 
         // Stash the hello's wire bytes before anything consumes it. Taken after
         // `resolve_ech` on purpose: when ECH is accepted `m` has been replaced

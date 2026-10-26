@@ -1,9 +1,12 @@
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ops::Range;
 
-use crate::crypto::hpke::{Hpke, HpkePrivateKey};
+use crate::crypto::hpke::{EncapsulatedSecret, Hpke, HpkeOpener, HpkePrivateKey};
+use crate::enums::AlertDescription;
 use crate::enums::EchClientHelloType;
 use crate::error::InvalidMessage;
+use crate::error::PeerMisbehaved;
 use crate::msgs::codec::{Codec, Reader};
 use crate::msgs::enums::ExtensionType;
 use crate::msgs::handshake::{
@@ -49,14 +52,15 @@ impl ServerEchConfig {
         private_key: HpkePrivateKey,
         hpke_suites: &[&'static dyn Hpke],
     ) -> Result<Self, Error> {
-        let contents = match EchConfigPayload::read(&mut Reader::init(ech_config)).map_err(
-            |_| Error::InvalidEncryptedClientHello(EncryptedClientHelloError::InvalidConfigList),
-        )? {
-            EchConfigPayload::V18(contents) => contents,
-            EchConfigPayload::Unknown { .. } => {
-                return Err(EncryptedClientHelloError::NoCompatibleConfig.into());
-            }
-        };
+        let contents =
+            match EchConfigPayload::read(&mut Reader::init(ech_config)).map_err(|_| {
+                Error::InvalidEncryptedClientHello(EncryptedClientHelloError::InvalidConfigList)
+            })? {
+                EchConfigPayload::V18(contents) => contents,
+                EchConfigPayload::Unknown { .. } => {
+                    return Err(EncryptedClientHelloError::NoCompatibleConfig.into());
+                }
+            };
 
         let kem_id = contents.key_config.kem_id;
         // Every symmetric suite the config offers that can be opened here. A
@@ -99,7 +103,8 @@ impl ServerEchConfig {
     /// other currently-accepted configs).
     pub fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
-        self.to_ech_config_payload().encode(&mut bytes);
+        self.to_ech_config_payload()
+            .encode(&mut bytes);
         bytes
     }
 
@@ -113,7 +118,8 @@ impl ServerEchConfig {
     fn hpke_info(&self) -> Vec<u8> {
         let mut info = Vec::with_capacity(128);
         info.extend_from_slice(b"tls ech\0");
-        self.to_ech_config_payload().encode(&mut info);
+        self.to_ech_config_payload()
+            .encode(&mut info);
         info
     }
 }
@@ -141,7 +147,12 @@ impl ServerEchConfigs {
     /// out, and every rejection - a GREASE extension included - would carry
     /// each retained generation's public key.
     pub fn with_current(configs: Vec<ServerEchConfig>, current: Vec<usize>) -> Result<Self, Error> {
-        if configs.is_empty() || current.is_empty() || current.iter().any(|i| *i >= configs.len()) {
+        if configs.is_empty()
+            || current.is_empty()
+            || current
+                .iter()
+                .any(|i| *i >= configs.len())
+        {
             return Err(EncryptedClientHelloError::NoCompatibleConfig.into());
         }
         Ok(Self(configs, current))
@@ -229,7 +240,7 @@ pub(crate) enum EchResolution {
     /// generation-time-only metadata with no wire representation), and the
     /// transcript this hello feeds into must match the client's own
     /// byte-for-byte.
-    Accepted(ClientHelloPayload, Vec<u8>),
+    Accepted(ClientHelloPayload, Vec<u8>, EchRetryContext),
     /// A real "outer" ECH extension was present but couldn't be decrypted
     /// against any configured `ServerEchConfig` (wrong/stale config_id,
     /// tampered ciphertext, or a GREASE ECH extension from a client with no
@@ -237,6 +248,73 @@ pub(crate) enum EchResolution {
     /// error - the server must fail open and continue with the outer hello,
     /// offering `retry_configs` so a real client can retry correctly.
     Rejected,
+}
+
+/// The HPKE context an accepted offer opened, kept for a second ClientHello.
+///
+/// After a HelloRetryRequest the client offers ECH again under the same
+/// context (RFC 9849 section 6.1.5): the same config and suite, an empty
+/// `enc`, and the payload sealed at the context's next sequence number. Only
+/// this opener can read it; a fresh decapsulation cannot.
+#[derive(Debug)]
+pub(crate) struct EchRetryContext {
+    opener: Box<dyn HpkeOpener>,
+    config_id: u8,
+    cipher_suite: HpkeSymmetricCipherSuite,
+}
+
+/// The ClientHello body with the ECH payload zeroed: the AAD the payload was
+/// sealed under (RFC 9849 section 5.2). None for a structurally malformed
+/// extension.
+fn aad_for(raw_body: &[u8]) -> Option<Vec<u8>> {
+    let range = find_extension_entry(raw_body, ExtensionType::EncryptedClientHello)
+        .ok()?
+        .and_then(|range| {
+            ech_outer_payload_range(raw_body, range)
+                .ok()
+                .flatten()
+        })?;
+    let mut aad = raw_body.to_vec();
+    aad[range].fill(0);
+    Some(aad)
+}
+
+/// Open the second ClientHello of an accepted ECH handshake with the first's
+/// context, as RFC 9849 section 7.1.1 requires: an offer that is missing,
+/// that names another config or suite, that carries an `enc`, or that does
+/// not open, aborts the handshake with the alert returned.
+pub(crate) fn resolve_retry(
+    context: &mut EchRetryContext,
+    outer_hello: &ClientHelloPayload,
+    raw_body: &[u8],
+) -> Result<(ClientHelloPayload, Vec<u8>), (AlertDescription, PeerMisbehaved)> {
+    let Some(EncryptedClientHello::Outer(ext)) = &outer_hello.encrypted_client_hello else {
+        return Err((
+            AlertDescription::MissingExtension,
+            PeerMisbehaved::EchMissingInSecondClientHello,
+        ));
+    };
+    if ext.config_id != context.config_id
+        || ext.cipher_suite != context.cipher_suite
+        || !ext.enc.0.is_empty()
+    {
+        return Err((
+            AlertDescription::IllegalParameter,
+            PeerMisbehaved::EchVariedInSecondClientHello,
+        ));
+    }
+    let undecryptable = || {
+        (
+            AlertDescription::DecryptError,
+            PeerMisbehaved::EchUndecryptableInSecondClientHello,
+        )
+    };
+    let aad = aad_for(raw_body).ok_or_else(undecryptable)?;
+    let decrypted = context
+        .opener
+        .open(&aad, &ext.payload.0)
+        .map_err(|_| undecryptable())?;
+    reconstruct_inner_hello(raw_body, &decrypted).map_err(|_| undecryptable())
 }
 
 /// Attempt to locate, decrypt, and reconstruct a real ClientHelloInner from
@@ -258,21 +336,10 @@ pub(crate) fn resolve(
         return EchResolution::NotOffered;
     };
 
-    let payload_range = match find_extension_entry(raw_body, ExtensionType::EncryptedClientHello)
-        .and_then(|found| match found {
-            Some(range) => ech_outer_payload_range(raw_body, range),
-            None => Ok(None),
-        }) {
-        Ok(Some(range)) => range,
-        // Structurally malformed ECH extension - can't compute a correct AAD,
-        // so there is nothing to trial-decrypt against. Fail open per spec.
-        Ok(None) | Err(_) => return EchResolution::Rejected,
-    };
-
-    let aad = {
-        let mut aad = raw_body.to_vec();
-        aad[payload_range].fill(0);
-        aad
+    // Structurally malformed ECH extension - can't compute a correct AAD,
+    // so there is nothing to trial-decrypt against. Fail open per spec.
+    let Some(aad) = aad_for(raw_body) else {
+        return EchResolution::Rejected;
     };
 
     // The candidates are the configs the offer's config_id names (RFC 9849
@@ -284,7 +351,10 @@ pub(crate) fn resolve(
     // Chrome's - cost an HPKE decapsulation per held key (section 10.4: it
     // "may exacerbate DoS attacks"). An id this server does not hold is
     // rejected at once, with retry_configs.
-    let candidates = configs.0.iter().filter(|c| c.config_id() == ext.config_id);
+    let candidates = configs
+        .0
+        .iter()
+        .filter(|c| c.config_id() == ext.config_id);
 
     for config in candidates {
         // The suite the client sealed with, if the config offers it
@@ -295,18 +365,29 @@ pub(crate) fn resolve(
         else {
             continue;
         };
-        let Ok(decrypted) = suite.open(
-            &crate::crypto::hpke::EncapsulatedSecret(ext.enc.0.clone()),
+        // A context rather than a single-shot open: a HelloRetryRequest's
+        // second ClientHello is sealed under this same context
+        let Ok(mut opener) = suite.setup_opener(
+            &EncapsulatedSecret(ext.enc.0.clone()),
             &config.hpke_info(),
-            &aad,
-            &ext.payload.0,
             &config.private_key,
         ) else {
             continue;
         };
+        let Ok(decrypted) = opener.open(&aad, &ext.payload.0) else {
+            continue;
+        };
 
         return match reconstruct_inner_hello(raw_body, &decrypted) {
-            Ok((inner, wire)) => EchResolution::Accepted(inner, wire),
+            Ok((inner, wire)) => EchResolution::Accepted(
+                inner,
+                wire,
+                EchRetryContext {
+                    opener,
+                    config_id: ext.config_id,
+                    cipher_suite: ext.cipher_suite,
+                },
+            ),
             // Decrypted successfully but the plaintext wasn't a well-formed
             // EncodedClientHelloInner - per spec this is still just a failed
             // candidate, not a protocol error (an attacker could otherwise
@@ -473,7 +554,10 @@ fn reconstruct_inner_hello(
         let entry_end = ext_block_start + ext_r.used();
 
         if ty == ExtensionType::EncryptedClientHelloOuterExtensions {
-            marker = Some((entry_start..entry_end, Vec::<ExtensionType>::read(&mut val_r)?));
+            marker = Some((
+                entry_start..entry_end,
+                Vec::<ExtensionType>::read(&mut val_r)?,
+            ));
             break;
         }
     }
@@ -519,8 +603,8 @@ fn reconstruct_inner_hello(
 mod tests {
     use alloc::string::String;
     use alloc::sync::Arc;
-    use alloc::vec::Vec;
     use alloc::vec;
+    use alloc::vec::Vec;
     use std::sync::Mutex;
 
     use pki_types::pem::PemObject;
@@ -604,8 +688,9 @@ mod tests {
         vec![EchConfigPayload::V18(contents)].encode(&mut list_bytes);
 
         let server_config =
-            ServerEchConfig::new(&single_config_bytes, private_key, ALL_SUPPORTED_SUITES)
-            .expect("constructing ServerEchConfig from our own freshly-generated config must succeed");
+            ServerEchConfig::new(&single_config_bytes, private_key, ALL_SUPPORTED_SUITES).expect(
+                "constructing ServerEchConfig from our own freshly-generated config must succeed",
+            );
 
         TestEchKeypair {
             server_config,
@@ -615,12 +700,8 @@ mod tests {
 
     fn test_cert_and_key() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
         let chain = vec![
-            CertificateDer::from(
-                &include_bytes!("../../../test-ca/ecdsa-p256/end.der")[..],
-            ),
-            CertificateDer::from(
-                &include_bytes!("../../../test-ca/ecdsa-p256/inter.der")[..],
-            ),
+            CertificateDer::from(&include_bytes!("../../../test-ca/ecdsa-p256/end.der")[..]),
+            CertificateDer::from(&include_bytes!("../../../test-ca/ecdsa-p256/inter.der")[..]),
         ];
         let key = PrivateKeyDer::from_pem_reader(
             &mut include_bytes!("../../../test-ca/ecdsa-p256/end.key").as_slice(),
@@ -652,7 +733,9 @@ mod tests {
 
     impl ResolvesServerCert for RecordingResolver {
         fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-            *self.seen_sni.lock().unwrap() = client_hello.server_name().map(String::from);
+            *self.seen_sni.lock().unwrap() = client_hello
+                .server_name()
+                .map(String::from);
             Some(self.key.clone())
         }
     }
@@ -759,6 +842,68 @@ mod tests {
     /// `PeerIncompatible(ServerRejectedEncryptedClientHello(retry_configs))`
     /// instead of completing the connection - real client applications are
     /// expected to open a fresh connection using those `retry_configs`.
+    /// ECH across a HelloRetryRequest (RFC 9849 sections 6.1.5, 7.1.1 and
+    /// 7.2.1). The server takes only P-384, which the client offered without a
+    /// share, so it asks again: the HelloRetryRequest must confirm the offer
+    /// it accepted, and the second ClientHello's offer - an empty `enc`, the
+    /// payload sealed at the next sequence number - must open with the
+    /// first's HPKE context. Before both, the client read the HelloRetryRequest
+    /// as a rejection and the server could not open the second offer: every
+    /// ECH client whose first key share this server did not take failed.
+    #[test]
+    fn ech_round_trip_accepted_after_hello_retry() {
+        let keypair = make_ech_keypair(0xA6, "second.testserver.com");
+        let (chain, key) = test_cert_and_key();
+        let mut server_provider = crate::crypto::aws_lc_rs::default_provider();
+        let signing_key = server_provider
+            .key_provider
+            .load_private_key(key)
+            .unwrap();
+        server_provider.kx_groups = vec![crate::crypto::aws_lc_rs::kx_group::SECP384R1];
+        let seen_sni = Arc::new(Mutex::new(None));
+        let resolver = Arc::new(RecordingResolver {
+            key: Arc::new(CertifiedKey::new(chain, signing_key)),
+            seen_sni: seen_sni.clone(),
+        });
+        let mut server_config = ServerConfig::builder_with_provider(Arc::new(server_provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(resolver);
+        server_config.ech = Some(Arc::new(
+            ServerEchConfigs::new(vec![keypair.server_config]).unwrap(),
+        ));
+
+        let ech_config = EchConfig::new(keypair.client_config_list, ALL_SUPPORTED_SUITES).unwrap();
+        let client_config = ClientConfig::builder_with_provider(Arc::new(
+            crate::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_ech(EchMode::Enable(ech_config))
+        .unwrap()
+        .with_root_certificates(test_roots())
+        .with_no_client_auth();
+        let mut client = ClientConnection::new(
+            Arc::new(client_config),
+            ServerName::try_from("testserver.com").unwrap(),
+        )
+        .unwrap();
+        let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
+
+        do_handshake(&mut client, &mut server);
+
+        assert_eq!(
+            client.handshake_kind(),
+            Some(crate::HandshakeKind::FullWithHelloRetryRequest),
+            "the server must have asked again for a P-384 share"
+        );
+        assert_eq!(client.ech_status(), ClientEchStatus::Accepted);
+        assert_eq!(
+            seen_sni.lock().unwrap().as_deref(),
+            Some("testserver.com"),
+            "the second ClientHello's inner SNI, not the public name, reaches certificate resolution"
+        );
+    }
+
     #[test]
     fn ech_round_trip_rejected_falls_back() {
         let server_keypair = make_ech_keypair(0x01, "second.testserver.com");
