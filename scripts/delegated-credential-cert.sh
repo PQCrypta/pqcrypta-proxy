@@ -34,16 +34,25 @@ CA_DIR=${CA_DIR:-/etc/pqcrypta/delegation-ca}
 DC_LEAF_DAYS=${DC_LEAF_DAYS:-90}
 DC_RENEW_DAYS=${DC_RENEW_DAYS:-30}
 CA_DAYS=${CA_DAYS:-1825}
-OPENSSL=${OPENSSL:-openssl}
 
 log() { echo "$(date -u +%FT%TZ) delegated-credential-cert: $*"; }
 
-# The directory the SNI resolver reads: that of [tls] cert_path.
-CERTS_DIR=$(python3 -I - "$PROXY_CONFIG" <<'EOF'
+# The directory the SNI resolver reads (that of [tls] cert_path), and the
+# OpenSSL the proxy runs ([pqc] openssl_path and openssl_lib_path), run as the
+# proxy runs it: not whichever `openssl` PATH finds, which need not match the
+# library the system loads for it.
+read -r CERTS_DIR CFG_OPENSSL CFG_OPENSSL_LIB < <(python3 -I - "$PROXY_CONFIG" <<'EOF'
 import os, sys, tomllib
-print(os.path.dirname(tomllib.load(open(sys.argv[1], 'rb'))['tls']['cert_path']))
+c = tomllib.load(open(sys.argv[1], 'rb'))
+pqc = c.get('pqc', {})
+print(os.path.dirname(c['tls']['cert_path']), pqc.get('openssl_path') or 'openssl',
+      pqc.get('openssl_lib_path') or '-')
 EOF
 )
+OPENSSL=${OPENSSL:-$CFG_OPENSSL}
+OPENSSL_LIB=${OPENSSL_LIB:-$CFG_OPENSSL_LIB}
+[ "$OPENSSL_LIB" = - ] && OPENSSL_LIB=
+ossl() { LD_LIBRARY_PATH=$OPENSSL_LIB "$OPENSSL" "$@"; }
 CERT="$CERTS_DIR/$DC_NAME.crt"
 KEY="$CERTS_DIR/$DC_NAME.key"
 
@@ -52,10 +61,10 @@ install -d -m 700 "$CA_DIR"
 
 # The private CA: ECDSA P-384, signing nothing but this certificate.
 if [[ ! -s "$CA_DIR/ca.key" || ! -s "$CA_DIR/ca.crt" ]] \
-    || ! "$OPENSSL" x509 -checkend $((DC_LEAF_DAYS * 86400)) -noout -in "$CA_DIR/ca.crt" >/dev/null; then
+    || ! ossl x509 -checkend $((DC_LEAF_DAYS * 86400)) -noout -in "$CA_DIR/ca.crt" >/dev/null; then
     log "Creating the delegation CA in $CA_DIR"
-    "$OPENSSL" genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-384 -out "$CA_DIR/ca.key.new"
-    "$OPENSSL" req -x509 -new -key "$CA_DIR/ca.key.new" -sha384 -days "$CA_DAYS" \
+    ossl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-384 -out "$CA_DIR/ca.key.new"
+    ossl req -x509 -new -key "$CA_DIR/ca.key.new" -sha384 -days "$CA_DAYS" \
         -subj "/O=PQ Crypta/CN=PQ Crypta Delegated Credentials Test CA" \
         -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
         -addext "keyUsage=critical,keyCertSign,cRLSign" \
@@ -66,9 +75,9 @@ if [[ ! -s "$CA_DIR/ca.key" || ! -s "$CA_DIR/ca.crt" ]] \
 fi
 
 if [[ -s "$CERT" && -s "$KEY" ]] \
-    && "$OPENSSL" x509 -checkend $((DC_RENEW_DAYS * 86400)) -noout -in "$CERT" >/dev/null \
-    && "$OPENSSL" verify -CAfile "$CA_DIR/ca.crt" "$CERT" >/dev/null 2>&1; then
-    log "$CERT is valid until $("$OPENSSL" x509 -enddate -noout -in "$CERT" | cut -d= -f2); nothing to do"
+    && ossl x509 -checkend $((DC_RENEW_DAYS * 86400)) -noout -in "$CERT" >/dev/null \
+    && ossl verify -CAfile "$CA_DIR/ca.crt" "$CERT" >/dev/null 2>&1; then
+    log "$CERT is valid until $(ossl x509 -enddate -noout -in "$CERT" | cut -d= -f2); nothing to do"
     exit 0
 fi
 
@@ -85,9 +94,9 @@ authorityKeyIdentifier = keyid
 # DelegationUsage ::= NULL (RFC 9345 section 4.2)
 1.3.6.1.4.1.44363.44 = DER:05:00
 EOF
-"$OPENSSL" genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$work/leaf.key"
-"$OPENSSL" req -new -key "$work/leaf.key" -subj "/CN=$DC_NAME" -out "$work/leaf.csr"
-"$OPENSSL" x509 -req -in "$work/leaf.csr" -CA "$CA_DIR/ca.crt" -CAkey "$CA_DIR/ca.key" \
+ossl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$work/leaf.key"
+ossl req -new -key "$work/leaf.key" -subj "/CN=$DC_NAME" -out "$work/leaf.csr"
+ossl x509 -req -in "$work/leaf.csr" -CA "$CA_DIR/ca.crt" -CAkey "$CA_DIR/ca.key" \
     -CAcreateserial -sha384 -days "$DC_LEAF_DAYS" -extfile "$work/ext.cnf" -out "$work/leaf.crt"
 cat "$work/leaf.crt" "$CA_DIR/ca.crt" >"$work/chain.crt"
 
