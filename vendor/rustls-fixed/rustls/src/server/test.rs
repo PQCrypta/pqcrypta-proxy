@@ -64,28 +64,36 @@ fn test_process_client_hello(hello: ClientHelloPayload) -> Result<(), Error> {
 
 #[macro_rules_attribute::apply(test_for_each_provider)]
 mod tests {
+    use alloc::string::String;
     use alloc::vec::Vec;
+    use core::time::Duration;
 
     use super::super::*;
     use crate::common_state::KxState;
+    use crate::crypto::tls13::OkmBlock;
     use crate::crypto::{
         ActiveKeyExchange, CryptoProvider, KeyExchangeAlgorithm, SupportedKxGroup,
+        WebPkiSupportedAlgorithms,
     };
-    use crate::enums::CertificateType;
+    use crate::enums::{CertificateType, ContentType};
     use crate::msgs::codec::{Codec, Reader};
     use crate::msgs::handshake::{
-        PresharedKeyBinder, PresharedKeyIdentity, PresharedKeyOffer, PskKeyExchangeModes,
+        CertificatePayloadTls13, PresharedKeyBinder, PresharedKeyIdentity, PresharedKeyOffer,
+        PskKeyExchangeModes,
     };
-    use crate::msgs::message::HEADER_SIZE;
+    use crate::msgs::message::{HEADER_SIZE, InboundOpaqueMessage};
     use crate::msgs::persist;
     use crate::pki_types::pem::PemObject;
-    use crate::pki_types::{CertificateDer, PrivateKeyDer};
+    use crate::pki_types::{CertificateDer, PrivateKeyDer, SubjectPublicKeyInfoDer, UnixTime};
     use crate::server::{AlwaysResolvesServerRawPublicKeys, ServerConfig, ServerConnection};
-    use crate::sign::CertifiedKey;
+    use crate::sign::{CertifiedKey, DelegatedCredential, SingleCertAndKey};
     use crate::sync::Arc;
-    use crate::tls13::key_schedule::KeyScheduleEarly;
+    use crate::tls13::construct_server_verify_message;
+    use crate::tls13::key_schedule::{KeyScheduleEarly, derive_traffic_iv, derive_traffic_key};
+    use crate::webpki::{verify_tls13_signature, verify_tls13_signature_with_raw_key};
     use crate::{
-        CipherSuiteCommon, SupportedCipherSuite, Tls12CipherSuite, Tls13CipherSuite, version,
+        CipherSuiteCommon, DigitallySignedStruct, KeyLog, SupportedCipherSuite, Tls12CipherSuite,
+        Tls13CipherSuite, version,
     };
 
     #[cfg(feature = "tls12")]
@@ -588,6 +596,243 @@ mod tests {
             },
             _ => unreachable!(),
         };
+
+    #[test]
+    fn server_sends_the_delegated_credential_a_client_offers() {
+        let flight = flight_for(Some(vec![SignatureScheme::ECDSA_NISTP256_SHA256]));
+        let dc = &flight.delegated_credential;
+
+        let leaf = &flight.certificate.entries[0];
+        assert_eq!(
+            leaf.extensions
+                .delegated_credential
+                .as_ref()
+                .map(|p| p.bytes()),
+            Some(dc.encoded())
+        );
+        assert!(
+            flight.certificate.entries[1..]
+                .iter()
+                .all(|e| e.extensions.delegated_credential.is_none())
+        );
+
+        // CertificateVerify comes from the delegated key, under the scheme
+        // its credential names
+        assert_eq!(flight.verify.scheme, dc.scheme());
+        let encoded = dc.encoded();
+        let spki_len = (usize::from(encoded[6]) << 16)
+            | (usize::from(encoded[7]) << 8)
+            | usize::from(encoded[8]);
+        let spki = SubjectPublicKeyInfoDer::from(&encoded[9..9 + spki_len]);
+        verify_tls13_signature_with_raw_key(
+            &flight.verify_message,
+            &spki,
+            &flight.verify,
+            &flight.algorithms,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn server_signs_with_the_certificate_key_unless_a_credential_is_acceptable() {
+        // not offered; offered for another scheme
+        for offered in [None, Some(vec![SignatureScheme::ED25519])] {
+            let flight = flight_for(offered);
+            assert!(!flight.certificate.any_delegated_credential());
+            assert_eq!(
+                flight.verify.scheme,
+                SignatureScheme::ECDSA_NISTP384_SHA384
+            );
+            verify_tls13_signature(
+                &flight.verify_message,
+                &flight.leaf,
+                &flight.verify,
+                &flight.algorithms,
+            )
+            .unwrap();
+        }
+    }
+
+    /// The server's first flight, decrypted, for a ClientHello offering
+    /// `offered` in its delegated_credential extension to a server whose
+    /// P-384 certificate carries a P-256 delegated credential.
+    struct ServerFlight {
+        delegated_credential: DelegatedCredential,
+        leaf: CertificateDer<'static>,
+        certificate: CertificatePayloadTls13<'static>,
+        verify: DigitallySignedStruct,
+        verify_message: Vec<u8>,
+        algorithms: WebPkiSupportedAlgorithms,
+    }
+
+    fn flight_for(offered: Option<Vec<SignatureScheme>>) -> ServerFlight {
+        let provider = Arc::new(CryptoProvider {
+            kx_groups: vec![super::provider::kx_group::X25519],
+            ..super::provider::default_provider()
+        });
+        let load = |pair: &rcgen::KeyPair| {
+            provider
+                .key_provider
+                .load_private_key(PrivateKeyDer::Pkcs8(pair.serialize_der().into()))
+                .unwrap()
+        };
+
+        let issuer = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["dc.example".into()]).unwrap();
+        params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2100, 1, 1);
+        let leaf = params
+            .self_signed(&issuer)
+            .unwrap()
+            .der()
+            .clone();
+        // a second entry, to show the credential rides on the end-entity's only
+        let mut certified = CertifiedKey::new(vec![leaf.clone(), leaf.clone()], load(&issuer));
+        let delegated_credential = DelegatedCredential::delegate(
+            &certified,
+            load(&rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap()),
+            UnixTime::since_unix_epoch(Duration::from_secs(946_684_800)),
+            UnixTime::since_unix_epoch(Duration::from_secs(4_102_444_800)),
+            UnixTime::now(),
+            Duration::from_secs(3_600),
+        )
+        .unwrap();
+        certified
+            .delegated_credentials
+            .push(delegated_credential.clone());
+
+        let secrets = Arc::new(Secrets::default());
+        let mut config = ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(SingleCertAndKey::from(certified)));
+        config.key_log = secrets.clone();
+
+        let mut ch = minimal_client_hello();
+        ch.cipher_suites = vec![CipherSuite::TLS13_AES_128_GCM_SHA256];
+        ch.extensions.signature_schemes = Some(vec![SignatureScheme::ECDSA_NISTP384_SHA384]);
+        ch.extensions.delegated_credential = offered;
+        let hmp = HandshakeMessagePayload(HandshakePayload::ClientHello(ch));
+        let mut transcript = hmp.get_encoding();
+        let ch = Message {
+            version: ProtocolVersion::TLSv1_3,
+            payload: MessagePayload::handshake(hmp),
+        };
+
+        let mut conn = ServerConnection::new(config.into()).unwrap();
+        conn.read_tls(&mut ch.into_wire_bytes().as_slice())
+            .unwrap();
+        conn.process_new_packets().unwrap();
+        let mut wire = vec![];
+        while conn.wants_write() {
+            conn.write_tls(&mut wire).unwrap();
+        }
+
+        let SupportedCipherSuite::Tls13(suite) =
+            super::provider::cipher_suite::TLS13_AES_128_GCM_SHA256
+        else {
+            unreachable!();
+        };
+        let secret = secrets.get("SERVER_HANDSHAKE_TRAFFIC_SECRET");
+        let expander = suite
+            .hkdf_provider
+            .expander_for_okm(&OkmBlock::new(&secret));
+        let mut decrypter = suite.aead_alg.decrypter(
+            derive_traffic_key(&*expander, suite.aead_alg),
+            derive_traffic_iv(&*expander),
+        );
+
+        // ServerHello in the clear, a compatibility ChangeCipherSpec, then
+        // the encrypted flight
+        let mut handshake = Vec::new();
+        let mut seq = 0;
+        let mut rest = &mut wire[..];
+        while !rest.is_empty() {
+            let typ = ContentType::from(rest[0]);
+            let len = usize::from(u16::from_be_bytes([rest[3], rest[4]]));
+            let (record, tail) = core::mem::take(&mut rest).split_at_mut(HEADER_SIZE + len);
+            rest = tail;
+            let payload = &mut record[HEADER_SIZE..];
+            match typ {
+                ContentType::Handshake => transcript.extend_from_slice(payload),
+                ContentType::ChangeCipherSpec => {}
+                ContentType::ApplicationData => {
+                    let plain = decrypter
+                        .decrypt(
+                            InboundOpaqueMessage::new(typ, ProtocolVersion::TLSv1_2, payload),
+                            seq,
+                        )
+                        .unwrap();
+                    seq += 1;
+                    assert_eq!(plain.typ, ContentType::Handshake);
+                    handshake.extend_from_slice(plain.payload);
+                }
+                other => panic!("unexpected {other:?} record"),
+            }
+        }
+
+        let mut certificate = None;
+        let mut verify = None;
+        let mut r = Reader::init(&handshake);
+        while r.any_left() {
+            let start = r.used();
+            let message = HandshakeMessagePayload::read_version(&mut r, ProtocolVersion::TLSv1_3)
+                .unwrap();
+            match message.0 {
+                HandshakePayload::CertificateTls13(c) => certificate = Some(c.into_owned()),
+                HandshakePayload::CertificateVerify(dss) => {
+                    let hash = suite
+                        .common
+                        .hash_provider
+                        .hash(&transcript);
+                    verify = Some((
+                        dss,
+                        construct_server_verify_message(&hash)
+                            .as_ref()
+                            .to_vec(),
+                    ));
+                }
+                _ => {}
+            }
+            transcript.extend_from_slice(&handshake[start..r.used()]);
+        }
+        let (verify, verify_message) = verify.expect("a CertificateVerify");
+
+        ServerFlight {
+            delegated_credential,
+            leaf,
+            certificate: certificate.expect("a Certificate"),
+            verify,
+            verify_message,
+            algorithms: provider.signature_verification_algorithms,
+        }
+    }
+
+    /// The traffic secrets a connection logs, by label
+    #[derive(Debug, Default)]
+    struct Secrets(std::sync::Mutex<Vec<(String, Vec<u8>)>>);
+
+    impl Secrets {
+        fn get(&self, label: &str) -> Vec<u8> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(l, _)| l == label)
+                .map(|(_, secret)| secret.clone())
+                .unwrap()
+        }
+    }
+
+    impl KeyLog for Secrets {
+        fn log(&self, label: &str, _client_random: &[u8], secret: &[u8]) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((label.into(), secret.to_vec()));
+        }
+    }
 }
 
 fn minimal_client_hello() -> ClientHelloPayload {

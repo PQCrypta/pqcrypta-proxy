@@ -787,6 +787,7 @@ fn sample_client_hello_payload() -> ClientHelloPayload {
                 ..Default::default()
             }),
             key_shares: Some(vec![KeyShareEntry::new(NamedGroup::X25519, &[1, 2, 3][..])]),
+            delegated_credential: Some(vec![SignatureScheme::ECDSA_NISTP256_SHA256]),
             preshared_key_modes: Some(PskKeyExchangeModes {
                 psk_dhe: true,
                 psk: false,
@@ -956,6 +957,46 @@ fn all_tls13_handshake_payloads() -> Vec<HandshakeMessagePayload<'static>> {
     ]
 }
 
+#[test]
+fn delegated_credential_rides_on_the_end_entity_entry_only() {
+    let certs = [CertificateDer::from(vec![1]), CertificateDer::from(vec![2])];
+    let payload = CertificatePayloadTls13::new(certs.iter(), Some(b"ocsp"), Some(b"dc"));
+    assert!(payload.any_delegated_credential());
+    assert!(payload.entries[1].extensions.delegated_credential.is_none());
+
+    let encoding = payload.get_encoding();
+    let read = CertificatePayloadTls13::read_bytes(&encoding).unwrap();
+    assert_eq!(
+        read.entries[0]
+            .extensions
+            .delegated_credential
+            .as_ref()
+            .map(|p| p.bytes()),
+        Some(&b"dc"[..])
+    );
+    assert!(read.entries[1].extensions.delegated_credential.is_none());
+    assert!(!CertificatePayloadTls13::new(certs.iter(), None, None).any_delegated_credential());
+}
+
+#[test]
+fn client_hello_carries_the_delegated_credential_schemes() {
+    let exts = ClientExtensions {
+        delegated_credential: Some(vec![
+            SignatureScheme::ML_DSA_65,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+        ]),
+        ..Default::default()
+    };
+    // extensions length 10; type 0x0022, length 6, list length 4, the two schemes
+    assert_eq!(
+        exts.get_encoding(),
+        [0x00, 0x0a, 0x00, 0x22, 0x00, 0x06, 0x00, 0x04, 0x09, 0x05, 0x04, 0x03]
+    );
+    let encoding = exts.get_encoding();
+    let read = ClientExtensions::read_bytes(&encoding).unwrap();
+    assert_eq!(read.delegated_credential, exts.delegated_credential);
+}
+
 fn sample_certificate_payload_tls13() -> CertificatePayloadTls13<'static> {
     CertificatePayloadTls13 {
         context: PayloadU8::new(vec![1, 2, 3]),
@@ -965,6 +1006,7 @@ fn sample_certificate_payload_tls13() -> CertificatePayloadTls13<'static> {
                 status: Some(CertificateStatus {
                     ocsp_response: PayloadU24::from(Payload::new(vec![1, 2, 3])),
                 }),
+                delegated_credential: Some(Payload::new(vec![6, 7, 8])),
             },
         }],
     }

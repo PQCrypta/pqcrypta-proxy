@@ -32,4 +32,10 @@ impl ActiveCertifiedKey<'_> {
     pub(super) fn get_ocsp(&self) -> Option<&[u8]> {
         self.ocsp
     }
+
+    /// Get the delegated credentials, in the order the server prefers them
+    #[inline]
+    pub(super) fn get_delegated_credentials(&self) -> &[sign::DelegatedCredential] {
+        &self.key.delegated_credentials
+    }
 }
