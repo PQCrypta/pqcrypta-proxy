@@ -1259,9 +1259,33 @@ fn pqc_tls_identity(config: &ProxyConfig) -> String {
         .unwrap_or_default()
 }
 
+/// What tells a PQC listener to rebuild its OpenSSL contexts: a reloaded
+/// configuration, and a reload of the TLS material.
+#[cfg(feature = "pqc")]
+struct PqcTlsReloads {
+    config: watch::Receiver<Arc<ProxyConfig>>,
+    material: watch::Receiver<u64>,
+}
+
+#[cfg(feature = "pqc")]
+impl PqcTlsReloads {
+    /// A listener's configuration updates, and the process's TLS reloads
+    fn of(config: watch::Receiver<Arc<ProxyConfig>>) -> Self {
+        Self {
+            config,
+            material: crate::ech_config::reloads(),
+        }
+    }
+}
+
 /// Rebuild a PQC listener's OpenSSL acceptor, and the per-SNI contexts its
 /// servername callback switches to, whenever a reloaded configuration changes
-/// its TLS settings, and hand each new acceptor to `install`.
+/// its TLS settings or the TLS material is reloaded (`tls_reloads`: the admin
+/// API's reload, the certificate poller's, ACME's), and hand each new
+/// acceptor to `install`. A certificate added to the certificates directory
+/// reaches TCP clients with the reload that brings it to QUIC ones, and the
+/// acceptor's own certificate, which a client sending no server name gets, is
+/// the one on disk.
 ///
 /// `--watch-config` applied a changed `[pqc]` to nothing: the log said
 /// "Configuration hot-reloaded", while the acceptor kept the groups it was
@@ -1274,7 +1298,7 @@ fn pqc_tls_identity(config: &ProxyConfig) -> String {
 /// acceptor and says so.
 #[cfg(feature = "pqc")]
 fn spawn_pqc_tls_reload(
-    mut updates: watch::Receiver<Arc<ProxyConfig>>,
+    reloads: PqcTlsReloads,
     initial: &ProxyConfig,
     cert_path: &str,
     key_path: &str,
@@ -1284,13 +1308,34 @@ fn spawn_pqc_tls_reload(
 ) {
     let mut applied = pqc_tls_identity(initial);
     let (cert_path, key_path) = (cert_path.to_string(), key_path.to_string());
+    let PqcTlsReloads {
+        config: mut updates,
+        material: mut tls_reloads,
+    } = reloads;
     tokio::spawn(async move {
-        while updates.changed().await.is_ok() {
-            let config = updates.borrow_and_update().clone();
+        let mut reloads_open = true;
+        loop {
+            let (config, why) = tokio::select! {
+                changed = updates.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let config = updates.borrow_and_update().clone();
+                    if pqc_tls_identity(&config) == applied {
+                        continue;
+                    }
+                    (config, "the reloaded [pqc] and [tls]")
+                }
+                changed = tls_reloads.changed(), if reloads_open => {
+                    if changed.is_err() {
+                        reloads_open = false;
+                        continue;
+                    }
+                    tls_reloads.borrow_and_update();
+                    (updates.borrow().clone(), "the reloaded certificates")
+                }
+            };
             let identity = pqc_tls_identity(&config);
-            if identity == applied {
-                continue;
-            }
             let (cert, key) = (cert_path.clone(), key_path.clone());
             let (provider, map) = (Arc::clone(&pqc_provider), sni_map.clone());
             let built = tokio::task::spawn_blocking(move || {
@@ -1319,8 +1364,10 @@ fn spawn_pqc_tls_reload(
                     install(acceptor);
                     applied = identity;
                     info!(
-                        "🔒 OpenSSL listener rebuilt from the reloaded [pqc] and [tls]: groups {}",
-                        pqc_provider.groups_string()
+                        "🔒 OpenSSL listener rebuilt from {}: groups {}, {} certificate context(s)",
+                        why,
+                        pqc_provider.groups_string(),
+                        sni_map.read().len()
                     );
                 }
                 Ok(Err(e)) => warn!(
@@ -1459,7 +1506,7 @@ pub async fn run_http_listener_pqc(
                         let current = Arc::new(arc_swap::ArcSwap::from(ssl_acceptor));
                         let swap = Arc::clone(&current);
                         spawn_pqc_tls_reload(
-                            tls_updates,
+                            PqcTlsReloads::of(tls_updates),
                             &config,
                             cert_path,
                             key_path,
@@ -1487,7 +1534,7 @@ pub async fn run_http_listener_pqc(
                     let openssl_config = OpenSSLConfig::from_acceptor(ssl_acceptor);
                     let reload = openssl_config.clone();
                     spawn_pqc_tls_reload(
-                        tls_updates,
+                        PqcTlsReloads::of(tls_updates),
                         &config,
                         cert_path,
                         key_path,
@@ -2130,7 +2177,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     {
         let swap = Arc::clone(&ssl_context);
         spawn_pqc_tls_reload(
-            tls_updates,
+            PqcTlsReloads::of(tls_updates),
             &config,
             cert_path,
             key_path,
@@ -4338,6 +4385,73 @@ mod pqc_reload_tests {
         );
     }
 
+    /// A certificate added to the certificates directory reaches the OpenSSL
+    /// listener with the TLS reload that brings it to QUIC, with no restart and
+    /// no change to the configuration: the SNI contexts are rebuilt from the
+    /// directory. Only an ACME issuance or a changed `[pqc]`/`[tls]` rebuilt
+    /// them, so a certificate put there by anything else (the delegated
+    /// credentials test host's) was served over QUIC and not over TCP.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tls_reload_brings_a_new_certificate_to_the_openssl_listener() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let write = |name: &str| {
+            let cert = rcgen::generate_simple_self_signed(vec![name.to_string()])
+                .expect("self-signed certificate");
+            std::fs::write(dir.path().join(format!("{name}.crt")), cert.cert.pem())
+                .expect("write certificate");
+            std::fs::write(
+                dir.path().join(format!("{name}.key")),
+                cert.signing_key.serialize_pem(),
+            )
+            .expect("write key");
+        };
+        write("first.test");
+        let cert_path = dir.path().join("first.test.crt");
+        let key_path = dir.path().join("first.test.key");
+
+        let mut config = ProxyConfig::default();
+        // Classical groups only: the test needs no ML-KEM openssl binary
+        config.pqc.enabled = false;
+        config.tls.cert_path = cert_path.clone();
+        config.tls.key_path = key_path.clone();
+        let provider = Arc::new(
+            PqcTlsProvider::new(&config.pqc).with_tls_settings(&config.tls, config.client_auth()),
+        );
+        let sni_map =
+            openssl_pqc::build_sni_map(dir.path(), &provider, &config.server.http11_only_hosts);
+        assert_eq!(sni_map.read().len(), 1);
+
+        let (_config_tx, config_rx) = watch::channel(Arc::new(config.clone()));
+        let (reloads_tx, reloads_rx) = watch::channel(0u64);
+        let (installed_tx, mut installed_rx) = tokio::sync::mpsc::unbounded_channel();
+        spawn_pqc_tls_reload(
+            PqcTlsReloads {
+                config: config_rx,
+                material: reloads_rx,
+            },
+            &config,
+            cert_path.to_str().expect("utf-8 path"),
+            key_path.to_str().expect("utf-8 path"),
+            Arc::clone(&provider),
+            sni_map.clone(),
+            move |_acceptor| {
+                let _ = installed_tx.send(());
+            },
+        );
+
+        write("second.test");
+        reloads_tx.send(1).expect("send");
+        tokio::time::timeout(std::time::Duration::from_secs(30), installed_rx.recv())
+            .await
+            .expect("the TLS reload rebuilt the acceptor")
+            .expect("install channel open");
+        assert_eq!(
+            sni_map.read().len(),
+            2,
+            "the certificate added before the reload has a context"
+        );
+    }
+
     /// A reloaded `[tls]` reaches the OpenSSL listener: allowing TLS 1.2 lets a
     /// 1.2-only client in that the startup acceptor (TLS 1.3 only) refused,
     /// with no restart. Before, `--watch-config` logged the reload and the
@@ -4378,10 +4492,15 @@ mod pqc_reload_tests {
         );
 
         let (tx, rx) = watch::channel(Arc::new(config.clone()));
+        // No TLS reload in this test: its own channel, not the process's
+        let (_reloads_tx, reloads_rx) = watch::channel(0u64);
         let (installed_tx, mut installed_rx) = tokio::sync::mpsc::unbounded_channel();
         let swap = Arc::clone(&current);
         spawn_pqc_tls_reload(
-            rx,
+            PqcTlsReloads {
+                config: rx,
+                material: reloads_rx,
+            },
             &config,
             cert_path.to_str().expect("utf-8 path"),
             key_path.to_str().expect("utf-8 path"),

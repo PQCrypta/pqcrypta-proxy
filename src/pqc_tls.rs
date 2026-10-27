@@ -893,9 +893,10 @@ pub mod openssl_pqc {
 
     /// Reload an existing `PqcSniMap` in-place by rescanning `certs_dir`.
     ///
-    /// Called from the ACME cert-update handler whenever a new certificate is
-    /// issued.  The write lock is held only while swapping the `HashMap`; reads
-    /// from the SNI callback are blocked for at most microseconds.
+    /// Called by each OpenSSL listener on every TLS reload (the admin API's,
+    /// the certificate poller's, ACME's) and on a changed `[pqc]` or `[tls]`.
+    /// The write lock is held only while swapping the `HashMap`; reads from the
+    /// SNI callback are blocked for at most microseconds.
     pub fn reload_sni_map(
         sni_map: &PqcSniMap,
         certs_dir: &Path,
@@ -1130,12 +1131,12 @@ pub mod openssl_pqc {
     /// the SNI name is not in the map.
     ///
     /// The acceptor's servername callback reads from `sni_map` on every TLS handshake.
-    /// Because `sni_map` is an `Arc<RwLock<...>>`, calling `reload_sni_map()` from the
-    /// ACME handler immediately makes new certificates available to all in-progress and
+    /// Because `sni_map` is an `Arc<RwLock<...>>`, calling `reload_sni_map()` on a TLS
+    /// reload immediately makes new certificates available to all in-progress and
     /// future handshakes without restarting the listener.
     ///
     /// Build the initial map with `build_sni_map()` and pass it here; keep a clone
-    /// around so `reload_sni_map()` can update it when ACME issues new certs.
+    /// around so `reload_sni_map()` can update it when the TLS material reloads.
     pub fn create_pqc_acceptor_with_sni(
         default_cert_path: &Path,
         default_key_path: &Path,
