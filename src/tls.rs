@@ -10,14 +10,17 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::Context as _;
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 use rustls::crypto::CryptoProvider;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{
+    CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, UnixTime,
+};
 use rustls::server::ServerConfig as RustlsServerConfig;
 use rustls::version::{TLS12, TLS13};
 // L-1: Migrated from unmaintained rustls-pemfile to rustls-pki-types PEM parsing API
@@ -81,6 +84,11 @@ pub struct MultiDomainCertResolver {
     /// when no certificate names this host's addresses: `tls.cert_path`'s.
     /// See [`Self::for_primary`].
     default_domain: Option<String>,
+    /// When the delegated credentials are next minted afresh, in seconds
+    /// since the Unix epoch; `u64::MAX` while no certificate allows them
+    delegation_due: AtomicU64,
+    /// Set while one handshake mints them
+    minting: AtomicBool,
 }
 
 /// What a reload of the certs directory found.
@@ -173,6 +181,167 @@ pub fn address_domain(mut candidates: Vec<String>) -> Option<String> {
     candidates.into_iter().next()
 }
 
+// ── Delegated credentials (RFC 9345) ─────────────────────────────────────────
+
+/// The DelegationUsage extension (RFC 9345 §4.2): clients take delegated
+/// credentials only under a certificate that carries it.
+pub const DELEGATION_USAGE: &str = "1.3.6.1.4.1.44363.44";
+
+/// How long each delegated credential the proxy mints is valid for.
+pub const DELEGATED_CREDENTIAL_VALIDITY: Duration = Duration::from_hours(24);
+
+/// How long the proxy serves a delegated credential before it mints the
+/// next: none is served with less than 18 hours left, so a client whose
+/// clock runs that far ahead still accepts it.
+pub const DELEGATED_CREDENTIAL_REFRESH: Duration = Duration::from_hours(6);
+
+/// The validity of a certificate that allows delegated credentials, one with
+/// the DelegationUsage extension and the digitalSignature key usage
+/// (RFC 9345 §4.2); `None` for any other.
+pub fn delegation_validity(leaf: &[u8]) -> Option<(UnixTime, UnixTime)> {
+    use x509_parser::prelude::{FromDer, X509Certificate};
+    let (_, cert) = X509Certificate::from_der(leaf).ok()?;
+    let delegates = cert
+        .extensions()
+        .iter()
+        .any(|ext| ext.oid.to_id_string() == DELEGATION_USAGE);
+    let signs = cert
+        .key_usage()
+        .ok()
+        .flatten()
+        .is_some_and(|usage| usage.value.digital_signature());
+    if !(delegates && signs) {
+        return None;
+    }
+    let at = |t: i64| {
+        u64::try_from(t)
+            .ok()
+            .map(|secs| UnixTime::since_unix_epoch(Duration::from_secs(secs)))
+    };
+    let validity = cert.validity();
+    Some((
+        at(validity.not_before.timestamp())?,
+        at(validity.not_after.timestamp())?,
+    ))
+}
+
+/// Fresh delegated keys, one per scheme, in the order a handshake prefers
+/// them: ML-DSA-87 (CNSA 2.0) and ML-DSA-65 for a client that verifies
+/// post-quantum signatures, unless `pqc.enable_signatures` is off, then
+/// ECDSA P-256 for every other. Each lives only in memory.
+fn delegated_keys() -> anyhow::Result<Vec<Arc<dyn rustls::sign::SigningKey>>> {
+    use aws_lc_rs::signature::{
+        EcdsaKeyPair, PqdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING, ML_DSA_65_SIGNING,
+        ML_DSA_87_SIGNING,
+    };
+    let provider = build_pqc_provider();
+    let load = |pkcs8: &[u8]| {
+        provider
+            .key_provider
+            .load_private_key(PrivateKeyDer::Pkcs8(pkcs8.to_vec().into()))
+            .map_err(|e| anyhow::anyhow!("delegated key not loaded: {e}"))
+    };
+    let mut keys = Vec::new();
+    if ml_dsa_signing_enabled() {
+        for algorithm in [&ML_DSA_87_SIGNING, &ML_DSA_65_SIGNING] {
+            let pair = PqdsaKeyPair::generate(algorithm)
+                .map_err(|_| anyhow::anyhow!("ML-DSA delegated key not generated"))?;
+            let pkcs8 = pair
+                .to_pkcs8v1()
+                .map_err(|_| anyhow::anyhow!("ML-DSA delegated key not encoded"))?;
+            keys.push(load(pkcs8.as_ref())?);
+        }
+    }
+    let rng = aws_lc_rs::rand::SystemRandom::new();
+    let p256 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
+        .map_err(|_| anyhow::anyhow!("P-256 delegated key not generated"))?;
+    keys.push(load(p256.as_ref())?);
+    Ok(keys)
+}
+
+/// `certified` with delegated credentials minted now, valid for
+/// [`DELEGATED_CREDENTIAL_VALIDITY`], when its certificate allows them (see
+/// [`delegation_validity`]); `Ok(None)` when it does not.
+pub fn mint_delegated_credentials(
+    certified: &rustls::sign::CertifiedKey,
+) -> anyhow::Result<Option<rustls::sign::CertifiedKey>> {
+    let Some((not_before, not_after)) = certified
+        .cert
+        .first()
+        .and_then(|leaf| delegation_validity(leaf))
+    else {
+        return Ok(None);
+    };
+    let now = UnixTime::now();
+    let mut delegating = certified.clone();
+    delegating.delegated_credentials = delegated_keys()?
+        .into_iter()
+        .map(|key| {
+            rustls::sign::DelegatedCredential::delegate(
+                certified,
+                key,
+                not_before,
+                not_after,
+                now,
+                DELEGATED_CREDENTIAL_VALIDITY,
+            )
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(Some(delegating))
+}
+
+/// `certified`, with freshly minted delegated credentials when its
+/// certificate allows them; as it was when minting fails, so that the
+/// certificate's own key signs instead.
+fn delegating(
+    certified: Arc<rustls::sign::CertifiedKey>,
+    domain: &str,
+) -> Arc<rustls::sign::CertifiedKey> {
+    match mint_delegated_credentials(&certified) {
+        Ok(Some(minted)) => {
+            let schemes: Vec<String> = minted
+                .delegated_credentials
+                .iter()
+                .map(|dc| format!("{:?}", dc.scheme()))
+                .collect();
+            let expires = minted
+                .delegated_credentials
+                .first()
+                .and_then(|dc| {
+                    chrono::DateTime::from_timestamp(i64::try_from(dc.expires().as_secs()).ok()?, 0)
+                })
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_default();
+            info!(
+                "SNI resolver: '{}' delegates its certificate (RFC 9345): {} until {}",
+                domain,
+                schemes.join(", "),
+                expires
+            );
+            Arc::new(minted)
+        }
+        Ok(None) => certified,
+        Err(e) => {
+            warn!(
+                "SNI resolver: '{}' delegated credentials not minted, its certificate key signs — {}",
+                domain, e
+            );
+            certified
+        }
+    }
+}
+
+/// Whether either of a domain's certificates allows delegated credentials.
+fn allows_delegation(certs: &DomainCerts) -> bool {
+    std::iter::once(&certs.primary)
+        .chain(certs.post_quantum.as_ref())
+        .any(|ck| {
+            ck.cert
+                .first()
+                .is_some_and(|leaf| delegation_validity(leaf).is_some())
+        })
+}
+
 impl MultiDomainCertResolver {
     /// Build a resolver from all cert/key pairs found in `certs_dir`.
     pub fn new(certs_dir: &Path) -> anyhow::Result<Self> {
@@ -180,6 +349,8 @@ impl MultiDomainCertResolver {
             certs: RwLock::new(LoadedCerts::default()),
             certs_dir: certs_dir.to_path_buf(),
             default_domain: None,
+            delegation_due: AtomicU64::new(u64::MAX),
+            minting: AtomicBool::new(false),
         };
         resolver.reload()?;
         Ok(resolver)
@@ -236,7 +407,7 @@ impl MultiDomainCertResolver {
                 continue;
             }
             let primary = match load_certified_key(&cert_path, &key_path) {
-                Ok(ck) => Arc::new(ck),
+                Ok(ck) => delegating(Arc::new(ck), &domain),
                 Err(e) => {
                     warn!("SNI resolver: skipping '{}' — {}", domain, e);
                     continue;
@@ -253,7 +424,7 @@ impl MultiDomainCertResolver {
                             "SNI resolver: '{}' has an ML-DSA companion certificate",
                             domain
                         );
-                        Some(Arc::new(ck))
+                        Some(delegating(Arc::new(ck), &domain))
                     }
                     Err(e) => {
                         warn!("SNI resolver: '{}' companion not loaded — {}", domain, e);
@@ -290,11 +461,65 @@ impl MultiDomainCertResolver {
                 .map(|d| format!("; clients connecting by address get '{d}'"))
                 .unwrap_or_default()
         );
+        let delegates = new_certs.values().any(allows_delegation);
         *self.certs.write() = LoadedCerts {
             by_name: new_certs,
             by_address,
         };
+        self.delegation_due
+            .store(Self::next_delegation(delegates), Ordering::Release);
         Ok(())
+    }
+
+    /// When delegated credentials minted now are next due for minting.
+    fn next_delegation(delegates: bool) -> u64 {
+        if delegates {
+            UnixTime::now()
+                .as_secs()
+                .saturating_add(DELEGATED_CREDENTIAL_REFRESH.as_secs())
+        } else {
+            u64::MAX
+        }
+    }
+
+    /// Mint fresh delegated credentials for every certificate that allows
+    /// them, once the current ones have been served for
+    /// [`DELEGATED_CREDENTIAL_REFRESH`]. The handshake that finds them due
+    /// mints them; handshakes meanwhile keep the current ones, which have
+    /// hours left to run.
+    fn refresh_delegated_credentials(&self) {
+        if UnixTime::now().as_secs() < self.delegation_due.load(Ordering::Acquire)
+            || self.minting.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        // A snapshot, so that no lock is held while minting
+        let current = self.certs.read().by_name.clone();
+        let minted: Vec<(String, DomainCerts, DomainCerts)> = current
+            .into_iter()
+            .filter(|(_, certs)| allows_delegation(certs))
+            .map(|(domain, certs)| {
+                let fresh = DomainCerts {
+                    primary: delegating(certs.primary.clone(), &domain),
+                    post_quantum: certs.post_quantum.clone().map(|pq| delegating(pq, &domain)),
+                };
+                (domain, certs, fresh)
+            })
+            .collect();
+        let mut loaded = self.certs.write();
+        for (domain, previous, fresh) in minted {
+            // Unless a reload has replaced them, and minted its own, since
+            if let Some(entry) = loaded.by_name.get_mut(&domain) {
+                if Arc::ptr_eq(&entry.primary, &previous.primary) {
+                    *entry = fresh;
+                }
+            }
+        }
+        let delegates = loaded.by_name.values().any(allows_delegation);
+        drop(loaded);
+        self.delegation_due
+            .store(Self::next_delegation(delegates), Ordering::Release);
+        self.minting.store(false, Ordering::Release);
     }
 }
 
@@ -303,6 +528,7 @@ impl rustls::server::ResolvesServerCert for MultiDomainCertResolver {
         &self,
         client_hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        self.refresh_delegated_credentials();
         let certs = self.certs.read();
         let domain = match client_hello.server_name() {
             Some(sni) => covering_name(&certs.by_name, sni)?,
@@ -875,6 +1101,134 @@ mod covering_name_tests {
         assert_eq!(pick(".conformance.example.org"), None);
         assert_eq!(pick("*.conformance.example.org"), Some("wildcard"));
         assert_eq!(pick("x.*.conformance.example.org"), None);
+    }
+}
+
+#[cfg(test)]
+mod delegated_credential_tests {
+    use std::sync::atomic::Ordering;
+
+    use rustls::pki_types::{PrivateKeyDer, UnixTime};
+    use rustls::SignatureScheme;
+
+    use super::{
+        build_pqc_provider, mint_delegated_credentials, MultiDomainCertResolver,
+        DELEGATED_CREDENTIAL_REFRESH, DELEGATED_CREDENTIAL_VALIDITY,
+    };
+
+    /// A self-signed P-256 certificate for `name`, with or without the
+    /// DelegationUsage extension and the digitalSignature key usage.
+    fn certificate(
+        name: &str,
+        delegation_usage: bool,
+        digital_signature: bool,
+    ) -> (rcgen::Certificate, rcgen::KeyPair) {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
+        if digital_signature {
+            params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        }
+        if delegation_usage {
+            // DelegationUsage ::= NULL (RFC 9345 §4.2)
+            params.custom_extensions = vec![rcgen::CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 44363, 44],
+                vec![0x05, 0x00],
+            )];
+        }
+        (params.self_signed(&key).unwrap(), key)
+    }
+
+    fn certified(cert: &rcgen::Certificate, key: &rcgen::KeyPair) -> rustls::sign::CertifiedKey {
+        let signing = build_pqc_provider()
+            .key_provider
+            .load_private_key(PrivateKeyDer::Pkcs8(key.serialize_der().into()))
+            .unwrap();
+        rustls::sign::CertifiedKey::new(vec![cert.der().clone()], signing)
+    }
+
+    #[test]
+    fn a_certificate_that_allows_delegation_gets_a_credential_per_scheme() {
+        let (cert, key) = certificate("dc.example", true, true);
+        let before = UnixTime::now().as_secs();
+        let minted = mint_delegated_credentials(&certified(&cert, &key))
+            .unwrap()
+            .expect("credentials for a certificate that allows them");
+        let schemes: Vec<SignatureScheme> = minted
+            .delegated_credentials
+            .iter()
+            .map(|dc| dc.scheme())
+            .collect();
+        assert_eq!(
+            schemes,
+            [
+                SignatureScheme::ML_DSA_87,
+                SignatureScheme::ML_DSA_65,
+                SignatureScheme::ECDSA_NISTP256_SHA256
+            ]
+        );
+        for dc in &minted.delegated_credentials {
+            assert_eq!(dc.algorithm(), SignatureScheme::ECDSA_NISTP256_SHA256);
+            let expires = dc.expires().as_secs();
+            assert!(expires >= before + DELEGATED_CREDENTIAL_VALIDITY.as_secs());
+            assert!(expires <= UnixTime::now().as_secs() + DELEGATED_CREDENTIAL_VALIDITY.as_secs());
+        }
+    }
+
+    #[test]
+    fn a_certificate_without_delegation_usage_and_digital_signature_gets_none() {
+        for (delegation_usage, digital_signature) in [(false, true), (true, false), (false, false)]
+        {
+            let (cert, key) = certificate("plain.example", delegation_usage, digital_signature);
+            assert!(mint_delegated_credentials(&certified(&cert, &key))
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn the_resolver_mints_on_load_and_again_when_due() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, delegates) in [("dc.example", true), ("plain.example", false)] {
+            let (cert, key) = certificate(name, delegates, true);
+            std::fs::write(dir.path().join(format!("{name}.crt")), cert.pem()).unwrap();
+            std::fs::write(dir.path().join(format!("{name}.key")), key.serialize_pem()).unwrap();
+        }
+        let resolver = MultiDomainCertResolver::new(dir.path()).unwrap();
+        let credential = |resolver: &MultiDomainCertResolver, name: &str| {
+            resolver.certs.read().by_name[name]
+                .primary
+                .delegated_credentials
+                .iter()
+                .map(|dc| dc.encoded().to_vec())
+                .collect::<Vec<_>>()
+        };
+        let first = credential(&resolver, "dc.example");
+        assert_eq!(first.len(), 3);
+        assert_eq!(
+            credential(&resolver, "plain.example"),
+            Vec::<Vec<u8>>::new()
+        );
+        let due = resolver.delegation_due.load(Ordering::Acquire);
+        assert!(due > UnixTime::now().as_secs());
+        assert!(due <= UnixTime::now().as_secs() + DELEGATED_CREDENTIAL_REFRESH.as_secs());
+
+        // not yet due: the same credentials
+        resolver.refresh_delegated_credentials();
+        assert_eq!(credential(&resolver, "dc.example"), first);
+
+        // due: fresh keys, fresh credentials
+        resolver.delegation_due.store(0, Ordering::Release);
+        resolver.refresh_delegated_credentials();
+        let second = credential(&resolver, "dc.example");
+        assert_eq!(second.len(), 3);
+        assert!(second.iter().zip(&first).all(|(a, b)| a != b));
+        assert!(resolver.delegation_due.load(Ordering::Acquire) > UnixTime::now().as_secs());
+        assert!(!resolver.minting.load(Ordering::Acquire));
+        // the domain without delegation is untouched
+        assert_eq!(
+            credential(&resolver, "plain.example"),
+            Vec::<Vec<u8>>::new()
+        );
     }
 }
 

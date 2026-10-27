@@ -1119,6 +1119,15 @@ impl State<ClientConnectionData> for ExpectCertificate {
             ));
         }
 
+        // We never send the delegated_credential extension, so a credential
+        // here is one we did not ask for (RFC 9345 section 4.1.1).
+        if cert_chain.any_delegated_credential() {
+            return Err(cx.common.send_fatal_alert(
+                AlertDescription::UnexpectedMessage,
+                PeerMisbehaved::UnsolicitedCertExtension,
+            ));
+        }
+
         let end_entity_ocsp = cert_chain.end_entity_ocsp().to_vec();
         let server_cert = ServerCertDetails::new(
             cert_chain
@@ -1257,7 +1266,7 @@ fn emit_compressed_certificate_tls13(
     compressor: &dyn compress::CertCompressor,
     config: &ClientConfig,
 ) {
-    let mut cert_payload = CertificatePayloadTls13::new(certkey.cert.iter(), None);
+    let mut cert_payload = CertificatePayloadTls13::new(certkey.cert.iter(), None, None);
     cert_payload.context = PayloadU8::new(auth_context.clone().unwrap_or_default());
 
     let Ok(compressed) = config
@@ -1280,7 +1289,7 @@ fn emit_certificate_tls13(
     let certs = certkey
         .map(|ck| ck.cert.as_ref())
         .unwrap_or(&[][..]);
-    let mut cert_payload = CertificatePayloadTls13::new(certs.iter(), None);
+    let mut cert_payload = CertificatePayloadTls13::new(certs.iter(), None, None);
     cert_payload.context = PayloadU8::new(auth_context.unwrap_or_default());
 
     flight.add(HandshakeMessagePayload(HandshakePayload::CertificateTls13(

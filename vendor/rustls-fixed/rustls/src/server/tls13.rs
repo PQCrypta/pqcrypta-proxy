@@ -441,23 +441,52 @@ mod client_hello {
             let doing_client_auth = if full_handshake {
                 let client_auth = emit_certificate_req_tls13(&mut flight, &self.config)?;
 
+                // RFC 9345 section 4.1.1: a delegated credential only for a
+                // client that offered one it accepts
+                let delegated = match &client_hello.delegated_credential {
+                    Some(offered) if !server_key.get_delegated_credentials().is_empty() => {
+                        let now = self.config.current_time()?;
+                        server_key
+                            .get_delegated_credentials()
+                            .iter()
+                            .find(|dc| dc.acceptable(offered, &sigschemes_ext, now))
+                    }
+                    _ => None,
+                };
+                let delegated_credential = delegated.map(|dc| dc.encoded());
+
                 if let Some(compressor) = cert_compressor {
                     emit_compressed_certificate_tls13(
                         &mut flight,
                         &self.config,
                         server_key.get_cert(),
                         ocsp_response,
+                        delegated_credential,
                         compressor,
                     );
                 } else {
-                    emit_certificate_tls13(&mut flight, server_key.get_cert(), ocsp_response);
+                    emit_certificate_tls13(
+                        &mut flight,
+                        server_key.get_cert(),
+                        ocsp_response,
+                        delegated_credential,
+                    );
                 }
-                emit_certificate_verify_tls13(
-                    &mut flight,
-                    cx.common,
-                    server_key.get_key(),
-                    &sigschemes_ext,
-                )?;
+                match delegated {
+                    // The delegated key signs, with the scheme its credential names
+                    Some(dc) => emit_certificate_verify_tls13(
+                        &mut flight,
+                        cx.common,
+                        dc.key(),
+                        &[dc.scheme()],
+                    )?,
+                    None => emit_certificate_verify_tls13(
+                        &mut flight,
+                        cx.common,
+                        server_key.get_key(),
+                        &sigschemes_ext,
+                    )?,
+                }
                 client_auth
             } else {
                 false
@@ -972,9 +1001,10 @@ mod client_hello {
         flight: &mut HandshakeFlightTls13<'_>,
         cert_chain: &[CertificateDer<'static>],
         ocsp_response: Option<&[u8]>,
+        delegated_credential: Option<&[u8]>,
     ) {
         let cert = HandshakeMessagePayload(HandshakePayload::CertificateTls13(
-            CertificatePayloadTls13::new(cert_chain.iter(), ocsp_response),
+            CertificatePayloadTls13::new(cert_chain.iter(), ocsp_response, delegated_credential),
         ));
 
         trace!("sending certificate {cert:?}");
@@ -986,15 +1016,22 @@ mod client_hello {
         config: &ServerConfig,
         cert_chain: &[CertificateDer<'static>],
         ocsp_response: Option<&[u8]>,
+        delegated_credential: Option<&[u8]>,
         cert_compressor: &'static dyn CertCompressor,
     ) {
-        let payload = CertificatePayloadTls13::new(cert_chain.iter(), ocsp_response);
+        let payload =
+            CertificatePayloadTls13::new(cert_chain.iter(), ocsp_response, delegated_credential);
 
         let Ok(entry) = config
             .cert_compression_cache
             .compression_for(cert_compressor, &payload)
         else {
-            return emit_certificate_tls13(flight, cert_chain, ocsp_response);
+            return emit_certificate_tls13(
+                flight,
+                cert_chain,
+                ocsp_response,
+                delegated_credential,
+            );
         };
 
         let c = HandshakeMessagePayload(HandshakePayload::CompressedCertificate(

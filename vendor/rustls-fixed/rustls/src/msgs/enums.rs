@@ -127,6 +127,7 @@ enum_builder! {
         Padding => 0x0015,
         ExtendedMasterSecret => 0x0017,
         CompressCertificate => 0x001b,
+        DelegatedCredential => 0x0022,
         SessionTicket => 0x0023,
         PreSharedKey => 0x0029,
         EarlyData => 0x002a,

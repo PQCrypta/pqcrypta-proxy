@@ -105,6 +105,7 @@
 | **Log Rotation (SIGHUP)** | ✅ | `SIGHUP` reopens all log file handles in-place; compatible with logrotate `postrotate` — no restart required |
 | **TLS 1.3 Default** | ✅ | TLS 1.3 minimum by default on all listeners (`min_version = "1.3"`); configurable to allow TLS 1.2 via `min_version` in `[tls]` |
 | **Certificate Compression (RFC 8879)** | ✅ | The certificate chain is sent compressed to any client that offers `compress_certificate`. Measured on pqcrypta.com: 3,435 bytes to 2,376 with zlib (1.45:1), about 1&nbsp;KB off every full handshake — which roughly offsets what the X25519MLKEM768 key share adds. Both TLS stacks are covered, and they need different treatment: on the OpenSSL TCP listener it takes `SSL_CTX_set1_cert_comp_preference` **and** `SSL_CTX_compress_certs` (the preference alone reports success and changes nothing on the wire), while rustls on QUIC/HTTP-3 needs only its `brotli`/`zlib` crate features. zlib on TCP because these OpenSSL builds carry `-DZLIB` and nothing else; brotli and zlib on the QUIC side |
+| **Delegated Credentials (RFC 9345)** | ✅ | Under a certificate that allows it (the DelegationUsage extension and the digitalSignature key usage), the proxy mints delegated credentials itself: short-lived keys the certificate's key signs for, which then sign the handshake in its place. ML-DSA-87, ML-DSA-65 and ECDSA P-256 ones, each valid for a day and replaced every six hours, with keys that exist only in memory; a client that offers the `delegated_credential` extension gets the first it accepts, so a post-quantum client gets an ML-DSA `CertificateVerify` under an ECDSA certificate. Served by rustls, so over QUIC; see [Delegated Credentials](#delegated-credentials-rfc-9345) |
 | **Request IDs** | ✅ | `request_id_header` in `[server]` sends one ID per request to the backend and back to the client on every transport; a well-formed client ID (≤128 visible ASCII chars) is kept, anything else replaced with 128 random bits in hex; off by default |
 | **Server Identity Concealment** | ✅ | Backend `Server` header replaced by `server_header` in `[server]` (default `pqcrypta`, no version); an empty value passes the backend's through |
 | **JWT Rate Limiting** | ✅ | Per-subject rate limiting with HMAC-SHA256 signature verification; unsigned `sub` claims rejected; non-HMAC algorithms blocked |
@@ -1732,6 +1733,23 @@ With the default `pqc-signatures` feature, the SNI certificate resolver serves *
 # Connect with OpenSSL 3.5+
 openssl s_client -connect pqc.pqcrypta.com:443 -sigalgs mldsa87 \
     -groups X25519MLKEM768 -CAfile root-ca.crt
+```
+
+### Delegated Credentials (RFC 9345)
+
+A delegated credential is a short-lived key that a certificate's own key has signed for: the handshake is signed with it, so the certificate's key can stay offline and a compromised credential expires within a day. The SNI certificate resolver mints them for any certificate that allows delegation, one with the DelegationUsage extension (`1.3.6.1.4.1.44363.44`) and the `digitalSignature` key usage, which clients require before they accept one.
+
+- Three per certificate, in the order a handshake prefers them: ML-DSA-87 (CNSA 2.0) and ML-DSA-65, unless `pqc.enable_signatures` is off, then ECDSA P-256. A client gets the first whose scheme it lists in its `delegated_credential` extension and whose signature it can verify (the certificate signed it with a scheme in the client's `signature_algorithms`); every other client gets the certificate's own signature
+- Each is valid for 24 hours and replaced after six, so none is served with less than 18 hours left. The delegated keys are generated in memory and never written anywhere
+- The credential rides on the end-entity entry of `Certificate`, and the delegated key signs `CertificateVerify` under the scheme the credential names. TLS 1.3 only, as RFC 9345 requires; served wherever rustls terminates TLS, which is QUIC (HTTP/3) here. The OpenSSL TCP listener does not implement them
+- The vendored rustls implements the extension on both sides: `DelegatedCredential::delegate` signs a credential (RFC 9345 §4), the server sends one only to a client that offered it, and its client aborts with `unexpected_message` on one it never asked for (§4.1.1)
+
+No public CA issues the DelegationUsage extension, so `scripts/delegated-credential-cert.sh` issues the certificate from a private CA for a test host (`delegated-credential.conformance.pqcrypta.com`) and renews it weekly through `delegated-credential-cert.timer`; the proxy picks it up on its TLS reload and mints the credentials itself.
+
+```bash
+cp scripts/delegated-credential-cert.sh /usr/local/bin/pqcrypta-delegated-credential-cert
+cp scripts/delegated-credential-cert.{service,timer} /etc/systemd/system/
+systemctl enable --now delegated-credential-cert.timer
 ```
 
 ### Configuration

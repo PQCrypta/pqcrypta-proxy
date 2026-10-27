@@ -949,6 +949,11 @@ extension_struct! {
         ExtensionType::KeyShare =>
             pub(crate) key_shares: Option<Vec<KeyShareEntry>>,
 
+        /// Delegated credentials accepted, by the signature schemes their
+        /// CertificateVerify may use (RFC 9345 section 4.1.1)
+        ExtensionType::DelegatedCredential =>
+            pub(crate) delegated_credential: Option<Vec<SignatureScheme>>,
+
         /// QUIC transport parameters (RFC9001)
         ExtensionType::TransportParameters =>
             pub(crate) transport_parameters: Option<Payload<'a>>,
@@ -1002,6 +1007,7 @@ impl ClientExtensions<'_> {
             preshared_key_modes,
             certificate_authority_names,
             key_shares,
+            delegated_credential,
             transport_parameters,
             ticket_request,
             renegotiation_info,
@@ -1030,6 +1036,7 @@ impl ClientExtensions<'_> {
             preshared_key_modes,
             certificate_authority_names,
             key_shares,
+            delegated_credential,
             transport_parameters: transport_parameters.map(|x| x.into_owned()),
             ticket_request,
             renegotiation_info,
@@ -1746,6 +1753,11 @@ extension_struct! {
     pub(crate) struct CertificateExtensions<'a> {
         ExtensionType::StatusRequest =>
             pub(crate) status: Option<CertificateStatus<'a>>,
+
+        /// A delegated credential for the end-entity certificate (RFC 9345
+        /// section 4.1.1), as sent
+        ExtensionType::DelegatedCredential =>
+            pub(crate) delegated_credential: Option<Payload<'a>>,
     }
 }
 
@@ -1753,6 +1765,7 @@ impl CertificateExtensions<'_> {
     fn into_owned(self) -> CertificateExtensions<'static> {
         CertificateExtensions {
             status: self.status.map(|s| s.into_owned()),
+            delegated_credential: self.delegated_credential.map(|p| p.into_owned()),
         }
     }
 }
@@ -1849,27 +1862,36 @@ impl<'a> CertificatePayloadTls13<'a> {
     pub(crate) fn new(
         certs: impl Iterator<Item = &'a CertificateDer<'a>>,
         ocsp_response: Option<&'a [u8]>,
+        delegated_credential: Option<&'a [u8]>,
     ) -> Self {
         Self {
             context: PayloadU8::empty(),
             entries: certs
-                // zip certificate iterator with `ocsp_response` followed by
-                // an infinite-length iterator of `None`.
+                // zip certificate iterator with the end-entity certificate's
+                // extensions followed by an infinite-length iterator of `None`.
                 .zip(
-                    ocsp_response
+                    Some((ocsp_response, delegated_credential))
                         .into_iter()
-                        .map(Some)
-                        .chain(iter::repeat(None)),
+                        .chain(iter::repeat((None, None))),
                 )
-                .map(|(cert, ocsp)| {
+                .map(|(cert, (ocsp, delegated_credential))| {
                     let mut e = CertificateEntry::new(cert.clone());
                     if let Some(ocsp) = ocsp {
                         e.extensions.status = Some(CertificateStatus::new(ocsp));
                     }
+                    e.extensions.delegated_credential =
+                        delegated_credential.map(Payload::Borrowed);
                     e
                 })
                 .collect(),
         }
+    }
+
+    /// Whether any entry carries a delegated credential (RFC 9345)
+    pub(crate) fn any_delegated_credential(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.extensions.delegated_credential.is_some())
     }
 
     pub(crate) fn into_owned(self) -> CertificatePayloadTls13<'static> {
