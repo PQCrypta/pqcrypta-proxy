@@ -1059,37 +1059,18 @@ async fn run() -> anyhow::Result<()> {
             tokio::sync::mpsc::channel::<acme::CertificateUpdate>(16);
         service.set_cert_update_channel(cert_update_tx);
         let acme_tls_provider = tls_provider.clone();
-        #[cfg(feature = "pqc")]
-        let acme_pqc_sni_map = pqc_sni_map.clone();
-        #[cfg(feature = "pqc")]
-        let acme_pqc_provider = pqc_provider.clone();
-        #[cfg(feature = "pqc")]
-        let acme_certs_dir = config
-            .tls
-            .cert_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("/etc/pqcrypta/certs"))
-            .to_path_buf();
-        #[cfg(feature = "pqc")]
-        let acme_http11_only = config.server.http11_only_hosts.clone();
         tokio::spawn(async move {
             while let Some(update) = cert_update_rx.recv().await {
                 info!(
                     "ACME cert issued for '{}', reloading SNI resolver",
                     update.domain
                 );
+                // The TLS reload reaches every listener: QUIC and the rustls
+                // TCP listeners install the new configuration, and each
+                // OpenSSL listener rebuilds its SNI contexts and acceptor
                 if let Err(e) = acme_tls_provider.reload_certificates() {
                     error!("Failed to reload TLS certificates after ACME update: {}", e);
                 }
-                // Also hot-reload the OpenSSL SNI map so the TCP listener
-                // serves the new cert immediately without a restart.
-                #[cfg(feature = "pqc")]
-                openssl_pqc::reload_sni_map(
-                    &acme_pqc_sni_map,
-                    &acme_certs_dir,
-                    &acme_pqc_provider,
-                    &acme_http11_only,
-                );
             }
         });
 
