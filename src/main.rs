@@ -154,6 +154,15 @@ struct Args {
     #[arg(long)]
     validate: bool,
 
+    /// Merge fingerprint corpora into one and write it here: observed.json of
+    /// either version, or a published directory's full.json (`--from`)
+    #[arg(long, value_name = "OUT")]
+    merge_fingerprints: Option<PathBuf>,
+
+    /// A corpus or directory to merge (`--merge-fingerprints`); repeatable
+    #[arg(long = "from", value_name = "FILE")]
+    merge_from: Vec<PathBuf>,
+
     /// M-2: Explicitly allow backends with tls_skip_verify = true.
     /// This flag MUST be set when any backend disables TLS certificate verification.
     /// Without it the proxy will refuse to start when an insecure backend is found.
@@ -347,6 +356,25 @@ async fn run() -> anyhow::Result<()> {
         .expect("Failed to install rustls crypto provider");
 
     let args = Args::parse();
+
+    // A tool, not the proxy: merge the corpora and exit before anything
+    // binds, loads a config or writes the live corpus
+    if let Some(out) = args.merge_fingerprints.as_deref() {
+        if args.merge_from.is_empty() {
+            eprintln!("--merge-fingerprints needs at least one --from FILE");
+            std::process::exit(2);
+        }
+        match pqcrypta_proxy::fingerprint_corpus::merge_files(&args.merge_from, out) {
+            Ok(summary) => {
+                println!("{summary}");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("merge failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     // Initialize logging. Precedence is CLI flag / env var, then the config
     // file's [logging] section, then the built-in default — so a node's own
