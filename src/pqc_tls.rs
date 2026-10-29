@@ -291,6 +291,38 @@ impl OpensslTlsSettings {
     }
 }
 
+/// The application protocols the TCP listeners serve, by ALPN, in the
+/// server's order of preference.
+pub const TCP_APPLICATIONS: [&str; 2] = ["h2", "http/1.1"];
+const TCP_APPLICATIONS_WIRE: [&[u8]; 2] = [b"h2", b"http/1.1"];
+
+/// The first of `ours`, in our order, that the client's ALPN list offers.
+///
+/// A client that offers none of them is refused with a fatal
+/// no_application_protocol alert, as RFC 7301 section 3.2 requires ("SHALL").
+/// The callback runs only when the ClientHello carries ALPN at all, so a
+/// client that names no protocol still connects. A malformed list (a length
+/// past its end) offers nothing.
+pub(crate) fn select_application<'a>(
+    client_protos: &[u8],
+    ours: &[&'a [u8]],
+) -> Result<&'a [u8], openssl::ssl::AlpnError> {
+    let mut offered = Vec::new();
+    let mut pos = 0;
+    while pos < client_protos.len() {
+        let len = usize::from(client_protos[pos]);
+        let Some(name) = client_protos.get(pos + 1..pos + 1 + len) else {
+            break;
+        };
+        offered.push(name);
+        pos += 1 + len;
+    }
+    ours.iter()
+        .find(|ours| offered.contains(ours))
+        .copied()
+        .ok_or(openssl::ssl::AlpnError::ALERT_FATAL)
+}
+
 impl PqcTlsProvider {
     /// Create new PQC TLS provider
     pub fn new(config: &PqcConfig) -> Self {
@@ -624,17 +656,17 @@ impl PqcTlsProvider {
             }
         }
 
-        // Classical fallback: P-384, then P-256 in a tuple of its own. A client
-        // that supports P-384 gets it, asked with a HelloRetryRequest when its
-        // key share is for P-256 (SSL Labs' client: 192-bit, 100%, not P-256's
-        // 90%). One whose only classical group is P-256, the group RFC 8446
-        // section 9.1 makes every TLS 1.3 implementation support (picotls's QUIC
-        // offers nothing else classical), still connects, as it does over QUIC:
-        // both transports take the same groups in the same order, so a DNS
-        // HTTPS record's tls-supported-groups can state one list for both.
-        // X25519 is offered on no listener (128-bit, 90%).
+        // Classical fallback: one tuple, P-384, P-256 and X25519. A client's
+        // own classical key share is used where it sent one, so a client with
+        // no ML-KEM (Safari 18 and earlier, which shares X25519) completes in
+        // one round trip; one that sent no share we accept is asked for P-384,
+        // the strongest. RFC 8446 section 9.1 has every TLS 1.3 implementation
+        // support P-256 (MUST) and X25519 (SHOULD); picotls's QUIC offers
+        // nothing classical but P-256. Both transports take the same groups in
+        // the same tuples (`tls::group_tuples`), so a DNS HTTPS record's
+        // tls-supported-groups can state one list for both.
         //
-        // require_hybrid wins over fallback_to_classical: offering P-384 is what
+        // require_hybrid wins over fallback_to_classical: a classical group is what
         // lets a client with no PQC support complete a handshake, so leaving it
         // in would make the setting meaningless. With it suppressed, such a
         // client finds no mutually supported group and the handshake fails —
@@ -654,8 +686,7 @@ impl PqcTlsProvider {
         }
 
         if config.fallback_to_classical && !config.require_hybrid {
-            tuples.push("P-384".to_string());
-            tuples.push("P-256".to_string());
+            tuples.push("P-384:P-256:X25519".to_string());
         } else {
             // Warn whichever setting caused it. `require_hybrid` used to warn and
             // `fallback_to_classical = false` did not, so the more obscure of the
@@ -814,7 +845,10 @@ impl PqcTlsProvider {
 /// Used by `http_listener::run_http_listener_pqc` for post-quantum TLS.
 #[cfg(feature = "pqc")]
 pub mod openssl_pqc {
-    use super::{PqcHandshakeInfo, PqcKemAlgorithm, PqcTlsProvider};
+    use super::{
+        select_application, PqcHandshakeInfo, PqcKemAlgorithm, PqcTlsProvider,
+        TCP_APPLICATIONS_WIRE,
+    };
     use crate::config::ClientAuth;
     use foreign_types::ForeignTypeRef;
     use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
@@ -1165,29 +1199,7 @@ pub mod openssl_pqc {
             .set_alpn_protos(b"\x02h2\x08http/1.1")
             .map_err(|e| format!("Failed to set ALPN protos: {}", e))?;
         builder.set_alpn_select_callback(|_, client_protos| {
-            let mut pos = 0;
-            while pos < client_protos.len() {
-                let len = client_protos[pos] as usize;
-                if pos + 1 + len > client_protos.len() {
-                    break;
-                }
-                if &client_protos[pos + 1..pos + 1 + len] == b"h2" {
-                    return Ok(b"h2");
-                }
-                pos += 1 + len;
-            }
-            pos = 0;
-            while pos < client_protos.len() {
-                let len = client_protos[pos] as usize;
-                if pos + 1 + len > client_protos.len() {
-                    break;
-                }
-                if &client_protos[pos + 1..pos + 1 + len] == b"http/1.1" {
-                    return Ok(b"http/1.1");
-                }
-                pos += 1 + len;
-            }
-            Err(openssl::ssl::AlpnError::NOACK)
+            select_application(client_protos, &TCP_APPLICATIONS_WIRE)
         });
         builder.set_session_cache_mode(openssl::ssl::SslSessionCacheMode::SERVER);
 
@@ -1266,29 +1278,7 @@ pub mod openssl_pqc {
         // Required on every SslContext — without it OpenSSL does not negotiate any
         // protocol after an SNI context switch, causing HTTP 426 Upgrade Required.
         builder.set_alpn_select_callback(|_, client_protos| {
-            let mut pos = 0;
-            while pos < client_protos.len() {
-                let len = client_protos[pos] as usize;
-                if pos + 1 + len > client_protos.len() {
-                    break;
-                }
-                if &client_protos[pos + 1..pos + 1 + len] == b"h2" {
-                    return Ok(b"h2");
-                }
-                pos += 1 + len;
-            }
-            pos = 0;
-            while pos < client_protos.len() {
-                let len = client_protos[pos] as usize;
-                if pos + 1 + len > client_protos.len() {
-                    break;
-                }
-                if &client_protos[pos + 1..pos + 1 + len] == b"http/1.1" {
-                    return Ok(b"http/1.1");
-                }
-                pos += 1 + len;
-            }
-            Err(openssl::ssl::AlpnError::NOACK)
+            select_application(client_protos, &TCP_APPLICATIONS_WIRE)
         });
         builder.set_session_cache_mode(openssl::ssl::SslSessionCacheMode::SERVER);
         Ok(builder.build())
@@ -1321,18 +1311,7 @@ pub mod openssl_pqc {
             .set_alpn_protos(b"\x08http/1.1")
             .map_err(|e| format!("Failed to set HTTP/1.1-only ALPN: {}", e))?;
         builder.set_alpn_select_callback(|_, client_protos| {
-            let mut pos = 0;
-            while pos < client_protos.len() {
-                let len = client_protos[pos] as usize;
-                if pos + 1 + len > client_protos.len() {
-                    break;
-                }
-                if &client_protos[pos + 1..pos + 1 + len] == b"http/1.1" {
-                    return Ok(b"http/1.1");
-                }
-                pos += 1 + len;
-            }
-            Err(openssl::ssl::AlpnError::NOACK)
+            select_application(client_protos, &[&b"http/1.1"[..]])
         });
         builder.set_session_cache_mode(openssl::ssl::SslSessionCacheMode::SERVER);
         Ok(builder.build())
@@ -1349,12 +1328,12 @@ pub mod openssl_pqc {
     /// Apply PQC group list and 256-bit-only TLS 1.3 cipher restriction to an SslContextBuilder.
     ///
     /// Named groups: post-quantum tuples by NIST level (ML-KEM-1024, then ML-KEM-768), then
-    /// P-384 (secp384r1, 192-bit = 100% key exchange), then P-256 in a tuple of its own; see
-    /// `build_groups_string`. OpenSSL takes the first tuple holding a group the client supports,
-    /// so SSL Labs' test client (a secp256r1 key_share, secp384r1 listed) is sent a
-    /// HelloRetryRequest for secp384r1 rather than negotiating secp256r1 (128-bit = 90%), while a
-    /// client whose only classical group is secp256r1 (RFC 8446's must-support group) connects.
-    /// X25519 is excluded (128-bit, 90%).
+    /// P-384, P-256 and X25519 in one tuple after the post-quantum ones; see
+    /// `build_groups_string`. OpenSSL takes the first tuple holding a group the client supports
+    /// and, within it, a group the client sent a key share for: a classical client completes in
+    /// one round trip on its own share, and one that sent no share we accept is asked for P-384.
+    /// RFC 8446 section 9.1: P-256 is the group every TLS 1.3 implementation must support, X25519
+    /// one it should.
     ///
     /// Cipher suites: TLS_AES_256_GCM_SHA384 + TLS_CHACHA20_POLY1305_SHA256 only.
     /// TLS_AES_128_GCM_SHA256 is excluded (128-bit → 90% SSL Labs cipher strength score).
@@ -1372,9 +1351,9 @@ pub mod openssl_pqc {
         // accepts it, so a group the probe binary knows and the library does
         // not is dropped rather than failing the whole list -- and no fallback
         // can quietly put back a classical group require_hybrid removed.
-        // X25519 is never offered here (128-bit; 90% on SSL Labs), and P-256
-        // only after P-384, in a tuple of its own. The list comes in tuples
-        // ("/"); see `build_groups_string`.
+        // The classical groups, P-384, P-256 and X25519, share the last
+        // tuple, so a client's own classical share is used. The list comes in
+        // tuples ("/"); see `build_groups_string`.
         let configured = pqc_provider.groups_string();
         let mut accepted: Vec<String> = Vec::new();
         if pqc_provider.is_available() && !configured.is_empty() {
@@ -1396,7 +1375,7 @@ pub mod openssl_pqc {
             }
         }
         let groups = if accepted.is_empty() {
-            "P-384/P-256".to_string()
+            "P-384:P-256:X25519".to_string()
         } else {
             accepted.join("/")
         };
@@ -1604,6 +1583,43 @@ pub fn verify_pqc_support(config: &PqcConfig) -> Result<PqcStatus, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn tcp_takes_h2_then_http11_and_refuses_anything_else() {
+        let list = |names: &[&str]| -> Vec<u8> {
+            names
+                .iter()
+                .flat_map(|n| {
+                    std::iter::once(u8::try_from(n.len()).expect("a short name")).chain(n.bytes())
+                })
+                .collect()
+        };
+        // Our order wins over the client's
+        assert_eq!(
+            select_application(&list(&["http/1.1", "h2"]), &TCP_APPLICATIONS_WIRE),
+            Ok(&b"h2"[..])
+        );
+        assert_eq!(
+            select_application(&list(&["http/1.1"]), &TCP_APPLICATIONS_WIRE),
+            Ok(&b"http/1.1"[..])
+        );
+        // RFC 7301 section 3.2: none of ours offered is no_application_protocol
+        for names in [&["h3"][..], &["webtransport"], &["acme-tls/1"]] {
+            assert_eq!(
+                select_application(&list(names), &TCP_APPLICATIONS_WIRE),
+                Err(openssl::ssl::AlpnError::ALERT_FATAL)
+            );
+        }
+        // A length that runs past the end offers nothing
+        assert_eq!(
+            select_application(&[9, b'h', b'2'], &TCP_APPLICATIONS_WIRE),
+            Err(openssl::ssl::AlpnError::ALERT_FATAL)
+        );
+        assert_eq!(
+            select_application(&list(&["h2"]), &[&b"http/1.1"[..]]),
+            Err(openssl::ssl::AlpnError::ALERT_FATAL)
+        );
+    }
+
     /// Native ML-KEM is OpenSSL 3.5 or later, compared as numbers: 4.0 and
     /// later lines included, which the old substring test refused.
     #[test]
@@ -1661,7 +1677,7 @@ mod tests {
         );
         assert_eq!(
             groups,
-            "MLKEM1024:SecP384r1MLKEM1024/X25519MLKEM768:SecP256r1MLKEM768:MLKEM768/P-384/P-256"
+            "MLKEM1024:SecP384r1MLKEM1024/X25519MLKEM768:SecP256r1MLKEM768:MLKEM768/P-384:P-256:X25519"
         );
 
         // require_hybrid: no pure ML-KEM and no classical tuple
@@ -1702,7 +1718,7 @@ mod tests {
         assert_eq!(
             PqcTlsProvider::build_groups_string(&config, &all, x25519),
             "MLKEM1024:SecP384r1MLKEM1024/X25519MLKEM768:SecP256r1MLKEM768:MLKEM768/\
-             frodo1344shake:p384_frodo976shake/P-384/P-256"
+             frodo1344shake:p384_frodo976shake/P-384:P-256:X25519"
         );
         let hybrid_only = PqcConfig {
             require_hybrid: true,

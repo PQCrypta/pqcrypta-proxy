@@ -144,6 +144,7 @@ pub mod crawler_verify;
 pub mod data_file;
 pub mod dns_wire;
 pub mod doh;
+pub mod doq;
 pub mod early_data;
 pub mod ech_config;
 pub mod fingerprint;

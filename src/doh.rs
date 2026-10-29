@@ -104,10 +104,7 @@ pub async fn spawn(config: &DohConfig) -> anyhow::Result<SocketAddr> {
     let gateway = Arc::new(Gateway {
         path: config.path.clone(),
         timeout: Duration::from_millis(config.timeout_ms),
-        upstream: Upstream {
-            addr: upstream,
-            idle: Mutex::new(Vec::new()),
-        },
+        upstream: Upstream::new(upstream),
     });
     tokio::spawn(accept_loop(listener, gateway));
     Ok(local)
@@ -311,13 +308,22 @@ fn dns_response(message: Vec<u8>) -> Response<Full<Bytes>> {
 
 /// Connections to the name server, kept for reuse. Each carries one query at a
 /// time, so an answer always belongs to the query just sent on it.
-struct Upstream {
+/// The name server, asked over TCP on connections kept for reuse. DNS over
+/// QUIC on the QUIC listener ([`crate::doq`]) asks it through one of these too.
+pub(crate) struct Upstream {
     addr: SocketAddr,
     idle: Mutex<Vec<(TcpStream, Instant)>>,
 }
 
 impl Upstream {
-    async fn exchange(&self, query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    pub(crate) fn new(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            idle: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) async fn exchange(&self, query: &[u8]) -> anyhow::Result<Vec<u8>> {
         if let Some(stream) = self.take_idle() {
             match self.round_trip(stream, query).await {
                 Ok(answer) => return Ok(answer),
@@ -388,7 +394,7 @@ fn options(msg: &[u8], opt: &Record) -> Option<Vec<(u16, usize, usize)>> {
 
 /// What the gateway reads from a query before anything goes upstream.
 #[derive(Debug)]
-struct QueryInfo {
+pub(crate) struct QueryInfo {
     flags: u16,
     questions: usize,
     question_end: usize,
@@ -399,23 +405,23 @@ struct QueryInfo {
     /// Its DNSSEC OK bit.
     dnssec_ok: bool,
     /// It carries the Padding option, asking for a padded response.
-    padding: bool,
+    pub(crate) padding: bool,
 }
 
 impl QueryInfo {
-    fn opcode(&self) -> u16 {
+    pub(crate) fn opcode(&self) -> u16 {
         (self.flags >> 11) & 0x0F
     }
 
     /// A standard query for anything but a zone transfer.
-    fn forwardable(&self) -> bool {
+    pub(crate) fn forwardable(&self) -> bool {
         self.opcode() == 0 && !matches!(self.qtype, Some(TYPE_AXFR | TYPE_IXFR))
     }
 }
 
 /// `None` for anything that is not a well-formed query: too short, a response
 /// (QR set), or sections that run past the end.
-fn inspect(msg: &[u8]) -> Option<QueryInfo> {
+pub(crate) fn inspect(msg: &[u8]) -> Option<QueryInfo> {
     let flags = u16_at(msg, 2)?;
     if flags & 0x8000 != 0 {
         return None;
@@ -443,10 +449,23 @@ fn inspect(msg: &[u8]) -> Option<QueryInfo> {
 /// query's ID, opcode, RD and question, and for an EDNS query an OPT record
 /// with an Extended DNS Error saying why (RFC 8914 §4.22), padded on request.
 fn refusal(query: &[u8], info: &QueryInfo) -> Vec<u8> {
+    answered_here(query, info, RCODE_REFUSED, EDE_NOT_SUPPORTED, EDE_TEXT)
+}
+
+/// An answer made here rather than by the name server: the query's ID,
+/// opcode, RD and question with `rcode`, and for an EDNS query an OPT record
+/// carrying Extended DNS Error `ede` with `text` (RFC 8914), padded on request.
+pub(crate) fn answered_here(
+    query: &[u8],
+    info: &QueryInfo,
+    rcode: u16,
+    ede: u16,
+    text: &[u8],
+) -> Vec<u8> {
     let echo_question = info.questions == 1;
     let mut out = Vec::with_capacity(HEADER_LEN + info.question_end + 96);
     out.extend_from_slice(query.get(..2).unwrap_or(&[0, 0]));
-    let flags = 0x8000 | (info.flags & 0x7800) | (info.flags & 0x0100) | RCODE_REFUSED;
+    let flags = 0x8000 | (info.flags & 0x7800) | (info.flags & 0x0100) | (rcode & 0x0F);
     out.extend_from_slice(&flags.to_be_bytes());
     out.extend_from_slice(&u16::from(echo_question).to_be_bytes());
     out.extend_from_slice(&[0, 0, 0, 0]);
@@ -457,7 +476,7 @@ fn refusal(query: &[u8], info: &QueryInfo) -> Vec<u8> {
         out.extend_from_slice(query.get(HEADER_LEN..info.question_end).unwrap_or_default());
     }
     if info.edns {
-        let ede_length = 2 + EDE_TEXT.len();
+        let ede_length = 2 + text.len();
         out.push(0); // root owner name
         out.extend_from_slice(&TYPE_OPT.to_be_bytes());
         out.extend_from_slice(&REFUSAL_UDP_PAYLOAD.to_be_bytes());
@@ -466,8 +485,8 @@ fn refusal(query: &[u8], info: &QueryInfo) -> Vec<u8> {
         out.extend_from_slice(&u16::try_from(4 + ede_length).unwrap_or(0).to_be_bytes());
         out.extend_from_slice(&OPTION_EDE.to_be_bytes());
         out.extend_from_slice(&u16::try_from(ede_length).unwrap_or(0).to_be_bytes());
-        out.extend_from_slice(&EDE_NOT_SUPPORTED.to_be_bytes());
-        out.extend_from_slice(EDE_TEXT);
+        out.extend_from_slice(&ede.to_be_bytes());
+        out.extend_from_slice(text);
     }
     if info.padding {
         if let Some(padded) = padded(&out) {
@@ -481,7 +500,7 @@ fn refusal(query: &[u8], info: &QueryInfo) -> Vec<u8> {
 /// option, replacing any padding it already carries. `None`, to send it as it
 /// is, when it has no OPT record to carry the option, when its options are
 /// malformed, or when a TSIG or SIG(0) record signs the bytes this changes.
-fn padded(msg: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn padded(msg: &[u8]) -> Option<Vec<u8>> {
     let layout = layout(msg)?;
     if layout
         .additional

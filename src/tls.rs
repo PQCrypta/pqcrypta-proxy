@@ -870,6 +870,8 @@ pub struct TlsProvider {
     client_auth: ClientAuth,
     /// SNI cert resolver — shared across all listeners
     pub resolver: Arc<MultiDomainCertResolver>,
+    /// The QUIC listener's application protocols, by ALPN
+    applications: Vec<Vec<u8>>,
 }
 
 /// The proxy's key exchange preference, in one place.
@@ -879,8 +881,8 @@ pub struct TlsProvider {
 /// Constructing them separately would let the two drift, and a banner that reports a
 /// stack nothing uses is the failure this whole mechanism exists to prevent.
 ///
-/// X25519 is removed and the hybrids sorted first: clients offering only an X25519
-/// key_share get a HelloRetryRequest and fall back to secp384r1.
+/// The hybrids sorted first, then the classical groups: P-384, P-521, P-256 and
+/// X25519, which RFC 8446 section 9.1 has a TLS 1.3 server support (SHOULD).
 /// The configuration behind [`TlsProvider::build_zero_rtt_reject_config`].
 ///
 /// Free-standing and taking its own resolver so the behaviour can be exercised
@@ -991,9 +993,9 @@ pub fn build_single_group_provider(
     group: rustls::NamedGroup,
 ) -> anyhow::Result<rustls::crypto::CryptoProvider> {
     // Built from the unmodified post-quantum provider, not from
-    // `build_pqc_provider`, which removes X25519 outright: that is the edge's
-    // production policy, and inheriting it here left `t-classical-only` with an
-    // empty group list. The port then refused to bind at all -- correctly, by
+    // `build_pqc_provider`, whose groups are the edge's production policy: a
+    // test port offers its one group whatever that policy leaves out, and
+    // inheriting it here once left `t-classical-only` with an empty group list. The port then refused to bind at all -- correctly, by
     // the guard below, but it meant the one test about classical downgrade was
     // the one test that could not run.
     //
@@ -1510,7 +1512,8 @@ mod server_policy_tests {
             .filter(|g| !is_post_quantum_group(*g))
             .collect();
         assert_eq!(on_classical, off);
-        assert!(!on.contains(&NamedGroup::X25519) && !off.contains(&NamedGroup::X25519));
+        // X25519 is offered (RFC 8446 section 9.1, SHOULD), the last classical group
+        assert_eq!(off.last(), Some(&NamedGroup::X25519));
     }
 
     fn groups(pqc: &PqcConfig) -> Vec<NamedGroup> {
@@ -1683,11 +1686,18 @@ mod server_policy_tests {
         assert!(!policy.post_quantum);
         let (group, _) = negotiate(&policy, TLS13).unwrap();
         assert!(!is_post_quantum_group(group), "{group:?}");
-        // The classical tuple in the server's order: this client sent no
-        // classical key share the server offers (X25519 never is), so the
-        // server asks for secp384r1, as the OpenSSL listener does, where it
-        // took the client's first, secp256r1, before group_tuples.
-        assert_eq!(group, NamedGroup::secp384r1);
+        // One classical tuple: the client's own X25519 share is used, as the
+        // OpenSSL listener uses it, rather than a HelloRetryRequest for
+        // secp384r1, which a client sharing X25519 (Safari 18 and earlier)
+        // paid for in a round trip. A FIPS build (--all-features) does not
+        // use X25519, which FIPS 140-3 does not approve: it asks for
+        // secp384r1, the tuple's first.
+        let expected = if cfg!(feature = "fips") {
+            NamedGroup::secp384r1
+        } else {
+            NamedGroup::X25519
+        };
+        assert_eq!(group, expected);
     }
 
     #[test]
@@ -1750,6 +1760,7 @@ mod server_policy_tests {
                 true,
                 ClientAuth::None,
                 resolver.clone(),
+                &[b"h3".to_vec()],
             )
             .unwrap();
             assert_eq!(
@@ -1796,6 +1807,7 @@ mod server_policy_tests {
                 true,
                 ClientAuth::None,
                 resolver.clone(),
+                &[b"h3".to_vec()],
             )
             .unwrap();
             let mut roots = RootCertStore::empty();
@@ -1863,6 +1875,7 @@ mod server_policy_tests {
             true,
             ClientAuth::None,
             Arc::new(resolver),
+            &[b"h3".to_vec()],
         )
         .unwrap();
         let mut roots = RootCertStore::empty();
@@ -2095,15 +2108,13 @@ impl rustls::server::ResolvesServerCert for SingleChain {
 
 pub fn build_pqc_provider() -> rustls::crypto::CryptoProvider {
     let mut provider = rustls_post_quantum::provider();
-    provider
-        .kx_groups
-        .retain(|g| g.name() != rustls::NamedGroup::X25519);
     provider.kx_groups.sort_by_key(|g| match g.name() {
         rustls::NamedGroup::X25519MLKEM768 => 0u8,
         rustls::NamedGroup::secp384r1 => 1,
         rustls::NamedGroup::secp521r1 => 2,
         rustls::NamedGroup::secp256r1 => 3,
-        _ => 4,
+        rustls::NamedGroup::X25519 => 4,
+        _ => 5,
     });
 
     prefer_256_bit_aeads(&mut provider);
@@ -2166,11 +2177,12 @@ fn is_hybrid_group(group: rustls::NamedGroup) -> bool {
 /// - The classical fallback stays unless `require_hybrid` is set or
 ///   `fallback_to_classical` is false.
 ///
-/// Classical means secp384r1 and secp256r1, as on the OpenSSL listener (P-384,
-/// then P-256 in a tuple of its own), so both transports take the same groups
-/// in the same order. X25519 is not offered on any listener. secp256r1 is
-/// RFC 8446's one group every TLS 1.3 implementation must support, and QUIC
-/// stacks such as picotls offer nothing else classical.
+/// Classical means secp384r1, secp256r1 and X25519, one tuple, as on the
+/// OpenSSL listener, so both transports take the same groups in the same
+/// order and a classical client's own key share is used. RFC 8446 section 9.1
+/// has every TLS 1.3 implementation support secp256r1 (MUST) and X25519
+/// (SHOULD); QUIC stacks such as picotls offer nothing classical but
+/// secp256r1.
 ///
 /// Before this read `[pqc]` at all, `preferred_kem`, `require_hybrid` and
 /// `fallback_to_classical` shaped a group list the OpenSSL listener logged and
@@ -2203,9 +2215,6 @@ pub fn server_provider(post_quantum: bool, pqc: &PqcConfig) -> CryptoProvider {
             .copied()
             .filter(|g| {
                 let name = g.name();
-                if name == rustls::NamedGroup::X25519 {
-                    return false;
-                }
                 if !is_post_quantum_group(name) {
                     return keep_classical;
                 }
@@ -2222,6 +2231,7 @@ pub fn server_provider(post_quantum: bool, pqc: &PqcConfig) -> CryptoProvider {
             None if is_hybrid_group(name) => 101,
             None if is_post_quantum_group(name) => 102,
             None if name == rustls::NamedGroup::secp384r1 => 103,
+            None if name == rustls::NamedGroup::X25519 => 105,
             None => 104,
         }
     });
@@ -2475,6 +2485,7 @@ impl TlsProvider {
         tls_config: &TlsConfig,
         pqc_config: &PqcConfig,
         client_auth: ClientAuth,
+        applications: Vec<Vec<u8>>,
     ) -> anyhow::Result<Self> {
         // Check PQC availability
         let pqc_available = if pqc_config.enabled {
@@ -2501,6 +2512,7 @@ impl TlsProvider {
             pqc_available,
             client_auth,
             Arc::clone(&resolver),
+            &applications,
         )?;
         let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
             .map_err(|e| anyhow::anyhow!("Failed to create QUIC server config: {}", e))?;
@@ -2516,6 +2528,7 @@ impl TlsProvider {
             pqc_available: RwLock::new(pqc_available),
             client_auth,
             resolver,
+            applications,
         })
     }
 
@@ -2605,6 +2618,7 @@ impl TlsProvider {
             pqc_available,
             self.client_auth,
             Arc::clone(&self.resolver),
+            &self.applications,
         )?;
         let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
             .map_err(|e| anyhow::anyhow!("Failed to create QUIC server config: {}", e))?;
@@ -2827,20 +2841,23 @@ impl TlsProvider {
     }
 
     /// Create rustls server configuration using the shared SNI cert resolver.
+    ///
+    /// `applications` are the QUIC listener's application protocols by ALPN
+    /// (`ProxyConfig::quic_applications`): a client that offers none of them
+    /// is refused with no_application_protocol (RFC 9001 section 8.1).
     pub(crate) fn create_rustls_config_with_resolver(
         tls_config: &TlsConfig,
         pqc_config: &PqcConfig,
         pqc_available: bool,
         client_auth: ClientAuth,
         resolver: Arc<MultiDomainCertResolver>,
+        applications: &[Vec<u8>],
     ) -> anyhow::Result<RustlsServerConfig> {
         // Groups, versions, client authentication and tickets come from the one
         // policy every rustls listener builds from -- see ServerTlsPolicy.
         //
         // TLS_AES_128_GCM_SHA256 stays in the suite list: QUIC (RFC 9001) needs
-        // it for Initial packet protection. X25519 is not offered; a client whose
-        // only key_share is X25519 gets a HelloRetryRequest for the first group
-        // in its own list that this server offers.
+        // it for Initial packet protection.
         let policy = ServerTlsPolicy::from_config(
             tls_config,
             pqc_config,
@@ -2867,14 +2884,14 @@ impl TlsProvider {
         policy.apply_tickets(&mut config)?;
         policy.apply_group_tuples(&mut config);
 
-        // Configure ALPN protocols
-        config.alpn_protocols = tls_config
-            .alpn_protocols
-            .iter()
-            .map(|p| p.as_bytes().to_vec())
-            .collect();
-
-        info!("ALPN protocols: {:?}", tls_config.alpn_protocols);
+        config.alpn_protocols = applications.to_vec();
+        info!(
+            "QUIC application protocols: {:?}",
+            applications
+                .iter()
+                .map(|p| String::from_utf8_lossy(p))
+                .collect::<Vec<_>>()
+        );
 
         // Encrypted Client Hello (ECH) - optional, loaded from disk (rotated
         // by ech-keygen/ech-rotate.timer). Absent -> normal non-ECH TLS,
@@ -2997,7 +3014,11 @@ impl TlsProvider {
             key_path: tls_config.key_path.to_string_lossy().to_string(),
             pqc_enabled: *self.pqc_available.read(),
             pqc_provider: self.pqc_config.read().provider.clone(),
-            alpn_protocols: tls_config.alpn_protocols.clone(),
+            alpn_protocols: self
+                .applications
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect(),
             last_reloaded: last_modified
                 .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()),
         }
