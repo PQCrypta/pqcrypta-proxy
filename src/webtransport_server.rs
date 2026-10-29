@@ -86,12 +86,14 @@ impl WebTransportServer {
                 e
             })?,
         );
+        // WebTransport is an HTTP/3 extended CONNECT: this listener serves h3
         let rustls_config = TlsProvider::create_rustls_config_with_resolver(
             &config.tls,
             &config.pqc,
             config.pqc.enabled,
             config.client_auth(),
             resolver,
+            &[b"h3".to_vec()],
         )
         .map_err(|e| {
             error!("❌ WebTransport rustls config build failed: {}", e);

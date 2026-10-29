@@ -372,6 +372,8 @@ pub struct QuicListener {
     /// Fingerprint policy (blocking toggles, cache TTL) — same config the TCP
     /// listeners read, so one setting governs both transports.
     fingerprint_config: crate::config::FingerprintConfig,
+    /// DNS over QUIC for a client that names `doq` in ALPN, where `[doq]` is on
+    doq: Option<Arc<crate::doq::Service>>,
 }
 
 /// `template` with `crypto` as its TLS configuration, installed on `endpoint`
@@ -654,7 +656,14 @@ impl QuicListener {
         )?;
 
         info!("QUIC endpoint created on {}", addr);
-        info!("ALPN protocols: {:?}", config.tls.alpn_protocols);
+        info!(
+            "QUIC application protocols: {:?}",
+            config
+                .quic_applications()
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect::<Vec<_>>()
+        );
         info!("PQC enabled: {}", tls_provider.is_pqc_enabled());
 
         // Create backend pool
@@ -668,6 +677,11 @@ impl QuicListener {
 
         // Cloned before `config` moves into `Self`.
         let config_for_fingerprints = config.fingerprint.clone();
+        let doq = if config.doq.enabled {
+            Some(Arc::new(crate::doq::Service::new(&config.doq)?))
+        } else {
+            None
+        };
 
         Ok(Self {
             endpoint,
@@ -686,6 +700,7 @@ impl QuicListener {
             cache,
             fingerprint_extractor: Arc::new(FingerprintExtractor::new()),
             fingerprint_config: config_for_fingerprints,
+            doq,
         })
     }
 
@@ -785,6 +800,7 @@ impl QuicListener {
                         let cache = self.cache.clone();
                         let fingerprint_extractor = self.fingerprint_extractor.clone();
                         let fingerprint_config = self.fingerprint_config.clone();
+                        let doq = self.doq.clone();
 
                         tokio::spawn(async move {
                             metrics.connections.connection_opened(ConnectionProtocol::Http3);
@@ -802,6 +818,7 @@ impl QuicListener {
                                 cache,
                                 fingerprint_extractor,
                                 fingerprint_config,
+                                doq,
                             ).await {
                                 log_connection_end(remote_addr, &e);
                             }
@@ -884,6 +901,7 @@ impl QuicListener {
         cache: Arc<ResponseCache>,
         fingerprint_extractor: Arc<FingerprintExtractor>,
         fingerprint_config: crate::config::FingerprintConfig,
+        doq: Option<Arc<crate::doq::Service>>,
     ) -> anyhow::Result<()> {
         // Accept connection
         let mut connecting = incoming.accept()?;
@@ -919,6 +937,24 @@ impl QuicListener {
         let (connection, established) = connecting
             .into_0rtt()
             .map_err(|_| anyhow::anyhow!("QUIC stack refused 0.5-RTT on an incoming connection"))?;
+
+        // DNS over QUIC, where the client named it: `doq` is in the ALPN list
+        // only when `[doq]` is on, so a negotiated `doq` has its service
+        let negotiated = hello_data.as_ref().and_then(|d| d.protocol.clone());
+        if negotiated.as_deref() == Some(crate::doq::ALPN) {
+            if let Some(service) = doq {
+                crate::doq::serve(
+                    connection,
+                    established,
+                    early_data,
+                    remote_addr.ip(),
+                    service,
+                    advanced_rate_limiter,
+                )
+                .await;
+            }
+            return Ok(());
+        }
 
         // Advertises SETTINGS_ENABLE_WEBTRANSPORT=1 and
         // SETTINGS_WEBTRANSPORT_MAX_SESSIONS (draft-ietf-webtrans-http3-09 §8.2).

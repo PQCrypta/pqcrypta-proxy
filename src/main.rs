@@ -790,6 +790,7 @@ async fn run() -> anyhow::Result<()> {
         &config.tls,
         &config.pqc,
         config.client_auth(),
+        config.quic_applications(),
     )?);
 
     if tls_provider.is_pqc_enabled() {
@@ -2098,7 +2099,15 @@ fn print_startup_summary(config: &ProxyConfig, pqc_enabled: bool) {
     } else {
         info!("  OTEL Tracing:  ❌ Disabled");
     }
-    info!("  ALPN:          {:?}", config.tls.alpn_protocols);
+    info!(
+        "  ALPN:          QUIC {:?}, TCP {:?}",
+        config
+            .quic_applications()
+            .iter()
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect::<Vec<_>>(),
+        pqcrypta_proxy::pqc_tls::TCP_APPLICATIONS
+    );
     info!("  Backends:      {} configured", config.backends.len());
     info!("  Routes:        {} configured", config.routes.len());
     info!("═══════════════════════════════════════════════════════════════");

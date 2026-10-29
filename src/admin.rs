@@ -1005,7 +1005,10 @@ struct ServerConfigView {
 #[derive(Serialize)]
 struct TlsConfigView {
     cert_path: String,
+    /// The QUIC listener's application protocols (`ProxyConfig::quic_applications`)
     alpn_protocols: Vec<String>,
+    /// The TCP listeners' (`pqc_tls::TCP_APPLICATIONS`)
+    tcp_alpn_protocols: Vec<String>,
     require_client_cert: bool,
 }
 
@@ -1069,7 +1072,15 @@ async fn config_handler(State(state): State<Arc<AdminState>>) -> Json<ConfigResp
         },
         tls: TlsConfigView {
             cert_path: config.tls.cert_path.to_string_lossy().to_string(),
-            alpn_protocols: config.tls.alpn_protocols.clone(),
+            alpn_protocols: config
+                .quic_applications()
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect(),
+            tcp_alpn_protocols: crate::pqc_tls::TCP_APPLICATIONS
+                .iter()
+                .map(|p| (*p).to_string())
+                .collect(),
             require_client_cert: config.tls.require_client_cert,
         },
         pqc: PqcConfigView {
@@ -1357,14 +1368,11 @@ async fn health_webtransport_handler(
     let config = state.config_manager.get();
     let snapshot = state.metrics.snapshot();
 
-    // WebTransport is only reachable when it is in the negotiated ALPN set;
-    // reporting "ok" for a listener that cannot accept a session is worse than
-    // reporting nothing, because it silences the alert that would catch it.
-    let advertised = config
-        .tls
-        .alpn_protocols
-        .iter()
-        .any(|p| p == "webtransport" || p == "h3");
+    // WebTransport rides HTTP/3 (an extended CONNECT), so it is reachable
+    // only where the QUIC listener serves h3; reporting "ok" for a listener
+    // that cannot accept a session is worse than reporting nothing, because it
+    // silences the alert that would catch it.
+    let advertised = config.quic_applications().iter().any(|p| p == b"h3");
     let status = if advertised { "ok" } else { "unavailable" };
 
     Json(WebTransportHealthResponse {

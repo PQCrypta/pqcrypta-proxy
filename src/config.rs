@@ -209,6 +209,9 @@ pub struct ProxyConfig {
     /// DNS over HTTPS (RFC 8484) for a name server on this host
     #[serde(default)]
     pub doh: DohConfig,
+    /// DNS over QUIC (RFC 9250) on the QUIC listener, for the same name server
+    #[serde(default)]
+    pub doq: DoqConfig,
 }
 
 /// Current config schema version supported by this binary
@@ -279,6 +282,60 @@ impl DohConfig {
             return Err(anyhow::anyhow!("doh.timeout_ms must be more than 0"));
         }
         Ok(())
+    }
+}
+
+/// DNS over QUIC (RFC 9250) on the QUIC listener: a client that names `doq`
+/// in ALPN on the port HTTP/3 answers is served DNS instead ([`crate::doq`]).
+///
+/// Off by default. The name server answers DoQ on 853 itself; this is for a
+/// client whose path carries UDP 443 and not 853, asked through the DNS over
+/// HTTPS gateway's checks: `upstream` over TCP, standard queries only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DoqConfig {
+    /// Master switch. Default: false.
+    pub enabled: bool,
+    /// The name server, `ip:port`, asked over TCP. Default: "127.0.0.1:53".
+    pub upstream: String,
+    /// Time allowed for the name server's answer, in milliseconds; past it the
+    /// client gets SERVFAIL with Extended DNS Error 22. Default: 3000.
+    pub timeout_ms: u64,
+}
+
+impl Default for DoqConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            upstream: "127.0.0.1:53".to_string(),
+            timeout_ms: 3000,
+        }
+    }
+}
+
+impl DoqConfig {
+    /// The checks `ProxyConfig::validate` runs when DoQ is on.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.upstream.parse::<std::net::SocketAddr>().map_err(|e| {
+            anyhow::anyhow!("doq.upstream {:?} is not ip:port: {}", self.upstream, e)
+        })?;
+        if self.timeout_ms == 0 {
+            return Err(anyhow::anyhow!("doq.timeout_ms must be more than 0"));
+        }
+        Ok(())
+    }
+}
+
+impl ProxyConfig {
+    /// The application protocols the QUIC listener serves, by ALPN: HTTP/3,
+    /// and DNS over QUIC where it is on. A name the listener does not serve
+    /// is refused with no_application_protocol (RFC 9001 section 8.1).
+    pub fn quic_applications(&self) -> Vec<Vec<u8>> {
+        let mut names = vec![b"h3".to_vec()];
+        if self.doq.enabled {
+            names.push(crate::doq::ALPN.to_vec());
+        }
+        names
     }
 }
 
@@ -631,6 +688,7 @@ impl Default for ProxyConfig {
             masque: MasqueConfig::default(),
             conformance: ConformanceConfig::default(),
             doh: DohConfig::default(),
+            doq: DoqConfig::default(),
         }
     }
 }
@@ -1434,8 +1492,6 @@ pub struct TlsConfig {
     pub ca_cert_path: Option<PathBuf>,
     /// Require client certificates (mTLS)
     pub require_client_cert: bool,
-    /// ALPN protocols to advertise
-    pub alpn_protocols: Vec<String>,
     /// Minimum TLS version (1.2 or 1.3)
     pub min_version: String,
     /// Enable OCSP stapling
@@ -1549,12 +1605,6 @@ impl Default for TlsConfig {
             key_path: PathBuf::from("/etc/pqcrypta/key.pem"),
             ca_cert_path: None,
             require_client_cert: false,
-            alpn_protocols: vec![
-                "h3".to_string(),
-                "h2".to_string(),
-                "http/1.1".to_string(),
-                "webtransport".to_string(),
-            ],
             min_version: "1.3".to_string(),
             ocsp_stapling: true,
             cert_reload_interval_secs: 3600,
@@ -4302,6 +4352,9 @@ impl ProxyConfig {
 
         if self.doh.enabled {
             self.doh.validate()?;
+        }
+        if self.doq.enabled {
+            self.doq.validate()?;
         }
 
         // PQC passthrough conflict
