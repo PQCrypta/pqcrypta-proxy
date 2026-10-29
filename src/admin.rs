@@ -2008,14 +2008,14 @@ struct FingerprintParams {
     limit: Option<usize>,
 }
 
-/// `GET /security/fingerprints[?limit=N]` — observed JA3/JA4 fingerprints.
+/// `GET /security/fingerprints[?limit=N]` — observed fingerprints, one per
+/// JA4, most recently seen first.
 async fn security_fingerprints_handler(
     State(state): State<Arc<AdminState>>,
     Query(params): Query<FingerprintParams>,
 ) -> AdminJson {
-    let mut records = security_state(&state)?.observed_records();
+    let mut records = security_state(&state)?.corpus.entries();
     let total = records.len();
-    records.sort_by_key(|r| std::cmp::Reverse(r.last_seen));
     records.truncate(params.limit.unwrap_or(100).min(1000));
     Ok(Json(
         serde_json::json!({ "total": total, "fingerprints": records }),
@@ -2050,7 +2050,7 @@ async fn security_threats_handler(State(state): State<Arc<AdminState>>) -> Admin
         })
     });
     let mut classes: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
-    for f in sec.observed_records() {
+    for f in sec.corpus.entries() {
         *classes.entry(f.classification).or_default() += f.request_count;
     }
     Ok(Json(serde_json::json!({

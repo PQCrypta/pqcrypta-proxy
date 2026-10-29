@@ -2558,19 +2558,15 @@ pub struct SecurityConfig {
     /// verified by reverse DNS alone, which cannot verify DuckDuckBot.
     #[serde(default = "default_true")]
     pub crawler_published_ranges: bool,
-    /// How many distinct TLS fingerprints the observed corpus retains.
+    /// How many JA3s the classification cache holds for the request path,
+    /// least recently seen evicted first.
     ///
-    /// This began as a memory-exhaustion guard at a hardcoded 50,000 and is now
-    /// the size limit on a published dataset: `observed.json` is what
-    /// `/ja4/` serves, and that is the most-crawled path on the site by a
-    /// factor of eight. The corpus reached exactly 50,000 entries, which means
-    /// it had been evicting its long tail — least-recently-seen first, so the
-    /// rare fingerprints a directory exists to record are precisely the ones
-    /// that go.
-    ///
-    /// Still bounded, because it is still fed by anyone who can open a
-    /// connection. At roughly 500 bytes an entry the default costs ~125 MB
-    /// resident and ~125 MB on disk.
+    /// It bounds a cache and nothing else. It once bounded the published
+    /// corpus too, as the corpus was this cache written to disk: a client that
+    /// randomises its extension order brings a new JA3 almost every
+    /// connection, and at the limit those evicted the rare JA4s `/ja4/`
+    /// exists to record. The corpus (`crate::fingerprint_corpus`) is keyed by
+    /// JA4 and keeps every one; an entry evicted here is lost to no record.
     #[serde(default = "default_max_tracked_fingerprints")]
     pub max_tracked_fingerprints: usize,
 }

@@ -148,6 +148,7 @@ pub mod doq;
 pub mod early_data;
 pub mod ech_config;
 pub mod fingerprint;
+pub mod fingerprint_corpus;
 #[cfg(test)]
 pub(crate) mod fuzz_support;
 pub mod handlers;

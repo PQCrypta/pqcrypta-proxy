@@ -247,8 +247,12 @@ pub struct SecurityState {
     /// Separate from `ip_connections`, which caps how many connections an IP may
     /// hold at once: this caps how fast it may open them.
     pub connection_rates: Arc<DashMap<IpAddr, ConnectionRateWindow>>,
-    /// JA3 fingerprint cache (fingerprint -> classification)
+    /// JA3 fingerprint cache (fingerprint -> classification), for the
+    /// request path; bounded, as a cache is (`max_tracked_fingerprints`)
     pub ja3_cache: Arc<DashMap<String, TlsFingerprint>>,
+    /// Every distinct fingerprint seen, one record per JA4, never evicted:
+    /// what `observed.json` and /ja4/ hold ([`crate::fingerprint_corpus`])
+    pub corpus: Arc<crate::fingerprint_corpus::Corpus>,
     /// Circuit breaker states per backend
     pub circuit_breakers: Arc<DashMap<String, CircuitBreakerState>>,
     /// Configuration
@@ -608,65 +612,9 @@ fn default_transport() -> char {
 }
 
 impl SecurityState {
-    /// Snapshot the observed-fingerprint corpus to disk.
-    ///
-    /// Written atomically through a temp file: the public directory reads this
-    /// on a timer, and a half-written file would be a parse error served to
-    /// visitors rather than a stale-but-valid one.
-    ///
-    /// `Instant` is a monotonic reading with no meaning to another process, so
-    /// timestamps are converted to Unix seconds here by walking each elapsed
-    /// duration back from the current wall clock.
+    /// Write the observed-fingerprint corpus to disk ([`crate::fingerprint_corpus`]).
     pub fn flush_observed_fingerprints(&self, path: &std::path::Path) -> std::io::Result<usize> {
-        let records = self.observed_records();
-
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let tmp = path.with_extension("json.tmp");
-        let json = serde_json::to_vec_pretty(&records)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&tmp, json)?;
-        // 0644: the export job feeding the public directory runs unprivileged.
-        // These are observations, not policy — this file bans nobody by itself.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))?;
-        }
-        std::fs::rename(&tmp, path)?;
-
-        Ok(records.len())
-    }
-
-    /// The observed-fingerprint corpus, timestamps in Unix seconds: what
-    /// `flush_observed_fingerprints` writes and `GET /security/fingerprints`
-    /// serves.
-    pub fn observed_records(&self) -> Vec<ObservedFingerprint> {
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let to_unix = |i: Instant| now_unix.saturating_sub(i.elapsed().as_secs());
-
-        self.ja3_cache
-            .iter()
-            .map(|e| {
-                let v = e.value();
-                ObservedFingerprint {
-                    ja3_hash: v.ja3_hash.clone(),
-                    ja4_hash: v.ja4_hash.clone(),
-                    ja4_raw: v.ja4_raw.clone(),
-                    ja3_string: v.ja3_string.clone(),
-                    classification: format!("{:?}", v.classification),
-                    transport: v.transport,
-                    first_seen: to_unix(v.first_seen),
-                    last_seen: to_unix(v.last_seen),
-                    request_count: v.request_count,
-                    user_agents: v.user_agents.clone(),
-                }
-            })
-            .collect()
+        self.corpus.flush(path)
     }
 
     /// Record the User-Agent a request carrying this fingerprint presented.
@@ -690,6 +638,11 @@ impl SecurityState {
         };
 
         let ua: String = user_agent.chars().take(MAX_UA_LEN).collect();
+        // The corpus record this connection's fingerprint is kept under
+        self.corpus.note_user_agent(
+            &crate::fingerprint_corpus::key_of(ja3_hash, entry.ja4_hash.as_deref()),
+            &ua,
+        );
 
         if let Some(count) = entry.user_agents.get_mut(&ua) {
             *count = count.saturating_add(1);
@@ -717,7 +670,8 @@ impl SecurityState {
         entry.user_agents.insert(ua, 1);
     }
 
-    /// Reload the corpus written by a previous run.
+    /// Reload the corpus written by a previous run, of either version
+    /// ([`crate::fingerprint_corpus`]).
     ///
     /// Counts and first-seen dates are the point: without this, every restart
     /// resets the corpus to "nothing has ever been seen", and a proxy that
@@ -726,47 +680,21 @@ impl SecurityState {
     /// A missing or corrupt file is not an error — first boot is the normal
     /// case, and a bad file must not stop the proxy starting.
     pub fn load_observed_fingerprints(&self, path: &std::path::Path) -> usize {
-        let Ok(bytes) = std::fs::read(path) else {
-            return 0;
-        };
-        let Ok(records) = serde_json::from_slice::<Vec<ObservedFingerprint>>(&bytes) else {
-            warn!("Observed fingerprint corpus is unreadable — starting empty");
-            return 0;
-        };
-
-        let now = Instant::now();
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        // Rebuild Instants by walking the wall-clock age backwards. A record
-        // stamped in the future (clock moved) collapses to "just now" rather
-        // than underflowing.
-        let to_instant = |unix: u64| {
-            now.checked_sub(Duration::from_secs(now_unix.saturating_sub(unix)))
-                .unwrap_or(now)
-        };
-
-        let mut loaded = 0;
-        for r in records {
-            self.ja3_cache.insert(
-                r.ja3_hash.clone(),
-                TlsFingerprint {
-                    ja3_hash: r.ja3_hash,
-                    ja4_hash: r.ja4_hash,
-                    ja4_raw: r.ja4_raw,
-                    ja3_string: r.ja3_string,
-                    classification: FingerprintClass::from_label(&r.classification),
-                    transport: r.transport,
-                    first_seen: to_instant(r.first_seen),
-                    last_seen: to_instant(r.last_seen),
-                    request_count: r.request_count,
-                    user_agents: r.user_agents,
-                },
-            );
-            loaded += 1;
+        match self.corpus.load(path) {
+            Ok(n) => {
+                let rebuilt = self.corpus.rebuild_missing_raw();
+                if rebuilt > 0 {
+                    info!("Rebuilt and proved the JA4_r of {rebuilt} observed fingerprints");
+                }
+                n
+            }
+            Err(e) => {
+                if path.exists() {
+                    warn!("Observed fingerprint corpus is unreadable ({e}) — starting empty");
+                }
+                0
+            }
         }
-        loaded
     }
 }
 
@@ -785,24 +713,6 @@ pub enum FingerprintClass {
     Scanner,
     /// API client (curl, etc.)
     ApiClient,
-}
-
-impl FingerprintClass {
-    /// Parse back the `Debug` spelling written by the flush.
-    ///
-    /// Anything unrecognised becomes `Suspicious` — the same default a
-    /// never-before-seen fingerprint gets, so a corpus written by a future
-    /// version with new variants degrades instead of being discarded.
-    fn from_label(label: &str) -> Self {
-        match label {
-            "Browser" => Self::Browser,
-            "LegitimateBot" => Self::LegitimateBot,
-            "Malicious" => Self::Malicious,
-            "Scanner" => Self::Scanner,
-            "ApiClient" => Self::ApiClient,
-            _ => Self::Suspicious,
-        }
-    }
 }
 
 /// Circuit breaker state for backend protection
@@ -861,6 +771,7 @@ impl SecurityState {
             blocked_ips: Arc::new(DashMap::new()),
             request_counts: Arc::new(DashMap::new()),
             ja3_cache: Arc::new(DashMap::new()),
+            corpus: Arc::new(crate::fingerprint_corpus::Corpus::default()),
             crawler_verifier: Arc::new(arc_swap::ArcSwap::from_pointee(build_crawler_verifier(
                 config.security.crawler_published_ranges,
             ))),
@@ -2176,10 +2087,10 @@ impl SecurityState {
                 .collect();
             entries.sort_by_key(|(_, time)| *time);
             let to_remove = ja3_count.saturating_sub(max_fingerprints);
-            warn!(
-                "observed fingerprint corpus at ceiling: {} entries, limit {}, \
-                 evicting {} least-recently-seen. Raise \
-                 security.max_tracked_fingerprints to keep them.",
+            // A cache entry, not a record: the corpus keeps every fingerprint
+            // under its JA4 whatever this evicts
+            debug!(
+                "JA3 classification cache at {} entries, limit {}: evicting {} least-recently-seen",
                 ja3_count, max_fingerprints, to_remove
             );
             for (hash, _) in entries.into_iter().take(to_remove) {

@@ -854,6 +854,21 @@ impl FingerprintExtractor {
                 user_agents: std::collections::HashMap::new(),
             });
 
+        // The record: every distinct fingerprint, under its JA4, for good
+        security
+            .corpus
+            .observe(&crate::fingerprint_corpus::Sighting {
+                ja3_hash: &ja3_hash,
+                ja3_string: &fingerprint.ja3_string,
+                ja4_hash: ja4_hash.as_deref(),
+                ja4_raw: fingerprint.ja4_raw.as_deref(),
+                classification: &format!("{classification:?}"),
+                transport,
+                at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+            });
+
         // Authorized pentest sources are never banned by fingerprint.
         //
         // A fingerprint block is an auto-ban, and pentest_bypass_ips exists
