@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.5.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.4.1...v0.5.0) (2026-10-29)
+
+
+### Features
+
+* **acme:** certificates for IP addresses, renewal by ARI, CT logs from the log list ([481c7d0](https://github.com/PQCrypta/pqcrypta-proxy/commit/481c7d0bcd6cc90a2c65b1acc525204d1eba79bb))
+* **acme:** certificates for IP addresses, renewal by ARI, CT logs from the log list ([38ac27c](https://github.com/PQCrypta/pqcrypta-proxy/commit/38ac27c6c3e8fc97d15319160614e207b1273b2e))
+* **acme:** dns-01 and dns-account-01 by TSIG-signed DNS UPDATE ([8566013](https://github.com/PQCrypta/pqcrypta-proxy/commit/8566013c656bf1b45b817fa0b46063b81ed1ae1e))
+* **acme:** dns-01 and dns-account-01 by TSIG-signed DNS UPDATE ([79015cd](https://github.com/PQCrypta/pqcrypta-proxy/commit/79015cd60307c967c8d5d19046506d9e68681b31))
+
+
+### Bug Fixes
+
+* **deps:** crypto-bigint 0.7.6 (RUSTSEC-2026-0387), inout 0.2.5 (0.2.3 yanked) ([20b3474](https://github.com/PQCrypta/pqcrypta-proxy/commit/20b3474e6ac944222a5e397ec30354060ff51cd1))
+* **h3:** the GREASE frame goes ahead of the response, not last on the stream ([def5204](https://github.com/PQCrypta/pqcrypta-proxy/commit/def52043274385a77ce55e293f5004b377b7d398))
+* **h3:** the GREASE frame goes ahead of the response, not last on the stream ([8e7fa4c](https://github.com/PQCrypta/pqcrypta-proxy/commit/8e7fa4c377b9101bb842073f1f2b57653cb85199))
+* name_end is a test-only import in doh.rs (release builds deny unused imports) ([cba161e](https://github.com/PQCrypta/pqcrypta-proxy/commit/cba161e4f617bcbde75681a9dd6b432e43517eba))
+* **tls:** an address sent as the server name gets the certificate naming the address ([3b998ea](https://github.com/PQCrypta/pqcrypta-proxy/commit/3b998ea7fdbeb32dd3cb2768d6c7bd40c10fcee8))
+* **tls:** an address sent as the server name gets the certificate naming the address ([20fc4e6](https://github.com/PQCrypta/pqcrypta-proxy/commit/20fc4e6f40d58ecf613c2fe1a4fd3de0ca846646))
+
 ## [0.4.1](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.4.0...v0.4.1) (2026-10-23)
 
 
