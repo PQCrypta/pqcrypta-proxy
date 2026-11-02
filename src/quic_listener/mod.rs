@@ -129,56 +129,37 @@ pub(crate) fn log_quic_end(remote_addr: SocketAddr, msg: &str) {
     }
 }
 
-/// The Alt-Svc value for a response being sent **over QUIC**.
+/// The Alt-Svc value for a response being sent **over QUIC**: the same value a
+/// response over TCP carries, every UDP port that serves HTTP/3, this
+/// connection's among them.
 ///
-/// RFC 7838 §3: Alt-Svc lists services that are alternatives *to the connection the
-/// response arrived on*. A client already speaking h3 on this port learns nothing
-/// from being told h3 is available on this port — that is the connection it is
-/// using. This path used to send exactly that, an h3 advertisement over h3, which is
-/// redundant rather than wrong, but it also means the header carries no information
-/// at all for the one audience that receives it.
+/// RFC 7838 section 3: an Alt-Svc header "invalidates and replaces all cached
+/// alternative services for that origin". A response over QUIC that leaves out the
+/// connection it arrives on therefore has the client forget it. This path left out
+/// h3 on its own port and named `h2` there instead, which a browser does not store
+/// (Chrome keeps QUIC alternatives only): after a page over HTTP/3 on 443 the
+/// client held only h3 on 4434, after the next one, over TCP, h3 on 443 again, so
+/// a visitor reloading philibertsecurity.com alternated HTTP/3 and HTTP/2 on every
+/// load (the access log, 2026-11-02: fourteen reloads, strictly alternating). One
+/// value on every transport keeps a client's set the same whichever connection
+/// carried the response.
 ///
-/// What is genuinely alternative from here:
-///   * `h2` on the same port — the same origin over TCP, a real fallback
-///   * `h3` on any *other* configured UDP port
-///
-/// haproxy.org is the reference for this behaviour: `h3=":443"` over TCP and
-/// `h2=":443"` over QUIC. This goes one step further by keeping the other h3 ports,
-/// which are alternatives to this connection even though they share its protocol.
-///
-/// `config.server.udp_port` is the port *this* listener is bound to — `main.rs`
-/// clones the config per port and overwrites the field — so it identifies the
-/// current connection without threading a parameter through every call site.
+/// `config.server.udp_port` is the port *this* listener is bound to (`main.rs`
+/// clones the config per port and overwrites the field), the first one listed, as
+/// the TCP listener lists its own port first. An empty value (`alt_svc_ports = []`,
+/// a node that advertises no HTTP/3) is answered `clear` by
+/// [`H3ConnHeaders::alt_svc`]: a client that reached it over QUIC anyway drops
+/// what it cached.
 ///
 /// Built once per connection into [`H3ConnHeaders`], whose `alt_svc` answers
 /// `clear` instead for hosts listed in `server.tcp_only_hosts`.
 fn build_alt_svc_header_over_quic(config: &ProxyConfig) -> String {
-    let current = config.server.udp_port;
-
-    // The same port over TCP. Both listeners bind the same port set, so a client on
-    // h3:P can always reach h2:P.
-    let max_age = config.server.alt_svc_max_age_secs;
-    let mut parts = vec![format!("h2=\":{current}\"; ma={max_age}")];
-
-    // `server.alt_svc_ports`, when the operator has set it, is the list of ports
-    // that actually serve HTTP/3 — a bound port is not necessarily a reachable one.
-    // The current connection is still excluded: it is proven reachable, being in
-    // use, but it is not an alternative to itself.
-    let advertised: Vec<u16> = match config.server.alt_svc_ports.as_deref() {
-        Some(explicit) => explicit.to_vec(),
-        None => config.server.additional_ports.clone(),
-    };
-
-    let mut seen = vec![current];
-    for p in advertised {
-        if seen.contains(&p) {
-            continue;
-        }
-        seen.push(p);
-        parts.push(format!("h3=\":{p}\"; ma={max_age}"));
-    }
-
-    parts.join(", ")
+    crate::http_listener::layers::build_alt_svc_header_with_override(
+        config.server.udp_port,
+        &config.server.additional_ports,
+        config.server.alt_svc_ports.as_deref(),
+        config.server.alt_svc_max_age_secs,
+    )
 }
 
 /// The starting point for a QUIC connection's handshake facts.
@@ -264,7 +245,9 @@ impl H3ConnHeaders {
             server: Some(config.server.server_header.as_str())
                 .filter(|s| !s.is_empty())
                 .and_then(|s| HeaderValue::from_str(s).ok()),
-            alt_svc: HeaderValue::from_str(&build_alt_svc_header_over_quic(config)).ok(),
+            alt_svc: Some(build_alt_svc_header_over_quic(config))
+                .filter(|v| !v.is_empty())
+                .and_then(|v| HeaderValue::from_str(&v).ok()),
             client_ip: HeaderValue::from_str(&remote_addr.ip().to_string()).ok(),
             forwarded_port: HeaderValue::from(local_port),
             ja3: value(fingerprint.ja3_hash.as_deref()),
@@ -2120,43 +2103,41 @@ mod alt_svc_tests {
         c
     }
 
-    /// The point of the change: a client already on h3:443 is not told about h3:443.
+    /// What a response over TCP from the same listener says: every serving h3 port.
+    fn over_tcp(c: &ProxyConfig) -> String {
+        crate::http_listener::layers::build_alt_svc_header_with_override(
+            c.server.udp_port,
+            &c.server.additional_ports,
+            c.server.alt_svc_ports.as_deref(),
+            c.server.alt_svc_max_age_secs,
+        )
+    }
+
+    /// The connection in use stays in the set: Alt-Svc replaces a client's cached
+    /// alternatives (RFC 7838 section 3), so leaving it out had the client forget it
     #[test]
-    fn does_not_advertise_the_connection_it_is_on() {
+    fn advertises_the_connection_it_is_on_as_tcp_does() {
         let c = config_with(443, vec![4434], vec![]);
         let v = build_alt_svc_header_over_quic(&c);
+        assert_eq!(v, "h3=\":443\"; ma=86400, h3=\":4434\"; ma=86400");
+        assert_eq!(v, over_tcp(&c));
         assert!(
-            !v.contains("h3=\":443\""),
-            "h3 on the current port is this connection, not an alternative: {v}"
-        );
-        assert!(v.contains("h2=\":443\""), "TCP on the same port is: {v}");
-        assert!(v.contains("h3=\":4434\""), "another h3 port is: {v}");
-    }
-
-    /// A second h3 port shares the protocol but is still a different service, so
-    /// unlike haproxy.org's simpler form it is kept.
-    #[test]
-    fn keeps_other_h3_ports() {
-        let c = config_with(443, vec![4433, 4434], vec![]);
-        let v = build_alt_svc_header_over_quic(&c);
-        assert_eq!(
-            v,
-            "h2=\":443\"; ma=86400, h3=\":4433\"; ma=86400, h3=\":4434\"; ma=86400"
+            !v.contains("h2="),
+            "a browser stores QUIC alternatives only: {v}"
         );
     }
 
-    /// Each listener is handed a config clone with its own port in `udp_port`, so
-    /// the listener on an additional port must exclude *that* port, not 443.
+    /// Every listener, primary or not, says the same of the origin
     #[test]
-    fn excludes_the_current_port_on_a_secondary_listener() {
-        let c = config_with(4434, vec![4433, 4434], vec![]);
-        let v = build_alt_svc_header_over_quic(&c);
-        assert!(v.contains("h2=\":4434\""), "{v}");
-        assert!(v.contains("h3=\":4433\""), "{v}");
-        assert!(
-            !v.contains("h3=\":4434\""),
-            "4434 is the current connection here: {v}"
-        );
+    fn every_listener_names_every_h3_port() {
+        for (port, more) in [(443, vec![4433, 4434]), (4434, vec![4433, 4434])] {
+            let c = config_with(port, more, vec![]);
+            let v = build_alt_svc_header_over_quic(&c);
+            assert_eq!(v, over_tcp(&c));
+            for p in [port, 4433, 4434] {
+                assert_eq!(v.matches(&format!("h3=\":{p}\"")).count(), 1, "{p}: {v}");
+            }
+        }
     }
 
     /// A port listed in both `udp_port` and `additional_ports` must not produce two
@@ -2165,33 +2146,45 @@ mod alt_svc_tests {
     fn does_not_duplicate_a_port() {
         let c = config_with(443, vec![443, 443, 4434], vec![]);
         let v = build_alt_svc_header_over_quic(&c);
+        assert_eq!(v.matches("h3=\":443\"").count(), 1, "{v}");
         assert_eq!(v.matches("h3=\":4434\"").count(), 1, "{v}");
-        assert!(!v.contains("h3=\":443\""), "{v}");
     }
 
     /// The Midwest speedtest node: UDP 4433 is the WebTransport endpoint, so a plain
     /// HTTP/3 request there is answered by the WebTransport server and never gets
-    /// response headers. With a real h3 port on 4434, only that one is advertised.
+    /// response headers. With a real h3 port on 4434, only that one is advertised,
+    /// from the WebTransport listener as from the h3 one.
     #[test]
     fn override_names_only_the_ports_that_serve_http3() {
-        let mut c = config_with(4434, vec![4433, 4434], vec![]);
-        c.server.alt_svc_ports = Some(vec![4434]);
-        let v = build_alt_svc_header_over_quic(&c);
-        // 4434 is this connection, so it drops out even though the override lists it.
-        assert_eq!(v, "h2=\":4434\"; ma=86400");
-        assert!(
-            !v.contains("h3=\":4433\""),
-            "4433 serves WebTransport, not h3: {v}"
-        );
+        for port in [4433, 4434] {
+            let mut c = config_with(port, vec![4433, 4434], vec![]);
+            c.server.alt_svc_ports = Some(vec![4434]);
+            assert_eq!(build_alt_svc_header_over_quic(&c), "h3=\":4434\"; ma=86400");
+        }
     }
 
-    /// A node with no HTTP/3 at all still names its TCP alternative — that is real
-    /// and reachable — but no h3 port.
+    /// A node that advertises no HTTP/3 has nothing to name, and a client that
+    /// reached it over QUIC anyway is told to drop what it cached
     #[test]
-    fn empty_override_still_names_the_tcp_alternative() {
+    fn empty_override_advertises_nothing_and_clears() {
         let mut c = config_with(4433, vec![], vec![]);
         c.server.alt_svc_ports = Some(vec![]);
-        assert_eq!(build_alt_svc_header_over_quic(&c), "h2=\":4433\"; ma=86400");
+        assert_eq!(build_alt_svc_header_over_quic(&c), "");
+        let fp = crate::fingerprint::FingerprintResult {
+            allowed: true,
+            ja3_hash: None,
+            ja4_hash: None,
+            classification: None,
+            client_name: None,
+        };
+        let h = H3ConnHeaders::new(
+            &c,
+            "192.0.2.1:50000".parse().unwrap(),
+            4433,
+            &fp,
+            &crate::tls_acceptor::HandshakeFacts::default(),
+        );
+        assert_eq!(h.alt_svc(&c, None), "clear");
     }
 
     /// Unchanged behaviour: a TCP-only host still gets the eviction token, which is
