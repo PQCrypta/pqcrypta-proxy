@@ -508,12 +508,13 @@ impl Connection {
     ///
     /// If processing of events lags behind too much, you will get an error of type [`crate::Lagged`] indicating
     /// how many events were lost. The stream continues after a lag, delivering the oldest retained message next.
+    ///
+    /// The stream ends when the connection does.
     pub fn path_events(&self) -> crate::PathEvents {
         crate::PathEvents::new(
             self.0
                 .lock_without_waking("path_events")
-                .path_events
-                .subscribe(),
+                .subscribe_path_events(),
         )
     }
 
@@ -523,13 +524,14 @@ impl Connection {
     ///
     /// If processing of events lags behind too much, you will get an error of type [`crate::Lagged`] indicating
     /// how many events were lost. The stream continues after a lag, delivering the oldest retained message next.
+    ///
+    /// The stream ends when the connection does.
     pub fn nat_traversal_updates(&self) -> crate::NatTraversalUpdates {
-        crate::NatTraversalUpdates::new(
-            self.0
-                .lock_without_waking("nat_traversal_updates")
-                .nat_traversal_updates
-                .subscribe(),
-        )
+        let state = self.0.lock_without_waking("nat_traversal_updates");
+        crate::NatTraversalUpdates::new(match &state.nat_traversal_updates {
+            Some(tx) => tx.subscribe(),
+            None => tokio::sync::broadcast::channel(1).1,
+        })
     }
 
     /// Wait for the connection to be closed for any reason
@@ -1616,7 +1618,11 @@ pub(crate) struct State {
     /// We only insert entries if the discarded path has a non-zero reference count in [`Self::path_refs`].
     /// When the last reference to a path is dropped its entry is removed from both maps.
     pub(crate) final_path_stats: FxHashMap<PathId, PathStats>,
-    pub(crate) path_events: tokio::sync::broadcast::Sender<PathEvent>,
+    /// The path event subscribers' channel, until the connection terminates:
+    /// dropped then, so their streams end. Kept, it held every subscriber
+    /// that also held the connection (to read a path's stats) waiting on a
+    /// stream only this state's drop could end, and the state with it.
+    pub(crate) path_events: Option<tokio::sync::broadcast::Sender<PathEvent>>,
     sender: Pin<Box<dyn UdpSender>>,
     pub(crate) runtime: Arc<dyn Runtime>,
     send_buffer: Vec<u8>,
@@ -1625,7 +1631,9 @@ pub(crate) struct State {
     /// Our last external address reported by the peer. When multipath is enabled, this will be the
     /// last report across all paths.
     pub(crate) observed_external_addr: watch::Sender<Option<SocketAddr>>,
-    pub(crate) nat_traversal_updates: tokio::sync::broadcast::Sender<n0_nat_traversal::Event>,
+    /// As `path_events`, for NAT traversal updates
+    pub(crate) nat_traversal_updates:
+        Option<tokio::sync::broadcast::Sender<n0_nat_traversal::Event>>,
     on_closed: Vec<oneshot::Sender<Closed>>,
     /// [`proto::TransportConfig::send_coalescing`], read once.
     send_coalescing: bool,
@@ -1671,9 +1679,9 @@ impl State {
             runtime,
             send_buffer: Vec::new(),
             buffered_transmit: None,
-            path_events: tokio::sync::broadcast::channel(32).0,
+            path_events: Some(tokio::sync::broadcast::channel(32).0),
             observed_external_addr: watch::Sender::new(None),
-            nat_traversal_updates: tokio::sync::broadcast::channel(32).0,
+            nat_traversal_updates: Some(tokio::sync::broadcast::channel(32).0),
             on_closed: Vec::new(),
             final_path_stats: Default::default(),
             path_refs: Default::default(),
@@ -1837,14 +1845,14 @@ impl State {
                     wake_stream(id, &mut self.blocked_writers);
                 }
                 Path(ref evt @ PathEvent::ObservedAddr { addr: observed, .. }) => {
-                    self.path_events.send(evt.clone()).ok();
+                    self.send_path_event(evt.clone());
                     self.observed_external_addr.send_if_modified(|addr| {
                         let old = addr.replace(observed);
                         old != *addr
                     });
                 }
                 Path(ref evt @ PathEvent::Established { id, .. }) => {
-                    self.path_events.send(evt.clone()).ok();
+                    self.send_path_event(evt.clone());
                     if let Some(sender) = self.open_path.remove(&id) {
                         sender.send_modify(|value| *value = Ok(()));
                     }
@@ -1857,7 +1865,7 @@ impl State {
                     if self.path_refs.contains_key(&id) {
                         self.final_path_stats.insert(id, *path_stats.clone());
                     }
-                    self.path_events.send(evt.clone()).ok();
+                    self.send_path_event(evt.clone());
                 }
                 Path(ref evt @ PathEvent::Abandoned { id, .. }) => {
                     if let Some(sender) = self.open_path.remove(&id) {
@@ -1872,13 +1880,15 @@ impl State {
                         sender.send_modify(|value| *value = Err(error));
                     }
                     // this will happen also for already opened paths
-                    self.path_events.send(evt.clone()).ok();
+                    self.send_path_event(evt.clone());
                 }
                 Path(evt @ PathEvent::RemoteStatus { .. }) => {
-                    self.path_events.send(evt).ok();
+                    self.send_path_event(evt);
                 }
                 NatTraversal(update) => {
-                    self.nat_traversal_updates.send(update).ok();
+                    if let Some(tx) = &self.nat_traversal_updates {
+                        tx.send(update).ok();
+                    }
                 }
                 _ => {
                     // PathEvent is #[non_exhaustive].
@@ -1944,8 +1954,27 @@ impl State {
     }
 
     /// Used to wake up all blocked futures when the connection becomes closed for any reason
+    /// Tell the path event subscribers, while there are any to tell
+    fn send_path_event(&self, evt: PathEvent) {
+        if let Some(tx) = &self.path_events {
+            tx.send(evt).ok();
+        }
+    }
+
+    /// A receiver of the path events, or of none where the connection has
+    /// terminated: its channel's sender is gone, so it ends at once
+    pub(crate) fn subscribe_path_events(&self) -> tokio::sync::broadcast::Receiver<PathEvent> {
+        match &self.path_events {
+            Some(tx) => tx.subscribe(),
+            None => tokio::sync::broadcast::channel(1).1,
+        }
+    }
+
     fn terminate(&mut self, reason: ConnectionError, shared: &Shared) {
         self.error = Some(reason.clone());
+        // The event streams end with the connection
+        self.path_events = None;
+        self.nat_traversal_updates = None;
         if let Some(x) = self.on_handshake_data.take() {
             let _ = x.send(());
         }
