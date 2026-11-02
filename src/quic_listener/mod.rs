@@ -940,7 +940,8 @@ impl QuicListener {
 
         // DNS over QUIC, where the client named it: `doq` is in the ALPN list
         // only when `[doq]` is on, so a negotiated `doq` has its service
-        let negotiated = hello_data.as_ref().and_then(|d| d.protocol.clone());
+        let (negotiated, established) =
+            application_protocol(hello_data.as_deref(), &connection, established).await;
         if negotiated.as_deref() == Some(crate::doq::ALPN) {
             if let Some(service) = doq {
                 crate::doq::serve(
@@ -1817,6 +1818,163 @@ impl QuicListener {
     /// Get local address
     pub fn local_addr(&self) -> anyhow::Result<SocketAddr> {
         Ok(self.endpoint.local_addr()?)
+    }
+}
+
+/// The handshake's completion, once [`application_protocol`] may have waited
+/// for it.
+type Established = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>;
+
+/// The application protocol a connection negotiated, by ALPN, and the
+/// handshake's completion to wait on from here.
+///
+/// noq makes a server's handshake data readable as soon as the first
+/// ClientHello's server name is known. After a HelloRetryRequest the protocol
+/// is chosen from the second ClientHello, so that first read has none, and it
+/// is read again once the handshake is done, where it is final. Taken from the
+/// first read alone, a DNS over QUIC client that named the server and was asked
+/// to retry was served HTTP/3: the server opened its control stream where the
+/// client allows no unidirectional stream, and the query went unanswered (kdig
+/// sending ML-KEM key shares, 2026-11-02). A client that names no server is
+/// readable only once the protocol is chosen. There is no 0-RTT after a
+/// HelloRetryRequest, so waiting holds back nothing the client sent early;
+/// HTTP/3's SETTINGS then leave after the handshake rather than with the
+/// server's first flight.
+async fn application_protocol(
+    hello: Option<&quinn::crypto::rustls::HandshakeData>,
+    connection: &quinn::Connection,
+    established: quinn::ZeroRttAccepted,
+) -> (Option<Vec<u8>>, Established) {
+    if let Some(protocol) = hello.and_then(|d| d.protocol.clone()) {
+        return (Some(protocol), Box::pin(established));
+    }
+    let accepted = established.await;
+    let protocol = connection
+        .handshake_data()
+        .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|d| d.protocol.clone());
+    (protocol, Box::pin(std::future::ready(accepted)))
+}
+
+#[cfg(test)]
+mod application_protocol_tests {
+    use super::*;
+    use crate::conformance::zero_rtt::{throwaway_cert, OneCert, PinnedTo};
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    /// A provider with these groups alone, in this order
+    fn groups(
+        kx: Vec<&'static dyn rustls::crypto::SupportedKxGroup>,
+    ) -> rustls::crypto::CryptoProvider {
+        rustls::crypto::CryptoProvider {
+            kx_groups: kx,
+            ..rustls::crypto::aws_lc_rs::default_provider()
+        }
+    }
+
+    /// The protocol the first read of the handshake data had, and the one
+    /// [`application_protocol`] settles on, for a DNS over QUIC client that
+    /// connects as `server_name` with its key share for X25519 to a server
+    /// that takes only P-384, so the server asks it to retry
+    async fn after_a_retry(server_name: &str) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        let throwaway = throwaway_cert();
+        let mut server_crypto =
+            rustls::ServerConfig::builder_with_provider(Arc::new(groups(vec![
+                rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
+            ])))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3 is available")
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(OneCert(throwaway.key.clone())));
+        server_crypto.alpn_protocols = vec![b"h3".to_vec(), crate::doq::ALPN.to_vec()];
+        let server = quinn::Endpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(
+                quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
+                    .expect("building the QUIC server configuration"),
+            )),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        )
+        .expect("binding a server port");
+        let server_addr = server.local_addr().expect("the server's address");
+
+        let client_provider = Arc::new(groups(vec![
+            rustls::crypto::aws_lc_rs::kx_group::X25519,
+            rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
+        ]));
+        let mut client_crypto =
+            rustls::ClientConfig::builder_with_provider(client_provider.clone())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .expect("TLS 1.3 is available")
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(PinnedTo(
+                    throwaway.der.clone(),
+                    client_provider,
+                )))
+                .with_no_client_auth();
+        client_crypto.alpn_protocols = vec![crate::doq::ALPN.to_vec()];
+        let client = quinn::Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("binding a client port");
+        client.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
+                .expect("building the QUIC client configuration"),
+        )));
+
+        let accept = async {
+            let mut connecting = server
+                .accept()
+                .await
+                .expect("a connection arrives")
+                .accept()
+                .expect("accepting it");
+            let hello = connecting
+                .handshake_data()
+                .await
+                .expect("the ClientHello is read")
+                .downcast::<quinn::crypto::rustls::HandshakeData>()
+                .ok();
+            let first_read = hello.as_ref().and_then(|d| d.protocol.clone());
+            let (connection, established) = connecting.into_0rtt().expect("a server takes 0.5-RTT");
+            let (protocol, established) =
+                application_protocol(hello.as_deref(), &connection, established).await;
+            established.await;
+            let group = connection
+                .handshake_data()
+                .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+                .and_then(|d| d.negotiated_key_exchange_group);
+            assert_eq!(
+                group,
+                Some(rustls::NamedGroup::secp384r1),
+                "the retried group"
+            );
+            (first_read, protocol)
+        };
+        let connect = async {
+            client
+                .connect(server_addr, server_name)
+                .expect("starting the connection")
+                .await
+                .expect("the handshake completes")
+        };
+        let (_client_connection, read) = tokio::join!(connect, accept);
+        read
+    }
+
+    #[tokio::test]
+    async fn dns_over_quic_that_names_the_server_and_is_asked_to_retry_is_dns_over_quic() {
+        let (first_read, protocol) = after_a_retry("conformance.test").await;
+        assert_eq!(
+            first_read, None,
+            "readable on the server name, before the protocol"
+        );
+        assert_eq!(protocol.as_deref(), Some(crate::doq::ALPN));
+    }
+
+    #[tokio::test]
+    async fn dns_over_quic_that_names_no_server_is_dns_over_quic_from_the_first_read() {
+        // An address as the name: rustls sends no server name for one
+        let (first_read, protocol) = after_a_retry("127.0.0.1").await;
+        assert_eq!(first_read.as_deref(), Some(crate::doq::ALPN));
+        assert_eq!(protocol.as_deref(), Some(crate::doq::ALPN));
     }
 }
 

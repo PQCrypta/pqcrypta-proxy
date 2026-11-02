@@ -66,7 +66,7 @@ pub mod session;
 /// Test-only: no client in reach attempts early data over HTTP/3, so the live
 /// port can only ever report that nothing was exercised. This drives it.
 #[cfg(test)]
-mod zero_rtt;
+pub(crate) mod zero_rtt;
 
 /// End-to-end proof that the two QPACK dynamic-table tests emit what they claim.
 ///

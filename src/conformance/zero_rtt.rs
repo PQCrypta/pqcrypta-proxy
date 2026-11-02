@@ -31,12 +31,12 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use super::impairment::{Counters, ImpairedSocket, Impairments};
 
 /// A certificate nobody trusts, for a server nobody else talks to.
-pub(super) struct Throwaway {
-    pub(super) key: Arc<rustls::sign::CertifiedKey>,
-    pub(super) der: CertificateDer<'static>,
+pub(crate) struct Throwaway {
+    pub(crate) key: Arc<rustls::sign::CertifiedKey>,
+    pub(crate) der: CertificateDer<'static>,
 }
 
-pub(super) fn throwaway_cert() -> Throwaway {
+pub(crate) fn throwaway_cert() -> Throwaway {
     let cert = rcgen::generate_simple_self_signed(vec!["conformance.test".to_string()])
         .expect("generating a self-signed certificate");
     let der = CertificateDer::from(cert.cert.der().to_vec());
@@ -58,7 +58,7 @@ pub(super) fn throwaway_cert() -> Throwaway {
 
 /// Serves the throwaway certificate for every name.
 #[derive(Debug)]
-pub(super) struct OneCert(pub(super) Arc<rustls::sign::CertifiedKey>);
+pub(crate) struct OneCert(pub(crate) Arc<rustls::sign::CertifiedKey>);
 
 impl rustls::server::ResolvesServerCert for OneCert {
     fn resolve(
@@ -76,9 +76,9 @@ impl rustls::server::ResolvesServerCert for OneCert {
 /// that the test fails if it is ever pointed at something other than the server
 /// it started.
 #[derive(Debug)]
-pub(super) struct PinnedTo(
-    pub(super) CertificateDer<'static>,
-    pub(super) Arc<rustls::crypto::CryptoProvider>,
+pub(crate) struct PinnedTo(
+    pub(crate) CertificateDer<'static>,
+    pub(crate) Arc<rustls::crypto::CryptoProvider>,
 );
 
 impl rustls::client::danger::ServerCertVerifier for PinnedTo {
