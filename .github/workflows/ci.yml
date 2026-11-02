@@ -190,9 +190,10 @@ jobs:
       - name: Run the fork's tests
         run: cargo test --manifest-path vendor/h3/Cargo.toml --lib --all-features
 
-  # The vendored noq fork's protocol tests: the QUIC stack the proxy serves
-  # with. noq is a workspace of its own, and its manifest repeats the proxy's
-  # rustls patch so noq-proto sees the rustls fork.
+  # The vendored noq fork's tests: noq-proto's protocol and noq's connections
+  # over it, the QUIC stack the proxy serves with. noq is a workspace of its
+  # own, and its manifest repeats the proxy's rustls patch so noq-proto sees
+  # the rustls fork.
   noq-fork:
     name: noq fork tests
     runs-on: ubuntu-latest
@@ -206,8 +207,8 @@ jobs:
           key: noq-fork
           workspaces: vendor/noq
 
-      - name: Run noq-proto's tests
-        run: cargo test --manifest-path vendor/noq/Cargo.toml -p noq-proto --lib
+      - name: Run noq-proto's and noq's tests
+        run: cargo test --manifest-path vendor/noq/Cargo.toml -p noq-proto -p noq --lib
 
   # =============================================================================
   # Integration Tests

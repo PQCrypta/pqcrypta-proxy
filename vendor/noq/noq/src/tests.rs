@@ -952,6 +952,38 @@ async fn stream_id_flow_control() {
     );
 }
 
+/// A subscriber that holds the connection, as one reading a path's stats
+/// from it does, still sees its event streams end when the connection ends.
+/// They ended only when the connection's state was dropped, which the
+/// subscriber's own handle prevented: the subscriber and the state stayed for
+/// good, one per connection.
+#[tokio::test]
+async fn event_streams_end_with_the_connection() {
+    let _guard = subscribe();
+    let endpoint = endpoint();
+    let (client, server) = tokio::join!(
+        endpoint
+            .connect(endpoint.local_addr().unwrap(), "localhost")
+            .unwrap(),
+        async { endpoint.accept().await.unwrap().await }
+    );
+    let client = client.unwrap();
+    let server = server.unwrap();
+    let held = server.clone();
+    let mut events = held.path_events();
+    let mut updates = held.nat_traversal_updates();
+    client.close(0u32.into(), b"done");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while events.next().await.is_some() {}
+        while updates.next().await.is_some() {}
+    })
+    .await
+    .expect("the event streams end with the connection");
+    // Subscribed after the end, they end at once
+    assert!(held.path_events().next().await.is_none());
+    assert!(held.nat_traversal_updates().next().await.is_none());
+}
+
 #[tokio::test]
 async fn two_datagram_readers() {
     let _guard = subscribe();

@@ -244,7 +244,7 @@ impl Path {
     /// If the address-discovery extension is not negotiated, the stream will never return.
     pub fn observed_external_addr(&self) -> Result<AddressDiscovery, ClosedPath> {
         let state = self.conn.lock_without_waking("per_path_observed_address");
-        let path_events = state.path_events.subscribe();
+        let path_events = state.subscribe_path_events();
         let initial_value = state.inner.path_observed_address(self.id())?;
         Ok(AddressDiscovery::new(
             self.id(),
