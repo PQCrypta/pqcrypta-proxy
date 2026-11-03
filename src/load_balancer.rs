@@ -1914,6 +1914,46 @@ pub fn extract_cookie_by_name(cookie_header: Option<&str>, name: &str) -> Option
 
 #[cfg(test)]
 mod tests {
+    /// The README and docs/CONFIG.md name every algorithm this build accepts,
+    /// and every count of them in the README is its count: both said six while
+    /// eleven were implemented (2026-11-02)
+    #[test]
+    fn the_docs_name_every_algorithm_and_count_them() {
+        let readme = include_str!("../README.md");
+        let config = include_str!("../docs/CONFIG.md");
+        for algorithm in BackendPool::ALGORITHMS {
+            let name = algorithm.split(':').next().unwrap();
+            assert!(
+                readme.contains(&format!("`{name}")),
+                "README.md does not name {algorithm}"
+            );
+            assert!(
+                config.contains(&format!("`{name}")),
+                "docs/CONFIG.md does not name {algorithm}"
+            );
+        }
+        let n = BackendPool::ALGORITHMS.len();
+        let mut counted = 0;
+        for line in readme.lines().filter(|l| l.contains("Load Balancing")) {
+            let words: Vec<&str> = line
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|w| !w.is_empty())
+                .collect();
+            for (k, w) in words.iter().enumerate() {
+                if w.eq_ignore_ascii_case("algorithms") {
+                    if let Some(stated) = words[k.saturating_sub(3)..k]
+                        .iter()
+                        .find_map(|w| w.parse::<usize>().ok())
+                    {
+                        assert_eq!(stated, n, "README.md says {stated} algorithms: {line}");
+                        counted += 1;
+                    }
+                }
+            }
+        }
+        assert!(counted > 0, "README.md states no count of the algorithms");
+    }
+
     use super::*;
 
     fn pool_config(toml_src: &str) -> BackendPoolConfig {

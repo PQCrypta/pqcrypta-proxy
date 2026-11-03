@@ -653,6 +653,11 @@ HTTP connection pool settings for backend connections.
 - `random` - Random server selection
 - `ip_hash` - Consistent hashing by client IP
 - `least_response_time` - Routes to fastest responding server (EMA tracking)
+- `uri_hash` - Affinity by request path, query string excluded (HAProxy `uri`)
+- `url_param:<name>` - Affinity by one query parameter (HAProxy `url_param`); round-robin for a request without it
+- `header:<name>` - Affinity by one request header (HAProxy `hdr(<name>)`); round-robin for a request without it
+- `first_available` - Fills servers in declared order up to each one's `max_connections` (HAProxy `first`); a server with no limit is last
+- `power_of_two_choices` - Two servers sampled at random, the less loaded per unit of weight taken (Envoy's default)
 
 ### Session Affinity
 

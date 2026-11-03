@@ -23,7 +23,7 @@
 - **Advanced Security**: JA3/JA4 fingerprinting on TCP *and* QUIC with replay and drift detection, circuit breaker, GeoIP blocking, DB-synced IP blocklists, WebTransport origin validation, 0-RTT replay protection
 - **Structured Audit Logging**: Async JSON audit log for admin actions, auth failures, WAF blocks, IP blocks, rate limit hits, PQC downgrades, config reloads
 - **Structured Access Logging**: Per-request JSON or text logs with latency, bytes, upstream, and client IP
-- **Enterprise Load Balancing**: 6 algorithms, session affinity, health-aware routing, per-backend retry policies, per-backend circuit breaker overrides, canary / percentage traffic splitting with sticky assignment and auto-rollback, traffic shadowing / mirroring
+- **Enterprise Load Balancing**: 11 algorithms, session affinity, health-aware routing, per-backend retry policies, per-backend circuit breaker overrides, canary / percentage traffic splitting with sticky assignment and auto-rollback, traffic shadowing / mirroring
 - **Multi-Dimensional Rate Limiting**: Composite keys, JA3/JA4-based, JWT-verified, adaptive ML anomaly detection; optional Redis backend distributes counters across all proxy instances
 - **Zero-Trust Primitives**: Per-route HMAC proof-of-possession (path+query signed, nonce replay prevention), internal route mTLS auto-enforcement, zero-trust mode startup validation (includes admin HMAC requirement), admin proof-of-possession, `trusted_internal_cidrs` deprecation
 - **OpenTelemetry Distributed Tracing**: W3C TraceContext + B3 propagation on all transports, OTLP HTTP/JSON export, configurable sampling, access-log trace-ID correlation
@@ -32,7 +32,7 @@
 
 | Feature | Status | Description |
 |---------|--------|-------------|
-| **Load Balancing** | ✅ | 6 algorithms with session affinity and health-aware routing |
+| **Load Balancing** | ✅ | 11 algorithms with session affinity and health-aware routing |
 | Circuit Breaker | ✅ | Backend health monitoring with auto-recovery |
 | **Advanced Rate Limiting** | ✅ | Multi-dimensional: IP, JA3/JA4, JWT, headers, composite keys on all paths (TCP + QUIC/HTTP3); optional Redis backend for distributed cross-instance coordination |
 | **Connection Rate Limiting** | ✅ | Per-IP cap on *new connections per second* (`connection_rate_limit`, `connections_per_second`), separate from `max_connections_per_ip` which caps concurrency — a client that opens and closes as fast as it can never trips a concurrency limit |
@@ -196,13 +196,18 @@
 - **ACME Domain Path Sanitization**: Domain names validated against RFC 1035 before use in file-system paths — prevents path traversal via config
 
 ### Load Balancing
-- **6 Load Balancing Algorithms**:
+- **11 Load Balancing Algorithms**:
   - `least_connections` (default): Routes to server with fewest active connections
   - `round_robin`: Simple rotation through servers
   - `weighted_round_robin`: nginx-style smooth weighted distribution
   - `random`: Random server selection
   - `ip_hash`: Consistent hashing by client IP for sticky sessions
   - `least_response_time`: Routes to fastest responding server (EMA tracking)
+  - `uri_hash`: Affinity by request path (HAProxy `uri`), the query string left out so cache-busters do not scatter one resource across the pool; each caching backend owns its own slice of the URL space
+  - `url_param:<name>`: Affinity by one query parameter (HAProxy `url_param`), for a session identifier carried in the URL; a request without it falls back to round-robin
+  - `header:<name>`: Affinity by one request header (HAProxy `hdr(<name>)`): a tenant ID, API key or device ID pins traffic without a cookie; a request without it falls back to round-robin
+  - `first_available`: Fills servers in declared order up to each one's `max_connections` (HAProxy `first`), keeping spare capacity idle so it can be scaled in; a server with no limit is last in line
+  - `power_of_two_choices`: Samples two servers at random and takes the less loaded per unit of weight (Envoy's default, NGINX's `random two least_conn`): near least-connections without its O(n) scan or herd effect
 - **Backend Pools**: Group multiple servers per route for high availability
 - **Session Affinity**: Cookie-based, IP hash, or custom header sticky sessions; each mode uses its own dedicated map with TTL eviction
 - **Canary / Percentage Traffic Splitting**: Route a configurable percentage of new traffic to a canary server while stable servers handle the rest; once assigned, clients receive a sticky `PQCPROXY_CANARY` cookie so they stay on the same server for the duration of the experiment; auto-rollback suspends the canary if its sliding-window error rate exceeds a configured threshold; live admin endpoints (`GET /canary`, `POST /canary/suspend/:id`, `POST /canary/resume/:id`, `POST /canary/weight/:id`) allow runtime inspection and control without restarting the proxy
@@ -1221,7 +1226,7 @@ enable_0rtt = false                           # deny 0-RTT early data on this ro
 # Global load balancer settings
 [load_balancer]
 enabled = true
-default_algorithm = "least_connections"  # Options: least_connections, round_robin, weighted_round_robin, random, ip_hash, least_response_time
+default_algorithm = "least_connections"  # Options: least_connections, round_robin, weighted_round_robin, random, ip_hash, least_response_time, uri_hash, url_param:<name>, header:<name>, first_available, power_of_two_choices
 
 # Session affinity (sticky sessions) settings
 [load_balancer.session_affinity]
@@ -1640,6 +1645,8 @@ Set `PQCRYPTA_ENV=production` to explicitly declare a production deployment. Set
                     │  │                   Load Balancer                      │ │
                     │  │  Algorithms: least_conn | round_robin | weighted    │ │
                     │  │              random | ip_hash | least_response_time │ │
+                    │  │              uri_hash | url_param | header          │ │
+                    │  │              first_available | power_of_two_choices │ │
                     │  │  Features: Session affinity, Health-aware routing   │ │
                     │  │           Slow start, Connection draining           │ │
                     │  └─────────────────────────────────────────────────────┘ │
