@@ -283,6 +283,19 @@ pub mod biremote {
             self.stream.1.stop(error_code)
         }
 
+        /// Ends the stream with a stream error (RFC 9114 section 8):
+        /// RESET_STREAM on the sending half and STOP_SENDING on the receiving
+        /// half, both carrying `error_code`.
+        ///
+        /// STOP_SENDING alone told a client whose request was already complete
+        /// nothing: the response half stayed open, so a plain GET to the
+        /// WebTransport endpoint waited for an answer until the connection went
+        /// idle instead of learning that it had been rejected.
+        pub fn reject(&mut self, error_code: VarInt) {
+            let _ = self.stream.0.reset(error_code);
+            let _ = self.stream.1.stop(error_code);
+        }
+
         pub fn upgrade(self, session_id: SessionId) -> StreamBiRemoteWT {
             StreamBiRemoteWT {
                 stream: self.stream,

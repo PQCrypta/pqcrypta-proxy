@@ -847,7 +847,12 @@ pub const CATALOG: &[Test] = &[
         class: Class::Interoperability,
         requirement: Requirement::Must,
         tier: Tier::Http3,
-        expectation: "Handle it as an error against that one request, not the whole connection.",
+        expectation:
+            "Handle it as an error against that one request, not the whole connection.\n\n\
+                      The section is sized one octet past the SETTINGS_MAX_FIELD_SECTION_SIZE \
+                      the client advertised. A client that advertises none accepts any size \
+                      (RFC 9114 §4.2.2) and has no maximum to exceed, so it cannot be tested \
+                      on this.",
         implemented: true,
         port_offset: Some(22),
     },

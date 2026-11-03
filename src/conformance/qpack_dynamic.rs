@@ -51,6 +51,7 @@ use super::zero_rtt::{throwaway_cert, OneCert, PinnedTo, Throwaway};
 const CLIENT_LIMITS: f::ClientQpackLimits = f::ClientQpackLimits {
     capacity: 4096,
     blocked_streams: 16,
+    max_field_section_size: None,
 };
 
 /// What one run of a test put on the wire.
