@@ -227,7 +227,11 @@ jobs:
           key: wtransport-fork
           workspaces: vendor/wtransport
 
+      # Warnings fail it: a method left unused when its callers moved to
+      # reject() reached main because nothing compiled the fork with them on
       - name: Run the fork's tests
+        env:
+          RUSTFLAGS: -D warnings
         run: cargo test --manifest-path vendor/wtransport/Cargo.toml --lib
 
   # =============================================================================
