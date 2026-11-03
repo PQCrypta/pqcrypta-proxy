@@ -558,8 +558,10 @@ pub(super) fn alt_svc_header_value(
 /// `h3=":4434"; ma=86400, h3=":4434"; ma=86400`. Harmless to a parser, but it is the
 /// same alternative stated twice, and it was visible on the live edge.
 ///
-/// The QUIC counterpart is `quic_listener::build_alt_svc_header_over_quic`, which
-/// excludes the connection in use rather than listing it.
+/// A response over QUIC carries the same value
+/// (`quic_listener::build_alt_svc_header_over_quic`): Alt-Svc replaces a client's
+/// cached alternatives (RFC 7838 section 3), so a value that differed by transport
+/// had a browser switch between HTTP/3 and HTTP/2 on every load.
 /// As above, but with `server.alt_svc_ports` applied when the operator has set it.
 ///
 /// The override replaces the derived list outright rather than filtering it: a port
