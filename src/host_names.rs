@@ -39,10 +39,11 @@ const RCODE_MASK: u16 = 0x000f;
 static ANSWERS: LazyLock<RwLock<HashMap<String, Vec<IpAddr>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
-/// Is `entry` a host name rather than an address? Letters, digits and
-/// hyphens in dot-separated labels of 1 to 63 octets, at most 253 in all, and
-/// a last label that is not all digits, so a mistyped address (`192.0.2`) is
-/// not taken for a name.
+/// Is `entry` a host name rather than an address?
+///
+/// Letters, digits and hyphens in dot-separated labels of 1 to 63 octets, at
+/// most 253 in all, and a last label that is not all digits, so a mistyped
+/// address (`192.0.2`) is not taken for a name.
 pub fn is_host_name(entry: &str) -> bool {
     let name = entry.trim().trim_end_matches('.');
     let labels: Vec<&str> = name.split('.').collect();
