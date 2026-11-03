@@ -2674,6 +2674,10 @@ pub(super) async fn emit(
 /// section of that size.
 const MAX_OVERSIZED_SECTION: u64 = 4 * 1024 * 1024;
 
+/// The largest value a QUIC varint carries (RFC 9000 §16), which as a field
+/// section limit is no limit
+const NO_LIMIT: u64 = (1 << 62) - 1;
+
 /// What the client's SETTINGS allow our QPACK encoder to do, on this
 /// connection.
 ///
@@ -3758,6 +3762,14 @@ fn quic_observation(
         // §4.2.2), so there is no maximum to exceed, and one whose maximum is
         // past what the suite sends was not reached.
         "h-oversized-field-section" => match qpack.max_field_section_size() {
+            // The largest value a varint carries is no maximum at all: curl,
+            // ngtcp2 and our own client advertised it, and were recorded as
+            // a limit past what the suite sends, inconclusive.
+            Some(NO_LIMIT) => Some(Observation::Unsupported(format!(
+                "the client advertised a SETTINGS_MAX_FIELD_SECTION_SIZE of {NO_LIMIT}, the \
+                 largest value the setting can carry, which is no maximum: it accepts a field \
+                 section of any size and there was none to exceed"
+            ))),
             None => Some(Observation::Unsupported(
                 "the client advertised no SETTINGS_MAX_FIELD_SECTION_SIZE, so it accepts a \
                  field section of any size (RFC 9114 §4.2.2) and there was no maximum to \

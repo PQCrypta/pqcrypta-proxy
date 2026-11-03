@@ -694,6 +694,37 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
         (Class::Interoperability, Observation::Signalled(what)) => {
             (Verdict::Pass, format!("Handled it: {what}."))
         }
+        // The section is past the client's own advertised maximum, which RFC
+        // 9114 §4.2.2 lets it refuse -- as an error against that request. A
+        // refusal on the stream arrives as `Signalled` and passes above; what
+        // reaches here ended the whole connection, and the generic wording
+        // below ("valid HTTP/3 a client is required to process") would blame
+        // the client for refusing at all.
+        (Class::Interoperability, Observation::ClosedWith { code })
+            if test.id == "h-oversized-field-section" =>
+        {
+            (
+                Verdict::Fail,
+                format!(
+                    "Closed the whole connection with error 0x{code:x} over a field section past \
+                 its own advertised maximum. RFC 9114 §4.2.2 lets a client refuse such a \
+                 section, as an error against that one request; the connection was not at \
+                 fault."
+                ),
+            )
+        }
+        (Class::Interoperability, Observation::ObjectedAtTransport(what))
+            if test.id == "h-oversized-field-section" =>
+        {
+            (
+                Verdict::Fail,
+                format!(
+                    "Closed the whole connection ({what}) over a field section past its own \
+                 advertised maximum. RFC 9114 §4.2.2 lets a client refuse such a section, as \
+                 an error against that one request; the connection was not at fault."
+                ),
+            )
+        }
         (Class::Interoperability, Observation::ClosedWith { code }) => (
             Verdict::Fail,
             format!(
@@ -1646,6 +1677,33 @@ mod tests {
     use super::*;
     use crate::conformance::catalog::{self, Class, Test, Tier};
 
+    /// A field section past the client's own maximum may be refused, as an
+    /// error against that request: refusing on the stream passes, closing the
+    /// whole connection fails, and the failure says why rather than calling
+    /// the section something the client was required to decode.
+    #[test]
+    fn an_oversized_section_may_be_refused_but_not_by_closing_the_connection() {
+        let t = catalog::find("h-oversized-field-section").expect("the test exists");
+        let (verdict, _) = judge(t, &Observation::Signalled("reset the stream".into()), None);
+        assert_eq!(verdict, Verdict::Pass);
+        let (verdict, detail) = judge(t, &Observation::ClosedWith { code: 0x106 }, None);
+        assert_eq!(verdict, Verdict::Fail);
+        assert!(
+            detail.contains("past its own advertised maximum"),
+            "{detail}"
+        );
+        assert!(
+            !detail.contains("required to be able to process"),
+            "{detail}"
+        );
+        let other = catalog::find("h-qpack-huffman").expect("the test exists");
+        let (_, detail) = judge(other, &Observation::ClosedWith { code: 0x106 }, None);
+        assert!(
+            detail.contains("required to be able to process"),
+            "{detail}"
+        );
+    }
+
     /// A client's own retry after its early data was refused resumes without
     /// early data; it must not replace the connection that met the refusal.
     #[test]
@@ -2167,7 +2225,12 @@ mod tests {
 
             let (v, d) = judge(t, &Observation::ClosedWith { code: 0x0106 }, None);
             assert_eq!(v, Verdict::Fail, "{id}: rejecting valid output is the fail");
-            assert!(d.contains("valid HTTP/3"), "{id}: say it was valid: {d}");
+            // The oversized section is past the client's own maximum, which it
+            // may refuse on the stream; its failure is the connection, said
+            // in its own words (an_oversized_section_may_be_refused_but_...).
+            if id != "h-oversized-field-section" {
+                assert!(d.contains("valid HTTP/3"), "{id}: say it was valid: {d}");
+            }
         }
     }
 
