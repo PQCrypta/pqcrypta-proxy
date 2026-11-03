@@ -136,10 +136,10 @@ impl Driver {
                 stream.session_id()
             );
 
-            stream
+            // A unidirectional stream has only a receiving half to stop.
+            let _ = stream
                 .into_stream()
-                .stop(ErrorCode::BufferedStreamRejected.to_code())
-                .expect("Stream not already stopped");
+                .stop(ErrorCode::BufferedStreamRejected.to_code());
         }
     }
 
@@ -161,11 +161,10 @@ impl Driver {
                 stream.session_id()
             );
 
-            stream
-                .into_stream()
-                .1
-                .stop(ErrorCode::BufferedStreamRejected.to_code())
-                .expect("Stream not already stopped");
+            // Both halves: STOP_SENDING alone left the response half open.
+            let mut halves = stream.into_stream();
+            let _ = halves.0.reset(ErrorCode::BufferedStreamRejected.to_code());
+            let _ = halves.1.stop(ErrorCode::BufferedStreamRejected.to_code());
         }
     }
 
@@ -607,17 +606,18 @@ mod worker {
 
                     let stream_session = match SessionRequest::try_from(headers) {
                         Ok(session_request) => stream.into_session(session_request),
+                        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1.1
+                        //# A server can reject a request ... by sending a stream error of
+                        //# type H3_REQUEST_REJECTED
                         Err(HeadersParseError::MethodNotConnect) => {
-                            stream
-                                .stop(ErrorCode::RequestRejected.to_code())
-                                .expect("Stream not already stopped");
+                            stream.reject(ErrorCode::RequestRejected.to_code());
                             return Ok(());
                         }
-                        // TODO(biagio): we might have more granularity with errors
+                        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+                        //# Malformed requests or responses that are
+                        //# detected MUST be treated as a stream error of type H3_MESSAGE_ERROR.
                         Err(_) => {
-                            stream
-                                .stop(ErrorCode::Message.to_code())
-                                .expect("Stream not already stopped");
+                            stream.reject(ErrorCode::Message.to_code());
                             return Ok(());
                         }
                     };
@@ -626,9 +626,9 @@ mod worker {
                         Ok(()) => {}
                         Err(TrySendError::Full(mut stream)) => {
                             debug!("Discarding session request: sessions queue is full");
-                            stream
-                                .stop(ErrorCode::RequestRejected.to_code())
-                                .expect("Stream not already stopped");
+                            // Both halves, as for any rejected request
+                            stream.reset(ErrorCode::RequestRejected.to_code());
+                            let _ = stream.stop(ErrorCode::RequestRejected.to_code());
                         }
                         Err(TrySendError::Closed(_)) => return Err(DriverError::NotConnected),
                     }

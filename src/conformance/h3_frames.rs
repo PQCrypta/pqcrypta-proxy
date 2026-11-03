@@ -516,6 +516,10 @@ pub struct ClientQpackLimits {
     pub capacity: u64,
     /// `SETTINGS_QPACK_BLOCKED_STREAMS`.
     pub blocked_streams: u64,
+    /// `SETTINGS_MAX_FIELD_SECTION_SIZE`, or None when the client sent none:
+    /// unlike the two above, an omitted value is not zero but unlimited
+    /// (RFC 9114 section 4.2.2), so it cannot share their representation.
+    pub max_field_section_size: Option<u64>,
 }
 
 /// Pull the QPACK limits out of a control stream's bytes.
@@ -542,6 +546,7 @@ pub fn parse_client_qpack_limits(control: &[u8]) -> Option<ClientQpackLimits> {
             let mut limits = ClientQpackLimits {
                 capacity: 0,
                 blocked_streams: 0,
+                max_field_section_size: None,
             };
             let mut p = off;
             while p < end {
@@ -552,6 +557,7 @@ pub fn parse_client_qpack_limits(control: &[u8]) -> Option<ClientQpackLimits> {
                 match id {
                     setting::QPACK_MAX_TABLE_CAPACITY => limits.capacity = value,
                     setting::QPACK_BLOCKED_STREAMS => limits.blocked_streams = value,
+                    setting::MAX_FIELD_SECTION_SIZE => limits.max_field_section_size = Some(value),
                     _ => {}
                 }
             }
@@ -833,6 +839,19 @@ mod tests {
         let limits = parse_client_qpack_limits(&stream).expect("SETTINGS arrived");
         assert_eq!(limits.capacity, 4096);
         assert_eq!(limits.blocked_streams, 0);
+        assert_eq!(
+            limits.max_field_section_size, None,
+            "omitted is unlimited, not zero"
+        );
+    }
+
+    #[test]
+    fn the_field_section_limit_is_read_when_advertised() {
+        let mut stream = BytesMut::new();
+        stream.extend_from_slice(&uni_stream_header(stream_type::CONTROL));
+        stream.extend_from_slice(&settings(&[(setting::MAX_FIELD_SECTION_SIZE, 65_536)]));
+        let limits = parse_client_qpack_limits(&stream).expect("SETTINGS arrived");
+        assert_eq!(limits.max_field_section_size, Some(65_536));
     }
 
     #[test]

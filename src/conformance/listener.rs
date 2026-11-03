@@ -2669,6 +2669,11 @@ pub(super) async fn emit(
     })
 }
 
+/// The largest field section `h-oversized-field-section` sends: a client that
+/// advertises this much or more is recorded as not reached rather than sent a
+/// section of that size.
+const MAX_OVERSIZED_SECTION: u64 = 4 * 1024 * 1024;
+
 /// What the client's SETTINGS allow our QPACK encoder to do, on this
 /// connection.
 ///
@@ -2682,6 +2687,11 @@ pub(super) async fn emit(
 pub(super) struct QpackLimits {
     capacity: std::sync::atomic::AtomicU64,
     blocked_streams: std::sync::atomic::AtomicU64,
+    /// SETTINGS_MAX_FIELD_SECTION_SIZE, meaningful only when `section_limit_sent`
+    max_field_section_size: std::sync::atomic::AtomicU64,
+    /// Whether the client advertised a field section limit at all: without
+    /// one it accepts any size (RFC 9114 section 4.2.2), which is not a zero.
+    section_limit_sent: std::sync::atomic::AtomicBool,
     /// Whether the client's SETTINGS frame has actually been parsed.
     ///
     /// Zero and "not yet known" were the same value, and everything that read
@@ -2699,6 +2709,10 @@ impl QpackLimits {
         use std::sync::atomic::Ordering::{Relaxed, Release};
         self.capacity.store(limits.capacity, Relaxed);
         self.blocked_streams.store(limits.blocked_streams, Relaxed);
+        self.max_field_section_size
+            .store(limits.max_field_section_size.unwrap_or(0), Relaxed);
+        self.section_limit_sent
+            .store(limits.max_field_section_size.is_some(), Relaxed);
         self.seen.store(true, Release);
         self.settled.notify_waiters();
     }
@@ -2726,6 +2740,14 @@ impl QpackLimits {
     fn blocked_streams(&self) -> u64 {
         self.blocked_streams
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The field section limit the client advertised, or None for unlimited
+    fn max_field_section_size(&self) -> Option<u64> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.section_limit_sent
+            .load(Relaxed)
+            .then(|| self.max_field_section_size.load(Relaxed))
     }
 
     /// Whether the dynamic table may be referenced at all.
@@ -3731,6 +3753,26 @@ fn quic_observation(
             Some(Observation::Unsupported(qpack.why_unusable()))
         }
 
+        // The test is a section past the client's own advertised maximum. A
+        // client that advertised none accepts a section of any size (RFC 9114
+        // §4.2.2), so there is no maximum to exceed, and one whose maximum is
+        // past what the suite sends was not reached.
+        "h-oversized-field-section" => match qpack.max_field_section_size() {
+            None => Some(Observation::Unsupported(
+                "the client advertised no SETTINGS_MAX_FIELD_SECTION_SIZE, so it accepts a \
+                 field section of any size (RFC 9114 §4.2.2) and there was no maximum to \
+                 exceed"
+                    .to_string(),
+            )),
+            Some(limit) if limit >= MAX_OVERSIZED_SECTION => {
+                Some(Observation::NotExercised(format!(
+                    "the client advertised a SETTINGS_MAX_FIELD_SECTION_SIZE of {limit} \
+                     octets, at or past the {MAX_OVERSIZED_SECTION} this suite sends"
+                )))
+            }
+            Some(_) => None,
+        },
+
         // Already sent on every connection: noq includes a reserved transport
         // parameter (31*N+27, RFC 9000 §18.1) in every handshake. Reaching this
         // point at all means the client completed a handshake carrying one, so
@@ -3919,8 +3961,10 @@ pub(super) async fn answer_probe(
     // port would be paying up to half a second to consult a value it never
     // reads, and the hold that costs would change the timing the test is
     // measuring.
-    if matches!(test.id, "h-qpack-dynamic-table" | "h-qpack-blocked-stream")
-        && !qpack.settle(SETTINGS_SETTLE).await
+    if matches!(
+        test.id,
+        "h-qpack-dynamic-table" | "h-qpack-blocked-stream" | "h-oversized-field-section"
+    ) && !qpack.settle(SETTINGS_SETTLE).await
     {
         debug!(
             "conformance: {} deciding against a default limit — the client's SETTINGS \
@@ -4136,10 +4180,21 @@ pub(super) async fn answer_probe(
             send.write_all(&f::data(BODY)).await?;
         }
 
-        // A field section past any sane SETTINGS_MAX_FIELD_SECTION_SIZE. The
-        // client should fail this one request, not the whole connection.
+        // A field section past the SETTINGS_MAX_FIELD_SECTION_SIZE the client
+        // advertised. The client should fail this one request, not the whole
+        // connection.
+        //
+        // It was a fixed 32 KiB "past any sane limit", and no client in the
+        // matrix advertises a limit that small: every one decoded it and the
+        // test passed without having sent what it is named for. The section
+        // is now sized from the client's own SETTINGS; one that advertised no
+        // limit, or one past MAX_OVERSIZED_SECTION, is recorded as such.
         "h-oversized-field-section" => {
-            let filler = "x".repeat(32 * 1024);
+            let size = qpack
+                .max_field_section_size()
+                .filter(|limit| *limit < MAX_OVERSIZED_SECTION)
+                .map_or(32 * 1024, |limit| limit + 1);
+            let filler = "x".repeat(usize::try_from(size).unwrap_or(32 * 1024));
             send.write_all(&f::headers(&[
                 (":status", "200"),
                 ("content-type", "text/plain"),
