@@ -2225,7 +2225,12 @@ mod tests {
 
             let (v, d) = judge(t, &Observation::ClosedWith { code: 0x0106 }, None);
             assert_eq!(v, Verdict::Fail, "{id}: rejecting valid output is the fail");
-            assert!(d.contains("valid HTTP/3"), "{id}: say it was valid: {d}");
+            // The oversized section is past the client's own maximum, which it
+            // may refuse on the stream; its failure is the connection, said
+            // in its own words (an_oversized_section_may_be_refused_but_...).
+            if id != "h-oversized-field-section" {
+                assert!(d.contains("valid HTTP/3"), "{id}: say it was valid: {d}");
+            }
         }
     }
 
