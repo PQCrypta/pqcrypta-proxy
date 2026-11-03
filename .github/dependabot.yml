@@ -22,3 +22,10 @@ updates:
       day: "monday"
     commit-message:
       prefix: "chore"
+    ignore:
+      # The proxy calls the openssl crate's types through foreign-types'
+      # ForeignTypeRef, and openssl implements it from foreign-types 0.3: under
+      # 0.5 the trait is another one, nothing builds and cargo-deny refuses the
+      # two versions (#116). It follows openssl's, not its own releases.
+      - dependency-name: "foreign-types"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
