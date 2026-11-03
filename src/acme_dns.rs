@@ -25,11 +25,11 @@ use tracing::{debug, info, warn};
 
 use crate::dns_wire::{encode_name, layout, read_name, u16_at, HEADER_LEN};
 
-const TYPE_A: u16 = 1;
+pub(crate) const TYPE_A: u16 = 1;
 const TYPE_NS: u16 = 2;
 const TYPE_SOA: u16 = 6;
 const TYPE_TXT: u16 = 16;
-const TYPE_AAAA: u16 = 28;
+pub(crate) const TYPE_AAAA: u16 = 28;
 const TYPE_TSIG: u16 = 250;
 const CLASS_IN: u16 = 1;
 const CLASS_NONE: u16 = 254;
@@ -666,7 +666,7 @@ fn txt_values(msg: &[u8]) -> Vec<String> {
 }
 
 /// The addresses of every A or AAAA record in a response's answer
-fn addresses_in(msg: &[u8], rtype: u16) -> Vec<IpAddr> {
+pub(crate) fn addresses_in(msg: &[u8], rtype: u16) -> Vec<IpAddr> {
     let Some(parsed) = layout(msg) else {
         return Vec::new();
     };
@@ -683,7 +683,7 @@ fn addresses_in(msg: &[u8], rtype: u16) -> Vec<IpAddr> {
 }
 
 /// One message and its answer over TCP (RFC 7766), within EXCHANGE_TIMEOUT
-async fn exchange(server: SocketAddr, message: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub(crate) async fn exchange(server: SocketAddr, message: &[u8]) -> anyhow::Result<Vec<u8>> {
     let length = u16::try_from(message.len())
         .map_err(|_| anyhow::anyhow!("a {}-octet message is over 65535", message.len()))?;
     tokio::time::timeout(EXCHANGE_TIMEOUT, async {

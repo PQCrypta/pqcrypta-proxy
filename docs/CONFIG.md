@@ -572,6 +572,8 @@ ML-inspired anomaly detection that learns normal traffic patterns.
 | `min_requests_for_error_check` | u64 | `200` | Minimum requests before error rate check |
 | `error_rate_threshold` | f64 | `0.7` | Error rate threshold (70%) to trigger suspicious |
 | `error_window_secs` | u64 | `60` | Error tracking sliding window (1 minute) |
+| `pentest_bypass_ips` | array[string] | `[]` | Authorised test sources: inspected by the WAF but never rate-limited or auto-banned. An entry is an address or a host name standing for the addresses it resolves to |
+| `host_resolver` | socket address? | none | A validating resolver, reached over TCP, for the host names in `pentest_bypass_ips`. Only an answer it authenticates (AD bit) counts, refreshed every minute; without one, a name matches nothing |
 
 ---
 
