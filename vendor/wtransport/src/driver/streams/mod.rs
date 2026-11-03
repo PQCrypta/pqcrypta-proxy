@@ -279,10 +279,6 @@ pub mod biremote {
             self.proto.read_frame_async(&mut self.stream.1).await
         }
 
-        pub fn stop(&mut self, error_code: VarInt) -> Result<(), AlreadyStop> {
-            self.stream.1.stop(error_code)
-        }
-
         /// Ends the stream with a stream error (RFC 9114 section 8):
         /// RESET_STREAM on the sending half and STOP_SENDING on the receiving
         /// half, both carrying `error_code`.
