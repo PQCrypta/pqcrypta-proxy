@@ -2131,6 +2131,14 @@ Add your test runner IP to `pentest_bypass_ips` in `[security]` to skip rate-lim
 pentest_bypass_ips = ["YOUR.RUNNER.IP.HERE"]
 ```
 
+A runner whose address changes (a home connection) can be listed by host name instead. The name stands for the addresses it resolves to, and DNS carries each change. Names resolve only through `host_resolver`, a validating resolver reached over TCP. Only an answer it authenticates counts, because a forged answer would exempt the forger:
+
+```toml
+[security]
+pentest_bypass_ips = ["runner.example.com"]
+host_resolver = "127.0.0.1:53"
+```
+
 Effect: rate limiting and auto-block are disabled for listed IPs (preventing mid-run lockout), but the WAF still executes — attack payloads still return 403, confirming WAF detection is working. Script 04 (rate limiting) needs a non-bypassed IP to test the limiter itself.
 
 ### Output

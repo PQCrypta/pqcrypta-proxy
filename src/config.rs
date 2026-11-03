@@ -2507,8 +2507,17 @@ pub struct SecurityConfig {
     /// Authorized pentest IPs — skip rate-limiting and auto-block but still run WAF.
     /// Each blocked attack still returns 403; the IP is never auto-banned mid-run.
     /// Remove these entries after the pentest engagement ends.
+    ///
+    /// An entry can be a host name, standing for the addresses it resolves to
+    /// through `host_resolver` (see host_names.rs): a host whose address
+    /// changes is listed once and DNS carries the change.
     #[serde(default)]
     pub pentest_bypass_ips: Vec<String>,
+    /// A validating resolver (address and port, reached over TCP) for the host
+    /// names in `pentest_bypass_ips`. Only an answer it authenticates (AD)
+    /// counts; without one, a name matches nothing.
+    #[serde(default)]
+    pub host_resolver: Option<SocketAddr>,
     /// Origins allowed to read the proxy's own refusals (403/429) cross-origin.
     /// Without CORS headers a refusal reaches the page as an opaque CORS error,
     /// so it cannot see the status and retries instead of backing off. One list
@@ -2737,6 +2746,7 @@ impl Default for SecurityConfig {
             geoip_block_duration_secs: default_geoip_block_duration_secs(),
             zero_trust_mode: false,
             pentest_bypass_ips: Vec::new(),
+            host_resolver: None,
             refusal_cors_origins: default_refusal_cors_origins(),
             geo_block_redirect_url: default_geo_block_redirect_url(),
             error_pages_path_prefix: default_error_pages_path_prefix(),
@@ -4738,7 +4748,8 @@ pub fn host_without_port(host: &str) -> &str {
     }
 }
 
-/// Does `ip` appear in a `pentest_bypass_ips`-style list?
+/// Does `ip` appear in a `pentest_bypass_ips`-style list, as an address or as
+/// one a host name in it resolves to (see host_names.rs)?
 ///
 /// Compares PARSED addresses, not strings. `IpAddr::to_string()` emits the
 /// canonical compressed form, so a string comparison silently fails for every
@@ -4747,13 +4758,11 @@ pub fn host_without_port(host: &str) -> &str {
 /// `2607:f1c0:f064:5800::1`. An operator editing this list by hand should not
 /// have to guess Rust's formatting to make a bypass take effect.
 pub fn ip_list_contains(list: &[String], ip: &std::net::IpAddr) -> bool {
-    list.iter().any(|entry| {
-        entry
-            .trim()
-            .parse::<std::net::IpAddr>()
-            .map(|parsed| &parsed == ip)
-            .unwrap_or(false)
-    })
+    list.iter()
+        .any(|entry| match entry.trim().parse::<std::net::IpAddr>() {
+            Ok(parsed) => &parsed == ip,
+            Err(_) => crate::host_names::resolves_to(entry, ip),
+        })
 }
 
 #[cfg(test)]

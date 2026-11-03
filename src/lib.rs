@@ -152,6 +152,7 @@ pub mod fingerprint_corpus;
 #[cfg(test)]
 pub(crate) mod fuzz_support;
 pub mod handlers;
+pub mod host_names;
 pub mod http3_features;
 pub mod http_listener;
 pub mod load_balancer;

@@ -809,6 +809,7 @@ impl SecurityState {
 
         // Spawn background cleanup task
         state.spawn_cleanup_task();
+        state.spawn_host_names_task();
 
         state
     }
@@ -902,6 +903,45 @@ impl SecurityState {
                 // Cleanup expired entries
                 state.cleanup();
                 debug!("Security state cleanup and blocklist reload completed");
+            }
+        });
+    }
+
+    /// Keep the host names in `pentest_bypass_ips` resolved (see host_names.rs),
+    /// from the configuration as it stands at each round, so a reload that
+    /// adds or drops one takes effect within a REFRESH.
+    fn spawn_host_names_task(&self) {
+        let config = self.config.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(crate::host_names::REFRESH);
+            let mut warned = false;
+            loop {
+                interval.tick().await;
+                let (resolver, names) = {
+                    let c = config.read();
+                    let names: Vec<String> = c
+                        .pentest_bypass_ips
+                        .iter()
+                        .filter(|e| e.trim().parse::<IpAddr>().is_err())
+                        .filter(|e| crate::host_names::is_host_name(e))
+                        .cloned()
+                        .collect();
+                    (c.host_resolver, names)
+                };
+                crate::host_names::retain(&names);
+                match resolver {
+                    Some(resolver) if !names.is_empty() => {
+                        crate::host_names::refresh(resolver, &names).await;
+                    }
+                    None if !names.is_empty() && !warned => {
+                        warn!(
+                            "security.pentest_bypass_ips names {names:?}, but no \
+                             security.host_resolver is set: they match nothing"
+                        );
+                        warned = true;
+                    }
+                    _ => {}
+                }
             }
         });
     }
