@@ -106,3 +106,10 @@ allowed_external_types = [
     "wtransport_proto::ids::StreamId",
     "wtransport_proto::varint::VarInt",
 ]
+
+# A standalone build of the fork (its tests) sees the patches the proxy's
+# manifest applies only when it repeats them: noq-proto uses the rustls fork's
+# additions (EchAcceptance, client_hello_wire). Cargo ignores this section when
+# the fork is a dependency of the proxy, whose own patches apply.
+[patch.crates-io]
+rustls = { path = "../rustls-fixed/rustls" }

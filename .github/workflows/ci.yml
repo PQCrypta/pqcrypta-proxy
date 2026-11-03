@@ -210,6 +210,26 @@ jobs:
       - name: Run noq-proto's and noq's tests
         run: cargo test --manifest-path vendor/noq/Cargo.toml -p noq-proto -p noq --lib
 
+  # The vendored wtransport's tests: the WebTransport server the proxy runs
+  # (the speedtest), its rejection of requests that are not a WebTransport
+  # CONNECT among what it decides. Its manifest repeats the proxy's rustls
+  # patch, as the h3 and noq forks' do.
+  wtransport-fork:
+    name: wtransport fork tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: wtransport-fork
+          workspaces: vendor/wtransport
+
+      - name: Run the fork's tests
+        run: cargo test --manifest-path vendor/wtransport/Cargo.toml --lib
+
   # =============================================================================
   # Integration Tests
   # =============================================================================
