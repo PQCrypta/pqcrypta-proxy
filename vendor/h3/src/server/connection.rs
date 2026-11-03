@@ -129,7 +129,10 @@ where
     pub async fn accept(&mut self) -> Result<Option<RequestResolver<C, B>>, ConnectionError> {
         // Accept the incoming stream
         let stream = match poll_fn(|cx| self.poll_accept_request_stream_internal(cx)).await? {
-            Some(s) => FrameStream::new(BufRecvStream::new(s)),
+            Some(s) => FrameStream::with_max_buffered(
+                BufRecvStream::new(s),
+                crate::config::headers_frame_ceiling(self.max_field_section_size),
+            ),
             None => {
                 // We always send a last GoAway frame to the client, so it knows which was the last
                 // non-rejected request.

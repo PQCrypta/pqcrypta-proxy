@@ -53,7 +53,7 @@ fn codec_basic_get() {
     decoder.on_encoder_recv(&mut enc_cur, &mut dec_buf).unwrap();
 
     let mut block_cur = Cursor::new(&mut block_buf);
-    let Decoded { fields, .. } = decoder.decode_header(&mut block_cur).unwrap();
+    let Decoded { fields, .. } = decoder.decode_header(&mut block_cur, u64::MAX).unwrap();
     assert_eq!(fields, header);
 
     let mut dec_cur = Cursor::new(&mut dec_buf);
@@ -86,7 +86,7 @@ fn blocked_header() {
 
     let mut block_cur = Cursor::new(&mut block_buf);
     assert_eq!(
-        decoder.decode_header(&mut block_cur),
+        decoder.decode_header(&mut block_cur, u64::MAX),
         Err(DecoderError::MissingRefs(1))
     );
 }
@@ -120,7 +120,7 @@ fn codec_table_size_0() {
     decoder.on_encoder_recv(&mut enc_cur, &mut dec_buf).unwrap();
 
     let mut block_cur = Cursor::new(&mut block_buf);
-    let Decoded { fields, .. } = decoder.decode_header(&mut block_cur).unwrap();
+    let Decoded { fields, .. } = decoder.decode_header(&mut block_cur, u64::MAX).unwrap();
     assert_eq!(fields, header);
 
     let mut dec_cur = Cursor::new(&mut dec_buf);
@@ -155,7 +155,7 @@ fn codec_table_full() {
     let mut block_cur = Cursor::new(&mut block_buf);
 
     decoder.on_encoder_recv(&mut enc_cur, &mut dec_buf).unwrap();
-    let Decoded { fields, .. } = decoder.decode_header(&mut block_cur).unwrap();
+    let Decoded { fields, .. } = decoder.decode_header(&mut block_cur, u64::MAX).unwrap();
     assert_eq!(fields, header);
 
     let mut dec_cur = Cursor::new(&mut dec_buf);
@@ -192,7 +192,7 @@ fn blocked_header_decodes_once_the_insert_arrives() {
 
     // The section arrives first, as QUIC permits.
     assert_eq!(
-        decoder.decode_header(&mut Cursor::new(&block_buf)),
+        decoder.decode_header(&mut Cursor::new(&block_buf), u64::MAX),
         Err(DecoderError::MissingRefs(1))
     );
 
@@ -206,7 +206,9 @@ fn blocked_header_decodes_once_the_insert_arrives() {
     // failed attempt left the cursor.
     let Decoded {
         fields, dyn_ref, ..
-    } = decoder.decode_header(&mut Cursor::new(&block_buf)).unwrap();
+    } = decoder
+        .decode_header(&mut Cursor::new(&block_buf), u64::MAX)
+        .unwrap();
     assert_eq!(fields, header);
     assert!(dyn_ref, "the section referenced the dynamic table");
 }
@@ -239,7 +241,9 @@ fn section_acknowledgment_unblocks_eviction() {
     decoder
         .on_encoder_recv(&mut Cursor::new(&mut enc_buf), &mut dec_buf)
         .unwrap();
-    let Decoded { dyn_ref, .. } = decoder.decode_header(&mut Cursor::new(&block_buf)).unwrap();
+    let Decoded { dyn_ref, .. } = decoder
+        .decode_header(&mut Cursor::new(&block_buf), u64::MAX)
+        .unwrap();
     assert!(dyn_ref);
 
     // What the request stream now queues on the decoder stream.

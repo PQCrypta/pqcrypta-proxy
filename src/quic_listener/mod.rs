@@ -949,7 +949,13 @@ impl QuicListener {
         // to 100. A client was told it could open ten times what it would be
         // given, which is worse than saying nothing: the setting exists so a
         // peer can size its own behaviour, and a wrong number is acted upon.
+        // The field section limit is the one the TCP listeners hold requests
+        // to (security.max_header_size), advertised in SETTINGS and enforced
+        // while decoding: h3's default was no limit, so a request of tens of
+        // thousands of one-octet field lines was decoded in full (QPACK
+        // "header accordions", FoxIO, October 2026).
         let h3_built = h3::server::builder()
+            .max_field_section_size(config.security.max_header_size as u64)
             .enable_webtransport(true)
             .enable_extended_connect(true)
             .enable_datagram(true)

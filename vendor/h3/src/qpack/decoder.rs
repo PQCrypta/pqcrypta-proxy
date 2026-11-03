@@ -117,7 +117,17 @@ impl Decoder {
 
     // Decode field lines received on Request of Push stream.
     // https://www.rfc-editor.org/rfc/rfc9204.html#name-field-line-representations
-    pub fn decode_header<T: Buf>(&self, buf: &mut T) -> Result<Decoded, DecoderError> {
+    //
+    // Decoding stops as soon as the section's size passes `max_size`, as the
+    // stateless decoder's does. It used to decode every field and leave the
+    // check to the caller, so a section of one-octet references to a large
+    // dynamic table entry was expanded in full before anything looked at its
+    // size: the amplification FoxIO measured at 4064:1 against two stacks.
+    pub fn decode_header<T: Buf>(
+        &self,
+        buf: &mut T,
+        max_size: u64,
+    ) -> Result<Decoded, DecoderError> {
         //= https://www.rfc-editor.org/rfc/rfc9204#section-4.5.1.1
         //# MaxEntries is the maximum number of entries -- that is, the number
         //# of entries that fit in the dynamic table of maximum capacity.
@@ -150,6 +160,9 @@ impl Decoder {
         while buf.has_remaining() {
             let field = Self::parse_header_field(&decoder_table, buf)?;
             mem_size += field.mem_size() as u64;
+            if mem_size > max_size {
+                return Err(DecoderError::HeaderTooLong(mem_size));
+            }
             fields.push(field);
         }
 
@@ -637,7 +650,7 @@ mod tests {
 
         let mut read = Cursor::new(&buf);
         assert_eq!(
-            decoder.decode_header(&mut read),
+            decoder.decode_header(&mut read, u64::MAX),
             Err(DecoderError::MissingRefs(8))
         );
     }
@@ -668,7 +681,7 @@ mod tests {
         let decoder = Decoder::from(build_table_with_size(2));
         let Decoded {
             fields, dyn_ref, ..
-        } = decoder.decode_header(&mut read).unwrap();
+        } = decoder.decode_header(&mut read, u64::MAX).unwrap();
         assert!(dyn_ref);
         assert_eq!(
             fields,
@@ -700,7 +713,7 @@ mod tests {
         let decoder = Decoder::from(build_table_with_size(4));
         let Decoded {
             fields, dyn_ref, ..
-        } = decoder.decode_header(&mut read).unwrap();
+        } = decoder.decode_header(&mut read, u64::MAX).unwrap();
         assert!(dyn_ref);
         assert_eq!(fields, &[field(2), field(3), field(4)])
     }
@@ -720,7 +733,7 @@ mod tests {
         let decoder = Decoder::from(build_table_with_size(4));
         let Decoded {
             fields, dyn_ref, ..
-        } = decoder.decode_header(&mut read).unwrap();
+        } = decoder.decode_header(&mut read, u64::MAX).unwrap();
         assert!(dyn_ref);
         assert_eq!(
             fields,
@@ -741,8 +754,31 @@ mod tests {
 
         let mut read = Cursor::new(&buf);
         let decoder = Decoder::from(build_table_with_size(4));
-        let Decoded { fields, .. } = decoder.decode_header(&mut read).unwrap();
+        let Decoded { fields, .. } = decoder.decode_header(&mut read, u64::MAX).unwrap();
         assert_eq!(fields, &[field(3).with_value("new bar3")]);
+    }
+
+    /// A section past the limit is refused partway, not decoded in full and
+    /// measured afterwards: of 100,000 one-octet references only as many are
+    /// decoded as fit the limit, plus the one that passed it.
+    #[test]
+    fn decoding_stops_at_the_limit() {
+        let mut buf = vec![];
+        HeaderPrefix::new(0, 0, 0, TABLE_SIZE).encode(&mut buf);
+        for _ in 0..100_000 {
+            Literal::new("x", "y").encode(&mut buf).unwrap();
+        }
+        let decoder = Decoder::from(build_table_with_size(0));
+        let mut read = Cursor::new(&buf);
+        let refused = decoder.decode_header(&mut read, 64 * 1024);
+        // Each "x: y" field counts 1 + 1 + 32 octets.
+        assert!(
+            matches!(refused, Err(DecoderError::HeaderTooLong(size)) if size > 64 * 1024 && size <= 64 * 1024 + 34)
+        );
+        assert!(
+            read.has_remaining(),
+            "the rest of the section was never decoded"
+        );
     }
 
     #[test]
@@ -753,7 +789,7 @@ mod tests {
 
         let mut read = Cursor::new(&buf);
         let decoder = Decoder::from(build_table_with_size(0));
-        let Decoded { fields, .. } = decoder.decode_header(&mut read).unwrap();
+        let Decoded { fields, .. } = decoder.decode_header(&mut read, u64::MAX).unwrap();
         assert_eq!(
             fields,
             &[HeaderField::new(b"foo".to_vec(), b"bar".to_vec())]
@@ -783,7 +819,7 @@ mod tests {
 
         let mut read = Cursor::new(&buf);
         let decoder = Decoder::from(build_table_with_size(4));
-        let Decoded { fields, .. } = decoder.decode_header(&mut read).unwrap();
+        let Decoded { fields, .. } = decoder.decode_header(&mut read, u64::MAX).unwrap();
         assert_eq!(fields, &[field(1), field(2), field(3), field(4)]);
     }
 
@@ -806,7 +842,7 @@ mod tests {
 
         let mut read = Cursor::new(&buf);
         let decoder = Decoder::from(build_table_with_size(max_entries + 10));
-        let Decoded { fields, .. } = decoder.decode_header(&mut read).expect("decode");
+        let Decoded { fields, .. } = decoder.decode_header(&mut read, u64::MAX).expect("decode");
         assert_eq!(fields, &[field(max_entries - 5)]);
 
         let mut buf = vec![];
@@ -824,7 +860,7 @@ mod tests {
 
         let mut read = Cursor::new(&buf);
         let decoder = Decoder::from(table);
-        let Decoded { fields, .. } = decoder.decode_header(&mut read).unwrap();
+        let Decoded { fields, .. } = decoder.decode_header(&mut read, u64::MAX).unwrap();
         assert_eq!(fields, &[field(max_entries + 6), field(max_entries + 10)]);
     }
 }

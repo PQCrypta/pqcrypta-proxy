@@ -13,7 +13,7 @@ use crate::stream::{BufRecvStream, WriteBuf};
 use crate::{
     buf::BufList,
     proto::{
-        frame::{self, Frame, PayloadLen},
+        frame::{self, Frame, FrameHead, PayloadLen},
         stream::StreamId,
     },
     quic::{BidiStream, RecvStream, SendStream},
@@ -32,6 +32,18 @@ impl<S, B> FrameStream<S, B> {
         Self {
             stream,
             decoder: FrameDecoder::default(),
+            remaining_data: 0,
+        }
+    }
+
+    /// The stream, buffering no frame longer than `max` (see FrameDecoder)
+    pub(crate) fn with_max_buffered(stream: BufRecvStream<S, B>, max: usize) -> Self {
+        Self {
+            stream,
+            decoder: FrameDecoder {
+                max_buffered: max,
+                ..FrameDecoder::default()
+            },
             remaining_data: 0,
         }
     }
@@ -77,7 +89,7 @@ where
                     Poll::Ready(false) => continue,
                     Poll::Pending => Poll::Pending,
                     Poll::Ready(true) => {
-                        if self.stream.buf_mut().has_remaining() {
+                        if self.stream.buf_mut().has_remaining() || self.decoder.skip > 0 {
                             // Reached the end of receive stream, but there is still some data:
                             // The frame is incomplete.
                             Poll::Ready(Err(FrameStreamError::UnexpectedEnd))
@@ -206,9 +218,31 @@ where
     }
 }
 
-#[derive(Default)]
+/// Frames from a stream's octets as they arrive.
+///
+/// Every frame but DATA is parsed whole, so its payload is buffered until it
+/// has all arrived, and that was so for any declared length: a HEADERS frame
+/// claiming 2^62 octets, or a reserved type that has to be ignored, was held
+/// in memory for as long as the peer kept sending it. A frame to be buffered
+/// is now judged by its header against `max_buffered` and refused before any
+/// of its payload is read (H3_EXCESSIVE_LOAD), and an unknown type's payload
+/// is discarded as it arrives rather than kept until it is complete.
 pub struct FrameDecoder {
     expected: Option<usize>,
+    /// Payload octets of an unknown frame still to discard
+    skip: u64,
+    /// The longest frame read whole
+    max_buffered: usize,
+}
+
+impl Default for FrameDecoder {
+    fn default() -> Self {
+        Self {
+            expected: None,
+            skip: 0,
+            max_buffered: crate::config::MAX_BUFFERED_FRAME,
+        }
+    }
 }
 
 impl FrameDecoder {
@@ -219,8 +253,48 @@ impl FrameDecoder {
         // Decode in a loop since we ignore unknown frames, and there may be
         // other frames already in our BufList.
         loop {
+            if self.skip > 0 {
+                let n = usize::try_from(self.skip)
+                    .unwrap_or(usize::MAX)
+                    .min(src.remaining());
+                src.advance(n);
+                self.skip -= n as u64;
+                if self.skip > 0 {
+                    return Ok(None);
+                }
+            }
+
             if !src.has_remaining() {
                 return Ok(None);
+            }
+
+            let head = Frame::head(&mut src.cursor());
+            match head {
+                Some(FrameHead::Forbidden(ty)) => {
+                    return Err(FrameStreamError::Proto(FrameProtocolError::ForbiddenFrame(
+                        ty,
+                    )));
+                }
+                Some(FrameHead::Buffered { ty, len }) if len > self.max_buffered as u64 => {
+                    return Err(FrameStreamError::Proto(FrameProtocolError::ExcessiveLoad {
+                        ty,
+                        len,
+                        max: self.max_buffered,
+                    }));
+                }
+                Some(FrameHead::Unknown {
+                    header_len,
+                    payload_len,
+                }) => {
+                    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
+                    //# Endpoints MUST
+                    //# NOT consider these frames to have any meaning upon receipt.
+                    src.advance(header_len);
+                    self.skip = payload_len;
+                    self.expected = None;
+                    continue;
+                }
+                _ => {}
             }
 
             if let Some(min) = self.expected {
@@ -299,6 +373,12 @@ pub enum FrameStreamError {
 #[derive(Debug, PartialEq)]
 /// Protocol specific errors that can occur while decoding frames in a stream
 pub enum FrameProtocolError {
+    /// A frame read whole whose declared length is past the ceiling
+    ExcessiveLoad {
+        ty: u64,
+        len: u64,
+        max: usize,
+    },
     Malformed,
     ForbiddenFrame(u64), // Known (http2) frames that should generate an error
     InvalidFrameValue,
@@ -387,6 +467,67 @@ mod tests {
             Ok(Some(Frame::Data(PayloadLen(4))))
         );
         assert_matches!(decoder.decode(&mut buf), Ok(None));
+    }
+
+    /// A frame read whole whose header declares more than the ceiling is
+    /// refused on its header alone, before any payload is buffered.
+    #[test]
+    fn a_buffered_frame_past_the_ceiling_is_refused_from_its_header() {
+        use crate::proto::varint::BufMutExt as _;
+        let mut buf = BytesMut::new();
+        crate::proto::frame::FrameType::HEADERS.encode(&mut buf);
+        buf.write_var(1 << 40);
+        let mut buf = BufList::from(buf);
+        let mut decoder = FrameDecoder {
+            max_buffered: 16 * 1024,
+            ..FrameDecoder::default()
+        };
+        assert_matches!(
+            decoder.decode(&mut buf),
+            Err(FrameStreamError::Proto(FrameProtocolError::ExcessiveLoad { ty: 1, len, max: 16384 })) if len == 1 << 40
+        );
+    }
+
+    /// An unknown type's payload is discarded as it arrives: none of it is
+    /// kept, however long it says it is, and the frame after it is read.
+    #[test]
+    fn an_unknown_frame_is_discarded_as_it_arrives() {
+        use crate::proto::varint::BufMutExt as _;
+        let mut head = BytesMut::new();
+        crate::proto::frame::FrameType::grease().encode(&mut head);
+        head.write_var(10 * 1024 * 1024);
+        head.put_slice(&[0u8; 4096]);
+        let mut buf = BufList::from(head);
+        let mut decoder = FrameDecoder::default();
+        assert_matches!(decoder.decode(&mut buf), Ok(None));
+        assert!(
+            !buf.has_remaining(),
+            "the payload so far was discarded, not kept"
+        );
+        assert_eq!(decoder.skip, 10 * 1024 * 1024 - 4096);
+
+        let mut rest = BytesMut::new();
+        rest.put_slice(&vec![0u8; 10 * 1024 * 1024 - 4096]);
+        Frame::headers(&b"header"[..]).encode_with_payload(&mut rest);
+        let mut buf = BufList::from(rest);
+        assert_matches!(decoder.decode(&mut buf), Ok(Some(Frame::Headers(_))));
+    }
+
+    /// An HTTP/2 frame type is refused from its type, without waiting for the
+    /// payload its length promises.
+    #[test]
+    fn an_http2_frame_is_refused_from_its_type() {
+        use crate::proto::varint::BufMutExt as _;
+        let mut buf = BytesMut::new();
+        crate::proto::frame::FrameType::H2_PING.encode(&mut buf);
+        buf.write_var(1 << 30);
+        let mut buf = BufList::from(buf);
+        assert_matches!(
+            FrameDecoder::default().decode(&mut buf),
+            Err(FrameStreamError::Proto(FrameProtocolError::ForbiddenFrame(
+                0x6
+            )))
+        );
     }
 
     // FrameStream

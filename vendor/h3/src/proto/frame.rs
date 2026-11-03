@@ -75,8 +75,53 @@ impl From<usize> for PayloadLen {
     }
 }
 
+/// What a frame's header says, read before its payload has arrived
+#[derive(Debug, PartialEq)]
+pub(crate) enum FrameHead {
+    /// Read as it arrives: DATA's payload streams to the application, and a
+    /// WebTransport stream runs to the end of the QUIC stream
+    Streamed,
+    /// Parsed whole once its payload is here: HEADERS, SETTINGS and the rest
+    Buffered { ty: u64, len: u64 },
+    /// A type with no meaning (RFC 9114 section 7.2.8): `header_len` octets of
+    /// header, then a payload to discard as it arrives
+    Unknown { header_len: usize, payload_len: u64 },
+    /// An HTTP/2 frame type, refused on its type alone
+    Forbidden(u64),
+}
+
 impl Frame<PayloadLen> {
     pub const MAX_ENCODED_SIZE: usize = VarInt::MAX_SIZE * 7;
+
+    /// The header of the frame at the front of `buf`, or None while its type
+    /// and length are not both here. Nothing about the payload is read: a
+    /// frame's declared length is judged before any of it is buffered.
+    pub(crate) fn head<T: Buf>(buf: &mut T) -> Option<FrameHead> {
+        let start = buf.remaining();
+        let ty = FrameType::decode(buf).ok()?;
+        match ty {
+            FrameType::WEBTRANSPORT_BI_STREAM => return Some(FrameHead::Streamed),
+            FrameType::H2_PRIORITY
+            | FrameType::H2_PING
+            | FrameType::H2_WINDOW_UPDATE
+            | FrameType::H2_CONTINUATION => return Some(FrameHead::Forbidden(ty.0)),
+            _ => {}
+        }
+        let len = buf.get_var().ok()?;
+        Some(match ty {
+            FrameType::DATA => FrameHead::Streamed,
+            FrameType::HEADERS
+            | FrameType::CANCEL_PUSH
+            | FrameType::SETTINGS
+            | FrameType::PUSH_PROMISE
+            | FrameType::GOAWAY
+            | FrameType::MAX_PUSH_ID => FrameHead::Buffered { ty: ty.0, len },
+            _ => FrameHead::Unknown {
+                header_len: start - buf.remaining(),
+                payload_len: len,
+            },
+        })
+    }
 
     /// Decodes a Frame from the stream according to <https://www.rfc-editor.org/rfc/rfc9114#section-7.1>
     pub fn decode<T: Buf>(buf: &mut T) -> Result<Self, FrameError> {
