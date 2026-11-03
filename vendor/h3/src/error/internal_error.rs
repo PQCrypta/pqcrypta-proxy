@@ -57,6 +57,13 @@ impl InternalConnectionError {
             //# after the identified fields or a frame payload that terminates before
             //# the end of the identified fields MUST be treated as a connection
             //# error of type H3_FRAME_ERROR.
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-10.5
+            //# An endpoint MAY treat activity that is suspicious as a connection
+            //# error of type H3_EXCESSIVE_LOAD
+            FrameProtocolError::ExcessiveLoad { ty, len, max } => InternalConnectionError {
+                code: Code::H3_EXCESSIVE_LOAD,
+                message: format!("frame 0x{ty:x} of {len} octets, past the {max} this endpoint reads whole"),
+            },
             FrameProtocolError::InvalidFrameValue | FrameProtocolError::Malformed => InternalConnectionError {
                 code: Code::H3_FRAME_ERROR,
                 message: "frame payload that contains additional bytes after the identified fields or a frame payload that terminates before the end of the identified fields".to_string(),

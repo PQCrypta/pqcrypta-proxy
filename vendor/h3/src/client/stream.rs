@@ -228,7 +228,7 @@ where
                         .qpack_decoder
                         .lock()
                         .expect("the QPACK decoder lock is never held across a panic")
-                        .decode_header(&mut section)
+                        .decode_header(&mut section, self.inner.max_field_section_size)
                 };
 
                 if !matches!(attempt, Err(qpack::DecoderError::MissingRefs(_))) {
@@ -283,19 +283,6 @@ where
                     self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
                     return Err(StreamError::HeaderTooBig {
                         actual_size: cancel_size,
-                        max_size: self.inner.max_field_section_size,
-                    });
-                }
-                // The stateful decoder takes no limit, as the stateless one
-                // did: since responses are decoded with it, a section over
-                // our own SETTINGS_MAX_FIELD_SECTION_SIZE was accepted. The
-                // crate's header_too_big_discard_from_client found it once
-                // its tests ran.
-                Ok(decoded) if decoded.mem_size > self.inner.max_field_section_size => {
-                    self.cancel_qpack_stream();
-                    self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
-                    return Err(StreamError::HeaderTooBig {
-                        actual_size: decoded.mem_size,
                         max_size: self.inner.max_field_section_size,
                     });
                 }

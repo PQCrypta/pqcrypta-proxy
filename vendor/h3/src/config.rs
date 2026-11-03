@@ -2,6 +2,38 @@ use std::convert::TryFrom;
 
 use crate::proto::{frame, varint::VarInt};
 
+/// The field section this endpoint accepts unless configured otherwise
+/// (SETTINGS_MAX_FIELD_SECTION_SIZE, RFC 9114 section 4.2.2), counted as QPACK
+/// does: each field's name and value plus 32 octets.
+///
+/// It was VarInt::MAX, no limit at all: a peer could send a field section of
+/// any size and every field of it was decoded and kept (the "header accordion"
+/// class FoxIO reported against seven HTTP/3 stacks, h3 among them, in
+/// October 2026). 64 KiB is what the proxy's HTTP/1.1 and HTTP/2 listeners
+/// allow (security.max_header_size), and what h3's own pending fix proposes.
+pub const DEFAULT_MAX_FIELD_SECTION_SIZE: u64 = 64 * 1024;
+
+/// The longest frame read whole, every frame but DATA (whose payload streams):
+/// on a control or push stream, SETTINGS, GOAWAY and the rest are a few octets.
+pub(crate) const MAX_BUFFERED_FRAME: usize = 1024 * 1024;
+
+/// The longest HEADERS frame a request stream buffers for an endpoint that
+/// accepts field sections of `max_field_section_size`.
+///
+/// A field line encodes in fewer octets than the 32 its decoded size adds for
+/// it, so a section within the limit encodes within it too; twice the limit
+/// leaves room for an encoder whose Huffman coding made a value longer. A
+/// frame past it is refused from its header, before its payload is buffered.
+pub(crate) fn headers_frame_ceiling(max_field_section_size: u64) -> usize {
+    usize::try_from(
+        max_field_section_size
+            .saturating_mul(2)
+            .saturating_add(1024),
+    )
+    .unwrap_or(usize::MAX)
+    .max(16 * 1024)
+}
+
 /// Configures the HTTP/3 connection
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
@@ -200,7 +232,42 @@ impl Default for Config {
             send_grease: true,
             #[cfg(test)]
             send_settings: true,
-            settings: Default::default(),
+            // Settings::default is also what a peer is taken to have before
+            // its SETTINGS arrive (RFC 9114 section 7.2.4.2), where the field
+            // section limit is unlimited; this endpoint's own is not.
+            settings: Settings {
+                max_field_section_size: DEFAULT_MAX_FIELD_SECTION_SIZE,
+                ..Default::default()
+            },
         }
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    /// This endpoint advertises and enforces a field section limit unless
+    /// told otherwise; a peer that sends no limit is still taken to have none.
+    #[test]
+    fn an_endpoint_has_a_field_section_limit_and_a_peer_without_one_has_none() {
+        assert_eq!(
+            Config::default().settings.max_field_section_size,
+            DEFAULT_MAX_FIELD_SECTION_SIZE
+        );
+        let sent = frame::Settings::try_from(Config::default()).unwrap();
+        assert_eq!(
+            sent.get(frame::SettingId::MAX_HEADER_LIST_SIZE),
+            Some(DEFAULT_MAX_FIELD_SECTION_SIZE)
+        );
+        let peer = Settings::from(&frame::Settings::default());
+        assert_eq!(peer.max_field_section_size, VarInt::MAX.0);
+    }
+
+    #[test]
+    fn a_headers_frame_ceiling_follows_the_limit() {
+        assert_eq!(headers_frame_ceiling(64 * 1024), 128 * 1024 + 1024);
+        assert_eq!(headers_frame_ceiling(0), 16 * 1024);
+        assert_eq!(headers_frame_ceiling(u64::MAX), usize::MAX);
     }
 }

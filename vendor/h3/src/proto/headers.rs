@@ -259,7 +259,11 @@ impl Iterator for HeaderIter {
 impl TryFrom<Vec<HeaderField>> for Header {
     type Error = HeaderError;
     fn try_from(headers: Vec<HeaderField>) -> Result<Self, Self::Error> {
-        let mut fields = HeaderMap::with_capacity(headers.len());
+        // HeaderMap holds at most 32,768 fields, and with_capacity and append
+        // panic past that: a request of that many one-octet field lines took
+        // the whole process down with it (release builds abort on a panic).
+        let mut fields =
+            HeaderMap::try_with_capacity(headers.len()).map_err(|_| HeaderError::TooManyFields)?;
         let mut pseudo = Pseudo::default();
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
@@ -316,7 +320,9 @@ impl TryFrom<Vec<HeaderField>> for Header {
                     if connection_specific {
                         return Err(HeaderError::ConnectionSpecificField(n.to_string()));
                     }
-                    fields.append(n, v);
+                    fields
+                        .try_append(n, v)
+                        .map_err(|_| HeaderError::TooManyFields)?;
                     continue;
                 }
             }
@@ -554,6 +560,8 @@ pub enum HeaderError {
     ConnectionSpecificField(String),
     /// Content-Length that is not one non-negative integer
     InvalidContentLength,
+    /// More fields than a header map holds
+    TooManyFields,
 }
 
 impl HeaderError {
@@ -599,6 +607,7 @@ impl fmt::Display for HeaderError {
                 write!(f, "connection-specific field {n}")
             }
             HeaderError::InvalidContentLength => write!(f, "content-length is not one length"),
+            HeaderError::TooManyFields => write!(f, "more fields than a header map holds"),
             HeaderError::ContradictedAuthority => {
                 write!(f, "uri and authority field are in contradiction")
             }
@@ -615,6 +624,21 @@ mod tests {
         list.iter()
             .map(|(n, v)| HeaderField::new(n.as_bytes().to_vec(), v.as_bytes().to_vec()))
             .collect()
+    }
+
+    /// More fields than a HeaderMap holds is an error the request is reset
+    /// with (H3_MESSAGE_ERROR), not a panic, which aborts a release build.
+    #[test]
+    fn too_many_fields_is_an_error_not_a_panic() {
+        let mut many = fields(&[(":method", "GET"), (":scheme", "https"), (":path", "/")]);
+        many.extend(
+            (0..40_000).map(|i| HeaderField::new(format!("x-{i}").into_bytes(), b"v".to_vec())),
+        );
+        assert_matches!(Header::try_from(many), Err(HeaderError::TooManyFields));
+
+        let mut repeated = fields(&[(":method", "GET"), (":scheme", "https"), (":path", "/")]);
+        repeated.extend((0..40_000).map(|_| HeaderField::new(b"accept".to_vec(), b"*/*".to_vec())));
+        assert_matches!(Header::try_from(repeated), Err(HeaderError::TooManyFields));
     }
 
     fn request(list: &[(&str, &str)]) -> Result<(), HeaderError> {
