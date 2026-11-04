@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::h3_frames as f;
-use super::listener::{answer_probe, emit, write_capacity_overflow, QpackLimits};
+use super::listener::{answer_probe, emit, write_capacity_overflow, Answered, QpackLimits};
 use super::zero_rtt::{throwaway_cert, OneCert, PinnedTo, Throwaway};
 
 /// A client that permits the dynamic table, which no real one does.
@@ -150,9 +150,14 @@ async fn drive(test_id: &'static str) -> Wire {
         let _ = recv.read_to_end(4096).await;
         // No early data here: these tests are about QPACK, and the flag only
         // decides whether the 0-RTT port answers 425.
-        answer_probe(&mut send, test, &qpack, Some(&mut emitted.encoder), false)
+        let answered = answer_probe(&mut send, test, &qpack, Some(&mut emitted.encoder), false)
             .await
             .expect("answering the probe");
+        assert_eq!(
+            answered,
+            Answered::InFull,
+            "nothing here holds a response back"
+        );
         let _ = send.finish();
 
         // Held open past the response: finishing a QPACK encoder stream is

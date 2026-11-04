@@ -4290,12 +4290,13 @@ pub(super) async fn answer_probe(
                 ("x-conformance-oversized", filler.as_str()),
             ]))
             .await?;
-            match tokio::time::timeout(OVERSIZED_REACTION_WINDOW, send.stopped()).await {
-                // Stopped, or gone: either way the rest is not wanted.
-                Ok(Ok(Some(_)) | Err(_)) => return Ok(Answered::CutShort),
-                // `None` needs a finished stream, and this one is not; the
-                // window passing is a client waiting for its body.
-                Ok(Ok(None)) | Err(_) => {}
+            // Stopped, or gone: either way the rest is not wanted. `None`
+            // needs a finished stream, and this one is not; the window
+            // passing is a client waiting for its body.
+            if let Ok(Ok(Some(_)) | Err(_)) =
+                tokio::time::timeout(OVERSIZED_REACTION_WINDOW, send.stopped()).await
+            {
+                return Ok(Answered::CutShort);
             }
             send.write_all(&f::data(BODY)).await?;
         }
