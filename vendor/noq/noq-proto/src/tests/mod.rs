@@ -507,6 +507,36 @@ fn stop_stream() {
     );
 }
 
+/// `challenge_path` sends one PATH_CHALLENGE, in a datagram expanded to the
+/// 1200 bytes RFC 9000 §8.2.1 requires, and the peer answers it.
+#[test]
+fn a_requested_path_challenge_is_padded_and_answered() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    pair.drive();
+
+    pair.server_conn_mut(server_ch).challenge_path();
+    let now = pair.time;
+    pair.server.drive(now);
+    let sizes: Vec<usize> = pair.server.outbound.iter().map(|(_, b)| b.len()).collect();
+    assert!(
+        sizes.iter().any(|&n| n >= usize::from(MIN_INITIAL_SIZE)),
+        "a datagram carrying PATH_CHALLENGE is expanded to 1200 bytes: {sizes:?}"
+    );
+    pair.drive();
+
+    assert_eq!(pair.server_conn_mut(server_ch).stats().frame_tx.path_challenge, 1);
+    assert_eq!(pair.client_conn_mut(client_ch).stats().frame_rx.path_challenge, 1);
+    assert_eq!(pair.client_conn_mut(client_ch).stats().frame_tx.path_response, 1);
+    assert_eq!(pair.server_conn_mut(server_ch).stats().frame_rx.path_response, 1);
+
+    // One-shot: nothing more is challenged unless asked again.
+    pair.server_conn_mut(server_ch).ping();
+    pair.drive();
+    assert_eq!(pair.server_conn_mut(server_ch).stats().frame_tx.path_challenge, 1);
+}
+
 /// A queued STOP_SENDING, then one in flight, leave the connection unsettled;
 /// once it is acknowledged, a close discards nothing.
 #[test]

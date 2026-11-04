@@ -285,11 +285,11 @@ impl Future for ConnectionDriver {
         if let Err(e) = conn.process_conn_events(&self.0.shared, cx) {
             // The endpoint dropped this connection's channel, which it does in
             // the same locked pass that forgets the connection's IDs -- and it
-            // handles incoming datagrams under that lock too. So a PING sent
-            // from here is answered by an acknowledgement that can only reach
-            // an endpoint that no longer knows the connection.
-            if std::mem::take(&mut conn.ping_after_forget) {
-                conn.inner.ping();
+            // handles incoming datagrams under that lock too. So a probe sent
+            // from here is answered by a packet that can only reach an
+            // endpoint that no longer knows the connection.
+            if std::mem::take(&mut conn.probe_after_forget) {
+                conn.inner.challenge_path();
                 let _ = conn.drive_transmit(cx);
             }
             conn.terminate(e, &self.0.shared);
@@ -739,23 +739,33 @@ impl Connection {
         conn.abandon(&self.0.shared);
     }
 
-    /// Abandon the connection, then send one PING once the endpoint has
-    /// forgotten it.
+    /// Abandon the connection, then send one probe -- a PATH_CHALLENGE in a
+    /// padded, ack-eliciting packet -- once the endpoint has forgotten it.
     ///
     /// [`Self::abandon`] transmits nothing: whatever is queued is discarded
     /// with the connection. So a peer that happened to be all square when it
     /// was called had nothing to say afterwards, and the conformance suite's
     /// Stateless Reset test waited out its window for a packet that never
-    /// came. A PING the peer must acknowledge leaves it owing one packet --
-    /// but only if the endpoint has forgotten the connection before that
-    /// acknowledgement lands. Sending the PING first and forgetting after lost
-    /// that race on a same-host path, where the answer returns in tens of
-    /// microseconds and the forget is an event the endpoint handles later. So
-    /// the order is reversed: the PING leaves when the driver sees the
-    /// endpoint drop this connection, which is proof the forget has happened.
-    pub fn abandon_after_ping(&self) {
-        let conn = &mut *self.0.lock_without_waking("abandon_after_ping"); // abandon self-wakes
-        conn.ping_after_forget = true;
+    /// came. A probe the peer must answer leaves it owing one packet -- but
+    /// only if the endpoint has forgotten the connection before that answer
+    /// lands. Sending the probe first and forgetting after lost that race on a
+    /// same-host path, where the answer returns in tens of microseconds and
+    /// the forget is an event the endpoint handles later. So the order is
+    /// reversed: the probe leaves when the driver sees the endpoint drop this
+    /// connection, which is proof the forget has happened.
+    ///
+    /// A PATH_CHALLENGE rather than the PING this once was, because of what
+    /// the answer is. A PING draws an ACK, which nothing retransmits: a peer
+    /// that missed the Stateless Reset that ACK draws has nothing in flight,
+    /// says nothing more, and looks exactly like a peer that recognised the
+    /// reset and went quiet as RFC 9000 §10.3.1 requires. xquic was credited
+    /// with that silence while its own log showed the connection still
+    /// established 13 s later (2026-11-04). The PATH_RESPONSE a challenge
+    /// draws is ack-eliciting (§8.2.2), so a peer that missed the reset keeps
+    /// probing for its acknowledgement, and only one that recognised it stops.
+    pub fn abandon_after_probe(&self) {
+        let conn = &mut *self.0.lock_without_waking("abandon_after_probe"); // abandon self-wakes
+        conn.probe_after_forget = true;
         conn.abandon(&self.0.shared);
     }
 
@@ -1607,9 +1617,10 @@ pub(crate) struct State {
     /// Set by [`State::abandon`]: the endpoint has been told to forget this
     /// connection, so neither Drop path may send anything to the peer.
     abandoned: bool,
-    /// Set by [`Connection::abandon_after_ping`]: once the endpoint has
-    /// forgotten this connection, send one PING before the driver exits.
-    ping_after_forget: bool,
+    /// Set by [`Connection::abandon_after_probe`]: once the endpoint has
+    /// forgotten this connection, send one PATH_CHALLENGE before the driver
+    /// exits.
+    probe_after_forget: bool,
     /// Tracks paths being opened
     open_path: FxHashMap<PathId, watch::Sender<Result<(), PathError>>>,
     /// Tracks reference counts for paths.
@@ -1682,7 +1693,7 @@ impl State {
             open_path: FxHashMap::default(),
             error: None,
             abandoned: false,
-            ping_after_forget: false,
+            probe_after_forget: false,
             sender,
             runtime,
             send_buffer: Vec::new(),

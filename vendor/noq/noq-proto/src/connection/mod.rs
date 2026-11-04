@@ -168,6 +168,9 @@ pub struct Connection {
     sent_unknown_frame: bool,
     /// Whether [`TransportConfig::send_path_challenge`]'s frame has gone out.
     sent_path_challenge: bool,
+    /// A PATH_CHALLENGE asked for by [`Connection::challenge_path`], not yet
+    /// written.
+    pending_path_challenge: bool,
     /// Consolidated cryptographic state
     crypto_state: CryptoState,
     /// The CID we initially chose, for use during the handshake
@@ -442,6 +445,7 @@ impl Connection {
             rng,
             sent_unknown_frame: false,
             sent_path_challenge: false,
+            pending_path_challenge: false,
             path_stats: Default::default(),
             partial_stats: ConnectionStats::default(),
             version,
@@ -2750,6 +2754,19 @@ impl Connection {
         for path_data in self.spaces[self.highest_space].number_spaces.values_mut() {
             path_data.pending_ping = true;
         }
+    }
+
+    /// Ask the peer to prove it is still on the path: one PATH_CHALLENGE, in an
+    /// ack-eliciting packet sent as soon as the connection can.
+    ///
+    /// Its answer is a PATH_RESPONSE, which RFC 9000 §8.2.2 obliges the peer to
+    /// send and which is itself ack-eliciting -- unlike the ACK a PING draws.
+    /// The conformance suite's Stateless Reset test needs exactly that: a peer
+    /// left owing an acknowledged reply keeps probing for it until something
+    /// stops it, so if the reset did not, the probes say so.
+    pub fn challenge_path(&mut self) {
+        self.pending_path_challenge = true;
+        self.ping();
     }
 
     /// Ping the remote endpoint over a specific path
@@ -6700,17 +6717,25 @@ impl Connection {
         // untracked for loss — if that packet goes missing the run reports the
         // test as unexercised rather than blaming the peer for a reply it was
         // never asked for.
-        if self.config.send_path_challenge
-            && !self.sent_path_challenge
+        //
+        // Padded like every other PATH_CHALLENGE this stack sends: RFC 9000
+        // §8.2.1 requires a datagram carrying one to be expanded to 1200 bytes,
+        // and this one went out at whatever size its packet happened to be.
+        if ((self.config.send_path_challenge && !self.sent_path_challenge)
+            || self.pending_path_challenge)
             && self.state.is_established()
             && space_id == SpaceId::Data
             && !is_0rtt
             && !scheduling_info.is_abandoned
             && builder.frame_space_remaining() >= frame::PathChallenge::SIZE_BOUND
         {
-            self.sent_path_challenge = true;
+            if self.config.send_path_challenge {
+                self.sent_path_challenge = true;
+            }
+            self.pending_path_challenge = false;
             let token = self.rng.random();
             builder.write_frame(frame::PathChallenge(token), stats);
+            builder.require_padding();
         }
 
         // A frame of unknown type, when one has been configured.
