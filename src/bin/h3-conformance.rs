@@ -142,6 +142,10 @@ struct Report {
     totals: Totals,
     by_class: std::collections::BTreeMap<String, ClassSummary>,
     results: Vec<ResultRow>,
+    /// Tests with a connection the server is still observing. Absent from a
+    /// server that predates it, which then reads as nothing in flight.
+    #[serde(default)]
+    in_flight: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -170,7 +174,8 @@ struct ResultRow {
     expectation: String,
 }
 
-/// Read the report, waiting while a test we drove still has no verdict.
+/// Read the report, waiting while a test we drove still has no verdict, or has
+/// a connection the server is still observing.
 ///
 /// `driven` is what this invocation actually ran, so a `not_run` among those is
 /// a verdict in flight rather than a test nobody attempted -- the distinction
@@ -183,7 +188,6 @@ async fn collect_report(
     url: &str,
     driven: &std::collections::BTreeSet<&str>,
     deadline: tokio::time::Instant,
-    quiet: bool,
 ) -> Result<String, i32> {
     loop {
         let body = match http.get(url).send().await {
@@ -220,21 +224,43 @@ async fn collect_report(
         // Counted from the body each time rather than from a parsed copy kept
         // across iterations, so a malformed report fails in one place: the
         // caller's own parse.
-        let outstanding = serde_json::from_str::<Report>(&body).map_or(0, |r| {
-            r.results
+        //
+        // Two ways a verdict is still on its way: a test with none yet, and a
+        // test with a connection the server is still observing. The second is
+        // what a retry looks like -- the test already carries the first
+        // attempt's verdict, and reading the report then returned that one.
+        let (unrun, observing) = serde_json::from_str::<Report>(&body).map_or((0, 0), |r| {
+            let unrun = r
+                .results
                 .iter()
                 .filter(|row| row.verdict == "not_run" && driven.contains(row.id.as_str()))
-                .count()
+                .count();
+            let observing = r
+                .in_flight
+                .iter()
+                .filter(|id| driven.contains(id.as_str()))
+                .count();
+            (unrun, observing)
         });
 
-        if outstanding == 0 || tokio::time::Instant::now() >= deadline {
-            if outstanding > 0 && !quiet {
-                // Said out loud rather than published in silence: a `not_run`
-                // that outlives the deadline is a verdict we stopped waiting
-                // for, and it must not read as "this client was never driven".
+        if unrun + observing == 0 || tokio::time::Instant::now() >= deadline {
+            // Said out loud rather than published in silence, and to stderr
+            // whatever the output mode, where the runner keeps it: a `not_run`
+            // that outlives the deadline is a verdict we stopped waiting for,
+            // and it must not read as "this client was never driven". With
+            // `--json` this used to be suppressed, so the matrix log never
+            // said why a cell was empty.
+            if unrun > 0 {
                 eprintln!(
-                    "warning: {outstanding} test(s) still had no verdict after {}s; \
+                    "warning: {unrun} test(s) still had no verdict after {}s; \
                      they are reported as not run",
+                    SETTLE_DEADLINE.as_secs()
+                );
+            }
+            if observing > 0 {
+                eprintln!(
+                    "warning: {observing} test(s) were still being observed after {}s; \
+                     their verdicts are the ones recorded by then",
                     SETTLE_DEADLINE.as_secs()
                 );
             }
@@ -345,7 +371,7 @@ async fn run(args: &Args) -> i32 {
     let driven: std::collections::BTreeSet<&str> = selected.iter().map(|t| t.id.as_str()).collect();
     let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
 
-    let mut body = match collect_report(&http, &url, &driven, deadline, args.json).await {
+    let mut body = match collect_report(&http, &url, &driven, deadline).await {
         Ok(body) => body,
         Err(code) => return code,
     };
@@ -426,7 +452,7 @@ async fn retry_inconclusive(
             drive(args, http, target, test, i + 1, again.len()).await;
         }
         let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
-        body = collect_report(http, url, driven, deadline, args.json).await?;
+        body = collect_report(http, url, driven, deadline).await?;
     }
     Ok(body)
 }
