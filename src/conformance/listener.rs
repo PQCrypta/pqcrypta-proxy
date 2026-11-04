@@ -2142,14 +2142,23 @@ async fn abandon_and_watch(
     let before_abandon = counters.datagrams_in();
     let resets_before = endpoint.stateless_resets_sent();
 
-    // Abandoned, then a PING the peer must acknowledge, sent once the
-    // endpoint has provably forgotten the connection -- so the peer is never
-    // all square when the endpoint forgets it, and its answer always meets a
-    // forgotten connection. Scored runs on 2026-09-25 read "0 datagram(s)
-    // arrived" (the body fully acknowledged before `abandon()` discarded the
-    // send queue) and, with the PING sent first, "1 datagram arrived" with no
-    // reset (the acknowledgement beat the endpoint's forget).
-    connection.abandon_after_ping();
+    // Abandoned, then a probe the peer must answer, sent once the endpoint
+    // has provably forgotten the connection -- so the peer is never all square
+    // when the endpoint forgets it, and its answer always meets a forgotten
+    // connection. Scored runs on 2026-09-25 read "0 datagram(s) arrived" (the
+    // body fully acknowledged before `abandon()` discarded the send queue)
+    // and, with the probe sent first, "1 datagram arrived" with no reset (the
+    // answer beat the endpoint's forget).
+    //
+    // The probe is a PATH_CHALLENGE, not the PING it was, so that the silence
+    // judged below means something. A PING's answer is an ACK, which nothing
+    // retransmits: a client that missed the reset had nothing in flight and
+    // went quiet exactly like one that recognised it. xquic passed that way
+    // while its own log showed the connection still established and closing
+    // on its idle timer 13 s later (2026-11-04). The PATH_RESPONSE a challenge
+    // draws is ack-eliciting, so a client the reset did not stop keeps probing
+    // for its acknowledgement into the silence window.
+    connection.abandon_after_probe();
 
     // Wait for the peer to say something, and watch rather than guess when.
     //
@@ -2212,9 +2221,10 @@ async fn abandon_and_watch(
     if after == 0 {
         Observation::Signalled(format!(
             "was sent a Stateless Reset and went quiet — nothing further arrived in the {} \
-             seconds that followed, which is the draining period §10.3.1 requires \
-             ({crossing} datagram(s) were already in flight when the reset went out and are \
-             not counted against it)",
+             seconds that followed, though the PATH_RESPONSE it had just sent was never \
+             acknowledged and a client the reset had not stopped would have kept probing for \
+             it. That is the draining period §10.3.1 requires ({crossing} datagram(s) were \
+             already in flight when the reset went out and are not counted against it)",
             SILENCE.as_secs()
         ))
     } else {
