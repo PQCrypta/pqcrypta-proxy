@@ -850,9 +850,10 @@ pub const CATALOG: &[Test] = &[
         expectation:
             "Handle it as an error against that one request, not the whole connection.\n\n\
                       The section is sized one octet past the SETTINGS_MAX_FIELD_SECTION_SIZE \
-                      the client advertised. A client that advertises none accepts any size \
-                      (RFC 9114 §4.2.2) and has no maximum to exceed, so it cannot be tested \
-                      on this.",
+                      the client advertised, and the body is held back for a second after it, \
+                      so a client refusing the section still has an unfinished stream to stop. \
+                      A client that advertises none accepts any size (RFC 9114 §4.2.2) and has \
+                      no maximum to exceed, so it cannot be tested on this.",
         implemented: true,
         port_offset: Some(22),
     },

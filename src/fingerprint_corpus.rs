@@ -765,7 +765,7 @@ mod tests {
         );
         assert_eq!(e.ja3_samples[0].ja3_string, "771,4865-4866");
         // From a directory before the spec fix: not taken as verified
-        let mut old = dir.clone();
+        let mut old = dir;
         old["generated_at"] = serde_json::json!("2026-09-30T06:00:00+00:00");
         assert!(!parse(old.to_string().as_bytes()).expect("parses")[0].ja4_verified);
     }
