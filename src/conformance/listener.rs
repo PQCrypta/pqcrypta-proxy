@@ -1427,6 +1427,27 @@ async fn run_one(
         observation
     };
 
+    // A field section past the client's own maximum, refused on the request
+    // stream: the answer h-oversized-field-section asks for, an error against
+    // that one request. quic-go (v0.65) cancels the request stream in both
+    // directions with H3_FRAME_ERROR as soon as a HEADERS frame's length is
+    // past its limit, and keeps the connection; the listener looked at
+    // stream-level signals only for QPACK failures, so that read as silence --
+    // PeerUnreachable when the probe that followed drew nothing back.
+    let observation = if test.id == "h-oversized-field-section" {
+        oversized_section_answer(
+            observation,
+            connection
+                .last_stop_sending()
+                .filter(|(id, _)| {
+                    id.initiator() == quinn_proto::Side::Client && id.dir() == quinn_proto::Dir::Bi
+                })
+                .map(|(_, code)| u64::from(code)),
+        )
+    } else {
+        observation
+    };
+
     // The client's own stream limit kept the anomaly off the wire, so whatever
     // happened afterwards says nothing about how it treats one.
     let observation = match undeliverable {
@@ -2667,6 +2688,32 @@ pub(super) async fn emit(
         control_is_late: test.id == GOAWAY_AFTER_REQUEST,
         undeliverable,
     })
+}
+
+/// What a client's STOP_SENDING on the request stream, `stopped_with`, says of
+/// how it took a field section past its own advertised maximum.
+///
+/// It refused the section on that request, which is what the test asks for,
+/// whatever was or was not seen of the connection afterwards: the follow-up
+/// completing, the peer going quiet, or it going away before a probe drew an
+/// answer. Only a connection closed over the section is a different answer,
+/// the failure itself, and what was not exercised or not supported stays so.
+fn oversized_section_answer(observation: Observation, stopped_with: Option<u64>) -> Observation {
+    match (observation, stopped_with) {
+        (
+            Observation::SurvivedAndContinued
+            | Observation::NoCloseObserved
+            | Observation::PeerUnreachable
+            | Observation::ClosedSilently
+            | Observation::TimedOut,
+            Some(code),
+        ) => Observation::Signalled(format!(
+            "stopped the request stream with 0x{code:x}, refusing the field section past its \
+             own advertised maximum as an error against that one request, and kept the \
+             connection open"
+        )),
+        (observation, _) => observation,
+    }
 }
 
 /// The largest field section `h-oversized-field-section` sends: a client that
@@ -5094,6 +5141,41 @@ mod tests {
 
     fn test(id: &str) -> &'static Test {
         catalog::find(id).expect("catalogue entry")
+    }
+
+    /// A client that stops the request stream refused the oversized section
+    /// as an error against that request -- a pass, however the connection
+    /// looked afterwards -- and one that closed the connection did not; with
+    /// no STOP_SENDING nothing changes.
+    #[test]
+    fn a_stopped_request_stream_is_the_refusal_the_oversized_test_asks_for() {
+        let t = test("h-oversized-field-section");
+        for silent in [
+            Observation::PeerUnreachable,
+            Observation::NoCloseObserved,
+            Observation::SurvivedAndContinued,
+            Observation::ClosedSilently,
+            Observation::TimedOut,
+        ] {
+            let answer = oversized_section_answer(silent.clone(), Some(0x106));
+            assert!(
+                matches!(&answer, Observation::Signalled(what) if what.contains("0x106")),
+                "{silent:?} with STOP_SENDING: {answer:?}"
+            );
+            let (verdict, _) = super::super::session::judge(t, &answer, None);
+            assert_eq!(verdict, super::super::session::Verdict::Pass, "{silent:?}");
+            assert_eq!(oversized_section_answer(silent.clone(), None), silent);
+        }
+        let closed = Observation::ClosedWith { code: 0x200 };
+        assert_eq!(
+            oversized_section_answer(closed.clone(), Some(0x106)),
+            closed
+        );
+        let skipped = Observation::NotExercised("past the cap".into());
+        assert_eq!(
+            oversized_section_answer(skipped.clone(), Some(0x106)),
+            skipped
+        );
     }
 
     fn closed_with(code: quinn_proto::TransportErrorCode) -> quinn::ConnectionError {
