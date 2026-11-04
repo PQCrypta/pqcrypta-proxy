@@ -507,6 +507,48 @@ fn stop_stream() {
     );
 }
 
+/// A queued STOP_SENDING, then one in flight, leave the connection unsettled;
+/// once it is acknowledged, a close discards nothing.
+#[test]
+fn settled_only_once_a_stop_sending_is_acknowledged() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+
+    let s = pair.client_streams(client_ch).open(Dir::Bi).unwrap();
+    pair.client_send(client_ch, s).write(b"hello").unwrap();
+    pair.drive();
+    assert!(pair.client_conn_mut(client_ch).is_settled());
+    assert!(pair.server_conn_mut(server_ch).is_settled());
+
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::Stream(StreamEvent::Opened { dir: Dir::Bi }))
+    );
+    assert_matches!(pair.server_streams(server_ch).accept(Dir::Bi), Some(stream) if stream == s);
+    pair.server_recv(server_ch, s).stop(VarInt(0x10c)).unwrap();
+    assert!(
+        !pair.server_conn_mut(server_ch).is_settled(),
+        "the STOP_SENDING is queued"
+    );
+
+    pair.drive_server();
+    assert!(
+        !pair.server_conn_mut(server_ch).is_settled(),
+        "the STOP_SENDING is in flight"
+    );
+
+    pair.drive();
+    assert!(
+        pair.server_conn_mut(server_ch).is_settled(),
+        "the STOP_SENDING is acknowledged"
+    );
+    assert_matches!(
+        pair.client_send(client_ch, s).write(b"more"),
+        Err(WriteError::Stopped(code)) if code == VarInt(0x10c)
+    );
+}
+
 #[test]
 fn reject_self_signed_server_cert() {
     let _guard = subscribe();

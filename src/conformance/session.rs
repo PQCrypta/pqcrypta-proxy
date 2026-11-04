@@ -1037,6 +1037,21 @@ impl Evidence {
         )
     }
 
+    /// Whether this connection showed how it ended.
+    ///
+    /// `PeerUnreachable` is informative -- a probe that drew nothing at all is
+    /// a finding -- but it shows nothing of the ending: nobody could be shown
+    /// to be listening. That is the shape of a connection the client process
+    /// abandoned by exiting, and a client that retries opens one. .NET's
+    /// HttpClient over msquic closes the connection with
+    /// QPACK_DECOMPRESSION_FAILED on `h-oversized-field-section`, retries the
+    /// request on a second connection, and exits under it; the second
+    /// replaced the close, and the cell read inconclusive in two runs of
+    /// three and fail in the third (2026-11-04).
+    pub fn shows_an_ending(&self) -> bool {
+        self.informative() && !matches!(self.observation, Observation::PeerUnreachable)
+    }
+
     /// Whether early data from this connection reached the endpoint, by the
     /// count taken off the wire for this connection alone.
     ///
@@ -1230,6 +1245,24 @@ impl Session {
                     tracing::info!(
                         "conformance: {} keeping the connection whose early data arrived, \
                          rather than a later one that sent none",
+                        test.id
+                    );
+                    return;
+                }
+            }
+        }
+        // Nor one whose ending was seen by a later one whose ending was not --
+        // except on the 0-RTT ports, where the connection carrying early data
+        // is the measurement however it ended, and the one before it only
+        // fetched the ticket.
+        let zero_rtt_measurement =
+            matches!(test.id, "q-zero-rtt-reject" | "q-zero-rtt-replay") && ev.met_early_data();
+        if !ev.shows_an_ending() && !zero_rtt_measurement {
+            if let Some(existing) = self.evidence.get(test.id) {
+                if existing.shows_an_ending() {
+                    tracing::info!(
+                        "conformance: {} keeping the connection whose ending was seen, rather \
+                         than a later one the probe could not reach",
                         test.id
                     );
                     return;
@@ -1784,6 +1817,59 @@ mod tests {
             s.evidence[t.id].observation,
             Observation::SurvivedAndContinued
         ));
+    }
+
+    /// A client that closes one connection over the anomaly, retries on
+    /// another and exits under it has answered on the first: the second,
+    /// which the probe could not reach, does not replace it. A later ending
+    /// that was seen still does.
+    #[test]
+    fn an_unreachable_retry_does_not_replace_a_close_that_was_seen() {
+        let t = catalog::find("h-oversized-field-section").expect("the test exists");
+        let mut s = Session::new("s".into());
+        s.record_evidence(
+            t,
+            ev(Observation::ClosedWith { code: 0x200 }, 98, Some(105), None),
+        );
+        s.record_evidence(t, ev(Observation::PeerUnreachable, 95, Some(101), None));
+        assert_eq!(
+            s.evidence[t.id].observation,
+            Observation::ClosedWith { code: 0x200 }
+        );
+        assert_eq!(score(t, &s.evidence[t.id]).0, Verdict::Fail);
+
+        let mut s = Session::new("s".into());
+        s.record_evidence(t, ev(Observation::PeerUnreachable, 95, Some(101), None));
+        s.record_evidence(
+            t,
+            ev(Observation::ClosedWith { code: 0x200 }, 98, Some(105), None),
+        );
+        assert_eq!(
+            s.evidence[t.id].observation,
+            Observation::ClosedWith { code: 0x200 },
+            "a seen ending replaces one that was not"
+        );
+        s.record_evidence(t, ev(Observation::ClosedSilently, 98, Some(105), None));
+        assert_eq!(
+            s.evidence[t.id].observation,
+            Observation::ClosedSilently,
+            "one seen ending replaces another, as before"
+        );
+    }
+
+    /// On the 0-RTT ports the connection carrying early data is the
+    /// measurement, however its ending went: it still replaces the connection
+    /// that only fetched the ticket.
+    #[test]
+    fn early_data_that_went_unanswered_still_replaces_the_ticket_fetch() {
+        let t = catalog::find("q-zero-rtt-reject").expect("the test exists");
+        let mut s = Session::new("s".into());
+        s.record_evidence(t, ev(Observation::SurvivedAndContinued, 1, Some(1), None));
+        let mut resumed = ev(Observation::PeerUnreachable, 1, Some(1), None);
+        resumed.zero_rtt_datagrams_in = 3;
+        s.record_evidence(t, resumed);
+        assert_eq!(s.evidence[t.id].zero_rtt_datagrams_in, 3);
+        assert_eq!(s.evidence[t.id].observation, Observation::PeerUnreachable);
     }
 
     /// A ticket counts only if the exchange that delivered it finished before

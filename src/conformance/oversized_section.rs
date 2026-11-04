@@ -138,6 +138,7 @@ fn headers_frame_len(stream: &[u8]) -> Option<usize> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_enforcing_its_limit_stops_the_held_response() {
     let served = serve(async |connection| {
+        let watch = connection.clone();
         let (mut driver, mut send_request) = h3::client::builder()
             .max_field_section_size(LIMIT)
             .build::<_, _, bytes::Bytes>(h3_quinn::Connection::new(connection))
@@ -159,8 +160,14 @@ async fn a_client_enforcing_its_limit_stops_the_held_response() {
             matches!(refused, Err(h3::error::StreamError::HeaderTooBig { max_size, .. }) if max_size == LIMIT),
             "{refused:?}"
         );
-        // The refusal on the wire before the connection goes.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // As h3-get does: dropping the last request handle closes the
+        // connection, and a close discards the queued STOP_SENDING, so the
+        // refusal has to be sent and acknowledged first.
+        let until = Instant::now() + Duration::from_secs(2);
+        while !watch.is_settled() && Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(watch.is_settled(), "the refusal was sent and acknowledged");
         drop(stream);
         drop(send_request);
         let _ = tokio::time::timeout(Duration::from_secs(2), driving).await;
