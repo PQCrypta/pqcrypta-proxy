@@ -2672,7 +2672,13 @@ pub(super) async fn emit(
 /// The largest field section `h-oversized-field-section` sends: a client that
 /// advertises this much or more is recorded as not reached rather than sent a
 /// section of that size.
-const MAX_OVERSIZED_SECTION: u64 = 4 * 1024 * 1024;
+///
+/// Past every limit a client in the matrix advertises: it was 4 MiB, and
+/// quic-go, which advertises 10 MiB and enforces it since the QPACK fix FoxIO
+/// prompted (v0.57), was the one client recorded as not reached -- the client
+/// this test most needed to reach. The clients run on the suite's own host, so
+/// sixteen mebibytes cost a fraction of a second.
+const MAX_OVERSIZED_SECTION: u64 = 16 * 1024 * 1024;
 
 /// The largest value a QUIC varint carries (RFC 9000 §16), which as a field
 /// section limit is no limit
