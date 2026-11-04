@@ -345,7 +345,11 @@ const DRAIN: Duration = Duration::from_secs(2);
 /// acknowledged, or resent once if lost, and short on a path that has stopped
 /// answering.
 async fn settle(connection: &quinn::Connection) {
-    let bound = (connection.rtt() * 3 + Duration::from_millis(50)).min(DRAIN);
+    // This client opens no path but the first.
+    let rtt = connection
+        .rtt(quinn::PathId::ZERO)
+        .unwrap_or(Duration::from_millis(100));
+    let bound = (rtt * 3 + Duration::from_millis(50)).min(DRAIN);
     let until = tokio::time::Instant::now() + bound;
     while !connection.is_settled() && tokio::time::Instant::now() < until {
         tokio::time::sleep(Duration::from_millis(2)).await;
