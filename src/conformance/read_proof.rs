@@ -269,6 +269,139 @@ async fn probe_with_busy_request_stream() -> Option<bool> {
     outcome
 }
 
+/// Run the probe against a client that reads its control stream slowly, and
+/// return everything the client read from it after the prelude.
+///
+/// Slowly enough that the fill waits on credit mid-frame for many of the
+/// probe's 10 ms ticks: the case where a write raced against the tick could be
+/// abandoned half done.
+async fn bytes_read_by_a_slow_reader() -> Vec<u8> {
+    let _ = rustls::crypto::CryptoProvider::install_default(crate::tls::build_pqc_provider());
+    let throwaway = throwaway_cert();
+    let counters = Arc::new(Counters::default());
+
+    let mut server_config = quinn::ServerConfig::with_crypto(server_crypto(&throwaway));
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(
+        Duration::from_secs(10)
+            .try_into()
+            .expect("10s is a valid idle timeout"),
+    ));
+    server_config.transport = Arc::new(transport);
+
+    let socket = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("binding a loopback port");
+    let runtime = quinn::default_runtime().expect("a tokio runtime is running");
+    let impaired = Box::new(ImpairedSocket::new(
+        runtime
+            .wrap_udp_socket(socket)
+            .expect("wrapping the socket"),
+        Impairments::default(),
+        counters,
+    ));
+    let server = quinn::Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        impaired,
+        runtime,
+    )
+    .expect("building the server endpoint");
+    let addr = server.local_addr().expect("the server is bound");
+
+    let server_side = tokio::spawn(async move {
+        let incoming = server.accept().await.expect("a connection arrives");
+        let connection = incoming.await.expect("the handshake completes");
+        let mut control = connection
+            .open_uni()
+            .await
+            .expect("opening the control stream");
+        control
+            .write_all(PRELUDE)
+            .await
+            .expect("writing a SETTINGS-shaped prelude");
+        let verdict =
+            control_stream_was_read("framing-self-test", "self-test", &connection, &mut control)
+                .await;
+        // Held until the client has read what it is going to: dropping the
+        // stream finishes it.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        drop(control);
+        verdict
+    });
+
+    let client = client_endpoint(&throwaway);
+    let connection = client
+        .connect(addr, "conformance.test")
+        .expect("starting the connection")
+        .await
+        .expect("the handshake completes");
+
+    let reading = connection.clone();
+    let reader = tokio::spawn(async move {
+        let mut recv = reading
+            .accept_uni()
+            .await
+            .expect("the control stream arrives");
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 4 * 1024];
+        while let Ok(Ok(Some(n))) =
+            tokio::time::timeout(Duration::from_secs(2), recv.read(&mut buf)).await
+        {
+            got.extend_from_slice(&buf[..n]);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        got
+    });
+
+    let verdict = server_side.await.expect("the probe task finishes");
+    assert_eq!(
+        verdict,
+        Some(true),
+        "a client that reads, however slowly, reads"
+    );
+    let got = reader.await.expect("the reader finishes");
+    drop(connection);
+    client.wait_idle().await;
+    assert!(got.starts_with(PRELUDE), "the prelude arrives first");
+    got[PRELUDE.len()..].to_vec()
+}
+
+/// What the stand-in control streams open with.
+const PRELUDE: &[u8] = b"\x00\x04\x00";
+
+/// The padding has to be padding: frames of a reserved type, each whole.
+///
+/// A frame cut short and followed by a fresh one reads, to the client, as a
+/// frame whose payload runs on into the next -- and then as whatever frame
+/// header it lands on in the zeros after. That was a DATA frame on the control
+/// stream, which a client must reject with H3_FRAME_UNEXPECTED, and quic-go
+/// did, at the port where that is the required answer to a different anomaly
+/// (2026-11-04).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_padding_arrives_as_whole_reserved_frames() {
+    let padding = bytes_read_by_a_slow_reader().await;
+    let reserved = super::h3_frames::reserved_value(0x1f);
+    let mut rest = &padding[..];
+    let mut frames = 0;
+    while !rest.is_empty() {
+        let (ty, a) = super::h3_frames::read_varint(rest).expect("a frame type");
+        assert_eq!(
+            ty, reserved,
+            "frame {frames} is of type 0x{ty:x}: the padding stopped being padding"
+        );
+        let (len, b) = super::h3_frames::read_varint(&rest[a..]).expect("a frame length");
+        let end = a + b + usize::try_from(len).expect("fits");
+        assert!(
+            end <= rest.len(),
+            "frame {frames} was cut off: {} of its {end} bytes arrived",
+            rest.len()
+        );
+        rest = &rest[end..];
+        frames += 1;
+    }
+    assert!(frames >= 1, "the probe wrote padding at all");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn credit_granted_on_another_stream_is_not_read_as_a_control_stream_read() {
     assert_eq!(

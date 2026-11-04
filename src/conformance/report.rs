@@ -66,6 +66,9 @@ pub struct Report {
     /// and how many connections had been recorded by then.
     pub collected_at_ms: u64,
     pub connections_recorded: u64,
+    /// Tests with a connection still being observed: their verdicts can still
+    /// change, a retry's included.
+    pub in_flight: Vec<&'static str>,
     pub catalog_size: usize,
     pub by_class: BTreeMap<String, ClassSummary>,
     pub totals: ClassSummary,
@@ -153,6 +156,7 @@ pub fn build(session_id: &str, snap: &session::Snapshot, generated_at: String) -
         snapshot_id: format!("{session_id}#{}", snap.seq),
         collected_at_ms: snap.collected_at_ms,
         connections_recorded: snap.connections_recorded,
+        in_flight: snap.in_flight.clone(),
         catalog_size: catalog::CATALOG.len(),
         by_class,
         totals,

@@ -881,6 +881,37 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
 pub fn score(test: &'static Test, ev: &Evidence) -> (Verdict, String, Option<&'static str>) {
     let (verdict, detail) = judge(test, &ev.observation, ev.expected_code);
 
+    // Valid HTTP/3 the client had to process, a pass that rests on nothing
+    // having been said, and the client's own account that the request failed.
+    //
+    // The wire cannot tell these apart from a decoded response: a client that
+    // fails a request whose every byte has arrived has no stream left to stop,
+    // and need not close the connection over it. Its process is the one
+    // witness, and on these tests a failure has no correct reading -- unlike
+    // the reset-stream tests, where a client that handles the reset right still
+    // cannot finish (see `ORACLE_VERSION`).
+    if test.class == Class::Interoperability
+        && verdict == Verdict::Pass
+        && matches!(
+            ev.observation,
+            Observation::NoCloseObserved | Observation::PeerUnreachable
+        )
+    {
+        if let Some(status) = ev.exit_status.filter(|&s| s != 0) {
+            return (
+                Verdict::Inconclusive,
+                format!(
+                    "Nothing on the wire objected to the response, and the client process then \
+                     reported the request as failed (exit status {status}). A client that \
+                     decodes this completes its request, so the silence is no evidence it \
+                     did: whether it refused the response without signalling or failed for a \
+                     reason of its own is not shown."
+                ),
+                Some("client_reported_failure"),
+            );
+        }
+    }
+
     // Only a verdict resting on an absence can be affected: the others were
     // reached from something the client did.
     let rests_on_absence = matches!(
@@ -1000,9 +1031,10 @@ pub struct Evidence {
     /// The client process's exit status, where the driver reported one (none
     /// when a signal ended it, or from a driver that predates it).
     ///
-    /// Recorded, not judged: statuses mean different things per client (see
-    /// `ORACLE_VERSION`), so no verdict reads it. It is here so that a reader
-    /// of a cell -- or a later oracle -- can see how the process ended.
+    /// Recorded everywhere and judged in one place: statuses mean different
+    /// things per client, except where the request had to succeed (see
+    /// `ORACLE_VERSION`). It is here so that a reader of a cell -- or a later
+    /// oracle -- can see how the process ended.
     #[serde(default)]
     pub exit_status: Option<i32>,
     /// Which connection within the session produced this, and when it was
@@ -1072,9 +1104,18 @@ impl Evidence {
 /// (2026-09-25) and withdrawn: exit statuses mean different things per client.
 /// Chromium's wrapper exits 1 on tests it passes, and curl (18), quiche (254)
 /// and lsquic (2) exit non-zero when a reset stream correctly ends the request,
-/// so it turned ten correct passes inconclusive. The status is recorded in the
-/// evidence; no rule reads it.
-pub const ORACLE_VERSION: &str = "reaction-opportunity/2";
+/// so it turned ten correct passes inconclusive.
+///
+/// `/4` reads the status in one place, and what `/3` got wrong was its reach
+/// rather than the reading. Every pass it overturned was on a test whose right
+/// outcome ends the request, or one judged on something the client did. On
+/// the interoperability tests nothing should end the request -- the response
+/// is valid HTTP/3 the client must process -- and their pass rests on silence,
+/// so a client reporting that its request failed contradicts the one thing
+/// that pass assumes. Chromium, on trailers, decoded the trailing section,
+/// failed the body read with ERR_CONNECTION_CLOSED and never loaded the page;
+/// its cell read "Decoded it and completed the request" (2026-11-04).
+pub const ORACLE_VERSION: &str = "reaction-opportunity/4";
 
 /// One client's walk through the catalogue.
 pub struct Session {
@@ -1124,6 +1165,19 @@ pub struct Session {
     /// the damaging one in [`Registry::associate`], where a run still being
     /// driven has its connections taken.
     reported: bool,
+    /// Connections filed under this session whose evidence is not recorded
+    /// yet, by a number each was given when it was filed, with their test.
+    ///
+    /// A verdict lands when the observation ends, seconds after the client
+    /// has gone: the settle window, the PING that asks for a lost close. The
+    /// driver used to wait only for tests still reading `not_run`, and a test
+    /// it drove a second time already had the first attempt's verdict -- so
+    /// the report was read before the retry's evidence arrived, and every
+    /// retry slower than a close was driven for nothing. msquic's
+    /// `h-oversized-field-section` was retried in each run that needed it,
+    /// and the inconclusive it was retried for is what went out (2026-11-04).
+    in_flight: HashMap<u64, &'static str>,
+    filed: u64,
 }
 
 impl Session {
@@ -1138,7 +1192,32 @@ impl Session {
             first_exchange_completed: HashMap::new(),
             snapshots: 0,
             reported: false,
+            in_flight: HashMap::new(),
+            filed: 0,
         }
+    }
+
+    /// File a connection on `test`'s port under this session, until its
+    /// evidence is recorded; returns the number [`settled`](Self::settled)
+    /// takes.
+    pub fn filed(&mut self, test: &'static Test) -> u64 {
+        self.filed += 1;
+        self.in_flight.insert(self.filed, test.id);
+        self.filed
+    }
+
+    /// The connection filed as `n` has recorded its evidence, or ended without
+    /// any. Settling one twice is harmless.
+    pub fn settled(&mut self, n: u64) {
+        self.in_flight.remove(&n);
+    }
+
+    /// The tests with a connection whose evidence has not landed yet.
+    pub fn in_flight(&self) -> Vec<&'static str> {
+        let mut tests: Vec<&'static str> = self.in_flight.values().copied().collect();
+        tests.sort_unstable();
+        tests.dedup();
+        tests
     }
 
     /// Note that a connection on `test`'s port completed its exchange at `at`.
@@ -1337,6 +1416,7 @@ impl Session {
                 .try_into()
                 .unwrap_or(u64::MAX),
             connections_recorded: self.recorded,
+            in_flight: self.in_flight(),
             results: self.results(),
         }
     }
@@ -1358,6 +1438,10 @@ pub struct Snapshot {
     /// in the reading, which is the check that distinguishes a stale report
     /// from a disagreeing one.
     pub connections_recorded: u64,
+    /// The tests with a connection still being observed when it was taken:
+    /// verdicts on their way, which a reader waiting for a run to finish
+    /// should wait for.
+    pub in_flight: Vec<&'static str>,
     pub results: Vec<Result_>,
 }
 
@@ -1591,18 +1675,89 @@ mod tests {
         }
     }
 
-    /// The exit status is evidence, not a rule. A client that handles a reset
-    /// response stream correctly still cannot finish its request, and exits
-    /// non-zero for it (curl 18, quiche 254, lsquic 2); scoring that as
-    /// anything but the pass it is would accuse every correct client.
+    /// A test is in flight while any connection filed under it is, and
+    /// settling is idempotent, so a guard dropped after its evidence was
+    /// recorded changes nothing.
     #[test]
-    fn the_exit_status_changes_no_verdict() {
-        let t = test_of("h-trailers");
-        let mut e = ev(Observation::PeerUnreachable, 5, Some(5), Some(50));
-        let without = score(t, &e);
-        for status in [Some(0), Some(1), Some(2), Some(254), None] {
-            e.exit_status = status;
-            assert_eq!(score(t, &e), without, "exit status {status:?}");
+    fn a_verdict_is_in_flight_until_every_connection_for_it_settles() {
+        let mut s = Session::new("in-flight".to_string());
+        let trailers = test_of("h-trailers");
+        let retry = test_of("q-retry");
+        assert_eq!(s.snapshot().in_flight, Vec::<&str>::new());
+
+        let first = s.filed(trailers);
+        let second = s.filed(trailers);
+        let other = s.filed(retry);
+        assert_eq!(s.snapshot().in_flight, vec!["h-trailers", "q-retry"]);
+
+        s.settled(first);
+        s.settled(other);
+        s.settled(other);
+        assert_eq!(
+            s.snapshot().in_flight,
+            vec!["h-trailers"],
+            "one connection still owes it"
+        );
+
+        s.settled(second);
+        assert_eq!(s.snapshot().in_flight, Vec::<&str>::new());
+    }
+
+    /// Where a correct client cannot finish its request, the exit status is
+    /// evidence, not a rule. A client that handles a reset response stream
+    /// correctly exits non-zero for it (curl 18, quiche 254, lsquic 2); scoring
+    /// that as anything but what the wire showed would accuse every correct
+    /// client.
+    #[test]
+    fn the_exit_status_changes_no_verdict_where_the_request_may_fail() {
+        for id in ["h-response-stream-reset", "h-early-hints", "h-max-push-id"] {
+            let t = test_of(id);
+            for obs in [Observation::PeerUnreachable, Observation::NoCloseObserved] {
+                let mut e = ev(obs.clone(), 5, Some(5), Some(50));
+                let without = score(t, &e);
+                for status in [Some(0), Some(1), Some(2), Some(254), None] {
+                    e.exit_status = status;
+                    assert_eq!(score(t, &e), without, "{id} {obs:?} exit status {status:?}");
+                }
+            }
+        }
+    }
+
+    /// On valid HTTP/3 the client had to process, a silence-pass does not
+    /// survive the client's own report that the request failed: Chromium
+    /// decoded the trailers, failed the body read and timed out, and was
+    /// credited with completing the request (2026-11-04).
+    #[test]
+    fn a_failed_request_withholds_the_silence_pass_on_valid_http3() {
+        for id in ["h-trailers", "h-qpack-huffman", "q-key-update"] {
+            let t = test_of(id);
+            for obs in [Observation::PeerUnreachable, Observation::NoCloseObserved] {
+                let mut e = ev(obs.clone(), 5, Some(5), Some(50));
+                e.exit_status = Some(0);
+                assert_eq!(score(t, &e).0, Verdict::Pass, "{id} {obs:?} exiting 0");
+                e.exit_status = None;
+                assert_eq!(score(t, &e).0, Verdict::Pass, "{id} {obs:?}, no status");
+                for status in [1, 2, 254] {
+                    e.exit_status = Some(status);
+                    let (verdict, detail, reason) = score(t, &e);
+                    assert_eq!(verdict, Verdict::Inconclusive, "{id} {obs:?} exit {status}");
+                    assert_eq!(reason, Some("client_reported_failure"));
+                    assert!(
+                        detail.contains(&format!("exit status {status}")),
+                        "{detail}"
+                    );
+                }
+            }
+            // What the client did say still decides.
+            let mut closed = ev(Observation::ClosedSilently, 5, Some(5), Some(50));
+            closed.exit_status = Some(1);
+            let mut clean = closed.clone();
+            clean.exit_status = Some(0);
+            assert_eq!(
+                score(t, &closed),
+                score(t, &clean),
+                "{id}: a close was seen"
+            );
         }
     }
 

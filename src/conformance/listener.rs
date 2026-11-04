@@ -561,6 +561,8 @@ impl TestListener {
             ));
         }
 
+        let retries = Arc::new(RetriesOutstanding::default());
+
         while let Some(incoming) = self.endpoint.accept().await {
             let test = self.test;
             let conformance = self.conformance.clone();
@@ -575,14 +577,29 @@ impl TestListener {
             // token, and that second Incoming arrives already validated and is
             // handled normally. Every other test wants an ordinary handshake so
             // whatever the client does is attributable to the anomaly.
-            if test.id == "q-retry" && !incoming.remote_address_validated() {
-                if let Err(e) = incoming.retry() {
-                    // retry() consumes the Incoming even when it fails, so
-                    // there is nothing left to accept; the client will try
-                    // again on its own.
-                    debug!("conformance: q-retry could not send Retry: {e}");
+            if test.id == "q-retry" {
+                let peer = incoming.remote_address();
+                if incoming.remote_address_validated() {
+                    retries.answered(peer);
+                } else {
+                    match incoming.retry() {
+                        Ok(()) => {
+                            let n = retries.sent(peer);
+                            tokio::spawn(watch_retry_answered(
+                                test,
+                                conformance,
+                                retries.clone(),
+                                peer,
+                                n,
+                            ));
+                        }
+                        // retry() consumes the Incoming even when it fails, so
+                        // there is nothing left to accept; the client will try
+                        // again on its own.
+                        Err(e) => debug!("conformance: q-retry could not send Retry: {e}"),
+                    }
+                    continue;
                 }
-                continue;
             }
 
             tokio::spawn(async move {
@@ -597,6 +614,118 @@ impl TestListener {
             });
         }
     }
+}
+
+/// How long a client has, once sent a Retry, to come back with its token.
+///
+/// §8.1.2 has the client answer at once, with the Initial it had already
+/// built; even a client that lost the Retry and is retransmitting on its own
+/// timer is back with the token well inside this.
+const RETRY_ANSWER_WAIT: Duration = Duration::from_secs(3);
+
+/// The Retries `q-retry` has sent that no token-bearing Initial has answered
+/// yet, by the address each went to.
+///
+/// Numbered, because a client whose first flight spans two datagrams can be
+/// sent a second Retry before it has read the first; only the latest one to an
+/// address can still be answered, so only its watcher may conclude anything.
+#[derive(Default)]
+struct RetriesOutstanding {
+    by_peer: std::sync::Mutex<std::collections::HashMap<SocketAddr, u64>>,
+    sent: std::sync::atomic::AtomicU64,
+}
+
+impl RetriesOutstanding {
+    /// Note a Retry sent to `peer`, and return its number.
+    fn sent(&self, peer: SocketAddr) -> u64 {
+        let n = self.sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        self.lock().insert(peer, n);
+        n
+    }
+
+    /// `peer` came back with a token: whatever happens next is the handshake's
+    /// to record.
+    fn answered(&self, peer: SocketAddr) {
+        self.lock().remove(&peer);
+    }
+
+    /// Whether Retry `n` to `peer` is still unanswered -- settling it, so it is
+    /// reported once.
+    fn abandoned(&self, peer: SocketAddr, n: u64) -> bool {
+        let mut by_peer = self.lock();
+        if by_peer.get(&peer) == Some(&n) {
+            by_peer.remove(&peer);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<SocketAddr, u64>> {
+        // Nothing held across the lock can panic, so a poisoned map is still a
+        // correct one.
+        self.by_peer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Record a Retry that was never answered.
+///
+/// Without this a client that gave up after the Retry left no evidence at
+/// all, and the cell read "Not attempted" -- the wording for a client that
+/// was never driven. lsquic does give up, once in about thirteen sessions:
+/// it chooses its first connection ID's length at random, the token carries
+/// that ID, and at eight bytes the Initial it rebuilds around the token trips
+/// its own repacking ("unexpected values resizing lost packet"), so it aborts
+/// with an internal error and sends nothing (2026-11-04). Fifteen of 189
+/// stored runs held that `not_run`.
+async fn watch_retry_answered(
+    test: &'static Test,
+    conformance: Arc<Conformance>,
+    retries: Arc<RetriesOutstanding>,
+    peer: SocketAddr,
+    n: u64,
+) {
+    tokio::time::sleep(RETRY_ANSWER_WAIT).await;
+    if !retries.abandoned(peer, n) {
+        return;
+    }
+    // The handshake never began, so there is no server name to file under:
+    // the address that started the session is the only handle.
+    let peer_ip = crate::security::canonical_addr(peer).ip();
+    let session_id = resolve_session(None, peer_ip, &conformance);
+    conformance.sessions.with(&session_id, |s| {
+        s.record_evidence(
+            test,
+            Evidence {
+                test_id: test.id.to_string(),
+                test_version: 1,
+                observation: Observation::Violated(format!(
+                    "abandoned the connection at the Retry: no Initial carrying its token \
+                     arrived in the {}s after it, where RFC 9000 §8.1.2 has a client answer a \
+                     Retry with one",
+                    RETRY_ANSWER_WAIT.as_secs()
+                )),
+                expected_code: None,
+                read_proof: None,
+                early_data_accepted: false,
+                zero_rtt_datagrams_in: 0,
+                // No connection followed, so the clock starts at the Retry.
+                t_anomaly_ms: 0,
+                t_exchange_completed_ms: None,
+                t_observation_end_ms: RETRY_ANSWER_WAIT.as_millis().try_into().unwrap_or(u64::MAX),
+                t_exit_ms: None,
+                exit_status: None,
+                connection_seq: 0,
+                recorded_at_ms: 0,
+            },
+        );
+    });
+    info!(
+        "conformance: {} session={session_id} Retry to {peer} was never answered",
+        test.id
+    );
 }
 
 /// Judge the version-negotiation test from the socket.
@@ -1010,6 +1139,9 @@ async fn run_one(
         };
 
     let session_id = resolve_session(sni.as_deref(), peer_ip, &conformance);
+    // Owed to the session from here until the evidence below is recorded, so
+    // the driver can wait for it rather than read the report around it.
+    let owed = Owed::file(&conformance, &session_id, test);
 
     // Held for the lifetime of this function, not just for the emit call.
     //
@@ -1503,6 +1635,8 @@ async fn run_one(
             },
         );
     });
+
+    drop(owed);
 
     info!(
         "conformance: {} session={} observed={:?} close_reason={:?}",
@@ -2332,6 +2466,37 @@ fn resolve_session(
         // session.
         .or_else(|| conformance.sessions.for_source(peer_ip))
         .unwrap_or_else(|| conformance.sessions.create())
+}
+
+/// A connection's verdict, owed to its session until it is recorded.
+///
+/// Dropped once the evidence is in, or with the connection if it ends before
+/// recording anything -- an error mid-test is that too, and a verdict that is
+/// never coming must not be waited for.
+struct Owed {
+    conformance: Arc<Conformance>,
+    session_id: String,
+    n: Option<u64>,
+}
+
+impl Owed {
+    fn file(conformance: &Arc<Conformance>, session_id: &str, test: &'static Test) -> Self {
+        Self {
+            conformance: conformance.clone(),
+            session_id: session_id.to_string(),
+            n: conformance.sessions.with(session_id, |s| s.filed(test)),
+        }
+    }
+}
+
+impl Drop for Owed {
+    fn drop(&mut self) {
+        if let Some(n) = self.n.take() {
+            self.conformance
+                .sessions
+                .with(&self.session_id, |s| s.settled(n));
+        }
+    }
 }
 
 /// The leading label of `<session>.<conformance-host>`, when that is the shape.
@@ -4781,6 +4946,10 @@ const PROBE_CHUNK: usize = 64 * 1024;
 /// How long the client has to extend credit once the window is full.
 const READ_PROOF_WAIT: Duration = Duration::from_millis(1_500);
 
+/// How long the read-proof keeps writing, once it has its answer, to finish
+/// the frame it was in the middle of.
+const FRAME_FINISH_WAIT: Duration = Duration::from_millis(500);
+
 /// Did the client actually read our control stream?
 ///
 /// Returns `Some(true)` if it demonstrably did, `Some(false)` if it
@@ -4795,9 +4964,10 @@ const READ_PROOF_WAIT: Duration = Duration::from_millis(1_500);
 ///
 /// The padding is a reserved frame type, which RFC 9114 §7.2.8 requires
 /// clients to skip using its length, so the probe adds nothing the client is
-/// entitled to object to. It runs only after the test's own exchange has
-/// settled and only when the verdict would otherwise be inconclusive, so it
-/// cannot colour what it is measuring.
+/// entitled to object to -- provided every frame arrives whole. It runs
+/// alongside the test's own exchange, on the stream that carries the anomaly
+/// (see where it is started for why), so a frame that went out broken would be
+/// an anomaly of ours, met in the same window as the one under test.
 ///
 /// Why this exists: "the client completed its request and closed without
 /// objecting, but the anomaly was on the control stream" was 41 of the 199
@@ -4902,6 +5072,19 @@ pub(super) async fn control_stream_was_read(
         f::reserved_frame(0x1f, &vec![0u8; PROBE_CHUNK])
     };
     let mut written = 0u64;
+    // How far into the current frame the stream has got.
+    //
+    // The fill used to race `write_all(&frame)` against the poll below, and
+    // `write_all` is not cancellation safe: when the tick won, the frame was
+    // left part-written and the next pass started a fresh one from its first
+    // byte -- inside the last one's payload, as the client parses it. The
+    // client then read a frame header out of zero padding, a DATA frame on
+    // the control stream, and closed with H3_FRAME_UNEXPECTED; quic-go did so
+    // at the port whose required code is exactly that, and was scored as
+    // having rejected a MAX_PUSH_ID it in fact skips (2026-11-04). `write` is
+    // cancellation safe -- it writes a prefix and says how much, or nothing --
+    // so the position survives the race and every frame goes out whole.
+    let mut at = 0usize;
 
     let probe = async {
         loop {
@@ -4910,12 +5093,13 @@ pub(super) async fn control_stream_was_read(
             }
             // Keep filling, because a receiver only grants more once it has
             // consumed enough to be worth granting. Bounded by the window:
-            // past that, `write_all` blocks and the polling below is what
-            // makes progress.
+            // past that, `write` waits and the polling below is what makes
+            // progress.
             tokio::select! {
-                res = control.write_all(&frame) => {
-                    res?;
-                    written += frame.len() as u64;
+                res = control.write(&frame[at..]) => {
+                    let n = res?;
+                    written += n as u64;
+                    at = (at + n) % frame.len();
                 }
                 () = tokio::time::sleep(Duration::from_millis(10)) => {}
             }
@@ -4926,6 +5110,7 @@ pub(super) async fn control_stream_was_read(
     };
 
     let outcome = tokio::time::timeout(READ_PROOF_WAIT, probe).await;
+
     let (verdict, why) = match &outcome {
         Ok(Ok(true)) => (
             Some(true),
@@ -4950,6 +5135,19 @@ pub(super) async fn control_stream_was_read(
             "the wait ended before the window was filled, which proves nothing".to_string(),
         ),
     };
+
+    // The probe can end mid-frame, and a frame cut off is not padding the
+    // client must skip: finish it while the client is still taking data.
+    let finish_by = tokio::time::Instant::now() + FRAME_FINISH_WAIT;
+    while at != 0 {
+        match tokio::time::timeout_at(finish_by, control.write(&frame[at..])).await {
+            Ok(Ok(n)) => {
+                written += n as u64;
+                at = (at + n) % frame.len();
+            }
+            _ => break,
+        }
+    }
     info!(
         "conformance: {test_id} session={session_id} read-proof result={verdict:?} \
          window={limit} wrote={written} why={why}"
@@ -5209,6 +5407,37 @@ mod tests {
 
     fn test(id: &str) -> &'static Test {
         catalog::find(id).expect("catalogue entry")
+    }
+
+    /// A Retry nobody answered is reported once, and only by the watcher of
+    /// the latest Retry to that address; an answered one is not reported at
+    /// all.
+    #[test]
+    fn only_the_latest_unanswered_retry_is_reported_abandoned() {
+        let peer: SocketAddr = "192.0.2.7:50000".parse().expect("an address");
+        let other: SocketAddr = "192.0.2.7:50001".parse().expect("an address");
+        let retries = RetriesOutstanding::default();
+
+        let n = retries.sent(peer);
+        assert!(retries.abandoned(peer, n), "nothing came back");
+        assert!(!retries.abandoned(peer, n), "and it is reported once");
+
+        let n = retries.sent(peer);
+        retries.answered(peer);
+        assert!(!retries.abandoned(peer, n), "the token came back");
+
+        let first = retries.sent(peer);
+        let second = retries.sent(peer);
+        let elsewhere = retries.sent(other);
+        assert!(
+            !retries.abandoned(peer, first),
+            "a later Retry to the same address superseded it"
+        );
+        assert!(retries.abandoned(peer, second));
+        assert!(
+            retries.abandoned(other, elsewhere),
+            "addresses are separate"
+        );
     }
 
     /// A client that stops the request stream refused the oversized section
