@@ -683,6 +683,25 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
             Verdict::Pass,
             "Decoded it and completed the request.".to_string(),
         ),
+        // Silence after a section past the client's own maximum is no evidence
+        // it decoded it: a client that does completes the follow-up request on
+        // the same connection (`SurvivedAndContinued`, above), as every passing
+        // client did. msquic, which closes the connection over it, once went
+        // away with the close unseen and was scored "decoded it and completed
+        // the request" (2026-11-04) -- the case Verdict::Inconclusive exists
+        // for.
+        (Class::Interoperability, Observation::NoCloseObserved | Observation::PeerUnreachable)
+            if test.id == "h-oversized-field-section" =>
+        {
+            (
+                Verdict::Inconclusive,
+                "Went away without a close this end saw, after a field section past its own \
+                 advertised maximum: whether it refused the section, closed the connection over \
+                 it or decoded it is not shown. A client that decodes it completes the \
+                 follow-up request on the same connection."
+                    .to_string(),
+            )
+        }
         (Class::Interoperability, Observation::NoCloseObserved) => (
             Verdict::Pass,
             "Decoded it and completed the request.".to_string(),
@@ -1686,6 +1705,17 @@ mod tests {
         let t = catalog::find("h-oversized-field-section").expect("the test exists");
         let (verdict, _) = judge(t, &Observation::Signalled("reset the stream".into()), None);
         assert_eq!(verdict, Verdict::Pass);
+        let (verdict, _) = judge(t, &Observation::SurvivedAndContinued, None);
+        assert_eq!(
+            verdict,
+            Verdict::Pass,
+            "the follow-up completed: it decoded the section"
+        );
+        for silent in [Observation::NoCloseObserved, Observation::PeerUnreachable] {
+            let (verdict, detail) = judge(t, &silent, None);
+            assert_eq!(verdict, Verdict::Inconclusive, "{silent:?} shows nothing");
+            assert!(!detail.contains("Decoded it"), "{detail}");
+        }
         let (verdict, detail) = judge(t, &Observation::ClosedWith { code: 0x106 }, None);
         assert_eq!(verdict, Verdict::Fail);
         assert!(
