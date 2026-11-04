@@ -77,6 +77,12 @@ pub(crate) mod zero_rtt;
 #[cfg(test)]
 mod qpack_dynamic;
 
+/// End-to-end proof that `h-oversized-field-section` sees a refusal for what it
+/// is: the body is held back, so a client enforcing its limit has a stream left
+/// to stop.
+#[cfg(test)]
+mod oversized_section;
+
 /// Proof that the control-stream read-proof answers in both directions.
 ///
 /// Test-only for the reason the module explains: no client in the fleet

@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use futures_util::FutureExt as _;
 use tracing::{debug, info, warn};
 
 use super::catalog::{self, Test, Tier};
@@ -3232,6 +3233,10 @@ async fn watch_for_liveness(
 
     let observation = match probe {
         Ok(Ok(stream)) => {
+            // Whether the client stopped or abandoned the response before it
+            // was all written: a clean close after that is not a completed
+            // exchange.
+            let mut cut_short = false;
             {
                 let (mut send, mut recv) = stream;
                 // NOTE: `send` is moved into `hold` at the end of this block for
@@ -3327,10 +3332,11 @@ async fn watch_for_liveness(
                     }
                 }
 
-                if let Err(e) = answer_probe(&mut send, test, qpack, encoder, early_data_seen).await
-                {
-                    debug!("conformance: could not answer liveness probe: {}", e);
+                match answer_probe(&mut send, test, qpack, encoder, early_data_seen).await {
+                    Ok(answered) => cut_short = answered == Answered::CutShort,
+                    Err(e) => debug!("conformance: could not answer liveness probe: {}", e),
                 }
+                let _ = reset_if_stopped(&mut send);
                 // The exchange carrying the anomaly is now complete. For every
                 // assertion answered in-band this is the client's opportunity
                 // to have reacted, and anything it does after it -- including
@@ -3385,6 +3391,12 @@ async fn watch_for_liveness(
                 // of a close we had to ask for as of one that arrived on its
                 // own. Whether the settle window saw it decides nothing here;
                 // only whether the client closed, and how.
+                //
+                // Unless the request was not completed: a client that closed
+                // under a response it had stopped, or before the rest of it
+                // was written, gave the exchange up, and the close says only
+                // that it carried no error code.
+                Observation::ClosedSilently if cut_short => Observation::ClosedSilently,
                 Observation::ClosedSilently => Observation::SurvivedAndContinued,
                 other => other,
             }
@@ -4006,7 +4018,7 @@ pub(super) async fn answer_probe(
     qpack: &QpackLimits,
     encoder: Option<&mut quinn::SendStream>,
     early_data_seen: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Answered> {
     const BODY: &[u8] = b"liveness probe received; this connection survived the test\n";
 
     // Wait for the client's SETTINGS before deciding what its limits are.
@@ -4254,6 +4266,18 @@ pub(super) async fn answer_probe(
         // test passed without having sent what it is named for. The section
         // is now sized from the client's own SETTINGS; one that advertised no
         // limit, or one past MAX_OVERSIZED_SECTION, is recorded as such.
+        //
+        // The body is held back after the section, so that the client's answer
+        // to it can be seen. Written straight after, the whole response was at
+        // the client before it had decided anything, and a refusal then had
+        // nothing left on the wire to refuse: STOP_SENDING means nothing on a
+        // stream whose data has all arrived (RFC 9000 §3.5), so our own client
+        // and quiche refused the section, exited non-zero, closed cleanly, and
+        // were credited with having decoded it (2026-11-04). With the stream
+        // still open a refusal has to show -- the stream stopped, or the
+        // connection closed under an unfinished response -- and a client still
+        // waiting when the window ends is waiting for the body of a response it
+        // accepted.
         "h-oversized-field-section" => {
             let size = qpack
                 .max_field_section_size()
@@ -4266,6 +4290,13 @@ pub(super) async fn answer_probe(
                 ("x-conformance-oversized", filler.as_str()),
             ]))
             .await?;
+            match tokio::time::timeout(OVERSIZED_REACTION_WINDOW, send.stopped()).await {
+                // Stopped, or gone: either way the rest is not wanted.
+                Ok(Ok(Some(_)) | Err(_)) => return Ok(Answered::CutShort),
+                // `None` needs a finished stream, and this one is not; the
+                // window passing is a client waiting for its body.
+                Ok(Ok(None)) | Err(_) => {}
+            }
             send.write_all(&f::data(BODY)).await?;
         }
 
@@ -4466,7 +4497,7 @@ pub(super) async fn answer_probe(
             if let Err(e) = send.reset(code) {
                 debug!("conformance: {} could not reset the response: {e}", test.id);
             }
-            return Ok(());
+            return Ok(Answered::InFull);
         }
 
         _ => {
@@ -4491,8 +4522,44 @@ pub(super) async fn answer_probe(
     if test.id != "q-stateless-reset" {
         send.finish()?;
     }
-    Ok(())
+    Ok(Answered::InFull)
 }
+
+/// Reset a response stream the client has stopped, with the client's own code,
+/// and say which.
+///
+/// RFC 9000 §3.5 requires the reset of a stream stopped while it is still
+/// being written, and it has to be sent now: the listener holds its response
+/// streams for the life of the connection, and the reset a drop would send
+/// comes after the connection has gone and can carry nothing. Only a response
+/// held open meets this -- one written and finished at once is stopped, if at
+/// all, after it has left.
+pub(super) fn reset_if_stopped(send: &mut quinn::SendStream) -> Option<quinn::VarInt> {
+    let Some(Ok(Some(code))) = send.stopped().now_or_never() else {
+        return None;
+    };
+    send.reset(code).ok().map(|()| code)
+}
+
+/// Whether the probe's response went out as the test writes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub(super) enum Answered {
+    /// All of it: to its end, or to wherever the test itself ends it.
+    InFull,
+    /// The client stopped the stream or closed the connection while the rest
+    /// of the response was held back for its reaction.
+    CutShort,
+}
+
+/// How long `h-oversized-field-section` holds the body back after the
+/// section, for the client to refuse it in.
+///
+/// A refusal is decided on reading the section and sent at once, so this is a
+/// round trip and a little processing; a second covers a browser driving the
+/// suite from across the internet, like `CONTROL_STREAM_GRACE`, and is well
+/// inside any client's patience for a body.
+const OVERSIZED_REACTION_WINDOW: Duration = Duration::from_secs(1);
 
 /// The entries the two dynamic-table tests insert before referencing them.
 ///

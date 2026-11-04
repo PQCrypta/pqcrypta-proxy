@@ -66,7 +66,7 @@ struct Wire {
     insertions_at: Instant,
 }
 
-fn server_config(throwaway: &Throwaway) -> quinn::ServerConfig {
+pub(super) fn server_config(throwaway: &Throwaway) -> quinn::ServerConfig {
     let mut config =
         rustls::ServerConfig::builder_with_provider(Arc::new(crate::tls::build_pqc_provider()))
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -89,7 +89,7 @@ fn server_config(throwaway: &Throwaway) -> quinn::ServerConfig {
     server_config
 }
 
-fn client_endpoint(throwaway: &Throwaway) -> quinn::Endpoint {
+pub(super) fn client_endpoint(throwaway: &Throwaway) -> quinn::Endpoint {
     let provider = Arc::new(crate::tls::build_pqc_provider());
     let mut client_crypto = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])

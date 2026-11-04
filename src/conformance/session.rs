@@ -684,21 +684,41 @@ pub fn judge(test: &Test, obs: &Observation, expected_code: Option<u64>) -> (Ver
             "Decoded it and completed the request.".to_string(),
         ),
         // Silence after a section past the client's own maximum is no evidence
-        // it decoded it: a client that does completes the follow-up request on
-        // the same connection (`SurvivedAndContinued`, above), as every passing
-        // client did. msquic, which closes the connection over it, once went
-        // away with the close unseen and was scored "decoded it and completed
-        // the request" (2026-11-04) -- the case Verdict::Inconclusive exists
-        // for.
+        // it decoded it. The body is held back after the section: a client
+        // that decodes it waits for the body, reads the response to its end
+        // and closes (`SurvivedAndContinued`, above), and one that refuses it
+        // stops the stream or closes under the unfinished response. msquic,
+        // which closes the connection over it, once went away with the close
+        // unseen and was scored "decoded it and completed the request"
+        // (2026-11-04) -- the case Verdict::Inconclusive exists for.
         (Class::Interoperability, Observation::NoCloseObserved | Observation::PeerUnreachable)
             if test.id == "h-oversized-field-section" =>
         {
             (
                 Verdict::Inconclusive,
-                "Went away without a close this end saw, after a field section past its own \
-                 advertised maximum: whether it refused the section, closed the connection over \
-                 it or decoded it is not shown. A client that decodes it completes the \
-                 follow-up request on the same connection."
+                "Neither stopped the request stream nor closed the connection where this end \
+                 saw it, after a field section past its own advertised maximum: whether it \
+                 refused the section, closed the connection over it or decoded it is not \
+                 shown. A client that decodes it waits for the body, reads the response to \
+                 its end and closes."
+                    .to_string(),
+            )
+        }
+        // The listener keeps a clean close as `ClosedSilently` only where it
+        // came under the unfinished response -- after the body, it is
+        // `SurvivedAndContinued`. So the client gave the request up on reading
+        // the section, and ended the connection without an error code, which
+        // §8.1 makes a shutdown, not a connection error: the refusal the test
+        // asks for, from a client with nothing left to do on the connection.
+        (Class::Interoperability, Observation::ClosedSilently)
+            if test.id == "h-oversized-field-section" =>
+        {
+            (
+                Verdict::Pass,
+                "Gave the request up on a field section past its own advertised maximum: \
+                 closed the connection before the rest of the response was sent, with no \
+                 error code, which §8.1 makes a graceful shutdown rather than a connection \
+                 error."
                     .to_string(),
             )
         }
@@ -1709,13 +1729,22 @@ mod tests {
         assert_eq!(
             verdict,
             Verdict::Pass,
-            "the follow-up completed: it decoded the section"
+            "it waited for the held body and read the response to its end: it decoded the section"
         );
         for silent in [Observation::NoCloseObserved, Observation::PeerUnreachable] {
             let (verdict, detail) = judge(t, &silent, None);
             assert_eq!(verdict, Verdict::Inconclusive, "{silent:?} shows nothing");
             assert!(!detail.contains("Decoded it"), "{detail}");
         }
+        // Kept by the listener only for a close under the unfinished response.
+        let (verdict, detail) = judge(t, &Observation::ClosedSilently, None);
+        assert_eq!(
+            verdict,
+            Verdict::Pass,
+            "a clean close is no connection error"
+        );
+        assert!(detail.contains("Gave the request up"), "{detail}");
+        assert!(!detail.contains("Decoded it"), "{detail}");
         let (verdict, detail) = judge(t, &Observation::ClosedWith { code: 0x106 }, None);
         assert_eq!(verdict, Verdict::Fail);
         assert!(
