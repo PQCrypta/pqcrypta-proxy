@@ -246,6 +246,7 @@ async fn get(url: &str) -> anyhow::Result<u16> {
     // encoder that has to decide, per section, whether referencing a recent
     // insert is worth the risk: zero forbids the reference outright, and the
     // table is then advertised and unusable.
+    let watch = connection.clone();
     let (mut driver, mut send_request) = h3::client::builder()
         .qpack_max_table_capacity(4096)
         .qpack_blocked_streams(16)
@@ -295,6 +296,7 @@ async fn get(url: &str) -> anyhow::Result<u16> {
             None => false,
         };
         if rejected {
+            settle(&watch).await;
             drop(send_request);
             let _ = tokio::time::timeout(DRAIN, driving).await;
             return plain_exchange(&endpoint, addr, host, &uri).await;
@@ -316,6 +318,7 @@ async fn get(url: &str) -> anyhow::Result<u16> {
     // fix, not this client's behaviour: a close carrying no error code is a
     // shutdown, not a surrender. Making it conditional here cost five cells
     // that the unconditional version had already resolved.
+    settle(&watch).await;
     drop(send_request);
     let _ = tokio::time::timeout(DRAIN, driving).await;
     let _ = tokio::time::timeout(DRAIN, endpoint.wait_idle()).await;
@@ -325,6 +328,29 @@ async fn get(url: &str) -> anyhow::Result<u16> {
 
 /// How long to let a decided close reach the wire before giving up on it.
 const DRAIN: Duration = Duration::from_secs(2);
+
+/// Let what this client has queued reach the server before the connection
+/// closes.
+///
+/// Dropping the last `SendRequest` closes the connection there and then, and
+/// a close discards every frame still queued. h3 refuses a response by
+/// stopping its stream -- a field section past our maximum is answered with
+/// STOP_SENDING H3_REQUEST_CANCELLED, as RFC 9114 §4.2.2 has it -- so the
+/// refusal was decided, queued and thrown away, and the server saw only a
+/// clean close under a response it was still holding open
+/// (h-oversized-field-section, 2026-11-04). Draining the endpoint afterwards
+/// cannot help: by then the frame is gone.
+///
+/// Bounded by a few round trips: long enough for the frame to be sent and
+/// acknowledged, or resent once if lost, and short on a path that has stopped
+/// answering.
+async fn settle(connection: &quinn::Connection) {
+    let bound = (connection.rtt() * 3 + Duration::from_millis(50)).min(DRAIN);
+    let until = tokio::time::Instant::now() + bound;
+    while !connection.is_settled() && tokio::time::Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
 
 /// A complete exchange on a fresh connection that offers no early data.
 ///
@@ -342,6 +368,7 @@ async fn plain_exchange(
         .await
         .context("completing the retry handshake")?;
 
+    let watch = connection.clone();
     let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(connection))
         .await
         .map_err(|e| anyhow!("opening the HTTP/3 connection for the retry: {e}"))?;
@@ -352,6 +379,7 @@ async fn plain_exchange(
 
     let outcome = exchange(&mut send_request, uri).await;
 
+    settle(&watch).await;
     drop(send_request);
     let _ = tokio::time::timeout(DRAIN, driving).await;
     let _ = tokio::time::timeout(DRAIN, endpoint.wait_idle()).await;

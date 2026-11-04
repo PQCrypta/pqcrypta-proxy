@@ -2838,6 +2838,28 @@ impl Connection {
         !self.spaces[SpaceId::Data].pending.is_empty(&self.streams)
     }
 
+    /// Whether everything this endpoint has to say has been sent and heard:
+    /// no frame is queued, no stream has data waiting, and every ack-eliciting
+    /// packet sent has been acknowledged or declared lost (a lost packet's
+    /// frames are queued again, so they count as unsent).
+    ///
+    /// [`close()`](Self::close) discards whatever is still queued -- the
+    /// CONNECTION_CLOSE goes alone (RFC 9000 §10.2) -- so an endpoint that
+    /// queues a stream-level signal and then closes at once never sends it.
+    /// h3's client does exactly that: it stops the request stream over a
+    /// response it refuses, and closes the connection as soon as the last
+    /// request handle is dropped. Our client and the conformance suite both
+    /// lost a refusal that way (2026-11-04). Waiting for this before closing
+    /// is how an endpoint lets its last word reach the peer's QUIC stack.
+    pub fn is_settled(&self) -> bool {
+        !self.has_pending_retransmits()
+            && !self.streams.can_send_stream_data()
+            && self
+                .paths
+                .values()
+                .all(|path| path.data.in_flight.ack_eliciting == 0)
+    }
+
     /// Look up whether we're the client or server of this Connection
     pub fn side(&self) -> Side {
         self.side.side()

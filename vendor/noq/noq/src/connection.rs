@@ -691,6 +691,14 @@ impl Connection {
             .last_stop_sending()
     }
 
+    /// Whether everything this endpoint has queued has been sent and
+    /// acknowledged, so that a [`close()`](Self::close) now discards nothing.
+    ///
+    /// See [`noq_proto::Connection::is_settled`].
+    pub fn is_settled(&self) -> bool {
+        self.0.lock_without_waking("is_settled").inner.is_settled()
+    }
+
     /// How many unidirectional streams the peer lets this endpoint open before
     /// it grants more with MAX_STREAMS.
     ///
