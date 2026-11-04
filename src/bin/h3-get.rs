@@ -296,9 +296,7 @@ async fn get(url: &str) -> anyhow::Result<u16> {
             None => false,
         };
         if rejected {
-            settle(&watch).await;
-            drop(send_request);
-            let _ = tokio::time::timeout(DRAIN, driving).await;
+            hang_up(&watch, send_request, driving).await;
             return plain_exchange(&endpoint, addr, host, &uri).await;
         }
     }
@@ -318,9 +316,7 @@ async fn get(url: &str) -> anyhow::Result<u16> {
     // fix, not this client's behaviour: a close carrying no error code is a
     // shutdown, not a surrender. Making it conditional here cost five cells
     // that the unconditional version had already resolved.
-    settle(&watch).await;
-    drop(send_request);
-    let _ = tokio::time::timeout(DRAIN, driving).await;
+    hang_up(&watch, send_request, driving).await;
     let _ = tokio::time::timeout(DRAIN, endpoint.wait_idle()).await;
 
     outcome
@@ -329,13 +325,26 @@ async fn get(url: &str) -> anyhow::Result<u16> {
 /// How long to let a decided close reach the wire before giving up on it.
 const DRAIN: Duration = Duration::from_secs(2);
 
+/// End the HTTP/3 connection once what this client queued has been heard:
+/// settle, then drop the last request handle -- which closes the connection
+/// -- and let the driver see the close out.
+async fn hang_up(
+    watch: &quinn::Connection,
+    send_request: h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>,
+    driving: tokio::task::JoinHandle<h3::error::ConnectionError>,
+) {
+    settle(watch).await;
+    drop(send_request);
+    let _ = tokio::time::timeout(DRAIN, driving).await;
+}
+
 /// Let what this client has queued reach the server before the connection
 /// closes.
 ///
 /// Dropping the last `SendRequest` closes the connection there and then, and
 /// a close discards every frame still queued. h3 refuses a response by
 /// stopping its stream -- a field section past our maximum is answered with
-/// STOP_SENDING H3_REQUEST_CANCELLED, as RFC 9114 §4.2.2 has it -- so the
+/// `STOP_SENDING` `H3_REQUEST_CANCELLED`, as RFC 9114 §4.2.2 has it -- so the
 /// refusal was decided, queued and thrown away, and the server saw only a
 /// clean close under a response it was still holding open
 /// (h-oversized-field-section, 2026-11-04). Draining the endpoint afterwards
@@ -383,9 +392,7 @@ async fn plain_exchange(
 
     let outcome = exchange(&mut send_request, uri).await;
 
-    settle(&watch).await;
-    drop(send_request);
-    let _ = tokio::time::timeout(DRAIN, driving).await;
+    hang_up(&watch, send_request, driving).await;
     let _ = tokio::time::timeout(DRAIN, endpoint.wait_idle()).await;
     outcome
 }
