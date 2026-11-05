@@ -155,10 +155,12 @@ COUNTRY_COUNT=$(sync_table "${COUNTRY_QUERY}" "${BLOCKLIST_DIR}/blocked_countrie
 COUNTRY_COUNT="${COUNTRY_COUNT:-0}"
 
 # ---------------------------------------------------------------------------
-# Write sync status (informational, not used for blocking decisions)
+# Write sync status (informational, not used for blocking decisions), with the
+# lists' mode: a deployment may give readers of the lists a POSIX ACL on the
+# directory, which a mode without group bits would mask
 # ---------------------------------------------------------------------------
 STATUS_TMP="${BLOCKLIST_DIR}/sync_status.json.tmp"
-cat > "${STATUS_TMP}" << EOF
+(umask 0027 && cat > "${STATUS_TMP}") << EOF
 {
     "last_sync": "${TS}",
     "blocked_ips": ${IP_COUNT},
@@ -167,8 +169,8 @@ cat > "${STATUS_TMP}" << EOF
     "total_blocked": $((IP_COUNT + FP_COUNT + COUNTRY_COUNT))
 }
 EOF
+chmod 0640 "${STATUS_TMP}"
 mv "${STATUS_TMP}" "${BLOCKLIST_DIR}/sync_status.json"
-chmod 0600 "${BLOCKLIST_DIR}/sync_status.json"
 
 log "Sync complete: ${IP_COUNT} IPs, ${FP_COUNT} fingerprints, ${COUNTRY_COUNT} countries"
 
