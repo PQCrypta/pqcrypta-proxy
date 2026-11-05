@@ -1355,10 +1355,10 @@ fn default_preload_rel() -> String {
     "preload".to_string()
 }
 
+/// In state/, the directory the proxy writes, beside root's fingerprints/
+/// (the JA3 list it reads), which the proxy only reads.
 fn default_observed_fingerprints_path() -> Option<PathBuf> {
-    Some(PathBuf::from(
-        "/var/lib/pqcrypta-proxy/fingerprints/observed.json",
-    ))
+    Some(PathBuf::from("/var/lib/pqcrypta-proxy/state/observed.json"))
 }
 
 fn default_access_log_format() -> String {
@@ -2563,7 +2563,7 @@ pub struct SecurityConfig {
     /// Verify crawlers against the address ranges their operators publish
     /// (Google, Bing, DuckDuckGo, Apple, OpenAI, Perplexity, Common Crawl,
     /// Ahrefs), fetched every six hours and cached in
-    /// `/var/lib/pqcrypta-proxy/crawler-ranges.json`. Off, crawlers are
+    /// `/var/lib/pqcrypta-proxy/state/crawler-ranges.json`. Off, crawlers are
     /// verified by reverse DNS alone, which cannot verify DuckDuckBot.
     #[serde(default = "default_true")]
     pub crawler_published_ranges: bool,

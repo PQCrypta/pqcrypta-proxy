@@ -44,12 +44,20 @@ RestrictSUIDSGID=true
 MemoryDenyWriteExecute=true
 LockPersonality=true
 
-# Allow reading certificates
+# Read: the configuration, keys and certificates. Written: what the proxy
+# itself writes, each a directory of the proxy account's own: its logs, its
+# state (observed fingerprints, crawler ranges), the certificates its ACME
+# client renews and that client's account, and the conformance suite's ECN
+# evidence. Root's files the proxy reads (blocklists, the JA3 list, ECH keys)
+# are in root's directories, readable through the proxy's group: each
+# directory has one writer.
 ReadOnlyPaths=/etc/letsencrypt
 ReadOnlyPaths=/etc/pqcrypta
-
-# Allow writing logs
 ReadWritePaths=/var/log/pqcrypta-proxy
+ReadWritePaths=/var/lib/pqcrypta-proxy/state
+ReadWritePaths=/etc/pqcrypta/certs
+ReadWritePaths=/etc/pqcrypta/acme
+ReadWritePaths=-/var/lib/pqcrypta/conformance/ecn-evidence
 
 # Network capabilities
 AmbientCapabilities=CAP_NET_BIND_SERVICE

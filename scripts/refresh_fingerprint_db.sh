@@ -25,7 +25,9 @@
 DEST_DIR="/var/lib/pqcrypta-proxy/fingerprints"
 DEST_FILE="${DEST_DIR}/ja3.json"
 CURATED_FILE="${DEST_DIR}/ja3-curated.json"
-LOG_FILE="/var/log/pqcrypta-proxy/fingerprint_db_refresh.log"
+# In root's log directory; the proxy's own (/var/log/pqcrypta-proxy) is the
+# proxy account's.
+LOG_FILE="/var/log/pqcrypta/fingerprint_db_refresh.log"
 SOURCE_URL="https://raw.githubusercontent.com/salesforce/ja3/master/lists/osx-nix-ja3.csv"
 
 # MaxMind GeoLite2 refresh. geoipupdate downloads into GEOIP_STAGE (persistent,
@@ -85,10 +87,10 @@ TOKEN_PLACEHOLDER='auth_token = "REPLACE_WITH_ADMIN_TOKEN"  # live value lives o
 # all, running with GeoIP off and an empty JA3 DB while its own config keyed rate
 # limiting on ja3_fingerprint.
 #
-# owner-sensitive=yes → on a node whose proxy does not run as root the file is
-# chowned to the run user and forced to 640; remotellm runs as `pqcrypta`, and a
-# root-owned 600 file there loads as an EMPTY database with only a warning.
-# "no" files are world-readable, so they need no chown.
+# owner-sensitive=yes → on a node whose proxy does not run as root the file
+# takes the proxy's group and 640, and stays root's, which writes it; the proxy
+# reads it. A root-owned 600 file loads as an EMPTY database with only a warning.
+# "no" files are world-readable, so they need no group.
 #
 # GeoLite2-Country.mmdb is deliberately NOT here: the proxy reads City (via
 # config `geoip_db_path`) and ASN (hardcoded in speedtest.rs) and nothing reads
@@ -263,7 +265,7 @@ sync_fleet() {
             fi
             CHANGED="${CHANGED} $(basename "${SRC}")"
             if [ "${OWNED}" = "yes" ]; then
-                FIXUPS="${FIXUPS} if [ -n \"\$RU\" ] && [ \"\$RU\" != root ]; then chown \$RU:\$RU ${DEST} && chmod 640 ${DEST}; else chmod ${MODE} ${DEST}; fi;"
+                FIXUPS="${FIXUPS} if [ -n \"\$RU\" ] && [ \"\$RU\" != root ]; then chown root:\$RG ${DEST} && chmod 640 ${DEST}; else chmod ${MODE} ${DEST}; fi;"
             else
                 FIXUPS="${FIXUPS} chmod ${MODE} ${DEST};"
             fi
@@ -276,7 +278,7 @@ sync_fleet() {
 
         # Reload, as locally (reload_local); restart only a proxy that cannot
         NODE_OUT=$(ssh "${SSH_ARGS[@]}" -o BatchMode=yes -o ConnectTimeout=60 "${TARGET}" \
-            "RU=\$(systemctl show pqcrypta-proxy -p User --value);${FIXUPS} \
+            "RU=\$(systemctl show pqcrypta-proxy -p User --value); RG=\$(systemctl show pqcrypta-proxy -p Group --value); RG=\${RG:-\$RU};${FIXUPS} \
              systemctl reload pqcrypta-proxy 2>/dev/null || systemctl restart pqcrypta-proxy; \
              for i in \$(seq 1 15); do \
                  S=\$(systemctl is-active pqcrypta-proxy); \
@@ -629,8 +631,10 @@ if [ "${NEW_SUM}" = "${OLD_SUM}" ]; then
     finish
 fi
 
-# Atomic replace
-chmod 0600 "${TMP_JSON}"
+# Atomic replace. Readable by the proxy's group when it runs as its own
+# account (the directory's group, set-group-ID there): root's, 0640.
+chmod 0640 "${TMP_JSON}"
+chgrp --reference="$(dirname "${DEST_FILE}")" "${TMP_JSON}"
 mv "${TMP_JSON}" "${DEST_FILE}"
 log "Updated JA3 database: ${ENTRY_COUNT} entries (was: $([ -n "${OLD_SUM}" ] && echo 'different' || echo 'new'))"
 

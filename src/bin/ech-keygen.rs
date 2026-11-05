@@ -170,14 +170,25 @@ fn main() {
     EchConfigPayload::V18(contents).encode(&mut entry_bytes);
 
     let key_path = args.out_dir.join(format!("{config_id:02x}.key"));
-    fs::write(&key_path, private_key.secret_bytes()).expect("failed to write private key");
-    // Unix mode bits have no Windows equivalent; PermissionsExt::from_mode does
-    // not exist there, which broke the windows-latest build. On Windows the
-    // files inherit the directory ACL instead — the operator is responsible for
-    // the ACL on out_dir, exactly as they are for its 0700 on Unix.
+    // Created with its mode in one step, 0640: the proxy, which runs as its own
+    // account, reads it through the directory's group (set-group-ID, so the
+    // file takes it). Unix mode bits have no Windows equivalent; there the file
+    // inherits the directory's ACL, which the operator sets on out_dir as they
+    // set its mode on Unix.
     #[cfg(unix)]
-    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
-        .expect("failed to chmod private key");
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o640)
+            .open(&key_path)
+            .and_then(|mut f| f.write_all(private_key.secret_bytes()))
+            .expect("failed to write private key");
+    }
+    #[cfg(not(unix))]
+    fs::write(&key_path, private_key.secret_bytes()).expect("failed to write private key");
 
     let ech_path = args.out_dir.join(format!("{config_id:02x}.ech"));
     fs::write(&ech_path, &entry_bytes).expect("failed to write ECHConfig entry");

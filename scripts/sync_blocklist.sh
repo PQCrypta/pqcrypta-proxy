@@ -9,11 +9,13 @@ set -euo pipefail
 
 # Configuration
 BLOCKLIST_DIR="/var/lib/pqcrypta-proxy/blocklists"
-PROXY_USER="pqcrypta"
+# The proxy's group: it reads these files, root writes them
+PROXY_GROUP="pqcrypta"
 DB_NAME="pqcrypta"
 DB_USER="pqcrypta_user"
 DB_HOST="localhost"
-LOG_FILE="/var/log/pqcrypta-proxy/blocklist_sync.log"
+# In root's log directory, not the proxy account's (/var/log/pqcrypta-proxy)
+LOG_FILE="/var/log/pqcrypta/blocklist_sync.log"
 
 # Ensure log directory exists
 mkdir -p "$(dirname "${LOG_FILE}")"
@@ -27,14 +29,20 @@ log() {
 
 log "Starting blocklist sync..."
 
-# Ensure blocklist directory exists with strict permissions (outside web root).
-# Owner = pqcrypta service user, mode = 0700 (no world/group access).
+# The blocklist directory (outside the web root): root's, which writes it,
+# readable by the proxy's group and no one else; without the group (a node
+# whose proxy runs as root), root's alone.
 if [ ! -d "${BLOCKLIST_DIR}" ]; then
     mkdir -p "${BLOCKLIST_DIR}"
     log "Created blocklist directory: ${BLOCKLIST_DIR}"
 fi
-chown "${PROXY_USER}:${PROXY_USER}" "${BLOCKLIST_DIR}" 2>/dev/null || true
-chmod 0700 "${BLOCKLIST_DIR}"
+if getent group "${PROXY_GROUP}" >/dev/null; then
+    chown "root:${PROXY_GROUP}" "${BLOCKLIST_DIR}"
+    chmod 2750 "${BLOCKLIST_DIR}"
+else
+    chown root:root "${BLOCKLIST_DIR}"
+    chmod 0700 "${BLOCKLIST_DIR}"
+fi
 
 # ---------------------------------------------------------------------------
 # Helper: run a DB query and write the result to a JSON file ONLY if the
@@ -71,10 +79,11 @@ sync_table() {
         JSON_OUTPUT="[]"
     fi
 
-    # Atomic write: write to tmp then rename
-    printf '%s\n' "${JSON_OUTPUT}" > "${TMP_FILE}"
+    # Atomic write: write to tmp then rename, the mode set before the rename
+    # (the directory's set-group-ID gives the file the proxy's group)
+    (umask 0027 && printf '%s\n' "${JSON_OUTPUT}" > "${TMP_FILE}")
+    chmod 0640 "${TMP_FILE}"
     mv "${TMP_FILE}" "${DEST_FILE}"
-    chmod 0600 "${DEST_FILE}"
 
     local COUNT
     COUNT=$(jq 'length' "${DEST_FILE}" 2>/dev/null || echo "0")

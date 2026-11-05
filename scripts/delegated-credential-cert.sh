@@ -100,11 +100,28 @@ ossl x509 -req -in "$work/leaf.csr" -CA "$CA_DIR/ca.crt" -CAkey "$CA_DIR/ca.key"
     -CAcreateserial -sha384 -days "$DC_LEAF_DAYS" -extfile "$work/ext.cnf" -out "$work/leaf.crt"
 cat "$work/leaf.crt" "$CA_DIR/ca.crt" >"$work/chain.crt"
 
+# Written as the certificate directory's owner: the directory is the proxy's
+# (its ACME client renews there), and each directory has one writer. The
+# content crosses on stdin, so the account needs nothing of ours (the work
+# directory and the CA stay root's). On a node whose proxy runs as root the
+# owner is root and this is a plain write.
+owner=$(stat -c %u "$CERTS_DIR")
+group=$(stat -c %g "$CERTS_DIR")
+as_owner() {
+    if [ "$owner" = 0 ]; then
+        "$@"
+    else
+        setpriv --reuid="$owner" --regid="$group" --clear-groups "$@"
+    fi
+}
+# put MODE SOURCE TARGET: the file at TARGET, made with MODE, from SOURCE
+put() {
+    as_owner sh -c 'umask 077 && cat > "$2.new" && chmod "$1" "$2.new" && mv -f "$2.new" "$2"' \
+        sh "$1" "$3" <"$2"
+}
 # The key before the certificate: the resolver loads a domain by its .crt.
-install -m 600 "$work/leaf.key" "$KEY.new"
-install -m 644 "$work/chain.crt" "$CERT.new"
-mv "$KEY.new" "$KEY"
-mv "$CERT.new" "$CERT"
+put 600 "$work/leaf.key" "$KEY"
+put 644 "$work/chain.crt" "$CERT"
 log "Wrote $CERT and $KEY"
 
 # [admin] enabled / bind_address / port / auth_token, and the poller interval.

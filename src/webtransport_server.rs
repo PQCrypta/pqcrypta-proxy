@@ -291,7 +291,7 @@ impl WebTransportServer {
                 None => self.server.accept().await,
             };
 
-            info!("📨 Received incoming WebTransport session");
+            debug!("📨 Received incoming WebTransport session");
 
             if let Some(updates) = self.config_updates.as_mut() {
                 if updates.has_changed().unwrap_or(false) {
@@ -343,8 +343,8 @@ async fn handle_incoming_session(
     origin_session_counts: Arc<DashMap<String, Arc<AtomicU32>>>,
     security: Option<crate::security::SecurityState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    info!("📨 Processing incoming WebTransport session...");
-    info!("📍 Remote address: {}", incoming_session.remote_address());
+    debug!("📨 Processing incoming WebTransport session...");
+    debug!("📍 Remote address: {}", incoming_session.remote_address());
 
     // Await the IncomingSession to get SessionRequest
     let session_request = incoming_session.await?;
@@ -353,9 +353,9 @@ async fn handle_incoming_session(
     let authority = session_request.authority().to_string();
     let remote_addr = crate::security::canonical_addr(session_request.remote_address());
 
-    info!("📥 WebTransport session request received");
+    debug!("📥 WebTransport session request received");
     info!("   Path: {}", path);
-    info!("   Authority: {}", authority);
+    debug!("   Authority: {}", authority);
 
     // SR-02: Origin validation.
     //
@@ -393,10 +393,10 @@ async fn handle_incoming_session(
             session_request.forbidden().await;
             return Ok(());
         }
-        info!("   Origin: {} ✅", origin);
+        debug!("   Origin: {} ✅", origin);
     } else {
         // No Origin header — non-browser / native client; always accepted.
-        info!("   Origin: (none — non-browser client)");
+        debug!("   Origin: (none — non-browser client)");
     }
 
     // WT-RL-01: Per-origin session limit.
@@ -435,7 +435,7 @@ async fn handle_incoming_session(
         // Accept the session
         let connection = session_request.accept().await?;
 
-        info!("✅ WebTransport connection established: {}", remote_addr);
+        debug!("✅ WebTransport connection established: {}", remote_addr);
 
         // The slot is given back when `_slot` drops: when the session ends,
         // and equally when this task panics or is cancelled.
@@ -612,7 +612,7 @@ async fn handle_connection(
         }
     }
 
-    info!("🔚 WebTransport connection closed: {}", remote_addr);
+    debug!("🔚 WebTransport connection closed: {}", remote_addr);
     Ok(())
 }
 

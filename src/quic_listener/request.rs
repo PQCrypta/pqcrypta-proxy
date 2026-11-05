@@ -231,7 +231,7 @@ impl QuicListener {
             .and_then(|v| v.to_str().ok());
         metrics.requests.request_start();
 
-        info!(
+        debug!(
             "HTTP/3 request: {} {} host={:?} from {}",
             method, path, host, remote_addr
         );
@@ -772,7 +772,7 @@ impl QuicListener {
         let route = match config.find_route(host.as_deref(), &path, false) {
             Some(r) => {
                 let route_name = r.name.as_deref().unwrap_or("unnamed");
-                info!(
+                debug!(
                     "HTTP/3 route matched: {} -> backend {}",
                     route_name, r.backend
                 );

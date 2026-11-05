@@ -49,7 +49,7 @@ impl WebTransportHandler {
     /// This method is for HTTP/3 layer WebTransport handling via h3/quinn.
     #[allow(clippy::unused_async_trait_impl)] // public async API; callers .await it
     pub async fn handle_session(&self) -> anyhow::Result<()> {
-        info!(
+        debug!(
             "WebTransport session handler started for client {}",
             self.remote_addr
         );

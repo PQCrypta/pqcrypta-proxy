@@ -42,10 +42,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-/// Where the published ranges are cached between refreshes and restarts. The
-/// edge honeypot feed (scripts/detect_bots_from_logs.sh) reads it to spare
-/// verified crawlers its bans.
-pub const RANGES_CACHE: &str = "/var/lib/pqcrypta-proxy/crawler-ranges.json";
+/// Where the published ranges are cached between refreshes and restarts.
+///
+/// The edge honeypot feed (scripts/detect_bots_from_logs.sh) reads it to spare
+/// verified crawlers its bans. In state/, the one directory under
+/// /var/lib/pqcrypta-proxy the proxy writes: root writes the rest of it (the
+/// blocklists, the JA3 list), and the proxy runs as its own account.
+pub const RANGES_CACHE: &str = "/var/lib/pqcrypta-proxy/state/crawler-ranges.json";
 
 /// How often the published ranges are fetched again.
 const RANGES_REFRESH: Duration = Duration::from_hours(6);
