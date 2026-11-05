@@ -788,28 +788,6 @@ impl FingerprintExtractor {
                 request_count: 1,
             });
 
-        // Record the first sighting of a fingerprint.
-        //
-        // The proxy computed JA3/JA4 for every connection and then kept it only
-        // in an in-memory cache, so there was no record anywhere of what had
-        // actually been seen — which is why the classification database could
-        // not be extended from real traffic and block_malicious sat armed with
-        // nothing to match. One line per NEW fingerprint (not per request) is
-        // enough to build that corpus. No User-Agent here: this runs at the TLS
-        // layer, where no HTTP request exists yet — correlate through the
-        // x-ja3-hash header the proxy injects downstream.
-        if !security.ja3_cache.contains_key(&ja3_hash) {
-            info!(
-                target: "fingerprint_observed",
-                "New TLS fingerprint: ja3={:?} ja4={:?} class={:?} client={:?} ip={}",
-                ja3_hash,
-                ja4_hash,
-                classification,
-                client_name,
-                client_ip
-            );
-        }
-
         // Update security state JA3 cache.
         //
         // Accumulates rather than overwrites. The unconditional `insert` this
@@ -855,7 +833,7 @@ impl FingerprintExtractor {
             });
 
         // The record: every distinct fingerprint, under its JA4, for good
-        security
+        let first_sighting = security
             .corpus
             .observe(&crate::fingerprint_corpus::Sighting {
                 ja3_hash: &ja3_hash,
@@ -868,6 +846,29 @@ impl FingerprintExtractor {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs()),
             });
+
+        // Record the first sighting of a fingerprint.
+        //
+        // One line per fingerprint the corpus has never seen, so running a
+        // single named tool and reading that window gives its fingerprints.
+        // Keyed on the corpus, by JA4, rather than the JA3 cache: a client that
+        // shuffles its extensions (Chrome, per connection) has a new JA3 every
+        // time, which logged hundreds of "new" lines an hour for one browser.
+        // JA4 sorts what JA3 hashes in order, and the corpus is never evicted.
+        // No User-Agent here: this runs at the TLS layer, where no HTTP request
+        // exists yet; correlate through the x-ja3-hash header the proxy
+        // injects downstream.
+        if first_sighting {
+            info!(
+                target: "fingerprint_observed",
+                "New TLS fingerprint: ja3={:?} ja4={:?} class={:?} client={:?} ip={}",
+                ja3_hash,
+                ja4_hash,
+                classification,
+                client_name,
+                client_ip
+            );
+        }
 
         // Authorized pentest sources are never banned by fingerprint.
         //

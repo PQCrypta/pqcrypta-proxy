@@ -770,7 +770,7 @@ impl QuicListener {
                             }
                         }
                     } else {
-                        info!("[{}] Incoming QUIC connection from {}", accept_count, remote_addr);
+                        debug!("[{}] Incoming QUIC connection from {}", accept_count, remote_addr);
 
                         // Spawn connection handler
                         let config = self.config.clone();
@@ -980,7 +980,7 @@ impl QuicListener {
                 metrics.tls.handshake_completed(false, false);
                 return Err(reason.into());
             }
-            info!("QUIC connection established: {}", remote_addr);
+            debug!("QUIC connection established: {}", remote_addr);
             // Read again: this is where a HelloRetryRequest's group and ALPN
             // become final.
             let data = connection
@@ -1003,7 +1003,7 @@ impl QuicListener {
         if let Some(crypto_data) = handshake_data.as_deref() {
             if let Some(protocol) = &crypto_data.protocol {
                 let alpn = String::from_utf8_lossy(protocol);
-                info!("ALPN negotiated: {} for {}", alpn, remote_addr);
+                debug!("ALPN negotiated: {} for {}", alpn, remote_addr);
                 handshake_facts.alpn = Some(alpn.into_owned());
             }
             handshake_facts.kex_group = crypto_data
@@ -1182,7 +1182,7 @@ impl QuicListener {
             }
         }
 
-        info!("Connection closed: {}", remote_addr);
+        debug!("Connection closed: {}", remote_addr);
         Ok(())
     }
 

@@ -9,16 +9,16 @@ set -euo pipefail
 
 DEST_DIR="/var/lib/pqcrypta-proxy/fingerprints"
 DEST_FILE="${DEST_DIR}/ja3.json"
-PROXY_USER="root"   # Adjust to your service user if different
-
-# Determine service user (fall back to root)
-if id pqcrypta &>/dev/null; then
-    PROXY_USER="pqcrypta"
+# The directory and file are root's (root writes them, here and in
+# refresh_fingerprint_db.sh); the proxy, running as its own account, reads
+# them through its group.
+PROXY_GROUP="root"
+if getent group pqcrypta >/dev/null; then
+    PROXY_GROUP="pqcrypta"
 fi
 
-# Create directory
-install -d -m 0700 "${DEST_DIR}"
-chown "${PROXY_USER}:${PROXY_USER}" "${DEST_DIR}" 2>/dev/null || true
+# Create directory (set-group-ID: what is written here takes the group)
+install -d -m 2750 -o root -g "${PROXY_GROUP}" "${DEST_DIR}"
 
 echo "Downloading Salesforce JA3 fingerprint list..."
 TMP_CSV=$(mktemp /tmp/ja3_XXXXXX.csv)
@@ -70,8 +70,8 @@ with open("${DEST_FILE}", "w") as out:
 print(f"Wrote {len(entries)} fingerprints to ${DEST_FILE}")
 PYEOF
 
-chmod 0600 "${DEST_FILE}"
-chown "${PROXY_USER}:${PROXY_USER}" "${DEST_FILE}" 2>/dev/null || true
+chown "root:${PROXY_GROUP}" "${DEST_FILE}"
+chmod 0640 "${DEST_FILE}"
 rm -f "${TMP_CSV}"
 
 echo "Done. Restart pqcrypta-proxy to load the new database:"

@@ -134,13 +134,14 @@ impl Corpus {
         self.entries.is_empty()
     }
 
-    /// Record one connection's fingerprint.
-    pub fn observe(&self, s: &Sighting<'_>) {
+    /// Record one connection's fingerprint. True when the corpus had never
+    /// seen it: its first sighting, under its JA4 (else its JA3), ever.
+    pub fn observe(&self, s: &Sighting<'_>) -> bool {
         let key = key_of(s.ja3_hash, s.ja4_hash);
-        let mut entry = self
-            .entries
-            .entry(key.clone())
-            .or_insert_with(|| CorpusEntry {
+        let mut first = false;
+        let mut entry = self.entries.entry(key.clone()).or_insert_with(|| {
+            first = true;
+            CorpusEntry {
                 key,
                 ja4_hash: s.ja4_hash.map(str::to_string),
                 ja4_raw: None,
@@ -153,7 +154,8 @@ impl Corpus {
                 user_agents: HashMap::new(),
                 ja3_variant_count: 0,
                 ja3_samples: Vec::new(),
-            });
+            }
+        });
         let e = entry.value_mut();
         e.first_seen = e.first_seen.min(s.at);
         e.last_seen = e.last_seen.max(s.at);
@@ -163,6 +165,7 @@ impl Corpus {
             e.ja4_raw = Some(raw.to_string());
         }
         note_ja3(e, s.ja3_hash, s.ja3_string, 1);
+        first
     }
 
     /// Record a User-Agent seen on a request with this fingerprint.

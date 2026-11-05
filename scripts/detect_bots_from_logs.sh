@@ -12,7 +12,8 @@
 ACCESS_LOG="/var/log/pqcrypta-proxy/access.log"
 DB_NAME="pqcrypta"
 DB_USER="pqcrypta_user"
-LOG_FILE="/var/log/pqcrypta-proxy/bot_detection.log"
+# In root's log directory, not the proxy account's (/var/log/pqcrypta-proxy)
+LOG_FILE="/var/log/pqcrypta/bot_detection.log"
 STATE_FILE="/var/www/html/pqcrypta-proxy/data/.last_processed_byte"
 TEMP_DIR="/tmp/pqcrypta-bot-detect"
 
@@ -27,7 +28,7 @@ log() { echo "[${TS}] $1" >> "${LOG_FILE}"; }
 # or to a page that 404s, is not an attack. Both passes below banned Googlebot
 # and Bingbot for exactly that, for 72 hours on every site behind the proxy,
 # and the 403s the ban produced counted as fresh probes, renewing it.
-CRAWLER_RANGES="/var/lib/pqcrypta-proxy/crawler-ranges.json"
+CRAWLER_RANGES="/var/lib/pqcrypta-proxy/state/crawler-ranges.json"
 
 # split_verified_crawlers IN OUT VERIFIED: copy the TSV lines of IN (address in
 # the first field) to OUT unless the address is a verified crawler's; write
