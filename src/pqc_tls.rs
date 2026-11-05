@@ -1062,15 +1062,30 @@ pub mod openssl_pqc {
         // went on answering a zlib-offering client with a plain 3,435-byte
         // Certificate. Safe to call here: the certificate is loaded before this
         // point at every call site.
+        //
+        // It returns 0 for two different reasons: the compression failed (an
+        // error on OpenSSL's queue), or no chain came out smaller, in which
+        // case OpenSSL keeps none and queues nothing. ML-DSA keys and
+        // signatures are close to random and do not shrink. The queue is
+        // emptied first, so what is on it afterwards is this call's.
+        drop(openssl::error::ErrorStack::get());
         let compressed = unsafe { SSL_CTX_compress_certs(ctx, TLSEXT_COMP_CERT_ZLIB) };
 
         if rc == 1 && compressed == 1 {
             tracing::info!("TLS certificate compression enabled (RFC 8879, zlib)");
         } else if rc == 1 {
-            tracing::warn!(
-                "TLS certificate compression preference set but SSL_CTX_compress_certs returned \
-                 {compressed}; chains will be sent uncompressed"
-            );
+            let errors = openssl::error::ErrorStack::get();
+            if errors.errors().is_empty() {
+                tracing::info!(
+                    "TLS certificate compression offered (RFC 8879, zlib); this chain is sent \
+                     uncompressed, as zlib does not make it smaller"
+                );
+            } else {
+                tracing::warn!(
+                    "TLS certificate compression offered but the chain could not be compressed \
+                     ({errors}); it is sent uncompressed"
+                );
+            }
         } else {
             // Not fatal: an uncompressed chain is correct, just larger.
             tracing::warn!(

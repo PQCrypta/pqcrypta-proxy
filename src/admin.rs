@@ -999,6 +999,10 @@ struct ConfigResponse {
 struct ServerConfigView {
     bind_address: String,
     udp_port: u16,
+    /// The other UDP ports QUIC is served on (`server.additional_ports`)
+    additional_ports: Vec<u16>,
+    /// The WebTransport server's port (`server.webtransport_port`)
+    webtransport_port: u16,
     max_connections: u32,
 }
 
@@ -1068,6 +1072,8 @@ async fn config_handler(State(state): State<Arc<AdminState>>) -> Json<ConfigResp
         server: ServerConfigView {
             bind_address: config.server.bind_address.clone(),
             udp_port: config.server.udp_port,
+            additional_ports: config.server.additional_ports.clone(),
+            webtransport_port: config.server.webtransport_port,
             max_connections: config.server.max_connections,
         },
         tls: TlsConfigView {
