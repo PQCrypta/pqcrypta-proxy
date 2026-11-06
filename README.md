@@ -376,10 +376,13 @@ scripts/download_geoip.sh
 ```
 
 This writes `GeoLite2-City.mmdb` (the `geoip_db_path` database, which carries the country too)
-and `GeoLite2-ASN.mmdb` to `data/geoip/`. After that, `scripts/refresh_fingerprint_db.sh` keeps
-them current: run weekly from cron, it calls `geoipupdate` with `/etc/GeoIP.conf`
-(`EditionIDs GeoLite2-City GeoLite2-ASN`), validates each downloaded file, replaces the live one
-by rename only when it changed, and pushes it to the other proxy nodes. It is the only scheduler
+and `GeoLite2-ASN.mmdb` (`geoip_asn_db_path`) to `/var/lib/pqcrypta-proxy/geoip/`, where the
+defaults look (`GEOIP_DIR` overrides it). After that, `scripts/refresh_fingerprint_db.sh` keeps
+them current: run weekly by a timer, as an account that owns the data directories, it calls
+`geoipupdate` with `/etc/GeoIP.conf` handed over as a credential (`EditionIDs GeoLite2-City
+GeoLite2-ASN`), validates each downloaded file, replaces the live one by rename only when it
+changed, and sends it to the other proxy nodes, which check it against its checksum and format
+before taking it; each proxy reloads a data file when it changes. It is the only scheduler
 for `geoipupdate`; disable the Ubuntu package's own `geoipupdate.timer`.
 
 A changed database reaches the running proxy by a reload (`systemctl reload pqcrypta-proxy`,
@@ -726,7 +729,7 @@ priority = 100
 [security]
 dos_protection = true
 blocked_ips = []
-geoip_db_path = "/var/www/html/pqcrypta-proxy/data/geoip/GeoLite2-City.mmdb"
+geoip_db_path = "/var/lib/pqcrypta-proxy/geoip/GeoLite2-City.mmdb"
 blocked_countries = ["CN", "RU", "KP"]
 
 # Rate limits live in [rate_limiting], not under [security]; the auto-block

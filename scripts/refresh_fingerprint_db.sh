@@ -1,11 +1,20 @@
 #!/bin/bash
-# Weekly cron refresh of the JA3/JA4 fingerprint database, and the distribution
-# point for every pqcrypta-proxy runtime data file across the fleet.
+# Weekly refresh of the JA3/JA4 fingerprint database and the GeoLite2
+# databases, the distribution point for every pqcrypta-proxy runtime data file
+# across the fleet, and the check that each node's config is what
+# pqcrypta-configs tracks.
+#
+# Runs as the fleet's data account, pqcrypta-fleet (pqcrypta-configs
+# pqcrypta-fleet-refresh.service, Sundays 03:15): it owns the data directories
+# it writes, and reaches the other nodes over ssh as the same account
+# (/etc/pqcrypta/fleet/ssh_config), where a forced command
+# (pqcrypta-fleet-endpoint) answers sums, put and config and nothing else. A
+# proxy reloads its data files when they change (pqcrypta-proxy-data.path), so
+# nothing here reloads one. It ran as root, over root's ssh to every node.
 #
 # Refresh: downloads the latest Salesforce JA3 list, converts it to JSON, merges
 # the locally curated overlay on top, and atomically replaces the existing
-# database ONLY if the download and conversion succeed, restarting the local
-# proxy only when the content actually changed.
+# database ONLY if the download and conversion succeed.
 #
 # Distribution: this host is the master for the runtime data files, and this is
 # the only job that runs on a schedule, so it also replicates FLEET_DATA_FILES to
@@ -19,16 +28,14 @@
 # 157-entry upstream list, leaving the main node with no scanner fingerprints at
 # all. Anything hand-classified belongs in CURATED_FILE, never in ja3.json.
 #
-# Cron (weekly, Sunday 03:15):
-#   15 3 * * 0 root /var/www/html/pqcrypta-proxy/scripts/refresh_fingerprint_db.sh
+# Exit status: 0, or 3 when a node's config has moved from what is tracked
+# (the unit's failure is the alert; the drifted copy is in DRIFT_DIR).
 
 DEST_DIR="/var/lib/pqcrypta-proxy/fingerprints"
 DEST_FILE="${DEST_DIR}/ja3.json"
 CURATED_FILE="${DEST_DIR}/ja3-curated.json"
-# In root's log directory; the proxy's own (/var/log/pqcrypta-proxy) is the
-# proxy account's.
-LOG_FILE="/var/log/pqcrypta/fingerprint_db_refresh.log"
 SOURCE_URL="https://raw.githubusercontent.com/salesforce/ja3/master/lists/osx-nix-ja3.csv"
+STATE="${STATE_DIRECTORY:-/var/lib/pqcrypta-fleet}"
 
 # MaxMind GeoLite2 refresh. geoipupdate downloads into GEOIP_STAGE (persistent,
 # so its conditional GET makes an unchanged week free), each file is validated
@@ -40,95 +47,54 @@ SOURCE_URL="https://raw.githubusercontent.com/salesforce/ja3/master/lists/osx-ni
 # second writer into the staging directory on a schedule that promotes nothing.
 # The timer was disabled on 2026-08-15; the cron.d entry self-disables under
 # systemd. If a package upgrade re-enables the timer, disable it again rather
-# than letting two owners race.
-GEOIP_DIR="/var/www/html/pqcrypta-proxy/data/geoip"
-GEOIP_STAGE="/var/lib/pqcrypta-proxy/geoip-staging"
-GEOIP_CONF="/etc/GeoIP.conf"
+# than letting two owners race. Its account and licence key are the unit's
+# credential (/etc/GeoIP.conf is root's).
+GEOIP_DIR="/var/lib/pqcrypta-proxy/geoip"
+GEOIP_STAGE="${STATE}/geoip-staging"
+GEOIP_CONF="${CREDENTIALS_DIRECTORY:-/nonexistent}/GeoIP.conf"
 GEOIP_EDITIONS="GeoLite2-City GeoLite2-ASN"
 
-# Other pqcrypta-proxy nodes: "<ssh-target>|<ssh-opts>" (see feedback_proxy_deploy_both).
-# The refresh cron only runs here, so every other node gets its data files pushed.
-# Use `-o Port=` and not `-p`: ssh reads `-p` as the port but scp reads it as
-# "preserve times" and then swallows the number as a source path. This host's
-# ssh_config defaults outbound to 1707, so the port must be stated explicitly.
-FLEET_NODES=(
-    "root@10.10.0.2|-o Port=22"
-    "root@209.46.123.222|-o Port=22"
-    "root@74.208.108.89|-o Port=22 -i /root/.ssh/pentest_sync_rsa"
-)
-
-# Which tracked config each node's live file should match. Keyed by the same
-# target string as FLEET_NODES so the two lists cannot drift apart silently.
-declare -A FLEET_CONFIG_DIR=(
-    ["root@10.10.0.2"]="remotellm"
-    ["root@209.46.123.222"]="mail"
-    ["root@74.208.108.89"]="api3"
-)
+# The other pqcrypta-proxy nodes, "<ssh host>|<tracked config dir>": each
+# pqcrypta-configs pqcrypta/nodes/<dir>/ssh-host names its node as
+# fleet/ssh_config knows it, by name. The list was a copy of the nodes'
+# addresses; it is read from the one place that says which nodes there are.
 CONFIG_REPO="/var/www/html/pqcrypta-configs/pqcrypta/nodes"
-LIVE_CONFIG="/etc/pqcrypta/proxy-config.toml"
+SSH_CONFIG="/etc/pqcrypta/fleet/ssh_config"
+FLEET_NODES=()
+for HOST_FILE in "${CONFIG_REPO}"/*/ssh-host; do
+    [ -f "${HOST_FILE}" ] || continue
+    FLEET_NODES+=("$(tr -d '[:space:]' < "${HOST_FILE}")|$(basename "$(dirname "${HOST_FILE}")")")
+done
+
 # The placeholder the repo commits in place of a real admin token. Deliberately
 # 24 characters — under the 32 the proxy demands — so a config copied from the
-# repo fails to start rather than running with a guessable token.
+# repo fails to start rather than running with a guessable token. The node's
+# endpoint writes it in (pqcrypta-config-redact); it is checked again here.
 TOKEN_PLACEHOLDER='auth_token = "REPLACE_WITH_ADMIN_TOKEN"  # live value lives only in /etc/pqcrypta/proxy-config.toml (0640) — never commit a real token'
+DRIFT_DIR="${STATE}/drift"
 
-# Runtime data files replicated to every node:
-#   "<local path>|<mode>|<owner-sensitive>|<remote destination resolver>"
+# Runtime data files replicated to every node, at the same paths everywhere
+# (each node's config names them: security.geoip_db_path and
+# geoip_asn_db_path). These are the files whose absence the proxy survives with
+# only a WARN and a silently disabled feature, which is exactly why drift here
+# goes unnoticed: the mail host was found on 2026-08-15 with none of them and
+# no directories at all, running with GeoIP off and an empty JA3 DB while its
+# own config keyed rate limiting on ja3_fingerprint.
 #
-# The resolver is a command run ON the target node whose output is the
-# destination path; empty means "same path as here". It exists because api3
-# keeps the City database at /etc/pqcrypta/geoip/ via its own `geoip_db_path`,
-# so a sync that assumed the local path wrote a file that node's proxy does not
-# read — the copy would have looked successful while api3 quietly kept serving a
-# stale database forever. Resolving per node also means a future path change on
-# any node needs no edit here.
-# These are the files whose absence the proxy survives with only a WARN and a
-# silently disabled feature, which is exactly why drift here goes unnoticed:
-# the mail host was found on 2026-08-15 with none of them and no directories at
-# all, running with GeoIP off and an empty JA3 DB while its own config keyed rate
-# limiting on ja3_fingerprint.
-#
-# owner-sensitive=yes → on a node whose proxy does not run as root the file
-# takes the proxy's group and 640, and stays root's, which writes it; the proxy
-# reads it. A root-owned 600 file loads as an EMPTY database with only a warning.
-# "no" files are world-readable, so they need no group.
-#
-# GeoLite2-Country.mmdb is deliberately NOT here: the proxy reads City (via
-# config `geoip_db_path`) and ASN (hardcoded in speedtest.rs) and nothing reads
-# Country.
-GEOIP_PATH_RESOLVER="awk -F'\"' '/^geoip_db_path/ {print \$2}' /etc/pqcrypta/proxy-config.toml"
+# GeoLite2-Country.mmdb is deliberately NOT here: the proxy reads City and ASN
+# and nothing reads Country.
 FLEET_DATA_FILES=(
-    "${DEST_FILE}|600|yes|"
-    "${GEOIP_DIR}/GeoLite2-City.mmdb|644|no|${GEOIP_PATH_RESOLVER}"
-    "${GEOIP_DIR}/GeoLite2-ASN.mmdb|644|no|"
+    "${DEST_FILE}"
+    "${GEOIP_DIR}/GeoLite2-City.mmdb"
+    "${GEOIP_DIR}/GeoLite2-ASN.mmdb"
 )
-
-mkdir -p "$(dirname "${LOG_FILE}")"
 
 # Each line's own time. One timestamp taken at the start stamped every line
 # with it, so a restart that ran from 03:15:04 to 03:15:38 was logged as done
 # at 03:15:01, the second the script started.
-log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "${LOG_FILE}"; }
-
-LOCAL_RELOADED=0
-GEOIP_CHANGED=0
-
-# Make the local proxy load the new files, at most once per run however many
-# changed. A reload (SIGHUP, the unit's ExecReload), not a restart: the proxy
-# compares each data file with the one it loaded and reloads what changed
-# (src/data_file.rs). The restart this replaces stopped every listener while
-# the old process drained, every Sunday on every node (34 s on web1 on
-# 2026-10-18). A proxy that cannot reload is restarted instead, and says so.
-reload_local() {
-    [ "${LOCAL_RELOADED}" -eq 1 ] && return
-    LOCAL_RELOADED=1
-    if systemctl reload pqcrypta-proxy 2>/dev/null; then
-        log "pqcrypta-proxy reloaded: new data files loaded without a restart"
-    elif systemctl restart pqcrypta-proxy 2>&1; then
-        log "WARNING: pqcrypta-proxy could not reload — restarted to load the new data files"
-    else
-        log "WARNING: local reload and restart failed — new data will be loaded on next restart"
-    fi
-}
+# To stdout: the unit appends it to /var/log/pqcrypta/fingerprint_db_refresh.log
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
+fleet() { ssh -F "${SSH_CONFIG}" "$@"; }
 
 # A MaxMind DB ends with the metadata marker \xab\xcd\xefMaxMind.com. Checking for
 # it catches a truncated or error-page download, which would otherwise replace a
@@ -176,9 +142,10 @@ update_geoip() {
         fi
         # Copy then rename: a rename within the directory is atomic, so the proxy
         # never sees a half-written database even if it starts mid-promotion.
+        # GeoLite2 is MaxMind's published data: readable by all (the web
+        # server's pages read it too).
         if cp "${STAGED}" "${LIVE}.tmp" && chmod 644 "${LIVE}.tmp" && mv "${LIVE}.tmp" "${LIVE}"; then
-            log "Updated ${EDITION} ($(stat -c %s "${LIVE}") bytes, built $(date -r "${LIVE}" '+%Y-%m-%d'))"
-            GEOIP_CHANGED=1
+            log "Updated ${EDITION} ($(stat -c %s "${LIVE}") bytes, built $(date -r "${LIVE}" '+%Y-%m-%d'); the proxy reloads it)"
         else
             rm -f "${LIVE}.tmp"
             log "ERROR: could not promote ${EDITION} into ${GEOIP_DIR}"
@@ -187,107 +154,39 @@ update_geoip() {
 }
 
 # Replicate FLEET_DATA_FILES to every other node. Each file is compared by
-# checksum first, so an in-sync node is never copied to and never restarted, and
-# the ~72 MB of GeoIP data crosses the wire only when it actually changes. A node
-# that is unreachable is logged and skipped — it must never hold up the others or
-# fail the refresh.
+# checksum first (the endpoint's sums), so an in-sync node is never copied to,
+# and the ~72 MB of GeoIP data crosses the wire only when it actually changes.
+# The node checks what it receives against its checksum and its format before
+# renaming it into place, and its proxy reloads it. A node that is unreachable
+# is logged and skipped — it must never hold up the others or fail the refresh.
 sync_fleet() {
-    SPECS=()
-    for SPEC in "${FLEET_DATA_FILES[@]}"; do
-        SRC="${SPEC%%|*}"
-        if [ ! -s "${SRC}" ]; then
-            log "WARNING: local master ${SRC} is missing or empty — not distributed"
-            continue
-        fi
-        SPECS+=("${SPEC}")
-    done
-    if [ "${#SPECS[@]}" -eq 0 ]; then
-        log "ERROR: no local data files available to distribute"
-        return
-    fi
-
-    # Remote probe: resolve each file's destination on that node, create its
-    # directory, and report its checksum — one line of "<index> <path> <sum>"
-    # per file, in a single round trip.
-    PROBE=""
-    IDX=0
-    for SPEC in "${SPECS[@]}"; do
-        SRC="${SPEC%%|*}"
-        RESOLVER="${SPEC##*|}"
-        if [ -n "${RESOLVER}" ]; then
-            PROBE="${PROBE} D=\$(${RESOLVER} 2>/dev/null); [ -z \"\$D\" ] && D=${SRC};"
-        else
-            PROBE="${PROBE} D=${SRC};"
-        fi
-        PROBE="${PROBE} mkdir -p \$(dirname \$D) 2>/dev/null; echo \"${IDX} \$D \$(sha256sum \$D 2>/dev/null | awk '{print \$1}')\";"
-        IDX=$((IDX + 1))
-    done
-
+    local NODE TARGET SUMS SRC NAME LOCAL_SUM REMOTE_SUM OUT CHANGED
     for NODE in "${FLEET_NODES[@]}"; do
         TARGET="${NODE%%|*}"
-        # The node's ssh options, one word each
-        read -r -a SSH_ARGS <<< "${NODE#*|}"
-
-        # The trailing `:` forces a zero exit so a missing FILE is not mistaken
-        # for an unreachable NODE.
-        PROBE_OUT=$(ssh "${SSH_ARGS[@]}" -o BatchMode=yes -o ConnectTimeout=15 "${TARGET}" \
-            "${PROBE} :" 2>/dev/null)
-        if [ "$?" -ne 0 ]; then
-            log "WARNING: ${TARGET} unreachable — left on its previous data files"
+        if ! SUMS=$(fleet "${TARGET}" sums 2>&1); then
+            log "WARNING: ${TARGET} unreachable (${SUMS}) — left on its previous data files"
             continue
         fi
-
         CHANGED=""
-        FIXUPS=""
-        IDX=0
-        for SPEC in "${SPECS[@]}"; do
-            SRC="${SPEC%%|*}"
-            REST="${SPEC#*|}"
-            MODE="${REST%%|*}"
-            REST="${REST#*|}"
-            OWNED="${REST%%|*}"
-
-            DEST=$(echo "${PROBE_OUT}" | awk -v k="${IDX}" '$1 == k { print $2 }')
-            REMOTE_SUM=$(echo "${PROBE_OUT}" | awk -v k="${IDX}" '$1 == k { print $3 }')
-            IDX=$((IDX + 1))
-            if [ -z "${DEST}" ]; then
-                log "WARNING: ${TARGET} did not resolve a destination for $(basename "${SRC}") — skipped"
+        for SRC in "${FLEET_DATA_FILES[@]}"; do
+            NAME=$(basename "${SRC}")
+            if [ ! -s "${SRC}" ]; then
+                log "WARNING: local master ${SRC} is missing or empty — not distributed"
                 continue
             fi
-
             LOCAL_SUM=$(sha256sum "${SRC}" | awk '{print $1}')
+            REMOTE_SUM=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get(sys.argv[1]) or "")' "${NAME}" <<< "${SUMS}" 2>/dev/null)
             [ "${LOCAL_SUM}" = "${REMOTE_SUM}" ] && continue
-
-            if ! scp -q -C "${SSH_ARGS[@]}" -o BatchMode=yes -o ConnectTimeout=15 \
-                    "${SRC}" "${TARGET}:${DEST}" 2>/dev/null; then
-                log "WARNING: could not copy $(basename "${SRC}") to ${TARGET}:${DEST} — node left on its previous copy"
-                continue
-            fi
-            CHANGED="${CHANGED} $(basename "${SRC}")"
-            if [ "${OWNED}" = "yes" ]; then
-                FIXUPS="${FIXUPS} if [ -n \"\$RU\" ] && [ \"\$RU\" != root ]; then chown root:\$RG ${DEST} && chmod 640 ${DEST}; else chmod ${MODE} ${DEST}; fi;"
+            if OUT=$(fleet "${TARGET}" put "${NAME}" "${LOCAL_SUM}" < "${SRC}" 2>&1); then
+                CHANGED="${CHANGED} ${NAME}"
             else
-                FIXUPS="${FIXUPS} chmod ${MODE} ${DEST};"
+                log "WARNING: ${TARGET} refused ${NAME} (${OUT}) — node left on its previous copy"
             fi
         done
-
-        if [ -z "${CHANGED}" ]; then
-            log "${TARGET} already in sync — not reloaded"
-            continue
-        fi
-
-        # Reload, as locally (reload_local); restart only a proxy that cannot
-        NODE_OUT=$(ssh "${SSH_ARGS[@]}" -o BatchMode=yes -o ConnectTimeout=60 "${TARGET}" \
-            "RU=\$(systemctl show pqcrypta-proxy -p User --value); RG=\$(systemctl show pqcrypta-proxy -p Group --value); RG=\${RG:-\$RU};${FIXUPS} \
-             systemctl reload pqcrypta-proxy 2>/dev/null || systemctl restart pqcrypta-proxy; \
-             for i in \$(seq 1 15); do \
-                 S=\$(systemctl is-active pqcrypta-proxy); \
-                 [ \"\$S\" = active ] && break; sleep 2; \
-             done; echo \"\$S\"" 2>&1)
-        if [ "${NODE_OUT}" = "active" ]; then
-            log "Pushed to ${TARGET}:${CHANGED} (proxy active)"
+        if [ -n "${CHANGED}" ]; then
+            log "Pushed to ${TARGET}:${CHANGED} (its proxy reloads them)"
         else
-            log "WARNING: ${TARGET} did not come back active (${NODE_OUT}) — files copied${CHANGED}, check that node"
+            log "${TARGET} already in sync"
         fi
     done
 }
@@ -295,201 +194,60 @@ sync_fleet() {
 # Report proxy configs that have drifted from what is tracked in
 # pqcrypta-configs.
 #
-# Detection only: it refreshes the working copy and says what moved, and never
-# commits. These files are public and carry a redacted admin token, so a machine
-# that both edits and publishes them is one sed away from leaking one — and an
-# unreviewed config commit is worth less than a loud diff someone reads.
+# Detection only: a node whose config moved has its copy (admin token replaced
+# by the placeholder) kept in DRIFT_DIR for review, and the run fails, which is
+# the alert. Nothing writes the repository's working tree, which is root's.
 #
 # The reason this exists: the tracked copy was found 474 lines behind the
 # running node, still naming the obsolete x25519_kyber768 KEM. A rebuild from
 # the repo would have deployed it. Nothing was watching, so nothing said so.
+DRIFTED=0
 check_config_drift() {
     [ -d "${CONFIG_REPO}" ] || { log "config drift: ${CONFIG_REPO} missing, skipped"; return; }
-    local DRIFTED=0
-
-    for NODE in "local" "${FLEET_NODES[@]}"; do
-        local TARGET NAME TMP
-        if [ "${NODE}" = "local" ]; then
-            TARGET="local"; NAME="local"
-        else
-            TARGET="${NODE%%|*}"
-            NAME="${FLEET_CONFIG_DIR[${TARGET}]:-}"
-            [ -n "${NAME}" ] || { log "config drift: no tracked dir for ${TARGET}, skipped"; continue; }
-        fi
-
-        local TRACKED="${CONFIG_REPO}/${NAME}/proxy-config.toml"
+    rm -rf "${DRIFT_DIR}" && mkdir -p "${DRIFT_DIR}"
+    local NODE TARGET NAME TRACKED COPY N
+    # This node's own copy is written by pqcrypta-config-redact as this account
+    for NODE in "local|local" "${FLEET_NODES[@]}"; do
+        TARGET="${NODE%%|*}"
+        NAME="${NODE#*|}"
+        TRACKED="${CONFIG_REPO}/${NAME}/proxy-config.toml"
+        COPY="${DRIFT_DIR}/${NAME}.proxy-config.toml"
         [ -f "${TRACKED}" ] || { log "config drift: ${NAME} not tracked yet"; DRIFTED=1; continue; }
-
-        TMP=$(mktemp /tmp/cfgdrift_XXXXXX.toml)
-        if [ "${NODE}" = "local" ]; then
-            cp "${LIVE_CONFIG}" "${TMP}" 2>/dev/null
+        if [ "${TARGET}" = "local" ]; then
+            cp "${STATE}/proxy-config.toml" "${COPY}" 2>/dev/null
         else
-            read -r -a SSH_ARGS <<< "${NODE#*|}"
-            ssh "${SSH_ARGS[@]}" -o ConnectTimeout=10 -o BatchMode=yes "${TARGET}" \
-                "cat ${LIVE_CONFIG}" > "${TMP}" 2>/dev/null
+            fleet "${TARGET}" config > "${COPY}" 2>/dev/null
         fi
-        if [ ! -s "${TMP}" ]; then
-            log "config drift: could not read ${NAME} config — node unreachable?"
-            rm -f "${TMP}"; continue
+        if [ ! -s "${COPY}" ]; then
+            log "config drift: could not read ${NAME}'s config — node unreachable?"
+            rm -f "${COPY}"; continue
         fi
-
-        # Redact before anything compares or copies. Done with the whole line so
-        # a token containing regex metacharacters cannot survive a partial match.
-        sed -i "s|^auth_token[[:space:]]*=.*|${TOKEN_PLACEHOLDER}|" "${TMP}"
-
-        # Refuse to touch the repo if a token somehow survived. Cheap, and the
-        # one failure here is unrecoverable once pushed.
         # "A token line exists AND it is not the placeholder". Both halves are
-        # needed. Piping into `grep -qv` looks equivalent and is not: on empty
-        # input `grep -qv` exits 0 here, so a node with no [admin] section —
-        # remotellm — would have aborted on every run and never synced. An
-        # earlier version also paired that with a grep -E carrying a PCRE
-        # lookahead, a dialect it does not support, which could never match and
-        # only made the guard look thorough.
-        if grep -qE '^auth_token' "${TMP}" \
-           && ! grep -qE '^auth_token[[:space:]]*=[[:space:]]*"REPLACE_WITH_ADMIN_TOKEN"' "${TMP}"; then
-            log "config drift: ABORT on ${NAME} — redaction did not take, repo untouched"
-            rm -f "${TMP}"; DRIFTED=1; continue
+        # needed: a node with no [admin] section (fortress) has no token line.
+        if grep -qE '^auth_token' "${COPY}" \
+           && ! grep -qxF "${TOKEN_PLACEHOLDER}" "${COPY}"; then
+            log "config drift: ABORT on ${NAME} — its copy does not carry the placeholder, discarded"
+            rm -f "${COPY}"; DRIFTED=1; continue
         fi
-
-        local N
-        N=$(diff "${TRACKED}" "${TMP}" 2>/dev/null | grep -c '^[<>]')
+        N=$(diff "${TRACKED}" "${COPY}" 2>/dev/null | grep -c '^[<>]')
         if [ "${N}" -gt 0 ]; then
-            cp "${TMP}" "${TRACKED}"
-            log "config drift: ${NAME} moved ${N} lines — working copy refreshed, review and commit"
-            DRIFTED=1
-        fi
-        rm -f "${TMP}"
-    done
-
-    check_apache_drift || DRIFTED=1
-    check_app_config_drift || DRIFTED=1
-
-    [ "${DRIFTED}" -eq 0 ] && log "config drift: all four nodes match what is tracked"
-}
-
-# The app's config.php, tracked redacted beside the rest.
-#
-# It is gitignored in the app repo because it holds live credentials, so without
-# this nothing watches it: the 2026-09-15 CSP fix — which stopped it overwriting
-# every page's Content-Security-Policy and un-broke the speedtest server picker —
-# existed only on disk, and a restore from git would have reverted it silently.
-#
-# Delegates the redaction to scripts/sync_app_config.sh in the configs repo,
-# which is fail-closed: it refuses to write if any live value survives. If that
-# script aborts, this reports drift rather than swallowing it, because an
-# un-refreshed copy is exactly the state this exists to catch.
-check_app_config_drift() {
-    local SYNC="${CONFIG_REPO}/../../scripts/sync_app_config.sh"
-    local TRACKED="${CONFIG_REPO}/../../php/config.php.redacted"
-    [ -x "${SYNC}" ] || { log "app config drift: ${SYNC} missing, skipped"; return 0; }
-
-    local BEFORE=""
-    [ -f "${TRACKED}" ] && BEFORE=$(sha256sum "${TRACKED}" | cut -d' ' -f1)
-
-    if ! "${SYNC}" >/dev/null 2>&1; then
-        log "app config drift: sync_app_config.sh ABORTED — live config not published, investigate"
-        return 1
-    fi
-
-    local AFTER
-    AFTER=$(sha256sum "${TRACKED}" 2>/dev/null | cut -d' ' -f1)
-    if [ "${BEFORE}" != "${AFTER}" ]; then
-        log "app config drift: config.php moved — redacted copy refreshed, review and commit"
-        return 1
-    fi
-
-    log "app config drift: config.php matches what is tracked"
-    return 0
-}
-
-# Apache vhosts on this node, tracked beside the proxy config.
-#
-# They were untracked until 2026-09-14, which meant a security-relevant edit
-# there was unreviewable and could drift the same way the proxy config once sat
-# 474 lines behind its node. The edit that prompted this was a deny rule for
-# backup files: `index.php.backup-logo-...` had been answering 200 with the raw
-# PHP source of the page.
-#
-# Copied from sites-ENABLED, dereferenced, so the tracked set records which
-# vhosts are live as well as what they contain. No redaction step: these carry
-# certificate *paths*, never key material, and that is asserted below rather
-# than assumed — a vhost that ever gains a secret must not reach this public
-# repo.
-check_apache_drift() {
-    local DIR="${CONFIG_REPO}/local/apache"
-    local SRC="/etc/apache2/sites-enabled"
-    # Apache's listening ports: not a vhost, so not in sites-enabled, but
-    # included by apache2.conf and as security-relevant as any vhost. It was
-    # tracked, and reported every week as "no longer enabled" because only
-    # sites-enabled was compared.
-    local PORTS="/etc/apache2/ports.conf"
-    # Our own server-wide confs (pqcrypta-remoteip.conf: REMOTE_ADDR from the
-    # proxy's X-Real-IP), enabled from conf-available: as security-relevant
-    # as a vhost, and tracked beside them
-    local CONFS="/etc/apache2/conf-enabled"
-    [ -d "${SRC}" ] || return 0
-    [ -d "${DIR}" ] || { log "apache drift: ${DIR} not tracked yet"; return 1; }
-
-    local DRIFTED=0 F NAME TMP
-    for F in "${SRC}"/*.conf "${PORTS}" "${CONFS}"/pqcrypta-*.conf; do
-        [ -e "${F}" ] || continue
-        NAME=$(basename "${F}")
-        TMP=$(mktemp /tmp/apadrift_XXXXXX.conf)
-        cp "$(readlink -f "${F}")" "${TMP}" 2>/dev/null
-
-        # Fail closed if a vhost ever starts carrying key material or an inline
-        # credential. The repo is public with secret scanning on every push; an
-        # unreviewed copy is worth less than a loud refusal.
-        if grep -qiE 'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|SetEnv[[:space:]]+[A-Za-z_]*(KEY|SECRET|PASS)[A-Za-z_]*[[:space:]]+[^[:space:]]|RequestHeader[[:space:]]+set[[:space:]]+Authorization' "${TMP}"; then
-            log "apache drift: ABORT on ${NAME} — looks like it carries a secret, repo untouched"
-            rm -f "${TMP}"; DRIFTED=1; continue
-        fi
-
-        if [ ! -f "${DIR}/${NAME}" ]; then
-            cp "${TMP}" "${DIR}/${NAME}"
-            log "apache drift: ${NAME} was not tracked — working copy added, review and commit"
+            log "config drift: ${NAME} moved ${N} lines — copy in ${COPY}, review and commit to pqcrypta-configs"
             DRIFTED=1
         else
-            local N
-            N=$(diff "${DIR}/${NAME}" "${TMP}" 2>/dev/null | grep -c '^[<>]')
-            if [ "${N}" -gt 0 ]; then
-                cp "${TMP}" "${DIR}/${NAME}"
-                log "apache drift: ${NAME} moved ${N} lines — working copy refreshed, review and commit"
-                DRIFTED=1
-            fi
-        fi
-        rm -f "${TMP}"
-    done
-
-    # A vhost that was disabled or deleted should stop being tracked.
-    for F in "${DIR}"/*.conf; do
-        [ -e "${F}" ] || continue
-        NAME=$(basename "${F}")
-        if [ "${NAME}" = "$(basename "${PORTS}")" ] && [ -e "${PORTS}" ]; then
-            continue
-        fi
-        if [ -e "${CONFS}/${NAME}" ]; then
-            continue
-        fi
-        if [ ! -e "${SRC}/${NAME}" ]; then
-            log "apache drift: ${NAME} is tracked but no longer enabled — remove it from the repo"
-            DRIFTED=1
+            rm -f "${COPY}"
         fi
     done
-
-    [ "${DRIFTED}" -eq 0 ] && log "apache drift: all vhosts match what is tracked"
-    return "${DRIFTED}"
+    [ "${DRIFTED}" -eq 0 ] && log "config drift: every node's config matches what is tracked"
 }
 
 # Every exit path goes through here, so the GeoIP refresh and the fleet are
 # reconciled even when the JA3 fetch failed and the local database was left
 # untouched.
 finish() {
-    [ "${GEOIP_CHANGED}" -eq 1 ] && reload_local
     sync_fleet
     check_config_drift
     log "Refresh complete"
+    [ "${DRIFTED}" -eq 0 ] || exit 3
     exit 0
 }
 
@@ -503,7 +261,10 @@ set +e
 update_geoip
 
 TMP_CSV=$(mktemp /tmp/ja3_refresh_XXXXXX.csv)
-TMP_JSON=$(mktemp /tmp/ja3_refresh_XXXXXX.json)
+# Beside the database it replaces, so that the replacement is a rename within
+# one file system: built in /tmp, it was copied across, and the proxy could
+# load it half written
+TMP_JSON=$(mktemp "${DEST_DIR}/.ja3_refresh_XXXXXX.json")
 
 cleanup() {
     rm -f "${TMP_CSV}" "${TMP_JSON}"
@@ -631,14 +392,10 @@ if [ "${NEW_SUM}" = "${OLD_SUM}" ]; then
     finish
 fi
 
-# Atomic replace. Readable by the proxy's group when it runs as its own
-# account (the directory's group, set-group-ID there): root's, 0640.
+# Atomic replace. Readable by the proxy's group (the directory's, set-group-ID),
+# the fleet account's: 0640. The proxy reloads it (pqcrypta-proxy-data.path).
 chmod 0640 "${TMP_JSON}"
-chgrp --reference="$(dirname "${DEST_FILE}")" "${TMP_JSON}"
 mv "${TMP_JSON}" "${DEST_FILE}"
 log "Updated JA3 database: ${ENTRY_COUNT} entries (was: $([ -n "${OLD_SUM}" ] && echo 'different' || echo 'new'))"
-
-# The proxy loads the new database on reload
-reload_local
 
 finish

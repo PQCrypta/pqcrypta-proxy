@@ -22,8 +22,8 @@
 # A MaxMind account can be created free at https://www.maxmind.com/en/geolite2/signup
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DATA_DIR="${SCRIPT_DIR}/../data/geoip"
+# Where the proxy's defaults look (security.geoip_db_path, geoip_asn_db_path)
+DATA_DIR="${GEOIP_DIR:-/var/lib/pqcrypta-proxy/geoip}"
 MAXMIND_BASE="https://download.maxmind.com/app/geoip_download"
 
 ACCOUNT_ID="${1:-${MAXMIND_ACCOUNT_ID:-}}"
@@ -79,4 +79,4 @@ download_db "GeoLite2-ASN"
 
 echo ""
 echo "GeoIP databases updated in ${DATA_DIR}"
-echo "Weekly refresh: scripts/refresh_fingerprint_db.sh (cron) keeps them current."
+echo "Weekly refresh: scripts/refresh_fingerprint_db.sh (a weekly timer) keeps them current."

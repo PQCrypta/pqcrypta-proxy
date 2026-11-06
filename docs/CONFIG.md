@@ -563,7 +563,8 @@ ML-inspired anomaly detection that learns normal traffic patterns.
 | `dos_protection` | bool | `true` | Enable DoS protection |
 | `blocked_ips` | array[string] | `[]` | Manually blocked IP addresses |
 | `allowed_ips` | array[string] | `[]` | IP whitelist (empty = allow all) |
-| `geoip_db_path` | path? | `"/var/www/html/pqcrypta-proxy/data/geoip/GeoLite2-City.mmdb"` | MaxMind GeoIP database path |
+| `geoip_db_path` | path? | `"/var/lib/pqcrypta-proxy/geoip/GeoLite2-City.mmdb"` | MaxMind GeoIP (City) database path |
+| `geoip_asn_db_path` | path? | `"/var/lib/pqcrypta-proxy/geoip/GeoLite2-ASN.mmdb"` | MaxMind GeoIP ASN database path |
 | `blocked_countries` | array[string] | `[]` | Blocked country codes (ISO 3166-1 alpha-2, e.g., `["CN", "RU", "KP"]`) |
 | `max_connections_per_ip` | u32 | `100` | Maximum connections per IP |
 | `auto_block_threshold` | u32 | `10` | Suspicious patterns before auto-block |
