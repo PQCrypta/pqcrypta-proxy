@@ -3,46 +3,31 @@
 # Syncs blocklists from PostgreSQL database to JSON files for proxy hot-reload.
 # Blocklist files are stored OUTSIDE the web root to prevent direct HTTP access.
 #
-# Run via cron: */1 * * * * /var/www/html/pqcrypta-proxy/scripts/sync_blocklist.sh
+# Run every minute by pqcrypta-blocklist-sync.timer (pqcrypta-configs) as the
+# account pqcrypta-proxydata, which owns the blocklist directory (the proxy
+# reads it through its group) and signs in to the database as the role of its
+# name by peer authentication, with SELECT on the four lists and nothing else.
+# What it says goes to stdout (the unit appends it to
+# /var/log/pqcrypta/blocklist_sync.log).
 
 set -euo pipefail
 
 # Configuration
+# The blocklist directory (outside the web root): this account's, set-group-ID
+# to the proxy's group, which reads it (tmpfiles.d/pqcrypta-proxy.conf)
 BLOCKLIST_DIR="/var/lib/pqcrypta-proxy/blocklists"
-# The proxy's group: it reads these files, root writes them
-PROXY_GROUP="pqcrypta"
 DB_NAME="pqcrypta"
-DB_USER="pqcrypta_user"
-DB_HOST="localhost"
-# In root's log directory, not the proxy account's (/var/log/pqcrypta-proxy)
-LOG_FILE="/var/log/pqcrypta/blocklist_sync.log"
-
-# Ensure log directory exists
-mkdir -p "$(dirname "${LOG_FILE}")"
+DB_USER="pqcrypta-proxydata"
 
 # Timestamp
 TS=$(date '+%Y-%m-%d %H:%M:%S')
 
 log() {
-    echo "[${TS}] $1" >> "${LOG_FILE}"
+    echo "[${TS}] $1"
 }
 
 log "Starting blocklist sync..."
-
-# The blocklist directory (outside the web root): root's, which writes it,
-# readable by the proxy's group and no one else; without the group (a node
-# whose proxy runs as root), root's alone.
-if [ ! -d "${BLOCKLIST_DIR}" ]; then
-    mkdir -p "${BLOCKLIST_DIR}"
-    log "Created blocklist directory: ${BLOCKLIST_DIR}"
-fi
-if getent group "${PROXY_GROUP}" >/dev/null; then
-    chown "root:${PROXY_GROUP}" "${BLOCKLIST_DIR}"
-    chmod 2750 "${BLOCKLIST_DIR}"
-else
-    chown root:root "${BLOCKLIST_DIR}"
-    chmod 0700 "${BLOCKLIST_DIR}"
-fi
+[ -d "${BLOCKLIST_DIR}" ] || { log "ERROR: no ${BLOCKLIST_DIR}"; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Helper: run a DB query and write the result to a JSON file ONLY if the
@@ -57,13 +42,11 @@ sync_table() {
 
     # Run query; capture output and exit code separately so set -e does not
     # fire before we can inspect the result.
-    # AUD-05: Run as the application user (pqcrypta_user) with SELECT-only privileges,
-    # not as the postgres superuser via sudo.  Grant pqcrypta_user SELECT on
-    # bot_blocklist, fingerprint_blocklist, country_blocklist, and EXECUTE on
-    # cleanup_expired_blocklist_entries() instead of using the superuser.
+    # AUD-05: a role with SELECT on the lists alone, by peer authentication
+    # over the local socket (no password), never the superuser.
     local DB_OUTPUT
-    if ! DB_OUTPUT=$(psql -h "${DB_HOST}" -U "${DB_USER}" -d "${DB_NAME}" -t -A -c "${QUERY}" 2>&1); then
-        log "WARNING: DB query failed for ${LABEL} (psql exited non-zero) - preserving existing blocklist"
+    if ! DB_OUTPUT=$(psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1 -t -A -c "${QUERY}" 2>&1); then
+        log "WARNING: DB query failed for ${LABEL} - preserving existing blocklist: $(printf '%s' "${DB_OUTPUT}" | head -1)"
         return 0
     fi
 
@@ -174,14 +157,6 @@ mv "${STATUS_TMP}" "${BLOCKLIST_DIR}/sync_status.json"
 
 log "Sync complete: ${IP_COUNT} IPs, ${FP_COUNT} fingerprints, ${COUNTRY_COUNT} countries"
 
-# ---------------------------------------------------------------------------
-# Hourly cleanup of expired entries in the database
-# ---------------------------------------------------------------------------
-MINUTE=$(date '+%M')
-if [ "${MINUTE}" = "00" ]; then
-    log "Running hourly cleanup..."
-    psql -h "${DB_HOST}" -U "${DB_USER}" -d "${DB_NAME}" -c "SELECT cleanup_expired_blocklist_entries()" >> "${LOG_FILE}" 2>&1 || \
-        log "WARNING: hourly cleanup query failed"
-fi
-
+# Expired entries leave the database hourly by a job of their own
+# (pqcrypta-pg-blocklist-expiry.timer): this account only reads the lists.
 exit 0
