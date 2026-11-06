@@ -23,6 +23,9 @@
 #   3. cp delegated-credential-cert.service delegated-credential-cert.timer /etc/systemd/system/
 #   4. systemctl enable --now delegated-credential-cert.timer
 #
+# The unit runs it as the proxy's account (pqcrypta), whose certificate
+# directory it writes; the CA is the unit's state directory.
+#
 # DC_NAME must resolve to this host; delegated-credential.conformance.pqcrypta.com
 # does through the conformance wildcard.
 
@@ -30,7 +33,8 @@ set -euo pipefail
 
 DC_NAME=${DC_NAME:-delegated-credential.conformance.pqcrypta.com}
 PROXY_CONFIG=${PROXY_CONFIG:-/etc/pqcrypta/proxy-config.toml}
-CA_DIR=${CA_DIR:-/etc/pqcrypta/delegation-ca}
+# The unit's state directory (StateDirectory=pqcrypta-delegation-ca), or CA_DIR
+CA_DIR=${CA_DIR:-${STATE_DIRECTORY:-/var/lib/pqcrypta-delegation-ca}}
 DC_LEAF_DAYS=${DC_LEAF_DAYS:-90}
 DC_RENEW_DAYS=${DC_RENEW_DAYS:-30}
 CA_DAYS=${CA_DAYS:-1825}

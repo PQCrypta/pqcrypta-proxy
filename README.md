@@ -1754,7 +1754,7 @@ A delegated credential is a short-lived key that a certificate's own key has sig
 - The credential rides on the end-entity entry of `Certificate`, and the delegated key signs `CertificateVerify` under the scheme the credential names. TLS 1.3 only, as RFC 9345 requires; served wherever rustls terminates TLS, which is QUIC (HTTP/3) here. The OpenSSL TCP listener does not implement them
 - The vendored rustls implements the extension on both sides: `DelegatedCredential::delegate` signs a credential (RFC 9345 §4), the server sends one only to a client that offered it, and its client aborts with `unexpected_message` on one it never asked for (§4.1.1)
 
-No public CA issues the DelegationUsage extension, so `scripts/delegated-credential-cert.sh` issues the certificate from a private CA for a test host (`delegated-credential.conformance.pqcrypta.com`) and renews it weekly through `delegated-credential-cert.timer`; the proxy picks it up on its TLS reload and mints the credentials itself.
+No public CA issues the DelegationUsage extension, so `scripts/delegated-credential-cert.sh` issues the certificate from a private CA for a test host (`delegated-credential.conformance.pqcrypta.com`) and renews it weekly through `delegated-credential-cert.timer`; the proxy picks it up on its TLS reload and mints the credentials itself. The unit runs it as the proxy's account, which keeps its own certificates, with the private CA in the unit's state directory (`/var/lib/pqcrypta-delegation-ca`), the file system otherwise read-only and only the admin API on loopback reachable.
 
 ```bash
 cp scripts/delegated-credential-cert.sh /usr/local/bin/pqcrypta-delegated-credential-cert

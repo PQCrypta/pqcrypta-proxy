@@ -1,5 +1,5 @@
 [Unit]
-Description=PQCrypta IP Update — sync dynamic IP to GoDaddy DNS + notify pqcrypta.com
+Description=PQCrypta IP Update — record this node's address and heartbeat the speedtest location list
 After=network-online.target
 Wants=network-online.target
 
@@ -8,3 +8,34 @@ Type=oneshot
 ExecStart=/usr/local/bin/pqcrypta-ip-update
 StandardOutput=journal
 StandardError=journal
+# A dynamic account: the config (its token) as a credential, the last address
+# seen in its state directory, nothing else writable
+DynamicUser=yes
+LoadCredential=ip-update.conf:/etc/pqcrypta/ip-update.conf
+Environment=IP_UPDATE_CONF=%d/ip-update.conf
+StateDirectory=pqcrypta-ip-update
+TimeoutStartSec=2min
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateIPC=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SocketBindDeny=any
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
