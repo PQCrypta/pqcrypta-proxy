@@ -1246,21 +1246,17 @@ impl QuicListener {
                     }
                 }
                 Err(e) => {
-                    // Stream-level error (flow-control, reset, etc.) — respond
-                    // and return Ok so the QUIC connection stays alive for other
-                    // streams. A malformed body (DATA that does not add up to
-                    // its content-length, RFC 9114 section 4.1.2) is the
-                    // client's: 400, which the section lets a server send
-                    // before closing the stream. Anything else is ours: 500.
+                    // The body could not be read. Whose doing it was decides
+                    // the status recorded, and whether there is anyone left to
+                    // answer; the QUIC connection stays up for other streams.
                     debug!("QUIC recv_data error on {} {}: {}", method, path, e);
-                    let status = match &e {
-                        h3::error::StreamError::StreamError { code, .. }
-                            if *code == h3::error::Code::H3_MESSAGE_ERROR =>
-                        {
-                            http::StatusCode::BAD_REQUEST
-                        }
-                        _ => http::StatusCode::INTERNAL_SERVER_ERROR,
-                    };
+                    let status = body_read_failure_status(&e);
+                    // A client that reset its stream or closed the connection
+                    // (499), or that stopped sending until the connection timed
+                    // out (408), is not answered: its stream is gone. Recorded
+                    // as the server's own 500 until 2026-11-06, every client
+                    // cancelling mid-request read as a server error.
+                    let answerable = !matches!(status.as_u16(), 499 | 408);
                     log_h3_refusal(
                         remote_addr,
                         method,
@@ -1280,9 +1276,11 @@ impl QuicListener {
                         0,
                         Some(&path),
                     );
-                    if let Ok(response) = http::Response::builder().status(status).body(()) {
-                        let _ = stream.send_response(response).await;
-                        let _ = stream.finish().await;
+                    if answerable {
+                        if let Ok(response) = http::Response::builder().status(status).body(()) {
+                            let _ = stream.send_response(response).await;
+                            let _ = stream.finish().await;
+                        }
                     }
                     return Ok(());
                 }
@@ -2175,4 +2173,48 @@ fn log_h3_refusal(
         ja4,
         backend: None,
     });
+}
+
+/// The status a request whose body could not be read is recorded with.
+///
+/// - The client reset its request stream, or its connection closed: 499
+///   (client closed request; nginx's code, which the access log readers use).
+/// - The connection timed out waiting for the client: 408.
+/// - The client's stream broke HTTP/3's framing or its message rules (a body
+///   that does not add up to its content-length, RFC 9114 section 4.1.2, a
+///   frame where none may be, a request that ends before it is complete): 400,
+///   which section 4.1.2 lets a server send before closing the stream.
+/// - Anything raised on this side: 500.
+fn body_read_failure_status(e: &h3::error::StreamError) -> http::StatusCode {
+    use h3::error::{Code, ConnectionError, StreamError};
+    match e {
+        // Its variants are non-exhaustive outside h3: matched as structs, with `..`
+        StreamError::RemoteTerminate { .. } => client_closed_request(),
+        StreamError::ConnectionError {
+            0: ConnectionError::Remote { .. },
+            ..
+        } => client_closed_request(),
+        StreamError::ConnectionError {
+            0: ConnectionError::Timeout { .. },
+            ..
+        } => http::StatusCode::REQUEST_TIMEOUT,
+        StreamError::StreamError { code, .. }
+            if [
+                Code::H3_MESSAGE_ERROR,
+                Code::H3_FRAME_UNEXPECTED,
+                Code::H3_FRAME_ERROR,
+                Code::H3_REQUEST_INCOMPLETE,
+            ]
+            .contains(code) =>
+        {
+            http::StatusCode::BAD_REQUEST
+        }
+        _ => http::StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// 499, "client closed request": not a registered status, so built from its
+/// number (within 100-999, which `from_u16` accepts; the fallback is unreachable)
+fn client_closed_request() -> http::StatusCode {
+    http::StatusCode::from_u16(499).unwrap_or(http::StatusCode::BAD_REQUEST)
 }

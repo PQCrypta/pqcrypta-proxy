@@ -1146,9 +1146,9 @@ address = "127.0.0.1:8053"
 timeout_ms = 5000
 max_connections = 100
 
-# Prometheus metrics server
+# Prometheus metrics server, on loopback only
 # Required Prometheus configuration in /etc/default/prometheus:
-#   ARGS="--web.external-url=https://example.com/prometheus --web.route-prefix=/prometheus"
+#   ARGS="--web.listen-address=127.0.0.1:9090 --web.external-url=https://example.com/prometheus --web.route-prefix=/prometheus"
 [backends.prometheus]
 name = "prometheus"
 type = "http1"
@@ -1402,12 +1402,16 @@ X-Forwarded-Proto = "https"
 X-Forwarded-Host = "example.com"
 
 # Prometheus metrics route
-# Serves Prometheus at /prometheus/ subpath (requires --web.external-url and --web.route-prefix flags)
+# Serves Prometheus at /prometheus/ subpath (requires --web.external-url and --web.route-prefix flags).
+# Prometheus's API has no authentication of its own, so the route is internal:
+# only a client presenting a certificate the [tls] client CA issued is served
+# (on every transport; HTTP/3 never presents one, so it is refused there).
 [[routes]]
 name = "prometheus"
 host = "example.com"
 path_prefix = "/prometheus"
 backend = "prometheus"
+internal = true
 forward_client_identity = true
 client_identity_header = "X-Real-IP"
 priority = 20
