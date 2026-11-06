@@ -1,8 +1,15 @@
 #!/bin/bash
 # Bot Detection from Proxy Access Logs
 # Processes ALL unprocessed log entries and adds detected bots to database
-# Tracks position with state file to avoid reprocessing
-# Run via cron: */5 * * * * /var/www/html/pqcrypta-proxy/scripts/detect_bots_from_logs.sh
+# Tracks its position in the log (inode and offset) to avoid reprocessing, and
+# finishes the rotated log before the new one.
+#
+# Run every 5 minutes by pqcrypta-www-bot-detect.timer (pqcrypta-configs): as
+# the web server's account, reading the access log through the group
+# pqcrypta-log, with its position in the unit's state directory, its working
+# files in the unit's runtime directory, the proxy's crawler cache handed over
+# as a credential, and what it says on stdout (the unit appends it to
+# /var/log/pqcrypta/bot_detection.log).
 #
 # SEC-A01: All SQL executed via parameterised psql -v variables (:'name' quoted literals)
 #          rather than string interpolation, preventing SQL injection through attacker-
@@ -12,15 +19,20 @@
 ACCESS_LOG="/var/log/pqcrypta-proxy/access.log"
 DB_NAME="pqcrypta"
 DB_USER="pqcrypta_user"
-# In root's log directory, not the proxy account's (/var/log/pqcrypta-proxy)
-LOG_FILE="/var/log/pqcrypta/bot_detection.log"
-STATE_FILE="/var/www/html/pqcrypta-proxy/data/.last_processed_byte"
-TEMP_DIR="/tmp/pqcrypta-bot-detect"
+DB_HOST="localhost"
+STATE_FILE="${STATE_DIRECTORY:-/var/lib/pqcrypta-bot-detect}/position"
+# The unit's runtime directory (RuntimeDirectory=pqcrypta-bot-detect): the
+# \copy below names it literally
+TEMP_DIR="/run/pqcrypta-bot-detect"
 
 mkdir -p "$(dirname "${STATE_FILE}")" "${TEMP_DIR}"
 
 TS=$(date '+%Y-%m-%d %H:%M:%S')
-log() { echo "[${TS}] $1" >> "${LOG_FILE}"; }
+log() { echo "[${TS}] $1"; }
+
+# The database password from the platform's .env (the web server's group reads it)
+PGPASSWORD=$(sed -n 's/^DB_PASS=//p' /var/www/html/.env 2>/dev/null | tail -n 1 | tr -d "\"'")
+export PGPASSWORD
 
 # Verified crawlers: the address ranges their operators publish (Google, Bing,
 # DuckDuckGo, Apple, OpenAI, ...), fetched and cached by the proxy
@@ -28,7 +40,9 @@ log() { echo "[${TS}] $1" >> "${LOG_FILE}"; }
 # or to a page that 404s, is not an attack. Both passes below banned Googlebot
 # and Bingbot for exactly that, for 72 hours on every site behind the proxy,
 # and the 403s the ban produced counted as fresh probes, renewing it.
-CRAWLER_RANGES="/var/lib/pqcrypta-proxy/state/crawler-ranges.json"
+# The unit hands the cache over as a credential: the proxy's state directory
+# is its account's alone
+CRAWLER_RANGES="${CREDENTIALS_DIRECTORY:-/var/lib/pqcrypta-proxy/state}/crawler-ranges.json"
 
 # split_verified_crawlers IN OUT VERIFIED: copy the TSV lines of IN (address in
 # the first field) to OUT unless the address is a verified crawler's; write
@@ -61,26 +75,34 @@ with open(verified, "w") as v:
 ' "$1" "$2" "$3" "${CRAWLER_RANGES}"
 }
 
-# Our own servers: RISK_OWN_ADDRESSES (addresses or CIDR blocks, comma-
-# separated), the list the API's risk engine treats as ours. Their requests are
-# our own tooling -- health checks, conformance runs, an operator checking that
-# /.git is refused -- not evidence: on 2026-10-09 such a check from the mail
-# host banned that server's IPv6 address on every site for seven days.
-OWN_ADDRESSES=$(sed -n 's/^RISK_OWN_ADDRESSES=//p' /etc/pqcrypta/api.env 2>/dev/null \
+# Our own servers: RISK_OWN_ADDRESSES (addresses, CIDR blocks or host names,
+# comma-separated), the list the API's risk engine treats as ours, from
+# /etc/pqcrypta/own-addresses.env, which the API's unit reads too. Their
+# requests are our own tooling -- health checks, conformance runs, an operator
+# checking that /.git is refused -- not evidence: on 2026-10-09 such a check
+# from the mail host banned that server's IPv6 address on every site for seven
+# days. A name stands for the addresses it resolves to now (the unit resolves
+# through the validating scanner resolver), as in the API.
+OWN_ADDRESSES=$(sed -n 's/^RISK_OWN_ADDRESSES=//p' /etc/pqcrypta/own-addresses.env 2>/dev/null \
     | tail -n 1 | tr -d "\"' ")
 
 # drop_own_addresses IN OUT: copy the TSV lines of IN (address in the first
 # field) to OUT unless the address is one of OWN_ADDRESSES.
 drop_own_addresses() {
     python3 -c '
-import ipaddress, sys
+import ipaddress, socket, sys
 src, out, own = sys.argv[1:4]
 nets = []
 for entry in filter(None, own.split(",")):
     try:
         nets.append(ipaddress.ip_network(entry, strict=False))
     except ValueError:
-        pass
+        # A host name: the addresses it resolves to now
+        try:
+            for info in socket.getaddrinfo(entry, None, proto=socket.IPPROTO_TCP):
+                nets.append(ipaddress.ip_network(info[4][0].split("%", 1)[0]))
+        except OSError as e:
+            print(f"own address {entry} does not resolve ({e}); not exempt this run", file=sys.stderr)
 seen = {}
 with open(src) as f, open(out, "w") as o:
     for line in f:
@@ -101,24 +123,40 @@ PATTERNS='wp-admin|wp-login|wp-content|wp-includes|\.git|\.env|\.sql|\.bak|\.old
 
 [ ! -f "${ACCESS_LOG}" ] && { log "Access log not found"; exit 0; }
 
-# Get last processed byte position
-LAST_BYTE=0
-[ -f "${STATE_FILE}" ] && LAST_BYTE=$(cat "${STATE_FILE}" 2>/dev/null || echo "0")
+# Where the last run stopped: the log's inode and the offset in it
+LAST_INODE="" LAST_BYTE=0
+[ -f "${STATE_FILE}" ] && read -r LAST_INODE LAST_BYTE < "${STATE_FILE}"
+LAST_BYTE=${LAST_BYTE:-0}
 
-# Current file size
+CURRENT_INODE=$(stat -c%i "${ACCESS_LOG}" 2>/dev/null || echo "")
 CURRENT_SIZE=$(stat -c%s "${ACCESS_LOG}" 2>/dev/null || echo "0")
+: > "${TEMP_DIR}/new_lines.txt"
 
-# Handle log rotation
-[ "${CURRENT_SIZE}" -lt "${LAST_BYTE}" ] && LAST_BYTE=0
+if [ -n "${LAST_INODE}" ] && [ "${LAST_INODE}" != "${CURRENT_INODE}" ]; then
+    # Rotated since the last run: the rest of the rotated log first (if it is
+    # the file the last run read), then the new one from its start
+    if [ "$(stat -c%i "${ACCESS_LOG}.1" 2>/dev/null)" = "${LAST_INODE}" ]; then
+        tail -c "+$((LAST_BYTE + 1))" "${ACCESS_LOG}.1" >> "${TEMP_DIR}/new_lines.txt" 2>/dev/null || true
+        log "Log rotated: finished access.log.1 from byte ${LAST_BYTE}"
+    fi
+    LAST_BYTE=0
+elif [ "${CURRENT_SIZE}" -lt "${LAST_BYTE}" ]; then
+    # Truncated in place
+    LAST_BYTE=0
+fi
 
 BYTES_TO_PROCESS=$((CURRENT_SIZE - LAST_BYTE))
-[ "${BYTES_TO_PROCESS}" -le 0 ] && { log "No new data to process"; exit 0; }
+if [ "${BYTES_TO_PROCESS}" -le 0 ] && [ ! -s "${TEMP_DIR}/new_lines.txt" ]; then
+    printf '%s %s\n' "${CURRENT_INODE}" "${CURRENT_SIZE}" > "${STATE_FILE}"
+    log "No new data to process"
+    exit 0
+fi
 
 log "Processing ${BYTES_TO_PROCESS} bytes (from byte ${LAST_BYTE} to ${CURRENT_SIZE})"
 
 # Extract new data once; both the suspicious-pattern pass and the honeypot
 # feed below consume the same slice
-tail -c "+$((LAST_BYTE + 1))" "${ACCESS_LOG}" > "${TEMP_DIR}/new_lines.txt" 2>/dev/null || true
+tail -c "+$((LAST_BYTE + 1))" "${ACCESS_LOG}" >> "${TEMP_DIR}/new_lines.txt" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # Honeypot feed: the proxy WAF blocks scanner probes at the edge, so they never
@@ -170,7 +208,7 @@ BEGIN { FS = "\"" }
 drop_own_addresses "${TEMP_DIR}/all_probes.tsv" "${TEMP_DIR}/foreign_probes.tsv" \
     || cp "${TEMP_DIR}/all_probes.tsv" "${TEMP_DIR}/foreign_probes.tsv"
 if [ -n "${OWN_ADDRESSES}" ]; then
-    OWN_LIFTED=$(psql -U "${DB_USER}" -d "${DB_NAME}" -q -t -A -v "nets={${OWN_ADDRESSES}}" << 'ENDSQL' 2>>"${LOG_FILE}" || echo "0"
+    OWN_LIFTED=$(psql -h "${DB_HOST}" -U "${DB_USER}" -d "${DB_NAME}" -q -t -A -v "nets={${OWN_ADDRESSES}}" << 'ENDSQL' || echo "0"
 WITH lifted AS (
     UPDATE security_blocklist SET is_active = false
     WHERE is_active AND block_type = 'honeypot_trigger'
@@ -193,7 +231,7 @@ split_verified_crawlers "${TEMP_DIR}/foreign_probes.tsv" "${TEMP_DIR}/probes.tsv
 # Only the automatic edge bans; an operator's own block stands.
 if [ -s "${TEMP_DIR}/crawlers.txt" ]; then
     CRAWLER_IPS="{$(paste -sd, "${TEMP_DIR}/crawlers.txt")}"
-    LIFTED=$(psql -U "${DB_USER}" -d "${DB_NAME}" -q -t -A -v "ips=${CRAWLER_IPS}" << 'ENDSQL' 2>>"${LOG_FILE}" || echo "0"
+    LIFTED=$(psql -h "${DB_HOST}" -U "${DB_USER}" -d "${DB_NAME}" -q -t -A -v "ips=${CRAWLER_IPS}" << 'ENDSQL' || echo "0"
 WITH honeypot AS (
     UPDATE security_blocklist SET is_active = false
     WHERE ip_address = ANY (:'ips'::inet[]) AND is_active AND block_type = 'honeypot_trigger'
@@ -225,9 +263,9 @@ PROBE_LINES=$(wc -l < "${TEMP_DIR}/probes.tsv" 2>/dev/null || echo "0")
 if [ "${PROBE_LINES}" -gt 0 ]; then
     # NOTE: \copy performs no psql variable interpolation, so the TSV path is
     # the literal TEMP_DIR value (constant defined at the top of this script)
-    HONEYPOT_HITS=$(psql -U "${DB_USER}" -d "${DB_NAME}" -q -t -A << 'ENDSQL' 2>>"${LOG_FILE}" || echo "0"
+    HONEYPOT_HITS=$(psql -h "${DB_HOST}" -U "${DB_USER}" -d "${DB_NAME}" -q -t -A << 'ENDSQL' || echo "0"
 CREATE TEMP TABLE edge_probes (ip text, method text, path text, qs text, ua text, host text);
-\copy edge_probes FROM '/tmp/pqcrypta-bot-detect/probes.tsv' WITH (FORMAT text)
+\copy edge_probes FROM '/run/pqcrypta-bot-detect/probes.tsv' WITH (FORMAT text)
 
 WITH matched AS (
     -- Exact-path matches count on every host (/.env, /wp-config.php are never
@@ -319,10 +357,10 @@ ENDSQL
     # -----------------------------------------------------------------------
     INGEST_KEY=$(grep -E '^BOT_THREAT_INGEST_KEY=' /var/www/html/.env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'"' ')
     if [ -n "${INGEST_KEY}" ]; then
-        INGEST_COUNT=$(BOT_INGEST_KEY="${INGEST_KEY}" python3 - <<'PYEOF' 2>>"${LOG_FILE}" || echo 0
+        INGEST_COUNT=$(BOT_INGEST_KEY="${INGEST_KEY}" python3 - <<'PYEOF' || echo 0
 import os, re, json, urllib.request
 
-TSV = "/tmp/pqcrypta-bot-detect/probes.tsv"
+TSV = "/run/pqcrypta-bot-detect/probes.tsv"
 KEY = os.environ["BOT_INGEST_KEY"]
 URL = "http://127.0.0.1:3003/bot-threat/log-request"
 # Only replay requests that look like probing/attacks — keeps bot_ip_tracking
@@ -404,7 +442,7 @@ if [ "${SUSPICIOUS_COUNT}" -gt 0 ]; then
         # SEC-A01: Use psql :'variable' quoted literals for SAMPLE_PATH (string)
         # and :count::int cast for the integer — no raw shell expansion in SQL.
         # SEC-A09: Connect as pqcrypta_user, not the postgres superuser.
-        psql -U "${DB_USER}" -d "${DB_NAME}" -q \
+        psql -h "${DB_HOST}" -U "${DB_USER}" -d "${DB_NAME}" -q \
             -v "ip=${ip}" \
             -v "path=${SAMPLE_PATH}" \
             -v "count=${count}" \
@@ -421,7 +459,7 @@ ENDSQL
 
             REASON="Proxy: ${count} suspicious requests"
 
-            psql -U "${DB_USER}" -d "${DB_NAME}" -q \
+            psql -h "${DB_HOST}" -U "${DB_USER}" -d "${DB_NAME}" -q \
                 -v "ip=${ip}" \
                 -v "reason=${REASON}" \
                 -v "threat=${THREAT_LEVEL}" \
@@ -449,8 +487,8 @@ ENDSQL
     log "Processed ${UNIQUE_IPS} unique IPs, blocked ${BLOCKED_IPS}"
 fi
 
-# Update state file
-echo "${CURRENT_SIZE}" > "${STATE_FILE}"
+# Where this run stopped
+printf '%s %s\n' "${CURRENT_INODE}" "${CURRENT_SIZE}" > "${STATE_FILE}"
 
 # Cleanup
 rm -f "${TEMP_DIR}/suspicious.txt" "${TEMP_DIR}/ip_counts.txt" "${TEMP_DIR}/all_probes.tsv" "${TEMP_DIR}/crawlers.txt"
