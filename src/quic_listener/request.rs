@@ -1250,13 +1250,12 @@ impl QuicListener {
                     // the status recorded, and whether there is anyone left to
                     // answer; the QUIC connection stays up for other streams.
                     debug!("QUIC recv_data error on {} {}: {}", method, path, e);
-                    let status = body_read_failure_status(&e);
-                    // A client that reset its stream or closed the connection
-                    // (499), or that stopped sending until the connection timed
-                    // out (408), is not answered: its stream is gone. Recorded
-                    // as the server's own 500 until 2026-11-06, every client
-                    // cancelling mid-request read as a server error.
-                    let answerable = !matches!(status.as_u16(), 499 | 408);
+                    // Whose doing it was, and whether its stream is still there
+                    // to answer on (body_read_failure_status). Recorded as the
+                    // server's own 500 until 2026-11-06: every client that
+                    // cancelled mid-request, and every connection closed for
+                    // breaking HTTP/3, read as a server error.
+                    let (status, answerable) = body_read_failure_status(&e);
                     log_h3_refusal(
                         remote_addr,
                         method,
@@ -2175,42 +2174,85 @@ fn log_h3_refusal(
     });
 }
 
-/// The status a request whose body could not be read is recorded with.
+/// The status a request whose body could not be read is recorded with, and
+/// whether there is anyone left to answer.
 ///
-/// - The client reset its request stream, or its connection closed: 499
-///   (client closed request; nginx's code, which the access log readers use).
-/// - The connection timed out waiting for the client: 408.
+/// - The client reset its request stream, cancelled it, or its connection
+///   closed: 499 (client closed request; nginx's code, which the access log
+///   readers use). Not answered.
+/// - The connection timed out waiting for the client: 408. Not answered.
 /// - The client's stream broke HTTP/3's framing or its message rules (a body
 ///   that does not add up to its content-length, RFC 9114 section 4.1.2, a
 ///   frame where none may be, a request that ends before it is complete): 400,
 ///   which section 4.1.2 lets a server send before closing the stream.
-/// - Anything raised on this side: 500.
-fn body_read_failure_status(e: &h3::error::StreamError) -> http::StatusCode {
-    use h3::error::{Code, ConnectionError, StreamError};
+/// - This side closed the connection because the client broke HTTP/3 or QPACK
+///   on it (settings late or twice, a push stream from a client, a second
+///   control stream, a frame on the wrong stream): 400, not answered, since
+///   the connection is gone. These were the server's 500s, one for every
+///   conformance probe of that kind.
+/// - This side was closing the connection gracefully (a shutdown or reload):
+///   503, not answered.
+/// - Anything else raised on this side: 500.
+fn body_read_failure_status(e: &h3::error::StreamError) -> (http::StatusCode, bool) {
+    use h3::error::{ConnectionError, LocalError, StreamError};
     match e {
         // Its variants are non-exhaustive outside h3: matched as structs, with `..`
-        StreamError::RemoteTerminate { .. } => client_closed_request(),
+        StreamError::RemoteTerminate { .. } => (client_closed_request(), false),
         StreamError::ConnectionError {
             0: ConnectionError::Remote { .. },
             ..
-        } => client_closed_request(),
+        } => (client_closed_request(), false),
         StreamError::ConnectionError {
             0: ConnectionError::Timeout { .. },
             ..
-        } => http::StatusCode::REQUEST_TIMEOUT,
-        StreamError::StreamError { code, .. }
-            if [
-                Code::H3_MESSAGE_ERROR,
-                Code::H3_FRAME_UNEXPECTED,
-                Code::H3_FRAME_ERROR,
-                Code::H3_REQUEST_INCOMPLETE,
-            ]
-            .contains(code) =>
-        {
-            http::StatusCode::BAD_REQUEST
+        } => (http::StatusCode::REQUEST_TIMEOUT, false),
+        StreamError::ConnectionError {
+            0:
+                ConnectionError::Local {
+                    error: LocalError::Application { code, .. },
+                    ..
+                },
+            ..
+        } if client_protocol_error(code) => (http::StatusCode::BAD_REQUEST, false),
+        StreamError::ConnectionError {
+            0:
+                ConnectionError::Local {
+                    error: LocalError::Closing { .. },
+                    ..
+                },
+            ..
+        } => (http::StatusCode::SERVICE_UNAVAILABLE, false),
+        StreamError::StreamError { code, .. } if *code == h3::error::Code::H3_REQUEST_CANCELLED => {
+            (client_closed_request(), false)
         }
-        _ => http::StatusCode::INTERNAL_SERVER_ERROR,
+        StreamError::StreamError { code, .. } if client_protocol_error(code) => {
+            (http::StatusCode::BAD_REQUEST, true)
+        }
+        _ => (http::StatusCode::INTERNAL_SERVER_ERROR, true),
     }
+}
+
+/// An HTTP/3 or QPACK error code that names something the peer did wrong
+/// (RFC 9114 section 8.1, RFC 9204 section 6), as opposed to this side's own
+/// failure (H3_INTERNAL_ERROR, H3_EXCESSIVE_LOAD) or a neutral close
+fn client_protocol_error(code: &h3::error::Code) -> bool {
+    use h3::error::Code;
+    [
+        Code::H3_GENERAL_PROTOCOL_ERROR,
+        Code::H3_STREAM_CREATION_ERROR,
+        Code::H3_CLOSED_CRITICAL_STREAM,
+        Code::H3_FRAME_UNEXPECTED,
+        Code::H3_FRAME_ERROR,
+        Code::H3_ID_ERROR,
+        Code::H3_SETTINGS_ERROR,
+        Code::H3_MISSING_SETTINGS,
+        Code::H3_REQUEST_INCOMPLETE,
+        Code::H3_MESSAGE_ERROR,
+        Code::QPACK_DECOMPRESSION_FAILED,
+        Code::QPACK_ENCODER_STREAM_ERROR,
+        Code::QPACK_DECODER_STREAM_ERROR,
+    ]
+    .contains(code)
 }
 
 /// 499, "client closed request": not a registered status, so built from its
