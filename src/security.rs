@@ -3448,12 +3448,27 @@ mod tests {
         assert!(security.connection_rate_exceeded(ip, None, 50));
     }
 
-    /// Against the real GeoLite2 databases when present (every node has them).
+    /// Against the real GeoLite2 databases when present (every node has them,
+    /// where the defaults name them; a checkout may hold a copy in data/geoip).
     #[cfg(feature = "geoip")]
     #[tokio::test]
     async fn asn_country_allowlist_and_region_blocking() {
-        let city = std::path::Path::new("data/geoip/GeoLite2-City.mmdb");
-        let asn = std::path::Path::new("data/geoip/GeoLite2-ASN.mmdb");
+        let pick = |installed: &'static str, checkout: &'static str| {
+            let installed = std::path::Path::new(installed);
+            if installed.exists() {
+                installed
+            } else {
+                std::path::Path::new(checkout)
+            }
+        };
+        let city = pick(
+            "/var/lib/pqcrypta-proxy/geoip/GeoLite2-City.mmdb",
+            "data/geoip/GeoLite2-City.mmdb",
+        );
+        let asn = pick(
+            "/var/lib/pqcrypta-proxy/geoip/GeoLite2-ASN.mmdb",
+            "data/geoip/GeoLite2-ASN.mmdb",
+        );
         if !city.exists() || !asn.exists() {
             eprintln!("GeoLite2 databases not present; skipping");
             return;

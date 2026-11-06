@@ -2586,7 +2586,7 @@ fn default_max_tracked_fingerprints() -> usize {
 
 fn default_geoip_asn_db_path() -> Option<PathBuf> {
     Some(PathBuf::from(
-        "/var/www/html/pqcrypta-proxy/data/geoip/GeoLite2-ASN.mmdb",
+        "/var/lib/pqcrypta-proxy/geoip/GeoLite2-ASN.mmdb",
     ))
 }
 
@@ -2729,7 +2729,7 @@ impl Default for SecurityConfig {
             blocked_ips: Vec::new(),
             allowed_ips: Vec::new(),
             geoip_db_path: Some(PathBuf::from(
-                "/var/www/html/pqcrypta-proxy/data/geoip/GeoLite2-City.mmdb",
+                "/var/lib/pqcrypta-proxy/geoip/GeoLite2-City.mmdb",
             )),
             blocked_countries: Vec::new(), // e.g., vec!["CN", "RU", "KP", "IR"]
             max_connections_per_ip: 100,

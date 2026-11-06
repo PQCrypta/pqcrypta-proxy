@@ -200,7 +200,7 @@ All rate limiting and DoS protection features are now fully implemented and inte
 [security]
 dos_protection = true
 blocked_ips = []
-geoip_db_path = "/var/www/html/pqcrypta-proxy/data/geoip/GeoLite2-City.mmdb"
+geoip_db_path = "/var/lib/pqcrypta-proxy/geoip/GeoLite2-City.mmdb"
 blocked_countries = ["CN", "RU", "KP"]
 
 [security.rate_limit]

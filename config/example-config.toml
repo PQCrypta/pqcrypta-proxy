@@ -667,7 +667,7 @@ blocked_ips = []
 allowed_ips = []
 
 # GeoIP database path for country blocking (optional)
-# geoip_db_path = "/var/www/html/pqcrypta-proxy/data/geoip/GeoLite2-City.mmdb"
+# geoip_db_path = "/var/lib/pqcrypta-proxy/geoip/GeoLite2-City.mmdb"
 
 # Blocked country codes (ISO 3166-1 alpha-2)
 blocked_countries = []  # e.g., ["CN", "RU", "KP", "IR"]
