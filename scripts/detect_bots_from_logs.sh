@@ -85,24 +85,31 @@ with open(verified, "w") as v:
 # through the validating scanner resolver), as in the API.
 OWN_ADDRESSES=$(sed -n 's/^RISK_OWN_ADDRESSES=//p' /etc/pqcrypta/own-addresses.env 2>/dev/null \
     | tail -n 1 | tr -d "\"' ")
-
-# drop_own_addresses IN OUT: copy the TSV lines of IN (address in the first
-# field) to OUT unless the address is one of OWN_ADDRESSES.
-drop_own_addresses() {
-    python3 -c '
+# The list as addresses and CIDR blocks only, its host names resolved once:
+# what the filter and the lift query below compare against (PostgreSQL's inet
+# takes no name, and the query failed on the one entry that was a name)
+OWN_NETS=$(python3 -c '
 import ipaddress, socket, sys
-src, out, own = sys.argv[1:4]
 nets = []
-for entry in filter(None, own.split(",")):
+for entry in filter(None, sys.argv[1].split(",")):
     try:
-        nets.append(ipaddress.ip_network(entry, strict=False))
+        nets.append(str(ipaddress.ip_network(entry, strict=False)))
     except ValueError:
-        # A host name: the addresses it resolves to now
         try:
             for info in socket.getaddrinfo(entry, None, proto=socket.IPPROTO_TCP):
-                nets.append(ipaddress.ip_network(info[4][0].split("%", 1)[0]))
+                nets.append(str(ipaddress.ip_network(info[4][0].split("%", 1)[0])))
         except OSError as e:
             print(f"own address {entry} does not resolve ({e}); not exempt this run", file=sys.stderr)
+print(",".join(dict.fromkeys(nets)))
+' "${OWN_ADDRESSES}")
+
+# drop_own_addresses IN OUT: copy the TSV lines of IN (address in the first
+# field) to OUT unless the address is in one of OWN_NETS.
+drop_own_addresses() {
+    python3 -c '
+import ipaddress, sys
+src, out, own = sys.argv[1:4]
+nets = [ipaddress.ip_network(entry) for entry in filter(None, own.split(","))]
 seen = {}
 with open(src) as f, open(out, "w") as o:
     for line in f:
@@ -115,7 +122,7 @@ with open(src) as f, open(out, "w") as o:
                 seen[ip] = False
         if not seen[ip]:
             o.write(line)
-' "$1" "$2" "${OWN_ADDRESSES}"
+' "$1" "$2" "${OWN_NETS}"
 }
 
 # Suspicious path patterns
@@ -207,8 +214,8 @@ BEGIN { FS = "\"" }
 # ban already on one is lifted.
 drop_own_addresses "${TEMP_DIR}/all_probes.tsv" "${TEMP_DIR}/foreign_probes.tsv" \
     || cp "${TEMP_DIR}/all_probes.tsv" "${TEMP_DIR}/foreign_probes.tsv"
-if [ -n "${OWN_ADDRESSES}" ]; then
-    OWN_LIFTED=$(psql -h "${DB_HOST}" -U "${DB_USER}" -d "${DB_NAME}" -q -t -A -v "nets={${OWN_ADDRESSES}}" << 'ENDSQL' || echo "0"
+if [ -n "${OWN_NETS}" ]; then
+    OWN_LIFTED=$(psql -h "${DB_HOST}" -U "${DB_USER}" -d "${DB_NAME}" -q -t -A -v "nets={${OWN_NETS}}" << 'ENDSQL' || echo "0"
 WITH lifted AS (
     UPDATE security_blocklist SET is_active = false
     WHERE is_active AND block_type = 'honeypot_trigger'

@@ -22,8 +22,10 @@ DB_USER="pqcrypta-proxydata"
 # Timestamp
 TS=$(date '+%Y-%m-%d %H:%M:%S')
 
+# To stderr: sync_table answers its count on stdout (the unit sends both to
+# the log)
 log() {
-    echo "[${TS}] $1"
+    echo "[${TS}] $1" >&2
 }
 
 log "Starting blocklist sync..."
