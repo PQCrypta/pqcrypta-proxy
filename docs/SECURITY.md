@@ -128,7 +128,7 @@ x_content_type_options = "nosniff"
 referrer_policy = "strict-origin-when-cross-origin"
 
 # Disable browser features
-permissions_policy = "camera=(), microphone=(), geolocation=(), interest-cohort=()"
+permissions_policy = "camera=(), microphone=(), geolocation=()"
 
 # Cross-origin isolation
 cross_origin_opener_policy = "same-origin"

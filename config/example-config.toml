@@ -245,8 +245,9 @@ x_content_type_options = "nosniff"
 # Control referrer information
 referrer_policy = "strict-origin-when-cross-origin"
 
-# Disable browser features (FLoC, camera, microphone, geolocation)
-permissions_policy = "camera=(), microphone=(), geolocation=(), interest-cohort=()"
+# Disable browser features (camera, microphone, geolocation); a route that
+# needs one sets its own in headers_override
+permissions_policy = "camera=(), microphone=(), geolocation=()"
 
 # Cross-origin isolation headers
 cross_origin_opener_policy = "same-origin"

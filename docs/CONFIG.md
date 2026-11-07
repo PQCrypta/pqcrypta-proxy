@@ -251,7 +251,7 @@ All responses automatically include these security headers. The `Server` header 
 | `x_frame_options` | string | `"DENY"` | Prevent clickjacking. Options: `"DENY"`, `"SAMEORIGIN"` |
 | `x_content_type_options` | string | `"nosniff"` | Prevent MIME-type sniffing |
 | `referrer_policy` | string | `"strict-origin-when-cross-origin"` | Control referrer information |
-| `permissions_policy` | string | `"camera=(), microphone=(), geolocation=(), interest-cohort=(), fullscreen=(self), payment=()"` | Disable browser features |
+| `permissions_policy` | string | `"camera=(), microphone=(), geolocation=(), fullscreen=(self), payment=()"` | Disable browser features |
 | `cross_origin_opener_policy` | string | `"same-origin"` | COOP header. Options: `"same-origin"`, `"same-origin-allow-popups"`, `"unsafe-none"` |
 | `cross_origin_embedder_policy` | string | `"require-corp"` | COEP header. Options: `"require-corp"`, `"credentialless"`, `"unsafe-none"` |
 | `cross_origin_resource_policy` | string | `"same-origin"` | CORP header. Options: `"same-origin"`, `"same-site"`, `"cross-origin"` |
