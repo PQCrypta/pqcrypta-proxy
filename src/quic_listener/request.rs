@@ -229,7 +229,8 @@ impl QuicListener {
             .headers()
             .get("referer")
             .and_then(|v| v.to_str().ok());
-        metrics.requests.request_start();
+        // In progress until this handler returns or is dropped
+        let _in_progress = metrics.requests.request_start();
 
         debug!(
             "HTTP/3 request: {} {} host={:?} from {}",

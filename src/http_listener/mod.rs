@@ -2793,7 +2793,8 @@ async fn proxy_handler(
         .map(|v| v.eq_ignore_ascii_case("websocket"))
         .unwrap_or(false);
     let request_start = std::time::Instant::now();
-    state.metrics.requests.request_start();
+    // In progress until this handler returns or is dropped
+    let _in_progress = state.metrics.requests.request_start();
     // Strip port from host if present — axum's Host extractor includes the port
     // for non-standard ports (e.g. "tcp2.pqcrypta.com:4433"). All subsequent host
     // comparisons (tcp_only_hosts, route matching, etc.) expect bare hostnames.

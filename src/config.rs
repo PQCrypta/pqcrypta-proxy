@@ -3028,7 +3028,9 @@ impl Default for HeadersConfig {
             x_frame_options: "DENY".to_string(),
             x_content_type_options: "nosniff".to_string(),
             referrer_policy: "strict-origin-when-cross-origin".to_string(),
-            permissions_policy: "camera=(), microphone=(), geolocation=(), interest-cohort=(), fullscreen=(self), payment=()".to_string(),
+            permissions_policy:
+                "camera=(), microphone=(), geolocation=(), fullscreen=(self), payment=()"
+                    .to_string(),
             cross_origin_opener_policy: "same-origin".to_string(),
             cross_origin_embedder_policy: "require-corp".to_string(),
             cross_origin_resource_policy: "same-origin".to_string(),
@@ -3038,7 +3040,9 @@ impl Default for HeadersConfig {
             x_quantum_resistant: "ML-KEM-1024, ML-DSA-87, X25519MLKEM768".to_string(),
             x_security_level: "Post-Quantum Ready".to_string(),
             // SEC-07: Provide a safe default CSP. Operators should tighten this per-deployment.
-            content_security_policy: "default-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'".to_string(),
+            content_security_policy:
+                "default-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+                    .to_string(),
 
             // HTTP/3 Performance & Monitoring Headers
             server_timing_enabled: true,
@@ -3471,6 +3475,12 @@ impl ConfigManager {
     fn load_config(path: &Path) -> anyhow::Result<ProxyConfig> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("Failed to read config file {:?}: {}", path, e))?;
+        // An empty file parses as every default: no routes, no backends, the
+        // default ports. That is a file caught being written or truncated, never
+        // a configuration anyone means, so it is refused, not applied.
+        if content.trim().is_empty() {
+            anyhow::bail!("Config file {:?} is empty", path);
+        }
 
         let (mut config, ignored) = parse_config_str(&content)
             .map_err(|e| anyhow::anyhow!("Failed to parse config file {:?}: {}", path, e))?;
@@ -3620,6 +3630,27 @@ fn merge_toml_values(base: toml::Value, overlay: toml::Value) -> toml::Value {
     }
 }
 
+/// Whether a watched file's event means a write to it has finished: its
+/// writer closed it, or another file was renamed onto it (`sed -i`, certbot,
+/// anything that writes a temporary file and renames it into place).
+///
+/// The watcher reloaded on every modification. Writing a file in place
+/// truncates it and then writes it, an event each, so the first reload could
+/// read the file empty or half written; an empty file parses as every default,
+/// which was then applied until the next event, and each such reload logged
+/// the defaults' ports, listeners and admin settings as changed settings that
+/// needed a restart.
+fn is_finished_write(kind: &notify::EventKind) -> bool {
+    use notify::event::{AccessKind, AccessMode, ModifyKind, RenameMode};
+    matches!(
+        kind,
+        notify::EventKind::Access(AccessKind::Close(AccessMode::Write))
+            | notify::EventKind::Modify(ModifyKind::Name(
+                RenameMode::To | RenameMode::Both | RenameMode::Any
+            ))
+    )
+}
+
 impl ConfigManager {
     // re-open for remaining methods
 
@@ -3715,7 +3746,7 @@ impl ConfigManager {
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             match res {
                 Ok(event) => {
-                    if !(event.kind.is_modify() || event.kind.is_create()) {
+                    if !is_finished_write(&event.kind) {
                         return;
                     }
                     // A directory watch also reports siblings — editor swap files,
@@ -4780,6 +4811,49 @@ mod tests {
                 "{path} is not a key of the configuration"
             );
         }
+    }
+
+    #[test]
+    fn only_a_finished_write_reloads() {
+        use notify::event::{
+            AccessKind, AccessMode, CreateKind, DataChange, ModifyKind, RenameMode,
+        };
+        use notify::EventKind;
+        // A writer closing the file, a file renamed onto it
+        assert!(super::is_finished_write(&EventKind::Access(
+            AccessKind::Close(AccessMode::Write)
+        )));
+        assert!(super::is_finished_write(&EventKind::Modify(
+            ModifyKind::Name(RenameMode::To)
+        )));
+        assert!(super::is_finished_write(&EventKind::Modify(
+            ModifyKind::Name(RenameMode::Both)
+        )));
+        // Part way through a write: the truncation, each write, a file just
+        // created; and the file renamed away
+        assert!(!super::is_finished_write(&EventKind::Modify(
+            ModifyKind::Data(DataChange::Any)
+        )));
+        assert!(!super::is_finished_write(&EventKind::Modify(
+            ModifyKind::Any
+        )));
+        assert!(!super::is_finished_write(&EventKind::Create(
+            CreateKind::File
+        )));
+        assert!(!super::is_finished_write(&EventKind::Modify(
+            ModifyKind::Name(RenameMode::From)
+        )));
+    }
+
+    #[test]
+    fn an_empty_config_file_is_refused() {
+        let dir = std::env::temp_dir().join(format!("pqcrypta-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("proxy-config.toml");
+        std::fs::write(&path, "\n  \n").unwrap();
+        let err = super::ConfigManager::load_config(&path).unwrap_err();
+        assert!(err.to_string().contains("is empty"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

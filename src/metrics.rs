@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
@@ -163,6 +164,17 @@ pub struct EndpointErrorEntry {
     pub last_seen: i64,
 }
 
+/// One request counted in progress, from [`RequestMetrics::request_start`]
+/// until this is dropped
+#[must_use = "the request stops counting as in progress when this is dropped"]
+pub struct InProgress(Arc<AtomicU64>);
+
+impl Drop for InProgress {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Global request metrics
 pub struct RequestMetrics {
     /// Total requests received
@@ -173,8 +185,8 @@ pub struct RequestMetrics {
     client_errors: AtomicU64,
     /// Server errors (5xx)
     server_errors: AtomicU64,
-    /// Requests in progress
-    in_progress: AtomicU64,
+    /// Requests in progress: each request's [`InProgress`] holds one
+    in_progress: Arc<AtomicU64>,
     /// Total request bytes received
     bytes_received: AtomicU64,
     /// Total response bytes sent
@@ -194,7 +206,7 @@ impl RequestMetrics {
             success: AtomicU64::new(0),
             client_errors: AtomicU64::new(0),
             server_errors: AtomicU64::new(0),
-            in_progress: AtomicU64::new(0),
+            in_progress: Arc::new(AtomicU64::new(0)),
             bytes_received: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
             latency_histogram: LatencyHistogram::new(),
@@ -203,10 +215,16 @@ impl RequestMetrics {
         }
     }
 
-    /// Record a request start
-    pub fn request_start(&self) {
+    /// Record a request start. The request counts as in progress until the
+    /// returned guard is dropped, which a handler does on every way out of it:
+    /// each return, an error, and a client resetting the stream, which drops
+    /// the handler's future part way through. The count used to fall in
+    /// `request_end_full`, which those last ways out never reached: it only
+    /// grew between restarts (to 8000 on a node with a dozen requests open).
+    pub fn request_start(&self) -> InProgress {
         self.total.fetch_add(1, Ordering::Relaxed);
         self.in_progress.fetch_add(1, Ordering::Relaxed);
+        InProgress(Arc::clone(&self.in_progress))
     }
 
     /// Record a request completion (without path tracking)
@@ -238,7 +256,6 @@ impl RequestMetrics {
         bytes_out: u64,
         path: Option<&str>,
     ) {
-        self.in_progress.fetch_sub(1, Ordering::Relaxed);
         self.bytes_received.fetch_add(bytes_in, Ordering::Relaxed);
         self.bytes_sent.fetch_add(bytes_out, Ordering::Relaxed);
         self.latency_histogram.observe(latency);
@@ -1565,8 +1582,10 @@ mod tests {
     fn test_request_metrics() {
         let m = RequestMetrics::new();
 
-        m.request_start();
+        let request = m.request_start();
+        assert_eq!(m.in_progress.load(Ordering::Relaxed), 1);
         m.request_end(200, Duration::from_millis(50), 100, 200);
+        drop(request);
 
         assert_eq!(m.total.load(Ordering::Relaxed), 1);
         assert_eq!(m.success.load(Ordering::Relaxed), 1);
@@ -1574,14 +1593,30 @@ mod tests {
     }
 
     #[test]
+    fn a_request_that_never_ends_stops_counting_when_dropped() {
+        let m = RequestMetrics::new();
+        let finished = m.request_start();
+        let abandoned = m.request_start();
+        assert_eq!(m.in_progress.load(Ordering::Relaxed), 2);
+        m.request_end(200, Duration::from_millis(5), 0, 0);
+        drop(finished);
+        assert_eq!(m.in_progress.load(Ordering::Relaxed), 1);
+        // A handler's future dropped part way (the client reset the stream):
+        // no request_end, and the count still falls
+        drop(abandoned);
+        assert_eq!(m.in_progress.load(Ordering::Relaxed), 0);
+        assert_eq!(m.total.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
     fn test_failure_tracking() {
         let m = RequestMetrics::new();
 
-        m.request_start();
+        let _request = m.request_start();
         m.request_end_with_path(404, Duration::from_millis(10), 0, 0, Some("/api/encrypt"));
-        m.request_start();
+        let _request = m.request_start();
         m.request_end_with_path(500, Duration::from_millis(20), 0, 0, Some("/api/encrypt"));
-        m.request_start();
+        let _request = m.request_start();
         m.request_end_with_path(403, Duration::from_millis(5), 0, 0, Some("/api/decrypt"));
 
         assert_eq!(m.client_errors.load(Ordering::Relaxed), 2);
@@ -1669,7 +1704,7 @@ mod tests {
     fn test_metrics_registry() {
         let registry = MetricsRegistry::new();
 
-        registry.requests.request_start();
+        let _request = registry.requests.request_start();
         registry
             .requests
             .request_end(200, Duration::from_millis(50), 100, 200);

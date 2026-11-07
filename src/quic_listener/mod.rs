@@ -117,6 +117,10 @@ pub(crate) fn log_quic_end(remote_addr: SocketAddr, msg: &str) {
     if is_benign_h3_close(&msg)
         || msg.contains("peer doesn't support any known protocol")
         || msg.contains("received fatal alert")
+        // A client offering no key exchange group, cipher suite or signature
+        // scheme this server accepts (the TLS group checks offer refused ones
+        // on purpose)
+        || msg.contains("peer is incompatible")
     {
         debug!("QUIC connection from {} ended: {}", remote_addr, msg);
     } else if msg.contains("no server certificate chain resolved") {
