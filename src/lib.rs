@@ -171,6 +171,7 @@ pub mod request_id;
 pub mod route_gate;
 pub mod security;
 pub mod speedtest;
+pub mod speedtest_meter;
 pub mod startup_verify;
 pub mod telemetry;
 pub mod tls;

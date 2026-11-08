@@ -853,6 +853,39 @@ impl MasqueConfig {
     }
 }
 
+/// A QUIC congestion controller (see `server.quic_congestion_control`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuicCongestionControl {
+    /// BBRv3: model-based, paced at the measured bottleneck rate.
+    #[default]
+    Bbr3,
+    /// CUBIC (RFC 9438): loss-based.
+    Cubic,
+    /// NewReno (RFC 9002 §7): loss-based.
+    NewReno,
+}
+
+impl QuicCongestionControl {
+    /// The controller's name, as configured.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Bbr3 => "bbr3",
+            Self::Cubic => "cubic",
+            Self::NewReno => "new_reno",
+        }
+    }
+
+    /// A factory for QUIC transport configs.
+    pub fn factory(self) -> Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> {
+        match self {
+            Self::Bbr3 => Arc::new(quinn::congestion::Bbr3Config::default()),
+            Self::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
+            Self::NewReno => Arc::new(quinn::congestion::NewRenoConfig::default()),
+        }
+    }
+}
+
 /// Server bind configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1084,6 +1117,19 @@ pub struct ServerConfig {
     #[serde(default = "default_multipath_paths")]
     pub max_concurrent_multipath_paths: u32,
 
+    /// Congestion controller for every QUIC connection this proxy serves, on
+    /// the main listener and the WebTransport endpoint alike.
+    ///
+    /// `bbr3` (default): BBRv3 (draft-ietf-ccwg-bbr). It models the path's
+    /// bottleneck bandwidth and round-trip time and paces at that rate, so it
+    /// fills a long or lossy path that a loss-based controller backs off from at
+    /// the first random drop, and keeps the bottleneck queue short while doing
+    /// it. The nodes' TCP runs the kernel's BBR, so a speed test compares QUIC and
+    /// TCP under the same model rather than Cubic against BBR. `cubic` and
+    /// `new_reno` are the loss-based alternatives.
+    #[serde(default)]
+    pub quic_congestion_control: QuicCongestionControl,
+
     /// Maximum concurrent WebTransport sessions per origin (default 100).
     #[serde(default = "default_wt_max_sessions")]
     pub webtransport_max_sessions_per_origin: u32,
@@ -1293,6 +1339,7 @@ impl Default for ServerConfig {
             udp_gro: false,
             enable_quic_retry: false,
             max_concurrent_multipath_paths: 4,
+            quic_congestion_control: QuicCongestionControl::default(),
             webtransport_max_sessions_per_origin: 100,
             webtransport_max_streams_per_session: 1000,
             webtransport_max_datagrams_per_sec: 500,
@@ -3530,6 +3577,7 @@ pub const RESTART_BOUND_SETTINGS: &[&str] = &[
     "server.graceful_shutdown_timeout_secs",
     "server.enable_quic_migration",
     "server.enable_ack_frequency",
+    "server.quic_congestion_control",
     "server.ack_eliciting_threshold",
     "server.ack_piggyback",
     "server.quic_send_coalescing",

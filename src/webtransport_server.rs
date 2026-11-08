@@ -123,6 +123,12 @@ impl WebTransportServer {
         // Send window — 64 MB
         transport_config.send_window(64 * 1024 * 1024);
 
+        // Congestion control: server.quic_congestion_control (BBRv3 by default),
+        // the same controller the main QUIC listener runs.
+        let congestion = config.server.quic_congestion_control;
+        transport_config.congestion_controller_factory(congestion.factory());
+        crate::speedtest::set_congestion_control(congestion.name());
+
         // Concurrent streams
         transport_config.max_concurrent_bidi_streams(VarInt::from_u32(1000));
         transport_config.max_concurrent_uni_streams(VarInt::from_u32(1000));
@@ -141,7 +147,8 @@ impl WebTransportServer {
         }
 
         info!(
-            "🔧 Transport config: receive_window=64MB, stream_window=32MB, send_window=64MB, datagram_buf=4MB"
+            "🔧 Transport config: receive_window=64MB, stream_window=32MB, send_window=64MB, datagram_buf=4MB, congestion={}",
+            congestion.name()
         );
 
         // Bind the UDP socket ourselves so we can size SO_RCVBUF/SO_SNDBUF

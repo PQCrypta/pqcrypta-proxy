@@ -21,8 +21,18 @@
 //!               (or framed error JSON if status byte is `0x01`)
 //!
 //! ### Upload
-//! Client sends: framed `{"op":"upload","bytes":N}` + N raw bytes + closes write side
+//! Client sends: framed `{"op":"upload","bytes":N,"test":ID}` + N raw bytes + closes write side
 //! Server sends: framed JSON result `{"bytes_received":M,"duration_ms":D,"throughput_mbps":T}`
+//!
+//! `test` (32 hex digits, optional) names the upload this stream belongs to:
+//! every stream (and every TCP or HTTP/3 request) carrying the same id adds what
+//! it receives to one server-side meter ([`crate::speedtest_meter`]).
+//!
+//! ### Meter
+//! Client sends: framed `{"op":"meter","test":ID}`
+//! Server sends: framed JSON — the bytes received for that test per
+//! `bucket_ms` bucket, counted on arrival at this process, whatever transport
+//! carried them. `{"error":"no_meter"}` when none is live.
 //!
 //! ### Info
 //! Client sends: framed `{"op":"info"}`
@@ -64,9 +74,13 @@ const SESSION_IDLE_TIMEOUT: Duration = Duration::from_mins(5); // 5 minutes
 /// Hard cap on total session lifetime regardless of activity.
 const SESSION_MAX_DURATION: Duration = Duration::from_mins(30); // 30 minutes
 
-/// Maximum size for a single download: 1 GB (client enforces a time limit of 5–10 s;
-/// this cap exists only to prevent runaway sessions on very slow paths).
-const MAX_DOWNLOAD_BYTES: usize = 1024 * 1024 * 1024;
+/// Maximum size for a single download: 1 GB.
+///
+/// The client enforces a time limit; this cap exists only to prevent runaway
+/// sessions on very slow paths. The TCP and HTTP/3 download handlers use the
+/// same cap, so no transport's stream runs dry before the client's time limit
+/// on a fast link.
+pub const MAX_DOWNLOAD_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Maximum size for a single upload: 500 MB (client time-limits to 5–10 s).
 const MAX_UPLOAD_BYTES: usize = 500 * 1024 * 1024;
@@ -90,6 +104,16 @@ const TRACEROUTE_MAX_HOPS: u32 = 30;
 /// speed tests annotated from a file the rest of the proxy did not use.
 static GEOIP_PATHS: OnceLock<(Option<std::path::PathBuf>, Option<std::path::PathBuf>)> =
     OnceLock::new();
+
+/// The QUIC congestion controller the WebTransport endpoint runs, reported in
+/// `info` so a result can say what the server's sender was.
+static CONGESTION_CONTROL: OnceLock<&'static str> = OnceLock::new();
+
+/// Record the WebTransport endpoint's congestion controller. Call once, when
+/// the endpoint is built; later calls are ignored.
+pub fn set_congestion_control(name: &'static str) {
+    let _ = CONGESTION_CONTROL.set(name);
+}
 
 /// Tell the speed test where the City and ASN databases are. Call once, before
 /// the first session; later calls are ignored.
@@ -201,6 +225,11 @@ fn is_unsafe_for_traceroute(ip: &IpAddr) -> bool {
         }
         IpAddr::V6(v6) => v6.is_loopback() || v6.is_multicast() || v6.is_unspecified(),
     }
+}
+
+/// A client address as the speed test keys it: IPv6-mapped IPv4 unwrapped.
+pub fn canonical_ip(ip: IpAddr) -> IpAddr {
+    normalise_ip(ip)
 }
 
 /// Unwrap IPv6-mapped IPv4 addresses (::ffff:a.b.c.d → a.b.c.d)
@@ -329,6 +358,7 @@ async fn run_speedtest_stream(
         Some("upload") => handle_op_upload(send, recv, &command, remote_addr).await?,
         Some("geoip") => handle_op_geoip(send, remote_addr).await?,
         Some("traceroute") => handle_op_traceroute(send, remote_addr).await?,
+        Some("meter") => handle_op_meter(send, &command).await?,
         Some(op) => {
             warn!("Unknown speedtest op '{}' from {}", op, remote_addr);
             write_framed_json(send, &json!({"error": "unknown_op", "op": op})).await?;
@@ -366,6 +396,9 @@ async fn handle_op_info(
             "traceroute":      true,
             "geoip":           true,
             "post_quantum_tls": true,
+            "upload_meter":     true,
+            "congestion_control": CONGESTION_CONTROL.get().copied(),
+            "meter_bucket_ms":  crate::speedtest_meter::BUCKET_MS,
             "max_download_bytes": MAX_DOWNLOAD_BYTES,
             "max_upload_bytes":   MAX_UPLOAD_BYTES,
             "max_traceroute_hops": TRACEROUTE_MAX_HOPS,
@@ -373,6 +406,37 @@ async fn handle_op_info(
         "server_ts_ms": chrono::Utc::now().timestamp_millis()
     });
     write_framed_json(send, &info).await?;
+    send.finish().await?;
+    Ok(())
+}
+
+/// The size an HTTP speed-test download asked for (`size=` or `bytes=`), 10 MB
+/// by default; callers clamp it to [`MAX_DOWNLOAD_BYTES`].
+pub fn download_size(query: Option<&str>) -> u64 {
+    query
+        .and_then(|q| {
+            q.split('&').find_map(|kv| {
+                let (k, v) = kv.split_once('=')?;
+                matches!(k, "size" | "bytes")
+                    .then(|| v.parse::<u64>().ok())
+                    .flatten()
+            })
+        })
+        .unwrap_or(10 * 1024 * 1024)
+}
+
+/// The upload meter for a test id (see the module docs): what every stream and
+/// request of that test delivered here, per bucket.
+async fn handle_op_meter(
+    send: &mut wtransport::stream::SendStream,
+    command: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let reply = command
+        .get("test")
+        .and_then(|v| v.as_str())
+        .and_then(crate::speedtest_meter::snapshot)
+        .unwrap_or_else(|| json!({"error": "no_meter"}));
+    write_framed_json(send, &reply).await?;
     send.finish().await?;
     Ok(())
 }
@@ -497,6 +561,10 @@ async fn handle_op_upload(
     // steady_mbps is computed over the remaining window and is what the client displays.
     // throughput_mbps (overall average) is also reported for diagnostics.
     let warmup_dur = std::time::Duration::from_secs(2);
+    let meter = command
+        .get("test")
+        .and_then(|v| v.as_str())
+        .and_then(|id| crate::speedtest_meter::open_stream(id, normalise_ip(remote_addr.ip())));
     let mut start: Option<Instant> = None; // set on first data byte — excludes command-frame RTT
     let mut total_bytes: usize = 0;
     let mut post_warmup_bytes: usize = 0;
@@ -511,6 +579,9 @@ async fn handle_op_upload(
                         start = Some(Instant::now()); // clock starts on first byte received
                     }
                     total_bytes += n;
+                    if let Some(m) = &meter {
+                        m.record(n);
+                    }
                     // Count bytes that arrive after the warmup window has passed
                     if start.is_some_and(|s| s.elapsed() >= warmup_dur) {
                         post_warmup_bytes += n;
@@ -526,6 +597,9 @@ async fn handle_op_upload(
         Ok(())
     })
     .await;
+
+    // The stream has stopped receiving: the meter stops counting it as open.
+    drop(meter);
 
     match read_result {
         Ok(Ok(())) => {}

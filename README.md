@@ -142,6 +142,7 @@
 | **Report-To Header** | ✅ | Reporting endpoint configuration injected into responses for NEL and CSP violation delivery |
 | **Fingerprint Cache TTL** | ✅ | JA3/JA4 fingerprint classification cache with configurable max-age and background cleanup |
 | **QUIC ACK piggybacking & send coalescing** | ✅ | Owed ACKs ride on outgoing packets (`ack_piggyback`) and responses that finish together leave in one transmit (`quic_send_coalescing`); `ack_eliciting_threshold` (default 1) governs only ACK-only packets |
+| **QUIC congestion control: BBRv3** | ✅ | `quic_congestion_control` (default `bbr3`, also `cubic`, `new_reno`) on the main QUIC listener and the WebTransport endpoint alike: BBRv3 models the path's bottleneck bandwidth and RTT and paces at that rate, so it fills long or lossy paths that a loss-based controller backs off from at the first random drop, and keeps the bottleneck queue short |
 | **QUIC ACK Frequency** | ✅ | draft-ietf-quic-ack-frequency extension (`enable_ack_frequency`, default on) — peers may request fewer, batched ACKs, cutting ACK traffic and CPU on high-throughput connections; negotiated, so inert against clients that lack it |
 | **MASQUE / CONNECT-UDP (RFC 9298)** | ✅ | UDP proxying over HTTP/3 Extended CONNECT (`:protocol = connect-udp`); UDP payloads relayed as HTTP Datagrams (RFC 9297) bound to the request stream; disabled by default with `host:port` allowlist, per-session idle timeout, and per-connection session cap (`[masque]`) |
 | **DNS over HTTPS (RFC 8484)** | ✅ | A gateway for an authoritative name server on the same host: GET, HEAD and POST over HTTP/1.1, HTTP/2 and HTTP/3; DNS over TCP to the server; `Cache-Control` from the answer TTLs; RFC 8467 padding on request; zone transfers and other opcodes refused with an Extended DNS Error; loopback-only, off by default (`[doh]`) |
@@ -2026,12 +2027,21 @@ The proxy has two config options that together enable independent TCP and QUIC m
 
 The QUIC path uses WebTransport streams natively; the TCP path uses HTTP/1.1 connections to the same backend. Both paths hit the same server, measuring the protocol itself rather than network distance.
 
+### Upload meter
+
+A browser uploads over several streams or connections at once and stops them at its time limit, so neither one stream's own figures nor what the page handed to its send buffer describe the upload. Each upload names its test with a 128-bit id (`"test"` in the WebTransport command, `?test=` on `POST /speedtest/tcp-upload-stream` over TCP or HTTP/3), and every stream carrying that id adds what it receives to one meter in the proxy process: bytes per 50 ms bucket, counted on arrival. The client reads it with the `meter` op on its WebTransport session, or `GET /speedtest/tcp-upload-meter?test=ID` on a TCP-only host, while the test runs and after it, and computes one rate over the whole test from what the server received. Meters last three minutes and are capped overall and per client address.
+
+### Latency over TCP
+
+Every response on a TCP-only speed-test host carries `Timing-Allow-Origin` for the allowed front ends, so the page can read the full Resource Timing entry: `responseStart − requestStart` is one round trip plus the handler's time, without the browser's fetch and scheduling overhead around it.
+
 ### Operations (JSON over length-prefixed frames)
 
 | Operation | Client sends | Server sends |
 |-----------|-------------|--------------|
 | `download` | `{"op":"download","bytes":N}` | 1-byte status + N raw bytes |
-| `upload` | `{"op":"upload","bytes":N}` + N raw bytes | `{"bytes_received":M,"duration_ms":D,"throughput_mbps":T}` |
+| `upload` | `{"op":"upload","bytes":N,"test":ID}` + N raw bytes | `{"bytes_received":M,"duration_ms":D,"throughput_mbps":T}`; with `test`, counted on that test's meter |
+| `meter` | `{"op":"meter","test":ID}` | The test's meter: `bucket_ms`, `buckets` (bytes per bucket from the first byte), `bytes`, `span_ms`, `streams`, `open` |
 | `info` | `{"op":"info"}` | Server capabilities JSON |
 | `geoip` | `{"op":"geoip"}` | Client IP, city, country, ASN |
 | `traceroute` | `{"op":"traceroute"}` | Stream of hop frames with per-hop GeoIP, then `{"type":"done"}` |
@@ -2042,7 +2052,7 @@ The QUIC path uses WebTransport streams natively; the TCP path uses HTTP/1.1 con
 
 | Parameter | Value |
 |-----------|-------|
-| Max download | 1 GB (client time-limits to 5–10 s in practice) |
+| Max download | 1 GB per stream or request, on every transport (client time-limits it) |
 | Max upload | 500 MB |
 | Download chunk | 256 KB (keeps QUIC send buffer full) |
 | Session idle timeout | 5 minutes |
@@ -2051,6 +2061,14 @@ The QUIC path uses WebTransport streams natively; the TCP path uses HTTP/1.1 con
 ---
 
 ## Examples
+
+### `speedtest-probe` — the speed test from the command line
+
+```bash
+cargo run --release --example speedtest-probe -- https://api.pqcrypta.com:4433/speedtest --origin https://pqcrypta.com
+```
+
+Datagram round trips, a time-bounded download over parallel streams and an upload read back from the node's meter, without a browser's limits in the way: what the node and the path can carry, to check a page's figures against.
 
 ### `masque-client` — a MASQUE (RFC 9298) reference client
 

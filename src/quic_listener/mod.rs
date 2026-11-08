@@ -499,6 +499,9 @@ impl QuicListener {
 
         // Create transport configuration
         let mut transport_config = TransportConfig::default();
+        // server.quic_congestion_control: BBRv3 by default (see its docs).
+        transport_config
+            .congestion_controller_factory(config.server.quic_congestion_control.factory());
         transport_config
             .max_concurrent_bidi_streams(config.server.max_streams_per_connection.into());
         transport_config
