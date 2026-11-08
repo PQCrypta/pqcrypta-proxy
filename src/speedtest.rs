@@ -9,6 +9,7 @@
 //! - Server capability info query
 //! - Route analysis (traceroute from server → client with GeoIP per hop)
 //! - Client GeoIP lookup
+//! - The session's QUIC counters as this server sees them
 //!
 //! ## Wire Protocol
 //!
@@ -33,6 +34,16 @@
 //! Server sends: framed JSON — the bytes received for that test per
 //! `bucket_ms` bucket, counted on arrival at this process, whatever transport
 //! carried them. `{"error":"no_meter"}` when none is live.
+//!
+//! ### Transport
+//! Client sends: framed `{"op":"transport"}`
+//! Server sends: framed JSON — this session's QUIC counters as the sender
+//! sees them: `sent_bytes`/`sent_datagrams` (every UDP datagram put on the
+//! wire, retransmissions included), `received_bytes`, `lost_packets`/
+//! `lost_bytes` (declared lost, so sent again), `congestion_events`, and the
+//! path's `rtt_ms`, `cwnd` and `congestion_control`. Read before and after a
+//! download, the differences are what that transfer cost on the wire and how
+//! much of it the path dropped.
 //!
 //! ### Info
 //! Client sends: framed `{"op":"info"}`
@@ -273,6 +284,7 @@ pub async fn handle_speedtest_session(
                         tokio::spawn(handle_speedtest_stream(
                             send_stream,
                             recv_stream,
+                            Arc::clone(&connection),
                             remote_addr,
                         ));
                     }
@@ -335,9 +347,10 @@ pub async fn handle_speedtest_session(
 async fn handle_speedtest_stream(
     mut send: wtransport::stream::SendStream,
     mut recv: wtransport::stream::RecvStream,
+    connection: Arc<Connection>,
     remote_addr: SocketAddr,
 ) {
-    if let Err(e) = run_speedtest_stream(&mut send, &mut recv, remote_addr).await {
+    if let Err(e) = run_speedtest_stream(&mut send, &mut recv, &connection, remote_addr).await {
         debug!("Speed test stream error for {}: {}", remote_addr, e);
         let err_payload = json!({"error": "internal_error"});
         let _ = write_framed_json(&mut send, &err_payload).await;
@@ -348,6 +361,7 @@ async fn handle_speedtest_stream(
 async fn run_speedtest_stream(
     send: &mut wtransport::stream::SendStream,
     recv: &mut wtransport::stream::RecvStream,
+    connection: &Connection,
     remote_addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let command = read_framed_json(recv).await?;
@@ -359,6 +373,7 @@ async fn run_speedtest_stream(
         Some("geoip") => handle_op_geoip(send, remote_addr).await?,
         Some("traceroute") => handle_op_traceroute(send, remote_addr).await?,
         Some("meter") => handle_op_meter(send, &command).await?,
+        Some("transport") => handle_op_transport(send, connection).await?,
         Some(op) => {
             warn!("Unknown speedtest op '{}' from {}", op, remote_addr);
             write_framed_json(send, &json!({"error": "unknown_op", "op": op})).await?;
@@ -397,6 +412,7 @@ async fn handle_op_info(
             "geoip":           true,
             "post_quantum_tls": true,
             "upload_meter":     true,
+            "transport_stats":  true,
             "congestion_control": CONGESTION_CONTROL.get().copied(),
             "meter_bucket_ms":  crate::speedtest_meter::BUCKET_MS,
             "max_download_bytes": MAX_DOWNLOAD_BYTES,
@@ -427,6 +443,33 @@ pub fn download_size(query: Option<&str>) -> u64 {
 
 /// The upload meter for a test id (see the module docs): what every stream and
 /// request of that test delivered here, per bucket.
+/// This session's QUIC counters as the server sees them (see "Transport" above).
+async fn handle_op_transport(
+    send: &mut wtransport::stream::SendStream,
+    connection: &Connection,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    write_framed_json(send, &transport_stats(connection.quic_connection())).await?;
+    send.finish().await?;
+    Ok(())
+}
+
+fn transport_stats(quic: &quinn::Connection) -> Value {
+    let stats = quic.stats();
+    let path = quic.path_stats(quinn::PathId::ZERO);
+    json!({
+        "op": "transport_result",
+        "sent_bytes": stats.udp_tx.bytes,
+        "sent_datagrams": stats.udp_tx.datagrams,
+        "received_bytes": stats.udp_rx.bytes,
+        "lost_packets": stats.lost_packets,
+        "lost_bytes": stats.lost_bytes,
+        "congestion_events": path.as_ref().map(|p| p.congestion_events),
+        "rtt_ms": path.as_ref().map(|p| p.rtt.as_secs_f64() * 1000.0),
+        "cwnd": path.as_ref().map(|p| p.cwnd),
+        "congestion_control": CONGESTION_CONTROL.get().copied(),
+    })
+}
+
 async fn handle_op_meter(
     send: &mut wtransport::stream::SendStream,
     command: &serde_json::Value,
