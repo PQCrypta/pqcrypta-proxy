@@ -1835,21 +1835,6 @@ impl SecurityState {
         window.count > per_second
     }
 
-    pub fn increment_connections(&self, ip: IpAddr) -> u32 {
-        let mut count = self.ip_connections.entry(ip).or_insert(0);
-        *count += 1;
-        *count
-    }
-
-    /// Decrement connection count for IP
-    pub fn decrement_connections(&self, ip: IpAddr) {
-        if let Some(mut count) = self.ip_connections.get_mut(&ip) {
-            if *count > 0 {
-                *count -= 1;
-            }
-        }
-    }
-
     /// Record a request for adaptive rate limiting
     // Prometheus gauge values are f64; precision loss on large counter values is acceptable.
     #[allow(clippy::cast_precision_loss)]
@@ -2155,6 +2140,87 @@ impl SecurityState {
     }
 }
 
+/// One request's place in its client address's in-flight count
+/// (`security.max_connections_per_ip`), given back when the guard drops: when
+/// the request is answered, refused, or abandoned part way because its client
+/// went away. A request's future is dropped then, and code after an `.await`
+/// in it never runs, so a count given back by hand at the end of the
+/// middleware was never given back for those, nor on any path that returned
+/// before the end (the streaming speed-test upload did): an address that
+/// reached the limit that way stayed over it, blocked, until a restart. An
+/// address's entry goes when its count reaches zero.
+struct InFlight {
+    counts: Arc<DashMap<IpAddr, u32>>,
+    ip: IpAddr,
+}
+
+impl InFlight {
+    /// Count one more request from `ip`; returns the guard and the new count.
+    fn enter(counts: &Arc<DashMap<IpAddr, u32>>, ip: IpAddr) -> (Self, u32) {
+        let n = {
+            let mut c = counts.entry(ip).or_insert(0);
+            *c += 1;
+            *c
+        };
+        (
+            Self {
+                counts: Arc::clone(counts),
+                ip,
+            },
+            n,
+        )
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.counts.get_mut(&self.ip) {
+            *c = c.saturating_sub(1);
+        }
+        self.counts.remove_if(&self.ip, |_, c| *c == 0);
+    }
+}
+
+#[cfg(test)]
+mod in_flight_tests {
+    use super::*;
+
+    #[test]
+    fn every_way_a_request_ends_gives_its_place_back() {
+        let counts: Arc<DashMap<IpAddr, u32>> = Arc::new(DashMap::new());
+        let ip: IpAddr = "192.0.2.4".parse().unwrap();
+        let (a, n1) = InFlight::enter(&counts, ip);
+        let (b, n2) = InFlight::enter(&counts, ip);
+        assert_eq!((n1, n2), (1, 2));
+        drop(a);
+        assert_eq!(*counts.get(&ip).unwrap(), 1);
+        drop(b);
+        assert!(counts.get(&ip).is_none(), "no entry left at zero");
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_request_gives_its_place_back() {
+        // A request whose client goes away is a future dropped mid-await.
+        let counts: Arc<DashMap<IpAddr, u32>> = Arc::new(DashMap::new());
+        let ip: IpAddr = "192.0.2.5".parse().unwrap();
+        let c2 = Arc::clone(&counts);
+        let task = tokio::spawn(async move {
+            let (_slot, _) = InFlight::enter(&c2, ip);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        while counts.get(&ip).is_none() {
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        let _ = task.await;
+        assert!(
+            counts.get(&ip).is_none(),
+            "an abandoned request still counted"
+        );
+    }
+}
+
 /// Security middleware for rate limiting, IP blocking, and request validation
 pub async fn security_middleware(
     // `Arc`, not the struct. Axum clones the middleware's state for every
@@ -2294,7 +2360,9 @@ pub async fn security_middleware(
     // inspected and still get a 403 for a blocked attack — which is the whole
     // contract of pentest_bypass_ips. Putting this call inside the non-pentest
     // branch silently disabled the WAF for those addresses.
-    {
+    // The block yields this request's place in its address's in-flight count
+    // (when counted), held until the request is done, however it ends.
+    let _in_flight: Option<InFlight> = {
         let view = SecurityRequestView {
             ip,
             peer_port: Some(client_addr.port()),
@@ -2358,10 +2426,15 @@ pub async fn security_middleware(
                 .and_then(|v| v.to_str().ok()),
         ) == CrawlerVerdict::Verified;
 
-        if dos_protection && !is_pentest_bypass {
-            let connections = security.increment_connections(ip);
-            if connections > max_connections_per_ip {
-                security.decrement_connections(ip);
+        // The request's place in the count is held by a guard, given back when
+        // the request is done however it ends (see `InFlight`).
+        if dos_protection {
+            let (slot, connections) = InFlight::enter(&security.ip_connections, ip);
+            if is_pentest_bypass {
+                // Counted, never blocked.
+                debug!("Pentest bypass IP {} — skipping rate-limit/auto-block", ip);
+            } else if connections > max_connections_per_ip {
+                drop(slot);
                 if !crawler_exempt {
                     security.block_ip(
                         ip,
@@ -2375,14 +2448,11 @@ pub async fn security_middleware(
                 );
                 return too_many_connections_response(alt_svc);
             }
+            Some(slot)
+        } else {
+            None
         }
-        // Pentest IP: still track the DoS connection counter so cleanup runs
-        // correctly, but never block on it.
-        if dos_protection && is_pentest_bypass {
-            security.increment_connections(ip);
-            debug!("Pentest bypass IP {} — skipping rate-limit/auto-block", ip);
-        }
-    }
+    };
 
     // 6. Request size validation — covers both Content-Length and chunked bodies.
     //
@@ -2478,9 +2548,6 @@ pub async fn security_middleware(
                             "WAF body block (CL): rule={} ip={} path={}",
                             rule, ip, waf_path
                         );
-                        if dos_protection {
-                            security.decrement_connections(ip);
-                        }
                         if !is_pentest_bypass {
                             let mut counter = security.request_counts.entry(ip).or_default();
                             counter.suspicious_patterns += 1;
@@ -2535,9 +2602,6 @@ pub async fn security_middleware(
                 "Chunked request body exceeded limit from {}: >{} bytes",
                 ip, max_request_size
             );
-            if dos_protection {
-                security.decrement_connections(ip);
-            }
             return payload_too_large_response(max_request_size, alt_svc);
         }
 
@@ -2574,9 +2638,6 @@ pub async fn security_middleware(
                     is_pentest_bypass,
                 ) {
                     warn!("WAF body block: rule={} ip={} path={}", rule, ip, waf_path);
-                    if dos_protection {
-                        security.decrement_connections(ip);
-                    }
                     // Same escalation as the header/path WAF block path above.
                     {
                         let mut counter = security.request_counts.entry(ip).or_default();
@@ -2606,9 +2667,6 @@ pub async fn security_middleware(
             .sum();
         if header_size > max_header_size {
             warn!("Headers too large from {}: {} bytes", ip, header_size);
-            if dos_protection {
-                security.decrement_connections(ip);
-            }
             return headers_too_large_response(max_header_size, alt_svc);
         }
 
@@ -2616,9 +2674,6 @@ pub async fn security_middleware(
         let response = next.run(request).await;
         let status = response.status();
         security.record_request(ip, status);
-        if dos_protection {
-            security.decrement_connections(ip);
-        }
         return response;
     }
 
@@ -2630,10 +2685,6 @@ pub async fn security_middleware(
 
     if header_size > max_header_size {
         warn!("Headers too large from {}: {} bytes", ip, header_size);
-        // P1-fix: decrement the DoS counter that was incremented in step 3.
-        if dos_protection {
-            security.decrement_connections(ip);
-        }
         return headers_too_large_response(max_header_size, alt_svc);
     }
 
@@ -2643,11 +2694,6 @@ pub async fn security_middleware(
 
     // 8. Record request for adaptive rate limiting
     security.record_request(ip, status);
-
-    // 9. Decrement connection count
-    if dos_protection {
-        security.decrement_connections(ip);
-    }
 
     response
 }
