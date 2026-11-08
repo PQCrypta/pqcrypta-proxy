@@ -296,7 +296,7 @@ impl H3ConnHeaders {
     /// fall back to TCP, otherwise the value built for this connection.
     pub(super) fn alt_svc(&self, config: &ProxyConfig, host: Option<&str>) -> HeaderValue {
         if let Some(h) = host {
-            if config.server.tcp_only_hosts.iter().any(|t| t == h) {
+            if config.server.is_tcp_only_host(h) {
                 return HeaderValue::from_static("clear");
             }
         }
@@ -499,6 +499,9 @@ impl QuicListener {
 
         // Create transport configuration
         let mut transport_config = TransportConfig::default();
+        // server.quic_congestion_control: BBRv3 by default (see its docs).
+        transport_config
+            .congestion_controller_factory(config.server.quic_congestion_control.factory());
         transport_config
             .max_concurrent_bidi_streams(config.server.max_streams_per_connection.into());
         transport_config
@@ -2217,7 +2220,10 @@ mod alt_svc_tests {
             &crate::tls_acceptor::HandshakeFacts::default(),
         );
         assert_eq!(h.alt_svc(&c, Some("ssllabs.pqcrypta.com")), "clear");
+        // A host on another port arrives with its port, in any case.
+        assert_eq!(h.alt_svc(&c, Some("SSLLabs.pqcrypta.com:4433")), "clear");
         assert_ne!(h.alt_svc(&c, Some("pqcrypta.com")), "clear");
+        assert_ne!(h.alt_svc(&c, Some("pqcrypta.com:4433")), "clear");
         assert_ne!(h.alt_svc(&c, None), "clear");
         // Built once, and the same value the builder produces.
         assert_eq!(

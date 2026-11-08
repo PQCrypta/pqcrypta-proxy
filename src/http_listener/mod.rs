@@ -35,7 +35,7 @@ use bytes;
 use axum::{
     body::Body,
     extract::{ConnectInfo, FromRequestParts, Host, State},
-    http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri},
     middleware,
     response::{IntoResponse, Redirect, Response},
     Router,
@@ -483,14 +483,54 @@ impl<S: Send + 'static> Accept<tokio::net::TcpStream, S> for TcpAcceptor {
     }
 }
 
+/// The origin a speed-test response names in `Access-Control-Allow-Origin`:
+/// the request's, when the WebTransport allowlist has it (so the test runs from
+/// any allowed front end), otherwise the first allowed origin.
+fn speedtest_cors_origin(state: &HttpListenerState, headers: &HeaderMap) -> String {
+    let allowed = &state.config.server.webtransport_allowed_origins;
+    headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .filter(|o| allowed.iter().any(|a| a == o))
+        .map(str::to_string)
+        .or_else(|| allowed.first().cloned())
+        .unwrap_or_else(|| "https://pqcrypta.com".to_string())
+}
+
+/// CORS and Resource Timing headers for a speed-test response.
+///
+/// `Timing-Allow-Origin` lets the page read the request's full Resource Timing
+/// entry (W3C Resource Timing §4.5): `requestStart` to `responseStart` is one
+/// round trip plus this handler's time, without the browser's own fetch and
+/// scheduling overhead around it, which is what a TCP latency figure should
+/// be. Without it a cross-origin entry reports those fields as zero.
+pub(super) fn speedtest_cross_origin_headers(h: &mut HeaderMap, origin: &str) {
+    let value = HeaderValue::from_str(origin)
+        .unwrap_or_else(|_| HeaderValue::from_static("https://pqcrypta.com"));
+    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value.clone());
+    h.insert(HeaderName::from_static("timing-allow-origin"), value);
+    h.insert(header::VARY, HeaderValue::from_static("origin"));
+}
+
 /// Route one request. `Host` and `ConnectInfo` were extractor arguments while
 /// this went through the Router; they are run by hand here so `proxy_handler`
 /// keeps its signature.
 async fn dispatch(state: Arc<HttpListenerState>, req: Request<Body>) -> Response {
     if req.uri().path() == TCP_UPLOAD_PATH {
+        let origin = speedtest_cors_origin(&state, req.headers());
         return match *req.method() {
-            Method::POST => tcp_upload_measure_handler(req.into_body()).await,
-            Method::OPTIONS => tcp_upload_cors_preflight().await,
+            Method::POST => {
+                let client = req
+                    .extensions()
+                    .get::<ConnectInfo<SocketAddr>>()
+                    .map(|c| crate::speedtest::canonical_ip(c.0.ip()));
+                let test = crate::speedtest_meter::test_id_from_query(req.uri().query());
+                let meter = test
+                    .zip(client)
+                    .and_then(|(t, ip)| crate::speedtest_meter::open_stream(&t, ip));
+                tcp_upload_measure_handler(req.into_body(), &origin, meter).await
+            }
+            Method::OPTIONS => tcp_upload_cors_preflight(&origin).await,
             _ => (
                 StatusCode::METHOD_NOT_ALLOWED,
                 [(header::ALLOW, "POST,OPTIONS")],
@@ -2844,28 +2884,14 @@ async fn proxy_handler(
 
     // ── TCP-only speedtest hosts — true TCP-only speedtest (no Alt-Svc, no QUIC) ─
     // Handled in-process before route lookup so no backend is required.
-    // Covers tcp.pqcrypta.com (primary) and any host in tcp_only_hosts config.
-    let is_native_tcp_speedtest = host == "tcp.pqcrypta.com"
-        || state
-            .config
-            .server
-            .tcp_only_hosts
-            .iter()
-            .any(|h| h == &host);
+    // Every host in tcp_only_hosts (each node lists its own: tcp, tcp2, tcp3).
+    let is_native_tcp_speedtest = state.config.server.is_tcp_only_host(&host);
     if is_native_tcp_speedtest {
         // Echo the request's Origin when it is in the allowlist, so the TCP
         // speedtest works from any allowed front-end regardless of list order.
         // Fall back to the first allowed origin (then pqcrypta.com) when the
         // request has no Origin or it is not allowed.
-        let allowed = &state.config.server.webtransport_allowed_origins;
-        let req_origin = headers
-            .get(header::ORIGIN)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let cors_origin: String = req_origin
-            .filter(|o| allowed.iter().any(|a| a == o))
-            .or_else(|| allowed.first().cloned())
-            .unwrap_or_else(|| "https://pqcrypta.com".to_string());
+        let cors_origin = speedtest_cors_origin(&state, &headers);
 
         // CORS preflight
         if method == Method::OPTIONS {
@@ -2903,11 +2929,28 @@ async fn proxy_handler(
                 .try_into()
                 .unwrap_or(u64::MAX);
             let mut resp = axum::Json(serde_json::json!({ "ok": true, "ts": ts })).into_response();
+            speedtest_cross_origin_headers(resp.headers_mut(), &cors_origin);
             resp.headers_mut().insert(
-                "access-control-allow-origin",
-                HeaderValue::from_str(&cors_origin)
-                    .unwrap_or_else(|_| HeaderValue::from_static("https://pqcrypta.com")),
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store, no-cache"),
             );
+            return resp;
+        }
+
+        // Upload meter: what every request of one upload test delivered here
+        // (see crate::speedtest_meter).
+        if method == Method::GET && path == "/speedtest/tcp-upload-meter" {
+            let snapshot = crate::speedtest_meter::test_id_from_query(uri.query())
+                .and_then(|t| crate::speedtest_meter::snapshot(&t));
+            let mut resp = match snapshot {
+                Some(v) => axum::Json(v).into_response(),
+                None => (
+                    StatusCode::NOT_FOUND,
+                    axum::Json(serde_json::json!({ "error": "no_meter" })),
+                )
+                    .into_response(),
+            };
+            speedtest_cross_origin_headers(resp.headers_mut(), &cors_origin);
             resp.headers_mut().insert(
                 header::CACHE_CONTROL,
                 HeaderValue::from_static("no-store, no-cache"),
@@ -2917,19 +2960,9 @@ async fn proxy_handler(
 
         // Download — stream LCG-generated random bytes directly over TCP/H2
         if method == Method::GET && path == "/speedtest/tcp-download.php" {
-            let bytes_requested: u64 = uri
-                .query()
-                .and_then(|q| {
-                    q.split('&').find_map(|kv| {
-                        let mut parts = kv.splitn(2, '=');
-                        match (parts.next(), parts.next()) {
-                            (Some("size"), Some(v)) => v.parse::<u64>().ok(),
-                            _ => None,
-                        }
-                    })
-                })
-                .unwrap_or(10 * 1024 * 1024);
-            let bytes_to_send: u64 = bytes_requested.clamp(65_536, 100 * 1024 * 1024);
+            let bytes_requested: u64 = crate::speedtest::download_size(uri.query());
+            let bytes_to_send: u64 =
+                bytes_requested.clamp(65_536, crate::speedtest::MAX_DOWNLOAD_BYTES as u64);
 
             // Pre-compute a 256 KiB pseudo-random chunk via LCG
             const CHUNK: usize = 256 * 1024;
@@ -2970,11 +3003,7 @@ async fn proxy_handler(
                 header::CACHE_CONTROL,
                 HeaderValue::from_static("no-store, no-cache, must-revalidate"),
             );
-            resp.headers_mut().insert(
-                "access-control-allow-origin",
-                HeaderValue::from_str(&cors_origin)
-                    .unwrap_or_else(|_| HeaderValue::from_static("https://pqcrypta.com")),
-            );
+            speedtest_cross_origin_headers(resp.headers_mut(), &cors_origin);
             resp.headers_mut()
                 .insert("x-accel-buffering", HeaderValue::from_static("no"));
             info!(

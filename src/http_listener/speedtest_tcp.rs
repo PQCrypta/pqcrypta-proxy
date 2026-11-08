@@ -14,10 +14,20 @@ use tracing::info;
 /// the WebTransport upload handler. Eliminates the client-side XHR send-buffer
 /// illusion by counting bytes at the server as they arrive over the wire.
 ///
-/// Wire: POST /speedtest/tcp-upload-stream  (Content-Type: application/octet-stream)
+/// Wire: POST /speedtest/tcp-upload-stream[?test=ID]  (Content-Type: application/octet-stream)
 /// Response: { ok, bytes_received, duration_ms, throughput_mbps, steady_mbps }
+///
+/// With `test`, the bytes are also counted, as they arrive, on that test's
+/// shared meter (crate::speedtest_meter): a browser uploads over several
+/// connections at once and aborts them at its time limit, so no one request's
+/// own figures describe the upload. `GET /speedtest/tcp-upload-meter?test=ID`
+/// (or the `meter` op on a WebTransport session to this node) reads it.
 #[allow(clippy::cast_precision_loss)]
-pub(super) async fn tcp_upload_measure_handler(body: Body) -> Response {
+pub(super) async fn tcp_upload_measure_handler(
+    body: Body,
+    origin: &str,
+    meter: Option<crate::speedtest_meter::MeterStream>,
+) -> Response {
     use futures_util::StreamExt as _;
     use std::time::Instant;
 
@@ -39,6 +49,9 @@ pub(super) async fn tcp_upload_measure_handler(body: Body) -> Response {
                     start = Some(Instant::now());
                 }
                 total_bytes += n;
+                if let Some(m) = &meter {
+                    m.record(data.len());
+                }
                 if start.is_some_and(|s| s.elapsed().as_secs_f64() >= WARMUP_SECS) {
                     post_warmup_bytes += n;
                 }
@@ -46,6 +59,8 @@ pub(super) async fn tcp_upload_measure_handler(body: Body) -> Response {
             Err(_) => break,
         }
     }
+    // The request has stopped receiving: the meter stops counting it as open.
+    drop(meter);
 
     let elapsed_secs = start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -90,24 +105,18 @@ pub(super) async fn tcp_upload_measure_handler(body: Body) -> Response {
         axum::Json(json_body),
     )
         .into_response();
-    // Add CORS header so tcp.pqcrypta.com cross-origin uploads work.
-    if let Ok(v) = HeaderValue::from_str("https://pqcrypta.com") {
-        resp.headers_mut().insert("access-control-allow-origin", v);
-    }
+    super::speedtest_cross_origin_headers(resp.headers_mut(), origin);
     resp
 }
 
 /// CORS preflight handler for the TCP upload route.
 /// Browsers send OPTIONS before the POST because Content-Type: application/octet-stream
 /// is not a "simple" request type. Without this, Axum returns 405 and the upload is blocked.
-pub(super) async fn tcp_upload_cors_preflight() -> Response {
+pub(super) async fn tcp_upload_cors_preflight(origin: &str) -> Response {
     let mut resp = Response::new(axum::body::Body::empty());
     *resp.status_mut() = StatusCode::NO_CONTENT;
     let h = resp.headers_mut();
-    h.insert(
-        header::ACCESS_CONTROL_ALLOW_ORIGIN,
-        HeaderValue::from_static("https://pqcrypta.com"),
-    );
+    super::speedtest_cross_origin_headers(h, origin);
     h.insert(
         header::ACCESS_CONTROL_ALLOW_METHODS,
         HeaderValue::from_static("POST, OPTIONS"),

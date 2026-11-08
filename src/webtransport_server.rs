@@ -9,9 +9,9 @@
 use dashmap::DashMap;
 use serde_json::json;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tracing::{debug, error, info, warn, Instrument};
@@ -123,6 +123,12 @@ impl WebTransportServer {
         // Send window — 64 MB
         transport_config.send_window(64 * 1024 * 1024);
 
+        // Congestion control: server.quic_congestion_control (BBRv3 by default),
+        // the same controller the main QUIC listener runs.
+        let congestion = config.server.quic_congestion_control;
+        transport_config.congestion_controller_factory(congestion.factory());
+        crate::speedtest::set_congestion_control(congestion.name());
+
         // Concurrent streams
         transport_config.max_concurrent_bidi_streams(VarInt::from_u32(1000));
         transport_config.max_concurrent_uni_streams(VarInt::from_u32(1000));
@@ -141,7 +147,8 @@ impl WebTransportServer {
         }
 
         info!(
-            "🔧 Transport config: receive_window=64MB, stream_window=32MB, send_window=64MB, datagram_buf=4MB"
+            "🔧 Transport config: receive_window=64MB, stream_window=32MB, send_window=64MB, datagram_buf=4MB, congestion={}",
+            congestion.name()
         );
 
         // Bind the UDP socket ourselves so we can size SO_RCVBUF/SO_SNDBUF
@@ -399,6 +406,18 @@ async fn handle_incoming_session(
         debug!("   Origin: (none — non-browser client)");
     }
 
+    // WT-RL-02: per-client-address session limit.
+    let client_ip = crate::speedtest::canonical_ip(remote_addr.ip());
+    let max_client = config.server.webtransport_max_sessions_per_client;
+    let Some(_client_slot) = ClientSlot::reserve(&CLIENT_SESSIONS, client_ip, max_client) else {
+        warn!(
+            "WT-RL-02: WebTransport session limit ({}) reached for {} — rejecting",
+            max_client, remote_addr
+        );
+        session_request.forbidden().await;
+        return Ok(());
+    };
+
     // WT-RL-01: Per-origin session limit.
     let max_sessions = config.server.webtransport_max_sessions_per_origin;
     let Some(_slot) = OriginSlot::reserve(&origin_session_counts, &origin_key, max_sessions) else {
@@ -491,6 +510,43 @@ impl OriginSlot {
 impl Drop for OriginSlot {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Sessions open per client address (`server.webtransport_max_sessions_per_client`).
+static CLIENT_SESSIONS: LazyLock<DashMap<IpAddr, u32>> = LazyLock::new(DashMap::new);
+
+/// One client address's claim on a concurrent-session slot, given back on drop.
+///
+/// The count is read and raised under the map shard's lock and nothing awaits
+/// while it is held (see [`OriginSlot`] for what holding it across an await
+/// did). An address's entry goes when its last session ends, so the map holds
+/// only addresses with sessions open.
+struct ClientSlot {
+    counts: &'static DashMap<IpAddr, u32>,
+    ip: IpAddr,
+}
+
+impl ClientSlot {
+    /// Take a slot for `ip`, or `None` when it already has `max` sessions
+    /// (0: no limit).
+    fn reserve(counts: &'static DashMap<IpAddr, u32>, ip: IpAddr, max: u32) -> Option<Self> {
+        let mut n = counts.entry(ip).or_insert(0);
+        if max != 0 && *n >= max {
+            return None;
+        }
+        *n += 1;
+        drop(n);
+        Some(Self { counts, ip })
+    }
+}
+
+impl Drop for ClientSlot {
+    fn drop(&mut self) {
+        if let Some(mut n) = self.counts.get_mut(&self.ip) {
+            *n = n.saturating_sub(1);
+        }
+        self.counts.remove_if(&self.ip, |_, n| *n == 0);
     }
 }
 
@@ -1221,6 +1277,30 @@ mod tests {
 
     /// The per-origin cap still holds, and a slot comes back when its
     /// session ends.
+    #[test]
+    fn a_client_address_holds_at_most_its_cap_and_leaves_no_entry() {
+        static COUNTS: LazyLock<DashMap<IpAddr, u32>> = LazyLock::new(DashMap::new);
+        let ip: IpAddr = "192.0.2.9".parse().unwrap();
+        let a = ClientSlot::reserve(&COUNTS, ip, 2).expect("first session");
+        let b = ClientSlot::reserve(&COUNTS, ip, 2).expect("second session");
+        assert!(
+            ClientSlot::reserve(&COUNTS, ip, 2).is_none(),
+            "a third exceeded a cap of two"
+        );
+        drop(a);
+        let c = ClientSlot::reserve(&COUNTS, ip, 2).expect("a slot given back");
+        drop(b);
+        drop(c);
+        assert!(
+            COUNTS.get(&ip).is_none(),
+            "an address with no sessions keeps no entry"
+        );
+        assert!(
+            ClientSlot::reserve(&COUNTS, ip, 0).is_some(),
+            "0 is no limit"
+        );
+    }
+
     #[test]
     fn the_per_origin_cap_is_enforced_and_released() {
         let dir = tempfile::tempdir().unwrap();

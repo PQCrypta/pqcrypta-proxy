@@ -580,21 +580,18 @@ impl QuicListener {
         // The default proxy path buffers the entire PHP response before sending —
         // for 12 parallel 100 MB streams that's 1.2 GB RAM and a ~10× throughput
         // hit. Intercept here and stream bytes directly over H3 without PHP.
-        if path == "/speedtest/tcp-download.php" && (method == "GET" || method == "HEAD") {
-            let bytes_requested: u64 = uri
-                .query()
-                .and_then(|q| {
-                    q.split('&').find_map(|kv| {
-                        let mut parts = kv.splitn(2, '=');
-                        if parts.next()? == "bytes" {
-                            parts.next()?.parse().ok()
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .unwrap_or(10 * 1024 * 1024);
-            let bytes_to_send: u64 = bytes_requested.clamp(65_536, 100 * 1024 * 1024);
+        // A TCP-only host's speed test never runs here: it falls through to the
+        // 421 below, so the browser retries it over TCP, which it measures.
+        let tcp_only_host = host
+            .as_deref()
+            .is_some_and(|h| config.server.is_tcp_only_host(h));
+        if !tcp_only_host
+            && path == "/speedtest/tcp-download.php"
+            && (method == "GET" || method == "HEAD")
+        {
+            let bytes_requested: u64 = crate::speedtest::download_size(uri.query());
+            let bytes_to_send: u64 =
+                bytes_requested.clamp(65_536, crate::speedtest::MAX_DOWNLOAD_BYTES as u64);
 
             let dl_start = std::time::Instant::now();
             let response = http::Response::builder()
@@ -621,7 +618,7 @@ impl QuicListener {
                 }
                 let chunk_bytes = Bytes::from(chunk_buf);
 
-                let mut remaining = bytes_to_send as usize;
+                let mut remaining = usize::try_from(bytes_to_send).unwrap_or(usize::MAX);
                 while remaining > 0 {
                     let n = remaining.min(CHUNK);
                     // Client cancels when the time limit hits — that's normal; just stop.
@@ -655,10 +652,16 @@ impl QuicListener {
         }
 
         // ── Speedtest: server-side upload measurement ─────────────────────────
-        // Chrome upgrades all pqcrypta.com:443 requests to HTTP/3 via cached Alt-Svc,
-        // so the "TCP" upload stream arrives here. Count bytes received; the client
-        // uses the known test duration as the time denominator — no server-side timing.
-        if path == "/speedtest/tcp-upload-stream" && method == "POST" {
+        // An upload to this path over HTTP/3. With `?test=ID` its bytes are
+        // counted, on arrival, on that test's shared meter
+        // (crate::speedtest_meter), as they are over TCP and WebTransport.
+        if !tcp_only_host && path == "/speedtest/tcp-upload-stream" && method == "POST" {
+            let meter = crate::speedtest_meter::test_id_from_query(uri.query()).and_then(|t| {
+                crate::speedtest_meter::open_stream(
+                    &t,
+                    crate::speedtest::canonical_ip(remote_addr.ip()),
+                )
+            });
             let measure_start = std::time::Instant::now();
             let mut total_bytes: u64 = 0;
             let mut chunk_count: u64 = 0;
@@ -671,10 +674,14 @@ impl QuicListener {
                         chunk.advance(n);
                         total_bytes += n as u64;
                         chunk_count += 1;
+                        if let Some(m) = &meter {
+                            m.record(n);
+                        }
                     }
                     Err(_) => break,
                 }
             }
+            drop(meter);
 
             let total_elapsed = measure_start.elapsed();
             info!(
@@ -735,7 +742,7 @@ impl QuicListener {
         // alternative broken and retry the same request on a new connection,
         // which for this host is TCP. Alt-Svc "clear" goes with it.
         if let Some(h) = host.as_deref() {
-            if config.server.tcp_only_hosts.iter().any(|t| t == h) {
+            if config.server.is_tcp_only_host(h) {
                 debug!("HTTP/3 request for TCP-only host {h}: 421 so the client retries over TCP");
                 log_access(&AccessLogEntry {
                     ja3: fingerprint.ja3_hash.as_deref(),

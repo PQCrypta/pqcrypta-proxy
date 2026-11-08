@@ -853,6 +853,55 @@ impl MasqueConfig {
     }
 }
 
+impl ServerConfig {
+    /// Is `host` (a Host header or :authority, port and case as sent) one of
+    /// `tcp_only_hosts`?
+    ///
+    /// A host on a port other than 443 arrives as `name:port`; compared as sent,
+    /// fortress's `tcp2.pqcrypta.com:4433` never matched `tcp2.pqcrypta.com`,
+    /// so its TCP-only responses advertised HTTP/3 (`h3=":4434"`) instead of
+    /// `Alt-Svc: clear`, and browsers ran its "TCP" speed test over QUIC.
+    pub fn is_tcp_only_host(&self, host: &str) -> bool {
+        let name = host_without_port(host);
+        self.tcp_only_hosts
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(name))
+    }
+}
+
+/// A QUIC congestion controller (see `server.quic_congestion_control`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuicCongestionControl {
+    /// BBRv3: model-based, paced at the measured bottleneck rate.
+    #[default]
+    Bbr3,
+    /// CUBIC (RFC 9438): loss-based.
+    Cubic,
+    /// NewReno (RFC 9002 §7): loss-based.
+    NewReno,
+}
+
+impl QuicCongestionControl {
+    /// The controller's name, as configured.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Bbr3 => "bbr3",
+            Self::Cubic => "cubic",
+            Self::NewReno => "new_reno",
+        }
+    }
+
+    /// A factory for QUIC transport configs.
+    pub fn factory(self) -> Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> {
+        match self {
+            Self::Bbr3 => Arc::new(quinn::congestion::Bbr3Config::default()),
+            Self::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
+            Self::NewReno => Arc::new(quinn::congestion::NewRenoConfig::default()),
+        }
+    }
+}
+
 /// Server bind configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1084,9 +1133,36 @@ pub struct ServerConfig {
     #[serde(default = "default_multipath_paths")]
     pub max_concurrent_multipath_paths: u32,
 
-    /// Maximum concurrent WebTransport sessions per origin (default 100).
+    /// Congestion controller for every QUIC connection this proxy serves, on
+    /// the main listener and the WebTransport endpoint alike.
+    ///
+    /// `bbr3` (default): BBRv3 (draft-ietf-ccwg-bbr). It models the path's
+    /// bottleneck bandwidth and round-trip time and paces at that rate, so it
+    /// fills a long or lossy path that a loss-based controller backs off from at
+    /// the first random drop, and keeps the bottleneck queue short while doing
+    /// it. The nodes' TCP runs the kernel's BBR, so a speed test compares QUIC and
+    /// TCP under the same model rather than Cubic against BBR. `cubic` and
+    /// `new_reno` are the loss-based alternatives.
+    #[serde(default)]
+    pub quic_congestion_control: QuicCongestionControl,
+
+    /// Maximum concurrent WebTransport sessions per origin (default 4096).
+    ///
+    /// A browser session's origin is the page that opened it, so every visitor
+    /// of one page shares this count: it bounds the whole site's sessions, not
+    /// one visitor's (see `webtransport_max_sessions_per_client`). At 100 a
+    /// handful of open tabs filled it for everyone, and a speed test's upload
+    /// alone opens up to 32 sessions.
     #[serde(default = "default_wt_max_sessions")]
     pub webtransport_max_sessions_per_origin: u32,
+
+    /// Maximum concurrent WebTransport sessions from one client address
+    /// (default 64; 0 for no limit). The speed test's upload opens up to 32
+    /// sessions at once: a browser holds only about 128 KB in flight per
+    /// WebTransport session, so one session cannot fill a long path, and
+    /// parallel sessions are its parallel connections, as six are over TCP.
+    #[serde(default = "default_wt_max_sessions_per_client")]
+    pub webtransport_max_sessions_per_client: u32,
 
     /// Maximum concurrent streams per WebTransport session (default 1000).
     #[serde(default = "default_wt_max_streams")]
@@ -1293,7 +1369,9 @@ impl Default for ServerConfig {
             udp_gro: false,
             enable_quic_retry: false,
             max_concurrent_multipath_paths: 4,
-            webtransport_max_sessions_per_origin: 100,
+            quic_congestion_control: QuicCongestionControl::default(),
+            webtransport_max_sessions_per_origin: default_wt_max_sessions(),
+            webtransport_max_sessions_per_client: default_wt_max_sessions_per_client(),
             webtransport_max_streams_per_session: 1000,
             webtransport_max_datagrams_per_sec: 500,
             webtransport_port: 4433,
@@ -1458,7 +1536,11 @@ fn default_multipath_paths() -> u32 {
 }
 
 fn default_wt_max_sessions() -> u32 {
-    100
+    4096
+}
+
+fn default_wt_max_sessions_per_client() -> u32 {
+    64
 }
 
 fn default_wt_max_streams() -> u32 {
@@ -3530,6 +3612,7 @@ pub const RESTART_BOUND_SETTINGS: &[&str] = &[
     "server.graceful_shutdown_timeout_secs",
     "server.enable_quic_migration",
     "server.enable_ack_frequency",
+    "server.quic_congestion_control",
     "server.ack_eliciting_threshold",
     "server.ack_piggyback",
     "server.quic_send_coalescing",
