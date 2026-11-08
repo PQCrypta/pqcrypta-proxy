@@ -110,7 +110,7 @@ pub(super) async fn alt_svc_middleware(
         host_hdr
     };
     let server = &state.config.server;
-    let is_tcp_only = server.tcp_only_hosts.iter().any(|h| h == host);
+    let is_tcp_only = server.is_tcp_only_host(host);
 
     // Clients that must stay on TCP get `alt-svc: clear` so they never upgrade
     // to QUIC/HTTP3: crawlers and scanners by User-Agent, and clients such as

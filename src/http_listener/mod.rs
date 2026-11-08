@@ -2884,14 +2884,8 @@ async fn proxy_handler(
 
     // ── TCP-only speedtest hosts — true TCP-only speedtest (no Alt-Svc, no QUIC) ─
     // Handled in-process before route lookup so no backend is required.
-    // Covers tcp.pqcrypta.com (primary) and any host in tcp_only_hosts config.
-    let is_native_tcp_speedtest = host == "tcp.pqcrypta.com"
-        || state
-            .config
-            .server
-            .tcp_only_hosts
-            .iter()
-            .any(|h| h == &host);
+    // Every host in tcp_only_hosts (each node lists its own: tcp, tcp2, tcp3).
+    let is_native_tcp_speedtest = state.config.server.is_tcp_only_host(&host);
     if is_native_tcp_speedtest {
         // Echo the request's Origin when it is in the allowlist, so the TCP
         // speedtest works from any allowed front-end regardless of list order.

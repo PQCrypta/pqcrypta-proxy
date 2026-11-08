@@ -853,6 +853,22 @@ impl MasqueConfig {
     }
 }
 
+impl ServerConfig {
+    /// Is `host` (a Host header or :authority, port and case as sent) one of
+    /// `tcp_only_hosts`?
+    ///
+    /// A host on a port other than 443 arrives as `name:port`; compared as sent,
+    /// fortress's `tcp2.pqcrypta.com:4433` never matched `tcp2.pqcrypta.com`,
+    /// so its TCP-only responses advertised HTTP/3 (`h3=":4434"`) instead of
+    /// `Alt-Svc: clear`, and browsers ran its "TCP" speed test over QUIC.
+    pub fn is_tcp_only_host(&self, host: &str) -> bool {
+        let name = host_without_port(host);
+        self.tcp_only_hosts
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(name))
+    }
+}
+
 /// A QUIC congestion controller (see `server.quic_congestion_control`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

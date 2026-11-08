@@ -580,7 +580,15 @@ impl QuicListener {
         // The default proxy path buffers the entire PHP response before sending —
         // for 12 parallel 100 MB streams that's 1.2 GB RAM and a ~10× throughput
         // hit. Intercept here and stream bytes directly over H3 without PHP.
-        if path == "/speedtest/tcp-download.php" && (method == "GET" || method == "HEAD") {
+        // A TCP-only host's speed test never runs here: it falls through to the
+        // 421 below, so the browser retries it over TCP, which it measures.
+        let tcp_only_host = host
+            .as_deref()
+            .is_some_and(|h| config.server.is_tcp_only_host(h));
+        if !tcp_only_host
+            && path == "/speedtest/tcp-download.php"
+            && (method == "GET" || method == "HEAD")
+        {
             let bytes_requested: u64 = crate::speedtest::download_size(uri.query());
             let bytes_to_send: u64 =
                 bytes_requested.clamp(65_536, crate::speedtest::MAX_DOWNLOAD_BYTES as u64);
@@ -647,7 +655,7 @@ impl QuicListener {
         // An upload to this path over HTTP/3. With `?test=ID` its bytes are
         // counted, on arrival, on that test's shared meter
         // (crate::speedtest_meter), as they are over TCP and WebTransport.
-        if path == "/speedtest/tcp-upload-stream" && method == "POST" {
+        if !tcp_only_host && path == "/speedtest/tcp-upload-stream" && method == "POST" {
             let meter = crate::speedtest_meter::test_id_from_query(uri.query()).and_then(|t| {
                 crate::speedtest_meter::open_stream(
                     &t,
@@ -734,7 +742,7 @@ impl QuicListener {
         // alternative broken and retry the same request on a new connection,
         // which for this host is TCP. Alt-Svc "clear" goes with it.
         if let Some(h) = host.as_deref() {
-            if config.server.tcp_only_hosts.iter().any(|t| t == h) {
+            if config.server.is_tcp_only_host(h) {
                 debug!("HTTP/3 request for TCP-only host {h}: 421 so the client retries over TCP");
                 log_access(&AccessLogEntry {
                     ja3: fingerprint.ja3_hash.as_deref(),
