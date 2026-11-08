@@ -166,8 +166,12 @@ async fn download(conn: &Connection, streams: usize, secs: u64) -> (u64, f64) {
     )
 }
 
-async fn upload(conn: &Connection, streams: usize, secs: u64) -> Result<Value, Error> {
+/// Upload for `secs`; returns the node's meter and what this side wrote (which
+/// runs ahead of the network by at most the send buffers, and is all a node
+/// without the meter can be judged by).
+async fn upload(conn: &Connection, streams: usize, secs: u64) -> Result<(Value, u64), Error> {
     let test = format!("{:032x}", rand::random::<u128>());
+    let written = Arc::new(AtomicU64::new(0));
     let deadline = Instant::now() + Duration::from_secs(secs);
     // Random bytes: nothing on the path can compress them.
     let chunk: Arc<Vec<u8>> = Arc::new((0..64 * 1024).map(|_| rand::random::<u8>()).collect());
@@ -176,6 +180,7 @@ async fn upload(conn: &Connection, streams: usize, secs: u64) -> Result<Value, E
             let conn = conn.clone();
             let chunk = chunk.clone();
             let test = test.clone();
+            let written = written.clone();
             tokio::spawn(async move {
                 let command = json!({"op": "upload", "bytes": 500u64 << 20, "test": test});
                 let Ok((mut send, _recv)) = request(&conn, &command).await else {
@@ -188,6 +193,7 @@ async fn upload(conn: &Connection, streams: usize, secs: u64) -> Result<Value, E
                     {
                         break;
                     }
+                    written.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                 }
                 let _ = send.finish().await;
             })
@@ -199,12 +205,13 @@ async fn upload(conn: &Connection, streams: usize, secs: u64) -> Result<Value, E
     // Every stream finished: read the meter once nothing is still arriving.
     for _ in 0..40 {
         let meter = call(conn, json!({"op": "meter", "test": test})).await?;
-        if meter.get("open").and_then(Value::as_u64) == Some(0) {
-            return Ok(meter);
+        if meter.get("open").and_then(Value::as_u64) == Some(0) || meter.get("error").is_some() {
+            return Ok((meter, written.load(Ordering::Relaxed)));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    call(conn, json!({"op": "meter", "test": test})).await
+    let meter = call(conn, json!({"op": "meter", "test": test})).await?;
+    Ok((meter, written.load(Ordering::Relaxed)))
 }
 
 #[tokio::main]
