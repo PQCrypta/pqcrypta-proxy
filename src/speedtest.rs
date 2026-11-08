@@ -40,8 +40,10 @@
 //! Server sends: framed JSON — this session's QUIC counters as the sender
 //! sees them: `sent_bytes`/`sent_datagrams` (every UDP datagram put on the
 //! wire, retransmissions included), `received_bytes`, `lost_packets`/
-//! `lost_bytes` (declared lost, so sent again), `congestion_events`, and the
-//! path's `rtt_ms`, `cwnd` and `congestion_control`. Read before and after a
+//! `lost_bytes` (declared lost, so sent again), `congestion_events`, the
+//! path's `rtt_ms`, `cwnd`, `max_udp_payload` (as path MTU discovery has
+//! proved it) and `congestion_control`, and the client's
+//! `peer_max_udp_payload`. Read before and after a
 //! download, the differences are what that transfer cost on the wire and how
 //! much of it the path dropped.
 //!
@@ -58,7 +60,10 @@
 //! Server sends: stream of framed JSON frames — one per hop — then a done frame.
 //!   - `{"type":"client", "ip":"...", "city":"...", ...}` — client's geoip
 //!   - `{"type":"hop", "hop":N, "ip":"...", "avg_rtt_ms":F, "org":"...", ...}` — one per hop
-//!   - `{"type":"done", "total_hops":N}` — final frame
+//!   - `{"type":"done", "total_hops":N, "path_mtu_bytes":M, ...}` — final frame;
+//!     the path MTU is the one this QUIC connection's own path MTU discovery
+//!     proved (no ICMP), `path_mtu_at_least` when the search reached its
+//!     ceiling (the browser's limit or a 1500-byte link) and the path may carry more
 //!   - `{"type":"error", "error":"...", "message":"..."}` — on failure
 //!
 //! ### Datagrams
@@ -371,7 +376,7 @@ async fn run_speedtest_stream(
         Some("download") => handle_op_download(send, &command, remote_addr).await?,
         Some("upload") => handle_op_upload(send, recv, &command, remote_addr).await?,
         Some("geoip") => handle_op_geoip(send, remote_addr).await?,
-        Some("traceroute") => handle_op_traceroute(send, remote_addr).await?,
+        Some("traceroute") => handle_op_traceroute(send, connection, remote_addr).await?,
         Some("meter") => handle_op_meter(send, &command).await?,
         Some("transport") => handle_op_transport(send, connection).await?,
         Some(op) => {
@@ -466,6 +471,8 @@ fn transport_stats(quic: &quinn::Connection) -> Value {
         "congestion_events": path.as_ref().map(|p| p.congestion_events),
         "rtt_ms": path.as_ref().map(|p| p.rtt.as_secs_f64() * 1000.0),
         "cwnd": path.as_ref().map(|p| p.cwnd),
+        "max_udp_payload": path.as_ref().map(|p| p.current_mtu),
+        "peer_max_udp_payload": quic.peer_max_udp_payload_size(),
         "congestion_control": CONGESTION_CONTROL.get().copied(),
     })
 }
@@ -778,6 +785,10 @@ async fn run_mtr_probe(ip_str: String, mode: &'static str, port: u16) -> Vec<Mtr
         "15".into(), // virtually all internet paths are ≤ 15 hops; was 20
         "--timeout".into(),
         "1".into(),
+        // Wait 1 s, not mtr's default 5, for answers after the last probe: a
+        // probe's own timeout is 1 s, so a later answer is one never counted.
+        "--gracetime".into(),
+        "1".into(),
     ];
     match mode {
         "udp" => {
@@ -795,7 +806,9 @@ async fn run_mtr_probe(ip_str: String, mode: &'static str, port: u16) -> Vec<Mtr
     args.push(ip_str);
 
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(12), // 15 hops × 1s timeout + 3s buffer; was 18
+        // One cycle takes the 1 s interval plus the 1 s grace (2.6 s measured
+        // to a 14-hop path); this only bounds an mtr that does not return.
+        std::time::Duration::from_secs(6),
         tokio::process::Command::new("/usr/bin/mtr")
             .args(&args)
             .output(),
@@ -857,56 +870,29 @@ fn annotate_rtt_deltas(hops: &mut BTreeMap<u32, MergedHop>) {
     }
 }
 
-/// Binary-search the path MTU toward `ip_str` using ping with the DF bit set.
-/// Returns the discovered path MTU in bytes (IP payload + headers), or None.
-async fn probe_path_mtu(ip_str: String) -> Option<u32> {
-    // Probe sizes (ping -s is ICMP payload; add 28 = 20 IP + 8 ICMP for total MTU)
-    // We test descending from near-Ethernet to minimum Internet MTU.
-    let probes: &[u32] = &[1452, 1400, 1300, 1200, 1000, 800, 576];
-
-    for &size in probes {
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            tokio::process::Command::new("ping")
-                .args([
-                    "-c",
-                    "1",
-                    "-W",
-                    "2",
-                    "-M",
-                    "do",
-                    "-s",
-                    &size.to_string(),
-                    &ip_str,
-                ])
-                .output(),
-        )
-        .await;
-
-        if let Ok(Ok(output)) = result {
-            if output.status.success() {
-                return Some(size + 28);
-            }
-            // Some kernels report "Frag needed" with the actual MTU in stderr/stdout
-            let combined = String::from_utf8_lossy(&output.stdout).to_string()
-                + &String::from_utf8_lossy(&output.stderr);
-            if let Some(pos) = combined.find("mtu = ") {
-                let rest = &combined[pos + 6..];
-                if let Some(end) = rest.find(|c: char| !c.is_ascii_digit()) {
-                    if let Ok(v) = rest[..end].parse::<u32>() {
-                        return Some(v);
-                    }
-                }
-            }
-        }
-    }
-    None
+/// The path MTU toward the client, as QUIC's own path MTU discovery proved it.
+///
+/// This connection's DPLPMTUD (RFC 8899) proved the largest UDP payload the
+/// client acknowledged; the UDP and IP headers are added. It needs no ICMP, which
+/// the IONOS-hosted nodes never receive and many clients do not answer: the
+/// ping search it replaces waited 2 s on each of seven sizes there (14 s with
+/// nothing found). Also whether the search reached its ceiling (the lesser
+/// of the client's `max_udp_payload_size` and
+/// [`crate::config::QUIC_MAX_UDP_PAYLOAD_PROBED`]), when the path may carry more.
+fn quic_path_mtu(quic: &quinn::Connection, client_ip: &IpAddr) -> Option<(u32, bool)> {
+    let proved = quic.path_stats(quinn::PathId::ZERO)?.current_mtu;
+    let ceiling = quic
+        .peer_max_udp_payload_size()
+        .min(u64::from(crate::config::QUIC_MAX_UDP_PAYLOAD_PROBED));
+    let headers = if client_ip.is_ipv4() { 20 + 8 } else { 40 + 8 };
+    Some((u32::from(proved) + headers, u64::from(proved) >= ceiling))
 }
 
 /// Run a server-side multi-method route analysis toward the client IP and stream frames back.
 /// Sends: client GeoIP → merged hops (ICMP+UDP+TCP parallel) → server frame → done.
 async fn handle_op_traceroute(
     send: &mut wtransport::stream::SendStream,
+    connection: &Connection,
     remote_addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client_ip = normalise_ip(remote_addr.ip());
@@ -956,9 +942,6 @@ async fn handle_op_traceroute(
         });
     }
     drop(tx); // channel closes when all four tasks have sent
-
-    // Path MTU runs in the background; we await it just before the done frame.
-    let mtu_handle = tokio::spawn(probe_path_mtu(ip_str.clone()));
 
     // ── Receive method results and stream hops as each method completes ───
     let mut merged: BTreeMap<u32, MergedHop> = BTreeMap::new();
@@ -1071,14 +1054,16 @@ async fn handle_op_traceroute(
     .await?;
 
     // ── Done frame ────────────────────────────────────────────────────────
-    let path_mtu = mtu_handle.await.unwrap_or(None);
+    let path_mtu = quic_path_mtu(connection.quic_connection(), &client_ip);
     write_framed_json(
         send,
         &json!({
             "type":                "done",
             "total_hops":          hop_count,
             "hidden_hops":         hidden_count,
-            "path_mtu_bytes":      path_mtu,
+            "path_mtu_bytes":      path_mtu.map(|(bytes, _)| bytes),
+            "path_mtu_at_least":   path_mtu.map(|(_, at_least)| at_least),
+            "path_mtu_method":     "quic-dplpmtud",
             "congestion_hops":     congestion_count,
             "probe_methods_tried": probe_methods_tried,
         }),

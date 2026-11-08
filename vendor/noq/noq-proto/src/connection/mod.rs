@@ -7284,6 +7284,15 @@ impl Connection {
     ///
     /// Buffers passed to [`Connection::poll_transmit`] should be at least this large.
     ///
+    /// The largest UDP payload the peer accepts: its `max_udp_payload_size` transport
+    /// parameter (65527 when it sent none)
+    ///
+    /// Path MTU discovery searches no higher than the lesser of this and
+    /// [`MtuDiscoveryConfig::upper_bound`](crate::MtuDiscoveryConfig::upper_bound).
+    pub fn peer_max_udp_payload_size(&self) -> u64 {
+        self.peer_params.max_udp_payload_size.into_inner()
+    }
+
     /// When multipath is enabled, this value is the minimum MTU across all available paths.
     pub fn current_mtu(&self) -> u16 {
         self.paths
