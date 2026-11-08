@@ -257,15 +257,26 @@ async fn main() -> Result<(), Error> {
         args.down_streams
     );
 
-    let meter = upload(&conn, args.up_streams, args.secs).await?;
-    let bytes = meter["bytes"].as_u64().unwrap_or(0);
-    let span = meter["span_ms"].as_f64().unwrap_or(0.0) / 1000.0;
+    let (meter, written) = upload(&conn, args.up_streams, args.secs).await?;
+    #[allow(clippy::cast_precision_loss)]
+    let secs = args.secs as f64;
     println!(
-        "upload (node's meter): {:.1} Mbps ({} bytes over {span:.2} s, {} streams)",
-        mbps(bytes, span),
-        bytes,
-        meter["streams"]
+        "upload (written here): {:.1} Mbps ({written} bytes in {secs:.0} s, {} streams)",
+        mbps(written, secs),
+        args.up_streams
     );
+    if meter.get("error").is_none() {
+        let bytes = meter["bytes"].as_u64().unwrap_or(0);
+        let span = meter["span_ms"].as_f64().unwrap_or(0.0) / 1000.0;
+        println!(
+            "upload (node's meter): {:.1} Mbps ({} bytes over {span:.2} s, {} streams)",
+            mbps(bytes, span),
+            bytes,
+            meter["streams"]
+        );
+    } else {
+        println!("upload (node's meter): this node has no meter");
+    }
     conn.close(0u32.into(), b"done");
     Ok(())
 }
