@@ -680,9 +680,16 @@ fn is_cacheable_by_default(status: u16) -> bool {
 /// Placed as the **innermost** Axum layer so that security headers, Alt-Svc, and
 /// compression are applied uniformly to both cache hits and cache misses.
 ///
-/// On **cache miss**: the response body is buffered (up to 100 MiB), stored in
-/// the cache if within the size limit, and then returned.  The body stream is
-/// fully reconstructed, so outer middleware (e.g., compression) can still read it.
+/// On **cache miss**: a response the cache could store is buffered up to the
+/// cache's own size limit (`max_body_size_bytes`), stored, and returned. One it
+/// could never store (`no-store`, `private`, `no-cache`, or a `Content-Length`
+/// over the limit) streams through untouched, and one that turns out longer
+/// than the limit streams on, the bytes already read first: a body is never
+/// held back that cannot be kept, and never lost. It was buffered whole up to
+/// 100 MiB whatever its headers said, and a longer one was sent with its
+/// headers and an empty body: the speed test's 1 GB downloads arrived as
+/// nothing, and anything under 100 MiB waited to be read in full before its
+/// first byte left (205 ms for 100 MB on a 1 ms path).
 ///
 /// On **cache hit**: the stored body is returned immediately without calling the
 /// inner handler, saving a backend round-trip.
@@ -843,8 +850,14 @@ pub async fn cache_middleware(
 
             let (mut parts, resp_body) = response.into_parts();
 
-            // Buffer the full body (up to 100 MiB, consistent with compression middleware)
-            match axum::body::to_bytes(resp_body, 100 * 1024 * 1024).await {
+            if !may_store(&parts.headers, cache.config.max_body_size_bytes) {
+                parts
+                    .headers
+                    .insert("x-cache", HeaderValue::from_static("MISS"));
+                return Response::from_parts(parts, resp_body);
+            }
+
+            match buffer_within(resp_body, cache.config.max_body_size_bytes).await {
                 Ok(body_bytes) => {
                     // Never store a HEAD response. Its body is empty by
                     // definition, so the entry holds nothing worth serving, and
@@ -866,12 +879,175 @@ pub async fn cache_middleware(
                         .insert("x-cache", HeaderValue::from_static("MISS"));
                     Response::from_parts(parts, Body::from(body_bytes))
                 }
-                Err(e) => {
-                    debug!("Cache: failed to buffer response body: {}", e);
-                    Response::from_parts(parts, Body::empty())
+                Err(body) => {
+                    // Longer than the cache keeps: not stored, sent whole.
+                    parts
+                        .headers
+                        .insert("x-cache", HeaderValue::from_static("MISS"));
+                    Response::from_parts(parts, body)
                 }
             }
         }
+    }
+}
+
+/// Could a response with these headers be stored? The cheap refusals only,
+/// read before any of the body is: `put` still makes the full decision. A
+/// response refused here is passed on as it streams.
+fn may_store(headers: &axum::http::HeaderMap, max_body: usize) -> bool {
+    let refused = headers
+        .get_all(axum::http::header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|cc| {
+            let d = CacheControlDirectives::parse(cc);
+            d.no_store || d.is_private || d.no_cache
+        });
+    let too_long = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .is_some_and(|n| n > max_body as u64);
+    !refused && !too_long
+}
+
+/// The whole body when it ends within `limit` bytes; otherwise a body that
+/// replays what was read and then the rest, as it arrives. A read error part
+/// way is passed on after the bytes before it.
+async fn buffer_within(mut body: Body, limit: usize) -> Result<Bytes, Body> {
+    use futures_util::StreamExt as _;
+    use http_body_util::BodyExt as _;
+    let mut read: Vec<Bytes> = Vec::new();
+    let mut total = 0usize;
+    loop {
+        match body.frame().await {
+            None => {
+                let mut whole = bytes::BytesMut::with_capacity(total);
+                for b in read {
+                    whole.extend_from_slice(&b);
+                }
+                return Ok(whole.freeze());
+            }
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data() {
+                    total += data.len();
+                    read.push(data);
+                    if total > limit {
+                        let head =
+                            futures_util::stream::iter(read.into_iter().map(Ok::<_, axum::Error>));
+                        return Err(Body::from_stream(head.chain(body.into_data_stream())));
+                    }
+                }
+            }
+            Some(Err(e)) => {
+                let head = futures_util::stream::iter(read.into_iter().map(Ok::<_, axum::Error>));
+                let fail = futures_util::stream::once(async move { Err::<Bytes, _>(e) });
+                return Err(Body::from_stream(head.chain(fail)));
+            }
+        }
+    }
+}
+
+// Not under `bench-null-middleware`, which makes the middleware a no-op for
+// measurement (and is on in `--all-features` runs): these test its own work.
+#[cfg(all(test, not(feature = "bench-null-middleware")))]
+mod miss_tests {
+    use super::*;
+    use axum::routing::get;
+    use axum::Router;
+    use tower::ServiceExt as _;
+
+    /// A router behind the cache middleware whose one route answers with
+    /// `chunks` chunks of 64 KiB, as a stream, under `headers`.
+    fn app(
+        cache: Arc<ResponseCache>,
+        chunks: usize,
+        headers: &'static [(&'static str, &'static str)],
+    ) -> Router {
+        Router::new()
+            .route(
+                "/r",
+                get(move || async move {
+                    let stream = futures_util::stream::iter(
+                        (0..chunks)
+                            .map(|_| Ok::<_, std::io::Error>(Bytes::from(vec![7u8; 64 * 1024]))),
+                    );
+                    let mut resp = Response::new(Body::from_stream(stream));
+                    for (k, v) in headers {
+                        resp.headers_mut().insert(*k, HeaderValue::from_static(v));
+                    }
+                    resp
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                cache,
+                cache_middleware,
+            ))
+    }
+
+    fn cache() -> Arc<ResponseCache> {
+        Arc::new(ResponseCache::new(ResponseCacheConfig {
+            enabled: true,
+            max_body_size_bytes: 1024 * 1024,
+            ..Default::default()
+        }))
+    }
+
+    async fn body_len(app: Router) -> usize {
+        let req = Request::builder()
+            .uri("/r")
+            .header("host", "pqcrypta.com")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .len()
+    }
+
+    #[tokio::test]
+    async fn a_body_longer_than_the_cache_keeps_arrives_whole_and_is_not_stored() {
+        let c = cache();
+        // 4 MiB, no Content-Length, cacheable headers: read past the limit.
+        let len = body_len(app(c.clone(), 64, &[("cache-control", "max-age=60")])).await;
+        assert_eq!(len, 64 * 64 * 1024, "every byte reaches the client");
+        assert_eq!(c.stats().0, 0, "nothing stored");
+    }
+
+    #[tokio::test]
+    async fn a_no_store_body_streams_through() {
+        let c = cache();
+        let len = body_len(app(
+            c.clone(),
+            64,
+            &[("cache-control", "no-store, no-cache")],
+        ))
+        .await;
+        assert_eq!(len, 64 * 64 * 1024);
+        assert_eq!(c.stats().0, 0);
+    }
+
+    #[tokio::test]
+    async fn a_short_cacheable_body_is_stored_and_returned() {
+        let c = cache();
+        let len = body_len(app(c.clone(), 4, &[("cache-control", "max-age=60")])).await;
+        assert_eq!(len, 4 * 64 * 1024);
+        assert_eq!(c.stats().0, 1, "stored");
+    }
+
+    #[test]
+    fn refusals_are_read_from_the_headers() {
+        let mut h = axum::http::HeaderMap::new();
+        assert!(may_store(&h, 1024));
+        h.insert("content-length", HeaderValue::from_static("4096"));
+        assert!(!may_store(&h, 1024), "longer than the cache keeps");
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            "cache-control",
+            HeaderValue::from_static("private, max-age=60"),
+        );
+        assert!(!may_store(&h, 1024));
     }
 }
 
