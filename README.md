@@ -1195,7 +1195,8 @@ name otherwise, where only one session at a time can run from one address.
 
 ```toml
 [server]
-webtransport_max_sessions_per_origin = 100    # max concurrent sessions per Origin header
+webtransport_max_sessions_per_origin = 4096   # max concurrent sessions per Origin header (every visitor of a page shares it)
+webtransport_max_sessions_per_client = 64    # max concurrent sessions per client address (0: no limit)
 webtransport_max_streams_per_session = 1000   # max concurrent streams per session
 webtransport_max_datagrams_per_sec = 500      # datagram rate limit per session
 ```
@@ -2057,6 +2058,8 @@ Every response on a TCP-only speed-test host carries `Timing-Allow-Origin` for t
 | Download chunk | 256 KB (keeps QUIC send buffer full) |
 | Session idle timeout | 5 minutes |
 | Session hard cap | 30 minutes |
+| Sessions per client address | 64 (`webtransport_max_sessions_per_client`); the page's upload opens up to 32, since a browser holds about 128 KB in flight per WebTransport session |
+| Sessions per origin | 4096 (`webtransport_max_sessions_per_origin`): every visitor of a page shares its origin, so this bounds the site, not a visitor |
 
 ---
 

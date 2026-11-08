@@ -1130,9 +1130,23 @@ pub struct ServerConfig {
     #[serde(default)]
     pub quic_congestion_control: QuicCongestionControl,
 
-    /// Maximum concurrent WebTransport sessions per origin (default 100).
+    /// Maximum concurrent WebTransport sessions per origin (default 4096).
+    ///
+    /// A browser session's origin is the page that opened it, so every visitor
+    /// of one page shares this count: it bounds the whole site's sessions, not
+    /// one visitor's (see `webtransport_max_sessions_per_client`). At 100 a
+    /// handful of open tabs filled it for everyone, and a speed test's upload
+    /// alone opens up to 32 sessions.
     #[serde(default = "default_wt_max_sessions")]
     pub webtransport_max_sessions_per_origin: u32,
+
+    /// Maximum concurrent WebTransport sessions from one client address
+    /// (default 64; 0 for no limit). The speed test's upload opens up to 32
+    /// sessions at once: a browser holds only about 128 KB in flight per
+    /// WebTransport session, so one session cannot fill a long path, and
+    /// parallel sessions are its parallel connections, as six are over TCP.
+    #[serde(default = "default_wt_max_sessions_per_client")]
+    pub webtransport_max_sessions_per_client: u32,
 
     /// Maximum concurrent streams per WebTransport session (default 1000).
     #[serde(default = "default_wt_max_streams")]
@@ -1340,7 +1354,8 @@ impl Default for ServerConfig {
             enable_quic_retry: false,
             max_concurrent_multipath_paths: 4,
             quic_congestion_control: QuicCongestionControl::default(),
-            webtransport_max_sessions_per_origin: 100,
+            webtransport_max_sessions_per_origin: default_wt_max_sessions(),
+            webtransport_max_sessions_per_client: default_wt_max_sessions_per_client(),
             webtransport_max_streams_per_session: 1000,
             webtransport_max_datagrams_per_sec: 500,
             webtransport_port: 4433,
@@ -1505,7 +1520,11 @@ fn default_multipath_paths() -> u32 {
 }
 
 fn default_wt_max_sessions() -> u32 {
-    100
+    4096
+}
+
+fn default_wt_max_sessions_per_client() -> u32 {
+    64
 }
 
 fn default_wt_max_streams() -> u32 {
