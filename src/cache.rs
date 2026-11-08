@@ -948,7 +948,9 @@ async fn buffer_within(mut body: Body, limit: usize) -> Result<Bytes, Body> {
     }
 }
 
-#[cfg(test)]
+// Not under `bench-null-middleware`, which makes the middleware a no-op for
+// measurement (and is on in `--all-features` runs): these test its own work.
+#[cfg(all(test, not(feature = "bench-null-middleware")))]
 mod miss_tests {
     use super::*;
     use axum::routing::get;
