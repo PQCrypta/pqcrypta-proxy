@@ -249,13 +249,34 @@ async fn main() -> Result<(), Error> {
         );
     }
 
+    let before = call(&conn, json!({"op": "transport"})).await?;
     let (bytes, secs) = download(&conn, args.down_streams, args.secs).await;
+    let after = call(&conn, json!({"op": "transport"})).await?;
     println!(
         "download: {:.1} Mbps ({} bytes in {secs:.2} s, {} streams)",
         mbps(bytes, secs),
         bytes,
         args.down_streams
     );
+    // What the node put on the wire for that download, and how much of it the
+    // path dropped (so the node sent it again).
+    let grew = |key: &str| {
+        after[key]
+            .as_u64()
+            .unwrap_or(0)
+            .saturating_sub(before[key].as_u64().unwrap_or(0))
+    };
+    let (sent, lost) = (grew("sent_bytes"), grew("lost_bytes"));
+    if sent > 0 {
+        #[allow(clippy::cast_precision_loss)]
+        let share = lost as f64 / sent as f64 * 100.0;
+        println!(
+            "download on the wire (node's count): {:.1} Mbps sent, {share:.2}% lost and sent again, {} congestion events, {} congestion control",
+            mbps(sent, secs),
+            grew("congestion_events"),
+            after["congestion_control"].as_str().unwrap_or("unnamed")
+        );
+    }
 
     let (meter, written) = upload(&conn, args.up_streams, args.secs).await?;
     #[allow(clippy::cast_precision_loss)]
