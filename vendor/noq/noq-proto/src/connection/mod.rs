@@ -1448,6 +1448,12 @@ impl Connection {
         if cwnd_blocked {
             path.congestion.on_cwnd_limited();
         }
+        // Marked as the sender runs dry, not only when an acknowledgement next arrives: a flow
+        // that sends one small packet at a time (a datagram echo, a lone request's response)
+        // would otherwise have every other packet taken as a measure of the path's bandwidth.
+        if path.app_limited {
+            path.congestion.on_app_limited();
+        }
 
         match last_packet_number {
             Some(last_packet_number) => {

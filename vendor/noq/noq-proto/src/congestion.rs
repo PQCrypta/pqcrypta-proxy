@@ -29,6 +29,15 @@ pub trait Controller: Send + Sync + std::fmt::Debug {
     /// the congestion window at this point in the current round trip.
     fn on_cwnd_limited(&mut self) {}
 
+    /// The connection had nothing to send: neither the congestion window nor the pacer held it
+    /// back, the application ran dry
+    ///
+    /// The spec's `MarkConnectionAppLimited` moment: what the controller sends from here until
+    /// the data now in flight is delivered is application-limited (`P.is_app_limited`), so its
+    /// delivery rate says how fast the application wrote, not how fast the path can carry.
+    /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-06.html#section-4.1.2.3>
+    fn on_app_limited(&mut self) {}
+
     /// Packet deliveries were confirmed
     ///
     /// `app_limited` indicates whether the connection was blocked on outgoing

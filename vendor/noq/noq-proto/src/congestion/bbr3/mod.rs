@@ -1649,6 +1649,12 @@ impl Bbr3 {
         self.cwnd_limited_this_round = true;
     }
 
+    /// equivalent to MarkConnectionAppLimited
+    /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-06.html#section-4.1.2.3>
+    fn on_app_limited(&mut self) {
+        self.app_limited = Ord::max(self.delivered + self.inflight, 1);
+    }
+
     /// UpdateRateSample accumulates `C.delivered` and `C.delivered_time` for every ACKed packet,
     /// independently of the newest-packet branch that folds the rate sample into the model, so
     /// neither may be conditional on a rate sample already existing.
@@ -1739,9 +1745,13 @@ impl Bbr3 {
     ) {
         self.inflight = in_flight;
         if largest_packet_num_acked.is_some() {
+            // The app-limited phase ends once what was in flight when it began is delivered;
+            // one that is still on (the connection still had nothing to send) begins again at
+            // once, so no packet sent in it is taken for a measure of the path.
             if self.app_limited != 0 && self.delivered > self.app_limited {
                 self.app_limited = 0;
-            } else if app_limited {
+            }
+            if app_limited {
                 self.app_limited = Ord::max(self.delivered + self.inflight, 1);
             }
             let round_count = self.round_count;
@@ -1924,6 +1934,10 @@ impl Controller for Bbr3 {
 
     fn on_packet_sent(&mut self, now: Instant, bytes: u16, pn: u64) {
         Self::on_packet_sent(self, now, bytes, pn, SpaceKind::Data);
+    }
+
+    fn on_app_limited(&mut self) {
+        Self::on_app_limited(self);
     }
 
     fn on_cwnd_limited(&mut self) {
@@ -2297,6 +2311,65 @@ mod test {
             err < 0.02,
             "max_bw {max_bw} not within 2% of simulated {BW} (rel err {err})"
         );
+    }
+
+    /// A flow that sends one small packet at a time and is otherwise idle (a datagram echo, a
+    /// lone request's response): 100 bytes every 25 ms over a 21 ms path for 10 s, acknowledged
+    /// one round trip later, with the app-limited signals a connection gives. `mark_on_send`
+    /// says whether the connection reports `on_app_limited` as it runs dry, or only the flag
+    /// `on_end_acks` receives. Returns whether STARTUP ended, and the pacing rate at the end.
+    fn echo_flow(mark_on_send: bool) -> (bool, f64, f64) {
+        const SIZE: u16 = 100;
+        const RTT_NS: u64 = 21_000_000;
+        const EVERY_NS: u64 = 25_000_000;
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), 1200);
+        let initial_pacing = bbr.pacing_rate;
+        let base = Instant::now();
+        let at = |ns: u64| base + Duration::from_nanos(ns);
+        let mut rtt = RttEstimator::new(Duration::from_nanos(RTT_NS));
+        let mut flight: VecDeque<(u64, u64)> = VecDeque::new();
+        let mut inflight = 0u64;
+        for pn in 0..400u64 {
+            let now = pn * EVERY_NS;
+            while let Some(&(acked, sent)) = flight.front() {
+                if sent + RTT_NS > now {
+                    break;
+                }
+                flight.pop_front();
+                inflight -= u64::from(SIZE);
+                rtt.update(Duration::ZERO, Duration::from_nanos(RTT_NS));
+                let t = at(sent + RTT_NS);
+                bbr.on_ack(t, at(sent), u64::from(SIZE), acked, SpaceKind::Data, true, &rtt);
+                bbr.on_end_acks(t, inflight, true, Some(acked), SpaceKind::Data);
+            }
+            bbr.on_packet_sent(at(now), SIZE, pn, SpaceKind::Data);
+            inflight += u64::from(SIZE);
+            flight.push_back((pn, now));
+            if mark_on_send {
+                bbr.on_app_limited();
+            }
+        }
+        (bbr.full_bw_reached, bbr.pacing_rate, initial_pacing)
+    }
+
+    /// An echo flow never ends STARTUP: every delivery-rate sample it gives is
+    /// application-limited, so the few KB/s it delivers are never taken for the path's
+    /// bandwidth, and a burst that follows (the speed test's 1000-byte datagrams, a large
+    /// response) leaves at STARTUP's rate. Paced at a bandwidth estimate of its pings, a burst
+    /// of 400 KB took 8 s on a 21 ms path, and 90% of the echoes came back too late.
+    #[test]
+    fn echo_flow_stays_application_limited() {
+        for mark_on_send in [true, false] {
+            let (full_bw_reached, pacing_rate, initial_pacing) = echo_flow(mark_on_send);
+            assert!(
+                !full_bw_reached,
+                "STARTUP ended on application-limited samples (mark_on_send: {mark_on_send})"
+            );
+            assert!(
+                pacing_rate >= initial_pacing,
+                "pacing fell to {pacing_rate:.0} B/s from {initial_pacing:.0} (mark_on_send: {mark_on_send})"
+            );
+        }
     }
 
     /// A.2: Exiting STARTUP on loss when application-limited.
