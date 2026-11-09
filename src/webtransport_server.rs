@@ -129,6 +129,9 @@ impl WebTransportServer {
         transport_config.congestion_controller_factory(congestion.factory());
         crate::speedtest::set_congestion_control(congestion.name());
 
+        // Path MTU discovery to the byte, up to a 1500-byte link (see its docs).
+        transport_config.mtu_discovery_config(Some(crate::config::quic_mtu_discovery()));
+
         // Concurrent streams
         transport_config.max_concurrent_bidi_streams(VarInt::from_u32(1000));
         transport_config.max_concurrent_uni_streams(VarInt::from_u32(1000));

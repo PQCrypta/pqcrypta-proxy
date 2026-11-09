@@ -502,6 +502,8 @@ impl QuicListener {
         // server.quic_congestion_control: BBRv3 by default (see its docs).
         transport_config
             .congestion_controller_factory(config.server.quic_congestion_control.factory());
+        // Path MTU discovery to the byte, up to a 1500-byte link (see its docs).
+        transport_config.mtu_discovery_config(Some(crate::config::quic_mtu_discovery()));
         transport_config
             .max_concurrent_bidi_streams(config.server.max_streams_per_connection.into());
         transport_config

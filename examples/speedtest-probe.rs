@@ -277,6 +277,10 @@ async fn main() -> Result<(), Error> {
             after["congestion_control"].as_str().unwrap_or("unnamed")
         );
     }
+    println!(
+        "path MTU discovery: {} bytes of UDP payload proved (this client accepts up to {})",
+        after["max_udp_payload"], after["peer_max_udp_payload"]
+    );
 
     let (meter, written) = upload(&conn, args.up_streams, args.secs).await?;
     #[allow(clippy::cast_precision_loss)]

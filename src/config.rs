@@ -869,6 +869,26 @@ impl ServerConfig {
     }
 }
 
+/// The largest UDP payload QUIC path MTU discovery probes for.
+///
+/// It is what a 1500-byte IPv4 link carries (IPv6 settles at 1452 on such a
+/// link by itself). noq's default of 1452 stopped every IPv4 path 20 bytes short.
+pub const QUIC_MAX_UDP_PAYLOAD_PROBED: u16 = 1472;
+
+/// Path MTU discovery for the QUIC listeners.
+///
+/// DPLPMTUD (RFC 8899; RFC 9000 section 14.3) up to
+/// [`QUIC_MAX_UDP_PAYLOAD_PROBED`], and to the byte (noq's
+/// default stops once a step would change the size by less than 20 bytes),
+/// so the size it settles on is the path's own. Probes are single padded
+/// PINGs; a lost one is not taken as congestion.
+pub fn quic_mtu_discovery() -> quinn::MtuDiscoveryConfig {
+    let mut mtud = quinn::MtuDiscoveryConfig::default();
+    mtud.upper_bound(QUIC_MAX_UDP_PAYLOAD_PROBED)
+        .minimum_change(1);
+    mtud
+}
+
 /// A QUIC congestion controller (see `server.quic_congestion_control`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

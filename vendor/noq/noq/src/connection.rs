@@ -893,6 +893,17 @@ impl Connection {
         self.0.lock_without_waking("stats").inner.stats()
     }
 
+    /// The largest UDP payload the peer accepts (its `max_udp_payload_size` transport parameter)
+    ///
+    /// Path MTU discovery searches no higher than the lesser of this and the configured
+    /// [`MtuDiscoveryConfig::upper_bound`](crate::MtuDiscoveryConfig::upper_bound).
+    pub fn peer_max_udp_payload_size(&self) -> u64 {
+        self.0
+            .lock_without_waking("peer_max_udp_payload_size")
+            .inner
+            .peer_max_udp_payload_size()
+    }
+
     /// Returns path statistics
     pub fn path_stats(&self, path_id: PathId) -> Option<PathStats> {
         self.0.lock_without_waking("path_stats").path_stats(path_id)
