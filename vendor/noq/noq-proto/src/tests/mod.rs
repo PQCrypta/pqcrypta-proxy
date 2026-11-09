@@ -4657,6 +4657,90 @@ fn cwnd_limited_is_not_reported_when_only_pacing_blocks() {
     );
 }
 
+/// A controller that limits neither window nor rate and counts how often the connection reports
+/// that it ran dry (the spec's `MarkConnectionAppLimited`).
+#[derive(Debug)]
+struct AppLimitedRecorder {
+    reports: Arc<AtomicU64>,
+}
+
+impl Controller for AppLimitedRecorder {
+    fn on_app_limited(&mut self) {
+        self.reports.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn on_congestion_event(
+        &mut self,
+        _now: Instant,
+        _sent: Instant,
+        _is_persistent_congestion: bool,
+        _is_ecn: bool,
+        _lost_bytes: u64,
+        _largest_lost: u64,
+    ) {
+    }
+
+    fn on_mtu_update(&mut self, _new_mtu: u16) {}
+
+    fn window(&self) -> u64 {
+        u64::MAX / 2
+    }
+
+    fn clone_box(&self) -> Box<dyn Controller> {
+        Box::new(Self {
+            reports: self.reports.clone(),
+        })
+    }
+
+    fn initial_window(&self) -> u64 {
+        u64::MAX / 2
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+}
+
+struct AppLimitedRecorderConfig {
+    reports: Arc<AtomicU64>,
+}
+
+impl ControllerFactory for AppLimitedRecorderConfig {
+    fn build(self: Arc<Self>, _now: Instant, _current_mtu: u16) -> Box<dyn Controller> {
+        Box::new(AppLimitedRecorder {
+            reports: self.reports.clone(),
+        })
+    }
+}
+
+/// A connection that has sent all it has tells its controller so as it runs dry, not only
+/// through the flag an acknowledgement carries later: BBR3 marks what it sends then as
+/// application-limited, and a flow of single small packets is otherwise half taken for a
+/// measure of the path.
+#[test]
+fn app_limited_is_reported_when_the_sender_runs_dry() {
+    let _guard = subscribe();
+    let reports = Arc::new(AtomicU64::new(0));
+
+    let mut transport = TransportConfig::default();
+    transport.congestion_controller_factory(Arc::new(AppLimitedRecorderConfig {
+        reports: reports.clone(),
+    }));
+    let mut client_cfg = client_config();
+    client_cfg.transport = Arc::new(transport);
+
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect_with(client_cfg);
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, s).write(&[42; 1000]).unwrap();
+    pair.drive();
+
+    assert!(
+        reports.load(Ordering::Relaxed) > 0,
+        "a connection with nothing left to send never reported it to its controller"
+    );
+}
+
 /// A controller that never limits the window or the rate, but reports a small send quantum, so
 /// the quantum is the only thing that can bound an aggregate handed to the NIC.
 #[derive(Debug, Clone)]
