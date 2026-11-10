@@ -787,6 +787,10 @@ impl ExpectClientHello {
                     cx.data.ech_status = super::ech::EchStatus::Rejected;
                     return Ok(m);
                 }
+                super::ech::EchResolution::UnknownConfig => {
+                    cx.data.ech_status = super::ech::EchStatus::UnknownConfig;
+                    return Ok(m);
+                }
                 super::ech::EchResolution::Accepted(inner, wire, context) => {
                     cx.data.ech_retry = Some(context);
                     (inner, wire)

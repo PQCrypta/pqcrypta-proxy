@@ -179,10 +179,13 @@ pub(super) enum EchStatus {
     /// No `encrypted_client_hello` extension was present.
     #[default]
     NotOffered,
-    /// An `encrypted_client_hello` extension was present but could not be
-    /// decrypted against any configured key. `retry_configs` should be
+    /// An `encrypted_client_hello` extension named a configured key but could
+    /// not be opened with it (or was malformed). `retry_configs` should be
     /// included in EncryptedExtensions per draft-ietf-tls-esni-25 7.1.1.
     Rejected,
+    /// An `encrypted_client_hello` extension named a `config_id` no configured
+    /// key has: answered as [`EchStatus::Rejected`] is, with `retry_configs`.
+    UnknownConfig,
     /// ECH was successfully decrypted and the handshake is proceeding with
     /// the reconstructed ClientHelloInner. Carries that inner hello's
     /// `random`, needed to derive the ServerHello acceptance confirmation
@@ -196,18 +199,27 @@ pub(super) enum EchStatus {
 /// This is [`EchStatus`] with the accepted inner hello's `random` dropped. That
 /// field is handshake machinery feeding the acceptance-confirmation derivation;
 /// it is transcript material and there is no reason to hand it out. The
-/// three-way outcome on its own is what an application can act on, and mirrors
-/// what the client side already exposes via `ClientConnection::ech_status`.
+/// outcome on its own is what an application can act on, as the client side's
+/// `ClientConnection::ech_status` is; a rejection is split by whether the offer
+/// named one of this server's keys, which only the server can know.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EchAcceptance {
     /// No `encrypted_client_hello` extension was present on the ClientHello.
     NotOffered,
-    /// The extension was present but decrypted against none of the configured
-    /// keys - a stale `config_id`, a tampered payload, or a GREASE extension
-    /// from a client with no real config. Per draft-ietf-tls-esni-25 7.1 this
-    /// is not an error: the handshake continued on the ClientHelloOuter and
+    /// The extension named one of the configured keys and did not open with
+    /// it: a tampered or corrupted payload, or a GREASE extension whose random
+    /// `config_id` happened to be one of this server's (a malformed extension
+    /// is reported here too). Per draft-ietf-tls-esni-25 7.1 this is not an
+    /// error: the handshake continued on the ClientHelloOuter and
     /// `retry_configs` were returned in EncryptedExtensions.
     Rejected,
+    /// The extension named a `config_id` none of the configured keys has. A
+    /// GREASE extension (section 6.2: a client that has no ECH configuration
+    /// for this server sends one with a random `config_id`), or a config
+    /// retired longer ago than the server keeps them; on the wire the two are
+    /// alike. Handled as [`EchAcceptance::Rejected`] is: the handshake
+    /// continued on the ClientHelloOuter with `retry_configs`.
+    UnknownConfig,
     /// The extension decrypted and the handshake ran on the reconstructed
     /// ClientHelloInner, so the client's real SNI never appeared in cleartext
     /// on the wire.
@@ -219,6 +231,7 @@ impl From<EchStatus> for EchAcceptance {
         match status {
             EchStatus::NotOffered => Self::NotOffered,
             EchStatus::Rejected => Self::Rejected,
+            EchStatus::UnknownConfig => Self::UnknownConfig,
             EchStatus::Accepted { .. } => Self::Accepted,
         }
     }
@@ -241,13 +254,16 @@ pub(crate) enum EchResolution {
     /// transcript this hello feeds into must match the client's own
     /// byte-for-byte.
     Accepted(ClientHelloPayload, Vec<u8>, EchRetryContext),
-    /// A real "outer" ECH extension was present but couldn't be decrypted
-    /// against any configured `ServerEchConfig` (wrong/stale config_id,
-    /// tampered ciphertext, or a GREASE ECH extension from a client with no
-    /// real config). Per draft-ietf-tls-esni-25 section 7.1 this is NOT an
-    /// error - the server must fail open and continue with the outer hello,
-    /// offering `retry_configs` so a real client can retry correctly.
+    /// A real "outer" ECH extension named a configured `ServerEchConfig` but
+    /// couldn't be opened with it (tampered ciphertext), or was malformed.
+    /// Per draft-ietf-tls-esni-25 section 7.1 this is NOT an error - the
+    /// server must fail open and continue with the outer hello, offering
+    /// `retry_configs` so a real client can retry correctly.
     Rejected,
+    /// An outer ECH extension named a `config_id` no configured
+    /// `ServerEchConfig` has: GREASE, or a retired config. Handled as
+    /// `Rejected` is.
+    UnknownConfig,
 }
 
 /// The HPKE context an accepted offer opened, kept for a second ClientHello.
@@ -355,6 +371,11 @@ pub(crate) fn resolve(
         .0
         .iter()
         .filter(|c| c.config_id() == ext.config_id);
+    // An id none of the configs has: nothing to try, and worth telling apart
+    // from an offer to a held key that did not open.
+    if candidates.clone().next().is_none() {
+        return EchResolution::UnknownConfig;
+    }
 
     for config in candidates {
         // The suite the client sealed with, if the config offers it
@@ -610,7 +631,7 @@ mod tests {
     use pki_types::pem::PemObject;
     use pki_types::{CertificateDer, DnsName, EchConfigListBytes, PrivateKeyDer, ServerName};
 
-    use super::{ServerEchConfig, ServerEchConfigs};
+    use super::{EchAcceptance, ServerEchConfig, ServerEchConfigs};
     use crate::client::{EchConfig, EchMode, EchStatus as ClientEchStatus};
     use crate::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES;
     use crate::crypto::hpke::{Hpke, HpkeSuite};
@@ -969,6 +990,8 @@ mod tests {
             Some("second.testserver.com"),
             "on fallback, cert resolution must see the outer public_name, not the (undeliverable) real inner SNI"
         );
+        // The offer named the server's own config_id: a held key it did not open with
+        assert_eq!(server.ech_acceptance(), EchAcceptance::Rejected);
     }
 
     /// Drive a handshake by hand (rather than via `do_handshake`, which
@@ -1072,7 +1095,7 @@ mod tests {
     /// section 7.1). Sealed to the server's own key under an id the server
     /// does not use, it is rejected with retry_configs rather than trial
     /// decrypted - the same answer a GREASE extension or a stale config gets,
-    /// at no HPKE cost.
+    /// at no HPKE cost - and reported as an unknown config, as they are.
     #[test]
     fn ech_offer_is_opened_only_with_the_config_its_id_names() {
         let server_keypair = make_ech_keypair(0x01, "second.testserver.com");
@@ -1131,6 +1154,7 @@ mod tests {
             },
             other => panic!("expected a rejection with retry_configs, got {other:?}"),
         }
+        assert_eq!(server.ech_acceptance(), EchAcceptance::UnknownConfig);
     }
 
     /// The client picks one of the config's symmetric suites (RFC 9849 6.1),

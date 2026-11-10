@@ -458,6 +458,7 @@ impl HandshakeFacts {
             ech: match conn.ech_acceptance() {
                 rustls::server::EchAcceptance::NotOffered => "not-offered",
                 rustls::server::EchAcceptance::Rejected => "rejected",
+                rustls::server::EchAcceptance::UnknownConfig => "unknown-config",
                 rustls::server::EchAcceptance::Accepted => "accepted",
             },
             prepared: std::sync::OnceLock::default(),

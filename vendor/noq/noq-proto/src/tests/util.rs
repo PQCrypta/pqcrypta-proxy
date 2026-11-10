@@ -536,12 +536,22 @@ impl Default for ConnPairBuilder {
             mtu: None,
             server_transport_cfg: transport_cfg.clone(),
             client_transport_cfg: transport_cfg,
-            server_endpoint_cfg: Default::default(),
-            client_endpoint_cfg: Default::default(),
+            server_endpoint_cfg: seeded_endpoint_cfg(1),
+            client_endpoint_cfg: seeded_endpoint_cfg(2),
             server_cfg: None,
             routes: None,
         }
     }
+}
+
+/// An endpoint configuration whose random choices (connection IDs, each
+/// connection's key update interval) are the same on every run, so a test
+/// that passes once passes every time. A test that wants other draws sets its
+/// own with [`ConnPairBuilder::with_server_endpoint_cfg`] or seeds its own.
+fn seeded_endpoint_cfg(seed: u8) -> EndpointConfig {
+    let mut cfg = EndpointConfig::default();
+    cfg.rng_seed(Some([seed; 32]));
+    cfg
 }
 
 impl ConnPairBuilder {

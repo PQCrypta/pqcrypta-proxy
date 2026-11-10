@@ -911,8 +911,10 @@ mod client_hello {
         // config_id, or a GREASE offer with no real config on the client's
         // side), advertise our current configs so a real ECH client can
         // retry correctly, per draft-ietf-tls-esni-25 section 7.1.1.
-        if let (crate::server::ech::EchStatus::Rejected, Some(ech_configs)) =
-            (cx.data.ech_status, &config.ech)
+        if let (
+            crate::server::ech::EchStatus::Rejected | crate::server::ech::EchStatus::UnknownConfig,
+            Some(ech_configs),
+        ) = (cx.data.ech_status, &config.ech)
         {
             ep.extensions.encrypted_client_hello_ack =
                 Some(crate::msgs::handshake::ServerEncryptedClientHello {

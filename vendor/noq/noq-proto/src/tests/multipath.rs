@@ -417,6 +417,22 @@ fn open_path_key_update() -> TestResult {
 /// The client should receive an event closing the path.
 #[test]
 fn open_path_validation_fails_server_side() -> TestResult {
+    path_validation_fails_server_side(false)
+}
+
+/// As [`open_path_validation_fails_server_side`], with the client updating its
+/// keys just before the path's idle deadline, so the server's KeyDiscard timer
+/// fires first. A connection updates its keys after a random number of packets
+/// (`key_phase_size`), and before the test pair was seeded a run occasionally
+/// did this on its own: the test then looked at the client one timer too early
+/// and failed.
+#[test]
+fn open_path_validation_fails_server_side_after_key_update() -> TestResult {
+    path_validation_fails_server_side(true)
+}
+
+fn path_validation_fails_server_side(key_update: bool) -> TestResult {
+    const PATH_IDLE: Duration = Duration::from_secs(8);
     let _guard = subscribe();
     let client_addr_two = "[::1:2]:1".parse()?;
     let server_addr_two = "[::2:2]:1".parse()?;
@@ -432,10 +448,10 @@ fn open_path_validation_fails_server_side() -> TestResult {
         );
     builder
         .server_transport_cfg
-        .default_path_max_idle_timeout(Some(Duration::from_secs(8)));
+        .default_path_max_idle_timeout(Some(PATH_IDLE));
     builder
         .client_transport_cfg
-        .default_path_max_idle_timeout(Some(Duration::from_secs(8)));
+        .default_path_max_idle_timeout(Some(PATH_IDLE));
     let mut pair = builder.connect();
 
     // Open a path from ::1:2 to ::2:2. Client datagrams will arrive from ::1:2 which is not
@@ -444,23 +460,45 @@ fn open_path_validation_fails_server_side() -> TestResult {
         remote: server_addr_two,
         local_ip: Some(client_addr_two.ip()),
     };
+    let opened_at = pair.time;
     let path_id = pair.open_path(Client, network_path, PathStatus::Available)?;
 
     info!("client opens path, drive to just before idle");
     pair.drive();
 
+    if key_update {
+        // As the client's routine update does when its phase runs out here:
+        // the keep-alive carries the new keys, and the server's KeyDiscard
+        // timer is armed to fire before the client path's idle deadline.
+        pair.conn_mut(Client).force_key_update();
+    }
     info!("manual keep-alive of PathId::ZERO");
     pair.ping_path(Client, PathId::ZERO)?;
     pair.drive();
 
+    // Every timer up to the path's idle deadline, not just the next one: a
+    // key update's KeyDiscard, or a delayed ACK on path 0, can come first.
     info!("advancing time to past client path {path_id} idle");
-    pair.advance_time();
-    pair.drive();
+    let deadline = opened_at + PATH_IDLE + Duration::from_secs(1);
+    let event = loop {
+        if let Some(event) = pair.poll(Client) {
+            break event;
+        }
+        assert!(
+            pair.time <= deadline,
+            "client path {path_id} still open a second past its idle deadline"
+        );
+        assert!(
+            pair.advance_time(),
+            "no timer left before client path {path_id} timed out"
+        );
+        pair.drive();
+    };
 
     // The client gave up first and timed out.
     assert_matches!(
-        pair.poll(Client),
-        Some(Event::Path(PathEvent::Abandoned { id, reason: PathAbandonReason::TimedOut  }))
+        event,
+        Event::Path(PathEvent::Abandoned { id, reason: PathAbandonReason::TimedOut  })
             if id == path_id
     );
     // The server sees a closed path being abandoned, never emits this to the application.
