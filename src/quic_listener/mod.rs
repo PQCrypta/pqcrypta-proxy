@@ -1029,6 +1029,7 @@ impl QuicListener {
                 handshake_facts.ech = match ech {
                     rustls::server::EchAcceptance::NotOffered => "not-offered",
                     rustls::server::EchAcceptance::Rejected => "rejected",
+                    rustls::server::EchAcceptance::UnknownConfig => "unknown-config",
                     rustls::server::EchAcceptance::Accepted => "accepted",
                 };
             }
