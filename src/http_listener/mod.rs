@@ -2335,9 +2335,9 @@ pub async fn run_http_listener_pqc_with_fingerprint(
 /// this is the OpenSSL equivalent, reading the group through the FFI binding in
 /// `pqc_tls::openssl_pqc::negotiated_group` rather than assuming it.
 ///
-/// ECH is reported as `not-supported` rather than `not-offered`: this listener
-/// has no ECH keys at all, so "the client did not offer it" would be a claim
-/// this code is in no position to make.
+/// ECH is reported as `not-supported`: OpenSSL holds no ECH keys. Where the
+/// node has ECH keys the PQC listener knows more and says so (see
+/// [`openssl_ech_status`]).
 fn pqc_handshake_facts(ssl: &openssl::ssl::SslRef) -> crate::tls_acceptor::HandshakeFacts {
     crate::tls_acceptor::HandshakeFacts {
         tls_version: Some(ssl.version_str().to_string()),
@@ -2348,6 +2348,22 @@ fn pqc_handshake_facts(ssl: &openssl::ssl::SslRef) -> crate::tls_acceptor::Hands
             .map(|p| String::from_utf8_lossy(p).into_owned()),
         ech: "not-supported",
         prepared: std::sync::OnceLock::default(),
+    }
+}
+
+/// The ECH outcome of a connection the OpenSSL listener served itself.
+///
+/// With ECH keys on this node a ClientHello that offered ECH, sealed to one of
+/// them or not, was handed to rustls before OpenSSL saw it: one served here
+/// offered none, and `not-offered` says so. Without keys the listener cannot
+/// tell, and `not-supported` says that instead. It used to say `not-supported`
+/// either way, which a page read back to a visitor as this site having no ECH.
+#[cfg(feature = "pqc")]
+fn openssl_ech_status(ech_held: bool) -> &'static str {
+    if ech_held {
+        "not-offered"
+    } else {
+        "not-supported"
     }
 }
 
@@ -2491,6 +2507,7 @@ async fn handle_pqc_fingerprinted_connection<S>(
     // client fell back to a cleartext ClientHello. A GREASE client ignores
     // the retry_configs (section 6.2), and costs no decryption: only the
     // config an offer names is tried.
+    let ech_held = ech_route.is_some();
     if let Some(route) = ech_route {
         if crate::ech_config::offered_config_id(&peek_buf[..peek_len]).is_some() {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -2651,7 +2668,10 @@ async fn handle_pqc_fingerprinted_connection<S>(
         is_browser,
         handshake_done: ssl_stream.handshake_done(),
         client_cert_present,
-        handshake: pqc_handshake_facts(ssl_stream.ssl()),
+        handshake: crate::tls_acceptor::HandshakeFacts {
+            ech: openssl_ech_status(ech_held),
+            ..pqc_handshake_facts(ssl_stream.ssl())
+        },
     };
     metrics
         .tls
@@ -4572,5 +4592,18 @@ mod pqc_reload_tests {
             tls12_client_accepted(&current.load()),
             "the rebuilt acceptor allows TLS 1.2"
         );
+    }
+}
+
+#[cfg(all(test, feature = "pqc"))]
+mod ech_status_tests {
+    use super::openssl_ech_status;
+
+    /// A node with ECH keys hands every ClientHello that offers ECH to rustls,
+    /// so one OpenSSL serves offered none; a node without keys cannot tell.
+    #[test]
+    fn the_openssl_listener_says_not_offered_where_this_node_holds_ech_keys() {
+        assert_eq!(openssl_ech_status(true), "not-offered");
+        assert_eq!(openssl_ech_status(false), "not-supported");
     }
 }
