@@ -21,6 +21,10 @@ allow = [
     "Zlib",
     "CC0-1.0",
     "CDLA-Permissive-2.0",
+    # aws-lc-fips-sys ("ISC AND (Apache-2.0 OR ISC) AND OpenSSL"), in the graph
+    # with the `fips` feature: CI checks every feature (cargo-deny-action's
+    # default --all-features), so a run without them reports it unmatched.
+    "OpenSSL",
 ]
 
 [bans]
