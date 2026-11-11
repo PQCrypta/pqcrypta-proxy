@@ -1,4 +1,12 @@
-use std::{any::Any, io, str, sync::Arc};
+use alloc::{
+    boxed::Box,
+    format,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
+use core::{any::Any, str};
+use std::io;
 
 use aes_gcm::{KeyInit, aead::AeadInOut};
 use bytes::BytesMut;
@@ -336,9 +344,10 @@ pub struct HandshakeData {
 /// A QUIC-compatible TLS client configuration
 ///
 /// noq implicitly constructs a `QuicClientConfig` with reasonable defaults within
-/// [`ClientConfig::with_root_certificates()`][root_certs] and [`ClientConfig::try_with_platform_verifier()`][platform].
-/// Alternatively, `QuicClientConfig`'s [`TryFrom`] implementation can be used to wrap around a
-/// custom [`rustls::ClientConfig`], in which case care should be taken around certain points:
+/// [`ClientConfig::with_root_certificates()`][root_certs] and
+/// [`ClientConfig::try_with_platform_verifier()`][platform]. Alternatively, `QuicClientConfig`'s
+/// [`TryFrom`] implementation can be used to wrap around a custom [`rustls::ClientConfig`], in
+/// which case care should be taken around certain points:
 ///
 /// - If `enable_early_data` is not set to true, then sending 0-RTT data will not be possible on
 ///   outgoing connections.
@@ -383,8 +392,8 @@ impl QuicClientConfig {
 
     /// Initialize a sane QUIC-compatible TLS client configuration
     ///
-    /// QUIC requires that TLS 1.3 be enabled. Advanced users can use any [`rustls::ClientConfig`] that
-    /// satisfies this requirement.
+    /// QUIC requires that TLS 1.3 be enabled. Advanced users can use any [`rustls::ClientConfig`]
+    /// that satisfies this requirement.
     #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
     pub(crate) fn new(verifier: Arc<dyn ServerCertVerifier>) -> Self {
         let inner = Self::inner(verifier);
@@ -491,8 +500,8 @@ pub struct NoInitialCipherSuite {
     specific: bool,
 }
 
-impl std::fmt::Display for NoInitialCipherSuite {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for NoInitialCipherSuite {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self.specific {
             true => "invalid cipher suite specified",
             false => "no initial cipher suite found",
@@ -500,7 +509,7 @@ impl std::fmt::Display for NoInitialCipherSuite {
     }
 }
 
-impl std::error::Error for NoInitialCipherSuite {}
+impl core::error::Error for NoInitialCipherSuite {}
 
 /// A QUIC-compatible TLS server configuration
 ///

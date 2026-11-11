@@ -1421,7 +1421,7 @@ impl Default for ServerConfig {
 /// silently did not exist. The paths are reported instead.
 pub fn parse_config_str(content: &str) -> Result<(ProxyConfig, Vec<String>), toml::de::Error> {
     let mut ignored = Vec::new();
-    let config = serde_ignored::deserialize(toml::Deserializer::new(content), |path| {
+    let config = serde_ignored::deserialize(toml::Deserializer::parse(content)?, |path| {
         ignored.push(path.to_string());
     })?;
     Ok((config, ignored))

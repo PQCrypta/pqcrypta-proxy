@@ -1,6 +1,6 @@
 [package]
 name = "wtransport"
-version = "0.7.0"
+version = "0.7.2"
 license = "MIT OR Apache-2.0"
 authors = ["Biagio Festa"]
 description = "Implementation of the WebTransport (over HTTP3) protocol"
@@ -8,7 +8,7 @@ repository = "https://github.com/BiagioFesta/wtransport"
 keywords = ["webtransport"]
 categories = [ "network-programming", "asynchronous" ]
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.88"
 
 [[example]]
 name = "client"
@@ -28,7 +28,7 @@ required-features = ["self-signed"]
 
 [dependencies]
 bytes = "1.4.0"
-pem = "3.0.4"
+pem = "4"
 # Ported from quinn to noq (multipath-capable quinn fork) by aliasing noq as
 # `quinn` — noq exposes the same public API surface wtransport uses
 # (Connection/Endpoint/SendStream/RecvStream/Incoming/Connecting/ServerConfig/
@@ -40,15 +40,15 @@ rcgen = { version = "0.14.5", default-features = false, optional = true }
 rustls = { version = "0.23.23", default-features = false }
 rustls-native-certs = "0.8.0"
 rustls-pki-types = "1.13.2"
-sha2 = "0.11"
-socket2 = "0.5.3"
+sha2 = "0.11.0"
+socket2 = "0.6.3"
 thiserror = "2.0.3"
 time = "0.3.21"
 tokio = { version = "1.28.1", default-features = false, features = ["macros", "fs", "io-util"] }
 tracing = "0.1.37"
 url = "2.4.0"
-wtransport-proto = { version = "0.7.0", path = "../wtransport-proto", features = ["async"] }
-x509-parser = "0.17.0"
+wtransport-proto = { version = "0.7.2", path = "../wtransport-proto", features = ["async"] }
+x509-parser = "0.18.1"
 
 [dev-dependencies]
 anyhow = "1.0.71"
@@ -89,14 +89,13 @@ allowed_external_types = [
     "quinn_proto::config::ServerConfig",
     "quinn_proto::config::transport::TransportConfig",
     "quinn_proto::connection::ConnectionError",
-    "quinn_proto::crypto::HandshakeTokenKey",
     "rustls",
     "rustls::client::client_conn::ClientConfig",
     "rustls::server::server_conn::ServerConfig",
     "rustls::verify::ServerCertVerifier",
     "rustls::webpki::anchors::RootCertStore",
     "time",
-    "time::duration::Duration",
+    "time::Duration",
     "time::offset_date_time::OffsetDateTime",
     "tokio::io::async_read::AsyncRead",
     "tokio::io::async_write::AsyncWrite",

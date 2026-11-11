@@ -1,8 +1,8 @@
-use std::{
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use core::{
     fmt,
     net::{SocketAddrV4, SocketAddrV6},
     num::TryFromIntError,
-    sync::Arc,
 };
 
 #[cfg(all(feature = "rustls", any(feature = "aws-lc-rs", feature = "ring")))]
@@ -217,8 +217,8 @@ pub struct ServerConfig {
 
     /// Whether to allow clients to migrate to new addresses
     ///
-    /// Improves behavior for clients that move between different internet connections or suffer NAT
-    /// rebinding. Enabled by default.
+    /// Improves behavior for clients that move between different internet connections or suffer
+    /// NAT rebinding. Enabled by default.
     pub(crate) migration: bool,
 
     pub(crate) preferred_address_v4: Option<SocketAddrV4>,

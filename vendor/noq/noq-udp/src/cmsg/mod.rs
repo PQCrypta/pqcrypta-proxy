@@ -26,9 +26,10 @@ pub(crate) struct Encoder<'a, M: MsgHdr> {
 
 impl<'a, M: MsgHdr> Encoder<'a, M> {
     /// # Safety
-    /// - `hdr` must contain a suitably aligned pointer to a big enough buffer to hold control messages
-    ///   bytes. All bytes of this buffer can be safely written.
-    /// - The `Encoder` must be dropped before `hdr` is passed to a system call, and must not be leaked.
+    /// - `hdr` must contain a suitably aligned pointer to a big enough buffer to hold control
+    ///   messages bytes. All bytes of this buffer can be safely written.
+    /// - The `Encoder` must be dropped before `hdr` is passed to a system call, and must not be
+    ///   leaked.
     pub(crate) unsafe fn new(hdr: &'a mut M) -> Self {
         Self {
             cmsg: unsafe { hdr.cmsg_first_hdr().as_mut() },
@@ -78,9 +79,10 @@ impl<M: MsgHdr> Drop for Encoder<'_, M> {
 ///
 /// `cmsg` must refer to a native cmsg containing a payload of type `T`
 pub(crate) unsafe fn decode<T: Copy, C: CMsgHdr>(cmsg: &impl CMsgHdr) -> T {
-    assert!(align_of::<T>() <= align_of::<C>());
     debug_assert_eq!(cmsg.len(), C::cmsg_len(size_of::<T>()));
-    unsafe { ptr::read(cmsg.cmsg_data() as *const T) }
+    // The payload is only aligned for `C`, which on musl is less strict than payloads such as
+    // `libc::timespec`, so it cannot be read through an aligned `ptr::read`.
+    unsafe { ptr::read_unaligned(cmsg.cmsg_data() as *const T) }
 }
 
 pub(crate) struct Iter<'a, M: MsgHdr> {

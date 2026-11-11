@@ -32,9 +32,10 @@ use std::time::Duration;
 
 use bytes;
 
+use axum::serve::ListenerExt;
 use axum::{
     body::Body,
-    extract::{ConnectInfo, FromRequestParts, Host, State},
+    extract::{ConnectInfo, FromRequestParts, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri},
     middleware,
     response::{IntoResponse, Redirect, Response},
@@ -45,6 +46,7 @@ use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
+use request_host::RequestHost;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tower::ServiceExt;
@@ -73,6 +75,7 @@ use crate::security::{security_middleware, SecurityState};
 
 mod backend_tls;
 mod cors;
+mod request_host;
 // Shared with the HTTP/3 path: the security headers (layers::ResponseHeaderSet)
 pub(crate) mod layers;
 mod passthrough;
@@ -540,7 +543,7 @@ async fn dispatch(state: Arc<HttpListenerState>, req: Request<Body>) -> Response
     }
 
     let (mut parts, body) = req.into_parts();
-    let host = match Host::from_request_parts(&mut parts, &()).await {
+    let host = match RequestHost::from_request_parts(&mut parts, &()).await {
         Ok(host) => host,
         Err(rejection) => return rejection.into_response(),
     };
@@ -2825,7 +2828,7 @@ pub(crate) fn copy_forwardable_headers(src: &http::HeaderMap, dst: &mut http::He
 /// Main proxy handler - routes requests to appropriate backends
 async fn proxy_handler(
     State(state): State<Arc<HttpListenerState>>,
-    Host(host): Host,
+    RequestHost(host): RequestHost,
     ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
     mut req: Request<Body>,
 ) -> Response {
@@ -2855,7 +2858,7 @@ async fn proxy_handler(
     let request_start = std::time::Instant::now();
     // In progress until this handler returns or is dropped
     let _in_progress = state.metrics.requests.request_start();
-    // Strip port from host if present — axum's Host extractor includes the port
+    // Strip port from host if present — the request's host includes the port
     // for non-standard ports (e.g. "tcp2.pqcrypta.com:4433"). All subsequent host
     // comparisons (tcp_only_hosts, route matching, etc.) expect bare hostnames.
     let host: String = crate::config::host_without_port(&host).to_string();
@@ -4126,7 +4129,7 @@ pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 
     };
     let startup_domains = lower(&allowed_domains);
 
-    let app = Router::new().fallback(move |Host(host): Host, uri: Uri| {
+    let app = Router::new().fallback(move |RequestHost(host): RequestHost, uri: Uri| {
         let challenges = acme_challenges.clone();
         let (permitted, redirect_to_https, redirect_status, canon) = match config_updates {
             Some(ref updates) => {
@@ -4240,9 +4243,12 @@ pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 
     // Unconditionally, unlike the proxy listeners' `server.tcp_nodelay`: this
     // server answers redirects and ACME challenges, so there is never a stream
     // for Nagle to coalesce and its only possible effect is a delayed-ACK wait.
-    axum::serve(listener, app.into_make_service())
-        .tcp_nodelay(true)
-        .await?;
+    let listener = listener.tap_io(|tcp| {
+        if let Err(e) = tcp.set_nodelay(true) {
+            debug!("TCP_NODELAY not set on a redirect connection: {}", e);
+        }
+    });
+    axum::serve(listener, app.into_make_service()).await?;
 
     Ok(())
 }

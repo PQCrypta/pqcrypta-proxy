@@ -85,7 +85,7 @@ impl FrameKind {
     /// Checks whether an `id` is valid for a [`FrameKind::Exercise`].
     #[inline(always)]
     pub const fn is_id_exercise(id: VarInt) -> bool {
-        id.into_inner() >= 0x21 && ((id.into_inner() - 0x21) % 0x1f == 0)
+        id.into_inner() >= 0x21 && (id.into_inner() - 0x21).is_multiple_of(0x1f)
     }
 
     const fn parse(id: VarInt) -> Option<Self> {

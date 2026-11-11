@@ -7,7 +7,7 @@ use std::{
 
 use bytes::Bytes;
 use pin_project_lite::pin_project;
-use proto::{ClosedStream, ConnectionError, FinishError, StreamId};
+use proto::{ClosedStream, ConnectionError, FinishError, StreamAffinity, StreamId};
 use thiserror::Error;
 use tokio::sync::futures::OwnedNotified;
 
@@ -27,12 +27,12 @@ use crate::{
 /// A `write` method is said to be *cancel-safe* when dropping its future before the future becomes
 /// ready will always result in no data being written to the stream. This is true of methods which
 /// succeed immediately when any progress is made, and is not true of methods which might need to
-/// perform multiple writes internally before succeeding. Each `write` method documents whether it is
-/// cancel-safe.
+/// perform multiple writes internally before succeeding. Each `write` method documents whether it
+/// is cancel-safe.
 ///
 /// [`reset()`]: SendStream::reset
 /// [`finish()`]: SendStream::finish
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SendStream {
     conn: ConnectionRef,
     stream: StreamId,
@@ -79,8 +79,9 @@ impl SendStream {
         Ok(())
     }
 
-    /// Writes [`Bytes`] from a slice of buffers into this stream, returning how many bytes were.
-    /// written
+    /// Writes [`Bytes`] from a slice of buffers into this stream.
+    ///
+    /// Returns how many bytes were written.
     ///
     /// Bytes to try to write are provided to this method as an array of cheaply cloneable chunks.
     /// Unless this method errors, it waits until some amount of those bytes can be written into
@@ -90,8 +91,8 @@ impl SendStream {
     /// On success, this method both mutates `bufs` and returns the number of bytes written:
     ///
     /// - `bufs` is advanced past chunks that were fully written.
-    /// - If a [`Bytes`] chunk was partially written, the chunk at the new front of `bufs` is
-    ///   [split to](Bytes::split_to) contain only the suffix of bytes that were not written.
+    /// - If a [`Bytes`] chunk was partially written, the chunk at the new front of `bufs` is [split
+    ///   to](Bytes::split_to) contain only the suffix of bytes that were not written.
     ///
     /// # Cancel safety
     ///
@@ -191,8 +192,8 @@ impl SendStream {
             conn.skip_waking();
             match e {
                 FinishError::ClosedStream => Err(ClosedStream::default()),
-                // Harmless. If the application needs to know about stopped streams at this point, it
-                // should call `stopped`.
+                // Harmless. If the application needs to know about stopped streams at this point,
+                // it should call `stopped`.
                 FinishError::Stopped(_) => Ok(()),
             }
         } else {
@@ -238,6 +239,43 @@ impl SendStream {
         conn.inner.send_stream(self.stream).priority()
     }
 
+    /// Sets a new affinity for this stream's application data.
+    ///
+    /// Stream affinity allows setting the exact network path over which the STREAM frames
+    /// for a particular stream are sent. Setting the affinity to a path that can not carry
+    /// any data will mean the stream's data can not be transmitted. This is equivalent to
+    /// setting the affinity to [`StreamAffinity::Block`]. It is up to the application to
+    /// monitor for path changes and update a stream's affinity if a
+    /// [`StreamAffinity::Sticky`] path closes.
+    ///
+    /// Note that blocking stream frames from this API is not ideal: it uses up data from
+    /// the connection-wide [send window] before further writes to the stream are
+    /// blocked. Therefore it should be used as a last resort only, it is better not to
+    /// create a stream if no suitable network path exists. If the desired network path
+    /// disappears before the entire stream is delivered consider using
+    /// [`SendStream::reset`] as an alternative to blocking the stream data.
+    ///
+    /// Packet scheduling affects all QUIC frames, not only application data. It functions
+    /// entirely independent of stream affinity. It may decide to stop scheduling packets on
+    /// a path depending on many circumstances, e.g. because of increased packet loss on a
+    /// path, while the path might still be able to carry packets. When packet scheduling
+    /// stops using a path **no** packets are sent on that path, regardless of what stream
+    /// affinity indicates.
+    ///
+    /// Setting stream affinity to be sticky to a path on which no packets are sent means no
+    /// application data will be sent for the stream. The same caveats as above apply in
+    /// this case. If a path becomes incapable of transmitting packets entirely it will
+    /// usually be closed after a short while.
+    ///
+    /// [send window]: crate::TransportConfig::send_window
+    pub fn set_affinity(&self, affinity: StreamAffinity) -> Result<(), ClosedStream> {
+        self.conn
+            .lock_and_wake("SendStream::set_affinity")
+            .inner
+            .send_stream(self.stream)
+            .set_affinity(affinity)
+    }
+
     /// The peer's current flow-control limit for this stream, in bytes.
     ///
     /// Moves only when the peer sends MAX_STREAM_DATA naming this stream,
@@ -277,8 +315,8 @@ impl SendStream {
     /// determine whether the stream was rejected.
     pub fn stopped(&self) -> Stopped {
         let notified = {
-            // Create an `OwnedNotified` to move into the future. By creating it before the first poll,
-            // we make sure that we don't miss any notifications.
+            // Create an `OwnedNotified` to move into the future. By creating it before the first
+            // poll, we make sure that we don't miss any notifications.
             let mut conn = self.conn.lock_without_waking("SendStream::stopped");
             conn.stopped
                 .entry(self.stream)

@@ -1,7 +1,9 @@
-use std::cmp::Ordering;
-use std::fmt::{self, Write};
-use std::iter::Sum;
-use std::ops::{Add, Range, Sub};
+use core::{
+    cmp::Ordering,
+    fmt::{self, Write},
+    iter::Sum,
+    ops::{Add, Range, Sub},
+};
 
 use tinyvec::TinyVec;
 
@@ -11,10 +13,10 @@ use tinyvec::TinyVec;
 /// a range.
 ///
 /// The array-based RangeSet provides 2 benefits:
-/// - There exists an inline representation, which avoids the need of heap
-///   allocating ACK ranges for SentFrames for small ranges.
-/// - Iterating over ranges should usually be faster since there is only
-///   a single cache-friendly contiguous range.
+/// - There exists an inline representation, which avoids the need of heap allocating ACK ranges for
+///   SentFrames for small ranges.
+/// - Iterating over ranges should usually be faster since there is only a single cache-friendly
+///   contiguous range.
 ///
 /// `ArrayRangeSet` is especially useful for tracking ACK ranges where the amount
 /// of ranges is usually very low (since ACK numbers are in consecutive fashion

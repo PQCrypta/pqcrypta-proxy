@@ -1,3 +1,4 @@
+use alloc::string::{String, ToString};
 use bytes::Bytes;
 use tracing::trace;
 
@@ -400,7 +401,8 @@ enum InnerState {
     Established,
     /// See [`StateType::Closed`].
     Closed {
-        /// The reason the remote closed the connection, or the reason we are sending to the remote.
+        /// The reason the remote closed the connection, or the reason we are sending to the
+        /// remote.
         remote_reason: CloseReason,
         /// Set to true if we closed the connection locally.
         is_local: bool,

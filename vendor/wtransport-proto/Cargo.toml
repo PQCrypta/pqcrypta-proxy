@@ -1,6 +1,6 @@
 [package]
 name = "wtransport-proto"
-version = "0.7.0"
+version = "0.7.2"
 license = "MIT OR Apache-2.0"
 authors = ["Biagio Festa"]
 description = "Implementation of the WebTransport (over HTTP3) protocol"
@@ -8,7 +8,7 @@ repository = "https://github.com/BiagioFesta/wtransport"
 keywords = ["webtransport"]
 categories = [ "network-programming", "asynchronous" ]
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.88"
 
 [dependencies]
 httlib-huffman = "0.3.4"

@@ -601,21 +601,42 @@ mod tests {
         assert_eq!(pacer.tokens, pacer.capacity);
         let initial_tokens = pacer.tokens;
 
-        pacer.delay(rtt, true, mtu as u64, mtu, now, &unpaced_metrics(window * 2));
+        pacer.delay(
+            rtt,
+            true,
+            mtu as u64,
+            mtu,
+            now,
+            &unpaced_metrics(window * 2),
+        );
         assert_eq!(
             pacer.capacity,
             (2 * window as u128 * TARGET_BURST_INTERVAL.as_nanos() / rtt.as_nanos()) as u64
         );
         assert_eq!(pacer.tokens, initial_tokens);
 
-        pacer.delay(rtt, true, mtu as u64, mtu, now, &unpaced_metrics(window / 2));
+        pacer.delay(
+            rtt,
+            true,
+            mtu as u64,
+            mtu,
+            now,
+            &unpaced_metrics(window / 2),
+        );
         assert_eq!(
             pacer.capacity,
             (window as u128 / 2 * TARGET_BURST_INTERVAL.as_nanos() / rtt.as_nanos()) as u64
         );
         assert_eq!(pacer.tokens, initial_tokens / 2);
 
-        pacer.delay(rtt, true, mtu as u64, mtu * 2, now, &unpaced_metrics(window));
+        pacer.delay(
+            rtt,
+            true,
+            mtu as u64,
+            mtu * 2,
+            now,
+            &unpaced_metrics(window),
+        );
         assert_eq!(
             pacer.capacity,
             (window as u128 * TARGET_BURST_INTERVAL.as_nanos() / rtt.as_nanos()) as u64
@@ -637,7 +658,14 @@ mod tests {
 
         for _ in 0..packet_capacity {
             assert_eq!(
-                pacer.delay(rtt, true, mtu as u64, mtu, old_instant, &unpaced_metrics(window)),
+                pacer.delay(
+                    rtt,
+                    true,
+                    mtu as u64,
+                    mtu,
+                    old_instant,
+                    &unpaced_metrics(window)
+                ),
                 None,
                 "When capacity is available packets should be sent immediately"
             );
@@ -648,7 +676,14 @@ mod tests {
         let pace_duration = Duration::from_nanos((TARGET_BURST_INTERVAL.as_nanos() * 4 / 5) as u64);
 
         let actual_delay = pacer
-            .delay(rtt, true, mtu as u64, mtu, old_instant, &unpaced_metrics(window))
+            .delay(
+                rtt,
+                true,
+                mtu as u64,
+                mtu,
+                old_instant,
+                &unpaced_metrics(window),
+            )
             .expect("Send must be delayed");
 
         let diff = actual_delay.abs_diff(pace_duration);
@@ -674,7 +709,14 @@ mod tests {
 
         for _ in 0..packet_capacity / 2 {
             assert_eq!(
-                pacer.delay(rtt, true, mtu as u64, mtu, old_instant, &unpaced_metrics(window)),
+                pacer.delay(
+                    rtt,
+                    true,
+                    mtu as u64,
+                    mtu,
+                    old_instant,
+                    &unpaced_metrics(window)
+                ),
                 None,
                 "When capacity is available packets should be sent immediately"
             );
@@ -813,7 +855,10 @@ mod tests {
         let mut pacer = Pacer::new(rtt, window, mtu, None, now);
 
         // Earn credit at the high rate, as during a ProbeBW_UP phase...
-        assert_eq!(pacer.delay(rtt, true, u64::from(mtu), mtu, now, &fast), None);
+        assert_eq!(
+            pacer.delay(rtt, true, u64::from(mtu), mtu, now, &fast),
+            None
+        );
         assert_eq!(pacer.capacity, rate_capacity(TEST_PACING_RATE, mtu));
 
         // ...then a gain change lowers it. Credit earned at the old rate must not survive as a
@@ -851,7 +896,14 @@ mod tests {
 
         // ...so the window path must not mistake it for a budget of its own, even though
         // neither the window nor the MTU it keys on has changed.
-        pacer.delay(rtt, true, u64::from(mtu), mtu, now, &unpaced_metrics(window));
+        pacer.delay(
+            rtt,
+            true,
+            u64::from(mtu),
+            mtu,
+            now,
+            &unpaced_metrics(window),
+        );
 
         assert_eq!(
             pacer.capacity,

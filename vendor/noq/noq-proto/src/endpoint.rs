@@ -1,28 +1,26 @@
-use std::{
-    collections::{HashMap, hash_map},
+use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
+use core::{
     convert::TryFrom,
     fmt, mem,
     net::{IpAddr, SocketAddr},
     ops::{Index, IndexMut},
-    sync::Arc,
 };
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use rand::{Rng, RngExt, SeedableRng, rngs::StdRng};
-use rustc_hash::FxHashMap;
 use slab::Slab;
 use thiserror::Error;
 use tracing::{debug, error, trace, warn};
 
 use crate::{
-    Duration, FourTuple, INITIAL_MTU, Instant, MAX_CID_SIZE, MIN_INITIAL_SIZE, PathId,
-    RESET_TOKEN_SIZE, ResetToken, Side, Transmit, TransportConfig, TransportError,
+    Duration, FourTuple, FxHashMap, HashMap, INITIAL_MTU, Instant, MAX_CID_SIZE, MIN_INITIAL_SIZE,
+    PathId, RESET_TOKEN_SIZE, ResetToken, Side, Transmit, TransportConfig, TransportError,
     cid_generator::ConnectionIdGenerator,
     coding::{BufMutExt, Decodable, Encodable, UnexpectedEnd},
     config::{ClientConfig, EndpointConfig, ServerConfig},
     connection::{Connection, ConnectionError, SideArgs},
     crypto::{self, Keys, UnsupportedVersion},
-    frame,
+    frame, hash_map,
     packet::{
         FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket, PacketDecodeError,
         PacketNumber, PartialDecode, ProtectedInitialHeader,
@@ -370,7 +368,7 @@ impl Endpoint {
         trace!(initial_dcid = %remote_id);
 
         let ch = ConnectionHandle(self.connections.vacant_key());
-        let local_cid = self.new_cid(ch, PathId::ZERO);
+        let local_cid = self.new_cid(RouteDatagramTo::Connection(ch, PathId::ZERO));
         let params = TransportParameters::new(
             &config.transport,
             &self.config,
@@ -415,7 +413,7 @@ impl Endpoint {
     ) -> ConnectionEvent {
         let mut ids = vec![];
         for _ in 0..num {
-            let id = self.new_cid(ch, path_id);
+            let id = self.new_cid(RouteDatagramTo::Connection(ch, path_id));
             let cid_meta = self.connections[ch].local_cids.entry(path_id).or_default();
             let sequence = cid_meta.issued;
             cid_meta.issued += 1;
@@ -435,8 +433,8 @@ impl Endpoint {
         ))
     }
 
-    /// Generate a connection ID for `ch`
-    fn new_cid(&mut self, ch: ConnectionHandle, path_id: PathId) -> ConnectionId {
+    /// Generate and reserve a local connection ID.
+    fn new_cid(&mut self, route_to: RouteDatagramTo) -> ConnectionId {
         loop {
             let cid = self.local_cid_generator.generate_cid();
             if cid.is_empty() {
@@ -445,7 +443,7 @@ impl Endpoint {
                 return cid;
             }
             if let hash_map::Entry::Vacant(e) = self.index.connection_ids.entry(cid) {
-                e.insert((ch, path_id));
+                e.insert(route_to);
                 break cid;
             }
         }
@@ -638,7 +636,7 @@ impl Endpoint {
         };
 
         let ch = ConnectionHandle(self.connections.vacant_key());
-        let local_cid = self.new_cid(ch, PathId::ZERO);
+        let local_cid = self.new_cid(RouteDatagramTo::Connection(ch, PathId::ZERO));
         let mut params = TransportParameters::new(
             &server_config.transport,
             &self.config,
@@ -652,7 +650,7 @@ impl Endpoint {
         params.retry_src_cid = incoming.token.retry_src_cid;
         let mut pref_addr_cid = None;
         if server_config.has_preferred_address() {
-            let cid = self.new_cid(ch, PathId::ZERO);
+            let cid = self.new_cid(RouteDatagramTo::Connection(ch, PathId::ZERO));
             pref_addr_cid = Some(cid);
             params.preferred_address = Some(PreferredAddress {
                 address_v4: server_config.preferred_address_v4,
@@ -882,7 +880,8 @@ impl Endpoint {
             remote_cid,
             network_path,
             tls,
-            self.local_cid_generator.as_ref(),
+            self.local_cid_generator.cid_len(),
+            self.local_cid_generator.cid_lifetime(),
             now,
             version,
             self.allow_mtud,
@@ -1053,7 +1052,7 @@ struct ConnectionIndex {
     /// Identifies connections based on locally created CIDs
     ///
     /// Uses a cheaper hash function since keys are locally created
-    connection_ids: FxHashMap<ConnectionId, (ConnectionHandle, PathId)>,
+    connection_ids: FxHashMap<ConnectionId, RouteDatagramTo>,
     /// Identifies incoming connections with zero-length CIDs
     ///
     /// Uses a standard `HashMap` to protect against hash collision attacks.
@@ -1066,7 +1065,8 @@ struct ConnectionIndex {
     /// necessarily know what address we're sending from, and hence receiving at.
     ///
     /// Uses a standard `HashMap` to protect against hash collision attacks.
-    // TODO(matheus23): It's possible this could be changed now that we track the full 4-tuple on the client side, too.
+    // TODO(matheus23): It's possible this could be changed now that we track the full 4-tuple on
+    // the client side, too.
     outgoing_connection_remotes: HashMap<SocketAddr, ConnectionHandle>,
     /// Reset tokens provided by the peer for the CID each connection is currently sending to
     ///
@@ -1126,8 +1126,10 @@ impl ConnectionIndex {
                 }
             },
             _ => {
-                self.connection_ids
-                    .insert(dst_cid, (connection, PathId::ZERO));
+                self.connection_ids.insert(
+                    dst_cid,
+                    RouteDatagramTo::Connection(connection, PathId::ZERO),
+                );
             }
         }
     }
@@ -1160,9 +1162,9 @@ impl ConnectionIndex {
     /// Find the existing connection that `datagram` should be routed to, if any
     fn get(&self, network_path: &FourTuple, datagram: &PartialDecode) -> Option<RouteDatagramTo> {
         if !datagram.dst_cid().is_empty()
-            && let Some(&(ch, path_id)) = self.connection_ids.get(&datagram.dst_cid())
+            && let Some(&route) = self.connection_ids.get(&datagram.dst_cid())
         {
-            return Some(RouteDatagramTo::Connection(ch, path_id));
+            return Some(route);
         }
         if (datagram.is_initial() || datagram.is_0rtt())
             && let Some(&ch) = self.connection_ids_initial.get(&datagram.dst_cid())
@@ -1212,7 +1214,8 @@ pub(crate) struct ConnectionMeta {
     ///
     /// Each path has its own active CID. We use the [`PathId`] as a unique index, allowing
     /// us to retire the reset token when a path is abandoned.
-    // TODO(matheus23): Should be migrated to make reset tokens per 4-tuple instead of per remote addr
+    // TODO(matheus23): Should be migrated to make reset tokens per 4-tuple instead of per remote
+    // addr
     reset_token: FxHashMap<PathId, (SocketAddr, ResetToken)>,
 }
 
@@ -1328,7 +1331,8 @@ impl Incoming {
     /// Decrypt the Initial packet payload
     ///
     /// This clones and decrypts the packet payload (~1200 bytes).
-    /// Can be used to extract information from the TLS ClientHello without completing the handshake.
+    /// Can be used to extract information from the TLS ClientHello without completing the
+    /// handshake.
     pub fn decrypt(&self) -> Option<DecryptedInitial> {
         let packet_number = self.packet.header.number.expand(0);
         let mut payload = self.packet.payload.clone();
@@ -1612,7 +1616,7 @@ impl ResetTokenTable {
     }
 
     fn remove(&mut self, remote: SocketAddr, token: ResetToken) {
-        use std::collections::hash_map::Entry;
+        use crate::hash_map::Entry;
         match self.0.entry(remote) {
             Entry::Vacant(_) => {}
             Entry::Occupied(mut e) => {

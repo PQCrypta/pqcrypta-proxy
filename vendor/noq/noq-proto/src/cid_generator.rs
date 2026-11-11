@@ -1,4 +1,4 @@
-use std::hash::Hasher;
+use core::hash::Hasher;
 
 use rand::Rng;
 use rand::RngExt;
@@ -29,7 +29,8 @@ pub trait ConnectionIdGenerator: Send + Sync {
     fn cid_len(&self) -> usize;
     /// Returns the lifetime of generated Connection IDs
     ///
-    /// Connection IDs will be retired after the returned `Duration`, if any. Assumed to be constant.
+    /// Connection IDs will be retired after the returned `Duration`, if any. Assumed to be
+    /// constant.
     fn cid_lifetime(&self) -> Option<Duration>;
 }
 

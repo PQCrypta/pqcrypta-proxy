@@ -1,11 +1,13 @@
 #[cfg(feature = "qlog")]
-use std::path::Path;
-use std::{
+use alloc::borrow::ToOwned;
+use alloc::sync::Arc;
+use core::{
     fmt,
     net::SocketAddr,
     num::{NonZeroU8, NonZeroU32},
-    sync::Arc,
 };
+#[cfg(feature = "qlog")]
+use std::path::Path;
 
 use crate::{
     ConnectionId, Duration, INITIAL_MTU, Instant, MAX_UDP_PAYLOAD, Side, VarInt,
@@ -34,7 +36,6 @@ pub struct TransportConfig {
     pub(crate) stream_receive_window: VarInt,
     pub(crate) receive_window: VarInt,
     pub(crate) send_window: u64,
-    pub(crate) send_fairness: bool,
     pub(crate) send_unknown_frame_type: Option<u64>,
     pub(crate) send_invalid_transport_param: Option<(u64, u64)>,
     pub(crate) send_path_challenge: bool,
@@ -60,6 +61,8 @@ pub struct TransportConfig {
     pub(crate) datagram_send_buffer_size: usize,
     #[cfg(test)]
     pub(crate) deterministic_packet_numbers: bool,
+    #[cfg(test)]
+    pub(crate) initial_key_phase_size: Option<u64>,
 
     pub(crate) congestion_controller_factory: Arc<dyn congestion::ControllerFactory + Send + Sync>,
 
@@ -159,18 +162,11 @@ impl TransportConfig {
         self
     }
 
-    /// Whether to implement fair queuing for send streams having the same priority.
-    ///
-    /// When enabled, connections schedule data from outgoing streams having the same priority in a
-    /// round-robin fashion. When disabled, streams are scheduled in the order they are written to.
-    ///
-    /// Note that this only affects streams with the same priority. Higher priority streams always
-    /// take precedence over lower priority streams.
-    ///
-    /// Disabling fairness can reduce fragmentation and protocol overhead for workloads that use
-    /// many small streams.
-    pub fn send_fairness(&mut self, value: bool) -> &mut Self {
-        self.send_fairness = value;
+    /// Has no effect. Equal-priority send streams are always scheduled round-robin.
+    #[deprecated(
+        note = "Send fairness is now always enabled. Neither enabling nor disabling it has no effect."
+    )]
+    pub fn send_fairness(&mut self, _value: bool) -> &mut Self {
         self
     }
 
@@ -420,7 +416,8 @@ impl TransportConfig {
         self
     }
 
-    /// Number of consecutive PTOs after which network is considered to be experiencing persistent congestion.
+    /// Number of consecutive PTOs after which network is considered to be experiencing persistent
+    /// congestion.
     pub fn persistent_congestion_threshold(&mut self, value: u32) -> &mut Self {
         self.persistent_congestion_threshold = value;
         self
@@ -430,9 +427,9 @@ impl TransportConfig {
     ///
     /// Keep-alive packets prevent an inactive but otherwise healthy connection from timing out.
     ///
-    /// `None` to disable, which is the default. Only one side of any given connection needs keep-alive
-    /// enabled for the connection to be preserved. Must be set lower than the idle_timeout of both
-    /// peers to be effective.
+    /// `None` to disable, which is the default. Only one side of any given connection needs
+    /// keep-alive enabled for the connection to be preserved. Must be set lower than the
+    /// idle_timeout of both peers to be effective.
     pub fn keep_alive_interval(&mut self, value: Option<Duration>) -> &mut Self {
         self.keep_alive_interval = value;
         self
@@ -459,6 +456,8 @@ impl TransportConfig {
     /// The peer is forbidden to send single datagrams larger than this size. If the aggregate size
     /// of all datagrams that have been received from the peer but not consumed by the application
     /// exceeds this value, old datagrams are dropped until it is no longer exceeded.
+    ///
+    /// The amount of payload data buffered may be smaller than `value` due to overhead.
     pub fn datagram_receive_buffer_size(&mut self, value: Option<usize>) -> &mut Self {
         self.datagram_receive_buffer_size = value;
         self
@@ -470,6 +469,8 @@ impl TransportConfig {
     /// than the link, or even the underlying hardware, can transmit them. This limits the amount of
     /// memory that may be consumed in that case. When the send buffer is full and a new datagram is
     /// sent, older datagrams are dropped until sufficient space is available.
+    ///
+    /// The amount of payload data buffered may be smaller than `value` due to overhead.
     pub fn datagram_send_buffer_size(&mut self, value: usize) -> &mut Self {
         self.datagram_send_buffer_size = value;
         self
@@ -482,6 +483,23 @@ impl TransportConfig {
     #[cfg(test)]
     pub(crate) fn deterministic_packet_numbers(&mut self, enabled: bool) -> &mut Self {
         self.deterministic_packet_numbers = enabled;
+        self
+    }
+
+    /// Override the size of the first 1-RTT key phase
+    ///
+    /// A fresh connection picks a short key phase at random (10..1000 packets) so that peers
+    /// which mishandle key updates fail early. That makes the first autonomous key update land
+    /// wherever the seed likes, which is a liability in tests that merely happen to run long
+    /// enough: it arms a `KeyDiscard` timer ahead of the deadline they are waiting for. Set this
+    /// to a size the test will never reach to keep the connection on its initial keys; peer
+    /// initiated and forced updates are unaffected, and the AEAD confidentiality limit still
+    /// applies.
+    ///
+    /// Defaults to `None`, i.e. the random production behavior.
+    #[cfg(test)]
+    pub(crate) fn initial_key_phase_size(&mut self, packets: Option<u64>) -> &mut Self {
+        self.initial_key_phase_size = packets;
         self
     }
 
@@ -552,7 +570,7 @@ impl TransportConfig {
         self
     }
 
-    /// Sets a default per-path maximum idle timeout
+    /// Sets a default per-path maximum idle timeout.
     ///
     /// If the path is idle for this long the path will be abandoned. Bear in mind this will
     /// interact with the [`TransportConfig::max_idle_timeout`], if the last path is
@@ -560,6 +578,9 @@ impl TransportConfig {
     ///
     /// You can also change this using [`Connection::set_path_max_idle_timeout`] for
     /// existing paths.
+    ///
+    /// The idle timeout will only apply to paths of a multipath-negotiated connection. Before
+    /// multipath is negotiated, only the connection-wide max idle timeout is in effect.
     ///
     /// [`Connection::set_path_max_idle_timeout`]: crate::Connection::set_path_max_idle_timeout
     pub fn default_path_max_idle_timeout(&mut self, timeout: Option<Duration>) -> &mut Self {
@@ -711,14 +732,14 @@ impl Default for TransportConfig {
             stream_receive_window: STREAM_RWND.into(),
             receive_window: VarInt::MAX,
             send_window: (8 * STREAM_RWND).into(),
-            send_fairness: true,
             send_unknown_frame_type: None,
             send_invalid_transport_param: None,
             send_path_challenge: false,
 
             packet_threshold: 3,
             time_threshold: 9.0 / 8.0,
-            initial_rtt: Duration::from_millis(333), // per spec, intentionally distinct from EXPECTED_RTT
+            initial_rtt: Duration::from_millis(333), /* per spec, intentionally distinct from
+                                                      * EXPECTED_RTT */
             initial_mtu: INITIAL_MTU,
             min_mtu: INITIAL_MTU,
             mtu_discovery_config: Some(MtuDiscoveryConfig::default()),
@@ -737,6 +758,8 @@ impl Default for TransportConfig {
             datagram_send_buffer_size: 1024 * 1024,
             #[cfg(test)]
             deterministic_packet_numbers: false,
+            #[cfg(test)]
+            initial_key_phase_size: None,
 
             congestion_controller_factory: Arc::new(congestion::CubicConfig::default()),
 
@@ -768,7 +791,6 @@ impl fmt::Debug for TransportConfig {
             stream_receive_window,
             receive_window,
             send_window,
-            send_fairness,
             send_unknown_frame_type,
             send_invalid_transport_param,
             send_path_challenge,
@@ -792,6 +814,8 @@ impl fmt::Debug for TransportConfig {
             datagram_send_buffer_size,
             #[cfg(test)]
                 deterministic_packet_numbers: _,
+            #[cfg(test)]
+                initial_key_phase_size: _,
             congestion_controller_factory: _,
             enable_segmentation_offload,
             address_discovery_role,
@@ -811,7 +835,6 @@ impl fmt::Debug for TransportConfig {
             .field("stream_receive_window", stream_receive_window)
             .field("receive_window", receive_window)
             .field("send_window", send_window)
-            .field("send_fairness", send_fairness)
             .field("send_unknown_frame_type", send_unknown_frame_type)
             .field("send_invalid_transport_param", send_invalid_transport_param)
             .field("send_path_challenge", send_path_challenge)
