@@ -1,5 +1,5 @@
-use std::{
-    borrow::Cow,
+use alloc::{borrow::Cow, string::String};
+use core::{
     fmt::{self, Display},
     mem,
     net::{IpAddr, SocketAddr},
@@ -23,6 +23,8 @@ use super::connection::qlog::ToQlog;
 
 #[cfg(test)]
 use crate::varint::varint_u64;
+#[cfg(test)]
+use alloc::{vec, vec::Vec};
 #[cfg(test)]
 use proptest::{collection, prelude::any, strategy::Strategy};
 #[cfg(test)]
@@ -537,8 +539,8 @@ impl Frame {
     pub(crate) fn is_1rtt(&self) -> bool {
         // See also https://www.ietf.org/archive/id/draft-ietf-quic-multipath-17.html#section-4-1:
         // > All frames defined in this document MUST only be sent in 1-RTT packets.
-        // > If an endpoint receives a multipath-specific frame in a different packet type, it MUST close the
-        // > connection with an error of type PROTOCOL_VIOLATION.
+        // > If an endpoint receives a multipath-specific frame in a different packet type, it MUST
+        // > close the connection with an error of type PROTOCOL_VIOLATION.
 
         self.is_multipath_frame() || self.is_qad_frame()
     }
@@ -1261,7 +1263,7 @@ pub(crate) struct EcnCounts {
     pub ce: u64,
 }
 
-impl std::ops::AddAssign<EcnCodepoint> for EcnCounts {
+impl core::ops::AddAssign<EcnCodepoint> for EcnCounts {
     fn add_assign(&mut self, rhs: EcnCodepoint) {
         match rhs {
             EcnCodepoint::Ect0 => {
@@ -1946,8 +1948,8 @@ impl proptest::arbitrary::Arbitrary for NewConnectionId {
             connection_id_and_reset_token(),
         )
             .prop_map(|(path_id, a, b, (id, reset_token))| {
-                let sequence = std::cmp::max(a, b);
-                let retire_prior_to = std::cmp::min(a, b);
+                let sequence = core::cmp::max(a, b);
+                let retire_prior_to = core::cmp::min(a, b);
                 Self {
                     path_id,
                     sequence,
@@ -2340,7 +2342,7 @@ pub(crate) struct AddAddress {
 impl AddAddress {
     /// Smallest number of bytes this type of frame is guaranteed to fit within.
     pub(crate) const SIZE_BOUND: usize = Self {
-        ip: IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        ip: IpAddr::V6(core::net::Ipv6Addr::LOCALHOST),
         port: u16::MAX,
         seq_no: VarInt::MAX,
     }
@@ -2701,7 +2703,7 @@ mod test {
     fn test_observed_addr_roundrip() {
         let observed_addr = ObservedAddr {
             seq_no: VarInt(42),
-            ip: std::net::Ipv4Addr::LOCALHOST.into(),
+            ip: core::net::Ipv4Addr::LOCALHOST.into(),
             port: 4242,
         };
         let mut buf = Vec::with_capacity(observed_addr.size());
@@ -2838,7 +2840,7 @@ mod test {
     fn test_add_address_roundrip() {
         let add_address = AddAddress {
             seq_no: VarInt(42),
-            ip: std::net::Ipv4Addr::LOCALHOST.into(),
+            ip: core::net::Ipv4Addr::LOCALHOST.into(),
             port: 4242,
         };
         let mut buf = Vec::with_capacity(add_address.size());
@@ -2863,7 +2865,7 @@ mod test {
     fn test_reach_out_roundrip() {
         let reach_out = ReachOut {
             round: VarInt(42),
-            ip: std::net::Ipv6Addr::LOCALHOST.into(),
+            ip: core::net::Ipv6Addr::LOCALHOST.into(),
             port: 4242,
         };
         let mut buf = Vec::with_capacity(reach_out.size());

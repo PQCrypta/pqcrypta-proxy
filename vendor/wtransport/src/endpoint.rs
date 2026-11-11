@@ -706,9 +706,54 @@ impl SessionRequest {
         self.stream_session.request().headers().as_ref()
     }
 
+    /// Accepts the client request with headers.
+    pub async fn accept_with_headers<I, K, V>(
+        self,
+        headers: I,
+    ) -> Result<Connection, ConnectionError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.accept_impl(
+            headers
+                .into_iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect(),
+        )
+        .await
+    }
+
     /// Accepts the client request and it establishes the WebTransport session.
-    pub async fn accept(mut self) -> Result<Connection, ConnectionError> {
-        let response = SessionResponseProto::ok();
+    pub async fn accept(self) -> Result<Connection, ConnectionError> {
+        self.accept_impl(HashMap::new()).await
+    }
+
+    /// Rejects the client request by replying with `403` status code.
+    pub async fn forbidden(self) {
+        self.reject(SessionResponseProto::forbidden()).await;
+    }
+
+    /// Rejects the client request by replying with `404` status code.
+    pub async fn not_found(self) {
+        self.reject(SessionResponseProto::not_found()).await;
+    }
+
+    /// Rejects the client request by replying with `429` status code.
+    pub async fn too_many_requests(self) {
+        self.reject(SessionResponseProto::too_many_requests()).await;
+    }
+
+    async fn accept_impl(
+        mut self,
+        headers: HashMap<String, String>,
+    ) -> Result<Connection, ConnectionError> {
+        let mut response = SessionResponseProto::ok();
+
+        for (key, value) in headers {
+            response.add(key, value);
+        }
 
         self.send_response(response).await?;
 
@@ -726,21 +771,6 @@ impl SessionRequest {
             self.driver,
             session_id,
         ))
-    }
-
-    /// Rejects the client request by replying with `403` status code.
-    pub async fn forbidden(self) {
-        self.reject(SessionResponseProto::forbidden()).await;
-    }
-
-    /// Rejects the client request by replying with `404` status code.
-    pub async fn not_found(self) {
-        self.reject(SessionResponseProto::not_found()).await;
-    }
-
-    /// Rejects the client request by replying with `429` status code.
-    pub async fn too_many_requests(self) {
-        self.reject(SessionResponseProto::too_many_requests()).await;
     }
 
     async fn reject(mut self, response: SessionResponseProto) {
@@ -768,5 +798,63 @@ impl SessionRequest {
                 ))
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "self-signed"))]
+mod tests {
+    use super::*;
+    use crate::tls::client::build_default_tls_config;
+    use crate::tls::Identity;
+    use rustls::pki_types::CertificateDer;
+    use rustls::RootCertStore;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn dropping_driver_before_settings_closes_quic_connection() {
+        let identity = Identity::self_signed(["localhost"]).unwrap();
+
+        let mut root_store = RootCertStore::empty();
+        for certificate in identity.certificate_chain().as_slice() {
+            root_store
+                .add(CertificateDer::from(certificate.der().to_vec()))
+                .unwrap();
+        }
+
+        let server = Endpoint::server(
+            ServerConfig::builder()
+                .with_bind_address(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .with_identity(identity)
+                .build(),
+        )
+        .unwrap();
+        let server_address = server.local_addr().unwrap();
+
+        let mut transport_config = quinn::TransportConfig::default();
+        transport_config.max_concurrent_uni_streams(0u32.into());
+        transport_config.keep_alive_interval(Some(Duration::from_millis(200)));
+
+        let tls_config = build_default_tls_config(Arc::new(root_store), None);
+        let mut client_config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls_config).unwrap(),
+        ));
+        client_config.transport_config(Arc::new(transport_config));
+
+        let mut client = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        client.set_default_client_config(client_config);
+
+        let connecting = client.connect(server_address, "localhost").unwrap();
+        let quic_connection = server.accept().await.0.await.unwrap();
+        let client_connection = connecting.await.unwrap();
+
+        let driver = Driver::init(quic_connection.clone());
+        drop(driver);
+        drop(quic_connection);
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), client_connection.closed())
+                .await
+                .is_ok()
+        );
     }
 }

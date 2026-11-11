@@ -6,7 +6,7 @@
 //! contained in this modules should generally only be referred to by custom
 //! implementations of the `crypto::Session` trait.
 
-use std::{
+use core::{
     convert::TryFrom,
     net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
     num::NonZeroU8,
@@ -202,7 +202,7 @@ impl TransportParameters {
             ),
             grease_transport_parameter: Some(ReservedTransportParameter::random(rng)),
             write_order: Some({
-                let mut order = std::array::from_fn(|i| i as u8);
+                let mut order = core::array::from_fn(|i| i as u8);
                 order.shuffle(rng);
                 order
             }),
@@ -361,7 +361,7 @@ impl TransportParameters {
 
         let ids = match &self.write_order {
             Some(order) => order,
-            None => &std::array::from_fn(|i| i as u8),
+            None => &core::array::from_fn(|i| i as u8),
         };
 
         for idx in ids {
@@ -648,9 +648,10 @@ impl TransportParameters {
 /// A reserved transport parameter.
 ///
 /// It has an identifier of the form 31 * N + 27 for the integer value of N.
-/// Such identifiers are reserved to exercise the requirement that unknown transport parameters be ignored.
-/// The reserved transport parameter has no semantics and can carry arbitrary values.
-/// It may be included in transport parameters sent to the peer, and should be ignored when received.
+/// Such identifiers are reserved to exercise the requirement that unknown transport parameters be
+/// ignored. The reserved transport parameter has no semantics and can carry arbitrary values.
+/// It may be included in transport parameters sent to the peer, and should be ignored when
+/// received.
 ///
 /// See spec: <https://www.rfc-editor.org/rfc/rfc9000.html#section-18.1>
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -851,6 +852,7 @@ fn decode_cid(len: usize, value: &mut Option<ConnectionId>, r: &mut impl Buf) ->
 
 #[cfg(test)]
 mod test {
+    use alloc::{boxed::Box, vec, vec::Vec};
 
     use super::*;
 
@@ -919,7 +921,7 @@ mod test {
     struct StepRng(u64);
 
     impl rand::TryRng for StepRng {
-        type Error = std::convert::Infallible;
+        type Error = core::convert::Infallible;
 
         #[inline]
         fn try_next_u32(&mut self) -> Result<u32, Self::Error> {

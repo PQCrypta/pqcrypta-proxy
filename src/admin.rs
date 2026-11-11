@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::acme::{AcmeService, AcmeStatusInfo};
 use crate::audit_logger::{AuditEvent, AuditLogger};
@@ -300,21 +300,21 @@ impl AdminServer {
                 }),
             )
             .route("/ratelimit", get(ratelimit_handler))
-            .route("/ratelimit/reset/:key", post(ratelimit_reset_handler))
-            .route("/blocklist/block/:ip", post(blocklist_block_handler))
+            .route("/ratelimit/reset/{key}", post(ratelimit_reset_handler))
+            .route("/blocklist/block/{ip}", post(blocklist_block_handler))
             .route("/security/status", get(security_status_handler))
-            .route("/security/geoip/:ip", get(security_geoip_handler))
+            .route("/security/geoip/{ip}", get(security_geoip_handler))
             .route("/security/fingerprints", get(security_fingerprints_handler))
             .route("/security/threats", get(security_threats_handler))
             .route("/waf/explain", post(waf_explain_handler))
             .route("/health/quic", get(health_quic_handler))
             .route("/health/webtransport", get(health_webtransport_handler))
             .route("/canary", get(canary_handler))
-            .route("/canary/suspend/:server_id", post(canary_suspend_handler))
-            .route("/canary/resume/:server_id", post(canary_resume_handler))
-            .route("/canary/weight/:server_id", post(canary_weight_handler))
+            .route("/canary/suspend/{server_id}", post(canary_suspend_handler))
+            .route("/canary/resume/{server_id}", post(canary_resume_handler))
+            .route("/canary/weight/{server_id}", post(canary_weight_handler))
             .route("/blocklist", get(blocklist_handler))
-            .route("/blocklist/unblock/:ip", post(blocklist_unblock_handler))
+            .route("/blocklist/unblock/{ip}", post(blocklist_unblock_handler))
             .route("/cache", get(cache_stats_handler))
             .route("/cache/purge", post(cache_purge_handler))
             .layer(axum::middleware::from_fn_with_state(
@@ -357,11 +357,15 @@ impl AdminServer {
 
         // Unconditionally: the admin API returns small JSON documents, so Nagle
         // has nothing to coalesce here and can only add a delayed-ACK wait.
+        let listener = axum::serve::ListenerExt::tap_io(listener, |tcp| {
+            if let Err(e) = tcp.set_nodelay(true) {
+                debug!("TCP_NODELAY not set on an admin connection: {}", e);
+            }
+        });
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
-        .tcp_nodelay(true)
         .with_graceful_shutdown(async move {
             shutdown.await;
             info!("Admin API shutting down");

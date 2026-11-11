@@ -25,7 +25,7 @@ async fn main() -> Result<()> {
 
     info!("Server ready!");
 
-    for id in 0.. {
+    for id in 0..i32::MAX {
         let incoming_session = server.accept().await;
         tokio::spawn(handle_connection(incoming_session).instrument(info_span!("Connection", id)));
     }

@@ -1,6 +1,7 @@
 use super::SpaceKind;
 use crate::{Instant, MAX_UDP_PAYLOAD, MtuDiscoveryConfig};
-use std::cmp;
+use alloc::vec::Vec;
+use core::cmp;
 use tracing::trace;
 
 /// Implements Datagram Packetization Layer Path Maximum Transmission Unit Discovery
@@ -136,9 +137,9 @@ impl MtuDiscovery {
 
     /// Notifies the [`MtuDiscovery`] that a non-probe packet was lost
     ///
-    /// When done notifying of lost packets, [`MtuDiscovery::black_hole_detected`] must be called, to
-    /// ensure the last loss burst is properly processed and to trigger black hole recovery logic if
-    /// necessary.
+    /// When done notifying of lost packets, [`MtuDiscovery::black_hole_detected`] must be called,
+    /// to ensure the last loss burst is properly processed and to trigger black hole recovery
+    /// logic if necessary.
     pub(crate) fn on_non_probe_lost(&mut self, pn: u64, len: u16) {
         self.black_hole_detector.on_non_probe_lost(pn, len);
     }
@@ -185,8 +186,8 @@ impl EnabledMtuDiscovery {
     ///
     /// - There is no current in-flight probe.
     /// - A search for a new MTU is in progress.
-    /// - The MTU discovery was completed but the [`MtuDiscoveryConfig::interval`] expired,
-    ///   this re-starts a n MTU search.
+    /// - The MTU discovery was completed but the [`MtuDiscoveryConfig::interval`] expired, this
+    ///   re-starts a n MTU search.
     fn poll_transmit(&mut self, now: Instant, current_mtu: u16, next_pn: u64) -> Option<u16> {
         if let Phase::Initial = &self.phase {
             // Start the first search
@@ -376,8 +377,8 @@ struct BlackHoleDetector {
     /// Packet number of the biggest packet larger than `min_mtu` which we've received
     /// acknowledgment of more recently than any suspicious loss burst, if any
     largest_post_loss_packet: u64,
-    /// The maximum of `min_mtu` and the size of `largest_post_loss_packet`, or exactly `min_mtu` if
-    /// no larger packets have been received since the most recent loss burst.
+    /// The maximum of `min_mtu` and the size of `largest_post_loss_packet`, or exactly `min_mtu`
+    /// if no larger packets have been received since the most recent loss burst.
     acked_mtu: u16,
     /// The UDP payload size guaranteed to be supported by the network
     min_mtu: u16,
@@ -407,9 +408,16 @@ impl BlackHoleDetector {
     }
 
     fn on_non_probe_acked(&mut self, pn: u64, len: u16) {
-        if len <= self.acked_mtu {
+        if len < self.acked_mtu {
             // We've already seen a larger packet since the most recent suspicious loss burst;
             // nothing to do.
+            return;
+        }
+        if len == self.acked_mtu {
+            // Another delivery of the largest size seen since the most recent suspicious loss
+            // burst. It doesn't raise `acked_mtu`, but loss bursts that precede it cannot be
+            // explained by an MTU reduction either, so remember it as the newest such delivery.
+            self.largest_post_loss_packet = self.largest_post_loss_packet.max(pn);
             return;
         }
         self.acked_mtu = len;
@@ -526,6 +534,8 @@ const BLACK_HOLE_THRESHOLD: usize = 3;
 
 #[cfg(test)]
 mod tests {
+    use std::println;
+
     use super::*;
     use crate::Duration;
     use crate::MAX_UDP_PAYLOAD;
@@ -964,6 +974,36 @@ mod tests {
         assert!(
             bhd.black_hole_detected(),
             "1300 byte losses following a 1400 byte delivery are suspicious"
+        );
+    }
+
+    // Loss bursts that precede the delivery of another packet of the largest size seen so far
+    // are not suspicious: that delivery proves the path still carries packets of that size, even
+    // though it does not raise `acked_mtu`. This is the steady state of a bulk transfer, where
+    // every packet is full-size and one ACK typically both confirms new packets and reveals
+    // older losses.
+    #[test]
+    fn equal_size_delivery_clears_preceding_bursts() {
+        let mut bhd = BlackHoleDetector::new(1200);
+        // A full-size packet was delivered long ago...
+        bhd.on_non_probe_acked(0, 1400);
+        // ...and a newer full-size packet is delivered now, before loss detection runs
+        bhd.on_non_probe_acked((BLACK_HOLE_THRESHOLD + 1) as u64 * 2, 1400);
+        // Loss detection then reveals bursts that were transmitted before that delivery
+        for i in 0..(BLACK_HOLE_THRESHOLD + 1) {
+            bhd.on_non_probe_lost(i as u64 * 2 + 1, 1400);
+        }
+        assert!(
+            !bhd.black_hole_detected(),
+            "full-size losses preceding a full-size delivery are not suspicious"
+        );
+        // Full-size losses transmitted after the last delivery are still suspicious
+        for i in 0..(BLACK_HOLE_THRESHOLD + 1) {
+            bhd.on_non_probe_lost((BLACK_HOLE_THRESHOLD as u64 + 1 + i as u64) * 2 + 1, 1400);
+        }
+        assert!(
+            bhd.black_hole_detected(),
+            "full-size losses following the last full-size delivery are suspicious"
         );
     }
 

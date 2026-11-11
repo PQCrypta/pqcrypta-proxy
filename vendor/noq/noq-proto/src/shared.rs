@@ -1,4 +1,5 @@
-use std::{fmt, net::SocketAddr};
+use alloc::vec::Vec;
+use core::{fmt, net::SocketAddr};
 
 use bytes::{Buf, BufMut, BytesMut};
 
@@ -76,9 +77,9 @@ pub(crate) enum EndpointEventInner {
     ///
     /// The fields are:
     /// - The path ID for which the identifiers are needed.
-    /// - The time when the identifiers were needed, not used to generate the CIDs but sent
-    ///   back via the [`ConnectionEventInner::NewIdentifiers`] so the connection can track
-    ///   the lifetime of when it needs to be rotated.  should be rotated.
+    /// - The time when the identifiers were needed, not used to generate the CIDs but sent back via
+    ///   the [`ConnectionEventInner::NewIdentifiers`] so the connection can track the lifetime of
+    ///   when it needs to be rotated.  should be rotated.
     /// - The number of CIDs needed.
     NeedIdentifiers(PathId, Instant, u64),
     /// Retire a locally issued CID
@@ -146,14 +147,14 @@ impl ConnectionId {
     }
 }
 
-impl ::std::ops::Deref for ConnectionId {
+impl ::core::ops::Deref for ConnectionId {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
         &self.bytes[0..self.len as usize]
     }
 }
 
-impl ::std::ops::DerefMut for ConnectionId {
+impl ::core::ops::DerefMut for ConnectionId {
     fn deref_mut(&mut self) -> &mut [u8] {
         &mut self.bytes[0..self.len as usize]
     }

@@ -69,7 +69,7 @@ mod webtransport {
         pub async fn serve(self) -> Result<()> {
             info!("Server running on port {}", self.local_port());
 
-            for id in 0.. {
+            for id in 0..i32::MAX {
                 let incoming_session = self.endpoint.accept().await;
 
                 tokio::spawn(

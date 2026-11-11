@@ -127,7 +127,7 @@ aws-lc-rs = "1.18"
 # Configuration
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
+toml = "1.2"
 
 # Logging and tracing
 tracing = "0.1"
@@ -141,7 +141,7 @@ opentelemetry-otlp = { version = "0.33", default-features = false, features = ["
 tracing-opentelemetry = "0.34"
 
 # Admin API and HTTP listener
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.8", features = ["macros"] }
 axum-server = { version = "0.8", features = ["tls-rustls", "tls-openssl"] }
 tower = "0.5"
 # Async OpenSSL for TLS connections with PQC
@@ -162,7 +162,7 @@ hmac = "0.13"
 rand = "0.8"
 subtle = "2.6"
 jsonwebtoken = { version = "11.1", default-features = false, features = ["aws_lc_rs"] }
-parking_lot = "0.12"
+parking_lot = "0.13"
 dashmap = "6.1"
 # Reverse/forward DNS for verified search-engine crawler checks (crawler_verify.rs).
 # Thin libc getnameinfo/getaddrinfo wrapper — blocking, so calls run in spawn_blocking.
@@ -298,9 +298,6 @@ debug = true
 # handshake pipeline. See vendor/rustls-fixed/rustls/src/server/ech.rs.
 [patch.crates-io]
 rustls = { path = "vendor/rustls-fixed/rustls" }
-# ml-kem at RustCrypto's sha3 0.12 bump (vendor/ml-kem/VENDORED.md): the
-# released 0.3.2 is on sha3 0.11 while x-wing and hpke are on 0.12.
-ml-kem = { path = "vendor/ml-kem" }
 # h3: forked to fix the QPACK string encoder. Upstream always sets the Huffman
 # bit and never checks whether Huffman actually shrinks the value, copies the
 # input before encoding, grows the output a byte at a time, and copies it out a

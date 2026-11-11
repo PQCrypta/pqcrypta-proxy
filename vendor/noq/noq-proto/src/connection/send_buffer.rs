@@ -1,4 +1,7 @@
-use std::{collections::VecDeque, ops::Range};
+use alloc::collections::VecDeque;
+#[cfg(test)]
+use alloc::vec::Vec;
+use core::ops::Range;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -131,7 +134,7 @@ impl SendBufferData {
         self.segments
             .iter()
             .map(|x| x.as_ref())
-            .chain(std::iter::once(self.last_segment.as_ref()))
+            .chain(core::iter::once(self.last_segment.as_ref()))
     }
 
     /// Returns data which is associated with a range
@@ -242,9 +245,9 @@ impl SendBuffer {
     ///
     /// The method returns a tuple:
     /// - The first return value indicates the range of data to send
-    /// - The second return value indicates whether the length needs to be encoded
-    ///   in the STREAM frames metadata (`true`), or whether it can be omitted
-    ///   since the selected range will fill the whole packet.
+    /// - The second return value indicates whether the length needs to be encoded in the STREAM
+    ///   frames metadata (`true`), or whether it can be omitted since the selected range will fill
+    ///   the whole packet.
     pub(super) fn poll_transmit(&mut self, mut max_len: usize) -> (Range<u64>, bool) {
         debug_assert!(max_len >= 8 + 8);
         let mut encode_length = false;
@@ -477,7 +480,7 @@ mod tests {
 
         fn same(a: &[u8], b: &[u8]) -> bool {
             // surprisingly, eq also checks the fat pointer metadata aka length
-            std::ptr::eq(a.as_ptr(), b.as_ptr())
+            core::ptr::eq(a.as_ptr(), b.as_ptr())
         }
 
         let mut buf = SendBuffer::new();
@@ -700,6 +703,8 @@ pub mod send_buffer_benches {
     //!
     //! These are defined here and re-exported via `bench_exports` in lib.rs,
     //! so we can access the private `SendBuffer` struct.
+    use alloc::{vec, vec::Vec};
+
     use bytes::Bytes;
     use criterion::Criterion;
 
@@ -725,7 +730,7 @@ pub mod send_buffer_benches {
             b.iter(|| {
                 // Get from end (very slow - scans through all 1000 segments)
                 tgt.clear();
-                buf.get_into(BYTES - PACKET_SIZE..BYTES, std::hint::black_box(&mut tgt));
+                buf.get_into(BYTES - PACKET_SIZE..BYTES, core::hint::black_box(&mut tgt));
             });
         });
     }
@@ -752,7 +757,7 @@ pub mod send_buffer_benches {
                 tgt.clear();
                 let mut range = BYTES - PACKET_SIZE..BYTES;
                 while range.start < range.end {
-                    let slice = std::hint::black_box(buf.get(range.clone()));
+                    let slice = core::hint::black_box(buf.get(range.clone()));
                     range.start += slice.len() as u64;
                     tgt.extend_from_slice(slice);
                 }

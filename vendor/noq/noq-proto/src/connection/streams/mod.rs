@@ -1,7 +1,6 @@
-use std::{
-    collections::{BinaryHeap, hash_map},
-    io,
-};
+use alloc::collections::BinaryHeap;
+use core::ops::{Deref, DerefMut};
+use std::io;
 
 use bytes::Bytes;
 use thiserror::Error;
@@ -9,9 +8,12 @@ use tracing::trace;
 
 use super::spaces::Retransmits;
 use crate::{
-    Dir, StreamId, VarInt,
-    connection::streams::state::{get_or_insert_recv, get_or_insert_send},
-    frame,
+    Dir, IntMap, PathId, StreamId, StreamIdKey, VarInt,
+    connection::{
+        paths::PathIdKey,
+        streams::state::{StreamRecv, get_or_insert_recv, get_or_insert_send},
+    },
+    frame, hash_map,
 };
 
 mod recv;
@@ -91,11 +93,12 @@ impl<'a> Streams<'a> {
 
     /// The number of remotely initiated open streams of a certain directionality.
     ///
-    /// Includes remotely initiated streams, which have not been accepted via [`accept`](Self::accept).
-    /// These streams count against the respective concurrency limit reported by
+    /// Includes remotely initiated streams, which have not been accepted via
+    /// [`accept`](Self::accept). These streams count against the respective concurrency limit
+    /// reported by
     /// [`Connection::max_concurrent_streams`](super::Connection::max_concurrent_streams).
     pub fn remote_open_streams(&self, dir: Dir) -> u64 {
-        // total opened - total closed = total opened - ( total permitted - total permitted unclosed )
+        // total opened - total closed = total opened - (total permitted - total permitted unclosed)
         self.state.next_remote[dir as usize]
             - (self.state.max_remote[dir as usize]
                 - self.state.allocated_remote_count[dir as usize])
@@ -110,6 +113,23 @@ pub struct RecvStream<'a> {
 }
 
 impl RecvStream<'_> {
+    /// Whether this stream is still in ordered read mode.
+    ///
+    /// A stream switches permanently to unordered mode when [`Self::read`] is called with
+    /// `ordered` set to `false`.
+    pub fn is_ordered(&self) -> Result<bool, ClosedStream> {
+        let Some(stream) = self.state.recv.get(&self.id) else {
+            return Err(ClosedStream { _private: () });
+        };
+        let Some(stream) = stream.as_ref().and_then(StreamRecv::as_open_recv) else {
+            return Ok(true);
+        };
+        if stream.stopped {
+            return Err(ClosedStream { _private: () });
+        }
+        Ok(stream.assembler.is_ordered())
+    }
+
     /// Read from the given recv stream
     ///
     /// `max_length` limits the maximum size of the returned `Bytes` value; passing `usize::MAX`
@@ -249,7 +269,7 @@ impl<'a> SendStream<'a> {
     /// the chunk will be advanced and contain only non-written data after the call.
     pub fn write_chunks(&mut self, data: &mut &mut [Bytes]) -> Result<usize, WriteError> {
         let written = self.write_source(&mut BytesArray::from_chunks(data))?;
-        *data = &mut std::mem::take(data)[written.chunks..];
+        *data = &mut core::mem::take(data)[written.chunks..];
         Ok(written.bytes)
     }
 
@@ -291,7 +311,9 @@ impl<'a> SendStream<'a> {
         self.state.unacked_data += written.bytes as u64;
         trace!(stream = %self.id, "wrote {} bytes", written.bytes);
         if !was_pending {
-            self.state.pending.push_pending(self.id, stream.priority);
+            self.state
+                .pending
+                .push_pending(self.id, stream.priority, stream.affinity);
         }
         Ok(written)
     }
@@ -322,7 +344,9 @@ impl<'a> SendStream<'a> {
         let was_pending = stream.is_pending();
         stream.finish()?;
         if !was_pending {
-            self.state.pending.push_pending(self.id, stream.priority);
+            self.state
+                .pending
+                .push_pending(self.id, stream.priority, stream.affinity);
         }
 
         Ok(())
@@ -351,6 +375,7 @@ impl<'a> SendStream<'a> {
         // credit based on the final offset communicated in the RESET_STREAM frame we send.
         self.state.unacked_data -= stream.pending.unacked();
         stream.reset();
+        self.state.pending.remove(self.id);
         self.pending.reset_stream.push((self.id, error_code));
 
         // Don't reopen an already-closed stream we haven't forgotten yet
@@ -371,6 +396,50 @@ impl<'a> SendStream<'a> {
             .ok_or(ClosedStream { _private: () })?;
 
         stream.priority = priority;
+        Ok(())
+    }
+
+    /// Sets the path affinity of a stream.
+    ///
+    /// Applies to pending and future STREAM data, including retransmissions and FINs.
+    /// Does not affect stream control frames.
+    /// Unblocking rejoins the back of the stream's priority group.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClosedStream`] if the stream no longer exists.
+    ///
+    /// # Panics
+    ///
+    /// Panics when applied to a receive-only stream.
+    pub fn set_affinity(&mut self, new_affinity: StreamAffinity) -> Result<(), ClosedStream> {
+        let max_send_data = self.state.max_send_data(self.id);
+        let stream = self
+            .state
+            .send
+            .get_mut(&self.id)
+            .map(get_or_insert_send(max_send_data))
+            .ok_or(ClosedStream { _private: () })?;
+
+        if stream.affinity == new_affinity {
+            return Ok(());
+        }
+        if stream.affinity == StreamAffinity::Block {
+            if !stream.is_reset() && stream.is_pending() {
+                self.state
+                    .pending
+                    .push_pending(self.id, stream.priority, new_affinity);
+            }
+        } else {
+            match new_affinity {
+                StreamAffinity::Any => self.state.pending.move_pending(self.id, None),
+                StreamAffinity::Sticky(path) => {
+                    self.state.pending.move_pending(self.id, Some(path))
+                }
+                StreamAffinity::Block => self.state.pending.remove(self.id),
+            }
+        }
+        stream.affinity = new_affinity;
         Ok(())
     }
 
@@ -415,71 +484,180 @@ impl<'a> SendStream<'a> {
     }
 }
 
-/// A queue of streams with pending outgoing data, sorted by priority
+/// Restricts which paths may carry a stream's STREAM frames.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum StreamAffinity {
+    /// Uses the connection's available/backup scheduling policy.
+    #[default]
+    Any,
+    /// Uses only this path, overriding available/backup preference but not transport limits.
+    Sticky(PathId),
+    /// Prevents transmission of STREAM frames for this stream.
+    Block,
+}
+
+/// Pending streams partitioned by affinity, with shared priority and fairness ordering.
 struct PendingStreamsQueue {
-    streams: BinaryHeap<PendingStream>,
-    /// The next stream to write out. This is `Some` when `TransportConfig::send_fairness(false)` and writing a stream is
-    /// interrupted while the stream still has some pending data. See `reinsert_pending()`.
-    next: Option<PendingStream>,
-    /// A monotonically decreasing counter, used to implement round-robin scheduling for streams of the same priority.
-    /// Underflowing is not a practical concern, as it is initialized to u64::MAX and only decremented by 1 in `push_pending`
+    any: BinaryHeap<PendingStream>,
+    sticky: IntMap<PathIdKey, BinaryHeap<PendingStream>>,
+    /// Used as a sort of "reverse index" to find in which queue a stream is currently pending.
+    affinities: IntMap<StreamIdKey, Option<PathId>>,
+    /// A monotonically decreasing counter, used to implement round-robin scheduling for streams of
+    /// the same priority. Underflowing is not a practical concern, as it is initialized to
+    /// u64::MAX and only decremented by 1 in `push_pending`
     recency: u64,
 }
 
 impl PendingStreamsQueue {
     fn new() -> Self {
         Self {
-            streams: BinaryHeap::new(),
-            next: None,
+            any: BinaryHeap::new(),
+            sticky: IntMap::default(),
+            affinities: IntMap::default(),
             recency: u64::MAX,
         }
     }
 
-    /// Reinsert a stream that was pending and still contains unsent data.
-    fn reinsert_pending(&mut self, id: StreamId, priority: i32) {
-        assert!(self.next.is_none());
-
-        self.next = Some(PendingStream {
-            priority,
-            recency: self.recency, // the value here doesn't really matter
-            id,
-        });
-    }
-
-    /// Push a pending stream ID with the given priority, queued after any already-queued streams for the priority
-    fn push_pending(&mut self, id: StreamId, priority: i32) {
-        // Note that in the case where fairness is disabled, if we have a reinserted stream we don't
-        // bump it even if priority > next.priority. In order to minimize fragmentation we
-        // always try to complete a stream once part of it has been written.
-
-        // As the recency counter is monotonically decreasing, we know that using its value to sort this stream will queue it
-        // after all other queued streams of the same priority.
-        // This is enough to implement round-robin scheduling for streams that are still pending even after being handled,
-        // as in that case they are removed from the `BinaryHeap`, handled, and then immediately reinserted.
+    /// Enqueues a stream in its affinity bucket after queued streams of the same priority.
+    ///
+    /// Ignores blocked streams and preserves any existing queued entry and its turn.
+    fn push_pending(&mut self, id: StreamId, priority: i32, affinity: StreamAffinity) {
+        let sticky = match affinity {
+            StreamAffinity::Any => None,
+            StreamAffinity::Sticky(path) => Some(path),
+            StreamAffinity::Block => return,
+        };
+        // Empty writes and late ACKs can leave an entry queued without pending work.
+        // Re-enqueueing that stream keeps its existing turn rather than duplicating it.
+        match self.affinities.entry(StreamIdKey(id)) {
+            hash_map::Entry::Occupied(_) => return,
+            hash_map::Entry::Vacant(entry) => {
+                entry.insert(sticky);
+            }
+        }
+        // As the recency counter is monotonically decreasing, we know that using its value to sort
+        // this stream will queue it after all other queued streams of the same priority.
+        // This is enough to implement round-robin scheduling for streams that are still pending
+        // even after being handled, as in that case they are removed from the `BinaryHeap`,
+        // handled, and then immediately reinserted.
         self.recency -= 1;
-        self.streams.push(PendingStream {
+        let pending = PendingStream {
             priority,
             recency: self.recency,
             id,
-        });
+        };
+        self.queue_mut(sticky).push(pending);
     }
 
-    fn pop(&mut self) -> Option<PendingStream> {
-        self.next.take().or_else(|| self.streams.pop())
+    /// Removes the highest-ranked entry eligible for this path.
+    ///
+    /// Includes the [`StreamAffinity::Any`] queue only when `include_affinity_any` is true.
+    fn pop(&mut self, path: PathId, include_affinity_any: bool) -> Option<PendingStream> {
+        let any = include_affinity_any.then(|| self.any.peek()).flatten();
+        let sticky = self.sticky.get(&PathIdKey(path)).and_then(|q| q.peek());
+        let pending = if any > sticky {
+            self.queue_mut(None).pop()
+        } else {
+            sticky?; // skip looking at the sticky map, if none exists.
+            self.queue_mut(Some(path)).pop()
+        }?;
+        self.affinities.remove(&StreamIdKey(pending.id));
+        Some(pending)
+    }
+
+    /// Moves a queued stream to the destination queue, preserving priority and recency.
+    ///
+    /// Does nothing if the stream is not queued.
+    fn move_pending(&mut self, id: StreamId, new_affinity: Option<PathId>) {
+        let Some(affinity) = self.affinities.get_mut(&StreamIdKey(id)) else {
+            return;
+        };
+        let old_affinity = core::mem::replace(affinity, new_affinity);
+        let mut moved = None;
+        self.queue_mut(old_affinity).retain(|pending| {
+            if pending.id == id {
+                moved = Some(pending.clone());
+                false
+            } else {
+                true
+            }
+        });
+        self.queue_mut(new_affinity).extend(moved);
+    }
+
+    fn queue_mut(&mut self, sticky: Option<PathId>) -> PendingQueueMut<'_> {
+        match sticky {
+            None => PendingQueueMut::Any(&mut self.any),
+            Some(path) => {
+                let entry = match self.sticky.entry(PathIdKey(path)) {
+                    hash_map::Entry::Occupied(entry) => entry,
+                    hash_map::Entry::Vacant(entry) => entry.insert_entry(BinaryHeap::new()),
+                };
+                PendingQueueMut::Sticky(Some(entry))
+            }
+        }
+    }
+
+    fn remove(&mut self, id: StreamId) {
+        let Some(sticky) = self.affinities.remove(&StreamIdKey(id)) else {
+            return;
+        };
+        // Abandoned-path queues might never be selected again.
+        self.queue_mut(sticky).retain(|pending| pending.id != id);
     }
 
     fn clear(&mut self) {
-        self.next = None;
-        self.streams.clear();
-    }
-
-    fn iter(&self) -> impl Iterator<Item = &PendingStream> {
-        self.next.iter().chain(self.streams.iter())
+        self.any.clear();
+        self.sticky.clear();
+        self.affinities.clear();
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.streams.len() + self.next.is_some() as usize
+        self.any.len() + self.sticky.values().map(|q| q.len()).sum::<usize>()
+    }
+}
+
+/// Helper enum for a mutable reference to a specific queue in the [`PendingStreamsQueue`].
+///
+/// This helper ensures proper cleanup of empty sticky queues in its drop implementation.
+enum PendingQueueMut<'a> {
+    Any(&'a mut BinaryHeap<PendingStream>),
+    // The entry is present until Drop takes ownership to remove an empty bucket.
+    Sticky(Option<hash_map::OccupiedEntry<'a, PathIdKey, BinaryHeap<PendingStream>>>),
+}
+
+impl Deref for PendingQueueMut<'_> {
+    type Target = BinaryHeap<PendingStream>;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Any(queue) => queue,
+            Self::Sticky(entry) => entry.as_ref().expect("entry is present until drop").get(),
+        }
+    }
+}
+
+impl DerefMut for PendingQueueMut<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Any(queue) => queue,
+            Self::Sticky(entry) => entry
+                .as_mut()
+                .expect("entry is present until drop")
+                .get_mut(),
+        }
+    }
+}
+
+impl Drop for PendingQueueMut<'_> {
+    fn drop(&mut self) {
+        if let Self::Sticky(entry) = self {
+            let entry = entry.take().expect("entry is present until drop");
+            if entry.get().is_empty() {
+                entry.remove();
+            }
+        }
     }
 }
 
@@ -487,18 +665,20 @@ impl PendingStreamsQueue {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PendingStream {
     /// The priority of the stream
-    // Note that this field should be kept above the `recency` field, in order for the `Ord` derive to be correct
-    // (See https://doc.rust-lang.org/stable/std/cmp/trait.Ord.html#derivable)
+    // Note that this field should be kept above the `recency` field, in order for the `Ord` derive
+    // to be correct (See https://doc.rust-lang.org/stable/std/cmp/trait.Ord.html#derivable)
     priority: i32,
-    /// A tie-breaker for streams of the same priority, used to improve fairness by implementing round-robin scheduling:
-    /// Larger values are prioritized, so it is initialised to `u64::MAX`, and when a stream writes data, we know
-    /// that it currently has the highest recency value, so it is deprioritized by setting its recency to 1 less than the
-    /// previous lowest recency value, such that all other streams of this priority will get processed once before we get back
-    /// round to this one
+    /// A tie-breaker for streams of the same priority, used to improve fairness by implementing
+    /// round-robin scheduling: Larger values are prioritized, so it is initialised to
+    /// `u64::MAX`, and when a stream writes data, we know that it currently has the highest
+    /// recency value, so it is deprioritized by setting its recency to 1 less than the
+    /// previous lowest recency value, such that all other streams of this priority will get
+    /// processed once before we get back round to this one
     recency: u64,
     /// The ID of the stream
-    // The way this type is used ensures that every instance has a unique `recency` value, so this field should be kept below
-    // the `priority` and `recency` fields, so that it does not interfere with the behaviour of the `Ord` derive
+    // The way this type is used ensures that every instance has a unique `recency` value, so this
+    // field should be kept below the `priority` and `recency` fields, so that it does not
+    // interfere with the behaviour of the `Ord` derive
     id: StreamId,
 }
 

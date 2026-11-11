@@ -10,14 +10,22 @@
 // Function bodies in this module are regularly cfg'd out
 #![allow(unused_variables)]
 
-#[cfg(not(feature = "qlog"))]
-use std::marker::PhantomData;
 #[cfg(feature = "qlog")]
-use std::sync::{Arc, Mutex};
-use std::{
+use alloc::{
+    boxed::Box,
+    format,
+    string::{String, ToString},
+    sync::Arc,
+    vec,
+};
+#[cfg(not(feature = "qlog"))]
+use core::marker::PhantomData;
+use core::{
     net::{IpAddr, SocketAddr},
     time::Duration,
 };
+#[cfg(feature = "qlog")]
+use std::sync::Mutex;
 
 #[cfg(feature = "qlog")]
 use qlog::{
@@ -212,7 +220,7 @@ impl QlogSink {
                 }),
                 frames: None,
                 trigger: Some(
-                    match info.time_sent.saturating_duration_since(now) >= loss_delay {
+                    match now.saturating_duration_since(info.time_sent) >= loss_delay {
                         true => PacketLostTrigger::TimeThreshold,
                         false => PacketLostTrigger::ReorderingThreshold,
                     },
@@ -298,8 +306,8 @@ impl QlogSink {
 
     /// Emits a timer event.
     ///
-    /// This function is not public: Instead, create a [`QlogSinkWithTime`] via [`Self::with_time`] and use
-    /// its `emit_timer_` methods.
+    /// This function is not public: Instead, create a [`QlogSinkWithTime`] via [`Self::with_time`]
+    /// and use its `emit_timer_` methods.
     #[cfg(feature = "qlog")]
     fn emit_timer(&self, timer: Timer, op: TimerOp, now: Instant) {
         let Some(stream) = self.stream.as_ref() else {
@@ -456,8 +464,9 @@ impl QlogSentPacket {
 
     /// Adds a frame by pushing a [`QuicFrame`].
     ///
-    /// This function is only available if the `qlog` feature is enabled, because constructing a [`QuicFrame`] may involve
-    /// calculations which shouldn't be performed if the `qlog` feature is disabled.
+    /// This function is only available if the `qlog` feature is enabled, because constructing a
+    /// [`QuicFrame`] may involve calculations which shouldn't be performed if the `qlog`
+    /// feature is disabled.
     #[cfg(feature = "qlog")]
     fn frame_raw(&mut self, frame: QuicFrame) {
         self.inner.frames.get_or_insert_default().push(frame);

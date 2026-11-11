@@ -1,8 +1,7 @@
 mod max_filter;
 
-use std::any::Any;
-use std::collections::VecDeque;
-use std::sync::Arc;
+use alloc::{boxed::Box, collections::VecDeque, sync::Arc};
+use core::any::Any;
 
 use rand::{RngExt, SeedableRng};
 use rand_pcg::Pcg32;
@@ -1872,6 +1871,7 @@ impl Bbr3 {
             ssthresh: None,
             pacing_rate: Some(self.pacing_rate.round() as u64),
             send_quantum: Some(self.send_quantum),
+            bandwidth_estimate: (self.max_bw > 0.0).then_some((self.max_bw * 8.0).round() as u64),
         }
     }
 
@@ -2064,9 +2064,11 @@ impl ControllerFactory for Bbr3Config {
 
 #[cfg(test)]
 mod test {
+    use alloc::{vec, vec::Vec};
+
     use super::*;
-    use std::cell::Cell;
-    use std::ops::ControlFlow;
+    use core::cell::Cell;
+    use core::ops::ControlFlow;
 
     /// PROBE_UP undo snapshot taken before a (possibly spurious) loss:
     /// (state, bw_shortterm, inflight_shortterm, inflight_longterm).
@@ -2339,7 +2341,15 @@ mod test {
                 inflight -= u64::from(SIZE);
                 rtt.update(Duration::ZERO, Duration::from_nanos(RTT_NS));
                 let t = at(sent + RTT_NS);
-                bbr.on_ack(t, at(sent), u64::from(SIZE), acked, SpaceKind::Data, true, &rtt);
+                bbr.on_ack(
+                    t,
+                    at(sent),
+                    u64::from(SIZE),
+                    acked,
+                    SpaceKind::Data,
+                    true,
+                    &rtt,
+                );
                 bbr.on_end_acks(t, inflight, true, Some(acked), SpaceKind::Data);
             }
             bbr.on_packet_sent(at(now), SIZE, pn, SpaceKind::Data);

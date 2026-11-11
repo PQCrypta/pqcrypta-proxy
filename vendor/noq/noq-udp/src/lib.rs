@@ -12,8 +12,8 @@
 //!   addresses for sent packets, allowing responses to be sent from the address that the peer
 //!   expects when there are multiple possibilities. This is common when bound to a wildcard address
 //!   in IPv6 due to [RFC 8981] temporary addresses.
-//! - [Explicit Congestion Notification], which is required by QUIC to prevent packet loss and reduce
-//!   latency on congested links when supported by the network path.
+//! - [Explicit Congestion Notification], which is required by QUIC to prevent packet loss and
+//!   reduce latency on congested links when supported by the network path.
 //! - Disabled IP-layer fragmentation, which allows the true physical MTU to be detected and reduces
 //!   risk of QUIC packet loss.
 //!
@@ -28,13 +28,18 @@
 #![warn(clippy::use_self)]
 
 use core::time::Duration;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-#[cfg(unix)]
-use std::os::unix::io::AsFd;
+#[cfg(any(unix, target_os = "wasi"))]
+use std::os::fd::AsFd;
 #[cfg(windows)]
 use std::os::windows::io::AsSocket;
+use std::{
+    io,
+    net::{IpAddr, Ipv6Addr, SocketAddr},
+};
 #[cfg(not(wasm_browser))]
 use std::{sync::Mutex, time::Instant};
+#[cfg(windows)]
+use windows_sys::Win32::Networking::WinSock;
 
 #[cfg(apple_fast)]
 mod apple_fast;
@@ -180,6 +185,32 @@ impl Transmit<'_> {
     }
 }
 
+/// Returns true if the given I/O error corresponds to a message size error.
+///
+/// Useful, for example, after invoking `std::io::Error::last_os_error()`
+/// to check if the last OS error was a message size error
+/// (EMSGSIZE on Unix, WSAEMSGSIZE on Windows).
+///
+/// Note: EMSGSIZE's value is not standardized across OSes (90 on Linux,
+/// 40 on macOS/iOS/BSD; on Windows, `io::Error::raw_os_error()` returns
+/// the Winsock error WSAEMSGSIZE (10040) via `GetLastError()`, which is
+/// distinct from the MSVCRT `errno.h` EMSGSIZE value of 115, which is
+/// never actually populated by socket operations).
+pub fn is_msg_size_err(err: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        err.raw_os_error() == Some(libc::EMSGSIZE)
+    }
+    #[cfg(windows)]
+    {
+        err.raw_os_error() == Some(WinSock::WSAEMSGSIZE)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
 /// Log at most 1 IO error per minute
 #[cfg(not(wasm_browser))]
 const IO_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
@@ -216,13 +247,13 @@ fn log_sendmsg_error(_: &Mutex<Instant>, _: impl core::fmt::Debug, _: &Transmit<
 
 /// A borrowed UDP socket
 ///
-/// On Unix, constructible via `From<T: AsFd>`. On Windows, constructible via `From<T:
+/// On Unix and WASI, constructible via `From<T: AsFd>`. On Windows, constructible via `From<T:
 /// AsSocket>`.
 // Wrapper around socket2 to avoid making it a public dependency and incurring stability risk
 #[cfg(not(wasm_browser))]
 pub struct UdpSockRef<'a>(socket2::SockRef<'a>);
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 impl<'s, S> From<&'s S> for UdpSockRef<'s>
 where
     S: AsFd,

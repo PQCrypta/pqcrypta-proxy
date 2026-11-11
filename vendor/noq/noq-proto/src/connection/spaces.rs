@@ -1,18 +1,22 @@
-use std::{
-    cmp,
+use alloc::{
+    boxed::Box,
     collections::{BTreeMap, BTreeSet, VecDeque},
-    mem,
-    ops::{Bound, Index, IndexMut},
+    vec::Vec,
+};
+use core::{
+    cmp, mem,
+    ops::{Bound, Index, IndexMut, Range},
 };
 
 use rand::{CryptoRng, RngExt};
-use rustc_hash::{FxHashMap, FxHashSet};
 use sorted_index_buffer::SortedIndexBuffer;
 use tracing::trace;
 
 use super::{PathId, paths::PathResponses, paths::PathRetransmits};
 use crate::{
-    Dir, Duration, FourTuple, Instant, StreamId, TransportError, TransportErrorCode, VarInt,
+    Dir, Duration, FourTuple, FxHashMap, FxHashSet, Instant, StreamId, TransportError,
+    TransportErrorCode, VarInt,
+    cid_queue::CidQueue,
     connection::StreamsState,
     frame::{self, AddAddress, RemoveAddress},
     packet::SpaceId,
@@ -156,13 +160,19 @@ impl PacketSpace {
             .number_spaces
             .values()
             .any(|pns| pns.pending_acks.can_send());
-        let space_specific = self.number_spaces.get(&path_id).is_some_and(|s| {
-            s.pending_ping || s.pending_immediate_ack || !s.pending_path_responses.is_empty()
-        });
+        let probing_frames = self
+            .number_spaces
+            .get(&path_id)
+            .is_some_and(|s| !s.pending_path_responses.is_empty());
+        let space_specific = self
+            .number_spaces
+            .get(&path_id)
+            .is_some_and(|s| s.pending_ping || s.pending_immediate_ack);
         let other = !self.pending.is_empty(streams);
         SendableFrames {
             acks,
             close: false,
+            probing_frames,
             space_specific,
             other,
         }
@@ -293,7 +303,6 @@ pub(super) struct PacketNumberSpace {
 
     //
     // Loss Detection
-    //
     /// The time the most recently sent retransmittable packet was sent.
     pub(super) time_of_last_ack_eliciting_packet: Option<Instant>,
     /// Earliest time when we might declare a packet lost.
@@ -405,7 +414,7 @@ impl PacketNumberSpace {
     }
 
     /// Checks whether a skipped packet number was ACKed.
-    pub(super) fn check_ack(&self, range: std::ops::Range<u64>) -> Result<(), TransportError> {
+    pub(super) fn check_ack(&self, range: core::ops::Range<u64>) -> Result<(), TransportError> {
         if let Some(ref filter) = self.pn_filter
             && filter
                 .prev_skipped_packet_number
@@ -521,13 +530,14 @@ pub(super) enum OpenStatus {
 /// Represents one or more packets subject to retransmission
 #[derive(Debug, Clone)]
 pub(super) struct SentPacket {
-    /// [`PathData::generation`](super::PathData::generation) of the path on which this packet was sent
+    /// [`PathData::generation`](super::PathData::generation) of the path on which this packet was
+    /// sent
     pub(super) path_generation: u64,
     /// The time the packet was sent.
     pub(super) time_sent: Instant,
-    /// The number of bytes sent in the packet, not including UDP or IP overhead, but including QUIC
-    /// framing overhead. Zero if this packet is not counted towards congestion control, i.e. not an
-    /// "in flight" packet.
+    /// The number of bytes sent in the packet, not including UDP or IP overhead, but including
+    /// QUIC framing overhead. Zero if this packet is not counted towards congestion control,
+    /// i.e. not an "in flight" packet.
     pub(super) size: u16,
     /// Whether an acknowledgement is expected directly in response to this packet.
     pub(super) ack_eliciting: bool,
@@ -576,8 +586,8 @@ pub struct Retransmits {
     ///
     /// Stores the remote_max_path_id at the time this was generated.
     /// This frame is entirely informational, so when it's retransmitted, the remote_max_path_id is
-    /// intentionally not updated to preserve the fact that this was the state of the client at some
-    /// point.
+    /// intentionally not updated to preserve the fact that this was the state of the client at
+    /// some point.
     pub(super) paths_blocked: Option<PathId>,
     /// For each enqueued NEW_TOKEN frame, a copy of the path's remote address
     ///
@@ -598,12 +608,13 @@ pub struct Retransmits {
     pub(super) new_tokens: Vec<FourTuple>,
     /// Paths which need to be abandoned
     pub(super) path_abandon: BTreeMap<PathId, TransportErrorCode>,
-    /// If a [`frame::PathStatusAvailable`] and [`frame::PathStatusBackup`] need to be sent for a path
+    /// If a [`frame::PathStatusAvailable`] and [`frame::PathStatusBackup`] need to be sent for a
+    /// path
     pub(super) path_status: BTreeSet<PathId>,
     /// Whether a PATH_CIDS_BLOCKED frame needs to be sent for a path.
     ///
-    /// Stores the next_seq number for the blocked path. This number can be "outdated" at the time of
-    /// sending when this is a retransmission. This is intentional, as this frame is purely
+    /// Stores the next_seq number for the blocked path. This number can be "outdated" at the time
+    /// of sending when this is a retransmission. This is intentional, as this frame is purely
     /// informational, and this would preserve this information.
     pub(super) path_cids_blocked: BTreeMap<PathId, VarInt>,
 
@@ -617,6 +628,28 @@ pub struct Retransmits {
 }
 
 impl Retransmits {
+    /// Queue connection IDs retired on `path_id` for retransmission, bounding how many can be
+    /// queued at once.
+    pub(super) fn retire_cids(
+        &mut self,
+        path_id: PathId,
+        seqs: Range<u64>,
+    ) -> Result<(), TransportError> {
+        /// Ensure `retire_cids` cannot grow without bound. Limit is somewhat arbitrary but very
+        /// permissive.
+        const MAX_PENDING_RETIRED_CIDS: u64 = CidQueue::LEN as u64 * 10;
+        // We don't bother counting in-flight frames because those are bounded by congestion
+        // control.
+        let num = seqs.end.saturating_sub(seqs.start);
+        if (self.retire_cids.len() as u64).saturating_add(num) > MAX_PENDING_RETIRED_CIDS {
+            return Err(TransportError::CONNECTION_ID_LIMIT_ERROR(
+                "queued too many retired CIDs",
+            ));
+        }
+        self.retire_cids.extend(seqs.map(|seq| (path_id, seq)));
+        Ok(())
+    }
+
     pub(super) fn is_empty(&self, streams: &StreamsState) -> bool {
         let Self {
             max_data,
@@ -665,7 +698,7 @@ impl Retransmits {
     }
 }
 
-impl ::std::ops::BitOrAssign for Retransmits {
+impl ::core::ops::BitOrAssign for Retransmits {
     fn bitor_assign(&mut self, rhs: Self) {
         let Self {
             max_data,
@@ -719,7 +752,7 @@ impl ::std::ops::BitOrAssign for Retransmits {
     }
 }
 
-impl ::std::ops::BitOrAssign<ThinRetransmits> for Retransmits {
+impl ::core::ops::BitOrAssign<ThinRetransmits> for Retransmits {
     fn bitor_assign(&mut self, rhs: ThinRetransmits) {
         let ThinRetransmits { retransmits } = rhs;
         if let Some(retransmits) = retransmits {
@@ -728,7 +761,7 @@ impl ::std::ops::BitOrAssign<ThinRetransmits> for Retransmits {
     }
 }
 
-impl ::std::iter::FromIterator<Self> for Retransmits {
+impl ::core::iter::FromIterator<Self> for Retransmits {
     fn from_iter<T>(iter: T) -> Self
     where
         T: IntoIterator<Item = Self>,
@@ -1029,13 +1062,23 @@ pub(super) struct SendableFrames {
     pub(super) acks: bool,
     /// Whether there is a CONNECTION_CLOSE to send, this is not ack-eliciting.
     pub(super) close: bool,
-    /// Whether there are any frames that must be sent on this specific space.
+    /// Whether there are any probing frames to send on this specific space.
+    ///
+    /// A space here in the sense of a QUIC Multipath packet number space: `Initial`,
+    /// `Handshake` and all `Data(PathId)` spaces.
+    ///
+    /// These frames are allowed to be sent on un-validated paths, e.g. PATH_CHALLENGE and
+    /// PATH_RESPONSE. These are ACK-eliciting.
+    ///
+    /// See [`Self::space_specific`] for frames that need to be sent on a validated space.
+    pub(super) probing_frames: bool,
+    /// Whether there are any frames that must be sent on this specific space if validated.
     ///
     /// A space here in the sense of a QUIC Multipath packet number space: `Initial`,
     /// `Handshake` and all `Data(PathId)` spaces.
     ///
     /// These are ack-eliciting. Some frames are scheduled per path, e.g. PING,
-    /// IMMEDIATE_ACK, PATH_CHALLENGE or PATH_RESPONSE.
+    /// IMMEDIATE_ACK. But also STREAM frames for streams that are sticky to a path.
     pub(super) space_specific: bool,
     /// Whether there are any other frames to send, these are ack-eliciting.
     pub(super) other: bool,
@@ -1047,6 +1090,7 @@ impl SendableFrames {
         Self {
             acks: false,
             close: false,
+            probing_frames: false,
             space_specific: false,
             other: false,
         }
@@ -1057,6 +1101,7 @@ impl SendableFrames {
         let Self {
             acks: _,
             close,
+            probing_frames,
             space_specific,
             other,
         } = *self;
@@ -1064,7 +1109,7 @@ impl SendableFrames {
             // No ack-eliciting frames are included with a CONNECTION_CLOSE, only acks.
             return false;
         }
-        space_specific || other
+        probing_frames || space_specific || other
     }
 
     /// Whether no data is sendable.
@@ -1072,24 +1117,27 @@ impl SendableFrames {
         let Self {
             acks,
             close,
+            probing_frames,
             space_specific,
             other,
         } = *self;
-        !acks && !close && !space_specific && !other
+        !acks && !close && !probing_frames && !space_specific && !other
     }
 }
 
-impl ::std::ops::BitOrAssign for SendableFrames {
+impl ::core::ops::BitOrAssign for SendableFrames {
     fn bitor_assign(&mut self, rhs: Self) {
         let Self {
             acks,
             close,
+            probing_frames,
             space_specific,
             other,
         } = rhs;
 
         self.acks |= acks;
         self.close |= close;
+        self.probing_frames |= probing_frames;
         self.space_specific |= space_specific;
         self.other |= other;
     }
@@ -1114,7 +1162,8 @@ pub(super) struct PendingAcks {
     ///
     /// * `0`: no special action is taken
     /// * `1`: an ACK is immediately sent if it is out-of-order according to RFC 9000
-    /// * `>1`: an ACK is immediately sent if it is out-of-order according to the ACK frequency draft
+    /// * `>1`: an ACK is immediately sent if it is out-of-order according to the ACK frequency
+    ///   draft
     reordering_threshold: u64,
     /// The earliest ack-eliciting packet since the last ACK was sent, used to calculate the moment
     /// upon which `max_ack_delay` elapses
@@ -1407,6 +1456,8 @@ const MAX_ACK_BLOCKS: usize = 64;
 
 #[cfg(test)]
 mod test {
+    use alloc::vec;
+
     use rand::Rng;
     use rand::seq::SliceRandom;
 
