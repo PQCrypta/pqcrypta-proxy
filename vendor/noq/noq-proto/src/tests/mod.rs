@@ -5733,10 +5733,11 @@ fn sent_packets_stats_snapshot_test() {
     let client_stats = pair.client_conn_mut(client_ch).stats();
     let server_stats = pair.server_conn_mut(server_ch).stats();
     assert_eq!(client_stats.sent_packets, 13);
-    // One more than upstream noq: this fork's server sends 1-RTT frames as
-    // 0.5-RTT data right behind its Handshake flight (the NEW_CONNECTION_IDs
-    // here; an HTTP/3 server's SETTINGS in use), where upstream holds them for
-    // the packet carrying HANDSHAKE_DONE.
+    // One more than upstream noq: before the first RTT sample this fork's pacer
+    // lets the initial window go out in one burst (`pacing::optimal_capacity`),
+    // so the server's NEW_CONNECTION_IDs leave as 0.5-RTT data right behind its
+    // Handshake flight. Upstream's pacer, timing a 333 ms initial RTT, holds them
+    // until the packet that carries HANDSHAKE_DONE.
     assert_eq!(server_stats.sent_packets, 11);
 
     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();

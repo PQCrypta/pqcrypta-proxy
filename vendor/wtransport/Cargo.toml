@@ -28,7 +28,7 @@ required-features = ["self-signed"]
 
 [dependencies]
 bytes = "1.4.0"
-pem = "3.0.4"
+pem = "4"
 # Ported from quinn to noq (multipath-capable quinn fork) by aliasing noq as
 # `quinn` — noq exposes the same public API surface wtransport uses
 # (Connection/Endpoint/SendStream/RecvStream/Incoming/Connecting/ServerConfig/

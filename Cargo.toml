@@ -162,7 +162,7 @@ hmac = "0.13"
 rand = "0.8"
 subtle = "2.6"
 jsonwebtoken = { version = "11.1", default-features = false, features = ["aws_lc_rs"] }
-parking_lot = "0.13"
+parking_lot = "0.12"
 dashmap = "6.1"
 # Reverse/forward DNS for verified search-engine crawler checks (crawler_verify.rs).
 # Thin libc getnameinfo/getaddrinfo wrapper — blocking, so calls run in spawn_blocking.
@@ -197,7 +197,7 @@ sha1 = "0.11"
 md-5 = "0.11"
 
 # X.509 certificate parsing (for OCSP)
-x509-parser = "0.16"
+x509-parser = "0.18"
 
 # HTTP client for OCSP requests and ACME
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }

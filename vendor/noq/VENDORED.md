@@ -34,11 +34,14 @@ when the proxy builds noq as a dependency.
 - A NEW_TOKEN for a client's new address after it migrates.
 - Before the first RTT sample, the pacer's burst may be the initial window
   (RFC 9002 section 7.7), so a two-datagram post-quantum ClientHello and a
-  server's first flight are not split by the initial RTT.
+  server's first flight are not split by the initial RTT. (The handshake
+  snapshot test counts one more server packet than upstream for this: the
+  NEW_CONNECTION_IDs leave as 0.5-RTT data instead of waiting for
+  HANDSHAKE_DONE's packet.)
 - BBRv3 told when the sender runs dry (`Controller::on_app_limited`), so a flow
   of small packets is not read as the path's bandwidth.
 - Event streams that end with their connection; `PathId::get`; a seeded test
-  pair. The handshake snapshot test counts the 0.5-RTT packet above.
+  pair.
 
 ## Updating it
 

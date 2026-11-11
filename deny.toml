@@ -21,7 +21,6 @@ allow = [
     "Zlib",
     "CC0-1.0",
     "CDLA-Permissive-2.0",
-    "OpenSSL",
 ]
 
 [bans]
@@ -37,25 +36,20 @@ deny = []
 # Update Cargo.toml direct dep when upstreams converge on a single version.
 skip = [
     # x509-parser / asn1-rs chain — multiple crates pull different sub-versions
-    { name = "x509-parser", reason = "F-13: multiple transitive versions; direct dep is 0.16; upstream convergence tracked" },
-    { name = "asn1-rs", reason = "transitive of x509-parser multi-version chain" },
-    { name = "asn1-rs-derive", reason = "proc-macro companion of asn1-rs; multiple versions mirror asn1-rs chain" },
-    { name = "der-parser", reason = "transitive of x509-parser chain; 9.x and 10.x pulled by different sub-trees" },
-    { name = "oid-registry", reason = "transitive of x509-parser chain; 0.7 and 0.8 pulled by different sub-trees" },
     # rand ecosystem — 0.8/0.9 migration still in progress across the crate graph
     { name = "rand", reason = "0.8 and 0.9 pulled by separate dependency subtrees; upstream migration ongoing" },
     { name = "rand_chacha", reason = "version-mirrors rand: 0.3 via rand 0.8 (direct, failsafe, governor), 0.9 via rand 0.9 (opentelemetry_sdk 0.33)" },
     { name = "rand_core", reason = "version-mirrors rand; 0.6 and 0.9 pulled by rand 0.8 and 0.9 sub-trees" },
     { name = "getrandom", reason = "multiple versions due to rand/crypto crate ecosystem transition" },
+    { name = "r-efi", reason = "version-mirrors getrandom: 5.x via getrandom 0.3 (rand 0.9, opentelemetry_sdk), 6.x via getrandom 0.4 (rand 0.10, tempfile, uuid)" },
+    { name = "synstructure", reason = "build-time proc-macro helper: 0.13 via asn1-rs-derive 0.6 (x509-parser 0.18, its newest), 0.14 via yoke-derive 0.8 (icu, through url)" },
     # bitflags — 1.x → 2.x migration ongoing; many crates still on 1.x
-    { name = "bitflags", reason = "1.3 retained by notify/kqueue; 2.x used by majority; migration tracked" },
     # hashbrown — std uses 0.14 internally; external crates use 0.15
     { name = "hashbrown", reason = "0.14 used by std/indexmap internals; 0.15 used by direct crates" },
     # thiserror — 1.x → 2.x migration; older transitive crates not yet updated
     { name = "thiserror", reason = "1.x retained by older transitive crates; 2.x used by direct deps" },
     { name = "thiserror-impl", reason = "proc-macro companion of thiserror; mirrors thiserror version split" },
     # socket2 — 0.4 used by tokio 1.x internals; 0.5 used by newer crates
-    { name = "socket2", reason = "0.4 pulled by tokio internals; 0.5 used by direct/newer crates" },
     # ipnetwork — pulled at different versions by database and network crates
     { name = "ipnetwork", reason = "multiple transitive versions from sqlx and network crate sub-trees" },
     # openssl-probe — version split between openssl-related crate trees
@@ -78,21 +72,8 @@ skip = [
     { name = "cpufeatures", reason = "0.2 pulled by aes/polyval; 0.3 by sha1/sha2/chacha20; RustCrypto migration ongoing" },
     # rustls-platform-verifier — hyper-rustls 0.27 pins 0.6, the vendored noq-proto
     # (multipath QUIC fork) pins 0.7. Resolves when hyper-rustls moves to 0.7.
-    { name = "rustls-platform-verifier", reason = "0.6 pulled by hyper-rustls 0.27; 0.7 by vendored noq-proto; awaiting hyper-rustls bump" },
-    { name = "jni", reason = "Android-only; 0.21 and 0.22 pulled by the two rustls-platform-verifier versions" },
-    { name = "jni-sys", reason = "Android-only; version-mirrors jni via rustls-platform-verifier split" },
-    { name = "rustls-platform-verifier-android", reason = "Android-only; 0.1 pulled by rustls-platform-verifier 0.6, 0.2 by 0.7.1, the same split" },
     # windows-* — cross-compilation targets; 0.52 vs 0.x splits from indirect Windows crates
     { name = "windows-sys", reason = "multiple versions from Windows-platform crate tree; harmless on Linux" },
-    { name = "windows-targets", reason = "mirrors windows-sys version split" },
-    { name = "windows_aarch64_gnullvm", reason = "mirrors windows-sys version split" },
-    { name = "windows_aarch64_msvc", reason = "mirrors windows-sys version split" },
-    { name = "windows_i686_gnu", reason = "mirrors windows-sys version split" },
-    { name = "windows_i686_gnullvm", reason = "mirrors windows-sys version split" },
-    { name = "windows_i686_msvc", reason = "mirrors windows-sys version split" },
-    { name = "windows_x86_64_gnu", reason = "mirrors windows-sys version split" },
-    { name = "windows_x86_64_gnullvm", reason = "mirrors windows-sys version split" },
-    { name = "windows_x86_64_msvc", reason = "mirrors windows-sys version split" },
 ]
 
 [sources]
