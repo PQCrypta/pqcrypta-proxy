@@ -840,7 +840,7 @@ mod tests {
         ));
         client_config.transport_config(Arc::new(transport_config));
 
-        let mut client = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let client = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
         client.set_default_client_config(client_config);
 
         let connecting = client.connect(server_address, "localhost").unwrap();
