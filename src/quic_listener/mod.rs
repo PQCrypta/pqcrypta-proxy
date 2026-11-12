@@ -783,7 +783,13 @@ impl QuicListener {
             .ok_or_else(|| anyhow::anyhow!("no async runtime found for QUIC endpoint"))?;
         let mut endpoint_config = quinn::EndpointConfig::default();
         endpoint_config.supported_versions(vec![0x0000_0001, 0x6b33_43cf]); // QUIC v1 (RFC 9000) + v2 (RFC 9369)
-        let endpoint = Endpoint::new(
+                                                                            // Through the path-loss decorator: a telemetry session served here
+                                                                            // (WebTransport over this port) can put loss on its own path, and with
+                                                                            // none set a datagram costs one atomic load (path_loss.rs)
+        let socket = Box::new(crate::path_loss::LossySocket::new(
+            runtime.wrap_udp_socket(socket)?,
+        ));
+        let endpoint = Endpoint::new_with_abstract_socket(
             endpoint_config,
             Some(server_config.clone()),
             socket,

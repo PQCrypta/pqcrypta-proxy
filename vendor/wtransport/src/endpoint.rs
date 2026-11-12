@@ -141,6 +141,35 @@ impl Endpoint<endpoint_side::Server> {
         })
     }
 
+    /// Constructs a *server* endpoint whose socket is first passed through
+    /// `wrap`: a decorator that sees every datagram the endpoint sends and
+    /// receives (the proxy's adds per-peer path loss on request).
+    pub fn server_with_socket(
+        server_config: ServerConfig,
+        wrap: impl FnOnce(Box<dyn quinn::AsyncUdpSocket>) -> Box<dyn quinn::AsyncUdpSocket>,
+    ) -> std::io::Result<Self> {
+        use quinn::Runtime as _;
+        let endpoint_config = server_config.endpoint_config;
+        let quic_config = server_config.quic_config;
+        let socket = server_config.bind_address_config.bind_socket()?;
+        let runtime = Arc::new(TokioRuntime);
+        let socket = wrap(runtime.wrap_udp_socket(socket)?);
+
+        let endpoint = quinn::Endpoint::new_with_abstract_socket(
+            endpoint_config,
+            Some(quic_config),
+            socket,
+            runtime,
+        )?;
+
+        Ok(Self {
+            endpoint,
+            side: endpoint_side::Server {
+                _marker: PhantomData,
+            },
+        })
+    }
+
     /// Get the next incoming connection attempt from a client.
     pub async fn accept(&self) -> IncomingSession {
         let quic_incoming = self
