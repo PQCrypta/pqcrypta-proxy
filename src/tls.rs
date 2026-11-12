@@ -195,6 +195,9 @@ pub const DELEGATED_CREDENTIAL_VALIDITY: Duration = Duration::from_hours(24);
 /// clock runs that far ahead still accepts it.
 pub const DELEGATED_CREDENTIAL_REFRESH: Duration = Duration::from_hours(6);
 
+/// How soon minting is tried again after it failed for a certificate
+pub const DELEGATED_CREDENTIAL_RETRY: Duration = Duration::from_mins(5);
+
 /// The validity of a certificate that allows delegated credentials, one with
 /// the DelegationUsage extension and the digitalSignature key usage
 /// (RFC 9345 §4.2); `None` for any other.
@@ -296,6 +299,7 @@ pub fn mint_delegated_credentials(
 fn delegating(
     certified: Arc<rustls::sign::CertifiedKey>,
     domain: &str,
+    failed: &std::sync::atomic::AtomicBool,
 ) -> Arc<rustls::sign::CertifiedKey> {
     match mint_delegated_credentials(&certified) {
         Ok(Some(minted)) => {
@@ -322,10 +326,14 @@ fn delegating(
         }
         Ok(None) => certified,
         Err(e) => {
+            // The credentials it has are served until they expire (rustls
+            // offers none past its expiry; the certificate key signs then),
+            // and minting is tried again soon rather than at the next refresh
             warn!(
                 "SNI resolver: '{}' delegated credentials not minted, its certificate key signs — {}",
                 domain, e
             );
+            failed.store(true, Ordering::Relaxed);
             certified
         }
     }
@@ -386,6 +394,8 @@ impl MultiDomainCertResolver {
     /// certificate it is serving; the write that completes the pair is a
     /// change of its own, and the reload that follows takes it.
     pub fn reload(&self) -> anyhow::Result<()> {
+        // Set when a certificate's delegated credentials could not be minted
+        let failed = std::sync::atomic::AtomicBool::new(false);
         let mut new_certs = HashMap::new();
         let mut naming_addresses = Vec::new();
         let serving = |domain: &str| self.certs.read().by_name.get(domain).cloned();
@@ -412,7 +422,7 @@ impl MultiDomainCertResolver {
                 continue;
             }
             let primary = match load_certified_key(&cert_path, &key_path) {
-                Ok(ck) => delegating(Arc::new(ck), &domain),
+                Ok(ck) => delegating(Arc::new(ck), &domain, &failed),
                 Err(e) => {
                     match serving(&domain) {
                         Some(kept) => {
@@ -446,7 +456,7 @@ impl MultiDomainCertResolver {
                             "SNI resolver: '{}' has an ML-DSA companion certificate",
                             domain
                         );
-                        Some(delegating(Arc::new(ck), &domain))
+                        Some(delegating(Arc::new(ck), &domain, &failed))
                     }
                     Err(e) => {
                         let kept = serving(&domain).and_then(|certs| certs.post_quantum);
@@ -498,8 +508,16 @@ impl MultiDomainCertResolver {
             by_name: new_certs,
             by_address,
         };
-        self.delegation_due
-            .store(Self::next_delegation(delegates), Ordering::Release);
+        self.delegation_due.store(
+            if failed.load(Ordering::Relaxed) {
+                UnixTime::now()
+                    .as_secs()
+                    .saturating_add(DELEGATED_CREDENTIAL_RETRY.as_secs())
+            } else {
+                Self::next_delegation(delegates)
+            },
+            Ordering::Release,
+        );
         Ok(())
     }
 
@@ -527,13 +545,17 @@ impl MultiDomainCertResolver {
         }
         // A snapshot, so that no lock is held while minting
         let current = self.certs.read().by_name.clone();
+        let failed = std::sync::atomic::AtomicBool::new(false);
         let minted: Vec<(String, DomainCerts, DomainCerts)> = current
             .into_iter()
             .filter(|(_, certs)| allows_delegation(certs))
             .map(|(domain, certs)| {
                 let fresh = DomainCerts {
-                    primary: delegating(certs.primary.clone(), &domain),
-                    post_quantum: certs.post_quantum.clone().map(|pq| delegating(pq, &domain)),
+                    primary: delegating(certs.primary.clone(), &domain, &failed),
+                    post_quantum: certs
+                        .post_quantum
+                        .clone()
+                        .map(|pq| delegating(pq, &domain, &failed)),
                 };
                 (domain, certs, fresh)
             })
@@ -549,9 +571,35 @@ impl MultiDomainCertResolver {
         }
         let delegates = loaded.by_name.values().any(allows_delegation);
         drop(loaded);
-        self.delegation_due
-            .store(Self::next_delegation(delegates), Ordering::Release);
+        let due = if failed.load(Ordering::Relaxed) {
+            UnixTime::now()
+                .as_secs()
+                .saturating_add(DELEGATED_CREDENTIAL_RETRY.as_secs())
+        } else {
+            Self::next_delegation(delegates)
+        };
+        self.delegation_due.store(due, Ordering::Release);
         self.minting.store(false, Ordering::Release);
+    }
+}
+
+impl MultiDomainCertResolver {
+    /// Every chain served now: each domain's and its post-quantum
+    /// companion's (a chain several domains share, once).
+    pub fn served_chains(&self) -> Vec<Vec<CertificateDer<'static>>> {
+        let certs = self.certs.read();
+        let mut seen = std::collections::HashSet::new();
+        certs
+            .by_name
+            .values()
+            .flat_map(|d| std::iter::once(&d.primary).chain(d.post_quantum.as_ref()))
+            .filter(|key| {
+                key.cert
+                    .first()
+                    .is_some_and(|ee| seen.insert(ee.as_ref().to_vec()))
+            })
+            .map(|key| key.cert.clone())
+            .collect()
     }
 }
 
@@ -571,10 +619,10 @@ impl rustls::server::ResolvesServerCert for MultiDomainCertResolver {
                     .get(by_address.or(self.default_domain.as_deref())?)?
             }
         };
-        Some(choose_certified_key(
+        Some(crate::ocsp::stapled(choose_certified_key(
             domain,
             client_hello.signature_schemes(),
-        ))
+        )))
     }
 }
 
@@ -947,6 +995,10 @@ pub struct TlsProvider {
     pub resolver: Arc<MultiDomainCertResolver>,
     /// The QUIC listener's application protocols, by ALPN
     applications: Vec<Vec<u8>>,
+    /// Where each reload's outcome is recorded, once the audit log exists
+    audit: std::sync::OnceLock<Arc<crate::audit_logger::AuditLogger>>,
+    /// Reloads that succeeded (for the metrics)
+    reloads: std::sync::atomic::AtomicU64,
 }
 
 /// The proxy's key exchange preference, in one place.
@@ -2261,7 +2313,7 @@ impl rustls::server::ResolvesServerCert for SingleChain {
         &self,
         _hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        Some(self.0.clone())
+        Some(crate::ocsp::stapled(self.0.clone()))
     }
 }
 
@@ -2688,6 +2740,8 @@ impl TlsProvider {
             client_auth,
             resolver,
             applications,
+            audit: std::sync::OnceLock::new(),
+            reloads: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -2761,7 +2815,35 @@ impl TlsProvider {
 
     /// Reload TLS certificates — refreshes the shared SNI resolver then rebuilds QUIC config.
     /// Called when ACME issues a new cert or the certs directory changes.
+    /// Record each reload's outcome in the audit log.
+    pub fn set_audit_logger(&self, logger: Arc<crate::audit_logger::AuditLogger>) {
+        let _ = self.audit.set(logger);
+    }
+
+    /// Reload the certificates and ECH configs from disk, for every listener,
+    /// whatever asked for it: a change on disk, an ACME renewal, a
+    /// configuration reload or the admin API.
     pub fn reload_certificates(&self) -> anyhow::Result<()> {
+        let reloaded = self.reload_tls_material();
+        if reloaded.is_ok() {
+            self.reloads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::ocsp::certificates_changed();
+        }
+        if let Some(audit) = self.audit.get() {
+            audit.log(crate::audit_logger::AuditEvent::TlsReload {
+                success: reloaded.is_ok(),
+            });
+        }
+        reloaded
+    }
+
+    /// Certificate reloads that succeeded since start.
+    pub fn certificate_reloads(&self) -> u64 {
+        self.reloads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn reload_tls_material(&self) -> anyhow::Result<()> {
         let tls_config = self.tls_config.read().clone();
         let pqc_config = self.pqc_config.read().clone();
         let pqc_available = *self.pqc_available.read();
@@ -2850,151 +2932,28 @@ impl TlsProvider {
         self.reload_certificates()
     }
 
-    /// Check if PQC is available on this system
+    /// Whether the provider the listeners are built from holds a post-quantum
+    /// group for `[pqc]` as configured: asked of the provider itself, which
+    /// is what a handshake will be offered from.
+    ///
+    /// Also installs the process's default provider. Code that builds a
+    /// rustls configuration without naming a provider (an HTTP client, a
+    /// test) finds this one, whichever cryptography features its
+    /// dependencies turned on.
     fn check_pqc_availability(pqc_config: &PqcConfig) -> bool {
-        // Always try rustls-post-quantum first (preferred, native Rust implementation)
-        if Self::check_rustls_pqc() {
-            info!("Using rustls-post-quantum provider for PQC (X25519MLKEM768)");
-            return true;
+        let _ = rustls_post_quantum::provider().install_default();
+        let groups: Vec<_> = server_provider(true, pqc_config)
+            .kx_groups
+            .iter()
+            .map(|group| group.name())
+            .filter(|group| is_post_quantum_group(*group))
+            .collect();
+        if groups.is_empty() {
+            warn!("[pqc] leaves the TLS provider no post-quantum group to offer");
+        } else {
+            info!("Post-quantum key exchange groups available: {groups:?}");
         }
-
-        // Fallback to OpenSSL if configured
-        match pqc_config.provider.as_str() {
-            "openssl3.5" => Self::check_openssl_pqc(pqc_config),
-            "rustls-pqc" => false, // Already tried above
-            _ => {
-                warn!("Unknown PQC provider: {}", pqc_config.provider);
-                false
-            }
-        }
-    }
-
-    /// Check if OpenSSL 3.5 with OQS provider is available
-    fn check_openssl_pqc(pqc_config: &PqcConfig) -> bool {
-        #[cfg(feature = "pqc")]
-        {
-            use std::process::Command;
-
-            let openssl_path = pqc_config
-                .openssl_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| "openssl".to_string());
-
-            // Set library path for OpenSSL 3.5
-            let lib_path = pqc_config
-                .openssl_lib_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            // P1-fix: clear the parent environment before spawning.
-            // pqc_tls.rs::check_openssl35 already does this; tls.rs previously did not,
-            // leaving LD_PRELOAD, DYLD_INSERT_LIBRARIES, etc. from the parent process
-            // open to injection.  Align with the hardened pattern from pqc_tls.rs.
-            let version_output = Command::new(&openssl_path)
-                .arg("version")
-                .env_clear()
-                .env("PATH", "/usr/bin:/bin")
-                .env("LD_LIBRARY_PATH", &lib_path)
-                .output();
-
-            match version_output {
-                Ok(output) => {
-                    let version_str = String::from_utf8_lossy(&output.stdout);
-                    if version_str.contains("3.5")
-                        || version_str.contains("3.4")
-                        || version_str.contains("3.3")
-                    {
-                        info!("OpenSSL version detected: {}", version_str.trim());
-
-                        // Check for OQS provider
-                        let provider_output = Command::new(&openssl_path)
-                            .args(["list", "-providers"])
-                            .env_clear()
-                            .env("PATH", "/usr/bin:/bin")
-                            .env("LD_LIBRARY_PATH", &lib_path)
-                            .output();
-
-                        match provider_output {
-                            Ok(output) => {
-                                let providers = String::from_utf8_lossy(&output.stdout);
-                                if providers.contains("oqs") || providers.contains("OQS") {
-                                    info!(
-                                        "OQS provider detected - PQC hybrid key exchange available"
-                                    );
-                                    return true;
-                                }
-
-                                // Check for built-in Kyber support (OpenSSL 3.5+)
-                                let kem_output = Command::new(&openssl_path)
-                                    .args(["list", "-kem-algorithms"])
-                                    .env_clear()
-                                    .env("PATH", "/usr/bin:/bin")
-                                    .env("LD_LIBRARY_PATH", &lib_path)
-                                    .output();
-
-                                if let Ok(output) = kem_output {
-                                    let kems = String::from_utf8_lossy(&output.stdout);
-                                    if kems.contains("kyber")
-                                        || kems.contains("Kyber")
-                                        || kems.contains("ML-KEM")
-                                    {
-                                        info!("Kyber/ML-KEM KEM detected - PQC available natively");
-                                        return true;
-                                    }
-                                }
-
-                                warn!("OpenSSL found but no PQC KEM algorithms available");
-                                false
-                            }
-                            Err(e) => {
-                                warn!("Failed to check OpenSSL providers: {}", e);
-                                false
-                            }
-                        }
-                    } else {
-                        warn!(
-                            "OpenSSL version {} does not support PQC",
-                            version_str.trim()
-                        );
-                        false
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to check OpenSSL version: {}", e);
-                    false
-                }
-            }
-        }
-
-        #[cfg(not(feature = "pqc"))]
-        {
-            warn!("PQC feature not compiled - OpenSSL PQC unavailable");
-            false
-        }
-    }
-
-    /// Check if rustls PQC support is available via aws-lc-rs
-    fn check_rustls_pqc() -> bool {
-        // Check if rustls-post-quantum provider is available
-        // This uses aws-lc-rs which has X25519MLKEM768 support
-        match rustls_post_quantum::provider().install_default() {
-            Ok(_) => {
-                info!("rustls-post-quantum provider installed - X25519MLKEM768 hybrid key exchange available");
-                true
-            }
-            Err(_) => {
-                // Provider might already be installed, check if it's available
-                if CryptoProvider::get_default().is_some() {
-                    info!("Default crypto provider already set - checking for PQC support");
-                    true
-                } else {
-                    warn!("Failed to install rustls-post-quantum provider");
-                    false
-                }
-            }
-        }
+        !groups.is_empty()
     }
 
     /// Create rustls server configuration using the shared SNI cert resolver.

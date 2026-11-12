@@ -30,11 +30,27 @@ pub struct RotationConfig {
     pub max_age: Option<Duration>,
 }
 
+/// Open a log file for appending, creating it readable by its owner and
+/// group and by nobody else: a log holds clients' addresses and the paths
+/// they asked for. A file that exists keeps the mode it has.
+pub fn open_append(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o640);
+    }
+    options.open(path)
+}
+
 /// A file writer that rotates on size and prunes old rotations.
 pub struct RotatingFileWriter {
     config: RotationConfig,
     file: File,
     written: u64,
+    /// Set while rotation is failing, so that it is reported once
+    rotation_failing: bool,
 }
 
 impl RotatingFileWriter {
@@ -49,16 +65,14 @@ impl RotatingFileWriter {
             }
         }
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&config.path)?;
+        let file = open_append(&config.path)?;
         let written = file.metadata().map(|m| m.len()).unwrap_or(0);
 
         Ok(Self {
             config,
             file,
             written,
+            rotation_failing: false,
         })
     }
 
@@ -85,7 +99,7 @@ impl RotatingFileWriter {
             fs::rename(path, numbered_path(path, 1))?;
         }
 
-        self.file = OpenOptions::new().create(true).append(true).open(path)?;
+        self.file = open_append(path)?;
         self.written = 0;
         self.prune_by_age();
 
@@ -130,8 +144,21 @@ impl Write for RotatingFileWriter {
             && self.written + buf.len() as u64 > self.config.max_size_bytes
             && self.written > 0
         {
-            // A failed rotation must not cost us the line being written.
-            let _ = self.rotate();
+            // A failed rotation must not cost us the line being written: the
+            // file already open is written on. It is said once, on stderr,
+            // since this writer is where the log itself goes.
+            match self.rotate() {
+                Ok(()) => self.rotation_failing = false,
+                Err(e) => {
+                    if !self.rotation_failing {
+                        eprintln!(
+                            "log rotation of {} failed ({e}); it grows past its limit until rotation succeeds",
+                            self.config.path.display()
+                        );
+                    }
+                    self.rotation_failing = true;
+                }
+            }
         }
 
         let written = self.file.write(buf)?;

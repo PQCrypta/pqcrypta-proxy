@@ -9,6 +9,14 @@
 //! 4,216 in three days. The cache stays bounded (it is a cache); this is a
 //! record, keyed by the stable identity, and is never evicted.
 //!
+//! What is kept for good is what has been seen more than once: from two
+//! client networks, or on two days. A new fingerprint waits in a bounded
+//! probation segment until then, oldest let go first when it is full, so a
+//! client that sends a new ClientHello shape with every connection cannot
+//! grow the corpus without limit, and cannot push out anything established.
+//! Everything in the file when the proxy starts, from before this existed,
+//! is established.
+//!
 //! A JA4 keeps what the directory shows of it: its counts, first and last
 //! sighting, the User-Agents on its requests and a sample of its JA3
 //! variants, each sample bounded so that one client cannot grow its record
@@ -91,6 +99,10 @@ pub struct CorpusEntry {
     pub ja3_variant_count: u64,
     #[serde(default)]
     pub ja3_samples: Vec<Ja3Sample>,
+    /// Seen from one client network on one day so far: kept while the
+    /// probation segment has room (see the module notes)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub probation: bool,
 }
 
 /// The file.
@@ -109,12 +121,58 @@ pub struct Sighting<'a> {
     pub classification: &'a str,
     pub transport: char,
     pub at: u64,
+    /// The client's address, which a fingerprint must be seen from more than
+    /// one network of to be kept for good
+    pub client: Option<std::net::IpAddr>,
+}
+
+/// Fingerprints waiting to be seen again.
+const PROBATION: usize = 20_000;
+
+/// A fingerprint in probation, with where and when it has been seen.
+struct Probation {
+    entry: CorpusEntry,
+    /// Distinct client networks (an IPv4 /24, an IPv6 /48), up to two
+    networks: Vec<u128>,
+    /// Distinct days (Unix days), up to two
+    days: Vec<u64>,
+}
+
+impl Probation {
+    /// Note a sighting; true once it has been seen from two networks or on
+    /// two days.
+    fn note(&mut self, client: Option<std::net::IpAddr>, at: u64) -> bool {
+        if let Some(network) = client.map(client_network) {
+            if self.networks.len() < 2 && !self.networks.contains(&network) {
+                self.networks.push(network);
+            }
+        }
+        let day = at / 86_400;
+        if self.days.len() < 2 && !self.days.contains(&day) {
+            self.days.push(day);
+        }
+        self.networks.len() >= 2 || self.days.len() >= 2
+    }
+}
+
+/// The network a client is counted as for promotion: one scanner moving
+/// through one subnet is one network.
+pub(crate) fn client_network(ip: std::net::IpAddr) -> u128 {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) => u128::from(u32::from(v4) & 0xffff_ff00),
+        std::net::IpAddr::V6(v6) => (u128::from(v6) & (!0u128 << 80)) | 1,
+    }
 }
 
 /// The corpus, in memory.
 #[derive(Default)]
 pub struct Corpus {
+    /// Kept for good
     entries: DashMap<String, CorpusEntry>,
+    /// Kept while there is room
+    probation: DashMap<String, Probation>,
+    /// Probation keys in the order they arrived, oldest first
+    arrivals: parking_lot::Mutex<std::collections::VecDeque<String>>,
 }
 
 /// The record's key: the JA4, else the JA3.
@@ -127,45 +185,72 @@ pub fn key_of(ja3_hash: &str, ja4_hash: Option<&str>) -> String {
 
 impl Corpus {
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.len() + self.probation.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.probation.is_empty()
+    }
+
+    /// Records kept for good.
+    pub fn established(&self) -> usize {
+        self.entries.len()
     }
 
     /// Record one connection's fingerprint. True when the corpus had never
-    /// seen it: its first sighting, under its JA4 (else its JA3), ever.
+    /// seen it, or had let it go from probation: its first sighting, under
+    /// its JA4 (else its JA3), that the corpus holds.
     pub fn observe(&self, s: &Sighting<'_>) -> bool {
         let key = key_of(s.ja3_hash, s.ja4_hash);
-        let mut first = false;
-        let mut entry = self.entries.entry(key.clone()).or_insert_with(|| {
-            first = true;
-            CorpusEntry {
-                key,
-                ja4_hash: s.ja4_hash.map(str::to_string),
-                ja4_raw: None,
-                ja4_verified: false,
-                classification: s.classification.to_string(),
-                transport: s.transport,
-                first_seen: s.at,
-                last_seen: s.at,
-                request_count: 0,
-                user_agents: HashMap::new(),
-                ja3_variant_count: 0,
-                ja3_samples: Vec::new(),
-            }
-        });
-        let e = entry.value_mut();
-        e.first_seen = e.first_seen.min(s.at);
-        e.last_seen = e.last_seen.max(s.at);
-        e.request_count = e.request_count.saturating_add(1);
-        e.classification = s.classification.to_string();
-        if let Some(raw) = s.ja4_raw.filter(|r| !r.is_empty()) {
-            e.ja4_raw = Some(raw.to_string());
+        if let Some(mut e) = self.entries.get_mut(&key) {
+            record(e.value_mut(), s);
+            return false;
         }
-        note_ja3(e, s.ja3_hash, s.ja3_string, 1);
+        let mut first = false;
+        let promoted = {
+            let mut waiting = self.probation.entry(key.clone()).or_insert_with(|| {
+                first = true;
+                Probation {
+                    entry: new_entry(key.clone(), s),
+                    networks: Vec::new(),
+                    days: Vec::new(),
+                }
+            });
+            record(&mut waiting.entry, s);
+            waiting.note(s.client, s.at).then(|| {
+                let mut kept = waiting.entry.clone();
+                kept.probation = false;
+                kept
+            })
+        };
+        if let Some(kept) = promoted {
+            // Established before it leaves probation, so a sighting in
+            // between finds it in one of the two.
+            self.entries.insert(key.clone(), kept);
+            self.probation.remove(&key);
+        } else if first {
+            self.arrived(key);
+        }
         first
+    }
+
+    /// A new key in probation; the oldest let go while there are too many.
+    fn arrived(&self, key: String) {
+        let mut arrivals = self.arrivals.lock();
+        arrivals.push_back(key);
+        while self.probation.len() > PROBATION {
+            match arrivals.pop_front() {
+                Some(oldest) => {
+                    self.probation.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+        // Keys that were promoted are still queued: dropped once they
+        // outnumber the ones waiting.
+        if arrivals.len() > 2 * PROBATION {
+            arrivals.retain(|k| self.probation.contains_key(k));
+        }
     }
 
     /// Record a User-Agent seen on a request with this fingerprint.
@@ -173,15 +258,26 @@ impl Corpus {
         if key.is_empty() || user_agent.is_empty() {
             return;
         }
+        let ua: String = user_agent.chars().take(MAX_UA_LEN).collect();
         if let Some(mut entry) = self.entries.get_mut(key) {
-            let ua: String = user_agent.chars().take(MAX_UA_LEN).collect();
             add_user_agent(entry.value_mut(), ua, 1);
+        } else if let Some(mut waiting) = self.probation.get_mut(key) {
+            add_user_agent(&mut waiting.entry, ua, 1);
         }
     }
 
-    /// Every record, most recently seen first.
+    /// Every record, established and in probation, most recently seen first.
     pub fn entries(&self) -> Vec<CorpusEntry> {
-        let mut all: Vec<CorpusEntry> = self.entries.iter().map(|e| e.value().clone()).collect();
+        let mut all: Vec<CorpusEntry> = self
+            .entries
+            .iter()
+            .map(|e| e.value().clone())
+            .chain(self.probation.iter().map(|p| {
+                let mut e = p.entry.clone();
+                e.probation = true;
+                e
+            }))
+            .collect();
         all.sort_by(|a, b| {
             b.last_seen
                 .cmp(&a.last_seen)
@@ -194,6 +290,34 @@ impl Corpus {
     /// lineage that has them (the larger count, the earlier first sighting,
     /// the later last), as two snapshots of one corpus overlap.
     pub fn absorb(&self, entry: CorpusEntry) {
+        if entry.probation && !self.entries.contains_key(&entry.key) {
+            let key = entry.key.clone();
+            let first = !self.probation.contains_key(&key);
+            match self.probation.get_mut(&key) {
+                Some(mut waiting) => merge(&mut waiting.entry, entry),
+                None => {
+                    self.probation.insert(
+                        key.clone(),
+                        Probation {
+                            entry,
+                            networks: Vec::new(),
+                            days: Vec::new(),
+                        },
+                    );
+                }
+            }
+            if first {
+                self.arrived(key);
+            }
+            return;
+        }
+        // Established here or in the file: kept for good, with what probation
+        // held of it.
+        let mut entry = entry;
+        entry.probation = false;
+        if let Some((_, waiting)) = self.probation.remove(&entry.key) {
+            merge(&mut entry, waiting.entry);
+        }
         match self.entries.get_mut(&entry.key) {
             Some(mut have) => merge(have.value_mut(), entry),
             None => {
@@ -215,30 +339,47 @@ impl Corpus {
                 lists.insert(sigs.to_string());
             }
         }
+        for waiting in self.probation.iter() {
+            if let Some(sigs) = waiting.entry.ja4_raw.as_deref().and_then(signature_list) {
+                lists.insert(sigs.to_string());
+            }
+        }
         let lists: Vec<String> = lists.into_iter().collect();
         let mut rebuilt = 0;
         for mut e in self.entries.iter_mut() {
-            if e.ja4_raw.is_some() {
-                continue;
-            }
-            let Some(ja4) = e.ja4_hash.clone() else {
-                continue;
-            };
-            let raw = e
-                .ja3_samples
-                .iter()
-                .filter(|s| !s.ja3_string.is_empty())
-                .find_map(|s| rebuild_raw(&ja4, &s.ja3_string, &lists));
-            if let Some(raw) = raw {
-                e.ja4_raw = Some(raw);
-                // Proved by its hashes: no longer taken on the directory's word
-                e.ja4_verified = false;
-                rebuilt += 1;
-            }
+            rebuilt += usize::from(rebuild_entry_raw(e.value_mut(), &lists));
+        }
+        for mut waiting in self.probation.iter_mut() {
+            rebuilt += usize::from(rebuild_entry_raw(&mut waiting.entry, &lists));
         }
         rebuilt
     }
+}
 
+/// Give `e` the JA4_r its JA4 was hashed from, where it has none and one can
+/// be rebuilt and proved (`rebuild_raw`); true when it was.
+fn rebuild_entry_raw(e: &mut CorpusEntry, lists: &[String]) -> bool {
+    if e.ja4_raw.is_some() {
+        return false;
+    }
+    let Some(ja4) = e.ja4_hash.clone() else {
+        return false;
+    };
+    let raw = e
+        .ja3_samples
+        .iter()
+        .filter(|s| !s.ja3_string.is_empty())
+        .find_map(|s| rebuild_raw(&ja4, &s.ja3_string, lists));
+    let Some(raw) = raw else {
+        return false;
+    };
+    e.ja4_raw = Some(raw);
+    // Proved by its hashes: no longer taken on the directory's word
+    e.ja4_verified = false;
+    true
+}
+
+impl Corpus {
     /// Write the corpus, atomically through a temp file: the public directory
     /// reads it on a timer, and a half-written file would be a parse error.
     pub fn flush(&self, path: &Path) -> std::io::Result<usize> {
@@ -330,6 +471,7 @@ pub fn group_rows(rows: Vec<ObservedFingerprint>) -> Vec<CorpusEntry> {
                 user_agents: HashMap::new(),
                 ja3_variant_count: 0,
                 ja3_samples: Vec::new(),
+                probation: false,
             });
         let e = entry.value_mut();
         e.first_seen = e.first_seen.min(r.first_seen);
@@ -433,6 +575,7 @@ fn from_directory(v: &serde_json::Value, spec: bool) -> Option<CorpusEntry> {
         user_agents,
         ja3_variant_count: num("ja3_variant_count").max(samples.len() as u64),
         ja3_samples: samples,
+        probation: false,
     })
 }
 
@@ -519,6 +662,37 @@ pub fn rebuild_raw(ja4: &str, ja3_string: &str, signature_lists: &[String]) -> O
 }
 
 /// Count a JA3 under its JA4, keeping the most seen.
+/// A record for `key`, as its first sighting `s` makes it.
+fn new_entry(key: String, s: &Sighting<'_>) -> CorpusEntry {
+    CorpusEntry {
+        key,
+        ja4_hash: s.ja4_hash.map(str::to_string),
+        ja4_raw: None,
+        ja4_verified: false,
+        classification: s.classification.to_string(),
+        transport: s.transport,
+        first_seen: s.at,
+        last_seen: s.at,
+        request_count: 0,
+        user_agents: HashMap::new(),
+        ja3_variant_count: 0,
+        ja3_samples: Vec::new(),
+        probation: false,
+    }
+}
+
+/// What one sighting adds to a record.
+fn record(e: &mut CorpusEntry, s: &Sighting<'_>) {
+    e.first_seen = e.first_seen.min(s.at);
+    e.last_seen = e.last_seen.max(s.at);
+    e.request_count = e.request_count.saturating_add(1);
+    e.classification = s.classification.to_string();
+    if let Some(raw) = s.ja4_raw.filter(|r| !r.is_empty()) {
+        e.ja4_raw = Some(raw.to_string());
+    }
+    note_ja3(e, s.ja3_hash, s.ja3_string, 1);
+}
+
 fn note_ja3(e: &mut CorpusEntry, ja3_hash: &str, ja3_string: &str, n: u64) {
     if ja3_hash.is_empty() {
         return;
@@ -698,6 +872,66 @@ mod tests {
         assert_eq!(chrome.user_agents.get("Mozilla/5.0"), Some(&80));
     }
 
+    /// A new fingerprint waits in probation until it has been seen from a
+    /// second network or on a second day; probation is bounded, oldest let go
+    /// first, and nothing kept for good is ever let go. Both segments survive
+    /// a write and a read.
+    #[test]
+    fn what_is_seen_twice_is_kept_and_probation_is_bounded() {
+        let corpus = Corpus::default();
+        let ip = |s: &str| Some(s.parse::<std::net::IpAddr>().unwrap());
+        let seen = |corpus: &Corpus, ja4: &str, client, at| {
+            corpus.observe(&Sighting {
+                ja3_hash: &"c".repeat(32),
+                ja3_string: "771,4865",
+                ja4_hash: Some(ja4),
+                ja4_raw: None,
+                classification: "Unknown",
+                transport: 't',
+                at,
+                client,
+            })
+        };
+        let a = "t13d1516h2_aaaaaaaaaaaa_aaaaaaaaaaaa";
+        assert!(seen(&corpus, a, ip("198.51.100.7"), 100));
+        assert!(
+            !seen(&corpus, a, ip("198.51.100.200"), 200),
+            "one /24 is one network"
+        );
+        assert_eq!(corpus.established(), 0);
+        assert!(!seen(&corpus, a, ip("203.0.113.9"), 300));
+        assert_eq!(corpus.established(), 1);
+
+        let b = "t13d1516h2_bbbbbbbbbbbb_bbbbbbbbbbbb";
+        seen(&corpus, b, ip("198.51.100.7"), 100);
+        seen(&corpus, b, ip("198.51.100.7"), 86_400 + 100);
+        assert_eq!(corpus.established(), 2, "seen on a second day");
+
+        // A client with a new shape every connection fills probation, and no more
+        for i in 0..(PROBATION + 50) {
+            seen(
+                &corpus,
+                &format!("t13d{i:07}h2_cccccccccccc_cccccccccccc"),
+                ip("192.0.2.1"),
+                500,
+            );
+        }
+        assert_eq!(corpus.established(), 2);
+        assert_eq!(corpus.len(), 2 + PROBATION);
+        assert!(corpus
+            .entries()
+            .iter()
+            .all(|e| e.key != "t13d0000000h2_cccccccccccc_cccccccccccc"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("observed.json");
+        corpus.flush(&path).unwrap();
+        let read = Corpus::default();
+        read.load(&path).unwrap();
+        assert_eq!(read.established(), 2);
+        assert_eq!(read.len(), 2 + PROBATION);
+    }
+
     #[test]
     fn a_fingerprint_is_never_evicted_and_a_record_is_bounded() {
         let corpus = Corpus::default();
@@ -714,6 +948,7 @@ mod tests {
                 classification: "Browser",
                 transport: 't',
                 at: 1_000 + i,
+                client: None,
             });
         }
         // Rare fingerprints alongside: every one kept
@@ -726,6 +961,7 @@ mod tests {
                 classification: "Scanner",
                 transport: 't',
                 at: 10,
+                client: None,
             });
         }
         assert_eq!(corpus.len(), 302);
@@ -821,6 +1057,7 @@ mod tests {
                 ja3_string: ja3.into(),
                 count: 3,
             }],
+            probation: false,
         });
         assert_eq!(corpus.rebuild_missing_raw(), 1);
         let e = &corpus.entries()[0];

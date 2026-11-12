@@ -461,6 +461,17 @@ impl<S, B> BufRecvStream<S, B> {
             _marker: PhantomData,
         }
     }
+
+    /// The bytes read from the stream and not yet consumed, and the stream:
+    /// what a WebTransport stream carries after its header is these bytes,
+    /// then the rest of the stream.
+    pub fn into_parts(mut self) -> (Bytes, S) {
+        let mut prefix = bytes::BytesMut::new();
+        while let Some(chunk) = self.buf.take_first_chunk() {
+            prefix.extend_from_slice(&chunk);
+        }
+        (prefix.freeze(), self.stream)
+    }
 }
 
 impl<B, S: RecvStream> BufRecvStream<S, B> {
@@ -558,6 +569,10 @@ where
 
     fn send_id(&self) -> quic::StreamId {
         self.stream.send_id()
+    }
+
+    fn set_urgency(&mut self, urgency: u8, incremental: bool) {
+        self.stream.set_urgency(urgency, incremental);
     }
 
     fn poll_ready(

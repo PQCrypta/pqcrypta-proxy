@@ -23,6 +23,22 @@ const MAX_ENDPOINT_ERRORS: usize = 2048;
 /// The most of a failing path that is kept, in bytes.
 const MAX_ERROR_PATH_LEN: usize = 256;
 
+/// `value` as a Prometheus label value: backslash, double quote and line
+/// feed escaped (text exposition format). Route, backend and pool names come
+/// from the configuration, which does not forbid them.
+fn label_value(value: &str) -> std::borrow::Cow<'_, str> {
+    if value.contains(['\\', '"', '\n']) {
+        std::borrow::Cow::Owned(
+            value
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n"),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(value)
+    }
+}
+
 /// Global metrics registry
 pub struct MetricsRegistry {
     /// Request metrics
@@ -39,6 +55,26 @@ pub struct MetricsRegistry {
     pub tls: TlsMetrics,
     /// Server start time
     start_time: Instant,
+    /// Read the gauges whose values live elsewhere (blocked addresses, the
+    /// fingerprint corpus, backend load) each time the metrics are exported
+    samplers: RwLock<Vec<Sampler>>,
+}
+
+/// Reads values from where they live into the registry; see
+/// [`MetricsRegistry::add_sampler`].
+pub type Sampler = Box<dyn Fn(&MetricsRegistry) + Send + Sync>;
+
+/// One backend's load, as [`PoolMetrics::set_load`] takes it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PoolLoad {
+    /// Requests that have had a place, ever
+    pub total: u64,
+    /// Requests in flight now
+    pub active: u64,
+    /// Requests waiting for a place now
+    pub waiting: u64,
+    /// Requests refused for want of a place, ever
+    pub refused: u64,
 }
 
 impl MetricsRegistry {
@@ -52,7 +88,28 @@ impl MetricsRegistry {
             rate_limiter: RateLimiterMetrics::new(),
             tls: TlsMetrics::new(),
             start_time: Instant::now(),
+            samplers: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Run `sampler` before every export: it sets the gauges whose values
+    /// live in another part of the proxy, so they are read as they are when
+    /// scraped rather than kept up to date on every change.
+    pub fn add_sampler(&self, sampler: impl Fn(&Self) + Send + Sync + 'static) {
+        self.samplers.write().push(Box::new(sampler));
+    }
+
+    fn sample(&self) {
+        for sampler in self.samplers.read().iter() {
+            sampler(self);
+        }
+    }
+
+    /// A TLS handshake that failed: counted with the handshakes and with the
+    /// connections that never became one.
+    pub fn handshake_failed(&self) {
+        self.tls.handshake_completed(false, false);
+        self.connections.handshake_failed();
     }
 
     /// Get uptime in seconds
@@ -63,6 +120,7 @@ impl MetricsRegistry {
     /// Export metrics in Prometheus text format
     pub fn export_prometheus(&self) -> String {
         use std::fmt::Write;
+        self.sample();
         let mut output = String::with_capacity(8192);
 
         // Server uptime
@@ -98,12 +156,14 @@ impl MetricsRegistry {
     /// the full graceful_shutdown_timeout_secs duration.
     pub fn active_connections(&self) -> u64 {
         self.connections
+            .counters
             .active
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Get metrics snapshot as JSON
     pub fn snapshot(&self) -> MetricsSnapshot {
+        self.sample();
         MetricsSnapshot {
             uptime_secs: self.uptime_secs(),
             requests: self.requests.snapshot(),
@@ -229,23 +289,6 @@ impl RequestMetrics {
         self.total.fetch_add(1, Ordering::Relaxed);
         self.in_progress.fetch_add(1, Ordering::Relaxed);
         InProgress(Arc::clone(&self.in_progress))
-    }
-
-    /// Record a request completion (without path tracking)
-    pub fn request_end(&self, status_code: u16, latency: Duration, bytes_in: u64, bytes_out: u64) {
-        self.request_end_full(status_code, latency, bytes_in, bytes_out, None);
-    }
-
-    /// Record a request completion with path tracking for error details
-    pub fn request_end_with_path(
-        &self,
-        status_code: u16,
-        latency: Duration,
-        bytes_in: u64,
-        bytes_out: u64,
-        path: Option<&str>,
-    ) {
-        self.request_end_full(status_code, latency, bytes_in, bytes_out, path);
     }
 
     /// Record a request completion with full control over error tracking.
@@ -383,11 +426,6 @@ impl RequestMetrics {
         self.failure_log.lock().iter().cloned().collect()
     }
 
-    /// Get total error count (client + server errors)
-    pub fn total_errors(&self) -> u64 {
-        self.client_errors.load(Ordering::Relaxed) + self.server_errors.load(Ordering::Relaxed)
-    }
-
     fn export_prometheus(&self, output: &mut String) {
         use std::fmt::Write;
 
@@ -492,81 +530,78 @@ pub struct RequestMetricsSnapshot {
 
 /// Connection metrics
 pub struct ConnectionMetrics {
-    /// Total connections accepted
+    counters: Arc<ConnectionCounters>,
+}
+
+/// The counts behind [`ConnectionMetrics`], shared with every
+/// [`OpenConnection`] so a connection is counted closed wherever it ends.
+#[derive(Default)]
+struct ConnectionCounters {
+    /// Connections accepted, all protocols
     total: AtomicU64,
-    /// Active connections
+    /// Open now, all protocols
     active: AtomicU64,
-    /// HTTP/3 (QUIC) connections
-    http3: AtomicU64,
-    /// HTTP/2 connections
-    http2: AtomicU64,
-    /// HTTP/1.1 connections
-    http1: AtomicU64,
-    /// WebTransport sessions
-    webtransport: AtomicU64,
-    /// TLS passthrough connections
-    passthrough: AtomicU64,
+    /// Accepted, by protocol (`ConnectionProtocol::index`)
+    opened: [AtomicU64; ConnectionProtocol::ALL.len()],
+    /// Open now, by protocol
+    open: [AtomicU64; ConnectionProtocol::ALL.len()],
     /// Failed handshakes
     handshake_failures: AtomicU64,
+}
+
+/// One open connection or session, counted closed when dropped: hold it for
+/// as long as the connection lasts.
+#[must_use = "the connection is counted open only while this is held"]
+pub struct OpenConnection {
+    counters: Arc<ConnectionCounters>,
+    protocol: usize,
+}
+
+impl Drop for OpenConnection {
+    fn drop(&mut self) {
+        self.counters.active.fetch_sub(1, Ordering::Relaxed);
+        self.counters.open[self.protocol].fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl ConnectionMetrics {
     fn new() -> Self {
         Self {
-            total: AtomicU64::new(0),
-            active: AtomicU64::new(0),
-            http3: AtomicU64::new(0),
-            http2: AtomicU64::new(0),
-            http1: AtomicU64::new(0),
-            webtransport: AtomicU64::new(0),
-            passthrough: AtomicU64::new(0),
-            handshake_failures: AtomicU64::new(0),
+            counters: Arc::new(ConnectionCounters::default()),
         }
     }
 
-    /// Record a new connection
-    pub fn connection_opened(&self, protocol: ConnectionProtocol) {
-        self.total.fetch_add(1, Ordering::Relaxed);
-        self.active.fetch_add(1, Ordering::Relaxed);
-
-        match protocol {
-            ConnectionProtocol::Http3 => {
-                self.http3.fetch_add(1, Ordering::Relaxed);
-            }
-            ConnectionProtocol::Http2 => {
-                self.http2.fetch_add(1, Ordering::Relaxed);
-            }
-            ConnectionProtocol::Http1 => {
-                self.http1.fetch_add(1, Ordering::Relaxed);
-            }
-            ConnectionProtocol::WebTransport => {
-                self.webtransport.fetch_add(1, Ordering::Relaxed);
-            }
-            ConnectionProtocol::Passthrough => {
-                self.passthrough.fetch_add(1, Ordering::Relaxed);
-            }
+    /// Count a connection (or session) open until the returned guard drops.
+    pub fn connection_opened(&self, protocol: ConnectionProtocol) -> OpenConnection {
+        let c = &self.counters;
+        let i = protocol.index();
+        c.total.fetch_add(1, Ordering::Relaxed);
+        c.active.fetch_add(1, Ordering::Relaxed);
+        c.opened[i].fetch_add(1, Ordering::Relaxed);
+        c.open[i].fetch_add(1, Ordering::Relaxed);
+        OpenConnection {
+            counters: Arc::clone(c),
+            protocol: i,
         }
-    }
-
-    /// Record a connection close
-    pub fn connection_closed(&self) {
-        self.active.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Record a handshake failure
     pub fn handshake_failed(&self) {
-        self.handshake_failures.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .handshake_failures
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn export_prometheus(&self, output: &mut String) {
         use std::fmt::Write;
+        let c = &self.counters;
 
         output.push_str("# HELP pqcrypta_connections_total Total connections accepted\n");
         output.push_str("# TYPE pqcrypta_connections_total counter\n");
         let _ = writeln!(
             output,
             "pqcrypta_connections_total {}",
-            self.total.load(Ordering::Relaxed)
+            c.total.load(Ordering::Relaxed)
         );
 
         output.push_str("# HELP pqcrypta_connections_active Current active connections\n");
@@ -574,56 +609,64 @@ impl ConnectionMetrics {
         let _ = writeln!(
             output,
             "pqcrypta_connections_active {}",
-            self.active.load(Ordering::Relaxed)
+            c.active.load(Ordering::Relaxed)
         );
 
-        output.push_str("# HELP pqcrypta_connections_by_protocol Connections by protocol\n");
+        output.push_str(
+            "# HELP pqcrypta_connections_by_protocol Connections accepted, by protocol\n",
+        );
         output.push_str("# TYPE pqcrypta_connections_by_protocol counter\n");
-        let _ = writeln!(
-            output,
-            "pqcrypta_connections_by_protocol{{protocol=\"http3\"}} {}",
-            self.http3.load(Ordering::Relaxed)
+        for protocol in ConnectionProtocol::ALL {
+            let _ = writeln!(
+                output,
+                "pqcrypta_connections_by_protocol{{protocol=\"{}\"}} {}",
+                protocol.label(),
+                c.opened[protocol.index()].load(Ordering::Relaxed)
+            );
+        }
+
+        output.push_str(
+            "# HELP pqcrypta_connections_open_by_protocol Connections open now, by protocol\n",
         );
-        let _ = writeln!(
-            output,
-            "pqcrypta_connections_by_protocol{{protocol=\"http2\"}} {}",
-            self.http2.load(Ordering::Relaxed)
-        );
-        let _ = writeln!(
-            output,
-            "pqcrypta_connections_by_protocol{{protocol=\"http1\"}} {}",
-            self.http1.load(Ordering::Relaxed)
-        );
-        let _ = writeln!(
-            output,
-            "pqcrypta_connections_by_protocol{{protocol=\"webtransport\"}} {}",
-            self.webtransport.load(Ordering::Relaxed)
-        );
-        let _ = writeln!(
-            output,
-            "pqcrypta_connections_by_protocol{{protocol=\"passthrough\"}} {}",
-            self.passthrough.load(Ordering::Relaxed)
-        );
+        output.push_str("# TYPE pqcrypta_connections_open_by_protocol gauge\n");
+        for protocol in ConnectionProtocol::ALL {
+            let _ = writeln!(
+                output,
+                "pqcrypta_connections_open_by_protocol{{protocol=\"{}\"}} {}",
+                protocol.label(),
+                c.open[protocol.index()].load(Ordering::Relaxed)
+            );
+        }
 
         output.push_str("# HELP pqcrypta_handshake_failures_total TLS handshake failures\n");
         output.push_str("# TYPE pqcrypta_handshake_failures_total counter\n");
         let _ = writeln!(
             output,
             "pqcrypta_handshake_failures_total {}",
-            self.handshake_failures.load(Ordering::Relaxed)
+            c.handshake_failures.load(Ordering::Relaxed)
         );
     }
 
     fn snapshot(&self) -> ConnectionMetricsSnapshot {
+        let c = &self.counters;
+        let opened = |p: ConnectionProtocol| c.opened[p.index()].load(Ordering::Relaxed);
+        let open = |p: ConnectionProtocol| c.open[p.index()].load(Ordering::Relaxed);
         ConnectionMetricsSnapshot {
-            total: self.total.load(Ordering::Relaxed),
-            active: self.active.load(Ordering::Relaxed),
-            http3: self.http3.load(Ordering::Relaxed),
-            http2: self.http2.load(Ordering::Relaxed),
-            http1: self.http1.load(Ordering::Relaxed),
-            webtransport: self.webtransport.load(Ordering::Relaxed),
-            passthrough: self.passthrough.load(Ordering::Relaxed),
-            handshake_failures: self.handshake_failures.load(Ordering::Relaxed),
+            total: c.total.load(Ordering::Relaxed),
+            active: c.active.load(Ordering::Relaxed),
+            http3: opened(ConnectionProtocol::Http3),
+            http2: opened(ConnectionProtocol::Http2),
+            http1: opened(ConnectionProtocol::Http1),
+            webtransport: opened(ConnectionProtocol::WebTransport),
+            connect_udp: opened(ConnectionProtocol::ConnectUdp),
+            passthrough: opened(ConnectionProtocol::Passthrough),
+            open_http3: open(ConnectionProtocol::Http3),
+            open_http2: open(ConnectionProtocol::Http2),
+            open_http1: open(ConnectionProtocol::Http1),
+            open_webtransport: open(ConnectionProtocol::WebTransport),
+            open_connect_udp: open(ConnectionProtocol::ConnectUdp),
+            open_passthrough: open(ConnectionProtocol::Passthrough),
+            handshake_failures: c.handshake_failures.load(Ordering::Relaxed),
         }
     }
 }
@@ -634,19 +677,66 @@ pub enum ConnectionProtocol {
     Http3,
     Http2,
     Http1,
+    /// A WebTransport session
     WebTransport,
+    /// A CONNECT-UDP (MASQUE) session
+    ConnectUdp,
     Passthrough,
+}
+
+impl ConnectionProtocol {
+    pub const ALL: [Self; 6] = [
+        Self::Http3,
+        Self::Http2,
+        Self::Http1,
+        Self::WebTransport,
+        Self::ConnectUdp,
+        Self::Passthrough,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Http3 => 0,
+            Self::Http2 => 1,
+            Self::Http1 => 2,
+            Self::WebTransport => 3,
+            Self::ConnectUdp => 4,
+            Self::Passthrough => 5,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Http3 => "http3",
+            Self::Http2 => "http2",
+            Self::Http1 => "http1",
+            Self::WebTransport => "webtransport",
+            Self::ConnectUdp => "connect_udp",
+            Self::Passthrough => "passthrough",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnectionMetricsSnapshot {
+    /// Accepted, all protocols
     pub total: u64,
+    /// Open now, all protocols
     pub active: u64,
+    /// Accepted, by protocol
     pub http3: u64,
     pub http2: u64,
     pub http1: u64,
     pub webtransport: u64,
+    pub connect_udp: u64,
     pub passthrough: u64,
+    /// Open now, by protocol
+    pub open_http3: u64,
+    pub open_http2: u64,
+    pub open_http1: u64,
+    pub open_webtransport: u64,
+    pub open_connect_udp: u64,
+    pub open_passthrough: u64,
     pub handshake_failures: u64,
 }
 
@@ -715,7 +805,7 @@ impl RouteMetrics {
         output.push_str("# TYPE pqcrypta_route_requests_total counter\n");
 
         for entry in self.routes.iter() {
-            let name = entry.key();
+            let name = label_value(entry.key());
             let stats = entry.value();
             let _ = writeln!(
                 output,
@@ -729,7 +819,7 @@ impl RouteMetrics {
         output.push_str("# TYPE pqcrypta_route_success_total counter\n");
 
         for entry in self.routes.iter() {
-            let name = entry.key();
+            let name = label_value(entry.key());
             let stats = entry.value();
             let _ = writeln!(
                 output,
@@ -743,7 +833,7 @@ impl RouteMetrics {
         output.push_str("# TYPE pqcrypta_route_errors_total counter\n");
 
         for entry in self.routes.iter() {
-            let name = entry.key();
+            let name = label_value(entry.key());
             let stats = entry.value();
             let _ = writeln!(
                 output,
@@ -759,7 +849,7 @@ impl RouteMetrics {
         output.push_str("# TYPE pqcrypta_route_latency_seconds_p95 gauge\n");
 
         for entry in self.routes.iter() {
-            let name = entry.key();
+            let name = label_value(entry.key());
             let stats = entry.value();
             let _ = writeln!(
                 output,
@@ -808,27 +898,28 @@ pub struct RouteMetricsSnapshot {
 // Pool Metrics
 // ============================================================================
 
-/// Backend pool metrics
+/// Backend metrics: one series per named backend, load-balancer pool member
+/// (by its address) and load-balancer pool (its queue and breakers).
 pub struct PoolMetrics {
     pools: DashMap<String, PoolStats>,
 }
 
 struct PoolStats {
-    /// Total connections to pool
+    /// Requests that have had a place on the backend, ever
     connections_total: AtomicU64,
-    /// Active connections
+    /// Requests in flight on it now
     connections_active: AtomicU64,
-    /// Idle connections
+    /// Idle connections the backend client holds for it
     connections_idle: AtomicU64,
-    /// Connection errors
+    /// Requests the backend did not answer (connect, send or timeout)
     connection_errors: AtomicU64,
-    /// Requests queued
+    /// Requests waiting for a place now
     queue_depth: AtomicU64,
-    /// Requests dropped (queue full)
+    /// Requests refused for want of a place, ever
     queue_dropped: AtomicU64,
-    /// Circuit breaker open
+    /// Breakers open: 0 or 1 for a backend, its members' for a pool
     circuit_open: AtomicU64,
-    /// Backend latency
+    /// Time to the backend's response head
     latency: LatencyHistogram,
 }
 
@@ -843,6 +934,9 @@ impl PoolMetrics {
         &self,
         pool_name: &str,
     ) -> dashmap::mapref::one::RefMut<'_, String, PoolStats> {
+        if let Some(stats) = self.pools.get_mut(pool_name) {
+            return stats;
+        }
         self.pools
             .entry(pool_name.to_string())
             .or_insert_with(|| PoolStats {
@@ -857,51 +951,36 @@ impl PoolMetrics {
             })
     }
 
-    /// Record a new connection to pool
-    pub fn connection_opened(&self, pool_name: &str) {
-        let stats = self.get_or_create(pool_name);
-        stats.connections_total.fetch_add(1, Ordering::Relaxed);
-        stats.connections_active.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Record connection closed
-    pub fn connection_closed(&self, pool_name: &str) {
-        if let Some(stats) = self.pools.get(pool_name) {
-            stats.connections_active.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
-
-    /// Record connection error
+    /// A request the backend did not answer
     pub fn connection_error(&self, pool_name: &str) {
         let stats = self.get_or_create(pool_name);
         stats.connection_errors.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Update idle connection count
+    /// Idle connections held for the backend now
     pub fn set_idle_connections(&self, pool_name: &str, count: u64) {
         let stats = self.get_or_create(pool_name);
         stats.connections_idle.store(count, Ordering::Relaxed);
     }
 
-    /// Update queue depth
-    pub fn set_queue_depth(&self, pool_name: &str, depth: u64) {
+    /// The backend's places: had, in flight, waiting, refused
+    pub fn set_load(&self, pool_name: &str, load: PoolLoad) {
         let stats = self.get_or_create(pool_name);
-        stats.queue_depth.store(depth, Ordering::Relaxed);
+        stats.connections_total.store(load.total, Ordering::Relaxed);
+        stats
+            .connections_active
+            .store(load.active, Ordering::Relaxed);
+        stats.queue_depth.store(load.waiting, Ordering::Relaxed);
+        stats.queue_dropped.store(load.refused, Ordering::Relaxed);
     }
 
-    /// Record request dropped from queue
-    pub fn queue_dropped(&self, pool_name: &str) {
+    /// Breakers open now
+    pub fn set_circuit_open(&self, pool_name: &str, open: u64) {
         let stats = self.get_or_create(pool_name);
-        stats.queue_dropped.fetch_add(1, Ordering::Relaxed);
+        stats.circuit_open.store(open, Ordering::Relaxed);
     }
 
-    /// Record circuit breaker state
-    pub fn set_circuit_open(&self, pool_name: &str, open: bool) {
-        let stats = self.get_or_create(pool_name);
-        stats.circuit_open.store(u64::from(open), Ordering::Relaxed);
-    }
-
-    /// Record backend latency
+    /// Time to the backend's response head
     pub fn record_latency(&self, pool_name: &str, latency: Duration) {
         let stats = self.get_or_create(pool_name);
         stats.latency.observe(latency);
@@ -910,77 +989,70 @@ impl PoolMetrics {
     fn export_prometheus(&self, output: &mut String) {
         use std::fmt::Write;
 
-        output.push_str("# HELP pqcrypta_pool_connections_active Active connections per pool\n");
-        output.push_str("# TYPE pqcrypta_pool_connections_active gauge\n");
-
-        for entry in self.pools.iter() {
-            let name = entry.key();
-            let stats = entry.value();
-            let _ = writeln!(
-                output,
-                "pqcrypta_pool_connections_active{{pool=\"{}\"}} {}",
-                name,
-                stats.connections_active.load(Ordering::Relaxed)
-            );
+        type Field = fn(&PoolStats) -> u64;
+        let series: [(&str, &str, &str, Field); 7] = [
+            (
+                "pqcrypta_pool_connections_total",
+                "counter",
+                "Requests that have had a place on the backend",
+                |s| s.connections_total.load(Ordering::Relaxed),
+            ),
+            (
+                "pqcrypta_pool_connections_active",
+                "gauge",
+                "Requests in flight on the backend",
+                |s| s.connections_active.load(Ordering::Relaxed),
+            ),
+            (
+                "pqcrypta_pool_connections_idle",
+                "gauge",
+                "Idle connections held for the backend",
+                |s| s.connections_idle.load(Ordering::Relaxed),
+            ),
+            (
+                "pqcrypta_pool_connection_errors_total",
+                "counter",
+                "Requests the backend did not answer",
+                |s| s.connection_errors.load(Ordering::Relaxed),
+            ),
+            (
+                "pqcrypta_pool_queue_depth",
+                "gauge",
+                "Requests waiting for a place on the backend",
+                |s| s.queue_depth.load(Ordering::Relaxed),
+            ),
+            (
+                "pqcrypta_pool_queue_dropped_total",
+                "counter",
+                "Requests refused for want of a place on the backend",
+                |s| s.queue_dropped.load(Ordering::Relaxed),
+            ),
+            (
+                "pqcrypta_pool_circuit_open",
+                "gauge",
+                "Circuit breakers open (a backend: 0 or 1; a pool: its members')",
+                |s| s.circuit_open.load(Ordering::Relaxed),
+            ),
+        ];
+        for (name, kind, help, field) in series {
+            let _ = writeln!(output, "# HELP {name} {help}");
+            let _ = writeln!(output, "# TYPE {name} {kind}");
+            for entry in self.pools.iter() {
+                let _ = writeln!(
+                    output,
+                    "{name}{{pool=\"{}\"}} {}",
+                    label_value(entry.key()),
+                    field(entry.value())
+                );
+            }
         }
 
-        output.push_str("# HELP pqcrypta_pool_connections_idle Idle connections per pool\n");
-        output.push_str("# TYPE pqcrypta_pool_connections_idle gauge\n");
-
+        let name = "pqcrypta_pool_latency_seconds";
+        let _ = writeln!(output, "# HELP {name} Time to the backend's response head");
+        let _ = writeln!(output, "# TYPE {name} histogram");
         for entry in self.pools.iter() {
-            let name = entry.key();
-            let stats = entry.value();
-            let _ = writeln!(
-                output,
-                "pqcrypta_pool_connections_idle{{pool=\"{}\"}} {}",
-                name,
-                stats.connections_idle.load(Ordering::Relaxed)
-            );
-        }
-
-        output
-            .push_str("# HELP pqcrypta_pool_connection_errors_total Connection errors per pool\n");
-        output.push_str("# TYPE pqcrypta_pool_connection_errors_total counter\n");
-
-        for entry in self.pools.iter() {
-            let name = entry.key();
-            let stats = entry.value();
-            let _ = writeln!(
-                output,
-                "pqcrypta_pool_connection_errors_total{{pool=\"{}\"}} {}",
-                name,
-                stats.connection_errors.load(Ordering::Relaxed)
-            );
-        }
-
-        output.push_str("# HELP pqcrypta_pool_queue_depth Current queue depth per pool\n");
-        output.push_str("# TYPE pqcrypta_pool_queue_depth gauge\n");
-
-        for entry in self.pools.iter() {
-            let name = entry.key();
-            let stats = entry.value();
-            let _ = writeln!(
-                output,
-                "pqcrypta_pool_queue_depth{{pool=\"{}\"}} {}",
-                name,
-                stats.queue_depth.load(Ordering::Relaxed)
-            );
-        }
-
-        output.push_str(
-            "# HELP pqcrypta_pool_circuit_open Circuit breaker state (1=open, 0=closed)\n",
-        );
-        output.push_str("# TYPE pqcrypta_pool_circuit_open gauge\n");
-
-        for entry in self.pools.iter() {
-            let name = entry.key();
-            let stats = entry.value();
-            let _ = writeln!(
-                output,
-                "pqcrypta_pool_circuit_open{{pool=\"{}\"}} {}",
-                name,
-                stats.circuit_open.load(Ordering::Relaxed)
-            );
+            let labels = format!("pool=\"{}\"", label_value(entry.key()));
+            entry.value().latency.write_series(output, name, &labels);
         }
     }
 
@@ -989,6 +1061,7 @@ impl PoolMetrics {
             .iter()
             .map(|entry| {
                 let stats = entry.value();
+                let circuit_open = stats.circuit_open.load(Ordering::Relaxed);
                 PoolMetricsSnapshot {
                     name: entry.key().clone(),
                     connections_total: stats.connections_total.load(Ordering::Relaxed),
@@ -997,7 +1070,8 @@ impl PoolMetrics {
                     connection_errors: stats.connection_errors.load(Ordering::Relaxed),
                     queue_depth: stats.queue_depth.load(Ordering::Relaxed),
                     queue_dropped: stats.queue_dropped.load(Ordering::Relaxed),
-                    circuit_open: stats.circuit_open.load(Ordering::Relaxed) == 1,
+                    circuit_open: circuit_open > 0,
+                    circuits_open: circuit_open,
                     latency_p50_ms: stats.latency.percentile(50),
                     latency_p95_ms: stats.latency.percentile(95),
                 }
@@ -1016,6 +1090,8 @@ pub struct PoolMetricsSnapshot {
     pub queue_depth: u64,
     pub queue_dropped: u64,
     pub circuit_open: bool,
+    /// Breakers open: 0 or 1 for a backend, its members' for a pool
+    pub circuits_open: u64,
     pub latency_p50_ms: f64,
     pub latency_p95_ms: f64,
 }
@@ -1121,7 +1197,9 @@ impl RateLimiterMetrics {
             self.requests_blocked.load(Ordering::Relaxed)
         );
 
-        output.push_str("# HELP pqcrypta_ratelimit_unique_ips Unique IPs tracked\n");
+        output.push_str(
+            "# HELP pqcrypta_ratelimit_unique_ips Client addresses with a live request counter\n",
+        );
         output.push_str("# TYPE pqcrypta_ratelimit_unique_ips gauge\n");
         let _ = writeln!(
             output,
@@ -1129,7 +1207,17 @@ impl RateLimiterMetrics {
             self.unique_ips.load(Ordering::Relaxed)
         );
 
-        output.push_str("# HELP pqcrypta_ratelimit_blocked_ips Currently blocked IPs\n");
+        output.push_str(
+            "# HELP pqcrypta_ratelimit_unique_fingerprints TLS fingerprints the corpus holds\n",
+        );
+        output.push_str("# TYPE pqcrypta_ratelimit_unique_fingerprints gauge\n");
+        let _ = writeln!(
+            output,
+            "pqcrypta_ratelimit_unique_fingerprints {}",
+            self.unique_fingerprints.load(Ordering::Relaxed)
+        );
+
+        output.push_str("# HELP pqcrypta_ratelimit_blocked_ips Addresses and ranges blocked now\n");
         output.push_str("# TYPE pqcrypta_ratelimit_blocked_ips gauge\n");
         let _ = writeln!(
             output,
@@ -1217,17 +1305,16 @@ impl TlsMetrics {
         }
     }
 
-    /// Record certificate reload
-    pub fn cert_reloaded(&self) {
-        self.cert_reloads.fetch_add(1, Ordering::Relaxed);
+    /// Certificate reloads that succeeded, as the TLS provider counts them
+    pub fn set_cert_reloads(&self, reloads: u64) {
+        self.cert_reloads.store(reloads, Ordering::Relaxed);
     }
 
-    /// Record OCSP fetch
-    pub fn ocsp_fetched(&self, success: bool) {
-        self.ocsp_fetches.fetch_add(1, Ordering::Relaxed);
-        if !success {
-            self.ocsp_failures.fetch_add(1, Ordering::Relaxed);
-        }
+    /// OCSP responses fetched and how many of those fetches failed, as the
+    /// OCSP service counts them
+    pub fn set_ocsp_fetches(&self, fetches: u64, failures: u64) {
+        self.ocsp_fetches.store(fetches, Ordering::Relaxed);
+        self.ocsp_failures.store(failures, Ordering::Relaxed);
     }
 
     /// Update PQC status
@@ -1528,7 +1615,21 @@ impl LatencyHistogram {
 
         let _ = writeln!(output, "# HELP {} Request latency histogram", name);
         let _ = writeln!(output, "# TYPE {} histogram", name);
+        self.write_series(output, name, "");
+    }
 
+    /// The histogram's buckets, sum and count, each with `labels` (written
+    /// inside the braces, before `le`; empty for none).
+    #[allow(clippy::cast_precision_loss)]
+    fn write_series(&self, output: &mut String, name: &str, labels: &str) {
+        use std::fmt::Write;
+
+        let sep = if labels.is_empty() { "" } else { "," };
+        let braces = if labels.is_empty() {
+            String::new()
+        } else {
+            format!("{{{labels}}}")
+        };
         let s0 = &self.slots[0];
         let s1 = &self.slots[1];
         let mut cum = 0u64;
@@ -1538,24 +1639,21 @@ impl LatencyHistogram {
             cum += s0.buckets[i].load(Ordering::Relaxed) + s1.buckets[i].load(Ordering::Relaxed);
             let _ = writeln!(
                 output,
-                "{}_bucket{{le=\"{}\"}} {}",
-                name,
+                "{name}_bucket{{{labels}{sep}le=\"{}\"}} {cum}",
                 *bound as f64 / 1000.0,
-                cum
             );
         }
 
         // +Inf bucket (last index)
         cum += s0.buckets[num_bounds].load(Ordering::Relaxed)
             + s1.buckets[num_bounds].load(Ordering::Relaxed);
-        let _ = writeln!(output, "{}_bucket{{le=\"+Inf\"}} {}", name, cum);
+        let _ = writeln!(output, "{name}_bucket{{{labels}{sep}le=\"+Inf\"}} {cum}");
 
         let sum = self.cumulative_sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0;
-        let _ = writeln!(output, "{}_sum {:.6}", name, sum);
+        let _ = writeln!(output, "{name}_sum{braces} {sum:.6}");
         let _ = writeln!(
             output,
-            "{}_count {}",
-            name,
+            "{name}_count{braces} {}",
             self.cumulative_count.load(Ordering::Relaxed)
         );
     }
@@ -1595,6 +1693,27 @@ fn normalize_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A connection is counted open by protocol while its guard is held, and
+    /// closed when it drops however it ends; CONNECT-UDP is its own protocol.
+    #[test]
+    fn open_connections_are_counted_by_protocol_until_they_close() {
+        let m = ConnectionMetrics::new();
+        let h3 = m.connection_opened(ConnectionProtocol::Http3);
+        let udp = m.connection_opened(ConnectionProtocol::ConnectUdp);
+        let s = m.snapshot();
+        assert_eq!((s.active, s.open_http3, s.open_connect_udp), (2, 1, 1));
+        assert_eq!(s.open_webtransport, 0);
+        drop(h3);
+        let s = m.snapshot();
+        assert_eq!((s.active, s.open_http3, s.http3), (1, 0, 1));
+        drop(udp);
+        let s = m.snapshot();
+        assert_eq!((s.active, s.total, s.connect_udp), (0, 2, 1));
+        let mut text = String::new();
+        m.export_prometheus(&mut text);
+        assert!(text.contains("pqcrypta_connections_open_by_protocol{protocol=\"connect_udp\"} 0"));
+    }
+
     use super::*;
 
     #[test]
@@ -1644,7 +1763,7 @@ mod tests {
 
         let request = m.request_start();
         assert_eq!(m.in_progress.load(Ordering::Relaxed), 1);
-        m.request_end(200, Duration::from_millis(50), 100, 200);
+        m.request_end_full(200, Duration::from_millis(50), 100, 200, None);
         drop(request);
 
         assert_eq!(m.total.load(Ordering::Relaxed), 1);
@@ -1658,11 +1777,11 @@ mod tests {
         let finished = m.request_start();
         let abandoned = m.request_start();
         assert_eq!(m.in_progress.load(Ordering::Relaxed), 2);
-        m.request_end(200, Duration::from_millis(5), 0, 0);
+        m.request_end_full(200, Duration::from_millis(5), 0, 0, None);
         drop(finished);
         assert_eq!(m.in_progress.load(Ordering::Relaxed), 1);
         // A handler's future dropped part way (the client reset the stream):
-        // no request_end, and the count still falls
+        // no request_end_full, and the count still falls
         drop(abandoned);
         assert_eq!(m.in_progress.load(Ordering::Relaxed), 0);
         assert_eq!(m.total.load(Ordering::Relaxed), 2);
@@ -1673,11 +1792,11 @@ mod tests {
         let m = RequestMetrics::new();
 
         let _request = m.request_start();
-        m.request_end_with_path(404, Duration::from_millis(10), 0, 0, Some("/api/encrypt"));
+        m.request_end_full(404, Duration::from_millis(10), 0, 0, Some("/api/encrypt"));
         let _request = m.request_start();
-        m.request_end_with_path(500, Duration::from_millis(20), 0, 0, Some("/api/encrypt"));
+        m.request_end_full(500, Duration::from_millis(20), 0, 0, Some("/api/encrypt"));
         let _request = m.request_start();
-        m.request_end_with_path(403, Duration::from_millis(5), 0, 0, Some("/api/decrypt"));
+        m.request_end_full(403, Duration::from_millis(5), 0, 0, Some("/api/decrypt"));
 
         assert_eq!(m.client_errors.load(Ordering::Relaxed), 2);
         assert_eq!(m.server_errors.load(Ordering::Relaxed), 1);
@@ -1730,19 +1849,43 @@ mod tests {
         assert_eq!(snapshot[0].errors, 1);
     }
 
+    /// A backend's gauges are read from their sources when the metrics are
+    /// exported, its errors and latency recorded as they happen, and a name
+    /// the configuration allows is still a valid label.
     #[test]
-    fn test_pool_metrics() {
-        let m = PoolMetrics::new();
+    fn backend_metrics_are_sampled_on_export() {
+        let m = MetricsRegistry::new();
+        let in_flight = Arc::new(AtomicU64::new(0));
+        let source = Arc::clone(&in_flight);
+        m.add_sampler(move |m| {
+            m.pools.set_load(
+                "api \"pool\"",
+                PoolLoad {
+                    total: 2,
+                    active: source.load(Ordering::Relaxed),
+                    waiting: 0,
+                    refused: 0,
+                },
+            );
+        });
+        m.pools.connection_error("api \"pool\"");
+        m.pools
+            .record_latency("api \"pool\"", Duration::from_millis(3));
 
-        m.connection_opened("api-pool");
-        m.connection_opened("api-pool");
-        m.connection_closed("api-pool");
-        m.connection_error("api-pool");
-
+        in_flight.store(1, Ordering::Relaxed);
         let snapshot = m.snapshot();
-        assert_eq!(snapshot.len(), 1);
-        assert_eq!(snapshot[0].connections_active, 1);
-        assert_eq!(snapshot[0].connection_errors, 1);
+        assert_eq!(snapshot.pools.len(), 1);
+        assert_eq!(snapshot.pools[0].connections_active, 1);
+        assert_eq!(snapshot.pools[0].connections_total, 2);
+        assert_eq!(snapshot.pools[0].connection_errors, 1);
+
+        in_flight.store(0, Ordering::Relaxed);
+        let text = m.export_prometheus();
+        assert!(text.contains("pqcrypta_pool_connections_active{pool=\"api \\\"pool\\\"\"} 0"));
+        assert!(text.contains("pqcrypta_pool_latency_seconds_count{pool=\"api \\\"pool\\\"\"} 1"));
+        assert!(text.contains(
+            "pqcrypta_pool_latency_seconds_bucket{pool=\"api \\\"pool\\\"\",le=\"+Inf\"} 1"
+        ));
     }
 
     #[test]
@@ -1767,8 +1910,8 @@ mod tests {
         let _request = registry.requests.request_start();
         registry
             .requests
-            .request_end(200, Duration::from_millis(50), 100, 200);
-        registry
+            .request_end_full(200, Duration::from_millis(50), 100, 200, None);
+        let _open = registry
             .connections
             .connection_opened(ConnectionProtocol::Http3);
 

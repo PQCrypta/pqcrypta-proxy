@@ -439,6 +439,7 @@ impl RateLimitKind {
 ///
 /// Deliberately transport-agnostic: no axum, no h3, no body ownership. Anything
 /// that cannot be expressed here does not belong in a shared rule.
+#[derive(Clone, Copy)]
 pub struct SecurityRequestView<'a> {
     pub ip: IpAddr,
     /// Source port of the connection carrying the request. Every request
@@ -1236,6 +1237,57 @@ impl SecurityState {
         None
     }
 
+    /// Take a request's place in its address's in-flight count
+    /// (`security.max_connections_per_ip`), on any transport: the guard gives
+    /// it back when the request is done, however it ends. `Ok(None)` with
+    /// `dos_protection` off.
+    ///
+    /// An address over the limit is refused and blocked for
+    /// `auto_block_duration_secs`. A verified crawler is refused and not
+    /// blocked: a rendering burst must not cost it a blackout. An address in
+    /// `pentest_bypass_ips` is counted and never refused.
+    pub fn enter_request(
+        &self,
+        ip: IpAddr,
+        user_agent: Option<&str>,
+    ) -> Result<Option<InFlight>, TooManyInFlight> {
+        let (dos_protection, limit, block_secs, bypass) = {
+            let config = self.config.read();
+            (
+                config.dos_protection,
+                config.max_connections_per_ip,
+                config.auto_block_duration_secs,
+                crate::config::ip_list_contains(&config.pentest_bypass_ips, &ip),
+            )
+        };
+        if !dos_protection {
+            return Ok(None);
+        }
+        let (slot, in_flight) = InFlight::enter(&self.ip_connections, ip);
+        if bypass {
+            debug!("Pentest bypass IP {} — skipping rate-limit/auto-block", ip);
+            return Ok(Some(slot));
+        }
+        if in_flight <= limit {
+            return Ok(Some(slot));
+        }
+        drop(slot);
+        let crawler =
+            self.crawler_verifier.load_full().classify(ip, user_agent) == CrawlerVerdict::Verified;
+        if !crawler {
+            self.block_ip(
+                ip,
+                BlockReason::ConnectionLimitExceeded,
+                Some(Duration::from_secs(block_secs)),
+            );
+        }
+        warn!(
+            "Too many requests in flight from {}: {} (limit {})",
+            ip, in_flight, limit
+        );
+        Err(TooManyInFlight { in_flight, limit })
+    }
+
     /// Block an IP address
     pub fn block_ip(&self, ip: IpAddr, reason: BlockReason, duration: Option<Duration>) {
         // Never block trusted IPs (loopback, or operator-configured trusted_internal_cidrs)
@@ -1264,6 +1316,14 @@ impl SecurityState {
             reason,
             block_count
         );
+
+        if let Some(audit) = &self.audit_logger {
+            audit.log(crate::audit_logger::AuditEvent::IpBlocked {
+                ip: ip.to_string(),
+                reason: format!("{reason:?}"),
+                duration_secs: duration.map(|d| d.as_secs()),
+            });
+        }
 
         self.blocked_ips.insert(
             ip,
@@ -1508,96 +1568,149 @@ impl SecurityState {
         policy: &RequestPolicy,
         is_pentest: bool,
     ) -> SecurityDecision {
-        let ip = view.ip;
-        let (auto_block_threshold, auto_block_duration_secs) = {
-            let c = self.config.read();
-            (c.auto_block_threshold, c.auto_block_duration_secs)
-        };
-        if let Some(waf) = self.waf().filter(|_| policy.waf_enabled != Some(false)) {
-            // `x-health-check-bypass: 1` used to skip these rules for anyone
-            // who sent it -- a scanner could add the header and walk past every
-            // bad-bot user-agent rule. Our own checks come from the addresses
-            // in pentest_bypass_ips, which `is_pentest` covers.
-            let skip_bot_ua = self.scanner_ua_exempt.load().is_match(view.path)
-                || policy.skip_bot_blocking
-                // pentest_bypass_ips covers the authorized red-team host plus this
-                // server's own egress and loopback. Those addresses run curl-driven
-                // self-checks that carry no browser User-Agent, so without this the
-                // bad-bot-UA rules 403'd our own monitoring — the bypass list only
-                // suppressed the auto-block counter below, never the Block verdict.
-                || is_pentest;
+        match self.waf().filter(|_| policy.waf_enabled != Some(false)) {
+            Some(waf) => self.act_on(
+                waf.inspect(&self.waf_request(view, policy, is_pentest)),
+                view,
+                is_pentest,
+            ),
+            None => SecurityDecision::Allow,
+        }
+    }
 
-            let waf_req = WafRequest {
-                method: view.method,
-                path: view.path,
-                query: view.query,
-                headers: view.headers,
-                body: view.body,
-                skip_bot_ua_check: skip_bot_ua,
-                generic_client_allowed: generic_client_allowed(policy, view.headers)
-                    || self.programmatic_client_paths.load().is_match(view.path),
-                mode_override: policy.waf_mode.as_deref(),
+    /// [`Self::run_waf`] over a request's head (see [`Self::evaluate_head`]).
+    fn run_waf_head(
+        &self,
+        view: &SecurityRequestView<'_>,
+        policy: &RequestPolicy,
+        is_pentest: bool,
+    ) -> (SecurityDecision, Option<PendingWaf>) {
+        let Some(waf) = self.waf().filter(|_| policy.waf_enabled != Some(false)) else {
+            return (SecurityDecision::Allow, None);
+        };
+        let waf_req = self.waf_request(view, policy, is_pentest);
+        match waf.inspect_head(&waf_req) {
+            crate::waf::HeadVerdict::Decided(verdict) => {
+                (self.act_on(verdict, view, is_pentest), None)
+            }
+            crate::waf::HeadVerdict::Pending(head) => (
+                SecurityDecision::Allow,
+                Some(PendingWaf {
+                    engine: waf,
+                    head: Some(head),
+                    is_pentest,
+                    ip: view.ip,
+                    path: view.path.into(),
+                    audit: self.audit_logger.clone(),
+                }),
+            ),
+        }
+    }
+
+    /// The WAF's view of a request under `policy`.
+    fn waf_request<'a>(
+        &self,
+        view: &SecurityRequestView<'a>,
+        policy: &'a RequestPolicy,
+        is_pentest: bool,
+    ) -> WafRequest<'a> {
+        // `x-health-check-bypass: 1` used to skip these rules for anyone
+        // who sent it -- a scanner could add the header and walk past every
+        // bad-bot user-agent rule. Our own checks come from the addresses
+        // in pentest_bypass_ips, which `is_pentest` covers.
+        let skip_bot_ua = self.scanner_ua_exempt.load().is_match(view.path)
+            || policy.skip_bot_blocking
+            // pentest_bypass_ips covers the authorized red-team host plus this
+            // server's own egress and loopback. Those addresses run curl-driven
+            // self-checks that carry no browser User-Agent, so without this the
+            // bad-bot-UA rules 403'd our own monitoring — the bypass list only
+            // suppressed the auto-block counter below, never the Block verdict.
+            || is_pentest;
+
+        WafRequest {
+            method: view.method,
+            path: view.path,
+            query: view.query,
+            headers: view.headers,
+            body: view.body,
+            skip_bot_ua_check: skip_bot_ua,
+            generic_client_allowed: generic_client_allowed(policy, view.headers)
+                || self.programmatic_client_paths.load().is_match(view.path),
+            mode_override: policy.waf_mode.as_deref(),
+        }
+    }
+
+    /// Log, audit and count a WAF verdict, and turn it into the request's
+    /// decision. A block raises the source's suspicious-pattern count, which
+    /// blocks it at `auto_block_threshold`, unless it is a pentest source.
+    fn act_on(
+        &self,
+        verdict: WafVerdict,
+        view: &SecurityRequestView<'_>,
+        is_pentest: bool,
+    ) -> SecurityDecision {
+        report_waf_verdict(&verdict, view.ip, view.path, self.audit_logger.as_ref());
+        let WafVerdict::Block { rule, .. } = verdict else {
+            return SecurityDecision::Allow;
+        };
+        if !is_pentest {
+            let (auto_block_threshold, auto_block_duration_secs) = {
+                let c = self.config.read();
+                (c.auto_block_threshold, c.auto_block_duration_secs)
             };
-            match waf.inspect(&waf_req) {
-                WafVerdict::Block {
-                    ref rule,
-                    severity,
-                    score,
-                    matched,
-                    ref location,
-                } => {
-                    warn!(
-                        "WAF block: rule={} severity={} score={} rules_matched={} location={} ip={} path={}",
-                        rule,
-                        severity.as_str(),
-                        score,
-                        matched,
-                        location,
-                        ip,
-                        view.path
-                    );
-                    if let Some(audit) = &self.audit_logger {
-                        audit.log_waf_block(ip, rule.clone(), view.path, location.clone());
-                    }
-                    if !is_pentest {
-                        let mut counter = self.request_counts.entry(ip).or_default();
-                        counter.suspicious_patterns += 1;
-                        if counter.suspicious_patterns >= auto_block_threshold {
-                            drop(counter);
-                            self.block_ip(
-                                ip,
-                                BlockReason::TooManyErrors,
-                                Some(Duration::from_secs(auto_block_duration_secs)),
-                            );
-                        }
-                    }
-                    return SecurityDecision::WafBlock { rule: rule.clone() };
-                }
-                WafVerdict::Detect {
-                    ref rule,
-                    severity,
-                    score,
-                    matched,
-                    ref location,
-                } => {
-                    warn!(
-                        "WAF detect: rule={} severity={} score={} rules_matched={} location={} ip={} path={}",
-                        rule,
-                        severity.as_str(),
-                        score,
-                        matched,
-                        location,
-                        ip,
-                        view.path
-                    );
-                    if let Some(audit) = &self.audit_logger {
-                        audit.log_waf_detect(ip, rule.clone(), view.path, location.clone());
-                    }
-                }
-                WafVerdict::Allow => {}
+            let mut counter = self.request_counts.entry(view.ip).or_default();
+            counter.suspicious_patterns += 1;
+            if counter.suspicious_patterns >= auto_block_threshold {
+                drop(counter);
+                self.block_ip(
+                    view.ip,
+                    BlockReason::TooManyErrors,
+                    Some(Duration::from_secs(auto_block_duration_secs)),
+                );
             }
         }
-        SecurityDecision::Allow
+        SecurityDecision::WafBlock { rule }
+    }
+
+    /// The WAF's verdict on a request whose head [`Self::evaluate_head`]
+    /// left pending, now that its body (`view.body`) is in hand: the body is
+    /// read and added to what the head scored. A body over
+    /// [`LONG_BODY_SCAN`] is read with the worker handed to the runtime's
+    /// other tasks (see [`Self::inspect_body`]).
+    pub fn inspect_rest(
+        &self,
+        mut pending: PendingWaf,
+        view: &SecurityRequestView<'_>,
+        policy: &RequestPolicy,
+    ) -> SecurityDecision {
+        let Some(head) = pending.head.take() else {
+            return SecurityDecision::Allow;
+        };
+        let (engine, is_pentest) = (Arc::clone(&pending.engine), pending.is_pentest);
+        let req = self.waf_request(view, policy, is_pentest);
+        let long = view.body.is_some_and(|body| body.len() > LONG_BODY_SCAN);
+        let verdict = if long && on_multi_thread_runtime() {
+            tokio::task::block_in_place(|| engine.inspect_rest(head, &req))
+        } else {
+            engine.inspect_rest(head, &req)
+        };
+        self.act_on(verdict, view, is_pentest)
+    }
+
+    /// The WAF's verdict on a request whose head was left pending and whose
+    /// body is not read (it had none, or the route reads none): the head's
+    /// assessment as it stands, counted and logged once.
+    pub fn finish_waf(
+        &self,
+        pending: PendingWaf,
+        view: &SecurityRequestView<'_>,
+        policy: &RequestPolicy,
+    ) -> SecurityDecision {
+        let without_body = SecurityRequestView {
+            body: None,
+            ..*view
+        };
+        self.inspect_rest(pending, &without_body, policy)
     }
 
     /// WAF inspection for a request whose body has been buffered.
@@ -1605,13 +1718,23 @@ impl SecurityState {
     /// Only the WAF runs: the rate limiters and blocklist already saw this
     /// request during [`Self::evaluate`], and charging them twice for one
     /// request would halve every configured limit.
+    ///
+    /// The WAF reads a whole body, at some hundreds of MiB a second: a body
+    /// over [`LONG_BODY_SCAN`] is read with its worker thread handed over to
+    /// the runtime's other tasks for the length of it, so the connections
+    /// that worker serves are not held while it reads.
     pub fn inspect_body(
         &self,
         view: &SecurityRequestView<'_>,
         policy: &RequestPolicy,
         is_pentest: bool,
     ) -> SecurityDecision {
-        self.run_waf(view, policy, is_pentest)
+        let long = view.body.is_some_and(|body| body.len() > LONG_BODY_SCAN);
+        if long && on_multi_thread_runtime() {
+            tokio::task::block_in_place(|| self.run_waf(view, policy, is_pentest))
+        } else {
+            self.run_waf(view, policy, is_pentest)
+        }
     }
 
     /// Run every transport-independent security rule against a request.
@@ -1631,11 +1754,42 @@ impl SecurityState {
         view: &SecurityRequestView<'_>,
         policy: &RequestPolicy,
     ) -> SecurityDecision {
+        match self.checks_before_waf(view, policy) {
+            Err(decided) => decided,
+            Ok(is_pentest) => self.run_waf(view, policy, is_pentest),
+        }
+    }
+
+    /// [`Self::evaluate`] for a request whose body is still to come: the WAF
+    /// reads its head now, and what it made of it is returned to be completed
+    /// with the body ([`Self::inspect_rest`]) or without one
+    /// ([`Self::finish_waf`]). The request is assessed, counted and logged
+    /// once, with its head and body scored together.
+    pub fn evaluate_head(
+        &self,
+        view: &SecurityRequestView<'_>,
+        policy: &RequestPolicy,
+    ) -> (SecurityDecision, Option<PendingWaf>) {
+        match self.checks_before_waf(view, policy) {
+            Err(decided) => (decided, None),
+            Ok(is_pentest) => self.run_waf_head(view, policy, is_pentest),
+        }
+    }
+
+    /// Every rule of [`Self::evaluate`] but the WAF: `Err` with the decision
+    /// when one of them decides the request (a trusted source is allowed
+    /// here, before the WAF), else `Ok` with whether the source is one of
+    /// `pentest_bypass_ips`.
+    fn checks_before_waf(
+        &self,
+        view: &SecurityRequestView<'_>,
+        policy: &RequestPolicy,
+    ) -> Result<bool, SecurityDecision> {
         let ip = view.ip;
 
         // Trusted sources skip everything, as they do on both paths today.
         if self.is_trusted(&ip) {
-            return SecurityDecision::Allow;
+            return Err(SecurityDecision::Allow);
         }
 
         let (auto_block_threshold, auto_block_duration_secs, max_header_size, dos_protection) = {
@@ -1699,7 +1853,7 @@ impl SecurityState {
                     | BlockReason::SuspiciousFingerprint
             );
             if !(automatic && is_pentest) {
-                return SecurityDecision::Blocked(info);
+                return Err(SecurityDecision::Blocked(info));
             }
         }
 
@@ -1715,7 +1869,7 @@ impl SecurityState {
                     view.path,
                     presented.unwrap_or("none captured")
                 );
-                return SecurityDecision::Ja3Rejected;
+                return Err(SecurityDecision::Ja3Rejected);
             }
         }
 
@@ -1737,7 +1891,7 @@ impl SecurityState {
                 .filter(|secs| *secs > 0)
                 .map(Duration::from_secs);
             self.block_ip(ip, BlockReason::GeoBlocked, duration);
-            return SecurityDecision::GeoBlocked;
+            return Err(SecurityDecision::GeoBlocked);
         }
 
         // 4. Rate limits — per-route override where the route names one.
@@ -1782,11 +1936,11 @@ impl SecurityState {
                         Some(Duration::from_secs(auto_block_duration_secs)),
                     );
                 }
-                return SecurityDecision::RateLimited {
+                return Err(SecurityDecision::RateLimited {
                     limit: conn_rate_per_sec,
                     retry_after_secs: 1,
                     kind: RateLimitKind::Connection,
-                };
+                });
             }
 
             if rate_enabled && self.get_ip_rate_limiter(ip).check().is_err() {
@@ -1801,11 +1955,11 @@ impl SecurityState {
                         Some(Duration::from_secs(auto_block_duration_secs)),
                     );
                 }
-                return SecurityDecision::RateLimited {
+                return Err(SecurityDecision::RateLimited {
                     limit: rate_rps,
                     retry_after_secs: 1,
                     kind: RateLimitKind::Request,
-                };
+                });
             }
         }
 
@@ -1819,9 +1973,9 @@ impl SecurityState {
             .sum();
         if header_size > max_header_size {
             warn!("Headers too large from {}: {} bytes", ip, header_size);
-            return SecurityDecision::HeadersTooLarge {
+            return Err(SecurityDecision::HeadersTooLarge {
                 max: max_header_size,
-            };
+            });
         }
 
         // 5b. Request hygiene ([security.validation]).
@@ -1832,11 +1986,10 @@ impl SecurityState {
                 .check(view.method, view.path, view.query, view.headers);
         if let Some((status, reason)) = invalid {
             warn!("Invalid request from {}: {}", ip, reason);
-            return SecurityDecision::InvalidRequest { status, reason };
+            return Err(SecurityDecision::InvalidRequest { status, reason });
         }
 
-        // 6. WAF
-        self.run_waf(view, policy, is_pentest)
+        Ok(is_pentest)
     }
 
     /// Record the connection a request from `ip` arrived on, and report
@@ -2194,18 +2347,124 @@ impl SecurityState {
     }
 }
 
+/// What the WAF made of a request's head, waiting for its body.
+///
+/// See [`SecurityState::evaluate_head`]. Completed by
+/// [`SecurityState::inspect_rest`] or [`SecurityState::finish_waf`]; held with
+/// the engine that assessed it, so a WAF reload in between cannot mix two
+/// rule sets in one assessment.
+pub struct PendingWaf {
+    engine: Arc<WafEngine>,
+    /// Taken by the pass that completes it
+    head: Option<crate::waf::WafHead>,
+    is_pentest: bool,
+    /// For a request that ends before its body is read: whom and what the
+    /// head's verdict is reported against
+    ip: IpAddr,
+    path: Box<str>,
+    audit: Option<Arc<AuditLogger>>,
+}
+
+/// A request that ended with its WAF assessment still waiting for the body
+/// (served from cache, redirected, refused by a route gate, cut off) is
+/// judged on its head: counted once, and in detect mode logged and audited.
+/// A head that could block on its own was decided when it was read, so
+/// nothing here blocks.
+impl Drop for PendingWaf {
+    fn drop(&mut self) {
+        if let Some(head) = self.head.take() {
+            let verdict = self.engine.conclude(&head, &self.path);
+            report_waf_verdict(&verdict, self.ip, &self.path, self.audit.as_ref());
+        }
+    }
+}
+
+/// Log a WAF verdict, and audit it where there is an audit log.
+fn report_waf_verdict(
+    verdict: &WafVerdict,
+    ip: IpAddr,
+    path: &str,
+    audit: Option<&Arc<AuditLogger>>,
+) {
+    match verdict {
+        WafVerdict::Block {
+            rule,
+            severity,
+            score,
+            matched,
+            location,
+        } => {
+            warn!(
+                "WAF block: rule={} severity={} score={} rules_matched={} location={} ip={} path={}",
+                rule,
+                severity.as_str(),
+                score,
+                matched,
+                location,
+                ip,
+                path
+            );
+            if let Some(audit) = audit {
+                audit.log_waf_block(ip, rule.clone(), path, location.clone());
+            }
+        }
+        WafVerdict::Detect {
+            rule,
+            severity,
+            score,
+            matched,
+            location,
+        } => {
+            warn!(
+                "WAF detect: rule={} severity={} score={} rules_matched={} location={} ip={} path={}",
+                rule,
+                severity.as_str(),
+                score,
+                matched,
+                location,
+                ip,
+                path
+            );
+            if let Some(audit) = audit {
+                audit.log_waf_detect(ip, rule.clone(), path, location.clone());
+            }
+        }
+        WafVerdict::Allow => {}
+    }
+}
+
+/// Whether this runs on a multi-threaded Tokio runtime, where a worker can
+/// hand its tasks to the others for a long synchronous stretch.
+fn on_multi_thread_runtime() -> bool {
+    tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+}
+
+/// A body longer than this is inspected off the async worker (see
+/// `SecurityState::inspect_body`): about 3 to 7 ms of the WAF's reading.
+const LONG_BODY_SCAN: usize = 1024 * 1024;
+
 /// One request's place in its client address's in-flight count
-/// (`security.max_connections_per_ip`), given back when the guard drops: when
-/// the request is answered, refused, or abandoned part way because its client
-/// went away. A request's future is dropped then, and code after an `.await`
+/// (`security.max_connections_per_ip`).
+///
+/// Given back when the guard drops: when the request is answered, refused,
+/// or abandoned part way because its client went away. A request's future is dropped then, and code after an `.await`
 /// in it never runs, so a count given back by hand at the end of the
 /// middleware was never given back for those, nor on any path that returned
 /// before the end (the streaming speed-test upload did): an address that
 /// reached the limit that way stayed over it, blocked, until a restart. An
 /// address's entry goes when its count reaches zero.
-struct InFlight {
+pub struct InFlight {
     counts: Arc<DashMap<IpAddr, u32>>,
     ip: IpAddr,
+}
+
+/// An address already has `security.max_connections_per_ip` requests in
+/// flight: the request that found it so is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TooManyInFlight {
+    pub in_flight: u32,
+    pub limit: u32,
 }
 
 impl InFlight {
@@ -2331,6 +2590,36 @@ pub async fn security_middleware(
         }
     };
 
+    // A connection whose key exchange was classical, where the server refuses
+    // those (pqc.downgrade_action = "block"; see pqc_policy.rs). The listener
+    // sets x-pqc-enabled from the handshake on every TLS connection, in place
+    // of whatever the client sent.
+    let classical = headers
+        .get("x-pqc-enabled")
+        .is_some_and(|post_quantum| post_quantum.as_bytes() == b"false");
+    if classical && crate::pqc_policy::refuses(false) {
+        let response =
+            (StatusCode::MISDIRECTED_REQUEST, crate::pqc_policy::REFUSAL).into_response();
+        let header_str =
+            |name: hyper::header::HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
+        log_access(&AccessLogEntry {
+            ja3: None,
+            ja4: None,
+            backend: None,
+            remote_addr: client_addr,
+            method: request.method().as_str(),
+            path: request.uri().path(),
+            protocol: crate::access_logger::protocol_name(request.version()),
+            status: response.status().as_u16(),
+            body_size: crate::access_logger::declared_body_size(response.headers()),
+            referer: header_str(hyper::header::REFERER),
+            user_agent: header_str(hyper::header::USER_AGENT),
+            host: host.as_deref(),
+            response_time_ms: 0,
+        });
+        return response;
+    }
+
     // Resolve the route before any check runs, so per-route policy can shape
     // what follows: by the host and canonical path the request is routed on.
     // None means no route matched, in which case the global settings apply
@@ -2344,14 +2633,46 @@ pub async fn security_middleware(
         request_policy(&routes, host.as_deref(), &path, request.method())
     };
 
-    // The body-scan paths below run after `request` is consumed, so take the
-    // pieces they need while the policy is still in scope.
-    let waf_mode_cl = route_policy.waf_mode.clone();
     let waf_enabled_cl = route_policy.waf_enabled;
-    let waf_mode_body = route_policy.waf_mode.clone();
-    let route_skip_bot = route_policy.skip_bot_blocking;
-    let route_credentialed = route_policy.credentialed_clients;
-    let route_programmatic = route_policy.programmatic_clients;
+
+    // Pre-borrow alt_svc_header for use in all early-return helpers below.
+    let alt_svc_value = security.alt_svc_header.load_full();
+    let alt_svc: &str = alt_svc_value.as_str();
+
+    // A refusal of this layer: rendered for the client (with the CORS headers
+    // a browser needs to see it) and written to the access log. Security
+    // refusals used to return without ever reaching the access logger, so a
+    // blocked client saw a 403 while access.log stayed silent and only the
+    // journal recorded it; refusals of a body were still missing from it.
+    let refuse = |decision: &SecurityDecision,
+                  method: &str,
+                  path: &str,
+                  version: hyper::Version|
+     -> Response {
+        let origin = headers.get("origin").and_then(|v| v.to_str().ok());
+        let response = {
+            let config = security.config.read();
+            render_decision(decision, alt_svc, origin, &config)
+        };
+        let header_str =
+            |name: hyper::header::HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
+        log_access(&AccessLogEntry {
+            ja3: None,
+            ja4: None,
+            backend: None,
+            remote_addr: client_addr,
+            method,
+            path,
+            protocol: crate::access_logger::protocol_name(version),
+            status: response.status().as_u16(),
+            body_size: crate::access_logger::declared_body_size(response.headers()),
+            referer: header_str(hyper::header::REFERER),
+            user_agent: header_str(hyper::header::USER_AGENT),
+            host: host.as_deref(),
+            response_time_ms: 0,
+        });
+        response
+    };
 
     // Fast path: skip all security checks for trusted IPs (loopback, or CIDRs listed in
     // security.trusted_internal_cidrs). RFC1918 ranges are no longer implicitly trusted
@@ -2361,38 +2682,16 @@ pub async fn security_middleware(
         return next.run(request).await;
     }
 
-    // Authorized pentest bypass: skip rate-limiting and auto-block but still run WAF.
-    // Pentest IPs get proper 403 for blocked attacks without being banned mid-run.
-    let is_pentest_bypass = {
-        let config = security.config.read();
-        crate::config::ip_list_contains(&config.pentest_bypass_ips, &ip)
-    };
-
+    // Pentest sources are inspected but never rate-limited or auto-banned:
+    // `SecurityState::evaluate_head` and the WAF step own that, for both passes.
     // Read config values without cloning the entire struct - just read what we need
-    let (
-        dos_protection,
-        max_connections_per_ip,
-        max_request_size,
-        max_header_size,
-        auto_block_threshold,
-        auto_block_duration_secs,
-    ) = {
+    let (max_request_size, max_header_size) = {
         let config = security.config.read();
-        (
-            config.dos_protection,
-            config.max_connections_per_ip,
-            config.max_request_size,
-            config.max_header_size,
-            config.auto_block_threshold,
-            config.auto_block_duration_secs,
-        )
+        (config.max_request_size, config.max_header_size)
     };
     // Rate-limit figures are read inside SecurityState::evaluate, which owns
     // the per-route override logic; the middleware keeps no second copy.
 
-    // Pre-borrow alt_svc_header for use in all early-return helpers below.
-    let alt_svc_value = security.alt_svc_header.load_full();
-    let alt_svc: &str = alt_svc_value.as_str();
     // Extract path once here so it's available to both WAF and size checks.
     let request_path = request.uri().path().to_ascii_lowercase();
 
@@ -2406,7 +2705,9 @@ pub async fn security_middleware(
     // branch silently disabled the WAF for those addresses.
     // The block yields this request's place in its address's in-flight count
     // (when counted), held until the request is done, however it ends.
-    let _in_flight: Option<InFlight> = {
+    // What the WAF made of the head, completed once the body is read (or
+    // known to be absent): the request is assessed, counted and logged once.
+    let (mut waf_pending, _in_flight): (Option<PendingWaf>, Option<InFlight>) = {
         let view = SecurityRequestView {
             ip,
             peer_port: Some(client_addr.port()),
@@ -2416,87 +2717,31 @@ pub async fn security_middleware(
             headers: request.headers(),
             body: None,
         };
-        let decision = security.evaluate(&view, &route_policy);
+        let (decision, pending) = security.evaluate_head(&view, &route_policy);
 
         if !matches!(decision, SecurityDecision::Allow) {
-            let request_origin = headers
-                .get("origin")
-                .and_then(|v| v.to_str().ok())
-                .map(String::from);
-            let response = {
-                let config = security.config.read();
-                render_decision(&decision, alt_svc, request_origin.as_deref(), &config)
-            };
-
-            // Security refusals used to return without ever reaching the access
-            // logger, so a blocked client saw a 403 while access.log stayed
-            // silent and only the journal recorded it. That made a Search
-            // Console "Blocked due to access forbidden (403)" impossible to
-            // reconcile against the logs. Record them like any other response.
-            // Borrowed, not allocated: AccessLogEntry holds `&str` now, and this
-            // path runs on every blocked request.
-            let header_str =
-                |name: hyper::header::HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
-            let protocol = crate::access_logger::protocol_name(request.version());
-            log_access(&AccessLogEntry {
-                ja3: None,
-                ja4: None,
-                backend: None,
-                remote_addr: client_addr,
-                method: request.method().as_str(),
-                path: request.uri().path(),
-                protocol,
-                status: response.status().as_u16(),
-                body_size: crate::access_logger::declared_body_size(response.headers()),
-                referer: header_str(hyper::header::REFERER),
-                user_agent: header_str(hyper::header::USER_AGENT),
-                host: host.as_deref(),
-                response_time_ms: 0,
-            });
-
-            return response;
+            return refuse(
+                &decision,
+                request.method().as_str(),
+                request.uri().path(),
+                request.version(),
+            );
         }
 
-        // DoS concurrency limit — counted here because the matching decrement
-        // happens once this middleware's response is built.
-        //
-        // A verified crawler is exempt from the *ban*, not from the limit: it
-        // still gets 503'd when it exceeds the concurrency cap, but a rendering
-        // burst must not cost it a multi-minute blackout.
-        let crawler_exempt = security.crawler_verifier.load_full().classify(
-            ip,
-            headers
-                .get(hyper::header::USER_AGENT)
-                .and_then(|v| v.to_str().ok()),
-        ) == CrawlerVerdict::Verified;
-
-        // The request's place in the count is held by a guard, given back when
-        // the request is done however it ends (see `InFlight`).
-        if dos_protection {
-            let (slot, connections) = InFlight::enter(&security.ip_connections, ip);
-            if is_pentest_bypass {
-                // Counted, never blocked.
-                debug!("Pentest bypass IP {} — skipping rate-limit/auto-block", ip);
-            } else if connections > max_connections_per_ip {
-                drop(slot);
-                if !crawler_exempt {
-                    security.block_ip(
-                        ip,
-                        BlockReason::ConnectionLimitExceeded,
-                        Some(Duration::from_secs(auto_block_duration_secs)),
-                    );
-                }
-                warn!(
-                    "Too many connections from {}: {} (limit {})",
-                    ip, connections, max_connections_per_ip
-                );
-                return too_many_connections_response(alt_svc);
-            }
-            Some(slot)
-        } else {
-            None
+        // The request's place in its address's in-flight count, held until
+        // the request is done (see `SecurityState::enter_request`).
+        let user_agent = headers
+            .get(hyper::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok());
+        match security.enter_request(ip, user_agent) {
+            Ok(slot) => (pending, slot),
+            Err(TooManyInFlight { .. }) => return too_many_connections_response(alt_svc),
         }
     };
+
+    // This request's body's share of the memory request bodies may occupy
+    // together, given back when the request is done (see body_budget.rs).
+    let mut body_memory = crate::body_budget::Reservation::new();
 
     // 6. Request size validation — covers both Content-Length and chunked bodies.
     //
@@ -2504,6 +2749,26 @@ pub async fn security_middleware(
     // and discards the body incrementally without buffering, so applying a size
     // limit here would reject legitimate high-throughput upload measurements.
     if request_path == "/speedtest/tcp-upload-stream" {
+        if let Some(pending) = waf_pending.take() {
+            let view = SecurityRequestView {
+                ip,
+                peer_port: Some(client_addr.port()),
+                method: request.method().as_str(),
+                path: &request_path,
+                query: request.uri().query().unwrap_or(""),
+                headers: request.headers(),
+                body: None,
+            };
+            let decision = security.finish_waf(pending, &view, &route_policy);
+            if !matches!(decision, SecurityDecision::Allow) {
+                return refuse(
+                    &decision,
+                    request.method().as_str(),
+                    request.uri().path(),
+                    request.version(),
+                );
+            }
+        }
         return next.run(request).await;
     }
     //
@@ -2534,84 +2799,63 @@ pub async fn security_middleware(
                 }
             }
         }
-        // WAF body scan for Content-Length requests — previously skipped.
-        // Buffer up to max_body_scan_bytes (65 KB) and inspect with WAF.
-        if security.waf().is_some() && route_policy.waf_enabled != Some(false) {
-            let scan_limit = 65_536usize;
-            let (parts, body) = request.into_parts();
-            // Collect the ENTIRE body (matching the declared Content-Length) —
-            // only the first `scan_limit` bytes are actually inspected by the WAF
-            // below. Previously this loop broke out (and the request was
-            // reconstructed) as soon as scan_limit was reached, silently
-            // truncating any body over 64 KB while forwarding the original,
-            // now-too-large Content-Length header. The backend would then wait
-            // forever for the remaining bytes the proxy had already discarded,
-            // hanging every request whose body crossed the 64 KB mark.
-            let mut collected_bytes: Vec<u8> = Vec::new();
-            let mut frame_stream = body.into_data_stream();
-            while let Some(chunk_result) = {
-                use futures_util::StreamExt;
-                frame_stream.next().await
-            } {
-                match chunk_result {
-                    Ok(chunk) => {
-                        collected_bytes.extend_from_slice(&chunk);
-                    }
-                    Err(_) => break,
+        // WAF body scan for requests with a declared length.
+        if let Some(waf) = security
+            .waf()
+            .filter(|_| route_policy.waf_enabled != Some(false))
+        {
+            let (mut parts, body) = request.into_parts();
+            // The whole body is read (to its declared length, within
+            // max_request_size) and the whole of it is what the WAF is given
+            // and what the backend receives.
+            let collected_bytes = match read_body(body, max_request_size, &mut body_memory).await {
+                Ok(collected) => collected,
+                Err(BodyRefusal::TooLarge) => {
+                    warn!(
+                        "Request too large from {}: over {} bytes",
+                        ip, max_request_size
+                    );
+                    return payload_too_large_response(max_request_size, alt_svc);
                 }
-            }
-            if !collected_bytes.is_empty() {
-                if security.waf().is_some() && waf_enabled_cl != Some(false) {
-                    let waf_path = parts.uri.path().to_string();
-                    let waf_query = parts.uri.query().unwrap_or("").to_string();
-                    let skip_bot_ua_cl = is_pentest_bypass || route_skip_bot;
-                    let scan_slice_end = collected_bytes.len().min(scan_limit);
-                    let body_view = SecurityRequestView {
-                        ip,
-                        peer_port: Some(client_addr.port()),
-                        method: parts.method.as_str(),
-                        path: &waf_path,
-                        query: &waf_query,
-                        headers: &parts.headers,
-                        body: Some(&collected_bytes[..scan_slice_end]),
-                    };
-                    let body_policy = RequestPolicy {
-                        skip_bot_blocking: skip_bot_ua_cl,
-                        credentialed_clients: route_credentialed,
-                        programmatic_clients: route_programmatic,
-                        waf_mode: waf_mode_cl.clone(),
-                        waf_enabled: waf_enabled_cl,
-                        ..Default::default()
-                    };
-                    // Detect mode never comes back as a block: the WAF answers Allow
-                    // and counts the match itself.
-                    if let SecurityDecision::WafBlock { ref rule } =
-                        security.inspect_body(&body_view, &body_policy, is_pentest_bypass)
-                    {
-                        warn!(
-                            "WAF body block (CL): rule={} ip={} path={}",
-                            rule, ip, waf_path
-                        );
-                        if !is_pentest_bypass {
-                            let mut counter = security.request_counts.entry(ip).or_default();
-                            counter.suspicious_patterns += 1;
-                            if counter.suspicious_patterns >= auto_block_threshold {
-                                drop(counter);
-                                let block_duration = Duration::from_secs(auto_block_duration_secs);
-                                security.block_ip(
-                                    ip,
-                                    BlockReason::TooManyErrors,
-                                    Some(block_duration),
-                                );
-                            }
-                        }
-                        let mut resp =
-                            (StatusCode::FORBIDDEN, "Request blocked by security policy")
-                                .into_response();
-                        resp.headers_mut()
-                            .insert("x-waf-block", HeaderValue::from_static("1"));
-                        return resp;
-                    }
+                Err(BodyRefusal::NoMemory) => {
+                    warn!("Request body from {} refused: body memory budget spent", ip);
+                    return body_memory_exhausted_response(alt_svc);
+                }
+                Err(BodyRefusal::Incomplete) => {
+                    debug!("Request body from {} ended before its declared length", ip);
+                    return incomplete_body_response(alt_svc);
+                }
+            };
+            let collected_bytes = match forwardable_body(
+                &waf,
+                &mut parts,
+                collected_bytes,
+                max_request_size,
+                &mut body_memory,
+                alt_svc,
+            ) {
+                Ok(body) => body,
+                Err(refused) => return *refused,
+            };
+            // The body added to what the head scored: one verdict.
+            if let Some(pending) = waf_pending.take() {
+                let body_view = SecurityRequestView {
+                    ip,
+                    peer_port: Some(client_addr.port()),
+                    method: parts.method.as_str(),
+                    path: &request_path,
+                    query: parts.uri.query().unwrap_or(""),
+                    headers: &parts.headers,
+                    body: Some(&collected_bytes),
+                };
+                let decision = security.inspect_rest(pending, &body_view, &route_policy);
+                if !matches!(decision, SecurityDecision::Allow) {
+                    return refuse(
+                        &decision,
+                        parts.method.as_str(),
+                        parts.uri.path(),
+                        parts.version,
+                    );
                 }
             }
             // Reconstruct request with buffered body for the backend.
@@ -2619,85 +2863,62 @@ pub async fn security_middleware(
         }
     } else if is_chunked || !has_content_length {
         // Slow path: buffer the body and enforce the limit on actual bytes.
-        let (parts, body) = request.into_parts();
-        // Collect up to max_request_size + 1 bytes; excess triggers the error branch.
-        let mut collected_bytes: Vec<u8> = Vec::new();
-        let mut frame_stream = body.into_data_stream();
-        let mut oversized = false;
-
-        while let Some(chunk_result) = {
-            use futures_util::StreamExt;
-            frame_stream.next().await
-        } {
-            match chunk_result {
-                Ok(chunk) => {
-                    collected_bytes.extend_from_slice(&chunk);
-                    if collected_bytes.len() > max_request_size {
-                        oversized = true;
-                        break;
-                    }
-                }
-                Err(_) => break,
+        let (mut parts, body) = request.into_parts();
+        let collected_bytes = match read_body(body, max_request_size, &mut body_memory).await {
+            Ok(collected) => collected,
+            Err(BodyRefusal::TooLarge) => {
+                warn!(
+                    "Chunked request body exceeded limit from {}: >{} bytes",
+                    ip, max_request_size
+                );
+                return payload_too_large_response(max_request_size, alt_svc);
             }
-        }
+            Err(BodyRefusal::NoMemory) => {
+                warn!("Request body from {} refused: body memory budget spent", ip);
+                return body_memory_exhausted_response(alt_svc);
+            }
+            Err(BodyRefusal::Incomplete) => {
+                debug!("Request body from {} ended before its end", ip);
+                return incomplete_body_response(alt_svc);
+            }
+        };
 
-        if oversized {
-            warn!(
-                "Chunked request body exceeded limit from {}: >{} bytes",
-                ip, max_request_size
-            );
-            return payload_too_large_response(max_request_size, alt_svc);
-        }
+        // Decoded where the WAF reads it, so it reads what is delivered.
+        let collected_bytes = match security.waf().filter(|_| waf_enabled_cl != Some(false)) {
+            Some(waf) => match forwardable_body(
+                &waf,
+                &mut parts,
+                collected_bytes,
+                max_request_size,
+                &mut body_memory,
+                alt_svc,
+            ) {
+                Ok(body) => body,
+                Err(refused) => return *refused,
+            },
+            None => collected_bytes,
+        };
 
-        // P1-fix: WAF body inspection on the now-buffered bytes.
-        // Step 5 above inspected path/query/headers without a body; this second
-        // pass supplies the buffered bytes so that body-embedded payloads
-        // (SQLi, XSS, command injection, etc.) are detected.
-        if !collected_bytes.is_empty() {
-            if security.waf().is_some() && waf_enabled_cl != Some(false) {
-                let waf_path = parts.uri.path().to_string();
-                let waf_query = parts.uri.query().unwrap_or("").to_string();
-                let skip_bot_ua_body = is_pentest_bypass || route_skip_bot;
-                let body_view_chunked = SecurityRequestView {
-                    ip,
-                    peer_port: Some(client_addr.port()),
-                    method: parts.method.as_str(),
-                    path: &waf_path,
-                    query: &waf_query,
-                    headers: &parts.headers,
-                    body: Some(collected_bytes.as_slice()),
-                };
-                let body_policy_chunked = RequestPolicy {
-                    skip_bot_blocking: skip_bot_ua_body,
-                    credentialed_clients: route_credentialed,
-                    programmatic_clients: route_programmatic,
-                    waf_mode: waf_mode_body.clone(),
-                    waf_enabled: waf_enabled_cl,
-                    ..Default::default()
-                };
-                // Detect mode is the WAF's to log: it answers Allow.
-                if let SecurityDecision::WafBlock { ref rule } = security.inspect_body(
-                    &body_view_chunked,
-                    &body_policy_chunked,
-                    is_pentest_bypass,
-                ) {
-                    warn!("WAF body block: rule={} ip={} path={}", rule, ip, waf_path);
-                    // Same escalation as the header/path WAF block path above.
-                    {
-                        let mut counter = security.request_counts.entry(ip).or_default();
-                        counter.suspicious_patterns += 1;
-                        if counter.suspicious_patterns >= auto_block_threshold {
-                            drop(counter);
-                            let block_duration = Duration::from_secs(auto_block_duration_secs);
-                            security.block_ip(ip, BlockReason::TooManyErrors, Some(block_duration));
-                        }
-                    }
-                    let mut resp = (StatusCode::FORBIDDEN, "Request blocked by security policy")
-                        .into_response();
-                    resp.headers_mut()
-                        .insert("x-waf-block", HeaderValue::from_static("1"));
-                    return resp;
-                }
+        // The body (empty for a request without one) added to what the head
+        // scored: one verdict.
+        if let Some(pending) = waf_pending.take() {
+            let body_view = SecurityRequestView {
+                ip,
+                peer_port: Some(client_addr.port()),
+                method: parts.method.as_str(),
+                path: &request_path,
+                query: parts.uri.query().unwrap_or(""),
+                headers: &parts.headers,
+                body: Some(&collected_bytes),
+            };
+            let decision = security.inspect_rest(pending, &body_view, &route_policy);
+            if !matches!(decision, SecurityDecision::Allow) {
+                return refuse(
+                    &decision,
+                    parts.method.as_str(),
+                    parts.uri.path(),
+                    parts.version,
+                );
             }
         }
 
@@ -2909,6 +3130,119 @@ fn render_decision(
     response
 }
 
+/// The answer to a request whose body would take the process past the
+/// memory it gives request bodies (see body_budget.rs).
+fn body_memory_exhausted_response(alt_svc: &str) -> Response {
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "The server is holding as many request bodies as it can; try again shortly",
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert("retry-after", HeaderValue::from_static("5"));
+    add_alt_svc(&mut response, alt_svc);
+    response
+}
+
+/// The answer to a request whose body stopped arriving part way: what was
+/// read is not the request its sender wrote, and is not forwarded as one.
+fn incomplete_body_response(alt_svc: &str) -> Response {
+    let mut response = (
+        StatusCode::BAD_REQUEST,
+        "The request body was not received whole",
+    )
+        .into_response();
+    add_alt_svc(&mut response, alt_svc);
+    response
+}
+
+/// How reading a request body into memory ended short of the whole body.
+enum BodyRefusal {
+    /// More than `security.max_request_size`
+    TooLarge,
+    /// The process's budget for request bodies is spent
+    NoMemory,
+    /// The body stopped arriving before its end
+    Incomplete,
+}
+
+/// Read a request body whole, to at most `max` bytes, counting it against
+/// the process's budget for request bodies as it arrives.
+async fn read_body(
+    body: Body,
+    max: usize,
+    reservation: &mut crate::body_budget::Reservation,
+) -> Result<Vec<u8>, BodyRefusal> {
+    use futures_util::StreamExt;
+    let mut collected: Vec<u8> = Vec::new();
+    let mut frames = body.into_data_stream();
+    while let Some(chunk) = frames.next().await {
+        let chunk = chunk.map_err(|_| BodyRefusal::Incomplete)?;
+        if collected.len() + chunk.len() > max {
+            return Err(BodyRefusal::TooLarge);
+        }
+        if !reservation.grow(chunk.len()) {
+            return Err(BodyRefusal::NoMemory);
+        }
+        collected.extend_from_slice(&chunk);
+    }
+    Ok(collected)
+}
+
+/// A body whose request carries a content coding, decoded, with the request
+/// head made to describe the decoded body (see request_encoding.rs); the
+/// body as it came when there is none or the WAF does not decode bodies.
+/// What is inspected is then what the backend receives.
+fn forwardable_body(
+    waf: &WafEngine,
+    parts: &mut http::request::Parts,
+    body: Vec<u8>,
+    limit: usize,
+    reservation: &mut crate::body_budget::Reservation,
+    alt_svc: &str,
+) -> Result<Vec<u8>, Box<Response>> {
+    if !waf.decodes_bodies() {
+        return Ok(body);
+    }
+    let coding = parts
+        .headers
+        .get(hyper::header::CONTENT_ENCODING)
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+    match crate::request_encoding::decode(coding.as_deref(), &body, limit) {
+        Ok(None) => Ok(body),
+        Ok(Some(decoded)) => {
+            if !reservation.grow(decoded.len()) {
+                return Err(Box::new(body_memory_exhausted_response(alt_svc)));
+            }
+            let h = &mut parts.headers;
+            h.remove(hyper::header::CONTENT_ENCODING);
+            h.remove(hyper::header::TRANSFER_ENCODING);
+            // Digests of the encoded bytes (RFC 9530) describe what is no
+            // longer sent.
+            for digest in ["content-digest", "repr-digest", "content-md5"] {
+                h.remove(digest);
+            }
+            h.insert(
+                hyper::header::CONTENT_LENGTH,
+                HeaderValue::from(decoded.len()),
+            );
+            Ok(decoded)
+        }
+        Err(refusal) => {
+            let mut response = (refusal.status(), refusal.message()).into_response();
+            if matches!(refusal, crate::request_encoding::Refusal::Unsupported(_)) {
+                response.headers_mut().insert(
+                    hyper::header::ACCEPT_ENCODING,
+                    HeaderValue::from_static(crate::request_encoding::ACCEPTED),
+                );
+            }
+            add_alt_svc(&mut response, alt_svc);
+            Err(Box::new(response))
+        }
+    }
+}
+
 /// Generate too many connections response
 fn too_many_connections_response(alt_svc: &str) -> Response {
     let mut response = (
@@ -2947,14 +3281,6 @@ fn headers_too_large_response(max_size: usize, alt_svc: &str) -> Response {
         .into_response();
     add_alt_svc(&mut response, alt_svc);
     response
-}
-
-/// Classify a JA3 fingerprint hash using the provided database.
-///
-/// Classification is **advisory-only** and MUST NOT cause automatic blocking.
-/// Returns `Suspicious` for any hash not found in the database.
-pub fn classify_ja3(ja3_hash: &str, db: &Ja3Database) -> FingerprintClass {
-    db.classify(ja3_hash)
 }
 
 #[cfg(feature = "geoip")]
@@ -3913,10 +4239,10 @@ mod tests {
         // With an empty database every hash classifies as Suspicious (advisory only).
         let db = Ja3Database::default();
         let hash = "e7d705a3286e19ea42f587b344ee6865";
-        assert_eq!(classify_ja3(hash, &db), FingerprintClass::Suspicious);
+        assert_eq!(db.classify(hash), FingerprintClass::Suspicious);
 
         let unknown = "00000000000000000000000000000000";
-        assert_eq!(classify_ja3(unknown, &db), FingerprintClass::Suspicious);
+        assert_eq!(db.classify(unknown), FingerprintClass::Suspicious);
     }
 
     #[test]
@@ -3938,30 +4264,30 @@ mod tests {
         assert!(!db.is_empty());
 
         assert_eq!(
-            classify_ja3("aabbccddeeff00112233445566778899", &db),
+            db.classify("aabbccddeeff00112233445566778899"),
             FingerprintClass::Browser
         );
         assert_eq!(
-            classify_ja3("112233445566778899aabbccddeeff00", &db),
+            db.classify("112233445566778899aabbccddeeff00"),
             FingerprintClass::Malicious
         );
         assert_eq!(
-            classify_ja3("deadbeefdeadbeefdeadbeefdeadbeef", &db),
+            db.classify("deadbeefdeadbeefdeadbeefdeadbeef"),
             FingerprintClass::ApiClient
         );
         assert_eq!(
-            classify_ja3("cafebabecafebabecafebabecafebabe", &db),
+            db.classify("cafebabecafebabecafebabecafebabe"),
             FingerprintClass::LegitimateBot
         );
         // Unknown hash still returns Suspicious
         assert_eq!(
-            classify_ja3("ffffffffffffffffffffffffffffffff", &db),
+            db.classify("ffffffffffffffffffffffffffffffff"),
             FingerprintClass::Suspicious
         );
 
         // Case-insensitive lookup
         assert_eq!(
-            classify_ja3("AABBCCDDEEFF00112233445566778899", &db),
+            db.classify("AABBCCDDEEFF00112233445566778899"),
             FingerprintClass::Browser
         );
 
@@ -4096,6 +4422,129 @@ mod decision_rendering_tests {
             Some(Duration::from_hours(24)),
             "a real duration must still expire"
         );
+    }
+
+    /// A request that ends before its body is read is judged on its head
+    /// once, when its pending assessment goes.
+    #[tokio::test]
+    async fn a_pending_assessment_concludes_once_when_dropped() {
+        let mut config = ProxyConfig::default();
+        config.waf.enabled = true;
+        let security = SecurityState::new(&config);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "user-agent",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/141.0 Safari/537.36"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("accept", "text/html".parse().unwrap());
+        let view = SecurityRequestView {
+            ip: "203.0.113.31".parse().unwrap(),
+            peer_port: Some(40000),
+            method: "GET",
+            path: "/",
+            query: "",
+            headers: &headers,
+            body: None,
+        };
+        let (decision, pending) = security.evaluate_head(&view, &RequestPolicy::default());
+        assert!(matches!(decision, SecurityDecision::Allow));
+        let waf = security.waf().expect("the WAF is on");
+        assert_eq!(waf.stats().inspected, 1);
+        assert_eq!(waf.stats().allowed, 0, "not concluded while pending");
+        drop(pending.expect("the head waits for its body"));
+        assert_eq!(waf.stats().allowed, 1);
+        assert_eq!(waf.stats().inspected, 1);
+    }
+
+    /// A body is read whole or not at all: one that stops arriving part way
+    /// is not the request its sender wrote, and one past the limit is not
+    /// read to its end.
+    #[tokio::test]
+    async fn a_body_is_read_whole_or_refused() {
+        use bytes::Bytes;
+        let pieces = |pieces: Vec<Result<&'static str, std::io::Error>>| {
+            Body::from_stream(futures_util::stream::iter(
+                pieces.into_iter().map(|piece| piece.map(Bytes::from)),
+            ))
+        };
+        let mut memory = crate::body_budget::Reservation::new();
+
+        let whole = read_body(pieces(vec![Ok("abc"), Ok("def")]), 6, &mut memory).await;
+        assert_eq!(whole.ok().as_deref(), Some(b"abcdef".as_slice()));
+
+        let large = read_body(pieces(vec![Ok("abc"), Ok("defg")]), 6, &mut memory).await;
+        assert!(matches!(large, Err(BodyRefusal::TooLarge)));
+
+        let cut = read_body(
+            pieces(vec![
+                Ok("abc"),
+                Err(std::io::Error::other("the client went away")),
+            ]),
+            64,
+            &mut memory,
+        )
+        .await;
+        assert!(matches!(cut, Err(BodyRefusal::Incomplete)));
+    }
+
+    /// Under `pqc.downgrade_action = "block"` a request on a connection whose
+    /// key exchange was classical is answered 421, and no other request is.
+    /// Not in a `bench-null-middleware` build, whose middleware does none of
+    /// its work by design.
+    #[cfg(not(feature = "bench-null-middleware"))]
+    #[tokio::test]
+    async fn a_classical_connection_is_answered_421_where_those_are_refused() {
+        use tower::ServiceExt as _;
+
+        let mut config = ProxyConfig::default();
+        config.pqc.enabled = true;
+        config.pqc.downgrade_action = "block".into();
+        let security = Arc::new(SecurityState::new(&config));
+        let call = |pqc_enabled: Option<&'static str>| {
+            let app = axum::Router::new()
+                .route("/", axum::routing::get(|| async { "ok" }))
+                .layer(axum::middleware::from_fn_with_state(
+                    security.clone(),
+                    security_middleware,
+                ));
+            let mut request = Request::builder()
+                .uri("/")
+                .header("host", "example.com")
+                .header(
+                    "user-agent",
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/141.0 Safari/537.36",
+                )
+                .header("accept", "text/html");
+            if let Some(value) = pqc_enabled {
+                request = request.header("x-pqc-enabled", value);
+            }
+            let mut request = request.body(Body::empty()).unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(std::net::SocketAddr::from((
+                    [203, 0, 113, 21],
+                    40000,
+                ))));
+            async move { app.oneshot(request).await.unwrap().status() }
+        };
+
+        let policy = crate::pqc_policy::TEST_POLICY.lock().await;
+        crate::pqc_policy::configure(&config.pqc);
+        let classical = call(Some("false")).await;
+        let post_quantum = call(Some("true")).await;
+        let plain_http = call(None).await;
+        config.pqc.downgrade_action = "log".into();
+        crate::pqc_policy::configure(&config.pqc);
+        let logged = call(Some("false")).await;
+        crate::pqc_policy::configure(&crate::config::PqcConfig::default());
+        drop(policy);
+
+        assert_eq!(classical, StatusCode::MISDIRECTED_REQUEST);
+        assert_eq!(post_quantum, StatusCode::OK);
+        assert_eq!(plain_http, StatusCode::OK);
+        assert_eq!(logged, StatusCode::OK);
     }
 
     /// An error page is served to an address the blocklist would refuse,

@@ -1,160 +1,177 @@
-//! TLS passthrough: SNI-based routing that forwards the encrypted stream
-//! to a backend without terminating TLS.
+//! TLS passthrough.
+//!
+//! A connection whose ClientHello names a passthrough route
+//! (`passthrough_routes`, by SNI; `*.example.com` covers its subdomains and
+//! itself) is relayed to that route's backend still encrypted.
+//!
+//! It is a switch inside every TCP listener's own accept path, after the
+//! connection has been admitted (connection limits, block list) and its whole
+//! ClientHello peeked within the handshake time: a separate listener on the
+//! same port could not bind it. The peeked bytes are still in the socket, so
+//! the backend receives the ClientHello as the client sent it. A relay ends
+//! when either side does, after `idle` with nothing moving either way, or at
+//! shutdown.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use tokio::net::{TcpListener, TcpStream};
+use arc_swap::ArcSwap;
+use tokio::net::TcpStream;
+use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use crate::config::ProxyConfig;
+use crate::config::{PassthroughRoute, ProxyConfig};
+use crate::metrics::{ConnectionProtocol, MetricsRegistry};
 
 use super::proxy_protocol::send_proxy_v2_header;
 
-/// Run TLS passthrough server (SNI-based routing without termination)
-/// Enabled when passthrough_routes are configured in proxy-config.toml
-pub async fn run_tls_passthrough_server(
-    addr: SocketAddr,
-    config: Arc<ProxyConfig>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if config.passthrough_routes.is_empty() {
-        info!("📭 No passthrough routes configured, skipping passthrough server");
-        return Ok(());
-    }
+/// The passthrough routes, as last loaded or reloaded
+static ROUTES: LazyLock<ArcSwap<Vec<PassthroughRoute>>> =
+    LazyLock::new(|| ArcSwap::from_pointee(Vec::new()));
 
-    info!(
-        "🔀 Starting TLS passthrough server on {} (SNI routing)",
-        addr
-    );
-    for route in &config.passthrough_routes {
-        info!("   {} → {}", route.sni, route.backend);
-    }
+/// Where relays are counted, and the signal that the process is shutting down
+static RUNTIME: std::sync::OnceLock<(Arc<MetricsRegistry>, watch::Receiver<()>)> =
+    std::sync::OnceLock::new();
 
-    let listener = TcpListener::bind(addr).await?;
-
-    loop {
-        let (stream, client_addr) = listener.accept().await?;
-        let client_addr = crate::security::canonical_addr(client_addr);
-
-        // Passthrough shovels bytes in both directions, so Nagle here just adds
-        // a delayed-ACK wait to whatever the tunnelled protocol does.
-        if config.server.tcp_nodelay {
-            if let Err(e) = stream.set_nodelay(true) {
-                warn!("Failed to set TCP_NODELAY on {}: {}", client_addr, e);
-            }
-        }
-        let config = config.clone();
-
-        tokio::spawn(async move {
-            if let Err(e) = handle_passthrough_connection(stream, client_addr, config).await {
-                debug!("Passthrough connection error from {}: {}", client_addr, e);
-            }
-        });
-    }
+/// Count relays in `metrics` and end them when `shutdown` fires (once, at
+/// startup).
+pub fn init(metrics: Arc<MetricsRegistry>, shutdown: watch::Receiver<()>) {
+    let _ = RUNTIME.set((metrics, shutdown));
 }
 
-/// Handle a TLS passthrough connection by peeking at SNI
-async fn handle_passthrough_connection(
-    client_stream: TcpStream,
-    client_addr: SocketAddr,
-    config: Arc<ProxyConfig>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Peek at the TLS ClientHello to extract SNI
-    let mut peek_buf = [0u8; 1024];
-    let n = client_stream.peek(&mut peek_buf).await?;
+/// Take `passthrough_routes`, at startup and on every reload.
+pub fn configure(config: &ProxyConfig) {
+    for route in &config.passthrough_routes {
+        info!("🔀 TLS passthrough: {} → {}", route.sni, route.backend);
+    }
+    ROUTES.store(Arc::new(config.passthrough_routes.clone()));
+}
 
-    let sni = extract_sni_from_client_hello(&peek_buf[..n]);
+/// Whether any passthrough route is configured (a listener that does not
+/// peek the ClientHello otherwise need not, then).
+pub fn active() -> bool {
+    !ROUTES.load().is_empty()
+}
 
-    // M-4: Use ok_or_else instead of unwrap() to avoid fragile guard pattern
-    let sni = sni.ok_or_else(|| {
-        warn!("No SNI in ClientHello from {}", client_addr);
-        Box::<dyn std::error::Error + Send + Sync>::from("No SNI in ClientHello")
-    })?;
-    debug!("SNI from {}: {}", client_addr, sni);
+/// The route for a ClientHello naming `sni`.
+fn route_for(sni: &str) -> Option<PassthroughRoute> {
+    let sni = sni.trim_end_matches('.').to_ascii_lowercase();
+    ROUTES
+        .load()
+        .iter()
+        .find(|route| {
+            let pattern = route.sni.to_ascii_lowercase();
+            match pattern.strip_prefix("*.") {
+                Some(base) => sni == base || sni.ends_with(&format!(".{base}")),
+                None => pattern == sni,
+            }
+        })
+        .cloned()
+}
 
-    // Find matching passthrough route (case-insensitive SNI matching)
-    let sni_lower = sni.to_ascii_lowercase();
-    let route = config.passthrough_routes.iter().find(|r| {
-        let r_sni_lower = r.sni.to_ascii_lowercase();
-        if r_sni_lower.starts_with("*.") {
-            // Wildcard match
-            let suffix = &r_sni_lower[1..]; // ".example.com"
-            sni_lower.ends_with(suffix) || sni_lower == r_sni_lower[2..]
-        } else {
-            r_sni_lower == sni_lower
-        }
-    });
+/// When the ClientHello in `peeked` names a passthrough route, relay the
+/// connection there and return None once the relay ends; otherwise give the
+/// stream back to be served.
+pub(crate) async fn divert(
+    stream: TcpStream,
+    peeked: &[u8],
+    client: SocketAddr,
+    idle: Duration,
+) -> Option<TcpStream> {
+    if !active() {
+        return Some(stream);
+    }
+    let Some(route) = extract_sni_from_client_hello(peeked).and_then(|sni| route_for(&sni)) else {
+        return Some(stream);
+    };
+    let Some((metrics, shutdown)) = RUNTIME.get() else {
+        return Some(stream);
+    };
+    relay(stream, &route, client, metrics, idle, shutdown.clone()).await;
+    None
+}
 
-    // M-4: Use ok_or_else instead of unwrap() to avoid fragile guard pattern
-    let route = route.ok_or_else(|| {
-        warn!(
-            "No passthrough route for SNI '{}' from {}",
-            sni, client_addr
-        );
-        Box::<dyn std::error::Error + Send + Sync>::from(format!("No route for SNI: {}", sni))
-    })?;
-    info!(
-        "Passthrough: {} → {} (SNI: {})",
-        client_addr, route.backend, sni
-    );
+/// [`divert`] for a listener that has not peeked the ClientHello: peek it
+/// whole (within `deadline`), then divert.
+pub(crate) async fn peek_and_divert(
+    stream: TcpStream,
+    client: SocketAddr,
+    idle: Duration,
+    deadline: tokio::time::Instant,
+) -> Option<TcpStream> {
+    if !active() {
+        return Some(stream);
+    }
+    let mut peeked = vec![0u8; 5 + 16 * 1024];
+    let n = match super::peek_client_hello(&stream, &mut peeked, deadline).await {
+        Some(Ok(n)) => n,
+        _ => 0,
+    };
+    divert(stream, &peeked[..n], client, idle).await
+}
 
-    // Connect to backend
-    let backend_stream = tokio::time::timeout(
-        Duration::from_millis(route.timeout_ms),
+async fn relay(
+    mut client_stream: TcpStream,
+    route: &PassthroughRoute,
+    client: SocketAddr,
+    metrics: &MetricsRegistry,
+    idle: Duration,
+    mut shutdown: watch::Receiver<()>,
+) {
+    let _open = metrics
+        .connections
+        .connection_opened(ConnectionProtocol::Passthrough);
+    let backend = match tokio::time::timeout(
+        Duration::from_millis(route.timeout_ms.max(1)),
         TcpStream::connect(&route.backend),
     )
     .await
-    .map_err(|_| "Backend connection timeout")?
-    .map_err(|e| format!("Backend connection failed: {}", e))?;
-
-    if let Err(e) = backend_stream.set_nodelay(true) {
-        warn!("Failed to set TCP_NODELAY on {}: {}", route.backend, e);
-    }
-
-    // Send PROXY protocol v2 header if enabled (before stream split)
-    if route.proxy_protocol {
-        // Get local address (proxy address that client connected to)
-        let local_addr = client_stream
-            .local_addr()
-            .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 0)));
-
-        // Send PROXY protocol v2 header to backend
-        if let Err(e) = send_proxy_v2_header(&backend_stream, client_addr, local_addr).await {
+    {
+        Ok(Ok(backend)) => backend,
+        Ok(Err(e)) => {
+            warn!("Passthrough {} → {}: {}", client, route.backend, e);
+            return;
+        }
+        Err(_) => {
             warn!(
-                "Failed to send PROXY protocol v2 header to {}: {}",
-                route.backend, e
+                "Passthrough {} → {}: connect timed out",
+                client, route.backend
             );
-            // Continue anyway - some backends may not require it
-        } else {
-            debug!(
-                "Sent PROXY protocol v2 header: {} → {} (backend: {})",
-                client_addr, local_addr, route.backend
+            return;
+        }
+    };
+    let _ = backend.set_nodelay(true);
+    if route.proxy_protocol {
+        let local = client_stream
+            .local_addr()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+        if let Err(e) = send_proxy_v2_header(&backend, client, local).await {
+            warn!(
+                "Passthrough {} → {}: PROXY header not sent: {}",
+                client, route.backend, e
             );
+            return;
         }
     }
-
-    // Bidirectional copy
-    let (mut client_read, mut client_write) = client_stream.into_split();
-    let (mut backend_read, mut backend_write) = backend_stream.into_split();
-
-    let client_to_backend =
-        tokio::spawn(async move { tokio::io::copy(&mut client_read, &mut backend_write).await });
-
-    let backend_to_client =
-        tokio::spawn(async move { tokio::io::copy(&mut backend_read, &mut client_write).await });
-
-    // Wait for either direction to complete
+    debug!(
+        "Passthrough {} → {} ({})",
+        client,
+        route.backend,
+        route.name.as_deref().unwrap_or(&route.sni)
+    );
     tokio::select! {
-        _ = client_to_backend => {},
-        _ = backend_to_client => {},
+        (up, down) = crate::ws_tunnel::relay(&mut client_stream, backend, Some(idle)) => {
+            debug!("Passthrough {} ended: {} bytes up, {} down", client, up, down);
+        }
+        _ = shutdown.changed() => {
+            debug!("Passthrough {} closed at shutdown", client);
+        }
     }
-
-    Ok(())
 }
 
 /// Extract SNI from TLS ClientHello
-fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {
+pub(crate) fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {
     // TLS record header: type (1) + version (2) + length (2)
     if data.len() < 5 {
         return None;
@@ -453,12 +470,12 @@ mod tests {
 
         // We'll set length later
         let record_len_pos = data.len();
-        data.extend_from_slice(&[0x00, 0x00]); // Placeholder
+        data.extend_from_slice(&[0x00, 0x00]); // the record length, set below
 
         // Handshake header
         data.push(0x01); // ClientHello
         let handshake_len_pos = data.len();
-        data.extend_from_slice(&[0x00, 0x00, 0x00]); // Placeholder (3 bytes)
+        data.extend_from_slice(&[0x00, 0x00, 0x00]); // the handshake length, set below
 
         let client_hello_start = data.len();
 

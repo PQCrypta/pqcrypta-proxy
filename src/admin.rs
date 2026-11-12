@@ -232,6 +232,7 @@ impl AdminServer {
             global_cooldown_until: Arc::new(RwLock::new(None)),
             global_cooldown_count: Arc::new(AtomicU32::new(0)),
             config_manager: Some(self.state.config_manager.clone()),
+            audit_logger: self.state.audit_logger.clone(),
         });
 
         // F-14: Endpoint-level cooldown state to prevent ACME/OCSP quota exhaustion.
@@ -313,6 +314,11 @@ impl AdminServer {
             .route("/canary/suspend/{server_id}", post(canary_suspend_handler))
             .route("/canary/resume/{server_id}", post(canary_resume_handler))
             .route("/canary/weight/{server_id}", post(canary_weight_handler))
+            .route("/pools", get(pools_handler))
+            .route(
+                "/pools/{pool}/servers/{server_id}/{action}",
+                post(pool_server_handler),
+            )
             .route("/blocklist", get(blocklist_handler))
             .route("/blocklist/unblock/{ip}", post(blocklist_unblock_handler))
             .route("/cache", get(cache_stats_handler))
@@ -414,6 +420,8 @@ struct AdminAuthState {
     global_cooldown_count: Arc<AtomicU32>,
     /// The live configuration, for [`AdminAuthState::credentials`].
     config_manager: Option<Arc<ConfigManager>>,
+    /// Where a refused request is recorded
+    audit_logger: Option<Arc<AuditLogger>>,
 }
 
 /// The admin credentials in force for one request.
@@ -424,6 +432,21 @@ struct AdminCredentials {
 }
 
 impl AdminAuthState {
+    /// Record a request the admin API refused, with how many this address
+    /// has had refused in the current window.
+    fn refused(&self, client_ip: &str, reason: &str) {
+        if let Some(audit) = &self.audit_logger {
+            audit.log(AuditEvent::AuthFailure {
+                ip: client_ip.to_string(),
+                reason: reason.to_string(),
+                attempt: self
+                    .failed_attempts
+                    .get(client_ip)
+                    .map_or(0, |entry| entry.value().0),
+            });
+        }
+    }
+
     /// The IP allowlist, token and HMAC secret from the live `[admin]`, so a
     /// reload that rotates one applies to the next request. They were copied
     /// once at startup: a token rotated by editing the config and reloading
@@ -494,6 +517,7 @@ async fn auth_middleware(
     // Check IP whitelist
     if !credentials.allowed_ips.is_empty() && !credentials.allowed_ips.contains(&client_ip) {
         warn!("Admin API access denied for IP: {}", client_ip);
+        auth.refused(&client_ip, "address not in admin.allowed_ips");
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -568,6 +592,7 @@ async fn auth_middleware(
                     client_ip, *count, ADMIN_AUTH_MAX_FAILURES
                 );
             }
+            auth.refused(&client_ip, "bearer token not accepted");
 
             // AUD-10 / F-08: Increment global failure counter and trigger cooldown
             // if threshold hit.  The cooldown duration doubles on each successive
@@ -617,7 +642,20 @@ async fn auth_middleware(
             .get("x-admin-timestamp")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        let nonce_val = headers.get("x-admin-nonce").and_then(|v| v.to_str().ok());
+        // Required: without a nonce a signed request could be sent again,
+        // unchanged, for as long as its timestamp is in the window.
+        let Some(nonce_val) = headers
+            .get("x-admin-nonce")
+            .and_then(|v| v.to_str().ok())
+            .filter(|n| (8..=128).contains(&n.len()))
+        else {
+            warn!(
+                "Admin API HMAC request from {} carries no usable nonce",
+                client_ip
+            );
+            auth.refused(&client_ip, "request nonce missing");
+            return StatusCode::UNAUTHORIZED.into_response();
+        };
 
         // Validate timestamp freshness (±300 s replay window).
         let ts_u: u64 = ts.parse().unwrap_or(0);
@@ -630,6 +668,7 @@ async fn auth_middleware(
                 "Admin API HMAC timestamp out of 300s window from {}",
                 client_ip
             );
+            auth.refused(&client_ip, "request signature timestamp outside its window");
             return StatusCode::UNAUTHORIZED.into_response();
         }
 
@@ -642,10 +681,7 @@ async fn auth_middleware(
         };
         let req_method = request.method().as_str().to_owned();
 
-        let message = match nonce_val {
-            Some(n) => format!("{}\n{}\n{}\n{}", req_method, req_path_and_query, ts, n),
-            None => format!("{}\n{}\n{}", req_method, req_path_and_query, ts),
-        };
+        let message = format!("{req_method}\n{req_path_and_query}\n{ts}\n{nonce_val}");
 
         type HmacSha256 = Hmac<Sha256>;
         let mut mac =
@@ -656,15 +692,15 @@ async fn auth_middleware(
         let sig_valid: bool = sig.as_bytes().ct_eq(expected.as_bytes()).into();
         if !sig_valid {
             warn!("Admin API HMAC signature invalid from {}", client_ip);
+            auth.refused(&client_ip, "request signature not accepted");
             return StatusCode::UNAUTHORIZED.into_response();
         }
 
         // Nonce deduplication: reject replays within the 300s window.
-        if let Some(n) = nonce_val {
-            if auth.hmac_nonce_store.check_and_insert(n) {
-                warn!("Admin API HMAC nonce replay detected from {}", client_ip);
-                return StatusCode::UNAUTHORIZED.into_response();
-            }
+        if auth.hmac_nonce_store.check_and_insert(nonce_val) {
+            warn!("Admin API HMAC nonce replay detected from {}", client_ip);
+            auth.refused(&client_ip, "request nonce already used");
+            return StatusCode::UNAUTHORIZED.into_response();
         }
     }
 
@@ -1333,15 +1369,24 @@ struct QuicHealthResponse {
     status: String,
     port: u16,
     migration_enabled: bool,
+    /// HTTP/3 connections open now
     connections: u64,
+    /// HTTP/3 connections accepted since start
     http3_connections_total: u64,
+    /// WebTransport sessions open now, on this listener and the WebTransport port
+    webtransport_sessions: u64,
+    /// CONNECT-UDP sessions open now
+    connect_udp_sessions: u64,
 }
 
 /// WebTransport health response
 #[derive(Serialize)]
 struct WebTransportHealthResponse {
     status: String,
+    /// Sessions open now
     active_connections: u64,
+    /// Sessions accepted since start
+    sessions_total: u64,
     allowed_origins: Vec<String>,
     max_sessions_per_origin: u32,
     max_streams_per_session: u32,
@@ -1366,8 +1411,10 @@ async fn health_quic_handler(State(state): State<Arc<AdminState>>) -> Json<QuicH
         status: status.to_string(),
         port: config.server.udp_port,
         migration_enabled: config.server.enable_quic_migration,
-        connections: snapshot.connections.active,
+        connections: snapshot.connections.open_http3,
         http3_connections_total: snapshot.connections.http3,
+        webtransport_sessions: snapshot.connections.open_webtransport,
+        connect_udp_sessions: snapshot.connections.open_connect_udp,
     })
 }
 
@@ -1387,7 +1434,8 @@ async fn health_webtransport_handler(
 
     Json(WebTransportHealthResponse {
         status: status.to_string(),
-        active_connections: snapshot.connections.webtransport,
+        active_connections: snapshot.connections.open_webtransport,
+        sessions_total: snapshot.connections.webtransport,
         allowed_origins: config.server.webtransport_allowed_origins.clone(),
         max_sessions_per_origin: config.server.webtransport_max_sessions_per_origin,
         max_streams_per_session: config.server.webtransport_max_streams_per_session,
@@ -1476,6 +1524,74 @@ struct CanaryPoolRequest {
 }
 
 /// POST /canary/suspend/:server_id — suspend a canary server
+/// `GET /pools`: every load-balancer pool, its algorithm, queue and members.
+async fn pools_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+    match state.load_balancer {
+        Some(ref lb) => {
+            let mut pools = lb.all_stats();
+            pools.sort_by(|a, b| a.name.cmp(&b.name));
+            Json(pools).into_response()
+        }
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "load balancer not available"})),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /pools/{pool}/servers/{server_id}/{action}`: `drain` (no new
+/// sessions; the ones it has kept for `connection_draining.timeout_secs`),
+/// `undrain`, `unhealthy` (out of rotation until marked healthy or its health
+/// check finds it), `healthy` (back in, breaker closed, in slow start where
+/// the pool has it).
+async fn pool_server_handler(
+    State(state): State<Arc<AdminState>>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    Path((pool, server_id, action)): Path<(String, String, String)>,
+) -> impl IntoResponse {
+    let Some(ref lb) = state.load_balancer else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "load balancer not available"})),
+        )
+            .into_response();
+    };
+    let done = match action.as_str() {
+        "drain" => lb.drain_server(&pool, &server_id),
+        "undrain" => lb.undrain_server(&pool, &server_id),
+        "healthy" => lb.mark_healthy(&pool, &server_id),
+        "unhealthy" => lb.mark_unhealthy(&pool, &server_id),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "action is one of drain, undrain, healthy, unhealthy"
+                })),
+            )
+                .into_response();
+        }
+    };
+    if let Some(ref logger) = state.audit_logger {
+        logger.log(AuditEvent::AdminAction {
+            ip: remote_addr.ip().to_string(),
+            action: format!("pool-server-{action}"),
+            success: done,
+            detail: Some(format!("{pool}/{server_id}")),
+        });
+    }
+    if done {
+        Json(serde_json::json!({"success": true, "pool": pool, "server": server_id, "action": action}))
+            .into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("no server '{server_id}' in pool '{pool}'")})),
+        )
+            .into_response()
+    }
+}
+
 async fn canary_suspend_handler(
     State(state): State<Arc<AdminState>>,
     Path(server_id): Path<String>,
@@ -2123,7 +2239,7 @@ async fn waf_explain_handler(
             .map_err(|e| bad(format!("header {name}: {e}")))?;
         headers.insert(name, value);
     }
-    let mut body = match &req.body_base64 {
+    let body = match &req.body_base64 {
         Some(b) => Some(
             base64::engine::general_purpose::STANDARD
                 .decode(b)
@@ -2131,11 +2247,6 @@ async fn waf_explain_handler(
         ),
         None => None,
     };
-    // The same cap enforcement applies before inspecting a body.
-    let cap = state.config_manager.get().waf.max_body_scan_bytes;
-    if let Some(b) = body.as_mut() {
-        b.truncate(cap);
-    }
     let explanation = waf.explain(&crate::waf::WafRequest {
         method: &req.method,
         path: &req.path,
@@ -2177,6 +2288,7 @@ mod auth_tests {
             global_cooldown_until: Arc::new(RwLock::new(None)),
             global_cooldown_count: Arc::new(AtomicU32::new(0)),
             config_manager: None,
+            audit_logger: None,
         })
     }
 

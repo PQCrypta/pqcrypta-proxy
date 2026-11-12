@@ -265,6 +265,9 @@ impl StatusCode {
     /// HTTP 404 Not Found status code.
     pub const NOT_FOUND: Self = Self(404);
 
+    /// HTTP 421 Misdirected Request status code.
+    pub const MISDIRECTED_REQUEST: Self = Self(421);
+
     /// HTTP 429 Too Many Requests status code.
     pub const TOO_MANY_REQUESTS: Self = Self(429);
 

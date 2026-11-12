@@ -25,7 +25,6 @@ use tracing::{debug, error, info, warn, Instrument};
 use crate::cache::ResponseCache;
 use crate::config::{ConfigReloadEvent, ProxyConfig};
 use crate::connect_udp::{self, DatagramRouter};
-use crate::handlers::WebTransportHandler;
 use crate::http3_features::EarlyHintsState;
 use crate::load_balancer::LoadBalancer;
 use crate::metrics::{ConnectionProtocol, MetricsRegistry};
@@ -96,6 +95,38 @@ fn is_benign_h3_close<E: std::fmt::Display>(err: &E) -> bool {
                 || msg.ends_with("(code 256)")))
 }
 
+/// True when the error is the peer's own doing beyond hanging up: it broke
+/// HTTP/3 or QPACK and this side closed the connection for it (the codes RFC
+/// 9114 section 8.1 and RFC 9204 section 6 define for a peer's violation,
+/// and QUIC's PROTOCOL_VIOLATION), or it reset a stream of its own. Worth a
+/// line, since a client that keeps doing it is worth knowing about, but not
+/// an error of this server's: the conformance suite's own clients do it every
+/// hour by design.
+fn is_peer_violation<E: std::fmt::Display>(err: &E) -> bool {
+    const PEER_CODES: [&str; 13] = [
+        "H3_GENERAL_PROTOCOL_ERROR",
+        "H3_STREAM_CREATION_ERROR",
+        "H3_CLOSED_CRITICAL_STREAM",
+        "H3_FRAME_UNEXPECTED",
+        "H3_FRAME_ERROR",
+        "H3_EXCESSIVE_LOAD",
+        "H3_ID_ERROR",
+        "H3_SETTINGS_ERROR",
+        "H3_MISSING_SETTINGS",
+        "H3_MESSAGE_ERROR",
+        "QPACK_DECOMPRESSION_FAILED",
+        "QPACK_ENCODER_STREAM_ERROR",
+        "QPACK_DECODER_STREAM_ERROR",
+    ];
+    let msg = err.to_string();
+    // Raised here ("Local error"): the same code from the peer ("Remote
+    // error", "closed by peer") is the peer saying this side broke HTTP/3.
+    (msg.contains("Local error") && PEER_CODES.iter().any(|code| msg.contains(code)))
+        || msg.contains("Remote reset")
+        // quinn's description of PROTOCOL_VIOLATION, detected here
+        || (msg.contains("error with protocol compliance") && !msg.contains("closed by peer"))
+}
+
 /// How loudly to report a QUIC connection that ended in an error.
 ///
 /// Most of what ends a connection is the client's doing and says nothing about
@@ -123,6 +154,11 @@ pub(crate) fn log_quic_end(remote_addr: SocketAddr, msg: &str) {
         || msg.contains("peer is incompatible")
     {
         debug!("QUIC connection from {} ended: {}", remote_addr, msg);
+    } else if is_peer_violation(&msg) {
+        info!(
+            "QUIC connection from {} ended: the peer broke the protocol ({})",
+            remote_addr, msg
+        );
     } else if msg.contains("no server certificate chain resolved") {
         warn!(
             "QUIC handshake from {}: no certificate for the requested server name ({})",
@@ -394,6 +430,54 @@ pub(crate) fn install_crypto(
 /// `is_conformance_host`, ran `find_route` (an O(routes) scan -- one route in a
 /// test config, sixty on the live edge, nine of them carrying regexes) and
 /// cloned every policy field. Extracted so the caller can resolve it once.
+/// Hand a WebTransport unidirectional stream to its session, or refuse it
+/// (WT_BUFFERED_STREAM_REJECTED) when there is no such session now.
+fn deliver_wt_uni(
+    sessions: &mut std::collections::HashMap<u64, crate::wt_session::H3SessionFeed>,
+    session: u64,
+    prefix: Bytes,
+    mut stream: h3_quinn::RecvStream,
+) {
+    use h3::quic::RecvStream as _;
+    let feed = sessions.get(&session).filter(|feed| !feed.has_ended());
+    match feed {
+        Some(feed) => match stream.into_inner() {
+            Some(recv) => feed.deliver_uni(crate::wt_session::Prefixed::new(prefix, recv)),
+            None => debug!("WebTransport stream with a read in flight: dropped"),
+        },
+        None => {
+            stream.stop_sending(u64::from(crate::wt_session::WT_BUFFERED_STREAM_REJECTED));
+            sessions.remove(&session);
+        }
+    }
+}
+
+/// Hand a WebTransport bidirectional stream to its session, or refuse it as
+/// [`deliver_wt_uni`] does.
+fn deliver_wt_bi(
+    sessions: &mut std::collections::HashMap<u64, crate::wt_session::H3SessionFeed>,
+    session: u64,
+    prefix: Bytes,
+    stream: h3_quinn::BidiStream<Bytes>,
+) {
+    use h3::quic::{BidiStream as _, RecvStream as _, SendStream as _};
+    let (mut send, mut recv) = stream.split();
+    let feed = sessions.get(&session).filter(|feed| !feed.has_ended());
+    let Some(feed) = feed else {
+        let code = u64::from(crate::wt_session::WT_BUFFERED_STREAM_REJECTED);
+        send.reset(code);
+        recv.stop_sending(code);
+        sessions.remove(&session);
+        return;
+    };
+    match (send.into_inner(), recv.into_inner()) {
+        (Some(send), Some(recv)) => {
+            feed.deliver_bi(send, crate::wt_session::Prefixed::new(prefix, recv));
+        }
+        _ => debug!("WebTransport stream with I/O in flight: dropped"),
+    }
+}
+
 /// Whether an extended CONNECT this listener answers itself (WebTransport,
 /// WebSocket, CONNECT-UDP) is refused, and with which status: the advanced
 /// rate limiter and `SecurityState::evaluate`, as for any other request. A
@@ -710,7 +794,7 @@ impl QuicListener {
         info!("PQC enabled: {}", tls_provider.is_pqc_enabled());
 
         // Create backend pool
-        let backend_pool = Arc::new(BackendPool::new(config.clone()));
+        let backend_pool = Arc::new(BackendPool::new(&config));
 
         // Early Hints state is created once in main() and shared across all QUIC
         // listeners so the config reload handler can update it live.
@@ -863,7 +947,7 @@ impl QuicListener {
                         tokio::spawn(async move {
                             // Held until the connection ends
                             let _slot = slot;
-                            metrics.connections.connection_opened(ConnectionProtocol::Http3);
+                            let _open = metrics.connections.connection_opened(ConnectionProtocol::Http3);
                             if let Err(e) = Self::handle_connection(
                                 incoming,
                                 remote_addr,
@@ -882,7 +966,6 @@ impl QuicListener {
                             ).await {
                                 log_connection_end(remote_addr, &e);
                             }
-                            metrics.connections.connection_closed();
                         });
                     }
                 }
@@ -897,7 +980,7 @@ impl QuicListener {
                             // connect and pool timeouts are fixed when it is
                             // built) were kept from startup.
                             self.fingerprint_config = new_config.fingerprint.clone();
-                            self.backend_pool = Arc::new(BackendPool::new(new_config.clone()));
+                            self.backend_pool = Arc::new(BackendPool::new(&new_config));
                             self.config = new_config;
                         }
                         // main reloads the shared TLS provider, once, and
@@ -1074,7 +1157,7 @@ impl QuicListener {
             // says nothing about success; a close reason does.
             established.await;
             if let Some(reason) = connection.close_reason() {
-                metrics.tls.handshake_completed(false, false);
+                metrics.handshake_failed();
                 return Err(reason.into());
             }
             debug!("QUIC connection established: {}", remote_addr);
@@ -1127,15 +1210,23 @@ impl QuicListener {
         // is already serving 0-RTT -- when its handshake completes, which a
         // replayed flight never does.
         let pqc = handshake_facts.is_post_quantum();
+        let completed = {
+            let metrics = metrics.clone();
+            let group = handshake_facts.kex_group.clone();
+            let client = remote_addr.ip();
+            move || {
+                metrics.tls.handshake_completed(true, pqc);
+                crate::pqc_policy::handshake_completed(client, group.as_deref(), pqc);
+            }
+        };
         match completing {
-            None => metrics.tls.handshake_completed(true, pqc),
+            None => completed(),
             Some(established) => {
-                let metrics = metrics.clone();
                 let connection = connection.clone();
                 tokio::spawn(async move {
                     established.await;
                     if connection.close_reason().is_none() {
-                        metrics.tls.handshake_completed(true, pqc);
+                        completed();
                     }
                 });
             }
@@ -1274,9 +1365,12 @@ impl QuicListener {
                 .await?;
             }
             Err(e) => {
-                // Fall back to raw QUIC streams (WebTransport without HTTP/3)
-                warn!("HTTP/3 handshake failed, handling raw QUIC streams: {}", e);
-                Self::handle_raw_quic(connection, remote_addr, config, backend_pool).await?;
+                // A connection that cannot set up HTTP/3 has nothing this
+                // listener serves: it is closed, as H3_SETTINGS_ERROR asks
+                // (RFC 9114 section 7.2.4). Its streams used to be passed to
+                // the root route's backend as raw POSTs, past every rule.
+                debug!("HTTP/3 setup with {} failed: {}", remote_addr, e);
+                connection.close(quinn::VarInt::from_u32(0x109), b"HTTP/3 setup failed");
             }
         }
 
@@ -1361,7 +1455,9 @@ impl QuicListener {
                     )
                     .await
                     {
-                        if is_benign_h3_close(&e) {
+                        // A violation that ends the connection is reported
+                        // once, where the connection's accept loop ends.
+                        if is_benign_h3_close(&e) || is_peer_violation(&e) {
                             debug!("HTTP/3 request ended by peer: {}", e);
                         } else {
                             error!("HTTP/3 request error: {}", e);
@@ -1372,14 +1468,35 @@ impl QuicListener {
             );
         };
 
+        // The WebTransport sessions open on this connection, by session ID
+        // (the CONNECT's stream ID): their streams and datagrams are handed
+        // to them here (crate::wt_session).
+        let mut wt_sessions: std::collections::HashMap<u64, crate::wt_session::H3SessionFeed> =
+            std::collections::HashMap::new();
+
         loop {
-            match h3.accept().await {
-                Ok(Some(resolver)) => {
-                    // Resolve the request
-                    let (request, stream) = match resolver.resolve_request().await {
-                        Ok(result) => result,
+            match h3.accept_any().await {
+                Ok(Some(h3::server::Accepted::WebTransportUni {
+                    session,
+                    prefix,
+                    stream,
+                })) => {
+                    deliver_wt_uni(&mut wt_sessions, session, prefix, stream);
+                }
+                Ok(Some(h3::server::Accepted::Request(resolver))) => {
+                    // Resolve the request, or the WebTransport stream
+                    let (request, stream) = match resolver.resolve_any().await {
+                        Ok(h3::server::Resolved::Request(request, stream)) => (request, stream),
+                        Ok(h3::server::Resolved::WebTransportBi {
+                            session,
+                            prefix,
+                            stream,
+                        }) => {
+                            deliver_wt_bi(&mut wt_sessions, session, prefix, stream);
+                            continue;
+                        }
                         Err(e) => {
-                            if is_benign_h3_close(&e) {
+                            if is_benign_h3_close(&e) || is_peer_violation(&e) {
                                 debug!("HTTP/3 request abandoned before its headers: {}", e);
                             } else {
                                 error!("Failed to resolve request: {}", e);
@@ -1475,16 +1592,24 @@ impl QuicListener {
                     // every other request meets before anything is opened, and
                     // written to the access log either way.
                     if is_webtransport || is_ws_h3 || is_connect_udp {
-                        let refusal = connect_refusal(
-                            &security,
-                            &advanced_rate_limiter,
-                            &request,
-                            host.as_deref(),
-                            &path,
-                            remote_addr,
-                            &fingerprint,
-                        )
-                        .await;
+                        // A classical key exchange where the server refuses
+                        // those is answered as any other request on the
+                        // connection is (pqc_policy.rs).
+                        let refusal =
+                            if crate::pqc_policy::refuses(conn_headers.pqc_enabled == "true") {
+                                Some(http::StatusCode::MISDIRECTED_REQUEST)
+                            } else {
+                                connect_refusal(
+                                    &security,
+                                    &advanced_rate_limiter,
+                                    &request,
+                                    host.as_deref(),
+                                    &path,
+                                    remote_addr,
+                                    &fingerprint,
+                                )
+                                .await
+                            };
                         if let Some(status) = refusal {
                             log_connect(
                                 &request,
@@ -1532,11 +1657,10 @@ impl QuicListener {
                         // Note: find_route(is_webtransport=true) still returns non-WT routes
                         // (route_matches only prevents WT-only routes matching non-WT requests,
                         // not the reverse), so we must additionally check route.webtransport.
-                        let has_wt_route = config
+                        let wt_route = config
                             .find_route(host.as_deref(), &path, true)
-                            .as_ref()
-                            .is_some_and(|r| r.webtransport);
-                        if !has_wt_route {
+                            .filter(|r| r.webtransport);
+                        if wt_route.is_none() {
                             debug!(
                                 "WebTransport CONNECT rejected (no WT route) for {} from {}",
                                 path, remote_addr
@@ -1588,67 +1712,64 @@ impl QuicListener {
                         );
                         log_outcome(http::StatusCode::OK);
 
-                        // Track WebTransport session in metrics
-                        metrics
+                        // Counted open until the session's task ends
+                        let wt_open = metrics
                             .connections
                             .connection_opened(ConnectionProtocol::WebTransport);
 
                         // Handle WebTransport session - pass the stream to the handler
                         // The session handler will manage bidirectional streams and datagrams
-                        let handler = WebTransportHandler::new(
+                        // The session: its streams and datagrams come from
+                        // this loop and the connection's datagram router, and
+                        // it is served as the WebTransport server serves its
+                        // own (webtransport_server::serve_session).
+                        let session_id = stream.send_id().into_inner();
+                        let (session, feed) =
+                            crate::wt_session::H3Session::new(session_id, quic_connection.clone());
+                        let router = datagram_router
+                            .get_or_insert_with(|| DatagramRouter::new(quic_connection.clone()))
+                            .clone();
+                        router.route_webtransport(
+                            session.quarter_stream_id(),
+                            feed.datagram_sender(),
+                        );
+                        wt_sessions.retain(|_, feed| !feed.has_ended());
+                        wt_sessions.insert(session_id, feed);
+
+                        let serve = crate::webtransport_server::serve_session(
+                            Arc::clone(&session),
+                            remote_addr,
+                            path.clone(),
+                            wt_route.map(|r| r.backend.clone()),
                             config.clone(),
                             backend_pool.clone(),
-                            remote_addr,
+                            Some((*security).clone()),
                         );
-
-                        let wt_metrics = metrics.clone();
                         tokio::spawn(async move {
-                            // The CONNECT stream IS the session. Hold it for the
-                            // session's lifetime by moving it in here.
-                            //
-                            // It used to stay behind as a local and go out of
-                            // scope at the end of this match arm. h3's
-                            // RequestStream finishes and resets on drop, so the
-                            // server sent FIN and STOP_SENDING on stream 0
-                            // immediately after answering 200 — tearing down the
-                            // session it had just accepted.
-                            //
-                            // Invisible from here: the accept path logged success
-                            // and nothing logged the drop. Chrome's netlog named
-                            // it — STOP_SENDING_FRAME_RECEIVED, then a 5-byte FIN
-                            // on stream 0, then ERR_QUIC_PROTOCOL_ERROR, against a
-                            // :4433 control that reached
-                            // QUIC_SESSION_WEBTRANSPORT_SESSION_READY instead.
-                            //
-                            // Tolerant clients hid it. aioquic and the wtransport
-                            // crate both treat a finished CONNECT stream as a
-                            // usable session and reported the endpoint working.
+                            // The CONNECT stream IS the session (Chrome tears
+                            // the session down when it is finished or reset):
+                            // held for the session's life, and read, since the
+                            // session ends when the client finishes it.
                             let mut session_stream = stream;
                             debug!(
                                 "WebTransport session active for {} on path {}",
                                 remote_addr, path
                             );
-                            if let Err(e) = handler.handle_session().await {
-                                error!("WebTransport session error for {}: {}", remote_addr, e);
+                            let client_ended = async {
+                                while let Ok(Some(_)) = session_stream.recv_data().await {}
+                            };
+                            tokio::select! {
+                                served = serve => {
+                                    if let Err(e) = served {
+                                        debug!("WebTransport session for {} ended: {}", remote_addr, e);
+                                    }
+                                }
+                                () = client_ended => {}
                             }
-
-                            // Holding the stream in a binding was not enough:
-                            // `handle_session` logs twice and returns Ok(()) at
-                            // once, despite saying it "remains active until
-                            // client disconnects", so the task ended in
-                            // microseconds and the drop still finished the
-                            // stream. Chrome saw the same FIN and STOP_SENDING
-                            // as before the change.
-                            //
-                            // Reading is what actually waits. The CONNECT stream
-                            // stays open for the life of a WebTransport session,
-                            // so this resolves when the peer closes or resets it
-                            // — the session ending is the thing being awaited,
-                            // not a timer.
-                            while let Ok(Some(_)) = session_stream.recv_data().await {}
-
+                            session.end();
+                            router.unregister_session(session.quarter_stream_id());
                             debug!("WebTransport session ended for {}", remote_addr);
-                            wt_metrics.connections.connection_closed();
+                            drop(wt_open);
                         });
                     } else if is_connect_udp {
                         // RFC 9298: CONNECT-UDP. Relay UDP datagrams between the
@@ -1734,8 +1855,7 @@ impl QuicListener {
                             .get_or_insert_with(|| DatagramRouter::new(quic_connection.clone()))
                             .clone();
 
-                        if router.session_count().await >= config.masque.max_sessions_per_connection
-                        {
+                        if router.session_count() >= config.masque.max_sessions_per_connection {
                             warn!("CONNECT-UDP: session limit reached for {}", remote_addr);
                             log_outcome(http::StatusCode::SERVICE_UNAVAILABLE);
                             let reject = http::Response::builder()
@@ -1747,7 +1867,7 @@ impl QuicListener {
 
                         // Quarter Stream ID = request stream id / 4 (RFC 9297).
                         let quarter_id = stream.id().into_inner() / 4;
-                        let from_client = router.register_session(quarter_id).await;
+                        let from_client = router.register_session(quarter_id);
 
                         // Accept the session (RFC 9298 §3: 2xx).
                         let accept = http::Response::builder()
@@ -1755,7 +1875,7 @@ impl QuicListener {
                             .body(())?;
                         if let Err(e) = stream.send_response(accept).await {
                             error!("CONNECT-UDP: failed to accept for {}: {}", remote_addr, e);
-                            router.unregister_session(quarter_id).await;
+                            router.unregister_session(quarter_id);
                             continue;
                         }
 
@@ -1764,14 +1884,13 @@ impl QuicListener {
                             remote_addr, target_addr, quarter_id
                         );
                         log_outcome(http::StatusCode::OK);
-                        metrics
+                        let udp_open = metrics
                             .connections
-                            .connection_opened(ConnectionProtocol::WebTransport);
+                            .connection_opened(ConnectionProtocol::ConnectUdp);
 
                         let idle =
                             Duration::from_secs(config.masque.session_idle_timeout_secs.max(1));
                         let conn_clone = quic_connection.clone();
-                        let metrics_clone = metrics.clone();
                         tokio::spawn(async move {
                             // The request stream stays open for the session; reading it
                             // to end (FIN/RESET) signals the client closed the tunnel.
@@ -1790,7 +1909,7 @@ impl QuicListener {
                                 stream_closed,
                             )
                             .await;
-                            metrics_clone.connections.connection_closed();
+                            drop(udp_open);
                         });
                     } else if is_ws_h3 {
                         // RFC 9220: WebSocket-over-HTTP/3 extended CONNECT tunnel.
@@ -1819,33 +1938,47 @@ impl QuicListener {
                             continue;
                         };
 
-                        let backend_address = match config.get_backend(&route.backend) {
-                            Some(b) => b.address.clone(),
-                            None => {
-                                error!("WS/H3: backend not found: {}", route.backend);
-                                log_outcome(http::StatusCode::BAD_GATEWAY);
-                                let err_resp = http::Response::builder()
-                                    .status(http::StatusCode::BAD_GATEWAY)
-                                    .body(())?;
-                                let mut stream = stream;
-                                let _ = stream.send_response(err_resp).await;
-                                continue;
-                            }
+                        let Some(backend) = config.get_backend(&route.backend).cloned() else {
+                            error!("WS/H3: backend not found: {}", route.backend);
+                            log_outcome(http::StatusCode::BAD_GATEWAY);
+                            let err_resp = http::Response::builder()
+                                .status(http::StatusCode::BAD_GATEWAY)
+                                .body(())?;
+                            let mut stream = stream;
+                            let _ = stream.send_response(err_resp).await;
+                            continue;
                         };
 
-                        let req_headers = request.headers().clone();
-                        let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
-                        let idle_secs = route.ws_idle_timeout_secs;
-                        let path_ws = path.clone();
+                        // The request's fields as an ordinary proxied request
+                        // carries them
                         let host_ws = host.clone().unwrap_or_default();
+                        let request_id = crate::request_id::header_name(
+                            &config.server.request_id_header,
+                        )
+                        .map(|name| {
+                            let id = crate::request_id::resolve(request.headers(), &name);
+                            (name, id)
+                        });
+                        let forwarded = crate::http_listener::backend_request_headers(
+                            request.headers(),
+                            &host_ws,
+                            remote_addr.ip(),
+                            local_port,
+                            route,
+                            request_id.as_ref(),
+                        );
+                        let path_and_query = match uri.query() {
+                            Some(q) => format!("{path}?{q}"),
+                            None => path.clone(),
+                        };
+                        let idle_secs = route.ws_idle_timeout_secs;
 
                         tokio::spawn(async move {
                             if let Err(e) = ws_h3_tunnel(
                                 stream,
-                                backend_address,
-                                req_headers,
-                                path_ws,
-                                query,
+                                backend,
+                                forwarded,
+                                path_and_query,
                                 host_ws,
                                 idle_secs,
                             )
@@ -1871,105 +2004,15 @@ impl QuicListener {
                     // report continuous "error spikes" for ordinary traffic.
                     if is_benign_h3_close(&e) {
                         debug!("HTTP/3 connection closed by peer: {}", e);
+                    } else if is_peer_violation(&e) {
+                        info!(
+                            "HTTP/3 connection from {} ended: the peer broke the protocol ({})",
+                            remote_addr, e
+                        );
                     } else {
                         error!("HTTP/3 accept error: {}", e);
                     }
                     break;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Handle raw QUIC streams (fallback when HTTP/3 handshake fails)
-    async fn handle_raw_quic(
-        connection: quinn::Connection,
-        remote_addr: SocketAddr,
-        config: Arc<ProxyConfig>,
-        backend_pool: Arc<BackendPool>,
-    ) -> anyhow::Result<()> {
-        let handler = WebTransportHandler::new(config.clone(), backend_pool, remote_addr);
-
-        loop {
-            tokio::select! {
-                // Bidirectional streams
-                bi_result = connection.accept_bi() => {
-                    match bi_result {
-                        Ok((send, recv)) => {
-                            debug!("Bidirectional stream from {}", remote_addr);
-                            let handler_clone = WebTransportHandler::new(
-                                config.clone(),
-                                handler.backend_pool.clone(),
-                                remote_addr,
-                            );
-                            tokio::spawn(async move {
-                                if let Err(e) = handler_clone
-                                    .handle_bi_stream(send, recv, "/", None)
-                                    .await
-                                {
-                                    error!("Bi-stream error: {}", e);
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            debug!("Bi-stream accept ended: {}", e);
-                            break;
-                        }
-                    }
-                }
-
-                // Unidirectional streams
-                uni_result = connection.accept_uni() => {
-                    match uni_result {
-                        Ok(recv) => {
-                            debug!("Unidirectional stream from {}", remote_addr);
-                            let handler_clone = WebTransportHandler::new(
-                                config.clone(),
-                                handler.backend_pool.clone(),
-                                remote_addr,
-                            );
-                            tokio::spawn(async move {
-                                if let Err(e) = handler_clone
-                                    .handle_uni_stream(recv, "/", None)
-                                    .await
-                                {
-                                    error!("Uni-stream error: {}", e);
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            debug!("Uni-stream accept ended: {}", e);
-                            break;
-                        }
-                    }
-                }
-
-                // Datagrams
-                datagram_result = connection.read_datagram() => {
-                    match datagram_result {
-                        Ok(datagram) => {
-                            debug!("Datagram from {} ({} bytes)", remote_addr, datagram.len());
-                            let handler_clone = WebTransportHandler::new(
-                                config.clone(),
-                                handler.backend_pool.clone(),
-                                remote_addr,
-                            );
-                            let conn = connection.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = handler_clone
-                                    .handle_datagram(&conn, datagram, "/", None)
-                                    .await
-                                {
-                                    error!("Datagram error: {}", e);
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            debug!("Datagram read ended: {}", e);
-                            break;
-                        }
-                    }
                 }
             }
         }
@@ -2405,7 +2448,30 @@ mod alt_svc_tests {
 
 #[cfg(test)]
 mod close_classification_tests {
-    use super::is_benign_h3_close;
+    use super::{is_benign_h3_close, is_peer_violation};
+
+    /// What this side closes for the peer's breach is the peer's doing, and
+    /// the same code from the peer is not: it may be answering this side.
+    #[test]
+    fn a_peer_violation_is_told_from_an_accusation() {
+        for raised_here in [
+            "Connection error: Local error: Application { code: H3_FRAME_UNEXPECTED, reason: \"x\" }",
+            "Local error: Application { code: QPACK_DECOMPRESSION_FAILED, reason: \"x\" }",
+            "Local error: Application { code: H3_SETTINGS_ERROR, reason: \"x\" }",
+            "Remote reset: 0x0",
+            "detected an error with protocol compliance that was not covered by more specific error codes",
+        ] {
+            assert!(is_peer_violation(&raised_here), "{raised_here}");
+        }
+        for not_the_peers in [
+            "Remote error: H3_FRAME_ERROR",
+            "closed by peer: H3_SETTINGS_ERROR (code 265)",
+            "closed by peer: detected an error with protocol compliance (code 10)",
+            "Local error: Application { code: H3_INTERNAL_ERROR, reason: \"x\" }",
+        ] {
+            assert!(!is_peer_violation(&not_the_peers), "{not_the_peers}");
+        }
+    }
 
     /// Every connection open across a restart closes at once with a code h3
     /// does not define; logged as ERROR that was a burst of false alarms per

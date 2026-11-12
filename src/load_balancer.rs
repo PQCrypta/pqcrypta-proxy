@@ -4,12 +4,17 @@
 //! - Multiple algorithms (least_connections, round_robin, weighted, random, ip_hash, least_response_time)
 //! - Health-aware routing (skip unhealthy backends)
 //! - Session affinity (cookie-based and IP-based sticky sessions)
-//! - Request queuing when backends saturated
-//! - Slow start for recovering backends
-//! - Connection draining for graceful removal
-//!
-//! Connection draining is fully implemented via `BackendServer::start_draining()`,
-//! invoked through `LoadBalancer::drain_server()` for graceful backend removal.
+//! - `max_connections` per server, honoured by every algorithm
+//! - Request queuing: a request that finds every server up but full waits for
+//!   a place (`load_balancer.queue`, per pool `queue_max_size`/`queue_timeout_ms`)
+//! - Slow start for a server that recovers (health check, breaker) or joins on
+//!   a reload, through its weight or, for an algorithm that does not weigh
+//!   servers, by passing it over in proportion to its ramp
+//! - A half-open circuit breaker: one trial request at a time after
+//!   `cb_half_open_delay_secs`, closed by `cb_success_threshold` successes
+//! - Connection draining: a server a reload removes takes no new sessions and
+//!   keeps its own until `connection_draining.timeout_secs`; by hand through
+//!   the admin API (`/pools/{pool}/servers/{id}/drain`)
 
 /// Maximum age of a sticky session mapping before it is silently evicted.
 /// Prevents cookie_sessions / ip_sessions / header_sessions from growing without bound
@@ -17,7 +22,7 @@
 const SESSION_TTL: Duration = Duration::from_hours(1); // 1 hour
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -46,6 +51,14 @@ pub trait LoadBalancingAlgorithm: Send + Sync {
     /// Record a completed request (for algorithms that track metrics)
     fn record_completion(&self, _server: &BackendServer, _response_time: Duration, _success: bool) {
         // Default: no-op
+    }
+
+    /// Whether the choice follows each server's `effective_weight`, which
+    /// already ramps a server in slow start. One that does not has a server
+    /// in slow start passed over in proportion to its ramp instead (see
+    /// `BackendPool::select`).
+    fn weighs_servers(&self) -> bool {
+        false
     }
 }
 
@@ -109,6 +122,10 @@ impl Drop for ConnectionSlot {
             self.server
                 .active_connections
                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+        // A place is free: one request queued for this pool tries again.
+        if let Some(freed) = self.server.freed.read().as_ref() {
+            freed.notify_one();
+        }
     }
 }
 
@@ -144,6 +161,8 @@ pub struct BackendServer {
     pub cb_failure_threshold: u32,
     /// Consecutive successes to close a tripped circuit breaker
     pub cb_success_threshold: u32,
+    /// How long a tripped breaker stays open before trial requests go through
+    pub cb_half_open_delay: Duration,
 
     // === Metrics ===
     /// Current active connections
@@ -162,6 +181,12 @@ pub struct BackendServer {
     pub slow_start: RwLock<Option<SlowStartState>>,
     /// Draining state
     pub draining: RwLock<Option<DrainingState>>,
+    /// The pool's signal that a place has been given back (queued requests
+    /// wait on it), set by the pool that holds this server
+    freed: RwLock<Option<Arc<tokio::sync::Notify>>>,
+    /// Slow start on recovery: (duration, initial weight percent), as the
+    /// pool that holds this server was configured
+    ramp: RwLock<Option<(Duration, u32)>>,
 
     // === Canary state ===
     /// Whether this server is designated as a canary deployment target
@@ -191,6 +216,8 @@ pub struct BackendHealth {
     pub consecutive_successes: u32,
     /// Circuit breaker open
     pub circuit_open: bool,
+    /// When it opened: trial requests go through `cb_half_open_delay` later
+    pub opened_at: Option<Instant>,
 }
 
 impl Default for BackendHealth {
@@ -201,6 +228,7 @@ impl Default for BackendHealth {
             consecutive_failures: 0,
             consecutive_successes: 0,
             circuit_open: false,
+            opened_at: None,
         }
     }
 }
@@ -285,6 +313,7 @@ impl BackendServer {
             tls_sni: config.tls_sni.clone(),
             cb_failure_threshold: config.cb_failure_threshold.unwrap_or(5),
             cb_success_threshold: config.cb_success_threshold.unwrap_or(3),
+            cb_half_open_delay: Duration::from_secs(config.cb_half_open_delay_secs.unwrap_or(30)),
             active_connections: AtomicU32::new(0),
             total_requests: AtomicU64::new(0),
             total_failures: AtomicU64::new(0),
@@ -292,6 +321,8 @@ impl BackendServer {
             health: RwLock::new(BackendHealth::default()),
             slow_start: RwLock::new(None),
             draining: RwLock::new(None),
+            freed: RwLock::new(None),
+            ramp: RwLock::new(None),
             is_canary: config.canary,
             canary_weight_percent: AtomicU8::new(config.canary_weight_percent),
             canary_suspended: AtomicBool::new(false),
@@ -311,9 +342,54 @@ impl BackendServer {
         let draining = self.draining.read();
 
         health.healthy
-            && !health.circuit_open
+            && (!health.circuit_open || self.is_half_open(&health))
             && draining.is_none()
             && !(self.is_canary && self.canary_suspended.load(Ordering::Relaxed))
+    }
+
+    /// A tripped breaker past `cb_half_open_delay`: one trial request at a
+    /// time goes through, and `cb_success_threshold` of them close it (see
+    /// `record_result`). Without this a tripped server never had a request
+    /// again, so it never had the successes that close the breaker.
+    fn is_half_open(&self, health: &BackendHealth) -> bool {
+        health.circuit_open
+            && health
+                .opened_at
+                .is_some_and(|at| at.elapsed() >= self.cb_half_open_delay)
+            && self.active_connections.load(Ordering::Relaxed) == 0
+    }
+
+    /// Whether the server has a place for one more request
+    /// (`max_connections`, 0 = no limit).
+    pub fn has_capacity(&self) -> bool {
+        self.max_connections == 0
+            || self.active_connections.load(Ordering::Relaxed) < self.max_connections
+    }
+
+    /// The share of its weight a server in slow start has now, if it is in
+    /// slow start.
+    pub fn ramp_factor(&self) -> Option<f64> {
+        let slow_start = self.slow_start.read();
+        let ss = slow_start.as_ref()?;
+        let elapsed = ss.started_at.elapsed();
+        (elapsed < ss.duration).then(|| {
+            let progress = elapsed.as_secs_f64() / ss.duration.as_secs_f64();
+            (1.0 - ss.initial_weight_factor).mul_add(progress, ss.initial_weight_factor)
+        })
+    }
+
+    /// Slow start, where the pool holding this server has it configured.
+    fn ramp_up(&self) {
+        let ramp = *self.ramp.read();
+        if let Some((duration, percent)) = ramp {
+            self.start_slow_start(duration, percent);
+        }
+    }
+
+    /// Give this server to `pool`: its freed-place signal and its slow start.
+    fn join(&self, freed: &Arc<tokio::sync::Notify>, ramp: Option<(Duration, u32)>) {
+        *self.freed.write() = Some(Arc::clone(freed));
+        *self.ramp.write() = ramp;
     }
 
     /// Check if this canary server is available for canary-specific routing.
@@ -367,8 +443,11 @@ impl BackendServer {
             // Recover from circuit breaker (use per-backend threshold)
             if health.circuit_open && health.consecutive_successes >= self.cb_success_threshold {
                 health.circuit_open = false;
+                health.opened_at = None;
                 health.healthy = true;
                 info!("Backend {} circuit breaker closed", self.id);
+                drop(health);
+                self.ramp_up();
             }
         } else {
             self.total_failures.fetch_add(1, Ordering::Relaxed);
@@ -377,10 +456,13 @@ impl BackendServer {
             health.consecutive_successes = 0;
             health.consecutive_failures += 1;
 
-            // Open circuit breaker after per-backend failure threshold
-            if health.consecutive_failures >= self.cb_failure_threshold && !health.circuit_open {
+            // Open circuit breaker after per-backend failure threshold; a
+            // trial that fails while half-open opens it for another delay.
+            if health.circuit_open {
+                health.opened_at = Some(Instant::now());
+            } else if health.consecutive_failures >= self.cb_failure_threshold {
                 health.circuit_open = true;
-                health.healthy = false;
+                health.opened_at = Some(Instant::now());
                 warn!(
                     "Backend {} circuit breaker opened after {} failures",
                     self.id, health.consecutive_failures
@@ -422,6 +504,20 @@ impl BackendServer {
             "Backend {} marked for draining ({:?} timeout)",
             self.id, timeout
         );
+    }
+
+    /// Take the server out of draining: it takes new requests again.
+    pub fn stop_draining(&self) {
+        *self.draining.write() = None;
+        info!("Backend {} no longer draining", self.id);
+    }
+
+    /// Whether the server is draining and its time to do so has not run out.
+    pub fn is_draining(&self) -> bool {
+        self.draining
+            .read()
+            .as_ref()
+            .is_some_and(|d| d.started_at.elapsed() < d.timeout)
     }
 
     // ── Canary helpers ────────────────────────────────────────────────────────
@@ -551,6 +647,21 @@ pub struct BackendPool {
     /// The configuration this pool was built from, so a reload can tell
     /// whether it changed.
     source: BackendPoolConfig,
+
+    // === Lifecycle ===
+    /// Woken when one of this pool's servers gives a place back
+    freed: Arc<tokio::sync::Notify>,
+    /// Requests waiting for a place: (most at once, longest wait), when the
+    /// pool queues (`load_balancer.queue`, `queue_max_size`, `queue_timeout_ms`)
+    queue: Option<(usize, Duration)>,
+    /// Requests waiting now
+    queued: AtomicUsize,
+    /// Requests refused for want of a place: the queue full or the wait over
+    queue_refused: AtomicU64,
+    /// Slow start for a server that recovers or joins (`load_balancer.slow_start`)
+    ramp: Option<(Duration, u32)>,
+    /// How long a server removed by a reload drains (`load_balancer.connection_draining`)
+    drain_for: Option<Duration>,
 }
 
 /// State for weighted round-robin algorithm
@@ -562,7 +673,7 @@ struct WeightedRoundRobinState {
 
 impl BackendPool {
     /// Create pool from configuration
-    pub fn from_config(config: &BackendPoolConfig, _lb_config: &LoadBalancerConfig) -> Self {
+    pub fn from_config(config: &BackendPoolConfig, lb_config: &LoadBalancerConfig) -> Self {
         let algorithm = Self::create_algorithm(&config.algorithm);
         let hash_header_name = config
             .algorithm
@@ -591,6 +702,31 @@ impl BackendPool {
             algorithm.name()
         );
 
+        let freed = Arc::new(tokio::sync::Notify::new());
+        let queue = lb_config.queue.enabled.then(|| {
+            (
+                config.queue_max_size.unwrap_or(lb_config.queue.max_size),
+                Duration::from_millis(
+                    config
+                        .queue_timeout_ms
+                        .unwrap_or(lb_config.queue.timeout_ms),
+                ),
+            )
+        });
+        let ramp = lb_config.slow_start.enabled.then(|| {
+            (
+                Duration::from_secs(lb_config.slow_start.duration_secs),
+                lb_config.slow_start.initial_weight_percent,
+            )
+        });
+        let drain_for = lb_config
+            .connection_draining
+            .enabled
+            .then(|| Duration::from_secs(lb_config.connection_draining.timeout_secs));
+        for server in &servers {
+            server.join(&freed, ramp);
+        }
+
         Self {
             name: config.name.clone(),
             servers: RwLock::new(servers),
@@ -609,6 +745,12 @@ impl BackendPool {
             canary_config: config.canary.clone(),
             canary_sessions: DashMap::new(),
             source: config.clone(),
+            freed,
+            queue,
+            queued: AtomicUsize::new(0),
+            queue_refused: AtomicU64::new(0),
+            ramp,
+            drain_for,
         }
     }
 
@@ -691,8 +833,11 @@ impl BackendPool {
         }
 
         // Normal routing (canary servers are excluded from get_healthy_servers).
+        // A session stays with its server while that server drains: draining
+        // takes no new sessions and lets the ones it has finish.
         if let Some(server) = self.check_sticky_session(ctx) {
-            if server.is_available() {
+            let draining_with_session = server.is_draining() && server.health.read().healthy;
+            if (server.is_available() || draining_with_session) && server.has_capacity() {
                 return Some(SelectionResult {
                     server,
                     set_canary_cookie: None,
@@ -701,12 +846,107 @@ impl BackendPool {
         }
 
         let server = self.algorithm.select(self, ctx)?;
+        let server = self.pass_over_ramping(server);
         self.record_sticky_session(ctx, &server);
 
         Some(SelectionResult {
             server,
             set_canary_cookie: None,
         })
+    }
+
+    /// A server in slow start chosen by an algorithm that does not weigh
+    /// servers is kept in proportion to its ramp; otherwise the least busy
+    /// server that is not ramping takes the request, when there is one.
+    fn pass_over_ramping(&self, chosen: Arc<BackendServer>) -> Arc<BackendServer> {
+        if self.algorithm.weighs_servers() {
+            return chosen;
+        }
+        let Some(factor) = chosen.ramp_factor() else {
+            return chosen;
+        };
+        if rand::random::<f64>() < factor {
+            return chosen;
+        }
+        self.get_healthy_servers()
+            .into_iter()
+            .filter(|s| !Arc::ptr_eq(s, &chosen) && s.ramp_factor().is_none())
+            .min_by_key(|s| s.active_connections.load(Ordering::Relaxed))
+            .unwrap_or(chosen)
+    }
+
+    /// [`Self::select`], waiting for a place when every server that could
+    /// take the request is up but full: up to the queue's time, and only
+    /// while fewer than its size wait. A pool with no server up does not
+    /// queue; nothing would free a place.
+    pub async fn select_queued(&self, ctx: &SelectionContext) -> Option<SelectionResult> {
+        if let Some(chosen) = self.select(ctx) {
+            return Some(chosen);
+        }
+        let (most, wait) = self.queue?;
+        let any_up = self
+            .servers
+            .read()
+            .iter()
+            .any(|s| !s.is_canary && s.is_available());
+        if !any_up {
+            return None;
+        }
+        if self.queued.fetch_add(1, Ordering::AcqRel) >= most {
+            self.queued.fetch_sub(1, Ordering::AcqRel);
+            self.queue_refused.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        struct Leave<'a>(&'a AtomicUsize);
+        impl Drop for Leave<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let _leave = Leave(&self.queued);
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            // Registered before looking again, so a place freed in between
+            // is not missed.
+            let freed = self.freed.notified();
+            tokio::pin!(freed);
+            freed.as_mut().enable();
+            if let Some(chosen) = self.select(ctx) {
+                return Some(chosen);
+            }
+            if tokio::time::timeout_at(deadline, freed).await.is_err() {
+                self.queue_refused.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        }
+    }
+
+    /// Requests waiting for a place now.
+    pub fn queued(&self) -> usize {
+        self.queued.load(Ordering::Relaxed)
+    }
+
+    /// The pool's load (its members' requests, its queue) and how many of
+    /// its members have their breaker open, for the metrics.
+    pub fn load(&self) -> (crate::metrics::PoolLoad, u64) {
+        let servers = self.servers.read();
+        let load = crate::metrics::PoolLoad {
+            total: servers
+                .iter()
+                .map(|s| s.total_requests.load(Ordering::Relaxed))
+                .sum(),
+            active: servers
+                .iter()
+                .map(|s| u64::from(s.active_connections.load(Ordering::Relaxed)))
+                .sum(),
+            waiting: self.queued.load(Ordering::Relaxed) as u64,
+            refused: self.queue_refused.load(Ordering::Relaxed),
+        };
+        let open = servers
+            .iter()
+            .filter(|s| s.health.read().circuit_open)
+            .count() as u64;
+        (load, open)
     }
 
     /// Canary-specific selection logic.  Returns `None` if canary is not
@@ -922,14 +1162,23 @@ impl BackendPool {
         let servers = self.servers.read();
 
         if !self.health_aware {
-            // Still exclude canary servers even when health-checking is off.
-            return servers.iter().filter(|s| !s.is_canary).cloned().collect();
+            // Still exclude canary servers even when health-checking is off,
+            // and servers being drained or at `max_connections`.
+            return servers
+                .iter()
+                .filter(|s| !s.is_canary && s.draining.read().is_none() && s.has_capacity())
+                .cloned()
+                .collect();
         }
+
+        // A server at `max_connections` takes no more, whichever algorithm
+        // chooses: only first_available read the limit before.
+        let takes = |s: &&Arc<BackendServer>| s.is_available() && !s.is_canary && s.has_capacity();
 
         // First, try priority 1 healthy non-canary servers
         let priority_1: Vec<_> = servers
             .iter()
-            .filter(|s| s.is_available() && s.priority == 1 && !s.is_canary)
+            .filter(|s| takes(s) && s.priority == 1)
             .cloned()
             .collect();
 
@@ -938,11 +1187,7 @@ impl BackendPool {
         }
 
         // Failover to higher priority numbers (still excluding canary servers)
-        servers
-            .iter()
-            .filter(|s| s.is_available() && !s.is_canary)
-            .cloned()
-            .collect()
+        servers.iter().filter(takes).cloned().collect()
     }
 
     /// Record request completion and update canary auto-rollback counters.
@@ -970,11 +1215,6 @@ impl BackendPool {
                 }
             }
         }
-    }
-
-    /// Get algorithm name
-    pub fn algorithm_name(&self) -> &'static str {
-        self.algorithm.name()
     }
 
     /// The single request header this pool's algorithm hashes on, if any.
@@ -1058,6 +1298,27 @@ impl BackendPool {
             healthy_servers: healthy,
             total_connections,
             total_requests,
+            queued: self.queued(),
+            queue_refused: self.queue_refused.load(Ordering::Relaxed),
+            servers: servers
+                .iter()
+                .map(|s| {
+                    let health = s.health.read();
+                    ServerStats {
+                        id: s.id.clone(),
+                        healthy: health.healthy,
+                        circuit_open: health.circuit_open,
+                        draining: s.is_draining(),
+                        canary: s.is_canary,
+                        slow_start_percent: s.ramp_factor().map(|f| (f * 100.0).round()),
+                        active_connections: s.active_connections.load(Ordering::Relaxed),
+                        max_connections: s.max_connections,
+                        total_requests: s.total_requests.load(Ordering::Relaxed),
+                        total_failures: s.total_failures.load(Ordering::Relaxed),
+                        avg_response_time_us: s.avg_response_time_us.load(Ordering::Relaxed),
+                    }
+                })
+                .collect(),
         }
     }
 
@@ -1121,14 +1382,17 @@ impl BackendPool {
                     let was_healthy = health.healthy;
 
                     if reachable {
+                        health.healthy = true;
+                        health.last_check = Instant::now();
                         if !was_healthy {
                             info!(
                                 "Health check: backend {} is now reachable — marking healthy",
                                 addr
                             );
+                            drop(health);
+                            server.ramp_up();
+                            continue;
                         }
-                        health.healthy = true;
-                        health.last_check = Instant::now();
                     } else {
                         if was_healthy {
                             warn!(
@@ -1156,15 +1420,38 @@ pub struct CanaryServerStatus {
     pub window_errors: u64,
 }
 
-/// Pool statistics
-#[derive(Debug, Clone)]
+/// Pool statistics (the admin API's `/pools`)
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PoolStats {
     pub name: String,
     pub algorithm: String,
     pub total_servers: usize,
+    /// Servers taking new requests now
     pub healthy_servers: usize,
     pub total_connections: u32,
     pub total_requests: u64,
+    /// Requests waiting for a place now
+    pub queued: usize,
+    /// Requests refused for want of a place
+    pub queue_refused: u64,
+    pub servers: Vec<ServerStats>,
+}
+
+/// One pool member's state
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ServerStats {
+    pub id: String,
+    pub healthy: bool,
+    pub circuit_open: bool,
+    pub draining: bool,
+    pub canary: bool,
+    /// Share of its weight it has now, while in slow start
+    pub slow_start_percent: Option<f64>,
+    pub active_connections: u32,
+    pub max_connections: u32,
+    pub total_requests: u64,
+    pub total_failures: u64,
+    pub avg_response_time_us: u64,
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1345,6 +1632,10 @@ impl LoadBalancingAlgorithm for WeightedRoundRobinAlgorithm {
         Some(healthy_servers[max_idx].clone())
     }
 
+    fn weighs_servers(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "weighted_round_robin"
     }
@@ -1384,6 +1675,10 @@ impl LoadBalancingAlgorithm for IpHashAlgorithm {
         // Rendezvous rather than `hash % len`: a backend going unhealthy must move
         // only the clients that were on it, not re-home the entire pool.
         rendezvous_select(&healthy_servers, ctx.client_ip.to_string().as_bytes())
+    }
+
+    fn weighs_servers(&self) -> bool {
+        true
     }
 
     fn name(&self) -> &'static str {
@@ -1437,6 +1732,10 @@ impl LoadBalancingAlgorithm for UriHashAlgorithm {
         rendezvous_select(&healthy, ctx.path.as_bytes())
     }
 
+    fn weighs_servers(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "uri_hash"
     }
@@ -1481,6 +1780,10 @@ impl LoadBalancingAlgorithm for UrlParamHashAlgorithm {
                 Some(healthy[idx % healthy.len()].clone())
             }
         }
+    }
+
+    fn weighs_servers(&self) -> bool {
+        true
     }
 
     fn name(&self) -> &'static str {
@@ -1528,6 +1831,10 @@ impl LoadBalancingAlgorithm for HeaderHashAlgorithm {
                 Some(healthy[idx % healthy.len()].clone())
             }
         }
+    }
+
+    fn weighs_servers(&self) -> bool {
+        true
     }
 
     fn name(&self) -> &'static str {
@@ -1613,6 +1920,10 @@ impl LoadBalancingAlgorithm for PowerOfTwoChoicesAlgorithm {
         } else {
             healthy[b].clone()
         })
+    }
+
+    fn weighs_servers(&self) -> bool {
+        true
     }
 
     fn name(&self) -> &'static str {
@@ -1728,6 +2039,51 @@ impl LoadBalancer {
                             *slot = live.clone();
                         }
                     }
+                    // The rebuilt pool's queue and slow start, kept or new
+                    slot.join(&rebuilt.freed, rebuilt.ramp);
+                    // A server new to the pool starts slowly
+                    if !old_servers.iter().any(|s| s.address == slot.address) {
+                        slot.ramp_up();
+                    }
+                }
+                // A server the reload removed drains: it takes no new session,
+                // keeps the ones it has until the draining time is up, then
+                // leaves the pool.
+                if let Some(drain_for) = rebuilt.drain_for {
+                    let removed: Vec<Arc<BackendServer>> = old_servers
+                        .iter()
+                        .filter(|old| {
+                            !rebuilt
+                                .servers
+                                .read()
+                                .iter()
+                                .any(|s| s.address == old.address)
+                        })
+                        .cloned()
+                        .collect();
+                    for server in &removed {
+                        server.start_draining(drain_for);
+                        server.join(&rebuilt.freed, rebuilt.ramp);
+                    }
+                    if !removed.is_empty() {
+                        rebuilt.servers.write().extend(removed.iter().cloned());
+                        let pool = Arc::downgrade(&rebuilt);
+                        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                            runtime.spawn(async move {
+                                tokio::time::sleep(drain_for).await;
+                                if let Some(pool) = pool.upgrade() {
+                                    pool.servers.write().retain(|s| {
+                                        !removed.iter().any(|gone| Arc::ptr_eq(s, gone))
+                                    });
+                                    info!(
+                                        "Backend pool '{}': {} drained server(s) removed",
+                                        pool.name,
+                                        removed.len()
+                                    );
+                                }
+                            });
+                        }
+                    }
                 }
                 info!(
                     "Backend pool '{}' rebuilt from the reloaded config",
@@ -1744,11 +2100,6 @@ impl LoadBalancer {
         }
     }
 
-    /// Check if a pool exists
-    pub fn has_pool(&self, name: &str) -> bool {
-        self.pools.contains_key(name)
-    }
-
     /// Get pool by name
     pub fn get_pool(&self, name: &str) -> Option<Arc<BackendPool>> {
         self.pools.get(name).map(|p| p.clone())
@@ -1760,17 +2111,6 @@ impl LoadBalancer {
             .iter()
             .map(|e| (e.key().clone(), e.value().clone()))
             .collect()
-    }
-
-    /// Select backend for request.  Returns a `SelectionResult` that may carry
-    /// a canary `Set-Cookie` header value to inject into the response.
-    pub fn select_backend(
-        &self,
-        pool_name: &str,
-        ctx: &SelectionContext,
-    ) -> Option<SelectionResult> {
-        let pool = self.pools.get(pool_name)?;
-        pool.select(ctx)
     }
 
     /// Record request completion
@@ -1791,55 +2131,61 @@ impl LoadBalancer {
         self.pools.iter().map(|p| p.stats()).collect()
     }
 
-    /// Drain a server in a pool
-    pub fn drain_server(&self, pool_name: &str, server_id: &str) {
-        if let Some(pool) = self.pools.get(pool_name) {
-            let servers = pool.servers.read();
-            if let Some(server) = servers.iter().find(|s| s.id == server_id) {
-                server.start_draining(Duration::from_secs(
-                    self.config.connection_draining.timeout_secs,
-                ));
-            }
-        }
+    /// The server `server_id` of pool `pool_name`, if both exist.
+    fn server(&self, pool_name: &str, server_id: &str) -> Option<Arc<BackendServer>> {
+        let pool = self.pools.get(pool_name)?;
+        let servers = pool.servers.read();
+        servers.iter().find(|s| s.id == server_id).cloned()
     }
 
-    /// Mark a server as unhealthy
-    pub fn mark_unhealthy(&self, pool_name: &str, server_id: &str) {
-        if let Some(pool) = self.pools.get(pool_name) {
-            let servers = pool.servers.read();
-            if let Some(server) = servers.iter().find(|s| s.id == server_id) {
+    /// Drain a server: no new sessions, the ones it has kept for
+    /// `connection_draining.timeout_secs`. False when there is no such server.
+    pub fn drain_server(&self, pool_name: &str, server_id: &str) -> bool {
+        self.server(pool_name, server_id).is_some_and(|server| {
+            server.start_draining(Duration::from_secs(
+                self.config.connection_draining.timeout_secs,
+            ));
+            true
+        })
+    }
+
+    /// Take a server out of draining. False when there is no such server.
+    pub fn undrain_server(&self, pool_name: &str, server_id: &str) -> bool {
+        self.server(pool_name, server_id).is_some_and(|server| {
+            server.stop_draining();
+            true
+        })
+    }
+
+    /// Take a server out of rotation by hand until it is marked healthy or
+    /// its health check finds it again. False when there is no such server.
+    pub fn mark_unhealthy(&self, pool_name: &str, server_id: &str) -> bool {
+        self.server(pool_name, server_id).is_some_and(|server| {
+            server.health.write().healthy = false;
+            warn!(
+                "Backend {} in pool {} marked unhealthy",
+                server_id, pool_name
+            );
+            true
+        })
+    }
+
+    /// Put a server back in rotation by hand: healthy, its breaker closed,
+    /// and in slow start where the pool has it. False when there is no such
+    /// server.
+    pub fn mark_healthy(&self, pool_name: &str, server_id: &str) -> bool {
+        self.server(pool_name, server_id).is_some_and(|server| {
+            {
                 let mut health = server.health.write();
-                health.healthy = false;
-                warn!(
-                    "Backend {} in pool {} marked unhealthy",
-                    server_id, pool_name
-                );
+                health.healthy = true;
+                health.circuit_open = false;
+                health.opened_at = None;
+                health.consecutive_failures = 0;
             }
-        }
-    }
-
-    /// Mark a server as healthy (with optional slow start)
-    pub fn mark_healthy(&self, pool_name: &str, server_id: &str, slow_start: bool) {
-        if let Some(pool) = self.pools.get(pool_name) {
-            let servers = pool.servers.read();
-            if let Some(server) = servers.iter().find(|s| s.id == server_id) {
-                {
-                    let mut health = server.health.write();
-                    health.healthy = true;
-                    health.circuit_open = false;
-                    health.consecutive_failures = 0;
-                }
-
-                if slow_start && self.config.slow_start.enabled {
-                    server.start_slow_start(
-                        Duration::from_secs(self.config.slow_start.duration_secs),
-                        self.config.slow_start.initial_weight_percent,
-                    );
-                }
-
-                info!("Backend {} in pool {} marked healthy", server_id, pool_name);
-            }
-        }
+            server.ramp_up();
+            info!("Backend {} in pool {} marked healthy", server_id, pool_name);
+            true
+        })
     }
 
     /// Check if load balancer is enabled
@@ -2017,7 +2363,7 @@ mod tests {
             servers[1].weight, 7,
             "a changed server takes its new settings"
         );
-        assert!(lb.has_pool("web"), "a new pool is added");
+        assert!(lb.get_pool("web").is_some(), "a new pool is added");
 
         // Unchanged settings: the pool itself is kept.
         lb.reconcile_pools(&configured);
@@ -2026,7 +2372,7 @@ mod tests {
         configured.remove("web");
         lb.reconcile_pools(&configured);
         assert!(
-            !lb.has_pool("web"),
+            lb.get_pool("web").is_none(),
             "a pool no longer configured is dropped"
         );
     }
@@ -2078,6 +2424,77 @@ mod tests {
             servers,
             canary,
         }
+    }
+
+    /// Every algorithm honours `max_connections`; a request that finds every
+    /// server full waits in the queue and takes the first place given back.
+    #[tokio::test]
+    async fn a_full_pool_queues_and_a_freed_place_is_taken() {
+        let config = pool_config(
+            r#"
+            name = "q"
+            algorithm = "least_connections"
+            queue_max_size = 4
+            queue_timeout_ms = 2000
+            [[servers]]
+            address = "127.0.0.1:9101"
+            max_connections = 1
+            "#,
+        );
+        let mut lb_config = LoadBalancerConfig::default();
+        lb_config.queue.enabled = true;
+        let pool = Arc::new(BackendPool::from_config(&config, &lb_config));
+        let held = pool.select(&default_ctx()).unwrap().server.acquire_slot();
+        assert!(
+            pool.select(&default_ctx()).is_none(),
+            "full: least_connections skips it"
+        );
+
+        let waiting = {
+            let pool = Arc::clone(&pool);
+            tokio::spawn(async move {
+                pool.select_queued(&default_ctx())
+                    .await
+                    .map(|r| r.server.id.clone())
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(pool.queued(), 1);
+        drop(held);
+        assert_eq!(waiting.await.unwrap().as_deref(), Some("127.0.0.1:9101"));
+        assert_eq!(pool.queued(), 0);
+    }
+
+    /// A tripped breaker lets one trial through after its delay; enough
+    /// successes close it, and the server ramps back up.
+    #[test]
+    fn a_tripped_server_comes_back_through_half_open_trials() {
+        let config = pool_config(
+            r#"
+            name = "cb"
+            [[servers]]
+            address = "127.0.0.1:9102"
+            cb_failure_threshold = 2
+            cb_success_threshold = 2
+            cb_half_open_delay_secs = 0
+            "#,
+        );
+        let mut lb_config = LoadBalancerConfig::default();
+        lb_config.slow_start.enabled = true;
+        let pool = BackendPool::from_config(&config, &lb_config);
+        let server = pool.servers.read()[0].clone();
+        server.record_result(false, Duration::from_millis(1));
+        server.record_result(false, Duration::from_millis(1));
+        assert!(server.health.read().circuit_open);
+        // Past the delay (0 s here): one trial at a time
+        assert!(server.is_available());
+        let trial = server.acquire_slot();
+        assert!(!server.is_available(), "one trial at a time");
+        drop(trial);
+        server.record_result(true, Duration::from_millis(1));
+        server.record_result(true, Duration::from_millis(1));
+        assert!(!server.health.read().circuit_open);
+        assert!(server.ramp_factor().is_some(), "it ramps back up");
     }
 
     fn default_ctx() -> SelectionContext {

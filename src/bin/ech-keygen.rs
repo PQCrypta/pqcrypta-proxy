@@ -301,11 +301,19 @@ fn prune_and_rebuild_list(out_dir: &std::path::Path, retain: usize) {
     }
     assert_eq!(parsed_count, entries_bytes.len());
 
-    fs::write(out_dir.join("ech-config-list.bin"), &list_bytes)
-        .expect("failed to write ech-config-list.bin");
+    // Each written beside its name and renamed into place: the proxy reloads
+    // when this directory changes, and a list read part way through its write
+    // would name none of the configs DNS publishes.
+    let write_whole = |name: &str, bytes: &[u8]| {
+        let path = out_dir.join(name);
+        let staged = out_dir.join(format!(".{name}.tmp"));
+        fs::write(&staged, bytes)
+            .and_then(|()| fs::rename(&staged, &path))
+            .unwrap_or_else(|e| panic!("failed to write {name}: {e}"));
+    };
+    write_whole("ech-config-list.bin", &list_bytes);
     let b64 = base64_engine.encode(&list_bytes);
-    fs::write(out_dir.join("ech-config-list.b64"), &b64)
-        .expect("failed to write ech-config-list.b64");
+    write_whole("ech-config-list.b64", b64.as_bytes());
 
     println!(
         "retained {} config(s) on disk; publishing the newest of each KEM, {} config(s): ECHConfigList ({} bytes) -> {}",

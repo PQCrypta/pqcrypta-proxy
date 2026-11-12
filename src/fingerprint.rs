@@ -15,6 +15,7 @@
 //! 3. OpenSSL callback mechanism - for PQC-enabled connections
 
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher as StdHasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -33,37 +34,43 @@ use tracing::{debug, info, warn};
 use crate::config::FingerprintConfig;
 use crate::security::{BlockReason, FingerprintClass, SecurityState, TlsFingerprint};
 
-/// A fingerprint-related threat detected at the TLS layer
-#[derive(Debug, Clone)]
+/// What a fingerprint, or a client network, did within its window that a
+/// person's browser does not
+#[derive(Debug, Clone, PartialEq)]
 pub enum FingerprintThreat {
-    /// Same JA3 hash seen from multiple IPs in replay window
-    Replay { ja3: String, ip_count: usize },
-    /// Same JA3 hash but different cipher/extension composition (drift)
-    Drift { ja3: String, drift_score: f64 },
+    /// One fingerprint that is not a browser's or a known crawler's, from
+    /// many client networks at once: one tool run from many addresses
+    Replay { networks: usize },
+    /// One client network presenting a different fingerprint on most of its
+    /// connections: a client rotating its fingerprint
+    Drift {
+        distinct: usize,
+        connections: u32,
+        drift_score: f64,
+    },
 }
 
-/// State for JA3 replay detection
+/// Fingerprints followed for replay at once
+const MAX_REPLAY_ENTRIES: usize = 50_000;
+/// Client networks followed for drift at once
+const MAX_DRIFT_ENTRIES: usize = 200_000;
+/// Distinct fingerprints kept per network: enough to measure any threshold
+const MAX_FINGERPRINTS_PER_NETWORK: usize = 256;
+
+/// One fingerprint's client networks in the current replay window
 struct ReplayEntry {
-    /// Set of IPs that used this fingerprint within the window
-    ips: Vec<IpAddr>,
-    /// Window start
-    first_seen: Instant,
-    /// Total uses in this window
-    count: u64,
+    networks: HashSet<u128>,
+    window_start: Instant,
+    reported: bool,
 }
 
-/// State for JA3 drift detection
+/// One client network's connections and fingerprints in the current drift
+/// window
 struct DriftState {
-    /// Hash of cipher suite order seen first for this JA3
-    cipher_suite_hash: u64,
-    /// Hash of extension list order seen first for this JA3
-    extension_hash: u64,
-    /// First observation
-    first_seen: Instant,
-    /// Total requests in drift window
-    total: u64,
-    /// Requests where composition differed
-    drift_count: u64,
+    fingerprints: HashSet<u64>,
+    connections: u32,
+    window_start: Instant,
+    reported: bool,
 }
 
 /// TLS fingerprint extractor
@@ -73,16 +80,16 @@ pub struct FingerprintExtractor {
     cache: Arc<DashMap<String, CachedFingerprint>>,
     /// Known fingerprint database
     known_fingerprints: Arc<KnownFingerprints>,
-    /// Replay detection: ja3_hash -> ReplayEntry
+    /// Replay detection: fingerprint (JA4, else JA3) → its networks
     replay_cache: Arc<DashMap<String, ReplayEntry>>,
-    /// Drift detection: ja3_hash -> DriftState
-    drift_cache: Arc<DashMap<String, DriftState>>,
+    /// Drift detection: client network → its fingerprints
+    drift_cache: Arc<DashMap<u128, DriftState>>,
 }
 
-/// Hash a slice of u16 values to a u64 for composition tracking
-fn hash_u16_slice(values: &[u16]) -> u64 {
+/// A fingerprint as a u64, for counting distinct ones
+fn fingerprint_id(fingerprint: &str) -> u64 {
     let mut h = DefaultHasher::new();
-    values.hash(&mut h);
+    fingerprint.hash(&mut h);
     h.finish()
 }
 
@@ -276,107 +283,125 @@ impl FingerprintExtractor {
         }
     }
 
-    /// Check whether a JA3 hash exhibits replay behaviour (same fingerprint from many IPs
-    /// within the configured window).  Returns a threat if the IP count threshold is exceeded.
+    /// Replay: `fingerprint` (from `network`) counted against its window.
+    /// Returns the threat while the fingerprint is over the threshold, and
+    /// whether this is the first time it is reported in the window.
     pub fn check_replay(
         &self,
-        ja3: &str,
-        ip: IpAddr,
+        fingerprint: &str,
+        network: u128,
+        classification: &FingerprintClass,
         config: &FingerprintConfig,
-    ) -> Option<FingerprintThreat> {
-        if !config.replay_detection {
+    ) -> Option<(FingerprintThreat, bool)> {
+        if !config.replay_detection
+            || matches!(
+                classification,
+                FingerprintClass::Browser | FingerprintClass::LegitimateBot
+            )
+        {
             return None;
         }
         let window = Duration::from_secs(config.replay_window_secs);
+        let now = Instant::now();
+        if !self.replay_cache.contains_key(fingerprint)
+            && self.replay_cache.len() >= MAX_REPLAY_ENTRIES
+        {
+            self.replay_cache
+                .retain(|_, e| now.duration_since(e.window_start) <= window);
+            if self.replay_cache.len() >= MAX_REPLAY_ENTRIES {
+                return None;
+            }
+        }
         let mut entry = self
             .replay_cache
-            .entry(ja3.to_string())
+            .entry(fingerprint.to_string())
             .or_insert_with(|| ReplayEntry {
-                ips: Vec::new(),
-                first_seen: Instant::now(),
-                count: 0,
+                networks: HashSet::new(),
+                window_start: now,
+                reported: false,
             });
-
-        // Reset window if expired
-        if entry.first_seen.elapsed() > window {
-            entry.ips.clear();
-            entry.count = 0;
-            entry.first_seen = Instant::now();
+        if now.duration_since(entry.window_start) > window {
+            entry.networks.clear();
+            entry.window_start = now;
+            entry.reported = false;
         }
-
-        entry.count += 1;
-        if !entry.ips.contains(&ip) {
-            entry.ips.push(ip);
+        let threshold = config.replay_min_networks.max(2);
+        if entry.networks.len() < threshold {
+            entry.networks.insert(network);
         }
-
-        // Flag if more than 5 distinct IPs used the same JA3 in window
-        let ip_count = entry.ips.len();
-        if ip_count > 5 {
-            return Some(FingerprintThreat::Replay {
-                ja3: ja3.to_string(),
-                ip_count,
-            });
+        if entry.networks.len() < threshold {
+            return None;
         }
-
-        None
+        let first = !entry.reported;
+        entry.reported = true;
+        Some((
+            FingerprintThreat::Replay {
+                networks: entry.networks.len(),
+            },
+            first,
+        ))
     }
 
-    /// Check whether a JA3 hash shows composition drift (same hash but different cipher/
-    /// extension order), which can indicate fingerprint spoofing.
+    /// Drift: a connection from `network` presenting `fingerprint`, counted
+    /// against the network's window. Returns the threat while the network is
+    /// over the threshold, and whether this is the first time it is reported
+    /// in the window.
     pub fn check_drift(
         &self,
-        ja3: &str,
-        ciphers: &[u16],
-        extensions: &[u16],
+        network: u128,
+        fingerprint: &str,
         config: &FingerprintConfig,
-    ) -> Option<FingerprintThreat> {
+    ) -> Option<(FingerprintThreat, bool)> {
         if !config.drift_detection {
             return None;
         }
-        let cipher_hash = hash_u16_slice(ciphers);
-        let ext_hash = hash_u16_slice(extensions);
         let window = Duration::from_secs(config.drift_window_secs);
-
+        let now = Instant::now();
+        if !self.drift_cache.contains_key(&network) && self.drift_cache.len() >= MAX_DRIFT_ENTRIES {
+            self.drift_cache
+                .retain(|_, e| now.duration_since(e.window_start) <= window);
+            if self.drift_cache.len() >= MAX_DRIFT_ENTRIES {
+                return None;
+            }
+        }
         let mut entry = self
             .drift_cache
-            .entry(ja3.to_string())
+            .entry(network)
             .or_insert_with(|| DriftState {
-                cipher_suite_hash: cipher_hash,
-                extension_hash: ext_hash,
-                first_seen: Instant::now(),
-                total: 0,
-                drift_count: 0,
+                fingerprints: HashSet::new(),
+                connections: 0,
+                window_start: now,
+                reported: false,
             });
-
-        // Reset window if expired
-        if entry.first_seen.elapsed() > window {
-            entry.cipher_suite_hash = cipher_hash;
-            entry.extension_hash = ext_hash;
-            entry.total = 0;
-            entry.drift_count = 0;
-            entry.first_seen = Instant::now();
+        if now.duration_since(entry.window_start) > window {
+            entry.fingerprints.clear();
+            entry.connections = 0;
+            entry.window_start = now;
+            entry.reported = false;
         }
-
-        entry.total += 1;
-        if cipher_hash != entry.cipher_suite_hash || ext_hash != entry.extension_hash {
-            entry.drift_count += 1;
+        entry.connections = entry.connections.saturating_add(1);
+        if entry.fingerprints.len() < MAX_FINGERPRINTS_PER_NETWORK {
+            entry.fingerprints.insert(fingerprint_id(fingerprint));
         }
-
-        #[allow(clippy::cast_precision_loss)]
-        let drift_score = if entry.total > 0 {
-            entry.drift_count as f64 / entry.total as f64
-        } else {
-            0.0
-        };
-
-        if entry.total >= 10 && drift_score >= config.drift_threshold {
-            return Some(FingerprintThreat::Drift {
-                ja3: ja3.to_string(),
+        if entry.connections < config.drift_min_connections.max(2) {
+            return None;
+        }
+        let distinct = entry.fingerprints.len();
+        let drift_score =
+            f64::from(u32::try_from(distinct).unwrap_or(u32::MAX)) / f64::from(entry.connections);
+        if drift_score < config.drift_threshold {
+            return None;
+        }
+        let first = !entry.reported;
+        entry.reported = true;
+        Some((
+            FingerprintThreat::Drift {
+                distinct,
+                connections: entry.connections,
                 drift_score,
-            });
-        }
-
-        None
+            },
+            first,
+        ))
     }
 
     /// Classify a JA3 hash against the known fingerprint database
@@ -845,6 +870,7 @@ impl FingerprintExtractor {
                 at: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs()),
+                client: Some(client_ip),
             });
 
         // Record the first sighting of a fingerprint.
@@ -896,58 +922,69 @@ impl FingerprintExtractor {
             };
         }
 
+        // Replay and drift (see FingerprintThreat): judged on the JA4, which
+        // a browser keeps however it orders its extensions
+        let threat_blocked = self.judge_behaviour(
+            ja4_hash.as_deref().unwrap_or(&ja3_hash),
+            client_ip,
+            &classification,
+            security,
+            config,
+        );
+
         // Check if this fingerprint should be blocked (using configurable thresholds)
-        let allowed = match &classification {
-            // AUD-12: Block Malicious fingerprints only when block_malicious = true (default).
-            // When false, classification is advisory-only: the fingerprint is logged
-            // but the connection is not blocked, allowing operators to build allow-lists
-            // before enabling enforcement.
-            FingerprintClass::Malicious if config.block_malicious => {
-                warn!(
-                    "Blocking malicious fingerprint {} from {}",
-                    ja3_hash, client_ip
-                );
-                security.block_ip(
-                    client_ip,
-                    BlockReason::SuspiciousFingerprint,
-                    Some(Duration::from_secs(config.malicious_block_duration_secs)),
-                );
-                false
-            }
-            FingerprintClass::Malicious => {
-                // block_malicious = false: log but do not block
-                info!(
+        let allowed = !threat_blocked
+            && match &classification {
+                // AUD-12: Block Malicious fingerprints only when block_malicious = true (default).
+                // When false, classification is advisory-only: the fingerprint is logged
+                // but the connection is not blocked, allowing operators to build allow-lists
+                // before enabling enforcement.
+                FingerprintClass::Malicious if config.block_malicious => {
+                    warn!(
+                        "Blocking malicious fingerprint {} from {}",
+                        ja3_hash, client_ip
+                    );
+                    security.block_ip(
+                        client_ip,
+                        BlockReason::SuspiciousFingerprint,
+                        Some(Duration::from_secs(config.malicious_block_duration_secs)),
+                    );
+                    false
+                }
+                FingerprintClass::Malicious => {
+                    // block_malicious = false: log but do not block
+                    info!(
                     "Advisory: malicious fingerprint {} from {} (block_malicious=false, not blocking)",
                     ja3_hash, client_ip
                 );
-                true
-            }
-            FingerprintClass::Suspicious => {
-                // Check request rate for suspicious fingerprints (configurable thresholds)
-                if let Some(cached) = self.cache.get(&ja3_hash) {
-                    if cached.request_count > config.suspicious_rate_threshold
-                        && cached.first_seen.elapsed()
-                            < Duration::from_secs(config.suspicious_rate_window_secs)
-                    {
-                        warn!(
-                            "High rate from suspicious fingerprint {} (IP: {})",
-                            ja3_hash, client_ip
-                        );
-                        security.block_ip(
-                            client_ip,
-                            BlockReason::SuspiciousFingerprint,
-                            Some(Duration::from_secs(config.suspicious_block_duration_secs)),
-                        );
-                        false
+                    true
+                }
+                FingerprintClass::Suspicious => {
+                    // Check request rate for suspicious fingerprints (configurable thresholds)
+                    if let Some(cached) = self.cache.get(&ja3_hash) {
+                        if cached.request_count > config.suspicious_rate_threshold
+                            && cached.first_seen.elapsed()
+                                < Duration::from_secs(config.suspicious_rate_window_secs)
+                        {
+                            warn!(
+                                "High rate from suspicious fingerprint {} (IP: {})",
+                                ja3_hash, client_ip
+                            );
+                            security.block_ip(
+                                client_ip,
+                                BlockReason::SuspiciousFingerprint,
+                                Some(Duration::from_secs(config.suspicious_block_duration_secs)),
+                            );
+                            false
+                        } else {
+                            true
+                        }
                     } else {
                         true
                     }
-                } else {
-                    true
                 }
-            }
-            _ => true,
-        };
+                _ => true,
+            };
 
         if let Some(ref name) = client_name {
             debug!(
@@ -968,11 +1005,102 @@ impl FingerprintExtractor {
         }
     }
 
+    /// Count this connection for replay and drift; report what crosses a
+    /// threshold (once a window, warn and audit) and block the address when
+    /// that threat's action says so. True when it was blocked.
+    fn judge_behaviour(
+        &self,
+        fingerprint: &str,
+        client_ip: IpAddr,
+        classification: &FingerprintClass,
+        security: &SecurityState,
+        config: &FingerprintConfig,
+    ) -> bool {
+        let network = crate::fingerprint_corpus::client_network(client_ip);
+        let replay = self.check_replay(fingerprint, network, classification, config);
+        let drift = self.check_drift(network, fingerprint, config);
+        let mut blocked = false;
+        for (threat, first) in replay.into_iter().chain(drift) {
+            let block = match threat {
+                FingerprintThreat::Replay { .. } => config.replay_action == "block",
+                FingerprintThreat::Drift { .. } => config.drift_action == "block",
+            };
+            if block {
+                security.block_ip(
+                    client_ip,
+                    BlockReason::SuspiciousFingerprint,
+                    Some(Duration::from_secs(config.suspicious_block_duration_secs)),
+                );
+                blocked = true;
+            }
+            // Reported once a window; a block is audited by `block_ip`
+            if !first {
+                continue;
+            }
+            let ip = client_ip.to_string();
+            let event = match threat {
+                FingerprintThreat::Replay { networks } => {
+                    if first {
+                        warn!(
+                            "Fingerprint {} ({:?}) from {} client networks within {}s (latest {}){}",
+                            fingerprint,
+                            classification,
+                            networks,
+                            config.replay_window_secs,
+                            ip,
+                            if block { ": blocking" } else { "" }
+                        );
+                    }
+                    crate::audit_logger::AuditEvent::FingerprintReplay {
+                        fingerprint: fingerprint.to_string(),
+                        ip,
+                        networks,
+                        blocked: block,
+                    }
+                }
+                FingerprintThreat::Drift {
+                    distinct,
+                    connections,
+                    drift_score,
+                } => {
+                    if first {
+                        warn!(
+                            "Client network of {} presented {} fingerprints on {} connections within {}s{}",
+                            ip,
+                            distinct,
+                            connections,
+                            config.drift_window_secs,
+                            if block { ": blocking" } else { "" }
+                        );
+                    }
+                    crate::audit_logger::AuditEvent::FingerprintDrift {
+                        fingerprint: fingerprint.to_string(),
+                        ip,
+                        distinct,
+                        connections,
+                        drift_score,
+                        blocked: block,
+                    }
+                }
+            };
+            if let Some(audit) = &security.audit_logger {
+                audit.log(event);
+            }
+        }
+        blocked
+    }
+
     /// Cleanup old cache entries (using configurable max age)
     pub fn cleanup(&self, config: &FingerprintConfig) {
         let max_age = Duration::from_secs(config.cache_max_age_secs);
         self.cache
             .retain(|_, cached| cached.last_seen.elapsed() < max_age);
+        let replay = Duration::from_secs(config.replay_window_secs);
+        self.replay_cache
+            .retain(|_, e| e.window_start.elapsed() <= replay);
+        let drift = Duration::from_secs(config.drift_window_secs);
+        self.drift_cache
+            .retain(|_, e| e.window_start.elapsed() <= drift);
     }
 
     /// Get fingerprint statistics
@@ -1076,29 +1204,6 @@ impl Default for FingerprintInfo {
 }
 
 impl FingerprintInfo {
-    /// Create from a fingerprint result
-    pub fn from_result(result: &FingerprintResult) -> Self {
-        let is_browser = result
-            .classification
-            .as_ref()
-            .map(|c| matches!(c, FingerprintClass::Browser))
-            .unwrap_or(false);
-        let is_legitimate_bot = result
-            .classification
-            .as_ref()
-            .map(|c| matches!(c, FingerprintClass::LegitimateBot))
-            .unwrap_or(false);
-
-        Self {
-            ja3_hash: result.ja3_hash.clone(),
-            ja4_hash: result.ja4_hash.clone(),
-            classification: result.classification.clone(),
-            client_name: result.client_name.clone(),
-            is_browser,
-            is_legitimate_bot,
-        }
-    }
-
     /// Create from internal fingerprint headers
     pub fn from_headers(
         ja3_hash: Option<String>,
@@ -1538,6 +1643,99 @@ fn ja4_alpn(first: Option<&[u8]>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A browser's fingerprint from many networks is a browser; a tool's
+    /// is flagged once it reaches the threshold, and reported once a window.
+    #[test]
+    fn one_tool_from_many_networks_is_flagged_and_browsers_are_not() {
+        let fx = FingerprintExtractor::new();
+        let config = FingerprintConfig {
+            replay_min_networks: 5,
+            ..FingerprintConfig::default()
+        };
+        let net = |i: u32| {
+            crate::fingerprint_corpus::client_network(IpAddr::from(std::net::Ipv4Addr::from(
+                0x0A00_0000 + (i << 8),
+            )))
+        };
+        for i in 0..20 {
+            assert!(fx
+                .check_replay(
+                    "t13d1516h2_chrome",
+                    net(i),
+                    &FingerprintClass::Browser,
+                    &config
+                )
+                .is_none());
+        }
+        let tool = |i| {
+            fx.check_replay(
+                "t13d0812h1_tool",
+                net(i),
+                &FingerprintClass::Suspicious,
+                &config,
+            )
+        };
+        for i in 0..4 {
+            assert!(tool(i).is_none(), "{} networks", i + 1);
+        }
+        // The same network again adds nothing
+        assert!(tool(3).is_none());
+        assert_eq!(
+            tool(4),
+            Some((FingerprintThreat::Replay { networks: 5 }, true))
+        );
+        assert_eq!(
+            tool(5),
+            Some((FingerprintThreat::Replay { networks: 5 }, false)),
+            "still flagged, reported once"
+        );
+    }
+
+    /// A network whose connections keep one or two fingerprints (a browser,
+    /// a NAT of a few) is not drift; one presenting a new one on most
+    /// connections is, once it has made enough of them.
+    #[test]
+    fn a_network_rotating_its_fingerprint_is_flagged() {
+        let fx = FingerprintExtractor::new();
+        let config = FingerprintConfig {
+            drift_min_connections: 10,
+            drift_threshold: 0.7,
+            ..FingerprintConfig::default()
+        };
+        let office = 1;
+        for i in 0..40 {
+            let fp = if i % 2 == 0 {
+                "t13d1516h2_a"
+            } else {
+                "q13d0312h3_a"
+            };
+            assert!(fx.check_drift(office, fp, &config).is_none());
+        }
+        let bot = 2;
+        for i in 0..9 {
+            assert!(fx
+                .check_drift(bot, &format!("t13d{i}_rotating"), &config)
+                .is_none());
+        }
+        let Some((
+            FingerprintThreat::Drift {
+                distinct,
+                connections,
+                drift_score,
+            },
+            true,
+        )) = fx.check_drift(bot, "t13d9_rotating", &config)
+        else {
+            panic!("ten connections, ten fingerprints");
+        };
+        assert_eq!((distinct, connections), (10, 10));
+        assert!((drift_score - 1.0).abs() < f64::EPSILON);
+        assert!(matches!(
+            fx.check_drift(bot, "t13d10_rotating", &config),
+            Some((FingerprintThreat::Drift { .. }, false))
+        ));
+    }
 
     #[test]
     fn test_grease_detection() {

@@ -79,8 +79,10 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 
 use serde_json::{json, Value};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, error, info, warn};
-use wtransport::Connection;
+
+use crate::wt_session::WtSession;
 
 /// Session idle timeout: close session if no stream or datagram activity for this long.
 /// Prevents sessions from leaking when a client disconnects without a clean QUIC close
@@ -99,7 +101,10 @@ const SESSION_MAX_DURATION: Duration = Duration::from_mins(30); // 30 minutes
 pub const MAX_DOWNLOAD_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Maximum size for a single upload: 500 MB (client time-limits to 5–10 s).
-const MAX_UPLOAD_BYTES: usize = 500 * 1024 * 1024;
+pub const MAX_UPLOAD_BYTES: usize = 500 * 1024 * 1024;
+
+/// The longest one upload is read for, over either transport.
+pub const UPLOAD_TIME_LIMIT: Duration = Duration::from_mins(2);
 
 /// Maximum framed command size: 64 KB
 const MAX_FRAME_BYTES: usize = 65536;
@@ -263,8 +268,8 @@ fn normalise_ip(ip: IpAddr) -> IpAddr {
 /// Handle an established WebTransport session on the /speedtest path.
 ///
 /// Called from `webtransport_server::handle_connection` when `path == "/speedtest"`.
-pub async fn handle_speedtest_session(
-    connection: Arc<Connection>,
+pub async fn handle_speedtest_session<S: WtSession>(
+    connection: Arc<S>,
     remote_addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("🏎️  Speed test session started: {}", remote_addr);
@@ -312,7 +317,7 @@ pub async fn handle_speedtest_session(
                             );
                             continue;
                         }
-                        if let Err(e) = connection.send_datagram(&*datagram) {
+                        if let Err(e) = connection.send_datagram(&datagram) {
                             debug!("Datagram echo failed for {}: {}", remote_addr, e);
                         }
                     }
@@ -349,24 +354,50 @@ pub async fn handle_speedtest_session(
 
 // ─── Per-stream handler ────────────────────────────────────────────────────
 
-async fn handle_speedtest_stream(
-    mut send: wtransport::stream::SendStream,
-    mut recv: wtransport::stream::RecvStream,
-    connection: Arc<Connection>,
+async fn handle_speedtest_stream<
+    S: WtSession,
+    W: AsyncWrite + Unpin + Send,
+    R: AsyncRead + Unpin + Send,
+>(
+    mut send: W,
+    mut recv: R,
+    connection: Arc<S>,
     remote_addr: SocketAddr,
 ) {
-    if let Err(e) = run_speedtest_stream(&mut send, &mut recv, &connection, remote_addr).await {
+    // The client network's place under its stream limit (speedtest_budget.rs),
+    // held for the life of the stream.
+    let Some(_slot) = crate::speedtest_budget::enter_stream(remote_addr.ip()) else {
+        debug!(
+            "Speed test stream from {} refused: stream limit",
+            remote_addr
+        );
+        let _ = write_framed_json(
+            &mut send,
+            &json!({
+                "error": "too_many_streams",
+                "max": crate::speedtest_budget::STREAMS_PER_NETWORK
+            }),
+        )
+        .await;
+        let _ = send.shutdown().await;
+        return;
+    };
+    if let Err(e) = run_speedtest_stream(&mut send, &mut recv, &*connection, remote_addr).await {
         debug!("Speed test stream error for {}: {}", remote_addr, e);
         let err_payload = json!({"error": "internal_error"});
         let _ = write_framed_json(&mut send, &err_payload).await;
-        let _ = send.finish().await;
+        let _ = send.shutdown().await;
     }
 }
 
-async fn run_speedtest_stream(
-    send: &mut wtransport::stream::SendStream,
-    recv: &mut wtransport::stream::RecvStream,
-    connection: &Connection,
+async fn run_speedtest_stream<
+    S: WtSession,
+    W: AsyncWrite + Unpin + Send,
+    R: AsyncRead + Unpin + Send,
+>(
+    send: &mut W,
+    recv: &mut R,
+    connection: &S,
     remote_addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let command = read_framed_json(recv).await?;
@@ -382,12 +413,12 @@ async fn run_speedtest_stream(
         Some(op) => {
             warn!("Unknown speedtest op '{}' from {}", op, remote_addr);
             write_framed_json(send, &json!({"error": "unknown_op", "op": op})).await?;
-            send.finish().await?;
+            send.shutdown().await?;
         }
         None => {
             warn!("Speedtest command missing 'op' from {}", remote_addr);
             write_framed_json(send, &json!({"error": "missing_op"})).await?;
-            send.finish().await?;
+            send.shutdown().await?;
         }
     }
 
@@ -396,8 +427,8 @@ async fn run_speedtest_stream(
 
 // ─── Operations ───────────────────────────────────────────────────────────
 
-async fn handle_op_info(
-    send: &mut wtransport::stream::SendStream,
+async fn handle_op_info<W: AsyncWrite + Unpin + Send>(
+    send: &mut W,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let server_name =
         std::env::var("SPEEDTEST_SERVER_NAME").unwrap_or_else(|_| "PQ Crypta".to_string());
@@ -427,7 +458,7 @@ async fn handle_op_info(
         "server_ts_ms": chrono::Utc::now().timestamp_millis()
     });
     write_framed_json(send, &info).await?;
-    send.finish().await?;
+    send.shutdown().await?;
     Ok(())
 }
 
@@ -449,12 +480,12 @@ pub fn download_size(query: Option<&str>) -> u64 {
 /// The upload meter for a test id (see the module docs): what every stream and
 /// request of that test delivered here, per bucket.
 /// This session's QUIC counters as the server sees them (see "Transport" above).
-async fn handle_op_transport(
-    send: &mut wtransport::stream::SendStream,
-    connection: &Connection,
+async fn handle_op_transport<S: WtSession, W: AsyncWrite + Unpin + Send>(
+    send: &mut W,
+    connection: &S,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     write_framed_json(send, &transport_stats(connection.quic_connection())).await?;
-    send.finish().await?;
+    send.shutdown().await?;
     Ok(())
 }
 
@@ -477,8 +508,8 @@ fn transport_stats(quic: &quinn::Connection) -> Value {
     })
 }
 
-async fn handle_op_meter(
-    send: &mut wtransport::stream::SendStream,
+async fn handle_op_meter<W: AsyncWrite + Unpin + Send>(
+    send: &mut W,
     command: &serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let reply = command
@@ -487,12 +518,12 @@ async fn handle_op_meter(
         .and_then(crate::speedtest_meter::snapshot)
         .unwrap_or_else(|| json!({"error": "no_meter"}));
     write_framed_json(send, &reply).await?;
-    send.finish().await?;
+    send.shutdown().await?;
     Ok(())
 }
 
-async fn handle_op_download(
-    send: &mut wtransport::stream::SendStream,
+async fn handle_op_download<W: AsyncWrite + Unpin + Send>(
+    send: &mut W,
     command: &serde_json::Value,
     remote_addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -522,9 +553,30 @@ async fn handle_op_download(
             &json!({"error": "invalid_bytes", "max": MAX_DOWNLOAD_BYTES}),
         )
         .await?;
-        send.finish().await?;
+        send.shutdown().await?;
         return Ok(());
     }
+
+    let mut allowance = match crate::speedtest_budget::reserve(
+        remote_addr.ip(),
+        crate::speedtest_budget::Direction::Download,
+        requested as u64,
+    ) {
+        Ok(reservation) => reservation,
+        Err(refused) => {
+            send.write_all(&[0x01_u8]).await?;
+            write_framed_json(
+                send,
+                &json!({
+                    "error": "budget_exhausted",
+                    "retry_after_secs": refused.retry_after.as_secs().max(1)
+                }),
+            )
+            .await?;
+            send.shutdown().await?;
+            return Ok(());
+        }
+    };
 
     info!("📥 Download: {} bytes → {}", requested, remote_addr);
 
@@ -550,9 +602,11 @@ async fn handle_op_download(
     })
     .await;
 
+    // What was sent comes off the allowance; the rest is given back.
+    allowance.use_bytes((requested - remaining) as u64);
     match result {
         Ok(Ok(())) => {
-            send.finish().await?;
+            send.shutdown().await?;
         }
         Ok(Err(e)) => {
             // Client cancelled via STOP_SENDING — normal time-bounded termination
@@ -577,9 +631,9 @@ async fn handle_op_download(
 }
 
 #[allow(clippy::cast_precision_loss)]
-async fn handle_op_upload(
-    send: &mut wtransport::stream::SendStream,
-    recv: &mut wtransport::stream::RecvStream,
+async fn handle_op_upload<W: AsyncWrite + Unpin + Send, R: AsyncRead + Unpin + Send>(
+    send: &mut W,
+    recv: &mut R,
     command: &serde_json::Value,
     remote_addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -598,9 +652,29 @@ async fn handle_op_upload(
             &json!({"error": "invalid_bytes", "max": MAX_UPLOAD_BYTES}),
         )
         .await?;
-        send.finish().await?;
+        send.shutdown().await?;
         return Ok(());
     }
+
+    let mut allowance = match crate::speedtest_budget::reserve(
+        remote_addr.ip(),
+        crate::speedtest_budget::Direction::Upload,
+        declared as u64,
+    ) {
+        Ok(reservation) => reservation,
+        Err(refused) => {
+            write_framed_json(
+                send,
+                &json!({
+                    "error": "budget_exhausted",
+                    "retry_after_secs": refused.retry_after.as_secs().max(1)
+                }),
+            )
+            .await?;
+            send.shutdown().await?;
+            return Ok(());
+        }
+    };
 
     info!(
         "📤 Upload: expecting ~{} bytes from {}",
@@ -619,12 +693,12 @@ async fn handle_op_upload(
     let mut total_bytes: usize = 0;
     let mut post_warmup_bytes: usize = 0;
     let mut buf = vec![0u8; DOWNLOAD_CHUNK];
-    let upload_timeout = std::time::Duration::from_mins(2);
+    let upload_timeout = UPLOAD_TIME_LIMIT;
 
     let read_result = tokio::time::timeout(upload_timeout, async {
         loop {
             match recv.read(&mut buf).await {
-                Ok(Some(n)) => {
+                Ok(n) if n > 0 => {
                     if start.is_none() {
                         start = Some(Instant::now()); // clock starts on first byte received
                     }
@@ -640,7 +714,7 @@ async fn handle_op_upload(
                         break;
                     }
                 }
-                Ok(None) => break,
+                Ok(_) => break,
                 Err(e) => return Err(e),
             }
         }
@@ -650,6 +724,8 @@ async fn handle_op_upload(
 
     // The stream has stopped receiving: the meter stops counting it as open.
     drop(meter);
+    // What was received comes off the allowance; the rest is given back.
+    allowance.use_bytes(total_bytes as u64);
 
     match read_result {
         Ok(Ok(())) => {}
@@ -698,14 +774,14 @@ async fn handle_op_upload(
         }),
     )
     .await?;
-    send.finish().await?;
+    send.shutdown().await?;
     Ok(())
 }
 
 /// Return the client's GeoIP information (city, country, ASN) based on their
 /// connecting IP address.
-async fn handle_op_geoip(
-    send: &mut wtransport::stream::SendStream,
+async fn handle_op_geoip<W: AsyncWrite + Unpin + Send>(
+    send: &mut W,
     remote_addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ip = normalise_ip(remote_addr.ip());
@@ -713,7 +789,7 @@ async fn handle_op_geoip(
     let mut resp = geo_to_json(&ip.to_string(), &geo);
     resp["op"] = json!("geoip_result");
     write_framed_json(send, &resp).await?;
-    send.finish().await?;
+    send.shutdown().await?;
     Ok(())
 }
 
@@ -728,23 +804,14 @@ async fn get_server_public_ip() -> Option<String> {
         }
     }
 
-    // Fall back: parse the source address from `ip route get 1.1.1.1`
-    if let Ok(out) = tokio::process::Command::new("/usr/sbin/ip")
-        .args(["route", "get", "1.1.1.1"])
-        .output()
-        .await
-    {
-        if let Ok(text) = std::str::from_utf8(&out.stdout) {
-            // Output contains "src <IP>" somewhere in the first line
-            if let Some(pos) = text.find("src ") {
-                let rest = &text[pos + 4..];
-                if let Some(end) = rest.find(|c: char| c.is_whitespace()) {
-                    return Some(rest[..end].to_string());
-                }
-            }
-        }
-    }
-    None
+    // Fall back: the source address the kernel picks for a route to the
+    // internet, read from a connected UDP socket. Connecting one sends
+    // nothing; it only chooses the route. (This ran `ip route get` and parsed
+    // its output, a process for every route analysis.)
+    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok()?;
+    socket.connect("1.1.1.1:53").await.ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_unspecified()).then(|| ip.to_string())
 }
 
 // ─── Multi-method traceroute helpers ─────────────────────────────────────
@@ -811,6 +878,8 @@ async fn run_mtr_probe(ip_str: String, mode: &'static str, port: u16) -> Vec<Mtr
         std::time::Duration::from_secs(6),
         tokio::process::Command::new("/usr/bin/mtr")
             .args(&args)
+            // Ended with the timeout: dropping the future would leave it running.
+            .kill_on_drop(true)
             .output(),
     )
     .await;
@@ -890,9 +959,9 @@ fn quic_path_mtu(quic: &quinn::Connection, client_ip: &IpAddr) -> Option<(u32, b
 
 /// Run a server-side multi-method route analysis toward the client IP and stream frames back.
 /// Sends: client GeoIP → merged hops (ICMP+UDP+TCP parallel) → server frame → done.
-async fn handle_op_traceroute(
-    send: &mut wtransport::stream::SendStream,
-    connection: &Connection,
+async fn handle_op_traceroute<S: WtSession, W: AsyncWrite + Unpin + Send>(
+    send: &mut W,
+    connection: &S,
     remote_addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client_ip = normalise_ip(remote_addr.ip());
@@ -915,9 +984,28 @@ async fn handle_op_traceroute(
             }),
         )
         .await?;
-        send.finish().await?;
+        send.shutdown().await?;
         return Ok(());
     }
+
+    // One analysis at a time per network, spaced, and few on the server.
+    let _analysis = match crate::speedtest_budget::start_analysis(client_ip) {
+        Ok(slot) => slot,
+        Err(refused) => {
+            write_framed_json(
+                send,
+                &json!({
+                    "type": "error",
+                    "error": "busy",
+                    "retry_after_secs": refused.retry_after.as_secs().max(1),
+                    "message": "Route analysis is not available right now; try again shortly"
+                }),
+            )
+            .await?;
+            send.shutdown().await?;
+            return Ok(());
+        }
+    };
 
     info!("🗺️  Multi-method traceroute → {} starting", client_ip);
 
@@ -1074,15 +1162,15 @@ async fn handle_op_traceroute(
         "🗺️  Traceroute done: {} visible, {} filtered, {} congestion suspects, MTU {:?}, methods {:?} → {}",
         hop_count, hidden_count, congestion_count, path_mtu, probe_methods_tried, client_ip
     );
-    send.finish().await?;
+    send.shutdown().await?;
     Ok(())
 }
 
 // ─── Frame I/O helpers ────────────────────────────────────────────────────
 
 /// Read a length-prefixed JSON frame: `[4-byte BE u32][JSON bytes]`
-async fn read_framed_json(
-    recv: &mut wtransport::stream::RecvStream,
+async fn read_framed_json<R: AsyncRead + Unpin + Send>(
+    recv: &mut R,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
     let mut len_buf = [0u8; 4];
     read_exact(recv, &mut len_buf).await?;
@@ -1103,8 +1191,8 @@ async fn read_framed_json(
 }
 
 /// Write a length-prefixed JSON frame: `[4-byte BE u32][JSON bytes]`
-async fn write_framed_json(
-    send: &mut wtransport::stream::SendStream,
+async fn write_framed_json<W: AsyncWrite + Unpin + Send>(
+    send: &mut W,
     value: &serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bytes = serde_json::to_vec(value)?;
@@ -1117,17 +1205,17 @@ async fn write_framed_json(
 }
 
 /// Read exactly `buf.len()` bytes from a wtransport RecvStream.
-async fn read_exact(
-    recv: &mut wtransport::stream::RecvStream,
+async fn read_exact<R: AsyncRead + Unpin + Send>(
+    recv: &mut R,
     buf: &mut [u8],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut pos = 0;
     while pos < buf.len() {
         match recv.read(&mut buf[pos..]).await {
-            Ok(Some(n)) => pos += n,
-            Ok(None) => {
+            Ok(0) => {
                 return Err(format!("unexpected EOF after {} of {} bytes", pos, buf.len()).into())
             }
+            Ok(n) => pos += n,
             Err(e) => return Err(format!("stream read error: {}", e).into()),
         }
     }

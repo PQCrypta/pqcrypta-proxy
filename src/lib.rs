@@ -134,6 +134,8 @@ pub mod acme_dns;
 pub mod admin;
 pub mod audit_logger;
 pub mod backend_client;
+pub mod backend_limits;
+pub mod body_budget;
 pub mod cache;
 pub mod cert_compression;
 pub mod compression;
@@ -152,7 +154,6 @@ pub mod fingerprint;
 pub mod fingerprint_corpus;
 #[cfg(test)]
 pub(crate) mod fuzz_support;
-pub mod handlers;
 pub mod host_names;
 pub mod http3_features;
 pub mod http_listener;
@@ -163,16 +164,19 @@ pub mod ocsp;
 pub mod otel;
 pub mod path_canon;
 pub mod pqc_extended;
+pub mod pqc_policy;
 pub mod pqc_tickets;
 pub mod pqc_tls;
 pub mod proxy;
 pub mod quic_listener;
 pub mod rate_limiter; // Must be before config (config imports from it)
+pub mod request_encoding;
 pub mod request_id;
 pub mod request_target;
 pub mod route_gate;
 pub mod security;
 pub mod speedtest;
+pub mod speedtest_budget;
 pub mod speedtest_meter;
 pub mod startup_verify;
 pub mod telemetry;
@@ -180,6 +184,8 @@ pub mod tls;
 pub mod tls_acceptor;
 pub mod waf;
 pub mod webtransport_server;
+pub mod ws_tunnel;
+pub mod wt_session;
 
 // Re-export commonly used types
 pub use access_logger::{init_access_logger, log_access, AccessLogEntry, AccessLogger};
@@ -191,14 +197,12 @@ pub use fingerprint::{
     FingerprintResult, FingerprintStats, Ja3Fingerprint,
 };
 pub use http3_features::{
-    http3_features_middleware, CoalescingConfig, CoalescingState, EarlyHintsConfig,
-    EarlyHintsState, Http3FeaturesState, LinkHint, PreloadRule, PriorityConfig, PriorityState,
-    ResourcePriority,
+    http3_features_middleware, EarlyHintsConfig, EarlyHintsState, Http3FeaturesState, LinkHint,
+    PreloadRule, PriorityConfig, PriorityState, ResourcePriority,
 };
 pub use http_listener::{
     run_http_listener, run_http_listener_with_fingerprint,
     run_http_listener_with_fingerprint_and_resolver, run_http_redirect_server,
-    run_tls_passthrough_server,
 };
 #[cfg(feature = "pqc")]
 pub use http_listener::{run_http_listener_pqc, run_http_listener_pqc_with_fingerprint};
@@ -221,9 +225,7 @@ pub use pqc_extended::{
 };
 #[cfg(feature = "pqc")]
 pub use pqc_tls::openssl_pqc;
-pub use pqc_tls::{
-    verify_pqc_support, PqcHandshakeInfo, PqcKemAlgorithm, PqcStatus, PqcTlsProvider,
-};
+pub use pqc_tls::{verify_pqc_support, PqcKemAlgorithm, PqcStatus, PqcTlsProvider};
 pub use proxy::BackendPool;
 pub use rate_limiter::{
     build_context_from_request, AdvancedRateLimitConfig, AdvancedRateLimiter, RateLimitContext,

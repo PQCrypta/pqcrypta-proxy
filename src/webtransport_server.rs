@@ -13,10 +13,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use crate::wt_session::WtSession;
 use tracing::{debug, error, info, warn, Instrument};
 use wtransport::config::QuicTransportConfig;
-use wtransport::{Connection, Endpoint, ServerConfig};
+use wtransport::{Endpoint, ServerConfig};
 
 use crate::config::ProxyConfig;
 use crate::metrics::{ConnectionProtocol, MetricsRegistry};
@@ -309,7 +311,7 @@ impl WebTransportServer {
                 if updates.has_changed().unwrap_or(false) {
                     config = updates.borrow_and_update().clone();
                     // Its connect and pool timeouts are fixed when it is built.
-                    backend_pool = Arc::new(BackendPool::new(config.clone()));
+                    backend_pool = Arc::new(BackendPool::new(&config));
                     info!("WebTransport server: applying the reloaded configuration");
                 }
             }
@@ -335,10 +337,11 @@ impl WebTransportServer {
             };
             tokio::spawn(async move {
                 let _slot = slot;
-                if let Some(ref m) = session_metrics {
+                // Counted open until this task ends
+                let _open = session_metrics.as_ref().map(|m| {
                     m.connections
-                        .connection_opened(ConnectionProtocol::WebTransport);
-                }
+                        .connection_opened(ConnectionProtocol::WebTransport)
+                });
                 if let Err(e) = handle_incoming_session(
                     incoming_session,
                     config_clone,
@@ -351,9 +354,6 @@ impl WebTransportServer {
                     // A client that goes quiet or names a host with no certificate
                     // is ranked as the HTTP/3 listener ranks it, not as an error.
                     crate::quic_listener::log_quic_end(remote_addr, &e.to_string());
-                }
-                if let Some(ref m) = session_metrics {
-                    m.connections.connection_closed();
                 }
             });
         }
@@ -381,6 +381,29 @@ async fn handle_incoming_session(
     debug!("📥 WebTransport session request received");
     info!("   Path: {}", path);
     debug!("   Authority: {}", authority);
+
+    // The handshake's key exchange, held to `pqc.downgrade_action` as on
+    // every other listener (pqc_policy.rs): recorded when it is classical,
+    // and the session refused 421 where those are.
+    let group = session_request
+        .quic_connection()
+        .handshake_data()
+        .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|data| data.negotiated_key_exchange_group)
+        .map(|group| format!("{group:?}"));
+    let post_quantum = group
+        .as_deref()
+        .and_then(crate::pqc_tls::PqcKemAlgorithm::from_str)
+        .is_some();
+    crate::pqc_policy::handshake_completed(remote_addr.ip(), group.as_deref(), post_quantum);
+    if crate::pqc_policy::refuses(post_quantum) {
+        debug!(
+            "WebTransport session from {} refused: classical key exchange",
+            remote_addr
+        );
+        session_request.misdirected_request().await;
+        return Ok(());
+    }
 
     // The session request is an HTTP request, and is held to what every other
     // one is: the blocklist, the location rules, the rate limits and the WAF
@@ -544,8 +567,8 @@ async fn handle_incoming_session(
 
         // The slot is given back when `_slot` drops: when the session ends,
         // and equally when this task panics or is cancelled.
-        handle_connection(
-            connection,
+        serve_session(
+            Arc::new(connection),
             remote_addr,
             path,
             session_backend,
@@ -655,8 +678,8 @@ enum StreamRead {
 
 /// A stream's whole request, read no further than `max` bytes: what would not
 /// be accepted is not held either.
-async fn read_request(
-    recv_stream: &mut wtransport::stream::RecvStream,
+async fn read_request<R: tokio::io::AsyncRead + Unpin>(
+    recv_stream: &mut R,
     max: usize,
 ) -> Result<Vec<u8>, StreamRead> {
     let mut buffer = Vec::new();
@@ -674,9 +697,11 @@ async fn read_request(
     }
 }
 
-/// Handle an established WebTransport connection
-async fn handle_connection(
-    connection: Connection,
+/// Serve an established WebTransport session, on either listener: the speed
+/// test and the telemetry wall at their paths, and otherwise each stream and
+/// datagram forwarded to the session route's backend.
+pub async fn serve_session<S: WtSession>(
+    connection: Arc<S>,
     remote_addr: SocketAddr,
     path: String,
     session_backend: Option<String>,
@@ -688,8 +713,6 @@ async fn handle_connection(
         "🔄 Handling WebTransport connection from {} (path: {})",
         remote_addr, path
     );
-
-    let connection = Arc::new(connection);
 
     // Native speed test handler — serves /speedtest without backend proxying
     if path == "/speedtest" {
@@ -804,10 +827,10 @@ async fn handle_connection(
 }
 
 /// Handle unidirectional stream (client -> server)
-async fn handle_uni_stream(
-    mut recv_stream: wtransport::stream::RecvStream,
+async fn handle_uni_stream<S: WtSession>(
+    mut recv_stream: S::Recv,
     remote_addr: SocketAddr,
-    _connection: Arc<Connection>,
+    _connection: Arc<S>,
     session: Arc<SessionRoute>,
     config: Arc<ProxyConfig>,
     backend_pool: Arc<BackendPool>,
@@ -864,16 +887,26 @@ async fn handle_uni_stream(
 
 /// Handle bidirectional stream
 #[allow(clippy::too_many_arguments)] // WT handler: transport + routing + security
-async fn handle_bi_stream(
-    mut send_stream: wtransport::stream::SendStream,
-    mut recv_stream: wtransport::stream::RecvStream,
+async fn handle_bi_stream<S: WtSession>(
+    mut send_stream: S::Send,
+    mut recv_stream: S::Recv,
     remote_addr: SocketAddr,
-    _connection: Arc<Connection>,
+    _connection: Arc<S>,
     session: Arc<SessionRoute>,
     config: Arc<ProxyConfig>,
     backend_pool: Arc<BackendPool>,
     security: Option<crate::security::SecurityState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // A raw TCP backend: the stream's bytes are relayed both ways as they
+    // come, to a connection of its own
+    if let Some(backend) = session
+        .backend
+        .as_deref()
+        .and_then(|name| config.backends.get(name))
+        .filter(|b| b.backend_type == crate::config::BackendType::Tcp)
+    {
+        return relay_to_tcp(send_stream, recv_stream, backend, remote_addr).await;
+    }
     let max_size = config.security.max_request_size;
     let buffer = match read_request(&mut recv_stream, max_size).await {
         Ok(buffer) => buffer,
@@ -901,7 +934,7 @@ async fn handle_bi_stream(
             });
             let error_bytes = serde_json::to_vec(&error_response)?;
             send_stream.write_all(&error_bytes).await?;
-            let _ = send_stream.finish().await;
+            let _ = send_stream.shutdown().await;
             return Err(error);
         }
     };
@@ -930,7 +963,7 @@ async fn handle_bi_stream(
                 response.len()
             );
             send_stream.write_all(&response).await?;
-            send_stream.finish().await?;
+            send_stream.shutdown().await?;
             info!("✅ Bidirectional stream completed: {}", remote_addr);
         }
         Err(e) => {
@@ -946,7 +979,7 @@ async fn handle_bi_stream(
 
             let error_bytes = serde_json::to_vec(&error_response)?;
             send_stream.write_all(&error_bytes).await?;
-            send_stream.finish().await?;
+            send_stream.shutdown().await?;
         }
     }
 
@@ -954,11 +987,41 @@ async fn handle_bi_stream(
 }
 
 /// Handle datagram
+/// How long a relayed stream may carry nothing either way
+const RELAY_IDLE: Duration = Duration::from_mins(5);
+
+/// Relay a WebTransport stream to a raw TCP `backend` and back until either
+/// side finishes, or nothing moves for [`RELAY_IDLE`].
+async fn relay_to_tcp<W, R>(
+    send_stream: W,
+    recv_stream: R,
+    backend: &crate::config::BackendConfig,
+    remote_addr: SocketAddr,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let _place = crate::backend_limits::acquire(backend).await?;
+    let connect = tokio::net::TcpStream::connect(&backend.address);
+    let tcp = tokio::time::timeout(Duration::from_millis(backend.timeout_ms.max(1)), connect)
+        .await
+        .map_err(|_| format!("connecting to {} timed out", backend.address))??;
+    tcp.set_nodelay(true)?;
+    let mut client = tokio::io::join(recv_stream, send_stream);
+    let (up, down) = crate::ws_tunnel::relay(&mut client, tcp, Some(RELAY_IDLE)).await;
+    debug!(
+        "WebTransport relay for {} to {} ended: {} bytes up, {} down",
+        remote_addr, backend.address, up, down
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // WT handler: transport + routing + security
-async fn handle_datagram(
+async fn handle_datagram<S: WtSession>(
     datagram: Vec<u8>,
     remote_addr: SocketAddr,
-    connection: Arc<Connection>,
+    connection: Arc<S>,
     session: Arc<SessionRoute>,
     config: Arc<ProxyConfig>,
     backend_pool: Arc<BackendPool>,
@@ -1282,7 +1345,7 @@ mod tests {
             crt.to_str().unwrap(),
             key.to_str().unwrap(),
             config.clone(),
-            Arc::new(BackendPool::new(config)),
+            Arc::new(BackendPool::new(&config)),
         )
         .await
         .unwrap();

@@ -729,78 +729,6 @@ impl PqcTlsProvider {
         self.initialize();
     }
 
-    /// Generate test certificate with PQC (for testing)
-    pub fn generate_test_cert(&self, output_dir: &Path) -> Result<(), String> {
-        if !self.is_available() {
-            return Err("PQC not available".to_string());
-        }
-
-        let openssl_bin = self.openssl_bin_path();
-        let openssl_lib = self.openssl_lib_path();
-
-        let cert_path = output_dir.join("pqc-cert.pem");
-        let key_path = output_dir.join("pqc-key.pem");
-
-        // Generate key with ML-DSA-87 (NIST Level 5 signature)
-        let key_path_str = key_path
-            .to_str()
-            .ok_or_else(|| "Key path contains invalid UTF-8".to_string())?;
-        // SEC-10: use env_clear() to prevent library preload via inherited env vars
-        let mut key_cmd = Command::new(&openssl_bin);
-        key_cmd.env_clear().env("PATH", "/usr/bin:/bin");
-        if !openssl_lib.is_empty() {
-            key_cmd.env("LD_LIBRARY_PATH", &openssl_lib);
-        }
-        let key_output = key_cmd
-            .args(["genpkey", "-algorithm", "ML-DSA-87", "-out", key_path_str])
-            .output()
-            .map_err(|e| format!("Failed to generate PQC key: {}", e))?;
-
-        if !key_output.status.success() {
-            return Err(format!(
-                "PQC key generation failed: {}",
-                String::from_utf8_lossy(&key_output.stderr)
-            ));
-        }
-
-        // Generate self-signed certificate
-        let cert_path_str = cert_path
-            .to_str()
-            .ok_or_else(|| "Cert path contains invalid UTF-8".to_string())?;
-        // SEC-10: use env_clear() to prevent library preload via inherited env vars
-        let mut cert_cmd = Command::new(&openssl_bin);
-        cert_cmd.env_clear().env("PATH", "/usr/bin:/bin");
-        if !openssl_lib.is_empty() {
-            cert_cmd.env("LD_LIBRARY_PATH", &openssl_lib);
-        }
-        let cert_output = cert_cmd
-            .args([
-                "req",
-                "-new",
-                "-x509",
-                "-key",
-                key_path_str,
-                "-out",
-                cert_path_str,
-                "-days",
-                "365",
-                "-subj",
-                "/CN=PQCrypta Test/O=PQCrypta/C=US",
-            ])
-            .output()
-            .map_err(|e| format!("Failed to generate PQC cert: {}", e))?;
-
-        if !cert_output.status.success() {
-            return Err(format!(
-                "PQC cert generation failed: {}",
-                String::from_utf8_lossy(&cert_output.stderr)
-            ));
-        }
-
-        info!("Generated PQC test certificate at {:?}", cert_path);
-        Ok(())
-    }
-
     /// Get OpenSSL library path for subprocess calls
     /// Returns the LD_LIBRARY_PATH value for OpenSSL 3.5+
     pub fn openssl_lib_path(&self) -> String {
@@ -810,16 +738,6 @@ impl PqcTlsProvider {
             .as_ref()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default()
-    }
-
-    /// Get OpenSSL binary path
-    pub fn openssl_bin_path(&self) -> String {
-        let config = self.config.read();
-        config
-            .openssl_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "openssl".to_string())
     }
 }
 
@@ -845,10 +763,7 @@ impl PqcTlsProvider {
 /// Used by `http_listener::run_http_listener_pqc` for post-quantum TLS.
 #[cfg(feature = "pqc")]
 pub mod openssl_pqc {
-    use super::{
-        select_application, PqcHandshakeInfo, PqcKemAlgorithm, PqcTlsProvider,
-        TCP_APPLICATIONS_WIRE,
-    };
+    use super::{select_application, PqcTlsProvider, TCP_APPLICATIONS_WIRE};
     use crate::config::ClientAuth;
     use foreign_types::ForeignTypeRef;
     use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
@@ -1109,6 +1024,27 @@ pub mod openssl_pqc {
         builder: &mut openssl::ssl::SslContextBuilder,
         pqc_provider: &PqcTlsProvider,
     ) -> Result<(), String> {
+        // OCSP stapling (crate::ocsp): a client that asks for the status of
+        // the certificate it is served gets the verified response, when the
+        // service holds one for that certificate.
+        builder
+            .set_status_callback(|ssl| {
+                if !crate::ocsp::has_staples() {
+                    return Ok(false);
+                }
+                let staple = ssl
+                    .certificate()
+                    .and_then(|cert| cert.to_der().ok())
+                    .and_then(|der| crate::ocsp::staple_for(&der));
+                match staple {
+                    Some(response) => {
+                        ssl.set_ocsp_status(&response)?;
+                        Ok(true)
+                    }
+                    None => Ok(false),
+                }
+            })
+            .map_err(|e| format!("Failed to set the OCSP status callback: {}", e))?;
         let settings = pqc_provider.tls_settings();
         if settings.max_early_data > 0 {
             // Every context, the SNI ones included: the one a connection ends
@@ -1465,103 +1401,6 @@ pub mod openssl_pqc {
                 .to_str()
                 .ok()
                 .map(|s| s.to_string())
-        }
-    }
-
-    /// Get PQC handshake info from SSL connection
-    ///
-    /// Call this after a TLS handshake to retrieve information about the
-    /// negotiated post-quantum key exchange parameters.
-    ///
-    /// `key_exchange` and `pqc_active` are read from the connection rather than
-    /// assumed. They used to be hardcoded to `X25519MLKEM768` / `true`, which
-    /// made `PqcConfig::check_downgrade` structurally unable to fire on this
-    /// listener: a classical-only handshake reported itself as post-quantum.
-    pub fn get_pqc_info(ssl: &openssl::ssl::SslRef) -> PqcHandshakeInfo {
-        let cipher = ssl
-            .current_cipher()
-            .map(|c| c.name().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let version = ssl.version_str().to_string();
-
-        let group = negotiated_group(ssl);
-
-        // A group we recognise as a PQC or hybrid KEM is what makes a handshake
-        // post-quantum. An unknown or absent group is not PQC — assuming
-        // otherwise is the bug this replaced.
-        let pqc_active = group
-            .as_deref()
-            .and_then(PqcKemAlgorithm::from_str)
-            .is_some();
-
-        PqcHandshakeInfo {
-            cipher,
-            version,
-            key_exchange: group.unwrap_or_else(|| "unknown".to_string()),
-            pqc_active,
-        }
-    }
-}
-
-/// Information about a PQC TLS handshake
-///
-/// Used by `openssl_pqc::get_pqc_info()` to return details about the negotiated
-/// post-quantum key exchange after a TLS handshake completes.
-#[derive(Debug, Clone)]
-pub struct PqcHandshakeInfo {
-    /// Cipher suite name
-    pub cipher: String,
-    /// TLS version
-    pub version: String,
-    /// Key exchange algorithm
-    pub key_exchange: String,
-    /// Whether PQC was used
-    pub pqc_active: bool,
-}
-
-/// Action to take when a PQC downgrade is detected
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DowngradeAction {
-    /// Allow the classical-only connection silently
-    Allow,
-    /// Log the downgrade event and allow the connection
-    Log { classical_kem: String },
-    /// Block the connection (return 421)
-    Block { classical_kem: String },
-}
-
-impl PqcTlsProvider {
-    /// Determine whether a completed TLS handshake constitutes a PQC downgrade
-    /// and what action to take according to `PqcConfig.downgrade_action`.
-    ///
-    /// Returns `DowngradeAction::Allow` if PQC was used, PQC enforcement is
-    /// disabled, or logging/blocking is turned off.
-    pub fn check_downgrade(&self, handshake_info: &PqcHandshakeInfo) -> DowngradeAction {
-        let config = self.config.read();
-
-        if !config.enabled {
-            return DowngradeAction::Allow;
-        }
-
-        // If PQC was active in this handshake, no downgrade occurred.
-        if handshake_info.pqc_active {
-            return DowngradeAction::Allow;
-        }
-
-        // PQC enabled but classical-only KEM was negotiated → downgrade.
-        if !config.log_downgrades {
-            return DowngradeAction::Allow;
-        }
-
-        match config.downgrade_action.as_str() {
-            "block" => DowngradeAction::Block {
-                classical_kem: handshake_info.key_exchange.clone(),
-            },
-            "log" => DowngradeAction::Log {
-                classical_kem: handshake_info.key_exchange.clone(),
-            },
-            _ => DowngradeAction::Allow,
         }
     }
 }

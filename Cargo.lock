@@ -2642,6 +2642,7 @@ dependencies = [
  "jsonwebtoken",
  "maxminddb",
  "md-5",
+ "memchr",
  "mimalloc",
  "nix",
  "nonzero_ext",

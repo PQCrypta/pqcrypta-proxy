@@ -17,7 +17,7 @@
 - **Encrypted Client Hello**: Server-side ECH (RFC 9849) on TCP and QUIC, with rotating HPKE keys published in the DNS HTTPS record: a post-quantum X-Wing config first, so the inner ClientHello is not exposed to harvest-now-decrypt-later, and an X25519 one for the clients that implement only that
 - **Zero Downtime**: Hot reload configuration and TLS certificates; environment-specific config overlay (`--env`)
 - **ACME Automation**: Automatic Let's Encrypt certificate provisioning, renewal timed by the CA's renewal information (ARI, RFC 9773), IP address identifiers (RFC 8738) so a client connecting by address can authenticate it, and Certificate Transparency log submission
-- **OCSP Stapling**: Automated OCSP response fetching and stapling
+- **OCSP Stapling**: verified responses for every served certificate, stapled on every listener
 - **Prometheus Metrics**: Comprehensive metrics for TLS, connections, requests, backends, and WAF blocks
 - **WAF**: Pattern-based request inspection for injection and traversal attacks (SQLi, XSS, path traversal, NoSQLi, SSRF, CMDi, XXE, deserialization) in detect or block mode — covers OWASP A01/A03/A08/A10 attack patterns; categories requiring architectural or supply-chain controls (A02, A04, A05, A06, A09) are handled at other layers. Scanner/reconnaissance probe paths (`.git`, `.env`, `.aws`, `wp-login.php`, terraform state, SSH keys, CI/CD files, etc.) are blocked at path level before pattern scanning, preventing automated scanner traffic from reaching backends and polluting error-rate metrics
 - **Advanced Security**: JA3/JA4 fingerprinting on TCP *and* QUIC with replay and drift detection, circuit breaker, GeoIP blocking, DB-synced IP blocklists, WebTransport origin validation, 0-RTT replay protection
@@ -25,7 +25,7 @@
 - **Structured Access Logging**: Per-request JSON or text logs with latency, bytes, upstream, and client IP
 - **Enterprise Load Balancing**: 11 algorithms, session affinity, health-aware routing, per-backend retry policies, per-backend circuit breaker overrides, canary / percentage traffic splitting with sticky assignment and auto-rollback, traffic shadowing / mirroring
 - **Multi-Dimensional Rate Limiting**: Composite keys, JA3/JA4-based, JWT-verified, adaptive ML anomaly detection; optional Redis backend distributes counters across all proxy instances
-- **Zero-Trust Primitives**: Per-route HMAC proof-of-possession (path+query signed, nonce replay prevention), internal route mTLS auto-enforcement, zero-trust mode startup validation (includes admin HMAC requirement), admin proof-of-possession, `trusted_internal_cidrs` deprecation
+- **Zero-Trust Primitives**: Per-route HMAC proof-of-possession (method, path+query, timestamp and a required nonce signed; each nonce accepted once), internal route mTLS auto-enforcement, zero-trust mode startup validation (includes admin HMAC requirement), admin proof-of-possession, `trusted_internal_cidrs` deprecation
 - **OpenTelemetry Distributed Tracing**: W3C TraceContext + B3 propagation on all transports, OTLP HTTP/JSON export, configurable sampling, access-log trace-ID correlation
 
 ## All Features Implemented
@@ -40,8 +40,8 @@
 | DoS Protection | ✅ | Connection limits, request validation |
 | GeoIP Blocking | ✅ | Country-based blocking (MaxMind DB) |
 | JA3/JA4 Fingerprinting | ✅ | TLS client fingerprint detection and classification on **every transport** — HTTP/1.1, HTTP/2 and HTTP/3. Over QUIC the ClientHello arrives inside encrypted Initial CRYPTO frames, so the vendored rustls/noq forks surface it through `HandshakeData` and it is parsed by the same extractor the TCP paths use. The JA4 transport marker is `q` over QUIC and `t` over TCP |
-| Priority Hints | ✅ | RFC 9218 response prioritization |
-| Request Coalescing | ✅ | Deduplicates identical in-flight requests |
+| Priority Hints | ✅ | RFC 9218 on HTTP/3: each response is scheduled on its QUIC stream by the client's `Priority` header, the origin's `priority` response header (which wins), and PRIORITY_UPDATE frames the client sends later (which win over both); more urgent first, whole (non-incremental) responses one at a time in request order, incremental ones interleaved. HTTP/1.1 and HTTP/2 carry the `priority` header only |
+| Request Coalescing | ✅ | Identical cache misses collapse onto one fetch inside the response cache (`[http3] coalescing_*`): the first GET fetches, the rest wait up to `coalescing_max_wait_ms` and are answered from what it stored, or fetch for themselves when it could not be kept. Keyed and answered by the cache's own rules (host, path, query; a request with a cookie only from an entry the origin stated to be cacheable) |
 | Early Hints (103) | ✅ | Link headers for preload/preconnect |
 | Compression | ✅ | Brotli/gzip/deflate/zstd |
 | Security Headers | ✅ | HSTS, CSP, CORS, Alt-Svc; CORS headers injected on 429 rate-limit responses so browsers surface the status code instead of a misleading CORS error |
@@ -49,7 +49,7 @@
 | PQC TLS | ✅ | X25519MLKEM768 hybrid key exchange (NIST Level 3) + ML-DSA-87 server certificates (NIST Level 5, FIPS 204) |
 | Background Cleanup | ✅ | Auto-cleanup of expired entries |
 | **ACME Automation** | ✅ | Let's Encrypt HTTP-01/DNS-01; one individual cert per domain with atomic writes and immediate hot-reload; IP addresses beside a domain (RFC 8738, `shortlived` profile); renewal in the CA's ARI window (RFC 9773) with `replaces` |
-| **OCSP Stapling** | ✅ | Automated OCSP response fetching with caching |
+| **OCSP Stapling** | ✅ | For every certificate served (each domain's and its ML-DSA companion's) whose certificate names a responder: the response is verified with OpenSSL (signature by the issuer or a responder it certified for OCSP signing, the certificate it is about, `thisUpdate`/`nextUpdate`), stapled by both the rustls and the OpenSSL listeners while it is good, and refreshed halfway through its validity; a must-staple certificate (RFC 7633) without one is reported |
 | **Prometheus Metrics** | ✅ | TLS, connection, request, backend, and error metrics |
 | PROXY Protocol v2 | ✅ | Client IP preservation for downstream proxies |
 | Access Logging | ✅ | Per-request logging in JSON or text format with configurable file output |
@@ -61,18 +61,18 @@
 | Multiple Listener Ports | ✅ | Primary port plus any number of additional ports via `additional_ports` |
 | WebTransport Operations | ✅ | JSON operation routing over streams (encrypt/decrypt/keygen/health/ping/speedtest); QUIC-native speed test server with datagram RTT probing, stream throughput download/upload, packet-loss measurement, MTR-based hop traceroute with GeoIP annotation, and per-client info lookup |
 | **WAF** | ✅ | Pattern-based injection and traversal inspection — SQLi, XSS, path traversal, NoSQLi, SSRF, CMDi, XXE, deserialization; covers OWASP A01/A03/A08/A10 attack patterns. Scanner probe blocking: path-level block for `.git`, `.env`, `.aws`, `wp-login.php`, terraform state, SSH keys, CI/CD files, and 40+ other reconnaissance targets |
-| **Audit Logger** | ✅ | Async structured JSON audit log — admin actions, auth failures, WAF events, rate limits, PQC downgrades |
-| **JA3/JA4 Replay Detection** | ✅ | Flags same fingerprint from multiple IPs within configurable window |
-| **JA3/JA4 Drift Detection** | ✅ | Flags cipher/extension composition changes on the same fingerprint hash |
-| **PQC Downgrade Detection** | ✅ | Detects classical-only TLS negotiation when PQC is required; block/log/allow action. The negotiated group is read from the connection via `SSL_get0_group_name`, not assumed — it was previously hardcoded to `X25519MLKEM768`, which made the check unable to fire |
+| **Audit Logger** | ✅ | Structured JSON audit log, one line an event: admin actions and refused admin requests, WAF blocks and detections, address blocks, rate-limit refusals and classical handshakes (each once per address in an interval), configuration and TLS reloads. A bounded queue and one writer thread: under a flood the events it cannot keep are counted and the count is written (`events_dropped`). The file is created `0640` and reopened after a rotation |
+| **JA3/JA4 Replay Detection** | ✅ | One fingerprint that is not a browser's or a known crawler's arriving from `replay_min_networks` client networks (IPv4 /24, IPv6 /48) within `replay_window_secs`: warned and audited once a window; `replay_action = "block"` also blocks each address |
+| **JA3/JA4 Drift Detection** | ✅ | One client network presenting a different JA4 on most of its connections (distinct fingerprints / connections ≥ `drift_threshold` after `drift_min_connections`): a client rotating its fingerprint. A browser keeps one JA4 per transport, so a NAT of many people scores low. `drift_action` as above |
+| **Classical Key-Exchange Policy** | ✅ | `pqc.downgrade_action` decides what a connection whose key exchange is classical gets, on every listener (OpenSSL and rustls over TCP, HTTP/3, extended CONNECT, the WebTransport server): `allow` serves it, `log` serves it and records it in the audit log, `block` answers every request (or session) on it 421. The group is the one each handshake negotiated |
 | **Response Cache (RFC 9111)** | ✅ | Optional RFC 9111-compliant HTTP cache with Cache-Control parsing, ETag/If-None-Match, Last-Modified/If-Modified-Since, Vary header support, a store bounded by size (keys and headers counted with bodies) with S3-FIFO eviction and a periodic expiry sweep, and configurable path/host exclusions. HEAD responses are never stored — their body is empty by definition, and a stored empty body made the hit path report the resource as zero-length |
 | **HTTP/3 Client Conformance Suite** | ✅ | A public service that makes the server misbehave on purpose so a client library can find out how it copes: 59 anomalies, each citing the RFC clause it exercises — reserved frame types, a duplicated SETTINGS identifier, a control stream opening with the wrong frame, an unknown QUIC frame type, a Stateless Reset, a path-MTU black hole, refused 0-RTT. Every test binds its own UDP port, because anomalies like `supported_versions` are endpoint-wide and one port is the whole test; the vhost serves the catalogue, reports and badge. Verdicts are asymmetric by class — ignoring a reserved *HTTP/3* frame is a pass and ignoring a reserved *QUIC* frame is a failure, since QUIC reserves no ignorable frame types (RFC 9000 §12.4). A failure requires positive evidence that the client read the anomaly: silence on a unidirectional control stream, or a window that closes with nothing observed, is **inconclusive** — a rejection whose CONNECTION_CLOSE was lost looks exactly like no rejection at all. A run that never puts the client in the situation under test records inconclusive too, never a pass and never a failure. An anomaly is also emitted at the moment that makes the answer unambiguous: the mid-connection GOAWAY goes out once the client's request is in flight and names the stream after it, because sent at connection setup it races that request, and RFC 9114 §5.2 makes a client that reads it first *correct* to close and reconnect — measured that way the test scored a conformant client as having failed to recover. Machine-readable catalogue, JSON reports and an SVG badge; `h3-conformance` drives any client from CI. **TLS tier added 2026-09-17**: six ports whose anomaly is the key exchange itself rather than a malformed byte — hybrid-only (forcing the HelloRetryRequest round trip that post-quantum deployments break on), classical-only against a hybrid offer (discretionary: the report says which policy the client took, because no RFC yet mandates a post-quantum floor), and a ClientHello too large for one Initial packet, judged from a count of the client's Initials so a client that never sent a large one is reported unexercised rather than credited. Two more are now emitted through a `key_share_impairment` hook in `vendor/rustls-fixed`, which exists because a correct TLS implementation has no code path that produces either: a ServerHello naming a group the client never offered, payload left exactly as generated so that an abort can only be over RFC 8446 §4.1.3 and not over a share that would not parse; and a hybrid share with one bit flipped early in the ML-KEM ciphertext and the X25519 tail untouched, where a client that still completes has silently downgraded itself to the classical half alone. What is judged on the first is the abort and not the alert value — RFC 9001 §4.8 expressly lets a QUIC endpoint replace any alert with a generic one — and a handshake that ends with no CONNECTION_CLOSE at all is inconclusive rather than a failure. The third, a GREASE named group, was withdrawn before it judged anything: as built it put the reserved value in the ServerHello key_share, which is illegal under §4.1.3 whatever the value is, so it scored every conformant client as a failure for doing the right thing |
 | **Cache Purge (admin API)** | ✅ | `GET /cache` reports entries and bytes held; `POST /cache/purge` drops them — everything, or narrowed by `?host=`, `?prefix=`, `?host=&prefix=` for one path prefix on one host, or `?host=&path=` for one exact URL across every method. Exists because a deploy that changes generated output otherwise leaves the edge serving the old body until max-age expires, and the alternative was restarting the proxy. `path=` without `host=`, or with `prefix=`, is refused rather than silently widened or ignored. Audit-logged with scope and target |
 | **Single Shared Response Cache** | ✅ | One cache instance per process rather than one per listener. There were five — one per HTTP listener variant and one per QUIC port — so the same URL was cached separately for h2 and h3 and for each port, and a purge would have cleared one while the others served the old body. The key is `METHOD\|host\|path`, with no port or protocol in it, so sharing is what the key already assumed |
 | **Correct HEAD Semantics (RFC 9110 §9.3.2)** | ✅ | A HEAD response carries the header fields a GET would have. Backends serving chunked send no `Content-Length`, and the proxy no longer synthesizes `content-length: 0` from the empty buffered body — which had been telling every link checker, uptime monitor, CDN probe and security scanner that every dynamic page was empty. Fixed on all three transports (HTTP/1.1, HTTP/2 and the separate HTTP/3 implementation) |
 | **Per-Backend Connection Pool** | ✅ | Per-host idle timeout, max idle connections, max total connections, and acquire timeout for the HTTP/1.1 backend pool. A reused connection the backend closes just as a request is written (its keep-alive timeout racing the reuse) no longer turns into a 502: an idempotent request (RFC 9110 §9.2.2) with a replayable body is sent again on another connection; a POST is not, since its first copy may have been acted on |
-| **Per-Backend Retry** | ✅ | Configurable retries with exponential backoff per backend; retry on 5xx/connect-failure/timeout |
-| **Per-Backend Circuit Breaker** | ✅ | Per-backend overrides for failure threshold, half-open delay, and success threshold |
+| **Per-Backend Retry** | ✅ | `retries`, `retry_backoff_ms` (doubling) and `retry_on` per backend, on TCP and HTTP/3: a connection that could not be made is retried for any method; a 5xx or a timeout only for a method that may be repeated with a body that can be resent |
+| **Per-Backend Circuit Breaker** | ✅ | Per pool server: `cb_failure_threshold` failures open it; after `cb_half_open_delay_secs` one trial request at a time goes through, and `cb_success_threshold` successes close it (a trial that fails opens it for another delay); the server then ramps back up in slow start |
 | **0-RTT Replay Protection** | ✅ | Nonce store (strict/session/none); rejects replayed early-data nonces |
 | **QUIC Retry** | ✅ | Optional RFC 9000 source-address validation (`enable_quic_retry`); Retry token echoed before handshake, anti-spoofing at +1 RTT |
 | **Certificate Transparency** | ✅ | Submits new certs via `POST /ct/v1/add-chain` after ACME issuance, to logs chosen from the live CT log list: one per operator whose shard holds the expiry |
@@ -93,12 +93,12 @@
 | **HTTP/1.1-Only Hosts** | ✅ | `http11_only_hosts` in `[server]` — listed hostnames negotiate HTTP/1.1 only (no `h2` ALPN); browsers open an independent TCP connection per `fetch()` stream instead of coalescing onto one HTTP/2 pipe, eliminating head-of-line blocking on parallel speed test streams |
 | **Admin Loopback Enforcement** | ✅ | `require_loopback = true` (default) aborts startup when admin API is bound to a non-loopback address |
 | **Shared Security State** | ✅ | **Every** listener — QUIC and all three TCP paths — shares one `SecurityState`. Blocked IPs, rate limiter counters, the fingerprint corpus and DB-synced blocklists are visible across all of them. The TCP listeners previously each constructed their own, so an IP blocked on one was not blocked on another and the admin API could not clear it |
-| **Audit Logger Wired** | ✅ | `AuditLogger` constructed at startup and passed to the admin server; audit events are now actually written |
+| **Audit Events at Their Source** | ✅ | Each event is recorded where it happens: the admin API (actions, refused requests), the security layer (WAF verdicts, address blocks), the rate limiter, the TLS provider (every reload, whatever asked for it), the configuration reload handler and the handshake policy |
 | **Cryptographically Secure Admin Token** | ✅ | Ephemeral admin tokens use `OsRng` instead of `thread_rng` |
 | **`zero_trust_mode`** | ✅ | Startup validation enforcing mTLS, no plaintext backends, no CIDR trust, and admin HMAC proof-of-possession |
-| **Per-Route HMAC Signing** | ✅ | HMAC-SHA256 proof-of-possession signing full path+query string; optional `X-Request-Nonce` binds nonce into signature for full replay prevention within 300 s window |
+| **Per-Route HMAC Signing** | ✅ | HMAC-SHA256 proof-of-possession signing full path+query string; a required `X-Request-Nonce` (8–128 characters) is bound into the signature and accepted once within the window, so a signed request cannot be replayed |
 | **Internal Route Auto-mTLS** | ✅ | `internal = true` routes default to requiring client certificate |
-| **Admin HMAC Proof-of-Possession** | ✅ | Optional per-request HMAC signature (path+query signed) alongside bearer token; optional `X-Admin-Nonce` for full replay prevention |
+| **Admin HMAC Proof-of-Possession** | ✅ | Optional per-request HMAC signature (path+query+timestamp+nonce signed) alongside the bearer token; the `X-Admin-Nonce` (8–128 characters) is required and accepted once within the window |
 | **`trusted_internal_cidrs` Deprecation** | ✅ | Startup warning directing operators to cert-based trust |
 | **OpenSSL Subprocess Env Sanitisation** | ✅ | All `openssl` subprocesses clear the environment before execution (`env_clear()`) to prevent PATH/LD_PRELOAD injection |
 | **Hot Reload** | ✅ | Configuration and TLS certificates reloaded at runtime without dropping connections or restarting: routes, security, the WAF, admin credentials, pools and every listener's per-request settings; a change to a setting bound at startup (ports, listener kinds, process-wide services) is named in a warning |
@@ -111,12 +111,12 @@
 | **JWT Rate Limiting** | ✅ | Per-subject rate limiting with HMAC-SHA256 signature verification; unsigned `sub` claims rejected; non-HMAC algorithms blocked |
 | **Log Injection Prevention** | ✅ | Newlines and control characters stripped from all user-controlled fields before writing to access and audit logs |
 | **NEL (Network Error Logging)** | ✅ | Network Error Logging headers with configurable policy for client-side error reporting |
-| **`tls_skip_verify` Production Block** | ✅ | `tls_skip_verify = true` rejected at config load unless `--allow-insecure-backends` CLI flag is passed |
+| **Backend Certificates Always Verified** | ✅ | No option turns backend certificate verification off: `tls_cert` pins a self-signed backend or a private CA, and `tls_skip_verify` is refused at config load |
 | **SSRF Protection** | ✅ | Link-local and loopback backend addresses rejected; RFC1918 logged with warning; WAF SSRF pattern set active |
 | **Admin Brute-Force Lockout** | ✅ | Per-IP and global lockout with exponential back-off (5 min base, up to 30 min) on repeated auth failures |
-| **Connection Draining** | ✅ | Graceful backend removal with configurable drain timeout; in-flight requests complete before backend is taken out of rotation |
-| **Request Queuing** | ✅ | Queues requests when all backends are saturated; configurable queue depth and wait timeout |
-| **Slow Start** | ✅ | Gradually ramps traffic to recovered backends to avoid thundering herd after a circuit breaker reopens |
+| **Connection Draining** | ✅ | A pool server a reload removes takes no new sessions, keeps the ones it has until `connection_draining.timeout_secs`, then leaves the pool; requests in flight on it finish. By hand: `POST /pools/{pool}/servers/{id}/drain` (and `undrain`, `healthy`, `unhealthy`) on the admin API |
+| **Request Queuing** | ✅ | Every algorithm honours each pool server's `max_connections`; a request that finds every server up but full waits for the first place given back, up to `queue.timeout_ms`, with at most `queue.max_size` waiting (per pool: `queue_max_size`, `queue_timeout_ms`) |
+| **Slow Start** | ✅ | A pool server that recovers (its health check, its breaker) or joins on a reload ramps from `initial_weight_percent` to its weight over `duration_secs`: through its weight for the weighted and hashing algorithms, and for the others by being passed over in proportion to its ramp |
 | **Connection Pool** | ✅ | Per-backend connection pool with configurable max idle, max total, acquire timeout, and idle timeout |
 | **Session Affinity Modes** | ✅ | Sticky sessions via IP hash, custom header, or Set-Cookie with configurable SameSite attribute |
 | **Path Regex Routing** | ✅ | Per-route regex pattern matching with ReDoS prevention (pattern size-limited) |
@@ -148,7 +148,7 @@
 | **DNS over HTTPS (RFC 8484)** | ✅ | A gateway for an authoritative name server on the same host: GET, HEAD and POST over HTTP/1.1, HTTP/2 and HTTP/3; DNS over TCP to the server; `Cache-Control` from the answer TTLs; RFC 8467 padding on request; zone transfers and other opcodes refused with an Extended DNS Error; loopback-only, off by default (`[doh]`) |
 | **Encrypted Client Hello (ECH)** | ✅ | Server-side ECH, RFC 9849, with post-quantum HPKE: X-Wing (0x647A) and ML-KEM-768/1024 configs open through libcrux (`vendor/pqcrypta-hpke-pq`) beside the RFC 9180 DH ones. `ech-keygen --kem x-wing` and `--kem x25519` generate each, and the published list carries X-Wing first, so a client uses it where it can and browsers, which implement X25519 only today, still get ECH. HPKE keypairs generated and rotated by `ech-keygen` / `ech-rotate.timer` into `/etc/pqcrypta/ech-configs`, with previous configs retained so clients holding a cached DNS record still complete. A rotated key is taken up by every listener without a restart: QUIC and each TCP listener rebuild their rustls configs on the TLS reload (`ech_config::reloads`), and `ech-rotate.sh` asks for that reload through the admin API, then publishes the new list in DNS with `pqcrypta-ech-publish` (the self-hosted DNS signer) only once the proxy holds the key. Applies on **TCP and QUIC** — ECH is a TLS 1.3 extension and QUIC is TLS 1.3, so the same handshake resolves it. An offer holds across a HelloRetryRequest: the retry request confirms the acceptance, and the second ClientHello's offer, an empty `enc` sealed at the next sequence number, is opened with the first's HPKE context, so a client whose first key share the server does not take still gets ECH (RFC 9849 sections 6.1.5, 7.1.1 and 7.2.1); a second offer that is missing, changed or does not open aborts the handshake. The outcome is exposed to backends as `x-tls-ech`: `accepted`, `not-offered`, `rejected` (the offer named a key this server holds and did not open with it) or `unknown-config` (it named none: a GREASE offer from a client without this server's ECH configuration, or a config retired longer ago than any kept). Both rejections get `retry_configs`. On TCP a ClientHello without ECH stays on the OpenSSL listener, which says `not-offered` where the node holds ECH keys and `not-supported` where it holds none |
 | **Handshake Facts to Backends** | ✅ | `x-tls-version`, `x-tls-cipher`, `x-tls-group`, `x-tls-alpn`, `x-tls-ech` injected on all three listener paths, alongside the existing `x-ja3-hash` / `x-ja4-hash` / `x-client-name` / `x-client-type` / `x-client-cert` / `x-tls-early-data`. Every one is **stripped from the incoming request before being set**, so a caller cannot assert a handshake it did not have |
-| **Observed Fingerprint Corpus** | ✅ | Fingerprints seen in live traffic are persisted to `/var/lib/pqcrypta-proxy/state/observed.json` every 5 minutes and reloaded at startup, with the pre-hash JA3 string, per-fingerprint connection counts, and the User-Agents seen on requests carrying them. Bounded by `security.max_tracked_fingerprints` and evicted least-recently-seen, with a warning logged whenever eviction fires. That limit was a hardcoded 50,000 until 2026-09-17, by which point the corpus was sitting at exactly that number: it had been dropping its long tail for an unknown period, and the long tail is what a fingerprint directory is for. Default is now 250,000 (~125 MB). Evidence only — it never feeds classification or blocking |
+| **Observed Fingerprint Corpus** | ✅ | One record per JA4 (a JA3 where no JA4 was computed) with its counts, first and last sighting, the User-Agents on its requests and a bounded sample of its JA3 variants, persisted to `/var/lib/pqcrypta-proxy/state/observed.json` every 5 minutes and reloaded at startup. A fingerprint seen from two client networks (an IPv4 /24, an IPv6 /48) or on two days is kept for good; a new one waits in a probation segment of 20,000, oldest let go first, so a client that sends a new ClientHello shape with every connection cannot grow the corpus or push anything established out. The JA3 classification cache beside it is a cache, bounded by `security.max_tracked_fingerprints`. Evidence only — it never feeds classification or blocking |
 
 ## Features
 
@@ -156,7 +156,7 @@
 - **Domain-based Routing**: Route `api.example.com` → port 3003, `example.com` → port 8080
 - **TLS Termination**: Decrypt at proxy, plain HTTP to backend (default)
 - **TLS Re-encryption**: Decrypt at proxy, re-encrypt HTTPS to backend with mTLS support
-- **TLS Passthrough**: SNI-based routing without decryption
+- **TLS Passthrough**: SNI-based routing without decryption, switched inside every HTTPS listener's accept path (same port; limits, block list, idle and shutdown apply)
 - **HTTP→HTTPS Redirect**: Automatic port 80 to 443 redirect server
 - **Custom Header Injection**: Inject arbitrary response or request headers per route before forwarding to backends
 - **Per-Route Timeout Overrides**: Independent timeout configuration per route, overriding global defaults
@@ -167,10 +167,10 @@
 ### Security
 - **WAF**: Pattern-based injection and traversal inspection — SQLi, XSS, path traversal, NoSQLi, SSRF, command injection, XXE, insecure deserialization; detect or block mode; custom patterns; body scanning; covers OWASP A01/A03/A08/A10 attack patterns; `X-Forwarded-For` headers scanned without SSRF patterns (localhost/RFC1918 IPs in XFF are legitimate proxy hops, not SSRF — prevents false positives for clients behind local reverse proxies)
 - **JA3/JA4 TLS Fingerprinting**: Detects browsers, bots, scanners, malware based on TLS ClientHello
-- **JA3/JA4 Replay Detection**: Flags same fingerprint arriving from multiple IPs within a configurable window — catches credential-stuffing and fingerprint spoofing
-- **JA3/JA4 Drift Detection**: Flags cipher/extension composition changes on the same fingerprint hash — detects TLS library upgrades or evasion attempts
+- **JA3/JA4 Replay Detection**: one tool's fingerprint (not a browser's) from many client networks at once — a distributed campaign
+- **JA3/JA4 Drift Detection**: one client network rotating its TLS fingerprint across its connections — fingerprint evasion
 - **Malicious Fingerprint Blocking**: `block_malicious = true` in fingerprint config automatically blocks connections whose JA3/JA4 hash matches a known-malicious entry in the classification database; fingerprint cache with configurable TTL and background cleanup
-- **PQC Downgrade Detection**: Detects classical-only TLS negotiation when PQC is required; configurable action: block (421), log, or allow
+- **Classical Key-Exchange Policy**: `pqc.downgrade_action` decides what a connection whose handshake ended on a classical group gets, on every listener: `block` (421 to every request), `log` (served, recorded in the audit log), or `allow`
 - **PQC + Fingerprinting Combined**: OpenSSL ML-KEM with ClientHello capture for early blocking
 - **PQC Session Tickets**: rustls installs no ticketer by default, so with `pqc_session_tickets = false` the proxy issues no TLS 1.3 tickets at all and resumption relies on session storage. When enabled, each ticket encapsulates to the server's ML-KEM-1024 (FIPS 204) key for a fresh per-ticket secret, derives an AES-256-GCM key from it with HKDF-SHA384, and seals the resumption state with the KEM ciphertext as associated data. The keypair rolls every `session_ticket_lifetime_secs` (default 12 h) retaining one previous generation, since the trait requires lifetime to be enforced by key rolling rather than a timestamp inside the ticket. Note the server holds both halves of the keypair: what this changes is the algorithm protecting ticket key material and that each ticket gets an independent secret — it is not a defence against reading server memory
 - **Certificate Compression**: RFC 8879, on by default (`certificate_compression = "auto"` in `[tls]`; `"off"` disables it on both stacks). The two stacks enable it in completely different ways — OpenSSL sends an uncompressed chain unless the application calls **both** `SSL_CTX_set1_cert_comp_preference` *and* `SSL_CTX_compress_certs`, neither of which the `openssl` or `openssl-sys` crates bind, while rustls needs no call at all and populates `cert_compressors` from the `brotli` and `zlib` crate features. Only zlib is offered over TCP, because these OpenSSL builds report `-DZLIB` and nothing else and advertising an algorithm the library cannot produce is worse than offering one fewer. Measured on this deployment: the Certificate message is 3,435 bytes and the `CompressedCertificate` replacing it is 2,384, a saving of exactly 1,051 bytes per full handshake — most of what the X25519MLKEM768 key share adds. The setting is read once at startup because both stacks bake it into the TLS context, so changing it needs a restart rather than a config reload
@@ -192,7 +192,7 @@
 - **CORS Handling**: Full CORS support with preflight OPTIONS handling; all rate-limit 429 responses include `Access-Control-Allow-Origin` and `Access-Control-Allow-Credentials` headers when the request Origin matches an allowed origin — prevents browsers from reporting rate-limit errors as CORS failures
 - **Server Identity Concealment**: the backend's `Server` header is replaced by `server_header` in `[server]` (default `pqcrypta`, no version); an empty value passes the backend's own header through, as HAProxy and NGINX do by default
 - **Log Injection Prevention**: Newlines and all control characters stripped from every user-controlled field before writing to access or audit logs
-- **`tls_skip_verify` Production Block**: `tls_skip_verify = true` rejected at config load; requires explicit `--allow-insecure-backends` CLI flag to override
+- **Backend Certificates Always Verified**: `tls_cert` pins a self-signed backend or private CA; `tls_skip_verify` is refused at config load
 - **IP Blocklists (DB-synced)**: Live-synced IP, fingerprint, and country blocklists pulled from the application database — supports individual IPs and CIDR subnet ranges (e.g. `192.0.2.0/24`); updates without restart. The reload **reconciles in both directions**: entries added to the synced file are blocked, and database-sourced entries that disappear from it are released from memory on the next reload (60 s), so deactivating a row or clicking unblock in the threat dashboard actually lifts a live block. Only `DatabaseSync` entries are reconciled — blocks the proxy raised itself (rate limit, WAF, `Manual` config entries) are unaffected. For an immediate release, `POST /blocklist/unblock/:ip` on the admin API drops the IP (and any CIDR entry covering it) without waiting for the next sync; `GET /blocklist` shows what the running proxy is actually enforcing, which is the copy that decides whether a request is refused
 - **ACME Domain Path Sanitization**: Domain names validated against RFC 1035 before use in file-system paths — prevents path traversal via config
 
@@ -214,9 +214,9 @@
 - **Canary / Percentage Traffic Splitting**: Route a configurable percentage of new traffic to a canary server while stable servers handle the rest; once assigned, clients receive a sticky `PQCPROXY_CANARY` cookie so they stay on the same server for the duration of the experiment; auto-rollback suspends the canary if its sliding-window error rate exceeds a configured threshold; live admin endpoints (`GET /canary`, `POST /canary/suspend/:id`, `POST /canary/resume/:id`, `POST /canary/weight/:id`) allow runtime inspection and control without restarting the proxy
 - **Traffic Shadowing / Mirroring**: Per-route `[routes.shadow]` block sends a fire-and-forget async copy of each request to a secondary backend; client only ever sees the primary response and the shadow response is discarded; configurable percentage (0–100), independent timeout, custom marker header name+value, and per-route response logging — zero overhead on routes without shadow configured
 - **Health-Aware Routing**: Automatically bypasses unhealthy backends; proactive TCP-connect health checks on configurable interval detect failures before traffic hits them
-- **Slow Start**: Gradually increases traffic to recovering servers to avoid thundering herd after circuit breaker reopens
-- **Connection Draining**: Graceful server removal with configurable drain timeout; in-flight requests complete before backend is taken out of rotation
-- **Request Queuing**: Queues requests when all backends are saturated; configurable queue depth and wait timeout
+- **Slow Start**: a pool server that recovers or joins takes a growing share of requests over `slow_start.duration_secs`
+- **Connection Draining**: a pool server removed by a reload (or drained through the admin API) takes no new sessions and keeps its own until the drain timeout
+- **Request Queuing**: a request that finds every pool server full waits for a place, up to the queue's size and time
 - **Connection Pool**: Per-backend connection pool with configurable max idle connections, max total connections, acquire timeout, and idle timeout; idempotent requests that meet a pooled connection the backend closed as they were written are sent again on another connection instead of failing with a 502
 - **Per-Server Keep-Alive**: Configurable QUIC keep-alive interval per server to prevent idle connection timeouts
 - **Priority Failover**: Primary servers first, then failover to lower priority
@@ -229,8 +229,8 @@
 - **HTTP/3 peer violations answered as the RFCs name them**: a peer that breaks RFC 9114 or RFC 9204 gets the error the section requires. A push stream from a client, a second control or QPACK stream, or a closed critical stream ends the connection with H3_STREAM_CREATION_ERROR or H3_CLOSED_CRITICAL_STREAM. CANCEL_PUSH for a push never promised, or a MAX_PUSH_ID below an earlier one, gets H3_ID_ERROR. A frame with bytes after its fields, or one that ends inside them, gets H3_FRAME_ERROR. An impossible Required Insert Count gets QPACK_DECOMPRESSION_FAILED. An Insert Count Increment or Section Acknowledgment to an encoder that inserts nothing gets QPACK_DECODER_STREAM_ERROR. A malformed request is a stream error, H3_MESSAGE_ERROR, and the connection carries on: a repeated pseudo-header, one after a regular field, one of a response's in a request, a connection-specific field, or DATA that does not add up to its content-length (answered 400). The vendored `h3` fork's tests, upstream's integration suite with them, run over noq in CI (`h3-fork`), and the platform's HTTP/3 analyzer checks the same rules against the live server.
 - **HTTP/3 GREASE**: Every connection carries a reserved SETTINGS identifier, a reserved unidirectional stream type and one reserved frame type (RFC 9114 §7.2.8), so clients that do not ignore unknown extensions show it now rather than when a real extension arrives. The reserved frame goes ahead of the first response's HEADERS frame, never last on the stream: RFC 9114 §4.1 allows it anywhere, but aioquic before 1.6 loses the end of a stream whose last frame is one it ignores, and its clients (dnspython's DNS over HTTPS among them) then wait out their timeout for a response they have already received.
 - **Early Hints (103)**: Preload CSS/JS resources via Link headers — dns-prefetch, preconnect, modulepreload, and speculative prerender hint types supported. Preload rules are scoped per host/path in `[[http3.preload_resources]]` and hot-reload at runtime (preconnect origins + preload rules apply on the next request, no restart). Note: an `href` is only used by the browser when it byte-matches the page URL, so any `?v=` cache-buster must be included and kept in sync.
-- **Priority Hints**: RFC 9218 Extensible Priorities for resource scheduling (`u=3,i=?0`)
-- **Request Coalescing**: Deduplicate identical GET/HEAD requests in flight
+- **Priority Hints**: RFC 9218 Extensible Priorities drive HTTP/3 stream scheduling (request header, origin response header, PRIORITY_UPDATE)
+- **Request Coalescing**: identical cache misses wait for one fetch and are answered from the cache it fills
 - **Alt-Svc Advertisement**: Dynamic HTTP/3 upgrade headers on all ports — built from `udp_port` and `additional_ports` so every listener advertises its actual address, and **the same on every transport**: over TCP and over QUIC the value lists h3 on every UDP port that serves it, since each Alt-Svc header replaces a client's cached alternatives (RFC 7838 section 3). `alt_svc_ports` in `[server]` replaces the derived list outright, for the case where a bound port does not serve HTTP/3 — a provider filtering inbound UDP/443 upstream, or a port handed to the WebTransport server — since advertising one costs every visitor a QUIC attempt that can only time out. An empty list advertises no HTTP/3 at all, which is the truthful value for a node that serves none. `tcp_only_hosts` in `[server]` sends `Alt-Svc: clear` for designated TCP-only origins (and answers `421 Misdirected Request` to any request for one that arrives over HTTP/3, so the browser retries it over TCP), as do `alt_svc_clear_user_agents` (case-insensitive User-Agent substrings: search crawlers and TLS scanners by default) and `alt_svc_clear_cidrs` (source networks: Cloudflare's published ranges by default, since Cloudflare Radar sends a generic Chrome UA); `alt_svc_max_age_secs` sets `ma` on every advertisement (default 86400). With nothing advertised, `x-webtransport-port` is not sent either; `http11_only_hosts` in `[server]` suppresses `h2` ALPN entirely so browsers open an independent TCP connection per stream (required for parallel TCP speed tests)
 - **Virtual Host Routing**: Proper `:authority` pseudo-header handling for backend routing
 - **Server-Timing**: Performance metrics header for browser DevTools (RFC 6797)
@@ -241,7 +241,8 @@
 ### Protocols
 - **QUIC/HTTP/3**: Full HTTP/3 support via QuicListener (h3 + noq crates — noq is n0-computer's multipath-capable quinn fork; see Multipath QUIC above)
 - **Multipath QUIC (draft-ietf-quic-multipath)**: Full multipath support. The QUIC stack is [noq](https://github.com/n0-computer/noq) (n0-computer's multipath-capable quinn fork), which implements the complete extension — concurrent, data-carrying paths with per-path packet-number spaces, per-path loss recovery and congestion control, the full lifecycle frame set (ACK_MP/PATH_ABANDON/PATH_STATUS/MAX_PATH_ID/PATHS_BLOCKED), per-path connection-ID spaces, and a scheduler. The concurrent path budget is set by `server.max_concurrent_multipath_paths` (default 4; `1` keeps every connection single-path, `0` stops the extension being negotiated at all) and path creation/validation/teardown is automatic once negotiated. Peers that do not advertise multipath are unaffected whatever the value. HTTP/3 and WebTransport both run over noq (via the in-tree `h3-noq` binding and the noq-ported `wtransport`). Verify: scan pqcrypta.com at https://pqcrypta.com/http3_quic/ — the Multipath field validates a genuine second data-carrying path.
-- **WebTransport**: Native WebTransport session handling with bidirectional streams, unidirectional streams, and datagrams
+- **WebSocket tunnels** (`supports_websocket` per route): HTTP/1.1 upgrades, HTTP/2 extended CONNECT (RFC 8441) and HTTP/3 extended CONNECT (RFC 9220), relayed to the backend's own HTTP/1.1 upgrade over its TLS settings with the request's fields; the backend's answer is verified and its subprotocol and extensions passed on; idle in both directions closes the tunnel (`ws_idle_timeout_secs`)
+- **WebTransport**: sessions on the HTTP/3 port itself (beside ordinary requests on the same connection: its bidirectional and unidirectional streams and its datagrams are told apart by session and handed to it) and on the dedicated WebTransport port, served by one implementation: each stream and datagram forwarded to the route's backend (a `tcp` backend relays a stream's bytes both ways), the speed test at `/speedtest` and the telemetry wall at `/telemetry`
 - **WebTransport SNI Certificates**: The dedicated WebTransport listener selects the per-domain certificate by SNI from the certs directory (same multi-cert resolver as the HTTPS listeners), so a single node serves WebTransport for every hosted domain with that domain's own certificate
 - **WebTransport Origin Validation**: SR-02 cross-origin enforcement — configurable `webtransport_allowed_origins` allowlist rejects browser sessions from unlisted origins with 403; non-browser clients (no Origin header) always accepted
 - **WebTransport JSON Operations**: JSON operation routing over streams — encrypt, decrypt, keygen, health, ping dispatched to backend by operation type; plus a built-in QUIC-native speed test server (`speedtest` operation) providing datagram RTT probing, stream download/upload throughput measurement, packet-loss counting, MTR-based hop traceroute with GeoIP city/ASN/country annotation, and client IP info lookup
@@ -946,7 +947,7 @@ block_scanner_uas = true
 
 # Inspection surface
 scan_json_body = true         # Scan bodies, decoding JSON string escapes
-max_body_scan_bytes = 65536   # Max bytes of body to scan (default 64 KB)
+max_body_scan_bytes = 0       # How much of a body is inspected: 0 = all of it (default)
 scan_all_headers = true       # Every header except negotiation/cache/hints/credentials
 max_header_scan_bytes = 8192  # Max bytes of any single header value
 max_header_count = 80         # Header count above which a request is anomalous
@@ -993,12 +994,17 @@ datagram payloads are proxied to the same backends as HTTP requests, so they run
 through the same `inspect_body` before reaching a backend — a WebTransport
 session is not an uninspected path to `/encrypt` and friends.
 
-**Compressed bodies.** A `Content-Encoding: gzip|deflate|br|zstd` request body
-is decompressed (bounded by `max_decompressed_body_bytes`, so a decompression
-bomb cannot exhaust memory) and the decompressed form is scanned — otherwise a
-compressed payload is entropy to the pattern engine and passes. The raw
-compressed bytes are never text-scanned (they trip binary-ish rules), only
-matched against the binary deserialization signatures.
+**Compressed bodies.** A request body with a content coding (`gzip`, `deflate`,
+`br`, `zstd`, or several applied in turn) is decoded at the proxy, held to
+`security.max_request_size` and the body memory budget, scanned decoded, and
+**forwarded decoded** without its `Content-Encoding`: what the WAF reads is
+exactly what the backend receives, so bytes after a compressed stream cannot
+reach a backend unread. A body that does not decode is refused 400, one that
+decodes past the limit 413, and a coding the proxy cannot read 415 with the
+codings it reads in `Accept-Encoding`. `waf.decode_compressed_body = false`
+leaves coded bodies as they came. The raw compressed bytes are never
+text-scanned (they trip binary-ish rules), only matched against the binary
+deserialization signatures.
 
 **Request anomalies.** `request_anomaly` covers what no regex can express:
 conflicting `Content-Length` headers and `Content-Length` beside
@@ -1085,7 +1091,7 @@ audit_log_enabled = true
 audit_log_path = "/var/log/pqcrypta-proxy/audit.json"   # omit to write to stderr
 ```
 
-Each audit event is a JSON object with `timestamp`, `level`, `category`, and event-specific fields. Event categories: `admin_action`, `auth_failure`, `ip_blocked`, `rate_limit`, `pqc_downgrade`, `waf_block`, `waf_detect`, `config_reload`, `tls_reload`, `ja3_replay`, `ja3_drift`.
+Each audit event is one JSON line with `timestamp`, `level`, `category`, `event` and the event's own fields. Events: `admin_action`, `auth_failure`, `ip_blocked`, `rate_limit_hit`, `pqc_downgrade`, `waf_block`, `waf_detect`, `config_reload`, `tls_reload`, and `events_dropped` (how many events the queue could not hold). `rate_limit_hit` is written once per address in 10 seconds and `pqc_downgrade` once per address in 10 minutes. A text field is written to 1024 bytes. The file is created `0640` and reopened when a rotation renames or removes it.
 
 ### Per-Backend Retry Configuration
 
@@ -1094,10 +1100,17 @@ Each audit event is a JSON object with `timestamp`, `level`, `category`, and eve
 name = "api"
 type = "http1"
 address = "127.0.0.1:3003"
-retries = 3                                        # default 3
-retry_backoff_ms = 50                              # initial backoff; doubles each attempt
-retry_on = ["connect-failure", "5xx", "timeout"]   # default: connect-failure + 5xx
+retries = 2                                        # attempts after the first; default 2
+retry_backoff_ms = 50                              # before the first retry; doubles each time
+retry_on = ["connect-failure", "5xx", "timeout"]   # default: connect-failure
 ```
+
+A request that was never written (its connection could not be made) is sent
+again whatever its method: the backend did nothing. One that was written goes
+again only when its method may be repeated (GET, HEAD, OPTIONS, TRACE, PUT,
+DELETE; RFC 9110 section 9.2.2) and its body can be sent again: after a 5xx or a
+timeout, where `retry_on` names them. Each attempt has the backend's (or the
+route's) timeout. The same policy applies on TCP and HTTP/3.
 
 ### Per-Backend Circuit Breaker Override
 
@@ -1450,15 +1463,22 @@ name = "internal-api"
 type = "http1"
 address = "internal.example.com:443"
 tls_mode = "reencrypt"
-tls_cert = "/path/to/ca.pem"           # Optional: custom CA
+tls_cert = "/path/to/ca.pem"           # Optional: private CA, or the backend's own self-signed cert
 tls_client_cert = "/path/to/client.pem" # Optional: mTLS client cert
 tls_client_key = "/path/to/client.key"  # Optional: mTLS client key
-tls_skip_verify = false                 # DANGEROUS if true
 tls_sni = "internal.example.com"        # Optional: custom SNI
 ```
 
 #### 3. TLS Passthrough (SNI Routing)
-Route based on SNI without decryption.
+A connection whose ClientHello names a passthrough route is relayed to its
+backend still encrypted, by the HTTPS listener that accepted it, on the same
+port: after the connection limits and the block list, with the whole
+ClientHello peeked within `tls.handshake_timeout_secs` (a post-quantum
+ClientHello spans more than one segment). The backend receives the ClientHello
+as the client sent it. A relay ends when either side does, after
+`server.max_idle_timeout_secs` with nothing moving either way, or at shutdown;
+open relays are counted in `pqcrypta_connections_open_by_protocol`. Routes are
+taken again on every reload.
 
 ```toml
 [[passthrough_routes]]
@@ -1532,7 +1552,7 @@ The TCP middleware chain is assembled once at startup, and a layer whose
 feature is off is **left out**, not skipped per request: response cache,
 security headers (when every value is empty and Server-Timing is off), Alt-Svc
 (when nothing is advertised and `tcp_only_hosts` is empty), compression, the
-HTTP/3-features layer (coalescing and priority hints both off), the advanced
+HTTP/3-features layer (priority hints off), the advanced
 rate limiter, and trace-context extraction (when OTel is off and INFO spans are
 filtered out). The startup log names every layer left out. The security
 evaluator always runs; it carries the request-size, header-size and blocklist
@@ -1610,7 +1630,7 @@ Options:
 
 Environment variables: `PQCRYPTA_CONFIG`, `PQCRYPTA_UDP_PORT`, `PQCRYPTA_ADMIN_PORT`, `PQCRYPTA_LOG_LEVEL`, `PQCRYPTA_JSON_LOGS`, `PQCRYPTA_ENV`
 
-Set `PQCRYPTA_ENV=production` to explicitly declare a production deployment. Set `PQCRYPTA_ENV=development` to permit development-only options (such as `tls_skip_verify`) when ACME is not enabled. When ACME is active the environment is always treated as production regardless of this variable.
+`PQCRYPTA_ENV` (or `--env`) names the environment overlay merged over the configuration (see Environment Config Overlay). No setting is relaxed by it: backend certificates are verified in every environment.
 
 ## Architecture
 
@@ -1635,7 +1655,7 @@ Set `PQCRYPTA_ENV=production` to explicitly declare a production deployment. Set
                     │                                                          │
                     │  ┌─────────────────────────────────────────────────────┐ │
                     │  │              HTTP/3 Features Middleware             │ │
-                    │  │  Early Hints → Priority → Coalescing → Compression │ │
+                    │  │  Early Hints → Priority → Compression      │ │
                     │  └─────────────────────────────────────────────────────┘ │
                     │                                                          │
                     │  ┌─────────────────────────────────────────────────────┐ │
@@ -1883,7 +1903,24 @@ An IP address identifier is always validated by HTTP-01, whatever `challenge_typ
 
 ## OCSP Stapling
 
-Automated OCSP response fetching with background refresh.
+For every certificate chain the proxy serves, the end-entity certificate's
+responder (Authority Information Access) is asked for its status. A response
+is believed only when OpenSSL verifies it: signed by the issuer, or by a
+responder the issuer certified for OCSP signing; about this certificate; and
+current (`thisUpdate`/`nextUpdate`, five minutes of clock skew). A *good*
+response is stapled, by the rustls listeners (QUIC, plain TCP) and the OpenSSL
+ones alike, to clients that ask for it, until its `nextUpdate`; it is fetched
+again halfway through its validity (and no later than
+`refresh_before_expiry_secs` before its end). A *revoked* answer is logged as an
+error and nothing is stapled. A TLS reload makes the service look at the served
+chains again at once.
+
+A certificate that names no responder has nothing to staple: Let's Encrypt and
+Google Trust Services retired OCSP, and their certificates carry none. The
+status endpoint lists each certificate with its responder, its status, whether
+it is stapled now, and whether it requires stapling (TLS Feature
+`status_request`, RFC 7633). Verification uses OpenSSL, so stapling needs the
+`pqc` feature (a default build has it).
 
 ### Configuration
 
@@ -2031,6 +2068,10 @@ The QUIC path uses WebTransport streams natively; the TCP path uses HTTP/1.1 con
 ### Upload meter
 
 A browser uploads over several streams or connections at once and stops them at its time limit, so neither one stream's own figures nor what the page handed to its send buffer describe the upload. Each upload names its test with a 128-bit id (`"test"` in the WebTransport command, `?test=` on `POST /speedtest/tcp-upload-stream` over TCP or HTTP/3), and every stream carrying that id adds what it receives to one meter in the proxy process: bytes per 50 ms bucket, counted on arrival. The client reads it with the `meter` op on its WebTransport session, or `GET /speedtest/tcp-upload-meter?test=ID` on a TCP-only host, while the test runs and after it, and computes one rate over the whole test from what the server received. Meters last three minutes and are capped overall and per client address.
+
+### What one client may take
+
+The speed test moves as much data as a link carries and its route analysis starts probe processes, so each client network (an IPv4 address, an IPv6 /64) is held to, over WebTransport and TCP alike: 32 test streams at once; an hourly allowance of 16 GiB down and 8 GiB up, reserved before a transfer starts with the unused part given back; one upload of at most 500 MB and two minutes; one route analysis at a time, 30 s apart, with at most four on the server at once (each probe process is killed at its time limit). A refusal is `429` over TCP, or an error frame over WebTransport (`too_many_streams`, `budget_exhausted`, `busy`), with when to try again.
 
 ### Latency over TCP
 
@@ -2367,8 +2408,8 @@ describes the rig and the traps it guards against.
 - [x] Request size limits (413/431 responses); chunked body size enforced (Transfer-Encoding bypass closed)
 - [x] GeoIP blocking (MaxMind DB integration)
 - [x] JA3/JA4 TLS fingerprinting (browser/bot/malware detection)
-- [x] JA3/JA4 replay detection (same fingerprint from multiple IPs in window)
-- [x] JA3/JA4 drift detection (cipher/extension composition change on same hash)
+- [x] JA3/JA4 replay detection (one non-browser fingerprint from many client networks in a window)
+- [x] JA3/JA4 drift detection (one client network rotating its fingerprint)
 - [x] Circuit breaker (backend protection; per-backend failure threshold and half-open delay overrides)
 - [x] Per-backend retry (configurable count, exponential backoff, retry-on conditions)
 - [x] IP blocking (manual + auto with expiration; DB-synced blocklists)
@@ -2404,7 +2445,7 @@ describes the rig and the traps it guards against.
 - [x] Graceful shutdown drain polling (100 ms poll loop exits when connections reach zero — no fixed sleep)
 - [x] OpenSSL binary path validation (must be absolute, pointing to a regular file)
 - [x] Log injection prevention (newlines and control characters stripped from all user-controlled log fields)
-- [x] `tls_skip_verify` blocked in production (rejected at config load; requires `--allow-insecure-backends`)
+- [x] Backend certificates always verified (`tls_skip_verify` refused; pin with `tls_cert`)
 - [x] `unsafe_code = deny` globally (OpenSSL FFI retains targeted allow)
 - [x] Panic prevention (no production-path unwrap(); ok_or/? throughout)
 - [x] Memory exhaustion prevention (DashMap collections bounded with eviction)
@@ -2514,31 +2555,22 @@ jwt_secret = "your-hmac-sha256-secret-at-least-32-bytes"
 jwt_algorithms = ["HS256"]   # Only HS256/HS384/HS512 are valid; non-HMAC strings are rejected
 ```
 
-## Insecure Backend TLS
+## Backend TLS Verification
 
-`tls_skip_verify = true` on a backend completely disables certificate and signature verification for that upstream connection, enabling man-in-the-middle attacks on the proxy↔backend leg. The proxy logs a loud warning for every such backend at startup.
-
-**Production deployments reject `tls_skip_verify` at config load.** Production is detected automatically when:
-- ACME is enabled (`[acme] enabled = true`), or
-- `PQCRYPTA_ENV=production` is set in the environment.
-
-To use `tls_skip_verify` in a development environment where neither condition applies, set `PQCRYPTA_ENV=development`:
-
-```sh
-PQCRYPTA_ENV=development pqcrypta-proxy --config config.toml
-```
+A backend's certificate is always verified: the native roots, plus `tls_cert`,
+which is either the CA that issued the backend's certificate or the backend's
+own certificate when it is self-signed (pinned as its trust anchor). There is
+no way to turn verification off; a configuration that sets `tls_skip_verify`
+is refused at load with that advice.
 
 ```toml
-# Only valid when PQCRYPTA_ENV=development and acme.enabled = false
 [backends.dev-backend]
 name = "dev-backend"
 type = "http1"
 tls_mode = "reencrypt"
 address = "localhost:8443"
-tls_skip_verify = true
+tls_cert = "/etc/pqcrypta/dev-backend.crt"   # its self-signed certificate
 ```
-
-Replace self-signed backend certificates with CA-signed ones before enabling ACME or moving to production.
 
 ## 0-RTT Early Data
 

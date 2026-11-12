@@ -211,6 +211,19 @@ where
     pub fn send_id(&self) -> StreamId {
         self.inner.stream.send_id()
     }
+
+    /// Send this response with RFC 9218 priority `urgency` (0 most urgent,
+    /// to 7) and `incremental`, beside the connection's other responses.
+    pub fn set_priority(&mut self, urgency: u8, incremental: bool) {
+        self.inner.stream.set_urgency(urgency, incremental);
+    }
+
+    /// The Priority Field Value of the latest PRIORITY_UPDATE the client
+    /// sent for this request (RFC 9218 section 7), once.
+    pub fn take_priority_update(&self) -> Option<bytes::Bytes> {
+        let id = self.inner.stream.send_id().into_inner();
+        self.inner.conn_state.take_priority_update(id)
+    }
 }
 
 impl<S, B> RequestStream<S, B>

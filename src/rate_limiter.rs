@@ -286,6 +286,19 @@ impl Default for RateLimitKeyType {
     }
 }
 
+impl RateLimitKeyType {
+    /// Whether the client writes this key's value into each request as it
+    /// likes: a header (the API key among them), a cookie, a query parameter
+    /// or the path. Nothing here verifies such a value, so it names a
+    /// bucket and never earns one.
+    pub fn is_client_written(&self) -> bool {
+        matches!(
+            self,
+            Self::ApiKey | Self::Header(_) | Self::Cookie(_) | Self::QueryParam(_) | Self::Path
+        )
+    }
+}
+
 /// Global rate limits (DDoS protection)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalLimits {
@@ -971,6 +984,15 @@ impl RateLimitKey {
         }
     }
 
+    /// Whether any part of this key is a value the client wrote (see
+    /// [`RateLimitKeyType::is_client_written`]).
+    pub fn is_client_written(&self) -> bool {
+        match &self.components {
+            Some(components) => components.iter().any(|(t, _)| t.is_client_written()),
+            None => self.key_type.is_client_written(),
+        }
+    }
+
     /// The string this key's bucket is stored under, here and in Redis.
     ///
     /// A value the client wrote (a header, a cookie, a query parameter, the
@@ -1000,19 +1022,6 @@ impl RateLimitKey {
                 .collect::<Vec<_>>()
                 .join("|"),
             None => part(&self.key_type, &self.value),
-        }
-    }
-
-    /// Create key string for storage
-    pub fn to_key_string(&self) -> String {
-        if let Some(ref components) = self.components {
-            components
-                .iter()
-                .map(|(t, v)| format!("{:?}:{}", t, v))
-                .collect::<Vec<_>>()
-                .join("|")
-        } else {
-            format!("{:?}:{}", self.key_type, self.value)
         }
     }
 }
@@ -1079,9 +1088,6 @@ impl RateLimitContext {
 /// Sliding window rate counter for minute/hour limits
 #[derive(Debug)]
 pub struct SlidingWindowCounter {
-    /// Window size in seconds (used for stats/debugging)
-    window_secs: u64,
-
     /// Number of buckets (granularity)
     num_buckets: usize,
 
@@ -1104,7 +1110,6 @@ impl SlidingWindowCounter {
         let bucket_duration_secs = window_secs / num_buckets as u64;
 
         Self {
-            window_secs,
             num_buckets,
             buckets,
             current_bucket: AtomicU64::new(0),
@@ -1156,11 +1161,6 @@ impl SlidingWindowCounter {
 
             *last_update = Instant::now();
         }
-    }
-
-    /// Get window size in seconds
-    pub fn window_seconds(&self) -> u64 {
-        self.window_secs
     }
 }
 
@@ -1569,7 +1569,17 @@ pub struct AdvancedRateLimiter {
     /// `None` until the async connection task completes (or when Redis is not
     /// configured).  Falls back to `buckets` (in-memory) on every `None`.
     redis_backend: Arc<AsyncRwLock<Option<Arc<RedisBackend>>>>,
+
+    /// Where a refused request is recorded, once the audit log exists
+    audit: std::sync::OnceLock<Arc<crate::audit_logger::AuditLogger>>,
+
+    /// The autonomous system announcing an address (the `asn` key), once
+    /// the security layer's ASN database is attached
+    asn_of: std::sync::OnceLock<AsnLookup>,
 }
+
+/// The autonomous system announcing an address, if it is known.
+pub type AsnLookup = Arc<dyn Fn(IpAddr) -> Option<u32> + Send + Sync>;
 
 /// Rate limiter statistics
 #[derive(Debug, Default)]
@@ -1650,6 +1660,8 @@ impl AdvancedRateLimiter {
             )),
             stats: Arc::new(RateLimiterStats::default()),
             redis_backend,
+            audit: std::sync::OnceLock::new(),
+            asn_of: std::sync::OnceLock::new(),
         };
 
         // Spawn cleanup task
@@ -1689,6 +1701,36 @@ impl AdvancedRateLimiter {
     /// The **global** token-bucket always runs in-process so that each node
     /// can protect itself from being overwhelmed even when Redis is down.
     pub async fn check(&self, ctx: &RateLimitContext) -> RateLimitResult {
+        let result = self.decide(ctx).await;
+        if let (RateLimitResult::Limited { limit, .. }, Some(audit)) = (&result, self.audit.get()) {
+            audit.log_rate_limit(ctx.source_ip, &ctx.path, *limit);
+        }
+        result
+    }
+
+    /// Record refused requests in the audit log.
+    pub fn set_audit_logger(&self, logger: Arc<crate::audit_logger::AuditLogger>) {
+        let _ = self.audit.set(logger);
+    }
+
+    /// Resolve the `asn` key with `lookup` (once, at startup).
+    pub fn set_asn_lookup(&self, lookup: AsnLookup) {
+        let _ = self.asn_of.set(lookup);
+    }
+
+    /// Whether any limit is keyed on the autonomous system.
+    pub fn uses_asn_key(&self) -> bool {
+        let config = self.config.read();
+        let named = |t: &RateLimitKeyType| matches!(t, RateLimitKeyType::Asn);
+        config.key_strategy.order.iter().any(named)
+            || named(&config.key_strategy.fallback)
+            || config
+                .composite_keys
+                .iter()
+                .any(|c| c.keys.iter().any(named))
+    }
+
+    async fn decide(&self, ctx: &RateLimitContext) -> RateLimitResult {
         self.stats.total_requests.fetch_add(1, Ordering::Relaxed);
 
         // ── SYNC PHASE ───────────────────────────────────────────────────────
@@ -2032,7 +2074,23 @@ impl AdvancedRateLimiter {
                     network_bound: true,
                 },
             };
+            let floor_key = floor.key_string.clone();
             charges.push(floor);
+            // A value the client wrote names a bucket of its own and never
+            // replaces the one the request has without it: an unverified API
+            // key cannot lift a client past its fingerprint's budget.
+            if key.is_client_written() {
+                if let Some((identity, identity_limits)) = self.unwritten_identity(ctx, config) {
+                    let key_string = identity.storage_key(&network);
+                    if key_string != floor_key {
+                        charges.push(Charge {
+                            key_string,
+                            limits: identity_limits,
+                            network_bound: identity.is_network_bound(),
+                        });
+                    }
+                }
+            }
         }
         charges.push(Charge {
             key_string: key.storage_key(&network),
@@ -2040,6 +2098,36 @@ impl AdvancedRateLimiter {
             network_bound: key.is_network_bound(),
         });
         charges
+    }
+
+    /// The key and limits a request resolves to when the values it wrote
+    /// itself are set aside: the fingerprint keys first where
+    /// `fingerprint_limiting.prefer_over_ip` asks for that, then the first
+    /// key of `key_strategy.order` that is not client-written and resolves.
+    fn unwritten_identity(
+        &self,
+        ctx: &RateLimitContext,
+        config: &AdvancedRateLimitConfig,
+    ) -> Option<(RateLimitKey, PerKeyLimits)> {
+        let preferred: &[RateLimitKeyType] =
+            if config.fingerprint_limiting.enabled && config.fingerprint_limiting.prefer_over_ip {
+                &[
+                    RateLimitKeyType::Ja3Fingerprint,
+                    RateLimitKeyType::Ja4Fingerprint,
+                ]
+            } else {
+                &[]
+            };
+        preferred
+            .iter()
+            .chain(&config.key_strategy.order)
+            .filter(|key_type| !key_type.is_client_written())
+            .filter(|key_type| !matches!(key_type, RateLimitKeyType::Composite(_)))
+            .find_map(|key_type| {
+                let value = self.extract_key_value(key_type, ctx, config)?;
+                let limits = self.get_limits_for_key(key_type, &value, config);
+                Some((RateLimitKey::new(key_type.clone(), value), limits))
+            })
     }
 
     fn resolve_key_and_limits(
@@ -2196,7 +2284,13 @@ impl AdvancedRateLimiter {
 
             RateLimitKeyType::Method => Some(ctx.method.clone()),
 
-            RateLimitKeyType::Asn => None, // Would require GeoIP/ASN lookup
+            // The network the address is announced from: one bucket for every
+            // client a provider hosts (the security layer's ASN database)
+            RateLimitKeyType::Asn => self
+                .asn_of
+                .get()
+                .and_then(|lookup| lookup(ctx.source_ip))
+                .map(|asn| format!("AS{asn}")),
 
             RateLimitKeyType::Composite(_) => {
                 // Composite keys are not extracted directly - they are built
@@ -2687,7 +2781,7 @@ mod tests {
     fn test_rate_limit_key() {
         let key = RateLimitKey::new(RateLimitKeyType::SourceIp, "192.168.1.1".to_string());
 
-        assert_eq!(key.to_key_string(), "SourceIp:192.168.1.1");
+        assert_eq!(key.storage_key("192.168.1.1"), "SourceIp:192.168.1.1");
     }
 
     #[test]
@@ -2713,12 +2807,12 @@ mod tests {
         let components = key.components.as_ref().unwrap();
         assert_eq!(components.len(), 2);
 
-        // Verify to_key_string output format
-        let key_string = key.to_key_string();
-        assert!(key_string.contains("SourceIp"));
-        assert!(key_string.contains("Path"));
-        assert!(key_string.contains("192.168.1.1"));
-        assert!(key_string.contains("/api/v1"));
+        // The stored form: the address as it is, the path the client wrote
+        // as a digest
+        assert_eq!(
+            key.storage_key("192.168.1.1"),
+            format!("SourceIp:192.168.1.1|Path:{}", value_digest("/api/v1"))
+        );
     }
 
     #[test]
@@ -3306,6 +3400,29 @@ mod tests {
         }
     }
 
+    /// The `asn` key is the network an address is announced from: two
+    /// addresses of one provider are one key, another provider's another,
+    /// and an address no database knows has none.
+    #[tokio::test]
+    async fn the_asn_key_is_the_announcing_network() {
+        let limiter = AdvancedRateLimiter::new(layered_config(vec![RateLimitKeyType::Asn]));
+        let config = limiter.config.read().clone();
+        assert!(limiter.uses_asn_key());
+        let key = |ip| {
+            limiter.extract_key_value(&RateLimitKeyType::Asn, &ctx_from(ip, None, None), &config)
+        };
+        assert_eq!(key([192, 0, 2, 1]), None, "no database yet");
+        limiter.set_asn_lookup(Arc::new(|ip| match ip {
+            IpAddr::V4(v4) if v4.octets()[0] == 192 => Some(64_500),
+            IpAddr::V4(v4) if v4.octets()[0] == 198 => Some(64_501),
+            _ => None,
+        }));
+        assert_eq!(key([192, 0, 2, 1]).as_deref(), Some("AS64500"));
+        assert_eq!(key([192, 0, 2, 200]), key([192, 0, 2, 1]));
+        assert_eq!(key([198, 51, 100, 7]).as_deref(), Some("AS64501"));
+        assert_eq!(key([203, 0, 113, 9]), None);
+    }
+
     /// A key the client writes itself is counted beside its address, so a
     /// new value with every request is still one client.
     #[tokio::test]
@@ -3353,6 +3470,51 @@ mod tests {
         ));
     }
 
+    /// An API key the proxy cannot verify names a bucket of its own and never
+    /// replaces the one the request has without it: a new key on every
+    /// request is still held by the client's fingerprint bucket.
+    #[tokio::test]
+    async fn a_written_key_does_not_lift_a_client_past_its_fingerprint() {
+        let mut config = layered_config(vec![
+            RateLimitKeyType::ApiKey,
+            RateLimitKeyType::Ja3Fingerprint,
+            RateLimitKeyType::SourceIp,
+        ]);
+        // The address and the keys are generous; the fingerprint is not.
+        let generous = PerKeyLimits {
+            requests_per_second: 1000,
+            burst_size: 1000,
+            requests_per_minute: None,
+            requests_per_hour: None,
+        };
+        config.global_limits.per_ip = generous.clone();
+        config.global_limits.per_api_key = generous;
+        let limiter = AdvancedRateLimiter::new(config);
+        let ja3 = Some("e7d705a3286e19ea42f587b344ee6865");
+        let mut refused = 0;
+        for n in 0..6 {
+            let key = format!("key-{n}");
+            let ctx = ctx_from([198, 51, 100, 9], Some(&key), ja3);
+            if !matches!(limiter.check(&ctx).await, RateLimitResult::Allowed { .. }) {
+                refused += 1;
+            }
+        }
+        assert!(
+            refused >= 3,
+            "{refused} of 6 refused at a fingerprint burst of 2"
+        );
+
+        // The same client without a fingerprint is held by its address alone.
+        let other = ctx_from([198, 51, 100, 10], Some("key-x"), None);
+        assert!(matches!(
+            limiter.check(&other).await,
+            RateLimitResult::Allowed { .. }
+        ));
+        assert!(RateLimitKeyType::ApiKey.is_client_written());
+        assert!(!RateLimitKeyType::Ja3Fingerprint.is_client_written());
+        assert!(!RateLimitKeyType::JwtSubject.is_client_written());
+    }
+
     #[test]
     fn a_bucket_key_holds_no_value_the_client_wrote() {
         let written = "a-value-the-client-wrote-0123456789";
@@ -3373,7 +3535,7 @@ mod tests {
 
         let ip = RateLimitKey::new(RateLimitKeyType::SourceIp, "203.0.113.7".to_string());
         assert!(ip.is_network_bound());
-        assert_eq!(ip.storage_key("203.0.113.7"), ip.to_key_string());
+        assert_eq!(ip.storage_key("203.0.113.7"), "SourceIp:203.0.113.7");
     }
 
     /// Resetting an address clears what it was counted in under any key.

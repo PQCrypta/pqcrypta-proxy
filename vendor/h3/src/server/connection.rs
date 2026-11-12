@@ -67,6 +67,28 @@ where
     pub(super) max_push_id: Option<PushId>,
 }
 
+/// What [`Connection::accept_any`] accepted
+pub enum Accepted<C, B>
+where
+    C: quic::Connection<B>,
+    B: Buf,
+{
+    /// A request stream (or a WebTransport bidirectional stream; see
+    /// [`RequestResolver::resolve_any`])
+    Request(RequestResolver<C, B>),
+    /// A unidirectional stream of the WebTransport session whose CONNECT was
+    /// stream `session`: `prefix` is what arrived with its header, the rest
+    /// is read from `stream`
+    WebTransportUni {
+        /// The session's ID: the stream ID of its CONNECT
+        session: u64,
+        /// What arrived with the stream's header
+        prefix: bytes::Bytes,
+        /// The stream, read after `prefix`
+        stream: C::RecvStream,
+    },
+}
+
 impl<C, B> ConnectionState for Connection<C, B>
 where
     C: quic::Connection<B>,
@@ -147,6 +169,56 @@ where
         self.inner.send_grease_frame = false;
 
         Ok(Some(resolver))
+    }
+
+    /// The next request, or the next unidirectional stream of a WebTransport
+    /// session (draft-ietf-webtrans-http3 section 4.1; its stream type and
+    /// session ID already read). Requests resolve with
+    /// [`RequestResolver::resolve_any`], which also tells a WebTransport
+    /// bidirectional stream apart.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn accept_any(&mut self) -> Result<Option<Accepted<C, B>>, ConnectionError> {
+        enum Next<C: quic::Connection<B>, B: Buf> {
+            Uni(
+                crate::webtransport::SessionId,
+                crate::stream::BufRecvStream<C::RecvStream, B>,
+            ),
+            Bidi(Option<C::BidiStream>),
+        }
+        let next = poll_fn(|cx| {
+            let waiting = &mut self.inner.accepted_streams_mut().wt_uni_streams;
+            if !waiting.is_empty() {
+                // In the order they arrived
+                let (session, stream) = waiting.remove(0);
+                return Poll::Ready(Ok(Next::<C, B>::Uni(session, stream)));
+            }
+            self.poll_accept_request_stream_internal(cx)
+                .map(|accepted| accepted.map(Next::<C, B>::Bidi))
+        })
+        .await?;
+        match next {
+            Next::Uni(session, stream) => {
+                let (prefix, stream) = stream.into_parts();
+                Ok(Some(Accepted::WebTransportUni {
+                    session: session.into_inner(),
+                    prefix,
+                    stream,
+                }))
+            }
+            Next::Bidi(Some(stream)) => {
+                let stream = FrameStream::with_max_buffered(
+                    BufRecvStream::new(stream),
+                    crate::config::headers_frame_ceiling(self.max_field_section_size),
+                );
+                let resolver = self.create_resolver_internal(stream);
+                self.inner.send_grease_frame = false;
+                Ok(Some(Accepted::Request(resolver)))
+            }
+            Next::Bidi(None) => {
+                self.shutdown(0).await?;
+                Ok(None)
+            }
+        }
     }
 
     fn create_resolver_internal(
@@ -334,6 +406,41 @@ where
                         format!("CANCEL_PUSH for push {id}, which no PUSH_PROMISE has named"),
                     ),
                 )));
+            }
+
+            //= https://www.rfc-editor.org/rfc/rfc9218#section-7.1
+            //# If a PRIORITY_UPDATE frame is received with a Prioritized Element ID
+            //# that is not a client-initiated bidirectional stream, the server MUST
+            //# respond with a connection error of type H3_ID_ERROR.
+            //
+            // A push ID: this server pushes nothing, so there is no pushed
+            // response to reprioritise (RFC 9218 section 7.2 has the server
+            // treat an ID above the maximum it allowed as H3_ID_ERROR; every
+            // ID is that here).
+            Frame::PriorityUpdate {
+                push,
+                element,
+                field,
+            } => {
+                let request_stream = !*push && element % 4 == 0;
+                if !request_stream {
+                    return Poll::Ready(Err(self.inner.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_ID_ERROR,
+                            format!(
+                                "PRIORITY_UPDATE for {} {element}, not a client request stream",
+                                if *push { "push" } else { "stream" }
+                            ),
+                        ),
+                    )));
+                }
+                // A value no larger than a header's would be; anything longer
+                // says nothing a Priority field can
+                if field.len() <= 1024 {
+                    self.inner
+                        .shared
+                        .note_priority_update(*element, field.clone());
+                }
             }
 
             //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5

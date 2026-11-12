@@ -337,6 +337,10 @@ where
     fn send_id(&self) -> StreamId {
         self.send.send_id()
     }
+
+    fn set_urgency(&mut self, urgency: u8, incremental: bool) {
+        self.send.set_urgency(urgency, incremental);
+    }
 }
 impl<B> quic::SendStreamUnframed<B> for BidiStream<B>
 where
@@ -360,6 +364,14 @@ pub struct RecvStream {
     /// Read from the stream when it is wrapped: `stream` is moved into the
     /// read future while a read is pending, and the answer never changes.
     is_0rtt: bool,
+}
+
+impl RecvStream {
+    /// The noq stream, unless a read of it is still pending (nothing has been
+    /// read past what the caller was given).
+    pub fn into_inner(self) -> Option<noq::RecvStream> {
+        self.stream
+    }
 }
 
 // noq's ordered `RecvStream::read_chunk(max_len)` returns `Bytes` directly
@@ -462,6 +474,13 @@ pub struct SendStream<B: Buf> {
     writing: Option<WriteBuf<B>>,
 }
 
+impl<B: Buf> SendStream<B> {
+    /// The noq stream, unless data handed to it is still being written.
+    pub fn into_inner(self) -> Option<noq::SendStream> {
+        self.writing.is_none().then_some(self.stream)
+    }
+}
+
 impl<B> SendStream<B>
 where
     B: Buf,
@@ -534,6 +553,52 @@ where
     fn send_id(&self) -> StreamId {
         let num: u64 = self.stream.id().into();
         num.try_into().expect("invalid stream id")
+    }
+
+    fn set_urgency(&mut self, urgency: u8, incremental: bool) {
+        let index: u64 = u64::from(self.stream.id()) >> 2;
+        let _ = self
+            .stream
+            .set_priority(stream_priority(urgency, incremental, index));
+    }
+}
+
+/// The noq send priority (higher is sent first) for an RFC 9218 signal.
+///
+/// Urgency orders everything: a more urgent stream's data always goes before
+/// a less urgent one's. Within one urgency, non-incremental streams go first
+/// and one at a time, in the order they were opened (their data is useful
+/// only whole, RFC 9218 section 10); incremental streams then share what is
+/// left, noq serving equal priorities in turn.
+fn stream_priority(urgency: u8, incremental: bool, index: u64) -> i32 {
+    const SPAN: i32 = 1 << 24;
+    let level = 7 - i32::from(urgency.min(7));
+    let within = if incremental {
+        0
+    } else {
+        // Earlier streams higher; the window wraps after 2^24 streams
+        SPAN + (SPAN - 1 - i32::try_from(index % (1 << 24)).unwrap_or(SPAN - 1))
+    };
+    level * (2 * SPAN) + within
+}
+
+#[cfg(test)]
+mod priority_tests {
+    use super::stream_priority;
+
+    #[test]
+    fn urgency_then_whole_responses_in_order_then_shared() {
+        // More urgent first, whatever else
+        assert!(stream_priority(0, true, 9) > stream_priority(1, false, 0));
+        // Within an urgency: non-incremental before incremental
+        assert!(stream_priority(3, false, 1000) > stream_priority(3, true, 0));
+        // Non-incremental in the order opened
+        assert!(stream_priority(3, false, 4) > stream_priority(3, false, 5));
+        // Incremental streams of one urgency are equal: served in turn
+        assert_eq!(stream_priority(3, true, 4), stream_priority(3, true, 5));
+        // Out-of-range urgency is the least urgent, and every value fits
+        assert_eq!(stream_priority(9, true, 0), stream_priority(7, true, 0));
+        assert!(stream_priority(0, false, 0) > 0);
     }
 }
 

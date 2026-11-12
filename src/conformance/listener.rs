@@ -767,11 +767,12 @@ async fn watch_version_negotiation(
         // is no SNI to recover a session from here, because there is no TLS
         // handshake, so the source address is the only handle. It is also the
         // one the rest of the suite falls back to.
-        let session_id = counters
+        let peer = counters
             .last_peer()
-            .map(|peer| crate::security::canonical_addr(peer).ip())
+            .map(|peer| crate::security::canonical_addr(peer).ip());
+        let session_id = peer
             .and_then(|ip| conformance.sessions.for_source(ip))
-            .unwrap_or_else(|| conformance.sessions.create());
+            .unwrap_or_else(|| conformance.sessions.create_for(peer));
         conformance.sessions.with(&session_id, |s| {
             s.record_evidence(
                 test,
@@ -2465,7 +2466,7 @@ fn resolve_session(
         // wildcard certificate) files under the address that started the
         // session.
         .or_else(|| conformance.sessions.for_source(peer_ip))
-        .unwrap_or_else(|| conformance.sessions.create())
+        .unwrap_or_else(|| conformance.sessions.create_for(Some(peer_ip)))
 }
 
 /// A connection's verdict, owed to its session until it is recorded.

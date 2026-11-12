@@ -307,6 +307,12 @@ impl SessionResponse {
         Self::with_status_code(StatusCode::TOO_MANY_REQUESTS)
     }
 
+    /// Constructs with [`StatusCode::MISDIRECTED_REQUEST`]: the server will not
+    /// answer this request on this connection (RFC 9110 section 15.5.20).
+    pub fn misdirected_request() -> Self {
+        Self::with_status_code(StatusCode::MISDIRECTED_REQUEST)
+    }
+
     /// Returns the status code.
     pub fn code(&self) -> StatusCode {
         self.0

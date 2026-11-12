@@ -27,40 +27,88 @@ pub(super) async fn tcp_upload_measure_handler(
     body: Body,
     origin: &str,
     meter: Option<crate::speedtest_meter::MeterStream>,
+    client: std::net::IpAddr,
 ) -> Response {
     use futures_util::StreamExt as _;
     use std::time::Instant;
 
     const WARMUP_SECS: f64 = 2.0;
 
+    // The client network's place under its stream limit, held while the
+    // upload is read (crate::speedtest_budget).
+    let Some(_slot) = crate::speedtest_budget::enter_stream(client) else {
+        return refusal(
+            origin,
+            None,
+            serde_json::json!({
+                "error": "too_many_streams",
+                "max": crate::speedtest_budget::STREAMS_PER_NETWORK
+            }),
+        );
+    };
+
     let mut stream = body.into_data_stream();
     let mut start: Option<Instant> = None;
     let mut total_bytes: u64 = 0;
     let mut post_warmup_bytes: u64 = 0;
+    let mut exhausted: Option<std::time::Duration> = None;
 
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(data) => {
-                let n = data.len() as u64;
-                if n == 0 {
-                    continue;
-                }
-                if start.is_none() {
-                    start = Some(Instant::now());
-                }
-                total_bytes += n;
-                if let Some(m) = &meter {
-                    m.record(data.len());
-                }
-                if start.is_some_and(|s| s.elapsed().as_secs_f64() >= WARMUP_SECS) {
-                    post_warmup_bytes += n;
+    // Read for as long as the WebTransport upload may, and no more than it may
+    // send; each piece is charged to the client's hourly upload allowance as
+    // it arrives.
+    let read = tokio::time::timeout(crate::speedtest::UPLOAD_TIME_LIMIT, async {
+        while let Some(chunk) = stream.next().await {
+            let Ok(data) = chunk else { break };
+            let n = data.len() as u64;
+            if n == 0 {
+                continue;
+            }
+            match crate::speedtest_budget::reserve(
+                client,
+                crate::speedtest_budget::Direction::Upload,
+                n,
+            ) {
+                Ok(mut charged) => charged.use_bytes(n),
+                Err(refused) => {
+                    exhausted = Some(refused.retry_after);
+                    break;
                 }
             }
-            Err(_) => break,
+            if start.is_none() {
+                start = Some(Instant::now());
+            }
+            total_bytes += n;
+            if let Some(m) = &meter {
+                m.record(data.len());
+            }
+            if start.is_some_and(|s| s.elapsed().as_secs_f64() >= WARMUP_SECS) {
+                post_warmup_bytes += n;
+            }
+            if total_bytes >= crate::speedtest::MAX_UPLOAD_BYTES as u64 {
+                break;
+            }
         }
+    })
+    .await;
+    if read.is_err() {
+        info!(
+            "[speedtest-ul/tcp] time limit reached after {} bytes",
+            total_bytes
+        );
     }
     // The request has stopped receiving: the meter stops counting it as open.
     drop(meter);
+    if let Some(retry_after) = exhausted {
+        return refusal(
+            origin,
+            Some(retry_after),
+            serde_json::json!({
+                "error": "budget_exhausted",
+                "bytes_received": total_bytes,
+                "retry_after_secs": retry_after.as_secs().max(1)
+            }),
+        );
+    }
 
     let elapsed_secs = start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -105,6 +153,28 @@ pub(super) async fn tcp_upload_measure_handler(
         axum::Json(json_body),
     )
         .into_response();
+    super::speedtest_cross_origin_headers(resp.headers_mut(), origin);
+    resp
+}
+
+/// A speed-test refusal (429), as JSON with the cross-origin headers the page
+/// needs to read it, and `Retry-After` when there is a time to give.
+fn refusal(
+    origin: &str,
+    retry_after: Option<std::time::Duration>,
+    body: serde_json::Value,
+) -> Response {
+    let mut resp = (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::CACHE_CONTROL, "no-store")],
+        axum::Json(body),
+    )
+        .into_response();
+    if let Some(after) = retry_after {
+        if let Ok(v) = HeaderValue::from_str(&after.as_secs().max(1).to_string()) {
+            resp.headers_mut().insert(header::RETRY_AFTER, v);
+        }
+    }
     super::speedtest_cross_origin_headers(resp.headers_mut(), origin);
     resp
 }

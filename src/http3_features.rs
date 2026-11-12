@@ -3,13 +3,13 @@
 //! Implements these HTTP/3 features:
 //! - **Early Hints (103)**: Preload critical resources before final response
 //! - **Priority Hints**: Extensible Priorities (RFC 9218) for resource scheduling
-//! - **Request Coalescing**: Deduplicate identical in-flight requests
 //!
 //! # Integration
 //! All features are configurable via the `[http3]` section in proxy-config.toml:
 //! - `early_hints_enabled` - Enable 103 Early Hints (Link headers as fallback)
 //! - `priority_hints_enabled` - Enable RFC 9218 Priority headers
-//! - `coalescing_enabled` - Enable request deduplication
+//! - `coalescing_*` - collapse identical cache misses onto one fetch, which the
+//!   response cache does (`ResponseCache::lookup`)
 //!
 //! # Usage
 //! ```ignore
@@ -18,18 +18,16 @@
 //! ```
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{header, HeaderMap, HeaderValue, Request, Response, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Request, Response};
 use axum::middleware::Next;
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use tokio::sync::broadcast;
-use tracing::{debug, trace};
+use tracing::debug;
 
 // ============================================================================
 // Early Hints (103 Status Code)
@@ -399,26 +397,6 @@ pub fn is_page_load(headers: &HeaderMap) -> bool {
         .is_some_and(|accept| accept.contains("text/html"))
 }
 
-/// Build a 103 Early Hints response
-pub fn build_early_hints_response(hints: &[String]) -> Response<Body> {
-    let mut response = Response::new(Body::empty());
-    *response.status_mut() = StatusCode::EARLY_HINTS;
-
-    // Add Link headers
-    for (i, hint) in hints.iter().enumerate() {
-        if let Ok(value) = HeaderValue::from_str(hint) {
-            // Use append to add multiple Link headers
-            if i == 0 {
-                response.headers_mut().insert(header::LINK, value);
-            } else {
-                response.headers_mut().append(header::LINK, value);
-            }
-        }
-    }
-
-    response
-}
-
 // ============================================================================
 // Priority Hints (RFC 9218 - Extensible Priorities)
 // ============================================================================
@@ -592,22 +570,36 @@ impl PriorityState {
         }
     }
 
-    /// Parse client Priority header (RFC 9218)
+    /// A Priority field value (RFC 9218 section 4: a Structured Fields
+    /// dictionary), as a request header, a response header or a
+    /// PRIORITY_UPDATE frame carries it. Members left out keep their
+    /// defaults (`u=3`, not incremental); an urgency outside 0-7, an
+    /// incremental that is not a boolean, parameters and unknown members are
+    /// ignored, and a later member wins over an earlier one. None for a value
+    /// that is not ASCII, which no Structured Field is.
     pub fn parse_client_priority(header_value: &str) -> Option<ResourcePriority> {
+        if !header_value.is_ascii() {
+            return None;
+        }
         let mut urgency = 3u8;
         let mut incremental = false;
-
-        for part in header_value.split(',') {
-            let part = part.trim();
-            if part.starts_with("u=") {
-                if let Ok(u) = part[2..].parse::<u8>() {
-                    urgency = u.min(7);
+        for member in header_value.split(',') {
+            let item = member.split(';').next().unwrap_or_default().trim();
+            match item.split_once('=') {
+                Some(("u", value)) => {
+                    if let Ok(u @ 0..=7) = value.trim().parse::<u8>() {
+                        urgency = u;
+                    }
                 }
-            } else if part == "i" {
-                incremental = true;
+                Some(("i", value)) => match value.trim() {
+                    "?1" => incremental = true,
+                    "?0" => incremental = false,
+                    _ => {}
+                },
+                None if item == "i" => incremental = true,
+                _ => {}
             }
         }
-
         Some(ResourcePriority {
             urgency,
             incremental,
@@ -623,221 +615,6 @@ pub fn add_priority_header(response: &mut Response<Body>, priority: &ResourcePri
 }
 
 // ============================================================================
-// Request Coalescing (Deduplication)
-// ============================================================================
-
-/// Request coalescing configuration
-#[derive(Debug, Clone)]
-pub struct CoalescingConfig {
-    /// Enable request coalescing
-    pub enabled: bool,
-    /// Maximum wait time for coalesced requests (ms)
-    pub max_wait_ms: u64,
-    /// Maximum subscribers per coalesced request
-    pub max_subscribers: usize,
-    /// Methods to coalesce (typically only GET)
-    pub coalesce_methods: Vec<String>,
-    /// Paths to exclude from coalescing
-    pub exclude_paths: Vec<String>,
-}
-
-impl Default for CoalescingConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            max_wait_ms: 100,
-            max_subscribers: 100,
-            coalesce_methods: vec!["GET".to_string(), "HEAD".to_string()],
-            exclude_paths: vec![
-                "/api/".to_string(),
-                "/ws".to_string(),
-                "/stream".to_string(),
-            ],
-        }
-    }
-}
-
-/// Key for coalescing requests
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct CoalesceKey {
-    /// HTTP method
-    pub method: String,
-    /// Request URI
-    pub uri: String,
-    /// Significant headers hash (Accept, Accept-Encoding, etc.)
-    pub headers_hash: u64,
-}
-
-impl CoalesceKey {
-    /// Create a coalesce key from a request
-    pub fn from_request(method: &str, uri: &str, headers: &HeaderMap) -> Self {
-        use std::collections::hash_map::DefaultHasher;
-
-        let mut hasher = DefaultHasher::new();
-
-        // Hash significant headers that affect response
-        for header_name in &[
-            header::ACCEPT,
-            header::ACCEPT_ENCODING,
-            header::ACCEPT_LANGUAGE,
-            header::AUTHORIZATION,
-        ] {
-            if let Some(value) = headers.get(header_name) {
-                header_name.as_str().hash(&mut hasher);
-                value.as_bytes().hash(&mut hasher);
-            }
-        }
-
-        Self {
-            method: method.to_string(),
-            uri: uri.to_string(),
-            headers_hash: hasher.finish(),
-        }
-    }
-}
-
-/// Coalesced response that can be shared
-#[derive(Clone)]
-pub struct CoalescedResponse {
-    /// Response status
-    pub status: StatusCode,
-    /// Response headers
-    pub headers: HeaderMap,
-    /// Response body (shared bytes)
-    pub body: Arc<Vec<u8>>,
-    /// When the response was created
-    pub created_at: Instant,
-}
-
-/// In-flight request state
-pub struct InFlightRequest {
-    /// Broadcast channel for response
-    pub sender: broadcast::Sender<CoalescedResponse>,
-    /// Number of subscribers
-    pub subscriber_count: usize,
-    /// When the request started
-    pub started_at: Instant,
-}
-
-/// State for request coalescing
-#[derive(Clone)]
-pub struct CoalescingState {
-    pub config: Arc<RwLock<CoalescingConfig>>,
-    /// In-flight requests
-    pub in_flight: Arc<DashMap<CoalesceKey, Arc<RwLock<InFlightRequest>>>>,
-    /// Response cache for very short-term caching
-    pub response_cache: Arc<DashMap<CoalesceKey, CoalescedResponse>>,
-}
-
-impl Default for CoalescingState {
-    fn default() -> Self {
-        Self {
-            config: Arc::new(RwLock::new(CoalescingConfig::default())),
-            in_flight: Arc::new(DashMap::new()),
-            response_cache: Arc::new(DashMap::new()),
-        }
-    }
-}
-
-impl CoalescingState {
-    /// Check if a request should be coalesced
-    pub fn should_coalesce(&self, method: &str, path: &str) -> bool {
-        let config = self.config.read();
-
-        if !config.enabled {
-            return false;
-        }
-
-        // Check method
-        if !config
-            .coalesce_methods
-            .iter()
-            .any(|m| m.eq_ignore_ascii_case(method))
-        {
-            return false;
-        }
-
-        // Check excluded paths
-        for exclude in &config.exclude_paths {
-            if path.starts_with(exclude) {
-                return false;
-            }
-        }
-
-        true
-    }
-
-    /// Try to join an existing in-flight request
-    pub fn try_join(&self, key: &CoalesceKey) -> Option<broadcast::Receiver<CoalescedResponse>> {
-        if let Some(request) = self.in_flight.get(key) {
-            let mut req = request.write();
-            let config = self.config.read();
-
-            if req.subscriber_count < config.max_subscribers {
-                req.subscriber_count += 1;
-                debug!(
-                    "Coalescing request: {} {} (subscribers: {})",
-                    key.method, key.uri, req.subscriber_count
-                );
-                return Some(req.sender.subscribe());
-            }
-        }
-        None
-    }
-
-    /// Register a new in-flight request
-    pub fn register(&self, key: CoalesceKey) -> broadcast::Sender<CoalescedResponse> {
-        let (sender, _) = broadcast::channel(1);
-
-        let request = InFlightRequest {
-            sender: sender.clone(),
-            subscriber_count: 1,
-            started_at: Instant::now(),
-        };
-
-        self.in_flight.insert(key, Arc::new(RwLock::new(request)));
-        sender
-    }
-
-    /// Complete an in-flight request
-    pub fn complete(&self, key: &CoalesceKey, response: CoalescedResponse) {
-        if let Some((_, request)) = self.in_flight.remove(key) {
-            let req = request.read();
-            if req.sender.send(response.clone()).is_err() {
-                debug!(
-                    "Failed to broadcast coalesced response for {} {} - all receivers dropped",
-                    key.method, key.uri
-                );
-            }
-
-            debug!(
-                "Completed coalesced request: {} {} (served {} subscribers)",
-                key.method, key.uri, req.subscriber_count
-            );
-        }
-
-        // Optionally cache for a very short time
-        self.response_cache.insert(key.clone(), response);
-
-        // Clean up old cache entries
-        self.cleanup_cache();
-    }
-
-    /// Clean up expired cache entries
-    fn cleanup_cache(&self) {
-        let max_age = Duration::from_millis(50); // Very short cache
-
-        self.response_cache
-            .retain(|_, response| response.created_at.elapsed() < max_age);
-
-        // Also clean up stale in-flight requests
-        let max_inflight = Duration::from_secs(30);
-        self.in_flight
-            .retain(|_, request| request.read().started_at.elapsed() < max_inflight);
-    }
-}
-
-// ============================================================================
 // Combined HTTP/3 Features State
 // ============================================================================
 
@@ -846,7 +623,6 @@ impl CoalescingState {
 pub struct Http3FeaturesState {
     pub early_hints: EarlyHintsState,
     pub priority: PriorityState,
-    pub coalescing: CoalescingState,
 }
 
 impl Http3FeaturesState {
@@ -864,23 +640,11 @@ impl Http3FeaturesState {
             ..Default::default()
         };
 
-        let coalescing = CoalescingConfig {
-            enabled: config.coalescing_enabled,
-            max_wait_ms: config.coalescing_max_wait_ms,
-            max_subscribers: config.coalescing_max_subscribers,
-            coalesce_methods: config.coalescing_methods.clone(),
-            exclude_paths: config.coalescing_exclude_paths.clone(),
-        };
-
-        Self::with_config(early_hints, priority, coalescing)
+        Self::with_config(early_hints, priority)
     }
 
     /// Create with custom configuration
-    pub fn with_config(
-        early_hints: EarlyHintsConfig,
-        priority: PriorityConfig,
-        coalescing: CoalescingConfig,
-    ) -> Self {
+    pub fn with_config(early_hints: EarlyHintsConfig, priority: PriorityConfig) -> Self {
         Self {
             early_hints: EarlyHintsState {
                 config: Arc::new(RwLock::new(early_hints)),
@@ -890,11 +654,6 @@ impl Http3FeaturesState {
             priority: PriorityState {
                 config: Arc::new(RwLock::new(priority)),
             },
-            coalescing: CoalescingState {
-                config: Arc::new(RwLock::new(coalescing)),
-                in_flight: Arc::new(DashMap::new()),
-                response_cache: Arc::new(DashMap::new()),
-            },
         }
     }
 }
@@ -903,8 +662,10 @@ impl Http3FeaturesState {
 ///
 /// This middleware:
 /// 1. Sends Early Hints (103) before proxying
-/// 2. Handles request coalescing for identical requests
-/// 3. Adds Priority headers to responses
+/// 2. Adds Priority headers to responses
+///
+/// Identical requests are collapsed onto one fetch by the response cache
+/// (`ResponseCache::lookup`), keyed and answered by the cache's own rules.
 pub async fn http3_features_middleware(
     State(state): State<Http3FeaturesState>,
     request: Request<Body>,
@@ -918,47 +679,6 @@ pub async fn http3_features_middleware(
     {
         return next.run(request).await;
     }
-    let method = request.method().as_str().to_string();
-    let path = request.uri().path().to_string();
-    let headers = request.headers().clone();
-
-    // Check for request coalescing
-    let coalescing_config = state.coalescing.config.read().clone();
-    if coalescing_config.enabled && state.coalescing.should_coalesce(&method, &path) {
-        let key = CoalesceKey::from_request(&method, &path, &headers);
-
-        // Try to join existing request
-        if let Some(mut receiver) = state.coalescing.try_join(&key) {
-            trace!("Joining coalesced request for {} {}", method, path);
-
-            // Wait for the response
-            match tokio::time::timeout(
-                Duration::from_millis(coalescing_config.max_wait_ms),
-                receiver.recv(),
-            )
-            .await
-            {
-                Ok(Ok(coalesced)) => {
-                    // Build response from coalesced data
-                    let mut response = Response::new(Body::from((*coalesced.body).clone()));
-                    *response.status_mut() = coalesced.status;
-                    *response.headers_mut() = coalesced.headers;
-
-                    // Add header indicating this was coalesced
-                    response
-                        .headers_mut()
-                        .insert("x-coalesced", HeaderValue::from_static("true"));
-
-                    return response;
-                }
-                _ => {
-                    // Timeout or error, proceed with own request
-                    trace!("Coalescing timeout/error, proceeding with request");
-                }
-            }
-        }
-    }
-
     // Process the request
     let mut response = next.run(request).await;
 
@@ -1253,16 +973,18 @@ mod tests {
         let priority = PriorityState::parse_client_priority("u=0").unwrap();
         assert_eq!(priority.urgency, 0);
         assert!(!priority.incremental);
-    }
 
-    #[test]
-    fn test_coalesce_key() {
-        let headers = HeaderMap::new();
-        let key1 = CoalesceKey::from_request("GET", "/api/data", &headers);
-        let key2 = CoalesceKey::from_request("GET", "/api/data", &headers);
-
-        assert_eq!(key1, key2);
-        assert_eq!(key1.method, "GET");
-        assert_eq!(key1.uri, "/api/data");
+        let p = |v| {
+            let r = PriorityState::parse_client_priority(v).unwrap();
+            (r.urgency, r.incremental)
+        };
+        assert_eq!(p(""), (3, false), "defaults");
+        assert_eq!(p("i=?1"), (3, true));
+        assert_eq!(p("u=5, i=?0"), (5, false));
+        assert_eq!(p("u=9"), (3, false), "out of range is ignored, not clamped");
+        assert_eq!(p("u=1;x=2, i;y"), (1, true), "parameters ignored");
+        assert_eq!(p("u=1, u=6"), (6, false), "the last member wins");
+        assert_eq!(p("foo, u=2"), (2, false), "unknown members ignored");
+        assert!(PriorityState::parse_client_priority("u=1, é").is_none());
     }
 }

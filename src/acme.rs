@@ -706,14 +706,6 @@ impl AcmeService {
         }
     }
 
-    /// Check if a token is a pending HTTP-01 challenge
-    pub fn get_challenge_response(&self, token: &str) -> Option<String> {
-        self.pending_challenges
-            .read()
-            .get(token)
-            .map(|c| c.key_authorization.clone())
-    }
-
     /// Get current ACME status
     pub fn get_status(&self) -> AcmeStatusInfo {
         let cached_status = self.cert_status.read();
@@ -786,12 +778,7 @@ impl AcmeService {
         }
     }
 
-    /// Force immediate certificate check/renewal
-    pub async fn force_renewal(&self) -> anyhow::Result<()> {
-        self.renewal_task().await
-    }
-
-    /// The check and renewal `force_renewal` runs, as a future owning what it
+    /// An immediate certificate check and renewal, as a future owning what it
     /// needs, so a caller that reaches the service through a lock can spawn it
     /// (the admin API's /acme/renew).
     pub fn renewal_task(
@@ -843,13 +830,65 @@ impl AcmeService {
     }
 }
 
-/// Write a file atomically: write to a .tmp sibling then rename into place.
-/// Prevents partial reads if two goroutines write simultaneously.
-fn write_atomic(path: &std::path::Path, content: &str) -> anyhow::Result<()> {
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, content)?;
-    fs::rename(&tmp, path)?;
-    Ok(())
+/// A file written beside its destination and not yet in place.
+#[cfg(feature = "acme")]
+struct Staged {
+    tmp: PathBuf,
+    path: PathBuf,
+}
+
+#[cfg(feature = "acme")]
+impl Staged {
+    /// Write `content` to a sibling of `path` and sync it to disk. A
+    /// `private` file is created readable by its owner alone, so a key is
+    /// never on disk under another mode.
+    fn write(path: &Path, content: &str, private: bool) -> anyhow::Result<Self> {
+        use std::io::Write as _;
+        let mut name = path.as_os_str().to_os_string();
+        name.push(".tmp");
+        let tmp = PathBuf::from(name);
+        // What an interrupted write left behind has a mode of its own.
+        let _ = fs::remove_file(&tmp);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if private {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        #[cfg(not(unix))]
+        let _ = private;
+        let mut file = options.open(&tmp)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        Ok(Self {
+            tmp,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Put the file in place: a reader sees the old file or the new, whole.
+    fn commit(self) -> anyhow::Result<()> {
+        fs::rename(&self.tmp, &self.path)?;
+        Ok(())
+    }
+}
+
+/// Write one file atomically (see [`Staged`]).
+#[cfg(feature = "acme")]
+fn write_atomic(path: &Path, content: &str, private: bool) -> anyhow::Result<()> {
+    Staged::write(path, content, private)?.commit()
+}
+
+/// Write a certificate chain and its key. Both are on disk before either
+/// is put in place, the key first, so the two names hold halves of
+/// different pairs only for the moment between two renames.
+#[cfg(feature = "acme")]
+fn write_pair(cert_path: &Path, chain: &str, key_path: &Path, key: &str) -> anyhow::Result<()> {
+    let key = Staged::write(key_path, key, true)?;
+    let chain = Staged::write(cert_path, chain, false)?;
+    key.commit()?;
+    chain.commit()
 }
 
 /// Check and renew certificates as needed, and say when the next renewal
@@ -980,17 +1019,9 @@ async fn check_and_renew_certificates(
                     format!("{}{}{}", cert_pem, sep, chain_pem)
                 };
 
-                // Atomic write: write to .tmp then rename — prevents partial reads
-                write_atomic(&cert_path, &full_chain)
-                    .map_err(|e| anyhow::anyhow!("Failed to write cert for {}: {}", domain, e))?;
-                write_atomic(&key_path, &key_pem)
-                    .map_err(|e| anyhow::anyhow!("Failed to write key for {}: {}", domain, e))?;
-
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600));
-                }
+                write_pair(&cert_path, &full_chain, &key_path, &key_pem).map_err(|e| {
+                    anyhow::anyhow!("Failed to write the certificate for {}: {}", domain, e)
+                })?;
 
                 let issued = IssuedCertificate::read(&cert_path)?;
                 if let Err(e) =
@@ -1598,15 +1629,9 @@ async fn get_or_create_account(config: &AcmeConfig) -> anyhow::Result<Account> {
         fs::create_dir_all(parent)?;
     }
 
+    // The account's key: the owner's alone from the moment it is on disk.
     let json = serde_json::to_string_pretty(&stored)?;
-    fs::write(&config.account_path, json)?;
-
-    // Set restrictive permissions on account file
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&config.account_path, fs::Permissions::from_mode(0o600))?;
-    }
+    write_atomic(&config.account_path, &json, true)?;
 
     info!(
         "ACME account created and saved to {:?}",
@@ -1677,12 +1702,6 @@ async fn check_and_renew_certificates(
     }
 
     Ok(None)
-}
-
-/// HTTP-01 challenge handler for ACME validation
-/// This should be called from the HTTP server when requests come to /.well-known/acme-challenge/
-pub fn handle_acme_challenge(acme_service: &AcmeService, token: &str) -> Option<String> {
-    acme_service.get_challenge_response(token)
 }
 
 /// Submit an issued certificate to configured Certificate Transparency logs.
@@ -1916,6 +1935,36 @@ mod tests {
 
         assert_eq!(cert, PathBuf::from("/etc/certs/example.com.crt"));
         assert_eq!(key, PathBuf::from("/etc/certs/example.com.key"));
+    }
+
+    /// A key is the owner's alone from its first byte on disk, a pair is
+    /// whole in both names, and nothing is left beside them.
+    #[cfg(feature = "acme")]
+    #[test]
+    fn a_pair_is_written_whole_and_its_key_is_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let (crt, key) = (
+            dir.path().join("a.example.crt"),
+            dir.path().join("a.example.key"),
+        );
+        fs::write(&key, "old key").unwrap();
+        // What an interrupted write left, readable by everyone
+        fs::write(dir.path().join("a.example.key.tmp"), "half").unwrap();
+
+        write_pair(&crt, "chain", &key, "new key").unwrap();
+        assert_eq!(fs::read_to_string(&crt).unwrap(), "chain");
+        assert_eq!(fs::read_to_string(&key).unwrap(), "new key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&key).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the key's mode is {mode:o}");
+        }
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
     }
 
     #[test]

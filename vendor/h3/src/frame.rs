@@ -194,6 +194,10 @@ where
     fn send_id(&self) -> StreamId {
         self.stream.send_id()
     }
+
+    fn set_urgency(&mut self, urgency: u8, incremental: bool) {
+        self.stream.set_urgency(urgency, incremental);
+    }
 }
 
 impl<S, B> FrameStream<S, B>
