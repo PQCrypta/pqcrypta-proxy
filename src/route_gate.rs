@@ -650,9 +650,11 @@ mod tests {
         use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
 
+        // A key of this run's own: the signature is as good as one can be
+        let key = hex::encode(rand::random::<[u8; 32]>());
         let mut r = route();
         r.security = Some(crate::config::RouteSecurityPolicy {
-            hmac_secret: Some("s3cret".to_string()),
+            hmac_secret: Some(key.clone()),
             ..Default::default()
         });
         let ts = std::time::SystemTime::now()
@@ -660,7 +662,7 @@ mod tests {
             .unwrap()
             .as_secs()
             .to_string();
-        let mut mac = Hmac::<Sha256>::new_from_slice(b"s3cret").unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes()).unwrap();
         mac.update(format!("GET\n/x\n{ts}").as_bytes());
         let sig = hex::encode(mac.finalize().into_bytes());
         let mut h = HeaderMap::new();
