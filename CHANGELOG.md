@@ -1,5 +1,66 @@
 # Changelog
 
+## [0.8.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.7.0...v0.8.0) (2026-11-12)
+
+
+### Features
+
+* **admin:** GET /pools, and drain, undrain, healthy and unhealthy per pool member ([be6ac0d](https://github.com/PQCrypta/pqcrypta-proxy/commit/be6ac0db08327b5d0899d799e29d142b6d6b104e))
+* **admin:** GET /pools, and drain, undrain, healthy and unhealthy per pool member ([114a0dc](https://github.com/PQCrypta/pqcrypta-proxy/commit/114a0dcf1044df0f732b04af760ec1e9ae38708f))
+* **admin:** GET /pools, and drain, undrain, healthy and unhealthy per pool member ([2efc6fa](https://github.com/PQCrypta/pqcrypta-proxy/commit/2efc6fafd85f45733437fa028ffa064d3416bbd9))
+* **audit:** a bounded writer thread holding the file, reopened after rotation; events from every subsystem ([be6ac0d](https://github.com/PQCrypta/pqcrypta-proxy/commit/be6ac0db08327b5d0899d799e29d142b6d6b104e))
+* **audit:** a bounded writer thread holding the file, reopened after rotation; events from every subsystem ([114a0dc](https://github.com/PQCrypta/pqcrypta-proxy/commit/114a0dcf1044df0f732b04af760ec1e9ae38708f))
+* **audit:** a bounded writer thread holding the file, reopened after rotation; events from every subsystem ([2efc6fa](https://github.com/PQCrypta/pqcrypta-proxy/commit/2efc6fafd85f45733437fa028ffa064d3416bbd9))
+* **backends:** http2, http3 and unix backends on ordinary routes ([be6ac0d](https://github.com/PQCrypta/pqcrypta-proxy/commit/be6ac0db08327b5d0899d799e29d142b6d6b104e))
+* **backends:** http2, http3 and unix backends on ordinary routes ([114a0dc](https://github.com/PQCrypta/pqcrypta-proxy/commit/114a0dcf1044df0f732b04af760ec1e9ae38708f))
+* **backends:** http2, http3 and unix backends on ordinary routes ([2efc6fa](https://github.com/PQCrypta/pqcrypta-proxy/commit/2efc6fafd85f45733437fa028ffa064d3416bbd9))
+* **fingerprint:** replay and drift detection, with log or block actions ([be6ac0d](https://github.com/PQCrypta/pqcrypta-proxy/commit/be6ac0db08327b5d0899d799e29d142b6d6b104e))
+* **fingerprint:** replay and drift detection, with log or block actions ([114a0dc](https://github.com/PQCrypta/pqcrypta-proxy/commit/114a0dcf1044df0f732b04af760ec1e9ae38708f))
+* **fingerprint:** replay and drift detection, with log or block actions ([2efc6fa](https://github.com/PQCrypta/pqcrypta-proxy/commit/2efc6fafd85f45733437fa028ffa064d3416bbd9))
+* **http3:** RFC 9218 priorities schedule responses on their streams, PRIORITY_UPDATE included ([be6ac0d](https://github.com/PQCrypta/pqcrypta-proxy/commit/be6ac0db08327b5d0899d799e29d142b6d6b104e))
+* **http3:** RFC 9218 priorities schedule responses on their streams, PRIORITY_UPDATE included ([114a0dc](https://github.com/PQCrypta/pqcrypta-proxy/commit/114a0dcf1044df0f732b04af760ec1e9ae38708f))
+* **http3:** RFC 9218 priorities schedule responses on their streams, PRIORITY_UPDATE included ([2efc6fa](https://github.com/PQCrypta/pqcrypta-proxy/commit/2efc6fafd85f45733437fa028ffa064d3416bbd9))
+* **load-balancer:** capacity on every algorithm, a request queue, slow start, a half-open breaker and draining ([be6ac0d](https://github.com/PQCrypta/pqcrypta-proxy/commit/be6ac0db08327b5d0899d799e29d142b6d6b104e))
+* **load-balancer:** capacity on every algorithm, a request queue, slow start, a half-open breaker and draining ([114a0dc](https://github.com/PQCrypta/pqcrypta-proxy/commit/114a0dcf1044df0f732b04af760ec1e9ae38708f))
+* **load-balancer:** capacity on every algorithm, a request queue, slow start, a half-open breaker and draining ([2efc6fa](https://github.com/PQCrypta/pqcrypta-proxy/commit/2efc6fafd85f45733437fa028ffa064d3416bbd9))
+* **metrics:** gauges read from their sources at scrape time; per-backend latency, errors, load and idle connections ([be6ac0d](https://github.com/PQCrypta/pqcrypta-proxy/commit/be6ac0db08327b5d0899d799e29d142b6d6b104e))
+* **metrics:** gauges read from their sources at scrape time; per-backend latency, errors, load and idle connections ([114a0dc](https://github.com/PQCrypta/pqcrypta-proxy/commit/114a0dcf1044df0f732b04af760ec1e9ae38708f))
+* **metrics:** gauges read from their sources at scrape time; per-backend latency, errors, load and idle connections ([2efc6fa](https://github.com/PQCrypta/pqcrypta-proxy/commit/2efc6fafd85f45733437fa028ffa064d3416bbd9))
+* **ocsp:** responses verified with OpenSSL and stapled by both TLS stacks, for every served certificate ([be6ac0d](https://github.com/PQCrypta/pqcrypta-proxy/commit/be6ac0db08327b5d0899d799e29d142b6d6b104e))
+* **ocsp:** responses verified with OpenSSL and stapled by both TLS stacks, for every served certificate ([114a0dc](https://github.com/PQCrypta/pqcrypta-proxy/commit/114a0dcf1044df0f732b04af760ec1e9ae38708f))
+* **ocsp:** responses verified with OpenSSL and stapled by both TLS stacks, for every served certificate ([2efc6fa](https://github.com/PQCrypta/pqcrypta-proxy/commit/2efc6fafd85f45733437fa028ffa064d3416bbd9))
+* **passthrough:** TLS passthrough is a switch inside every HTTPS accept path ([be6ac0d](https://github.com/PQCrypta/pqcrypta-proxy/commit/be6ac0db08327b5d0899d799e29d142b6d6b104e))
+* **passthrough:** TLS passthrough is a switch inside every HTTPS accept path ([114a0dc](https://github.com/PQCrypta/pqcrypta-proxy/commit/114a0dcf1044df0f732b04af760ec1e9ae38708f))
+* **passthrough:** TLS passthrough is a switch inside every HTTPS accept path ([2efc6fa](https://github.com/PQCrypta/pqcrypta-proxy/commit/2efc6fafd85f45733437fa028ffa064d3416bbd9))
+* **pqc:** downgrade_action allow, log or block on every listener ([be6ac0d](https://github.com/PQCrypta/pqcrypta-proxy/commit/be6ac0db08327b5d0899d799e29d142b6d6b104e))
+* **pqc:** downgrade_action allow, log or block on every listener ([114a0dc](https://github.com/PQCrypta/pqcrypta-proxy/commit/114a0dcf1044df0f732b04af760ec1e9ae38708f))
+* **pqc:** downgrade_action allow, log or block on every listener ([2efc6fa](https://github.com/PQCrypta/pqcrypta-proxy/commit/2efc6fafd85f45733437fa028ffa064d3416bbd9))
+* **rate-limit:** the asn key resolves through the ASN database ([be6ac0d](https://github.com/PQCrypta/pqcrypta-proxy/commit/be6ac0db08327b5d0899d799e29d142b6d6b104e))
+* **rate-limit:** the asn key resolves through the ASN database ([114a0dc](https://github.com/PQCrypta/pqcrypta-proxy/commit/114a0dcf1044df0f732b04af760ec1e9ae38708f))
+* **rate-limit:** the asn key resolves through the ASN database ([2efc6fa](https://github.com/PQCrypta/pqcrypta-proxy/commit/2efc6fafd85f45733437fa028ffa064d3416bbd9))
+* **security:** request bodies decoded before inspection, read whole by the WAF, and counted against a memory budget ([be6ac0d](https://github.com/PQCrypta/pqcrypta-proxy/commit/be6ac0db08327b5d0899d799e29d142b6d6b104e))
+* **security:** request bodies decoded before inspection, read whole by the WAF, and counted against a memory budget ([114a0dc](https://github.com/PQCrypta/pqcrypta-proxy/commit/114a0dcf1044df0f732b04af760ec1e9ae38708f))
+* **security:** request bodies decoded before inspection, read whole by the WAF, and counted against a memory budget ([2efc6fa](https://github.com/PQCrypta/pqcrypta-proxy/commit/2efc6fafd85f45733437fa028ffa064d3416bbd9))
+* **websocket:** WebSockets over HTTP/1.1, HTTP/2 extended CONNECT (RFC 8441) and HTTP/3 extended CONNECT (RFC 9220), with the backend's answer verified ([be6ac0d](https://github.com/PQCrypta/pqcrypta-proxy/commit/be6ac0db08327b5d0899d799e29d142b6d6b104e))
+* **websocket:** WebSockets over HTTP/1.1, HTTP/2 extended CONNECT (RFC 8441) and HTTP/3 extended CONNECT (RFC 9220), with the backend's answer verified ([114a0dc](https://github.com/PQCrypta/pqcrypta-proxy/commit/114a0dcf1044df0f732b04af760ec1e9ae38708f))
+* **websocket:** WebSockets over HTTP/1.1, HTTP/2 extended CONNECT (RFC 8441) and HTTP/3 extended CONNECT (RFC 9220), with the backend's answer verified ([2efc6fa](https://github.com/PQCrypta/pqcrypta-proxy/commit/2efc6fafd85f45733437fa028ffa064d3416bbd9))
+* **webtransport:** sessions on the HTTP/3 port, beside ordinary requests on the same connection, served by the one session implementation the WebTransport port uses ([be6ac0d](https://github.com/PQCrypta/pqcrypta-proxy/commit/be6ac0db08327b5d0899d799e29d142b6d6b104e))
+* **webtransport:** sessions on the HTTP/3 port, beside ordinary requests on the same connection, served by the one session implementation the WebTransport port uses ([114a0dc](https://github.com/PQCrypta/pqcrypta-proxy/commit/114a0dcf1044df0f732b04af760ec1e9ae38708f))
+* **webtransport:** sessions on the HTTP/3 port, beside ordinary requests on the same connection, served by the one session implementation the WebTransport port uses ([2efc6fa](https://github.com/PQCrypta/pqcrypta-proxy/commit/2efc6fafd85f45733437fa028ffa064d3416bbd9))
+
+
+### Bug Fixes
+
+* **backends:** a backend's certificate is always verified ([be6ac0d](https://github.com/PQCrypta/pqcrypta-proxy/commit/be6ac0db08327b5d0899d799e29d142b6d6b104e))
+* **backends:** a backend's certificate is always verified ([114a0dc](https://github.com/PQCrypta/pqcrypta-proxy/commit/114a0dcf1044df0f732b04af760ec1e9ae38708f))
+* **backends:** a backend's certificate is always verified ([2efc6fa](https://github.com/PQCrypta/pqcrypta-proxy/commit/2efc6fafd85f45733437fa028ffa064d3416bbd9))
+* **speedtest:** an unused reservation goes back to the window it was taken from ([be6ac0d](https://github.com/PQCrypta/pqcrypta-proxy/commit/be6ac0db08327b5d0899d799e29d142b6d6b104e))
+* **speedtest:** an unused reservation goes back to the window it was taken from ([114a0dc](https://github.com/PQCrypta/pqcrypta-proxy/commit/114a0dcf1044df0f732b04af760ec1e9ae38708f))
+* **speedtest:** an unused reservation goes back to the window it was taken from ([2efc6fa](https://github.com/PQCrypta/pqcrypta-proxy/commit/2efc6fafd85f45733437fa028ffa064d3416bbd9))
+* **tls:** delegated credentials are minted again soon after a failed attempt ([be6ac0d](https://github.com/PQCrypta/pqcrypta-proxy/commit/be6ac0db08327b5d0899d799e29d142b6d6b104e))
+* **tls:** delegated credentials are minted again soon after a failed attempt ([114a0dc](https://github.com/PQCrypta/pqcrypta-proxy/commit/114a0dcf1044df0f732b04af760ec1e9ae38708f))
+* **tls:** delegated credentials are minted again soon after a failed attempt ([2efc6fa](https://github.com/PQCrypta/pqcrypta-proxy/commit/2efc6fafd85f45733437fa028ffa064d3416bbd9))
+
 ## [0.7.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.6.0...v0.7.0) (2026-11-12)
 
 
