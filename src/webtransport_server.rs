@@ -213,8 +213,12 @@ impl WebTransportServer {
         info!("🔧 Keep-alive interval: 15 seconds");
         info!("🔧 Max idle timeout: 120 seconds");
 
-        // Create WebTransport endpoint
-        let server = Endpoint::server(config_builder).map_err(|e| {
+        // Create WebTransport endpoint, its socket able to put loss on one
+        // peer's path when that peer's telemetry session asks (path_loss.rs)
+        let server = Endpoint::server_with_socket(config_builder, |socket| {
+            Box::new(crate::path_loss::LossySocket::new(socket))
+        })
+        .map_err(|e| {
             error!("❌ WebTransport endpoint creation failed: {}", e);
             e
         })?;

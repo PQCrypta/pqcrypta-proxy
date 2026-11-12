@@ -158,6 +158,7 @@ pub mod ocsp;
 pub mod openssl_alloc;
 pub mod otel;
 pub mod path_canon;
+pub mod path_loss;
 pub mod pqc_extended;
 pub mod pqc_policy;
 pub mod pqc_tickets;
