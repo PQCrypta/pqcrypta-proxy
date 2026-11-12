@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.9.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.8.0...v0.9.0) (2026-11-12)
+
+
+### Features
+
+* ACME reissues a certificate whose key file is not its own ([837fab9](https://github.com/PQCrypta/pqcrypta-proxy/commit/837fab90cf87f9732ddd81ebfc1302681673a9c7))
+* ACME reissues a certificate whose key file is not its own ([10eaa2f](https://github.com/PQCrypta/pqcrypta-proxy/commit/10eaa2fbab4703fc9bf42753acc60a5bd49c68a3))
+* compression negotiates Accept-Encoding by weight with the proxy's preference among equals, and honours no-transform ([837fab9](https://github.com/PQCrypta/pqcrypta-proxy/commit/837fab90cf87f9732ddd81ebfc1302681673a9c7))
+* compression negotiates Accept-Encoding by weight with the proxy's preference among equals, and honours no-transform ([10eaa2f](https://github.com/PQCrypta/pqcrypta-proxy/commit/10eaa2fbab4703fc9bf42753acc60a5bd49c68a3))
+* OpenSSL allocates through mimalloc, the proxy's allocator ([837fab9](https://github.com/PQCrypta/pqcrypta-proxy/commit/837fab90cf87f9732ddd81ebfc1302681673a9c7))
+* OpenSSL allocates through mimalloc, the proxy's allocator ([10eaa2f](https://github.com/PQCrypta/pqcrypta-proxy/commit/10eaa2fbab4703fc9bf42753acc60a5bd49c68a3))
+* otel.trusted_parents: trace context continued from those peers, linked from all others ([837fab9](https://github.com/PQCrypta/pqcrypta-proxy/commit/837fab90cf87f9732ddd81ebfc1302681673a9c7))
+* otel.trusted_parents: trace context continued from those peers, linked from all others ([10eaa2f](https://github.com/PQCrypta/pqcrypta-proxy/commit/10eaa2fbab4703fc9bf42753acc60a5bd49c68a3))
+* pqcrypta_memory_* metrics: pressure level, working set, limits, stall, refused and shed connections ([837fab9](https://github.com/PQCrypta/pqcrypta-proxy/commit/837fab90cf87f9732ddd81ebfc1302681673a9c7))
+* pqcrypta_memory_* metrics: pressure level, working set, limits, stall, refused and shed connections ([10eaa2f](https://github.com/PQCrypta/pqcrypta-proxy/commit/10eaa2fbab4703fc9bf42753acc60a5bd49c68a3))
+* sd_notify readiness, reload, stopping and watchdog; packaged unit Type=notify-reload with WatchdogSec and the deployed unit's hardening ([837fab9](https://github.com/PQCrypta/pqcrypta-proxy/commit/837fab90cf87f9732ddd81ebfc1302681673a9c7))
+* sd_notify readiness, reload, stopping and watchdog; packaged unit Type=notify-reload with WatchdogSec and the deployed unit's hardening ([10eaa2f](https://github.com/PQCrypta/pqcrypta-proxy/commit/10eaa2fbab4703fc9bf42753acc60a5bd49c68a3))
+* shed load as the process's own memory runs short: no caching, smaller cache and request-body budget, idle connections closed, new connections from exempt addresses only when critical ([837fab9](https://github.com/PQCrypta/pqcrypta-proxy/commit/837fab90cf87f9732ddd81ebfc1302681673a9c7))
+* shed load as the process's own memory runs short: no caching, smaller cache and request-body budget, idle connections closed, new connections from exempt addresses only when critical ([10eaa2f](https://github.com/PQCrypta/pqcrypta-proxy/commit/10eaa2fbab4703fc9bf42753acc60a5bd49c68a3))
+* the release builds and runs the container image ([837fab9](https://github.com/PQCrypta/pqcrypta-proxy/commit/837fab90cf87f9732ddd81ebfc1302681673a9c7))
+* the release builds and runs the container image ([10eaa2f](https://github.com/PQCrypta/pqcrypta-proxy/commit/10eaa2fbab4703fc9bf42753acc60a5bd49c68a3))
+* the response to a credentialed cross-site request is sent uncompressed ([837fab9](https://github.com/PQCrypta/pqcrypta-proxy/commit/837fab90cf87f9732ddd81ebfc1302681673a9c7))
+* the response to a credentialed cross-site request is sent uncompressed ([10eaa2f](https://github.com/PQCrypta/pqcrypta-proxy/commit/10eaa2fbab4703fc9bf42753acc60a5bd49c68a3))
+
+
+### Bug Fixes
+
+* a reload applies new rate limits to every key and to the node's own quota ([837fab9](https://github.com/PQCrypta/pqcrypta-proxy/commit/837fab90cf87f9732ddd81ebfc1302681673a9c7))
+* a reload applies new rate limits to every key and to the node's own quota ([10eaa2f](https://github.com/PQCrypta/pqcrypta-proxy/commit/10eaa2fbab4703fc9bf42753acc60a5bd49c68a3))
+* adaptive rate-limit baseline keeps time-decayed weighted moments, one sample a second; the global baseline measures requests per second ([837fab9](https://github.com/PQCrypta/pqcrypta-proxy/commit/837fab90cf87f9732ddd81ebfc1302681673a9c7))
+* adaptive rate-limit baseline keeps time-decayed weighted moments, one sample a second; the global baseline measures requests per second ([10eaa2f](https://github.com/PQCrypta/pqcrypta-proxy/commit/10eaa2fbab4703fc9bf42753acc60a5bd49c68a3))
+* conformance listeners admit connections as the other listeners do ([837fab9](https://github.com/PQCrypta/pqcrypta-proxy/commit/837fab90cf87f9732ddd81ebfc1302681673a9c7))
+* conformance listeners admit connections as the other listeners do ([10eaa2f](https://github.com/PQCrypta/pqcrypta-proxy/commit/10eaa2fbab4703fc9bf42753acc60a5bd49c68a3))
+* connection limits count an IPv6 client per /64 ([837fab9](https://github.com/PQCrypta/pqcrypta-proxy/commit/837fab90cf87f9732ddd81ebfc1302681673a9c7))
+* connection limits count an IPv6 client per /64 ([10eaa2f](https://github.com/PQCrypta/pqcrypta-proxy/commit/10eaa2fbab4703fc9bf42753acc60a5bd49c68a3))
+* ech-keygen writes each config atomically; the TSIG secret is wiped on drop ([837fab9](https://github.com/PQCrypta/pqcrypta-proxy/commit/837fab90cf87f9732ddd81ebfc1302681673a9c7))
+* ech-keygen writes each config atomically; the TSIG secret is wiped on drop ([10eaa2f](https://github.com/PQCrypta/pqcrypta-proxy/commit/10eaa2fbab4703fc9bf42753acc60a5bd49c68a3))
+* ML-DSA keys holding seed and expanded key are checked for agreement ([837fab9](https://github.com/PQCrypta/pqcrypta-proxy/commit/837fab90cf87f9732ddd81ebfc1302681673a9c7))
+* ML-DSA keys holding seed and expanded key are checked for agreement ([10eaa2f](https://github.com/PQCrypta/pqcrypta-proxy/commit/10eaa2fbab4703fc9bf42753acc60a5bd49c68a3))
+* startup probes leave nothing in the live security state; their audit records are marked startup_probe ([837fab9](https://github.com/PQCrypta/pqcrypta-proxy/commit/837fab90cf87f9732ddd81ebfc1302681673a9c7))
+* startup probes leave nothing in the live security state; their audit records are marked startup_probe ([10eaa2f](https://github.com/PQCrypta/pqcrypta-proxy/commit/10eaa2fbab4703fc9bf42753acc60a5bd49c68a3))
+* UDP GRO is a noq-udp setting, not an environment variable written at run time ([837fab9](https://github.com/PQCrypta/pqcrypta-proxy/commit/837fab90cf87f9732ddd81ebfc1302681673a9c7))
+* UDP GRO is a noq-udp setting, not an environment variable written at run time ([10eaa2f](https://github.com/PQCrypta/pqcrypta-proxy/commit/10eaa2fbab4703fc9bf42753acc60a5bd49c68a3))
+
 ## [0.8.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.7.0...v0.8.0) (2026-11-12)
 
 
