@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.7.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.6.0...v0.7.0) (2026-11-12)
+
+
+### Features
+
+* **masque:** allowed_clients names the clients a CONNECT-UDP session is relayed for ([f7ac1ac](https://github.com/PQCrypta/pqcrypta-proxy/commit/f7ac1ac180f64a0ae2b06c3da3a9ae27aa128df3))
+* **server:** max_connections and max_connections_per_ip bound the connections open on every listener ([f7ac1ac](https://github.com/PQCrypta/pqcrypta-proxy/commit/f7ac1ac180f64a0ae2b06c3da3a9ae27aa128df3))
+
+
+### Bug Fixes
+
+* **cache:** freshness follows RFC 9111 for requests with credentials, max-age=0, Expires and conditional requests ([f7ac1ac](https://github.com/PQCrypta/pqcrypta-proxy/commit/f7ac1ac180f64a0ae2b06c3da3a9ae27aa128df3))
+* **cache:** the cache is bounded by size with S3-FIFO eviction, swept for expired entries, and consulted behind the route's gates ([f7ac1ac](https://github.com/PQCrypta/pqcrypta-proxy/commit/f7ac1ac180f64a0ae2b06c3da3a9ae27aa128df3))
+* **compression:** partial content is sent as the origin encoded it ([f7ac1ac](https://github.com/PQCrypta/pqcrypta-proxy/commit/f7ac1ac180f64a0ae2b06c3da3a9ae27aa128df3))
+* **http3:** an extended CONNECT passes the security rules and is written to the access log ([f7ac1ac](https://github.com/PQCrypta/pqcrypta-proxy/commit/f7ac1ac180f64a0ae2b06c3da3a9ae27aa128df3))
+* **http3:** Early Hints are compiled once per set of matching rules ([f7ac1ac](https://github.com/PQCrypta/pqcrypta-proxy/commit/f7ac1ac180f64a0ae2b06c3da3a9ae27aa128df3))
+* **metrics:** the failing-path table keeps the paths that fail most, to a fixed size ([f7ac1ac](https://github.com/PQCrypta/pqcrypta-proxy/commit/f7ac1ac180f64a0ae2b06c3da3a9ae27aa128df3))
+* **quic:** a handshake is held to tls.handshake_timeout_secs ([f7ac1ac](https://github.com/PQCrypta/pqcrypta-proxy/commit/f7ac1ac180f64a0ae2b06c3da3a9ae27aa128df3))
+* **rate-limit:** a key the client writes is counted beside its address's bucket, and a fingerprint bucket is kept per network ([f7ac1ac](https://github.com/PQCrypta/pqcrypta-proxy/commit/f7ac1ac180f64a0ae2b06c3da3a9ae27aa128df3))
+* **routing:** every layer reads a request's host one way, and a request that names two hosts is answered 400 ([f7ac1ac](https://github.com/PQCrypta/pqcrypta-proxy/commit/f7ac1ac180f64a0ae2b06c3da3a9ae27aa128df3))
+* **security:** an error page is exempt from the blocklist and location rules only, by its canonical path ([f7ac1ac](https://github.com/PQCrypta/pqcrypta-proxy/commit/f7ac1ac180f64a0ae2b06c3da3a9ae27aa128df3))
+* **server:** a TCP connection with nothing in flight closes after max_idle_timeout_secs, and shutdown does not wait on a silent peer ([f7ac1ac](https://github.com/PQCrypta/pqcrypta-proxy/commit/f7ac1ac180f64a0ae2b06c3da3a9ae27aa128df3))
+* **tls:** a certificate is served with its own key, a reload keeps the certificate in service for a pair that does not load, and the watch follows files written in place ([f7ac1ac](https://github.com/PQCrypta/pqcrypta-proxy/commit/f7ac1ac180f64a0ae2b06c3da3a9ae27aa128df3))
+* **tls:** client certificates are verified against tls.ca_cert_path and nothing else ([f7ac1ac](https://github.com/PQCrypta/pqcrypta-proxy/commit/f7ac1ac180f64a0ae2b06c3da3a9ae27aa128df3))
+* **waf:** header values are inspected the way bodies are, read lossily ([f7ac1ac](https://github.com/PQCrypta/pqcrypta-proxy/commit/f7ac1ac180f64a0ae2b06c3da3a9ae27aa128df3))
+* **webtransport:** a session passes the security rules, its streams are read to a limit, and its requests go to its own route's backend ([f7ac1ac](https://github.com/PQCrypta/pqcrypta-proxy/commit/f7ac1ac180f64a0ae2b06c3da3a9ae27aa128df3))
+
 ## [0.6.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.5.0...v0.6.0) (2026-11-11)
 
 
