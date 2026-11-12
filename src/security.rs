@@ -4491,6 +4491,9 @@ mod decision_rendering_tests {
 
     /// Under `pqc.downgrade_action = "block"` a request on a connection whose
     /// key exchange was classical is answered 421, and no other request is.
+    /// Not in a `bench-null-middleware` build, whose middleware does none of
+    /// its work by design.
+    #[cfg(not(feature = "bench-null-middleware"))]
     #[tokio::test]
     async fn a_classical_connection_is_answered_421_where_those_are_refused() {
         use tower::ServiceExt as _;
