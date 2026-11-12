@@ -5,17 +5,13 @@
 
 ### Features
 
-* telemetry impairments act on a stream's real data (delay, jitter, bandwidth, disconnect), and loss drops real packets on the session's path ([7a0b360](https://github.com/PQCrypta/pqcrypta-proxy/commit/7a0b360f5acbd5a9c4255f13b8522453ba22ce76))
 * telemetry impairments act on a stream's real data (delay, jitter, bandwidth, disconnect), and loss drops real packets on the session's path ([82b6026](https://github.com/PQCrypta/pqcrypta-proxy/commit/82b60261d31055ce85b607ecce1fc74f0ce74a1a))
-* telemetry streams carry real payload, stamped, so the client measures throughput and arrival delay from what it receives ([7a0b360](https://github.com/PQCrypta/pqcrypta-proxy/commit/7a0b360f5acbd5a9c4255f13b8522453ba22ce76))
 * telemetry streams carry real payload, stamped, so the client measures throughput and arrival delay from what it receives ([82b6026](https://github.com/PQCrypta/pqcrypta-proxy/commit/82b60261d31055ce85b607ecce1fc74f0ce74a1a))
-* the telemetry stats stream reports the packets QUIC lost and its congestion events ([7a0b360](https://github.com/PQCrypta/pqcrypta-proxy/commit/7a0b360f5acbd5a9c4255f13b8522453ba22ce76))
 * the telemetry stats stream reports the packets QUIC lost and its congestion events ([82b6026](https://github.com/PQCrypta/pqcrypta-proxy/commit/82b60261d31055ce85b607ecce1fc74f0ce74a1a))
 
 
 ### Bug Fixes
 
-* a telemetry session draws on the speed test's download allowance, pauses while its page is hidden, and ends every task it started when it ends ([7a0b360](https://github.com/PQCrypta/pqcrypta-proxy/commit/7a0b360f5acbd5a9c4255f13b8522453ba22ce76))
 * a telemetry session draws on the speed test's download allowance, pauses while its page is hidden, and ends every task it started when it ends ([82b6026](https://github.com/PQCrypta/pqcrypta-proxy/commit/82b60261d31055ce85b607ecce1fc74f0ce74a1a))
 
 ## [0.9.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.8.0...v0.9.0) (2026-11-12)
