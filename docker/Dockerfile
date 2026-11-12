@@ -25,8 +25,14 @@
 # Stage 1: Build
 # Trixie (Debian 13) ships OpenSSL 3.5.x; the `pqc` feature links 3.2+ symbols
 # (SSL_get0_group_name) and needs 3.5 for native ML-KEM, so bookworm's 3.0 will
-# not link. This matches the OpenSSL 3.5 that production runs.
-FROM rust:1-trixie AS builder
+# not link. CI builds against the same 3.5; production nodes link OpenSSL
+# 4.0.3 with liboqs, built from source, which this image does not carry.
+#
+# Both images are pinned by digest as well as by name: a tag is moved by
+# whoever publishes it, and the toolchain is the 1.99.0 every other build
+# uses. The release workflow builds this file, so a pin that stops working is
+# found when a release is cut, not by whoever builds the image next.
+FROM rust:1.99.0-trixie@sha256:81015672d6939b0265f09adf96d5de125482bb1330106076956b0518e74edc90 AS builder
 
 WORKDIR /build
 
@@ -61,7 +67,7 @@ ENV PQCRYPTA_GIT_COMMIT=${PQCRYPTA_GIT_COMMIT}
 RUN cargo build --release --locked
 
 # Stage 2: Runtime
-FROM debian:trixie-slim
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 
 # Install runtime dependencies
 # AUD-08: curl is required by the HEALTHCHECK instruction below.
@@ -99,8 +105,9 @@ USER pqcrypta
 # Define volumes for runtime secrets
 VOLUME ["/etc/pqcrypta/certs"]
 
-# Expose ports
+# Expose ports: HTTP/3 on UDP, HTTP/1.1 and HTTP/2 on TCP, the admin API
 EXPOSE 4433/udp
+EXPOSE 4433/tcp
 EXPOSE 8081/tcp
 
 # Health check

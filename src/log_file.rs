@@ -273,31 +273,19 @@ mod tests {
     /// this test rotated repeatedly and proved nothing — the backup shuffle had
     /// recreated the path it asserted on, and count-pruning could have removed
     /// the file just as well as age-pruning.
-    // clippy suggests `Duration::from_days` here, which is still unstable
-    // (rust-lang/rust#120301) and does not compile on this toolchain. The
-    // explicit arithmetic is the only spelling available, so silence the lint
-    // rather than leave a suggestion that cannot be taken.
-    // The pedantic `duration_suboptimal_units` lint wants `Duration::from_days`
-    // here, which is still unstable (rust-lang/rust#120301) and does not compile
-    // on this toolchain. The explicit arithmetic is the only spelling available,
-    // so silence the lint rather than leave a suggestion that cannot be taken.
-    #[allow(clippy::duration_suboptimal_units)]
     #[test]
     fn prunes_rotations_older_than_max_age() {
         let dir = temp_dir("age");
         let path = dir.join("proxy.log");
         let stale = numbered_path(&path, 1);
         fs::write(&stale, b"stale\n").unwrap();
-        filetime_set(
-            &stale,
-            SystemTime::now() - Duration::from_secs(60 * 60 * 24 * 30),
-        );
+        filetime_set(&stale, SystemTime::now() - Duration::from_hours(24 * 30));
 
         let mut writer = RotatingFileWriter::open(RotationConfig {
             path: path.clone(),
             max_size_bytes: 32,
             max_backups: 3,
-            max_age: Some(Duration::from_secs(60 * 60 * 24)),
+            max_age: Some(Duration::from_hours(24)),
         })
         .unwrap();
 

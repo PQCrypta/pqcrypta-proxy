@@ -6,7 +6,7 @@
 //! - WebTransport (webtransport_server.rs)
 //!
 //! Propagation formats supported:
-//! - **W3C TraceContext** (`traceparent` / `tracestate`) — RFC 9543
+//! - **W3C Trace Context** (`traceparent` / `tracestate`, a W3C Recommendation)
 //! - **B3 multi-header** (`x-b3-traceid`, `x-b3-spanid`, `x-b3-sampled`)
 //! - **B3 single-header** (`b3`)
 //!
@@ -14,13 +14,22 @@
 //! incoming request (W3C takes priority) and injects both formats into every
 //! upstream/backend request so downstream services can correlate traces.
 //!
+//! A request continues the trace it names only from `otel.trusted_parents`.
+//! From anywhere else the context is a client's claim: its trace ID is
+//! chosen by the client and its sampled flag, under the parent-based
+//! sampler, would make the proxy trace and export every request the client
+//! marks. Such a request begins a trace of the proxy's own, sampled by the
+//! proxy's ratio, and carries the context it named as a span link, so the
+//! two can still be found together.
+//!
 //! OTLP export uses HTTP/JSON transport via the existing `reqwest` client.
 //! The global tracer provider is a NOOP until `init_otel()` is called, so
 //! spans created during startup are silently dropped — request-handling spans
 //! created after startup are fully exported.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::net::IpAddr;
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use http::{HeaderMap, HeaderName, HeaderValue};
 use opentelemetry::propagation::text_map_propagator::FieldIter;
@@ -52,7 +61,7 @@ impl Extractor for HeaderMapCarrier<'_> {
     }
 
     fn keys(&self) -> Vec<&str> {
-        self.0.keys().map(|k| k.as_str()).collect()
+        self.0.keys().map(http::HeaderName::as_str).collect()
     }
 }
 
@@ -278,7 +287,7 @@ pub fn extract_context_from_headers(headers: &HeaderMap) -> Context {
 
 /// Extract the remote parent context from a `HashMap<String, String>`.
 /// Used by the QUIC/HTTP3 and WebTransport paths.
-#[allow(clippy::implicit_hasher)]
+#[expect(clippy::implicit_hasher)]
 pub fn extract_context_from_map(map: &HashMap<String, String>) -> Context {
     global::get_text_map_propagator(|p| p.extract(&HashMapCarrier(map)))
 }
@@ -289,23 +298,64 @@ pub fn inject_context_into_headers(ctx: &Context, headers: &mut HeaderMap) {
 }
 
 /// Inject the given context into a `HashMap<String, String>`.
-#[allow(clippy::implicit_hasher)]
+#[expect(clippy::implicit_hasher)]
 pub fn inject_context_into_map(ctx: &Context, map: &mut HashMap<String, String>) {
     global::get_text_map_propagator(|p| p.inject_context(ctx, &mut HashMapInjector(map)));
 }
 
-/// Set the parent of the given tracing `Span` from the remote context in HTTP headers.
+/// Attach the remote context in a request's headers to `span`: as its
+/// parent when `peer` is in `otel.trusted_parents`, as a link otherwise.
 ///
-/// Call this at the top of every server-side request handler to stitch the incoming
-/// trace into the local span tree.
-pub fn set_parent_from_headers(span: &Span, headers: &HeaderMap) {
-    set_parent(span, extract_context_from_headers(headers));
+/// Call this at the top of every server-side request handler, before the
+/// span is entered.
+pub fn set_parent_from_headers(span: &Span, headers: &HeaderMap, peer: IpAddr) {
+    attach(span, extract_context_from_headers(headers), peer);
 }
 
 /// Set the parent from a `HashMap<String, String>` (QUIC / WebTransport path).
-#[allow(clippy::implicit_hasher)]
-pub fn set_parent_from_map(span: &Span, map: &HashMap<String, String>) {
-    set_parent(span, extract_context_from_map(map));
+#[expect(clippy::implicit_hasher)]
+pub fn set_parent_from_map(span: &Span, map: &HashMap<String, String>, peer: IpAddr) {
+    attach(span, extract_context_from_map(map), peer);
+}
+
+/// `otel.trusted_parents`, as last configured.
+static TRUSTED_PARENTS: LazyLock<arc_swap::ArcSwap<Vec<ipnet::IpNet>>> =
+    LazyLock::new(|| arc_swap::ArcSwap::from_pointee(Vec::new()));
+
+/// `otel.trusted_parents` read: addresses (one host each) or CIDR ranges.
+pub fn parse_trusted_parents(entries: &[String]) -> Result<Vec<ipnet::IpNet>, String> {
+    entries
+        .iter()
+        .map(|entry| {
+            entry
+                .parse::<ipnet::IpNet>()
+                .or_else(|_| entry.parse::<IpAddr>().map(ipnet::IpNet::from))
+                .map_err(|_| format!("{entry:?} is not an address or CIDR range"))
+        })
+        .collect()
+}
+
+/// Apply `otel.trusted_parents`, at startup and on every reload.
+pub fn configure_trusted_parents(entries: &[String]) {
+    match parse_trusted_parents(entries) {
+        Ok(parsed) => TRUSTED_PARENTS.store(Arc::new(parsed)),
+        Err(e) => tracing::warn!("otel.trusted_parents not applied: {e}"),
+    }
+}
+
+/// Attach what a request from `peer` named: as the parent where `peer` is
+/// trusted to name it, as a link otherwise (see the module documentation).
+fn attach(span: &Span, ctx: Context, peer: IpAddr) {
+    let named = ctx.span().span_context().clone();
+    if !named.is_valid() {
+        return;
+    }
+    let peer = peer.to_canonical();
+    if TRUSTED_PARENTS.load().iter().any(|net| net.contains(&peer)) {
+        set_parent(span, ctx);
+    } else {
+        span.add_link(named);
+    }
 }
 
 /// Attach `ctx` as the parent of `span`, which must not have been entered yet.
@@ -328,7 +378,7 @@ pub fn inject_current_context_into_headers(headers: &mut HeaderMap) {
 }
 
 /// Inject the current span context into a `HashMap<String, String>`.
-#[allow(clippy::implicit_hasher)]
+#[expect(clippy::implicit_hasher)]
 pub fn inject_current_context_into_map(map: &mut HashMap<String, String>) {
     let ctx = Span::current().context();
     inject_context_into_map(&ctx, map);
@@ -367,21 +417,42 @@ pub(crate) fn with_test_tracing<R>(f: impl FnOnce() -> R) -> R {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
 
+    /// The trusted parents every test sets (the same list, so tests running
+    /// at once agree), and a peer in it and one outside it.
+    pub(crate) fn trust_test_parents() -> (IpAddr, IpAddr) {
+        configure_trusted_parents(&["192.0.2.0/28".to_string()]);
+        (
+            "192.0.2.5".parse().unwrap(),
+            "198.51.100.7".parse().unwrap(),
+        )
+    }
+
     #[test]
-    fn a_span_joins_the_trace_its_headers_name() {
+    fn a_span_joins_the_trace_its_headers_name_from_a_trusted_peer() {
         with_test_tracing(|| {
             let mut headers = HeaderMap::new();
             headers.insert(
                 "traceparent",
                 HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
             );
+            let (trusted, untrusted) = trust_test_parents();
             let span = tracing::info_span!("t");
-            set_parent_from_headers(&span, &headers);
+            set_parent_from_headers(&span, &headers, trusted);
+            assert_eq!(trace_id_of(&span), TRACE);
+
+            // From anywhere else the trace is the proxy's own
+            let span = tracing::info_span!("t");
+            set_parent_from_headers(&span, &headers, untrusted);
+            let own = trace_id_of(&span);
+            assert!(!own.is_empty() && own != TRACE, "{own}");
+            // An IPv4-mapped spelling of a trusted address is trusted
+            let span = tracing::info_span!("t");
+            set_parent_from_headers(&span, &headers, "::ffff:192.0.2.5".parse().unwrap());
             assert_eq!(trace_id_of(&span), TRACE);
         });
     }
@@ -390,8 +461,9 @@ mod tests {
     fn a_span_joins_a_b3_trace_from_a_map() {
         with_test_tracing(|| {
             let map = HashMap::from([("b3".to_string(), format!("{TRACE}-00f067aa0ba902b7-1"))]);
+            let (trusted, _) = trust_test_parents();
             let span = tracing::info_span!("t");
-            set_parent_from_map(&span, &map);
+            set_parent_from_map(&span, &map, trusted);
             assert_eq!(trace_id_of(&span), TRACE);
         });
     }
@@ -406,9 +478,10 @@ mod tests {
                 "traceparent",
                 HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
             );
+            let (trusted, _) = trust_test_parents();
             let span = tracing::info_span!("t");
             let _entered = span.enter();
-            set_parent_from_headers(&span, &headers);
+            set_parent_from_headers(&span, &headers, trusted);
             assert_ne!(trace_id_of(&span), TRACE);
         });
     }

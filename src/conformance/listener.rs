@@ -132,6 +132,9 @@ pub struct TestListener {
     /// The post-quantum chain this port serves, as loaded; `None` on every
     /// port but `t-cert-compression-pq`.
     chain: Option<ChainSize>,
+    /// The listeners' security state: its blocklist, and who is exempt from
+    /// the connection limits every listener applies (crate::conn_limits)
+    security: Arc<crate::security::SecurityState>,
 }
 
 impl TestListener {
@@ -141,6 +144,7 @@ impl TestListener {
         addr: SocketAddr,
         tls_provider: &Arc<TlsProvider>,
         conformance: Arc<Conformance>,
+        security: Arc<crate::security::SecurityState>,
     ) -> anyhow::Result<Self> {
         let mut chain = None;
         // One port needs a TLS configuration of its own: it must offer early
@@ -537,6 +541,7 @@ impl TestListener {
             conformance,
             counters,
             chain,
+            security,
         })
     }
 
@@ -602,7 +607,32 @@ impl TestListener {
                 }
             }
 
+            // Admitted as every listener admits a connection: not from a
+            // blocked address, and with a place under the connection limits
+            // (per client, in all, and none while memory is critically
+            // short), held for as long as the connection is. These ports are
+            // as open to the Internet as the proxy's own.
+            let peer = crate::security::canonical_addr(incoming.remote_address()).ip();
+            if !self.security.is_trusted(&peer)
+                && (self.security.is_blocked(&peer).is_some()
+                    || self.security.is_geo_blocked(&peer))
+            {
+                debug!("conformance: {} refuses blocked {}", test.id, peer);
+                incoming.refuse();
+                continue;
+            }
+            let Some(slot) = crate::conn_limits::admit(peer, self.security.is_limit_exempt(&peer))
+            else {
+                debug!(
+                    "conformance: {} refuses {}: connection limit",
+                    test.id, peer
+                );
+                incoming.refuse();
+                continue;
+            };
+
             tokio::spawn(async move {
+                let _slot = slot;
                 if let Err(e) =
                     run_one(incoming, test, conformance, counters, endpoint, chain).await
                 {
@@ -5315,7 +5345,12 @@ fn classify_error(err: &quinn::ConnectionError) -> Observation {
 /// A port that cannot be bound is logged and skipped rather than aborting
 /// startup: the suite is a side feature, and refusing to serve the site because
 /// one test port is taken would be a poor trade.
-pub fn spawn_all(conformance: &Arc<Conformance>, tls_provider: &Arc<TlsProvider>, bind_ip: &str) {
+pub fn spawn_all(
+    conformance: &Arc<Conformance>,
+    tls_provider: &Arc<TlsProvider>,
+    bind_ip: &str,
+    security: &Arc<crate::security::SecurityState>,
+) {
     let start = conformance.config.port_range.0;
     let mut bound = 0usize;
 
@@ -5332,7 +5367,13 @@ pub fn spawn_all(conformance: &Arc<Conformance>, tls_provider: &Arc<TlsProvider>
             }
         };
 
-        match TestListener::bind(test, addr, &tls_provider, conformance.clone()) {
+        match TestListener::bind(
+            test,
+            addr,
+            tls_provider,
+            conformance.clone(),
+            Arc::clone(security),
+        ) {
             Ok(listener) => {
                 bound += 1;
                 tokio::spawn(listener.run());

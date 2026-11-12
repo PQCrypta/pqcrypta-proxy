@@ -800,7 +800,6 @@ where
 /// Every layer but `security` is optional and present only when its feature is
 /// on. `security` always runs: it carries the request-size, header-size and
 /// blocklist enforcement that has no switch of its own.
-#[allow(clippy::too_many_arguments)]
 fn build_proxy_service(
     state: &Arc<HttpListenerState>,
     compression_state: CompressionState,
@@ -927,7 +926,7 @@ fn build_proxy_service(
 /// Which optional layers `build_proxy_service` puts in the chain.
 #[cfg(not(feature = "bench-no-middleware"))]
 #[derive(Debug, Clone, Copy)]
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 struct LayerSelection {
     trace_context: bool,
     advanced_rate_limit: bool,
@@ -1182,7 +1181,7 @@ fn reloadable_app(
 }
 
 /// Create and run the HTTP listener with TLS termination
-#[allow(clippy::similar_names, clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub async fn run_http_listener(
     addr: SocketAddr,
     cert_path: &str,
@@ -1462,7 +1461,7 @@ fn spawn_pqc_tls_reload(
 /// Create and run the HTTP listener with PQC-enabled OpenSSL TLS
 /// Uses OpenSSL 3.5+ with ML-KEM hybrid key exchange for quantum-resistant connections
 #[cfg(feature = "pqc")]
-#[allow(clippy::similar_names, clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub async fn run_http_listener_pqc(
     addr: SocketAddr,
     cert_path: &str,
@@ -1668,7 +1667,7 @@ pub async fn run_http_listener_pqc(
 // Every argument is a distinct per-listener dependency with no natural
 // grouping; bundling them into a struct purely to satisfy the lint would add an
 // indirection none of the sibling listeners have.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub async fn run_http_listener_with_fingerprint(
     addr: SocketAddr,
     cert_path: &str,
@@ -1702,7 +1701,7 @@ pub async fn run_http_listener_with_fingerprint(
 /// When `shared_resolver` is `Some`, the same `MultiDomainCertResolver` instance
 /// used by the ACME subsystem is wired into the TLS config so that newly-issued
 /// certificates are served immediately without restarting the listener.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub async fn run_http_listener_with_fingerprint_and_resolver(
     addr: SocketAddr,
     cert_path: &str,
@@ -1863,7 +1862,7 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
 /// HTTP/1.1-only one, so browsers that negotiate http/1.1 open independent TCP
 /// connections per stream (up to 6 per origin) instead of coalescing them on
 /// one HTTP/2 pipe. Both carry the current ECH configs.
-#[allow(clippy::type_complexity)]
+#[expect(clippy::type_complexity)]
 fn fingerprinting_configs(
     config: &ProxyConfig,
     resolver: &std::sync::Arc<crate::tls::MultiDomainCertResolver>,
@@ -2138,7 +2137,7 @@ async fn handle_fingerprinted_connection<S>(
 ///                    → Axum router with middleware stack
 /// ```
 #[cfg(feature = "pqc")]
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub async fn run_http_listener_pqc_with_fingerprint(
     addr: SocketAddr,
     cert_path: &str,
@@ -2389,9 +2388,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     Ok(())
 }
 
-/// Handle a single PQC connection with fingerprinting
 #[cfg(feature = "pqc")]
-#[allow(clippy::too_many_arguments)]
 /// Capture what the OpenSSL PQC listener's handshake negotiated.
 ///
 /// The rustls path builds the same facts in `HandshakeFacts::from_connection`;
@@ -2514,7 +2511,7 @@ async fn peek_client_hello(
 // Every argument is a distinct per-connection dependency with no natural
 // grouping; bundling them into a struct purely to satisfy the lint would add an
 // indirection this accept path does not otherwise need.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn handle_pqc_fingerprinted_connection<S>(
     stream: TcpStream,
     remote_addr: SocketAddr,
@@ -2932,9 +2929,12 @@ where
     E: hyper_util::server::conn::auto::HttpServerConnExec<S::Future, B> + Send + Sync,
 {
     tokio::pin!(conn);
+    let mut relief = crate::memory_pressure::relief();
     // Until the process shuts down, or the connection has had nothing in
-    // flight for `idle`.
+    // flight for `idle`, which is shorter while memory is short; and then a
+    // connection with nothing in flight is closed at once.
     loop {
+        let idle = crate::memory_pressure::idle_limit(idle);
         let wait = match activity.idle_for() {
             Some(quiet) if quiet >= idle => break,
             Some(quiet) => idle.saturating_sub(quiet),
@@ -2944,6 +2944,10 @@ where
             result = conn.as_mut() => return result,
             _ = shutdown.changed() => break,
             () = tokio::time::sleep(wait) => {}
+            () = crate::memory_pressure::idle_at_relief(&mut relief, activity) => {
+                crate::memory_pressure::connection_shed();
+                break;
+            }
         }
     }
     // Asked to close: what is in flight finishes. A connection with nothing
@@ -4402,7 +4406,7 @@ async fn proxy_handler(
 /// The spawned task runs independently of the caller; the client never sees the shadow
 /// response.  All configurable values (timeout, marker header name/value, logging) come
 /// from [`ShadowConfig`] — nothing is hardcoded.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn spawn_shadow_request(
     shadow_cfg: &ShadowConfig,
     body_bytes: bytes::Bytes,

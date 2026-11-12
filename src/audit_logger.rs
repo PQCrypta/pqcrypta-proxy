@@ -151,6 +151,10 @@ struct AuditRecord<'a> {
     timestamp: String,
     level: &'static str,
     category: &'static str,
+    /// Set on what the startup self-test caused, acting as a TEST-NET
+    /// address to measure that the WAF and the rate limits enforce
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    startup_probe: bool,
     #[serde(flatten)]
     event: &'a AuditEvent,
 }
@@ -167,6 +171,22 @@ fn clip(text: &mut String) {
 }
 
 impl AuditEvent {
+    /// The client address the event is about, where it is about one.
+    fn ip(&self) -> Option<&str> {
+        match self {
+            Self::AdminAction { ip, .. }
+            | Self::AuthFailure { ip, .. }
+            | Self::IpBlocked { ip, .. }
+            | Self::RateLimitHit { ip, .. }
+            | Self::PqcDowngrade { ip, .. }
+            | Self::WafBlock { ip, .. }
+            | Self::WafDetect { ip, .. }
+            | Self::FingerprintReplay { ip, .. }
+            | Self::FingerprintDrift { ip, .. } => Some(ip),
+            Self::ConfigReload { .. } | Self::TlsReload { .. } | Self::EventsDropped { .. } => None,
+        }
+    }
+
     fn level(&self) -> &'static str {
         match self {
             Self::AdminAction { success: false, .. }
@@ -344,6 +364,9 @@ impl Sink {
             timestamp: Utc::now().to_rfc3339(),
             level: event.level(),
             category: event.category(),
+            startup_probe: event
+                .ip()
+                .is_some_and(crate::startup_verify::is_probe_source),
             event,
         };
         let mut line = match serde_json::to_string(&record) {
@@ -568,15 +591,24 @@ mod tests {
         let (tx, rx) = sync_channel(8);
         tx.send(waf_block("/a\nb")).unwrap();
         tx.send(AuditEvent::TlsReload { success: false }).unwrap();
+        tx.send(AuditEvent::IpBlocked {
+            ip: "192.0.2.2".into(),
+            reason: "RateLimitExceeded".into(),
+            duration_secs: Some(600),
+        })
+        .unwrap();
         drop(tx);
         write_events(&rx, Some(path.clone()), &AtomicU64::new(0));
 
         let written = lines(&path);
         assert_eq!(
             written.len(),
-            2,
+            3,
             "one line an event, whatever a field holds"
         );
+        // What the startup self-test caused says so; nothing else carries it
+        assert_eq!(written[2]["startup_probe"], true);
+        assert!(written[0].get("startup_probe").is_none());
         assert_eq!(written[0]["event"], "waf_block");
         assert_eq!(written[0]["category"], "waf");
         assert_eq!(written[0]["path"], "/a\nb");

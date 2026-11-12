@@ -455,13 +455,11 @@ impl PqcCapabilities {
         }
     }
 
-    #[allow(clippy::needless_pass_by_ref_mut)]
+    /// FIPS mode is fixed when the proxy is built: the aws-lc-rs FIPS module
+    /// is what `--features fips` compiles in.
     fn detect_fips_mode(&mut self) {
-        #[cfg(feature = "fips")]
-        {
-            // FIPS mode is enabled at compile time via the fips feature
-            // aws-lc-rs FIPS module is active when built with --features fips
-            self.fips_mode = true;
+        self.fips_mode = cfg!(feature = "fips");
+        if self.fips_mode {
             info!("FIPS mode: ENABLED (aws-lc-rs FIPS module compiled)");
         }
     }

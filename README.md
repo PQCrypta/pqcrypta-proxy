@@ -656,13 +656,17 @@ cp config/example-config.toml /etc/pqcrypta/proxy-config.toml
 ### Docker
 
 ```bash
-# Build Docker image
-docker build -t pqcrypta-proxy .
+# Build the image from the repository root (the Dockerfile is docker/'s; the
+# commit names the build in --version)
+docker build -f docker/Dockerfile \
+  --build-arg PQCRYPTA_GIT_COMMIT="$(git rev-parse HEAD)" -t pqcrypta-proxy .
 
-# Run container
-docker run -p 80:80 -p 443:443/tcp -p 443:443/udp \
-  -v /etc/letsencrypt:/etc/letsencrypt:ro \
-  -v ./config:/etc/pqcrypta:ro \
+# Run it: the proxy runs unprivileged in the container, on 4433 (TCP and
+# UDP) with the admin API on 8081, which the health check asks; the
+# configuration's listeners must say so
+docker run -d -p 443:4433/tcp -p 443:4433/udp \
+  -v /path/to/certs:/etc/pqcrypta/certs:ro \
+  -v /path/to/config.toml:/etc/pqcrypta/config.toml:ro \
   pqcrypta-proxy
 ```
 
@@ -823,7 +827,7 @@ requests_per_hour = 100
 - **JWT Subject Extraction**: Rate limit by authenticated user, not just IP
 - **X-Forwarded-For Trust Chain**: `trusted_proxies` lists the hops whose XFF header is honoured when deriving the client IP
 - **IPv6 Subnet Grouping**: `ipv6_subnet_bits` groups /64 subnets to prevent per-host evasion
-- **Adaptive Baseline**: profiles normal traffic over `baseline_window_secs` and flags requests beyond `std_dev_multiplier` standard deviations
+- **Adaptive Baseline**: each key's request rate, sampled once a second, as a mean and standard deviation that weigh older samples less (a sample `baseline_window_secs` old weighs 1/e), so the baseline follows traffic that changes; a rate beyond `std_dev_multiplier` standard deviations is anomalous. A reload that changes the limits applies to every key at once
 - **Layered Limits**: Global → Route → Client hierarchy for defense in depth
 
 #### Adaptive: `sensitivity` and `auto_adjust`
@@ -1574,6 +1578,16 @@ compress_types = ["text/html", "text/css", "application/json"]   # exact MIME ty
 Applies to HTTP/1.1 and HTTP/2 responses. Before this section existed the
 compression settings were fixed in code and could not be changed or turned off.
 
+The coding is the one the client weighs highest in `Accept-Encoding`, and
+among codings it weighs the same (browsers weigh them all the same) the
+proxy's preference: brotli, zstd, gzip, deflate. `q=0` refuses a coding
+however it is spelled, and `*` stands for those not named. Not compressed:
+a response the origin marked `Cache-Control: no-transform`, and the response
+to a request that carries credentials (a cookie, `Authorization`) and that
+the browser says another site made (`Sec-Fetch-Site: cross-site`). That page
+chooses part of what such a response reflects and can see its length, which,
+compressed, tells it how much of a guess matched a secret beside it (BREACH).
+
 ### CORS Configuration
 
 ```toml
@@ -2300,6 +2314,13 @@ otlp_endpoint = "http://localhost:4318"
 # Sampling ratio: 1.0 = always, 0.0 = never, 0.1 = 10% of root spans
 # Uses ParentBased(TraceIdRatioBased) — child spans inherit parent decision
 sample_ratio = 1.0
+
+# Who may name the trace a request continues (addresses or CIDR ranges):
+# the proxy's own tracing peers, such as a load balancer in front of it.
+# A request from anywhere else begins a trace of the proxy's own, sampled by
+# sample_ratio, and keeps the traceparent/B3 context it sent as a span link,
+# so a client cannot choose trace IDs or mark every request sampled.
+trusted_parents = []
 
 # Optional resource attributes added to every exported span
 # [otel.resource_attributes]

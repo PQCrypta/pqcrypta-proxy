@@ -446,16 +446,18 @@ pub fn render_kx_verification(runtime: &VerifiedRuntime, expected_pq: bool) {
 
 /// The dynamic cryptographic runtime: what this process actually mapped.
 ///
-/// libcrypto is reported even though it does not terminate inbound TLS, and the
-/// `load-bearing` row is the reason. Today rustls does the handshake and OpenSSL is
-/// auxiliary; that is a fact about this build, not a law. If a future dependency moves
-/// a TLS path onto OpenSSL, this row is where the change becomes visible instead of
-/// silent — which matters most on hosts that load a distro libcrypto with no ML-KEM at
-/// all, as two of three do here.
+/// The `load-bearing` row says which TLS libcrypto terminates. With the `pqc`
+/// feature and `pqc.enabled` the TCP listeners are OpenSSL's, built on the
+/// libcrypto named here (OpenSSL 4.0.3 with liboqs on the nodes), and rustls
+/// terminates QUIC and the ECH offers the TCP listener hands it; otherwise rustls
+/// terminates everything and OpenSSL is auxiliary, which is said only when the
+/// rustls verification handshake succeeded.
 ///
-/// `load_bearing` is derived, never assumed: inbound TLS is rustls if and only if the
-/// rustls verification handshake succeeded. When it did not, this claims nothing.
-pub fn dynamic_runtime_section(runtime: &VerifiedRuntime) -> Section {
+/// `openssl_terminates_tcp` is whether the TCP listeners are OpenSSL's (built with
+/// `pqc` and `pqc.enabled`): then OpenSSL terminates TLS over TCP and rustls QUIC
+/// (and the ECH offers the TCP listener hands it), and the post-bind probe of the
+/// TCP port is what verifies OpenSSL's side.
+pub fn dynamic_runtime_section(runtime: &VerifiedRuntime, openssl_terminates_tcp: bool) -> Section {
     let mut rows = Vec::new();
     match mapped_openssl() {
         Some(path) => {
@@ -463,20 +465,28 @@ pub fn dynamic_runtime_section(runtime: &VerifiedRuntime) -> Section {
             if let Some(v) = openssl_version_string() {
                 rows.push(Row::observed("version", v));
             }
-            rows.push(Row::observed("role", "auxiliary"));
-            rows.push(Row {
-                name: "load-bearing for TLS".into(),
-                value: if runtime.succeeded() {
-                    "NO — rustls terminates inbound TLS".into()
-                } else {
-                    "UNKNOWN — TLS not verified this start".into()
-                },
-                provenance: if runtime.succeeded() {
-                    Provenance::Verified
-                } else {
-                    Provenance::Observed
-                },
-            });
+            if openssl_terminates_tcp {
+                rows.push(Row::configured("role", "terminates TLS over TCP"));
+                rows.push(Row::configured(
+                    "load-bearing for TLS",
+                    "YES — TLS over TCP; rustls terminates QUIC and ECH",
+                ));
+            } else {
+                rows.push(Row::observed("role", "auxiliary"));
+                rows.push(Row {
+                    name: "load-bearing for TLS".into(),
+                    value: if runtime.succeeded() {
+                        "NO — rustls terminates inbound TLS".into()
+                    } else {
+                        "UNKNOWN — TLS not verified this start".into()
+                    },
+                    provenance: if runtime.succeeded() {
+                        Provenance::Verified
+                    } else {
+                        Provenance::Observed
+                    },
+                });
+            }
         }
         None => {
             rows.push(Row::observed("libcrypto", "not mapped by this process"));
@@ -488,30 +498,24 @@ pub fn dynamic_runtime_section(runtime: &VerifiedRuntime) -> Section {
     }
 }
 
-/// The OpenSSL version string, read from the library this process mapped.
+/// The OpenSSL version string, as the library this process loaded says it
+/// (`OpenSSL_version(OPENSSL_VERSION)`), its name and version alone.
 ///
-/// Parsed out of the SONAME-adjacent version banner in the mapped file rather than by
-/// running an `openssl` binary: the CLI on PATH is frequently a different build from
-/// the library the process loaded, and reporting one while using the other is how the
-/// previous banner came to describe a component that had nothing to do with the
-/// handshake.
+/// Asked of the loaded library rather than an `openssl` binary: the CLI on PATH is
+/// frequently a different build from the library the process loaded, and reporting
+/// one while using the other is how the previous banner came to describe a component
+/// that had nothing to do with the handshake. It used to be scanned out of the mapped
+/// file's bytes for "OpenSSL 3", which an OpenSSL 4 never matched.
+#[cfg(feature = "pqc")]
 fn openssl_version_string() -> Option<String> {
-    let path = mapped_openssl()?;
-    let bytes = std::fs::read(path).ok()?;
-    let needle = b"OpenSSL 3";
-    let idx = bytes.windows(needle.len()).position(|w| w == needle)?;
-    let text: String = bytes[idx..]
-        .iter()
-        .take(24)
-        .take_while(|b| b.is_ascii_graphic() || **b == b' ')
-        .map(|b| *b as char)
-        .collect();
-    Some(
-        text.split_whitespace()
-            .take(2)
-            .collect::<Vec<_>>()
-            .join(" "),
-    )
+    let text = openssl::version::version();
+    let named: Vec<&str> = text.split_whitespace().take(2).collect();
+    (named.len() == 2).then(|| named.join(" "))
+}
+
+#[cfg(not(feature = "pqc"))]
+fn openssl_version_string() -> Option<String> {
+    None
 }
 
 /// Enforce `pqc_required` against what was actually measured.
@@ -976,6 +980,31 @@ const PROBE_SOURCE_WAF: std::net::IpAddr =
     std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
 const PROBE_SOURCE_RATELIMIT: std::net::IpAddr =
     std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 2));
+
+/// Whether `ip` is one of the addresses the startup probes act as: what the
+/// rules do to them (a WAF block, a rate-limit block) is the probe's own
+/// doing, and the audit log says so.
+pub fn is_probe_source(ip: &str) -> bool {
+    [
+        PROBE_SOURCE_WAF,
+        PROBE_SOURCE_RATELIMIT,
+        PROBE_SOURCE_REQRATE,
+    ]
+    .iter()
+    .any(|source| source.to_string() == ip)
+}
+
+/// Remove what the probes left in the live security state (blocks, counters,
+/// rate buckets on their own addresses), once they have measured.
+pub fn forget_probes(engine: &crate::security::SecurityState) {
+    for source in [
+        PROBE_SOURCE_WAF,
+        PROBE_SOURCE_RATELIMIT,
+        PROBE_SOURCE_REQRATE,
+    ] {
+        engine.forget(source);
+    }
+}
 
 /// The outcome of probing one enforcement control.
 pub enum ProbeOutcome {

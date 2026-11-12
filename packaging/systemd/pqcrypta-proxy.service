@@ -5,7 +5,14 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=notify
+# The proxy tells the service manager when it is serving, reloading and
+# stopping, and pings its watchdog (src/service_notify.rs): `systemctl reload`
+# returns once the reload is done, and a proxy whose runtime hangs is
+# restarted. notify-reload needs systemd 253 or later (Debian 13, Ubuntu
+# 24.04); with an older one, use Type=notify and the ExecReload line below.
+Type=notify-reload
+WatchdogSec=30s
+#ExecReload=/bin/kill -HUP $MAINPID
 User=pqcrypta
 Group=pqcrypta
 
@@ -17,11 +24,10 @@ Environment=PQCRYPTA_JSON_LOGS=true
 # Binary path
 ExecStart=/usr/local/bin/pqcrypta-proxy --config ${PQCRYPTA_CONFIG}
 
-# Reload configuration
-ExecReload=/bin/kill -HUP $MAINPID
-
-# Graceful shutdown (30 second timeout)
-TimeoutStopSec=30
+# Graceful shutdown: longer than server.graceful_shutdown_timeout_secs (30 s),
+# the proxy's own budget for draining, so the drain is never killed at the
+# moment it would have finished
+TimeoutStopSec=45
 KillSignal=SIGTERM
 KillMode=mixed
 
@@ -29,6 +35,14 @@ KillMode=mixed
 Restart=on-failure
 RestartSec=5
 RestartPreventExitStatus=SIGTERM
+
+# Memory, as fractions of the host's: above MemoryHigh the kernel reclaims
+# from the proxy and slows it, at MemoryMax it stops it alone (and Restart=
+# brings it back) instead of choosing a victim among the host's other
+# services. The proxy itself sheds load before either (src/memory_pressure.rs).
+MemoryHigh=20%
+MemoryMax=30%
+MemorySwapMax=256M
 
 # Security hardening
 NoNewPrivileges=true
@@ -38,11 +52,22 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
 RestrictRealtime=true
 RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 MemoryDenyWriteExecute=true
 LockPersonality=true
+SystemCallArchitectures=native
+# What a network service calls; anything else fails with EPERM rather than
+# killing the process, so an unexpected call is an error in the log
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
 # Read: the configuration, keys and certificates. Written: what the proxy
 # itself writes, each a directory of the proxy account's own: its logs, its
@@ -51,7 +76,7 @@ LockPersonality=true
 # evidence. Root's files the proxy reads (blocklists, the JA3 list, ECH keys)
 # are in root's directories, readable through the proxy's group: each
 # directory has one writer.
-ReadOnlyPaths=/etc/letsencrypt
+ReadOnlyPaths=-/etc/letsencrypt
 ReadOnlyPaths=/etc/pqcrypta
 ReadWritePaths=/var/log/pqcrypta-proxy
 ReadWritePaths=/var/lib/pqcrypta-proxy/state

@@ -148,9 +148,9 @@ impl UdpSocketState {
             //
             // Left switchable rather than decided here: GRO is a real CPU
             // saving at load and turning it off globally is a throughput
-            // change that should be measured, not assumed. `NOQ_NO_GRO=1`
-            // disables it.
-            if std::env::var_os("NOQ_NO_GRO").is_none()
+            // change that should be measured, not assumed. `crate::set_gro`
+            // turns it off.
+            if crate::gro()
                 && set_socket_option(&*io, libc::SOL_UDP, libc::UDP_GRO, OPTION_ON).is_ok()
             {
                 // As defined in net/ipv4/udp_offload.c

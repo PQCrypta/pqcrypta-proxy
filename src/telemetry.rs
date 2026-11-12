@@ -1,4 +1,4 @@
-#![allow(
+#![expect(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -231,7 +231,7 @@ fn compute_intensity(cfg: &ImpairmentConfig, elapsed_s: f64) -> f64 {
         ImpairmentPattern::Cascade => {
             let steps = cfg.cascade_steps as f64;
             let cycle = cfg.cascade_steps * 2;
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let step = ((elapsed_s / cfg.cascade_step_s) as u32) % cycle;
             let normalized = if step < cfg.cascade_steps {
                 step as f64 / steps

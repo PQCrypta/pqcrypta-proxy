@@ -92,52 +92,113 @@ impl CompressionEncoding {
     }
 }
 
-/// Parse Accept-Encoding header and return best supported encoding
+/// The codings the proxy produces, in the order it prefers them when a
+/// client weighs several the same.
+const PRODUCED: [(CompressionEncoding, &[&str]); 4] = [
+    (CompressionEncoding::Brotli, &["br"]),
+    (CompressionEncoding::Zstd, &["zstd"]),
+    (CompressionEncoding::Gzip, &["gzip", "x-gzip"]),
+    (CompressionEncoding::Deflate, &["deflate"]),
+];
+
+/// A qvalue (RFC 9110 section 12.4.2) in thousandths: `0` to `1`, with at
+/// most three decimals. `None` for anything else.
+fn qvalue(text: &str) -> Option<u16> {
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    if fraction.len() > 3 || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let thousandths = fraction
+        .bytes()
+        .chain(std::iter::repeat(b'0'))
+        .take(3)
+        .fold(0u16, |n, d| n * 10 + u16::from(d - b'0'));
+    match whole {
+        "0" => Some(thousandths),
+        "1" if thousandths == 0 => Some(1000),
+        _ => None,
+    }
+}
+
+/// The coding to send, from a request's `Accept-Encoding` (RFC 9110 section
+/// 12.5.3).
+///
+/// The one the client weighs highest of those the proxy produces, the
+/// proxy's preference among equals; a coding weighed `q=0`, or not named
+/// where `*` is not either, is not acceptable. Identity where none is.
+///
+/// Browsers name every coding with the same weight (Chrome sends `gzip,
+/// deflate, br, zstd`), so the order they are listed in says nothing; it
+/// once picked gzip for them.
 pub fn parse_accept_encoding(accept_encoding: Option<&HeaderValue>) -> CompressionEncoding {
-    let Some(value) = accept_encoding else {
+    let Some(value) = accept_encoding.and_then(|v| v.to_str().ok()) else {
         return CompressionEncoding::Identity;
     };
-
-    let Ok(value_str) = value.to_str() else {
-        return CompressionEncoding::Identity;
-    };
-
-    // Parse encodings with quality values
-    let mut encodings: Vec<(&str, f32)> = value_str
-        .split(',')
-        .filter_map(|part| {
-            let part = part.trim();
-            let (encoding, quality) = if let Some(idx) = part.find(";q=") {
-                let (enc, q) = part.split_at(idx);
-                let q = q[3..].parse::<f32>().unwrap_or(1.0);
-                (enc.trim(), q)
-            } else {
-                (part, 1.0)
-            };
-            if quality > 0.0 {
-                Some((encoding, quality))
-            } else {
-                None
+    let mut named: [Option<u16>; PRODUCED.len()] = [None; PRODUCED.len()];
+    let mut any: Option<u16> = None;
+    for member in value.split(',') {
+        let mut fields = member.split(';');
+        let coding = fields.next().unwrap_or_default().trim();
+        if coding.is_empty() {
+            continue;
+        }
+        // The weight, `q=` among the parameters with optional whitespace
+        // around the `;`; one that is not a qvalue makes the member refused
+        let mut weight = 1000;
+        for parameter in fields {
+            if let Some((name, value)) = parameter.split_once('=') {
+                if name.trim().eq_ignore_ascii_case("q") {
+                    weight = qvalue(value.trim()).unwrap_or(0);
+                }
             }
-        })
-        .collect();
-
-    // Sort by quality (highest first)
-    encodings.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Return best supported encoding
-    for (encoding, _) in encodings {
-        match encoding.to_lowercase().as_str() {
-            "br" | "brotli" => return CompressionEncoding::Brotli,
-            "zstd" => return CompressionEncoding::Zstd,
-            "gzip" => return CompressionEncoding::Gzip,
-            "deflate" => return CompressionEncoding::Deflate,
-            "*" => return CompressionEncoding::Brotli, // Use best by default
-            _ => {}
+        }
+        if coding == "*" {
+            any = Some(weight);
+        } else if let Some(slot) = PRODUCED
+            .iter()
+            .position(|(_, names)| names.iter().any(|n| n.eq_ignore_ascii_case(coding)))
+        {
+            named[slot] = Some(weight);
         }
     }
+    let mut best: Option<(u16, CompressionEncoding)> = None;
+    for (slot, (encoding, _)) in PRODUCED.iter().enumerate() {
+        let weight = named[slot].or(any).unwrap_or(0);
+        // Strictly greater: an equal weight keeps the proxy's earlier choice
+        if weight > 0 && best.is_none_or(|(held, _)| weight > held) {
+            best = Some((weight, *encoding));
+        }
+    }
+    best.map_or(CompressionEncoding::Identity, |(_, encoding)| encoding)
+}
 
-    CompressionEncoding::Identity
+/// Whether compressing the response to this request would let a page on
+/// another site learn a secret from it (BREACH).
+///
+/// The request carries the visitor's credentials (a cookie, an `Authorization`), and the browser
+/// says another site made it (`Sec-Fetch-Site: cross-site`). Such a page
+/// chooses part of what the response reflects and sees only how long it
+/// is; compressed, that length tells it how much of its guess matched a
+/// secret beside it. Same-origin and same-site requests, and navigations
+/// the visitor made (`none`), are compressed as before.
+pub fn exposes_secrets_to_compression(request: &HeaderMap) -> bool {
+    let credentialed =
+        request.contains_key(header::COOKIE) || request.contains_key(header::AUTHORIZATION);
+    credentialed
+        && request
+            .get("sec-fetch-site")
+            .is_some_and(|site| site.as_bytes().eq_ignore_ascii_case(b"cross-site"))
+}
+
+/// Whether the origin forbids a proxy changing the content's coding
+/// (`Cache-Control: no-transform`, RFC 9111 section 5.2.2.6).
+pub fn forbids_transformation(response: &HeaderMap) -> bool {
+    response
+        .get_all(header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|directive| directive.trim().eq_ignore_ascii_case("no-transform"))
 }
 
 /// Check if content type should be compressed
@@ -196,8 +257,6 @@ impl Default for CompressionState {
 /// 2. Passes request to next handler
 /// 3. Compresses response body if appropriate
 /// 4. Sets Content-Encoding header
-// Prometheus gauge values are f64; precision loss on large counter values is acceptable.
-#[allow(clippy::cast_precision_loss)]
 pub async fn compression_middleware(
     State(state): State<CompressionState>,
     request: Request<Body>,
@@ -220,8 +279,11 @@ pub async fn compression_middleware(
     // Parse Accept-Encoding from request
     let encoding = parse_accept_encoding(request.headers().get(header::ACCEPT_ENCODING));
 
-    // Don't compress if client doesn't support it
-    if encoding == CompressionEncoding::Identity {
+    // Don't compress if client doesn't support it, or where the length of a
+    // compressed response would tell another site about its secrets
+    if encoding == CompressionEncoding::Identity
+        || exposes_secrets_to_compression(request.headers())
+    {
         return next.run(request).await;
     }
 
@@ -240,6 +302,11 @@ pub async fn compression_middleware(
         // Don't compress already compressed responses
         if is_already_compressed(headers) {
             trace!("Response already compressed, skipping");
+            false
+        }
+        // Nor what the origin said no proxy may transform
+        else if forbids_transformation(headers) {
+            trace!("Cache-Control: no-transform, not compressed");
             false
         }
         // A byte range is a range of the representation the origin sent:
@@ -351,7 +418,7 @@ where
     use async_compression::tokio::bufread::{BrotliEncoder, GzipEncoder, ZlibEncoder, ZstdEncoder};
     use async_compression::Level;
     use tokio_util::io::ReaderStream;
-    #[allow(clippy::cast_possible_wrap)]
+    #[expect(clippy::cast_possible_wrap)]
     match encoding {
         CompressionEncoding::Brotli => Body::from_stream(ReaderStream::new(
             BrotliEncoder::with_quality(reader, Level::Precise(config.brotli_quality as i32)),
@@ -392,15 +459,79 @@ mod tests {
             CompressionEncoding::Gzip
         );
 
-        // Test zstd
+        // Equal weights: the proxy's preference, not the listing order
         let header = HeaderValue::from_static("zstd, gzip, br");
         assert_eq!(
             parse_accept_encoding(Some(&header)),
-            CompressionEncoding::Zstd
+            CompressionEncoding::Brotli
+        );
+        let chrome = HeaderValue::from_static("gzip, deflate, br, zstd");
+        assert_eq!(
+            parse_accept_encoding(Some(&chrome)),
+            CompressionEncoding::Brotli
         );
 
         // Test no compression
         assert_eq!(parse_accept_encoding(None), CompressionEncoding::Identity);
+    }
+
+    #[test]
+    fn a_refused_coding_is_not_sent_however_the_weight_is_spelled() {
+        let pick = |v: &'static str| parse_accept_encoding(Some(&HeaderValue::from_static(v)));
+        assert_eq!(pick("br; q=0, gzip"), CompressionEncoding::Gzip);
+        assert_eq!(pick("br ;Q=0 , zstd;q=0.5"), CompressionEncoding::Zstd);
+        assert_eq!(pick("br;q=0.000, gzip;q=0.001"), CompressionEncoding::Gzip);
+        // `*` stands for every coding not named
+        assert_eq!(pick("*;q=0.5, br;q=0"), CompressionEncoding::Zstd);
+        assert_eq!(pick("*"), CompressionEncoding::Brotli);
+        assert_eq!(pick("gzip;q=0, *;q=0"), CompressionEncoding::Identity);
+        // A weight that is not a qvalue refuses the coding
+        assert_eq!(pick("br;q=2, gzip;q=0.9"), CompressionEncoding::Gzip);
+        assert_eq!(pick("br;q=0.5000, gzip;q=0.1"), CompressionEncoding::Gzip);
+        assert_eq!(pick("x-gzip"), CompressionEncoding::Gzip);
+        assert_eq!(pick("identity, compress"), CompressionEncoding::Identity);
+        assert_eq!(qvalue("1.000"), Some(1000));
+        assert_eq!(qvalue("0.25"), Some(250));
+        assert_eq!(qvalue("1.5"), None);
+    }
+
+    #[test]
+    fn a_cross_site_request_with_credentials_is_not_compressed() {
+        let headers = |pairs: &[(&'static str, &'static str)]| {
+            let mut h = HeaderMap::new();
+            for (name, value) in pairs {
+                h.insert(*name, HeaderValue::from_static(value));
+            }
+            h
+        };
+        assert!(exposes_secrets_to_compression(&headers(&[
+            ("cookie", "session=1"),
+            ("sec-fetch-site", "cross-site"),
+        ])));
+        assert!(exposes_secrets_to_compression(&headers(&[
+            ("authorization", "Bearer x"),
+            ("sec-fetch-site", "Cross-Site"),
+        ])));
+        assert!(!exposes_secrets_to_compression(&headers(&[
+            ("cookie", "session=1"),
+            ("sec-fetch-site", "same-origin"),
+        ])));
+        assert!(!exposes_secrets_to_compression(&headers(&[(
+            "sec-fetch-site",
+            "cross-site"
+        )])));
+        assert!(!exposes_secrets_to_compression(&headers(&[(
+            "cookie",
+            "session=1"
+        )])));
+        assert!(forbids_transformation(&headers(&[(
+            "cache-control",
+            "public, No-Transform"
+        )])));
+        assert!(!forbids_transformation(&headers(&[(
+            "cache-control",
+            "no-store"
+        )])));
     }
 
     #[test]

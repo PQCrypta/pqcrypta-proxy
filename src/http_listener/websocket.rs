@@ -19,7 +19,7 @@ use crate::config::BackendConfig;
 /// an HTTP/1.1 upgrade, `200` to an HTTP/2 extended CONNECT) with what the
 /// backend agreed to, and relay the two until either ends or nothing moves
 /// for the route's `ws_idle_timeout_secs` (0: no limit).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(super) async fn handle_websocket_tunnel(
     backend: &BackendConfig,
     forwarded: HeaderMap,

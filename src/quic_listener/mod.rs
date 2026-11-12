@@ -41,6 +41,14 @@ mod websocket;
 
 use websocket::ws_h3_tunnel;
 
+/// HTTP/3's code for a connection closed with nothing wrong (RFC 9114
+/// section 8.1).
+const H3_NO_ERROR: u32 = 0x100;
+
+/// How long a peer sent GOAWAY for memory has to close the connection itself
+/// before it is closed (crate::memory_pressure).
+const SHED_GRACE: Duration = Duration::from_secs(2);
+
 /// `server.server_header` (SEC-08: product name, no version) on a response the
 /// proxy builds; an empty setting sends none.
 pub(super) trait ServerHeader {
@@ -614,8 +622,8 @@ pub(super) fn apply_response_policy_headers(
 
 impl QuicListener {
     /// Create a new QUIC listener
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::unused_async_trait_impl)] // public async API; callers .await it
+    #[expect(clippy::too_many_arguments)]
+    #[expect(clippy::unused_async_trait_impl)] // public async API; callers .await it
     pub async fn new(
         config: Arc<ProxyConfig>,
         tls_provider: Arc<TlsProvider>,
@@ -1029,7 +1037,7 @@ impl QuicListener {
     }
 
     /// Handle a single QUIC connection
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn handle_connection(
         incoming: quinn::Incoming,
         remote_addr: SocketAddr,
@@ -1379,7 +1387,7 @@ impl QuicListener {
     }
 
     /// Handle HTTP/3 connection with WebTransport support
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn handle_h3_connection(
         h3: &mut h3::server::Connection<H3Connection, Bytes>,
         quic_connection: QuinnConnection,
@@ -1414,12 +1422,20 @@ impl QuicListener {
         // router: with tracing off, a request pays nothing for it.
         let request_spans = config.otel.enabled || request_span_enabled();
 
+        // What is in flight on the connection (every request, tunnel and
+        // session holds a place until it ends), so that while memory is short
+        // a connection with nothing in flight is sent GOAWAY and closed
+        // (crate::memory_pressure); the time it closes at once sent it.
+        let activity = crate::conn_limits::Activity::new();
+        let mut relief = crate::memory_pressure::relief();
+        let mut closing: Option<tokio::time::Instant> = None;
+
         // Every ordinary request becomes its own task. One definition for both
         // places that dispatch one: the plain-request fast path below and an
         // extended CONNECT this listener does not terminate itself.
         let spawn_request = |stream, request: http::Request<()>| {
             let span = if request_spans {
-                request_span(&request)
+                request_span(&request, remote_addr.ip())
             } else {
                 tracing::Span::none()
             };
@@ -1435,8 +1451,10 @@ impl QuicListener {
             let fingerprint_clone = fingerprint.clone();
             let conn_headers_clone = conn_headers.clone();
 
+            let flight = activity.begin();
             tokio::spawn(
                 async move {
+                    let _flight = flight;
                     if let Err(e) = Self::handle_h3_request(
                         stream,
                         request,
@@ -1475,7 +1493,37 @@ impl QuicListener {
             std::collections::HashMap::new();
 
         loop {
-            match h3.accept_any().await {
+            let accepted = tokio::select! {
+                accepted = h3.accept_any() => accepted,
+                () = crate::memory_pressure::idle_at_relief(&mut relief, &activity),
+                    if closing.is_none() =>
+                {
+                    // GOAWAY (RFC 9114 section 5.2): the peer opens no more
+                    // requests here and takes the next one elsewhere
+                    crate::memory_pressure::connection_shed();
+                    if let Err(e) = h3.shutdown(0).await {
+                        debug!("HTTP/3 GOAWAY to {} failed: {}", remote_addr, e);
+                        break;
+                    }
+                    closing = Some(tokio::time::Instant::now() + SHED_GRACE);
+                    continue;
+                }
+                () = async {
+                    match closing {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if activity.idle_for().is_some() {
+                        quic_connection.close(quinn::VarInt::from_u32(H3_NO_ERROR), b"");
+                        break;
+                    }
+                    // What was opened before the GOAWAY is still running
+                    closing = Some(tokio::time::Instant::now() + SHED_GRACE);
+                    continue;
+                }
+            };
+            match accepted {
                 Ok(Some(h3::server::Accepted::WebTransportUni {
                     session,
                     prefix,
@@ -1745,7 +1793,9 @@ impl QuicListener {
                             backend_pool.clone(),
                             Some((*security).clone()),
                         );
+                        let flight = activity.begin();
                         tokio::spawn(async move {
+                            let _flight = flight;
                             // The CONNECT stream IS the session (Chrome tears
                             // the session down when it is finished or reset):
                             // held for the session's life, and read, since the
@@ -1891,7 +1941,9 @@ impl QuicListener {
                         let idle =
                             Duration::from_secs(config.masque.session_idle_timeout_secs.max(1));
                         let conn_clone = quic_connection.clone();
+                        let flight = activity.begin();
                         tokio::spawn(async move {
+                            let _flight = flight;
                             // The request stream stays open for the session; reading it
                             // to end (FIN/RESET) signals the client closed the tunnel.
                             let (_send, mut recv) = stream.split();
@@ -1973,7 +2025,9 @@ impl QuicListener {
                         };
                         let idle_secs = route.ws_idle_timeout_secs;
 
+                        let flight = activity.begin();
                         tokio::spawn(async move {
+                            let _flight = flight;
                             if let Err(e) = ws_h3_tunnel(
                                 stream,
                                 backend,
@@ -2524,7 +2578,7 @@ fn request_span_enabled() -> bool {
 /// and there was no current span on this path at all, so an HTTP/3 request
 /// never joined its caller's trace and the backend was handed an empty
 /// context, whatever the documentation said about all transports.
-fn request_span(request: &http::Request<()>) -> tracing::Span {
+fn request_span(request: &http::Request<()>, peer: std::net::IpAddr) -> tracing::Span {
     let span = tracing::info_span!(
         "http.request",
         http.method = %request.method(),
@@ -2533,7 +2587,7 @@ fn request_span(request: &http::Request<()>) -> tracing::Span {
         otel.kind = "server",
         trace_id = tracing::field::Empty,
     );
-    crate::otel::set_parent_from_headers(&span, request.headers());
+    crate::otel::set_parent_from_headers(&span, request.headers(), peer);
     let trace_id = crate::otel::trace_id_of(&span);
     if !trace_id.is_empty() {
         span.record("trace_id", trace_id);
@@ -2545,8 +2599,8 @@ fn request_span(request: &http::Request<()>) -> tracing::Span {
 mod tests {
     use super::*;
 
-    /// An HTTP/3 request continues its caller's trace. It did not: the parent
-    /// was set on `Span::current()`, and on this path there was none.
+    /// An HTTP/3 request continues its trusted caller's trace. It did not: the
+    /// parent was set on `Span::current()`, and on this path there was none.
     #[test]
     fn an_http3_request_span_joins_the_callers_trace() {
         crate::otel::with_test_tracing(|| {
@@ -2558,7 +2612,8 @@ mod tests {
                 )
                 .body(())
                 .unwrap();
-            let span = request_span(&request);
+            let (trusted, _) = crate::otel::tests::trust_test_parents();
+            let span = request_span(&request, trusted);
             assert_eq!(
                 crate::otel::trace_id_of(&span),
                 "4bf92f3577b34da6a3ce929d0e0e4736"

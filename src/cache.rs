@@ -642,7 +642,8 @@ impl ResponseCache {
         response_headers: &[(String, String)],
         body: Bytes,
     ) {
-        if !self.config.enabled {
+        // Nothing new is kept while memory is short
+        if !self.config.enabled || !crate::memory_pressure::caches() {
             return;
         }
 
@@ -1058,6 +1059,21 @@ impl ResponseCache {
         (self.store.len(), self.size_bytes.load(Ordering::Relaxed))
     }
 
+    /// Evict down to half the cache's budget, the entries least likely to be
+    /// asked for again first: what [`crate::memory_pressure`] gives up first.
+    pub fn shrink_to_half(&self) {
+        let before = self.size_bytes.load(Ordering::Relaxed);
+        let target = self.max_bytes() / 2;
+        if before <= target {
+            return;
+        }
+        let mut queues = self.queues.lock();
+        self.evict_to_fit(&mut queues, target);
+        drop(queues);
+        let after = self.size_bytes.load(Ordering::Relaxed);
+        info!("Cache cut for memory: {before} -> {after} bytes");
+    }
+
     /// Drop every entry. Returns how many were removed.
     pub fn purge_all(&self) -> usize {
         let mut queues = self.queues.lock();
@@ -1255,6 +1271,11 @@ pub fn not_modified_response(
 /// safe but what the key already assumed.
 static SHARED: std::sync::OnceLock<Arc<ResponseCache>> = std::sync::OnceLock::new();
 
+/// The process-wide response cache, if one has been built.
+pub fn built() -> Option<Arc<ResponseCache>> {
+    SHARED.get().cloned()
+}
+
 /// Fetch (building on first call) the process-wide response cache.
 ///
 /// The first caller's config wins. Cache sizing cannot follow a hot reload
@@ -1298,6 +1319,10 @@ fn is_cacheable_by_default(status: u16) -> bool {
 /// read before any of the body is: `put` still makes the full decision. A
 /// response refused here is passed on as it streams.
 pub(crate) fn may_store(headers: &axum::http::HeaderMap, max_body: usize) -> bool {
+    // While memory is short nothing is stored, so nothing is held to store
+    if !crate::memory_pressure::caches() {
+        return false;
+    }
     let d = CacheControlDirectives::of(headers);
     let refused = d.no_store || d.is_private || d.no_cache;
     let too_long = headers

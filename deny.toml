@@ -4,7 +4,8 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # unmaintained: scope of packages to check (all/workspace/transitive/none)
 # "vulnerability", "notice" keys removed in cargo-deny 0.16+
 unmaintained = "workspace"
-yanked = "warn"
+# A version its publisher withdrew is not built on
+yanked = "deny"
 ignore = []
 
 [licenses]
@@ -81,6 +82,8 @@ skip = [
 ]
 
 [sources]
-unknown-registry = "warn"
-unknown-git = "warn"
+# crates.io only: every other crate is vendored in-tree (vendor/), so a
+# dependency from anywhere else is a change to refuse until it is looked at
+unknown-registry = "deny"
+unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

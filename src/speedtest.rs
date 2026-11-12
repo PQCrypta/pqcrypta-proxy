@@ -630,7 +630,7 @@ async fn handle_op_download<W: AsyncWrite + Unpin + Send>(
     Ok(())
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 async fn handle_op_upload<W: AsyncWrite + Unpin + Send, R: AsyncRead + Unpin + Send>(
     send: &mut W,
     recv: &mut R,

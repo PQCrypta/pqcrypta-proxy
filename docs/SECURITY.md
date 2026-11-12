@@ -508,7 +508,21 @@ let rps = NonZeroU32::new(config.requests_per_second.max(1)).unwrap_or(NonZeroU3
 
 ### Memory Exhaustion Prevention
 
-DashMap collections are now bounded to prevent DoS attacks:
+The process watches its own memory (`src/memory_pressure.rs`): every 250 ms it
+reads its cgroup's working set (anonymous, unreclaimable kernel and socket
+memory) against `MemoryHigh`/`MemoryMax`, and the kernel's memory stall figure.
+At 80 % of `MemoryHigh` (or stalled 20 % of the time) it stops caching, cuts
+the response cache and the request-body budget by half, closes connections
+with nothing in flight (GOAWAY on HTTP/2 and HTTP/3), shortens the idle time to
+5 s and returns freed memory to the system; at 95 % it also empties the cache,
+holds request bodies to an eighth of their budget and admits new connections
+from exempt addresses only, on every listener. The unit caps the process
+(`MemoryHigh=20%`, `MemoryMax=30%` of the host), so whatever is left ends with
+the proxy restarted rather than another service killed. `pqcrypta_memory_*`
+metrics report the level, the working set, the limits and what was refused or
+closed.
+
+DashMap collections are bounded as well:
 
 ```rust
 // Constants in security.rs

@@ -455,6 +455,8 @@ struct IssuedCertificate {
     der: Vec<u8>,
     /// The serial number's octets
     serial: Vec<u8>,
+    /// Its SubjectPublicKeyInfo, DER: what its key must have
+    spki: Vec<u8>,
 }
 
 impl IssuedCertificate {
@@ -484,8 +486,25 @@ impl IssuedCertificate {
             dns_names,
             ip_addresses: crate::tls::certificate_ip_addresses(&pem.contents),
             serial: cert.raw_serial().to_vec(),
+            spki: cert.public_key().raw.to_vec(),
             der: pem.contents.clone(),
         })
+    }
+
+    /// Whether the key at `key_path` is this certificate's: `Some(false)` when
+    /// it is another's, `None` when the key cannot be read to tell.
+    ///
+    /// A renewal puts the new key in place and then the new chain, so a
+    /// process stopped between the two renames leaves a key beside a
+    /// certificate it does not belong to, which no handshake can use, while
+    /// the certificate itself looks current: such a pair is reissued at once.
+    /// A key that cannot be read is not a reason to reissue, or a key type
+    /// this cannot parse would be reissued on every check.
+    fn matches_key(&self, key_path: &Path) -> Option<bool> {
+        use rcgen::PublicKeyData as _;
+        let pem = fs::read_to_string(key_path).ok()?;
+        let key = rcgen::KeyPair::from_pem(&pem).ok()?;
+        Some(key.subject_public_key_info() == self.spki)
     }
 
     /// Whether it names `domain` and exactly the addresses configured for
@@ -963,6 +982,13 @@ async fn check_and_renew_certificates(
                 info!(
                     "[{}] Certificate names {:?} {:?}, configured {:?}: reissuing",
                     domain, cert.dns_names, cert.ip_addresses, addresses
+                );
+            } else if cert.matches_key(&key_path) == Some(false) {
+                warn!(
+                    "[{}] {} is not the key of {}: reissuing",
+                    domain,
+                    key_path.display(),
+                    cert_path.display()
                 );
             } else if plan.at <= now {
                 info!(
@@ -2100,6 +2126,30 @@ mod tests {
             !plain.covers("www.example.com", &[v4]),
             "addresses configured since"
         );
+    }
+
+    /// A certificate knows its own key from another's, and a key that cannot
+    /// be read is not taken for another's.
+    #[test]
+    fn a_certificate_knows_its_own_key() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let issued = rcgen::generate_simple_self_signed(vec!["www.example.com".to_string()])
+            .expect("self-signed");
+        let other = rcgen::KeyPair::generate().expect("another key");
+        let cert_path = dir.path().join("www.example.com.crt");
+        fs::write(&cert_path, issued.cert.pem()).expect("write");
+        let cert = IssuedCertificate::read(&cert_path).expect("read");
+
+        let own = dir.path().join("own.key");
+        fs::write(&own, issued.signing_key.serialize_pem()).expect("write");
+        assert_eq!(cert.matches_key(&own), Some(true));
+        let foreign = dir.path().join("foreign.key");
+        fs::write(&foreign, other.serialize_pem()).expect("write");
+        assert_eq!(cert.matches_key(&foreign), Some(false));
+        assert_eq!(cert.matches_key(&dir.path().join("missing.key")), None);
+        let garbage = dir.path().join("garbage.key");
+        fs::write(&garbage, "not a key").expect("write");
+        assert_eq!(cert.matches_key(&garbage), None);
     }
 
     /// An order with addresses carries them as IP identifiers under the

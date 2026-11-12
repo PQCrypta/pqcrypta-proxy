@@ -3,54 +3,13 @@
 // cast_precision_loss, wildcard_imports) have been removed from this allow-list
 // and are now enforced crate-wide.  Any remaining suppressions below apply only
 // to style/pedantic lints that do not have security implications.
-#![allow(clippy::module_name_repetitions)]
-#![allow(clippy::missing_errors_doc)]
-#![allow(clippy::missing_panics_doc)]
 #![allow(clippy::cognitive_complexity)]
-#![allow(clippy::needless_continue)]
-#![allow(clippy::option_if_let_else)]
-#![allow(clippy::use_self)]
-#![allow(clippy::match_same_arms)]
-#![allow(clippy::derivable_impls)]
 #![allow(clippy::too_many_lines)]
-#![allow(clippy::single_match_else)]
-#![allow(clippy::manual_let_else)]
-#![allow(clippy::option_map_or_none)]
-#![allow(clippy::map_unwrap_or)]
 #![allow(clippy::uninlined_format_args)]
-#![allow(clippy::missing_const_for_fn)]
 #![allow(clippy::doc_markdown)]
-#![allow(clippy::struct_excessive_bools)]
-#![allow(clippy::unnecessary_debug_formatting)]
-#![allow(clippy::unused_self)]
-#![allow(clippy::format_push_string)]
-#![allow(clippy::significant_drop_tightening)]
-#![allow(clippy::manual_strip)]
-#![allow(clippy::bool_comparison)]
-#![allow(clippy::needless_borrow)]
-#![allow(clippy::explicit_iter_loop)]
 #![allow(clippy::redundant_closure_for_method_calls)]
-#![allow(clippy::should_implement_trait)]
-#![allow(clippy::single_char_pattern)]
-#![allow(clippy::similar_names)]
-#![allow(clippy::nonminimal_bool)]
-#![allow(clippy::op_ref)]
-#![allow(clippy::assigning_clones)]
-#![allow(clippy::collapsible_if)]
-#![allow(clippy::items_after_statements)]
-#![allow(clippy::ptr_as_ptr)]
-#![allow(clippy::unnecessary_cast)]
 #![allow(clippy::unnecessary_wraps)]
-#![allow(clippy::type_complexity)]
-#![allow(clippy::cast_lossless)]
-#![allow(clippy::struct_field_names)]
-#![allow(clippy::branches_sharing_code)]
-#![allow(clippy::ref_option_ref)]
 #![allow(clippy::unused_async)]
-#![allow(clippy::if_not_else)]
-#![allow(clippy::ignored_unit_patterns)]
-#![allow(clippy::ref_option)]
-#![allow(clippy::trivially_copy_pass_by_ref)]
 
 //! `PQCrypta` Proxy - QUIC/HTTP3/WebTransport Proxy with Hybrid PQC TLS
 //!
@@ -275,6 +234,11 @@ static GLOBAL: alloc_counter::Counting = alloc_counter::Counting(mimalloc::MiMal
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> anyhow::Result<()> {
+    // OpenSSL takes other allocation functions only before it has allocated
+    // anything: this comes first (openssl_alloc.rs). Logged once logging is up.
+    #[cfg(feature = "pqc")]
+    pqcrypta_proxy::openssl_alloc::route_to_mimalloc();
+
     // Raise the file-descriptor limit before anything opens a socket.
     raise_fd_limit();
 
@@ -456,12 +420,8 @@ async fn run() -> anyhow::Result<()> {
     // coalesced batches, so GRO costs this endpoint its ECN readings, and an
     // endpoint that under-reports ECT(0) makes every peer disable ECN for the
     // path (RFC 9000 §13.4.2). See `server.udp_gro` for the measurements.
+    quinn::udp::set_gro(config.server.udp_gro);
     if !config.server.udp_gro {
-        // SAFETY: single-threaded here, before any runtime or socket exists.
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::set_var("NOQ_NO_GRO", "1");
-        };
         info!("UDP_GRO disabled (server.udp_gro = false): ECN readings over throughput");
     }
 
@@ -565,6 +525,15 @@ async fn run() -> anyhow::Result<()> {
         config.security.max_buffered_body_bytes,
         config.security.max_request_size,
     );
+    // The process's memory against its cgroup's limits, and what it gives up
+    // when that runs short (memory_pressure.rs).
+    pqcrypta_proxy::memory_pressure::spawn();
+    #[cfg(feature = "pqc")]
+    if pqcrypta_proxy::openssl_alloc::routed() {
+        info!("OpenSSL allocates through mimalloc");
+    } else {
+        warn!("OpenSSL allocates through its own allocator: it had allocated before main could route it");
+    }
     // What a classical key exchange means on every listener (pqc_policy.rs).
     pqcrypta_proxy::pqc_policy::configure(&config.pqc);
     pqcrypta_proxy::pqc_policy::set_audit_logger(audit_logger.clone());
@@ -717,7 +686,10 @@ async fn run() -> anyhow::Result<()> {
                 ),
             ],
         },
-        startup_verify::dynamic_runtime_section(&runtime),
+        startup_verify::dynamic_runtime_section(
+            &runtime,
+            cfg!(feature = "pqc") && config.pqc.enabled,
+        ),
         startup_verify::Section {
             title: "POLICY",
             rows: vec![startup_verify::Row::configured(
@@ -752,6 +724,7 @@ async fn run() -> anyhow::Result<()> {
     // NOOP global provider.  Calling init_otel() here installs a real OTLP
     // provider so all subsequent request-handling spans are exported.
     // =========================================================================
+    pqcrypta_proxy::otel::configure_trusted_parents(&config.otel.trusted_parents);
     let otel_provider = if config.otel.enabled {
         match pqcrypta_proxy::otel::init_otel(&config.otel) {
             Ok(provider) => {
@@ -970,6 +943,9 @@ async fn run() -> anyhow::Result<()> {
                     // TCP listeners: routes, backends, headers, middleware.
                     let _ = tcp_config_tx.send(new_config.clone());
                     reload_rate_limiter.update_config(new_config.advanced_rate_limiting.clone());
+                    pqcrypta_proxy::otel::configure_trusted_parents(
+                        &new_config.otel.trusted_parents,
+                    );
                     reload_lb.reconcile_pools(&new_config.backend_pools);
                     info!("Security, rate-limit and load-balancer configuration updated");
 
@@ -1566,6 +1542,8 @@ async fn run() -> anyhow::Result<()> {
                 &conf,
                 &tls_provider,
                 &config.server.bind_address,
+                // Its maps are shared: the blocklist the other listeners hold
+                &std::sync::Arc::new(security_state.clone()),
             );
         }
     }
@@ -1721,9 +1699,18 @@ async fn run() -> anyhow::Result<()> {
             if let Some(logger) = pqcrypta_proxy::access_logger::get_access_logger() {
                 logger.reopen();
             }
-            // The same reload POST /reload and the file watcher trigger.
-            if let Err(e) = sighup_config_manager.reload().await {
-                error!("SIGHUP configuration reload failed: {}", e);
+            // The same reload POST /reload and the file watcher trigger,
+            // told to the service manager, which (Type=notify-reload) waits
+            // for its end: READY=1 whether it applied or not
+            pqcrypta_proxy::service_notify::reloading();
+            match sighup_config_manager.reload().await {
+                Ok(()) => pqcrypta_proxy::service_notify::ready("Serving; configuration reloaded"),
+                Err(e) => {
+                    error!("SIGHUP configuration reload failed: {}", e);
+                    pqcrypta_proxy::service_notify::ready(&format!(
+                        "Serving the previous configuration; the reload failed: {e}"
+                    ));
+                }
             }
         }
     });
@@ -1770,6 +1757,7 @@ async fn run() -> anyhow::Result<()> {
         let waf = startup_verify::probe_waf(&config, &security_state);
         let (conn_rate, req_rate) =
             startup_verify::probe_rate_limits(&config, &security_state).await;
+        startup_verify::forget_probes(&security_state);
         let mtls = startup_verify::probe_mtls(
             config.tls.require_client_cert,
             probe_addr,
@@ -1793,6 +1781,15 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
+    // Serving, and probed: the service manager is told, and its watchdog
+    // pinged from here on
+    pqcrypta_proxy::service_notify::ready(&format!(
+        "Serving pqcrypta-proxy {} on {}",
+        env!("CARGO_PKG_VERSION"),
+        config.server.udp_port
+    ));
+    pqcrypta_proxy::service_notify::spawn_watchdog();
+
     // Wait for shutdown signal
     info!("Press Ctrl+C to shutdown gracefully");
     tokio::select! {
@@ -1806,6 +1803,7 @@ async fn run() -> anyhow::Result<()> {
 
     // Graceful shutdown
     info!("Shutting down...");
+    pqcrypta_proxy::service_notify::stopping();
 
     // Stop config watching
     config_manager.stop_watching();
