@@ -139,6 +139,7 @@ pub mod cert_compression;
 pub mod compression;
 pub mod config;
 pub mod conformance;
+pub mod conn_limits;
 pub mod connect_udp;
 pub mod crawler_verify;
 pub mod data_file;
@@ -168,6 +169,7 @@ pub mod proxy;
 pub mod quic_listener;
 pub mod rate_limiter; // Must be before config (config imports from it)
 pub mod request_id;
+pub mod request_target;
 pub mod route_gate;
 pub mod security;
 pub mod speedtest;
@@ -181,7 +183,7 @@ pub mod webtransport_server;
 
 // Re-export commonly used types
 pub use access_logger::{init_access_logger, log_access, AccessLogEntry, AccessLogger};
-pub use cache::{cache_middleware, CacheLookup, ResponseCache, ResponseCacheConfig};
+pub use cache::{CacheLookup, ResponseCache, ResponseCacheConfig};
 pub use compression::{compression_middleware, CompressionConfig, CompressionState};
 pub use config::{ConfigManager, Http3Config, OtelConfig, ProxyConfig};
 pub use fingerprint::{

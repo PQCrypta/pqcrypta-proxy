@@ -201,26 +201,35 @@ impl QuicListener {
         // `stream` — and nothing below mutates it, so these all outlive their
         // uses. Every one of them was an allocation on the hot path.
         let method = request.method().as_str();
-        // In HTTP/3, host comes from :authority pseudo-header (in URI) or fallback
-        // to host header. An authority host is almost always already lowercase,
-        // so only pay for the copy when it actually needs changing.
-        let host: Option<Cow<'_, str>> = uri
-            .authority()
-            .map(|a| {
-                let h = a.host();
-                if h.bytes().any(|b| b.is_ascii_uppercase()) {
-                    Cow::Owned(h.to_ascii_lowercase())
-                } else {
-                    Cow::Borrowed(h)
+        // The host this request names, as every layer and transport reads it
+        // (crate::request_target): lowercase and without its port, the form
+        // route hosts are written in.
+        let host: Option<Cow<'_, str>> =
+            match crate::request_target::effective_host(uri, request.headers()) {
+                Ok(host) => host.map(|h| {
+                    let h = crate::config::host_without_port(h);
+                    if h.bytes().any(|b| b.is_ascii_uppercase()) {
+                        Cow::Owned(h.to_ascii_lowercase())
+                    } else {
+                        Cow::Borrowed(h)
+                    }
+                }),
+                Err(crate::request_target::HostMismatch) => {
+                    warn!(
+                        "[QUIC/H3] request from {} names two hosts (:authority and Host)",
+                        remote_addr
+                    );
+                    metrics
+                        .requests
+                        .request_end_full(400, start_time.elapsed(), 0, 0, Some(&path));
+                    let response = http::Response::builder()
+                        .status(http::StatusCode::BAD_REQUEST)
+                        .server_header(&config)
+                        .body(())?;
+                    respond_and_finish(&mut stream, response).await?;
+                    return Ok(());
                 }
-            })
-            .or_else(|| {
-                request
-                    .headers()
-                    .get("host")
-                    .and_then(|v| v.to_str().ok())
-                    .map(Cow::Borrowed)
-            });
+            };
         let user_agent = request
             .headers()
             .get("user-agent")
@@ -394,8 +403,9 @@ impl QuicListener {
             // Resolved at most once per request: the body-pass WAF inspection
             // below reuses this instead of repeating the host derivation, the
             // route scan and the policy-field clones.
-            let h3_route_policy = route_policy
-                .get_or_insert_with(|| resolve_route_policy(&security, &request, &path));
+            let h3_route_policy = route_policy.get_or_insert_with(|| {
+                resolve_route_policy(&security, &request, host.as_deref(), &path)
+            });
 
             {
                 let raw_path = request.uri().path();
@@ -529,15 +539,9 @@ impl QuicListener {
         // registry the TCP path uses. A second instance here would have given a
         // session started over one transport no results from the other.
         if let Some(conf) = crate::conformance::shared(&config.conformance) {
-            let conformance_host = request
-                .headers()
-                .get(hyper::header::HOST)
-                .and_then(|v| v.to_str().ok())
-                .map(|h| crate::config::host_without_port(h).to_ascii_lowercase())
-                .or_else(|| request.uri().host().map(str::to_ascii_lowercase))
-                .unwrap_or_default();
+            let conformance_host: &str = host.as_deref().unwrap_or_default();
 
-            if conf.owns_host(&conformance_host) {
+            if conf.owns_host(conformance_host) {
                 if let Some(resp) = crate::conformance::http::route(
                     &conf,
                     request.method(),
@@ -558,7 +562,7 @@ impl QuicListener {
                         .server_header(&config)
                         .header(
                             header::ALT_SVC,
-                            conn_headers.alt_svc(&config, Some(&conformance_host)),
+                            conn_headers.alt_svc(&config, Some(conformance_host)),
                         )
                         .body(())?;
 
@@ -1314,8 +1318,9 @@ impl QuicListener {
             // Same policy the header pass used. It used to be rebuilt here
             // because that one was scoped to a block that had closed; it is now
             // resolved once per request and shared.
-            let body_route_policy = route_policy
-                .get_or_insert_with(|| resolve_route_policy(&security, &request, &path));
+            let body_route_policy = route_policy.get_or_insert_with(|| {
+                resolve_route_policy(&security, &request, host.as_deref(), &path)
+            });
             let body_view = crate::security::SecurityRequestView {
                 ip,
                 peer_port: Some(remote_addr.port()),
@@ -1374,16 +1379,16 @@ impl QuicListener {
         // Range requests bypass the cache entirely: the cache stores whole responses
         // and must hand range requests to the backend so they get a correct 206 with
         // a matching Content-Range, rather than a cached full 200 body.
-        let cache_host_str = host.as_deref().unwrap_or("");
-        let is_range_request = request.headers().contains_key("range");
-        if (method == "GET" || method == "HEAD")
-            && !is_range_request
-            && cache.config.enabled
-            && !cache.is_excluded_path(&path)
-            && !cache.is_excluded_host(cache_host_str)
-        {
-            let host_str = cache_host_str;
-            let cache_key = ResponseCache::build_key(method, host_str, &path_with_query);
+        // Whether the cache may answer this request and keep its response:
+        // the same rule as on TCP (`ResponseCache::plan`).
+        let cache_plan = cache.plan(
+            request.method(),
+            request.headers(),
+            host.as_deref().unwrap_or(""),
+            &path,
+            request.uri().query(),
+        );
+        if let Some(plan) = cache_plan.as_ref().filter(|plan| plan.lookup) {
             let if_none_match = request
                 .headers()
                 .get("if-none-match")
@@ -1395,8 +1400,9 @@ impl QuicListener {
                 .and_then(|v| v.to_str().ok())
                 .map(String::from);
 
-            match cache.get(
-                &cache_key,
+            match cache.get_for(
+                &plan.key,
+                plan.credentialed,
                 if_none_match.as_deref(),
                 if_modified_since.as_deref(),
             ) {
@@ -1657,7 +1663,7 @@ impl QuicListener {
         // Traffic shadowing: fire-and-forget async copy to shadow backend (if configured)
         if let Some(ref shadow_cfg) = route.shadow {
             if !shadow_cfg.backend.is_empty() && shadow_cfg.percent > 0 {
-                let roll: u8 = rand::random::<u8>() % 100;
+                let roll: u8 = rand::Rng::gen_range(&mut rand::thread_rng(), 0..100);
                 if roll < shadow_cfg.percent.min(100) {
                     if let Some(shadow_backend) = config.get_backend(&shadow_cfg.backend).cloned() {
                         // The shadow path still takes the older
@@ -1928,16 +1934,19 @@ impl QuicListener {
         //
         // HEAD is buffered too, but its body is empty by definition, so that
         // costs nothing and keeps the length logic below in one place.
+        let cache_limit = cache.config.max_body_size_bytes;
         let will_cache = method == "GET"
-            && cache.config.enabled
-            && !cache.is_excluded_path(&path)
-            && !cache.is_excluded_host(cache_host_str);
+            && cache_plan.is_some()
+            && crate::cache::may_store(&stream_headers, cache_limit);
 
         // Released once the body has been read to its end, from whichever of
         // the two paths below reads it.
         let mut backend_lease = Some(backend_lease);
         let mut streaming_body: Option<hyper::body::Incoming> = None;
-        let buffered: Option<Bytes> = if will_cache || method == "HEAD" {
+        // What was read of a body that turned out longer than the cache
+        // keeps: sent first, then the rest as it arrives.
+        let mut read_ahead: Vec<Bytes> = Vec::new();
+        let buffered: Option<Bytes> = if method == "HEAD" {
             let body = stream_body
                 .collect()
                 .await
@@ -1947,19 +1956,51 @@ impl QuicListener {
                 lease.release();
             }
             Some(body)
+        } else if will_cache {
+            // Read no further than the cache's own limit: a longer body is not
+            // kept, so it is not held either.
+            let mut body = stream_body;
+            let mut total = 0usize;
+            let whole = loop {
+                match body.frame().await {
+                    None => break true,
+                    Some(Ok(frame)) => {
+                        if let Ok(data) = frame.into_data() {
+                            total += data.len();
+                            read_ahead.push(data);
+                            if total > cache_limit {
+                                break false;
+                            }
+                        }
+                    }
+                    Some(Err(e)) => {
+                        return Err(anyhow::anyhow!("Failed to read response body: {}", e));
+                    }
+                }
+            };
+            if whole {
+                if let Some(lease) = backend_lease.take() {
+                    lease.release();
+                }
+                let mut all = bytes::BytesMut::with_capacity(total);
+                for data in std::mem::take(&mut read_ahead) {
+                    all.extend_from_slice(&data);
+                }
+                Some(all.freeze())
+            } else {
+                streaming_body = Some(body);
+                None
+            }
         } else {
             streaming_body = Some(stream_body);
             None
         };
 
-        // Store response in cache (GET only; cache.put() enforces all Cache-Control
+        // Store response in cache (GET only; the cache enforces all Cache-Control
         // rules). HEAD is deliberately excluded: its body is empty by definition,
-        // so the entry holds nothing worth serving, and the cache-hit arm derives
-        // `content-length` from the stored body — which reported every cached HEAD
-        // as a zero-length resource. The TCP cache middleware skips HEAD for the
-        // same reason.
-        if will_cache {
-            let cache_key = ResponseCache::build_key(method, cache_host_str, &path_with_query);
+        // so the entry holds nothing worth serving.
+        if let (true, Some(plan), Some(body)) = (will_cache, cache_plan.as_ref(), buffered.as_ref())
+        {
             // The cache stores `Vec<(String, String)>`; converting here rather
             // than upstream keeps the forwarding path on `HeaderMap`, and this
             // runs only for cacheable GETs rather than every request.
@@ -1971,11 +2012,12 @@ impl QuicListener {
                         .map(|v| (n.as_str().to_string(), v.to_string()))
                 })
                 .collect();
-            cache.put(
-                &cache_key,
+            cache.put_for(
+                &plan.key,
+                plan.credentialed,
                 stream_status.as_u16(),
                 &cache_headers,
-                buffered.clone().unwrap_or_default(),
+                body.clone(),
             );
         }
 
@@ -2097,6 +2139,13 @@ impl QuicListener {
                 let mut body = streaming_body
                     .take()
                     .ok_or_else(|| anyhow::anyhow!("streaming body already consumed"))?;
+                for data in read_ahead {
+                    if !data.is_empty() {
+                        sent += data.len();
+                        frames += 1;
+                        stream.send_data(data).await?;
+                    }
+                }
                 while let Some(frame_result) = body.frame().await {
                     let frame = frame_result
                         .map_err(|e| anyhow::anyhow!("Backend body stream failed: {}", e))?;

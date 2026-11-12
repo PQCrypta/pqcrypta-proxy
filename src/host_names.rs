@@ -1,6 +1,7 @@
-//! Host names in `security.pentest_bypass_ips`.
+//! Host names in `security.pentest_bypass_ips` and the `[masque]` client
+//! lists.
 //!
-//! The list takes host names beside addresses. A name stands for the
+//! Each list takes host names beside addresses. A name stands for the
 //! addresses it resolves to: a host whose address its ISP changes (fortress,
 //! on a home connection) is listed once by name and DNS carries each change,
 //! where a copy of its address went stale at every renumbering and went on
@@ -38,6 +39,24 @@ const RCODE_MASK: u16 = 0x000f;
 /// Each name's addresses, as the resolver last authenticated them
 static ANSWERS: LazyLock<RwLock<HashMap<String, Vec<IpAddr>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// The host names each list outside `security.pentest_bypass_ips` holds, by
+/// the list's name: the refresh keeps them resolved with that list's.
+static WATCHED: LazyLock<RwLock<HashMap<&'static str, Vec<String>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Keep `names` resolved for `list`, in place of the names it gave before.
+pub fn watch(list: &'static str, names: Vec<String>) {
+    WATCHED.write().insert(list, names);
+}
+
+/// Every name a list has asked to be kept resolved.
+pub fn watched() -> Vec<String> {
+    let mut names: Vec<String> = WATCHED.read().values().flatten().cloned().collect();
+    names.sort();
+    names.dedup();
+    names
+}
 
 /// Is `entry` a host name rather than an address?
 ///

@@ -133,8 +133,10 @@ impl WebTransportServer {
         transport_config.mtu_discovery_config(Some(crate::config::quic_mtu_discovery()));
 
         // Concurrent streams
-        transport_config.max_concurrent_bidi_streams(VarInt::from_u32(1000));
-        transport_config.max_concurrent_uni_streams(VarInt::from_u32(1000));
+        // server.webtransport_max_streams_per_session, in each direction
+        let max_streams = VarInt::from_u32(config.server.webtransport_max_streams_per_session);
+        transport_config.max_concurrent_bidi_streams(max_streams);
+        transport_config.max_concurrent_uni_streams(max_streams);
 
         // Datagram buffers — 4 MB each prevents ExcessiveLoad when datagrams
         // arrive during high-throughput download/upload streams.
@@ -319,7 +321,20 @@ impl WebTransportServer {
             let counts_clone = Arc::clone(&origin_counts);
             let security_clone = security.clone();
             let remote_addr = incoming_session.remote_address();
+            // A place under the connection limits, held until the session ends
+            let peer = crate::security::canonical_addr(remote_addr).ip();
+            let exempt = security_clone
+                .as_ref()
+                .is_some_and(|sec| sec.is_limit_exempt(&peer));
+            let Some(slot) = crate::conn_limits::admit(peer, exempt) else {
+                debug!(
+                    "WebTransport connection from {} refused: connection limit reached",
+                    remote_addr
+                );
+                continue;
+            };
             tokio::spawn(async move {
+                let _slot = slot;
                 if let Some(ref m) = session_metrics {
                     m.connections
                         .connection_opened(ConnectionProtocol::WebTransport);
@@ -366,6 +381,74 @@ async fn handle_incoming_session(
     debug!("📥 WebTransport session request received");
     info!("   Path: {}", path);
     debug!("   Authority: {}", authority);
+
+    // The session request is an HTTP request, and is held to what every other
+    // one is: the blocklist, the location rules, the rate limits and the WAF
+    // (`SecurityState::evaluate`). A WebTransport client is a program, so the
+    // user-agent rules for unnamed clients do not apply to it.
+    let host = crate::config::host_without_port(&authority).to_ascii_lowercase();
+    let (raw_path, query) = path.split_once('?').unwrap_or((path.as_str(), ""));
+    let route_path = crate::path_canon::canonical_path(
+        raw_path,
+        crate::path_canon::PathCanon::from(&config.server),
+    )
+    .into_owned();
+    if let Some(sec) = &security {
+        let mut headers = axum::http::HeaderMap::new();
+        for (name, value) in session_request.headers() {
+            if let (Ok(name), Ok(value)) = (
+                axum::http::HeaderName::from_bytes(name.as_bytes()),
+                axum::http::HeaderValue::from_str(value),
+            ) {
+                headers.append(name, value);
+            }
+        }
+        let mut policy = crate::security::request_policy(
+            &config,
+            Some(&host),
+            &route_path,
+            &hyper::Method::CONNECT,
+        );
+        policy.skip_bot_blocking = true;
+        let lowered = raw_path.to_ascii_lowercase();
+        let view = crate::security::SecurityRequestView {
+            ip: remote_addr.ip(),
+            peer_port: Some(remote_addr.port()),
+            method: "CONNECT",
+            path: &lowered,
+            query,
+            headers: &headers,
+            body: None,
+        };
+        match sec.evaluate(&view, &policy) {
+            crate::security::SecurityDecision::Allow => {}
+            crate::security::SecurityDecision::RateLimited { .. } => {
+                warn!(
+                    "WebTransport session from {} refused: rate limited",
+                    remote_addr
+                );
+                session_request.too_many_requests().await;
+                return Ok(());
+            }
+            decision => {
+                warn!(
+                    "WebTransport session from {} refused: {:?}",
+                    remote_addr, decision
+                );
+                session_request.forbidden().await;
+                return Ok(());
+            }
+        }
+    }
+
+    // The backend this session's requests go to: its own route's, by the host
+    // and path it was opened for. None for the paths served here (the speed
+    // test, the telemetry wall) and for a session no route covers, which is
+    // answered only what the proxy answers itself.
+    let session_backend: Option<String> = config
+        .find_route(Some(&host), &route_path, true)
+        .filter(|route| route.webtransport)
+        .map(|route| route.backend.clone());
 
     // SR-02: Origin validation.
     //
@@ -465,6 +548,7 @@ async fn handle_incoming_session(
             connection,
             remote_addr,
             path,
+            session_backend,
             config,
             backend_pool,
             security,
@@ -553,11 +637,49 @@ impl Drop for ClientSlot {
     }
 }
 
+/// The path a session was opened for and the backend its route names.
+struct SessionRoute {
+    path: String,
+    backend: Option<String>,
+}
+
+/// How long a stream's request may take to arrive.
+const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Why a stream's request was not read.
+enum StreamRead {
+    TooLarge,
+    Failed(std::io::Error),
+    TimedOut,
+}
+
+/// A stream's whole request, read no further than `max` bytes: what would not
+/// be accepted is not held either.
+async fn read_request(
+    recv_stream: &mut wtransport::stream::RecvStream,
+    max: usize,
+) -> Result<Vec<u8>, StreamRead> {
+    let mut buffer = Vec::new();
+    let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
+    let read = tokio::time::timeout(
+        STREAM_READ_TIMEOUT,
+        (&mut *recv_stream).take(limit).read_to_end(&mut buffer),
+    )
+    .await;
+    match read {
+        Ok(Ok(_)) if buffer.len() > max => Err(StreamRead::TooLarge),
+        Ok(Ok(_)) => Ok(buffer),
+        Ok(Err(e)) => Err(StreamRead::Failed(e)),
+        Err(_) => Err(StreamRead::TimedOut),
+    }
+}
+
 /// Handle an established WebTransport connection
 async fn handle_connection(
     connection: Connection,
     remote_addr: SocketAddr,
     path: String,
+    session_backend: Option<String>,
     config: Arc<ProxyConfig>,
     backend_pool: Arc<BackendPool>,
     security: Option<crate::security::SecurityState>,
@@ -579,6 +701,12 @@ async fn handle_connection(
         return crate::telemetry::handle_telemetry_session(connection, remote_addr).await;
     }
 
+    // What every stream and datagram of this session is routed by.
+    let session = Arc::new(SessionRoute {
+        path,
+        backend: session_backend,
+    });
+
     // Per-session datagram budget window (see webtransport_max_datagrams_per_sec).
     let mut dg_window_start = std::time::Instant::now();
     let mut dg_count: u32 = 0;
@@ -594,9 +722,9 @@ async fn handle_connection(
                         let config_clone = config.clone();
                         let backend_clone = backend_pool.clone();
                         let security_clone = security.clone();
-                        let path_clone = path.clone();
+                        let session_clone = Arc::clone(&session);
                         tokio::spawn(handle_uni_stream(
-                            recv_stream, remote_addr, conn, path_clone, config_clone, backend_clone,
+                            recv_stream, remote_addr, conn, session_clone, config_clone, backend_clone,
                             security_clone,
                         ).in_current_span());
                     }
@@ -616,9 +744,9 @@ async fn handle_connection(
                         let config_clone = config.clone();
                         let backend_clone = backend_pool.clone();
                         let security_clone = security.clone();
-                        let path_clone = path.clone();
+                        let session_clone = Arc::clone(&session);
                         tokio::spawn(handle_bi_stream(
-                            send_stream, recv_stream, remote_addr, conn, path_clone, config_clone,
+                            send_stream, recv_stream, remote_addr, conn, session_clone, config_clone,
                             backend_clone, security_clone,
                         ).in_current_span());
                     }
@@ -656,9 +784,9 @@ async fn handle_connection(
                         let config_clone = config.clone();
                         let backend_clone = backend_pool.clone();
                         let security_clone = security.clone();
-                        let path_clone = path.clone();
+                        let session_clone = Arc::clone(&session);
                         tokio::spawn(handle_datagram(
-                            datagram.to_vec(), remote_addr, conn, path_clone, config_clone,
+                            datagram.to_vec(), remote_addr, conn, session_clone, config_clone,
                             backend_clone, security_clone,
                         ).in_current_span());
                     }
@@ -680,40 +808,30 @@ async fn handle_uni_stream(
     mut recv_stream: wtransport::stream::RecvStream,
     remote_addr: SocketAddr,
     _connection: Arc<Connection>,
-    path: String,
+    session: Arc<SessionRoute>,
     config: Arc<ProxyConfig>,
     backend_pool: Arc<BackendPool>,
     security: Option<crate::security::SecurityState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Apply timeout for request reading
-    let timeout_duration = Duration::from_secs(30);
     let max_size = config.security.max_request_size;
-
-    let mut buffer = Vec::new();
-    let read_result =
-        tokio::time::timeout(timeout_duration, recv_stream.read_to_end(&mut buffer)).await;
-
-    match read_result {
-        Ok(Ok(_bytes_read)) => {
-            if buffer.len() > max_size {
-                error!(
-                    "Request from {} exceeds max size ({} > {})",
-                    remote_addr,
-                    buffer.len(),
-                    max_size
-                );
-                return Err("Request too large".into());
-            }
+    let buffer = match read_request(&mut recv_stream, max_size).await {
+        Ok(buffer) => buffer,
+        Err(StreamRead::TooLarge) => {
+            debug!(
+                "Request from {} exceeds max size ({} bytes)",
+                remote_addr, max_size
+            );
+            return Err("Request too large".into());
         }
-        Ok(Err(e)) => {
-            error!("Read error from {}: {}", remote_addr, e);
+        Err(StreamRead::Failed(e)) => {
+            debug!("Read error from {}: {}", remote_addr, e);
             return Err(format!("Stream read error: {}", e).into());
         }
-        Err(_) => {
-            error!("Request timeout from {}", remote_addr);
+        Err(StreamRead::TimedOut) => {
+            debug!("Request timeout from {}", remote_addr);
             return Err("Request timeout".into());
         }
-    }
+    };
 
     debug!(
         "📥 Unidirectional data from {} ({} bytes)",
@@ -724,7 +842,7 @@ async fn handle_uni_stream(
     // Process and proxy the request
     match proxy_request(
         &buffer,
-        &path,
+        &session,
         remote_addr,
         &config,
         &backend_pool,
@@ -751,59 +869,42 @@ async fn handle_bi_stream(
     mut recv_stream: wtransport::stream::RecvStream,
     remote_addr: SocketAddr,
     _connection: Arc<Connection>,
-    path: String,
+    session: Arc<SessionRoute>,
     config: Arc<ProxyConfig>,
     backend_pool: Arc<BackendPool>,
     security: Option<crate::security::SecurityState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Apply timeout for request reading
-    let timeout_duration = Duration::from_secs(30);
     let max_size = config.security.max_request_size;
-
-    let mut buffer = Vec::new();
-    let read_result =
-        tokio::time::timeout(timeout_duration, recv_stream.read_to_end(&mut buffer)).await;
-
-    match read_result {
-        Ok(Ok(_bytes_read)) => {
-            if buffer.len() > max_size {
-                let error_response = json!({
-                    "success": false,
-                    "error": format!("Request exceeds max size of {} bytes", max_size),
-                    "timestamp": chrono::Utc::now().to_rfc3339()
-                });
-                let error_bytes = serde_json::to_vec(&error_response)?;
-                send_stream.write_all(&error_bytes).await?;
-                let _ = send_stream.finish().await;
-                return Err("Request too large".into());
-            }
-        }
-        Ok(Err(e)) => {
-            // SEC-02: Log full error server-side; send only a generic message to the client
-            // to prevent leaking internal details (file paths, OS errors, library internals).
-            error!("Stream read error for {}: {}", remote_addr, e);
+    let buffer = match read_request(&mut recv_stream, max_size).await {
+        Ok(buffer) => buffer,
+        Err(why) => {
+            // SEC-02: the detail is logged here; the client gets a generic
+            // message, with no file path, OS error or library internals in it.
+            let (message, error): (String, Box<dyn std::error::Error + Send + Sync>) = match why {
+                StreamRead::TooLarge => (
+                    format!("Request exceeds max size of {} bytes", max_size),
+                    "Request too large".into(),
+                ),
+                StreamRead::Failed(e) => {
+                    debug!("Stream read error for {}: {}", remote_addr, e);
+                    (
+                        "Stream error".to_string(),
+                        format!("Stream read error: {}", e).into(),
+                    )
+                }
+                StreamRead::TimedOut => ("Request timeout".to_string(), "Request timeout".into()),
+            };
             let error_response = json!({
                 "success": false,
-                "error": "Stream error",
+                "error": message,
                 "timestamp": chrono::Utc::now().to_rfc3339()
             });
             let error_bytes = serde_json::to_vec(&error_response)?;
             send_stream.write_all(&error_bytes).await?;
             let _ = send_stream.finish().await;
-            return Err(format!("Stream read error: {}", e).into());
+            return Err(error);
         }
-        Err(_) => {
-            let error_response = json!({
-                "success": false,
-                "error": "Request timeout",
-                "timestamp": chrono::Utc::now().to_rfc3339()
-            });
-            let error_bytes = serde_json::to_vec(&error_response)?;
-            send_stream.write_all(&error_bytes).await?;
-            let _ = send_stream.finish().await;
-            return Err("Request timeout".into());
-        }
-    }
+    };
 
     debug!(
         "📥 Bidirectional request from {} ({} bytes)",
@@ -814,7 +915,7 @@ async fn handle_bi_stream(
     // Process and proxy the request
     match proxy_request(
         &buffer,
-        &path,
+        &session,
         remote_addr,
         &config,
         &backend_pool,
@@ -858,7 +959,7 @@ async fn handle_datagram(
     datagram: Vec<u8>,
     remote_addr: SocketAddr,
     connection: Arc<Connection>,
-    path: String,
+    session: Arc<SessionRoute>,
     config: Arc<ProxyConfig>,
     backend_pool: Arc<BackendPool>,
     security: Option<crate::security::SecurityState>,
@@ -894,7 +995,7 @@ async fn handle_datagram(
         timeout_duration,
         proxy_request(
             &datagram,
-            &path,
+            &session,
             remote_addr,
             &config,
             &backend_pool,
@@ -942,7 +1043,7 @@ async fn handle_datagram(
 /// Proxy request to backend server via HTTP
 async fn proxy_request(
     data: &[u8],
-    path: &str,
+    session: &SessionRoute,
     remote_addr: SocketAddr,
     config: &Arc<ProxyConfig>,
     backend_pool: &Arc<BackendPool>,
@@ -954,6 +1055,7 @@ async fn proxy_request(
     // HTTP/3 paths run. The payload is treated as the request body; there are no
     // HTTP headers on a WT frame, so a minimal header map is synthesised. When
     // no security state is attached (WAF disabled) this is a no-op.
+    let path = session.path.as_str();
     if let Some(sec) = security {
         if sec.waf().is_some() {
             let ip = crate::security::canonical_addr(remote_addr).ip();
@@ -1017,6 +1119,7 @@ async fn proxy_request(
                 return forward_to_backend(
                     data,
                     backend_path,
+                    session.backend.as_deref(),
                     request_credential(&request).as_deref(),
                     remote_addr,
                     config,
@@ -1028,7 +1131,16 @@ async fn proxy_request(
     }
 
     // For non-JSON data, forward to the path directly
-    forward_to_backend(data, path, None, remote_addr, config, backend_pool).await
+    forward_to_backend(
+        data,
+        path,
+        session.backend.as_deref(),
+        None,
+        remote_addr,
+        config,
+        backend_pool,
+    )
+    .await
 }
 
 /// The API key a WebTransport request carries in its body ("api_key"),
@@ -1045,28 +1157,42 @@ fn request_credential(request: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Forward request to HTTP backend using the BackendPool
+/// Forward a request to the backend of the session's route.
+///
+/// A session no WebTransport route covers has no backend, and what it sends
+/// is answered here: nothing is forwarded on a guess.
 async fn forward_to_backend(
     data: &[u8],
     path: &str,
+    backend_name: Option<&str>,
     api_key: Option<&str>,
     remote_addr: SocketAddr,
     config: &Arc<ProxyConfig>,
     backend_pool: &Arc<BackendPool>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    // Find the appropriate backend for this path
-    let backend_name = find_backend_for_path(path, config);
+    let Some(backend_name) = backend_name else {
+        debug!(
+            "WebTransport request from {} for {}: the session has no route",
+            remote_addr, path
+        );
+        let body = json!({
+            "success": false,
+            "error": "No WebTransport route for this session",
+            "webtransport": true,
+        });
+        return Ok(serde_json::to_vec(&body)?);
+    };
 
-    let backend = config.backends.get(&backend_name).ok_or_else(|| {
+    let backend = config.backends.get(backend_name).ok_or_else(|| {
         format!(
-            "No backend configured for path: {} (tried: {})",
-            path, backend_name
+            "Backend '{}' of the session's route is not configured",
+            backend_name
         )
     })?;
 
     debug!(
-        "🔄 Forwarding WebTransport request to backend '{}': {}{}",
-        backend_name, backend.address, path
+        "🔄 Forwarding WebTransport request to backend '{}': {}",
+        backend_name, path
     );
 
     // Create headers for the request
@@ -1088,42 +1214,9 @@ async fn forward_to_backend(
         .await
         .map_err(|e| format!("Backend proxy error: {}", e))?;
 
-    info!("✅ Backend response received ({} bytes)", response.len());
+    debug!("✅ Backend response received ({} bytes)", response.len());
 
     Ok(response)
-}
-
-/// Find the appropriate backend name for a given path
-fn find_backend_for_path(path: &str, config: &ProxyConfig) -> String {
-    // Check routes for a match
-    for route in &config.routes {
-        // Check if this route handles WebTransport
-        if !route.webtransport {
-            continue;
-        }
-
-        // Check path prefix match
-        if let Some(prefix) = &route.path_prefix {
-            if path.starts_with(prefix) {
-                return route.backend.clone();
-            }
-        }
-
-        // Check exact path match
-        if let Some(exact) = &route.path_exact {
-            if path == exact {
-                return route.backend.clone();
-            }
-        }
-    }
-
-    // Fallback: use the first backend (usually "main" or "api")
-    config
-        .backends
-        .keys()
-        .next()
-        .cloned()
-        .unwrap_or_else(|| "main".to_string())
 }
 
 #[cfg(test)]

@@ -778,11 +778,15 @@ impl RedisBackend {
         let redis_key = self.tb_key(key_str);
         let max_tokens = burst as f64;
         let tokens_per_ms = rps as f64 / 1000.0;
-        let now_ms: u64 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .saturating_mul(1000);
+        // Milliseconds, as the script's refill rate is per millisecond: taken
+        // in whole seconds, a bucket refilled in one lump a second.
+        let now_ms: u64 = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
 
         let mut conn = self.conn.clone();
         let result: Result<(i64, i64), _> = tokio::time::timeout(self.cmd_timeout, async {
@@ -886,6 +890,23 @@ impl RedisBackend {
     }
 }
 
+/// One bucket a request is counted in: the key it is stored under and the
+/// limits that apply there.
+#[derive(Debug, Clone)]
+struct Charge {
+    key_string: String,
+    limits: PerKeyLimits,
+    /// The key is one the client cannot choose (`RateLimitKey::is_network_bound`)
+    network_bound: bool,
+}
+
+/// A fixed-length stand-in for a value the client wrote, for use in a bucket's
+/// key: the first 128 bits of its SHA-256, in hex.
+fn value_digest(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(value.as_bytes())[..16])
+}
+
 // ============================================================================
 // RATE LIMIT KEY
 // ============================================================================
@@ -928,6 +949,57 @@ impl RateLimitKey {
             key_type: RateLimitKeyType::Composite(key_type_names),
             value,
             components: Some(components),
+        }
+    }
+
+    /// Whether every part of this key is something the client cannot choose:
+    /// the address it connected from, or a subject whose token verified. Any
+    /// other key is counted beside the address's own bucket, never instead of
+    /// it (see `AdvancedRateLimiter::charges`).
+    pub fn is_network_bound(&self) -> bool {
+        let bound = |t: &RateLimitKeyType| {
+            matches!(
+                t,
+                RateLimitKeyType::SourceIp
+                    | RateLimitKeyType::RealIp
+                    | RateLimitKeyType::JwtSubject
+            )
+        };
+        match &self.components {
+            Some(components) => components.iter().all(|(t, _)| bound(t)),
+            None => bound(&self.key_type),
+        }
+    }
+
+    /// The string this key's bucket is stored under, here and in Redis.
+    ///
+    /// A value the client wrote (a header, a cookie, a query parameter, the
+    /// path) goes in as a digest: it may be a credential, and it may be as
+    /// long as a header is allowed to be. A TLS fingerprint is counted per
+    /// `network`: a fingerprint names a client build, which every user of
+    /// that build shares, so on its own it would be one bucket for all of
+    /// them.
+    pub fn storage_key(&self, network: &str) -> String {
+        let part = |t: &RateLimitKeyType, v: &str| -> String {
+            match t {
+                RateLimitKeyType::ApiKey
+                | RateLimitKeyType::Header(_)
+                | RateLimitKeyType::Cookie(_)
+                | RateLimitKeyType::QueryParam(_)
+                | RateLimitKeyType::Path => format!("{:?}:{}", t, value_digest(v)),
+                RateLimitKeyType::Ja3Fingerprint | RateLimitKeyType::Ja4Fingerprint => {
+                    format!("{:?}:{}@{}", t, v, network)
+                }
+                _ => format!("{:?}:{}", t, v),
+            }
+        };
+        match &self.components {
+            Some(components) => components
+                .iter()
+                .map(|(t, v)| part(t, v))
+                .collect::<Vec<_>>()
+                .join("|"),
+            None => part(&self.key_type, &self.value),
         }
     }
 
@@ -1627,8 +1699,7 @@ impl AdvancedRateLimiter {
         // Strategy: do ALL config access inside a scope block so the guard is
         // dropped before we enter the async phase below.
         struct SyncData {
-            key_string: String,
-            limits: PerKeyLimits,
+            charges: Vec<Charge>,
             adaptive_enabled: bool,
             adaptive_cfg: AdaptiveConfig,
         }
@@ -1693,20 +1764,25 @@ impl AdvancedRateLimiter {
             }
 
             Some(SyncData {
-                key_string: key.to_key_string(),
-                limits,
+                charges: self.charges(ctx, &config, &key, limits),
                 adaptive_enabled: config.adaptive.enabled,
                 adaptive_cfg: config.adaptive.clone(),
             })
             // config guard is dropped here — safe to .await after this point
         };
 
-        let SyncData {
-            key_string,
-            limits,
+        let Some(SyncData {
+            charges,
             adaptive_enabled,
             adaptive_cfg,
-        } = sync_data.expect("sync_data is always Some when we reach this line");
+        }) = sync_data
+        else {
+            // Every way out of the block above that is not a `Some` returned.
+            return RateLimitResult::Allowed {
+                remaining: u32::MAX,
+                limit: u32::MAX,
+            };
+        };
 
         // ── ASYNC PHASE ──────────────────────────────────────────────────────
         // The parking_lot guard is gone; it is safe to `.await` here.
@@ -1719,13 +1795,40 @@ impl AdvancedRateLimiter {
             guard.clone() // cheap Arc::clone; guard dropped immediately
         };
 
-        let result = if let Some(ref backend) = redis_backend {
-            self.check_distributed(backend, &key_string, &limits, &adaptive_cfg)
-                .await
-        } else {
-            // No Redis configured or not yet connected — use local bucket
-            self.check_local(&key_string, &limits, &adaptive_cfg)
+        // Each bucket in turn, the address's own first: a request it refuses
+        // is counted nowhere else, so a refused client cannot make buckets.
+        // An allowed request reports the tightest of what it was counted in.
+        let mut result = RateLimitResult::Allowed {
+            remaining: u32::MAX,
+            limit: u32::MAX,
         };
+        for charge in &charges {
+            // Redis holds the buckets of keys a client cannot choose. One
+            // keyed on a value the client wrote is counted here, where the
+            // number kept is bounded: in Redis every new value would be a
+            // new set of keys.
+            let counted = match redis_backend.as_ref().filter(|_| charge.network_bound) {
+                Some(backend) => self.check_distributed(backend, charge, &adaptive_cfg).await,
+                // No Redis configured or not yet connected — use local bucket
+                None => self.check_local(charge, &adaptive_cfg),
+            };
+            match (&result, counted) {
+                (
+                    RateLimitResult::Allowed {
+                        remaining: held, ..
+                    },
+                    RateLimitResult::Allowed { remaining, limit },
+                ) => {
+                    if remaining <= *held {
+                        result = RateLimitResult::Allowed { remaining, limit };
+                    }
+                }
+                (_, refused) => {
+                    result = refused;
+                    break;
+                }
+            }
+        }
 
         if adaptive_enabled {
             self.global_baseline.record(1);
@@ -1751,10 +1854,10 @@ impl AdvancedRateLimiter {
     async fn check_distributed(
         &self,
         backend: &RedisBackend,
-        key_string: &str,
-        limits: &PerKeyLimits,
+        charge: &Charge,
         adaptive_cfg: &AdaptiveConfig,
     ) -> RateLimitResult {
+        let (key_string, limits) = (charge.key_string.as_str(), &charge.limits);
         // Per-second token bucket via Redis (or local governor fallback)
         let tb_result = backend
             .check_token_bucket(key_string, limits.requests_per_second, limits.burst_size)
@@ -1763,7 +1866,7 @@ impl AdvancedRateLimiter {
         let token_result = match tb_result {
             Some(r) => r,
             // Redis failed → local governor
-            None => self.check_local(key_string, limits, adaptive_cfg),
+            None => self.check_local(charge, adaptive_cfg),
         };
 
         if !matches!(token_result, RateLimitResult::Allowed { .. }) {
@@ -1780,7 +1883,7 @@ impl AdvancedRateLimiter {
                 Some(_) => {} // allowed
                 None => {
                     // Redis failed — check local minute counter
-                    let local = self.get_or_create_bucket(key_string, limits, adaptive_cfg);
+                    let local = self.get_or_create_bucket(charge, adaptive_cfg);
                     if let Some(ref counter) = local.minute_counter {
                         let count = counter.increment();
                         if count > u64::from(rpm) {
@@ -1806,7 +1909,7 @@ impl AdvancedRateLimiter {
                 Some(_) => {} // allowed
                 None => {
                     // Redis failed — check local hour counter
-                    let local = self.get_or_create_bucket(key_string, limits, adaptive_cfg);
+                    let local = self.get_or_create_bucket(charge, adaptive_cfg);
                     if let Some(ref counter) = local.hour_counter {
                         let count = counter.increment();
                         if count > u64::from(rph) {
@@ -1823,49 +1926,53 @@ impl AdvancedRateLimiter {
         }
 
         // Adaptive anomaly detection (always local — per-node baseline)
-        self.check_adaptive(key_string, limits, adaptive_cfg)
+        self.check_adaptive(charge, adaptive_cfg)
     }
 
     // ── Internal: local in-memory path ──────────────────────────────────────
 
-    fn check_local(
-        &self,
-        key_string: &str,
-        limits: &PerKeyLimits,
-        adaptive_cfg: &AdaptiveConfig,
-    ) -> RateLimitResult {
-        let bucket = self.get_or_create_bucket(key_string, limits, adaptive_cfg);
-        bucket.check(limits, adaptive_cfg)
+    fn check_local(&self, charge: &Charge, adaptive_cfg: &AdaptiveConfig) -> RateLimitResult {
+        let bucket = self.get_or_create_bucket(charge, adaptive_cfg);
+        bucket.check(&charge.limits, adaptive_cfg)
     }
 
+    /// The bucket `charge` is counted in, made on first use.
+    ///
+    /// The map holds at most [`Self::MAX_TRACKED_KEYS`] buckets. An address's
+    /// own bucket is always kept: there is one per network a client really
+    /// connected from. Past the limit, a key the client chose is counted in a
+    /// bucket of its own that is not kept, so the map's size does not follow
+    /// the number of values clients send; the address's bucket is the one
+    /// that holds such a client.
     fn get_or_create_bucket(
         &self,
-        key_string: &str,
-        limits: &PerKeyLimits,
+        charge: &Charge,
         adaptive_cfg: &AdaptiveConfig,
     ) -> Arc<RateLimitBucket> {
+        if let Some(bucket) = self.buckets.get(&charge.key_string) {
+            return Arc::clone(bucket.value());
+        }
+        if !charge.network_bound && self.buckets.len() >= Self::MAX_TRACKED_KEYS {
+            return Arc::new(RateLimitBucket::new(&charge.limits, Some(adaptive_cfg)));
+        }
         self.buckets
-            .entry(key_string.to_owned())
+            .entry(charge.key_string.clone())
             .or_insert_with(|| {
                 self.stats.keys_tracked.fetch_add(1, Ordering::Relaxed);
-                Arc::new(RateLimitBucket::new(limits, Some(adaptive_cfg)))
+                Arc::new(RateLimitBucket::new(&charge.limits, Some(adaptive_cfg)))
             })
             .clone()
     }
 
-    fn check_adaptive(
-        &self,
-        key_string: &str,
-        limits: &PerKeyLimits,
-        adaptive_cfg: &AdaptiveConfig,
-    ) -> RateLimitResult {
+    fn check_adaptive(&self, charge: &Charge, adaptive_cfg: &AdaptiveConfig) -> RateLimitResult {
+        let limits = &charge.limits;
         if !adaptive_cfg.enabled {
             return RateLimitResult::Allowed {
                 remaining: limits.requests_per_second.saturating_sub(1),
                 limit: limits.requests_per_second,
             };
         }
-        let bucket = self.get_or_create_bucket(key_string, limits, adaptive_cfg);
+        let bucket = self.get_or_create_bucket(charge, adaptive_cfg);
         if let Some(ref baseline) = bucket.baseline {
             let recent_count = bucket
                 .minute_counter
@@ -1890,6 +1997,51 @@ impl AdvancedRateLimiter {
     }
 
     /// Resolve rate limit key and applicable limits
+    /// The buckets one request is counted in.
+    ///
+    /// A key the client cannot choose (its address, a verified subject) is one
+    /// bucket, as it always was. Any other key (an API key header, a TLS
+    /// fingerprint, a cookie) is counted beside the bucket of the network the
+    /// request came from, and that bucket first: a client that presents a new
+    /// value with every request then gets a new bucket for the value and the
+    /// same one for its address, which is the one that holds it. On a route
+    /// with limits of its own, the address's bucket there is the route's.
+    fn charges(
+        &self,
+        ctx: &RateLimitContext,
+        config: &AdvancedRateLimitConfig,
+        key: &RateLimitKey,
+        limits: PerKeyLimits,
+    ) -> Vec<Charge> {
+        let network = self.normalize_ip(ctx.source_ip, config.ipv6_subnet_bits);
+        let mut charges = Vec::with_capacity(2);
+        if !key.is_network_bound() {
+            let route = ctx
+                .route_name
+                .as_ref()
+                .filter(|name| config.route_limits.contains_key(name.as_str()));
+            let floor = match route {
+                Some(route) => Charge {
+                    key_string: format!("{:?}:{route}#{network}", RateLimitKeyType::SourceIp),
+                    limits: limits.clone(),
+                    network_bound: true,
+                },
+                None => Charge {
+                    key_string: format!("{:?}:{network}", RateLimitKeyType::SourceIp),
+                    limits: self.get_limits_for_key(&RateLimitKeyType::SourceIp, &network, config),
+                    network_bound: true,
+                },
+            };
+            charges.push(floor);
+        }
+        charges.push(Charge {
+            key_string: key.storage_key(&network),
+            limits,
+            network_bound: key.is_network_bound(),
+        });
+        charges
+    }
+
     fn resolve_key_and_limits(
         &self,
         ctx: &RateLimitContext,
@@ -2354,10 +2506,16 @@ impl AdvancedRateLimiter {
     /// whole key (`SourceIp:203.0.113.7`) or just its value (`203.0.113.7`),
     /// which also clears composite keys containing it. Returns buckets removed.
     pub fn reset_key(&self, key: &str) -> usize {
+        // A value sits after its type's name; on a route it follows `route#`,
+        // and a fingerprint is followed by `@network`.
         let matches = |k: &str| {
             k == key
-                || k.split('|')
-                    .any(|part| part == key || part.split_once(':').is_some_and(|(_, v)| v == key))
+                || k.split('|').any(|part| {
+                    part == key
+                        || part.split_once(':').is_some_and(|(_, v)| {
+                            v == key || v.split(['#', '@']).any(|piece| piece == key)
+                        })
+                })
         };
         let mut removed = 0;
         self.buckets.retain(|k, _| {
@@ -3113,5 +3271,120 @@ mod tests {
             None,
             "JWT extraction must return None without Bearer prefix"
         );
+    }
+
+    fn layered_config(order: Vec<RateLimitKeyType>) -> AdvancedRateLimitConfig {
+        let tight = PerKeyLimits {
+            requests_per_second: 1,
+            burst_size: 2,
+            requests_per_minute: None,
+            requests_per_hour: None,
+        };
+        let mut config = AdvancedRateLimitConfig::default();
+        config.key_strategy.order = order;
+        config.global_limits.per_ip = tight.clone();
+        config.global_limits.per_fingerprint = tight.clone();
+        config.fingerprint_limiting.unknown_limits = tight;
+        config
+    }
+
+    fn ctx_from(ip: [u8; 4], api_key: Option<&str>, ja3: Option<&str>) -> RateLimitContext {
+        let mut headers = HashMap::new();
+        if let Some(k) = api_key {
+            headers.insert("X-API-Key".to_string(), k.to_string());
+        }
+        RateLimitContext {
+            source_ip: IpAddr::V4(Ipv4Addr::from(ip)),
+            headers,
+            path: "/".to_string(),
+            method: "GET".to_string(),
+            query_params: HashMap::new(),
+            cookies: HashMap::new(),
+            ja3_hash: ja3.map(str::to_string),
+            ja4_hash: None,
+            route_name: None,
+        }
+    }
+
+    /// A key the client writes itself is counted beside its address, so a
+    /// new value with every request is still one client.
+    #[tokio::test]
+    async fn a_new_api_key_with_every_request_is_still_one_address() {
+        let limiter = AdvancedRateLimiter::new(layered_config(vec![
+            RateLimitKeyType::ApiKey,
+            RateLimitKeyType::SourceIp,
+        ]));
+        let mut refused = 0;
+        for n in 0..6 {
+            let key = format!("key-{n}");
+            let ctx = ctx_from([203, 0, 113, 7], Some(&key), None);
+            if !matches!(limiter.check(&ctx).await, RateLimitResult::Allowed { .. }) {
+                refused += 1;
+            }
+        }
+        assert!(refused >= 3, "{refused} of 6 refused at a burst of 2");
+        // Another address is not held by the first one's requests
+        let other = ctx_from([203, 0, 113, 8], Some("key-0"), None);
+        assert!(matches!(
+            limiter.check(&other).await,
+            RateLimitResult::Allowed { .. }
+        ));
+    }
+
+    /// Two addresses running the same client build each have their own
+    /// budget: a fingerprint names the build, not the user.
+    #[tokio::test]
+    async fn one_fingerprint_from_two_addresses_is_two_clients() {
+        let limiter = AdvancedRateLimiter::new(layered_config(vec![
+            RateLimitKeyType::Ja3Fingerprint,
+            RateLimitKeyType::SourceIp,
+        ]));
+        let ja3 = Some("e7d705a3286e19ea42f587b344ee6865");
+        let first = ctx_from([198, 51, 100, 1], None, ja3);
+        let mut refused = false;
+        for _ in 0..6 {
+            refused |= !matches!(limiter.check(&first).await, RateLimitResult::Allowed { .. });
+        }
+        assert!(refused, "the first address ran out");
+        let second = ctx_from([198, 51, 100, 2], None, ja3);
+        assert!(matches!(
+            limiter.check(&second).await,
+            RateLimitResult::Allowed { .. }
+        ));
+    }
+
+    #[test]
+    fn a_bucket_key_holds_no_value_the_client_wrote() {
+        let written = "a-value-the-client-wrote-0123456789";
+        let key = RateLimitKey::new(RateLimitKeyType::ApiKey, written.to_string());
+        let stored = key.storage_key("203.0.113.7");
+        assert!(!stored.contains(written));
+        assert_eq!(stored.len(), "ApiKey:".len() + 32);
+        assert!(!key.is_network_bound());
+
+        let long = RateLimitKey::new(RateLimitKeyType::Path, "/x".repeat(4000));
+        assert_eq!(long.storage_key("203.0.113.7").len(), "Path:".len() + 32);
+
+        let ja3 = RateLimitKey::new(RateLimitKeyType::Ja3Fingerprint, "abc".to_string());
+        assert_eq!(
+            ja3.storage_key("203.0.113.7"),
+            "Ja3Fingerprint:abc@203.0.113.7"
+        );
+
+        let ip = RateLimitKey::new(RateLimitKeyType::SourceIp, "203.0.113.7".to_string());
+        assert!(ip.is_network_bound());
+        assert_eq!(ip.storage_key("203.0.113.7"), ip.to_key_string());
+    }
+
+    /// Resetting an address clears what it was counted in under any key.
+    #[tokio::test]
+    async fn resetting_an_address_clears_its_fingerprint_bucket_too() {
+        let limiter = AdvancedRateLimiter::new(layered_config(vec![
+            RateLimitKeyType::Ja3Fingerprint,
+            RateLimitKeyType::SourceIp,
+        ]));
+        let ctx = ctx_from([198, 51, 100, 9], None, Some("abc"));
+        let _ = limiter.check(&ctx).await;
+        assert_eq!(limiter.reset_key("198.51.100.9"), 2);
     }
 }

@@ -226,15 +226,26 @@ impl LinkHint {
 #[derive(Clone)]
 pub struct EarlyHintsState {
     pub config: Arc<RwLock<EarlyHintsConfig>>,
-    /// Cache of host:path -> compiled hints
-    pub hints_cache: Arc<DashMap<String, CachedHints>>,
+    /// Compiled hints, by the rules they were compiled from: which reload of
+    /// the configuration, and which of its preload rules matched. The hints
+    /// are a function of those alone, so there are as many entries as there
+    /// are ways the rules combine, whatever paths are asked for.
+    pub hints_cache: Arc<DashMap<(u64, Vec<usize>), CachedHints>>,
+    /// Counts reloads of `config`; part of the cache key, so hints compiled
+    /// from one configuration are never served under the next.
+    generation: Arc<std::sync::atomic::AtomicU64>,
 }
+
+/// The most rule combinations whose hints are kept compiled; past it they are
+/// compiled per request.
+const MAX_HINT_SETS: usize = 1024;
 
 impl Default for EarlyHintsState {
     fn default() -> Self {
         Self {
             config: Arc::new(RwLock::new(EarlyHintsConfig::default())),
             hints_cache: Arc::new(DashMap::new()),
+            generation: Arc::default(),
         }
     }
 }
@@ -277,6 +288,7 @@ impl EarlyHintsState {
         Self {
             config: Arc::new(RwLock::new(Self::build_config(config))),
             hints_cache: Arc::new(DashMap::new()),
+            generation: Arc::default(),
         }
     }
 
@@ -285,7 +297,12 @@ impl EarlyHintsState {
     /// connections sees the change) and clears the compiled-hints cache so the
     /// next request rebuilds Link headers from the new rules.
     pub fn update_from_http3_config(&self, config: &crate::config::Http3Config) {
-        *self.config.write() = Self::build_config(config);
+        {
+            let mut held = self.config.write();
+            *held = Self::build_config(config);
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.hints_cache.clear();
     }
 
@@ -298,15 +315,37 @@ impl EarlyHintsState {
     /// Rules with a `host_pattern` only fire for that exact hostname.
     /// Rules with no `host_pattern` fire for every host.
     pub fn get_hints_for_request(&self, host: &str, path: &str) -> Vec<String> {
-        // Cache key includes host so per-domain rules don't bleed across domains
-        let cache_key = format!("{}:{}", host, path);
+        let config = self.config.read();
+        // Read under the config lock a reload takes to change it
+        let generation = self.generation.load(std::sync::atomic::Ordering::Relaxed);
+
+        // The preload rules that apply, respecting host and path filters
+        let matched: Vec<usize> = config
+            .preload_rules
+            .iter()
+            .enumerate()
+            .filter(|(_, rule)| {
+                let host_matches = match &rule.host_pattern {
+                    Some(h) => h == host,
+                    None => true,
+                };
+                let path_matches = if rule.exact {
+                    path == rule.path_pattern
+                } else {
+                    path.starts_with(&rule.path_pattern) || rule.path_pattern == "*"
+                };
+                host_matches && path_matches
+            })
+            .map(|(index, _)| index)
+            .collect();
+
+        let cache_key = (generation, matched);
         if let Some(cached) = self.hints_cache.get(&cache_key) {
             if !cached.versioned || cached.built.elapsed() < VERSIONED_HINTS_TTL {
                 return cached.headers.clone();
             }
         }
 
-        let config = self.config.read();
         let mut hints = Vec::new();
         let mut versioned = false;
 
@@ -314,28 +353,21 @@ impl EarlyHintsState {
         for origin in &config.preconnect_origins {
             hints.push(format!("<{}>; rel=preconnect", origin));
         }
-
-        // Find matching preload rules, respecting host and path filters
-        for rule in &config.preload_rules {
-            let host_matches = match &rule.host_pattern {
-                Some(h) => h == host,
-                None => true,
-            };
-            let path_matches = if rule.exact {
-                path == rule.path_pattern
-            } else {
-                path.starts_with(&rule.path_pattern) || rule.path_pattern == "*"
-            };
-            if host_matches && path_matches {
-                for hint in &rule.hints {
-                    versioned |= hint.is_versioned();
-                    hints.extend(hint.to_link_header());
-                }
+        for rule in cache_key
+            .1
+            .iter()
+            .filter_map(|i| config.preload_rules.get(*i))
+        {
+            for hint in &rule.hints {
+                versioned |= hint.is_versioned();
+                hints.extend(hint.to_link_header());
             }
         }
 
         // Cache the result (a versioned one is rebuilt after VERSIONED_HINTS_TTL)
-        if !hints.is_empty() || versioned {
+        if (!hints.is_empty() || versioned)
+            && (self.hints_cache.len() < MAX_HINT_SETS || self.hints_cache.contains_key(&cache_key))
+        {
             self.hints_cache.insert(
                 cache_key,
                 CachedHints {
@@ -853,6 +885,7 @@ impl Http3FeaturesState {
             early_hints: EarlyHintsState {
                 config: Arc::new(RwLock::new(early_hints)),
                 hints_cache: Arc::new(DashMap::new()),
+                generation: Arc::default(),
             },
             priority: PriorityState {
                 config: Arc::new(RwLock::new(priority)),
@@ -1030,6 +1063,50 @@ mod tests {
         assert_eq!(hint.to_link_header(), None);
     }
 
+    /// Hints are kept by the rules that produced them: any number of paths
+    /// under one rule is one entry.
+    #[test]
+    fn every_path_under_one_rule_shares_its_compiled_hints() {
+        let mut c = crate::config::Http3Config {
+            preconnect_origins: vec!["https://api.example.com".into()],
+            preload_resources: vec![crate::config::PreloadResourceConfig {
+                host: Some("example.com".into()),
+                path: "/app".into(),
+                href: "/css/site.css".into(),
+                rel: "preload".into(),
+                as_type: "style".into(),
+                crossorigin: None,
+                exact: false,
+                version_file: None,
+            }],
+            ..Default::default()
+        };
+        let state = EarlyHintsState::from_http3_config(&c);
+        for n in 0..500 {
+            assert_eq!(
+                state
+                    .get_hints_for_request("example.com", &format!("/app/{n}"))
+                    .len(),
+                2
+            );
+            assert_eq!(
+                state
+                    .get_hints_for_request("example.com", &format!("/other/{n}"))
+                    .len(),
+                1
+            );
+        }
+        assert_eq!(state.hints_cache.len(), 2);
+        // A reload starts again from the new rules
+        c.preload_resources.clear();
+        state.update_from_http3_config(&c);
+        assert_eq!(
+            state.get_hints_for_request("example.com", "/app/1").len(),
+            1
+        );
+        assert_eq!(state.hints_cache.len(), 1);
+    }
+
     #[test]
     fn versioned_hints_are_rebuilt_once_stale() {
         let css = file_with_mtime("site.css", 1_700_000_000);
@@ -1059,7 +1136,7 @@ mod tests {
         // Within the TTL the cached headers are served
         assert!(state.get_hints_for_request("example.com", "/")[0].contains("v=1700000000"));
         // Past it, the file is looked at again
-        if let Some(mut cached) = state.hints_cache.get_mut("example.com:/") {
+        for mut cached in state.hints_cache.iter_mut() {
             cached.built = Instant::now()
                 .checked_sub(VERSIONED_HINTS_TTL + Duration::from_secs(1))
                 .expect("the clock reaches back past one TTL");

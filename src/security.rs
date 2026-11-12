@@ -511,6 +511,47 @@ pub struct RequestPolicy {
     pub waf_mode: Option<String>,
     /// Per-route rate limits, overriding `[rate_limiting]`
     pub rate_limit_override: Option<RateLimitConfig>,
+    /// A GET or HEAD for one of the error pages
+    /// (`security.error_pages_path_prefix`): served to an address on the
+    /// blocklist or refused by location too, since those refusals send the
+    /// visitor here. Every other rule applies to it as to any request.
+    pub error_page: bool,
+}
+
+/// The policy a request for `host` (lowercase, no port) and canonical `path`
+/// is judged by: its route's, where one matches. Both transports resolve it
+/// here, from the host and path they route on.
+pub fn request_policy(
+    routes: &ProxyConfig,
+    host: Option<&str>,
+    path: &str,
+    method: &hyper::Method,
+) -> RequestPolicy {
+    // The conformance vhost has no route entry: its flag is OR'd in.
+    let on_conformance_host = is_conformance_host(routes, host);
+    let prefix = &routes.security.error_pages_path_prefix;
+    let error_page = !prefix.is_empty()
+        && path.starts_with(prefix.as_str())
+        && matches!(*method, hyper::Method::GET | hyper::Method::HEAD);
+    let mut policy = routes
+        .find_route(host, path, false)
+        .map(|r| RequestPolicy {
+            skip_bot_blocking: r.skip_bot_blocking,
+            credentialed_clients: r.allow_credentialed_clients,
+            programmatic_clients: r.allow_programmatic_clients,
+            allowed_ja3: r.security.as_ref().and_then(|s| s.allowed_ja3.clone()),
+            waf_enabled: r.security.as_ref().and_then(|s| s.waf_enabled),
+            waf_mode: r.security.as_ref().and_then(|s| s.waf_mode.clone()),
+            rate_limit_override: r
+                .security
+                .as_ref()
+                .and_then(|s| s.rate_limit_override.clone()),
+            error_page: false,
+        })
+        .unwrap_or_default();
+    policy.skip_bot_blocking |= on_conformance_host;
+    policy.error_page = error_page;
+    policy
 }
 
 /// One-second sliding window of new connections from a single IP.
@@ -873,6 +914,14 @@ impl SecurityState {
     /// SEC-A05: Unconditionally trusts loopback only.  RFC1918 private ranges are
     /// NOT implicitly trusted — they must be listed in `security.trusted_internal_cidrs`
     /// to receive bypass treatment, making the trust decision explicit and auditable.
+    /// Whether `ip` is outside the per-address connection limit: a trusted
+    /// address, or one of `pentest_bypass_ips` (the operator's own hosts,
+    /// which probe and test in bursts).
+    pub fn is_limit_exempt(&self, ip: &IpAddr) -> bool {
+        self.is_trusted(ip)
+            || crate::config::ip_list_contains(&self.config.read().pentest_bypass_ips, ip)
+    }
+
     pub fn is_trusted(&self, ip: &IpAddr) -> bool {
         if is_trusted_ip(ip) {
             return true;
@@ -907,7 +956,8 @@ impl SecurityState {
         });
     }
 
-    /// Keep the host names in `pentest_bypass_ips` resolved (see host_names.rs),
+    /// Keep the host names in `pentest_bypass_ips`, and those other lists have
+    /// asked for (`host_names::watch`), resolved (see host_names.rs),
     /// from the configuration as it stands at each round, so a reload that
     /// adds or drops one takes effect within a REFRESH.
     fn spawn_host_names_task(&self) {
@@ -919,13 +969,14 @@ impl SecurityState {
                 interval.tick().await;
                 let (resolver, names) = {
                     let c = config.read();
-                    let names: Vec<String> = c
+                    let mut names: Vec<String> = c
                         .pentest_bypass_ips
                         .iter()
                         .filter(|e| e.trim().parse::<IpAddr>().is_err())
                         .filter(|e| crate::host_names::is_host_name(e))
                         .cloned()
                         .collect();
+                    names.extend(crate::host_names::watched());
                     (c.host_resolver, names)
                 };
                 crate::host_names::retain(&names);
@@ -935,7 +986,7 @@ impl SecurityState {
                     }
                     None if !names.is_empty() && !warned => {
                         warn!(
-                            "security.pentest_bypass_ips names {names:?}, but no \
+                            "host names are listed ({names:?}), but no \
                              security.host_resolver is set: they match nothing"
                         );
                         warned = true;
@@ -1636,7 +1687,10 @@ impl SecurityState {
         // the whole block duration despite the bypass. A deliberate operator
         // block still stands — Manual, DatabaseSync and GeoBlocked are decisions,
         // not heuristics.
-        if let Some(info) = self.is_blocked(&ip) {
+        //
+        // An error page is what these two refusals send a visitor to, so it is
+        // served to a blocked address as well (`RequestPolicy::error_page`).
+        if let Some(info) = self.is_blocked(&ip).filter(|_| !policy.error_page) {
             let automatic = matches!(
                 info.reason,
                 BlockReason::RateLimitExceeded
@@ -1666,7 +1720,7 @@ impl SecurityState {
         }
 
         // 3. Location and network: country, region, AS, Tor exit.
-        if let Some(reason) = self.geo_block_reason(&ip) {
+        if let Some(reason) = self.geo_block_reason(&ip).filter(|_| !policy.error_page) {
             warn!("GeoIP blocked request from {} ({})", ip, reason);
             // `geoip_block_duration_secs = 0` means the block never expires.
             //
@@ -2245,43 +2299,49 @@ pub async fn security_middleware(
     }
     let ip = client_addr.ip();
 
+    // The host this request names, as every other layer reads it; a request
+    // that names two is malformed (see crate::request_target).
+    let host = match crate::request_target::effective_host_name(request.uri(), &headers) {
+        Ok(host) => host,
+        Err(crate::request_target::HostMismatch) => {
+            warn!(
+                "Request from {} names two hosts (request target and Host field)",
+                ip
+            );
+            let response =
+                (StatusCode::BAD_REQUEST, "Host and request target disagree").into_response();
+            let header_str =
+                |name: hyper::header::HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
+            log_access(&AccessLogEntry {
+                ja3: None,
+                ja4: None,
+                backend: None,
+                remote_addr: client_addr,
+                method: request.method().as_str(),
+                path: request.uri().path(),
+                protocol: crate::access_logger::protocol_name(request.version()),
+                status: response.status().as_u16(),
+                body_size: crate::access_logger::declared_body_size(response.headers()),
+                referer: header_str(hyper::header::REFERER),
+                user_agent: header_str(hyper::header::USER_AGENT),
+                host: header_str(hyper::header::HOST),
+                response_time_ms: 0,
+            });
+            return response;
+        }
+    };
+
     // Resolve the route before any check runs, so per-route policy can shape
-    // what follows. None means no route matched, in which case the global
-    // settings apply unchanged.
+    // what follows: by the host and canonical path the request is routed on.
+    // None means no route matched, in which case the global settings apply
+    // unchanged.
     let route_policy = {
-        // Header first, URI authority second: HTTP/2 sends no `Host` header, so
-        // reading only the header left every h2 request looking hostless here.
-        let host = headers
-            .get(hyper::header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned)
-            .or_else(|| request.uri().host().map(str::to_owned))
-            .map(|h| crate::config::host_without_port(&h).to_ascii_lowercase());
-        let req_path = request.uri().path().to_string();
         let routes = security.route_index.load_full();
-        let on_conformance_host = is_conformance_host(&routes, host.as_deref());
-        routes
-            .find_route(host.as_deref(), &req_path, false)
-            .map(|r| RequestPolicy {
-                skip_bot_blocking: r.skip_bot_blocking,
-                credentialed_clients: r.allow_credentialed_clients,
-                programmatic_clients: r.allow_programmatic_clients,
-                allowed_ja3: r.security.as_ref().and_then(|s| s.allowed_ja3.clone()),
-                waf_enabled: r.security.as_ref().and_then(|s| s.waf_enabled),
-                waf_mode: r.security.as_ref().and_then(|s| s.waf_mode.clone()),
-                rate_limit_override: r
-                    .security
-                    .as_ref()
-                    .and_then(|s| s.rate_limit_override.clone()),
-            })
-            .map(|mut p| {
-                p.skip_bot_blocking |= on_conformance_host;
-                p
-            })
-            .unwrap_or_else(|| RequestPolicy {
-                skip_bot_blocking: on_conformance_host,
-                ..RequestPolicy::default()
-            })
+        let path = crate::path_canon::canonical_path(
+            request.uri().path(),
+            crate::path_canon::PathCanon::from(&routes.server),
+        );
+        request_policy(&routes, host.as_deref(), &path, request.method())
     };
 
     // The body-scan paths below run after `request` is consumed, so take the
@@ -2299,22 +2359,6 @@ pub async fn security_middleware(
     if security.is_trusted(&ip) {
         debug!("Trusted IP {} - bypassing security checks", ip);
         return next.run(request).await;
-    }
-
-    // Error pages are public content — exempt from all blocks so geo-redirected users can
-    // reach them even after their IP has been added to the temporary blocklist.
-    {
-        let exempt = {
-            let config = security.config.read();
-            !config.error_pages_path_prefix.is_empty()
-                && request
-                    .uri()
-                    .path()
-                    .starts_with(&config.error_pages_path_prefix)
-        };
-        if exempt {
-            return next.run(request).await;
-        }
     }
 
     // Authorized pentest bypass: skip rate-limiting and auto-block but still run WAF.
@@ -2406,7 +2450,7 @@ pub async fn security_middleware(
                 body_size: crate::access_logger::declared_body_size(response.headers()),
                 referer: header_str(hyper::header::REFERER),
                 user_agent: header_str(hyper::header::USER_AGENT),
-                host: header_str(hyper::header::HOST),
+                host: host.as_deref(),
                 response_time_ms: 0,
             });
 
@@ -4052,6 +4096,73 @@ mod decision_rendering_tests {
             Some(Duration::from_hours(24)),
             "a real duration must still expire"
         );
+    }
+
+    /// An error page is served to an address the blocklist would refuse,
+    /// since that refusal is what sends a visitor there. Nothing else about
+    /// the request is judged differently, and only the canonical path counts.
+    #[tokio::test]
+    async fn an_error_page_is_exempt_from_the_blocklist_and_nothing_else() {
+        let mut config = ProxyConfig::default();
+        config.waf.enabled = true;
+        config.security.error_pages_path_prefix = "/error_pages/".into();
+        let security = SecurityState::new(&config);
+        let ip: IpAddr = "203.0.113.77".parse().unwrap();
+        security.block_ip(ip, BlockReason::Manual, None);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "user-agent",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/141.0 Safari/537.36"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("accept", "text/html".parse().unwrap());
+        let judge = |method: &hyper::Method, raw: &str, query: &str| {
+            let canonical = crate::path_canon::canonical_path(
+                raw,
+                crate::path_canon::PathCanon::from(&config.server),
+            );
+            let policy = request_policy(&config, Some("example.com"), &canonical, method);
+            let lowered = raw.to_ascii_lowercase();
+            let view = SecurityRequestView {
+                ip,
+                peer_port: Some(40000),
+                method: method.as_str(),
+                path: &lowered,
+                query,
+                headers: &headers,
+                body: None,
+            };
+            security.evaluate(&view, &policy)
+        };
+        let get = hyper::Method::GET;
+
+        assert!(matches!(
+            judge(&get, "/error_pages/403.html", ""),
+            SecurityDecision::Allow
+        ));
+        // Any other page: the block stands
+        assert!(matches!(judge(&get, "/", ""), SecurityDecision::Blocked(_)));
+        // A path that only starts like one resolves elsewhere, and is judged there
+        assert!(!matches!(
+            judge(&get, "/error_pages/../", ""),
+            SecurityDecision::Allow
+        ));
+        // The page itself is still inspected
+        assert!(matches!(
+            judge(
+                &get,
+                "/error_pages/403.html",
+                "id=1%27%20UNION%20SELECT%20password%20FROM%20users--"
+            ),
+            SecurityDecision::WafBlock { .. }
+        ));
+        // And only read: a POST there is an ordinary request
+        assert!(matches!(
+            judge(&hyper::Method::POST, "/error_pages/403.html", ""),
+            SecurityDecision::Blocked(_)
+        ));
     }
 
     /// A blocked IP is refused outright, not redirected: the caller is being

@@ -18,6 +18,10 @@ use serde::Serialize;
 
 /// Maximum number of recent failures to keep
 const FAILURE_LOG_SIZE: usize = 100;
+/// How many failing paths the per-endpoint error table follows.
+const MAX_ENDPOINT_ERRORS: usize = 2048;
+/// The most of a failing path that is kept, in bytes.
+const MAX_ERROR_PATH_LEN: usize = 256;
 
 /// Global metrics registry
 pub struct MetricsRegistry {
@@ -196,7 +200,7 @@ pub struct RequestMetrics {
     /// Per-endpoint error tracking keyed by "path\0error_type"
     endpoint_errors: Mutex<HashMap<String, EndpointErrorInfo>>,
     /// Recent failure log (ring buffer)
-    failure_log: Mutex<Vec<FailureEntry>>,
+    failure_log: Mutex<std::collections::VecDeque<FailureEntry>>,
 }
 
 impl RequestMetrics {
@@ -211,7 +215,7 @@ impl RequestMetrics {
             bytes_sent: AtomicU64::new(0),
             latency_histogram: LatencyHistogram::new(),
             endpoint_errors: Mutex::new(HashMap::new()),
-            failure_log: Mutex::new(Vec::with_capacity(FAILURE_LOG_SIZE)),
+            failure_log: Mutex::new(std::collections::VecDeque::with_capacity(FAILURE_LOG_SIZE)),
         }
     }
 
@@ -288,6 +292,8 @@ impl RequestMetrics {
         } else {
             "server"
         };
+        // A path is the client's to choose: what is kept of one is bounded.
+        let normalized = bounded_path(normalized);
         // Update per-endpoint error tracking keyed by "path\0error_type"
         let key = format!("{}\0{}", normalized, error_type);
         let ts = i64::try_from(
@@ -299,8 +305,24 @@ impl RequestMetrics {
         .unwrap_or(i64::MAX);
         {
             let mut map = self.endpoint_errors.lock();
+            // The table holds the MAX_ENDPOINT_ERRORS paths that fail most
+            // (Space-Saving, Metwally et al. 2005): a path not in a full table
+            // takes the place of the one with the fewest failures and starts
+            // from that count, so a path that really is failing often is
+            // never pushed out by ones that each fail once.
+            let mut floor = 0;
+            if !map.contains_key(&key) && map.len() >= MAX_ENDPOINT_ERRORS {
+                let least = map
+                    .iter()
+                    .min_by_key(|(_, info)| info.count)
+                    .map(|(k, info)| (k.clone(), info.count));
+                if let Some((least_key, least_count)) = least {
+                    map.remove(&least_key);
+                    floor = least_count;
+                }
+            }
             let info = map.entry(key).or_insert(EndpointErrorInfo {
-                count: 0,
+                count: floor,
                 last_status: 0,
                 last_seen_ms: 0,
             });
@@ -316,9 +338,9 @@ impl RequestMetrics {
         };
         let mut log = self.failure_log.lock();
         if log.len() >= FAILURE_LOG_SIZE {
-            log.remove(0);
+            log.pop_front();
         }
-        log.push(entry);
+        log.push_back(entry);
     }
 
     /// Get per-endpoint error counts sorted by count descending, optionally filtered by type
@@ -358,7 +380,7 @@ impl RequestMetrics {
 
     /// Get recent failure log entries
     pub fn recent_failures(&self) -> Vec<FailureEntry> {
-        self.failure_log.lock().clone()
+        self.failure_log.lock().iter().cloned().collect()
     }
 
     /// Get total error count (client + server errors)
@@ -1541,6 +1563,18 @@ impl LatencyHistogram {
 
 /// Normalize a request path for grouping: strip query strings and collapse
 /// UUIDs/numeric IDs to placeholders so `/keys/abc-123` groups as `/keys/{id}`.
+/// `path` cut to [`MAX_ERROR_PATH_LEN`] bytes, on a character boundary.
+fn bounded_path(mut path: String) -> String {
+    if path.len() > MAX_ERROR_PATH_LEN {
+        let mut end = MAX_ERROR_PATH_LEN;
+        while !path.is_char_boundary(end) {
+            end -= 1;
+        }
+        path.truncate(end);
+    }
+    path
+}
+
 fn normalize_path(path: &str) -> String {
     let base = path.split('?').next().unwrap_or(path);
     let segments: Vec<&str> = base.split('/').collect();
@@ -1576,6 +1610,32 @@ mod tests {
         assert_eq!(h.cumulative_count.load(Ordering::Relaxed), 5);
         assert!(h.percentile(50) >= 10.0);
         assert!(h.percentile(99) >= 100.0);
+    }
+
+    /// The failing-path table is bounded, and a path that fails often stays
+    /// in it through any number of paths that fail once.
+    #[test]
+    fn the_failing_path_table_is_bounded_and_keeps_what_fails_most() {
+        let m = RequestMetrics::new();
+        for _ in 0..50 {
+            m.request_end_full(500, Duration::from_millis(1), 0, 0, Some("/checkout"));
+        }
+        for n in 0..(MAX_ENDPOINT_ERRORS * 3) {
+            let path = format!("/probe-{n}-{}", "x".repeat(1000));
+            m.request_end_full(404, Duration::from_millis(1), 0, 0, Some(&path));
+        }
+        let table = m.endpoint_error_counts();
+        assert!(
+            table.len() <= MAX_ENDPOINT_ERRORS,
+            "{} entries",
+            table.len()
+        );
+        assert!(table.iter().all(|e| e.path.len() <= MAX_ERROR_PATH_LEN));
+        assert!(
+            table.iter().any(|e| e.path == "/checkout" && e.count >= 50),
+            "the path that fails most was pushed out"
+        );
+        assert_eq!(m.recent_failures().len(), FAILURE_LOG_SIZE);
     }
 
     #[test]

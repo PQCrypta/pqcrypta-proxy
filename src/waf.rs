@@ -2069,9 +2069,14 @@ impl WafEngine {
         // (which targets specific paths with GET/POST).
         let is_root_protocol_probe = req.method.eq_ignore_ascii_case("HEAD") && req.path == "/";
 
-        let ua = req.headers.get("user-agent").and_then(|v| v.to_str().ok());
+        // Read lossily, like every other header: a name with one octet outside
+        // visible ASCII is still the name the client gave.
+        let ua = req
+            .headers
+            .get("user-agent")
+            .map(|v| String::from_utf8_lossy(v.as_bytes()));
 
-        match ua {
+        match ua.as_deref() {
             // No User-Agent header at all.
             None => {
                 if !is_root_protocol_probe {
@@ -2133,9 +2138,9 @@ impl WafEngine {
             if HEADERS_NEVER_SCANNED.contains(&name_str) {
                 continue;
             }
-            let Ok(v) = value.to_str() else {
-                continue;
-            };
+            // Lossy, as a body is read: a value is text to whatever parses it
+            // next whether or not every octet of it is visible ASCII.
+            let v = String::from_utf8_lossy(value.as_bytes());
             let filter = if HEADERS_SSRF_EXEMPT.contains(&name_str) {
                 Filter::NO_SSRF
             } else {
@@ -2144,7 +2149,7 @@ impl WafEngine {
             a.scanning = format!("header:{name_str}");
             if self.scan_payload(
                 a,
-                v,
+                &v,
                 excluded,
                 filter,
                 self.config.max_header_scan_bytes,
@@ -2296,21 +2301,21 @@ impl WafEngine {
         // Request smuggling: a second Content-Length, or Content-Length beside
         // Transfer-Encoding, means two parsers in the chain can disagree about
         // where this request ends.
-        let cls: Vec<&str> = req
+        let cls: Vec<std::borrow::Cow<'_, str>> = req
             .headers
             .get_all("content-length")
             .iter()
-            .filter_map(|v| v.to_str().ok())
+            .map(|v| String::from_utf8_lossy(v.as_bytes()))
             .collect();
         if cls.len() > 1 && cls.iter().any(|v| v.trim() != cls[0].trim()) && hit(0, a) {
             return;
         }
 
-        let tes: Vec<&str> = req
+        let tes: Vec<std::borrow::Cow<'_, str>> = req
             .headers
             .get_all("transfer-encoding")
             .iter()
-            .filter_map(|v| v.to_str().ok())
+            .map(|v| String::from_utf8_lossy(v.as_bytes()))
             .collect();
         if !tes.is_empty() && !cls.is_empty() && hit(1, a) {
             return;
@@ -2352,11 +2357,11 @@ impl WafEngine {
             return;
         }
 
-        let hosts: Vec<&str> = req
+        let hosts: Vec<std::borrow::Cow<'_, str>> = req
             .headers
             .get_all("host")
             .iter()
-            .filter_map(|v| v.to_str().ok())
+            .map(|v| String::from_utf8_lossy(v.as_bytes()))
             .collect();
         // A Host containing a space, slash or userinfo marker is an attempt at
         // routing or cache confusion, not a hostname.
@@ -3061,6 +3066,43 @@ mod tests {
             let v = engine().inspect(&req("GET", "/", &headers));
             assert!(blocked(&v), "SQLi in the {header} header must be blocked");
         }
+    }
+
+    /// A header value is read the way a body is: lossily, so an octet outside
+    /// visible ASCII changes nothing about what is scanned.
+    #[test]
+    fn a_header_value_with_other_octets_is_still_scanned() {
+        let e = engine();
+        for raw in [
+            &b"\xe9 1' UNION SELECT password FROM users--"[..],
+            &b"https://x.example/\xc3\xa9<script>alert(1)</script>"[..],
+        ] {
+            let mut h = browser_headers();
+            h.insert(
+                "x-custom",
+                axum::http::HeaderValue::from_bytes(raw).expect("obs-text is a legal value"),
+            );
+            assert!(
+                blocked(&e.inspect(&req("GET", "/", &h))),
+                "not scanned: {:?}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+    }
+
+    /// A scanner's name with such an octet in it is still that scanner's
+    /// name, not a missing User-Agent.
+    #[test]
+    fn a_scanner_user_agent_with_other_octets_is_still_that_scanner() {
+        let e = engine();
+        let mut h = browser_headers();
+        h.insert(
+            "user-agent",
+            axum::http::HeaderValue::from_bytes(b"sqlmap/1.7\xe9").expect("a legal value"),
+        );
+        let v = e.inspect(&req("GET", "/", &h));
+        assert!(blocked(&v));
+        assert!(!rule_of(&v).contains("PQW-BOT-900"), "{}", rule_of(&v));
     }
 
     /// HTML character references are the other common encoding for a reflected

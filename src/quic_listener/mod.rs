@@ -394,43 +394,94 @@ pub(crate) fn install_crypto(
 /// `is_conformance_host`, ran `find_route` (an O(routes) scan -- one route in a
 /// test config, sixty on the live edge, nine of them carrying regexes) and
 /// cloned every policy field. Extracted so the caller can resolve it once.
+/// Whether an extended CONNECT this listener answers itself (WebTransport,
+/// WebSocket, CONNECT-UDP) is refused, and with which status: the advanced
+/// rate limiter and `SecurityState::evaluate`, as for any other request. A
+/// client opening a session is a program, so the user-agent rules for unnamed
+/// clients are not applied to it.
+async fn connect_refusal(
+    security: &SecurityState,
+    advanced_rate_limiter: &AdvancedRateLimiter,
+    request: &http::Request<()>,
+    host: Option<&str>,
+    path: &str,
+    remote_addr: SocketAddr,
+    fingerprint: &crate::fingerprint::FingerprintResult,
+) -> Option<http::StatusCode> {
+    let ip = remote_addr.ip();
+    if security.is_trusted(&ip) {
+        return None;
+    }
+    let context = crate::rate_limiter::build_context_from_request(
+        ip,
+        request.headers(),
+        path,
+        request.method().as_str(),
+        fingerprint.ja3_hash.clone(),
+        fingerprint.ja4_hash.clone(),
+        None,
+    );
+    match advanced_rate_limiter.check(&context).await {
+        crate::rate_limiter::RateLimitResult::Allowed { .. } => {}
+        crate::rate_limiter::RateLimitResult::Limited { .. } => {
+            return Some(http::StatusCode::TOO_MANY_REQUESTS);
+        }
+        crate::rate_limiter::RateLimitResult::Blocked { .. } => {
+            return Some(http::StatusCode::FORBIDDEN);
+        }
+    }
+    let mut policy = resolve_route_policy(security, request, host, path);
+    policy.skip_bot_blocking = true;
+    let raw_path = request.uri().path().to_ascii_lowercase();
+    let view = crate::security::SecurityRequestView {
+        ip,
+        peer_port: Some(remote_addr.port()),
+        method: request.method().as_str(),
+        path: &raw_path,
+        query: request.uri().query().unwrap_or(""),
+        headers: request.headers(),
+        body: None,
+    };
+    let decision = security.evaluate(&view, &policy);
+    let config = security.config.read();
+    crate::security::decision_rendering(&decision, None, &config).map(|r| r.status)
+}
+
+/// The access-log line of an extended CONNECT answered here.
+fn log_connect(
+    request: &http::Request<()>,
+    host: Option<&str>,
+    path: &str,
+    remote_addr: SocketAddr,
+    fingerprint: &crate::fingerprint::FingerprintResult,
+    status: u16,
+) {
+    let field = |name: HeaderName| request.headers().get(name).and_then(|v| v.to_str().ok());
+    crate::access_logger::log_access(&crate::access_logger::AccessLogEntry {
+        ja3: fingerprint.ja3_hash.as_deref(),
+        ja4: fingerprint.ja4_hash.as_deref(),
+        backend: None,
+        remote_addr,
+        method: request.method().as_str(),
+        path,
+        protocol: "HTTP/3",
+        status,
+        body_size: 0,
+        referer: field(header::REFERER),
+        user_agent: field(header::USER_AGENT),
+        host,
+        response_time_ms: 0,
+    });
+}
+
 fn resolve_route_policy(
     security: &SecurityState,
     request: &http::Request<()>,
+    host: Option<&str>,
     path: &str,
 ) -> crate::security::RequestPolicy {
-    let host = request
-        .headers()
-        .get(hyper::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .map(|h| crate::config::host_without_port(h).to_ascii_lowercase())
-        .or_else(|| request.uri().host().map(str::to_ascii_lowercase));
     let routes = security.route_index.load_full();
-    let on_conformance_host = crate::security::is_conformance_host(&routes, host.as_deref());
-    routes
-        .find_route(host.as_deref(), path, false)
-        .map(|r| crate::security::RequestPolicy {
-            // The conformance vhost has no route entry, so the flag has to be
-            // OR'd in rather than read from one.
-            skip_bot_blocking: r.skip_bot_blocking || on_conformance_host,
-            credentialed_clients: r.allow_credentialed_clients,
-            programmatic_clients: r.allow_programmatic_clients,
-            allowed_ja3: r.security.as_ref().and_then(|s| s.allowed_ja3.clone()),
-            waf_enabled: r.security.as_ref().and_then(|s| s.waf_enabled),
-            waf_mode: r.security.as_ref().and_then(|s| s.waf_mode.clone()),
-            rate_limit_override: r
-                .security
-                .as_ref()
-                .and_then(|s| s.rate_limit_override.clone()),
-        })
-        // No route matched — which is the conformance vhost's normal state,
-        // since it is answered in-process and has no route entry.
-        // `unwrap_or_default()` alone would drop the flag on exactly the host
-        // that needs it.
-        .unwrap_or_else(|| crate::security::RequestPolicy {
-            skip_bot_blocking: on_conformance_host,
-            ..crate::security::RequestPolicy::default()
-        })
+    crate::security::request_policy(&routes, host, path, request.method())
 }
 
 /// A route's header decisions and then the security headers onto an HTTP/3
@@ -755,7 +806,22 @@ impl QuicListener {
                         false
                     };
 
-                    if should_refuse {
+                    // A place under the connection limits, taken once the
+                    // address is validated (a Retry costs nothing to answer).
+                    let validated = !self.config.server.enable_quic_retry
+                        || incoming.remote_address_validated();
+                    let slot = if should_refuse || !validated {
+                        None
+                    } else {
+                        let slot =
+                            crate::conn_limits::admit(ip, self.security.is_limit_exempt(&ip));
+                        if slot.is_none() {
+                            debug!("[QUIC] Refusing {}: connection limit reached", remote_addr);
+                        }
+                        slot
+                    };
+
+                    if should_refuse || (validated && slot.is_none()) {
                         incoming.refuse();
                     } else if self.config.server.enable_quic_retry
                         && !incoming.remote_address_validated()
@@ -795,6 +861,8 @@ impl QuicListener {
                         let doq = self.doq.clone();
 
                         tokio::spawn(async move {
+                            // Held until the connection ends
+                            let _slot = slot;
                             metrics.connections.connection_opened(ConnectionProtocol::Http3);
                             if let Err(e) = Self::handle_connection(
                                 incoming,
@@ -898,14 +966,19 @@ impl QuicListener {
         // Accept connection
         let mut connecting = incoming.accept()?;
 
+        // The handshake has the time a TCP one has (tls.handshake_timeout_secs);
+        // the idle timeout is for a connection that completed it.
+        let handshake_deadline = tokio::time::Instant::now()
+            + Duration::from_secs(config.tls.handshake_timeout_secs.max(1));
+
         // Readable once the server has processed the ClientHello. Whether it
         // accepted 0-RTT is settled in that same step, and when it did, nothing
         // else here can still change: early data is impossible after a
         // HelloRetryRequest, which is the one thing that leaves the group and
         // ALPN undecided at this point.
-        let hello_data = connecting
-            .handshake_data()
-            .await?
+        let hello_data = tokio::time::timeout_at(handshake_deadline, connecting.handshake_data())
+            .await
+            .map_err(|_| anyhow::anyhow!("QUIC handshake timed out before the ClientHello"))??
             .downcast::<quinn::crypto::rustls::HandshakeData>()
             .ok();
         let early_data = hello_data.as_ref().is_some_and(|d| d.early_data_accepted);
@@ -929,6 +1002,21 @@ impl QuicListener {
         let (connection, established) = connecting
             .into_0rtt()
             .map_err(|_| anyhow::anyhow!("QUIC stack refused 0.5-RTT on an incoming connection"))?;
+        // The handshake's completion, held to its deadline: a connection that
+        // has not finished by then is closed, which resolves it.
+        let established: Established = {
+            let connection = connection.clone();
+            Box::pin(async move {
+                tokio::pin!(established);
+                tokio::select! {
+                    accepted = &mut established => accepted,
+                    () = tokio::time::sleep_until(handshake_deadline) => {
+                        connection.close(0u32.into(), b"handshake timeout");
+                        established.await
+                    }
+                }
+            })
+        };
 
         // DNS over QUIC, where the client named it: `doq` is in the ALPN list
         // only when `[doq]` is on, so a negotiated `doq` has its service
@@ -1346,17 +1434,15 @@ impl QuicListener {
                         crate::path_canon::PathCanon::from(&config.server),
                     )
                     .into_owned();
-                    // In HTTP/3, host comes from :authority pseudo-header (in URI) or fallback to host header
-                    let host = uri
-                        .authority()
-                        .map(|a| a.host().to_ascii_lowercase())
-                        .or_else(|| {
-                            request
-                                .headers()
-                                .get("host")
-                                .and_then(|v| v.to_str().ok())
-                                .map(String::from)
-                        });
+                    // The host this request names (crate::request_target); one
+                    // that names two is left to the request handler, which
+                    // answers it 400.
+                    let Ok(host) =
+                        crate::request_target::effective_host_name(&uri, request.headers())
+                    else {
+                        spawn_request(stream, request);
+                        continue;
+                    };
 
                     // Check for protocol extension (RFC 9220 Extended CONNECT)
                     // In h3 crate, the :protocol pseudo-header is accessed via extensions
@@ -1385,6 +1471,54 @@ impl QuicListener {
                             .map(|p| p.as_str() == "connect-udp")
                             .unwrap_or(false);
 
+                    // What this listener answers itself is held to the rules
+                    // every other request meets before anything is opened, and
+                    // written to the access log either way.
+                    if is_webtransport || is_ws_h3 || is_connect_udp {
+                        let refusal = connect_refusal(
+                            &security,
+                            &advanced_rate_limiter,
+                            &request,
+                            host.as_deref(),
+                            &path,
+                            remote_addr,
+                            &fingerprint,
+                        )
+                        .await;
+                        if let Some(status) = refusal {
+                            log_connect(
+                                &request,
+                                host.as_deref(),
+                                &path,
+                                remote_addr,
+                                &fingerprint,
+                                status.as_u16(),
+                            );
+                            warn!(
+                                "[QUIC/H3] extended CONNECT ({:?}) for {} from {} refused: {}",
+                                protocol_ext, path, remote_addr, status
+                            );
+                            let mut stream = stream;
+                            let refused = http::Response::builder().status(status).body(())?;
+                            if stream.send_response(refused).await.is_ok() {
+                                let _ = stream.finish().await;
+                            }
+                            continue;
+                        }
+                    }
+
+                    // The access-log line of whichever answer follows.
+                    let log_outcome = |status: http::StatusCode| {
+                        log_connect(
+                            &request,
+                            host.as_deref(),
+                            &path,
+                            remote_addr,
+                            &fingerprint,
+                            status.as_u16(),
+                        );
+                    };
+
                     if is_webtransport {
                         info!(
                             "WebTransport CONNECT request for {} from {} (host: {:?})",
@@ -1407,6 +1541,7 @@ impl QuicListener {
                                 "WebTransport CONNECT rejected (no WT route) for {} from {}",
                                 path, remote_addr
                             );
+                            log_outcome(http::StatusCode::NOT_FOUND);
                             let reject = http::Response::builder()
                                 .status(http::StatusCode::NOT_FOUND)
                                 .body(())?;
@@ -1451,6 +1586,7 @@ impl QuicListener {
                             "WebTransport session accepted for {} on path {}",
                             remote_addr, path
                         );
+                        log_outcome(http::StatusCode::OK);
 
                         // Track WebTransport session in metrics
                         metrics
@@ -1521,6 +1657,7 @@ impl QuicListener {
 
                         if !config.masque.enabled {
                             debug!("CONNECT-UDP rejected (disabled) from {}", remote_addr);
+                            log_outcome(http::StatusCode::NOT_FOUND);
                             let reject = http::Response::builder()
                                 .status(http::StatusCode::NOT_FOUND)
                                 .body(())?;
@@ -1534,6 +1671,7 @@ impl QuicListener {
                                 "CONNECT-UDP bad target path '{}' from {}",
                                 path, remote_addr
                             );
+                            log_outcome(http::StatusCode::BAD_REQUEST);
                             let reject = http::Response::builder()
                                 .status(http::StatusCode::BAD_REQUEST)
                                 .body(())?;
@@ -1546,6 +1684,7 @@ impl QuicListener {
                                 "CONNECT-UDP target {}:{} not allowed (from {})",
                                 target_host, target_port, remote_addr
                             );
+                            log_outcome(http::StatusCode::FORBIDDEN);
                             let reject = http::Response::builder()
                                 .status(http::StatusCode::FORBIDDEN)
                                 .body(())?;
@@ -1563,12 +1702,32 @@ impl QuicListener {
                                 "CONNECT-UDP: cannot resolve {}:{} (from {})",
                                 target_host, target_port, remote_addr
                             );
+                            log_outcome(http::StatusCode::BAD_GATEWAY);
                             let reject = http::Response::builder()
                                 .status(http::StatusCode::BAD_GATEWAY)
                                 .body(())?;
                             let _ = stream.send_response(reject).await;
                             continue;
                         };
+
+                        // For the clients masque.allowed_clients admits, and to
+                        // a target on this host or a private network only for
+                        // those masque.private_target_clients names.
+                        if !config
+                            .masque
+                            .is_client_allowed(remote_addr.ip(), target_addr.ip())
+                        {
+                            warn!(
+                                "CONNECT-UDP to {} is not open to {}",
+                                target_addr, remote_addr
+                            );
+                            log_outcome(http::StatusCode::FORBIDDEN);
+                            let reject = http::Response::builder()
+                                .status(http::StatusCode::FORBIDDEN)
+                                .body(())?;
+                            let _ = stream.send_response(reject).await;
+                            continue;
+                        }
 
                         // Start (or reuse) the per-connection datagram router.
                         let router = datagram_router
@@ -1578,6 +1737,7 @@ impl QuicListener {
                         if router.session_count().await >= config.masque.max_sessions_per_connection
                         {
                             warn!("CONNECT-UDP: session limit reached for {}", remote_addr);
+                            log_outcome(http::StatusCode::SERVICE_UNAVAILABLE);
                             let reject = http::Response::builder()
                                 .status(http::StatusCode::SERVICE_UNAVAILABLE)
                                 .body(())?;
@@ -1603,6 +1763,7 @@ impl QuicListener {
                             "CONNECT-UDP session opened: {} -> {} (qsid={})",
                             remote_addr, target_addr, quarter_id
                         );
+                        log_outcome(http::StatusCode::OK);
                         metrics
                             .connections
                             .connection_opened(ConnectionProtocol::WebTransport);
@@ -1649,6 +1810,7 @@ impl QuicListener {
                                 "WS/H3 CONNECT rejected (no ws route) for {} from {}",
                                 path, remote_addr
                             );
+                            log_outcome(http::StatusCode::NOT_FOUND);
                             let reject = http::Response::builder()
                                 .status(http::StatusCode::NOT_FOUND)
                                 .body(())?;
@@ -1661,6 +1823,7 @@ impl QuicListener {
                             Some(b) => b.address.clone(),
                             None => {
                                 error!("WS/H3: backend not found: {}", route.backend);
+                                log_outcome(http::StatusCode::BAD_GATEWAY);
                                 let err_resp = http::Response::builder()
                                     .status(http::StatusCode::BAD_GATEWAY)
                                     .body(())?;
@@ -1842,7 +2005,7 @@ type Established = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Se
 async fn application_protocol(
     hello: Option<&quinn::crypto::rustls::HandshakeData>,
     connection: &quinn::Connection,
-    established: quinn::ZeroRttAccepted,
+    established: impl std::future::Future<Output = bool> + Send + 'static,
 ) -> (Option<Vec<u8>>, Established) {
     if let Some(protocol) = hello.and_then(|d| d.protocol.clone()) {
         return (Some(protocol), Box::pin(established));

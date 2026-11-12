@@ -726,6 +726,19 @@ pub struct MasqueConfig {
 
     /// Maximum concurrent CONNECT-UDP sessions per QUIC connection. Default: 8.
     pub max_sessions_per_connection: usize,
+
+    /// The clients a session is relayed for: addresses, CIDR networks, and
+    /// host names, each standing for the addresses it resolves to through
+    /// `security.host_resolver` (see host_names.rs). Empty (the default): any
+    /// client.
+    pub allowed_clients: Vec<String>,
+
+    /// The clients a session is relayed for when its target is on this host
+    /// or on a private network (loopback, RFC 1918, link-local, unique
+    /// local), written as `allowed_clients` is. Empty (the default): no
+    /// client, so such a target is relayed for nobody whatever
+    /// `allowed_targets` lists.
+    pub private_target_clients: Vec<String>,
 }
 
 impl Default for MasqueConfig {
@@ -735,6 +748,8 @@ impl Default for MasqueConfig {
             allowed_targets: Vec::new(),
             session_idle_timeout_secs: 60,
             max_sessions_per_connection: 8,
+            allowed_clients: Vec::new(),
+            private_target_clients: Vec::new(),
         }
     }
 }
@@ -840,6 +855,61 @@ impl Default for ConformanceConfig {
 }
 
 impl MasqueConfig {
+    /// One client-list entry as a network: a CIDR, or a single address.
+    fn client_network(entry: &str) -> Option<ipnet::IpNet> {
+        let entry = entry.trim();
+        entry.parse::<ipnet::IpNet>().ok().or_else(|| {
+            entry
+                .parse::<std::net::IpAddr>()
+                .ok()
+                .map(ipnet::IpNet::from)
+        })
+    }
+
+    /// Every entry of `allowed_clients` and `private_target_clients`.
+    fn client_entries(&self) -> impl Iterator<Item = &String> {
+        self.allowed_clients
+            .iter()
+            .chain(&self.private_target_clients)
+    }
+
+    /// Entries of the client lists that are not an address, a network or a
+    /// host name.
+    pub fn invalid_clients(&self) -> Vec<&str> {
+        self.client_entries()
+            .filter(|entry| {
+                Self::client_network(entry).is_none() && !crate::host_names::is_host_name(entry)
+            })
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// The host names in the client lists, which are kept resolved (see
+    /// host_names.rs).
+    pub fn client_names(&self) -> Vec<String> {
+        self.client_entries()
+            .filter(|entry| Self::client_network(entry).is_none())
+            .filter(|entry| crate::host_names::is_host_name(entry))
+            .cloned()
+            .collect()
+    }
+
+    /// Whether a session from `client` to the resolved `target` is relayed:
+    /// for a client `allowed_clients` admits, and to a target that is not
+    /// globally routable only for one `private_target_clients` names.
+    pub fn is_client_allowed(&self, client: std::net::IpAddr, target: std::net::IpAddr) -> bool {
+        let client = client.to_canonical();
+        let listed = |list: &[String]| {
+            list.iter().any(|entry| match Self::client_network(entry) {
+                Some(network) => network.contains(&client),
+                None => crate::host_names::resolves_to(entry, &client),
+            })
+        };
+        (self.allowed_clients.is_empty() || listed(&self.allowed_clients))
+            && (validate_acme_ip(target.to_canonical()).is_ok()
+                || listed(&self.private_target_clients))
+    }
+
     /// Returns true if the given target host/port is permitted by the allowlist.
     pub fn is_target_allowed(&self, host: &str, port: u16) -> bool {
         self.allowed_targets.iter().any(|entry| {
@@ -4488,6 +4558,14 @@ impl ProxyConfig {
                  Every CONNECT-UDP request will be rejected with 403. \
                  Add entries like \"host:port\" (host/port may be \"*\")."
             );
+        }
+
+        let invalid = self.masque.invalid_clients();
+        if !invalid.is_empty() {
+            return Err(anyhow::anyhow!(
+                "masque.allowed_clients / masque.private_target_clients: {invalid:?} is not \
+                 an address, a CIDR network or a host name"
+            ));
         }
 
         if self.doh.enabled {
