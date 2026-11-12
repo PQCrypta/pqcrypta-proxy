@@ -43,10 +43,10 @@ Complete reference for all configuration options in PQCrypta Proxy.
 | `bind_address` | string | `"0.0.0.0"` | IP address to bind QUIC/UDP listener |
 | `udp_port` | u16 | `443` | Primary UDP port for QUIC/HTTP3/WebTransport |
 | `additional_ports` | array[u16] | `[4433, 4434]` | Additional ports for WebTransport |
-| `max_connections` | u32 | `10000` | Maximum concurrent connections |
+| `max_connections` | u32 | `10000` | Maximum concurrent client connections across every listener (TCP, QUIC, WebTransport); a connection past it is refused. `0` = no limit |
 | `max_streams_per_connection` | u32 | `1000` | Maximum concurrent streams per connection |
 | `keepalive_interval_secs` | u64 | `15` | Keep-alive interval in seconds |
-| `max_idle_timeout_secs` | u64 | `120` | Maximum idle timeout in seconds |
+| `max_idle_timeout_secs` | u64 | `120` | How long a connection may be idle, in seconds: the QUIC idle timeout, and the time a TCP connection may have no exchange in flight before it is closed |
 | `enable_ipv6` | bool | `true` | Enable IPv6 dual-stack binding |
 | `worker_threads` | usize | `0` | Worker threads (0 = auto-detect based on CPU cores) |
 | `enable_quic_migration` | bool | `true` | Enable QUIC connection migration (RFC 9000 §9) |
@@ -69,7 +69,9 @@ target `host:port`, with UDP payloads carried as HTTP Datagrams (RFC 9297).
 
 **Disabled by default.** An open UDP relay can be abused for amplification,
 scanning, and exfiltration, so a target MUST match `allowed_targets` before a
-session is established.
+session is established. A CONNECT-UDP request is also held to the rules every
+other request meets (the blocklist, the location rules, the rate limits and
+the WAF) and is written to the access log.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
@@ -77,6 +79,8 @@ session is established.
 | `allowed_targets` | array[string] | `[]` | Permitted targets as `host:port`; `host`/`port` may be `*`. Empty = deny all |
 | `session_idle_timeout_secs` | u64 | `60` | Close a session after no datagrams in either direction for this long |
 | `max_sessions_per_connection` | usize | `8` | Maximum concurrent CONNECT-UDP sessions per QUIC connection |
+| `allowed_clients` | array[string] | `[]` | Clients a session is relayed for: addresses, CIDR networks, or host names (resolved through `security.host_resolver`, as in `pentest_bypass_ips`). Empty = any client |
+| `private_target_clients` | array[string] | `[]` | Clients a session is relayed for when its target is on this host or a private network (loopback, RFC 1918, link-local, unique local), written as `allowed_clients` is. Empty = no client: such a target is relayed for nobody, whatever `allowed_targets` lists |
 
 ---
 
@@ -209,12 +213,12 @@ as_type = "style"
 |--------|------|---------|-------------|
 | `cert_path` | path | `"/etc/pqcrypta/cert.pem"` | Path to TLS certificate chain (PEM format) |
 | `key_path` | path | `"/etc/pqcrypta/key.pem"` | Path to TLS private key (PEM format) |
-| `ca_cert_path` | path? | `null` | Optional CA certificate for client verification (mTLS) |
+| `ca_cert_path` | path? | `null` | The CA that issues client certificates (mTLS). Required whenever a listener asks for one (`require_client_cert`, a route with `mtls_required` or `internal`): client certificates are verified against it and nothing else |
 | `require_client_cert` | bool | `false` | Require client certificates (mTLS mode) |
 | `alpn_protocols` | array[string] | `["h3", "webtransport"]` | ALPN protocols to advertise |
 | `min_version` | string | `"1.3"` | Minimum TLS version. Options: `"1.2"`, `"1.3"` |
 | `ocsp_stapling` | bool | `true` | Enable OCSP stapling for certificate validation |
-| `cert_reload_interval_secs` | u64 | `3600` | Certificate reload interval (0 = disabled) |
+| `cert_reload_interval_secs` | u64 | `3600` | How often the certificates and ECH configs on disk are checked for a change (0 = disabled). A change is a file created, replaced, removed or written in place. A pair is served once its key is the certificate's key; a domain whose files do not load keeps the certificate it is serving |
 | `enable_0rtt` | bool | `false` | Enable 0-RTT early data on TCP and QUIC; early requests are served before the handshake completes and gated per route (425 Too Early). **WARNING**: early data can be replayed |
 | `zero_rtt_max_early_data` | u32 | `16384` | Early data a TCP session ticket allows when `enable_0rtt` is on (QUIC tickets always carry 0xffffffff) |
 | `zero_rtt_replay_protection` | string | `"strict"` | `strict`: refuse a repeated ClientHello; `session`: each ticket carries early data once (RFC 8446 §8.1); `none` |
@@ -406,6 +410,15 @@ Multi-dimensional rate limiting with composite keys, JA3/JA4 fingerprinting, and
 
 **Key Types**: `source_ip`, `real_ip`, `api_key`, `jwt_subject`, `ja3_fingerprint`, `ja4_fingerprint`, `header:NAME`, `cookie:NAME`, `query_param:NAME`, `path`, `method`, `asn`
 
+A key the client cannot choose (`source_ip`, `real_ip`, and a `jwt_subject`
+whose token verified) is one bucket. Any other key is counted beside the
+bucket of the network the request came from, and that bucket is checked
+first: a request with a new `api_key` value every time is still one address,
+held to `per_ip`. A TLS fingerprint names a client build that all of its
+users share, so a fingerprint bucket is kept per network. With Redis, the
+buckets of keys the client cannot choose are shared between instances;
+buckets keyed on a value the client wrote are kept on each instance.
+
 ### Headers for Key Extraction
 
 ```toml
@@ -566,7 +579,7 @@ ML-inspired anomaly detection that learns normal traffic patterns.
 | `geoip_db_path` | path? | `"/var/lib/pqcrypta-proxy/geoip/GeoLite2-City.mmdb"` | MaxMind GeoIP (City) database path |
 | `geoip_asn_db_path` | path? | `"/var/lib/pqcrypta-proxy/geoip/GeoLite2-ASN.mmdb"` | MaxMind GeoIP ASN database path |
 | `blocked_countries` | array[string] | `[]` | Blocked country codes (ISO 3166-1 alpha-2, e.g., `["CN", "RU", "KP"]`) |
-| `max_connections_per_ip` | u32 | `100` | Maximum connections per IP |
+| `max_connections_per_ip` | u32 | `100` | Maximum concurrent client connections from one address, on every listener, and maximum requests in flight from one address. Trusted addresses, `pentest_bypass_ips` and `proxy_protocol_trusted` peers are outside the connection count. `0` = no connection limit |
 | `auto_block_threshold` | u32 | `10` | Suspicious patterns before auto-block |
 | `auto_block_duration_secs` | u64 | `300` | Auto-block duration (5 minutes) |
 | `error_4xx_threshold` | u32 | `100` | 4xx errors before checking rate |

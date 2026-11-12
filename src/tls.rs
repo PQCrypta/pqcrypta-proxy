@@ -380,10 +380,15 @@ impl MultiDomainCertResolver {
     }
 
     /// Re-read every `*.crt` + `*.key` pair from the certs directory.
-    /// Existing entries are replaced; domains whose files disappeared are removed.
+    /// Existing entries are replaced; domains whose files disappeared are
+    /// removed. A domain whose files are there but do not load (a renewal
+    /// read between the certificate's write and the key's) keeps the
+    /// certificate it is serving; the write that completes the pair is a
+    /// change of its own, and the reload that follows takes it.
     pub fn reload(&self) -> anyhow::Result<()> {
         let mut new_certs = HashMap::new();
         let mut naming_addresses = Vec::new();
+        let serving = |domain: &str| self.certs.read().by_name.get(domain).cloned();
 
         let read_dir = std::fs::read_dir(&self.certs_dir).map_err(|e| {
             anyhow::anyhow!("Cannot read certs directory {:?}: {}", self.certs_dir, e)
@@ -409,7 +414,24 @@ impl MultiDomainCertResolver {
             let primary = match load_certified_key(&cert_path, &key_path) {
                 Ok(ck) => delegating(Arc::new(ck), &domain),
                 Err(e) => {
-                    warn!("SNI resolver: skipping '{}' — {}", domain, e);
+                    match serving(&domain) {
+                        Some(kept) => {
+                            warn!(
+                                "SNI resolver: '{}' not loaded, the certificate in service stays — {}",
+                                domain, e
+                            );
+                            if kept
+                                .primary
+                                .cert
+                                .first()
+                                .is_some_and(|leaf| !certificate_ip_addresses(leaf).is_empty())
+                            {
+                                naming_addresses.push(domain.clone());
+                            }
+                            new_certs.insert(domain, kept);
+                        }
+                        None => warn!("SNI resolver: skipping '{}' — {}", domain, e),
+                    }
                     continue;
                 }
             };
@@ -427,8 +449,18 @@ impl MultiDomainCertResolver {
                         Some(delegating(Arc::new(ck), &domain))
                     }
                     Err(e) => {
-                        warn!("SNI resolver: '{}' companion not loaded — {}", domain, e);
-                        None
+                        let kept = serving(&domain).and_then(|certs| certs.post_quantum);
+                        warn!(
+                            "SNI resolver: '{}' companion not loaded{} — {}",
+                            domain,
+                            if kept.is_some() {
+                                ", the one in service stays"
+                            } else {
+                                ""
+                            },
+                            e
+                        );
+                        kept
                     }
                 }
             } else {
@@ -600,7 +632,7 @@ pub fn load_certified_key(
                 "Loaded ML-DSA-87 (FIPS 204) certificate key from {:?}",
                 key_path
             );
-            return Ok(rustls::sign::CertifiedKey::new(certs, signing_key));
+            return certified_pair(certs, signing_key, cert_path, key_path);
         }
     }
 
@@ -614,7 +646,40 @@ pub fn load_certified_key(
         .load_private_key(private_key)
         .map_err(|e| anyhow::anyhow!("Cannot load signing key from {:?}: {}", key_path, e))?;
 
-    Ok(rustls::sign::CertifiedKey::new(certs, signing_key))
+    certified_pair(certs, signing_key, cert_path, key_path)
+}
+
+/// A certificate chain with its key, once the key is known to be the
+/// certificate's: the two files are written one after the other, and a
+/// handshake signed by another certificate's key is one no client accepts.
+///
+/// Only a key that is seen to differ is refused. A key that cannot give its
+/// public half, or a certificate the comparison cannot read, is served as
+/// loaded.
+fn certified_pair(
+    certs: Vec<CertificateDer<'static>>,
+    signing_key: Arc<dyn rustls::sign::SigningKey>,
+    cert_path: &Path,
+    key_path: &Path,
+) -> anyhow::Result<rustls::sign::CertifiedKey> {
+    let certified = rustls::sign::CertifiedKey::new(certs, signing_key);
+    match certified.keys_match() {
+        Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::KeyMismatch)) => {
+            Err(anyhow::anyhow!(
+                "the key in {:?} is not the key of the certificate in {:?}",
+                key_path,
+                cert_path
+            ))
+        }
+        Ok(()) => Ok(certified),
+        Err(e) => {
+            debug!(
+                "{:?}: key not compared with its certificate ({})",
+                cert_path, e
+            );
+            Ok(certified)
+        }
+    }
 }
 
 /// Runtime switch for `pqc.enable_signatures`, set once at startup.
@@ -649,7 +714,8 @@ pub fn ml_dsa_signing_enabled() -> bool {
 mod mldsa {
     use std::sync::Arc;
 
-    use aws_lc_rs::signature::{PqdsaKeyPair, ML_DSA_87_SIGNING};
+    use aws_lc_rs::signature::{KeyPair as _, PqdsaKeyPair, ML_DSA_87_SIGNING};
+    use rustls::pki_types::{AlgorithmIdentifier, SubjectPublicKeyInfoDer};
     use rustls::sign::{Signer, SigningKey};
     use rustls::{SignatureAlgorithm, SignatureScheme};
 
@@ -775,6 +841,15 @@ mod mldsa {
                     keypair: Arc::clone(&self.keypair),
                 }) as Box<dyn Signer>
             })
+        }
+
+        /// id-ml-dsa-87 with no parameters (RFC 9881 section 2) over the
+        /// encoded public key, as the certificate carries it.
+        fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
+            Some(rustls::sign::public_key_to_spki(
+                &AlgorithmIdentifier::from_slice(&ML_DSA_87_OID),
+                self.keypair.public_key(),
+            ))
         }
 
         fn algorithm(&self) -> SignatureAlgorithm {
@@ -1047,6 +1122,20 @@ pub fn single_group_server_config(
             anyhow::anyhow!("failed to build the single-group QUIC config for {group:?}: {e}")
         })?,
     ))
+}
+
+/// The newest modification time of a directory and the files in it.
+///
+/// A directory's own time moves when an entry is created, renamed or
+/// removed; a file written in place moves only the file's.
+fn newest_mtime(dir: &Path) -> Option<SystemTime> {
+    let modified = |path: &Path| std::fs::metadata(path).ok()?.modified().ok();
+    let files = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| modified(&entry.path()));
+    modified(dir).into_iter().chain(files).max()
 }
 
 /// The size of the chain the post-quantum port serves, as loaded.
@@ -1965,6 +2054,68 @@ mod server_policy_tests {
 
     /// Several certificates naming addresses: the first by name answers, the
     /// same on every reload.
+    /// The key of another certificate is refused when the pair is loaded,
+    /// not found out by every client's handshake.
+    #[test]
+    fn a_key_that_is_not_the_certificates_is_refused() {
+        let (dir, _) = certs_dir(&[
+            ("one.example", &["one.example"]),
+            ("two.example", &["two.example"]),
+        ]);
+        let pair = |cert: &str, key: &str| {
+            super::load_certified_key(
+                &dir.path().join(format!("{cert}.crt")),
+                &dir.path().join(format!("{key}.key")),
+            )
+        };
+        assert!(pair("one.example", "one.example").is_ok());
+        let refused = pair("one.example", "two.example").unwrap_err().to_string();
+        assert!(refused.contains("is not the key of the certificate"));
+    }
+
+    /// A renewal is two writes. Read between them, the domain keeps the
+    /// certificate it is serving, and takes the new one once the pair is whole.
+    #[test]
+    fn a_reload_keeps_the_certificate_in_service_until_the_pair_is_whole() {
+        let (dir, ders) = certs_dir(&[("site.example", &["site.example"])]);
+        let resolver = super::MultiDomainCertResolver::new(dir.path()).unwrap();
+        let served = |resolver: &super::MultiDomainCertResolver| {
+            resolver.certs.read().by_name["site.example"].primary.cert[0].clone()
+        };
+        assert_eq!(served(&resolver), ders[0]);
+
+        let renewed = rcgen::generate_simple_self_signed(vec!["site.example".to_string()]).unwrap();
+        let crt = dir.path().join("site.example.crt");
+        let key = dir.path().join("site.example.key");
+        std::fs::write(&crt, renewed.cert.pem()).unwrap();
+        resolver.reload().unwrap();
+        assert_eq!(served(&resolver), ders[0]);
+
+        std::fs::write(&key, renewed.signing_key.serialize_pem()).unwrap();
+        resolver.reload().unwrap();
+        assert_eq!(served(&resolver).as_ref(), renewed.cert.der().as_ref());
+
+        // A domain whose files are gone is gone.
+        std::fs::remove_file(&crt).unwrap();
+        resolver.reload().unwrap();
+        assert!(resolver.certs.read().by_name.is_empty());
+    }
+
+    /// A file written in place moves its own time and not its directory's.
+    #[test]
+    fn the_watch_follows_a_file_written_in_place() {
+        let (dir, _) = certs_dir(&[("site.example", &["site.example"])]);
+        let before = super::newest_mtime(dir.path()).unwrap();
+        let later = before + std::time::Duration::from_secs(30);
+        let file = std::fs::File::options()
+            .write(true)
+            .open(dir.path().join("site.example.key"))
+            .unwrap();
+        file.set_modified(later).unwrap();
+        assert_eq!(super::newest_mtime(dir.path()), Some(later));
+        assert_eq!(super::newest_mtime(&dir.path().join("absent")), None);
+    }
+
     #[test]
     fn the_address_certificate_is_the_first_by_name() {
         assert_eq!(
@@ -1972,6 +2123,14 @@ mod server_policy_tests {
             Some("ns1.example")
         );
         assert_eq!(super::address_domain(Vec::new()), None);
+    }
+
+    /// Asked for without the CA that issues them, client certificates are a
+    /// configuration error.
+    #[test]
+    fn client_certificates_need_the_ca_that_issues_them() {
+        let refused = super::TlsProvider::load_client_ca(&None).unwrap_err();
+        assert!(refused.to_string().contains("tls.ca_cert_path"));
     }
 
     /// `require_client_cert` refuses a client that presents none. The rustls
@@ -2607,6 +2766,14 @@ impl TlsProvider {
         let pqc_config = self.pqc_config.read().clone();
         let pqc_available = *self.pqc_available.read();
 
+        // What the files said before they were read: a write that lands while
+        // they are being loaded is newer than this, and is the next reload.
+        let certs_dir = tls_config
+            .cert_path
+            .parent()
+            .unwrap_or_else(|| Path::new("/etc/pqcrypta/certs"));
+        let read_as_of = Self::combined_watched_mtime(certs_dir);
+
         // Reload all per-domain certs from disk into the shared resolver.
         // HTTP listeners that hold Arc::clone(&resolver) see the new certs immediately.
         self.resolver.reload()?;
@@ -2628,12 +2795,7 @@ impl TlsProvider {
         // listener rebuilds its own, when this moves.
         crate::ech_config::note_reload();
 
-        // Update the watched directory mtime (certs + ECH configs)
-        let certs_dir = tls_config
-            .cert_path
-            .parent()
-            .unwrap_or_else(|| Path::new("/etc/pqcrypta/certs"));
-        *self.last_cert_modified.write() = Self::combined_watched_mtime(certs_dir);
+        *self.last_cert_modified.write() = read_as_of;
 
         info!("TLS material reloaded (certificates and ECH configs); every listener installs it");
         Ok(())
@@ -2659,16 +2821,11 @@ impl TlsProvider {
         }
     }
 
-    /// The newer of the certs directory's and the ECH configs directory's
-    /// mtime — either one changing is a reason to rebuild the TLS config.
+    /// The newest modification time among the certs directory, the ECH
+    /// configs directory and the files in each: any of them changing is a
+    /// reason to rebuild the TLS config.
     fn combined_watched_mtime(certs_dir: &Path) -> Option<SystemTime> {
-        let certs_mtime = std::fs::metadata(certs_dir)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        let ech_mtime = std::fs::metadata(crate::ech_config::ECH_CONFIG_DIR)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        certs_mtime.max(ech_mtime)
+        newest_mtime(certs_dir).max(newest_mtime(Path::new(crate::ech_config::ECH_CONFIG_DIR)))
     }
 
     /// Update configuration (for hot-reload)
@@ -2965,42 +3122,24 @@ impl TlsProvider {
         Ok(certs)
     }
 
-    /// Load client CA certificates for mTLS
+    /// The CA that issues client certificates (`tls.ca_cert_path`).
+    ///
+    /// A listener that asks for client certificates verifies them against
+    /// this and nothing else: there is no default set of issuers.
     fn load_client_ca(path: &Option<std::path::PathBuf>) -> anyhow::Result<rustls::RootCertStore> {
+        let ca_path = path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "client certificates are asked for but tls.ca_cert_path is not set. \
+                 Provide the CA that issues them."
+            )
+        })?;
         let mut root_store = rustls::RootCertStore::empty();
-
-        if let Some(ca_path) = path {
-            let certs = Self::load_certificates(ca_path)?;
-            for cert in certs {
-                root_store
-                    .add(cert)
-                    .map_err(|e| anyhow::anyhow!("Failed to add CA certificate: {}", e))?;
-            }
-            info!("Loaded {} client CA certificates", root_store.len());
-        } else {
-            // Load system root certificates
-            let native_certs = rustls_native_certs::load_native_certs();
-            let mut added = 0;
-            let mut failed = 0;
-            for cert in native_certs.certs {
-                match root_store.add(cert) {
-                    Ok(()) => added += 1,
-                    Err(e) => {
-                        debug!("Failed to add system root certificate: {}", e);
-                        failed += 1;
-                    }
-                }
-            }
-            if failed > 0 {
-                info!(
-                    "Loaded {} system root certificates ({} failed - likely duplicates)",
-                    added, failed
-                );
-            } else {
-                info!("Loaded {} system root certificates", root_store.len());
-            }
+        for cert in Self::load_certificates(ca_path)? {
+            root_store
+                .add(cert)
+                .map_err(|e| anyhow::anyhow!("Failed to add CA certificate: {}", e))?;
         }
-
+        info!("Loaded {} client CA certificates", root_store.len());
         Ok(root_store)
     }
 

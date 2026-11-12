@@ -284,6 +284,15 @@ pub async fn compression_middleware(
             trace!("Response already compressed, skipping");
             false
         }
+        // A byte range is a range of the representation the origin sent:
+        // encoded here, its Content-Range would describe bytes that are no
+        // longer the ones in the body.
+        else if response.status() == StatusCode::PARTIAL_CONTENT
+            || headers.contains_key(header::CONTENT_RANGE)
+        {
+            trace!("Partial content, not compressed");
+            false
+        }
         // Don't compress non-compressible content types
         else if !should_compress_content_type(headers.get(header::CONTENT_TYPE), config) {
             trace!("Content type not compressible");

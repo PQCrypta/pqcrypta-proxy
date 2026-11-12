@@ -3,7 +3,7 @@
 use std::future::Future;
 
 use axum::extract::FromRequestParts;
-use axum::http::{header, request::Parts, StatusCode};
+use axum::http::{request::Parts, StatusCode};
 
 /// The host a request names, with its port where it gave one.
 ///
@@ -34,23 +34,13 @@ impl<S: Send + Sync> FromRequestParts<S> for RequestHost {
     }
 }
 
+/// The request's host by the one rule every layer uses
+/// ([`crate::request_target::effective_host`]). A request that names two
+/// hosts has none here; the security layer has already answered it 400.
 fn request_host(parts: &Parts) -> Option<String> {
-    if let Some(authority) = parts.uri.authority() {
-        // A userinfo part (`user@`) is not part of the host; RFC 9113 forbids
-        // it in `:authority` and RFC 9110 deprecates it in http(s) URIs.
-        let host = authority
-            .as_str()
-            .rsplit_once('@')
-            .map_or(authority.as_str(), |(_, host)| host);
-        if !host.is_empty() {
-            return Some(host.to_owned());
-        }
-    }
-    parts
-        .headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .filter(|h| !h.is_empty())
+    crate::request_target::effective_host(&parts.uri, &parts.headers)
+        .ok()
+        .flatten()
         .map(str::to_owned)
 }
 
@@ -85,9 +75,12 @@ mod tests {
     }
 
     #[test]
-    fn the_authority_takes_the_place_of_a_host_header() {
-        let p = parts("https://pqcrypta.com/", &[("host", "other.example")]);
+    fn the_authority_and_a_host_header_name_one_host() {
+        let p = parts("https://pqcrypta.com/", &[("host", "PQCrypta.com:443")]);
         assert_eq!(request_host(&p).as_deref(), Some("pqcrypta.com"));
+        // Two different hosts name none: the request is malformed
+        let p = parts("https://pqcrypta.com/", &[("host", "other.example")]);
+        assert_eq!(request_host(&p), None);
     }
 
     #[test]

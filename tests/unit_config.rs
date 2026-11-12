@@ -271,6 +271,48 @@ allowed_targets = ["127.0.0.53:53", "*:443", "dns.example.com:*"]
 }
 
 #[test]
+fn test_masque_clients_and_internal_targets() {
+    use std::net::IpAddr;
+    let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+    let mut masque = pqcrypta_proxy::config::MasqueConfig::default();
+    // Neither list: anyone, to public targets only
+    assert!(masque.is_client_allowed(ip("203.0.113.9"), ip("1.1.1.1")));
+    assert!(!masque.is_client_allowed(ip("203.0.113.9"), ip("127.0.0.53")));
+    assert!(!masque.is_client_allowed(ip("203.0.113.9"), ip("10.0.0.5")));
+    assert!(!masque.is_client_allowed(ip("203.0.113.9"), ip("::1")));
+    assert!(!masque.is_client_allowed(ip("203.0.113.9"), ip("::ffff:127.0.0.1")));
+
+    // private_target_clients: they reach this host and private networks;
+    // everyone still reaches public targets
+    masque.private_target_clients = vec!["198.51.100.7".into(), "2001:db8:1::/48".into()];
+    assert_eq!(masque.invalid_clients(), [] as [&str; 0]);
+    assert!(masque.is_client_allowed(ip("198.51.100.7"), ip("127.0.0.53")));
+    assert!(masque.is_client_allowed(ip("::ffff:198.51.100.7"), ip("10.0.0.5")));
+    assert!(masque.is_client_allowed(ip("2001:db8:1::9"), ip("::1")));
+    assert!(masque.is_client_allowed(ip("203.0.113.9"), ip("1.1.1.1")));
+    assert!(!masque.is_client_allowed(ip("203.0.113.9"), ip("127.0.0.53")));
+
+    // allowed_clients: only they are relayed for at all, and a private
+    // target still needs the other list
+    masque.allowed_clients = vec!["198.51.100.0/24".into(), "192.0.2.4".into()];
+    assert!(masque.is_client_allowed(ip("198.51.100.7"), ip("127.0.0.53")));
+    assert!(masque.is_client_allowed(ip("192.0.2.4"), ip("1.1.1.1")));
+    assert!(!masque.is_client_allowed(ip("192.0.2.4"), ip("127.0.0.53")));
+    assert!(!masque.is_client_allowed(ip("203.0.113.9"), ip("1.1.1.1")));
+    assert!(!masque.is_client_allowed(ip("2001:db8:1::9"), ip("::1")));
+
+    // A host name stands for the addresses it resolves to, and for none
+    // until it has been resolved
+    masque
+        .private_target_clients
+        .push("relay-client.example".into());
+    assert_eq!(masque.invalid_clients(), [] as [&str; 0]);
+    assert_eq!(masque.client_names(), ["relay-client.example"]);
+    masque.allowed_clients.push("not an address".into());
+    assert_eq!(masque.invalid_clients(), ["not an address"]);
+}
+
+#[test]
 fn test_masque_empty_allowlist_denies_all() {
     let masque = MasqueConfig::default();
     assert!(!masque.is_target_allowed("127.0.0.53", 53));

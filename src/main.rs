@@ -593,6 +593,14 @@ async fn run() -> anyhow::Result<()> {
     let security_state = pqcrypta_proxy::security::SecurityState::new(&config)
         .with_audit_logger(audit_logger.clone());
 
+    // The connection limits every listener applies (see conn_limits.rs).
+    pqcrypta_proxy::conn_limits::configure(
+        config.server.max_connections,
+        config.security.max_connections_per_ip,
+    );
+    // Host names in the CONNECT-UDP client lists are kept resolved.
+    pqcrypta_proxy::host_names::watch("masque", config.masque.client_names());
+
     // One advanced rate limiter for the process: every TCP listener, every QUIC
     // port and the admin API. Each listener used to build its own, so a client
     // had a separate budget on every port and protocol, and the admin API had
@@ -948,6 +956,13 @@ async fn run() -> anyhow::Result<()> {
                     // [security], [rate_limiting] and [advanced_rate_limiting]
                     // are read per request, so they apply on the next one.
                     reload_security.apply_reloaded_config(&new_config);
+                    // The per-address connection limit follows the reload; the
+                    // total is the one the process started with.
+                    pqcrypta_proxy::conn_limits::configure(
+                        previous.server.max_connections,
+                        new_config.security.max_connections_per_ip,
+                    );
+                    pqcrypta_proxy::host_names::watch("masque", new_config.masque.client_names());
                     // TCP listeners: routes, backends, headers, middleware.
                     let _ = tcp_config_tx.send(new_config.clone());
                     reload_rate_limiter.update_config(new_config.advanced_rate_limiting.clone());

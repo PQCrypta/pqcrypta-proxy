@@ -1,28 +1,30 @@
-//! HTTP response cache — RFC 9111 compliant
+//! HTTP response cache (RFC 9111)
 //!
-//! Implements:
-//! - Cache-Control directive parsing (max-age, s-maxage, no-cache, no-store, private, public)
-//! - ETag / If-None-Match conditional requests (strong and weak comparison)
-//! - Last-Modified / If-Modified-Since conditional requests
-//! - Vary header support (Vary: * bypasses cache; all other Vary headers are recorded)
-//! - TTL-based expiry using `std::time::Instant`
-//! - Size-bounded DashMap store with expired-entry eviction
+//! - Cache-Control parsing (max-age, s-maxage, no-cache, no-store, private,
+//!   public), `Expires` and `Pragma`
+//! - ETag / If-None-Match and Last-Modified / If-Modified-Since
+//! - `Vary`: only a response that varies on nothing the key leaves out is kept
+//! - A store bounded by size, counting an entry's key and headers with its
+//!   body, with S3-FIFO admission and eviction: a new entry starts in a small
+//!   queue and reaches the main one only if it is asked for again, so a run of
+//!   URLs each requested once passes through without displacing what is in use
+//! - Expired entries are removed as they are met and by a periodic sweep
 //!
-//! The cache stores the raw backend response body (pre-compression). All outer
-//! middleware layers (security headers, Alt-Svc, compression) run on every served
-//! response — both cache hits and misses — because the cache is placed as the
-//! innermost Axum layer.
+//! The cache stores the response as the route produced it, before
+//! compression. A listener consults it once a request has passed its route's
+//! gates, and every outer layer (security headers, Alt-Svc, compression)
+//! applies to a stored response as to a new one.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::State;
-use axum::http::{HeaderValue, Method, Request, Response, StatusCode};
-use axum::middleware::Next;
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode};
 use bytes::Bytes;
 use dashmap::DashMap;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, trace};
 
@@ -91,23 +93,80 @@ struct CacheEntry {
     body: Bytes,
     /// ETag header value from backend (for If-None-Match comparison)
     etag: Option<String>,
-    /// Last-Modified header value from backend (for If-Modified-Since comparison)
+    /// Last-Modified header value from backend (sent back on a 304)
     last_modified: Option<String>,
+    /// That value as a time, for If-Modified-Since
+    modified_at: Option<chrono::DateTime<chrono::FixedOffset>>,
     /// Raw Cache-Control header from backend (forwarded on 304 responses)
     cache_control: Option<String>,
     /// When this entry was created (used to compute Age header)
     created_at: Instant,
     /// When this entry expires and must be evicted
     expires_at: Instant,
+    /// The origin stated this response's freshness for a shared cache
+    /// (`max-age`, `s-maxage`, `Expires` or `public`); otherwise it is kept
+    /// for the default lifetime, and only for requests without credentials.
+    explicit: bool,
+    /// What the entry counts for against the cache's size
+    cost: usize,
+    /// Which insertion of its key this is; a queue slot names it, so a slot
+    /// left behind by an entry since replaced or removed is recognised
+    id: u64,
+    /// Hits since eviction last considered it, to 3
+    freq: AtomicU8,
+    /// In the main queue rather than the small one
+    in_main: AtomicBool,
 }
+
+/// What an entry costs beyond its strings: its place in the map and a queue.
+const ENTRY_OVERHEAD: usize = 512;
+/// What a stored header costs beyond its name and value.
+const HEADER_OVERHEAD: usize = 48;
+/// Keys remembered after leaving the small queue unrequested, as hashes.
+const GHOST_MAX: usize = 100_000;
+/// How often expired entries are swept out.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+/// The longest a response with an error status is kept on the default
+/// lifetime (it was not stated to be cacheable, only allowed to be).
+const NEGATIVE_TTL: Duration = Duration::from_secs(10);
 
 impl CacheEntry {
     fn is_expired(&self) -> bool {
         Instant::now() >= self.expires_at
     }
+}
 
-    fn body_size(&self) -> usize {
-        self.body.len()
+/// The S3-FIFO queues, and the bytes each holds. A slot is a key and the id
+/// of the entry it was pushed for.
+#[derive(Default)]
+struct Queues {
+    small: VecDeque<(String, u64)>,
+    main: VecDeque<(String, u64)>,
+    small_bytes: usize,
+    main_bytes: usize,
+    ghost: VecDeque<u64>,
+    ghost_set: HashSet<u64>,
+}
+
+impl Queues {
+    /// Take `entry`'s cost off the queue it is in.
+    fn forget(&mut self, entry: &CacheEntry) {
+        if entry.in_main.load(Ordering::Relaxed) {
+            self.main_bytes = self.main_bytes.saturating_sub(entry.cost);
+        } else {
+            self.small_bytes = self.small_bytes.saturating_sub(entry.cost);
+        }
+    }
+
+    fn remember(&mut self, hash: u64) {
+        if self.ghost_set.insert(hash) {
+            self.ghost.push_back(hash);
+        }
+        while self.ghost.len() > GHOST_MAX {
+            if let Some(old) = self.ghost.pop_front() {
+                self.ghost_set.remove(&old);
+            }
+        }
     }
 }
 
@@ -140,77 +199,84 @@ pub enum CacheLookup {
 // Cache-Control parser
 // ============================================================================
 
+#[derive(Default)]
 struct CacheControlDirectives {
     no_store: bool,
     no_cache: bool,
     is_private: bool,
+    is_public: bool,
     max_age: Option<u64>,
     s_maxage: Option<u64>,
 }
 
 impl CacheControlDirectives {
-    fn parse(header: &str) -> Self {
-        let mut d = Self {
-            no_store: false,
-            no_cache: false,
-            is_private: false,
-            max_age: None,
-            s_maxage: None,
-        };
-        for part in header.split(',') {
-            let part = part.trim().to_lowercase();
-            if part == "no-store" {
-                d.no_store = true;
-            } else if part == "no-cache" {
-                d.no_cache = true;
-            } else if part == "private" {
-                d.is_private = true;
-            } else if let Some(val) = part.strip_prefix("max-age=") {
-                d.max_age = val.parse::<u64>().ok();
-            } else if let Some(val) = part.strip_prefix("s-maxage=") {
-                d.s_maxage = val.parse::<u64>().ok();
+    /// Every `Cache-Control` field line of `headers` together.
+    fn of(headers: &HeaderMap) -> Self {
+        let mut d = Self::default();
+        for value in headers.get_all(header::CACHE_CONTROL) {
+            if let Ok(value) = value.to_str() {
+                d.add(value);
             }
         }
         d
     }
+
+    fn add(&mut self, header: &str) {
+        for part in header.split(',') {
+            let part = part.trim().to_lowercase();
+            if part == "no-store" {
+                self.no_store = true;
+            } else if part == "no-cache" || part.starts_with("no-cache=") {
+                self.no_cache = true;
+            } else if part == "private" || part.starts_with("private=") {
+                self.is_private = true;
+            } else if part == "public" {
+                self.is_public = true;
+            } else if let Some(val) = part.strip_prefix("max-age=") {
+                self.max_age = val.trim_matches('"').parse::<u64>().ok();
+            } else if let Some(val) = part.strip_prefix("s-maxage=") {
+                self.s_maxage = val.trim_matches('"').parse::<u64>().ok();
+            }
+        }
+    }
 }
 
-/// Rebuild a HEAD response without asserting a body length the origin never sent.
-///
-/// RFC 9110 §9.3.2: a HEAD response carries the header fields a GET would have.
-/// These backends serve chunked with no `Content-Length`, and correctly omit it on
-/// HEAD — but rebuilding with `Body::from(Bytes::new())` reports an exact size of
-/// zero, and hyper then synthesises `content-length: 0`, telling every link
-/// checker, uptime monitor and security scanner that probes with HEAD that the
-/// page is empty. An empty *stream* has an unknown size hint, so hyper emits only
-/// the length headers the origin actually chose.
-///
-/// When the origin did send a `Content-Length`, that value is already right and is
-/// passed straight through.
-fn head_response(parts: axum::http::response::Parts) -> Response<Body> {
-    if parts
-        .headers
-        .contains_key(axum::http::header::CONTENT_LENGTH)
-    {
-        return Response::from_parts(parts, Body::empty());
-    }
-    Response::from_parts(
-        parts,
-        Body::from_stream(futures_util::stream::empty::<
-            Result<bytes::Bytes, std::io::Error>,
-        >()),
-    )
+/// An HTTP-date (RFC 9110 section 5.6.7) as a time.
+fn http_date(value: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc2822(value.trim()).ok()
+}
+
+/// A request the cache may answer and keep the answer to
+/// ([`ResponseCache::plan`]).
+#[derive(Debug, Clone)]
+pub struct CachePlan {
+    /// The entry's key
+    pub key: String,
+    /// The request carries a cookie: only a response the origin stated to be
+    /// cacheable is kept for it or served to it
+    pub credentialed: bool,
+    /// The client did not ask for a response fresh from the origin
+    pub lookup: bool,
 }
 
 // ============================================================================
 // Response cache
 // ============================================================================
 
-/// Shared, concurrent response cache backed by `DashMap`.
+/// One step of eviction, from one of the two queues; false when it is empty.
+type Evict = fn(&ResponseCache, &mut Queues) -> bool;
+
+/// Shared, concurrent response cache.
+///
+/// Entries live in a `DashMap`, so a lookup takes no lock of the cache's own.
+/// Everything that adds or removes an entry holds `queues`, taken before any
+/// lock of the map.
 pub struct ResponseCache {
     store: DashMap<String, CacheEntry>,
+    queues: Mutex<Queues>,
     size_bytes: AtomicUsize,
-    /// Public config reference (read by middleware and QUIC handler)
+    next_id: AtomicU64,
+    /// Public config reference (read by the listeners)
     pub config: ResponseCacheConfig,
 }
 
@@ -219,9 +285,22 @@ impl ResponseCache {
     pub fn new(config: ResponseCacheConfig) -> Self {
         Self {
             store: DashMap::new(),
+            queues: Mutex::new(Queues::default()),
             size_bytes: AtomicUsize::new(0),
+            next_id: AtomicU64::new(0),
             config,
         }
+    }
+
+    fn max_bytes(&self) -> usize {
+        self.config.max_size_mb.saturating_mul(1024 * 1024)
+    }
+
+    fn key_hash(key: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        hasher.finish()
     }
 
     /// Build a cache key from the request method, host, and path (with query string).
@@ -238,10 +317,69 @@ impl ResponseCache {
         )
     }
 
-    /// Look up a response.  Returns `Hit`, `NotModified`, or `Miss`.
+    /// Whether the cache may answer this request and keep its response, and
+    /// under which key. `host` is lowercase without its port and `path` the
+    /// canonical path: what the request is routed on.
+    ///
+    /// GET and HEAD only, a HEAD answered from the GET's entry. A range
+    /// request goes to the backend (the cache keeps whole responses), and so
+    /// does one carrying `Authorization` (RFC 9111 section 3.5) or asking not
+    /// to be stored.
+    pub fn plan(
+        &self,
+        method: &Method,
+        headers: &HeaderMap,
+        host: &str,
+        path: &str,
+        query: Option<&str>,
+    ) -> Option<CachePlan> {
+        if !self.config.enabled || !matches!(*method, Method::GET | Method::HEAD) {
+            return None;
+        }
+        if headers.contains_key(header::RANGE) || headers.contains_key(header::AUTHORIZATION) {
+            return None;
+        }
+        if self.is_excluded_path(path) || self.is_excluded_host(host) {
+            return None;
+        }
+        let asked = CacheControlDirectives::of(headers);
+        if asked.no_store {
+            return None;
+        }
+        let pragma_no_cache = headers
+            .get(header::PRAGMA)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.to_ascii_lowercase().contains("no-cache"));
+        let key = match query {
+            Some(q) => Self::build_key("GET", host, &format!("{path}?{q}")),
+            None => Self::build_key("GET", host, path),
+        };
+        Some(CachePlan {
+            key,
+            credentialed: headers.contains_key(header::COOKIE),
+            // RFC 9111 section 5.2.1: the client wants the origin's answer
+            lookup: !(asked.no_cache || asked.max_age == Some(0) || pragma_no_cache),
+        })
+    }
+
+    /// Look up a response for a request without credentials.
     pub fn get(
         &self,
         key: &str,
+        if_none_match: Option<&str>,
+        if_modified_since: Option<&str>,
+    ) -> CacheLookup {
+        self.get_for(key, false, if_none_match, if_modified_since)
+    }
+
+    /// Look up a response.  Returns `Hit`, `NotModified`, or `Miss`.
+    ///
+    /// A `credentialed` request (one carrying a cookie) is answered only from
+    /// an entry the origin stated to be cacheable.
+    pub fn get_for(
+        &self,
+        key: &str,
+        credentialed: bool,
         if_none_match: Option<&str>,
         if_modified_since: Option<&str>,
     ) -> CacheLookup {
@@ -249,28 +387,44 @@ impl ResponseCache {
             return CacheLookup::Miss;
         }
 
-        let entry = match self.store.get(key) {
-            Some(e) => e,
-            None => return CacheLookup::Miss,
+        let Some(entry) = self.store.get(key) else {
+            return CacheLookup::Miss;
         };
 
-        // Evict on first access after expiry
         if entry.is_expired() {
-            let body_size = entry.body_size();
+            // The map's guard goes before `queues` is taken (see the type).
             drop(entry);
-            self.store.remove(key);
-            self.size_bytes.fetch_sub(body_size, Ordering::Relaxed);
+            self.remove_expired(key);
             return CacheLookup::Miss;
         }
+        if credentialed && !entry.explicit {
+            return CacheLookup::Miss;
+        }
+
+        // Asked for again: what S3-FIFO keeps an entry on.
+        let _ = entry
+            .freq
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |f| {
+                (f < 3).then_some(f + 1)
+            });
 
         let age_secs = entry.created_at.elapsed().as_secs();
 
         // --- ETag conditional check (If-None-Match) ---
+        // A list of validators, each compared weakly (RFC 9110 section 13.1.2).
         if let (Some(inm), Some(etag)) = (if_none_match, &entry.etag) {
-            // Strip optional weak prefix and quotes for comparison
-            let client = inm.trim().trim_start_matches("W/").trim_matches('"');
-            let cached = etag.trim().trim_start_matches("W/").trim_matches('"');
-            if client == "*" || client == cached {
+            let opaque = |tag: &str| -> String {
+                tag.trim()
+                    .trim_start_matches("W/")
+                    .trim_matches('"')
+                    .to_string()
+            };
+            let cached = opaque(etag);
+            if inm
+                .split(',')
+                .map(str::trim)
+                .any(|candidate| candidate == "*" || opaque(candidate) == cached)
+            {
                 trace!("Cache 304 via ETag for {}", key);
                 return CacheLookup::NotModified {
                     etag: entry.etag.clone(),
@@ -282,12 +436,13 @@ impl ResponseCache {
         }
 
         // --- Last-Modified conditional check (If-Modified-Since) ---
-        // Only when no If-None-Match was sent (RFC 9110 §13.1.3)
+        // Only when no If-None-Match was sent (RFC 9110 §13.1.3), and only
+        // where both dates read as dates.
         if if_none_match.is_none() {
-            if let (Some(ims), Some(lm)) = (if_modified_since, &entry.last_modified) {
-                // HTTP-date lexicographic comparison is valid for RFC 1123 dates:
-                // "Mon, 01 Jan 2024 00:00:00 GMT" < "Tue, 02 Jan 2024 00:00:00 GMT"
-                if lm.as_str() <= ims {
+            if let (Some(since), Some(modified)) =
+                (if_modified_since.and_then(http_date), entry.modified_at)
+            {
+                if modified <= since {
                     trace!("Cache 304 via Last-Modified for {}", key);
                     return CacheLookup::NotModified {
                         etag: entry.etag.clone(),
@@ -303,7 +458,7 @@ impl ResponseCache {
             "Cache HIT: {} (age {}s, {} bytes)",
             key,
             age_secs,
-            entry.body_size()
+            entry.body.len()
         );
         CacheLookup::Hit {
             status: entry.status,
@@ -313,9 +468,25 @@ impl ResponseCache {
         }
     }
 
+    /// Store a backend response to a request without credentials.
+    pub fn put(&self, key: &str, status: u16, response_headers: &[(String, String)], body: Bytes) {
+        self.put_for(key, false, status, response_headers, body);
+    }
+
     /// Store a backend response.  Respects Cache-Control directives, size limits,
     /// and the `no_cache_set_cookie` configuration flag.
-    pub fn put(&self, key: &str, status: u16, response_headers: &[(String, String)], body: Bytes) {
+    ///
+    /// The response to a `credentialed` request (one carrying a cookie) is kept
+    /// only when the origin stated it to be cacheable; one it said nothing
+    /// about may be that visitor's own.
+    pub fn put_for(
+        &self,
+        key: &str,
+        credentialed: bool,
+        status: u16,
+        response_headers: &[(String, String)],
+        body: Bytes,
+    ) {
         if !self.config.enabled {
             return;
         }
@@ -326,21 +497,37 @@ impl ResponseCache {
         }
 
         // Parse headers we care about
+        let mut directives = CacheControlDirectives::default();
         let mut cache_control_val: Option<String> = None;
         let mut etag: Option<String> = None;
         let mut last_modified: Option<String> = None;
+        let mut expires: Option<String> = None;
         let mut vary: Option<String> = None;
         let mut has_set_cookie = false;
         let mut has_content_encoding = false;
         let mut has_content_range = false;
         let mut has_csp_nonce = false;
+        let mut pragma_no_cache = false;
 
         for (name, value) in response_headers {
             match name.to_lowercase().as_str() {
-                "cache-control" => cache_control_val = Some(value.clone()),
+                "cache-control" => {
+                    directives.add(value);
+                    cache_control_val = Some(match cache_control_val {
+                        Some(held) => format!("{held}, {value}"),
+                        None => value.clone(),
+                    });
+                }
                 "etag" => etag = Some(value.clone()),
                 "last-modified" => last_modified = Some(value.clone()),
-                "vary" => vary = Some(value.clone()),
+                "expires" => expires = Some(value.clone()),
+                "pragma" => pragma_no_cache |= value.to_ascii_lowercase().contains("no-cache"),
+                "vary" => {
+                    vary = Some(match vary {
+                        Some(held) => format!("{held}, {value}"),
+                        None => value.clone(),
+                    });
+                }
                 "set-cookie" => has_set_cookie = true,
                 "content-encoding" => has_content_encoding = true,
                 "content-range" => has_content_range = true,
@@ -360,13 +547,9 @@ impl ResponseCache {
         // response hands the same nonce to every subsequent visitor for the
         // life of the entry, and a nonce known to everyone authorises everyone:
         // an injected tag carrying it satisfies script-src, which is the one
-        // thing the nonce existed to prevent.
-        //
-        // Found on a first-party origin that emitted per-request nonces but no
-        // Cache-Control, so this cache happily pinned one nonce for its full
-        // 60-second TTL and served it to every client. The header is the
-        // reliable signal here: if the CSP names a nonce, the body is unique to
-        // one response by construction and is not ours to replay.
+        // thing the nonce existed to prevent. The header is the reliable signal
+        // here: if the CSP names a nonce, the body is unique to one response by
+        // construction and is not ours to replay.
         if has_csp_nonce {
             trace!("Not caching {}: response carries a CSP nonce", key);
             return;
@@ -415,12 +598,10 @@ impl ResponseCache {
         //   - `Vary: *` — varies on things not expressible as headers at all.
         //
         // `Accept-Encoding` is the one safe exception, and only because of where
-        // this cache sits: it is the innermost layer, inside compression, so it
-        // only ever stores identity bodies (backend-compressed responses are
-        // already refused above). The stored entry is correct for every client,
-        // and the outer layer applies the client's encoding to hits and misses
-        // alike. Move this cache outside the compression layer and that stops
-        // being true.
+        // this cache sits: inside compression, so it only ever stores identity
+        // bodies (backend-compressed responses are already refused above). The
+        // stored entry is correct for every client, and the outer layer applies
+        // the client's encoding to hits and misses alike.
         if let Some(varies_on) = vary.as_deref() {
             let unsupported: Vec<&str> = varies_on
                 .split(',')
@@ -436,74 +617,222 @@ impl ResponseCache {
             }
         }
 
-        // Determine TTL from Cache-Control
-        let ttl = if let Some(ref cc) = cache_control_val {
-            let d = CacheControlDirectives::parse(cc);
-            if d.no_store {
-                trace!("Not caching {}: no-store", key);
-                return;
-            }
-            if d.is_private {
-                trace!("Not caching {}: private", key);
-                return;
-            }
-            if d.no_cache {
-                trace!("Not caching {}: no-cache", key);
-                return;
-            }
-            // s-maxage takes precedence over max-age for shared caches (RFC 9111 §5.2.2.10)
-            let secs = d.s_maxage.or(d.max_age).unwrap_or(0);
-            if secs == 0 {
-                // max-age=0 or s-maxage=0 → use default TTL (heuristic)
-                Duration::from_secs(self.config.default_ttl_secs)
-            } else {
-                Duration::from_secs(secs)
-            }
-        } else {
-            // No Cache-Control header: only cache status codes that are heuristically
-            // cacheable per RFC 9110 §15.1
-            if !is_cacheable_by_default(status) {
-                trace!(
-                    "Not caching {}: status {} not cacheable by default",
-                    key,
-                    status
-                );
-                return;
-            }
-            Duration::from_secs(self.config.default_ttl_secs)
-        };
-
-        // Enforce total cache size limit
-        let body_size = body.len();
-        let max_bytes = self.config.max_size_mb * 1024 * 1024;
-        if self.size_bytes.load(Ordering::Relaxed) + body_size > max_bytes {
-            self.evict_expired();
-            if self.size_bytes.load(Ordering::Relaxed) + body_size > max_bytes {
-                trace!("Not caching {}: cache full", key);
-                return;
-            }
+        if directives.no_store || directives.is_private || directives.no_cache {
+            trace!("Not caching {}: no-store, private or no-cache", key);
+            return;
         }
 
+        // How long, and whether the origin said so. s-maxage takes precedence
+        // over max-age for a shared cache, and either over Expires (RFC 9111
+        // section 5.2.2.10, 5.3). A lifetime of zero is a response to
+        // revalidate every time: there is nothing to keep.
+        let stated = match directives.s_maxage.or(directives.max_age) {
+            Some(0) => {
+                trace!("Not caching {}: a lifetime of zero", key);
+                return;
+            }
+            Some(secs) => Some(Duration::from_secs(secs)),
+            None => match expires.as_deref() {
+                Some(expires) => {
+                    let left = http_date(expires)
+                        .map(|at| at.signed_duration_since(chrono::Utc::now()).num_seconds())
+                        .unwrap_or(0);
+                    match u64::try_from(left) {
+                        Ok(secs) if secs > 0 => Some(Duration::from_secs(secs)),
+                        // In the past, or not a date: already stale
+                        _ => {
+                            trace!("Not caching {}: Expires is not in the future", key);
+                            return;
+                        }
+                    }
+                }
+                None => None,
+            },
+        };
+        let explicit = stated.is_some() || directives.is_public;
+        let ttl = match stated {
+            Some(ttl) => ttl,
+            None => {
+                // The origin stated no lifetime: only the status codes that are
+                // heuristically cacheable (RFC 9110 §15.1), for the default one.
+                if pragma_no_cache || !is_cacheable_by_default(status) {
+                    trace!(
+                        "Not caching {}: status {} with no stated lifetime",
+                        key,
+                        status
+                    );
+                    return;
+                }
+                let default = Duration::from_secs(self.config.default_ttl_secs);
+                if status >= 400 {
+                    default.min(NEGATIVE_TTL)
+                } else {
+                    default
+                }
+            }
+        };
+        if ttl.is_zero() {
+            return;
+        }
+        if credentialed && !explicit {
+            trace!(
+                "Not caching {}: the request carried a cookie and the origin stated no lifetime",
+                key
+            );
+            return;
+        }
+
+        let cost = ENTRY_OVERHEAD
+            + key.len()
+            + body.len()
+            + response_headers
+                .iter()
+                .map(|(n, v)| n.len() + v.len() + HEADER_OVERHEAD)
+                .sum::<usize>();
         let now = Instant::now();
-        let new_entry = CacheEntry {
-            status,
-            headers: response_headers.to_vec(),
-            body,
-            etag,
-            last_modified,
-            cache_control: cache_control_val,
-            created_at: now,
-            expires_at: now + ttl,
-        };
-
-        // Replace existing entry and track size delta
-        if let Some(old) = self.store.insert(key.to_string(), new_entry) {
-            self.size_bytes
-                .fetch_sub(old.body_size(), Ordering::Relaxed);
-        }
-        self.size_bytes.fetch_add(body_size, Ordering::Relaxed);
+        let body_size = body.len();
+        self.insert(
+            key,
+            CacheEntry {
+                status,
+                headers: response_headers.to_vec(),
+                body,
+                etag,
+                modified_at: last_modified.as_deref().and_then(http_date),
+                last_modified,
+                cache_control: cache_control_val,
+                created_at: now,
+                expires_at: now + ttl,
+                explicit,
+                cost,
+                id: self.next_id.fetch_add(1, Ordering::Relaxed),
+                freq: AtomicU8::new(0),
+                in_main: AtomicBool::new(false),
+            },
+        );
 
         debug!("Cached {} (ttl {:?}, {} bytes)", key, ttl, body_size);
+    }
+
+    /// Add `entry` under `key`, replacing any it had, and evict until the
+    /// cache is within its size.
+    fn insert(&self, key: &str, entry: CacheEntry) {
+        let max = self.max_bytes();
+        if entry.cost > max {
+            return;
+        }
+        let mut queues = self.queues.lock();
+        if let Some((_, old)) = self.store.remove(key) {
+            queues.forget(&old);
+            self.size_bytes.fetch_sub(old.cost, Ordering::Relaxed);
+        }
+        // A key that left the small queue unrequested and is back goes
+        // straight to the main one.
+        let to_main = queues.ghost_set.remove(&Self::key_hash(key));
+        entry.in_main.store(to_main, Ordering::Relaxed);
+        let slot = (key.to_string(), entry.id);
+        if to_main {
+            queues.main_bytes += entry.cost;
+            queues.main.push_back(slot);
+        } else {
+            queues.small_bytes += entry.cost;
+            queues.small.push_back(slot);
+        }
+        self.size_bytes.fetch_add(entry.cost, Ordering::Relaxed);
+        self.store.insert(key.to_string(), entry);
+        self.evict_to_fit(&mut queues, max);
+    }
+
+    /// Evict until the queues hold no more than `max` bytes (S3-FIFO): from
+    /// the small queue while it is over a tenth of the cache, else from the
+    /// main one.
+    fn evict_to_fit(&self, queues: &mut Queues, max: usize) {
+        let small_target = max / 10;
+        // Every step takes a slot off a queue, and puts one back at most
+        // three times per entry: this many steps empty both.
+        let mut steps = (queues.small.len() + queues.main.len()).saturating_mul(5) + 16;
+        while queues.small_bytes + queues.main_bytes > max && steps > 0 {
+            steps -= 1;
+            let from_small = queues.small_bytes > small_target || queues.main.is_empty();
+            // The queue to take from, and the other where that one is empty
+            let (first, second): (Evict, Evict) = if from_small {
+                (Self::evict_small, Self::evict_main)
+            } else {
+                (Self::evict_main, Self::evict_small)
+            };
+            if !first(self, queues) && !second(self, queues) {
+                break;
+            }
+        }
+    }
+
+    /// Take the oldest slot of the small queue: an entry asked for more than
+    /// once since it came moves to the main queue, any other leaves the cache
+    /// and its key is remembered. False when the queue is empty.
+    fn evict_small(&self, queues: &mut Queues) -> bool {
+        let Some((key, id)) = queues.small.pop_front() else {
+            return false;
+        };
+        // (cost, keep) of the entry this slot is for, if it is still there
+        let live = self.store.get(&key).filter(|e| e.id == id).map(|e| {
+            let keep = !e.is_expired() && e.freq.load(Ordering::Relaxed) > 1;
+            if keep {
+                e.in_main.store(true, Ordering::Relaxed);
+                e.freq.store(0, Ordering::Relaxed);
+            }
+            (e.cost, keep)
+        });
+        match live {
+            None => {}
+            Some((cost, true)) => {
+                queues.small_bytes = queues.small_bytes.saturating_sub(cost);
+                queues.main_bytes += cost;
+                queues.main.push_back((key, id));
+            }
+            Some((cost, false)) => {
+                self.store.remove(&key);
+                queues.small_bytes = queues.small_bytes.saturating_sub(cost);
+                self.size_bytes.fetch_sub(cost, Ordering::Relaxed);
+                queues.remember(Self::key_hash(&key));
+            }
+        }
+        true
+    }
+
+    /// Take the oldest slot of the main queue: an entry asked for since it
+    /// was last here goes to the back with one use fewer, any other leaves
+    /// the cache. False when the queue is empty.
+    fn evict_main(&self, queues: &mut Queues) -> bool {
+        let Some((key, id)) = queues.main.pop_front() else {
+            return false;
+        };
+        let live = self.store.get(&key).filter(|e| e.id == id).map(|e| {
+            let freq = e.freq.load(Ordering::Relaxed);
+            let keep = !e.is_expired() && freq > 0;
+            if keep {
+                e.freq.store(freq - 1, Ordering::Relaxed);
+            }
+            (e.cost, keep)
+        });
+        match live {
+            None => {}
+            Some((_, true)) => queues.main.push_back((key, id)),
+            Some((cost, false)) => {
+                self.store.remove(&key);
+                queues.main_bytes = queues.main_bytes.saturating_sub(cost);
+                self.size_bytes.fetch_sub(cost, Ordering::Relaxed);
+            }
+        }
+        true
+    }
+
+    /// Remove `key`'s entry if it has expired.
+    fn remove_expired(&self, key: &str) {
+        let mut queues = self.queues.lock();
+        if let Some((_, entry)) = self.store.remove_if(key, |_, e| e.is_expired()) {
+            queues.forget(&entry);
+            self.size_bytes.fetch_sub(entry.cost, Ordering::Relaxed);
+        }
     }
 
     /// Return `true` if `path` matches any of the configured excluded prefixes.
@@ -528,33 +857,59 @@ impl ResponseCache {
         })
     }
 
+    /// Remove the entries `gone` selects, then the queue slots that name no
+    /// entry any more. Returns how many entries and bytes went.
+    fn remove_where<F>(&self, mut gone: F) -> (usize, usize)
+    where
+        F: FnMut(&str, &CacheEntry) -> bool,
+    {
+        let mut queues = self.queues.lock();
+        let (mut removed, mut bytes) = (0usize, 0usize);
+        {
+            let queues = &mut *queues;
+            self.store.retain(|key, entry| {
+                if gone(key, entry) {
+                    removed += 1;
+                    bytes += entry.cost;
+                    queues.forget(entry);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        if bytes > 0 {
+            self.size_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        }
+        let store = &self.store;
+        let live = |(key, id): &(String, u64)| store.get(key).is_some_and(|e| e.id == *id);
+        queues.small.retain(live);
+        queues.main.retain(live);
+        (removed, bytes)
+    }
+
     /// Evict all expired entries and reclaim their size accounting.
     pub fn evict_expired(&self) {
-        let mut removed = 0usize;
-        self.store.retain(|_, entry| {
-            if entry.is_expired() {
-                removed += entry.body_size();
-                false
-            } else {
-                true
-            }
-        });
+        let (removed, bytes) = self.remove_where(|_, entry| entry.is_expired());
         if removed > 0 {
-            self.size_bytes.fetch_sub(removed, Ordering::Relaxed);
-            debug!("Evicted {} bytes of expired cache entries", removed);
+            debug!("Evicted {removed} expired cache entries ({bytes} bytes)");
         }
     }
 
-    /// Return `(entry_count, total_size_bytes)` for monitoring.
+    /// Return `(entry_count, total_size_bytes)` for monitoring. The size is
+    /// what the entries count for against `max_size_mb`: bodies, headers,
+    /// keys and a fixed share each.
     pub fn stats(&self) -> (usize, usize) {
         (self.store.len(), self.size_bytes.load(Ordering::Relaxed))
     }
 
     /// Drop every entry. Returns how many were removed.
     pub fn purge_all(&self) -> usize {
+        let mut queues = self.queues.lock();
         let removed = self.store.len();
         let bytes = self.size_bytes.swap(0, Ordering::Relaxed);
         self.store.clear();
+        *queues = Queues::default();
         if removed > 0 {
             info!("Cache purged: {removed} entries, {bytes} bytes");
         }
@@ -571,21 +926,7 @@ impl ResponseCache {
     where
         F: Fn(&str) -> bool,
     {
-        let mut removed = 0usize;
-        let mut bytes = 0usize;
-        self.store.retain(|key, entry| {
-            if predicate(key) {
-                removed += 1;
-                bytes += entry.body_size();
-                false
-            } else {
-                true
-            }
-        });
-        if bytes > 0 {
-            self.size_bytes.fetch_sub(bytes, Ordering::Relaxed);
-        }
-        removed
+        self.remove_where(|key, _| predicate(key)).0
     }
 
     /// Drop every entry for one host, whatever the method or path.
@@ -637,6 +978,116 @@ impl ResponseCache {
         info!("Cache purged {host}{path}: {n} entries");
         n
     }
+
+    /// Answer a miss: keep `body` if the response may be stored and ends
+    /// within the cache's per-entry limit, and pass it on either way.
+    ///
+    /// A response the cache could never store (`no-store`, `private`,
+    /// `no-cache`, or a `Content-Length` over the limit) streams through
+    /// untouched, and one that turns out longer than the limit streams on,
+    /// the bytes already read first: a body is never held back that cannot be
+    /// kept, and never lost. `per_request` names a header that belongs to
+    /// this one response (its request ID) and is left out of what is stored.
+    pub async fn store_or_stream(
+        &self,
+        plan: &CachePlan,
+        per_request: Option<&HeaderName>,
+        mut parts: axum::http::response::Parts,
+        body: Body,
+    ) -> Response<Body> {
+        let limit = self.config.max_body_size_bytes;
+        if !may_store(&parts.headers, limit) {
+            parts
+                .headers
+                .insert("x-cache", HeaderValue::from_static("MISS"));
+            return Response::from_parts(parts, body);
+        }
+        match buffer_within(body, limit).await {
+            Ok(bytes) => {
+                let kept: Vec<(String, String)> = parts
+                    .headers
+                    .iter()
+                    .filter(|(name, _)| Some(*name) != per_request)
+                    .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
+                    .collect();
+                self.put_for(
+                    &plan.key,
+                    plan.credentialed,
+                    parts.status.as_u16(),
+                    &kept,
+                    bytes.clone(),
+                );
+                parts
+                    .headers
+                    .insert("x-cache", HeaderValue::from_static("MISS"));
+                Response::from_parts(parts, Body::from(bytes))
+            }
+            Err(body) => {
+                // Longer than the cache keeps: not stored, sent whole.
+                parts
+                    .headers
+                    .insert("x-cache", HeaderValue::from_static("MISS"));
+                Response::from_parts(parts, body)
+            }
+        }
+    }
+}
+
+/// A stored response as the answer to a request; a HEAD gets the headers a
+/// GET would have and no body (RFC 9110 section 9.3.2).
+pub fn hit_response(
+    is_head: bool,
+    status: u16,
+    headers: &[(String, String)],
+    body: Bytes,
+    age_secs: u64,
+) -> Response<Body> {
+    let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+    let mut builder = Response::builder().status(status_code);
+    for (k, v) in headers {
+        // Skip content-length — we set it precisely from the stored body
+        if !k.eq_ignore_ascii_case("content-length") {
+            if let Ok(val) = HeaderValue::from_str(v) {
+                builder = builder.header(k.as_str(), val);
+            }
+        }
+    }
+    builder = builder
+        .header("content-length", body.len().to_string())
+        .header("age", age_secs.to_string())
+        .header("x-cache", "HIT");
+    let resp_body = if is_head {
+        Body::empty()
+    } else {
+        Body::from(body)
+    };
+    builder
+        .body(resp_body)
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+/// 304 for a conditional request the stored response satisfies.
+pub fn not_modified_response(
+    etag: Option<String>,
+    last_modified: Option<String>,
+    cache_control: Option<String>,
+    age_secs: u64,
+) -> Response<Body> {
+    let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
+    for (name, value) in [
+        ("etag", etag),
+        ("last-modified", last_modified),
+        ("cache-control", cache_control),
+    ] {
+        if let Some(val) = value.and_then(|v| HeaderValue::from_str(&v).ok()) {
+            builder = builder.header(name, val);
+        }
+    }
+    builder
+        .header("age", age_secs.to_string())
+        .header("x-cache", "HIT")
+        .body(Body::empty())
+        .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
 /// The one response cache for this process.
@@ -656,7 +1107,24 @@ static SHARED: std::sync::OnceLock<Arc<ResponseCache>> = std::sync::OnceLock::ne
 /// should do.
 pub fn shared(config: &ResponseCacheConfig) -> Arc<ResponseCache> {
     SHARED
-        .get_or_init(|| Arc::new(ResponseCache::new(config.clone())))
+        .get_or_init(|| {
+            let cache = Arc::new(ResponseCache::new(config.clone()));
+            // Entries nobody asks for again leave on this timer rather than
+            // waiting to be pushed out. Where there is no runtime (a unit
+            // test) nothing is spawned and expiry happens on lookup alone.
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                let swept = Arc::clone(&cache);
+                runtime.spawn(async move {
+                    let mut tick = tokio::time::interval(SWEEP_INTERVAL);
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tick.tick().await;
+                        swept.evict_expired();
+                    }
+                });
+            }
+            cache
+        })
         .clone()
 }
 
@@ -671,238 +1139,12 @@ fn is_cacheable_by_default(status: u16) -> bool {
     )
 }
 
-// ============================================================================
-// Axum middleware (HTTP/1.1 + HTTP/2)
-// ============================================================================
-
-/// Response cache middleware for HTTP/1.1 and HTTP/2.
-///
-/// Placed as the **innermost** Axum layer so that security headers, Alt-Svc, and
-/// compression are applied uniformly to both cache hits and cache misses.
-///
-/// On **cache miss**: a response the cache could store is buffered up to the
-/// cache's own size limit (`max_body_size_bytes`), stored, and returned. One it
-/// could never store (`no-store`, `private`, `no-cache`, or a `Content-Length`
-/// over the limit) streams through untouched, and one that turns out longer
-/// than the limit streams on, the bytes already read first: a body is never
-/// held back that cannot be kept, and never lost. It was buffered whole up to
-/// 100 MiB whatever its headers said, and a longer one was sent with its
-/// headers and an empty body: the speed test's 1 GB downloads arrived as
-/// nothing, and anything under 100 MiB waited to be read in full before its
-/// first byte left (205 ms for 100 MB on a 1 ms path).
-///
-/// On **cache hit**: the stored body is returned immediately without calling the
-/// inner handler, saving a backend round-trip.
-///
-/// On **304 Not Modified**: a body-less 304 is returned when the client supplies
-/// a matching `If-None-Match` or `If-Modified-Since` header.
-pub async fn cache_middleware(
-    State(cache): State<Arc<ResponseCache>>,
-    request: Request<Body>,
-    next: Next,
-) -> Response<Body> {
-    // MEASUREMENT ONLY: the layer stays in the chain and pays every bit of the
-    // plumbing — the boxed future, the per-request clone, the `Next` indirection —
-    // but does none of its own work. Subtracting this from the full build gives
-    // the work; subtracting the no-chain build from this gives the plumbing.
-    #[cfg(feature = "bench-null-middleware")]
-    {
-        return next.run(request).await;
-    }
-    if !cache.config.enabled {
-        return next.run(request).await;
-    }
-
-    let method = request.method().clone();
-
-    // Only GET and HEAD are cacheable (safe, idempotent methods — RFC 9110 §9.3)
-    if !matches!(method, Method::GET | Method::HEAD) {
-        return next.run(request).await;
-    }
-
-    // Range requests bypass the cache entirely: the cache stores whole responses
-    // and must hand range requests to the backend so they get a correct 206 with
-    // a matching Content-Range, rather than a cached full 200 body (which breaks
-    // media playback). Mirrors the HTTP/3 path in quic_listener.rs.
-    if request.headers().contains_key("range") {
-        return next.run(request).await;
-    }
-
-    let uri = request.uri().clone();
-    let path = uri.path().to_string();
-    let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
-    let path_with_query = format!("{}{}", path, query);
-
-    if cache.is_excluded_path(&path) {
-        return next.run(request).await;
-    }
-
-    // Prefer URI authority (set for HTTP/2 :authority pseudo-header and HTTP/1.1 absolute-form
-    // requests) and fall back to the Host header (HTTP/1.1 origin-form requests).
-    let host = uri
-        .authority()
-        .map(|a| a.host().to_ascii_lowercase())
-        .or_else(|| {
-            request
-                .headers()
-                .get("host")
-                .and_then(|v| v.to_str().ok())
-                .map(|h| crate::config::host_without_port(h).to_ascii_lowercase())
-        })
-        .unwrap_or_default();
-
-    if cache.is_excluded_host(&host) {
-        return next.run(request).await;
-    }
-
-    let cache_key = ResponseCache::build_key(method.as_str(), &host, &path_with_query);
-    let is_head = method == Method::HEAD;
-
-    let if_none_match = request
-        .headers()
-        .get("if-none-match")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-
-    let if_modified_since = request
-        .headers()
-        .get("if-modified-since")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-
-    match cache.get(
-        &cache_key,
-        if_none_match.as_deref(),
-        if_modified_since.as_deref(),
-    ) {
-        CacheLookup::Hit {
-            status,
-            headers,
-            body,
-            age_secs,
-        } => {
-            let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
-            let mut builder = Response::builder().status(status_code);
-            for (k, v) in &headers {
-                // Skip content-length — we set it precisely from the stored body
-                if k.to_lowercase() != "content-length" {
-                    if let Ok(val) = HeaderValue::from_str(v) {
-                        builder = builder.header(k.as_str(), val);
-                    }
-                }
-            }
-            builder = builder
-                .header("content-length", body.len().to_string())
-                .header("age", age_secs.to_string())
-                .header("x-cache", "HIT");
-
-            let resp_body = if method == Method::HEAD {
-                Body::empty()
-            } else {
-                Body::from(body)
-            };
-
-            builder
-                .body(resp_body)
-                .unwrap_or_else(|_| Response::new(Body::empty()))
-        }
-
-        CacheLookup::NotModified {
-            etag,
-            last_modified,
-            cache_control,
-            age_secs,
-        } => {
-            let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
-            if let Some(et) = etag {
-                if let Ok(val) = HeaderValue::from_str(&et) {
-                    builder = builder.header("etag", val);
-                }
-            }
-            if let Some(lm) = last_modified {
-                if let Ok(val) = HeaderValue::from_str(&lm) {
-                    builder = builder.header("last-modified", val);
-                }
-            }
-            if let Some(cc) = cache_control {
-                if let Ok(val) = HeaderValue::from_str(&cc) {
-                    builder = builder.header("cache-control", val);
-                }
-            }
-            builder = builder
-                .header("age", age_secs.to_string())
-                .header("x-cache", "HIT");
-            builder
-                .body(Body::empty())
-                .unwrap_or_else(|_| Response::new(Body::empty()))
-        }
-
-        CacheLookup::Miss => {
-            let response = next.run(request).await;
-            let status = response.status().as_u16();
-
-            // Collect headers before consuming the body
-            let resp_headers: Vec<(String, String)> = response
-                .headers()
-                .iter()
-                .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
-                .collect();
-
-            let (mut parts, resp_body) = response.into_parts();
-
-            if !may_store(&parts.headers, cache.config.max_body_size_bytes) {
-                parts
-                    .headers
-                    .insert("x-cache", HeaderValue::from_static("MISS"));
-                return Response::from_parts(parts, resp_body);
-            }
-
-            match buffer_within(resp_body, cache.config.max_body_size_bytes).await {
-                Ok(body_bytes) => {
-                    // Never store a HEAD response. Its body is empty by
-                    // definition, so the entry holds nothing worth serving, and
-                    // the Hit arm above derives `content-length` from the stored
-                    // body — which would report every cached HEAD as a
-                    // zero-length representation for the life of the entry.
-                    // The key is method-scoped, so this cannot affect GET.
-                    if is_head {
-                        parts
-                            .headers
-                            .insert("x-cache", HeaderValue::from_static("MISS"));
-                        return head_response(parts);
-                    }
-                    if body_bytes.len() <= cache.config.max_body_size_bytes {
-                        cache.put(&cache_key, status, &resp_headers, body_bytes.clone());
-                    }
-                    parts
-                        .headers
-                        .insert("x-cache", HeaderValue::from_static("MISS"));
-                    Response::from_parts(parts, Body::from(body_bytes))
-                }
-                Err(body) => {
-                    // Longer than the cache keeps: not stored, sent whole.
-                    parts
-                        .headers
-                        .insert("x-cache", HeaderValue::from_static("MISS"));
-                    Response::from_parts(parts, body)
-                }
-            }
-        }
-    }
-}
-
 /// Could a response with these headers be stored? The cheap refusals only,
 /// read before any of the body is: `put` still makes the full decision. A
 /// response refused here is passed on as it streams.
-fn may_store(headers: &axum::http::HeaderMap, max_body: usize) -> bool {
-    let refused = headers
-        .get_all(axum::http::header::CACHE_CONTROL)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .any(|cc| {
-            let d = CacheControlDirectives::parse(cc);
-            d.no_store || d.is_private || d.no_cache
-        });
+pub(crate) fn may_store(headers: &axum::http::HeaderMap, max_body: usize) -> bool {
+    let d = CacheControlDirectives::of(headers);
+    let refused = d.no_store || d.is_private || d.no_cache;
     let too_long = headers
         .get(axum::http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
@@ -948,58 +1190,43 @@ async fn buffer_within(mut body: Body, limit: usize) -> Result<Bytes, Body> {
     }
 }
 
-// Not under `bench-null-middleware`, which makes the middleware a no-op for
-// measurement (and is on in `--all-features` runs): these test its own work.
-#[cfg(all(test, not(feature = "bench-null-middleware")))]
+#[cfg(test)]
 mod miss_tests {
     use super::*;
-    use axum::routing::get;
-    use axum::Router;
-    use tower::ServiceExt as _;
 
-    /// A router behind the cache middleware whose one route answers with
-    /// `chunks` chunks of 64 KiB, as a stream, under `headers`.
-    fn app(
-        cache: Arc<ResponseCache>,
-        chunks: usize,
-        headers: &'static [(&'static str, &'static str)],
-    ) -> Router {
-        Router::new()
-            .route(
-                "/r",
-                get(move || async move {
-                    let stream = futures_util::stream::iter(
-                        (0..chunks)
-                            .map(|_| Ok::<_, std::io::Error>(Bytes::from(vec![7u8; 64 * 1024]))),
-                    );
-                    let mut resp = Response::new(Body::from_stream(stream));
-                    for (k, v) in headers {
-                        resp.headers_mut().insert(*k, HeaderValue::from_static(v));
-                    }
-                    resp
-                }),
-            )
-            .layer(axum::middleware::from_fn_with_state(
-                cache,
-                cache_middleware,
-            ))
-    }
-
-    fn cache() -> Arc<ResponseCache> {
-        Arc::new(ResponseCache::new(ResponseCacheConfig {
+    fn cache() -> ResponseCache {
+        ResponseCache::new(ResponseCacheConfig {
             enabled: true,
             max_body_size_bytes: 1024 * 1024,
             ..Default::default()
-        }))
+        })
     }
 
-    async fn body_len(app: Router) -> usize {
-        let req = Request::builder()
-            .uri("/r")
-            .header("host", "pqcrypta.com")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+    fn plan() -> CachePlan {
+        CachePlan {
+            key: ResponseCache::build_key("GET", "pqcrypta.com", "/r"),
+            credentialed: false,
+            lookup: true,
+        }
+    }
+
+    /// A response of `chunks` chunks of 64 KiB, as a stream, under `headers`,
+    /// through `store_or_stream`; the length that came out.
+    async fn body_len(
+        c: &ResponseCache,
+        chunks: usize,
+        headers: &[(&'static str, &'static str)],
+    ) -> usize {
+        let stream = futures_util::stream::iter(
+            (0..chunks).map(|_| Ok::<_, std::io::Error>(Bytes::from(vec![7u8; 64 * 1024]))),
+        );
+        let mut resp = Response::new(Body::from_stream(stream));
+        for (k, v) in headers {
+            resp.headers_mut().insert(*k, HeaderValue::from_static(v));
+        }
+        let (parts, body) = resp.into_parts();
+        let resp = c.store_or_stream(&plan(), None, parts, body).await;
+        assert_eq!(resp.headers().get("x-cache").unwrap(), "MISS");
         axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap()
@@ -1010,7 +1237,7 @@ mod miss_tests {
     async fn a_body_longer_than_the_cache_keeps_arrives_whole_and_is_not_stored() {
         let c = cache();
         // 4 MiB, no Content-Length, cacheable headers: read past the limit.
-        let len = body_len(app(c.clone(), 64, &[("cache-control", "max-age=60")])).await;
+        let len = body_len(&c, 64, &[("cache-control", "max-age=60")]).await;
         assert_eq!(len, 64 * 64 * 1024, "every byte reaches the client");
         assert_eq!(c.stats().0, 0, "nothing stored");
     }
@@ -1018,12 +1245,7 @@ mod miss_tests {
     #[tokio::test]
     async fn a_no_store_body_streams_through() {
         let c = cache();
-        let len = body_len(app(
-            c.clone(),
-            64,
-            &[("cache-control", "no-store, no-cache")],
-        ))
-        .await;
+        let len = body_len(&c, 64, &[("cache-control", "no-store, no-cache")]).await;
         assert_eq!(len, 64 * 64 * 1024);
         assert_eq!(c.stats().0, 0);
     }
@@ -1031,9 +1253,29 @@ mod miss_tests {
     #[tokio::test]
     async fn a_short_cacheable_body_is_stored_and_returned() {
         let c = cache();
-        let len = body_len(app(c.clone(), 4, &[("cache-control", "max-age=60")])).await;
+        let len = body_len(&c, 4, &[("cache-control", "max-age=60")]).await;
         assert_eq!(len, 4 * 64 * 1024);
         assert_eq!(c.stats().0, 1, "stored");
+    }
+
+    #[tokio::test]
+    async fn a_header_of_this_one_response_is_not_stored() {
+        let c = cache();
+        let name = HeaderName::from_static("x-request-id");
+        let mut resp = Response::new(Body::from("body"));
+        resp.headers_mut()
+            .insert("cache-control", HeaderValue::from_static("max-age=60"));
+        resp.headers_mut()
+            .insert(name.clone(), HeaderValue::from_static("first"));
+        let (parts, body) = resp.into_parts();
+        let sent = c.store_or_stream(&plan(), Some(&name), parts, body).await;
+        assert_eq!(sent.headers().get(&name).unwrap(), "first");
+        let CacheLookup::Hit { headers, .. } = c.get(&plan().key, None, None) else {
+            panic!("stored");
+        };
+        assert!(headers
+            .iter()
+            .all(|(k, _)| k != "x-request-id" && k != "x-cache"));
     }
 
     #[test]
@@ -1048,6 +1290,296 @@ mod miss_tests {
             HeaderValue::from_static("private, max-age=60"),
         );
         assert!(!may_store(&h, 1024));
+    }
+}
+
+#[cfg(test)]
+mod bound_tests {
+    use super::*;
+
+    fn cache(max_size_mb: usize) -> ResponseCache {
+        ResponseCache::new(ResponseCacheConfig {
+            enabled: true,
+            max_size_mb,
+            ..Default::default()
+        })
+    }
+
+    fn fresh() -> Vec<(String, String)> {
+        vec![("cache-control".to_string(), "max-age=60".to_string())]
+    }
+
+    fn key(n: usize) -> String {
+        ResponseCache::build_key("GET", "pqcrypta.com", &format!("/page-{n}"))
+    }
+
+    /// Any number of distinct URLs leaves the cache within its size, with
+    /// every byte of every entry counted.
+    #[test]
+    fn distinct_urls_never_take_the_cache_past_its_size() {
+        let c = cache(1);
+        for n in 0..20_000 {
+            c.put(&key(n), 200, &fresh(), Bytes::from_static(b"tiny"));
+        }
+        let (entries, bytes) = c.stats();
+        assert!(bytes <= 1024 * 1024, "{bytes} bytes held");
+        assert!(entries <= 1024 * 1024 / ENTRY_OVERHEAD, "{entries} entries");
+        assert!(entries > 0);
+        let queues = c.queues.lock();
+        assert_eq!(queues.small_bytes + queues.main_bytes, bytes);
+        assert!(queues.small.len() + queues.main.len() <= entries + 1);
+    }
+
+    /// An entry in use outlives a run of URLs each asked for once.
+    #[test]
+    fn an_entry_in_use_survives_urls_requested_once() {
+        let c = cache(1);
+        let wanted = ResponseCache::build_key("GET", "pqcrypta.com", "/wanted");
+        c.put(&wanted, 200, &fresh(), Bytes::from(vec![1u8; 2048]));
+        for _ in 0..3 {
+            assert!(matches!(
+                c.get(&wanted, None, None),
+                CacheLookup::Hit { .. }
+            ));
+        }
+        for n in 0..20_000 {
+            c.put(&key(n), 200, &fresh(), Bytes::from_static(b"tiny"));
+            if n % 500 == 0 {
+                assert!(
+                    matches!(c.get(&wanted, None, None), CacheLookup::Hit { .. }),
+                    "evicted after {n} one-off entries"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replacing_an_entry_counts_it_once() {
+        let c = cache(1);
+        c.put(&key(1), 200, &fresh(), Bytes::from(vec![0u8; 1000]));
+        let first = c.stats().1;
+        c.put(&key(1), 200, &fresh(), Bytes::from(vec![0u8; 3000]));
+        assert_eq!(c.stats(), (1, first + 2000));
+        c.purge_all();
+        assert_eq!(c.stats(), (0, 0));
+    }
+
+    #[test]
+    fn expired_entries_are_swept_with_their_queue_slots() {
+        let c = cache(1);
+        // Expires a second from now: the shortest stated lifetime there is
+        let soon = (chrono::Utc::now() + chrono::Duration::seconds(2)).to_rfc2822();
+        for n in 0..50 {
+            c.put(
+                &key(n),
+                200,
+                &[("expires".to_string(), soon.clone())],
+                Bytes::from_static(b"x"),
+            );
+        }
+        c.put(&key(999), 200, &fresh(), Bytes::from_static(b"x"));
+        assert_eq!(c.stats().0, 51);
+        std::thread::sleep(Duration::from_millis(2100));
+        c.evict_expired();
+        assert_eq!(c.stats().0, 1);
+        let queues = c.queues.lock();
+        assert_eq!(queues.small.len() + queues.main.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod freshness_tests {
+    use super::*;
+
+    fn cache() -> ResponseCache {
+        ResponseCache::new(ResponseCacheConfig {
+            enabled: true,
+            ..Default::default()
+        })
+    }
+
+    fn stored(headers: &[(&str, &str)], status: u16, credentialed: bool) -> bool {
+        let c = cache();
+        let key = ResponseCache::build_key("GET", "pqcrypta.com", "/thing");
+        let headers: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        c.put_for(
+            &key,
+            credentialed,
+            status,
+            &headers,
+            Bytes::from_static(b"body"),
+        );
+        c.stats().0 > 0
+    }
+
+    #[test]
+    fn a_lifetime_of_zero_is_not_kept() {
+        assert!(!stored(&[("cache-control", "max-age=0")], 200, false));
+        assert!(!stored(
+            &[("cache-control", "max-age=60, s-maxage=0")],
+            200,
+            false
+        ));
+        assert!(stored(
+            &[("cache-control", "max-age=0, s-maxage=60")],
+            200,
+            false
+        ));
+    }
+
+    #[test]
+    fn expires_is_read_when_cache_control_states_no_lifetime() {
+        let past = "Thu, 19 Nov 1981 08:52:00 GMT";
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc2822();
+        assert!(!stored(&[("expires", past)], 200, false));
+        assert!(!stored(&[("expires", "0")], 200, false));
+        assert!(stored(&[("expires", &future)], 200, false));
+        // max-age wins over Expires
+        assert!(stored(
+            &[("cache-control", "max-age=60"), ("expires", past)],
+            200,
+            false
+        ));
+        assert!(!stored(&[("pragma", "no-cache")], 200, false));
+    }
+
+    #[test]
+    fn a_request_with_a_cookie_keeps_only_what_the_origin_called_cacheable() {
+        assert!(stored(&[], 200, false), "the default lifetime, no cookie");
+        assert!(!stored(&[], 200, true), "nothing stated, a cookie");
+        assert!(stored(&[("cache-control", "max-age=60")], 200, true));
+        assert!(stored(&[("cache-control", "public")], 200, true));
+    }
+
+    #[test]
+    fn an_entry_on_the_default_lifetime_is_not_served_to_a_request_with_a_cookie() {
+        let c = cache();
+        let key = ResponseCache::build_key("GET", "pqcrypta.com", "/thing");
+        c.put(&key, 200, &[], Bytes::from_static(b"body"));
+        assert!(matches!(
+            c.get_for(&key, false, None, None),
+            CacheLookup::Hit { .. }
+        ));
+        assert!(matches!(
+            c.get_for(&key, true, None, None),
+            CacheLookup::Miss
+        ));
+    }
+
+    #[test]
+    fn if_modified_since_compares_dates() {
+        let c = cache();
+        let key = ResponseCache::build_key("GET", "pqcrypta.com", "/thing");
+        c.put(
+            &key,
+            200,
+            &[
+                ("cache-control".to_string(), "max-age=60".to_string()),
+                (
+                    "last-modified".to_string(),
+                    "Mon, 09 Nov 2026 10:00:00 GMT".to_string(),
+                ),
+            ],
+            Bytes::from_static(b"body"),
+        );
+        // Earlier than the change, though "Wed" sorts after "Mon" as text
+        assert!(matches!(
+            c.get(&key, None, Some("Wed, 01 Jan 2020 00:00:00 GMT")),
+            CacheLookup::Hit { .. }
+        ));
+        assert!(matches!(
+            c.get(&key, None, Some("Mon, 09 Nov 2026 10:00:00 GMT")),
+            CacheLookup::NotModified { .. }
+        ));
+        assert!(matches!(
+            c.get(&key, None, Some("Tue, 10 Nov 2026 00:00:00 GMT")),
+            CacheLookup::NotModified { .. }
+        ));
+        assert!(matches!(
+            c.get(&key, None, Some("not a date")),
+            CacheLookup::Hit { .. }
+        ));
+    }
+
+    #[test]
+    fn if_none_match_reads_a_list() {
+        let c = cache();
+        let key = ResponseCache::build_key("GET", "pqcrypta.com", "/thing");
+        c.put(
+            &key,
+            200,
+            &[
+                ("cache-control".to_string(), "max-age=60".to_string()),
+                ("etag".to_string(), "\"v2\"".to_string()),
+            ],
+            Bytes::from_static(b"body"),
+        );
+        assert!(matches!(
+            c.get(&key, Some("\"v1\", W/\"v2\""), None),
+            CacheLookup::NotModified { .. }
+        ));
+        assert!(matches!(
+            c.get(&key, Some("\"v1\""), None),
+            CacheLookup::Hit { .. }
+        ));
+    }
+
+    #[test]
+    fn the_plan_follows_the_request() {
+        let c = ResponseCache::new(ResponseCacheConfig {
+            enabled: true,
+            excluded_paths: vec!["/auth".to_string()],
+            excluded_hosts: vec!["api.pqcrypta.com".to_string()],
+            ..Default::default()
+        });
+        let h = |pairs: &[(&'static str, &'static str)]| {
+            let mut map = HeaderMap::new();
+            for (k, v) in pairs {
+                map.insert(*k, HeaderValue::from_static(v));
+            }
+            map
+        };
+        let plan = |method: Method, headers: &HeaderMap, host: &str, path: &str| {
+            c.plan(&method, headers, host, path, None)
+        };
+        let get = plan(Method::GET, &h(&[]), "pqcrypta.com", "/page").expect("cacheable");
+        assert!(get.lookup && !get.credentialed);
+        // A HEAD is answered from the GET's entry
+        let head = plan(Method::HEAD, &h(&[]), "pqcrypta.com", "/page").expect("cacheable");
+        assert_eq!(head.key, get.key);
+        assert!(plan(Method::POST, &h(&[]), "pqcrypta.com", "/page").is_none());
+        assert!(plan(Method::GET, &h(&[]), "pqcrypta.com", "/auth/login").is_none());
+        assert!(plan(Method::GET, &h(&[]), "api.pqcrypta.com", "/page").is_none());
+        for refused in [
+            [("authorization", "Bearer x")],
+            [("range", "bytes=0-1")],
+            [("cache-control", "no-store")],
+        ] {
+            assert!(plan(Method::GET, &h(&refused), "pqcrypta.com", "/page").is_none());
+        }
+        let cookie = plan(
+            Method::GET,
+            &h(&[("cookie", "a=b")]),
+            "pqcrypta.com",
+            "/page",
+        );
+        assert!(cookie.expect("cacheable").credentialed);
+        for fresh in [
+            [("cache-control", "no-cache")],
+            [("cache-control", "max-age=0")],
+            [("pragma", "no-cache")],
+        ] {
+            let p = plan(Method::GET, &h(&fresh), "pqcrypta.com", "/page").expect("cacheable");
+            assert!(!p.lookup, "{fresh:?} asks for the origin's answer");
+        }
+        // The query is part of the key
+        let with_query = c
+            .plan(&Method::GET, &h(&[]), "pqcrypta.com", "/page", Some("a=1"))
+            .expect("cacheable");
+        assert_ne!(with_query.key, get.key);
     }
 }
 

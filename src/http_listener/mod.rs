@@ -44,7 +44,7 @@ use axum::{
 use axum_server::accept::Accept;
 use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
 use hyper::upgrade::OnUpgrade;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use request_host::RequestHost;
 use tokio::net::{TcpListener, TcpStream};
@@ -59,7 +59,6 @@ use crate::pqc_tls::{openssl_pqc, PqcTlsProvider};
 
 use crate::access_logger::{log_access, AccessLogEntry};
 use crate::backend_client::BackendClient;
-use crate::cache::cache_middleware;
 use crate::compression::{compression_middleware, CompressionState};
 use crate::config::{BackendConfig, ProxyConfig, ShadowConfig, TlsMode};
 use crate::fingerprint::{
@@ -147,6 +146,9 @@ pub struct HttpListenerState {
     /// Fingerprint extractor for TLS client identification
     pub fingerprint: Arc<FingerprintExtractor>,
     pub load_balancer: Arc<LoadBalancer>,
+    /// The process's response cache, consulted once a request has passed its
+    /// route's gates.
+    pub cache: Arc<crate::cache::ResponseCache>,
     /// Metrics registry for request tracking
     pub metrics: Arc<MetricsRegistry>,
     /// Nonce store for per-route HMAC replay protection (shared across all routes).
@@ -747,7 +749,8 @@ where
 ///
 /// Order (outside to inside): trace context -> advanced rate limit ->
 /// fingerprint -> security -> http3 features -> compression -> Alt-Svc ->
-/// security headers -> cache -> dispatch.
+/// security headers -> dispatch. The response cache is not a layer: the
+/// handler consults it once a request has passed its route's gates.
 ///
 /// Every layer but `security` is optional and present only when its feature is
 /// on. `security` always runs: it carries the request-size, header-size and
@@ -755,7 +758,6 @@ where
 #[allow(clippy::too_many_arguments)]
 fn build_proxy_service(
     state: &Arc<HttpListenerState>,
-    response_cache: Arc<crate::cache::ResponseCache>,
     compression_state: CompressionState,
     http3_features_state: Http3FeaturesState,
     security_state: Arc<SecurityState>,
@@ -777,7 +779,6 @@ fn build_proxy_service(
     #[cfg(feature = "bench-no-middleware")]
     let svc = {
         let _ = (
-            &response_cache,
             &compression_state,
             &http3_features_state,
             &security_state,
@@ -795,20 +796,11 @@ fn build_proxy_service(
         let layers_on = LayerSelection::from_config(&config, state, &http3_features_state);
         layers_on.log();
 
-        // Cache is innermost: it stores pre-compression bodies, so every outer layer
-        // applies to hits and misses alike.
-        let svc = Maybe::new(
-            layers_on.cache,
-            |inner| {
-                wrap(
-                    middleware::from_fn_with_state(response_cache, cache_middleware),
-                    inner,
-                )
-            },
-            ProxyDispatch {
-                state: state.clone(),
-            },
-        );
+        // The dispatcher answers from the response cache itself, so every
+        // layer here applies to a stored response as to a new one.
+        let svc = ProxyDispatch {
+            state: state.clone(),
+        };
         let svc = Maybe::new(
             layers_on.security_headers,
             |inner| {
@@ -898,7 +890,6 @@ struct LayerSelection {
     compression: bool,
     alt_svc: bool,
     security_headers: bool,
-    cache: bool,
 }
 
 #[cfg(not(feature = "bench-no-middleware"))]
@@ -922,7 +913,6 @@ impl LayerSelection {
             // even when this listener advertises nothing.
             alt_svc: state.alt_svc_value.is_some() || !config.server.tcp_only_hosts.is_empty(),
             security_headers: !state.response_headers.is_empty(),
-            cache: config.cache.enabled,
         }
     }
 
@@ -934,7 +924,6 @@ impl LayerSelection {
             ("compression", self.compression),
             ("alt_svc", self.alt_svc),
             ("security_headers", self.security_headers),
-            ("cache", self.cache),
         ]
         .into_iter()
         .filter_map(|(name, on)| (!on).then_some(name))
@@ -1023,6 +1012,7 @@ fn build_listener_app(
         security: Arc::new(security_state.clone()),
         fingerprint: fingerprint_extractor.clone(),
         load_balancer,
+        cache: crate::cache::shared(&config.cache),
         metrics: state_metrics,
         rate_limiter,
     };
@@ -1041,9 +1031,6 @@ fn build_listener_app(
     // Initialize HTTP/3 features state (Early Hints, Priority, Coalescing)
     let http3_features_state = Http3FeaturesState::from_proxy_config(&config.http3);
 
-    // Initialize response cache (innermost layer — security headers, alt-svc, and
-    // compression all run on top of it for both cache hits and cache misses)
-    let response_cache = crate::cache::shared(&config.cache);
     if config.cache.enabled {
         info!(
             "💾 Response cache enabled (max {}MiB, default TTL {}s)",
@@ -1065,7 +1052,6 @@ fn build_listener_app(
 
     build_proxy_service(
         &state,
-        response_cache,
         compression_state,
         http3_features_state,
         Arc::new(security_state),
@@ -1684,7 +1670,7 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
     // Read once here: `config` is moved into builders further down in
     // several of these functions.
     let nodelay = config.server.tcp_nodelay;
-    let handshake_timeout = std::time::Duration::from_secs(config.tls.handshake_timeout_secs);
+    let times = ConnectionTimes::of(&config);
     let proxy_trusted: Arc<[ipnet::IpNet]> = config.server.proxy_protocol_trusted.clone().into();
     let proxy_timeout = std::time::Duration::from_millis(config.server.proxy_protocol_timeout_ms);
     let mut shutdown_rx = shutdown_rx;
@@ -1721,6 +1707,7 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
         Some(ref resolver) => (std::sync::Arc::clone(resolver), false),
         None => (private_resolver(cert_path)?, true),
     };
+    let limits_security = security_state.clone();
     let fingerprinting_acceptor = Arc::new(build_fingerprinting_acceptor(
         &config,
         &resolver,
@@ -1756,8 +1743,13 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
                     Ok((stream, addr)) => (stream, crate::security::canonical_addr(addr)),
                     Err(e) => {
                         warn!("Failed to accept TCP connection: {}", e);
+                        crate::conn_limits::after_accept_error(&e).await;
                         continue;
                     }
+                };
+                let Some(slot) = admit_connection(remote_addr, &limits_security, &proxy_trusted)
+                else {
+                    continue;
                 };
 
                 // Nagle has to go on a client-facing socket. A proxy writes a
@@ -1765,12 +1757,9 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
                 // out the peer's delayed-ACK timer -- 40 ms, on every response
                 // whose last segment is short. `axum_server` covers the
                 // listeners it owns via `NoDelayAcceptor`; this accept loop is
-                // ours, so it has to do it here.
-                if nodelay {
-                    if let Err(e) = stream.set_nodelay(true) {
-                        warn!("Failed to set TCP_NODELAY on {}: {}", remote_addr, e);
-                    }
-                }
+                // ours, so it has to do it here. Keep-alive probes go on with
+                // it, so a peer that has gone is noticed.
+                crate::conn_limits::tune_client_socket(&stream, nodelay, times.idle);
 
                 // Clone resources for the spawned task
                 let acceptor = fingerprinting_acceptor.clone();
@@ -1781,6 +1770,8 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
                 let proxy_trusted = proxy_trusted.clone();
                 let conn_shutdown = shutdown_rx.clone();
                 tokio::spawn(async move {
+                    // Held until the connection ends
+                    let _slot = slot;
                     let mut stream = stream;
                     // PROXY header from a trusted load balancer, read in the
                     // connection's own task so a slow one cannot stall accept().
@@ -1789,7 +1780,7 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
                         Ok(None) => remote_addr,
                         Err(_) => return,
                     };
-                    handle_fingerprinted_connection(stream, remote_addr, acceptor, app, conn_metrics_clone, handshake_timeout, conn_shutdown).await;
+                    handle_fingerprinted_connection(stream, remote_addr, acceptor, app, conn_metrics_clone, times, conn_shutdown).await;
                 });
             }
 
@@ -1937,8 +1928,7 @@ async fn handle_fingerprinted_connection<S>(
     acceptor: Arc<FingerprintingTlsAcceptor>,
     app: S,
     metrics: Arc<MetricsRegistry>,
-    // `tls.handshake_timeout_secs`, over the ClientHello peek and the handshake.
-    handshake_timeout: std::time::Duration,
+    times: ConnectionTimes,
     shutdown: watch::Receiver<()>,
 ) where
     S: tower::Service<Request<Body>, Response = Response, Error = Infallible>
@@ -1948,9 +1938,10 @@ async fn handle_fingerprinted_connection<S>(
     S::Future: Send,
 {
     trace!("New TCP connection from {}", remote_addr);
+    let idle = times.idle;
 
     // Accept TLS connection with fingerprint capture
-    let accepted = tokio::time::timeout(handshake_timeout, acceptor.accept(stream, remote_addr))
+    let accepted = tokio::time::timeout(times.handshake, acceptor.accept(stream, remote_addr))
         .await
         .unwrap_or_else(|_| {
             Err(std::io::Error::new(
@@ -2003,9 +1994,12 @@ async fn handle_fingerprinted_connection<S>(
     );
 
     // Create service that injects fingerprint headers and routes to axum
+    let activity = crate::conn_limits::Activity::new();
+    let exchanges = Arc::clone(&activity);
     let service = hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
         let ci = conn_info.clone();
         let router = app.clone();
+        let flight = exchanges.begin();
 
         async move {
             // Every connection-derived header, strip-then-set; see
@@ -2025,28 +2019,23 @@ async fn handle_fingerprinted_connection<S>(
             let response = router.oneshot(req).await;
 
             match response {
-                Ok(res) => {
-                    // Convert axum response to hyper response
-                    let (parts, body) = res.into_parts();
-                    Ok::<_, std::convert::Infallible>(Response::from_parts(parts, body))
-                }
+                Ok(res) => Ok::<_, std::convert::Infallible>(in_flight_until_sent(res, flight)),
                 Err(infallible) => match infallible {},
             }
         }
     });
 
     // Serve HTTP/1.1 and HTTP/2 connections (via ALPN negotiation)
-    // HTTP/2 flow control windows set to 16 MB per stream / 64 MB per connection.
-    // The hyper default (65535 bytes) caps all streams to ~8 Mbps at 60 ms RTT —
-    // matching QUIC's initial window eliminates this bottleneck for download tests.
     let io = TokioIo::new(tls_stream);
-    let mut auto_builder = AutoBuilder::new(TokioExecutor::new());
-    auto_builder
-        .http2()
-        .initial_stream_window_size(16 * 1024 * 1024u32)
-        .initial_connection_window_size(64 * 1024 * 1024u32);
+    let auto_builder = connection_builder(idle);
 
-    if let Err(e) = serve_until_shutdown(auto_builder.serve_connection(io, service), shutdown).await
+    if let Err(e) = serve_until_shutdown(
+        auto_builder.serve_connection(io, service),
+        shutdown,
+        &activity,
+        idle,
+    )
+    .await
     {
         if !e.to_string().contains("connection reset") {
             debug!("HTTP connection error for {}: {}", remote_addr, e);
@@ -2110,7 +2099,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     // Read once here: `config` is moved into builders further down in
     // several of these functions.
     let nodelay = config.server.tcp_nodelay;
-    let handshake_timeout = std::time::Duration::from_secs(config.tls.handshake_timeout_secs);
+    let times = ConnectionTimes::of(&config);
     let proxy_trusted: Arc<[ipnet::IpNet]> = config.server.proxy_protocol_trusted.clone().into();
     let proxy_timeout = std::time::Duration::from_millis(config.server.proxy_protocol_timeout_ms);
     // SEC-002: with 0-RTT on, accepted through SSL_read_early_data and served
@@ -2263,8 +2252,13 @@ pub async fn run_http_listener_pqc_with_fingerprint(
                     Ok((stream, addr)) => (stream, crate::security::canonical_addr(addr)),
                     Err(e) => {
                         warn!("Failed to accept TCP connection: {}", e);
+                        crate::conn_limits::after_accept_error(&e).await;
                         continue;
                     }
+                };
+                let Some(slot) = admit_connection(remote_addr, &security_state, &proxy_trusted)
+                else {
+                    continue;
                 };
 
                 // Nagle has to go on a client-facing socket. A proxy writes a
@@ -2272,12 +2266,9 @@ pub async fn run_http_listener_pqc_with_fingerprint(
                 // out the peer's delayed-ACK timer -- 40 ms, on every response
                 // whose last segment is short. `axum_server` covers the
                 // listeners it owns via `NoDelayAcceptor`; this accept loop is
-                // ours, so it has to do it here.
-                if nodelay {
-                    if let Err(e) = stream.set_nodelay(true) {
-                        warn!("Failed to set TCP_NODELAY on {}: {}", remote_addr, e);
-                    }
-                }
+                // ours, so it has to do it here. Keep-alive probes go on with
+                // it, so a peer that has gone is noticed.
+                crate::conn_limits::tune_client_socket(&stream, nodelay, times.idle);
 
                 // Clone resources for spawned task
                 let ssl_ctx = ssl_context.load_full();
@@ -2292,6 +2283,8 @@ pub async fn run_http_listener_pqc_with_fingerprint(
                 let ech_route = ech_routes.load_full().map(|route| EchRoute::clone(&route));
 
                 tokio::spawn(async move {
+                    // Held until the connection ends
+                    let _slot = slot;
                     let mut stream = stream;
                     // PROXY header from a trusted load balancer, read in the
                     // connection's own task so a slow one cannot stall accept().
@@ -2311,7 +2304,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
                         router,
                         conn_metrics_clone,
                         zero_rtt,
-                        handshake_timeout,
+                        times,
                         conn_shutdown,
                     )
                     .await;
@@ -2469,8 +2462,7 @@ async fn handle_pqc_fingerprinted_connection<S>(
     // Some when `tls.enable_0rtt`: the replay guard for ClientHellos that
     // offer early data.
     zero_rtt: Option<crate::tls_acceptor::ZeroRttReplayGuard>,
-    // `tls.handshake_timeout_secs`, over the ClientHello peek and the handshake.
-    handshake_timeout: std::time::Duration,
+    times: ConnectionTimes,
     shutdown: watch::Receiver<()>,
 ) where
     S: tower::Service<Request<Body>, Response = Response, Error = Infallible>
@@ -2480,6 +2472,7 @@ async fn handle_pqc_fingerprinted_connection<S>(
     S::Future: Send,
 {
     use openssl::ssl::Ssl;
+    let (handshake_timeout, idle) = (times.handshake, times.idle);
 
     trace!("New TCP connection from {} (PQC mode)", remote_addr);
     let deadline = tokio::time::Instant::now() + handshake_timeout;
@@ -2520,7 +2513,10 @@ async fn handle_pqc_fingerprinted_connection<S>(
                 route.acceptor,
                 app,
                 metrics,
-                left,
+                ConnectionTimes {
+                    handshake: left,
+                    idle,
+                },
                 shutdown,
             )
             .await;
@@ -2681,9 +2677,12 @@ async fn handle_pqc_fingerprinted_connection<S>(
         .handshake_completed(true, conn_info.handshake.is_post_quantum());
 
     // Create service that injects fingerprint headers
+    let activity = crate::conn_limits::Activity::new();
+    let exchanges = Arc::clone(&activity);
     let service = hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
         let ci = conn_info.clone();
         let router = app.clone();
+        let flight = exchanges.begin();
 
         async move {
             // Every connection-derived header, strip-then-set; see
@@ -2702,26 +2701,23 @@ async fn handle_pqc_fingerprinted_connection<S>(
             let response = router.oneshot(req).await;
 
             match response {
-                Ok(res) => {
-                    let (parts, body) = res.into_parts();
-                    Ok::<_, std::convert::Infallible>(Response::from_parts(parts, body))
-                }
+                Ok(res) => Ok::<_, std::convert::Infallible>(in_flight_until_sent(res, flight)),
                 Err(infallible) => match infallible {},
             }
         }
     });
 
     // Serve HTTP/1.1 and HTTP/2 connections over PQC TLS (via ALPN negotiation)
-    // HTTP/2 flow control windows set to 16 MB per stream / 64 MB per connection
-    // (same rationale as Rustls listener above).
     let io = TokioIo::new(ssl_stream);
-    let mut auto_builder = AutoBuilder::new(TokioExecutor::new());
-    auto_builder
-        .http2()
-        .initial_stream_window_size(16 * 1024 * 1024u32)
-        .initial_connection_window_size(64 * 1024 * 1024u32);
+    let auto_builder = connection_builder(idle);
 
-    if let Err(e) = serve_until_shutdown(auto_builder.serve_connection(io, service), shutdown).await
+    if let Err(e) = serve_until_shutdown(
+        auto_builder.serve_connection(io, service),
+        shutdown,
+        &activity,
+        idle,
+    )
+    .await
     {
         if !e.to_string().contains("connection reset") {
             debug!("PQC HTTP connection error for {}: {}", remote_addr, e);
@@ -2729,6 +2725,86 @@ async fn handle_pqc_fingerprinted_connection<S>(
     }
 
     metrics.connections.connection_closed();
+}
+
+/// A place for one more client connection from `peer` under the connection
+/// limits (`server.max_connections`, `security.max_connections_per_ip`), or
+/// `None` when there is none: the connection is then closed unanswered.
+fn admit_connection(
+    peer: SocketAddr,
+    security: &SecurityState,
+    proxy_trusted: &[ipnet::IpNet],
+) -> Option<crate::conn_limits::ConnectionSlot> {
+    let ip = peer.ip();
+    // A load balancer in front connects for all of its clients.
+    let exempt = security.is_limit_exempt(&ip) || proxy_trusted.iter().any(|net| net.contains(&ip));
+    let slot = crate::conn_limits::admit(ip, exempt);
+    if slot.is_none() {
+        debug!("Connection from {} refused: connection limit reached", peer);
+    }
+    slot
+}
+
+/// The HTTP/1.1 and HTTP/2 server for one client connection.
+///
+/// HTTP/2 flow control windows are 16 MB per stream and 64 MB per connection:
+/// hyper's default (65535 bytes) caps a stream at about 8 Mbps at 60 ms RTT.
+/// Both protocols get a timer, which hyper needs before it bounds anything:
+/// a request's header must arrive within `idle`, and an HTTP/2 peer that
+/// stops answering PING is dropped.
+fn connection_builder(idle: std::time::Duration) -> AutoBuilder<TokioExecutor> {
+    let mut builder = AutoBuilder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(idle);
+    builder
+        .http2()
+        .timer(TokioTimer::new())
+        .keep_alive_interval(Some(H2_PING_INTERVAL))
+        .keep_alive_timeout(H2_PING_TIMEOUT)
+        .initial_stream_window_size(16 * 1024 * 1024u32)
+        .initial_connection_window_size(64 * 1024 * 1024u32);
+    builder
+}
+
+/// The two times a client connection is held to.
+#[derive(Clone, Copy, Debug)]
+struct ConnectionTimes {
+    /// `tls.handshake_timeout_secs`, over the ClientHello peek and the handshake
+    handshake: std::time::Duration,
+    /// `server.max_idle_timeout_secs`: how long with nothing in flight
+    idle: std::time::Duration,
+}
+
+impl ConnectionTimes {
+    fn of(config: &ProxyConfig) -> Self {
+        Self {
+            handshake: std::time::Duration::from_secs(config.tls.handshake_timeout_secs),
+            // The idle time QUIC connections are held to
+            idle: std::time::Duration::from_secs(config.server.max_idle_timeout_secs.max(1)),
+        }
+    }
+}
+
+/// How often an HTTP/2 connection is pinged, and how long the answer may take.
+const H2_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+const H2_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long a connection asked to close, with nothing in flight, is given to
+/// do so before it is dropped.
+const CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `response`, with its body holding `flight`: the exchange stays in flight
+/// until the body has been sent or dropped.
+fn in_flight_until_sent(response: Response, flight: crate::conn_limits::InFlight) -> Response {
+    use http_body_util::BodyExt as _;
+    let (parts, body) = response.into_parts();
+    let body = body.map_frame(move |frame| {
+        let _held = &flight;
+        frame
+    });
+    Response::from_parts(parts, Body::new(body))
 }
 
 /// Serve a connection until it ends -- and when the process begins to shut
@@ -2743,6 +2819,8 @@ async fn handle_pqc_fingerprinted_connection<S>(
 async fn serve_until_shutdown<I, S, E, B>(
     conn: hyper_util::server::conn::auto::Connection<'_, I, S, E>,
     mut shutdown: watch::Receiver<()>,
+    activity: &crate::conn_limits::Activity,
+    idle: std::time::Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: hyper::service::Service<Request<hyper::body::Incoming>, Response = http::Response<B>> + Send,
@@ -2755,11 +2833,32 @@ where
     E: hyper_util::server::conn::auto::HttpServerConnExec<S::Future, B> + Send + Sync,
 {
     tokio::pin!(conn);
-    tokio::select! {
-        result = conn.as_mut() => result,
-        _ = shutdown.changed() => {
-            conn.as_mut().graceful_shutdown();
-            conn.await
+    // Until the process shuts down, or the connection has had nothing in
+    // flight for `idle`.
+    loop {
+        let wait = match activity.idle_for() {
+            Some(quiet) if quiet >= idle => break,
+            Some(quiet) => idle.saturating_sub(quiet),
+            None => idle,
+        };
+        tokio::select! {
+            result = conn.as_mut() => return result,
+            _ = shutdown.changed() => break,
+            () = tokio::time::sleep(wait) => {}
+        }
+    }
+    // Asked to close: what is in flight finishes. A connection with nothing
+    // in flight has only the close itself left to exchange, and a peer that
+    // does not take part in it within the grace is dropped.
+    conn.as_mut().graceful_shutdown();
+    loop {
+        tokio::select! {
+            result = conn.as_mut() => return result,
+            () = tokio::time::sleep(CLOSE_GRACE) => {
+                if activity.idle_for().is_some() {
+                    return Ok(());
+                }
+            }
         }
     }
 }
@@ -3151,6 +3250,118 @@ async fn proxy_handler(
             }
         }
 
+        // The response cache, behind the route's gates: a stored response
+        // answers only a request the route itself would have let through.
+        // (An upgrade is not an exchange a stored response can answer.)
+        let cache_plan = state
+            .cache
+            .plan(&method, &headers, &host, &path, uri.query())
+            .filter(|_| !is_ws_upgrade);
+        if let Some(plan) = cache_plan.as_ref().filter(|plan| plan.lookup) {
+            let conditional =
+                |name: header::HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
+            let stored = match state.cache.get_for(
+                &plan.key,
+                plan.credentialed,
+                conditional(header::IF_NONE_MATCH),
+                conditional(header::IF_MODIFIED_SINCE),
+            ) {
+                crate::cache::CacheLookup::Hit {
+                    status,
+                    headers: kept,
+                    body,
+                    age_secs,
+                } => Some(crate::cache::hit_response(
+                    method == Method::HEAD,
+                    status,
+                    &kept,
+                    body,
+                    age_secs,
+                )),
+                crate::cache::CacheLookup::NotModified {
+                    etag,
+                    last_modified,
+                    cache_control,
+                    age_secs,
+                } => Some(crate::cache::not_modified_response(
+                    etag,
+                    last_modified,
+                    cache_control,
+                    age_secs,
+                )),
+                crate::cache::CacheLookup::Miss => None,
+            };
+            if let Some(mut resp) = stored {
+                // The entry may have been stored by another transport, as the
+                // backend sent it: what the route does to a response's
+                // headers is done to this one too.
+                {
+                    let h = resp.headers_mut();
+                    for key in &route.remove_headers {
+                        if let Ok(name) = header::HeaderName::from_bytes(key.as_bytes()) {
+                            h.remove(&name);
+                        }
+                    }
+                    for (key, value) in &route.headers_override {
+                        if let (Ok(name), Ok(val)) = (
+                            header::HeaderName::from_bytes(key.as_bytes()),
+                            HeaderValue::from_str(value),
+                        ) {
+                            h.insert(name, val);
+                        }
+                    }
+                    if route.stripe_compatibility {
+                        h.remove("cross-origin-embedder-policy");
+                        h.remove("cross-origin-opener-policy");
+                    }
+                    if let Some(server) = &state.server_header_value {
+                        h.insert(header::SERVER, server.clone());
+                    }
+                }
+                if let Some((name, id)) = &request_id {
+                    resp.headers_mut().insert(name.clone(), id.clone());
+                }
+                // The security layer leaves what the route decided alone, on
+                // a stored response as on a new one.
+                let owned = layers::RouteOwnedHeaders::of(route);
+                if !owned.is_empty() {
+                    resp.extensions_mut().insert(owned);
+                }
+                let status = resp.status().as_u16();
+                state.metrics.requests.request_end_full(
+                    status,
+                    request_start.elapsed(),
+                    0,
+                    0,
+                    Some(&path),
+                );
+                log_access(&AccessLogEntry {
+                    ja3: headers.get("x-ja3-hash").and_then(|v| v.to_str().ok()),
+                    ja4: headers.get("x-ja4-hash").and_then(|v| v.to_str().ok()),
+                    backend: Some("cache"),
+                    remote_addr: client_addr,
+                    method: &method_str,
+                    path: &path,
+                    protocol: protocol_str,
+                    status,
+                    body_size: if method == Method::HEAD {
+                        0
+                    } else {
+                        crate::access_logger::declared_body_size(resp.headers())
+                    },
+                    referer: referer.as_deref(),
+                    user_agent: user_agent.as_deref(),
+                    host: Some(&host_str),
+                    response_time_ms: request_start
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                });
+                return resp;
+            }
+        }
+
         // Track request timing for load balancer
         let request_start = std::time::Instant::now();
 
@@ -3425,7 +3636,7 @@ async fn proxy_handler(
         // Shadow mirroring: spawn fire-and-forget task concurrently with primary forward.
         // The client only receives the primary response; shadow response is logged + discarded.
         if let (Some(shadow_cfg), Some(shadow_bytes)) = (&route.shadow, &shadow_body_bytes) {
-            let roll: u8 = rand::random::<u8>() % 100;
+            let roll: u8 = rand::Rng::gen_range(&mut rand::thread_rng(), 0..100);
             if roll < shadow_cfg.percent.min(100) {
                 if let Some(shadow_backend) = state.config.get_backend(&shadow_cfg.backend) {
                     spawn_shadow_request(
@@ -3492,8 +3703,7 @@ async fn proxy_handler(
                     Some(&path),
                 );
 
-                let timeout_body =
-                    format!("Backend timeout after {}ms", backend_timeout.as_millis());
+                let timeout_body = "Gateway Timeout";
 
                 // Log backend timeout
                 log_access(&AccessLogEntry {
@@ -3703,8 +3913,10 @@ async fn proxy_handler(
                                 .load_balancer
                                 .cookie_config
                                 .generate_cookie(&server.id);
+                            // Beside the backend's own cookies, not in
+                            // place of them
                             if let Ok(val) = HeaderValue::from_str(&cookie) {
-                                parts.headers.insert(header::SET_COOKIE, val);
+                                parts.headers.append(header::SET_COOKIE, val);
                             }
                         }
                     }
@@ -3823,32 +4035,49 @@ async fn proxy_handler(
                         )
                     }
                     // The length is written to the access log when the stream ends.
-                    BodySource::Streamed(body) => Response::from_parts(
-                        parts,
-                        logged_stream(
-                            body,
-                            crate::access_logger::DeferredAccessLog {
-                                ja3: headers
-                                    .get("x-ja3-hash")
-                                    .and_then(|v| v.to_str().ok())
-                                    .map(str::to_owned),
-                                ja4: headers
-                                    .get("x-ja4-hash")
-                                    .and_then(|v| v.to_str().ok())
-                                    .map(str::to_owned),
-                                backend: Some(route.backend.clone()),
-                                remote_addr: client_addr,
-                                method: method_str.clone(),
-                                path: path.clone(),
-                                protocol: protocol_str,
-                                status: resp_status,
-                                referer: referer.clone(),
-                                user_agent: user_agent.clone(),
-                                host: Some(host_str.clone()),
-                                started: request_start,
-                            },
-                        ),
-                    ),
+                    BodySource::Streamed(body) => {
+                        // Kept for the next request where the response allows
+                        // it; a HEAD's has no body to keep.
+                        let (parts, body) = match &cache_plan {
+                            Some(plan) if method == Method::GET => state
+                                .cache
+                                .store_or_stream(
+                                    plan,
+                                    request_id.as_ref().map(|(name, _)| name),
+                                    parts,
+                                    body,
+                                )
+                                .await
+                                .into_parts(),
+                            _ => (parts, body),
+                        };
+                        Response::from_parts(
+                            parts,
+                            logged_stream(
+                                body,
+                                crate::access_logger::DeferredAccessLog {
+                                    ja3: headers
+                                        .get("x-ja3-hash")
+                                        .and_then(|v| v.to_str().ok())
+                                        .map(str::to_owned),
+                                    ja4: headers
+                                        .get("x-ja4-hash")
+                                        .and_then(|v| v.to_str().ok())
+                                        .map(str::to_owned),
+                                    backend: Some(route.backend.clone()),
+                                    remote_addr: client_addr,
+                                    method: method_str.clone(),
+                                    path: path.clone(),
+                                    protocol: protocol_str,
+                                    status: resp_status,
+                                    referer: referer.clone(),
+                                    user_agent: user_agent.clone(),
+                                    host: Some(host_str.clone()),
+                                    started: request_start,
+                                },
+                            ),
+                        )
+                    }
                     BodySource::Buffered(bytes) => {
                         log_access(&AccessLogEntry {
                             ja3: headers.get("x-ja3-hash").and_then(|v| v.to_str().ok()),
@@ -3911,7 +4140,9 @@ async fn proxy_handler(
                     Some(&path),
                 );
 
-                let error_body = format!("Backend error: {}", e);
+                // The cause is in the log; the client is told only that the
+                // gateway failed.
+                let error_body = "Bad Gateway";
 
                 // Log backend error
                 log_access(&AccessLogEntry {
@@ -4611,5 +4842,75 @@ mod ech_status_tests {
     fn the_openssl_listener_says_not_offered_where_this_node_holds_ech_keys() {
         assert_eq!(openssl_ech_status(true), "not-offered");
         assert_eq!(openssl_ech_status(false), "not-supported");
+    }
+}
+
+#[cfg(test)]
+mod connection_lifetime_tests {
+    use super::*;
+
+    /// A hyper server for one side of an in-memory connection, answering
+    /// every request 200; it returns as `serve_until_shutdown` does.
+    async fn serve_one(
+        server: tokio::io::DuplexStream,
+        shutdown: watch::Receiver<()>,
+        idle: Duration,
+    ) {
+        let activity = crate::conn_limits::Activity::new();
+        let service = hyper::service::service_fn(|_req: Request<hyper::body::Incoming>| async {
+            Ok::<_, Infallible>(Response::new(Body::empty()))
+        });
+        let builder = connection_builder(idle);
+        let _ = serve_until_shutdown(
+            builder.serve_connection(TokioIo::new(server), service),
+            shutdown,
+            &activity,
+            idle,
+        )
+        .await;
+    }
+
+    /// A client that connects and says nothing is closed once it has been
+    /// idle for the idle time, and dropped if it does not take part.
+    #[tokio::test]
+    async fn a_connection_with_nothing_in_flight_is_closed_after_the_idle_time() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (_keep, shutdown) = watch::channel(());
+        let idle = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        serve_one(server, shutdown, idle).await;
+        let took = started.elapsed();
+        assert!(took >= idle, "closed after {took:?}, before the idle time");
+        assert!(
+            took < idle + CLOSE_GRACE + Duration::from_secs(2),
+            "held for {took:?}"
+        );
+        drop(client);
+    }
+
+    /// At shutdown an HTTP/2 peer that stops answering holds the connection
+    /// for the close grace and no longer.
+    #[tokio::test]
+    async fn a_silent_http2_peer_does_not_hold_the_shutdown() {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        // The client preface and an empty SETTINGS frame, then silence: it
+        // reads nothing the server sends and acknowledges no PING.
+        client
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00")
+            .await
+            .unwrap();
+        let (stop, shutdown) = watch::channel(());
+        let serving = tokio::spawn(serve_one(server, shutdown, Duration::from_secs(600)));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!serving.is_finished(), "an open connection is served");
+        let asked = std::time::Instant::now();
+        stop.send(()).unwrap();
+        tokio::time::timeout(CLOSE_GRACE + Duration::from_secs(3), serving)
+            .await
+            .expect("the connection was dropped within the close grace")
+            .unwrap();
+        assert!(asked.elapsed() < CLOSE_GRACE + Duration::from_secs(3));
+        drop(client);
     }
 }

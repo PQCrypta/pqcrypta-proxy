@@ -72,7 +72,7 @@ h3 = "0.0.8"
 h3-quinn = { package = "h3-noq", path = "vendor/h3-noq" }
 # Explicit UDP socket buffer sizing (SO_RCVBUF/SO_SNDBUF) for the QUIC listener.
 # Matches the version quinn-udp already pulls, so no extra crate copy is added.
-socket2 = "0.6"
+socket2 = { version = "0.6", features = ["all"] }
 
 # WebTransport (proper protocol support)
 wtransport = { path = "vendor/wtransport", features = ["quinn"] }

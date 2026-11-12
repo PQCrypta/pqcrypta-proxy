@@ -95,20 +95,11 @@ pub(super) async fn alt_svc_middleware(
     {
         return next.run(request).await;
     }
-    // HTTP/2 uses the :authority pseudo-header which hyper surfaces via URI,
-    // not the Host header. Fall back to URI host so both HTTP/1.1 and HTTP/2
-    // requests are checked correctly.
-    let host_hdr = request
-        .headers()
-        .get("host")
-        .and_then(|v| v.to_str().ok())
+    // The host as every layer reads it (crate::request_target).
+    let host = crate::request_target::effective_host(request.uri(), request.headers())
+        .ok()
+        .flatten()
         .unwrap_or("");
-    let uri_host = request.uri().host().unwrap_or("");
-    let host = if host_hdr.is_empty() {
-        uri_host
-    } else {
-        host_hdr
-    };
     let server = &state.config.server;
     let is_tcp_only = server.is_tcp_only_host(host);
 
@@ -375,10 +366,9 @@ impl ResponseHeaderSet {
     }
 
     fn is_addin_request(&self, request: &Request<Body>) -> bool {
-        let host = request
-            .headers()
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok());
+        let host = crate::request_target::effective_host(request.uri(), request.headers())
+            .ok()
+            .flatten();
         self.is_addin(host, request.uri().path())
     }
 
@@ -776,7 +766,9 @@ pub(super) async fn advanced_rate_limit_middleware(
                 body_size: 0,
                 referer: header("referer"),
                 user_agent: header("user-agent"),
-                host: header("host"),
+                host: crate::request_target::effective_host(request.uri(), &headers)
+                    .ok()
+                    .flatten(),
                 response_time_ms: 0,
                 ja3: header("x-ja3-hash"),
                 ja4: header("x-ja4-hash"),
@@ -811,7 +803,9 @@ pub(super) async fn advanced_rate_limit_middleware(
                 body_size: ACCESS_DENIED_BODY.len(),
                 referer: header_str(hyper::header::REFERER),
                 user_agent: header_str(hyper::header::USER_AGENT),
-                host: header_str(hyper::header::HOST),
+                host: crate::request_target::effective_host(request.uri(), &headers)
+                    .ok()
+                    .flatten(),
                 response_time_ms: 0,
             });
 
