@@ -211,6 +211,26 @@ pub fn is_msg_size_err(err: &io::Error) -> bool {
     }
 }
 
+/// Whether sockets set up from now on ask the kernel for UDP generic receive
+/// offload (Linux), as they do unless told not to.
+static GRO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Turn UDP generic receive offload on or off for the sockets set up from
+/// now on: off, every datagram arrives with its own ECN marks (see where
+/// `UdpSocketState` asks for it).
+///
+/// A setting of the process rather than an environment variable, which the
+/// process could only change with `std::env::set_var`: unsound once another
+/// thread may read the environment, and an async `main` already has them.
+pub fn set_gro(enabled: bool) {
+    GRO.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether UDP generic receive offload is asked for ([`set_gro`]).
+pub fn gro() -> bool {
+    GRO.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Log at most 1 IO error per minute
 #[cfg(not(wasm_browser))]
 const IO_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);

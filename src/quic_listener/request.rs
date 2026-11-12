@@ -65,7 +65,7 @@ where
 
 impl QuicListener {
     /// Handle a single HTTP/3 request
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(super) async fn handle_h3_request<S>(
         mut stream: h3::server::RequestStream<S, Bytes>,
         mut request: http::Request<()>,
@@ -2426,7 +2426,7 @@ impl QuicListener {
 /// rate limit, block, WAF, oversize body — which never reaches the logging
 /// in the proxied path. These were missing from the log entirely on HTTP/3,
 /// so the responses an operator most needs to see were the ones not there.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn log_h3_refusal(
     remote_addr: std::net::SocketAddr,
     method: &str,

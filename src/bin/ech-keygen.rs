@@ -49,7 +49,8 @@ enum Kem {
 
 #[derive(Parser)]
 struct Args {
-    /// Directory holding one `<config_id>.key` (private, mode 600) and
+    /// Directory holding one `<config_id>.key` (private, mode 640: the proxy
+    /// reads it through the directory's group) and
     /// `<config_id>.ech` (public wire bytes, mode 644) pair per retained
     /// generation, plus the assembled `ech-config-list.{bin,b64}` for DNS
     /// publishing.
@@ -190,11 +191,16 @@ fn main() {
     #[cfg(not(unix))]
     fs::write(&key_path, private_key.secret_bytes()).expect("failed to write private key");
 
+    // Written beside its name with its mode, then renamed into place: the
+    // proxy reloads when this directory changes, and a reload between the
+    // write and the end of it would read half a config
     let ech_path = args.out_dir.join(format!("{config_id:02x}.ech"));
-    fs::write(&ech_path, &entry_bytes).expect("failed to write ECHConfig entry");
+    let staged = args.out_dir.join(format!(".{config_id:02x}.ech.tmp"));
+    fs::write(&staged, &entry_bytes).expect("failed to write ECHConfig entry");
     #[cfg(unix)]
-    fs::set_permissions(&ech_path, fs::Permissions::from_mode(0o644))
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o644))
         .expect("failed to chmod ECHConfig entry");
+    fs::rename(&staged, &ech_path).expect("failed to put the ECHConfig entry in place");
 
     println!(
         "generated config_id=0x{config_id:02x} -> {}",

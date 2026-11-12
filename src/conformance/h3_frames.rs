@@ -128,7 +128,7 @@ pub const VARINT_MAX: u64 = (1 << 62) - 1;
 /// Panics above [`VARINT_MAX`]: every call site here passes a constant or a
 /// value already bounded by one, so exceeding it is a bug in this module rather
 /// than anything a peer can provoke.
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     reason = "each branch has already bounded the value to the width it casts to; \
               discarding the high bits is what the encoding requires"

@@ -687,7 +687,7 @@ impl FingerprintExtractor {
     /// The JA4 alone (see ja4_with_raw for the format), for the tests written
     /// against the extractor; the extractor takes JA4 and JA4_r together.
     #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn calculate_ja4(
         &self,
         tls_version: u16,

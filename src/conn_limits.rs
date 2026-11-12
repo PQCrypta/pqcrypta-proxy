@@ -42,7 +42,8 @@ pub fn open_connections() -> u64 {
 /// One client connection's place under the limits, given back on drop.
 #[derive(Debug)]
 pub struct ConnectionSlot {
-    /// The address it is counted against; None when it is exempt.
+    /// The client network it is counted against ([`client_network`]); None
+    /// when it is exempt.
     address: Option<IpAddr>,
 }
 
@@ -60,11 +61,18 @@ impl Drop for ConnectionSlot {
 
 /// Take a place for one more connection from `address`.
 ///
-/// `None` when the proxy holds `server.max_connections` already, or this
-/// address `security.max_connections_per_ip`. `exempt` addresses (the
-/// operator's own, and a load balancer that connects for many clients) are
-/// counted in the total alone.
+/// `None` when memory is critically short ([`crate::memory_pressure`]), when
+/// the proxy holds `server.max_connections` already, or when this client
+/// holds `security.max_connections_per_ip`. A client is its network
+/// ([`client_network`]): an IPv4 address, or the /64 an IPv6 address is in,
+/// which one host holds whole and can take any address of. `exempt`
+/// addresses (the operator's own, and a load balancer that connects for many
+/// clients) are counted in the total alone, and are admitted however short
+/// memory is.
 pub fn admit(address: IpAddr, exempt: bool) -> Option<ConnectionSlot> {
+    if crate::memory_pressure::refuses_connection(exempt) {
+        return None;
+    }
     let max_total = u64::from(MAX_TOTAL.load(Ordering::Relaxed));
     let taken = OPEN.fetch_add(1, Ordering::Relaxed);
     if max_total > 0 && taken >= max_total {
@@ -75,7 +83,7 @@ pub fn admit(address: IpAddr, exempt: bool) -> Option<ConnectionSlot> {
     if exempt || max_per_address == 0 {
         return Some(ConnectionSlot { address: None });
     }
-    let address = address.to_canonical();
+    let address = client_network(address);
     let within = {
         let mut count = PER_ADDRESS.entry(address).or_insert(0);
         if *count < max_per_address {
@@ -233,6 +241,24 @@ mod tests {
         let again = admit(address, false).expect("a place came back");
         drop((second, elsewhere, uncounted, again));
         assert!(PER_ADDRESS.get(&address).is_none(), "nothing left counted");
+
+        // An IPv6 client is its /64: another address in it shares the place
+        let host: IpAddr = "2001:db8:5:6::1".parse().unwrap();
+        let neighbour: IpAddr = "2001:db8:5:6:ffff:1:2:3".parse().unwrap();
+        let next_network: IpAddr = "2001:db8:5:7::1".parse().unwrap();
+        let first = admit(host, false).expect("first");
+        let second = admit(neighbour, false).expect("second, from the same /64");
+        assert!(
+            admit("2001:db8:5:6::99".parse().unwrap(), false).is_none(),
+            "the /64 is full"
+        );
+        let other_network = admit(next_network, false).expect("the next /64 has its own");
+        drop((first, second, other_network));
+        assert!(
+            PER_ADDRESS.get(&client_network(host)).is_none(),
+            "nothing left counted"
+        );
+        assert!(PER_ADDRESS.get(&client_network(next_network)).is_none());
 
         let before = open_connections();
         configure(u32::try_from(before + 1).unwrap(), 0);

@@ -424,7 +424,7 @@ impl BackendServer {
                 let factor =
                     (1.0 - ss.initial_weight_factor).mul_add(progress, ss.initial_weight_factor);
                 // clamp(0.0, u32::MAX as f64) ensures value is non-negative and within u32 range.
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 return (self.base_weight as f64 * factor).clamp(0.0, u32::MAX as f64) as u32;
             }
         }
@@ -538,7 +538,7 @@ impl BackendServer {
     }
 
     /// Return the current error rate in the sliding window (0.0–1.0).
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     pub fn canary_error_rate(&self) -> f64 {
         let requests = self.canary_window_requests.load(Ordering::Relaxed);
         if requests == 0 {
@@ -552,7 +552,7 @@ impl BackendServer {
     ///
     /// Returns `true` if auto-rollback was just triggered (i.e. the canary was
     /// suspended by this call).  The caller should log a warning in that case.
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     pub fn record_canary_result(&self, success: bool, config: &CanaryPoolConfig) -> bool {
         if !config.auto_rollback {
             return false;
@@ -1508,7 +1508,7 @@ fn rendezvous_score(key: &[u8], server: &BackendServer) -> f64 {
     buf.extend_from_slice(server.id.as_bytes());
 
     // Never exactly 0 or 1, so the logarithm stays finite.
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     let u = (mix64(fnv1a(&buf)) as f64 + 0.5) / (u64::MAX as f64 + 1.0);
     let weight = f64::from(server.effective_weight().max(1));
     -weight / u.ln()

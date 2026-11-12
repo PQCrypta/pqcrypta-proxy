@@ -392,7 +392,7 @@ Simple per-IP rate limiting. For advanced features, use `[advanced_rate_limiting
 [advanced_rate_limiting]
 ```
 
-Multi-dimensional rate limiting with composite keys, JA3/JA4 fingerprinting, and adaptive ML.
+Multi-dimensional rate limiting with composite keys, JA3/JA4 fingerprinting, and adaptive baselines (each key's own request rate, as time-decayed statistics).
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
@@ -516,10 +516,10 @@ ML-inspired anomaly detection that learns normal traffic patterns.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enabled` | bool | `false` | Enable adaptive rate limiting |
-| `baseline_window_secs` | u64 | `3600` | Baseline learning window (1 hour) |
+| `baseline_window_secs` | u64 | `3600` | How long the baseline remembers: a sample this old weighs 1/e of a new one |
 | `sensitivity` | f64 | `0.7` | Anomaly detection sensitivity (0.0-1.0) |
 | `auto_adjust` | bool | `false` | Auto-adjust limits based on traffic |
-| `min_samples` | u64 | `1000` | Minimum samples before blocking |
+| `min_samples` | u64 | `1000` | Samples (at most one a second while the key is active) before the baseline is used |
 | `std_dev_multiplier` | f64 | `3.0` | Standard deviations for anomaly threshold |
 
 ### Per-Route Rate Limits
@@ -588,7 +588,7 @@ ML-inspired anomaly detection that learns normal traffic patterns.
 | `geoip_db_path` | path? | `"/var/lib/pqcrypta-proxy/geoip/GeoLite2-City.mmdb"` | MaxMind GeoIP (City) database path |
 | `geoip_asn_db_path` | path? | `"/var/lib/pqcrypta-proxy/geoip/GeoLite2-ASN.mmdb"` | MaxMind GeoIP ASN database path |
 | `blocked_countries` | array[string] | `[]` | Blocked country codes (ISO 3166-1 alpha-2, e.g., `["CN", "RU", "KP"]`) |
-| `max_connections_per_ip` | u32 | `100` | Maximum concurrent client connections from one address, on every listener, and maximum requests in flight from one address. Trusted addresses, `pentest_bypass_ips` and `proxy_protocol_trusted` peers are outside the connection count. `0` = no connection limit |
+| `max_connections_per_ip` | u32 | `100` | Maximum concurrent client connections from one client (an IPv4 address, or the /64 an IPv6 address is in), on every listener including the conformance suite's, and maximum requests in flight from one address. Trusted addresses, `pentest_bypass_ips` and `proxy_protocol_trusted` peers are outside the connection count. `0` = no connection limit |
 | `auto_block_threshold` | u32 | `10` | Suspicious patterns before auto-block |
 | `auto_block_duration_secs` | u64 | `300` | Auto-block duration (5 minutes) |
 | `error_4xx_threshold` | u32 | `100` | 4xx errors before checking rate |

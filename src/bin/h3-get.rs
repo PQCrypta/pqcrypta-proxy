@@ -36,11 +36,7 @@ async fn main() -> std::process::ExitCode {
     // The proxy makes the same choice from `server.udp_gro`; this binary is a
     // separate process and has to make it for itself.
     //
-    // SAFETY: first statement in main, before any runtime or socket exists.
-    #[allow(unsafe_code)]
-    unsafe {
-        std::env::set_var("NOQ_NO_GRO", "1");
-    };
+    quinn::udp::set_gro(false);
 
     let mut args = std::env::args().skip(1);
     let Some(url) = args.next() else {

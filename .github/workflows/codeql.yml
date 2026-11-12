@@ -20,7 +20,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # the toolchain rust-toolchain.toml names
+        with:
+          toolchain: "1.99.0"
 
       - name: Install OpenSSL
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config

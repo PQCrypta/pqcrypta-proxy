@@ -243,10 +243,18 @@ tempfile = "3.14"
 # header), which is precisely the workload glibc's arena allocator handles worst
 # and a thread-caching allocator handles best.
 mimalloc = { version = "0.1", default-features = false }
+# Its C library directly, for what the GlobalAlloc wrapper does not reach:
+# OpenSSL's allocations routed to it (src/openssl_alloc.rs), and freed memory
+# returned to the system at once under memory pressure (mi_collect, the
+# `extended` API; src/memory_pressure.rs). The same version mimalloc links.
+libmimalloc-sys = { version = "0.1", default-features = false, features = ["extended"] }
+# Secrets the proxy holds itself (the TSIG key of its DNS-01 updates) are
+# wiped when dropped; the same version the TLS stacks already link.
+zeroize = "1.8"
 serde_ignored = "0.1"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["signal", "user", "resource"] }
+nix = { version = "0.29", features = ["signal", "user", "resource", "time"] }
 # Unix socket support for PHP-FPM backends (not available on Windows)
 hyperlocal = "0.9"
 # Signal handling (uses Unix-specific signal iterators)

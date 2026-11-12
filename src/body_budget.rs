@@ -5,7 +5,9 @@
 //! all of them together, on every transport: each body is counted here as
 //! it is read, and a request whose next piece would take the process past
 //! `security.max_buffered_body_bytes` is answered 503 instead of read. The
-//! count is given back when the request is done, however it ends.
+//! count is given back when the request is done, however it ends. While
+//! memory is short the budget is smaller ([`crate::memory_pressure`]): half
+//! of it, then an eighth, so small requests still pass and large uploads wait.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -54,7 +56,8 @@ impl Reservation {
     /// the caller refuses the request rather than read on.
     #[must_use]
     pub fn grow(&mut self, more: usize) -> bool {
-        Self::take(&HELD, LIMIT.load(Ordering::Relaxed), more) && {
+        let limit = crate::memory_pressure::body_budget(LIMIT.load(Ordering::Relaxed));
+        Self::take(&HELD, limit, more) && {
             self.bytes += more;
             true
         }

@@ -1,0 +1,7 @@
+# The compiler every build of the proxy uses: web1, api3, the CI jobs and the
+# release, so a binary that passed CI is one the nodes could have built. Moved
+# for all of them at once, here, when a new stable is adopted.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

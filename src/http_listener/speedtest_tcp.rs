@@ -22,7 +22,7 @@ use tracing::info;
 /// connections at once and aborts them at its time limit, so no one request's
 /// own figures describe the upload. `GET /speedtest/tcp-upload-meter?test=ID`
 /// (or the `meter` op on a WebTransport session to this node) reads it.
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 pub(super) async fn tcp_upload_measure_handler(
     body: Body,
     origin: &str,
@@ -111,7 +111,7 @@ pub(super) async fn tcp_upload_measure_handler(
     }
 
     let elapsed_secs = start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let elapsed_ms = (elapsed_secs * 1000.0).max(0.0) as u64;
 
     let throughput_mbps = if elapsed_secs > 0.0 {

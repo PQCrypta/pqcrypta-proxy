@@ -90,16 +90,14 @@ pub struct PqcTicketer {
     rng: SystemRandom,
 }
 
-// Fields are omitted on purpose — see the impl comment.
-#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for PqcTicketer {
     /// Deliberately opaque: the trait requires Debug and the struct holds key
-    /// material, which must never reach a log line.
+    /// material, which must never reach a log line. The `..` says so.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PqcTicketer")
             .field("algorithm", &"ML-KEM-1024 + AES-256-GCM")
             .field("lifetime_secs", &self.lifetime.as_secs())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

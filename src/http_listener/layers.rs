@@ -61,9 +61,12 @@ pub(super) async fn trace_context_middleware(request: Request<Body>, next: Next)
         trace_id = tracing::field::Empty,
     );
 
-    // Stitch the incoming trace context into the span so this proxy hop appears
-    // as a child of the caller's span in the distributed trace.
-    otel::set_parent_from_headers(&span, request.headers());
+    // Stitch the incoming trace context into the span: this proxy hop is a
+    // child of the caller's span where the caller is trusted to name one, and
+    // linked to it otherwise.
+    if let Some(ConnectInfo(peer)) = request.extensions().get::<ConnectInfo<SocketAddr>>() {
+        otel::set_parent_from_headers(&span, request.headers(), peer.ip());
+    }
 
     // Record the resolved trace ID as a span field for easy log correlation.
     // This span's own, not the current one's: it has not been entered yet.

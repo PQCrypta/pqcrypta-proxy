@@ -52,7 +52,9 @@ jobs:
         with:
           ref: ${{ env.TAG }}
 
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # the toolchain rust-toolchain.toml names
+        with:
+          toolchain: "1.99.0"
 
       - name: Setup OpenSSL 3.5 (Linux)
         uses: ./.github/actions/setup-openssl-linux
@@ -73,3 +75,31 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release edit "$TAG" --draft=false
+
+  # The container image of the release builds and runs: nothing else builds
+  # docker/Dockerfile, so a base image pin or a build step that stopped
+  # working would otherwise be found by whoever builds the image next.
+  image:
+    name: Container image
+    needs: release-please
+    if: always() && (needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.release-please.outputs.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Build the image
+        run: >-
+          docker build -f docker/Dockerfile
+          --build-arg PQCRYPTA_GIT_COMMIT="$(git rev-parse HEAD)"
+          -t "pqcrypta-proxy:$TAG" .
+
+      - name: The image's binary runs and names its commit
+        run: |
+          version=$(docker run --rm "pqcrypta-proxy:$TAG" --version)
+          echo "$version"
+          # build.rs keeps the first 7 characters of the commit it is given
+          case "$version" in *"($(git rev-parse HEAD | cut -c1-7))"*) ;; *) exit 1 ;; esac

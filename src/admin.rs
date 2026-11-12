@@ -77,7 +77,7 @@ pub struct AdminServer {
 
 impl AdminServer {
     /// Create a new admin server
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         config: AdminConfig,
         config_manager: Arc<ConfigManager>,

@@ -35,6 +35,13 @@ pub struct OtelConfig {
     pub sample_ratio: f64,
     /// Additional OpenTelemetry resource attributes (key = "value" pairs)
     pub resource_attributes: HashMap<String, String>,
+    /// Addresses or CIDR ranges whose requests continue the trace they name
+    /// (`traceparent`, B3): the proxy's own tracing peers, such as a load
+    /// balancer in front of it. Every other request begins a trace of the
+    /// proxy's own and keeps the context it named as a link: a client that
+    /// chose trace IDs, or set the sampled flag on every request it makes,
+    /// would otherwise decide what is traced and exported (default: none)
+    pub trusted_parents: Vec<String>,
 }
 
 impl Default for OtelConfig {
@@ -46,6 +53,7 @@ impl Default for OtelConfig {
             otlp_endpoint: "http://localhost:4318".to_string(),
             sample_ratio: 1.0,
             resource_attributes: HashMap::new(),
+            trusted_parents: Vec::new(),
         }
     }
 }
@@ -3643,7 +3651,7 @@ pub struct CorsConfig {
 
 impl ConfigManager {
     /// Create a new configuration manager and load initial config
-    #[allow(clippy::unused_async_trait_impl)] // public async API; callers .await it
+    #[expect(clippy::unused_async_trait_impl)] // public async API; callers .await it
     pub async fn new(
         config_path: impl AsRef<Path>,
     ) -> anyhow::Result<(Self, mpsc::Receiver<ConfigReloadEvent>)> {
@@ -4351,6 +4359,9 @@ impl ProxyConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        crate::otel::parse_trusted_parents(&self.otel.trusted_parents)
+            .map_err(|e| anyhow::anyhow!("otel.trusted_parents: {e}"))?;
+
         // Config schema version check
         match self.version {
             None => {

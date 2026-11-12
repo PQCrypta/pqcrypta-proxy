@@ -3,8 +3,9 @@
 //!
 //! Generated and rotated by the `ech-keygen` binary (see
 //! `scripts/ech-rotate.sh` / `ech-rotate.timer`) into [`ECH_CONFIG_DIR`] as
-//! `<config_id>.key` (private, mode 600) / `<config_id>.ech` (public wire
-//! bytes, mode 644) pairs — one pair per still-accepted generation.
+//! `<config_id>.key` (private: mode 640, the rotation account's, readable by
+//! the proxy's group and nobody else) / `<config_id>.ech` (public wire bytes,
+//! mode 644) pairs — one pair per still-accepted generation.
 //!
 //! [`load`] is called from every place a `rustls::ServerConfig` gets built,
 //! the same way certificate loading already is, so a fresh `ech-keygen` run

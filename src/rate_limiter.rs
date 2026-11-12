@@ -545,7 +545,8 @@ pub struct AdaptiveConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Baseline learning window (seconds)
+    /// How long the baseline remembers (seconds): a sample this old weighs
+    /// `1/e` of a new one, so the baseline follows a rate that changes
     #[serde(default = "default_baseline_window")]
     pub baseline_window_secs: u64,
 
@@ -579,7 +580,10 @@ pub struct AdaptiveConfig {
     #[serde(default)]
     pub auto_adjust: bool,
 
-    /// Minimum requests before baseline is established
+    /// Samples before the baseline is used: a key's rate is sampled at
+    /// most once a second while it is active, so the default 1000 is about
+    /// 17 minutes of a key's activity (a key idle for 5 minutes is
+    /// forgotten, its baseline with it)
     #[serde(default = "default_min_samples")]
     pub min_samples: u64,
 
@@ -777,7 +781,6 @@ impl RedisBackend {
 
     /// Distributed token-bucket check.  Returns `None` on Redis error
     /// (caller should fall back to in-memory).
-    #[allow(clippy::cast_precision_loss)]
     pub async fn check_token_bucket(
         &self,
         key_str: &str,
@@ -1168,63 +1171,105 @@ impl SlidingWindowCounter {
 // ADAPTIVE BASELINE
 // ============================================================================
 
-/// Adaptive baseline tracker for anomaly detection
+/// How often a baseline takes a sample at most: a rate is read once a
+/// second, however many requests arrive in it, so a burst is one sample and
+/// not as many samples as it has requests.
+const SAMPLE_EVERY: Duration = Duration::from_secs(1);
+
+/// A count as a sample, saturating far above any rate a key can have.
+fn sample_value(value: u64) -> f64 {
+    f64::from(u32::try_from(value).unwrap_or(u32::MAX))
+}
+
+/// What a request rate (one key's, or the proxy's) normally is, and how far
+/// it strays.
+///
+/// The mean and standard deviation of its samples, each weighing less the
+/// older it is, by `e^(-age / window)`, so the baseline follows the traffic
+/// as it changes rather than averaging all the time there has been.
+///
+/// The moments are kept by a weighted Welford update: the mean and the sum
+/// of squared deviations from it are carried as they are, so the variance is
+/// never the difference of two large sums (rounding can take that below
+/// zero, and a NaN threshold flags nothing), and every sample costs the
+/// same, one short lock and no allocation.
 #[derive(Debug)]
 pub struct AdaptiveBaseline {
-    /// Sum of all values
-    sum: AtomicU64,
+    moments: parking_lot::Mutex<Moments>,
 
-    /// Sum of squared values (for variance)
-    sum_squared: AtomicU64,
-
-    /// Count of samples
+    /// Samples taken, ever: what `min_samples` counts
     count: AtomicU64,
 
-    /// Rolling window samples
-    samples: RwLock<Vec<(Instant, u64)>>,
+    /// The age at which a sample weighs `1/e` of a new one
+    window: Duration,
 
-    /// Window duration
-    window_duration: Duration,
-
-    /// Minimum samples before baseline is valid
+    /// Samples before the baseline is used
     min_samples: u64,
 
-    /// Standard deviation multiplier for anomaly
+    /// Standard deviations above the mean at which a rate is anomalous
     std_dev_multiplier: f64,
+}
+
+#[derive(Debug, Default)]
+struct Moments {
+    /// The samples' total weight
+    weight: f64,
+    mean: f64,
+    /// The weighted sum of squared deviations from the mean
+    m2: f64,
+    last: Option<Instant>,
 }
 
 impl AdaptiveBaseline {
     pub fn new(window_secs: u64, min_samples: u64, std_dev_multiplier: f64) -> Self {
         Self {
-            sum: AtomicU64::new(0),
-            sum_squared: AtomicU64::new(0),
+            moments: parking_lot::Mutex::new(Moments::default()),
             count: AtomicU64::new(0),
-            samples: RwLock::new(Vec::new()),
-            window_duration: Duration::from_secs(window_secs),
+            window: Duration::from_secs(window_secs.max(1)),
             min_samples,
             std_dev_multiplier,
         }
     }
 
-    /// Record a sample
+    /// Take `value` as a sample now, unless one was taken within the last
+    /// second.
     pub fn record(&self, value: u64) {
-        self.sum.fetch_add(value, Ordering::Relaxed);
-        self.sum_squared.fetch_add(value * value, Ordering::Relaxed);
+        self.record_at(value, Instant::now());
+    }
+
+    fn record_at(&self, value: u64, at: Instant) {
+        let mut m = self.moments.lock();
+        if let Some(last) = m.last {
+            let since = at.saturating_duration_since(last);
+            if since < SAMPLE_EVERY {
+                return;
+            }
+            // What came before weighs less by the time since
+            let decay = (-since.as_secs_f64() / self.window.as_secs_f64()).exp();
+            m.weight *= decay;
+            m.m2 *= decay;
+        }
+        let x = sample_value(value);
+        m.weight += 1.0;
+        let delta = x - m.mean;
+        m.mean += delta / m.weight;
+        m.m2 = delta.mul_add(x - m.mean, m.m2);
+        m.last = Some(at);
+        drop(m);
         self.count.fetch_add(1, Ordering::Relaxed);
-
-        let mut samples = self.samples.write();
-        samples.push((Instant::now(), value));
-
-        // Trim old samples
-        let cutoff = Instant::now()
-            .checked_sub(self.window_duration)
-            .unwrap_or_else(Instant::now);
-        samples.retain(|(t, _)| *t > cutoff);
     }
 
     /// Whether enough samples have been seen for the mean to mean anything.
     pub fn is_established(&self) -> bool {
         self.count.load(Ordering::Relaxed) >= self.min_samples
+    }
+
+    fn mean_and_std_dev(&self) -> (f64, f64) {
+        let m = self.moments.lock();
+        if m.weight <= 0.0 {
+            return (0.0, 0.0);
+        }
+        (m.mean, (m.m2 / m.weight).max(0.0).sqrt())
     }
 
     /// The rate above which a sample counts as anomalous: `mean + k * stddev`,
@@ -1234,65 +1279,32 @@ impl AdaptiveBaseline {
     /// number itself, not the verdict — the same threshold that flags a spike
     /// is the right resting place for the key's standing limits.  Returns
     /// `None` until the baseline is established.
-    // Prometheus gauge values are f64; precision loss on large counter values is acceptable.
-    #[allow(clippy::cast_precision_loss)]
     pub fn threshold(&self) -> Option<f64> {
         if !self.is_established() {
             return None;
         }
-        let count = self.count.load(Ordering::Relaxed);
-        let sum = self.sum.load(Ordering::Relaxed) as f64;
-        let sum_sq = self.sum_squared.load(Ordering::Relaxed) as f64;
-        let n = count as f64;
-
-        let mean = sum / n;
-        // variance = E[X²] - E[X]² (correct statistical formula)
-        #[allow(clippy::suspicious_operation_groupings)]
-        let variance = mean.mul_add(-mean, sum_sq / n);
-        let std_dev = variance.sqrt();
-
+        let (mean, std_dev) = self.mean_and_std_dev();
         Some(self.std_dev_multiplier.mul_add(std_dev, mean))
     }
 
-    /// Check if value is anomalous
-    // Prometheus gauge values are f64; precision loss on large counter values is acceptable.
-    #[allow(clippy::cast_precision_loss)]
+    /// Whether `value` is above the threshold; never before the baseline is
+    /// established.
     pub fn is_anomaly(&self, value: u64) -> bool {
-        match self.threshold() {
-            Some(threshold) => value as f64 > threshold,
-            None => false, // Not enough data for baseline
-        }
+        self.threshold()
+            .is_some_and(|threshold| sample_value(value) > threshold)
     }
 
-    /// Get current mean
-    // Prometheus gauge values are f64; precision loss on large counter values is acceptable.
-    #[allow(clippy::cast_precision_loss)]
+    /// The mean rate
     pub fn get_mean(&self) -> f64 {
-        let count = self.count.load(Ordering::Relaxed);
-        if count == 0 {
-            return 0.0;
-        }
-        self.sum.load(Ordering::Relaxed) as f64 / count as f64
+        self.mean_and_std_dev().0
     }
 
-    /// Get current standard deviation
-    // Prometheus gauge values are f64; precision loss on large counter values is acceptable.
-    #[allow(clippy::cast_precision_loss)]
+    /// The standard deviation of the rate; 0 before there are two samples
     pub fn get_std_dev(&self) -> f64 {
-        let count = self.count.load(Ordering::Relaxed);
-        if count < 2 {
+        if self.count.load(Ordering::Relaxed) < 2 {
             return 0.0;
         }
-
-        let sum = self.sum.load(Ordering::Relaxed) as f64;
-        let sum_sq = self.sum_squared.load(Ordering::Relaxed) as f64;
-        let n = count as f64;
-
-        let mean = sum / n;
-        // variance = E[X²] - E[X]² (correct statistical formula)
-        #[allow(clippy::suspicious_operation_groupings)]
-        let variance = mean.mul_add(-mean, sum_sq / n);
-        variance.sqrt()
+        self.mean_and_std_dev().1
     }
 }
 
@@ -1398,7 +1410,7 @@ impl RateLimitBucket {
 
         // The baseline records per-minute counts, so its threshold is already
         // in the units `requests_per_minute` is expressed in.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let per_minute = threshold.ceil().clamp(0.0, f64::from(u32::MAX)) as u32;
         let per_minute = per_minute.max(limits.burst_size);
 
@@ -1481,7 +1493,7 @@ impl RateLimitBucket {
                     reason: LimitReason::AnomalyDetected,
                     retry_after_ms: 60_000,
                     // clamp(0.0, u32::MAX as f64) ensures value is non-negative and within u32 range.
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     limit: baseline.get_mean().clamp(0.0, u32::MAX as f64) as u32,
                 };
             }
@@ -1547,7 +1559,7 @@ pub struct AdvancedRateLimiter {
     config: Arc<RwLock<AdvancedRateLimitConfig>>,
 
     /// Global rate limiter (always in-process for fast DDoS protection)
-    global_limiter: Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>,
+    global_limiter: arc_swap::ArcSwap<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>,
 
     /// Per-key rate limit buckets (in-memory fallback / local-only path)
     buckets: Arc<DashMap<String, Arc<RateLimitBucket>>>,
@@ -1558,8 +1570,14 @@ pub struct AdvancedRateLimiter {
     /// Parsed trusted proxy CIDRs
     trusted_cidrs: Arc<RwLock<Vec<ipnet::IpNet>>>,
 
-    /// Global baseline (for overall traffic patterns)
-    global_baseline: Arc<AdaptiveBaseline>,
+    /// The proxy's own request rate: requests a second, sampled each second
+    global_baseline: arc_swap::ArcSwap<AdaptiveBaseline>,
+
+    /// The second (since `started`) being counted for `global_baseline`, and
+    /// the requests counted in it so far
+    global_second: AtomicU64,
+    global_count: AtomicU64,
+    started: Instant,
 
     /// Statistics
     stats: Arc<RateLimiterStats>,
@@ -1578,6 +1596,22 @@ pub struct AdvancedRateLimiter {
     asn_of: std::sync::OnceLock<AsnLookup>,
 }
 
+/// The node's own quota (`global_limits`).
+fn global_limiter_of(limits: &GlobalLimits) -> RateLimiter<NotKeyed, InMemoryState, DefaultClock> {
+    let rps = NonZeroU32::new(limits.requests_per_second.max(1)).unwrap_or(NonZeroU32::MIN);
+    let burst = NonZeroU32::new(limits.burst_size.max(1)).unwrap_or(NonZeroU32::MIN);
+    RateLimiter::direct(Quota::per_second(rps).allow_burst(burst))
+}
+
+/// The proxy's own request-rate baseline, as `adaptive` sets it.
+fn baseline_of(adaptive: &AdaptiveConfig) -> AdaptiveBaseline {
+    AdaptiveBaseline::new(
+        adaptive.baseline_window_secs,
+        adaptive.min_samples,
+        effective_std_dev_multiplier(adaptive),
+    )
+}
+
 /// The autonomous system announcing an address, if it is known.
 pub type AsnLookup = Arc<dyn Fn(IpAddr) -> Option<u32> + Send + Sync>;
 
@@ -1588,7 +1622,6 @@ pub struct RateLimiterStats {
     pub total_allowed: AtomicU64,
     pub total_limited: AtomicU64,
     pub total_blocked: AtomicU64,
-    pub keys_tracked: AtomicU64,
 }
 
 impl AdvancedRateLimiter {
@@ -1629,18 +1662,8 @@ impl AdvancedRateLimiter {
             })
             .collect();
 
-        // Create global rate limiter with safe NonZeroU32 handling
-        let global_rps = NonZeroU32::new(config.global_limits.requests_per_second.max(1))
-            .unwrap_or(NonZeroU32::MIN);
-        let global_burst =
-            NonZeroU32::new(config.global_limits.burst_size.max(1)).unwrap_or(NonZeroU32::MIN);
-
-        let global_quota = Quota::per_second(global_rps).allow_burst(global_burst);
-
-        // Extract adaptive config values before moving config
-        let adaptive_baseline_window = config.adaptive.baseline_window_secs;
-        let adaptive_min_samples = config.adaptive.min_samples;
-        let adaptive_std_dev_multiplier = effective_std_dev_multiplier(&config.adaptive);
+        let global_limiter = global_limiter_of(&config.global_limits);
+        let global_baseline = baseline_of(&config.adaptive);
 
         // Stash the Redis config before consuming `config`.
         let redis_cfg = config.redis.clone();
@@ -1649,19 +1672,18 @@ impl AdvancedRateLimiter {
 
         let limiter = Self {
             config: Arc::new(RwLock::new(config)),
-            global_limiter: Arc::new(RateLimiter::direct(global_quota)),
+            global_limiter: arc_swap::ArcSwap::from_pointee(global_limiter),
             buckets: Arc::new(DashMap::new()),
             route_buckets: Arc::new(DashMap::new()),
             trusted_cidrs: Arc::new(RwLock::new(trusted_cidrs)),
-            global_baseline: Arc::new(AdaptiveBaseline::new(
-                adaptive_baseline_window,
-                adaptive_min_samples,
-                adaptive_std_dev_multiplier,
-            )),
+            global_baseline: arc_swap::ArcSwap::from_pointee(global_baseline),
             stats: Arc::new(RateLimiterStats::default()),
             redis_backend,
             audit: std::sync::OnceLock::new(),
             asn_of: std::sync::OnceLock::new(),
+            global_second: AtomicU64::new(0),
+            global_count: AtomicU64::new(0),
+            started: Instant::now(),
         };
 
         // Spawn cleanup task
@@ -1757,7 +1779,7 @@ impl AdvancedRateLimiter {
             }
 
             // Global limit (in-process DDoS protection per node)
-            if self.global_limiter.check().is_err() {
+            if self.global_limiter.load().check().is_err() {
                 self.stats.total_limited.fetch_add(1, Ordering::Relaxed);
                 return RateLimitResult::Limited {
                     reason: LimitReason::Global,
@@ -1873,7 +1895,7 @@ impl AdvancedRateLimiter {
         }
 
         if adaptive_enabled {
-            self.global_baseline.record(1);
+            self.count_for_global_baseline();
         }
 
         match &result {
@@ -1999,10 +2021,7 @@ impl AdvancedRateLimiter {
         }
         self.buckets
             .entry(charge.key_string.clone())
-            .or_insert_with(|| {
-                self.stats.keys_tracked.fetch_add(1, Ordering::Relaxed);
-                Arc::new(RateLimitBucket::new(&charge.limits, Some(adaptive_cfg)))
-            })
+            .or_insert_with(|| Arc::new(RateLimitBucket::new(&charge.limits, Some(adaptive_cfg))))
             .clone()
     }
 
@@ -2027,7 +2046,7 @@ impl AdvancedRateLimiter {
                 return RateLimitResult::Limited {
                     reason: LimitReason::AnomalyDetected,
                     retry_after_ms: 60_000,
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     limit: baseline.get_mean().clamp(0.0, f64::from(u32::MAX)) as u32,
                 };
             }
@@ -2514,7 +2533,6 @@ impl AdvancedRateLimiter {
     fn spawn_cleanup_task(&self) {
         let buckets = self.buckets.clone();
         let route_buckets = self.route_buckets.clone();
-        let stats = self.stats.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_mins(1));
@@ -2524,14 +2542,11 @@ impl AdvancedRateLimiter {
                 let idle_threshold = Duration::from_mins(5); // 5 minutes
 
                 // Clean up idle buckets
+                // Buckets are added while this runs: the count is approximate
                 let before_count = buckets.len();
                 buckets.retain(|_, bucket| bucket.last_request.read().elapsed() < idle_threshold);
-                let removed = before_count - buckets.len();
-
+                let removed = before_count.saturating_sub(buckets.len());
                 if removed > 0 {
-                    stats
-                        .keys_tracked
-                        .fetch_sub(removed as u64, Ordering::Relaxed);
                     debug!("Cleaned up {} idle rate limit buckets", removed);
                 }
 
@@ -2552,10 +2567,6 @@ impl AdvancedRateLimiter {
                     for (key, _) in entries.into_iter().take(to_remove) {
                         buckets.remove(&key);
                     }
-
-                    stats
-                        .keys_tracked
-                        .fetch_sub(to_remove as u64, Ordering::Relaxed);
                     warn!(
                         "Rate limiter reached max capacity, evicted {} oldest entries",
                         to_remove
@@ -2588,13 +2599,24 @@ impl AdvancedRateLimiter {
             total_limited: self.stats.total_limited.load(Ordering::Relaxed),
             total_blocked: self.stats.total_blocked.load(Ordering::Relaxed),
             keys_tracked: self.buckets.len(),
-            global_baseline_mean: self.global_baseline.get_mean(),
-            global_baseline_std_dev: self.global_baseline.get_std_dev(),
+            global_baseline_mean: self.global_baseline.load().get_mean(),
+            global_baseline_std_dev: self.global_baseline.load().get_std_dev(),
             redis_connected,
         }
     }
 
-    /// Update configuration dynamically without restarting
+    /// Count one request toward the second it arrived in; the first request
+    /// of a new second gives the one before to the global baseline.
+    fn count_for_global_baseline(&self) {
+        let second = self.started.elapsed().as_secs();
+        if self.global_second.swap(second, Ordering::AcqRel) == second {
+            self.global_count.fetch_add(1, Ordering::AcqRel);
+        } else {
+            let previous = self.global_count.swap(1, Ordering::AcqRel);
+            self.global_baseline.load().record(previous);
+        }
+    }
+
     /// Drop every bucket, global or per-route, whose key is `key` or has a
     /// component equal to it, so a client's limits start fresh. `key` may be a
     /// whole key (`SourceIp:203.0.113.7`) or just its value (`203.0.113.7`),
@@ -2660,9 +2682,44 @@ impl AdvancedRateLimiter {
             .collect();
 
         *self.trusted_cidrs.write() = trusted_cidrs;
-        *self.config.write() = config;
 
-        info!("Rate limiter configuration updated");
+        // What was built from the configuration is built again from the new
+        // one where it changed: the node's quota and its baseline, and every
+        // key's bucket (each carries its quota, counters and baseline from
+        // when it was made, so a key that stayed busy kept the old limits)
+        let previous = self.config.read().clone();
+        let differs = |a: serde_json::Result<serde_json::Value>,
+                       b: serde_json::Result<serde_json::Value>| {
+            a.ok() != b.ok()
+        };
+        if differs(
+            serde_json::to_value(&previous.global_limits),
+            serde_json::to_value(&config.global_limits),
+        ) {
+            self.global_limiter
+                .store(Arc::new(global_limiter_of(&config.global_limits)));
+        }
+        if differs(
+            serde_json::to_value(&previous.adaptive),
+            serde_json::to_value(&config.adaptive),
+        ) {
+            self.global_baseline
+                .store(Arc::new(baseline_of(&config.adaptive)));
+        }
+        let rebuilt = differs(
+            serde_json::to_value(&previous),
+            serde_json::to_value(&config),
+        );
+        *self.config.write() = config;
+        if rebuilt {
+            self.buckets.clear();
+            self.route_buckets.clear();
+            info!(
+                "Rate limiter configuration updated: every key starts again under the new limits"
+            );
+        } else {
+            info!("Rate limiter configuration updated");
+        }
     }
 }
 
@@ -2762,9 +2819,10 @@ mod tests {
     fn test_adaptive_baseline() {
         let baseline = AdaptiveBaseline::new(3600, 10, 3.0);
 
-        // Record some samples
+        // Record some samples, a second apart
+        let start = Instant::now();
         for i in 0..20 {
-            baseline.record(100 + i);
+            baseline.record_at(100 + i, start + Duration::from_secs(i));
         }
 
         assert!(baseline.get_mean() > 100.0);
@@ -2775,6 +2833,46 @@ mod tests {
 
         // Very high value should be anomaly
         assert!(baseline.is_anomaly(1000));
+    }
+
+    /// Samples within a second of the last are one sample; the moments never
+    /// go negative however the samples fall; and the baseline follows a rate
+    /// that has changed, older samples weighing less.
+    #[test]
+    fn the_baseline_samples_once_a_second_and_follows_the_rate() {
+        let baseline = AdaptiveBaseline::new(60, 5, 3.0);
+        let start = Instant::now();
+        for i in 0..1000u64 {
+            baseline.record_at(7, start + Duration::from_millis(i));
+        }
+        assert_eq!(
+            baseline.count.load(Ordering::Relaxed),
+            1,
+            "one sample in the first second"
+        );
+
+        // A constant rate: no spread, and a NaN nowhere
+        let steady = AdaptiveBaseline::new(60, 5, 3.0);
+        for i in 0..100 {
+            steady.record_at(1_000_000_007, start + Duration::from_secs(i));
+        }
+        assert!(steady.get_std_dev() >= 0.0 && steady.get_std_dev() < 1e-3);
+        assert!(steady.threshold().is_some_and(f64::is_finite));
+
+        // An hour at 10, then ten minutes at 100, with a one-minute window:
+        // the baseline is the new rate's
+        let shifted = AdaptiveBaseline::new(60, 5, 3.0);
+        for i in 0..3600 {
+            shifted.record_at(10, start + Duration::from_secs(i));
+        }
+        for i in 3600..4200 {
+            shifted.record_at(100, start + Duration::from_secs(i));
+        }
+        assert!(
+            (shifted.get_mean() - 100.0).abs() < 0.5,
+            "{}",
+            shifted.get_mean()
+        );
     }
 
     #[test]
@@ -2949,20 +3047,26 @@ mod tests {
             };
             let baseline =
                 AdaptiveBaseline::new(3600, cfg.min_samples, effective_std_dev_multiplier(&cfg));
-            // A steady 100/min with a little jitter.
+            // A steady 100/min with a little jitter, a sample a second.
+            let start = Instant::now();
             for i in 0..40 {
-                baseline.record(if i % 2 == 0 { 98 } else { 102 });
+                baseline.record_at(
+                    if i % 2 == 0 { 98 } else { 102 },
+                    start + Duration::from_secs(i),
+                );
             }
             baseline
         };
 
-        // The samples give mean 100, stddev 2.  Sensitivity 0.95 maps to a
-        // multiplier of 0.5 (threshold 101); sensitivity 0.1 maps to 9.0
-        // (threshold 118).  110 sits between them, so it separates the two.
+        // The samples give mean 100, stddev 2 (the newest weigh a hair more
+        // than the oldest, a second against an hour's window).  Sensitivity
+        // 0.95 maps to a multiplier of 0.5 (threshold 101); sensitivity 0.1
+        // maps to 9.0 (threshold 118).  110 sits between them, so it
+        // separates the two.
         let sensitive = build(0.95);
         let lax = build(0.1);
-        assert!((sensitive.threshold().unwrap() - 101.0).abs() < 1e-6);
-        assert!((lax.threshold().unwrap() - 118.0).abs() < 1e-6);
+        assert!((sensitive.threshold().unwrap() - 101.0).abs() < 0.01);
+        assert!((lax.threshold().unwrap() - 118.0).abs() < 0.05);
 
         assert!(
             sensitive.is_anomaly(110),
@@ -3007,8 +3111,12 @@ mod tests {
         );
 
         // This key's normal is ~20 requests/minute.
+        let start = Instant::now();
         for i in 0..40 {
-            baseline.record(if i % 2 == 0 { 19 } else { 21 });
+            baseline.record_at(
+                if i % 2 == 0 { 19 } else { 21 },
+                start + Duration::from_secs(i),
+            );
         }
 
         let adjusted = bucket.effective_limits(&limits, &adaptive);
@@ -3052,8 +3160,9 @@ mod tests {
         let baseline = bucket.baseline.as_ref().expect("adaptive is enabled");
 
         // A baseline far above the configured minute ceiling.
-        for _ in 0..40 {
-            baseline.record(5000);
+        let start = Instant::now();
+        for i in 0..40 {
+            baseline.record_at(5000, start + Duration::from_secs(i));
         }
 
         let adjusted = bucket.effective_limits(&limits, &adaptive);
@@ -3078,9 +3187,12 @@ mod tests {
             ..AdaptiveConfig::default()
         };
         let bucket = RateLimitBucket::new(&limits, Some(&adaptive));
-        for _ in 0..40 {
-            bucket.baseline.as_ref().unwrap().record(20);
+        let baseline = bucket.baseline.as_ref().unwrap();
+        let start = Instant::now();
+        for i in 0..40 {
+            baseline.record_at(20, start + Duration::from_secs(i));
         }
+        assert!(baseline.is_established());
 
         let adjusted = bucket.effective_limits(&limits, &adaptive);
         assert_eq!(adjusted.requests_per_minute, Some(3000));

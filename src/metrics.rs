@@ -146,6 +146,9 @@ impl MetricsRegistry {
         // TLS metrics
         self.tls.export_prometheus(&mut output);
 
+        // The process's memory against its cgroup's limits
+        export_memory(&mut output, &crate::memory_pressure::snapshot());
+
         output
     }
 
@@ -172,7 +175,68 @@ impl MetricsRegistry {
             pools: self.pools.snapshot(),
             rate_limiter: self.rate_limiter.snapshot(),
             tls: self.tls.snapshot(),
+            memory: crate::memory_pressure::snapshot(),
         }
+    }
+}
+
+/// `pqcrypta_memory_*`: what [`crate::memory_pressure`] reads and does.
+fn export_memory(output: &mut String, memory: &crate::memory_pressure::MemorySnapshot) {
+    use std::fmt::Write;
+    if !memory.watched {
+        return;
+    }
+    let mut gauge = |name: &str, help: &str, value: String| {
+        let _ = writeln!(output, "# HELP {name} {help}");
+        let _ = writeln!(output, "# TYPE {name} gauge");
+        let _ = writeln!(output, "{name} {value}");
+    };
+    gauge(
+        "pqcrypta_memory_pressure_level",
+        "How short memory is: 0 normal, 1 elevated, 2 critical",
+        (memory.level as u8).to_string(),
+    );
+    gauge(
+        "pqcrypta_memory_working_set_bytes",
+        "Anonymous, unreclaimable kernel and socket memory of the process's cgroup",
+        memory.working_set_bytes.to_string(),
+    );
+    gauge(
+        "pqcrypta_memory_stalled_percent",
+        "Share of the last 10 s the process was stalled on memory",
+        memory.stalled_percent.to_string(),
+    );
+    for (name, help, value) in [
+        (
+            "pqcrypta_memory_high_bytes",
+            "The cgroup's memory.high",
+            memory.high_bytes,
+        ),
+        (
+            "pqcrypta_memory_max_bytes",
+            "The cgroup's memory.max",
+            memory.max_bytes,
+        ),
+    ] {
+        if let Some(value) = value {
+            gauge(name, help, value.to_string());
+        }
+    }
+    for (name, help, value) in [
+        (
+            "pqcrypta_memory_refused_connections_total",
+            "Connections refused because memory was critically short",
+            memory.refused_connections,
+        ),
+        (
+            "pqcrypta_memory_shed_connections_total",
+            "Idle connections closed because memory was short",
+            memory.shed_connections,
+        ),
+    ] {
+        let _ = writeln!(output, "# HELP {name} {help}");
+        let _ = writeln!(output, "# TYPE {name} counter");
+        let _ = writeln!(output, "{name} {value}");
     }
 }
 
@@ -192,6 +256,7 @@ pub struct MetricsSnapshot {
     pub pools: Vec<PoolMetricsSnapshot>,
     pub rate_limiter: RateLimiterMetricsSnapshot,
     pub tls: TlsMetricsSnapshot,
+    pub memory: crate::memory_pressure::MemorySnapshot,
 }
 
 // ============================================================================
@@ -1549,7 +1614,7 @@ impl LatencyHistogram {
     /// using Prometheus-style linear interpolation within buckets for
     /// accurate sub-bucket estimates.
     // Prometheus gauge values are f64; precision loss on large counter values is acceptable.
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     fn percentile(&self, p: u32) -> f64 {
         let s0 = &self.slots[0];
         let s1 = &self.slots[1];
@@ -1608,8 +1673,6 @@ impl LatencyHistogram {
     }
 
     /// Export windowed histogram in Prometheus format.
-    // Prometheus gauge values are f64; precision loss on large counter values is acceptable.
-    #[allow(clippy::cast_precision_loss)]
     fn export_prometheus(&self, output: &mut String, name: &str) {
         use std::fmt::Write;
 
@@ -1620,7 +1683,7 @@ impl LatencyHistogram {
 
     /// The histogram's buckets, sum and count, each with `labels` (written
     /// inside the braces, before `le`; empty for none).
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     fn write_series(&self, output: &mut String, name: &str, labels: &str) {
         use std::fmt::Write;
 

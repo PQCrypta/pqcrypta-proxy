@@ -57,7 +57,7 @@ impl WebTransportServer {
     ///
     /// ALPN Protocol: "h3" (HTTP/3) is automatically configured by wtransport crate
     /// The crate handles SETTINGS_ENABLE_WEBTRANSPORT frame automatically
-    #[allow(clippy::unused_async_trait_impl)] // public async API; callers .await it
+    #[expect(clippy::unused_async_trait_impl)] // public async API; callers .await it
     pub async fn new(
         addr: SocketAddr,
         cert_path: &str,
@@ -549,7 +549,11 @@ async fn handle_incoming_session(
             otel.kind = "server",
             trace_id = tracing::field::Empty,
         );
-        crate::otel::set_parent_from_map(&span, session_request.headers());
+        crate::otel::set_parent_from_map(
+            &span,
+            session_request.headers(),
+            crate::security::canonical_addr(session_request.remote_address()).ip(),
+        );
         let trace_id = crate::otel::trace_id_of(&span);
         if !trace_id.is_empty() {
             span.record("trace_id", trace_id);
@@ -886,7 +890,7 @@ async fn handle_uni_stream<S: WtSession>(
 }
 
 /// Handle bidirectional stream
-#[allow(clippy::too_many_arguments)] // WT handler: transport + routing + security
+#[expect(clippy::too_many_arguments)] // WT handler: transport + routing + security
 async fn handle_bi_stream<S: WtSession>(
     mut send_stream: S::Send,
     mut recv_stream: S::Recv,
@@ -1017,7 +1021,6 @@ where
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)] // WT handler: transport + routing + security
 async fn handle_datagram<S: WtSession>(
     datagram: Vec<u8>,
     remote_addr: SocketAddr,

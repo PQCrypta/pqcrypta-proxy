@@ -1359,7 +1359,6 @@ impl WafEngine {
     }
 
     /// Build a new WAF engine from config, compiling all patterns at construction time.
-    #[allow(clippy::new_without_default)]
     pub fn new(config: &WafConfig) -> Self {
         let mut rules: Vec<CompiledRule> = Vec::new();
         let mut payload_pats: Vec<&str> = Vec::new();

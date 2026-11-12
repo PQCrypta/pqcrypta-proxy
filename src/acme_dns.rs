@@ -126,7 +126,8 @@ impl Algorithm {
 struct TsigKey {
     name: String,
     algorithm: Algorithm,
-    secret: Vec<u8>,
+    /// Wiped when the key is dropped
+    secret: zeroize::Zeroizing<Vec<u8>>,
 }
 
 impl std::fmt::Debug for TsigKey {
@@ -206,11 +207,13 @@ impl DnsUpdater {
             .server
             .parse()
             .map_err(|e| anyhow::anyhow!("acme.dns_update.server '{}': {e}", config.server))?;
-        let text = std::fs::read_to_string(&config.secret_file).map_err(|e| {
-            anyhow::anyhow!("acme.dns_update.secret_file {:?}: {e}", config.secret_file)
-        })?;
+        let text =
+            zeroize::Zeroizing::new(std::fs::read_to_string(&config.secret_file).map_err(|e| {
+                anyhow::anyhow!("acme.dns_update.secret_file {:?}: {e}", config.secret_file)
+            })?);
         let secret = base64::engine::general_purpose::STANDARD
             .decode(text.trim())
+            .map(zeroize::Zeroizing::new)
             .map_err(|e| {
                 anyhow::anyhow!(
                     "acme.dns_update.secret_file {:?} is not base64: {e}",
@@ -717,7 +720,7 @@ mod tests {
         TsigKey {
             name: "acme-test".to_string(),
             algorithm: Algorithm::HmacSha256,
-            secret: b"0123456789abcdef0123456789abcdef".to_vec(),
+            secret: zeroize::Zeroizing::new(b"0123456789abcdef0123456789abcdef".to_vec()),
         }
     }
 
@@ -836,7 +839,7 @@ mod tests {
             "outside the fudge"
         );
         let other = TsigKey {
-            secret: b"another secret, also 32 octets!!".to_vec(),
+            secret: zeroize::Zeroizing::new(b"another secret, also 32 octets!!".to_vec()),
             ..key()
         };
         assert!(

@@ -82,7 +82,6 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::single_match_else)]
 #![allow(clippy::manual_let_else)]
-#![allow(clippy::option_map_or_none)]
 #![allow(clippy::map_unwrap_or)]
 #![allow(clippy::uninlined_format_args)]
 #![allow(clippy::missing_const_for_fn)]
@@ -92,27 +91,20 @@
 #![allow(clippy::unused_self)]
 #![allow(clippy::format_push_string)]
 #![allow(clippy::significant_drop_tightening)]
-#![allow(clippy::manual_strip)]
-#![allow(clippy::bool_comparison)]
 #![allow(clippy::needless_borrow)]
 #![allow(clippy::explicit_iter_loop)]
 #![allow(clippy::redundant_closure_for_method_calls)]
 #![allow(clippy::should_implement_trait)]
 #![allow(clippy::single_char_pattern)]
 #![allow(clippy::similar_names)]
-#![allow(clippy::nonminimal_bool)]
-#![allow(clippy::op_ref)]
 #![allow(clippy::assigning_clones)]
 #![allow(clippy::collapsible_if)]
 #![allow(clippy::items_after_statements)]
-#![allow(clippy::ptr_as_ptr)]
-#![allow(clippy::unnecessary_cast)]
 #![allow(clippy::unnecessary_wraps)]
 #![allow(clippy::type_complexity)]
 #![allow(clippy::cast_lossless)]
 #![allow(clippy::struct_field_names)]
 #![allow(clippy::branches_sharing_code)]
-#![allow(clippy::ref_option_ref)]
 #![allow(clippy::unused_async)]
 #![allow(clippy::if_not_else)]
 #![allow(clippy::ignored_unit_patterns)]
@@ -159,8 +151,11 @@ pub mod http3_features;
 pub mod http_listener;
 pub mod load_balancer;
 pub mod log_file;
+pub mod memory_pressure;
 pub mod metrics;
 pub mod ocsp;
+#[cfg(feature = "pqc")]
+pub mod openssl_alloc;
 pub mod otel;
 pub mod path_canon;
 pub mod pqc_extended;
@@ -175,6 +170,7 @@ pub mod request_id;
 pub mod request_target;
 pub mod route_gate;
 pub mod security;
+pub mod service_notify;
 pub mod speedtest;
 pub mod speedtest_budget;
 pub mod speedtest_meter;

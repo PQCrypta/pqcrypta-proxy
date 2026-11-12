@@ -810,11 +810,22 @@ mod mldsa {
         (end <= buf.len()).then_some((tag, start, end))
     }
 
-    /// Extract the seed (preferred) or expanded key from the PKCS#8 privateKey
-    /// field, handling all three CHOICE forms from
-    /// draft-ietf-lamps-dilithium-certificates: seed `[0]`, expandedKey
-    /// OCTET STRING, and the `both` SEQUENCE (what OpenSSL 3.5 writes).
-    fn extract_key_material(pkcs8: &[u8]) -> Option<(&[u8], bool)> {
+    /// The private key a PKCS#8 file holds, in the CHOICE form it took.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum KeyMaterial<'a> {
+        Seed(&'a [u8]),
+        Expanded(&'a [u8]),
+        /// What OpenSSL 3.5 writes: both, which must agree (RFC 9881 section 6)
+        Both {
+            seed: &'a [u8],
+            expanded: &'a [u8],
+        },
+    }
+
+    /// Extract the key material from the PKCS#8 privateKey field, handling
+    /// all three CHOICE forms of RFC 9881: seed `[0]`, expandedKey OCTET
+    /// STRING, and the `both` SEQUENCE.
+    fn extract_key_material(pkcs8: &[u8]) -> Option<KeyMaterial<'_>> {
         // PKCS#8: SEQUENCE { version INTEGER, algorithm SEQUENCE, privateKey OCTET STRING }
         let (0x30, mut pos, outer_end) = der_tlv(pkcs8, 0)? else {
             return None;
@@ -840,14 +851,22 @@ mod mldsa {
                 let (0x04, s, e) = der_tlv(inner, start)? else {
                     return None;
                 };
-                (e - s == SEED_LEN).then_some((&inner[s..e], true))
+                let (0x04, xs, xe) = der_tlv(inner, e)? else {
+                    return None;
+                };
+                (e - s == SEED_LEN && xe - xs == EXPANDED_KEY_LEN && xe <= end).then_some(
+                    KeyMaterial::Both {
+                        seed: &inner[s..e],
+                        expanded: &inner[xs..xe],
+                    },
+                )
             }
             // seed [0] IMPLICIT OCTET STRING
-            0x80 => (end - start == SEED_LEN).then_some((&inner[start..end], true)),
+            0x80 => (end - start == SEED_LEN).then_some(KeyMaterial::Seed(&inner[start..end])),
             // expandedKey OCTET STRING (or bare 32-byte seed as OCTET STRING)
             0x04 => match end - start {
-                SEED_LEN => Some((&inner[start..end], true)),
-                EXPANDED_KEY_LEN => Some((&inner[start..end], false)),
+                SEED_LEN => Some(KeyMaterial::Seed(&inner[start..end])),
+                EXPANDED_KEY_LEN => Some(KeyMaterial::Expanded(&inner[start..end])),
                 _ => None,
             },
             _ => None,
@@ -865,17 +884,40 @@ mod mldsa {
         /// then falls back to manual extraction of the seed / expanded key for
         /// CHOICE encodings it does not accept.
         pub(super) fn load(pkcs8: &[u8]) -> anyhow::Result<Self> {
-            let keypair = PqdsaKeyPair::from_pkcs8(&ML_DSA_87_SIGNING, pkcs8).or_else(|_| {
-                let (material, is_seed) = extract_key_material(pkcs8).ok_or_else(|| {
-                    anyhow::anyhow!("Unrecognised ML-DSA-87 PKCS#8 private-key encoding")
-                })?;
-                let result = if is_seed {
-                    PqdsaKeyPair::from_seed(&ML_DSA_87_SIGNING, material)
-                } else {
-                    PqdsaKeyPair::from_raw_private_key(&ML_DSA_87_SIGNING, material)
-                };
-                result.map_err(|e| anyhow::anyhow!("ML-DSA-87 key rejected: {:?}", e))
-            })?;
+            let rejected = |e| anyhow::anyhow!("ML-DSA-87 key rejected: {:?}", e);
+            let material = extract_key_material(pkcs8);
+            // A key in both forms is checked here, whichever parser would
+            // otherwise take it: the seed is the key, and the expanded form
+            // beside it must be what the seed expands to, or the file is not
+            // one key (RFC 9881 section 6)
+            let keypair = if let Some(KeyMaterial::Both { seed, expanded }) = material {
+                use aws_lc_rs::encoding::AsRawBytes as _;
+                let keypair =
+                    PqdsaKeyPair::from_seed(&ML_DSA_87_SIGNING, seed).map_err(rejected)?;
+                let derived = keypair
+                    .private_key()
+                    .as_raw_bytes()
+                    .map_err(|e| anyhow::anyhow!("ML-DSA-87 key not expanded: {e:?}"))?;
+                if !bool::from(subtle::ConstantTimeEq::ct_eq(derived.as_ref(), expanded)) {
+                    return Err(anyhow::anyhow!(
+                        "ML-DSA-87 key rejected: its expanded key is not what its seed expands to"
+                    ));
+                }
+                keypair
+            } else {
+                PqdsaKeyPair::from_pkcs8(&ML_DSA_87_SIGNING, pkcs8).or_else(|_| match material {
+                    Some(KeyMaterial::Seed(seed)) => {
+                        PqdsaKeyPair::from_seed(&ML_DSA_87_SIGNING, seed).map_err(rejected)
+                    }
+                    Some(KeyMaterial::Expanded(expanded)) => {
+                        PqdsaKeyPair::from_raw_private_key(&ML_DSA_87_SIGNING, expanded)
+                            .map_err(rejected)
+                    }
+                    Some(KeyMaterial::Both { .. }) | None => Err(anyhow::anyhow!(
+                        "Unrecognised ML-DSA-87 PKCS#8 private-key encoding"
+                    )),
+                })?
+            };
             Ok(Self {
                 keypair: Arc::new(keypair),
             })
@@ -965,6 +1007,68 @@ mod mldsa {
                     SignatureScheme::ECDSA_NISTP256_SHA256
                 ])
                 .is_none());
+        }
+
+        /// The `both` form: accepted when its halves agree, refused when the
+        /// expanded key is another's.
+        #[test]
+        fn a_both_form_key_must_agree_with_itself() {
+            use aws_lc_rs::encoding::AsRawBytes as _;
+            fn both(seed: &[u8], expanded: &[u8]) -> Vec<u8> {
+                let octets = |content: &[u8]| {
+                    let mut v = vec![0x04];
+                    v.extend(der_len(content.len()));
+                    v.extend_from_slice(content);
+                    v
+                };
+                let mut inner_seq = octets(seed);
+                inner_seq.extend(octets(expanded));
+                let mut choice = vec![0x30];
+                choice.extend(der_len(inner_seq.len()));
+                choice.extend(inner_seq);
+                let mut body = vec![0x02, 0x01, 0x00, 0x30, 0x0b];
+                body.extend_from_slice(&ML_DSA_87_OID);
+                body.extend(octets(&choice));
+                let mut der = vec![0x30];
+                der.extend(der_len(body.len()));
+                der.extend(body);
+                der
+            }
+            fn der_len(n: usize) -> Vec<u8> {
+                if n < 0x80 {
+                    vec![u8::try_from(n).unwrap()]
+                } else {
+                    let bytes = u32::try_from(n).unwrap().to_be_bytes();
+                    let skip = bytes.iter().take_while(|b| **b == 0).count();
+                    let mut v = vec![0x80 | u8::try_from(4 - skip).unwrap()];
+                    v.extend_from_slice(&bytes[skip..]);
+                    v
+                }
+            }
+            let seed = [7u8; SEED_LEN];
+            let expanded = PqdsaKeyPair::from_seed(&ML_DSA_87_SIGNING, &seed)
+                .unwrap()
+                .private_key()
+                .as_raw_bytes()
+                .unwrap();
+            let whole = both(&seed, expanded.as_ref());
+            assert!(matches!(
+                extract_key_material(&whole),
+                Some(KeyMaterial::Both { .. })
+            ));
+            assert!(MlDsa87SigningKey::load(&whole).is_ok());
+
+            let other = PqdsaKeyPair::from_seed(&ML_DSA_87_SIGNING, &[9u8; SEED_LEN])
+                .unwrap()
+                .private_key()
+                .as_raw_bytes()
+                .unwrap();
+            let torn = both(&seed, other.as_ref());
+            let refused = MlDsa87SigningKey::load(&torn).expect_err("halves disagree");
+            assert!(
+                refused.to_string().contains("not what its seed"),
+                "{refused}"
+            );
         }
 
         #[test]

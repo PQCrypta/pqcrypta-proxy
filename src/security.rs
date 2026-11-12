@@ -1358,6 +1358,18 @@ impl SecurityState {
         removed
     }
 
+    /// Forget everything kept about exactly `ip`: its block (not a range
+    /// that contains it, which `unblock_ip` also lifts), counters and rate
+    /// buckets. What the startup probes leave behind, on their own TEST-NET
+    /// addresses, once they have measured the controls.
+    pub fn forget(&self, ip: IpAddr) {
+        self.blocked_ips.remove(&ip);
+        self.ip_rate_limiters.remove(&ip);
+        self.ip_connections.remove(&ip);
+        self.request_counts.remove(&ip);
+        self.connection_rates.remove(&ip);
+    }
+
     /// Snapshot of currently blocked IPs and CIDRs, for the admin API.
     pub fn blocklist_snapshot(&self) -> (Vec<(IpAddr, String)>, Vec<(IpNet, String)>) {
         let ips = self
@@ -2044,7 +2056,7 @@ impl SecurityState {
 
     /// Record a request for adaptive rate limiting
     // Prometheus gauge values are f64; precision loss on large counter values is acceptable.
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     pub fn record_request(&self, ip: IpAddr, status: StatusCode) {
         // Skip tracking for trusted IPs (loopback, or operator-configured trusted_internal_cidrs)
         if self.is_trusted(&ip) {
