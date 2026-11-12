@@ -7,18 +7,15 @@
 //! - Raw TCP
 
 use std::collections::HashMap;
-use std::sync::Arc;
+
 use std::time::Duration;
 
 use crate::backend_client::BackendClient;
-use bytes::{Buf, Bytes};
-use dashmap::DashMap;
+use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::header::HeaderMap;
 use hyper::{Method, Request, StatusCode};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 use crate::config::{BackendConfig, BackendType, ProxyConfig};
@@ -81,15 +78,11 @@ pub type BackendLease = crate::backend_client::Lease<Full<Bytes>>;
 pub struct BackendPool {
     /// Pooled HTTP/1.1 connections to the backends; see [`crate::backend_client`].
     client: BackendClient<Full<Bytes>>,
-    /// Connection limiters per backend
-    limiters: DashMap<String, Arc<Semaphore>>,
-    /// Configuration
-    config: Arc<ProxyConfig>,
 }
 
 impl BackendPool {
     /// Create a new backend pool
-    pub fn new(config: Arc<ProxyConfig>) -> Self {
+    pub fn new(config: &ProxyConfig) -> Self {
         // connect_timeout comes from security.connection_timeout_secs, which
         // once bounded nothing: a backend that accepted TCP but never completed
         // the connection could hold a request until the much longer
@@ -101,29 +94,7 @@ impl BackendPool {
             Duration::from_secs(config.security.connection_timeout_secs),
         );
 
-        let pool = Self {
-            client,
-            limiters: DashMap::new(),
-            config,
-        };
-
-        // Initialize limiters for each backend. connection_pool.max_connections_per_host
-        // was ignored entirely; it now supplies the limit for any backend that does
-        // not set its own. It is deliberately NOT a ceiling over an explicit
-        // per-backend value — several backends here are configured above it on
-        // purpose, and silently capping them would throttle live traffic.
-        let host_cap = pool.config.connection_pool.max_connections_per_host;
-        for (name, backend) in &pool.config.backends {
-            let permits = if backend.max_connections > 0 {
-                backend.max_connections as usize
-            } else {
-                host_cap
-            };
-            pool.limiters
-                .insert(name.clone(), Arc::new(Semaphore::new(permits)));
-        }
-
-        pool
+        Self { client }
     }
 
     /// Proxy request to HTTP/1.1 or HTTP/2 backend
@@ -135,9 +106,6 @@ impl BackendPool {
         mut headers: HashMap<String, String>,
         body: &[u8],
     ) -> anyhow::Result<Vec<u8>> {
-        // Acquire connection permit
-        let _permit = self.acquire_permit(&backend.name).await?;
-
         // Inject W3C TraceContext + B3 headers so the backend can continue the trace
         otel::inject_current_context_into_map(&mut headers);
 
@@ -163,10 +131,11 @@ impl BackendPool {
 
         // Send request with timeout
         let timeout = Duration::from_millis(backend.timeout_ms);
-        let (response, lease) = tokio::time::timeout(timeout, self.client.send(backend, request))
+        let (response, lease) = self
+            .client
+            .send_with_retry(backend, request, timeout)
             .await
-            .map_err(|_| anyhow::Error::new(BackendTimeout(timeout)))?
-            .map_err(|e| anyhow::anyhow!("Backend request failed: {}", e))?;
+            .map_err(|e| backend_error(e, "Backend request failed"))?;
 
         // Check status
         let status = response.status();
@@ -197,9 +166,6 @@ impl BackendPool {
         mut headers: HashMap<String, String>,
         body: &[u8],
     ) -> anyhow::Result<ProxyResponse> {
-        // Acquire connection permit
-        let _permit = self.acquire_permit(&backend.name).await?;
-
         // Inject W3C TraceContext + B3 headers so the backend can continue the trace
         otel::inject_current_context_into_map(&mut headers);
 
@@ -225,10 +191,11 @@ impl BackendPool {
 
         // Send request with timeout
         let timeout = Duration::from_millis(backend.timeout_ms);
-        let (response, lease) = tokio::time::timeout(timeout, self.client.send(backend, request))
+        let (response, lease) = self
+            .client
+            .send_with_retry(backend, request, timeout)
             .await
-            .map_err(|_| anyhow::Error::new(BackendTimeout(timeout)))?
-            .map_err(|e| anyhow::anyhow!("Backend request failed: {}", e))?;
+            .map_err(|e| backend_error(e, "Backend request failed"))?;
 
         // Extract status and headers (use Vec to preserve multiple headers with same name).
         // Strip HTTP/1.1 hop-by-hop headers — these are connection-specific and forbidden
@@ -283,9 +250,12 @@ impl BackendPool {
         path: &str,
         mut headers: HeaderMap,
         body: Bytes,
-    ) -> anyhow::Result<(StatusCode, HeaderMap, hyper::body::Incoming, BackendLease)> {
-        let _permit = self.acquire_permit(&backend.name).await?;
-
+    ) -> anyhow::Result<(
+        StatusCode,
+        HeaderMap,
+        crate::backend_client::BackendBody,
+        BackendLease,
+    )> {
         otel::inject_current_context_into_headers(&mut headers);
 
         let mut request = Request::new(Full::new(body));
@@ -295,10 +265,11 @@ impl BackendPool {
         *request.headers_mut() = headers;
 
         let timeout = Duration::from_millis(backend.timeout_ms);
-        let (response, lease) = tokio::time::timeout(timeout, self.client.send(backend, request))
+        let (response, lease) = self
+            .client
+            .send_with_retry(backend, request, timeout)
             .await
-            .map_err(|_| anyhow::Error::new(BackendTimeout(timeout)))?
-            .map_err(|e| anyhow::anyhow!("Backend stream request failed: {}", e))?;
+            .map_err(|e| backend_error(e, "Backend stream request failed"))?;
 
         let status = response.status();
         let (parts, body_part) = response.into_parts();
@@ -313,626 +284,78 @@ impl BackendPool {
         Ok((status, response_headers, body_part, lease))
     }
 
-    /// Proxy request to HTTP backend with per-backend retry policy.
-    ///
-    /// Retry behaviour is controlled by `BackendConfig.retries`, `retry_backoff_ms`, and
-    /// `retry_on`.  Backoff doubles on each successive attempt (exponential), starting
-    /// from `retry_backoff_ms`.
-    pub async fn proxy_http_full_with_retry(
-        &self,
-        backend: &BackendConfig,
-        method: &str,
-        path: &str,
-        headers: HashMap<String, String>,
-        body: &[u8],
-    ) -> anyhow::Result<ProxyResponse> {
-        let max_retries = backend.retries.unwrap_or(3) as usize;
-        let base_backoff_ms = backend.retry_backoff_ms.unwrap_or(50);
-        let retry_on: Vec<String> = backend
-            .retry_on
-            .clone()
-            .unwrap_or_else(|| vec!["connect-failure".to_string(), "5xx".to_string()]);
-
-        let mut last_err: Option<anyhow::Error> = None;
-
-        for attempt in 0..=max_retries {
-            match self
-                .proxy_http_full(backend, method, path, headers.clone(), body)
-                .await
-            {
-                Ok(resp) => {
-                    if should_retry_status(resp.status, &retry_on) && attempt < max_retries {
-                        let backoff = base_backoff_ms.saturating_mul(1u64 << attempt.min(9));
-                        warn!(
-                            "Backend returned {}, retrying (attempt {}/{})...",
-                            resp.status,
-                            attempt + 1,
-                            max_retries
-                        );
-                        tokio::time::sleep(Duration::from_millis(backoff)).await;
-                        last_err = Some(anyhow::anyhow!("Backend returned status {}", resp.status));
-                        continue;
-                    }
-                    return Ok(resp);
-                }
-                Err(e) => {
-                    if is_retryable_error(&e, &retry_on) && attempt < max_retries {
-                        let backoff = base_backoff_ms.saturating_mul(1u64 << attempt.min(9));
-                        warn!(
-                            "Backend request failed (attempt {}/{}): {} — retrying...",
-                            attempt + 1,
-                            max_retries,
-                            e
-                        );
-                        tokio::time::sleep(Duration::from_millis(backoff)).await;
-                        last_err = Some(e);
-                        continue;
-                    }
-                    return Err(e);
-                }
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("All retry attempts exhausted")))
-    }
-
-    /// Proxy request to Unix socket backend (e.g., PHP-FPM)
-    #[cfg(unix)]
-    pub async fn proxy_unix(
-        &self,
-        backend: &BackendConfig,
-        method: &str,
-        path: &str,
-        headers: HashMap<String, String>,
-        body: &[u8],
-    ) -> anyhow::Result<Vec<u8>> {
-        use tokio::net::UnixStream;
-
-        // Acquire connection permit
-        let _permit = self.acquire_permit(&backend.name).await?;
-
-        // Parse Unix socket path
-        let socket_path = backend
-            .address
-            .strip_prefix("unix:")
-            .ok_or_else(|| anyhow::anyhow!("Invalid Unix socket address: {}", backend.address))?;
-
-        debug!("Proxying to Unix socket: {} {}", socket_path, path);
-
-        // Connect to Unix socket
-        let mut stream = UnixStream::connect(socket_path)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to connect to Unix socket: {}", e))?;
-
-        // Build FastCGI-style HTTP request
-        let http_request = self.build_http_request(method, path, &headers, body);
-
-        // Send request
-        stream.write_all(http_request.as_bytes()).await?;
-        stream.write_all(body).await?;
-
-        // Read response with timeout
-        let timeout = Duration::from_millis(backend.timeout_ms);
-        let mut response_buf = Vec::new();
-
-        tokio::time::timeout(timeout, async {
-            let mut buf = [0u8; 8192];
-            loop {
-                match stream.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => response_buf.extend_from_slice(&buf[..n]),
-                    Err(e) => return Err(anyhow::anyhow!("Read error: {}", e)),
-                }
-            }
-            Ok::<_, anyhow::Error>(())
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("Unix socket timeout"))??;
-
-        // Parse HTTP response and extract body
-        let response_body = self.extract_http_body(&response_buf)?;
-
-        debug!("Received {} bytes from Unix socket", response_body.len());
-        Ok(response_body)
-    }
-
-    /// Proxy request to Unix socket backend (e.g., PHP-FPM) - Windows stub
-    #[cfg(not(unix))]
-    pub async fn proxy_unix(
-        &self,
-        _backend: &BackendConfig,
-        _method: &str,
-        _path: &str,
-        _headers: HashMap<String, String>,
-        _body: &[u8],
-    ) -> anyhow::Result<Vec<u8>> {
-        Err(anyhow::anyhow!(
-            "Unix sockets not supported on this platform"
-        ))
-    }
-
-    /// Proxy request to HTTP/3 backend
-    pub async fn proxy_http3(
-        &self,
-        backend: &BackendConfig,
-        method: &str,
-        path: &str,
-        headers: HashMap<String, String>,
-        body: &[u8],
-    ) -> anyhow::Result<Vec<u8>> {
-        // Acquire connection permit
-        let _permit = self.acquire_permit(&backend.name).await?;
-
-        debug!("Proxying to HTTP/3 backend: {} {}", backend.address, path);
-
-        // Parse backend address
-        let addr: std::net::SocketAddr = backend
-            .address
-            .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid backend address: {}", e))?;
-
-        // Create QUIC endpoint for client
-        let mut roots = rustls::RootCertStore::empty();
-        let native_certs = rustls_native_certs::load_native_certs();
-        let mut added = 0;
-        for cert in native_certs.certs {
-            if roots.add(cert).is_ok() {
-                added += 1;
-            }
-        }
-        debug!("Loaded {} root certificates for backend TLS", added);
-
-        let mut crypto = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-
-        crypto.alpn_protocols = vec![b"h3".to_vec()];
-
-        // Skip verification if configured (dangerous)
-        if backend.tls_skip_verify {
-            warn!(
-                "TLS verification disabled for backend {} - INSECURE",
-                backend.name
-            );
-        }
-
-        let client_config = quinn::ClientConfig::new(Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
-                .map_err(|e| anyhow::anyhow!("Failed to create QUIC config: {}", e))?,
-        ));
-
-        let endpoint = quinn::Endpoint::client(
-            "0.0.0.0:0"
-                .parse()
-                .expect("SR-06: INADDR_ANY:0 is always a valid socket address"),
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to create endpoint: {}", e))?;
-        endpoint.set_default_client_config(client_config);
-
-        // Extract host for SNI: an IPv6 literal goes without its brackets
-        let host = crate::config::host_without_port(&backend.address)
-            .trim_start_matches('[')
-            .trim_end_matches(']');
-
-        // Connect to backend
-        let connection = endpoint
-            .connect(addr, host)
-            .map_err(|e| anyhow::anyhow!("Failed to connect: {}", e))?
-            .await
-            .map_err(|e| anyhow::anyhow!("Connection failed: {}", e))?;
-
-        // Create HTTP/3 connection
-        let quinn_conn = h3_quinn::Connection::new(connection);
-        let (mut driver, mut send_request) = h3::client::new(quinn_conn)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create HTTP/3 client: {}", e))?;
-
-        // Spawn driver
-        tokio::spawn(
-            async move { futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await },
-        );
-
-        // Build request
-        let mut request_builder = http::Request::builder()
-            .method(method)
-            .uri(format!("https://{}{}", host, path));
-
-        for (key, value) in headers {
-            request_builder = request_builder.header(&key, &value);
-        }
-
-        let request = request_builder
-            .body(())
-            .map_err(|e| anyhow::anyhow!("Failed to build request: {}", e))?;
-
-        // Send request
-        let mut stream = send_request
-            .send_request(request)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to send request: {}", e))?;
-
-        // Send body if present
-        if !body.is_empty() {
-            stream
-                .send_data(Bytes::copy_from_slice(body))
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to send body: {}", e))?;
-        }
-
-        stream
-            .finish()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to finish request: {}", e))?;
-
-        // Receive response
-        let response = stream
-            .recv_response()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to receive response: {}", e))?;
-
-        // Log response status
-        let status = response.status();
-        debug!("HTTP/3 backend response status: {}", status);
-
-        if !status.is_success() {
-            warn!("HTTP/3 backend returned non-success status: {}", status);
-        }
-
-        // Read response body
-        let mut response_body = Vec::new();
-        while let Some(mut chunk) = stream
-            .recv_data()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to receive data: {}", e))?
-        {
-            while chunk.has_remaining() {
-                let bytes = chunk.chunk();
-                response_body.extend_from_slice(bytes);
-                chunk.advance(bytes.len());
-            }
-        }
-
-        debug!("Received {} bytes from HTTP/3 backend", response_body.len());
-        Ok(response_body)
-    }
-
-    /// Proxy to raw TCP backend
-    pub async fn proxy_tcp(&self, backend: &BackendConfig, data: &[u8]) -> anyhow::Result<Vec<u8>> {
-        // Acquire connection permit
-        let _permit = self.acquire_permit(&backend.name).await?;
-
-        debug!(
-            "Proxying {} bytes to TCP backend: {}",
-            data.len(),
-            backend.address
-        );
-
-        // Connect to backend
-        let mut stream = TcpStream::connect(&backend.address)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to connect to TCP backend: {}", e))?;
-
-        // Send data
-        stream.write_all(data).await?;
-
-        // Read response with timeout
-        let timeout = Duration::from_millis(backend.timeout_ms);
-        let mut response_buf = Vec::new();
-
-        tokio::time::timeout(timeout, async {
-            let mut buf = [0u8; 8192];
-            loop {
-                match stream.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => response_buf.extend_from_slice(&buf[..n]),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                    Err(e) => return Err(anyhow::anyhow!("Read error: {}", e)),
-                }
-            }
-            Ok::<_, anyhow::Error>(())
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("TCP backend timeout"))??;
-
-        debug!("Received {} bytes from TCP backend", response_buf.len());
-        Ok(response_buf)
-    }
-
-    /// Acquire a connection permit for rate limiting
-    async fn acquire_permit(
-        &self,
-        backend_name: &str,
-    ) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
-        let limiter = self
-            .limiters
-            .get(backend_name)
-            .map(|r| r.clone())
-            .ok_or_else(|| anyhow::anyhow!("No limiter for backend: {}", backend_name))?;
-
-        // Bounded wait: connection_pool.acquire_timeout_ms was configured and then
-        // never used, so a saturated backend queued callers indefinitely instead
-        // of failing fast. Waiting forever behind an exhausted pool just converts
-        // a backend stall into a proxy-wide stall.
-        let wait = Duration::from_millis(self.config.connection_pool.acquire_timeout_ms);
-        match tokio::time::timeout(wait, limiter.clone().acquire_owned()).await {
-            Ok(Ok(permit)) => Ok(permit),
-            Ok(Err(e)) => Err(anyhow::anyhow!(
-                "Failed to acquire connection permit: {}",
-                e
-            )),
-            Err(_) => Err(anyhow::anyhow!(
-                "Timed out after {}ms waiting for a connection slot on backend {}",
-                wait.as_millis(),
-                backend_name
-            )),
-        }
-    }
-
-    /// Strip CR and LF characters from a string to prevent CRLF injection.
-    #[cfg(unix)]
-    fn strip_crlf(s: &str) -> String {
-        s.chars().filter(|&c| c != '\r' && c != '\n').collect()
-    }
-
-    /// Build HTTP request string for Unix socket.
-    ///
-    /// Header names and values are sanitized: any CR (`\r`) or LF (`\n`) characters
-    /// are removed before interpolation to prevent CRLF injection attacks.
-    #[cfg(unix)]
-    fn build_http_request(
-        &self,
-        method: &str,
-        path: &str,
-        headers: &HashMap<String, String>,
-        body: &[u8],
-    ) -> String {
-        // Sanitize method and path
-        let method = Self::strip_crlf(method);
-        let path = Self::strip_crlf(path);
-
-        let mut request = format!("{} {} HTTP/1.1\r\n", method, path);
-
-        for (key, value) in headers {
-            // Sanitize header key and value to prevent CRLF injection
-            let key = Self::strip_crlf(key);
-            let value = Self::strip_crlf(value);
-            request.push_str(&format!("{}: {}\r\n", key, value));
-        }
-
-        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
-        request.push_str("Connection: close\r\n");
-        request.push_str("\r\n");
-
-        request
-    }
-
-    /// Extract body from HTTP response
-    #[cfg(unix)]
-    fn extract_http_body(&self, response: &[u8]) -> anyhow::Result<Vec<u8>> {
-        // Find end of headers (double CRLF)
-        let response_str = String::from_utf8_lossy(response);
-        if let Some(header_end) = response_str.find("\r\n\r\n") {
-            Ok(response[header_end + 4..].to_vec())
-        } else if let Some(header_end) = response_str.find("\n\n") {
-            Ok(response[header_end + 2..].to_vec())
-        } else {
-            // No headers found, return entire response
-            Ok(response.to_vec())
-        }
-    }
-
     /// Check backend health
     pub async fn check_health(&self, backend: &BackendConfig) -> bool {
-        if let Some(ref health_endpoint) = backend.health_check {
-            match backend.backend_type {
-                BackendType::Http1 | BackendType::Http2 => {
-                    let request = match Request::builder()
-                        .method(Method::GET)
-                        .uri(health_endpoint.as_str())
-                        .body(Full::new(Bytes::new()))
-                    {
-                        Ok(r) => r,
-                        Err(_) => return false,
-                    };
+        let Some(ref health_endpoint) = backend.health_check else {
+            // No health check configured, assume healthy
+            return true;
+        };
+        match backend.backend_type {
+            // Every HTTP backend is asked its health endpoint over the
+            // transport its requests take
+            BackendType::Http1 | BackendType::Http2 | BackendType::Http3 | BackendType::Unix => {
+                let request = match Request::builder()
+                    .method(Method::GET)
+                    .uri(health_endpoint.as_str())
+                    .body(Full::new(Bytes::new()))
+                {
+                    Ok(r) => r,
+                    Err(_) => return false,
+                };
 
-                    let timeout = Duration::from_secs(5);
-                    match tokio::time::timeout(timeout, self.client.send(backend, request)).await {
-                        Ok(Ok((response, lease))) => {
-                            let healthy = response.status().is_success();
-                            // Read to the end so the connection can be reused.
-                            if response.into_body().collect().await.is_ok() {
-                                lease.release();
-                            }
-                            healthy
+                let timeout = Duration::from_secs(5);
+                match tokio::time::timeout(timeout, self.client.send(backend, request)).await {
+                    Ok(Ok((response, lease))) => {
+                        let healthy = response.status().is_success();
+                        // Read to the end so the connection can be reused.
+                        if response.into_body().collect().await.is_ok() {
+                            lease.release();
                         }
-                        _ => false,
+                        healthy
                     }
-                }
-                BackendType::Unix => {
-                    #[cfg(unix)]
-                    {
-                        use tokio::net::UnixStream;
-                        let socket_path = backend
-                            .address
-                            .strip_prefix("unix:")
-                            .unwrap_or(&backend.address);
-                        UnixStream::connect(socket_path).await.is_ok()
+                    Ok(Err(_)) => false,
+                    Err(_) => {
+                        self.client.timed_out(backend);
+                        false
                     }
-                    #[cfg(not(unix))]
-                    false
-                }
-                BackendType::Tcp | BackendType::Http3 => {
-                    // Simple TCP connect check
-                    TcpStream::connect(&backend.address).await.is_ok()
                 }
             }
-        } else {
-            // No health check configured, assume healthy
-            true
+            // A raw TCP backend answers no HTTP: it is up when it accepts
+            BackendType::Tcp => {
+                tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&backend.address))
+                    .await
+                    .is_ok_and(|r| r.is_ok())
+            }
         }
     }
 }
 
-/// Returns true if the HTTP status code is in the retry set.
-/// Currently only "5xx" is recognised — matching any 5xx response.
-fn should_retry_status(status: u16, retry_on: &[String]) -> bool {
-    status >= 500 && retry_on.iter().any(|s| s == "5xx")
-}
-
-/// Returns true if the error string suggests a retryable failure category.
-fn is_retryable_error(e: &anyhow::Error, retry_on: &[String]) -> bool {
-    let msg = e.to_string().to_lowercase();
-    let is_connect = msg.contains("connect")
-        || msg.contains("connection")
-        || msg.contains("refused")
-        || msg.contains("reset");
-    // By type for the proxy's own timeout; by text for the ones raised inside
-    // the connect path ("connect to ... timed out").
-    let is_timeout =
-        e.is::<BackendTimeout>() || msg.contains("timeout") || msg.contains("timed out");
-    (is_connect && retry_on.iter().any(|s| s == "connect-failure"))
-        || (is_timeout && retry_on.iter().any(|s| s == "timeout"))
+/// A failed send as the pool reports it: a timeout as [`BackendTimeout`],
+/// anything else under `context`.
+fn backend_error(e: crate::backend_client::SendError, context: &str) -> anyhow::Error {
+    match e {
+        crate::backend_client::SendError::TimedOut(after) => {
+            anyhow::Error::new(BackendTimeout(after))
+        }
+        crate::backend_client::SendError::Failed(e) => anyhow::anyhow!("{context}: {e}"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     #[test]
-    fn a_backend_timeout_is_retryable_as_a_timeout() {
-        let retry = vec!["timeout".to_string()];
-        let e = anyhow::Error::new(BackendTimeout(Duration::from_millis(5)));
-        assert!(is_retryable_error(&e, &retry));
-        assert!(!is_retryable_error(&e, &["connect-failure".to_string()]));
-    }
-
-    /// Helper: build a minimal BackendPool for unit testing build_http_request.
-    #[cfg(unix)]
-    fn make_pool() -> BackendPool {
-        let config = Arc::new(ProxyConfig::default());
-        BackendPool::new(config)
-    }
-
-    /// Count the number of HTTP header lines in a raw request by splitting on "\r\n".
-    /// The first line is the request line; subsequent non-empty lines before the blank
-    /// separator are headers.
-    #[cfg(unix)]
-    fn header_lines(request: &str) -> Vec<&str> {
-        request
-            .split("\r\n")
-            .skip(1) // skip request line
-            .take_while(|l| !l.is_empty())
-            .collect()
-    }
-
-    /// Verify that CRLF sequences in header names are stripped, preventing the
-    /// injected content from becoming a separate header line.
-    #[test]
-    #[cfg(unix)]
-    fn test_build_http_request_strips_crlf_in_header_name() {
-        let pool = make_pool();
-        let mut headers = HashMap::new();
-        // Attempt: inject a second header line via the key
-        headers.insert(
-            "X-Injected\r\nX-Evil: pwned".to_string(),
-            "value".to_string(),
+    fn a_timed_out_send_is_reported_as_a_backend_timeout() {
+        let e = backend_error(
+            crate::backend_client::SendError::TimedOut(Duration::from_millis(5)),
+            "x",
         );
-
-        let request = pool.build_http_request("GET", "/path", &headers, b"");
-
-        // Stripped output must not contain CR or LF in unexpected places.
-        // There should be exactly 3 expected header lines: the injected key (as one
-        // mangled header), Content-Length, and Connection.
-        let hlines = header_lines(&request);
-        for line in &hlines {
-            // No line should start with "X-Evil:" — that would mean injection succeeded.
-            assert!(
-                !line.starts_with("X-Evil:"),
-                "CRLF injection must not create a separate X-Evil header line; got: {:?}",
-                request
-            );
-        }
-
-        // The raw bytes for CR in the injected position must be absent.
-        // (Only the protocol-required \r\n delimiters inserted by us are allowed.)
-        assert!(
-            !request.contains("\r\nX-Evil:"),
-            "Injected CRLF must not produce a header boundary before X-Evil: {:?}",
-            request
+        assert!(e.is::<BackendTimeout>());
+        let e = backend_error(
+            crate::backend_client::SendError::Failed(anyhow::anyhow!("refused")),
+            "Backend request failed",
         );
-    }
-
-    /// Verify that CRLF sequences in header values are stripped.
-    #[test]
-    #[cfg(unix)]
-    fn test_build_http_request_strips_crlf_in_header_value() {
-        let pool = make_pool();
-        let mut headers = HashMap::new();
-        // Attempt: inject a second header line via the value
-        headers.insert(
-            "X-Header".to_string(),
-            "legit\r\nX-Injected: injected".to_string(),
-        );
-
-        let request = pool.build_http_request("GET", "/", &headers, b"");
-
-        // The injected CRLF must not split the value into a separate header line.
-        assert!(
-            !request.contains("\r\nX-Injected:"),
-            "CRLF injection in header value must not create a separate header: {:?}",
-            request
-        );
-        for line in header_lines(&request) {
-            assert!(
-                !line.starts_with("X-Injected:"),
-                "Injected header must not appear as a standalone line: {:?}",
-                request
-            );
-        }
-    }
-
-    /// Verify that CRLF sequences in the request path are stripped.
-    #[test]
-    #[cfg(unix)]
-    fn test_build_http_request_strips_crlf_in_path() {
-        let pool = make_pool();
-        let headers = HashMap::new();
-        // Attempt: inject headers by embedding CRLF in the path
-        let path = "/legit\r\nX-Injected: injected";
-
-        let request = pool.build_http_request("GET", path, &headers, b"");
-
-        // The CRLF from the injection must have been stripped, so the injected text
-        // is fused into the path string on the request line — harmless — rather than
-        // appearing as a separate "X-Injected:" header line.
-        assert!(
-            !request.contains("\r\nX-Injected:"),
-            "CRLF injection in path must not produce a separate header line: {:?}",
-            request
-        );
-        for line in header_lines(&request) {
-            assert!(
-                !line.starts_with("X-Injected:"),
-                "Injected header must not appear as a standalone header: {:?}",
-                request
-            );
-        }
-    }
-
-    /// Verify that a well-formed request without injections is unmodified.
-    #[test]
-    #[cfg(unix)]
-    fn test_build_http_request_clean_input_unchanged() {
-        let pool = make_pool();
-        let mut headers = HashMap::new();
-        headers.insert("Host".to_string(), "localhost".to_string());
-        headers.insert("X-Custom".to_string(), "safe-value".to_string());
-
-        let request = pool.build_http_request("POST", "/api/data", &headers, b"body");
-
-        assert!(request.starts_with("POST /api/data HTTP/1.1\r\n"));
-        assert!(request.contains("Content-Length: 4\r\n"));
-        assert!(request.contains("Connection: close\r\n"));
+        assert_eq!(e.to_string(), "Backend request failed: refused");
     }
 }

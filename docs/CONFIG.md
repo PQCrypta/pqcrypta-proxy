@@ -217,7 +217,7 @@ as_type = "style"
 | `require_client_cert` | bool | `false` | Require client certificates (mTLS mode) |
 | `alpn_protocols` | array[string] | `["h3", "webtransport"]` | ALPN protocols to advertise |
 | `min_version` | string | `"1.3"` | Minimum TLS version. Options: `"1.2"`, `"1.3"` |
-| `ocsp_stapling` | bool | `true` | Enable OCSP stapling for certificate validation |
+| `ocsp_stapling` | bool | `true` | Staple verified OCSP responses (with `[ocsp].enabled`); see the README's OCSP section |
 | `cert_reload_interval_secs` | u64 | `3600` | How often the certificates and ECH configs on disk are checked for a change (0 = disabled). A change is a file created, replaced, removed or written in place. A pair is served once its key is the certificate's key; a domain whose files do not load keeps the certificate it is serving |
 | `enable_0rtt` | bool | `false` | Enable 0-RTT early data on TCP and QUIC; early requests are served before the handshake completes and gated per route (425 Too Early). **WARNING**: early data can be replayed |
 | `zero_rtt_max_early_data` | u32 | `16384` | Early data a TCP session ticket allows when `enable_0rtt` is on (QUIC tickets always carry 0xffffffff) |
@@ -285,6 +285,8 @@ All responses automatically include these security headers. The `Server` header 
 | `additional_kems` | array[string] | `[]` | Additional KEMs to enable |
 | `experimental_groups` | array[string] | `[]` | Provider groups with no IANA codepoint (OQS: `frodo976shake`, `p384_frodo976shake`, ...), offered over TCP after standard ML-KEM and before the classical fallback; hybrids only under `require_hybrid` |
 | `enable_signatures` | bool | `false` | Enable PQC signature algorithms (ML-DSA) |
+| `downgrade_action` | string | `"log"` | What a connection whose key exchange is classical gets while `enabled` is true: `"allow"` (served), `"log"` (served, recorded in the audit log), `"block"` (every request on it answered 421). Any other value is refused at load |
+| `log_downgrades` | bool | `true` | Record classical handshakes in the audit log under `"log"` and `"block"`, once per address in 10 minutes |
 | `require_hybrid` | bool | `true` | Require hybrid mode (classical + PQC) |
 | `verify_provider` | bool | `true` | Verify PQC provider at startup |
 | `check_key_permissions` | bool | `true` | Check TLS key file permissions |
@@ -361,6 +363,8 @@ All responses automatically include these security headers. The `Server` header 
 | `file` | path? | `null` | Log file path (null = stdout) |
 | `access_log` | bool | `true` | Enable access logs |
 | `access_log_file` | path? | `null` | Access log file path |
+| `audit_log_enabled` | bool | `true` | Write the audit log: admin actions and refused admin requests, WAF verdicts, address blocks, rate-limit refusals, classical handshakes, configuration and TLS reloads |
+| `audit_log_path` | path? | `null` | Audit log file, one JSON line an event (null = stderr). Created `0640`; reopened after a rotation |
 
 ---
 
@@ -414,8 +418,12 @@ A key the client cannot choose (`source_ip`, `real_ip`, and a `jwt_subject`
 whose token verified) is one bucket. Any other key is counted beside the
 bucket of the network the request came from, and that bucket is checked
 first: a request with a new `api_key` value every time is still one address,
-held to `per_ip`. A TLS fingerprint names a client build that all of its
-users share, so a fingerprint bucket is kept per network. With Redis, the
+held to `per_ip`. A value the client writes itself (`api_key`, `header:`,
+`cookie:`, `query_param:`, `path`) is not verified here, so it never earns a
+budget: such a request is also counted in the bucket it would have without
+that value (the first other key in `order` that applies, a fingerprint for
+instance), and the tightest of them holds it. A TLS fingerprint names a client
+build that all of its users share, so a fingerprint bucket is kept per network. With Redis, the
 buckets of keys the client cannot choose are shared between instances;
 buckets keyed on a value the client wrote are kept on each instance.
 
@@ -571,6 +579,7 @@ ML-inspired anomaly detection that learns normal traffic patterns.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `max_request_size` | usize | `10485760` | Maximum request body size in bytes (10MB) |
+| `max_buffered_body_bytes` | usize | `0` | The memory all request bodies together may occupy while the proxy holds them, on every transport; a request whose body would take the process past it is answered 503 with `Retry-After`. `0` = four bodies of `max_request_size`, and at least 256 MiB |
 | `max_header_size` | usize | `65536` | Maximum header size in bytes (64KB) |
 | `connection_timeout_secs` | u64 | `30` | Connection timeout in seconds |
 | `dos_protection` | bool | `true` | Enable DoS protection |
@@ -607,6 +616,15 @@ JA3/JA4 TLS fingerprint detection for identifying browsers, bots, and malware.
 | `suspicious_rate_threshold` | u64 | `100` | Request count to trigger suspicious rate check |
 | `suspicious_rate_window_secs` | u64 | `60` | Time window for suspicious rate detection (1 minute) |
 | `cache_max_age_secs` | u64 | `3600` | Fingerprint cache max age (1 hour) |
+| `replay_detection` | bool | `true` | Flag one fingerprint that is not a browser's or a known crawler's arriving from many client networks (IPv4 /24, IPv6 /48) at once |
+| `replay_window_secs` | u64 | `60` | Replay window |
+| `replay_min_networks` | usize | `50` | Client networks within the window that flag a fingerprint |
+| `replay_action` | string | `"log"` | `"log"` (warn and audit once a window) or `"block"` (also block each address for `suspicious_block_duration_secs`) |
+| `drift_detection` | bool | `true` | Flag a client network presenting a different JA4 on most of its connections (a client rotating its fingerprint; a browser keeps one per transport) |
+| `drift_window_secs` | u64 | `300` | Drift window |
+| `drift_threshold` | f64 | `0.7` | Distinct fingerprints per connection that flag a network (more than 0, at most 1) |
+| `drift_min_connections` | u32 | `12` | Connections from the network within the window before it is judged |
+| `drift_action` | string | `"log"` | As `replay_action` |
 
 ---
 
@@ -646,7 +664,7 @@ HTTP connection pool settings for backend connections.
 |--------|------|---------|-------------|
 | `idle_timeout_secs` | u64 | `90` | Idle connection timeout (seconds) |
 | `max_idle_per_host` | usize | `10` | Maximum idle connections per host |
-| `max_connections_per_host` | usize | `100` | Maximum total connections per host |
+| `max_connections_per_host` | usize | `100` | Requests in flight to a backend that sets no `max_connections` of its own; a request holds its place until its response body has been sent on, on every transport |
 | `acquire_timeout_ms` | u64 | `5000` | Connection acquire timeout (5 seconds) |
 
 ---
@@ -764,7 +782,7 @@ Backend pools group multiple servers for load balancing.
 | `timeout_ms` | u64 | `30000` | Request timeout (30 seconds) |
 | `tls_mode` | string | `"terminate"` | TLS mode. Options: `"terminate"`, `"reencrypt"`, `"passthrough"` |
 | `tls_cert` | path? | `null` | CA certificate for backend verification |
-| `tls_skip_verify` | bool | `false` | Skip TLS verification (**DANGEROUS** - testing only) |
+| `tls_skip_verify` | bool | `false` | Refused when true: the certificate is always verified; pin a self-signed backend or private CA with `tls_cert` |
 | `tls_sni` | string? | `null` | Custom SNI hostname for TLS handshake |
 
 ---
@@ -780,17 +798,17 @@ Single backend definitions (use backend pools for load balancing).
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `name` | string | required | Backend name (used in routes) |
-| `type` | string | required | Backend type. Options: `"http1"`, `"http2"`, `"http3"`, `"unix"`, `"tcp"` |
+| `type` | string | required | How requests reach it: `"http1"` (HTTP/1.1 over TCP, or TLS with `tls`/`tls_mode = "reencrypt"`; connections pooled), `"http2"` (one multiplexed connection: TLS with ALPN `h2`, or cleartext h2c with prior knowledge), `"http3"` (one QUIC connection, ALPN `h3`, always TLS), `"unix"` (HTTP/1.1 over a Unix socket; `address` is its path), `"tcp"` (raw bytes: only for WebTransport routes, whose streams it carries) |
 | `address` | string | required | Backend address (e.g., `"127.0.0.1:8080"` or `"unix:/run/php-fpm.sock"`) |
 | `tls_mode` | string | `"terminate"` | TLS mode. Options: `"terminate"`, `"reencrypt"`, `"passthrough"` |
 | `tls` | bool | `false` | Legacy: Enable TLS (use `tls_mode` instead) |
 | `tls_cert` | path? | `null` | CA certificate for backend verification |
 | `tls_client_cert` | path? | `null` | Client certificate for mTLS |
 | `tls_client_key` | path? | `null` | Client key for mTLS |
-| `tls_skip_verify` | bool | `false` | Skip TLS verification (**DANGEROUS**) |
+| `tls_skip_verify` | bool | `false` | Refused when true, as for backends |
 | `tls_sni` | string? | `null` | Custom SNI hostname |
 | `timeout_ms` | u64 | `30000` | Connection timeout (30 seconds) |
-| `max_connections` | u32 | `100` | Maximum connections to this backend |
+| `max_connections` | u32 | `100` | Requests in flight to this backend at once, for the whole process and every transport; a request holds its place until its response body has been sent on, and one that cannot have a place within `connection_pool.acquire_timeout_ms` is refused |
 | `health_check` | string? | `null` | Health check endpoint path |
 | `health_check_interval_secs` | u64 | `30` | Health check interval |
 
@@ -871,6 +889,8 @@ Route configuration for request matching and forwarding.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `webtransport` | bool | `false` | Enable WebTransport for this route |
+| `supports_websocket` | bool | `false` | Tunnel WebSockets on this route: an HTTP/1.1 upgrade (RFC 6455), an HTTP/2 extended CONNECT (RFC 8441) or an HTTP/3 one (RFC 9220), each opened to the backend as an HTTP/1.1 upgrade with the backend's TLS settings and the request's fields, within its `timeout_ms`; the backend's `Sec-WebSocket-Accept` is verified and the subprotocol and extensions it agreed to are passed to the client |
+| `ws_idle_timeout_secs` | u64 | `300` | Close a WebSocket tunnel when nothing has moved either way for this long (0: never) |
 | `stream_to_method` | string? | `null` | Transform WebTransport stream to HTTP method |
 
 ### Redirects
@@ -889,7 +909,7 @@ Route configuration for request matching and forwarding.
 | `allow_credentialed_clients` | bool | `false` | Let curl, Wget, python-requests, python-urllib, Go, Java and empty User-Agents through when the request carries `X-API-Key` or `Authorization: Bearer`; scanners, scrapers and headless browsers stay blocked |
 | `allow_programmatic_clients` | bool | `false` | The same clients with or without a credential, for public endpoints documented for scripts; scanners, scrapers and headless browsers stay blocked |
 | `stripe_compatibility` | bool | `false` | Remove COEP/COOP headers (for Stripe.js) |
-| `timeout_override_ms` | u64? | `null` | Custom timeout for this route |
+| `timeout_override_ms` | u64? | `null` | The backend timeout for this route's requests, in place of the backend's `timeout_ms`, over TCP and HTTP/3 alike, pool members included |
 
 ### CORS Configuration
 

@@ -1314,6 +1314,23 @@ struct Assessment {
     top_location: String,
 }
 
+/// What [`WafEngine::inspect_head`] made of a request's head.
+pub enum HeadVerdict {
+    /// The head blocks on its own; the body need not be read.
+    Decided(WafVerdict),
+    /// To be completed by [`WafEngine::inspect_rest`] on the same engine.
+    Pending(WafHead),
+}
+
+/// A request's head as assessed, waiting for its body.
+pub struct WafHead {
+    assessment: Assessment,
+    /// The exclusions its path matched, by index into the engine's
+    excluded: Vec<usize>,
+    block_mode: bool,
+    threshold: u32,
+}
+
 /// One rule that matched, as reported by [`WafEngine::explain`].
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WafMatch {
@@ -1335,6 +1352,12 @@ pub struct WafExplanation {
 }
 
 impl WafEngine {
+    /// Whether a request body with a content coding is decoded to be read
+    /// (`waf.decode_compressed_body`), and then forwarded decoded.
+    pub fn decodes_bodies(&self) -> bool {
+        self.config.decode_compressed_body
+    }
+
     /// Build a new WAF engine from config, compiling all patterns at construction time.
     #[allow(clippy::new_without_default)]
     pub fn new(config: &WafConfig) -> Self {
@@ -1670,6 +1693,13 @@ fn multipart_text_view(body: &[u8], boundary: &str) -> Vec<u8> {
     out
 }
 
+/// The length of text a body is matched in at a time.
+const BODY_WINDOW: usize = 64 * 1024;
+
+/// How much of the window before it each window repeats: more than any
+/// payload a rule describes is long.
+const BODY_WINDOW_OVERLAP: usize = 8 * 1024;
+
 fn decompress_bounded(body: &[u8], encoding: &str, max_out: usize) -> Option<Vec<u8>> {
     use std::io::Read;
 
@@ -1793,7 +1823,53 @@ impl WafEngine {
             .map_or(self.config.mode == "block", |m| m == "block");
         let threshold = self.config.anomaly_threshold.max(1);
         let a = self.assess(req, threshold, false);
-        self.verdict(&a, block_mode, threshold, req)
+        self.verdict(&a, block_mode, threshold, req.path)
+    }
+
+    /// The head of a request whose body is still to come: everything but the
+    /// body, counted as one request. A head that blocks on its own is
+    /// decided now, so its body is never read; otherwise its assessment is
+    /// carried, as [`WafHead`], into [`Self::inspect_rest`], which adds the
+    /// body to it. One request is assessed once, with one score, one set of
+    /// exclusions (its head's path) and one verdict.
+    pub fn inspect_head(&self, req: &WafRequest<'_>) -> HeadVerdict {
+        self.stats.inspected.fetch_add(1, Ordering::Relaxed);
+        let block_mode = req
+            .mode_override
+            .map_or(self.config.mode == "block", |m| m == "block");
+        let threshold = self.config.anomaly_threshold.max(1);
+        let excluded = self.exclusions_for(req.path);
+        let mut a = Assessment::default();
+        self.assess_head(&mut a, req, &self.exclusion_refs(&excluded), threshold);
+        if block_mode && a.score >= threshold {
+            return HeadVerdict::Decided(self.verdict(&a, block_mode, threshold, req.path));
+        }
+        HeadVerdict::Pending(WafHead {
+            assessment: a,
+            excluded,
+            block_mode,
+            threshold,
+        })
+    }
+
+    /// The verdict on a request whose head [`Self::inspect_head`] left
+    /// pending: its body (`req.body`) added to what its head scored, or with
+    /// no body, the head's assessment as it stands.
+    pub fn inspect_rest(&self, head: WafHead, req: &WafRequest<'_>) -> WafVerdict {
+        let WafHead {
+            assessment: mut a,
+            excluded,
+            block_mode,
+            threshold,
+        } = head;
+        self.assess_body(&mut a, req, &self.exclusion_refs(&excluded), threshold);
+        self.verdict(&a, block_mode, threshold, req.path)
+    }
+
+    /// The verdict on a request whose head was left pending and whose body
+    /// was never read (it ended first): the head's assessment as it stands.
+    pub fn conclude(&self, head: &WafHead, path: &str) -> WafVerdict {
+        self.verdict(&head.assessment, head.block_mode, head.threshold, path)
     }
 
     /// Every rule the request matches, without stopping at the threshold and
@@ -1831,26 +1907,45 @@ impl WafEngine {
     /// Run the rules over a request. Scanning stops once the score reaches
     /// `threshold`; `explain` passes `u32::MAX` so every rule is evaluated.
     fn assess(&self, req: &WafRequest<'_>, threshold: u32, explain: bool) -> Assessment {
-        // Exclusions matching this path. Almost always empty, and when the
-        // operator has configured none this costs a length check.
-        let excluded: Vec<&CompiledExclusion> = if self.exclusions.is_empty() {
-            Vec::new()
-        } else {
-            self.exclusions
-                .iter()
-                .filter(|e| e.path.is_match(req.path))
-                .collect()
-        };
-
+        let excluded = self.exclusions_for(req.path);
+        let excluded = self.exclusion_refs(&excluded);
         let mut a = Assessment {
             explain,
             ..Assessment::default()
         };
+        self.assess_head(&mut a, req, &excluded, threshold);
+        self.assess_body(&mut a, req, &excluded, threshold);
+        a
+    }
 
+    /// The exclusions matching `path`, by index. Almost always none, and when
+    /// the operator has configured none this costs a length check.
+    fn exclusions_for(&self, path: &str) -> Vec<usize> {
+        self.exclusions
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.path.is_match(path))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn exclusion_refs(&self, indexes: &[usize]) -> Vec<&CompiledExclusion> {
+        indexes.iter().map(|&i| &self.exclusions[i]).collect()
+    }
+
+    /// Everything but the body: anomalies, probe paths, the user agent, the
+    /// path and query, the headers.
+    fn assess_head(
+        &self,
+        a: &mut Assessment,
+        req: &WafRequest<'_>,
+        excluded: &[&CompiledExclusion],
+        threshold: u32,
+    ) {
         // --- Structural anomalies (smuggling, header injection) --------------
         a.scanning = "request".into();
         if self.config.request_anomaly {
-            self.check_anomalies(&mut a, req, &excluded, threshold);
+            self.check_anomalies(a, req, excluded, threshold);
         }
 
         // --- Scanner/reconnaissance probe paths ------------------------------
@@ -1860,11 +1955,11 @@ impl WafEngine {
         if a.score < threshold {
             for set_idx in self.path_set.matches(req.path) {
                 let idx = self.path_map[set_idx];
-                if self.is_excluded(&excluded, idx) {
+                if self.is_excluded(excluded, idx) {
                     continue;
                 }
                 debug!("WAF scanner probe: {} on {}", self.rules[idx].id, req.path);
-                if self.record(&mut a, idx, threshold) {
+                if self.record(a, idx, threshold) {
                     break;
                 }
             }
@@ -1873,7 +1968,7 @@ impl WafEngine {
         // --- User-Agent ------------------------------------------------------
         if a.score < threshold && !req.skip_bot_ua_check && self.config.block_scanner_uas {
             a.scanning = "user-agent".into();
-            self.check_user_agent(&mut a, req, &excluded, threshold);
+            self.check_user_agent(a, req, excluded, threshold);
         }
 
         // --- Path and query --------------------------------------------------
@@ -1889,22 +1984,23 @@ impl WafEngine {
                 "path+query"
             }
             .into();
-            self.scan_payload(
-                &mut a,
-                &target,
-                &excluded,
-                Filter::ALL,
-                usize::MAX,
-                threshold,
-            );
+            self.scan_payload(a, &target, excluded, Filter::ALL, usize::MAX, threshold);
         }
 
         // --- Headers ----------------------------------------------------------
         if a.score < threshold {
-            self.scan_headers(&mut a, req, &excluded, threshold);
+            self.scan_headers(a, req, excluded, threshold);
         }
+    }
 
-        // --- Body -------------------------------------------------------------
+    /// The body, when the request has one in hand.
+    fn assess_body(
+        &self,
+        a: &mut Assessment,
+        req: &WafRequest<'_>,
+        excluded: &[&CompiledExclusion],
+        threshold: u32,
+    ) {
         if a.score < threshold {
             if let Some(body) = req.body {
                 a.scanning = "body".into();
@@ -1916,28 +2012,13 @@ impl WafEngine {
                     .headers
                     .get("content-type")
                     .and_then(|v| v.to_str().ok());
-                self.scan_body(
-                    &mut a,
-                    body,
-                    content_encoding,
-                    content_type,
-                    &excluded,
-                    threshold,
-                );
+                self.scan_body(a, body, content_encoding, content_type, excluded, threshold);
             }
         }
-
-        a
     }
 
     /// Turn an assessment into a verdict, updating the verdict counters.
-    fn verdict(
-        &self,
-        a: &Assessment,
-        block_mode: bool,
-        threshold: u32,
-        req: &WafRequest<'_>,
-    ) -> WafVerdict {
+    fn verdict(&self, a: &Assessment, block_mode: bool, threshold: u32, path: &str) -> WafVerdict {
         let Some(idx) = a.top else {
             self.stats.allowed.fetch_add(1, Ordering::Relaxed);
             return WafVerdict::Allow;
@@ -1955,7 +2036,7 @@ impl WafEngine {
             // threshold is visible for tuning, but the request is served.
             debug!(
                 "WAF below threshold: rule={} score={}/{} path={}",
-                rule, a.score, threshold, req.path
+                rule, a.score, threshold, path
             );
             self.stats.allowed.fetch_add(1, Ordering::Relaxed);
             return WafVerdict::Allow;
@@ -2237,13 +2318,13 @@ impl WafEngine {
         if !self.config.deserialization {
             return false;
         }
-        let limited = &body[..body.len().min(self.config.max_body_scan_bytes)];
+        let limited = &body[..self.body_scan_len(body.len())];
         for (n, (_, _, needle)) in BYTE_SIGNATURES.iter().enumerate() {
             let idx = self.byte_sig_base + n;
             if self.is_excluded(excluded, idx) {
                 continue;
             }
-            if limited.windows(needle.len()).any(|w| w == *needle) {
+            if memchr::memmem::find(limited, needle).is_some() {
                 debug!("WAF body byte signature {}", self.rules[idx].id);
                 if self.record(a, idx, threshold) {
                     return true;
@@ -2264,17 +2345,32 @@ impl WafEngine {
         if !self.config.scan_json_body {
             return;
         }
-        let limited = &body[..body.len().min(self.config.max_body_scan_bytes)];
-        let text = String::from_utf8_lossy(limited);
-        if self.scan_payload(
-            a,
-            &text,
-            excluded,
-            Filter::BODY,
-            self.config.max_body_scan_bytes,
-            threshold,
-        ) {
-            debug!("WAF hit in request body");
+        // The whole body, a window at a time: a rule is matched against text
+        // of a bounded length whatever the body's, and each window repeats
+        // the end of the one before, so what lies across a boundary is whole
+        // in one of them. A rule counts once however many windows hold it.
+        let limited = &body[..self.body_scan_len(body.len())];
+        let mut start = 0;
+        loop {
+            let end = limited.len().min(start + BODY_WINDOW);
+            let text = String::from_utf8_lossy(&limited[start..end]);
+            if self.scan_payload(a, &text, excluded, Filter::BODY, usize::MAX, threshold) {
+                debug!("WAF hit in request body");
+                return;
+            }
+            if end == limited.len() {
+                return;
+            }
+            start = end - BODY_WINDOW_OVERLAP;
+        }
+    }
+
+    /// How much of a body of `len` bytes is inspected: all of it, or its
+    /// first `waf.max_body_scan_bytes` where an operator has set that.
+    fn body_scan_len(&self, len: usize) -> usize {
+        match self.config.max_body_scan_bytes {
+            0 => len,
+            most => len.min(most),
         }
     }
 
@@ -2989,6 +3085,155 @@ mod tests {
             blocked(&v),
             "a body cut mid-character must still be inspected"
         );
+    }
+
+    /// A request whose head and body each fall short of the threshold is
+    /// blocked on the two together, and is counted once; concluded without
+    /// its body, the head alone is the verdict.
+    #[test]
+    fn a_head_and_its_body_are_one_assessment() {
+        let headers = browser_headers();
+        let req = |query: &'static str, body: Option<&'static [u8]>| WafRequest {
+            method: "POST",
+            path: "/submit",
+            query,
+            headers: &headers,
+            body,
+            skip_bot_ua_check: false,
+            generic_client_allowed: false,
+            mode_override: None,
+        };
+        let head_query = "q=1' UNION SELECT password FROM users--";
+        let body: &'static [u8] = b"comment=<script>alert(document.cookie)</script>";
+        let base = engine();
+        let head_score = base.explain(&req(head_query, None)).score;
+        let body_score = base.explain(&req("", Some(body))).score;
+        assert!(
+            head_score > 0 && body_score > 0,
+            "{head_score} {body_score}"
+        );
+
+        let mut cfg = config();
+        cfg.anomaly_threshold = head_score + body_score;
+        let engine = WafEngine::new(&cfg);
+        let HeadVerdict::Pending(head) = engine.inspect_head(&req(head_query, None)) else {
+            panic!("the head alone is below the threshold");
+        };
+        assert!(blocked(
+            &engine.inspect_rest(head, &req(head_query, Some(body)))
+        ));
+        assert_eq!(engine.stats().inspected, 1);
+
+        let HeadVerdict::Pending(head) = engine.inspect_head(&req(head_query, None)) else {
+            panic!("the head alone is below the threshold");
+        };
+        assert!(!blocked(&engine.conclude(&head, "/submit")));
+        assert_eq!(engine.stats().inspected, 2);
+
+        // A head that blocks on its own is decided before the body is read.
+        let mut strict = config();
+        strict.anomaly_threshold = head_score;
+        let strict = WafEngine::new(&strict);
+        assert!(matches!(
+            strict.inspect_head(&req(head_query, None)),
+            HeadVerdict::Decided(ref v) if blocked(v)
+        ));
+    }
+
+    /// The backend reads the whole body, so the whole body is inspected:
+    /// wherever a payload sits in it, across a window boundary included.
+    #[test]
+    fn a_payload_is_found_wherever_it_sits_in_a_body() {
+        let headers = browser_headers();
+        let payload = b"'; DROP TABLE users--";
+        let verdict = |engine: &WafEngine, body: &[u8]| {
+            blocked(&engine.inspect(&WafRequest {
+                method: "POST",
+                path: "/submit",
+                query: "",
+                headers: &headers,
+                body: Some(body),
+                skip_bot_ua_check: false,
+                generic_client_allowed: false,
+                mode_override: None,
+            }))
+        };
+        let padded = |padding: usize| {
+            let mut body = vec![b'a'; padding];
+            body.extend_from_slice(payload);
+            body.extend_from_slice(&vec![b'a'; 1000]);
+            body
+        };
+        let engine = engine();
+        assert!(
+            !verdict(&engine, &vec![b'a'; 3 * BODY_WINDOW]),
+            "padding alone"
+        );
+        for padding in [
+            0,
+            BODY_WINDOW - payload.len() / 2,
+            BODY_WINDOW,
+            2 * BODY_WINDOW - BODY_WINDOW_OVERLAP - 3,
+            5 * BODY_WINDOW + 17,
+        ] {
+            assert!(verdict(&engine, &padded(padding)), "after {padding} bytes");
+        }
+
+        // An operator's own limit is a limit: what follows it is not read.
+        let mut cfg = config();
+        cfg.max_body_scan_bytes = 4096;
+        let limited = WafEngine::new(&cfg);
+        assert!(verdict(&limited, &padded(1000)));
+        assert!(!verdict(&limited, &padded(8192)));
+    }
+
+    /// How fast a body is read, for choosing limits: run with
+    /// `cargo test --release body_scan_throughput -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn body_scan_throughput() {
+        let headers = browser_headers();
+        let engine = engine();
+        for (kind, body) in [
+            ("base64-like text", {
+                let line =
+                    b"QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5YWJjZGVmZ2hpamtsbW5vcA==";
+                line.iter()
+                    .copied()
+                    .cycle()
+                    .take(16 << 20)
+                    .collect::<Vec<u8>>()
+            }),
+            ("form fields", {
+                let field =
+                    b"name=Alice+Example&comment=An+ordinary+sentence+about+nothing.&id=12345&";
+                field
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(16 << 20)
+                    .collect::<Vec<u8>>()
+            }),
+        ] {
+            let started = std::time::Instant::now();
+            let verdict = engine.inspect(&WafRequest {
+                method: "POST",
+                path: "/submit",
+                query: "",
+                headers: &headers,
+                body: Some(&body),
+                skip_bot_ua_check: false,
+                generic_client_allowed: false,
+                mode_override: None,
+            });
+            let millis = started.elapsed().as_millis().max(1);
+            println!(
+                "{kind}: {} MiB in {millis} ms = {} KiB/s (blocked: {})",
+                body.len() >> 20,
+                (body.len() as u128 >> 10) * 1000 / millis,
+                blocked(&verdict)
+            );
+        }
     }
 
     /// A body that is not valid UTF-8 at all was never inspected.

@@ -354,15 +354,6 @@ pub fn headers(fields: &[(&str, &str)]) -> BytesMut {
     frame(frame_type::HEADERS, &payload)
 }
 
-/// The fields of an ordinary successful response.
-pub fn ok_response_fields(content_length: usize) -> Vec<(String, String)> {
-    vec![
-        (":status".to_string(), "200".to_string()),
-        ("content-type".to_string(), "text/plain".to_string()),
-        ("content-length".to_string(), content_length.to_string()),
-    ]
-}
-
 /// Huffman-coded literals, precomputed.
 ///
 /// A general encoder needs the whole 256-entry RFC 7541 Appendix B table, which

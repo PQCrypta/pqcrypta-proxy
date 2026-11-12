@@ -76,9 +76,54 @@ pub struct SharedState {
     /// decoder that quietly parks more than it said it would is a decoder
     /// whose SETTINGS mean nothing.
     qpack_blocked_max: AtomicU64,
+    /// PRIORITY_UPDATE values the client sent, by request stream, until the
+    /// stream takes them (RFC 9218 section 7: one may arrive before its
+    /// request). Bounded: the oldest give way.
+    priority_updates: Mutex<PriorityUpdates>,
+    /// How many are held, so a stream can look without locking
+    priority_updates_held: AtomicU64,
 }
 
+/// Held PRIORITY_UPDATE values, oldest first
+#[derive(Debug, Default)]
+struct PriorityUpdates {
+    by_stream: std::collections::HashMap<u64, bytes::Bytes>,
+    order: std::collections::VecDeque<u64>,
+}
+
+/// The most PRIORITY_UPDATE values held for streams that have not taken them
+const MAX_PRIORITY_UPDATES: usize = 256;
+
 impl SharedState {
+    /// Hold the latest priority the client sent for request stream `stream`.
+    pub(crate) fn note_priority_update(&self, stream: u64, field: bytes::Bytes) {
+        let Ok(mut held) = self.priority_updates.lock() else {
+            return;
+        };
+        if held.by_stream.insert(stream, field).is_none() {
+            held.order.push_back(stream);
+            while held.order.len() > MAX_PRIORITY_UPDATES {
+                if let Some(oldest) = held.order.pop_front() {
+                    held.by_stream.remove(&oldest);
+                }
+            }
+        }
+        self.priority_updates_held
+            .store(held.by_stream.len() as u64, Ordering::Release);
+    }
+
+    /// The latest priority the client sent for `stream`, once.
+    pub(crate) fn take_priority_update(&self, stream: u64) -> Option<bytes::Bytes> {
+        if self.priority_updates_held.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let mut held = self.priority_updates.lock().ok()?;
+        let field = held.by_stream.remove(&stream)?;
+        held.order.retain(|s| *s != stream);
+        self.priority_updates_held
+            .store(held.by_stream.len() as u64, Ordering::Release);
+        Some(field)
+    }
     /// Mark this state as belonging to a client endpoint.
     pub(crate) fn set_is_client(&self) {
         self.is_client
@@ -191,6 +236,8 @@ impl Default for SharedState {
             qpack_decoder_out: Mutex::new(BytesMut::new()),
             qpack_blocked: AtomicU64::new(0),
             qpack_blocked_max: AtomicU64::new(0),
+            priority_updates: Mutex::new(PriorityUpdates::default()),
+            priority_updates_held: AtomicU64::new(0),
         }
     }
 }

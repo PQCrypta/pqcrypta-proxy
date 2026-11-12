@@ -221,12 +221,15 @@ impl HmacNonceStore {
         let window = self.window_secs;
         self.nonces
             .retain(|_, inserted_at| now.duration_since(*inserted_at).as_secs() < window);
-        let digest = Self::digest(nonce);
-        if self.nonces.contains_key(&digest) {
-            return true; // replay
+        // One atomic step: two requests carrying the same nonce must not both
+        // find it absent.
+        match self.nonces.entry(Self::digest(nonce)) {
+            dashmap::mapref::entry::Entry::Occupied(_) => true, // replay
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                v.insert(now);
+                false
+            }
         }
-        self.nonces.insert(digest, now);
-        false
     }
 
     fn digest(nonce: &str) -> [u8; 32] {

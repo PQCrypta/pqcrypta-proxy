@@ -745,6 +745,22 @@ impl SessionRequest {
         self.reject(SessionResponseProto::too_many_requests()).await;
     }
 
+    /// Rejects the client request by replying with `421` status code: the
+    /// server will not answer it on this connection, which the client may
+    /// open again differently (RFC 9110 section 15.5.20).
+    pub async fn misdirected_request(self) {
+        self.reject(SessionResponseProto::misdirected_request()).await;
+    }
+
+    /// Returns a reference to the QUIC connection the request came on, whose
+    /// handshake is complete by the time the request is read.
+    #[cfg(feature = "quinn")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "quinn")))]
+    #[inline(always)]
+    pub fn quic_connection(&self) -> &quinn::Connection {
+        &self.quic_connection
+    }
+
     async fn accept_impl(
         mut self,
         headers: HashMap<String, String>,

@@ -251,10 +251,11 @@ fn mtls_gate(cx: &GateContext<'_>) -> Option<GateOutcome> {
 
 /// Per-route HMAC proof-of-possession.
 ///
-/// Signature = HMAC-SHA256(METHOD\nPATH_AND_QUERY\nTIMESTAMP\[\nNONCE\], secret).
-/// `X-Request-Nonce`, when present, is bound into the signature and checked for
-/// uniqueness within the window, which makes this full replay prevention rather
-/// than just freshness.
+/// Signature = HMAC-SHA256(METHOD\nPATH_AND_QUERY\nTIMESTAMP\nNONCE, secret).
+/// `X-Request-Nonce` (8 to 128 characters) is required, bound into the
+/// signature and accepted once within the window: a signed request cannot be
+/// sent again, which freshness alone (the timestamp) would allow for the
+/// whole window.
 fn hmac_gate(cx: &GateContext<'_>) -> Option<GateOutcome> {
     use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
@@ -276,10 +277,18 @@ fn hmac_gate(cx: &GateContext<'_>) -> Option<GateOutcome> {
         .get("x-request-timestamp")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let nonce_val = cx
+    let Some(nonce_val) = cx
         .headers
         .get("x-request-nonce")
-        .and_then(|v| v.to_str().ok());
+        .and_then(|v| v.to_str().ok())
+        .filter(|n| (8..=128).contains(&n.len()))
+    else {
+        warn!(
+            "Route {:?} HMAC request from {} carries no usable nonce",
+            cx.route.name, cx.client_ip
+        );
+        return refuse(StatusCode::UNAUTHORIZED);
+    };
 
     let ts_u: u64 = ts.parse().unwrap_or(0);
     let now_ts = std::time::SystemTime::now()
@@ -295,10 +304,10 @@ fn hmac_gate(cx: &GateContext<'_>) -> Option<GateOutcome> {
     }
 
     // Sign the full path and query to prevent query-parameter mutation attacks.
-    let message = match nonce_val {
-        Some(n) => format!("{}\n{}\n{}\n{}", cx.method, cx.path_and_query, ts, n),
-        None => format!("{}\n{}\n{}", cx.method, cx.path_and_query, ts),
-    };
+    let message = format!(
+        "{}\n{}\n{}\n{}",
+        cx.method, cx.path_and_query, ts, nonce_val
+    );
 
     type HmacSha256 = Hmac<Sha256>;
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key size");
@@ -316,14 +325,12 @@ fn hmac_gate(cx: &GateContext<'_>) -> Option<GateOutcome> {
 
     // Nonce deduplication: reject replays within the window. Runs after
     // signature validation so a bad signature cannot pollute the store.
-    if let Some(n) = nonce_val {
-        if cx.hmac_nonce_store.check_and_insert(n) {
-            warn!(
-                "Route {:?} HMAC nonce replay detected from {}",
-                cx.route.name, cx.client_ip
-            );
-            return refuse(StatusCode::UNAUTHORIZED);
-        }
+    if cx.hmac_nonce_store.check_and_insert(nonce_val) {
+        warn!(
+            "Route {:?} HMAC nonce replay detected from {}",
+            cx.route.name, cx.client_ip
+        );
+        return refuse(StatusCode::UNAUTHORIZED);
     }
     None
 }
@@ -633,6 +640,37 @@ mod tests {
             status_of(&evaluate(&ctx(&r, &h, &store, "GET", &safe))),
             Some(StatusCode::UNAUTHORIZED),
             "the same nonce must not be accepted twice"
+        );
+    }
+
+    /// A request signed without a nonce could be sent again for the whole
+    /// window, so it is refused however good its signature.
+    #[test]
+    fn hmac_without_a_nonce_is_refused() {
+        use hmac::{Hmac, KeyInit, Mac};
+        use sha2::Sha256;
+
+        let mut r = route();
+        r.security = Some(crate::config::RouteSecurityPolicy {
+            hmac_secret: Some("s3cret".to_string()),
+            ..Default::default()
+        });
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string();
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"s3cret").unwrap();
+        mac.update(format!("GET\n/x\n{ts}").as_bytes());
+        let sig = hex::encode(mac.finalize().into_bytes());
+        let mut h = HeaderMap::new();
+        h.insert("x-request-signature", HeaderValue::from_str(&sig).unwrap());
+        h.insert("x-request-timestamp", HeaderValue::from_str(&ts).unwrap());
+        let store = HmacNonceStore::new(300);
+        let safe: Vec<String> = vec![];
+        assert_eq!(
+            status_of(&evaluate(&ctx(&r, &h, &store, "GET", &safe))),
+            Some(StatusCode::UNAUTHORIZED)
         );
     }
 

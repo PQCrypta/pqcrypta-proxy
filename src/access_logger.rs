@@ -4,7 +4,7 @@
 //! $remote_addr - - [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent"
 
 use chrono::Local;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -140,7 +140,7 @@ impl AccessLogger {
     pub fn new(enabled: bool, path: Option<PathBuf>, format: LogFormat) -> Self {
         let file = if enabled {
             if let Some(ref p) = path {
-                match OpenOptions::new().create(true).append(true).open(p) {
+                match crate::log_file::open_append(p) {
                     Ok(f) => {
                         info!("Access log enabled: {:?}", p);
                         Some(f)
@@ -302,7 +302,7 @@ impl AccessLogger {
 
         if let Some(ref p) = self.path {
             if let Ok(mut guard) = self.file.lock() {
-                match OpenOptions::new().create(true).append(true).open(p) {
+                match crate::log_file::open_append(p) {
                     Ok(f) => {
                         *guard = Some(f);
                         info!("Access log re-opened: {:?}", p);

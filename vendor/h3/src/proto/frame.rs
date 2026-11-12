@@ -61,6 +61,14 @@ pub enum Frame<B> {
     /// Conversely, when sending, send this frame and unwrap the stream
     WebTransportStream(SessionId),
     Grease,
+    /// PRIORITY_UPDATE (RFC 9218 section 7): a new priority for a request
+    /// (or, `push`, a pushed response), sent by a client on its control
+    /// stream. `field` is the Priority Field Value, as in the header.
+    PriorityUpdate {
+        push: bool,
+        element: u64,
+        field: Bytes,
+    },
 }
 
 /// Represents the available data len for a `Data` frame on a RecvStream
@@ -115,7 +123,9 @@ impl Frame<PayloadLen> {
             | FrameType::SETTINGS
             | FrameType::PUSH_PROMISE
             | FrameType::GOAWAY
-            | FrameType::MAX_PUSH_ID => FrameHead::Buffered { ty: ty.0, len },
+            | FrameType::MAX_PUSH_ID
+            | FrameType::PRIORITY_UPDATE_REQUEST
+            | FrameType::PRIORITY_UPDATE_PUSH => FrameHead::Buffered { ty: ty.0, len },
             _ => FrameHead::Unknown {
                 header_len: start - buf.remaining(),
                 payload_len: len,
@@ -187,6 +197,22 @@ impl Frame<PayloadLen> {
             FrameType::MAX_PUSH_ID => exactly(&mut payload, |p| {
                 Ok(Frame::MaxPushId(p.get_var()?.try_into()?))
             }),
+            //= https://www.rfc-editor.org/rfc/rfc9218#section-7.1
+            //# Prioritized Element ID: The stream ID or push ID that is the
+            //# target of the priority update.
+            //# Priority Field Value: The priority update value in ASCII text,
+            //# encoded using Structured Fields.
+            FrameType::PRIORITY_UPDATE_REQUEST | FrameType::PRIORITY_UPDATE_PUSH => {
+                exactly(&mut payload, |p| {
+                    let element = p.get_var()?;
+                    let field = p.copy_to_bytes(p.remaining());
+                    Ok(Frame::PriorityUpdate {
+                        push: ty == FrameType::PRIORITY_UPDATE_PUSH,
+                        element,
+                        field,
+                    })
+                })
+            }
             //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
             //# These frame
             //# types MUST NOT be sent, and their receipt MUST be treated as a
@@ -263,6 +289,21 @@ where
                 id.encode(buf);
                 // rest of the data is sent streaming
             }
+            Frame::PriorityUpdate {
+                push,
+                element,
+                field,
+            } => {
+                if *push {
+                    FrameType::PRIORITY_UPDATE_PUSH.encode(buf);
+                } else {
+                    FrameType::PRIORITY_UPDATE_REQUEST.encode(buf);
+                }
+                let id = VarInt::from_u64(*element).unwrap_or(VarInt::MAX);
+                buf.write_var((id.size() + field.len()) as u64);
+                id.encode(buf);
+                buf.put_slice(field);
+            }
         }
     }
 }
@@ -321,6 +362,14 @@ impl fmt::Debug for Frame<PayloadLen> {
             Frame::MaxPushId(id) => write!(f, "MaxPushId({})", id),
             Frame::Grease => write!(f, "Grease()"),
             Frame::WebTransportStream(session) => write!(f, "WebTransportStream({:?})", session),
+            Frame::PriorityUpdate { push, element, .. } => {
+                write!(
+                    f,
+                    "PriorityUpdate({}{})",
+                    if *push { "push " } else { "" },
+                    element
+                )
+            }
         }
     }
 }
@@ -340,6 +389,14 @@ where
             Frame::MaxPushId(id) => write!(f, "MaxPushId({})", id),
             Frame::Grease => write!(f, "Grease()"),
             Frame::WebTransportStream(_) => write!(f, "WebTransportStream()"),
+            Frame::PriorityUpdate { push, element, .. } => {
+                write!(
+                    f,
+                    "PriorityUpdate({}{})",
+                    if *push { "push " } else { "" },
+                    element
+                )
+            }
         }
     }
 }
@@ -362,6 +419,15 @@ impl<T, U> PartialEq<Frame<T>> for Frame<U> {
             Frame::WebTransportStream(x) => {
                 matches!(other, Frame::WebTransportStream(y) if x == y)
             }
+            Frame::PriorityUpdate {
+                push,
+                element,
+                field,
+            } => matches!(
+                other,
+                Frame::PriorityUpdate { push: p, element: e, field: v }
+                    if p == push && e == element && v == field
+            ),
         }
     }
 }
@@ -395,6 +461,9 @@ frame_types! {
     MAX_PUSH_ID = 0xD,
     // Reserved frame types
     WEBTRANSPORT_BI_STREAM = 0x41,
+    // RFC 9218 section 7.1
+    PRIORITY_UPDATE_REQUEST = 0xF0700,
+    PRIORITY_UPDATE_PUSH = 0xF0701,
 }
 
 impl FrameType {
@@ -806,6 +875,26 @@ mod tests {
         let mut read = Cursor::new(&buf);
         let decoded = Frame::decode(&mut read).unwrap();
         assert_eq!(check_frame, decoded);
+    }
+
+    /// RFC 9218 section 7.1: type 0xF0700, the stream ID, then the field
+    #[test]
+    fn priority_update_frame() {
+        let frame = || Frame::PriorityUpdate {
+            push: false,
+            element: 4,
+            field: Bytes::from_static(b"u=1, i"),
+        };
+        codec_frame_check(
+            frame(),
+            &[
+                0x80, 0x0f, 0x07, 0x00, 7, 4, b'u', b'=', b'1', b',', b' ', b'i',
+            ],
+            frame(),
+        );
+        // A frame whose payload ends inside the ID is malformed
+        let mut short = Cursor::new(&[0x80, 0x0f, 0x07, 0x00, 1, 0x40][..]);
+        assert_matches!(Frame::decode(&mut short), Err(FrameError::Malformed));
     }
 
     #[test]

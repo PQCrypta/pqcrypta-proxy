@@ -9,8 +9,6 @@
 //! - Streaming compression for large responses
 //! - Smart skipping of pre-compressed content
 
-use std::io::Write;
-
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
@@ -175,46 +173,6 @@ pub fn is_already_compressed(headers: &HeaderMap) -> bool {
         }
     }
     false
-}
-
-/// Compress data using the specified encoding
-pub fn compress_bytes(
-    data: &[u8],
-    encoding: CompressionEncoding,
-    config: &CompressionConfig,
-) -> Option<Vec<u8>> {
-    match encoding {
-        CompressionEncoding::Brotli => {
-            let mut encoder = brotli::CompressorWriter::new(
-                Vec::new(),
-                4096,
-                config.brotli_quality,
-                22, // lgwin
-            );
-            encoder.write_all(data).ok()?;
-            Some(encoder.into_inner())
-        }
-        CompressionEncoding::Zstd => zstd::encode_all(data, config.zstd_level).ok(),
-        CompressionEncoding::Gzip => {
-            use std::io::Write;
-            let mut encoder = flate2::write::GzEncoder::new(
-                Vec::new(),
-                flate2::Compression::new(config.gzip_level),
-            );
-            encoder.write_all(data).ok()?;
-            encoder.finish().ok()
-        }
-        CompressionEncoding::Deflate => {
-            use std::io::Write;
-            let mut encoder = flate2::write::ZlibEncoder::new(
-                Vec::new(),
-                flate2::Compression::new(config.gzip_level),
-            );
-            encoder.write_all(data).ok()?;
-            encoder.finish().ok()
-        }
-        CompressionEncoding::Identity => None,
-    }
 }
 
 /// Compression middleware state
@@ -464,22 +422,27 @@ mod tests {
         assert!(!should_compress_content_type(Some(&mp4), &config));
     }
 
-    #[test]
-    fn test_compress_bytes() {
+    /// What the response encoder writes, the request decoder reads back
+    /// whole, for every coding the proxy offers.
+    #[tokio::test]
+    async fn every_coding_encodes_what_decodes_back() {
         let config = CompressionConfig::default();
         let data = b"Hello, World! This is a test string that should compress well when repeated. "
             .repeat(100);
-
-        // Test Brotli
-        let compressed = compress_bytes(&data, CompressionEncoding::Brotli, &config).unwrap();
-        assert!(compressed.len() < data.len());
-
-        // Test Zstd
-        let compressed = compress_bytes(&data, CompressionEncoding::Zstd, &config).unwrap();
-        assert!(compressed.len() < data.len());
-
-        // Test Gzip
-        let compressed = compress_bytes(&data, CompressionEncoding::Gzip, &config).unwrap();
-        assert!(compressed.len() < data.len());
+        for encoding in [
+            CompressionEncoding::Brotli,
+            CompressionEncoding::Zstd,
+            CompressionEncoding::Gzip,
+            CompressionEncoding::Deflate,
+        ] {
+            let body = encode_stream(std::io::Cursor::new(data.clone()), encoding, &config);
+            let encoded = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+            assert!(encoded.len() < data.len(), "{encoding:?} compresses");
+            let decoded =
+                crate::request_encoding::decode(Some(encoding.as_str()), &encoded, data.len() * 2)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(decoded, data, "{encoding:?} round trip");
+        }
     }
 }

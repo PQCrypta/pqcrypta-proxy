@@ -25,6 +25,15 @@ pub fn configure(max_total: u32, max_per_address: u32) {
     MAX_PER_ADDRESS.store(max_per_address, Ordering::Relaxed);
 }
 
+/// The network a client is counted as: an IPv4 address (an IPv4-mapped one
+/// unwrapped), or the /64 an IPv6 address is in, which one client holds.
+pub fn client_network(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => IpAddr::V6(std::net::Ipv6Addr::from(u128::from(v6) & (!0u128 << 64))),
+        v4 @ IpAddr::V4(_) => v4,
+    }
+}
+
 /// Client connections open now, on every listener.
 pub fn open_connections() -> u64 {
     OPEN.load(Ordering::Relaxed)

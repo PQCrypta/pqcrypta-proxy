@@ -359,7 +359,10 @@ pub struct WafConfig {
     pub ssrf: bool,
     /// Scan JSON request bodies
     pub scan_json_body: bool,
-    /// Maximum body bytes to scan (default 65536)
+    /// How much of a request body the WAF inspects, in bytes. 0 (the
+    /// default): all of it, since the backend reads all of it. A number
+    /// limits inspection to that many leading bytes, and what follows them
+    /// reaches the backend unread.
     pub max_body_scan_bytes: usize,
     /// User-supplied extra regex patterns (applied in block mode)
     pub custom_patterns: Vec<String>,
@@ -506,7 +509,7 @@ impl Default for WafConfig {
             nosqli: true,
             ssrf: false,
             scan_json_body: true,
-            max_body_scan_bytes: 65_536,
+            max_body_scan_bytes: 0,
             custom_patterns: Vec::new(),
             scanner_probe: true,
             block_scanner_uas: true,
@@ -1915,12 +1918,15 @@ pub struct PqcConfig {
     /// apply. The rustls listeners (HTTP/3) cannot offer them. Default: none.
     #[serde(default)]
     pub experimental_groups: Vec<String>,
-    /// PQC downgrade action: "allow" | "log" | "block" — default "log".
-    /// "block" rejects connections that negotiate classical-only KEM when PQC is enabled.
+    /// What is done with a connection whose key exchange is classical, where
+    /// `enabled` is true (see pqc_policy.rs): `"allow"` serves it, `"log"`
+    /// (the default) serves it and records it in the audit log, `"block"`
+    /// answers every request on it 421 and records it.
     #[serde(default = "default_downgrade_action")]
     pub downgrade_action: String,
 
-    /// Log PQC downgrade events (default true).
+    /// Record classical handshakes in the audit log, once per address in ten
+    /// minutes, under `downgrade_action` "log" or "block" (default true).
     #[serde(default = "default_true_pqc")]
     pub log_downgrades: bool,
 
@@ -2026,7 +2032,9 @@ pub struct BackendConfig {
     pub tls_client_cert: Option<PathBuf>,
     /// TLS client key for mTLS
     pub tls_client_key: Option<PathBuf>,
-    /// Skip TLS verification (dangerous, for testing only)
+    /// Refused by validation: a backend's certificate is always verified
+    /// (pin a self-signed one with `tls_cert`). Kept so a configuration
+    /// that sets it is told so rather than silently changed.
     #[serde(default)]
     pub tls_skip_verify: bool,
     /// SNI hostname for backend TLS (defaults to backend address hostname)
@@ -2605,6 +2613,11 @@ impl Default for RateLimitConfig {
 pub struct SecurityConfig {
     /// Maximum request size in bytes
     pub max_request_size: usize,
+    /// The memory all request bodies together may occupy while the proxy
+    /// holds them, in bytes (see body_budget.rs): a request whose body would
+    /// take the process past it is answered 503. 0 (the default): four
+    /// bodies of `max_request_size`, and at least 256 MiB.
+    pub max_buffered_body_bytes: usize,
     /// Maximum header size in bytes
     pub max_header_size: usize,
     /// Connection timeout in seconds
@@ -2895,7 +2908,8 @@ impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             max_request_size: 10 * 1024 * 1024, // 10MB
-            max_header_size: 64 * 1024,         // 64KB
+            max_buffered_body_bytes: 0,
+            max_header_size: 64 * 1024, // 64KB
             connection_timeout_secs: 30,
             dos_protection: true,
             blocked_ips: Vec::new(),
@@ -2979,21 +2993,53 @@ pub struct FingerprintConfig {
     /// produces false positives against legitimate clients.
     pub block_malicious: bool,
 
-    /// Enable JA3 replay detection (same fingerprint from many IPs in short window)
+    /// Replay detection: one fingerprint that is not a browser's or a known
+    /// crawler's arriving from many client networks (IPv4 /24, IPv6 /48) at
+    /// once: one tool run from many addresses
     #[serde(default = "default_true")]
     pub replay_detection: bool,
-    /// Time window in seconds for replay detection (default 60)
+    /// Window in seconds for replay detection (default 60)
     #[serde(default = "default_fp_replay_window")]
     pub replay_window_secs: u64,
-    /// Enable JA3 drift detection (same hash but different cipher/extension composition)
+    /// Client networks one fingerprint must arrive from within the window to
+    /// be flagged (default 50)
+    #[serde(default = "default_fp_replay_min_networks")]
+    pub replay_min_networks: usize,
+    /// What a flagged replay does: "log" (warn and audit) or "block" (also
+    /// block the address for `suspicious_block_duration_secs`)
+    #[serde(default = "default_fp_threat_action")]
+    pub replay_action: String,
+    /// Drift detection: one client network presenting a different
+    /// fingerprint on most of its connections (a client rotating its TLS
+    /// fingerprint). A browser keeps one JA4 per transport and resumption.
     #[serde(default = "default_true")]
     pub drift_detection: bool,
-    /// Time window in seconds for drift detection (default 300)
+    /// Window in seconds for drift detection (default 300)
     #[serde(default = "default_fp_drift_window")]
     pub drift_window_secs: u64,
-    /// Fraction of requests with drift to flag (0.0–1.0, default 0.7)
+    /// Distinct fingerprints per connection from one network, in the window,
+    /// that is flagged (0.0–1.0, default 0.7)
     #[serde(default = "default_fp_drift_threshold")]
     pub drift_threshold: f64,
+    /// Connections from one network in the window before drift is judged
+    /// (default 12): a few connections say nothing
+    #[serde(default = "default_fp_drift_min_connections")]
+    pub drift_min_connections: u32,
+    /// What flagged drift does: "log" or "block", as `replay_action`
+    #[serde(default = "default_fp_threat_action")]
+    pub drift_action: String,
+}
+
+fn default_fp_replay_min_networks() -> usize {
+    50
+}
+
+fn default_fp_drift_min_connections() -> u32 {
+    12
+}
+
+fn default_fp_threat_action() -> String {
+    "log".to_string()
 }
 
 fn default_fp_replay_window() -> u64 {
@@ -3027,9 +3073,13 @@ impl Default for FingerprintConfig {
             block_malicious: true, // Block malicious fingerprints by default (AUD-12)
             replay_detection: true,
             replay_window_secs: 60,
+            replay_min_networks: default_fp_replay_min_networks(),
+            replay_action: default_fp_threat_action(),
             drift_detection: true,
             drift_window_secs: 300,
             drift_threshold: 0.7,
+            drift_min_connections: default_fp_drift_min_connections(),
+            drift_action: default_fp_threat_action(),
         }
     }
 }
@@ -3511,7 +3561,7 @@ pub struct PoolServerConfig {
     pub tls_mode: TlsMode,
     /// TLS certificate for backend verification
     pub tls_cert: Option<PathBuf>,
-    /// Skip TLS verification (dangerous)
+    /// Refused by validation, as `BackendConfig::tls_skip_verify`
     #[serde(default)]
     pub tls_skip_verify: bool,
     /// Custom SNI hostname
@@ -3753,6 +3803,24 @@ pub fn restart_bound_changes(old: &ProxyConfig, new: &ProxyConfig) -> Vec<&'stat
         .collect()
 }
 
+/// The top-level sections that differ between two configurations, by name.
+pub fn changed_sections(old: &ProxyConfig, new: &ProxyConfig) -> Vec<String> {
+    let (Ok(serde_json::Value::Object(old)), Ok(serde_json::Value::Object(new))) =
+        (serde_json::to_value(old), serde_json::to_value(new))
+    else {
+        return Vec::new();
+    };
+    let mut changed: Vec<String> = old
+        .keys()
+        .chain(new.keys())
+        .filter(|section| old.get(*section) != new.get(*section))
+        .cloned()
+        .collect();
+    changed.sort();
+    changed.dedup();
+    changed
+}
+
 /// Two configuration sections compared by value. The config structs do not
 /// implement `PartialEq` -- some hold types that do not -- but all serialize.
 pub fn same_settings<T: Serialize>(a: &T, b: &T) -> bool {
@@ -3852,17 +3920,6 @@ impl ConfigManager {
                 Err(e)
             }
         }
-    }
-
-    /// Apply an environment-specific TOML overlay on top of the config file,
-    /// now and on every later load. The overlay is a partial TOML file whose
-    /// keys win over the base config; see `overlay_config`.
-    pub fn apply_env_overlay(&self, overlay_path: &Path) -> anyhow::Result<()> {
-        let mut overrides = self.overrides.read().clone();
-        overrides.env_overlay = Some(overlay_path.to_path_buf());
-        self.set_overrides(overrides)?;
-        info!("Environment overlay applied from {:?}", overlay_path);
-        Ok(())
     }
 
     /// Start watching the configuration file and the TLS cert/key for changes
@@ -4481,6 +4538,13 @@ impl ProxyConfig {
             ));
         }
 
+        if crate::pqc_policy::ClassicalAction::parse(&self.pqc.downgrade_action).is_none() {
+            return Err(anyhow::anyhow!(
+                "pqc.downgrade_action = \"{}\" is not one of \"allow\", \"log\", \"block\"",
+                self.pqc.downgrade_action
+            ));
+        }
+
         // [pqc] group settings that contradict each other or name nothing.
         if ![1, 3, 5].contains(&self.pqc.min_security_level) {
             return Err(anyhow::anyhow!(
@@ -4642,6 +4706,23 @@ impl ProxyConfig {
                 ));
             }
 
+            // A raw TCP backend carries a WebTransport session's streams as
+            // bytes; it answers no HTTP request
+            if !route.webtransport
+                && !self.backend_pools.contains_key(&route.backend)
+                && self
+                    .backends
+                    .get(&route.backend)
+                    .is_some_and(|b| b.backend_type == BackendType::Tcp)
+            {
+                return Err(anyhow::anyhow!(
+                    "Route {:?} sends HTTP requests to backend '{}', which is type \"tcp\": \
+                     a tcp backend serves only WebTransport routes (webtransport = true)",
+                    route.name,
+                    route.backend
+                ));
+            }
+
             // Validate path_regex to prevent ReDoS attacks
             if let Some(ref regex_str) = route.path_regex {
                 // Check regex length limit (prevent extremely long patterns)
@@ -4721,11 +4802,38 @@ impl ProxyConfig {
                     name
                 ));
             }
+            // A route names a backend or a pool, and a pool is looked up
+            // first: a backend of the same name would never be reached.
+            if self.backends.contains_key(name) {
+                return Err(anyhow::anyhow!(
+                    "'{}' is both a backend and a backend pool; routes would reach only the pool",
+                    name
+                ));
+            }
+            let mut members = std::collections::HashSet::new();
             for server in &pool.servers {
-                if server.address.parse::<std::net::SocketAddr>().is_err() {
+                let Ok(addr) = server.address.parse::<std::net::SocketAddr>() else {
                     return Err(anyhow::anyhow!(
                         "Invalid server address '{}' in pool '{}'",
                         server.address,
+                        name
+                    ));
+                };
+                // A member is known by its address (admin API, sessions,
+                // its limit and connections), so it is there once, and no
+                // backend has that name.
+                let id = format!("{}:{}", addr.ip(), addr.port());
+                if !members.insert(id.clone()) {
+                    return Err(anyhow::anyhow!(
+                        "Server '{}' is in pool '{}' twice",
+                        server.address,
+                        name
+                    ));
+                }
+                if self.backends.contains_key(&id) {
+                    return Err(anyhow::anyhow!(
+                        "Backend '{}' is named as pool '{}''s member at that address; name it otherwise",
+                        id,
                         name
                     ));
                 }
@@ -4749,6 +4857,32 @@ impl ProxyConfig {
                     e
                 ));
             }
+        }
+
+        // Fingerprint replay and drift
+        for (name, action) in [
+            ("replay_action", &self.fingerprint.replay_action),
+            ("drift_action", &self.fingerprint.drift_action),
+        ] {
+            if !matches!(action.as_str(), "log" | "block") {
+                return Err(anyhow::anyhow!(
+                    "fingerprint.{name} = {action:?}: expected \"log\" or \"block\""
+                ));
+            }
+        }
+        if !(self.fingerprint.drift_threshold > 0.0 && self.fingerprint.drift_threshold <= 1.0) {
+            return Err(anyhow::anyhow!(
+                "fingerprint.drift_threshold = {}: expected more than 0 and at most 1",
+                self.fingerprint.drift_threshold
+            ));
+        }
+
+        // OCSP responses are verified with OpenSSL's OCSP implementation
+        if self.ocsp.enabled && self.tls.ocsp_stapling && !cfg!(feature = "pqc") {
+            return Err(anyhow::anyhow!(
+                "ocsp.enabled with tls.ocsp_stapling needs OpenSSL to verify responses: \
+                 this build has no `pqc` feature"
+            ));
         }
 
         // Validate admin config
@@ -4795,46 +4929,28 @@ impl ProxyConfig {
             }
         }
 
-        // SEC-001: Reject tls_skip_verify in production environments.
-        // Production is indicated by ACME being enabled (real domain) or PQCRYPTA_ENV=production.
-        {
-            let is_production =
-                self.acme.enabled || std::env::var("PQCRYPTA_ENV").as_deref() == Ok("production");
-
-            if is_production {
-                let signal = if self.acme.enabled {
-                    "ACME is enabled (production domain detected)"
-                } else {
-                    "PQCRYPTA_ENV=production environment variable"
-                };
-
-                for (name, backend) in &self.backends {
-                    if backend.tls_skip_verify {
-                        return Err(anyhow::anyhow!(
-                            "Backend '{}' has tls_skip_verify = true, which is forbidden in \
-                             production environments (detected via {}). Use a valid CA-signed \
-                             certificate. To allow this only in non-production deployments, \
-                             set PQCRYPTA_ENV=development.",
-                            name,
-                            signal
-                        ));
-                    }
-                }
-
-                for (pool_name, pool) in &self.backend_pools {
-                    for server in &pool.servers {
-                        if server.tls_skip_verify {
-                            return Err(anyhow::anyhow!(
-                                "A server in backend pool '{}' has tls_skip_verify = true, which \
-                                 is forbidden in production environments (detected via {}). Use a \
-                                 valid CA-signed certificate. To allow this only in \
-                                 non-production deployments, set PQCRYPTA_ENV=development.",
-                                pool_name,
-                                signal
-                            ));
-                        }
-                    }
-                }
+        // A backend's certificate is always verified. `tls_skip_verify` let a
+        // backend go unverified; `tls_cert` pins a backend's own (self-signed)
+        // certificate or its private CA instead.
+        for (name, backend) in &self.backends {
+            if backend.tls_skip_verify {
+                return Err(anyhow::anyhow!(
+                    "Backend '{}' sets tls_skip_verify, which is no longer accepted: a \
+                     backend's certificate is always verified. Point tls_cert at its \
+                     certificate (self-signed) or at the CA that issued it.",
+                    name
+                ));
+            }
+        }
+        for (pool_name, pool) in &self.backend_pools {
+            if let Some(server) = pool.servers.iter().find(|s| s.tls_skip_verify) {
+                return Err(anyhow::anyhow!(
+                    "Server {} in backend pool '{}' sets tls_skip_verify, which is no longer \
+                     accepted: a backend's certificate is always verified. Point tls_cert at \
+                     its certificate (self-signed) or at the CA that issued it.",
+                    server.address,
+                    pool_name
+                ));
             }
         }
 

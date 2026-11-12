@@ -18,7 +18,6 @@
 //! and dispatches the remainder to the matching session. Sessions send by
 //! prepending their own Quarter Stream ID and Context ID 0.
 
-use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,9 +29,9 @@ use quinn::{Connection, VarInt};
 // (same `encode`/`decode` method names).
 use quinn_proto::coding::{Decodable, Encodable};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tokio::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Parse a CONNECT-UDP target from the request path.
 ///
@@ -66,42 +65,48 @@ pub fn parse_target(path: &str) -> Option<(String, u16)> {
     Some((host, port))
 }
 
-/// Routes inbound QUIC datagrams to per-stream CONNECT-UDP sessions.
+/// Routes inbound QUIC datagrams (RFC 9297: a Quarter Stream ID, then the
+/// payload) to the session of that stream: a CONNECT-UDP session or a
+/// WebTransport session on the HTTP/3 port.
 ///
-/// One router exists per QUIC connection. The first registered session starts
-/// the background reader task; it runs until the connection closes.
+/// One router exists per QUIC connection; its reader task runs until the
+/// connection closes. A datagram for no session is dropped, as is one whose
+/// session's queue is full (datagrams are unreliable, RFC 9297 section 2).
 pub struct DatagramRouter {
-    sessions: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Bytes>>>>,
+    routes: Arc<dashmap::DashMap<u64, Route>>,
+}
+
+struct Route {
+    to: mpsc::Sender<Bytes>,
+    /// A CONNECT-UDP session (counted against
+    /// `masque.max_sessions_per_connection`), not a WebTransport one
+    masque: bool,
 }
 
 impl DatagramRouter {
     /// Create a router for a connection and start its datagram reader task.
     pub fn new(connection: Connection) -> Arc<Self> {
-        let sessions: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Bytes>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let routes: Arc<dashmap::DashMap<u64, Route>> = Arc::new(dashmap::DashMap::new());
         let router = Arc::new(Self {
-            sessions: sessions.clone(),
+            routes: routes.clone(),
         });
 
         tokio::spawn(async move {
             loop {
                 match connection.read_datagram().await {
                     Ok(mut datagram) => {
-                        // Strip the Quarter Stream ID prefix (RFC 9297).
                         let qsid = match VarInt::decode(&mut datagram) {
                             Ok(v) => v.into_inner(),
                             Err(_) => continue, // malformed prefix
                         };
-                        let payload = datagram; // remaining bytes after the prefix
-                        let sender = {
-                            let map = sessions.lock().await;
-                            map.get(&qsid).cloned()
+                        let Some(to) = routes.get(&qsid).map(|r| r.to.clone()) else {
+                            continue;
                         };
-                        if let Some(tx) = sender {
-                            // Unbounded: a slow session cannot stall the reader.
-                            let _ = tx.send(payload);
+                        // Never waited on, so a slow session cannot stall the
+                        // reader
+                        if to.try_send(datagram).is_err() {
+                            trace!("datagram for qsid {} dropped: its queue is full", qsid);
                         }
-                        // No registered session => unrelated/closed stream; drop.
                     }
                     Err(e) => {
                         debug!("Datagram reader stopped: {}", e);
@@ -114,24 +119,40 @@ impl DatagramRouter {
         router
     }
 
-    /// Register a session by Quarter Stream ID, returning the receiver that
-    /// inbound datagrams for that stream will be dispatched to.
-    pub async fn register_session(&self, qsid: u64) -> mpsc::UnboundedReceiver<Bytes> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.sessions.lock().await.insert(qsid, tx);
+    /// Register a CONNECT-UDP session by Quarter Stream ID, returning the
+    /// receiver its datagrams are delivered to.
+    pub fn register_session(&self, qsid: u64) -> mpsc::Receiver<Bytes> {
+        let (tx, rx) = mpsc::channel(SESSION_QUEUE);
+        self.routes.insert(
+            qsid,
+            Route {
+                to: tx,
+                masque: true,
+            },
+        );
         rx
     }
 
-    /// Remove a session's routing entry once it ends.
-    pub async fn unregister_session(&self, qsid: u64) {
-        self.sessions.lock().await.remove(&qsid);
+    /// Deliver the datagrams of the WebTransport session whose CONNECT was
+    /// stream `4 * qsid` to `to`.
+    pub fn route_webtransport(&self, qsid: u64, to: mpsc::Sender<Bytes>) {
+        self.routes.insert(qsid, Route { to, masque: false });
     }
 
-    /// Current number of active CONNECT-UDP sessions on this connection.
-    pub async fn session_count(&self) -> usize {
-        self.sessions.lock().await.len()
+    /// Remove a session's route once it ends.
+    pub fn unregister_session(&self, qsid: u64) {
+        self.routes.remove(&qsid);
+    }
+
+    /// CONNECT-UDP sessions open on this connection now.
+    pub fn session_count(&self) -> usize {
+        self.routes.iter().filter(|r| r.masque).count()
     }
 }
+
+/// Datagrams from the client one session holds before its target's socket
+/// has taken them: some hundreds of KB at full-sized datagrams.
+const SESSION_QUEUE: usize = 256;
 
 /// Bind a local UDP socket in the address family of `target` and connect it.
 async fn bind_and_connect(target: SocketAddr) -> std::io::Result<UdpSocket> {
@@ -155,14 +176,14 @@ pub async fn run_session(
     quarter_id: u64,
     target: SocketAddr,
     idle_timeout: Duration,
-    mut from_client: mpsc::UnboundedReceiver<Bytes>,
+    mut from_client: mpsc::Receiver<Bytes>,
     stream_closed: impl std::future::Future<Output = ()> + Send + 'static,
 ) {
     let socket = match bind_and_connect(target).await {
         Ok(s) => s,
         Err(e) => {
             warn!("CONNECT-UDP: failed to open socket to {}: {}", target, e);
-            router.unregister_session(quarter_id).await;
+            router.unregister_session(quarter_id);
             return;
         }
     };
@@ -175,7 +196,11 @@ pub async fn run_session(
     // Shared last-activity timestamp drives a true idle timeout: a session is
     // closed only when *neither* direction has carried a datagram within the
     // window. Both relay tasks bump it on every packet.
-    let last_active = Arc::new(Mutex::new(Instant::now()));
+    // Milliseconds from `born` to the last datagram either way: an atomic,
+    // not a lock taken per datagram
+    let born = Instant::now();
+    let last_active = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let since_born = move || u64::try_from(born.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     // The Quarter Stream ID prefix is identical for every datagram this session
     // sends to the client, so encode it once.
@@ -199,7 +224,7 @@ pub async fn run_session(
         loop {
             match recv_socket.recv(&mut buf).await {
                 Ok(n) => {
-                    *recv_active.lock().await = Instant::now();
+                    recv_active.store(since_born(), std::sync::atomic::Ordering::Relaxed);
                     // Drop payloads that exceed the connection's datagram budget
                     // rather than tearing down the session (RFC 9298 §5).
                     if let Some(max) = recv_conn.max_datagram_size() {
@@ -238,7 +263,7 @@ pub async fn run_session(
             if ctx != 0 {
                 continue; // unknown context => drop (RFC 9298 §5)
             }
-            *send_active.lock().await = Instant::now();
+            send_active.store(since_born(), std::sync::atomic::Ordering::Relaxed);
             // `payload` now holds the raw UDP datagram.
             if send_socket.send(&payload).await.is_err() {
                 break;
@@ -250,7 +275,9 @@ pub async fn run_session(
     // packet in either direction, re-checking until the window truly elapses.
     let watchdog = async move {
         loop {
-            let elapsed = last_active.lock().await.elapsed();
+            let elapsed = Duration::from_millis(
+                since_born().saturating_sub(last_active.load(std::sync::atomic::Ordering::Relaxed)),
+            );
             if elapsed >= idle_timeout {
                 return;
             }
@@ -270,7 +297,7 @@ pub async fn run_session(
         }
     }
 
-    router.unregister_session(quarter_id).await;
+    router.unregister_session(quarter_id);
     info!("CONNECT-UDP session closed: qsid={}", quarter_id);
 }
 

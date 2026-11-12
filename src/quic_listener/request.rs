@@ -87,6 +87,22 @@ impl QuicListener {
     {
         let start_time = std::time::Instant::now();
 
+        // RFC 9218: the client's Priority for this request, or the default
+        // (u=3, not incremental), orders its response beside the
+        // connection's others. The origin's priority response header and a
+        // PRIORITY_UPDATE the client sends later can change it.
+        let client_priority = request
+            .headers()
+            .get("priority")
+            .and_then(|v| v.to_str().ok())
+            .and_then(crate::http3_features::PriorityState::parse_client_priority);
+        {
+            let (urgency, incremental) = client_priority
+                .as_ref()
+                .map_or((3, false), |p| (p.urgency, p.incremental));
+            stream.set_priority(urgency, incremental);
+        }
+
         // Establish the connection-derived headers before anything reads them.
         //
         // This has to happen here, not at forwarding time. `security.evaluate`
@@ -230,6 +246,20 @@ impl QuicListener {
                     return Ok(());
                 }
             };
+
+        // A connection whose key exchange was classical, where the server
+        // refuses those (pqc.downgrade_action = "block"; see pqc_policy.rs).
+        if crate::pqc_policy::refuses(conn_headers.pqc_enabled == "true") {
+            metrics
+                .requests
+                .request_end_full(421, start_time.elapsed(), 0, 0, Some(&path));
+            let response = http::Response::builder()
+                .status(http::StatusCode::MISDIRECTED_REQUEST)
+                .server_header(&config)
+                .body(())?;
+            respond_and_finish(&mut stream, response).await?;
+            return Ok(());
+        }
         let user_agent = request
             .headers()
             .get("user-agent")
@@ -257,8 +287,15 @@ impl QuicListener {
         // derivation, an O(routes) `find_route` scan and a clone of every policy
         // field. Resolved lazily so a request that reaches neither pays nothing.
         let mut route_policy: Option<crate::security::RequestPolicy> = None;
-
-        if !security.is_trusted(&ip) {
+        // What the WAF made of the head, completed with the body once it is
+        // read; a request that ends first is judged on its head (PendingWaf's
+        // drop). One assessment, one count, one verdict.
+        let mut waf_pending: Option<crate::security::PendingWaf> = None;
+        // This request's place in its address's in-flight count, taken once
+        // the request has passed the rules below and held until it is done.
+        let _in_flight: Option<crate::security::InFlight> = if security.is_trusted(&ip) {
+            None
+        } else {
             // Correlate the connection's fingerprint with what the request calls
             // itself. This is the only layer that has both, and it is what lets the
             // directory name a client instead of listing an opaque hash.
@@ -426,7 +463,8 @@ impl QuicListener {
                     headers: request.headers(),
                     body: None,
                 };
-                let decision = security.evaluate(&view, &h3_route_policy);
+                let (decision, pending) = security.evaluate_head(&view, h3_route_policy);
+                waf_pending = pending;
                 let request_origin = request
                     .headers()
                     .get("origin")
@@ -470,7 +508,37 @@ impl QuicListener {
                     return Ok(());
                 }
             }
-        }
+
+            // 3. The per-address limit on requests in flight
+            // (security.max_connections_per_ip), the one the TCP listeners
+            // apply: a QUIC connection carries many requests at once.
+            match security.enter_request(ip, user_agent) {
+                Ok(slot) => slot,
+                Err(crate::security::TooManyInFlight { .. }) => {
+                    log_h3_refusal(
+                        remote_addr,
+                        method,
+                        &path,
+                        host.as_deref(),
+                        referer,
+                        user_agent,
+                        fingerprint.ja3_hash.as_deref(),
+                        fingerprint.ja4_hash.as_deref(),
+                        start_time,
+                        503,
+                    );
+                    metrics
+                        .requests
+                        .request_end_full(503, start_time.elapsed(), 0, 0, Some(&path));
+                    let response = http::Response::builder()
+                        .status(http::StatusCode::SERVICE_UNAVAILABLE)
+                        .server_header(&config)
+                        .body(())?;
+                    respond_and_finish(&mut stream, response).await?;
+                    return Ok(());
+                }
+            }
+        };
 
         // Send 103 Early Hints if enabled and we have hints for this path
         // This is a key HTTP/3 optimization - send resource hints before proxying to backend
@@ -1133,7 +1201,7 @@ impl QuicListener {
                     }),
                 };
 
-                match pool.select(&ctx) {
+                match pool.select_queued(&ctx).await {
                     Some(result) => {
                         let cfg = result.server.backend_config();
                         (
@@ -1220,10 +1288,45 @@ impl QuicListener {
         // stream error (e.g. QUIC flow-control exhaustion on large uploads) does
         // not propagate up and kill the entire QUIC connection.
         let mut body = Vec::new();
+        // This body's share of the memory request bodies may occupy together,
+        // given back when the request is done (see body_budget.rs).
+        let mut body_memory = crate::body_budget::Reservation::new();
         loop {
             match stream.recv_data().await {
                 Ok(None) => break, // body fully received
                 Ok(Some(mut chunk)) => {
+                    if !body_memory.grow(chunk.remaining()) {
+                        warn!(
+                            "[QUIC/H3] request body from {} refused: body memory budget spent",
+                            remote_addr
+                        );
+                        log_h3_refusal(
+                            remote_addr,
+                            method,
+                            &path,
+                            host.as_deref(),
+                            referer,
+                            user_agent,
+                            fingerprint.ja3_hash.as_deref(),
+                            fingerprint.ja4_hash.as_deref(),
+                            start_time,
+                            503,
+                        );
+                        metrics.requests.request_end_full(
+                            503,
+                            start_time.elapsed(),
+                            body.len() as u64,
+                            0,
+                            Some(&path),
+                        );
+                        let response = http::Response::builder()
+                            .status(http::StatusCode::SERVICE_UNAVAILABLE)
+                            .header("retry-after", "5")
+                            .server_header(&config)
+                            .body(())?;
+                        respond_and_finish(&mut stream, response).await?;
+                        return Ok(());
+                    }
                     while chunk.has_remaining() {
                         let bytes = chunk.chunk();
                         body.extend_from_slice(bytes);
@@ -1298,6 +1401,77 @@ impl QuicListener {
             }
         }
 
+        // A body with a content coding is decoded here and forwarded decoded,
+        // so what the WAF reads is what the backend receives
+        // (request_encoding.rs), as on TCP.
+        let mut body_decoded = false;
+        if security.waf().is_some_and(|waf| waf.decodes_bodies()) {
+            let coding = request
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+            let refused = match crate::request_encoding::decode(
+                coding.as_deref(),
+                &body,
+                config.security.max_request_size,
+            ) {
+                Ok(None) => None,
+                Ok(Some(decoded)) if body_memory.grow(decoded.len()) => {
+                    body = decoded;
+                    body_decoded = true;
+                    None
+                }
+                Ok(Some(_)) => Some((http::StatusCode::SERVICE_UNAVAILABLE, false)),
+                Err(refusal) => Some((
+                    refusal.status(),
+                    matches!(refusal, crate::request_encoding::Refusal::Unsupported(_)),
+                )),
+            };
+            if let Some((status, unsupported)) = refused {
+                log_h3_refusal(
+                    remote_addr,
+                    method,
+                    &path,
+                    host.as_deref(),
+                    referer,
+                    user_agent,
+                    fingerprint.ja3_hash.as_deref(),
+                    fingerprint.ja4_hash.as_deref(),
+                    start_time,
+                    status.as_u16(),
+                );
+                metrics.requests.request_end_full(
+                    status.as_u16(),
+                    start_time.elapsed(),
+                    body.len() as u64,
+                    0,
+                    Some(&path),
+                );
+                let mut response = http::Response::builder()
+                    .status(status)
+                    .server_header(&config);
+                if unsupported {
+                    response = response.header(
+                        http::header::ACCEPT_ENCODING,
+                        crate::request_encoding::ACCEPTED,
+                    );
+                }
+                respond_and_finish(&mut stream, response.body(())?).await?;
+                return Ok(());
+            }
+        }
+        // The request head the WAF reads with a decoded body: without the
+        // coding it no longer has.
+        let decoded_head;
+        let body_head = if body_decoded {
+            let mut h = request.headers().clone();
+            h.remove(http::header::CONTENT_ENCODING);
+            decoded_head = h;
+            &decoded_head
+        } else {
+            request.headers()
+        };
+
         // WAF body inspection over HTTP/3.
         //
         // The header/path/query pass ran through `security.evaluate()` above
@@ -1306,18 +1480,12 @@ impl QuicListener {
         // way; without this, a body-borne attack (SQLi/XXE/prototype pollution
         // in a POST body) was blocked over TCP but sailed through over QUIC,
         // exactly the transport divergence this proxy exists not to have. The
-        // engine truncates to `max_body_scan_bytes` internally, so the whole
-        // buffered body is passed by reference.
-        if !body.is_empty() && security.waf().is_some() {
-            let is_pentest =
-                crate::config::ip_list_contains(&security.config.read().pentest_bypass_ips, &ip);
-            let body_query = request.uri().query().unwrap_or("").to_string();
-            // Re-resolve the per-route policy here: the one built for the header
-            // pass lives in a block that has since closed. Same idiom, so body
-            // inspection honours the same per-route waf_mode / waf_enabled.
-            // Same policy the header pass used. It used to be rebuilt here
-            // because that one was scoped to a block that had closed; it is now
-            // resolved once per request and shared.
+        // whole buffered body is passed by reference, and the engine reads
+        // all of it (see waf.max_body_scan_bytes).
+        // The body (empty for a request without one) added to what the head
+        // scored: the request's one verdict.
+        if let Some(pending) = waf_pending.take() {
+            // The policy the head pass used, resolved once per request.
             let body_route_policy = route_policy.get_or_insert_with(|| {
                 resolve_route_policy(&security, &request, host.as_deref(), &path)
             });
@@ -1326,11 +1494,11 @@ impl QuicListener {
                 peer_port: Some(remote_addr.port()),
                 method,
                 path: &path,
-                query: &body_query,
-                headers: request.headers(),
+                query: request.uri().query().unwrap_or(""),
+                headers: body_head,
                 body: Some(&body),
             };
-            let decision = security.inspect_body(&body_view, &body_route_policy, is_pentest);
+            let decision = security.inspect_rest(pending, &body_view, body_route_policy);
             let body_origin = request
                 .headers()
                 .get("origin")
@@ -1388,178 +1556,189 @@ impl QuicListener {
             &path,
             request.uri().query(),
         );
-        if let Some(plan) = cache_plan.as_ref().filter(|plan| plan.lookup) {
-            let if_none_match = request
-                .headers()
-                .get("if-none-match")
-                .and_then(|v| v.to_str().ok())
-                .map(String::from);
-            let if_modified_since = request
-                .headers()
-                .get("if-modified-since")
-                .and_then(|v| v.to_str().ok())
-                .map(String::from);
+        let _leading: Option<crate::cache::Leading> =
+            if let Some(plan) = cache_plan.as_ref().filter(|plan| plan.lookup) {
+                let if_none_match = request
+                    .headers()
+                    .get("if-none-match")
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from);
+                let if_modified_since = request
+                    .headers()
+                    .get("if-modified-since")
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from);
 
-            match cache.get_for(
-                &plan.key,
-                plan.credentialed,
-                if_none_match.as_deref(),
-                if_modified_since.as_deref(),
-            ) {
-                CacheLookup::Hit {
-                    status,
-                    headers: cached_headers,
-                    body: cached_body,
-                    age_secs,
-                } => {
-                    debug!(
-                        "HTTP/3 cache HIT: {} {} (age {}s)",
-                        method, path_with_query, age_secs
-                    );
-                    let status_code =
-                        http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::OK);
-                    let mut response_builder = http::Response::builder()
-                        .status(status_code)
-                        .header("age", age_secs.to_string())
-                        .header("x-cache", "HIT")
-                        .header(
-                            header::ALT_SVC,
-                            conn_headers.alt_svc(&config, host.as_deref()),
-                        )
-                        .server_header(&config);
-                    for (k, v) in &cached_headers {
-                        // Skip headers the proxy sets itself in this block. The cached
-                        // entry holds the raw backend headers, so replaying `server`
-                        // would emit a second `server: <backend>` alongside our own
-                        // server_header — duplicate `server` values that leak the backend
-                        // identity and shadow ours for some HTTP/3 clients. Same for
-                        // alt-svc/age/x-cache/content-length which are set above.
-                        let lk = k.to_lowercase();
-                        if matches!(
-                            lk.as_str(),
-                            "content-length" | "server" | "alt-svc" | "age" | "x-cache"
-                        ) {
-                            continue;
-                        }
-                        response_builder = response_builder.header(k.as_str(), v.as_str());
-                    }
-                    // HEAD sends no body but must report the length a GET would
-                    // have (RFC 9110 §9.3.2). Deriving the header from the
-                    // stripped body reported every cached HEAD as zero-length.
-                    let content_length = cached_body.len();
-                    // Refcount bump, not a copy: serving a cache hit used to
-                    // clone the whole body out of the entry.
-                    let body_bytes: Bytes = if method == "HEAD" {
-                        Bytes::new()
-                    } else {
-                        cached_body.clone()
-                    };
-                    response_builder =
-                        response_builder.header("content-length", content_length.to_string());
-                    // A cache hit replays the stored origin headers and nothing
-                    // else, so without this it answered with none of the security
-                    // headers a miss gets — including CSP.
-                    response_builder = super::apply_response_policy_headers(
-                        response_builder,
-                        Some(route),
-                        &conn_headers.response_headers,
-                        conn_headers.server.as_ref(),
-                        host.as_deref(),
+                // The first to miss leads the fetch and holds `_leading` until its
+                // response is stored; identical requests wait for it rather than
+                // each going to the backend (ResponseCache::lookup).
+                let (found, leading) = cache
+                    .lookup(
+                        plan,
+                        request.method(),
                         &path,
-                    );
-                    let response = response_builder.body(())?;
-                    let body_size = body_bytes.len();
-                    let latency = start_time.elapsed();
-                    stream.send_response(response).await?;
-                    if !body_bytes.is_empty() {
-                        stream.send_data(body_bytes).await?;
-                    }
-                    stream.finish().await?;
-                    metrics.requests.request_end_full(
+                        if_none_match.as_deref(),
+                        if_modified_since.as_deref(),
+                    )
+                    .await;
+                match found {
+                    CacheLookup::Hit {
                         status,
-                        latency,
-                        body.len() as u64,
-                        body_size as u64,
-                        Some(&path),
-                    );
-                    log_access(&AccessLogEntry {
-                        ja3: fingerprint.ja3_hash.as_deref(),
-                        ja4: fingerprint.ja4_hash.as_deref(),
-                        backend: Some(route.backend.as_str()),
-                        remote_addr,
-                        method,
-                        path: &path,
-                        protocol: "HTTP/3",
-                        status,
-                        body_size,
-                        referer,
-                        user_agent,
-                        host: host.as_deref(),
-                        response_time_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
-                    });
-                    return Ok(());
-                }
+                        headers: cached_headers,
+                        body: cached_body,
+                        age_secs,
+                    } => {
+                        debug!(
+                            "HTTP/3 cache HIT: {} {} (age {}s)",
+                            method, path_with_query, age_secs
+                        );
+                        let status_code =
+                            http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::OK);
+                        let mut response_builder = http::Response::builder()
+                            .status(status_code)
+                            .header("age", age_secs.to_string())
+                            .header("x-cache", "HIT")
+                            .header(
+                                header::ALT_SVC,
+                                conn_headers.alt_svc(&config, host.as_deref()),
+                            )
+                            .server_header(&config);
+                        for (k, v) in &cached_headers {
+                            // Skip headers the proxy sets itself in this block. The cached
+                            // entry holds the raw backend headers, so replaying `server`
+                            // would emit a second `server: <backend>` alongside our own
+                            // server_header — duplicate `server` values that leak the backend
+                            // identity and shadow ours for some HTTP/3 clients. Same for
+                            // alt-svc/age/x-cache/content-length which are set above.
+                            let lk = k.to_lowercase();
+                            if matches!(
+                                lk.as_str(),
+                                "content-length" | "server" | "alt-svc" | "age" | "x-cache"
+                            ) {
+                                continue;
+                            }
+                            response_builder = response_builder.header(k.as_str(), v.as_str());
+                        }
+                        // HEAD sends no body but must report the length a GET would
+                        // have (RFC 9110 §9.3.2). Deriving the header from the
+                        // stripped body reported every cached HEAD as zero-length.
+                        let content_length = cached_body.len();
+                        // Refcount bump, not a copy: serving a cache hit used to
+                        // clone the whole body out of the entry.
+                        let body_bytes: Bytes = if method == "HEAD" {
+                            Bytes::new()
+                        } else {
+                            cached_body.clone()
+                        };
+                        response_builder =
+                            response_builder.header("content-length", content_length.to_string());
+                        // A cache hit replays the stored origin headers and nothing
+                        // else, so without this it answered with none of the security
+                        // headers a miss gets — including CSP.
+                        response_builder = super::apply_response_policy_headers(
+                            response_builder,
+                            Some(route),
+                            &conn_headers.response_headers,
+                            conn_headers.server.as_ref(),
+                            host.as_deref(),
+                            &path,
+                        );
+                        let response = response_builder.body(())?;
+                        let body_size = body_bytes.len();
+                        let latency = start_time.elapsed();
+                        stream.send_response(response).await?;
+                        if !body_bytes.is_empty() {
+                            stream.send_data(body_bytes).await?;
+                        }
+                        stream.finish().await?;
+                        metrics.requests.request_end_full(
+                            status,
+                            latency,
+                            body.len() as u64,
+                            body_size as u64,
+                            Some(&path),
+                        );
+                        log_access(&AccessLogEntry {
+                            ja3: fingerprint.ja3_hash.as_deref(),
+                            ja4: fingerprint.ja4_hash.as_deref(),
+                            backend: Some(route.backend.as_str()),
+                            remote_addr,
+                            method,
+                            path: &path,
+                            protocol: "HTTP/3",
+                            status,
+                            body_size,
+                            referer,
+                            user_agent,
+                            host: host.as_deref(),
+                            response_time_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
+                        });
+                        return Ok(());
+                    }
 
-                CacheLookup::NotModified {
-                    etag,
-                    last_modified,
-                    cache_control,
-                    age_secs,
-                } => {
-                    debug!(
-                        "HTTP/3 cache 304: {} {} (age {}s)",
-                        method, path_with_query, age_secs
-                    );
-                    let mut response_builder = http::Response::builder()
-                        .status(http::StatusCode::NOT_MODIFIED)
-                        .header("age", age_secs.to_string())
-                        .header("x-cache", "HIT")
-                        .header(
-                            header::ALT_SVC,
-                            conn_headers.alt_svc(&config, host.as_deref()),
-                        )
-                        .server_header(&config);
-                    if let Some(et) = etag {
-                        response_builder = response_builder.header("etag", et);
+                    CacheLookup::NotModified {
+                        etag,
+                        last_modified,
+                        cache_control,
+                        age_secs,
+                    } => {
+                        debug!(
+                            "HTTP/3 cache 304: {} {} (age {}s)",
+                            method, path_with_query, age_secs
+                        );
+                        let mut response_builder = http::Response::builder()
+                            .status(http::StatusCode::NOT_MODIFIED)
+                            .header("age", age_secs.to_string())
+                            .header("x-cache", "HIT")
+                            .header(
+                                header::ALT_SVC,
+                                conn_headers.alt_svc(&config, host.as_deref()),
+                            )
+                            .server_header(&config);
+                        if let Some(et) = etag {
+                            response_builder = response_builder.header("etag", et);
+                        }
+                        if let Some(lm) = last_modified {
+                            response_builder = response_builder.header("last-modified", lm);
+                        }
+                        if let Some(cc) = cache_control {
+                            response_builder = response_builder.header("cache-control", cc);
+                        }
+                        let response = response_builder.body(())?;
+                        let latency = start_time.elapsed();
+                        respond_and_finish(&mut stream, response).await?;
+                        metrics.requests.request_end_full(
+                            304,
+                            latency,
+                            body.len() as u64,
+                            0,
+                            Some(&path),
+                        );
+                        log_access(&AccessLogEntry {
+                            ja3: fingerprint.ja3_hash.as_deref(),
+                            ja4: fingerprint.ja4_hash.as_deref(),
+                            backend: Some(route.backend.as_str()),
+                            remote_addr,
+                            method,
+                            path: &path,
+                            protocol: "HTTP/3",
+                            status: 304,
+                            // RFC 9110 §15.4.5: a 304 carries no body.
+                            body_size: 0,
+                            referer,
+                            user_agent,
+                            host: host.as_deref(),
+                            response_time_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
+                        });
+                        return Ok(());
                     }
-                    if let Some(lm) = last_modified {
-                        response_builder = response_builder.header("last-modified", lm);
-                    }
-                    if let Some(cc) = cache_control {
-                        response_builder = response_builder.header("cache-control", cc);
-                    }
-                    let response = response_builder.body(())?;
-                    let latency = start_time.elapsed();
-                    respond_and_finish(&mut stream, response).await?;
-                    metrics.requests.request_end_full(
-                        304,
-                        latency,
-                        body.len() as u64,
-                        0,
-                        Some(&path),
-                    );
-                    log_access(&AccessLogEntry {
-                        ja3: fingerprint.ja3_hash.as_deref(),
-                        ja4: fingerprint.ja4_hash.as_deref(),
-                        backend: Some(route.backend.as_str()),
-                        remote_addr,
-                        method,
-                        path: &path,
-                        protocol: "HTTP/3",
-                        status: 304,
-                        // RFC 9110 §15.4.5: a 304 carries no body.
-                        body_size: 0,
-                        referer,
-                        user_agent,
-                        host: host.as_deref(),
-                        response_time_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
-                    });
-                    return Ok(());
-                }
 
-                CacheLookup::Miss => {}
-            }
-        }
+                    CacheLookup::Miss => {}
+                }
+                leading
+            } else {
+                None
+            };
 
         // RFC 9114 §4.2: HTTP/3 has no Transfer-Encoding. A request carrying one
         // MUST be treated as malformed, not silently repaired — the header used
@@ -1599,6 +1778,14 @@ impl QuicListener {
         // The same copy as the TCP listeners'; see its notes on repeated
         // fields, cookie crumbs and Early-Data.
         crate::http_listener::copy_forwardable_headers(request.headers(), &mut headers);
+        // A body decoded above goes on as what it now is.
+        if body_decoded {
+            headers.remove(http::header::CONTENT_ENCODING);
+            for digest in ["content-digest", "repr-digest", "content-md5"] {
+                headers.remove(digest);
+            }
+            headers.insert(http::header::CONTENT_LENGTH, HeaderValue::from(body.len()));
+        }
         // The route's own headers after the client's, as on TCP, so a client
         // cannot overwrite one by sending it. They went in first here, and the
         // client's copy replaced them.
@@ -1728,6 +1915,18 @@ impl QuicListener {
                 }
             }
         }
+
+        // A route may raise or lower its backend's timeout for its own traffic
+        // (`timeout_override_ms`), on this transport as on TCP, pool members
+        // included: the override belongs to the route.
+        let backend = match route.timeout_override_ms {
+            Some(ms) if ms != backend.timeout_ms => {
+                let mut overridden = backend.into_owned();
+                overridden.timeout_ms = ms;
+                Cow::Owned(overridden)
+            }
+            _ => backend,
+        };
 
         // Proxy to backend (include query string in path).
         // Use the streaming path for all requests: inspect content-type from response
@@ -1942,7 +2141,7 @@ impl QuicListener {
         // Released once the body has been read to its end, from whichever of
         // the two paths below reads it.
         let mut backend_lease = Some(backend_lease);
-        let mut streaming_body: Option<hyper::body::Incoming> = None;
+        let mut streaming_body: Option<crate::backend_client::BackendBody> = None;
         // What was read of a body that turned out longer than the cache
         // keeps: sent first, then the rest as it arrives.
         let mut read_ahead: Vec<Bytes> = Vec::new();
@@ -2121,6 +2320,31 @@ impl QuicListener {
         let response = response_builder.body(())?;
         let response_status = stream_status.as_u16();
 
+        // The origin's priority for its response (RFC 9218 section 5) wins
+        // over the request's: it knows what the response is
+        if let Some(origin) = response
+            .headers()
+            .get("priority")
+            .and_then(|v| v.to_str().ok())
+            .and_then(crate::http3_features::PriorityState::parse_client_priority)
+        {
+            stream.set_priority(origin.urgency, origin.incremental);
+        }
+        // A PRIORITY_UPDATE the client sent while the request was forwarded
+        // (or before it arrived) wins over both
+        let reprioritise = |stream: &mut h3::server::RequestStream<S, Bytes>| {
+            if let Some(update) = stream
+                .take_priority_update()
+                .and_then(|field| String::from_utf8(field.to_vec()).ok())
+                .and_then(|field| {
+                    crate::http3_features::PriorityState::parse_client_priority(&field)
+                })
+            {
+                stream.set_priority(update.urgency, update.incremental);
+            }
+        };
+        reprioritise(&mut stream);
+
         stream.send_response(response).await?;
 
         // Buffered only when the cache needed the whole body; otherwise each
@@ -2153,6 +2377,7 @@ impl QuicListener {
                         if !data.is_empty() {
                             sent += data.len();
                             frames += 1;
+                            reprioritise(&mut stream);
                             stream.send_data(data.clone()).await?;
                         }
                     }

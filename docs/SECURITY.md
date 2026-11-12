@@ -76,15 +76,14 @@ name = "internal-api"
 type = "http1"
 address = "internal.example.com:443"
 tls_mode = "reencrypt"
-tls_cert = "/path/to/ca.pem"           # Custom CA for verification
+tls_cert = "/path/to/ca.pem"           # Private CA, or the backend's own self-signed cert
 tls_client_cert = "/path/to/client.pem" # mTLS client certificate
 tls_client_key = "/path/to/client.key"  # mTLS client key
-tls_skip_verify = false                 # NEVER set true in production
 tls_sni = "internal.example.com"        # Custom SNI hostname
 ```
 
 **Security considerations for re-encrypt mode:**
-- Always verify backend certificates (`tls_skip_verify = false`)
+- Backend certificates are always verified; pin a self-signed backend or private CA with `tls_cert`
 - Use mTLS for mutual authentication when possible
 - Ensure CA certificates are up to date
 - Monitor certificate expiration

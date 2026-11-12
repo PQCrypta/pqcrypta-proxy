@@ -183,6 +183,13 @@ pub trait SendStream<B: Buf> {
 
     /// Get QUIC send stream id
     fn send_id(&self) -> StreamId;
+
+    /// How urgently this stream's data is to be sent beside the connection's
+    /// other streams (RFC 9218 section 4: `urgency` 0, the most urgent, to 7;
+    /// `incremental`: whether its data is useful in parts and so may be
+    /// interleaved with other incremental streams of the same urgency).
+    /// A transport without stream priorities leaves it.
+    fn set_urgency(&mut self, _urgency: u8, _incremental: bool) {}
 }
 
 /// Allows sending unframed pure bytes to a stream. Similar to [`AsyncWrite`](https://docs.rs/tokio/latest/tokio/io/trait.AsyncWrite.html)

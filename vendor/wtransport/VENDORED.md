@@ -14,6 +14,9 @@ manifest (no upstream workspace).
 - A rejected WebTransport request ends both halves of its stream; the
   oversized field-section test sizes past the client's own limit;
   `StreamBiRemoteH3::stop`, unused since `reject()`, dropped.
+- `SessionRequest::quic_connection()` (the handshake's outcome before a
+  session is accepted) and `SessionRequest::misdirected_request()` (421),
+  with `SessionResponseProto::misdirected_request()`.
 - `[patch.crates-io] rustls = ../rustls-fixed/rustls` in its own manifest, so
   `cargo test --manifest-path vendor/wtransport/Cargo.toml` builds against the
   rustls the proxy uses; Cargo ignores it when the proxy builds wtransport.

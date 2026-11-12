@@ -61,10 +61,12 @@ use std::time::{Duration, Instant};
 
 use rand::Rng;
 use serde_json::{json, Value};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
-use wtransport::Connection;
+
+use crate::wt_session::WtSession;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -320,8 +322,8 @@ type ChannelMap = HashMap<String, Arc<RwLock<ImpairmentConfig>>>;
 
 /// Handle an established WebTransport session on the `/telemetry` path.
 /// Called from `webtransport_server::handle_connection` when `path == "/telemetry"`.
-pub async fn handle_telemetry_session(
-    connection: Arc<Connection>,
+pub async fn handle_telemetry_session<S: WtSession>(
+    connection: Arc<S>,
     remote_addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("📡 Telemetry Wall session started: {}", remote_addr);
@@ -397,7 +399,7 @@ pub async fn handle_telemetry_session(
                 match dg_result {
                     Ok(dg) => {
                         if dg.len() >= MIN_DATAGRAM_BYTES {
-                            if let Err(e) = connection.send_datagram(&*dg) {
+                            if let Err(e) = connection.send_datagram(&dg) {
                                 debug!("Datagram echo failed for {}: {}", remote_addr, e);
                             }
                         }
@@ -435,22 +437,15 @@ pub async fn handle_telemetry_session(
 
 // ─── Throughput channel ───────────────────────────────────────────────────────
 
-async fn run_throughput_channel(
-    connection: Arc<Connection>,
+async fn run_throughput_channel<S: WtSession>(
+    connection: Arc<S>,
     channel_id: String,
     impairment: Arc<RwLock<ImpairmentConfig>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
-        // Open a server-initiated unidirectional stream (double-await per wtransport API)
+        // Open a server-initiated unidirectional stream
         let mut send = match connection.open_uni().await {
-            Ok(opening) => match opening.await {
-                Ok(s) => s,
-                Err(e) => {
-                    debug!("Channel {} stream open failed: {}", channel_id, e);
-                    sleep(Duration::from_millis(500)).await;
-                    continue;
-                }
-            },
+            Ok(s) => s,
             Err(e) => {
                 debug!("Channel {} open_uni failed: {}", channel_id, e);
                 break;
@@ -592,7 +587,7 @@ async fn run_throughput_channel(
             }
         } // inner frame loop
 
-        let _ = send.finish().await;
+        let _ = send.shutdown().await;
 
         if disconnected {
             sleep(Duration::from_millis(600)).await;
@@ -616,13 +611,10 @@ fn build_imp_desc(imp: &ImpairmentConfig) -> Value {
 
 // ─── Stats channel (RTT, CWND, CPU, memory) ───────────────────────────────────
 
-async fn run_stats_channel(
-    connection: Arc<Connection>,
+async fn run_stats_channel<S: WtSession>(
+    connection: Arc<S>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut send = match connection.open_uni().await {
-        Ok(opening) => opening.await?,
-        Err(e) => return Err(e.into()),
-    };
+    let mut send = connection.open_uni().await?;
 
     // Channel header
     write_frame(
@@ -682,9 +674,9 @@ async fn run_stats_channel(
 
 // ─── Control stream ───────────────────────────────────────────────────────────
 
-async fn handle_control_stream(
-    mut send: wtransport::stream::SendStream,
-    mut recv: wtransport::stream::RecvStream,
+async fn handle_control_stream<W: AsyncWrite + Unpin + Send, R: AsyncRead + Unpin + Send>(
+    mut send: W,
+    mut recv: R,
     channels: Arc<ChannelMap>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Send session handshake listing available channels
@@ -727,7 +719,10 @@ async fn handle_control_stream(
                     );
                     *imp_lock.write().await = new_imp.clone();
                 } else {
-                    warn!("Telemetry: unknown channel '{}' in impair command", channel);
+                    debug!(
+                        "Telemetry: unknown channel '{}' in impair command",
+                        channel.chars().take(64).collect::<String>()
+                    );
                     write_frame(
                         &mut send,
                         &json!({"type":"ack","cmd":"impair","ok":false,"error":"unknown_channel"}),
@@ -776,7 +771,10 @@ async fn handle_control_stream(
             }
 
             other => {
-                warn!("Telemetry: unknown control command '{}'", other);
+                debug!(
+                    "Telemetry: unknown control command '{}'",
+                    other.chars().take(64).collect::<String>()
+                );
                 write_frame(
                     &mut send,
                     &json!({"type":"ack","cmd":other,"ok":false,"error":"unknown_cmd"}),
@@ -883,8 +881,8 @@ fn parse_meminfo_kb(line: &str) -> u64 {
 // ─── Frame I/O helpers ────────────────────────────────────────────────────────
 
 /// Write a length-prefixed JSON frame.
-async fn write_frame(
-    send: &mut wtransport::stream::SendStream,
+async fn write_frame<W: AsyncWrite + Unpin + Send>(
+    send: &mut W,
     value: &Value,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bytes = serde_json::to_vec(value)?;
@@ -897,8 +895,8 @@ async fn write_frame(
 }
 
 /// Read a length-prefixed JSON frame.
-async fn read_frame(
-    recv: &mut wtransport::stream::RecvStream,
+async fn read_frame<R: AsyncRead + Unpin + Send>(
+    recv: &mut R,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let mut len_buf = [0u8; 4];
     read_exact(recv, &mut len_buf).await?;
@@ -911,17 +909,17 @@ async fn read_frame(
     Ok(serde_json::from_slice(&body)?)
 }
 
-async fn read_exact(
-    recv: &mut wtransport::stream::RecvStream,
+async fn read_exact<R: AsyncRead + Unpin + Send>(
+    recv: &mut R,
     buf: &mut [u8],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut pos = 0;
     while pos < buf.len() {
         match recv.read(&mut buf[pos..]).await {
-            Ok(Some(n)) => pos += n,
-            Ok(None) => {
+            Ok(0) => {
                 return Err(format!("unexpected EOF after {pos} of {} bytes", buf.len()).into())
             }
+            Ok(n) => pos += n,
             Err(e) => return Err(format!("stream read error: {e}").into()),
         }
     }

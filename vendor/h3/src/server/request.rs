@@ -25,7 +25,29 @@ use crate::{
 
 use super::{connection::RequestEnd, stream::RequestStream};
 
-/// Helper struct to await the request headers and return a `Request` object
+/// What a bidirectional stream from the client turned out to be
+pub enum Resolved<C, B>
+where
+    C: quic::Connection<B>,
+    B: Buf,
+{
+    /// An HTTP request
+    Request(Request<()>, RequestStream<C::BidiStream, B>),
+    /// A stream of the WebTransport session whose CONNECT was stream
+    /// `session`: `prefix` is what arrived with its header, the rest is read
+    /// from `stream`
+    WebTransportBi {
+        /// The session's ID: the stream ID of its CONNECT
+        session: u64,
+        /// What arrived with the stream's header
+        prefix: bytes::Bytes,
+        /// The stream, read after `prefix`
+        stream: C::BidiStream,
+    },
+}
+
+/// A request stream accepted and not yet read: [`Self::resolve_request`] or
+/// [`Self::resolve_any`] reads it.
 pub struct RequestResolver<C, B>
 where
     C: quic::Connection<B>,
@@ -71,6 +93,29 @@ where
         let frame = std::future::poll_fn(|cx| self.frame_stream.poll_next(cx)).await;
         let req = self.accept_with_frame(frame)?;
         req.resolve().await
+    }
+
+    /// The stream as a request, or as a WebTransport bidirectional stream
+    /// (draft-ietf-webtrans-http3 section 4.2): one that opens with
+    /// WEBTRANSPORT_STREAM and the ID of the session it belongs to. That was
+    /// answered H3_FRAME_UNEXPECTED, closing the connection, which a server
+    /// that accepts WebTransport sessions cannot do.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn resolve_any(mut self) -> Result<Resolved<C, B>, StreamError> {
+        let frame = std::future::poll_fn(|cx| self.frame_stream.poll_next(cx)).await;
+        if let Ok(Some(Frame::WebTransportStream(session))) = frame {
+            // Not a request: it does not count toward the requests a
+            // graceful shutdown waits for
+            let RequestResolver { frame_stream, .. } = self;
+            let (prefix, stream) = frame_stream.into_inner().into_parts();
+            return Ok(Resolved::WebTransportBi {
+                session: session.into_inner(),
+                prefix,
+                stream,
+            });
+        }
+        let (request, stream) = self.accept_with_frame(frame)?.resolve().await?;
+        Ok(Resolved::Request(request, stream))
     }
 
     /// Accepts a http request where the first frame has already been read and decoded.

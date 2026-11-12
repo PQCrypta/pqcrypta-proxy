@@ -139,22 +139,6 @@ impl PqcKem {
         }
     }
 
-    /// Get the rustls/aws-lc-rs identifier (if supported)
-    pub fn rustls_name(&self) -> Option<&'static str> {
-        match self {
-            Self::X25519MlKem768 => Some("X25519MLKEM768"),
-            Self::MlKem512 => Some("ML-KEM-512"),
-            Self::MlKem768 => Some("ML-KEM-768"),
-            Self::MlKem1024 => Some("ML-KEM-1024"),
-            // Not yet in rustls-post-quantum
-            Self::SecP256r1MlKem768
-            | Self::SecP384r1MlKem1024
-            | Self::X448MlKem1024
-            | Self::Kyber768
-            | Self::X25519Kyber768 => None,
-        }
-    }
-
     /// Parse from string (case-insensitive, flexible formatting)
     pub fn from_str(s: &str) -> Option<Self> {
         let normalized = s.to_lowercase().replace(['-', '_', ' '], "");
@@ -181,23 +165,6 @@ impl PqcKem {
             Self::SecP384r1MlKem1024, // Higher security
             Self::X448MlKem1024,      // Maximum security
         ]
-    }
-
-    /// Get all algorithms at or above a security level
-    pub fn at_security_level(min_level: SecurityLevel) -> Vec<Self> {
-        let all = vec![
-            Self::X25519MlKem768,
-            Self::SecP256r1MlKem768,
-            Self::SecP384r1MlKem1024,
-            Self::X448MlKem1024,
-            Self::MlKem512,
-            Self::MlKem768,
-            Self::MlKem1024,
-        ];
-
-        all.into_iter()
-            .filter(|k| k.security_level() >= min_level)
-            .collect()
     }
 }
 
@@ -499,11 +466,6 @@ impl PqcCapabilities {
         }
     }
 
-    /// Check if a specific KEM is available
-    pub fn has_kem(&self, kem: PqcKem) -> bool {
-        self.available_kems.contains(&kem)
-    }
-
     /// Get the best available KEM meeting requirements
     pub fn best_kem(&self, min_level: SecurityLevel, prefer_hybrid: bool) -> Option<PqcKem> {
         let mut candidates: Vec<_> = self
@@ -740,10 +702,9 @@ mod tests {
 
     #[test]
     fn test_security_level_filter() {
-        let level5 = PqcKem::at_security_level(SecurityLevel::Level5);
-        assert!(level5.contains(&PqcKem::MlKem1024));
-        assert!(level5.contains(&PqcKem::SecP384r1MlKem1024));
-        assert!(!level5.contains(&PqcKem::MlKem512));
+        assert!(PqcKem::MlKem1024.security_level() >= SecurityLevel::Level5);
+        assert!(PqcKem::SecP384r1MlKem1024.security_level() >= SecurityLevel::Level5);
+        assert!(PqcKem::MlKem512.security_level() < SecurityLevel::Level5);
     }
 
     #[test]

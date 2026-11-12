@@ -624,7 +624,7 @@ fn esc(v: &str) -> String {
 }
 
 fn new_session(conformance: &Arc<Conformance>, client_ip: std::net::IpAddr) -> Response<Body> {
-    let id = conformance.sessions.create();
+    let id = conformance.sessions.create_for(Some(client_ip));
     // Test connections arrive on other ports with no way to name the session,
     // so remember which address started it.
     conformance.sessions.associate(client_ip, &id);

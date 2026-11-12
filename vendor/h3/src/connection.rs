@@ -951,7 +951,8 @@ where
             Ok(Some(
                 frame @ Frame::Goaway(_)
                 | frame @ Frame::CancelPush(_)
-                | frame @ Frame::MaxPushId(_),
+                | frame @ Frame::MaxPushId(_)
+                | frame @ Frame::PriorityUpdate { .. },
             )) => {
                 // handle these frames in client/server imples
                 frame

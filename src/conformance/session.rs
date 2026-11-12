@@ -1121,6 +1121,8 @@ pub const ORACLE_VERSION: &str = "reaction-opportunity/4";
 pub struct Session {
     pub id: String,
     created: Instant,
+    /// The network that started it (see [`source_network`]), when one did
+    source: Option<std::net::IpAddr>,
     /// The evidence, by test. The verdicts are derived from this.
     evidence: HashMap<&'static str, Evidence>,
     /// When the driver's client process exited, per test, in milliseconds
@@ -1185,6 +1187,7 @@ impl Session {
         Self {
             id,
             created: Instant::now(),
+            source: None,
             evidence: HashMap::new(),
             client_exit_ms: HashMap::new(),
             client_exit_status: HashMap::new(),
@@ -1446,6 +1449,15 @@ pub struct Snapshot {
 }
 
 /// All live sessions.
+/// The sessions one source network may hold at once.
+pub const PER_SOURCE: usize = 8;
+
+/// The network a session is counted against
+/// ([`crate::conn_limits::client_network`]).
+fn source_network(ip: std::net::IpAddr) -> std::net::IpAddr {
+    crate::conn_limits::client_network(ip)
+}
+
 pub struct Registry {
     sessions: DashMap<String, Session>,
     /// The most recent session started from each source address.
@@ -1475,15 +1487,39 @@ impl Registry {
         })
     }
 
-    /// Start a session, returning its id.
+    /// Start a session started by nobody in particular, returning its id
+    /// (see [`Self::create_for`]).
+    pub fn create(&self) -> String {
+        self.create_for(None)
+    }
+
+    /// Start a session for `source`, the address that asked for it or whose
+    /// connection needed one, returning its id.
     ///
     /// Sweeps expired entries first. The endpoint is unauthenticated, so the
     /// cap is what stops it being used to grow memory without bound; when the
     /// registry is full after a sweep, the oldest session is evicted rather
     /// than refusing the new client, since a stale report matters less than a
-    /// developer being unable to start a run.
-    pub fn create(&self) -> String {
+    /// developer being unable to start a run. One network holds at most
+    /// [`PER_SOURCE`] sessions and gives up its own oldest past that, so a
+    /// client starting sessions as fast as it can cycles through its own and
+    /// leaves everyone else's runs alone.
+    pub fn create_for(&self, source: Option<std::net::IpAddr>) -> String {
         self.sweep();
+        let network = source.map(source_network);
+        if let Some(network) = network {
+            let mine: Vec<(String, Duration)> = self
+                .sessions
+                .iter()
+                .filter(|e| e.value().source == Some(network))
+                .map(|e| (e.key().clone(), e.value().age()))
+                .collect();
+            if mine.len() >= PER_SOURCE {
+                if let Some((oldest, _)) = mine.iter().max_by_key(|(_, age)| *age) {
+                    self.sessions.remove(oldest);
+                }
+            }
+        }
         if self.sessions.len() >= self.max {
             if let Some(oldest) = self
                 .sessions
@@ -1495,7 +1531,9 @@ impl Registry {
             }
         }
         let id = new_session_id();
-        self.sessions.insert(id.clone(), Session::new(id.clone()));
+        let mut session = Session::new(id.clone());
+        session.source = network;
+        self.sessions.insert(id.clone(), session);
         id
     }
 
@@ -1625,6 +1663,22 @@ fn new_session_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// One network cycles through its own sessions; everyone else's stay.
+    #[test]
+    fn one_network_cannot_push_out_other_runs() {
+        let reg = Registry::new(3600, 64);
+        let other = reg.create_for(Some("198.51.100.1".parse().unwrap()));
+        let mut ids = Vec::new();
+        for n in 0..(PER_SOURCE * 4) {
+            // Any address in the same /64 is the same network
+            let ip = format!("2001:db8:1:2::{:x}", n + 1).parse().unwrap();
+            ids.push(reg.create_for(Some(ip)));
+        }
+        assert!(reg.exists(&other));
+        assert_eq!(reg.len(), PER_SOURCE + 1);
+        assert!(reg.exists(ids.last().unwrap()));
+        assert!(!reg.exists(&ids[0]));
+    }
 
     /// Record an observation with a plausible timeline, for tests about
     /// something other than the timeline itself.

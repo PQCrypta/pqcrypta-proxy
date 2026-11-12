@@ -278,6 +278,71 @@ pub struct ResponseCache {
     next_id: AtomicU64,
     /// Public config reference (read by the listeners)
     pub config: ResponseCacheConfig,
+    /// Misses being fetched, by key: what identical requests wait on
+    inflight: Arc<DashMap<String, InFlight>>,
+    /// How misses are collapsed (`http3.coalescing_*`), as last configured
+    collapse: parking_lot::RwLock<CollapseSettings>,
+}
+
+/// A miss being fetched: the requests waiting on it watch `done`, which
+/// closes when the fetch has stored its response or given up.
+struct InFlight {
+    done: tokio::sync::watch::Receiver<()>,
+    waiting: Arc<AtomicUsize>,
+}
+
+/// How identical misses are collapsed onto one fetch (`[http3]`
+/// `coalescing_enabled`, `coalescing_max_wait_ms`, `coalescing_max_subscribers`,
+/// `coalescing_methods`, `coalescing_exclude_paths`).
+#[derive(Debug, Clone)]
+pub struct CollapseSettings {
+    pub enabled: bool,
+    /// How long a request waits for the fetch it joined
+    pub wait: std::time::Duration,
+    /// Requests that may wait on one fetch; one past them fetches for itself
+    pub max_waiting: usize,
+    /// Methods that wait (GET leads a fetch; HEAD only waits on one)
+    pub methods: Vec<Method>,
+    /// Path prefixes never collapsed
+    pub exclude_paths: Vec<String>,
+}
+
+impl Default for CollapseSettings {
+    fn default() -> Self {
+        Self::of(&crate::config::Http3Config::default())
+    }
+}
+
+impl CollapseSettings {
+    pub fn of(config: &crate::config::Http3Config) -> Self {
+        Self {
+            enabled: config.coalescing_enabled,
+            wait: std::time::Duration::from_millis(config.coalescing_max_wait_ms),
+            max_waiting: config.coalescing_max_subscribers,
+            methods: config
+                .coalescing_methods
+                .iter()
+                .filter_map(|m| m.parse().ok())
+                .collect(),
+            exclude_paths: config.coalescing_exclude_paths.clone(),
+        }
+    }
+}
+
+/// The fetch of a miss, which identical requests wait on until this drops:
+/// held until the response has been stored (or will not be).
+pub struct Leading {
+    inflight: Arc<DashMap<String, InFlight>>,
+    key: String,
+    _done: tokio::sync::watch::Sender<()>,
+}
+
+impl Drop for Leading {
+    fn drop(&mut self) {
+        // Out of the map first, so no request joins a fetch that has ended;
+        // the sender drops after this and wakes every one that did.
+        self.inflight.remove(&self.key);
+    }
 }
 
 impl ResponseCache {
@@ -289,6 +354,8 @@ impl ResponseCache {
             size_bytes: AtomicUsize::new(0),
             next_id: AtomicU64::new(0),
             config,
+            inflight: Arc::new(DashMap::new()),
+            collapse: parking_lot::RwLock::new(CollapseSettings::default()),
         }
     }
 
@@ -360,6 +427,94 @@ impl ResponseCache {
             // RFC 9111 section 5.2.1: the client wants the origin's answer
             lookup: !(asked.no_cache || asked.max_age == Some(0) || pragma_no_cache),
         })
+    }
+
+    /// Apply `[http3]`'s collapse settings, at startup and on every reload.
+    pub fn configure_collapse(&self, config: &crate::config::Http3Config) {
+        *self.collapse.write() = CollapseSettings::of(config);
+    }
+
+    /// Look up `plan`'s response; on a miss, collapse identical requests onto
+    /// one fetch. The first GET to miss leads: it fetches, and the returned
+    /// [`Leading`] is held until its response has been stored. A request that
+    /// misses while a fetch for the same key is under way waits for it (up to
+    /// `coalescing_max_wait_ms`) and looks again, answered from the cache when
+    /// the response could be kept, or fetching for itself when it could not.
+    ///
+    /// The key is the cache's own (host, path and query), and a request is
+    /// answered from what was stored only by the cache's own rules (a request
+    /// with a cookie only from an entry the origin stated to be cacheable), so
+    /// no response reaches a request it would not have been served to from the
+    /// cache anyway.
+    pub async fn lookup(
+        &self,
+        plan: &CachePlan,
+        method: &Method,
+        path: &str,
+        if_none_match: Option<&str>,
+        if_modified_since: Option<&str>,
+    ) -> (CacheLookup, Option<Leading>) {
+        let first = self.get_for(
+            &plan.key,
+            plan.credentialed,
+            if_none_match,
+            if_modified_since,
+        );
+        if !matches!(first, CacheLookup::Miss) {
+            return (first, None);
+        }
+        let settings = self.collapse.read().clone();
+        if !settings.enabled
+            || !settings.methods.contains(method)
+            || settings
+                .exclude_paths
+                .iter()
+                .any(|p| path.starts_with(p.as_str()))
+        {
+            return (first, None);
+        }
+        let joined = match self.inflight.entry(plan.key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(fetch) => {
+                let fetch = fetch.get();
+                (fetch.waiting.load(Ordering::Relaxed) < settings.max_waiting)
+                    .then(|| (fetch.done.clone(), Arc::clone(&fetch.waiting)))
+            }
+            dashmap::mapref::entry::Entry::Vacant(free) => {
+                if *method != Method::GET {
+                    // Only a GET's response is stored: a HEAD does not lead.
+                    return (first, None);
+                }
+                let (done, watch) = tokio::sync::watch::channel(());
+                free.insert(InFlight {
+                    done: watch,
+                    waiting: Arc::new(AtomicUsize::new(0)),
+                });
+                return (
+                    first,
+                    Some(Leading {
+                        inflight: Arc::clone(&self.inflight),
+                        key: plan.key.clone(),
+                        _done: done,
+                    }),
+                );
+            }
+        };
+        let Some((mut done, waiting)) = joined else {
+            return (first, None);
+        };
+        waiting.fetch_add(1, Ordering::Relaxed);
+        // `changed` ends with the fetch: the sender goes when it does.
+        let _ = tokio::time::timeout(settings.wait, done.changed()).await;
+        waiting.fetch_sub(1, Ordering::Relaxed);
+        (
+            self.get_for(
+                &plan.key,
+                plan.credentialed,
+                if_none_match,
+                if_modified_since,
+            ),
+            None,
+        )
     }
 
     /// Look up a response for a request without credentials.
@@ -1667,6 +1822,72 @@ mod vary_tests {
 
 #[cfg(test)]
 mod purge_tests {
+
+    /// The first GET to miss fetches; an identical one waits for it and is
+    /// answered from what it stored, and goes on alone when nothing was.
+    #[tokio::test]
+    async fn identical_misses_wait_for_one_fetch() {
+        let cache = Arc::new(ResponseCache::new(ResponseCacheConfig {
+            enabled: true,
+            ..ResponseCacheConfig::default()
+        }));
+        let http3 = crate::config::Http3Config {
+            coalescing_max_wait_ms: 2_000,
+            ..crate::config::Http3Config::default()
+        };
+        cache.configure_collapse(&http3);
+        let headers = HeaderMap::new();
+        let plan = cache
+            .plan(&Method::GET, &headers, "example.com", "/page", None)
+            .expect("a cacheable GET");
+
+        let (first, leading) = cache.lookup(&plan, &Method::GET, "/page", None, None).await;
+        assert!(matches!(first, CacheLookup::Miss));
+        let leading = leading.expect("the first miss leads");
+
+        let follower = {
+            let cache = Arc::clone(&cache);
+            let plan = plan.clone();
+            tokio::spawn(
+                async move { cache.lookup(&plan, &Method::GET, "/page", None, None).await },
+            )
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!follower.is_finished(), "it waits for the fetch");
+        cache.put_for(
+            &plan.key,
+            false,
+            200,
+            &[("cache-control".to_string(), "max-age=60".to_string())],
+            Bytes::from_static(b"page"),
+        );
+        drop(leading);
+        let (found, led) = follower.await.unwrap();
+        assert!(matches!(found, CacheLookup::Hit { .. }));
+        assert!(led.is_none());
+
+        // Nothing stored: the waiting request goes on by itself, unled
+        let other = cache
+            .plan(&Method::GET, &headers, "example.com", "/private", None)
+            .unwrap();
+        let (_, leading) = cache
+            .lookup(&other, &Method::GET, "/private", None, None)
+            .await;
+        let waiting = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move {
+                cache
+                    .lookup(&other, &Method::GET, "/private", None, None)
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(leading);
+        let (found, led) = waiting.await.unwrap();
+        assert!(matches!(found, CacheLookup::Miss));
+        assert!(led.is_none());
+    }
+
     use super::*;
 
     fn cache() -> ResponseCache {

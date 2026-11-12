@@ -90,7 +90,6 @@ use pqcrypta_proxy::tls::TlsProvider;
 use pqcrypta_proxy::webtransport_server::WebTransportServer;
 use pqcrypta_proxy::{
     run_http_listener, run_http_listener_with_fingerprint_and_resolver, run_http_redirect_server,
-    run_tls_passthrough_server,
 };
 #[cfg(feature = "pqc")]
 use pqcrypta_proxy::{run_http_listener_pqc, run_http_listener_pqc_with_fingerprint};
@@ -162,13 +161,6 @@ struct Args {
     /// A corpus or directory to merge (`--merge-fingerprints`); repeatable
     #[arg(long = "from", value_name = "FILE")]
     merge_from: Vec<PathBuf>,
-
-    /// M-2: Explicitly allow backends with tls_skip_verify = true.
-    /// This flag MUST be set when any backend disables TLS certificate verification.
-    /// Without it the proxy will refuse to start when an insecure backend is found.
-    /// Never use this in production; it enables full man-in-the-middle of backend traffic.
-    #[arg(long, env = "PQCRYPTA_ALLOW_INSECURE_BACKENDS")]
-    allow_insecure_backends: bool,
 }
 
 /// Raise `RLIMIT_NOFILE`'s soft limit to the hard limit.
@@ -475,42 +467,6 @@ async fn run() -> anyhow::Result<()> {
 
     info!("Configuration validated successfully");
 
-    // M-2: Warn loudly for every backend that disables TLS certificate verification,
-    // and refuse to start unless --allow-insecure-backends was explicitly passed.
-    {
-        let insecure_backends: Vec<&str> = config
-            .backends
-            .values()
-            .filter(|b| b.tls_skip_verify)
-            .map(|b| b.name.as_str())
-            .collect();
-
-        if !insecure_backends.is_empty() {
-            for name in &insecure_backends {
-                warn!(
-                    "⚠️  Backend '{}' has tls_skip_verify=true — TLS certificate verification \
-                     is DISABLED for this backend (full MITM risk)",
-                    name
-                );
-            }
-            if args.allow_insecure_backends {
-                warn!(
-                    "⚠️  --allow-insecure-backends flag set: continuing with {} insecure backend(s). \
-                     This MUST NOT be used in production.",
-                    insecure_backends.len()
-                );
-            } else {
-                return Err(anyhow::anyhow!(
-                    "Startup aborted: backend(s) {:?} have tls_skip_verify=true but \
-                     --allow-insecure-backends was not passed. \
-                     Either fix the backend TLS configuration or pass \
-                     --allow-insecure-backends to acknowledge the risk.",
-                    insecure_backends
-                ));
-            }
-        }
-    }
-
     // Deprecation warning: trusted_internal_cidrs will be removed in a future release.
     if !config.security.trusted_internal_cidrs.is_empty() {
         warn!(
@@ -600,6 +556,18 @@ async fn run() -> anyhow::Result<()> {
     );
     // Host names in the CONNECT-UDP client lists are kept resolved.
     pqcrypta_proxy::host_names::watch("masque", config.masque.client_names());
+    // Each backend's limit on requests in flight, for every transport.
+    pqcrypta_proxy::backend_limits::configure(&config);
+    // How identical cache misses are collapsed onto one fetch ([http3] coalescing_*).
+    pqcrypta_proxy::cache::shared(&config.cache).configure_collapse(&config.http3);
+    // The memory request bodies may occupy together (body_budget.rs).
+    pqcrypta_proxy::body_budget::configure(
+        config.security.max_buffered_body_bytes,
+        config.security.max_request_size,
+    );
+    // What a classical key exchange means on every listener (pqc_policy.rs).
+    pqcrypta_proxy::pqc_policy::configure(&config.pqc);
+    pqcrypta_proxy::pqc_policy::set_audit_logger(audit_logger.clone());
 
     // One advanced rate limiter for the process: every TCP listener, every QUIC
     // port and the admin API. Each listener used to build its own, so a client
@@ -608,6 +576,31 @@ async fn run() -> anyhow::Result<()> {
     let shared_rate_limiter = Arc::new(AdvancedRateLimiter::new(
         config.advanced_rate_limiting.clone(),
     ));
+    shared_rate_limiter.set_audit_logger(audit_logger.clone());
+    // The `asn` key reads the security layer's ASN database, as reloaded
+    #[cfg(feature = "geoip")]
+    {
+        let geoip = Arc::clone(&security_state.geoip_db);
+        shared_rate_limiter.set_asn_lookup(Arc::new(move |ip| {
+            geoip.load().as_ref().and_then(|db| db.asn(ip))
+        }));
+        if shared_rate_limiter.uses_asn_key()
+            && !security_state
+                .geoip_db
+                .load()
+                .as_ref()
+                .is_some_and(|db| db.has_asn())
+        {
+            warn!(
+                "A rate limit is keyed on `asn` but no ASN database is loaded \
+                 (security.geoip_asn_db_path): that key matches no request"
+            );
+        }
+    }
+    #[cfg(not(feature = "geoip"))]
+    if shared_rate_limiter.uses_asn_key() {
+        warn!("A rate limit is keyed on `asn` but this build has no `geoip` feature: that key matches no request");
+    }
 
     // Reload the observed-fingerprint corpus and keep snapshotting it.
     //
@@ -828,6 +821,7 @@ async fn run() -> anyhow::Result<()> {
         config.client_auth(),
         config.quic_applications(),
     )?);
+    tls_provider.set_audit_logger(audit_logger.clone());
 
     if tls_provider.is_pqc_enabled() {
         info!(
@@ -842,7 +836,7 @@ async fn run() -> anyhow::Result<()> {
     }
 
     // Create backend pool
-    let backend_pool = Arc::new(BackendPool::new(config.clone()));
+    let backend_pool = Arc::new(BackendPool::new(&config));
     info!(
         "Backend pool initialized with {} backends",
         config.backends.len()
@@ -906,6 +900,7 @@ async fn run() -> anyhow::Result<()> {
     let reload_pqc_provider = pqc_provider.clone();
     let reload_early_hints = early_hints_state.clone();
     let reload_config_manager = config_manager.clone();
+    let reload_audit = audit_logger.clone();
     let mut applied = config_manager.get();
     tokio::spawn(async move {
         while let Some(event) = reload_rx.recv().await {
@@ -963,11 +958,28 @@ async fn run() -> anyhow::Result<()> {
                         new_config.security.max_connections_per_ip,
                     );
                     pqcrypta_proxy::host_names::watch("masque", new_config.masque.client_names());
+                    pqcrypta_proxy::pqc_policy::configure(&new_config.pqc);
+                    pqcrypta_proxy::http_listener::passthrough::configure(&new_config);
+                    pqcrypta_proxy::backend_limits::configure(&new_config);
+                    pqcrypta_proxy::cache::shared(&new_config.cache)
+                        .configure_collapse(&new_config.http3);
+                    pqcrypta_proxy::body_budget::configure(
+                        new_config.security.max_buffered_body_bytes,
+                        new_config.security.max_request_size,
+                    );
                     // TCP listeners: routes, backends, headers, middleware.
                     let _ = tcp_config_tx.send(new_config.clone());
                     reload_rate_limiter.update_config(new_config.advanced_rate_limiting.clone());
                     reload_lb.reconcile_pools(&new_config.backend_pools);
                     info!("Security, rate-limit and load-balancer configuration updated");
+
+                    reload_audit.log(pqcrypta_proxy::audit_logger::AuditEvent::ConfigReload {
+                        success: true,
+                        changed_sections: pqcrypta_proxy::config::changed_sections(
+                            &previous,
+                            &new_config,
+                        ),
+                    });
 
                     let restart_bound =
                         pqcrypta_proxy::config::restart_bound_changes(&previous, &new_config);
@@ -986,6 +998,10 @@ async fn run() -> anyhow::Result<()> {
                 }
                 ConfigReloadEvent::ReloadFailed(err) => {
                     error!("Configuration reload failed: {}", err);
+                    reload_audit.log(pqcrypta_proxy::audit_logger::AuditEvent::ConfigReload {
+                        success: false,
+                        changed_sections: Vec::new(),
+                    });
                 }
             }
         }
@@ -1024,49 +1040,38 @@ async fn run() -> anyhow::Result<()> {
     if config.ocsp.enabled && !config.tls.ocsp_stapling {
         info!("OCSP service configured but tls.ocsp_stapling = false — not stapling");
     }
-    let ocsp_service: Option<Arc<ocsp::OcspService>> = if config.ocsp.enabled
-        && config.tls.ocsp_stapling
-    {
-        info!("Initializing OCSP stapling service...");
-        let ocsp_config = ocsp::OcspConfig {
-            enabled: config.ocsp.enabled,
-            cache_duration: std::time::Duration::from_secs(config.ocsp.cache_duration_secs),
-            refresh_before_expiry: std::time::Duration::from_secs(
-                config.ocsp.refresh_before_expiry_secs,
-            ),
-            min_refresh_interval: std::time::Duration::from_mins(5),
-            request_timeout: std::time::Duration::from_secs(config.ocsp.timeout_secs),
-            max_retries: config.ocsp.max_retries,
-            // from_millis, not from_secs(ms / 1000): the integer division floored
-            // any sub-second delay to zero, so a 500 ms setting retried instantly.
-            retry_delay: std::time::Duration::from_millis(config.ocsp.retry_delay_ms),
-        };
-        let mut service = ocsp::OcspService::new(ocsp_config);
+    let ocsp_service: Option<Arc<ocsp::OcspService>> =
+        if config.ocsp.enabled && config.tls.ocsp_stapling {
+            info!("Initializing OCSP stapling service...");
+            let ocsp_config = ocsp::OcspConfig {
+                enabled: config.ocsp.enabled,
+                cache_duration: std::time::Duration::from_secs(config.ocsp.cache_duration_secs),
+                refresh_before_expiry: std::time::Duration::from_secs(
+                    config.ocsp.refresh_before_expiry_secs,
+                ),
+                min_refresh_interval: std::time::Duration::from_mins(5),
+                request_timeout: std::time::Duration::from_secs(config.ocsp.timeout_secs),
+                max_retries: config.ocsp.max_retries,
+                // from_millis, not from_secs(ms / 1000): the integer division floored
+                // any sub-second delay to zero, so a 500 ms setting retried instantly.
+                retry_delay: std::time::Duration::from_millis(config.ocsp.retry_delay_ms),
+            };
+            // Every chain the proxy serves, as the resolver holds it now: each
+            // pass reads them afresh, and a TLS reload wakes the service.
+            let resolver = Arc::clone(&tls_provider.resolver);
+            let service =
+                ocsp::OcspService::new(ocsp_config, Arc::new(move || resolver.served_chains()));
 
-        // Load certificates for OCSP
-        // L-1: Use rustls-pki-types PEM API (replaces unmaintained rustls-pemfile)
-        if let Ok(cert_pem) = std::fs::read(&config.tls.cert_path) {
-            use rustls::pki_types::CertificateDer;
-            use rustls_pki_types::pem::PemObject;
-            if let Ok(certs) =
-                CertificateDer::pem_reader_iter(&mut std::io::BufReader::new(cert_pem.as_slice()))
-                    .collect::<Result<Vec<_>, _>>()
-            {
-                service.update_certificates(certs);
+            if let Err(e) = service.start() {
+                error!("Failed to start OCSP service: {}", e);
+            } else {
+                info!("OCSP stapling service started");
             }
-        }
-
-        // Start the OCSP refresh background task
-        if let Err(e) = service.start() {
-            error!("Failed to start OCSP service: {}", e);
+            Some(Arc::new(service))
         } else {
-            info!("✅ OCSP stapling service started");
-        }
-        Some(Arc::new(service))
-    } else {
-        info!("📝 OCSP stapling disabled in config");
-        None
-    };
+            info!("📝 OCSP stapling disabled in config");
+            None
+        };
 
     // Create shared metrics registry
     let metrics_registry = Arc::new(metrics::MetricsRegistry::new());
@@ -1075,6 +1080,55 @@ async fn run() -> anyhow::Result<()> {
     metrics_registry
         .tls
         .set_pqc_status(tls_provider.is_pqc_enabled(), &config.pqc.preferred_kem);
+
+    // The gauges whose values live elsewhere, read when the metrics are
+    // exported; each backend exchange records its own outcome.
+    pqcrypta_proxy::backend_client::set_metrics(metrics_registry.clone());
+    {
+        let security = security_state.clone();
+        metrics_registry.add_sampler(move |m| {
+            m.rate_limiter
+                .set_unique_ips(security.request_counts.len() as u64);
+            m.rate_limiter.set_blocked_ips(
+                (security.blocked_ips.len() + security.blocked_cidrs.read().len()) as u64,
+            );
+            m.rate_limiter
+                .set_unique_fingerprints(security.corpus.len() as u64);
+            for entry in security.circuit_breakers.iter() {
+                let open = entry.value().state == pqcrypta_proxy::security::CircuitState::Open;
+                m.pools.set_circuit_open(entry.key(), u64::from(open));
+            }
+        });
+    }
+    metrics_registry.add_sampler(|m| {
+        for (backend, load) in pqcrypta_proxy::backend_limits::load() {
+            m.pools.set_load(&backend, load);
+        }
+        for (backend, idle) in pqcrypta_proxy::backend_client::idle_by_backend() {
+            m.pools.set_idle_connections(&backend, idle);
+        }
+    });
+    {
+        let lb = shared_lb.clone();
+        metrics_registry.add_sampler(move |m| {
+            for (name, pool) in lb.all_pools() {
+                let (load, open) = pool.load();
+                m.pools.set_load(&name, load);
+                m.pools.set_circuit_open(&name, open);
+            }
+        });
+    }
+    {
+        let tls = tls_provider.clone();
+        let ocsp = ocsp_service.clone();
+        metrics_registry.add_sampler(move |m| {
+            m.tls.set_cert_reloads(tls.certificate_reloads());
+            if let Some(ocsp) = &ocsp {
+                let (fetches, failures) = ocsp.fetch_counts();
+                m.tls.set_ocsp_fetches(fetches, failures);
+            }
+        });
+    }
 
     // Build the shared OpenSSL SNI map used by PQC listeners.
     // Created here (before the ACME handler) so both the ACME reload task and
@@ -1178,29 +1232,29 @@ async fn run() -> anyhow::Result<()> {
     }
     info!("═══════════════════════════════════════════════════════════════");
 
-    // Start HTTP redirect server (port 80 → HTTPS) with ACME challenge support
+    // Start HTTP redirect server (port 80 → HTTPS) with ACME challenge support.
+    // Its shutdown signal goes out with the HTTPS listeners'.
+    let mut redirect_shutdown_senders: Vec<tokio::sync::watch::Sender<()>> = Vec::new();
     if config.http_redirect.enabled {
         let redirect_port = config.http_redirect.port;
         let https_port = config.server.udp_port;
         let challenges = acme_challenges.clone();
 
-        // AUD-02: Pass the allowed_domains list so the redirect server validates
-        // the Host header before building the HTTPS URL.
-        let redirect_allowed_domains = config.http_redirect.allowed_domains.clone();
+        // The redirect settings (AUD-02's allowed domains among them) are read
+        // from the live configuration on each request
         let redirect_config_updates = tcp_config_rx.clone();
-        let redirect_to_https = config.http_redirect.redirect_to_https;
-        let redirect_status =
-            axum::http::StatusCode::from_u16(config.http_redirect.redirect_status)
-                .unwrap_or(axum::http::StatusCode::PERMANENT_REDIRECT);
+        let redirect_idle =
+            std::time::Duration::from_secs(config.server.max_idle_timeout_secs.max(1));
+        let (redirect_shutdown_tx, redirect_shutdown_rx) = tokio::sync::watch::channel(());
+        redirect_shutdown_senders.push(redirect_shutdown_tx);
         tokio::spawn(async move {
             if let Err(e) = run_http_redirect_server(
                 redirect_port,
                 https_port,
-                redirect_to_https,
-                redirect_status,
                 challenges,
-                redirect_allowed_domains,
-                Some(redirect_config_updates),
+                redirect_config_updates,
+                redirect_idle,
+                redirect_shutdown_rx,
             )
             .await
             {
@@ -1209,22 +1263,16 @@ async fn run() -> anyhow::Result<()> {
         });
     }
 
-    // Start TLS passthrough server if routes are configured
-    if !config.passthrough_routes.is_empty() {
-        let passthrough_addr: std::net::SocketAddr = format!(
-            "{}:{}",
-            config.server.effective_bind_address(),
-            config.server.udp_port // Use primary port for passthrough
-        )
-        .parse()?;
-        let passthrough_config = config.clone();
-
-        tokio::spawn(async move {
-            if let Err(e) = run_tls_passthrough_server(passthrough_addr, passthrough_config).await {
-                error!("TLS passthrough server error: {}", e);
-            }
-        });
-    }
+    // TLS passthrough is a switch in every TCP listener's accept path (see
+    // http_listener/passthrough.rs): its routes, where its relays are
+    // counted, and the signal that ends them at shutdown
+    pqcrypta_proxy::http_listener::passthrough::configure(&config);
+    let (passthrough_shutdown_tx, passthrough_shutdown_rx) = tokio::sync::watch::channel(());
+    pqcrypta_proxy::http_listener::passthrough::init(
+        metrics_registry.clone(),
+        passthrough_shutdown_rx,
+    );
+    redirect_shutdown_senders.push(passthrough_shutdown_tx);
 
     // Start HTTPS reverse proxy listeners (TCP) on all ports
     // Priority: PQC+fingerprinting > fingerprinting-only > PQC-only > standard rustls
@@ -1341,6 +1389,8 @@ async fn run() -> anyhow::Result<()> {
         if use_pqc_listener {
             let http_pqc_provider = pqc_provider.clone();
             let http_sni_map = pqc_sni_map.clone();
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+            http_shutdown_senders.push(shutdown_tx);
             tokio::spawn(async move {
                 info!(
                     "🔐 Starting PQC HTTPS reverse proxy on {} (OpenSSL ML-KEM)",
@@ -1358,6 +1408,7 @@ async fn run() -> anyhow::Result<()> {
                     http_security.clone(),
                     http_rate_limiter,
                     http_config_updates,
+                    shutdown_rx,
                 )
                 .await
                 {
@@ -1372,6 +1423,8 @@ async fn run() -> anyhow::Result<()> {
         }
 
         // Priority 4: Standard Rustls (no PQC, no fingerprinting)
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        http_shutdown_senders.push(shutdown_tx);
         tokio::spawn(async move {
             info!("🌐 Starting HTTPS reverse proxy on {} (Rustls)", bind_addr);
             if let Err(e) = run_http_listener(
@@ -1384,6 +1437,7 @@ async fn run() -> anyhow::Result<()> {
                 http_security,
                 http_rate_limiter,
                 http_config_updates,
+                shutdown_rx,
             )
             .await
             {
@@ -1534,7 +1588,7 @@ async fn run() -> anyhow::Result<()> {
     // This uses wtransport crate for proper WebTransport protocol support
     {
         let wt_config = config.clone();
-        let wt_backend_pool = Arc::new(BackendPool::new(config.clone()));
+        let wt_backend_pool = Arc::new(BackendPool::new(&config));
         let wt_security = security_state.clone();
         let wt_config_updates = tcp_config_rx.clone();
         // The WebTransport server uses a single cert (no SNI).  Resolution order:
@@ -1762,7 +1816,10 @@ async fn run() -> anyhow::Result<()> {
 
     // Send shutdown signals to HTTP fingerprinting listeners
     // Intentionally ignored: receivers may already be gone during shutdown
-    for http_shutdown_tx in http_shutdown_senders {
+    for http_shutdown_tx in http_shutdown_senders
+        .into_iter()
+        .chain(redirect_shutdown_senders)
+    {
         // watch channels don't need await - they use send() not send().await
         let _ = http_shutdown_tx.send(());
     }
@@ -1784,15 +1841,26 @@ async fn run() -> anyhow::Result<()> {
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(drain_secs);
     loop {
+        // Exchanges in flight (by protocol), and client connections any
+        // listener still holds, a handshake not yet finished among them
         let active = metrics_registry.active_connections();
-        if active == 0 {
+        let held = pqcrypta_proxy::conn_limits::open_connections();
+        if active == 0 && held == 0 {
             info!("All connections drained — proceeding with shutdown");
             break;
         }
         if std::time::Instant::now() >= deadline {
+            let c = metrics_registry.snapshot().connections;
             info!(
-                "Drain timeout reached ({} connection(s) still active)",
-                active
+                "Drain timeout reached: {} client connection(s) held; open: \
+                 http1 {}, http2 {}, http3 {}, webtransport {}, connect-udp {}, passthrough {}",
+                held,
+                c.open_http1,
+                c.open_http2,
+                c.open_http3,
+                c.open_webtransport,
+                c.open_connect_udp,
+                c.open_passthrough
             );
             break;
         }

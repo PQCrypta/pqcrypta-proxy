@@ -32,7 +32,6 @@ use std::time::Duration;
 
 use bytes;
 
-use axum::serve::ListenerExt;
 use axum::{
     body::Body,
     extract::{ConnectInfo, FromRequestParts, State},
@@ -77,7 +76,7 @@ mod cors;
 mod request_host;
 // Shared with the HTTP/3 path: the security headers (layers::ResponseHeaderSet)
 pub(crate) mod layers;
-mod passthrough;
+pub mod passthrough;
 mod proxy_protocol;
 mod speedtest_tcp;
 mod tls_config;
@@ -85,8 +84,7 @@ mod websocket;
 
 pub(crate) use layers::build_alt_svc_header_with_override;
 
-pub use backend_tls::create_backend_tls_connector;
-pub use passthrough::run_tls_passthrough_server;
+pub use backend_tls::{backend_client_config, create_backend_tls_connector};
 
 use cors::{add_cors_headers, handle_cors_preflight, is_mobile_user_agent};
 use layers::{
@@ -213,6 +211,13 @@ pub(crate) struct TcpAcceptor {
     nodelay: bool,
     proxy_trusted: Arc<[ipnet::IpNet]>,
     proxy_timeout: std::time::Duration,
+    /// `security.pentest_bypass_ips`: outside the per-address connection limit
+    limit_exempt: Arc<[String]>,
+    /// `server.max_idle_timeout_secs`, for the socket's keep-alive probes
+    idle: std::time::Duration,
+    /// `tls.handshake_timeout_secs`: how long the ClientHello may take, when
+    /// it is peeked for TLS passthrough
+    handshake: std::time::Duration,
 }
 
 impl TcpAcceptor {
@@ -223,8 +228,17 @@ impl TcpAcceptor {
             proxy_timeout: std::time::Duration::from_millis(
                 config.server.proxy_protocol_timeout_ms,
             ),
+            limit_exempt: config.security.pentest_bypass_ips.clone().into(),
+            idle: idle_time(config),
+            handshake: std::time::Duration::from_secs(config.tls.handshake_timeout_secs.max(1)),
         }
     }
+}
+
+/// `server.max_idle_timeout_secs`: how long a connection may have nothing in
+/// flight, and how long a request head may take to arrive.
+fn idle_time(config: &ProxyConfig) -> std::time::Duration {
+    std::time::Duration::from_secs(config.server.max_idle_timeout_secs.max(1))
 }
 
 /// The client address a PROXY header supplied, carried on each request of the
@@ -237,6 +251,9 @@ pub(crate) struct ProxiedPeer(pub(crate) SocketAddr);
 pub(crate) struct ProxiedPeerService<S> {
     inner: S,
     peer: Option<SocketAddr>,
+    /// The connection's place under the connection limits: the service is
+    /// the connection's own, so its last copy goes when the connection does.
+    _slot: Arc<crate::conn_limits::ConnectionSlot>,
 }
 
 impl<S, B> tower::Service<Request<B>> for ProxiedPeerService<S>
@@ -371,7 +388,7 @@ where
             let (stream, inner) = match accepted.await {
                 Ok(accepted) => accepted,
                 Err(e) => {
-                    metrics.tls.handshake_completed(false, false);
+                    metrics.handshake_failed();
                     return Err(e);
                 }
             };
@@ -379,6 +396,11 @@ where
             metrics
                 .tls
                 .handshake_completed(true, handshake.is_post_quantum());
+            crate::pqc_policy::handshake_completed(
+                remote_addr.ip(),
+                handshake.kex_group.as_deref(),
+                handshake.is_post_quantum(),
+            );
             let is_http1 = handshake.alpn.as_deref() != Some("h2");
             let conn = crate::tls_acceptor::FingerprintedConnection {
                 remote_addr,
@@ -469,19 +491,41 @@ impl<S: Send + 'static> Accept<tokio::net::TcpStream, S> for TcpAcceptor {
     fn accept(&self, mut stream: Self::Stream, service: S) -> Self::Future {
         let this = self.clone();
         Box::pin(async move {
-            if this.nodelay {
-                if let Err(e) = stream.set_nodelay(true) {
-                    warn!("Failed to set TCP_NODELAY on an accepted socket: {}", e);
-                }
-            }
             let peer = stream.peer_addr()?;
+            // The connection limits every listener applies (conn_limits.rs):
+            // a load balancer in front connects for all of its clients, and
+            // the operator's own hosts probe in bursts.
+            let ip = peer.ip();
+            let exempt = ip.is_loopback()
+                || this.proxy_trusted.iter().any(|net| net.contains(&ip))
+                || crate::config::ip_list_contains(&this.limit_exempt, &ip);
+            let slot = crate::conn_limits::admit(ip, exempt).ok_or_else(|| {
+                debug!("Connection from {} refused: connection limit reached", peer);
+                std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "connection limit reached",
+                )
+            })?;
+            crate::conn_limits::tune_client_socket(&stream, this.nodelay, this.idle);
             let proxied =
                 proxied_peer(&mut stream, peer, &this.proxy_trusted, this.proxy_timeout).await?;
+            // A ClientHello naming a passthrough route is relayed, not served
+            let client = proxied.unwrap_or(peer);
+            let deadline = tokio::time::Instant::now() + this.handshake;
+            let Some(stream) =
+                passthrough::peek_and_divert(stream, client, this.idle, deadline).await
+            else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "relayed by TLS passthrough",
+                ));
+            };
             Ok((
                 stream,
                 ProxiedPeerService {
                     inner: service,
                     peer: proxied,
+                    _slot: Arc::new(slot),
                 },
             ))
         })
@@ -525,15 +569,16 @@ async fn dispatch(state: Arc<HttpListenerState>, req: Request<Body>) -> Response
         let origin = speedtest_cors_origin(&state, req.headers());
         return match *req.method() {
             Method::POST => {
-                let client = req
+                let Some(client) = req
                     .extensions()
                     .get::<ConnectInfo<SocketAddr>>()
-                    .map(|c| crate::speedtest::canonical_ip(c.0.ip()));
+                    .map(|c| crate::speedtest::canonical_ip(c.0.ip()))
+                else {
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                };
                 let test = crate::speedtest_meter::test_id_from_query(req.uri().query());
-                let meter = test
-                    .zip(client)
-                    .and_then(|(t, ip)| crate::speedtest_meter::open_stream(&t, ip));
-                tcp_upload_measure_handler(req.into_body(), &origin, meter).await
+                let meter = test.and_then(|t| crate::speedtest_meter::open_stream(&t, client));
+                tcp_upload_measure_handler(req.into_body(), &origin, meter, client).await
             }
             Method::OPTIONS => tcp_upload_cors_preflight(&origin).await,
             _ => (
@@ -906,8 +951,7 @@ impl LayerSelection {
             // else. The level filter is fixed at startup.
             trace_context: config.otel.enabled || layers::request_span_enabled(),
             advanced_rate_limit: config.advanced_rate_limiting.enabled,
-            http3_features: http3_features.coalescing.config.read().enabled
-                || http3_features.priority.config.read().enabled,
+            http3_features: http3_features.priority.config.read().enabled,
             compression: config.compression.enabled,
             // Also sends `alt-svc: clear` to tcp_only_hosts, which stays needed
             // even when this listener advertises nothing.
@@ -1157,7 +1201,11 @@ pub async fn run_http_listener(
     advanced_rate_limiter: Arc<AdvancedRateLimiter>,
     // Every reloaded configuration; the listener rebuilds its app from each.
     config_updates: watch::Receiver<Arc<ProxyConfig>>,
+    // Fires when the process begins to shut down.
+    shutdown: watch::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let handle = shutdown_handle(shutdown);
+    let idle = idle_time(&config);
     // Read once here: `config` is moved into builders further down in
     // several of these functions.
     let port = addr.port();
@@ -1247,8 +1295,8 @@ pub async fn run_http_listener(
     // over `DefaultAcceptor` and so leaves Nagle on every accepted socket.
     if config.tls.enable_0rtt {
         // SEC-002: early data served before the handshake completes.
-        axum_server::bind(addr)
-            .acceptor(ConnectionHeadersAcceptor::new(
+        let mut server = axum_server::bind(addr).handle(handle.clone()).acceptor(
+            ConnectionHeadersAcceptor::new(
                 EarlyRustlsAcceptor::new(
                     current,
                     TcpAcceptor::new(&config),
@@ -1259,19 +1307,21 @@ pub async fn run_http_listener(
                     ),
                 ),
                 Arc::clone(&metrics),
-            ))
-            .serve(make_service)
-            .await?;
+            ),
+        );
+        connection_times(server.http_builder(), idle);
+        server.serve(make_service).await?;
     } else {
-        axum_server::bind(addr)
-            .acceptor(ConnectionHeadersAcceptor::new(
+        let mut server = axum_server::bind(addr).handle(handle.clone()).acceptor(
+            ConnectionHeadersAcceptor::new(
                 RustlsAcceptor::new(rustls_config)
                     .handshake_timeout(handshake_timeout)
                     .acceptor(TcpAcceptor::new(&config)),
                 Arc::clone(&metrics),
-            ))
-            .serve(make_service)
-            .await?;
+            ),
+        );
+        connection_times(server.http_builder(), idle);
+        server.serve(make_service).await?;
     }
 
     Ok(())
@@ -1432,7 +1482,11 @@ pub async fn run_http_listener_pqc(
     advanced_rate_limiter: Arc<AdvancedRateLimiter>,
     // Every reloaded configuration; the listener rebuilds its app from each.
     config_updates: watch::Receiver<Arc<ProxyConfig>>,
+    // Fires when the process begins to shut down.
+    shutdown: watch::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let handle = shutdown_handle(shutdown);
+    let idle = idle_time(&config);
     // Read once here: `config` is moved into builders further down in
     // several of these functions.
     let port = addr.port();
@@ -1528,8 +1582,8 @@ pub async fn run_http_listener_pqc(
     if config.tls.enable_0rtt {
         // SEC-002: every connection through SSL_read_early_data, as OpenSSL
         // requires once the context allows early data.
-        axum_server::bind(addr)
-            .acceptor(ConnectionHeadersAcceptor::new(
+        let mut server = axum_server::bind(addr).handle(handle.clone()).acceptor(
+            ConnectionHeadersAcceptor::new(
                 EarlyOpensslAcceptor::new(
                     {
                         let current = Arc::new(arc_swap::ArcSwap::from(ssl_acceptor));
@@ -1553,12 +1607,13 @@ pub async fn run_http_listener_pqc(
                     ),
                 ),
                 Arc::clone(&metrics),
-            ))
-            .serve(make_service)
-            .await?;
+            ),
+        );
+        connection_times(server.http_builder(), idle);
+        server.serve(make_service).await?;
     } else {
-        axum_server::bind(addr)
-            .acceptor(ConnectionHeadersAcceptor::new(
+        let mut server = axum_server::bind(addr).handle(handle.clone()).acceptor(
+            ConnectionHeadersAcceptor::new(
                 OpenSSLAcceptor::new({
                     let openssl_config = OpenSSLConfig::from_acceptor(ssl_acceptor);
                     let reload = openssl_config.clone();
@@ -1576,9 +1631,10 @@ pub async fn run_http_listener_pqc(
                 .handshake_timeout(handshake_timeout)
                 .acceptor(TcpAcceptor::new(&config)),
                 Arc::clone(&metrics),
-            ))
-            .serve(make_service)
-            .await?;
+            ),
+        );
+        connection_times(server.http_builder(), idle);
+        server.serve(make_service).await?;
     }
 
     Ok(())
@@ -1940,6 +1996,13 @@ async fn handle_fingerprinted_connection<S>(
     trace!("New TCP connection from {}", remote_addr);
     let idle = times.idle;
 
+    // A ClientHello naming a passthrough route is relayed, not served
+    let deadline = tokio::time::Instant::now() + times.handshake;
+    let Some(stream) = passthrough::peek_and_divert(stream, remote_addr, idle, deadline).await
+    else {
+        return;
+    };
+
     // Accept TLS connection with fingerprint capture
     let accepted = tokio::time::timeout(times.handshake, acceptor.accept(stream, remote_addr))
         .await
@@ -1960,7 +2023,7 @@ async fn handle_fingerprinted_connection<S>(
             return;
         }
         Err(e) => {
-            metrics.tls.handshake_completed(false, false);
+            metrics.handshake_failed();
             debug!("TLS accept failed for {}: {}", remote_addr, e);
             return;
         }
@@ -1974,7 +2037,8 @@ async fn handle_fingerprinted_connection<S>(
             _ => ConnectionProtocol::Http1,
         }
     };
-    metrics.connections.connection_opened(protocol);
+    // Counted open until this function returns, however it returns
+    let _open = metrics.connections.connection_opened(protocol);
     let is_http1 = protocol == ConnectionProtocol::Http1;
 
     // Extract fingerprint info from the connection
@@ -1982,6 +2046,11 @@ async fn handle_fingerprinted_connection<S>(
     metrics
         .tls
         .handshake_completed(true, conn_info.handshake.is_post_quantum());
+    crate::pqc_policy::handshake_completed(
+        conn_info.remote_addr.ip(),
+        conn_info.handshake.kex_group.as_deref(),
+        conn_info.handshake.is_post_quantum(),
+    );
     let ja3_hash = conn_info.ja3_hash.clone();
     let ja4_hash = conn_info.ja4_hash.clone();
 
@@ -2030,7 +2099,7 @@ async fn handle_fingerprinted_connection<S>(
     let auto_builder = connection_builder(idle);
 
     if let Err(e) = serve_until_shutdown(
-        auto_builder.serve_connection(io, service),
+        auto_builder.serve_connection_with_upgrades(io, service),
         shutdown,
         &activity,
         idle,
@@ -2041,8 +2110,6 @@ async fn handle_fingerprinted_connection<S>(
             debug!("HTTP connection error for {}: {}", remote_addr, e);
         }
     }
-
-    metrics.connections.connection_closed();
 }
 
 // ============================================================================
@@ -2493,6 +2560,12 @@ async fn handle_pqc_fingerprinted_connection<S>(
     };
     let peek_len = peeked.as_ref().map(|n| *n).unwrap_or(0);
 
+    // A ClientHello naming a passthrough route is relayed, not served
+    let Some(stream) = passthrough::divert(stream, &peek_buf[..peek_len], remote_addr, idle).await
+    else {
+        return;
+    };
+
     // A ClientHello offering ECH: rustls serves the connection (and
     // fingerprints it, once), whatever config it names. One sealed to a held
     // config is opened; one naming a config this server no longer holds (a
@@ -2621,12 +2694,12 @@ async fn handle_pqc_fingerprinted_connection<S>(
     {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            metrics.tls.handshake_completed(false, false);
+            metrics.handshake_failed();
             debug!("PQC TLS handshake failed for {}: {}", remote_addr, e);
             return;
         }
         Err(_) => {
-            metrics.tls.handshake_completed(false, false);
+            metrics.handshake_failed();
             debug!("PQC TLS handshake from {} timed out", remote_addr);
             return;
         }
@@ -2637,7 +2710,8 @@ async fn handle_pqc_fingerprinted_connection<S>(
         Some(b"h2") => ConnectionProtocol::Http2,
         _ => ConnectionProtocol::Http1,
     };
-    metrics.connections.connection_opened(protocol);
+    // Counted open until this function returns, however it returns
+    let _open = metrics.connections.connection_opened(protocol);
     let is_http1 = protocol == ConnectionProtocol::Http1;
 
     trace!(
@@ -2675,6 +2749,11 @@ async fn handle_pqc_fingerprinted_connection<S>(
     metrics
         .tls
         .handshake_completed(true, conn_info.handshake.is_post_quantum());
+    crate::pqc_policy::handshake_completed(
+        conn_info.remote_addr.ip(),
+        conn_info.handshake.kex_group.as_deref(),
+        conn_info.handshake.is_post_quantum(),
+    );
 
     // Create service that injects fingerprint headers
     let activity = crate::conn_limits::Activity::new();
@@ -2712,7 +2791,7 @@ async fn handle_pqc_fingerprinted_connection<S>(
     let auto_builder = connection_builder(idle);
 
     if let Err(e) = serve_until_shutdown(
-        auto_builder.serve_connection(io, service),
+        auto_builder.serve_connection_with_upgrades(io, service),
         shutdown,
         &activity,
         idle,
@@ -2723,8 +2802,6 @@ async fn handle_pqc_fingerprinted_connection<S>(
             debug!("PQC HTTP connection error for {}: {}", remote_addr, e);
         }
     }
-
-    metrics.connections.connection_closed();
 }
 
 /// A place for one more client connection from `peer` under the connection
@@ -2754,18 +2831,40 @@ fn admit_connection(
 /// stops answering PING is dropped.
 fn connection_builder(idle: std::time::Duration) -> AutoBuilder<TokioExecutor> {
     let mut builder = AutoBuilder::new(TokioExecutor::new());
+    connection_times(&mut builder, idle);
+    builder
+}
+
+/// What every connection's HTTP is held to: a request head within `idle`
+/// (between requests on a kept-alive HTTP/1.1 connection as well), and an
+/// HTTP/2 peer that stops answering PINGs closed.
+fn connection_times(builder: &mut AutoBuilder<TokioExecutor>, idle: std::time::Duration) {
     builder
         .http1()
         .timer(TokioTimer::new())
         .header_read_timeout(idle);
     builder
         .http2()
+        // RFC 8441: WebSockets over HTTP/2 (extended CONNECT)
+        .enable_connect_protocol()
         .timer(TokioTimer::new())
         .keep_alive_interval(Some(H2_PING_INTERVAL))
         .keep_alive_timeout(H2_PING_TIMEOUT)
         .initial_stream_window_size(16 * 1024 * 1024u32)
         .initial_connection_window_size(64 * 1024 * 1024u32);
-    builder
+}
+
+/// An `axum_server` handle that, when the process begins to shut down,
+/// closes each connection once what it is doing is done, within the close
+/// grace, as the other listeners' connections are.
+fn shutdown_handle(mut shutdown: watch::Receiver<()>) -> axum_server::Handle<SocketAddr> {
+    let handle = axum_server::Handle::new();
+    let closing = handle.clone();
+    tokio::spawn(async move {
+        let _ = shutdown.changed().await;
+        closing.graceful_shutdown(Some(CLOSE_GRACE));
+    });
+    handle
 }
 
 /// The two times a client connection is held to.
@@ -2817,7 +2916,7 @@ fn in_flight_until_sent(response: Response, flight: crate::conn_limits::InFlight
 /// timeout, plus startup. `graceful_shutdown` sends HTTP/2 GOAWAY and closes
 /// HTTP/1.1 after the response in progress; requests already running finish.
 async fn serve_until_shutdown<I, S, E, B>(
-    conn: hyper_util::server::conn::auto::Connection<'_, I, S, E>,
+    conn: hyper_util::server::conn::auto::UpgradeableConnection<'_, I, S, E>,
     mut shutdown: watch::Receiver<()>,
     activity: &crate::conn_limits::Activity,
     idle: std::time::Duration,
@@ -2861,6 +2960,70 @@ where
             }
         }
     }
+}
+
+/// The fields a request carries to its backend: the client's forwardable ones
+/// ([`copy_forwardable_headers`]), the backend's `Host`, the forwarding fields
+/// the proxy sets from the connection, the route's own and the request ID.
+/// One definition for ordinary requests and WebSocket tunnels.
+pub(crate) fn backend_request_headers(
+    headers: &HeaderMap,
+    host: &str,
+    client_ip: std::net::IpAddr,
+    port: u16,
+    route: &crate::config::RouteConfig,
+    request_id: Option<&(header::HeaderName, HeaderValue)>,
+) -> HeaderMap {
+    let mut h = HeaderMap::with_capacity(headers.len() + 8);
+    copy_forwardable_headers(headers, &mut h);
+
+    // Set correct host header for backend
+    if let Ok(v) = HeaderValue::from_str(host) {
+        h.insert(header::HOST, v);
+    }
+
+    // Add X-Forwarded headers
+    if let Ok(v) = HeaderValue::from_str(&client_ip.to_string()) {
+        h.insert("x-real-ip", v.clone());
+        h.insert("x-forwarded-for", v);
+    }
+    h.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+    h.insert("x-forwarded-port", HeaderValue::from(port));
+
+    // Add route-specific headers
+    for (key, value) in &route.add_headers {
+        if let (Ok(name), Ok(val)) = (
+            header::HeaderName::from_bytes(key.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            h.insert(name, val);
+        }
+    }
+    if let Some((name, id)) = request_id {
+        h.insert(name.clone(), id.clone());
+    }
+
+    // Forward client identity if configured
+    if route.forward_client_identity {
+        if let Some(ref header_name) = route.client_identity_header {
+            if let (Ok(name), Ok(val)) = (
+                header::HeaderName::from_bytes(header_name.as_bytes()),
+                HeaderValue::from_str(&client_ip.to_string()),
+            ) {
+                h.insert(name, val);
+            }
+        }
+    }
+
+    // Mobile detection header
+    if let Some(user_agent) = headers.get(header::USER_AGENT) {
+        if let Ok(ua_str) = user_agent.to_str() {
+            if is_mobile_user_agent(ua_str) {
+                h.insert("x-mobile-request", HeaderValue::from_static("mobile"));
+            }
+        }
+    }
+    h
 }
 
 /// Copy a client request's headers onto a backend request.
@@ -2949,11 +3112,20 @@ async fn proxy_handler(
     // below used to write a literal "HTTP/1.1", so h2 traffic was recorded as
     // h1 and the log could not tell the two apart.
     let protocol_str = crate::access_logger::protocol_name(req.version());
-    let is_ws_upgrade = headers
-        .get("upgrade")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case("websocket"))
-        .unwrap_or(false);
+    // A WebSocket opening: an HTTP/1.1 GET with `Upgrade: websocket` (RFC
+    // 6455), or an HTTP/2 extended CONNECT with `:protocol` websocket (RFC
+    // 8441, offered with SETTINGS_ENABLE_CONNECT_PROTOCOL)
+    let ws_extended_connect = req.method() == Method::CONNECT
+        && req
+            .extensions()
+            .get::<hyper::ext::Protocol>()
+            .is_some_and(|p| p.as_str().eq_ignore_ascii_case("websocket"));
+    let is_ws_upgrade = ws_extended_connect
+        || (req.method() == Method::GET
+            && headers
+                .get("upgrade")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.eq_ignore_ascii_case("websocket")));
     let request_start = std::time::Instant::now();
     // In progress until this handler returns or is dropped
     let _in_progress = state.metrics.requests.request_start();
@@ -3086,6 +3258,44 @@ async fn proxy_handler(
             let bytes_to_send: u64 =
                 bytes_requested.clamp(65_536, crate::speedtest::MAX_DOWNLOAD_BYTES as u64);
 
+            // A place under the client network's stream limit and the bytes
+            // reserved from its hourly allowance (crate::speedtest_budget),
+            // both held by the response body: charged as it is sent, the rest
+            // given back if the client stops reading.
+            let client = crate::security::canonical_addr(client_addr).ip();
+            let refused = |body: serde_json::Value, retry_after: Option<u64>| {
+                let mut resp = (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response();
+                if let Some(secs) = retry_after {
+                    resp.headers_mut()
+                        .insert(header::RETRY_AFTER, HeaderValue::from(secs.max(1)));
+                }
+                speedtest_cross_origin_headers(resp.headers_mut(), &cors_origin);
+                resp
+            };
+            let Some(slot) = crate::speedtest_budget::enter_stream(client) else {
+                return refused(
+                    serde_json::json!({
+                        "error": "too_many_streams",
+                        "max": crate::speedtest_budget::STREAMS_PER_NETWORK
+                    }),
+                    None,
+                );
+            };
+            let allowance = match crate::speedtest_budget::reserve(
+                client,
+                crate::speedtest_budget::Direction::Download,
+                bytes_to_send,
+            ) {
+                Ok(reservation) => reservation,
+                Err(r) => {
+                    let secs = r.retry_after.as_secs().max(1);
+                    return refused(
+                        serde_json::json!({"error": "budget_exhausted", "retry_after_secs": secs}),
+                        Some(secs),
+                    );
+                }
+            };
+
             // Pre-compute a 256 KiB pseudo-random chunk via LCG
             const CHUNK: usize = 256 * 1024;
             let mut lcg: u64 = 0xdead_beef_cafe_babe;
@@ -3100,15 +3310,19 @@ async fn proxy_handler(
             let chunk_bytes = bytes::Bytes::from(chunk_data);
 
             let data_stream = futures_util::stream::unfold(
-                (bytes_to_send, chunk_bytes),
-                move |(mut rem, chunk)| async move {
+                (bytes_to_send, chunk_bytes, allowance, slot),
+                move |(mut rem, chunk, mut allowance, slot)| async move {
                     if rem == 0 {
                         return None;
                     }
                     let n = usize::try_from(rem.min(CHUNK as u64)).unwrap_or(CHUNK);
                     let data = chunk.slice(..n);
                     rem -= n as u64;
-                    Some((Ok::<bytes::Bytes, std::io::Error>(data), (rem, chunk)))
+                    allowance.use_bytes(n as u64);
+                    Some((
+                        Ok::<bytes::Bytes, std::io::Error>(data),
+                        (rem, chunk, allowance, slot),
+                    ))
                 },
             );
 
@@ -3257,110 +3471,122 @@ async fn proxy_handler(
             .cache
             .plan(&method, &headers, &host, &path, uri.query())
             .filter(|_| !is_ws_upgrade);
-        if let Some(plan) = cache_plan.as_ref().filter(|plan| plan.lookup) {
-            let conditional =
-                |name: header::HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
-            let stored = match state.cache.get_for(
-                &plan.key,
-                plan.credentialed,
-                conditional(header::IF_NONE_MATCH),
-                conditional(header::IF_MODIFIED_SINCE),
-            ) {
-                crate::cache::CacheLookup::Hit {
-                    status,
-                    headers: kept,
-                    body,
-                    age_secs,
-                } => Some(crate::cache::hit_response(
-                    method == Method::HEAD,
-                    status,
-                    &kept,
-                    body,
-                    age_secs,
-                )),
-                crate::cache::CacheLookup::NotModified {
-                    etag,
-                    last_modified,
-                    cache_control,
-                    age_secs,
-                } => Some(crate::cache::not_modified_response(
-                    etag,
-                    last_modified,
-                    cache_control,
-                    age_secs,
-                )),
-                crate::cache::CacheLookup::Miss => None,
+        // The fetch this request leads, when it is the first to miss: held
+        // until its response is stored, so identical requests wait for it
+        // rather than each going to the backend (ResponseCache::lookup).
+        let _leading: Option<crate::cache::Leading> =
+            if let Some(plan) = cache_plan.as_ref().filter(|plan| plan.lookup) {
+                let conditional =
+                    |name: header::HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
+                let (found, leading) = state
+                    .cache
+                    .lookup(
+                        plan,
+                        &method,
+                        &path,
+                        conditional(header::IF_NONE_MATCH),
+                        conditional(header::IF_MODIFIED_SINCE),
+                    )
+                    .await;
+                let stored = match found {
+                    crate::cache::CacheLookup::Hit {
+                        status,
+                        headers: kept,
+                        body,
+                        age_secs,
+                    } => Some(crate::cache::hit_response(
+                        method == Method::HEAD,
+                        status,
+                        &kept,
+                        body,
+                        age_secs,
+                    )),
+                    crate::cache::CacheLookup::NotModified {
+                        etag,
+                        last_modified,
+                        cache_control,
+                        age_secs,
+                    } => Some(crate::cache::not_modified_response(
+                        etag,
+                        last_modified,
+                        cache_control,
+                        age_secs,
+                    )),
+                    crate::cache::CacheLookup::Miss => None,
+                };
+                if let Some(mut resp) = stored {
+                    // The entry may have been stored by another transport, as the
+                    // backend sent it: what the route does to a response's
+                    // headers is done to this one too.
+                    {
+                        let h = resp.headers_mut();
+                        for key in &route.remove_headers {
+                            if let Ok(name) = header::HeaderName::from_bytes(key.as_bytes()) {
+                                h.remove(&name);
+                            }
+                        }
+                        for (key, value) in &route.headers_override {
+                            if let (Ok(name), Ok(val)) = (
+                                header::HeaderName::from_bytes(key.as_bytes()),
+                                HeaderValue::from_str(value),
+                            ) {
+                                h.insert(name, val);
+                            }
+                        }
+                        if route.stripe_compatibility {
+                            h.remove("cross-origin-embedder-policy");
+                            h.remove("cross-origin-opener-policy");
+                        }
+                        if let Some(server) = &state.server_header_value {
+                            h.insert(header::SERVER, server.clone());
+                        }
+                    }
+                    if let Some((name, id)) = &request_id {
+                        resp.headers_mut().insert(name.clone(), id.clone());
+                    }
+                    // The security layer leaves what the route decided alone, on
+                    // a stored response as on a new one.
+                    let owned = layers::RouteOwnedHeaders::of(route);
+                    if !owned.is_empty() {
+                        resp.extensions_mut().insert(owned);
+                    }
+                    let status = resp.status().as_u16();
+                    state.metrics.requests.request_end_full(
+                        status,
+                        request_start.elapsed(),
+                        0,
+                        0,
+                        Some(&path),
+                    );
+                    log_access(&AccessLogEntry {
+                        ja3: headers.get("x-ja3-hash").and_then(|v| v.to_str().ok()),
+                        ja4: headers.get("x-ja4-hash").and_then(|v| v.to_str().ok()),
+                        backend: Some("cache"),
+                        remote_addr: client_addr,
+                        method: &method_str,
+                        path: &path,
+                        protocol: protocol_str,
+                        status,
+                        body_size: if method == Method::HEAD {
+                            0
+                        } else {
+                            crate::access_logger::declared_body_size(resp.headers())
+                        },
+                        referer: referer.as_deref(),
+                        user_agent: user_agent.as_deref(),
+                        host: Some(&host_str),
+                        response_time_ms: request_start
+                            .elapsed()
+                            .as_millis()
+                            .try_into()
+                            .unwrap_or(u64::MAX),
+                    });
+                    return resp;
+                }
+                leading
+            } else {
+                None
             };
-            if let Some(mut resp) = stored {
-                // The entry may have been stored by another transport, as the
-                // backend sent it: what the route does to a response's
-                // headers is done to this one too.
-                {
-                    let h = resp.headers_mut();
-                    for key in &route.remove_headers {
-                        if let Ok(name) = header::HeaderName::from_bytes(key.as_bytes()) {
-                            h.remove(&name);
-                        }
-                    }
-                    for (key, value) in &route.headers_override {
-                        if let (Ok(name), Ok(val)) = (
-                            header::HeaderName::from_bytes(key.as_bytes()),
-                            HeaderValue::from_str(value),
-                        ) {
-                            h.insert(name, val);
-                        }
-                    }
-                    if route.stripe_compatibility {
-                        h.remove("cross-origin-embedder-policy");
-                        h.remove("cross-origin-opener-policy");
-                    }
-                    if let Some(server) = &state.server_header_value {
-                        h.insert(header::SERVER, server.clone());
-                    }
-                }
-                if let Some((name, id)) = &request_id {
-                    resp.headers_mut().insert(name.clone(), id.clone());
-                }
-                // The security layer leaves what the route decided alone, on
-                // a stored response as on a new one.
-                let owned = layers::RouteOwnedHeaders::of(route);
-                if !owned.is_empty() {
-                    resp.extensions_mut().insert(owned);
-                }
-                let status = resp.status().as_u16();
-                state.metrics.requests.request_end_full(
-                    status,
-                    request_start.elapsed(),
-                    0,
-                    0,
-                    Some(&path),
-                );
-                log_access(&AccessLogEntry {
-                    ja3: headers.get("x-ja3-hash").and_then(|v| v.to_str().ok()),
-                    ja4: headers.get("x-ja4-hash").and_then(|v| v.to_str().ok()),
-                    backend: Some("cache"),
-                    remote_addr: client_addr,
-                    method: &method_str,
-                    path: &path,
-                    protocol: protocol_str,
-                    status,
-                    body_size: if method == Method::HEAD {
-                        0
-                    } else {
-                        crate::access_logger::declared_body_size(resp.headers())
-                    },
-                    referer: referer.as_deref(),
-                    user_agent: user_agent.as_deref(),
-                    host: Some(&host_str),
-                    response_time_ms: request_start
-                        .elapsed()
-                        .as_millis()
-                        .try_into()
-                        .unwrap_or(u64::MAX),
-                });
-                return resp;
-            }
-        }
 
         // Track request timing for load balancer
         let request_start = std::time::Instant::now();
@@ -3415,7 +3641,7 @@ async fn proxy_handler(
                 };
 
                 // Select backend from pool
-                match pool.select(&ctx) {
+                match pool.select_queued(&ctx).await {
                     Some(result) => {
                         let timeout = result.server.timeout;
                         canary_cookie_to_set = result.set_canary_cookie;
@@ -3487,48 +3713,52 @@ async fn proxy_handler(
         } else {
             backend_cfg.tls_mode.clone()
         };
-        // Origin form: the connection is already to the backend.
-        let use_https = match tls_mode {
-            TlsMode::Terminate => false,
-            TlsMode::Reencrypt => true,
-            TlsMode::Passthrough => {
-                // Passthrough mode shouldn't reach here - it's handled at TCP level
-                error!("Passthrough mode backend reached HTTP handler - this is a config error");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Invalid backend configuration",
-                )
-                    .into_response();
-            }
-        };
+        // A passthrough backend is reached by SNI before TLS is terminated
+        // (passthrough.rs); one named by an HTTP route is a configuration error
+        if tls_mode == TlsMode::Passthrough {
+            error!("Passthrough mode backend reached HTTP handler - this is a config error");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid backend configuration",
+            )
+                .into_response();
+        }
 
         debug!(
             "Proxying to backend: {}{}{} (TLS mode: {:?})",
             backend_address, path, query, tls_mode
         );
 
-        // WebSocket upgrade passthrough — extract the OnUpgrade future from the request
-        // extensions (inserted by hyper when it parses a Connection: Upgrade request) and
-        // hand the raw TCP stream to the tunnel handler.  All paths inside this block return.
+        // A WebSocket tunnel: the backend opened (its TLS settings, the
+        // request's fields), then the client told yes and the two relayed.
+        // Every path in this block returns.
         if ws_passthrough {
-            let on_upgrade = req.extensions_mut().remove::<OnUpgrade>();
-            let Some(on_upgrade) = on_upgrade else {
+            let Some(on_upgrade) = req.extensions_mut().remove::<OnUpgrade>() else {
                 error!(
-                    "WebSocket upgrade request on route {:?} has no OnUpgrade extension \
-                     (hyper did not inject it — is the connection HTTP/1.1?)",
+                    "WebSocket request on route {:?} carries no upgrade",
                     route.name
                 );
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             };
-            return handle_websocket_tunnel(
-                backend_address,
-                use_https,
+            let forwarded = backend_request_headers(
                 &headers,
+                &host,
+                client_addr.ip(),
+                state.port,
+                &route,
+                request_id.as_ref(),
+            );
+            return handle_websocket_tunnel(
+                &backend_cfg,
+                forwarded,
+                (!ws_extended_connect)
+                    .then(|| headers.get(header::SEC_WEBSOCKET_KEY).cloned())
+                    .flatten(),
                 on_upgrade,
-                &path,
-                &query,
+                &format!("{path}{query}"),
                 &host,
                 route.ws_idle_timeout_secs,
+                ws_extended_connect,
             )
             .await;
         }
@@ -3538,58 +3768,16 @@ async fn proxy_handler(
             .method(method.clone())
             .uri(format!("{path}{query}"));
 
-        // Copy headers with modifications
+        // The request's fields as the backend gets them
         if let Some(h) = proxy_req.headers_mut() {
-            copy_forwardable_headers(&headers, h);
-
-            // Set correct host header for backend
-            if let Ok(v) = HeaderValue::from_str(&host) {
-                h.insert(header::HOST, v);
-            }
-
-            // Add X-Forwarded headers
-            if let Ok(v) = HeaderValue::from_str(&client_addr.ip().to_string()) {
-                h.insert("x-real-ip", v.clone());
-                h.insert("x-forwarded-for", v);
-            }
-            h.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-            if let Ok(v) = HeaderValue::from_str(&state.port.to_string()) {
-                h.insert("x-forwarded-port", v);
-            }
-
-            // Add route-specific headers
-            for (key, value) in &route.add_headers {
-                if let (Ok(name), Ok(val)) = (
-                    header::HeaderName::from_bytes(key.as_bytes()),
-                    HeaderValue::from_str(value),
-                ) {
-                    h.insert(name, val);
-                }
-            }
-            if let Some((name, id)) = &request_id {
-                h.insert(name.clone(), id.clone());
-            }
-
-            // Forward client identity if configured
-            if route.forward_client_identity {
-                if let Some(ref header_name) = route.client_identity_header {
-                    if let (Ok(name), Ok(val)) = (
-                        header::HeaderName::from_bytes(header_name.as_bytes()),
-                        HeaderValue::from_str(&client_addr.ip().to_string()),
-                    ) {
-                        h.insert(name, val);
-                    }
-                }
-            }
-
-            // Mobile detection header
-            if let Some(user_agent) = headers.get(header::USER_AGENT) {
-                if let Ok(ua_str) = user_agent.to_str() {
-                    if is_mobile_user_agent(ua_str) {
-                        h.insert("x-mobile-request", HeaderValue::from_static("mobile"));
-                    }
-                }
-            }
+            *h = backend_request_headers(
+                &headers,
+                &host,
+                client_addr.ip(),
+                state.port,
+                &route,
+                request_id.as_ref(),
+            );
         }
 
         // Consume the request body now — WebSocket upgrades were handled above and always
@@ -3665,11 +3853,17 @@ async fn proxy_handler(
         // Send request to backend (using appropriate client), bounded by the
         // per-backend/pool-server timeout so a hung backend can't hold the
         // connection open indefinitely.
-        let result = tokio::time::timeout(
-            backend_timeout,
-            state.backend_client.send(&backend_cfg, proxy_request),
-        )
-        .await;
+        // Sent again where the backend's retry policy and the request allow
+        // (BackendClient::send_with_retry); a timeout is the last attempt's.
+        let result = match state
+            .backend_client
+            .send_with_retry(&backend_cfg, proxy_request, backend_timeout)
+            .await
+        {
+            Ok(sent) => Ok(Ok(sent)),
+            Err(crate::backend_client::SendError::TimedOut(_)) => Err(()),
+            Err(crate::backend_client::SendError::Failed(e)) => Ok(Err(e)),
+        };
 
         match result {
             Err(_) => {
@@ -4328,12 +4522,6 @@ fn spawn_shadow_request(
 pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 'static>(
     port: u16,
     https_port: u16,
-    // When false, plain-HTTP requests are refused instead of redirected. ACME
-    // challenges are still answered either way, so certificate renewal does not
-    // depend on this being on.
-    redirect_to_https: bool,
-    // `http_redirect.redirect_status`, validated at load to 301/302/307/308.
-    redirect_status: StatusCode,
     acme_challenges: Option<
         Arc<
             parking_lot::RwLock<
@@ -4341,16 +4529,20 @@ pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 
             >,
         >,
     >,
-    // AUD-02: Allowed hostnames for the HTTPS redirect.  Requests whose Host header
-    // is not in this list receive 400 Bad Request rather than being blindly redirected,
-    // preventing open-redirect attacks where an attacker supplies Host: evil.com.
-    // An empty Vec disables the check (backward-compatible default).
-    allowed_domains: Vec<String>,
-    // Reloaded configurations. When present, `redirect_to_https`,
-    // `redirect_status`, `allowed_domains` and the path settings are read from
-    // the latest one on each request; they were fixed at startup, so a reload
-    // that added a domain left its plain-HTTP visitors refused until a restart.
-    config_updates: Option<tokio::sync::watch::Receiver<Arc<ProxyConfig>>>,
+    // The configuration as last loaded or reloaded. Each request reads from
+    // it: `http_redirect.redirect_to_https` (false: plain HTTP is refused, not
+    // redirected; ACME challenges are answered either way),
+    // `http_redirect.redirect_status` (301/302/307/308),
+    // `http_redirect.allowed_domains` (AUD-02: a Host not listed gets 400
+    // rather than a redirect an attacker named; empty disables the check) and
+    // the path settings. Fixed at startup, a reload that added a domain left
+    // its plain-HTTP visitors refused until a restart.
+    config: tokio::sync::watch::Receiver<Arc<ProxyConfig>>,
+    // `server.max_idle_timeout_secs`: how long a connection may have nothing
+    // in flight, and how long its request head may take to arrive.
+    idle: std::time::Duration,
+    // Fires when the process begins to shut down.
+    shutdown: watch::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let https_port_clone = https_port;
 
@@ -4358,27 +4550,18 @@ pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 
     let lower = |domains: &[String]| -> Vec<String> {
         domains.iter().map(|d| d.to_ascii_lowercase()).collect()
     };
-    let startup_domains = lower(&allowed_domains);
 
     let app = Router::new().fallback(move |RequestHost(host): RequestHost, uri: Uri| {
         let challenges = acme_challenges.clone();
-        let (permitted, redirect_to_https, redirect_status, canon) = match config_updates {
-            Some(ref updates) => {
-                let config = updates.borrow();
-                (
-                    lower(&config.http_redirect.allowed_domains),
-                    config.http_redirect.redirect_to_https,
-                    StatusCode::from_u16(config.http_redirect.redirect_status)
-                        .unwrap_or(StatusCode::PERMANENT_REDIRECT),
-                    Some(crate::path_canon::PathCanon::from(&config.server)),
-                )
-            }
-            None => (
-                startup_domains.clone(),
-                redirect_to_https,
-                redirect_status,
-                None,
-            ),
+        let (permitted, redirect_to_https, redirect_status, canon) = {
+            let config = config.borrow();
+            (
+                lower(&config.http_redirect.allowed_domains),
+                config.http_redirect.redirect_to_https,
+                StatusCode::from_u16(config.http_redirect.redirect_status)
+                    .unwrap_or(StatusCode::PERMANENT_REDIRECT),
+                crate::path_canon::PathCanon::from(&config.server),
+            )
         };
         async move {
             let path = uri.path();
@@ -4425,10 +4608,7 @@ pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 
             // so. Lowercasing it unconditionally sent case-sensitive paths
             // (ERPNext's, on a node running normalize_paths = false) to a
             // different resource.
-            let path = match canon {
-                Some(canon) => crate::path_canon::canonical_path(path, canon).into_owned(),
-                None => path.to_ascii_lowercase(),
-            };
+            let path = crate::path_canon::canonical_path(path, canon).into_owned();
             let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
 
             // Build HTTPS URL
@@ -4471,17 +4651,79 @@ pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 
     );
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    // Unconditionally, unlike the proxy listeners' `server.tcp_nodelay`: this
-    // server answers redirects and ACME challenges, so there is never a stream
-    // for Nagle to coalesce and its only possible effect is a delayed-ACK wait.
-    let listener = listener.tap_io(|tcp| {
-        if let Err(e) = tcp.set_nodelay(true) {
-            debug!("TCP_NODELAY not set on a redirect connection: {}", e);
-        }
-    });
-    axum::serve(listener, app.into_make_service()).await?;
-
+    serve_plain(listener, app, idle, shutdown).await;
     Ok(())
+}
+
+/// Serve `app` over plain HTTP on `listener`, each connection held to what
+/// every TLS listener's is: a place in `server.max_connections` and
+/// `security.max_connections_per_ip`, keep-alive probes, the request head
+/// within `idle`, closed after `idle` with nothing in flight, and at shutdown
+/// closed once what it is doing is done (within the close grace).
+///
+/// TCP_NODELAY unconditionally, unlike the proxy listeners'
+/// `server.tcp_nodelay`: this serves redirects and ACME challenges, so there
+/// is never a stream for Nagle to coalesce and its only possible effect is a
+/// delayed-ACK wait.
+async fn serve_plain(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    idle: std::time::Duration,
+    mut shutdown: watch::Receiver<()>,
+) {
+    loop {
+        let (stream, peer) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    crate::conn_limits::after_accept_error(&e).await;
+                    continue;
+                }
+            },
+            _ = shutdown.changed() => return,
+        };
+        let Some(slot) = crate::conn_limits::admit(peer.ip(), peer.ip().is_loopback()) else {
+            debug!("Connection from {} refused: connection limit reached", peer);
+            continue;
+        };
+        crate::conn_limits::tune_client_socket(&stream, true, idle);
+        let app = app.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            let activity = crate::conn_limits::Activity::new();
+            let exchanges = Arc::clone(&activity);
+            let service =
+                hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
+                    let router = app.clone();
+                    let flight = exchanges.begin();
+                    async move {
+                        req.extensions_mut().insert(ConnectInfo(peer));
+                        let (parts, body) = req.into_parts();
+                        let response = router
+                            .oneshot(Request::from_parts(parts, Body::new(body)))
+                            .await;
+                        match response {
+                            Ok(res) => {
+                                Ok::<_, std::convert::Infallible>(in_flight_until_sent(res, flight))
+                            }
+                            Err(infallible) => match infallible {},
+                        }
+                    }
+                });
+            let builder = connection_builder(idle);
+            if let Err(e) = serve_until_shutdown(
+                builder.serve_connection_with_upgrades(TokioIo::new(stream), service),
+                shutdown,
+                &activity,
+                idle,
+            )
+            .await
+            {
+                debug!("Plain HTTP connection from {} ended: {}", peer, e);
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -4862,7 +5104,7 @@ mod connection_lifetime_tests {
         });
         let builder = connection_builder(idle);
         let _ = serve_until_shutdown(
-            builder.serve_connection(TokioIo::new(server), service),
+            builder.serve_connection_with_upgrades(TokioIo::new(server), service),
             shutdown,
             &activity,
             idle,
@@ -4886,6 +5128,45 @@ mod connection_lifetime_tests {
             "held for {took:?}"
         );
         drop(client);
+    }
+
+    /// The plain-HTTP server answers a request, closes a connection that then
+    /// says nothing for the idle time, and stops accepting at shutdown.
+    #[tokio::test]
+    async fn the_plain_http_server_answers_then_closes_an_idle_connection() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().fallback(|| async { "plain" });
+        let idle = Duration::from_millis(400);
+        let (stop, shutdown) = watch::channel(());
+        let server = tokio::spawn(serve_plain(listener, app, idle, shutdown));
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let mut answer = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut answer))
+            .await
+            .expect("the idle connection was closed")
+            .unwrap();
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(answer.ends_with("plain"), "{answer}");
+        assert!(
+            started.elapsed() < idle + CLOSE_GRACE + Duration::from_secs(2),
+            "held for {:?}",
+            started.elapsed()
+        );
+
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the accept loop stops at shutdown")
+            .unwrap();
     }
 
     /// At shutdown an HTTP/2 peer that stops answering holds the connection
