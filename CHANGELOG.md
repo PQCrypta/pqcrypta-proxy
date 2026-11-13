@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.11.1...v0.12.0) (2026-11-13)
+
+
+### Features
+
+* QUIC offers the TCP listener's groups and suites ([5516fbc](https://github.com/PQCrypta/pqcrypta-proxy/commit/5516fbc8d2ecbcc96a07ce29e2ea1d3694446ff6))
+
 ## [0.11.1](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.11.0...v0.11.1) (2026-11-13)
 
 
