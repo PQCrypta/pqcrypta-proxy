@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.12.1](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.12.0...v0.12.1) (2026-11-13)
+
+
+### Bug Fixes
+
+* require_hybrid shapes the QUIC listener's experimental groups as it does TCP's ([331af4d](https://github.com/PQCrypta/pqcrypta-proxy/commit/331af4d17346ad186789f614f0f73c1ba07717f9))
+* the delegated-credential script runs the OpenSSL the proxy links ([d8cf2b1](https://github.com/PQCrypta/pqcrypta-proxy/commit/d8cf2b1b9589b89a0e65b1f39882de99b2669b14))
+
 ## [0.12.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.11.1...v0.12.0) (2026-11-13)
 
 
