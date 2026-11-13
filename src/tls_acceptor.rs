@@ -87,8 +87,13 @@ impl Generations {
     }
 
     fn check(&self, digest: [u8; 32]) -> Seen {
+        self.check_at(digest, Instant::now())
+    }
+
+    /// As [`check`](Self::check), at `now`.
+    fn check_at(&self, digest: [u8; 32], now: Instant) -> Seen {
         let mut g = self.inner.lock();
-        let age = g.started.elapsed();
+        let age = now.saturating_duration_since(g.started);
         if age >= self.window {
             if age >= self.window * 2 {
                 g.previous.clear();
@@ -96,7 +101,7 @@ impl Generations {
             } else {
                 g.previous = std::mem::take(&mut g.current);
             }
-            g.started = Instant::now();
+            g.started = now;
         }
         if g.current.contains(&digest) || g.previous.contains(&digest) {
             return Seen::Again;
@@ -1397,13 +1402,21 @@ mod tests {
     /// A store remembers a digest for at least a window, across a rotation.
     #[test]
     fn a_digest_is_remembered_across_a_rotation() {
-        let g = Generations::new(std::time::Duration::from_millis(40), 8);
-        assert_eq!(g.check([1; 32]), Seen::New);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert_eq!(g.check([1; 32]), Seen::Again, "in the previous generation");
-        assert_eq!(g.check([2; 32]), Seen::New);
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        assert_eq!(g.check([1; 32]), Seen::New, "two windows on, forgotten");
+        let window = std::time::Duration::from_secs(60);
+        let g = Generations::new(window, 8);
+        let start = Instant::now();
+        let at = |secs: u64| start + std::time::Duration::from_secs(secs);
+        assert_eq!(g.check_at([1; 32], at(0)), Seen::New);
+        assert_eq!(g.check_at([1; 32], at(59)), Seen::Again, "in the window");
+        // A window on: the current generation becomes the previous one
+        assert_eq!(
+            g.check_at([1; 32], at(70)),
+            Seen::Again,
+            "in the previous generation"
+        );
+        assert_eq!(g.check_at([2; 32], at(70)), Seen::New);
+        // Two windows after the last rotation, both generations are gone
+        assert_eq!(g.check_at([1; 32], at(70 + 120)), Seen::New, "forgotten");
     }
 
     /// A full store records nothing more and says it cannot tell.

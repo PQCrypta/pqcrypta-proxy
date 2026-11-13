@@ -268,7 +268,7 @@ fn client_endpoint(throwaway: &Throwaway) -> (quinn::Endpoint, Arc<CountingStore
     client_crypto.resumption = rustls::client::Resumption::store(store.clone());
 
     let client_config = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
+        crate::tls::quic_client_config(client_crypto)
             .expect("building the QUIC client configuration"),
     ));
     let client = quinn::Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -320,10 +320,7 @@ fn permissive_server_config(
     // only permits 0-RTT with stateful resumption (RFC 8446 §8.1), and a
     // ticketer switches resumption to the stateless kind that cannot carry it.
     config.max_early_data_size = u32::MAX;
-    Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(config)
-            .expect("building the QUIC config"),
-    )
+    Arc::new(crate::tls::quic_server_config(config).expect("building the QUIC config"))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -164,6 +164,8 @@ pub mod pqc_extended;
 pub mod pqc_policy;
 pub mod pqc_tickets;
 pub mod pqc_tls;
+#[cfg(feature = "pqc")]
+pub mod provider_kx;
 pub mod proxy;
 pub mod quic_listener;
 pub mod rate_limiter; // Must be before config (config imports from it)

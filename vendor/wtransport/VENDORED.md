@@ -24,6 +24,12 @@ manifest (no upstream workspace).
 The race upstream fixed in `close_reason()` (b024c08) the fork had also
 patched; upstream's version is the one kept.
 
+- `ServerConfigBuilder::build` and `ClientConfigBuilder::build` take a TLS
+  configuration whose own suites leave TLS_AES_128_GCM_SHA256 out (the proxy
+  negotiates AES-256-GCM and ChaCha20 alone): its QUIC Initial packets take
+  AES-128-GCM on their own (`with_initial`, RFC 9001 section 5.2), where
+  upstream's `try_from` panicked.
+
 ## Updating it
 
 Taken at 0.6.1 (2026-01-22), carried to 0.7.0, and moved onto b16674e on

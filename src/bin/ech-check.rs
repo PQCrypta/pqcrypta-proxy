@@ -264,9 +264,7 @@ async fn quic(
     list: &[u8],
     within: Duration,
 ) -> Outcome {
-    let Ok(Ok(crypto)) =
-        client(list, &[b"h3"]).map(quinn::crypto::rustls::QuicClientConfig::try_from)
-    else {
+    let Ok(Ok(crypto)) = client(list, &[b"h3"]).map(pqcrypta_proxy::tls::quic_client_config) else {
         return Outcome::Failed;
     };
     let bind = if addr.is_ipv4() {

@@ -149,7 +149,7 @@ async fn get(url: &str) -> anyhow::Result<u16> {
     }
 
     let client_config = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
+        pqcrypta_proxy::tls::quic_client_config(crypto)
             .map_err(|e| anyhow!("building the QUIC client config: {e}"))?,
     ));
 

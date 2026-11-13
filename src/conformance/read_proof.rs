@@ -38,10 +38,7 @@ fn server_crypto(throwaway: &Throwaway) -> Arc<quinn::crypto::rustls::QuicServer
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(OneCert(throwaway.key.clone())));
     config.alpn_protocols = vec![b"h3".to_vec()];
-    Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(config)
-            .expect("building the QUIC config"),
-    )
+    Arc::new(crate::tls::quic_server_config(config).expect("building the QUIC config"))
 }
 
 fn client_endpoint(throwaway: &Throwaway) -> quinn::Endpoint {
@@ -55,8 +52,7 @@ fn client_endpoint(throwaway: &Throwaway) -> quinn::Endpoint {
     crypto.alpn_protocols = vec![b"h3".to_vec()];
 
     let mut config = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
-            .expect("building the QUIC client config"),
+        crate::tls::quic_client_config(crypto).expect("building the QUIC client config"),
     ));
     let mut transport = quinn::TransportConfig::default();
     // The window the probe has to overrun. Pinned rather than left to the

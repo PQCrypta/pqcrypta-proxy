@@ -1171,10 +1171,9 @@ pub fn zero_rtt_accept_server_config(
     // Advertised in the ticket, and honoured rather than declined.
     config.max_early_data_size = u32::MAX;
 
-    Ok(Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(config)
-            .map_err(|e| anyhow::anyhow!("failed to build the 0-RTT QUIC config: {e}"))?,
-    ))
+    Ok(Arc::new(quic_server_config(config).map_err(|e| {
+        anyhow::anyhow!("failed to build the 0-RTT QUIC config: {e}")
+    })?))
 }
 
 pub fn zero_rtt_reject_server_config(
@@ -1193,10 +1192,9 @@ pub fn zero_rtt_reject_server_config(
     // ...and declined every time, which is what the test is about.
     config.refuse_early_data = true;
 
-    Ok(Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(config)
-            .map_err(|e| anyhow::anyhow!("failed to build the 0-RTT QUIC config: {e}"))?,
-    ))
+    Ok(Arc::new(quic_server_config(config).map_err(|e| {
+        anyhow::anyhow!("failed to build the 0-RTT QUIC config: {e}")
+    })?))
 }
 
 /// A provider offering exactly one key-exchange group.
@@ -1233,7 +1231,7 @@ pub fn build_single_group_provider(
     // The cipher-suite preference IS inherited, deliberately, so the only thing
     // that differs between a test port and production is the group.
     let mut provider = rustls_post_quantum::provider();
-    prefer_256_bit_aeads(&mut provider);
+    negotiable_aeads(&mut provider);
     provider.kx_groups.retain(|g| g.name() == group);
     if provider.kx_groups.is_empty() {
         // Every caller names a group the post-quantum provider is expected to
@@ -1273,11 +1271,9 @@ pub fn single_group_server_config(
     // branch, so nothing here changes what a serving listener emits.
     config.key_share_impairment = impairment;
 
-    Ok(Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(config).map_err(|e| {
-            anyhow::anyhow!("failed to build the single-group QUIC config for {group:?}: {e}")
-        })?,
-    ))
+    Ok(Arc::new(quic_server_config(config).map_err(|e| {
+        anyhow::anyhow!("failed to build the single-group QUIC config for {group:?}: {e}")
+    })?))
 }
 
 /// The newest modification time of a directory and the files in it.
@@ -1525,7 +1521,10 @@ mod server_policy_tests {
     use rustls::pki_types::ServerName;
     use rustls::{ClientConfig, ClientConnection, NamedGroup, ProtocolVersion, RootCertStore};
 
-    use super::{is_post_quantum_group, server_provider, ServerTlsPolicy};
+    use super::{
+        build_pqc_provider, group_tuples, is_experimental_group, is_post_quantum_group,
+        quic_server_config, server_provider, RustlsServerConfig, ServerTlsPolicy,
+    };
     use crate::config::{ClientAuth, PqcConfig, TlsConfig};
     use crate::startup_verify::{pump_handshake, self_signed_pair, VERIFY_SNI};
 
@@ -1759,6 +1758,86 @@ mod server_policy_tests {
         assert_eq!(on_classical, off);
         // X25519 is offered (RFC 8446 section 9.1, SHOULD), the last classical group
         assert_eq!(off.last(), Some(&NamedGroup::X25519));
+    }
+
+    /// The handshake agrees AES-256-GCM or ChaCha20 on every rustls
+    /// listener, and a QUIC configuration still builds: its Initial packets
+    /// take AES-128-GCM on their own.
+    #[test]
+    fn no_aes_128_is_negotiated_and_quic_still_builds() {
+        let provider = build_pqc_provider();
+        // TLS 1.3's: AES-256-GCM first, then ChaCha20 where the build has it
+        // (not under FIPS)
+        let tls13: Vec<_> = provider
+            .cipher_suites
+            .iter()
+            .filter(|cs| cs.tls13().is_some())
+            .map(|cs| cs.suite())
+            .collect();
+        assert_eq!(
+            tls13.first(),
+            Some(&rustls::CipherSuite::TLS13_AES_256_GCM_SHA384)
+        );
+        assert!(
+            tls13.iter().all(|s| matches!(
+                s,
+                rustls::CipherSuite::TLS13_AES_256_GCM_SHA384
+                    | rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
+            )),
+            "{tls13:?}"
+        );
+        let mut config = RustlsServerConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(TLS13)
+            .expect("TLS 1.3")
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
+        config.alpn_protocols = vec![b"h3".to_vec()];
+        assert!(quic_server_config(config).is_ok());
+    }
+
+    /// The experimental groups the linked OpenSSL's providers carry are
+    /// offered, in a tuple of their own after ML-KEM and before the classical
+    /// groups, as the OpenSSL listener offers them; a name no provider carries
+    /// is left out.
+    #[cfg(feature = "pqc")]
+    #[test]
+    fn experimental_groups_take_their_own_tuple() {
+        let carried: Vec<String> = crate::provider_kx::provider_groups()
+            .iter()
+            .filter(|g| g.kem && matches!(NamedGroup::from(g.id), NamedGroup::Unknown(_)))
+            .map(|g| g.name.clone())
+            .collect();
+        let pqc = PqcConfig {
+            experimental_groups: carried
+                .iter()
+                .cloned()
+                .chain(["no_such_group".to_string()])
+                .collect(),
+            ..PqcConfig::default()
+        };
+        let provider = server_provider(true, &pqc);
+        let offered: Vec<NamedGroup> = provider.kx_groups.iter().map(|g| g.name()).collect();
+        let experimental: Vec<NamedGroup> = offered
+            .iter()
+            .copied()
+            .filter(|g| is_experimental_group(*g))
+            .collect();
+        assert_eq!(experimental.len(), carried.len(), "{offered:?}");
+        let tuples = group_tuples(&provider);
+        if !experimental.is_empty() {
+            let at = tuples
+                .iter()
+                .position(|t| t.iter().all(|g| is_experimental_group(*g)))
+                .expect("a tuple of their own");
+            assert!(tuples[..at]
+                .iter()
+                .flatten()
+                .all(|g| is_post_quantum_group(*g)));
+            assert!(tuples[at + 1..]
+                .iter()
+                .flatten()
+                .all(|g| !is_post_quantum_group(*g)));
+        }
     }
 
     fn groups(pqc: &PqcConfig) -> Vec<NamedGroup> {
@@ -2367,7 +2446,7 @@ pub fn pq_chain_server_config(
 
     Ok((
         Arc::new(
-            quinn::crypto::rustls::QuicServerConfig::try_from(config).map_err(|e| {
+            quic_server_config(config).map_err(|e| {
                 anyhow::anyhow!("failed to build the post-quantum QUIC config: {e}")
             })?,
         ),
@@ -2432,31 +2511,66 @@ pub fn build_pqc_provider() -> rustls::crypto::CryptoProvider {
         _ => 5,
     });
 
-    prefer_256_bit_aeads(&mut provider);
+    negotiable_aeads(&mut provider);
 
     provider
 }
 
-/// Order 256-bit AEADs ahead of AES-128, matching what the OpenSSL listener
-/// enforces for HTTP/1.1 and HTTP/2.
+/// The suites a handshake may agree: AES-256-GCM, then ChaCha20-Poly1305,
+/// as the OpenSSL listener's for HTTP/1.1 and HTTP/2 (CNSA 2.0 asks for
+/// AES-256; ChaCha20 serves a client without AES hardware).
 ///
-/// That listener *removes* TLS_AES_128_GCM_SHA256 outright. This cannot: RFC
-/// 9001 §5.2 fixes AES-128-GCM as the AEAD for QUIC Initial packet protection,
-/// and dropping the suite makes QuicServerConfig construction fail. So it stays
-/// available and simply loses the preference contest — rustls picks the
-/// server's first suite the client also offers, and every modern client offers
-/// all three.
-///
-/// Without this, HTTP/2 visitors got AES-256 and HTTP/3 visitors silently got
-/// AES-128 on the same hostname: the policy was written once, on one of two
-/// listeners.
-fn prefer_256_bit_aeads(provider: &mut rustls::crypto::CryptoProvider) {
+/// TLS_AES_128_GCM_SHA256 is not among them. QUIC protects its Initial
+/// packets with AES-128-GCM whatever the handshake agrees (RFC 9001 section
+/// 5.2), and takes that suite on its own ([`quic_server_config`]), so the
+/// handshake's choice and the Initial packets' are separate. It was kept in
+/// the list on the belief that QUIC could not do without it, and ranked last:
+/// a QUIC client offering only AES-128 got it, where TCP refused it.
+fn negotiable_aeads(provider: &mut rustls::crypto::CryptoProvider) {
+    provider.cipher_suites.retain(|cs| {
+        matches!(
+            cs.suite(),
+            rustls::CipherSuite::TLS13_AES_256_GCM_SHA384
+                | rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
+        ) || cs.tls13().is_none()
+    });
     provider.cipher_suites.sort_by_key(|cs| match cs.suite() {
         rustls::CipherSuite::TLS13_AES_256_GCM_SHA384 => 0u8,
         rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => 1,
-        rustls::CipherSuite::TLS13_AES_128_GCM_SHA256 => 2,
-        _ => 3,
+        _ => 2,
     });
+}
+
+/// A QUIC server configuration from `config`.
+///
+/// Initial packets are protected with TLS_AES_128_GCM_SHA256, as RFC 9001
+/// section 5.2 fixes, taken on its own, and the handshake agrees one of
+/// `config`'s suites ([`negotiable_aeads`]).
+pub fn quic_server_config(
+    config: RustlsServerConfig,
+) -> anyhow::Result<quinn::crypto::rustls::QuicServerConfig> {
+    let initial = rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256
+        .tls13()
+        .and_then(|suite| suite.quic_suite())
+        .ok_or_else(|| anyhow::anyhow!("TLS_AES_128_GCM_SHA256 has no QUIC suite"))?;
+    quinn::crypto::rustls::QuicServerConfig::with_initial(Arc::new(config), initial)
+        .map_err(|e| anyhow::anyhow!("failed to build the QUIC config: {e}"))
+}
+
+/// A QUIC client configuration from `config`.
+///
+/// As [`quic_server_config`]: Initial packets take TLS_AES_128_GCM_SHA256 on
+/// their own, so a client built from [`build_pqc_provider`] offers
+/// AES-256-GCM and ChaCha20 alone.
+pub fn quic_client_config(
+    config: rustls::ClientConfig,
+) -> anyhow::Result<quinn::crypto::rustls::QuicClientConfig> {
+    let initial = rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256
+        .tls13()
+        .and_then(|suite| suite.quic_suite())
+        .ok_or_else(|| anyhow::anyhow!("TLS_AES_128_GCM_SHA256 has no QUIC suite"))?;
+    quinn::crypto::rustls::QuicClientConfig::with_initial(Arc::new(config), initial)
+        .map_err(|e| anyhow::anyhow!("failed to build the QUIC client config: {e}"))
 }
 
 /// True for a group whose key exchange includes ML-KEM, alone or in a hybrid.
@@ -2538,6 +2652,13 @@ pub fn server_provider(post_quantum: bool, pqc: &PqcConfig) -> CryptoProvider {
                     && (is_hybrid_group(name) || (named_at(name).is_some() && !pqc.require_hybrid))
             })
             .collect();
+    // The experimental KEMs the OpenSSL listener offers, from the same
+    // provider, after the standard groups and ahead of the classical ones,
+    // where that listener puts them
+    #[cfg(feature = "pqc")]
+    if post_quantum {
+        groups.extend(crate::provider_kx::groups(&pqc.experimental_groups));
+    }
     groups.sort_by_key(|g| {
         let name = g.name();
         match named_at(name) {
@@ -2545,13 +2666,28 @@ pub fn server_provider(post_quantum: bool, pqc: &PqcConfig) -> CryptoProvider {
             None if name == rustls::NamedGroup::X25519MLKEM768 => 100,
             None if is_hybrid_group(name) => 101,
             None if is_post_quantum_group(name) => 102,
-            None if name == rustls::NamedGroup::secp384r1 => 103,
-            None if name == rustls::NamedGroup::X25519 => 105,
-            None => 104,
+            None if is_experimental_group(name) => 103,
+            None if name == rustls::NamedGroup::secp384r1 => 104,
+            None if name == rustls::NamedGroup::X25519 => 106,
+            None => 105,
         }
     });
     provider.kx_groups = groups;
     provider
+}
+
+/// One of the experimental KEMs a provider of the linked OpenSSL carries
+/// (`crate::provider_kx`).
+fn is_experimental_group(group: rustls::NamedGroup) -> bool {
+    #[cfg(feature = "pqc")]
+    {
+        crate::provider_kx::is_provider_group(group)
+    }
+    #[cfg(not(feature = "pqc"))]
+    {
+        let _ = group;
+        false
+    }
 }
 
 /// The provider's groups in tuples of comparable strength, for
@@ -2591,10 +2727,20 @@ pub fn group_tuples(provider: &CryptoProvider) -> Vec<Vec<rustls::NamedGroup>> {
             tuples.push(groups);
         }
     }
+    // The experimental KEMs in a tuple of their own, as the OpenSSL
+    // listener's groups string has them
+    let experimental: Vec<rustls::NamedGroup> = names
+        .iter()
+        .copied()
+        .filter(|g| is_experimental_group(*g))
+        .collect();
+    if !experimental.is_empty() {
+        tuples.push(experimental);
+    }
     let classical: Vec<rustls::NamedGroup> = names
         .iter()
         .copied()
-        .filter(|g| !is_post_quantum_group(*g))
+        .filter(|g| !is_post_quantum_group(*g) && !is_experimental_group(*g))
         .collect();
     if !classical.is_empty() {
         tuples.push(classical);
@@ -2829,7 +2975,7 @@ impl TlsProvider {
             Arc::clone(&resolver),
             &applications,
         )?;
-        let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
+        let quic_config = quic_server_config(rustls_config)
             .map_err(|e| anyhow::anyhow!("Failed to create QUIC server config: {}", e))?;
 
         // Watch the certs + ECH configs directory mtimes for change detection
@@ -2973,7 +3119,7 @@ impl TlsProvider {
             Arc::clone(&self.resolver),
             &self.applications,
         )?;
-        let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
+        let quic_config = quic_server_config(rustls_config)
             .map_err(|e| anyhow::anyhow!("Failed to create QUIC server config: {}", e))?;
 
         self.server_config.store(Arc::new(quic_config));
@@ -3076,8 +3222,9 @@ impl TlsProvider {
         // Groups, versions, client authentication and tickets come from the one
         // policy every rustls listener builds from -- see ServerTlsPolicy.
         //
-        // TLS_AES_128_GCM_SHA256 stays in the suite list: QUIC (RFC 9001) needs
-        // it for Initial packet protection.
+        // The handshake agrees AES-256-GCM or ChaCha20 (`negotiable_aeads`);
+        // QUIC's Initial packets take TLS_AES_128_GCM_SHA256 on their own
+        // (`quic_server_config`, RFC 9001 section 5.2).
         let policy = ServerTlsPolicy::from_config(
             tls_config,
             pqc_config,
