@@ -50,6 +50,13 @@ pub enum FingerprintThreat {
     },
 }
 
+/// Fingerprints the classification cache holds: a client that randomises its
+/// extension order (as Chrome does) has a new JA3 on nearly every connection,
+/// so without a ceiling the cache grew with ordinary traffic for as long as
+/// the process ran, and nothing swept it
+const MAX_CACHED_FINGERPRINTS: usize = 65_536;
+/// How often a full table may be swept for room
+const FULL_SWEEP_GAP: Duration = Duration::from_secs(5);
 /// Fingerprints followed for replay at once
 const MAX_REPLAY_ENTRIES: usize = 50_000;
 /// Client networks followed for drift at once
@@ -84,6 +91,11 @@ pub struct FingerprintExtractor {
     replay_cache: Arc<DashMap<String, ReplayEntry>>,
     /// Drift detection: client network → its fingerprints
     drift_cache: Arc<DashMap<u128, DriftState>>,
+    /// The three tables' ceilings: a full table is swept for expired entries
+    /// at most once per [`FULL_SWEEP_GAP`], not once per new key
+    cache_ceiling: Arc<crate::bounded::Ceiling>,
+    replay_ceiling: Arc<crate::bounded::Ceiling>,
+    drift_ceiling: Arc<crate::bounded::Ceiling>,
 }
 
 /// A fingerprint as a u64, for counting distinct ones
@@ -280,6 +292,18 @@ impl FingerprintExtractor {
             known_fingerprints: Arc::new(KnownFingerprints::default()),
             replay_cache: Arc::new(DashMap::new()),
             drift_cache: Arc::new(DashMap::new()),
+            cache_ceiling: Arc::new(crate::bounded::Ceiling::new(
+                MAX_CACHED_FINGERPRINTS,
+                FULL_SWEEP_GAP,
+            )),
+            replay_ceiling: Arc::new(crate::bounded::Ceiling::new(
+                MAX_REPLAY_ENTRIES,
+                FULL_SWEEP_GAP,
+            )),
+            drift_ceiling: Arc::new(crate::bounded::Ceiling::new(
+                MAX_DRIFT_ENTRIES,
+                FULL_SWEEP_GAP,
+            )),
         }
     }
 
@@ -304,13 +328,13 @@ impl FingerprintExtractor {
         let window = Duration::from_secs(config.replay_window_secs);
         let now = Instant::now();
         if !self.replay_cache.contains_key(fingerprint)
-            && self.replay_cache.len() >= MAX_REPLAY_ENTRIES
+            && !self.replay_ceiling.admits(self.replay_cache.len(), || {
+                self.replay_cache
+                    .retain(|_, e| now.duration_since(e.window_start) <= window);
+                self.replay_cache.len()
+            })
         {
-            self.replay_cache
-                .retain(|_, e| now.duration_since(e.window_start) <= window);
-            if self.replay_cache.len() >= MAX_REPLAY_ENTRIES {
-                return None;
-            }
+            return None;
         }
         let mut entry = self
             .replay_cache
@@ -357,12 +381,14 @@ impl FingerprintExtractor {
         }
         let window = Duration::from_secs(config.drift_window_secs);
         let now = Instant::now();
-        if !self.drift_cache.contains_key(&network) && self.drift_cache.len() >= MAX_DRIFT_ENTRIES {
-            self.drift_cache
-                .retain(|_, e| now.duration_since(e.window_start) <= window);
-            if self.drift_cache.len() >= MAX_DRIFT_ENTRIES {
-                return None;
-            }
+        if !self.drift_cache.contains_key(&network)
+            && !self.drift_ceiling.admits(self.drift_cache.len(), || {
+                self.drift_cache
+                    .retain(|_, e| now.duration_since(e.window_start) <= window);
+                self.drift_cache.len()
+            })
+        {
+            return None;
         }
         let mut entry = self
             .drift_cache
@@ -796,22 +822,30 @@ impl FingerprintExtractor {
             }
         };
 
-        // Update cache
+        // Update cache: a new fingerprint only while there is room, a full
+        // cache swept of fingerprints older than `cache_max_age_secs` at most
+        // once a gap
         let now = Instant::now();
-        self.cache
-            .entry(ja3_hash.clone())
-            .and_modify(|cached| {
-                cached.last_seen = now;
-                cached.request_count += 1;
-            })
-            .or_insert_with(|| CachedFingerprint {
-                ja3_hash: ja3_hash.clone(),
-                ja4_hash: ja4_hash.clone(),
-                classification: classification.clone(),
-                first_seen: now,
-                last_seen: now,
-                request_count: 1,
-            });
+        if let Some(mut cached) = self.cache.get_mut(&ja3_hash) {
+            cached.last_seen = now;
+            cached.request_count += 1;
+        } else if self.cache_ceiling.admits(self.cache.len(), || {
+            let max_age = Duration::from_secs(config.cache_max_age_secs);
+            self.cache
+                .retain(|_, cached| cached.last_seen.elapsed() < max_age);
+            self.cache.len()
+        }) {
+            self.cache
+                .entry(ja3_hash.clone())
+                .or_insert_with(|| CachedFingerprint {
+                    ja3_hash: ja3_hash.clone(),
+                    ja4_hash: ja4_hash.clone(),
+                    classification: classification.clone(),
+                    first_seen: now,
+                    last_seen: now,
+                    request_count: 1,
+                });
+        }
 
         // Update security state JA3 cache.
         //
@@ -825,37 +859,38 @@ impl FingerprintExtractor {
             .and_then(|j| j.chars().next())
             .unwrap_or('t');
 
-        security
-            .ja3_cache
-            .entry(ja3_hash.clone())
-            .and_modify(|existing| {
-                existing.last_seen = now;
-                existing.request_count = existing.request_count.saturating_add(1);
-                // Re-classification can change as the operator database grows,
-                // so take the current verdict rather than the one from first
-                // sighting.
-                existing.classification = classification.clone();
-                // The JA4 a JA3 maps to is recomputed on every sighting, so a
-                // row first stored under an earlier computation (before
-                // 2026-10-15 SNI and ALPN were hashed into part c) takes the
-                // current one when its client comes back.
-                existing.ja4_hash = ja4_hash.clone();
-                existing.ja4_raw = fingerprint.ja4_raw.clone();
-            })
-            .or_insert_with(|| TlsFingerprint {
-                ja3_hash: ja3_hash.clone(),
-                ja4_hash: ja4_hash.clone(),
-                ja4_raw: fingerprint.ja4_raw.clone(),
-                ja3_string: fingerprint.ja3_string.clone(),
-                classification: classification.clone(),
-                transport,
-                first_seen: now,
-                last_seen: now,
-                request_count: 1,
-                // Filled in by the HTTP layer via note_user_agent — no request
-                // exists yet at the TLS layer where this record is created.
-                user_agents: std::collections::HashMap::new(),
-            });
+        if let Some(mut existing) = security.ja3_cache.get_mut(&ja3_hash) {
+            existing.last_seen = now;
+            existing.request_count = existing.request_count.saturating_add(1);
+            // Re-classification can change as the operator database grows,
+            // so take the current verdict rather than the one from first
+            // sighting.
+            existing.classification = classification.clone();
+            // The JA4 a JA3 maps to is recomputed on every sighting, so a
+            // row first stored under an earlier computation (before
+            // 2026-10-15 SNI and ALPN were hashed into part c) takes the
+            // current one when its client comes back.
+            existing.ja4_hash = ja4_hash.clone();
+            existing.ja4_raw = fingerprint.ja4_raw.clone();
+        } else if security.admit_fingerprint() {
+            security
+                .ja3_cache
+                .entry(ja3_hash.clone())
+                .or_insert_with(|| TlsFingerprint {
+                    ja3_hash: ja3_hash.clone(),
+                    ja4_hash: ja4_hash.clone(),
+                    ja4_raw: fingerprint.ja4_raw.clone(),
+                    ja3_string: fingerprint.ja3_string.clone(),
+                    classification: classification.clone(),
+                    transport,
+                    first_seen: now,
+                    last_seen: now,
+                    request_count: 1,
+                    // Filled in by the HTTP layer via note_user_agent — no request
+                    // exists yet at the TLS layer where this record is created.
+                    user_agents: std::collections::HashMap::new(),
+                });
+        }
 
         // The record: every distinct fingerprint, under its JA4, for good
         let first_sighting = security
@@ -1088,19 +1123,6 @@ impl FingerprintExtractor {
             }
         }
         blocked
-    }
-
-    /// Cleanup old cache entries (using configurable max age)
-    pub fn cleanup(&self, config: &FingerprintConfig) {
-        let max_age = Duration::from_secs(config.cache_max_age_secs);
-        self.cache
-            .retain(|_, cached| cached.last_seen.elapsed() < max_age);
-        let replay = Duration::from_secs(config.replay_window_secs);
-        self.replay_cache
-            .retain(|_, e| e.window_start.elapsed() <= replay);
-        let drift = Duration::from_secs(config.drift_window_secs);
-        self.drift_cache
-            .retain(|_, e| e.window_start.elapsed() <= drift);
     }
 
     /// Get fingerprint statistics

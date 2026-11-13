@@ -35,6 +35,24 @@ use dashmap::DashMap;
 /// When exceeded, oldest entries are evicted
 const MAX_TRACKED_IPS: usize = 100_000;
 
+/// How often a full per-address table may be swept for room where a new
+/// address arrives. The periodic cleanup (once a minute) enforced the ceiling
+/// alone, so a table grew by the addresses arriving in a minute first: from an
+/// IPv6 network, a new address a request.
+const FULL_SWEEP_GAP: Duration = Duration::from_secs(5);
+
+/// The ceilings of the tables a new address or fingerprint adds to, enforced
+/// where entries are made ([`crate::bounded::Ceiling`]).
+struct Ceilings {
+    rate_limiters: crate::bounded::Ceiling,
+    overflow_limiters: crate::bounded::Ceiling,
+    requests: crate::bounded::Ceiling,
+    connections: crate::bounded::Ceiling,
+    fingerprints: crate::bounded::Ceiling,
+}
+
+type IpRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
+
 /// Fallback corpus ceiling, used only if the configured value is zero.
 ///
 /// The real limit is `security.max_tracked_fingerprints`. This was a hardcoded
@@ -221,6 +239,13 @@ impl Ja3Database {
     }
 }
 
+/// A limiter at `config`'s per-address rate and burst.
+fn rate_limiter_for(config: &RateLimitConfig) -> IpRateLimiter {
+    let rps = NonZeroU32::new(config.requests_per_second.max(1)).unwrap_or(NonZeroU32::MIN);
+    let burst = NonZeroU32::new(config.burst_size.max(1)).unwrap_or(NonZeroU32::MIN);
+    RateLimiter::direct(Quota::per_second(rps).allow_burst(burst))
+}
+
 /// Security state shared across all requests
 #[derive(Clone)]
 pub struct SecurityState {
@@ -239,6 +264,14 @@ pub struct SecurityState {
     >,
     /// Per-IP connection counters
     pub ip_connections: Arc<DashMap<IpAddr, u32>>,
+    /// Where `ip_rate_limiters` is full of live limiters: one limiter per
+    /// client network (an IPv6 /64), so addresses that did not fit are still
+    /// limited and a network moving through its addresses gains nothing, and
+    /// past that one for every address left over
+    overflow_limiters: Arc<DashMap<IpAddr, (Arc<IpRateLimiter>, Instant)>>,
+    overflow_limiter: Arc<IpRateLimiter>,
+    /// The per-address tables' ceilings
+    ceilings: Arc<Ceilings>,
     /// Blocked IPs with expiration time
     pub blocked_ips: Arc<DashMap<IpAddr, BlockedIpInfo>>,
     /// Request count per IP for adaptive blocking
@@ -806,9 +839,23 @@ impl SecurityState {
         // with the URL and interval it started with.
         spawn_tor_exit_refresh(tor_exits.clone(), security_config.clone());
 
+        let max_fingerprints = if config.security.max_tracked_fingerprints == 0 {
+            FALLBACK_MAX_JA3_FINGERPRINTS
+        } else {
+            config.security.max_tracked_fingerprints
+        };
         let state = Self {
             ip_rate_limiters: Arc::new(DashMap::new()),
             ip_connections: Arc::new(DashMap::new()),
+            overflow_limiters: Arc::new(DashMap::new()),
+            overflow_limiter: Arc::new(rate_limiter_for(&config.rate_limiting)),
+            ceilings: Arc::new(Ceilings {
+                rate_limiters: crate::bounded::Ceiling::new(MAX_TRACKED_IPS, FULL_SWEEP_GAP),
+                overflow_limiters: crate::bounded::Ceiling::new(MAX_TRACKED_IPS, FULL_SWEEP_GAP),
+                requests: crate::bounded::Ceiling::new(MAX_TRACKED_IPS, FULL_SWEEP_GAP),
+                connections: crate::bounded::Ceiling::new(MAX_TRACKED_IPS, FULL_SWEEP_GAP),
+                fingerprints: crate::bounded::Ceiling::new(max_fingerprints, FULL_SWEEP_GAP),
+            }),
             connection_rates: Arc::new(DashMap::new()),
             blocked_ips: Arc::new(DashMap::new()),
             request_counts: Arc::new(DashMap::new()),
@@ -1187,21 +1234,115 @@ impl SecurityState {
     ///
     /// AUD-07: The last-access timestamp is updated on every call so that the
     /// cleanup task can perform LRU eviction rather than arbitrary eviction.
-    pub fn get_ip_rate_limiter(
+    pub fn get_ip_rate_limiter(&self, ip: IpAddr) -> Arc<IpRateLimiter> {
+        if let Some(mut entry) = self.ip_rate_limiters.get_mut(&ip) {
+            // Update last-access time for LRU eviction
+            entry.1 = Instant::now();
+            return entry.0.clone();
+        }
+        let idle = self.limiter_idle();
+        if self
+            .ceilings
+            .rate_limiters
+            .admits(self.ip_rate_limiters.len(), || {
+                self.ip_rate_limiters
+                    .retain(|_, (_, used)| used.elapsed() < idle);
+                self.ip_rate_limiters.len()
+            })
+        {
+            return self
+                .ip_rate_limiters
+                .entry(ip)
+                .or_insert_with(|| (Arc::new(self.new_ip_rate_limiter()), Instant::now()))
+                .0
+                .clone();
+        }
+        // The table is full of live limiters: the address's network's
+        let network = crate::conn_limits::client_network(ip);
+        if let Some(mut entry) = self.overflow_limiters.get_mut(&network) {
+            entry.1 = Instant::now();
+            return entry.0.clone();
+        }
+        if self
+            .ceilings
+            .overflow_limiters
+            .admits(self.overflow_limiters.len(), || {
+                self.overflow_limiters
+                    .retain(|_, (_, used)| used.elapsed() < idle);
+                self.overflow_limiters.len()
+            })
+        {
+            return self
+                .overflow_limiters
+                .entry(network)
+                .or_insert_with(|| (Arc::new(self.new_ip_rate_limiter()), Instant::now()))
+                .0
+                .clone();
+        }
+        Arc::clone(&self.overflow_limiter)
+    }
+
+    /// A limiter at the configured per-address rate.
+    fn new_ip_rate_limiter(&self) -> IpRateLimiter {
+        rate_limiter_for(&self.rate_config.read())
+    }
+
+    /// How long a limiter goes unused before its bucket is full again, so
+    /// dropping it loses nothing: the burst at the configured rate, and a
+    /// second.
+    fn limiter_idle(&self) -> Duration {
+        let c = self.rate_config.read();
+        let refill =
+            u64::from(c.burst_size.max(1)).div_ceil(u64::from(c.requests_per_second.max(1)));
+        Duration::from_secs(refill.clamp(1, 3600) + 1)
+    }
+
+    /// The request counter for `ip`, made where the table has room: a table
+    /// full of live counters makes none, and the request goes uncounted for
+    /// blocking (its rate is still limited, [`Self::get_ip_rate_limiter`]).
+    fn request_counter(
         &self,
         ip: IpAddr,
-    ) -> Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>> {
-        let mut entry = self.ip_rate_limiters.entry(ip).or_insert_with(|| {
-            let config = self.rate_config.read();
-            // Safe NonZeroU32 construction - use .max(1) to ensure non-zero
-            let rps = NonZeroU32::new(config.requests_per_second.max(1)).unwrap_or(NonZeroU32::MIN);
-            let burst_nz = NonZeroU32::new(config.burst_size.max(1)).unwrap_or(NonZeroU32::MIN);
-            let quota = Quota::per_second(rps).allow_burst(burst_nz);
-            (Arc::new(RateLimiter::direct(quota)), Instant::now())
-        });
-        // Update last-access time for LRU eviction
-        entry.1 = Instant::now();
-        entry.0.clone()
+    ) -> Option<dashmap::mapref::one::RefMut<'_, IpAddr, RequestCounter>> {
+        if let Some(counter) = self.request_counts.get_mut(&ip) {
+            return Some(counter);
+        }
+        let stale = Duration::from_secs(
+            self.circuit_breaker_config
+                .read()
+                .stale_counter_cleanup_secs,
+        );
+        self.ceilings
+            .requests
+            .admits(self.request_counts.len(), || {
+                self.request_counts
+                    .retain(|_, counter| counter.window_start.is_some_and(|s| s.elapsed() < stale));
+                self.request_counts.len()
+            })
+            .then(|| self.request_counts.entry(ip).or_default())
+    }
+
+    /// Whether a fingerprint not yet in the JA3 cache may be added: a full
+    /// cache gives up its least recently seen tenth at most once a
+    /// [`FULL_SWEEP_GAP`], and a fingerprint that still finds it full is
+    /// classified without being cached (the corpus keeps its own record).
+    pub fn admit_fingerprint(&self) -> bool {
+        self.ceilings.fingerprints.admits(self.ja3_cache.len(), || {
+            let keep = self.ceilings.fingerprints.cap() / 10 * 9;
+            let mut seen: Vec<(Instant, String)> = self
+                .ja3_cache
+                .iter()
+                .map(|e| (e.value().last_seen, e.key().clone()))
+                .collect();
+            if seen.len() > keep {
+                let cut = seen.len() - keep;
+                seen.select_nth_unstable_by_key(cut - 1, |(at, _)| *at);
+                for (_, key) in seen.drain(..cut) {
+                    self.ja3_cache.remove(&key);
+                }
+            }
+            self.ja3_cache.len()
+        })
     }
 
     /// Check if an IP is blocked (single-IP list or CIDR range).
@@ -1670,15 +1811,16 @@ impl SecurityState {
                 let c = self.config.read();
                 (c.auto_block_threshold, c.auto_block_duration_secs)
             };
-            let mut counter = self.request_counts.entry(view.ip).or_default();
-            counter.suspicious_patterns += 1;
-            if counter.suspicious_patterns >= auto_block_threshold {
-                drop(counter);
-                self.block_ip(
-                    view.ip,
-                    BlockReason::TooManyErrors,
-                    Some(Duration::from_secs(auto_block_duration_secs)),
-                );
+            if let Some(mut counter) = self.request_counter(view.ip) {
+                counter.suspicious_patterns += 1;
+                if counter.suspicious_patterns >= auto_block_threshold {
+                    drop(counter);
+                    self.block_ip(
+                        view.ip,
+                        BlockReason::TooManyErrors,
+                        Some(Duration::from_secs(auto_block_duration_secs)),
+                    );
+                }
             }
         }
         SecurityDecision::WafBlock { rule }
@@ -1957,15 +2099,16 @@ impl SecurityState {
 
             if rate_enabled && self.get_ip_rate_limiter(ip).check().is_err() {
                 warn!("Rate limit exceeded for {}", ip);
-                let mut counter = self.request_counts.entry(ip).or_default();
-                counter.suspicious_patterns += 1;
-                if counter.suspicious_patterns >= auto_block_threshold && !skip_auto_block {
-                    drop(counter);
-                    self.block_ip(
-                        ip,
-                        BlockReason::RateLimitExceeded,
-                        Some(Duration::from_secs(auto_block_duration_secs)),
-                    );
+                if let Some(mut counter) = self.request_counter(ip) {
+                    counter.suspicious_patterns += 1;
+                    if counter.suspicious_patterns >= auto_block_threshold && !skip_auto_block {
+                        drop(counter);
+                        self.block_ip(
+                            ip,
+                            BlockReason::RateLimitExceeded,
+                            Some(Duration::from_secs(auto_block_duration_secs)),
+                        );
+                    }
                 }
                 return Err(SecurityDecision::RateLimited {
                     limit: rate_rps,
@@ -2029,6 +2172,20 @@ impl SecurityState {
             return false;
         }
         let now = Instant::now();
+        // A full table of live windows (each lasts a second) follows no new
+        // address; its requests are still limited by rate
+        if !self.connection_rates.contains_key(&ip)
+            && !self
+                .ceilings
+                .connections
+                .admits(self.connection_rates.len(), || {
+                    self.connection_rates
+                        .retain(|_, window| window.window_start.elapsed() < Duration::from_secs(1));
+                    self.connection_rates.len()
+                })
+        {
+            return false;
+        }
         let mut window = self
             .connection_rates
             .entry(ip)
@@ -2102,7 +2259,9 @@ impl SecurityState {
         let auto_block_duration = Duration::from_secs(config.auto_block_duration_secs);
         drop(config);
 
-        let mut counter = self.request_counts.entry(ip).or_default();
+        let Some(mut counter) = self.request_counter(ip) else {
+            return;
+        };
 
         // Reset window if needed (configurable window duration)
         if counter
@@ -2253,6 +2412,11 @@ impl SecurityState {
             let mut cidrs = self.blocked_cidrs.write();
             cidrs.retain(|(_, info)| info.expires_at.map(|e| Instant::now() < e).unwrap_or(true));
         }
+
+        // Overflow limiters whose buckets have refilled
+        let idle = self.limiter_idle();
+        self.overflow_limiters
+            .retain(|_, (_, used)| used.elapsed() < idle);
 
         // Connection-rate windows last one second; an older one would be reset
         // on its next use, so dropping it loses nothing. Nothing pruned this

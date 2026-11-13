@@ -7,15 +7,22 @@
 //! filled the cap and evicted, least recently seen first, the rare JA4s the
 //! public directory exists to record. /ja4/ fell from 7,071 fingerprints to
 //! 4,216 in three days. The cache stays bounded (it is a cache); this is a
-//! record, keyed by the stable identity, and is never evicted.
+//! record, keyed by the stable identity, and what it held when the proxy
+//! started, or has seen often over days since, is never evicted.
 //!
 //! What is kept for good is what has been seen more than once: from two
 //! client networks, or on two days. A new fingerprint waits in a bounded
 //! probation segment until then, oldest let go first when it is full, so a
 //! client that sends a new ClientHello shape with every connection cannot
 //! grow the corpus without limit, and cannot push out anything established.
-//! Everything in the file when the proxy starts, from before this existed,
-//! is established.
+//! What is kept for good is bounded too (`ESTABLISHED`, ten times the corpus
+//! of 2026-11): a client with two networks passes every shape it sends
+//! through probation. In a full corpus a new fingerprint takes the place of
+//! the oldest one kept since the process started that has not proved itself
+//! (16 sightings over three days); what the file held at start, and what has
+//! proved itself, is never given up, and when nothing else is left a new
+//! fingerprint waits in probation. Everything in the file when the proxy
+//! starts, from before this existed, is established.
 //!
 //! A JA4 keeps what the directory shows of it: its counts, first and last
 //! sighting, the User-Agents on its requests and a sample of its JA3
@@ -129,6 +136,17 @@ pub struct Sighting<'a> {
 /// Fingerprints waiting to be seen again.
 const PROBATION: usize = 20_000;
 
+/// Fingerprints kept for good, at most: ten times the corpus the public
+/// directory had grown to by 2026-11 (9,351). Seen from two networks, a
+/// ClientHello shaped anew for every connection is kept for good, so without a
+/// ceiling the record grew by every shape a client with two networks sent.
+const ESTABLISHED: usize = 100_000;
+
+/// What a fingerprint kept since the process started must show before a new
+/// one can no longer take its place in a full corpus: sightings, over days.
+const PROVEN_SIGHTINGS: u64 = 16;
+const PROVEN_SPAN_SECS: u64 = 3 * 86_400;
+
 /// A fingerprint in probation, with where and when it has been seen.
 struct Probation {
     entry: CorpusEntry,
@@ -165,14 +183,33 @@ pub(crate) fn client_network(ip: std::net::IpAddr) -> u128 {
 }
 
 /// The corpus, in memory.
-#[derive(Default)]
 pub struct Corpus {
+    /// The most records kept for good ([`ESTABLISHED`])
+    ceiling: usize,
     /// Kept for good
     entries: DashMap<String, CorpusEntry>,
     /// Kept while there is room
     probation: DashMap<String, Probation>,
     /// Probation keys in the order they arrived, oldest first
     arrivals: parking_lot::Mutex<std::collections::VecDeque<String>>,
+    /// Keys kept for good since the process started, in the order they were,
+    /// oldest first: in a full corpus a new fingerprint takes the place of the
+    /// oldest of them that has not proved itself (see [`proven`]). What the
+    /// corpus held at start, and what has proved itself, is never given up.
+    young: parking_lot::Mutex<std::collections::VecDeque<String>>,
+}
+
+impl Default for Corpus {
+    fn default() -> Self {
+        Self::with_ceiling(ESTABLISHED)
+    }
+}
+
+/// A fingerprint seen often enough, over long enough, that no new one takes
+/// its place.
+fn proven(e: &CorpusEntry) -> bool {
+    e.request_count >= PROVEN_SIGHTINGS
+        && e.last_seen.saturating_sub(e.first_seen) >= PROVEN_SPAN_SECS
 }
 
 /// The record's key: the JA4, else the JA3.
@@ -184,6 +221,17 @@ pub fn key_of(ja3_hash: &str, ja4_hash: Option<&str>) -> String {
 }
 
 impl Corpus {
+    /// A corpus keeping at most `ceiling` records for good.
+    fn with_ceiling(ceiling: usize) -> Self {
+        Self {
+            ceiling,
+            entries: DashMap::new(),
+            probation: DashMap::new(),
+            arrivals: parking_lot::Mutex::default(),
+            young: parking_lot::Mutex::default(),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len() + self.probation.len()
     }
@@ -224,14 +272,35 @@ impl Corpus {
             })
         };
         if let Some(kept) = promoted {
+            // A full corpus makes room first, or the fingerprint waits in
+            // probation: every record there has proved itself
+            if self.entries.len() >= self.ceiling && !self.make_room() {
+                return first;
+            }
             // Established before it leaves probation, so a sighting in
             // between finds it in one of the two.
             self.entries.insert(key.clone(), kept);
             self.probation.remove(&key);
+            self.young.lock().push_back(key);
         } else if first {
             self.arrived(key);
         }
         first
+    }
+
+    /// Room for one more record kept for good: the oldest fingerprint kept
+    /// since the process started that has not proved itself is let go. Each
+    /// key leaves the queue once, so the work is constant over time; false
+    /// when every young record has proved itself.
+    fn make_room(&self) -> bool {
+        let mut young = self.young.lock();
+        while let Some(key) = young.pop_front() {
+            let weak = self.entries.get(&key).is_some_and(|e| !proven(&e));
+            if weak && self.entries.remove(&key).is_some() {
+                return true;
+            }
+        }
+        false
     }
 
     /// A new key in probation; the oldest let go while there are too many.
@@ -874,7 +943,7 @@ mod tests {
 
     /// A new fingerprint waits in probation until it has been seen from a
     /// second network or on a second day; probation is bounded, oldest let go
-    /// first, and nothing kept for good is ever let go. Both segments survive
+    /// first, and nothing kept for good is let go below the ceiling. Both segments survive
     /// a write and a read.
     #[test]
     fn what_is_seen_twice_is_kept_and_probation_is_bounded() {
@@ -930,6 +999,88 @@ mod tests {
         read.load(&path).unwrap();
         assert_eq!(read.established(), 2);
         assert_eq!(read.len(), 2 + PROBATION);
+    }
+
+    /// What is kept for good is bounded: a full corpus gives up the oldest
+    /// young record that has not proved itself for a new one, never one it
+    /// started with or one that has proved itself, and when nothing else is
+    /// left the new one waits in probation.
+    #[test]
+    fn a_full_corpus_gives_up_only_unproven_young_records() {
+        let corpus = Corpus::with_ceiling(3);
+        let ip = |s: &str| Some(s.parse::<std::net::IpAddr>().unwrap());
+        let seen = |corpus: &Corpus, ja4: &str, client, at| {
+            corpus.observe(&Sighting {
+                ja3_hash: &"d".repeat(32),
+                ja3_string: "771,4865",
+                ja4_hash: Some(ja4),
+                ja4_raw: None,
+                classification: "Unknown",
+                transport: 't',
+                at,
+                client,
+            })
+        };
+        // Kept for good: the established table, not probation
+        let kept = |corpus: &Corpus, ja4: &str| corpus.entries.contains_key(ja4);
+        // Kept for good from two networks each
+        let promote = |corpus: &Corpus, ja4: &str| {
+            seen(corpus, ja4, ip("198.51.100.7"), 100);
+            seen(corpus, ja4, ip("203.0.113.9"), 100);
+        };
+        // The file held one at start: not young
+        corpus.entries.insert(
+            "t13d0000000h2_start_start".into(),
+            new_entry(
+                "t13d0000000h2_start_start".into(),
+                &Sighting {
+                    ja3_hash: &"e".repeat(32),
+                    ja3_string: "771,4865",
+                    ja4_hash: Some("t13d0000000h2_start_start"),
+                    ja4_raw: None,
+                    classification: "Unknown",
+                    transport: 't',
+                    at: 0,
+                    client: None,
+                },
+            ),
+        );
+        let proved = "t13d0000001h2_proved_proved";
+        promote(&corpus, proved);
+        // Seen often over days: it has proved itself
+        for day in 0..20u64 {
+            seen(&corpus, proved, ip("198.51.100.7"), 100 + day * 86_400);
+        }
+        let weak = "t13d0000002h2_weak_weak";
+        promote(&corpus, weak);
+        assert_eq!(corpus.established(), 3);
+
+        let new = "t13d0000003h2_new_new";
+        promote(&corpus, new);
+        assert_eq!(corpus.established(), 3, "the ceiling holds");
+        assert!(
+            kept(&corpus, new) && !kept(&corpus, weak),
+            "the unproven one made room"
+        );
+        assert!(kept(&corpus, proved) && kept(&corpus, "t13d0000000h2_start_start"));
+
+        // `new` is young and unproven, so the next takes its place
+        let next = "t13d0000004h2_next_next";
+        promote(&corpus, next);
+        assert!(!kept(&corpus, new));
+        // Once `next` has proved itself nothing young and unproven is left,
+        // and the one after waits
+        for day in 0..20u64 {
+            seen(&corpus, next, ip("198.51.100.7"), 100 + day * 86_400);
+        }
+        promote(&corpus, "t13d0000005h2_wait_wait");
+        assert!(kept(&corpus, next));
+        assert_eq!(corpus.established(), 3);
+        assert!(
+            !kept(&corpus, "t13d0000005h2_wait_wait"),
+            "it waits in probation"
+        );
+        assert!(kept(&corpus, proved) && kept(&corpus, "t13d0000000h2_start_start"));
     }
 
     #[test]

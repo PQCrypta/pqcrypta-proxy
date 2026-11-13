@@ -2,6 +2,8 @@
 
 This document provides security hardening guidelines, operational best practices, and a migration plan for deploying PQCrypta Proxy in production environments.
 
+To report a vulnerability, see the repository's [security policy](../SECURITY.md): privately, never in a public issue.
+
 **Last Updated**: 2026-01-25
 **Status**: All security features implemented with hardening release
 
@@ -20,7 +22,7 @@ This document provides security hardening guidelines, operational best practices
 | Request Size Limits | ✅ Complete | `security.rs` |
 | Security Headers | ✅ Complete | `http_listener.rs` |
 | Background Cleanup | ✅ Complete | `security.rs` |
-| Memory Exhaustion Prevention | ✅ Complete | `security.rs`, `rate_limiter.rs` |
+| Memory Exhaustion Prevention | ✅ Complete | `bounded.rs` (ceilings enforced where entries are made), `security.rs`, `rate_limiter.rs`, `fingerprint.rs`, `fingerprint_corpus.rs`, `load_balancer.rs`, `metrics.rs`, `tls_acceptor.rs`, `conformance/session.rs` |
 | ReDoS Prevention | ✅ Complete | `config.rs` |
 | Command Injection Prevention | ✅ Complete | `acme.rs` |
 | Safe Panic Handling | ✅ Complete | All modules |
@@ -522,18 +524,30 @@ the proxy restarted rather than another service killed. `pqcrypta_memory_*`
 metrics report the level, the working set, the limits and what was refused or
 closed.
 
-DashMap collections are bounded as well:
+Every table a client can add to is bounded where entries are made
+(`src/bounded.rs`, `Ceiling`), not only by a periodic sweep, which let a table
+grow by the arrival rate times the sweep's period first. A new key is admitted
+below the ceiling; at it, the table is swept for expired entries at most once
+every few seconds, whichever request gets there first, and a key that still
+finds it full is not admitted. What that means is each table's own decision:
 
-```rust
-// Constants in security.rs
-const MAX_TRACKED_IPS: usize = 100_000;
-const MAX_JA3_FINGERPRINTS: usize = 50_000;
+| Table | Ceiling | A key that does not fit |
+|---|---|---|
+| Per-address rate limiters (`security.rs`) | 100,000 addresses | limited by its network's (IPv6 /64) overflow limiter, 100,000 networks; past that by one shared limiter |
+| Per-address request counters and connection-rate windows | 100,000 each | not counted for auto-blocking (its rate is still limited) |
+| JA3 classification cache (`security.rs`, `fingerprint.rs`) | `max_tracked_fingerprints` / 65,536 | classified, not cached (the full cache gives up its least recently seen tenth) |
+| Fingerprint replay and drift windows (`fingerprint.rs`) | 50,000 / 200,000 | not followed |
+| Fingerprint corpus, kept for good (`fingerprint_corpus.rs`) | 100,000 | takes the place of the oldest record kept since start that has not proved itself (16 sightings over three days), else waits in probation (20,000) |
+| Advanced rate limiter buckets (`rate_limiter.rs`) | 100,000 keys | a client-chosen key: an unkept bucket; a network: its route's overflow bucket |
+| Sticky sessions per affinity mode (`load_balancer.rs`) | 100,000 | not made sticky |
+| 0-RTT replay digests (`tls_acceptor.rs`) | 262,144 a generation | early data declined, handshake completed (RFC 8446 §8) |
+| HMAC request nonces (`tls_acceptor.rs`) | 262,144 a generation | request refused as unverifiable |
+| Failing paths (`metrics.rs`) | 2,048, 256 bytes each | replaces the path with the fewest failures (Space-Saving), found in O(log n) |
+| Conformance source addresses (`conformance/session.rs`) | 65,536 | found by the session's server name alone |
 
-// Eviction logic in cleanup() function
-if blocked_count > MAX_TRACKED_IPS {
-    // Evict oldest temporary blocks
-}
-```
+The replay stores keep two generations, so a lookup costs the same however
+many digests they hold; the periodic cleanup (once a minute) still sweeps
+every per-address table and enforces `max_tracked_fingerprints`.
 
 ### ReDoS Prevention
 

@@ -114,22 +114,18 @@ fn handshake_timed_out() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS handshake timed out")
 }
 
-/// SEC-002: refuse a repeated ClientHello (or ticket) that offers early data,
-/// as the fingerprinting listeners do, before any handshake work.
-async fn refuse_replay(
+/// SEC-002: whether this connection's early data may be accepted, read from
+/// its ClientHello before any handshake work, as the fingerprinting listeners
+/// do: not a ClientHello (or ticket) seen within the window, nor one the
+/// replay store is too full to vouch for. Declined, the handshake goes on
+/// without it.
+async fn early_data_accepted(
     stream: &tokio::net::TcpStream,
     replay: &crate::tls_acceptor::ZeroRttReplayGuard,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
     let mut hello = vec![0u8; 4096];
     let n = stream.peek(&mut hello).await?;
-    if replay.is_replay(&hello[..n]) {
-        tracing::warn!("0-RTT replay detected — rejecting early data");
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::ConnectionRefused,
-            "0-RTT replay protection: duplicate early data rejected",
-        ));
-    }
-    Ok(())
+    Ok(replay.accepts_early_data(&hello[..n]))
 }
 
 impl<A, S> axum_server::accept::Accept<tokio::net::TcpStream, S> for EarlyRustlsAcceptor<A>
@@ -154,7 +150,11 @@ where
         Box::pin(async move {
             let (stream, service) = inner.await?;
             let tls = tokio::time::timeout(timeout, async {
-                refuse_replay(&stream, &replay).await?;
+                let config = if early_data_accepted(&stream, &replay).await? {
+                    config
+                } else {
+                    crate::tls_acceptor::without_early_data(&config)
+                };
                 crate::early_data::EarlyRustls::accept(config, stream, timeout).await
             })
             .await
@@ -218,9 +218,14 @@ where
         let replay = self.replay.clone();
         Box::pin(async move {
             let (stream, service) = inner.await?;
-            let ssl = openssl::ssl::Ssl::new(acceptor.context()).map_err(std::io::Error::other)?;
+            let mut ssl =
+                openssl::ssl::Ssl::new(acceptor.context()).map_err(std::io::Error::other)?;
             let tls = tokio::time::timeout(timeout, async {
-                refuse_replay(&stream, &replay).await?;
+                if !early_data_accepted(&stream, &replay).await? {
+                    // This connection's early data is declined: OpenSSL
+                    // skips it and completes the handshake
+                    ssl.set_max_early_data(0).map_err(std::io::Error::other)?;
+                }
                 crate::early_data::EarlyOpenssl::accept(ssl, stream, timeout).await
             })
             .await

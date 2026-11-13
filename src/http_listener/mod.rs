@@ -2359,7 +2359,10 @@ pub async fn run_http_listener_pqc_with_fingerprint(
                         Ok(None) => remote_addr,
                         Err(_) => return,
                     };
-                    handle_pqc_fingerprinted_connection(
+                    // Boxed: the handshake, its early-data decision and the
+                    // served connection hold over 16 KiB across awaits, kept
+                    // in an allocation of its own rather than in the task
+                    Box::pin(handle_pqc_fingerprinted_connection(
                         stream,
                         remote_addr,
                         ech_route,
@@ -2372,7 +2375,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
                         zero_rtt,
                         times,
                         conn_shutdown,
-                    )
+                    ))
                     .await;
                 });
             }
@@ -2656,26 +2659,29 @@ async fn handle_pqc_fingerprinted_connection<S>(
         );
     }
 
-    // SEC-002: a repeated ClientHello (or ticket) offering early data is
-    // refused before any handshake work.
-    if let Some(guard) = &zero_rtt {
-        if peek_len > 0 && guard.is_replay(&peek_buf[..peek_len]) {
-            warn!(
-                "0-RTT replay detected from {} — rejecting early data",
-                remote_addr
-            );
-            return;
-        }
-    }
+    // SEC-002: early data from a ClientHello (or ticket) the replay guard has
+    // seen within the window, or cannot vouch for, is declined before any
+    // handshake work; the handshake goes on without it.
+    let early_data_accepted = match &zero_rtt {
+        Some(guard) if peek_len > 0 => guard.accepts_early_data(&peek_buf[..peek_len]),
+        _ => true,
+    };
 
     // Create SSL instance and perform handshake
-    let ssl = match Ssl::new(&ssl_context) {
+    let mut ssl = match Ssl::new(&ssl_context) {
         Ok(ssl) => ssl,
         Err(e) => {
             debug!("Failed to create SSL instance for {}: {}", remote_addr, e);
             return;
         }
     };
+    if !early_data_accepted {
+        // OpenSSL skips this connection's early data and completes the handshake
+        if let Err(e) = ssl.set_max_early_data(0) {
+            debug!("Declining early data from {}: {}", remote_addr, e);
+            return;
+        }
+    }
 
     // Through SSL_read_early_data when 0-RTT is on: the stream is then served
     // as soon as the server's flight is out, early data first.

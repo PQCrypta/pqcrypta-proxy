@@ -17,9 +17,29 @@
 //!   the admin API (`/pools/{pool}/servers/{id}/drain`)
 
 /// Maximum age of a sticky session mapping before it is silently evicted.
-/// Prevents cookie_sessions / ip_sessions / header_sessions from growing without bound
-/// on long-running instances with many unique clients.
 const SESSION_TTL: Duration = Duration::from_hours(1); // 1 hour
+
+/// Sticky sessions a pool holds per affinity mode. The keys are what clients
+/// send (a cookie, a header, an address), and an entry used to go only when
+/// its own key came back after the TTL, so values sent once stayed for good.
+/// A full table is swept of sessions past the TTL at most once a
+/// [`SESSION_SWEEP_GAP`]; a session that still finds it full is not made
+/// sticky, and its request is balanced as any other.
+const MAX_SESSIONS: usize = 100_000;
+const SESSION_SWEEP_GAP: Duration = Duration::from_secs(5);
+
+/// Whether `key` may hold a sticky session in `sessions`.
+fn session_admitted<K: Eq + std::hash::Hash>(
+    sessions: &DashMap<K, (String, Instant)>,
+    ceiling: &crate::bounded::Ceiling,
+    key: &K,
+) -> bool {
+    sessions.contains_key(key)
+        || ceiling.admits(sessions.len(), || {
+            sessions.retain(|_, (_, at)| at.elapsed() <= SESSION_TTL);
+            sessions.len()
+        })
+}
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -631,6 +651,8 @@ pub struct BackendPool {
     /// Header-value → (server_id, last_access) for header-based affinity.
     /// P2-fix: previously used cookie_sessions (shared map), causing cross-mode confusion.
     header_sessions: DashMap<String, (String, Instant)>,
+    /// The three session tables' ceilings
+    session_ceilings: [crate::bounded::Ceiling; 3],
 
     // === Round-robin state ===
     rr_counter: AtomicU64,
@@ -739,6 +761,9 @@ impl BackendPool {
             cookie_sessions: DashMap::new(),
             ip_sessions: DashMap::new(),
             header_sessions: DashMap::new(),
+            session_ceilings: std::array::from_fn(|_| {
+                crate::bounded::Ceiling::new(MAX_SESSIONS, SESSION_SWEEP_GAP)
+            }),
             rr_counter: AtomicU64::new(0),
             hash_header_name,
             wrr_state: RwLock::new(WeightedRoundRobinState::default()),
@@ -1126,18 +1151,28 @@ impl BackendPool {
         match &self.affinity {
             AffinityMode::Cookie => {
                 if let Some(ref cookie) = ctx.session_cookie {
-                    self.cookie_sessions
-                        .insert(cookie.clone(), (server.id.clone(), Instant::now()));
+                    if session_admitted(&self.cookie_sessions, &self.session_ceilings[0], cookie) {
+                        self.cookie_sessions
+                            .insert(cookie.clone(), (server.id.clone(), Instant::now()));
+                    }
                 }
             }
             AffinityMode::IpHash => {
-                self.ip_sessions
-                    .insert(ctx.client_ip, (server.id.clone(), Instant::now()));
+                if session_admitted(&self.ip_sessions, &self.session_ceilings[1], &ctx.client_ip) {
+                    self.ip_sessions
+                        .insert(ctx.client_ip, (server.id.clone(), Instant::now()));
+                }
             }
             AffinityMode::Header => {
                 if let Some(ref header_val) = ctx.affinity_header {
-                    self.header_sessions
-                        .insert(header_val.clone(), (server.id.clone(), Instant::now()));
+                    if session_admitted(
+                        &self.header_sessions,
+                        &self.session_ceilings[2],
+                        header_val,
+                    ) {
+                        self.header_sessions
+                            .insert(header_val.clone(), (server.id.clone(), Instant::now()));
+                    }
                 }
             }
             AffinityMode::None => {}
@@ -2301,6 +2336,27 @@ mod tests {
     }
 
     use super::*;
+
+    /// A full session table admits no new key until a sweep frees room, and
+    /// a key already held is always admitted.
+    #[test]
+    fn a_full_session_table_admits_no_new_key() {
+        let sessions: DashMap<String, (String, Instant)> = DashMap::new();
+        let ceiling = crate::bounded::Ceiling::new(2, Duration::from_millis(1));
+        for k in ["a", "b"] {
+            assert!(session_admitted(&sessions, &ceiling, &k.to_string()));
+            sessions.insert(k.to_string(), ("s1".into(), Instant::now()));
+        }
+        assert!(!session_admitted(&sessions, &ceiling, &"c".to_string()));
+        assert!(session_admitted(&sessions, &ceiling, &"a".to_string()));
+        // One session past the TTL: the next sweep frees its place
+        if let Some(stale) = Instant::now().checked_sub(SESSION_TTL + Duration::from_secs(1)) {
+            sessions.insert("b".into(), ("s1".into(), stale));
+            std::thread::sleep(Duration::from_millis(5));
+            assert!(session_admitted(&sessions, &ceiling, &"c".to_string()));
+            assert!(!sessions.contains_key("b"));
+        }
+    }
 
     fn pool_config(toml_src: &str) -> BackendPoolConfig {
         toml::from_str(toml_src).unwrap()

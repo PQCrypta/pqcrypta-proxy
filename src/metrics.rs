@@ -282,6 +282,59 @@ struct EndpointErrorInfo {
     last_seen_ms: i64,
 }
 
+/// The failing paths the table follows: the [`MAX_ENDPOINT_ERRORS`] that fail
+/// most (Space-Saving, Metwally et al. 2005). A path not in a full table takes
+/// the place of the one with the fewest failures and starts from that count,
+/// so a path that really is failing often is never pushed out by ones that
+/// each fail once. The keys are also kept in count order, so the one with the
+/// fewest failures is found without a pass over the table: finding it by a
+/// pass cost every new failing path the whole table, under the lock every
+/// failing request takes.
+#[derive(Default)]
+struct FailingPaths {
+    entries: HashMap<Arc<str>, EndpointErrorInfo>,
+    /// The same keys, by count
+    by_count: std::collections::BTreeSet<(u64, Arc<str>)>,
+}
+
+impl FailingPaths {
+    /// One failure of `key` ("path\0error_type").
+    fn record(&mut self, key: String, status: u16, at_ms: i64) {
+        if let Some(k) = self
+            .entries
+            .get_key_value(key.as_str())
+            .map(|(k, _)| Arc::clone(k))
+        {
+            if let Some(info) = self.entries.get_mut(&*k) {
+                self.by_count.remove(&(info.count, Arc::clone(&k)));
+                info.count += 1;
+                info.last_status = status;
+                info.last_seen_ms = at_ms;
+                self.by_count.insert((info.count, k));
+            }
+            return;
+        }
+        let mut floor = 0;
+        if self.entries.len() >= MAX_ENDPOINT_ERRORS {
+            if let Some((least, least_key)) = self.by_count.pop_first() {
+                self.entries.remove(&*least_key);
+                floor = least;
+            }
+        }
+        let k: Arc<str> = key.into();
+        let count = floor + 1;
+        self.entries.insert(
+            Arc::clone(&k),
+            EndpointErrorInfo {
+                count,
+                last_status: status,
+                last_seen_ms: at_ms,
+            },
+        );
+        self.by_count.insert((count, k));
+    }
+}
+
 /// Per-endpoint error count snapshot
 #[derive(Debug, Clone, Serialize)]
 pub struct EndpointErrorEntry {
@@ -323,7 +376,7 @@ pub struct RequestMetrics {
     /// Request latency histogram buckets (in ms)
     latency_histogram: LatencyHistogram,
     /// Per-endpoint error tracking keyed by "path\0error_type"
-    endpoint_errors: Mutex<HashMap<String, EndpointErrorInfo>>,
+    endpoint_errors: Mutex<FailingPaths>,
     /// Recent failure log (ring buffer)
     failure_log: Mutex<std::collections::VecDeque<FailureEntry>>,
 }
@@ -339,7 +392,7 @@ impl RequestMetrics {
             bytes_received: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
             latency_histogram: LatencyHistogram::new(),
-            endpoint_errors: Mutex::new(HashMap::new()),
+            endpoint_errors: Mutex::new(FailingPaths::default()),
             failure_log: Mutex::new(std::collections::VecDeque::with_capacity(FAILURE_LOG_SIZE)),
         }
     }
@@ -411,33 +464,7 @@ impl RequestMetrics {
                 .as_millis(),
         )
         .unwrap_or(i64::MAX);
-        {
-            let mut map = self.endpoint_errors.lock();
-            // The table holds the MAX_ENDPOINT_ERRORS paths that fail most
-            // (Space-Saving, Metwally et al. 2005): a path not in a full table
-            // takes the place of the one with the fewest failures and starts
-            // from that count, so a path that really is failing often is
-            // never pushed out by ones that each fail once.
-            let mut floor = 0;
-            if !map.contains_key(&key) && map.len() >= MAX_ENDPOINT_ERRORS {
-                let least = map
-                    .iter()
-                    .min_by_key(|(_, info)| info.count)
-                    .map(|(k, info)| (k.clone(), info.count));
-                if let Some((least_key, least_count)) = least {
-                    map.remove(&least_key);
-                    floor = least_count;
-                }
-            }
-            let info = map.entry(key).or_insert(EndpointErrorInfo {
-                count: floor,
-                last_status: 0,
-                last_seen_ms: 0,
-            });
-            info.count += 1;
-            info.last_status = status_code;
-            info.last_seen_ms = ts;
-        }
+        self.endpoint_errors.lock().record(key, status_code, ts);
         // Add to failure log ring buffer
         let entry = FailureEntry {
             ts,
@@ -458,6 +485,7 @@ impl RequestMetrics {
     ) -> Vec<EndpointErrorEntry> {
         let map = self.endpoint_errors.lock();
         let mut entries: Vec<EndpointErrorEntry> = map
+            .entries
             .iter()
             .filter_map(|(k, v)| {
                 let parts: Vec<&str> = k.splitn(2, '\0').collect();
@@ -1818,6 +1846,16 @@ mod tests {
             "the path that fails most was pushed out"
         );
         assert_eq!(m.recent_failures().len(), FAILURE_LOG_SIZE);
+        let paths = m.endpoint_errors.lock();
+        assert_eq!(
+            paths.by_count.len(),
+            paths.entries.len(),
+            "one index entry per path"
+        );
+        assert!(paths
+            .by_count
+            .iter()
+            .all(|(count, key)| paths.entries.get(&**key).is_some_and(|i| i.count == *count)));
     }
 
     #[test]
