@@ -1051,9 +1051,13 @@ pub struct ServerConfig {
     /// WebTransport headroom while dropping the advertised ceiling tenfold.
     #[serde(default = "default_max_uni_streams")]
     pub max_uni_streams_per_connection: u32,
-    /// Keep-alive interval in seconds
+    /// How often the QUIC listener sends a keep-alive PING, in seconds: a NAT
+    /// keeps the path of a connection with a session or tunnel open. An idle
+    /// connection is still closed after `max_idle_timeout_secs`.
     pub keepalive_interval_secs: u64,
-    /// Maximum idle timeout in seconds
+    /// How long a connection may be idle, in seconds: the QUIC idle timeout,
+    /// the time a TCP or HTTP/3 connection may have nothing in flight before
+    /// it is closed, and how long a request's header block may take to arrive
     pub max_idle_timeout_secs: u64,
     /// Enable IPv6 dual-stack binding
     pub enable_ipv6: bool,
@@ -5000,6 +5004,18 @@ impl ProxyConfig {
             .iter()
             .filter(|r| self.route_matches(r, host, path, is_webtransport))
             .min_by_key(|r| r.priority)
+    }
+
+    /// Whether any route names `host` (its own pattern, or a wildcard that
+    /// covers it). A path no route takes on a host this proxy serves is a gap
+    /// in the configuration; on a host it never served (an address, a name
+    /// pointed here by someone else) it is a scanner's guess.
+    pub fn serves_host(&self, host: &str) -> bool {
+        let host = host_without_port(host);
+        self.routes
+            .iter()
+            .filter_map(|r| r.host.as_deref())
+            .any(|pattern| self.host_matches(pattern, host))
     }
 
     /// Check if a route matches the request

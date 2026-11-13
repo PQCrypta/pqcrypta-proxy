@@ -255,6 +255,9 @@ serde_ignored = "0.1"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "user", "resource", "time"] }
+# setsockopt(SO_RCVLOWAT) for the ClientHello peek (src/recv_low_water.rs): no
+# socket crate here has a setter for it; already linked through tokio and mio
+libc = "0.2"
 # Unix socket support for PHP-FPM backends (not available on Windows)
 hyperlocal = "0.9"
 # Signal handling (uses Unix-specific signal iterators)

@@ -169,6 +169,8 @@ pub mod provider_kx;
 pub mod proxy;
 pub mod quic_listener;
 pub mod rate_limiter; // Must be before config (config imports from it)
+#[cfg(unix)]
+pub mod recv_low_water;
 pub mod request_encoding;
 pub mod request_id;
 pub mod request_target;

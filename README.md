@@ -137,7 +137,7 @@
 | **Least Response Time Routing** | ✅ | Routes requests to the backend with the lowest moving-average response time |
 | **IP Hash Load Balancing** | ✅ | Deterministic backend selection by client IP hash for implicit session stickiness |
 | **Per-Server Priority** | ✅ | Failover priority levels; lower-priority backends only receive traffic when higher-priority ones are unhealthy |
-| **Per-Server Keep-Alive** | ✅ | Configurable QUIC keep-alive interval per server to prevent idle connection timeouts |
+| **Per-Server Keep-Alive** | ✅ | QUIC keep-alive PINGs every `keepalive_interval_secs`, so a NAT keeps the path of a connection with a session or tunnel open; a connection with nothing in flight is still closed after `max_idle_timeout_secs` (HTTP/3 with GOAWAY first), as a TCP connection is |
 | **DNS Prefetch / Preconnect / Prerender Hints** | ✅ | Early Hints Link headers for dns-prefetch, preconnect, modulepreload, and speculative prerender |
 | **Report-To Header** | ✅ | Reporting endpoint configuration injected into responses for NEL and CSP violation delivery |
 | **Fingerprint Cache TTL** | ✅ | JA3/JA4 fingerprint classification cache with configurable max-age and background cleanup |
@@ -218,7 +218,7 @@
 - **Connection Draining**: a pool server removed by a reload (or drained through the admin API) takes no new sessions and keeps its own until the drain timeout
 - **Request Queuing**: a request that finds every pool server full waits for a place, up to the queue's size and time
 - **Connection Pool**: Per-backend connection pool with configurable max idle connections, max total connections, acquire timeout, and idle timeout; idempotent requests that meet a pooled connection the backend closed as they were written are sent again on another connection instead of failing with a 502
-- **Per-Server Keep-Alive**: Configurable QUIC keep-alive interval per server to prevent idle connection timeouts
+- **Per-Server Keep-Alive**: QUIC keep-alive PINGs keep a NAT's path open under a session or tunnel; a connection with nothing in flight is closed after `max_idle_timeout_secs` on every transport
 - **Priority Failover**: Primary servers first, then failover to lower priority
 
 ### HTTP/3 Advanced Features

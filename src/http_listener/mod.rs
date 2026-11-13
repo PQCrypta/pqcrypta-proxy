@@ -2481,34 +2481,103 @@ fn current_ech_route(
     }))
 }
 
+/// How many bytes of `buf` (a peek of `n`) make the first TLS record whole:
+/// the 5-byte header, then the length it gives, at most the buffer. `n` itself
+/// for something that is not a handshake record.
+fn client_hello_needs(buf: &[u8], n: usize) -> usize {
+    if n == 0 || buf[0] != 22 {
+        return n;
+    }
+    if n < 5 {
+        return 5;
+    }
+    (5 + usize::from(u16::from_be_bytes([buf[3], buf[4]]))).min(buf.len())
+}
+
 /// Peek the ClientHello's TLS record until it is whole (its length is in the
-/// record header), the buffer is full, or `deadline`. None when nothing came
-/// in time; otherwise the last peek's result.
+/// record header), the buffer is full, the peer closes, or `deadline`. None
+/// when nothing came in time; otherwise the last peek's result.
+///
+/// The bytes are peeked, not read, so they stay for the TLS stack. A peek
+/// returns at once while anything is queued, so the wait for the rest of a
+/// record in flight is the kernel's: the receive low-water mark is set to what
+/// the record needs (`crate::recv_low_water`) and the socket waited on until
+/// it says readable, where this used to peek again every 2 ms (500 wake-ups a
+/// second for each connection whose ClientHello trickled in). The mark is put
+/// back to 1 before the TLS stack reads.
 async fn peek_client_hello(
     stream: &TcpStream,
     buf: &mut [u8],
     deadline: tokio::time::Instant,
 ) -> Option<std::io::Result<usize>> {
-    loop {
-        let n = match tokio::time::timeout_at(deadline, stream.peek(buf))
-            .await
-            .ok()?
-        {
-            Ok(n) => n,
-            Err(e) => return Some(Err(e)),
+    let mut waited = false;
+    let mut last = None;
+    let result = loop {
+        let n = match tokio::time::timeout_at(deadline, stream.peek(buf)).await {
+            Err(_) => break last.map(Ok),
+            Ok(Err(e)) => break Some(Err(e)),
+            Ok(Ok(n)) => n,
         };
-        let whole = n >= 5 && n >= 5 + u16::from_be_bytes([buf[3], buf[4]]) as usize;
-        if n == 0 || whole || n == buf.len() || buf[0] != 22 {
-            return Some(Ok(n));
+        let need = client_hello_needs(buf, n);
+        // Whole, not a handshake record, or no more after the kernel said
+        // there was (the peer closed or reset, which it reports as readable)
+        if n >= need || (WAIT_IS_THE_KERNELS && last == Some(n)) {
+            break Some(Ok(n));
         }
-        // More of the record is in flight: peek returns at once while
-        // anything is buffered, so wait a little before looking again
-        let pause = std::time::Duration::from_millis(2);
-        if tokio::time::Instant::now() + pause >= deadline {
-            return Some(Ok(n));
+        last = Some(n);
+        waited = true;
+        match wait_for_record(stream, need, deadline).await {
+            None => break Some(Ok(n)),
+            Some(Err(e)) => break Some(Err(e)),
+            Some(Ok(())) => {}
         }
-        tokio::time::sleep(pause).await;
+    };
+    #[cfg(unix)]
+    if waited {
+        let _ = crate::recv_low_water::set(stream, 1);
     }
+    #[cfg(not(unix))]
+    let _ = waited;
+    result
+}
+
+/// Whether [`wait_for_record`] returns only when the kernel has more to say,
+/// so a peek that finds nothing new after it means the peer is gone.
+const WAIT_IS_THE_KERNELS: bool = cfg!(unix);
+
+/// Wait until `need` bytes are queued on `stream`, the peer closes, or
+/// `deadline` (None). The receive low-water mark makes it one wake-up.
+#[cfg(unix)]
+async fn wait_for_record(
+    stream: &TcpStream,
+    need: usize,
+    deadline: tokio::time::Instant,
+) -> Option<std::io::Result<()>> {
+    crate::recv_low_water::set(stream, need).ok()?;
+    // Forget the readiness the queued bytes gave, so the wait below is for the
+    // kernel's next report: the record whole, or the peer gone
+    let _ = stream.try_io(tokio::io::Interest::READABLE, || {
+        Err::<(), _>(std::io::ErrorKind::WouldBlock.into())
+    });
+    tokio::time::timeout_at(deadline, stream.readable())
+        .await
+        .ok()
+}
+
+/// Windows has no receive low-water mark for TCP: look again shortly. (The
+/// proxy is built there, not deployed.)
+#[cfg(not(unix))]
+async fn wait_for_record(
+    _stream: &TcpStream,
+    _need: usize,
+    deadline: tokio::time::Instant,
+) -> Option<std::io::Result<()>> {
+    let pause = std::time::Duration::from_millis(2);
+    if tokio::time::Instant::now() + pause >= deadline {
+        return None;
+    }
+    tokio::time::sleep(pause).await;
+    Some(Ok(()))
 }
 
 // Every argument is a distinct per-connection dependency with no natural
@@ -2810,6 +2879,14 @@ async fn handle_pqc_fingerprinted_connection<S>(
 /// A place for one more client connection from `peer` under the connection
 /// limits (`server.max_connections`, `security.max_connections_per_ip`), or
 /// `None` when there is none: the connection is then closed unanswered.
+///
+/// The blocklist and the location rules are not applied here, as the QUIC
+/// listener applies them before its handshake, and on purpose: a blocked or
+/// geo-blocked visitor is answered with the error page that says why
+/// (`RequestPolicy::error_page`), which takes a handshake. The QUIC refusal is
+/// what sends a browser to TCP for that page, and an address that keeps
+/// coming back after its 403s is banned at the firewall by fail2ban from the
+/// access log.
 fn admit_connection(
     peer: SocketAddr,
     security: &SecurityState,
@@ -4373,8 +4450,14 @@ async fn proxy_handler(
             }
         }
     } else {
-        // No route matched - return 404
-        warn!("No route matched for {} {}", host, path);
+        // No route matched - return 404. A warning where this proxy serves the
+        // host (a gap in its routes); a scanner's guess at an address or a
+        // name it never served is noise anyone can make, logged at debug.
+        if state.config.serves_host(&host) {
+            warn!("No route matched for {} {}", host, path);
+        } else {
+            debug!("No route matched for {} {}", host, path);
+        }
 
         // Record request metrics (skip error tracking for health check traffic)
         state
@@ -4604,7 +4687,9 @@ pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 
                 // Strip port suffix if present (e.g. "example.com:80" → "example.com")
                 let host_name = crate::config::host_without_port(&host_lower);
                 if !permitted.iter().any(|d| d.as_str() == host_name) {
-                    warn!(
+                    // At debug: scanners send an address or another name on
+                    // port 80 all day, and each refusal was a warning
+                    debug!(
                         "HTTP redirect: rejected request with unknown Host header: {} — \
                          not in allowed_domains list",
                         host_lower
@@ -5203,5 +5288,122 @@ mod connection_lifetime_tests {
             .unwrap();
         assert!(asked.elapsed() < CLOSE_GRACE + Duration::from_secs(3));
         drop(client);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod peek_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    /// A ClientHello record of `len` body bytes: the header, then the body
+    fn record(len: u16) -> Vec<u8> {
+        let mut r = vec![22, 3, 1];
+        r.extend_from_slice(&len.to_be_bytes());
+        r.extend(std::iter::repeat_n(1u8, usize::from(len)));
+        r
+    }
+
+    async fn pair() -> (TcpStream, TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (server, client)
+    }
+
+    /// A record that arrives in three pieces is peeked whole, once it is,
+    /// and still there to read: the bytes are not taken off the socket
+    #[tokio::test]
+    async fn a_record_in_pieces_is_peeked_whole() {
+        let (server, mut client) = pair().await;
+        let hello = record(1800);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let sender = tokio::spawn(async move {
+            for piece in [&hello[..3], &hello[3..900], &hello[900..]] {
+                client.write_all(piece).await.unwrap();
+                client.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(60)).await;
+            }
+            client
+        });
+        let mut buf = vec![0u8; 4096];
+        let n = peek_client_hello(&server, &mut buf, deadline)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 1805);
+        let mut again = vec![0u8; 4096];
+        assert_eq!(server.peek(&mut again).await.unwrap(), 1805, "still queued");
+        drop(sender.await.unwrap());
+    }
+
+    /// A peer that sends half a record and closes is answered when it closes,
+    /// not at the deadline
+    #[tokio::test]
+    async fn a_peer_that_closes_mid_record_is_not_waited_for() {
+        let (server, mut client) = pair().await;
+        let hello = record(1800);
+        client.write_all(&hello[..700]).await.unwrap();
+        let closer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(client);
+        });
+        let started = tokio::time::Instant::now();
+        let mut buf = vec![0u8; 4096];
+        let n = peek_client_hello(&server, &mut buf, started + Duration::from_secs(10))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 700);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        closer.await.unwrap();
+    }
+
+    /// A record that stops arriving ends at the deadline with what came; a
+    /// connection that sends nothing ends with nothing
+    #[tokio::test]
+    async fn a_stalled_record_ends_at_the_deadline() {
+        let (server, mut client) = pair().await;
+        let hello = record(1800);
+        client.write_all(&hello[..400]).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        let mut buf = vec![0u8; 4096];
+        let n = peek_client_hello(&server, &mut buf, deadline)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 400);
+        assert!(tokio::time::Instant::now() >= deadline);
+
+        let (quiet, _client) = pair().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        assert!(peek_client_hello(&quiet, &mut buf, deadline)
+            .await
+            .is_none());
+        drop(client);
+    }
+
+    #[test]
+    fn what_a_client_hello_needs() {
+        let r = record(300);
+        assert_eq!(client_hello_needs(&r, 2), 5);
+        assert_eq!(client_hello_needs(&r, 5), 305);
+        assert_eq!(
+            client_hello_needs(&r[..200], 200),
+            200,
+            "capped by the buffer"
+        );
+        assert_eq!(
+            client_hello_needs(b"GET / HTTP/1.1", 14),
+            14,
+            "not a handshake"
+        );
     }
 }

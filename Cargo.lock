@@ -2647,6 +2647,7 @@ dependencies = [
  "ipnet",
  "ipnetwork 0.20.0",
  "jsonwebtoken",
+ "libc",
  "libmimalloc-sys",
  "maxminddb",
  "md-5",

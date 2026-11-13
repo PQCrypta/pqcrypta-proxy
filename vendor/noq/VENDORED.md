@@ -42,6 +42,9 @@ when the proxy builds noq as a dependency.
   of small packets is not read as the path's bandwidth.
 - Event streams that end with their connection; `PathId::get`; a seeded test
   pair.
+- An Initial whose Retry token differs from the connection's is logged at
+  debug, not warn: the packet is the peer's (or a spoofer's) to send, one line
+  each.
 
 ## Updating it
 

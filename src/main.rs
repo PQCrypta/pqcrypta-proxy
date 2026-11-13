@@ -1837,30 +1837,50 @@ async fn run() -> anyhow::Result<()> {
         "Waiting up to {}s for in-flight connections to drain...",
         drain_secs
     );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(drain_secs);
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(drain_secs);
+    // What the drain is waiting for, said every 2 s while it waits: a
+    // drain that took 14 s on web1 (2026-11-13) left no word of what held it
+    let drain_report = std::time::Duration::from_secs(2);
+    let mut next_report = started + drain_report;
+    let held_by_protocol = |held: u64| {
+        let c = metrics_registry.snapshot().connections;
+        format!(
+            "{} client connection(s) held; open: http1 {}, http2 {}, http3 {}, \
+             webtransport {}, connect-udp {}, passthrough {}",
+            held,
+            c.open_http1,
+            c.open_http2,
+            c.open_http3,
+            c.open_webtransport,
+            c.open_connect_udp,
+            c.open_passthrough
+        )
+    };
     loop {
         // Exchanges in flight (by protocol), and client connections any
         // listener still holds, a handshake not yet finished among them
         let active = metrics_registry.active_connections();
         let held = pqcrypta_proxy::conn_limits::open_connections();
+        let now = std::time::Instant::now();
         if active == 0 && held == 0 {
-            info!("All connections drained — proceeding with shutdown");
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            let c = metrics_registry.snapshot().connections;
             info!(
-                "Drain timeout reached: {} client connection(s) held; open: \
-                 http1 {}, http2 {}, http3 {}, webtransport {}, connect-udp {}, passthrough {}",
-                held,
-                c.open_http1,
-                c.open_http2,
-                c.open_http3,
-                c.open_webtransport,
-                c.open_connect_udp,
-                c.open_passthrough
+                "All connections drained in {:.1}s — proceeding with shutdown",
+                now.duration_since(started).as_secs_f64()
             );
             break;
+        }
+        if now >= deadline {
+            info!("Drain timeout reached: {}", held_by_protocol(held));
+            break;
+        }
+        if now >= next_report {
+            info!(
+                "Draining for {:.0}s: {}",
+                now.duration_since(started).as_secs_f64(),
+                held_by_protocol(held)
+            );
+            next_report = now + drain_report;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }

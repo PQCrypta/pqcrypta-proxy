@@ -1230,6 +1230,28 @@ impl SecurityState {
         self.geo_block_reason(ip).is_some()
     }
 
+    /// Block `ip` for a location rule (`reason`, from [`Self::geo_block_reason`])
+    /// for `geoip_block_duration_secs`, in one log line that names the rule.
+    /// Both transports block through here: the QUIC listener blocked for good
+    /// whatever the setting said, and logged the decision twice.
+    ///
+    /// `geoip_block_duration_secs = 0` means the block never expires. TOML has
+    /// no null, and the field carries a serde default, so omitting it cannot
+    /// express "permanent" — zero is the only value available to say it. It
+    /// also had to stop meaning what it used to: `Some(0)` became
+    /// `Instant::now() + 0`, a block that had already expired before it was
+    /// written, so an operator asking for the strongest setting got no block
+    /// at all.
+    pub fn geo_block(&self, ip: IpAddr, reason: &str) {
+        let duration = self
+            .config
+            .read()
+            .geoip_block_duration_secs
+            .filter(|secs| *secs > 0)
+            .map(Duration::from_secs);
+        self.block_ip_because(ip, BlockReason::GeoBlocked, duration, Some(reason));
+    }
+
     /// Get or create rate limiter for an IP.
     ///
     /// AUD-07: The last-access timestamp is updated on every call so that the
@@ -1431,6 +1453,19 @@ impl SecurityState {
 
     /// Block an IP address
     pub fn block_ip(&self, ip: IpAddr, reason: BlockReason, duration: Option<Duration>) {
+        self.block_ip_because(ip, reason, duration, None);
+    }
+
+    /// [`Self::block_ip`] with what the decision rested on (`country CN`), said
+    /// in the one line the block is logged in. A geo block was two warnings,
+    /// the rule's and the block's, and only the first named the country.
+    pub fn block_ip_because(
+        &self,
+        ip: IpAddr,
+        reason: BlockReason,
+        duration: Option<Duration>,
+        detail: Option<&str>,
+    ) {
         // Never block trusted IPs (loopback, or operator-configured trusted_internal_cidrs)
         if self.is_trusted(&ip) {
             debug!(
@@ -1449,12 +1484,13 @@ impl SecurityState {
             .unwrap_or(1);
 
         warn!(
-            "Blocked IP {} for {:?} (reason: {:?}, block count: {})",
+            "Blocked IP {} for {} (reason: {:?}{}, block count: {})",
             ip,
             duration
                 .map(|d| format!("{:?}", d))
                 .unwrap_or_else(|| "permanent".to_string()),
             reason,
+            detail.map(|d| format!(", {d}")).unwrap_or_default(),
             block_count
         );
 
@@ -2029,26 +2065,10 @@ impl SecurityState {
 
         // 3. Location and network: country, region, AS, Tor exit.
         if let Some(reason) = self.geo_block_reason(&ip).filter(|_| !policy.error_page) {
-            warn!("GeoIP blocked request from {} ({})", ip, reason);
-            // `geoip_block_duration_secs = 0` means the block never expires.
-            //
-            // TOML has no null, and the field carries a serde default, so
-            // omitting it cannot express "permanent" — zero is the only value
-            // available to say it. It also had to stop meaning what it used to:
-            // `Some(0)` became `Instant::now() + 0`, a block that had already
-            // expired before it was written, so an operator asking for the
-            // strongest setting got no block at all.
-            let duration = self
-                .config
-                .read()
-                .geoip_block_duration_secs
-                .filter(|secs| *secs > 0)
-                .map(Duration::from_secs);
-            self.block_ip(ip, BlockReason::GeoBlocked, duration);
+            self.geo_block(ip, &reason);
             return Err(SecurityDecision::GeoBlocked);
         }
 
-        // 4. Rate limits — per-route override where the route names one.
         // 4. Rate limits — per-route override where the route names one.
         let (rate_enabled, rate_rps, conn_rate_enabled, conn_rate_per_sec) = {
             let rc = self.rate_config.read();
