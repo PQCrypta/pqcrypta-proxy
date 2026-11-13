@@ -1804,8 +1804,6 @@ systemctl enable --now delegated-credential-cert.timer
 [pqc]
 enabled = true
 provider = "openssl3.5"
-openssl_path = "/usr/local/openssl-4.0.3/bin/openssl"
-openssl_lib_path = "/usr/local/openssl-4.0.3/lib64"
 preferred_kem = "X25519MLKEM768"
 fallback_to_classical = true   # offer P-384 so non-ML-KEM clients can connect
 require_pqc_provider = true    # refuse to start if our own PQC provider is broken
@@ -1826,7 +1824,7 @@ Until 2026-09-24 the OpenSSL listener logged the group list these settings produ
 
 Whichever setting removes the classical group, the proxy now logs a warning saying so. It used to warn for `require_hybrid` and stay silent for `fallback_to_classical = false`, so the more obscure route to a client lockout was also the quieter one.
 
-> **Important**: `openssl_path` must point to an OpenSSL 3.5+ binary built with ML-KEM support. The proxy checks this path at startup to decide whether the PQC TCP listener is available. With `require_pqc_provider = true` (the default) a wrong or missing path stops startup; with it false the proxy falls back to a standard rustls listener that accepts TLS 1.2 and does not negotiate X25519MLKEM768. Verify the path before deploying either way.
+> **Important**: PQC support is read from the OpenSSL the proxy links, not from a binary: at startup it asks that library for its version and offers each post-quantum group to a scratch context, the call the listeners make, so the answer is about the library that serves the handshakes. With `require_pqc_provider = true` (the default) a library without ML-KEM stops startup; with it false the proxy falls back to a standard rustls listener that accepts TLS 1.2 and does not negotiate X25519MLKEM768. It used to run an `openssl` binary named by `openssl_path` and `openssl_lib_path`, `/usr/local/openssl-3.5` by default, which spoke for that build rather than the linked one, and a host without the path refused to start under the default `require_pqc_provider` unless it named its own. Both settings are gone; a configuration that still sets them is told they are ignored.
 
 **OpenSSL 4.0.** The deployment's TCP listener links OpenSSL 4.0.3, with
 liboqs 0.16.0 and oqs-provider 0.12.0 for the FrodoKEM and HQC groups, from its

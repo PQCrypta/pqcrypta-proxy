@@ -1880,10 +1880,6 @@ pub struct PqcConfig {
     /// - "rustls": Pure Rust via aws-lc-rs (memory-safe, QUIC support)
     /// - "openssl3.5": OpenSSL 3.5+ with native ML-KEM (broader algorithms)
     pub provider: String,
-    /// OpenSSL binary path (for OpenSSL 3.5+ with native ML-KEM)
-    pub openssl_path: Option<PathBuf>,
-    /// OpenSSL library path
-    pub openssl_lib_path: Option<PathBuf>,
     /// Preferred KEM algorithm for key exchange
     pub preferred_kem: String,
     /// Offer the classical key-exchange groups (P-384, then P-256) after the hybrid PQC
@@ -1983,8 +1979,6 @@ impl Default for PqcConfig {
             enabled: true,
             required: false,
             provider: "auto".to_string(), // Auto-select best available
-            openssl_path: Some(PathBuf::from("/usr/local/openssl-3.5/bin/openssl")),
-            openssl_lib_path: Some(PathBuf::from("/usr/local/openssl-3.5/lib64")),
             // X25519MLKEM768 is the IETF standard hybrid (classical + PQC)
             // Provides NIST Level 3 security with classical fallback
             preferred_kem: "X25519MLKEM768".to_string(),

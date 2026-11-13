@@ -277,8 +277,6 @@ All responses automatically include these security headers. The `Server` header 
 |--------|------|---------|-------------|
 | `enabled` | bool | `true` | Enable PQC hybrid key exchange |
 | `provider` | string | `"auto"` | PQC provider. Options: `"auto"`, `"rustls"`, `"openssl3.5"` |
-| `openssl_path` | path? | `"/usr/local/openssl-3.5/bin/openssl"` | Path to OpenSSL 3.5+ binary |
-| `openssl_lib_path` | path? | `"/usr/local/openssl-3.5/lib64"` | OpenSSL library path |
 | `preferred_kem` | string | `"X25519MLKEM768"` | Preferred KEM algorithm |
 | `fallback_to_classical` | bool | `true` | Fallback to classical TLS if PQC unavailable |
 | `min_security_level` | u8 | `3` | Minimum NIST security level (1-5) |

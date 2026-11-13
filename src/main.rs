@@ -2256,92 +2256,6 @@ fn print_startup_summary(config: &ProxyConfig, pqc_enabled: bool) {
     info!("═══════════════════════════════════════════════════════════════");
 }
 
-/// L-4: Validate the configured OpenSSL binary path for basic safety properties.
-///
-/// Checks:
-/// - The path is absolute (not a bare name that could be hijacked via PATH)
-/// - The file exists and is a regular file
-/// - On Unix: the file is not world-writable (prevents binary substitution)
-#[cfg(feature = "pqc")]
-fn validate_openssl_path(
-    openssl_path: &std::path::Path,
-    has_warnings: &mut bool,
-    has_errors: &mut bool,
-) {
-    if !openssl_path.is_absolute() {
-        error!(
-            "  ❌ openssl_path '{}' is not an absolute path — a relative path can be \
-             hijacked via PATH manipulation",
-            openssl_path.display()
-        );
-        *has_errors = true;
-        return;
-    }
-
-    if !openssl_path.exists() {
-        // Not an error — the PQC code already falls back gracefully when OpenSSL is absent.
-        // The security concern (L-4) is about what the path points to when it *does* exist.
-        warn!(
-            "  ⚠️  openssl_path '{}' does not exist — PQC via OpenSSL unavailable; \
-             will fall back to rustls",
-            openssl_path.display()
-        );
-        *has_warnings = true;
-        return;
-    }
-
-    if !openssl_path.is_file() {
-        warn!(
-            "  ⚠️  openssl_path '{}' exists but is not a regular file",
-            openssl_path.display()
-        );
-        *has_warnings = true;
-        return;
-    }
-
-    // Unix: check that the file is not world-writable
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        match std::fs::metadata(openssl_path) {
-            Ok(meta) => {
-                let mode = meta.permissions().mode();
-                if mode & 0o002 != 0 {
-                    warn!(
-                        "  ⚠️  openssl_path '{}' is world-writable (mode {:o}) — \
-                         this allows any user to replace the binary",
-                        openssl_path.display(),
-                        mode
-                    );
-                    *has_warnings = true;
-                } else {
-                    info!(
-                        "  ✅ openssl_path '{}' permissions: OK (mode {:o})",
-                        openssl_path.display(),
-                        mode
-                    );
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "  ⚠️  Could not stat openssl_path '{}': {}",
-                    openssl_path.display(),
-                    e
-                );
-                *has_warnings = true;
-            }
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        info!(
-            "  ✅ openssl_path '{}': exists and is absolute",
-            openssl_path.display()
-        );
-    }
-}
-
 /// Perform security checks before starting the proxy
 ///
 /// Checks:
@@ -2349,7 +2263,7 @@ fn validate_openssl_path(
 /// 2. OpenSSL provider integrity verification (if PQC enabled)
 /// 3. PQC capability detection
 async fn perform_security_checks(config: &ProxyConfig) -> anyhow::Result<()> {
-    use pqcrypta_proxy::pqc_extended::{ExtendedPqcConfig, KeySecurityCheck, PqcCapabilities};
+    use pqcrypta_proxy::pqc_extended::{KeySecurityCheck, PqcCapabilities};
     use std::path::Path;
 
     info!("═══════════════════════════════════════════════════════════════");
@@ -2358,16 +2272,6 @@ async fn perform_security_checks(config: &ProxyConfig) -> anyhow::Result<()> {
 
     let mut has_warnings = false;
     let mut has_errors = false;
-
-    // =========================================================================
-    // 0. L-4: Validate openssl_path before executing the binary
-    // =========================================================================
-    #[cfg(feature = "pqc")]
-    if config.pqc.enabled {
-        if let Some(ref openssl_path) = config.pqc.openssl_path {
-            validate_openssl_path(openssl_path, &mut has_warnings, &mut has_errors);
-        }
-    }
 
     // =========================================================================
     // 1. Check TLS private key file permissions
@@ -2398,15 +2302,7 @@ async fn perform_security_checks(config: &ProxyConfig) -> anyhow::Result<()> {
     // =========================================================================
     #[cfg(feature = "pqc")]
     if config.pqc.enabled && config.pqc.verify_provider {
-        // Convert to ExtendedPqcConfig for verification
-        let extended_config = ExtendedPqcConfig {
-            enabled: config.pqc.enabled,
-            openssl_path: config.pqc.openssl_path.clone(),
-            openssl_lib_path: config.pqc.openssl_lib_path.clone(),
-            ..Default::default()
-        };
-
-        match pqcrypta_proxy::pqc_extended::verify_openssl_provider(&extended_config) {
+        match pqcrypta_proxy::pqc_extended::verify_openssl_provider() {
             Ok(()) => {
                 info!("  ✅ OpenSSL provider: VERIFIED");
             }
@@ -2446,14 +2342,7 @@ async fn perform_security_checks(config: &ProxyConfig) -> anyhow::Result<()> {
             }
         }
 
-        let extended_config = ExtendedPqcConfig {
-            enabled: config.pqc.enabled,
-            openssl_path: config.pqc.openssl_path.clone(),
-            openssl_lib_path: config.pqc.openssl_lib_path.clone(),
-            ..Default::default()
-        };
-
-        let capabilities = PqcCapabilities::detect(&extended_config);
+        let capabilities = PqcCapabilities::detect();
 
         info!("  📊 PQC Capabilities:");
         info!(
