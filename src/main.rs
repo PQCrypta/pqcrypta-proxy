@@ -57,7 +57,13 @@ use pqcrypta_proxy::{run_http_listener_pqc, run_http_listener_pqc_with_fingerpri
 #[derive(Parser, Debug)]
 #[command(name = "pqcrypta-proxy")]
 #[command(
-    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("PQCRYPTA_GIT_COMMIT"), ")"),
+    version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (",
+        env!("PQCRYPTA_GIT_COMMIT"),
+        ")",
+        env!("PQCRYPTA_BUILD_NOTE")
+    ),
     about,
     long_about = None
 )]

@@ -275,8 +275,9 @@ sample must never invent — `ressample.py` matches the backend by its config
 
 ## Measurement-only builds
 
-Three cargo features exist to answer questions a profile cannot. None is ever
-built by `scripts/deploy.sh`, and each produces a binary that must not ship.
+Three cargo features exist to answer questions a profile cannot. Each produces
+a binary that must not ship: its `--version` ends `[measurement build: …]`, and
+`scripts/deploy.sh` refuses it.
 
 - `count-allocs` — wraps the global allocator with counters. A profile gives the
   allocator's *share* of CPU; this gives the *number*, and the two lead to

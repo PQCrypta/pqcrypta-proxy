@@ -2341,18 +2341,23 @@ Spans are batched and exported asynchronously via OTLP HTTP/JSON (no protobuf de
 
 ## Deployment
 
-### Fleet deploy (build-verified)
+### Fleet deploy
 
-`scripts/deploy.sh` builds the release binary, records its sha256, deploys to
-every proxy node, and verifies each node is running that exact hash with the
-service active. It always builds first: `cargo test` and `cargo clippy` do not
-produce the release binary, so copying `target/release/pqcrypta-proxy` after
-only those can ship a stale build — this script closes that gap.
+`scripts/deploy.sh BINARY NODE...` installs a release binary on each node in
+turn (`local`, or an ssh destination). On each it copies the binary beside the
+live one and runs it with `--validate` as the service account against that
+node's configuration, which loads it and runs the startup security checks as a
+real start would. It keeps the live binary as `.prev-<UTC time>`, installs and
+restarts, and waits for the node to be active and running this binary's
+version, putting the previous binary back if it is not; the first node that
+fails stops the run. It builds nothing: build once, on a build host, and give
+it the binary. A measurement build (`[measurement build: …]` in `--version`) is
+refused.
 
 ```bash
-scripts/deploy.sh              # build + deploy all nodes + verify hashes
-scripts/deploy.sh --local-only # this node only
-scripts/deploy.sh --gate       # also run the post-deploy WAF regression gate
+cargo build --release --bin pqcrypta-proxy   # on the build host
+scripts/deploy.sh target/release/pqcrypta-proxy local node2 node3
+scripts/deploy.sh --gate target/release/pqcrypta-proxy local   # then the post-deploy WAF gate
 ```
 
 ### Systemd (Linux)

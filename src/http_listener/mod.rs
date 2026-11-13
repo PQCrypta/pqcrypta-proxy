@@ -819,7 +819,7 @@ fn build_proxy_service(
     // boxed future and a clone per layer per request — can be measured instead of
     // inferred from a profile's share. NOT deployable: it removes the security
     // evaluator, both rate limiters, the response cache, and every response header
-    // the chain adds. Never built by scripts/deploy.sh.
+    // the chain adds. Its `--version` says so, and scripts/deploy.sh refuses it.
     #[cfg(feature = "bench-no-middleware")]
     let svc = {
         let _ = (

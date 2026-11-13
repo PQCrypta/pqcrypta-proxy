@@ -15,7 +15,24 @@ fn git(args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// The measurement-only features (Cargo.toml: count-allocs, bench-*) a build
+/// has, said in `--version` (`[measurement build: …]`) so such a binary is
+/// told from a release one: `scripts/deploy.sh` refuses it.
+fn measurement_note() -> String {
+    let features: Vec<String> = std::env::vars()
+        .filter_map(|(k, _)| k.strip_prefix("CARGO_FEATURE_").map(str::to_string))
+        .filter(|f| f == "COUNT_ALLOCS" || f.starts_with("BENCH_"))
+        .map(|f| f.to_ascii_lowercase().replace('_', "-"))
+        .collect();
+    if features.is_empty() {
+        String::new()
+    } else {
+        format!(" [measurement build: {}]", features.join(", "))
+    }
+}
+
 fn main() {
+    println!("cargo:rustc-env=PQCRYPTA_BUILD_NOTE={}", measurement_note());
     // A build with no git checkout -- the Docker image, whose context has no
     // .git -- is given the commit instead (a build argument in CI).
     println!("cargo:rerun-if-env-changed=PQCRYPTA_GIT_COMMIT");
