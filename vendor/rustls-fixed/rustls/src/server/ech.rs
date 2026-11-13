@@ -264,6 +264,13 @@ pub(crate) enum EchResolution {
     /// `ServerEchConfig` has: GREASE, or a retired config. Handled as
     /// `Rejected` is.
     UnknownConfig,
+    /// An offer that opened, but whose ClientHelloInner cannot be decoded or
+    /// breaks RFC 9849's rules for it: the handshake is aborted with the
+    /// alert (section 5.1: `decode_error` or `illegal_parameter`, section
+    /// 7.1: `illegal_parameter`). Only a client holding the config's public
+    /// key gets this far, and it chose the plaintext, so the alert tells it
+    /// nothing it did not know.
+    Invalid(AlertDescription, PeerMisbehaved),
 }
 
 /// The HPKE context an accepted offer opened, kept for a second ClientHello.
@@ -330,7 +337,9 @@ pub(crate) fn resolve_retry(
         .opener
         .open(&aad, &ext.payload.0)
         .map_err(|_| undecryptable())?;
-    reconstruct_inner_hello(raw_body, &decrypted).map_err(|_| undecryptable())
+    let resolved = reconstruct_inner_hello(raw_body, &decrypted)?;
+    check_inner_hello(&resolved.0)?;
+    Ok(resolved)
 }
 
 /// Attempt to locate, decrypt, and reconstruct a real ClientHelloInner from
@@ -399,7 +408,13 @@ pub(crate) fn resolve(
             continue;
         };
 
-        return match reconstruct_inner_hello(raw_body, &decrypted) {
+        // Opened: from here the offer is the client's, and a ClientHelloInner
+        // that cannot be decoded or breaks the rules for it ends the handshake
+        // (RFC 9849 sections 5.1 and 7.1), where an offer that did not open
+        // falls back to the outer hello
+        let resolved = reconstruct_inner_hello(raw_body, &decrypted)
+            .and_then(|resolved| check_inner_hello(&resolved.0).map(|()| resolved));
+        return match resolved {
             Ok((inner, wire)) => EchResolution::Accepted(
                 inner,
                 wire,
@@ -409,11 +424,7 @@ pub(crate) fn resolve(
                     cipher_suite: ext.cipher_suite,
                 },
             ),
-            // Decrypted successfully but the plaintext wasn't a well-formed
-            // EncodedClientHelloInner - per spec this is still just a failed
-            // candidate, not a protocol error (an attacker could otherwise
-            // use malformed-plaintext responses as a decryption oracle).
-            Err(_) => continue,
+            Err((alert, why)) => EchResolution::Invalid(alert, why),
         };
     }
 
@@ -510,74 +521,101 @@ fn ech_outer_payload_range(
     Ok(Some(absolute_start..absolute_start + payload_len))
 }
 
-/// Reconstruct a real `ClientHelloInner` from the HPKE-decrypted
-/// `EncodedClientHelloInner` bytes, per draft-ietf-tls-esni-25 section 5.1,
-/// returning both the parsed form and its exact reconstructed wire body
-/// bytes (see `EchResolution::Accepted`'s doc comment for why both).
-///
-/// The wire layout of `EncodedClientHelloInner` itself is identical to a
-/// normal ClientHello body (confirmed against
-/// `ClientHelloPayload::payload_encode`'s `Encoding::EchInnerHello` case),
-/// but per section 6.1.3 the HPKE-encrypted plaintext is the encoded inner
-/// hello followed by *unmarked* zero padding out to a target length, and its
-/// `session_id` is mandatorily empty (the real value is never part of the
-/// encrypted bytes at all) - so this cannot be handed directly to
-/// `ClientHelloPayload::read`. Instead:
-///
-/// 1. Any `ech_outer_extensions` compression marker is located and replaced,
-///    in place, with the *real* extensions it references, copied verbatim
-///    (whole wire entries) from the outer hello's own raw bytes - not
-///    re-derived from parsed values, since a compressed extension's value is
-///    defined to be byte-identical to the outer's, so copying the literal
-///    bytes is both correct and exact. This also proves out byte-for-byte:
-///    the client's own encoding of the (uncompressed) inner hello for
-///    transcript purposes orders extensions via the same
-///    `order_seed`-driven scheme used for the *compressed* encoding (the
-///    seed is generation-time-only metadata a receiver can never recover),
-///    with the compressed block and the marker occupying the same relative
-///    position - so leaving everything else exactly as physically ordered
-///    in the decrypted bytes, and only substituting the marker's own byte
-///    range, reproduces the client's transcript bytes exactly without ever
-///    needing to know that seed.
-/// 2. `session_id` is substituted for the outer hello's real one.
-/// 3. The (framing-only) padding is simply not included in the rebuilt
-///    buffer at all, since it sits past the extensions block's own declared
-///    length and this rebuild only ever copies bounded sub-ranges.
-fn reconstruct_inner_hello(
-    outer_raw_body: &[u8],
-    decrypted: &[u8],
-) -> Result<(ClientHelloPayload, Vec<u8>), InvalidMessage> {
-    use crate::msgs::handshake::SessionId;
+/// Why an opened offer's ClientHelloInner is refused: the alert, and what the
+/// peer did.
+type InnerRefusal = (AlertDescription, PeerMisbehaved);
 
-    let mut r = Reader::init(decrypted);
-    let cv_random_start = r.used();
-    crate::ProtocolVersion::read(&mut r)?;
-    crate::msgs::handshake::Random::read(&mut r)?;
-    let cv_random_end = r.used();
+fn undecodable() -> InnerRefusal {
+    (
+        AlertDescription::DecodeError,
+        PeerMisbehaved::EchInnerHelloUndecodable,
+    )
+}
 
-    SessionId::read(&mut r)?; // mandatorily empty in the encrypted form; discarded
+fn outer_extensions_refused() -> InnerRefusal {
+    (
+        AlertDescription::IllegalParameter,
+        PeerMisbehaved::EchInnerHelloUndecodable,
+    )
+}
 
-    let cs_cm_start = r.used();
-    Vec::<crate::CipherSuite>::read(&mut r)?;
-    Vec::<crate::msgs::enums::Compression>::read(&mut r)?;
-    let cs_cm_end = r.used();
-
-    let ext_total_len = u16::read(&mut r)? as usize;
-    let ext_block_start = r.used();
-    let mut ext_r = r.sub(ext_total_len)?;
-
-    let mut marker: Option<(Range<usize>, Vec<ExtensionType>)> = None;
+/// The whole wire entry (type, length, value) of every extension of a
+/// ClientHello body, in order, as byte ranges of `raw`.
+fn extension_entries(raw: &[u8]) -> Result<Vec<(ExtensionType, Range<usize>)>, InvalidMessage> {
+    let (ext_block_start, mut ext_r) = client_hello_extensions_block(raw)?;
+    let mut entries = Vec::new();
     while ext_r.any_left() {
         let entry_start = ext_block_start + ext_r.used();
         let ty = ExtensionType::read(&mut ext_r)?;
         let len = u16::read(&mut ext_r)? as usize;
-        let mut val_r = ext_r.sub(len)?;
+        ext_r.sub(len)?;
+        entries.push((ty, entry_start..ext_block_start + ext_r.used()));
+    }
+    Ok(entries)
+}
+
+/// Reconstruct a real `ClientHelloInner` from the HPKE-decrypted
+/// `EncodedClientHelloInner` bytes (RFC 9849 section 5.1), returning both the
+/// parsed form and its exact reconstructed wire body bytes (see
+/// `EchResolution::Accepted`'s doc comment for why both).
+///
+/// The wire layout of `EncodedClientHelloInner` is a ClientHello body, but
+/// its `session_id` is empty (the real one is the outer hello's) and the
+/// plaintext ends in zero padding past the extensions block, so it is not
+/// handed to `ClientHelloPayload::read` as it is. Instead:
+///
+/// 1. An `ech_outer_extensions` marker is replaced, in place, by the whole
+///    wire entries of the extensions it names, copied from the outer hello's
+///    own bytes: a compressed extension is byte-identical to the outer's, and
+///    leaving everything else as physically ordered in the decrypted bytes
+///    reproduces the client's transcript bytes exactly. The names must
+///    appear in the outer hello in the same order, each once, and never
+///    `encrypted_client_hello`; they are matched in one pass over the outer
+///    extensions, so the work is linear in the two hellos whatever the
+///    marker lists, and what is copied is at most the outer hello (section
+///    5.1's implementation note). A name the pass cannot match refuses the
+///    hello with `illegal_parameter`.
+/// 2. `session_id` is substituted for the outer hello's real one.
+/// 3. The padding is not copied, since it lies past the extensions block's
+///    declared length and only bounded sub-ranges are copied.
+///
+/// Anything else that does not decode is a `decode_error`.
+fn reconstruct_inner_hello(
+    outer_raw_body: &[u8],
+    decrypted: &[u8],
+) -> Result<(ClientHelloPayload, Vec<u8>), InnerRefusal> {
+    use crate::msgs::handshake::SessionId;
+
+    let decode = |_: InvalidMessage| undecodable();
+    let mut r = Reader::init(decrypted);
+    let cv_random_start = r.used();
+    crate::ProtocolVersion::read(&mut r).map_err(decode)?;
+    crate::msgs::handshake::Random::read(&mut r).map_err(decode)?;
+    let cv_random_end = r.used();
+
+    SessionId::read(&mut r).map_err(decode)?; // empty in the encoded form; discarded
+
+    let cs_cm_start = r.used();
+    Vec::<crate::CipherSuite>::read(&mut r).map_err(decode)?;
+    Vec::<crate::msgs::enums::Compression>::read(&mut r).map_err(decode)?;
+    let cs_cm_end = r.used();
+
+    let ext_total_len = u16::read(&mut r).map_err(decode)? as usize;
+    let ext_block_start = r.used();
+    let mut ext_r = r.sub(ext_total_len).map_err(decode)?;
+
+    let mut marker: Option<(Range<usize>, Vec<ExtensionType>)> = None;
+    while ext_r.any_left() {
+        let entry_start = ext_block_start + ext_r.used();
+        let ty = ExtensionType::read(&mut ext_r).map_err(decode)?;
+        let len = u16::read(&mut ext_r).map_err(decode)? as usize;
+        let mut val_r = ext_r.sub(len).map_err(decode)?;
         let entry_end = ext_block_start + ext_r.used();
 
         if ty == ExtensionType::EncryptedClientHelloOuterExtensions {
             marker = Some((
                 entry_start..entry_end,
-                Vec::<ExtensionType>::read(&mut val_r)?,
+                Vec::<ExtensionType>::read(&mut val_r).map_err(decode)?,
             ));
             break;
         }
@@ -587,11 +625,20 @@ fn reconstruct_inner_hello(
     match &marker {
         Some((marker_range, refs)) => {
             spliced_extensions.extend_from_slice(&decrypted[ext_block_start..marker_range.start]);
+            // One pass over the outer extensions: each name moves the cursor
+            // forward to its match, so a name missing from the outer hello,
+            // one already used, or one earlier in the outer's order runs off
+            // the end
+            let outer_entries = extension_entries(outer_raw_body).map_err(decode)?;
+            let mut cursor = outer_entries.iter();
             for ext_type in refs {
-                let entry_range = find_extension_entry(outer_raw_body, *ext_type)?.ok_or(
-                    InvalidMessage::MissingData("ECHOuterExtensions reference not in outer hello"),
-                )?;
-                spliced_extensions.extend_from_slice(&outer_raw_body[entry_range]);
+                if *ext_type == ExtensionType::EncryptedClientHello {
+                    return Err(outer_extensions_refused());
+                }
+                let (_, entry_range) = cursor
+                    .find(|(ty, _)| ty == ext_type)
+                    .ok_or_else(outer_extensions_refused)?;
+                spliced_extensions.extend_from_slice(&outer_raw_body[entry_range.clone()]);
             }
             spliced_extensions
                 .extend_from_slice(&decrypted[marker_range.end..ext_block_start + ext_total_len]);
@@ -601,6 +648,10 @@ fn reconstruct_inner_hello(
                 .extend_from_slice(&decrypted[ext_block_start..ext_block_start + ext_total_len]);
         }
     }
+    // The outer extensions copied in can make the block longer than its
+    // two-byte length can say
+    let spliced_len =
+        u16::try_from(spliced_extensions.len()).map_err(|_| outer_extensions_refused())?;
 
     let mut body = Vec::with_capacity(decrypted.len() + spliced_extensions.len());
     body.extend_from_slice(&decrypted[cv_random_start..cv_random_end]);
@@ -608,16 +659,40 @@ fn reconstruct_inner_hello(
     // raw bytes (not `outer_hello.session_id`) so this function only ever
     // depends on wire bytes, consistent with the rest of this module.
     let mut outer_r = Reader::init(outer_raw_body);
-    crate::ProtocolVersion::read(&mut outer_r)?;
-    crate::msgs::handshake::Random::read(&mut outer_r)?;
-    SessionId::read(&mut outer_r)?.encode(&mut body);
+    crate::ProtocolVersion::read(&mut outer_r).map_err(decode)?;
+    crate::msgs::handshake::Random::read(&mut outer_r).map_err(decode)?;
+    SessionId::read(&mut outer_r)
+        .map_err(decode)?
+        .encode(&mut body);
     body.extend_from_slice(&decrypted[cs_cm_start..cs_cm_end]);
-    (spliced_extensions.len() as u16).encode(&mut body);
+    spliced_len.encode(&mut body);
     body.extend_from_slice(&spliced_extensions);
 
-    let inner = ClientHelloPayload::read(&mut Reader::init(&body))?;
+    let inner = ClientHelloPayload::read(&mut Reader::init(&body)).map_err(decode)?;
 
     Ok((inner, body))
+}
+
+/// What RFC 9849 section 7.1 requires of a ClientHelloInner: an
+/// `encrypted_client_hello` extension of type inner, and no offer of TLS 1.2
+/// or below (only TLS 1.3, named in `supported_versions`).
+fn check_inner_hello(inner: &ClientHelloPayload) -> Result<(), InnerRefusal> {
+    let refused = || {
+        (
+            AlertDescription::IllegalParameter,
+            PeerMisbehaved::EchInnerHelloInvalid,
+        )
+    };
+    if !matches!(
+        inner.encrypted_client_hello,
+        Some(EncryptedClientHello::Inner)
+    ) {
+        return Err(refused());
+    }
+    match &inner.supported_versions {
+        Some(versions) if versions.tls13 && !versions.tls12 => Ok(()),
+        _ => Err(refused()),
+    }
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -631,7 +706,12 @@ mod tests {
     use pki_types::pem::PemObject;
     use pki_types::{CertificateDer, DnsName, EchConfigListBytes, PrivateKeyDer, ServerName};
 
-    use super::{EchAcceptance, ServerEchConfig, ServerEchConfigs};
+    use super::{
+        EchAcceptance, ServerEchConfig, ServerEchConfigs, check_inner_hello, extension_entries,
+        reconstruct_inner_hello,
+    };
+    use crate::enums::AlertDescription;
+    use crate::error::PeerMisbehaved;
     use crate::client::{EchConfig, EchMode, EchStatus as ClientEchStatus};
     use crate::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES;
     use crate::crypto::hpke::{Hpke, HpkeSuite};
@@ -1215,5 +1295,175 @@ mod tests {
 
         assert!(client_error(&mut client, &mut server).is_none());
         assert_eq!(client.ech_status(), ClientEchStatus::Accepted);
+    }
+
+    // ── ClientHelloInner decoding (RFC 9849 sections 5.1 and 7.1) ──────────
+
+    const SNI: u16 = 0x0000;
+    const GROUPS: u16 = 0x000a;
+    const ALPN: u16 = 0x0010;
+    const VERSIONS: u16 = 0x002b;
+    const KEY_SHARE: u16 = 0x0033;
+    const ECH: u16 = 0xfe0d;
+    const OUTER_EXTENSIONS: u16 = 0xfd00;
+
+    /// A ClientHello body: TLS 1.2 legacy version, a fixed random, the
+    /// session id, one suite, null compression, and the extensions in order.
+    fn hello_body(session_id: &[u8], extensions: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        let mut body = vec![0x03, 0x03];
+        body.extend([7u8; 32]);
+        body.push(u8::try_from(session_id.len()).unwrap());
+        body.extend(session_id);
+        body.extend([0x00, 0x02, 0x13, 0x01, 0x01, 0x00]);
+        let mut block = Vec::new();
+        for (ty, value) in extensions {
+            block.extend(ty.to_be_bytes());
+            block.extend(u16::try_from(value.len()).unwrap().to_be_bytes());
+            block.extend(value);
+        }
+        body.extend(u16::try_from(block.len()).unwrap().to_be_bytes());
+        body.extend(block);
+        body
+    }
+
+    fn named(types: &[u16]) -> Vec<u8> {
+        let mut value = vec![u8::try_from(types.len() * 2).unwrap()];
+        for ty in types {
+            value.extend(ty.to_be_bytes());
+        }
+        value
+    }
+
+    fn groups() -> Vec<u8> {
+        vec![0x00, 0x02, 0x00, 0x1d]
+    }
+
+    fn alpn() -> Vec<u8> {
+        vec![0x00, 0x03, 0x02, b'h', b'2']
+    }
+
+    fn tls13_only() -> Vec<u8> {
+        vec![0x02, 0x03, 0x04]
+    }
+
+    /// An outer hello with server_name, supported_groups, ALPN and an ECH
+    /// offer, in that order.
+    fn outer() -> Vec<u8> {
+        let mut sni = vec![0x00, 0x0e, 0x00, 0x00, 0x0b];
+        sni.extend(b"example.com");
+        hello_body(
+            &[1, 2, 3, 4],
+            &[
+                (SNI, sni),
+                (GROUPS, groups()),
+                (ALPN, alpn()),
+                (ECH, vec![0x00, 0x00, 0x01, 0x00, 0x01, 0x05]),
+            ],
+        )
+    }
+
+    /// An EncodedClientHelloInner naming `refs` from the outer hello, with
+    /// zero padding after it.
+    fn encoded_inner(refs: &[u16]) -> Vec<u8> {
+        let mut inner = hello_body(
+            &[],
+            &[
+                (VERSIONS, tls13_only()),
+                (OUTER_EXTENSIONS, named(refs)),
+                (ECH, vec![0x01]),
+            ],
+        );
+        inner.extend([0u8; 24]);
+        inner
+    }
+
+    fn types_of(body: &[u8]) -> Vec<u16> {
+        extension_entries(body)
+            .unwrap()
+            .into_iter()
+            .map(|(ty, _)| u16::from(ty))
+            .collect()
+    }
+
+    #[test]
+    fn named_outer_extensions_are_spliced_in_where_the_marker_was() {
+        let (inner, body) = reconstruct_inner_hello(&outer(), &encoded_inner(&[GROUPS, ALPN]))
+            .expect("a well-formed inner hello");
+        assert_eq!(types_of(&body), [VERSIONS, GROUPS, ALPN, ECH]);
+        assert_eq!(
+            inner.session_id.as_ref(),
+            &[1, 2, 3, 4],
+            "the outer's session id"
+        );
+        assert!(check_inner_hello(&inner).is_ok());
+    }
+
+    #[test]
+    fn outer_extensions_named_against_the_rules_are_refused() {
+        let refused = |refs: &[u16]| {
+            reconstruct_inner_hello(&outer(), &encoded_inner(refs))
+                .map(|_| ())
+                .unwrap_err()
+        };
+        let illegal = (
+            AlertDescription::IllegalParameter,
+            PeerMisbehaved::EchInnerHelloUndecodable,
+        );
+        assert_eq!(refused(&[ALPN, GROUPS]), illegal, "out of the outer's order");
+        assert_eq!(refused(&[GROUPS, GROUPS]), illegal, "named twice");
+        assert_eq!(refused(&[GROUPS, ECH]), illegal, "encrypted_client_hello itself");
+        assert_eq!(refused(&[KEY_SHARE]), illegal, "not in the outer hello");
+        // The most a marker can name: refused at the second, after one copy
+        assert_eq!(refused(&[GROUPS; 127]), illegal);
+    }
+
+    #[test]
+    fn an_inner_hello_that_is_not_one_is_a_decode_error() {
+        let mut garbage = vec![0x03, 0x03];
+        garbage.extend([0xffu8; 40]);
+        assert_eq!(
+            reconstruct_inner_hello(&outer(), &garbage)
+                .map(|_| ())
+                .unwrap_err(),
+            (
+                AlertDescription::DecodeError,
+                PeerMisbehaved::EchInnerHelloUndecodable
+            )
+        );
+    }
+
+    #[test]
+    fn an_inner_hello_must_say_it_is_one_and_offer_tls13_alone() {
+        let decode = |extensions: &[(u16, Vec<u8>)]| {
+            let body = hello_body(&[], extensions);
+            reconstruct_inner_hello(&outer(), &body)
+                .expect("decodes")
+                .0
+        };
+        let invalid = Err((
+            AlertDescription::IllegalParameter,
+            PeerMisbehaved::EchInnerHelloInvalid,
+        ));
+        assert_eq!(
+            check_inner_hello(&decode(&[(VERSIONS, tls13_only())])),
+            invalid,
+            "no encrypted_client_hello of type inner"
+        );
+        assert_eq!(
+            check_inner_hello(&decode(&[
+                (VERSIONS, vec![0x04, 0x03, 0x04, 0x03, 0x03]),
+                (ECH, vec![0x01])
+            ])),
+            invalid,
+            "TLS 1.2 offered beside 1.3"
+        );
+        assert_eq!(
+            check_inner_hello(&decode(&[(ECH, vec![0x01])])),
+            invalid,
+            "no supported_versions: TLS 1.2"
+        );
+        assert!(
+            check_inner_hello(&decode(&[(VERSIONS, tls13_only()), (ECH, vec![0x01])])).is_ok()
+        );
     }
 }

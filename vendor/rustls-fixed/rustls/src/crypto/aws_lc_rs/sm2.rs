@@ -34,9 +34,10 @@ impl SupportedKxGroup for CurveSm2 {
         // the group order, so a uniform 32 bytes is retried until it is a
         // valid scalar (n is within 2^-32 of 2^256: a retry is rare)
         let secret = loop {
-            let mut bytes = [0u8; 32];
-            aws_lc_rs::rand::fill(&mut bytes).map_err(|_| crate::rand::GetRandomFailed)?;
-            if let Ok(secret) = SecretKey::from_slice(&bytes) {
+            let mut bytes = zeroize::Zeroizing::new([0u8; 32]);
+            aws_lc_rs::rand::fill(bytes.as_mut()).map_err(|_| crate::rand::GetRandomFailed)?;
+            // The candidate scalar is wiped whether it was used or not
+            if let Ok(secret) = SecretKey::from_slice(bytes.as_ref()) {
                 break secret;
             }
         };
