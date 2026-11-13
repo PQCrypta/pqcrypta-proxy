@@ -46,7 +46,7 @@ use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use request_host::RequestHost;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tower::ServiceExt;
 use tracing::{debug, error, info, trace, warn};
@@ -1294,8 +1294,9 @@ pub async fn run_http_listener(
     // over `DefaultAcceptor` and so leaves Nagle on every accepted socket.
     if config.tls.enable_0rtt {
         // SEC-002: early data served before the handshake completes.
-        let mut server = axum_server::bind(addr).handle(handle.clone()).acceptor(
-            ConnectionHeadersAcceptor::new(
+        let mut server = axum_server::from_tcp(crate::inherited::std_tcp_listener(addr)?)?
+            .handle(handle.clone())
+            .acceptor(ConnectionHeadersAcceptor::new(
                 EarlyRustlsAcceptor::new(
                     current,
                     TcpAcceptor::new(&config),
@@ -1306,19 +1307,18 @@ pub async fn run_http_listener(
                     ),
                 ),
                 Arc::clone(&metrics),
-            ),
-        );
+            ));
         connection_times(server.http_builder(), idle);
         server.serve(make_service).await?;
     } else {
-        let mut server = axum_server::bind(addr).handle(handle.clone()).acceptor(
-            ConnectionHeadersAcceptor::new(
+        let mut server = axum_server::from_tcp(crate::inherited::std_tcp_listener(addr)?)?
+            .handle(handle.clone())
+            .acceptor(ConnectionHeadersAcceptor::new(
                 RustlsAcceptor::new(rustls_config)
                     .handshake_timeout(handshake_timeout)
                     .acceptor(TcpAcceptor::new(&config)),
                 Arc::clone(&metrics),
-            ),
-        );
+            ));
         connection_times(server.http_builder(), idle);
         server.serve(make_service).await?;
     }
@@ -1581,8 +1581,9 @@ pub async fn run_http_listener_pqc(
     if config.tls.enable_0rtt {
         // SEC-002: every connection through SSL_read_early_data, as OpenSSL
         // requires once the context allows early data.
-        let mut server = axum_server::bind(addr).handle(handle.clone()).acceptor(
-            ConnectionHeadersAcceptor::new(
+        let mut server = axum_server::from_tcp(crate::inherited::std_tcp_listener(addr)?)?
+            .handle(handle.clone())
+            .acceptor(ConnectionHeadersAcceptor::new(
                 EarlyOpensslAcceptor::new(
                     {
                         let current = Arc::new(arc_swap::ArcSwap::from(ssl_acceptor));
@@ -1606,13 +1607,13 @@ pub async fn run_http_listener_pqc(
                     ),
                 ),
                 Arc::clone(&metrics),
-            ),
-        );
+            ));
         connection_times(server.http_builder(), idle);
         server.serve(make_service).await?;
     } else {
-        let mut server = axum_server::bind(addr).handle(handle.clone()).acceptor(
-            ConnectionHeadersAcceptor::new(
+        let mut server = axum_server::from_tcp(crate::inherited::std_tcp_listener(addr)?)?
+            .handle(handle.clone())
+            .acceptor(ConnectionHeadersAcceptor::new(
                 OpenSSLAcceptor::new({
                     let openssl_config = OpenSSLConfig::from_acceptor(ssl_acceptor);
                     let reload = openssl_config.clone();
@@ -1630,8 +1631,7 @@ pub async fn run_http_listener_pqc(
                 .handshake_timeout(handshake_timeout)
                 .acceptor(TcpAcceptor::new(&config)),
                 Arc::clone(&metrics),
-            ),
-        );
+            ));
         connection_times(server.http_builder(), idle);
         server.serve(make_service).await?;
     }
@@ -1782,7 +1782,7 @@ pub async fn run_http_listener_with_fingerprint_and_resolver(
     }
 
     // Bind TCP listener
-    let listener = TcpListener::bind(addr).await?;
+    let listener = crate::inherited::tcp_listener(addr).await?;
 
     info!("✅ Custom TLS accept loop configured");
     info!("🔒 HTTPS reverse proxy ready on port {} (TCP)", port);
@@ -2298,7 +2298,7 @@ pub async fn run_http_listener_pqc_with_fingerprint(
     };
 
     // Bind TCP listener
-    let listener = TcpListener::bind(addr).await?;
+    let listener = crate::inherited::tcp_listener(addr).await?;
 
     info!("✅ PQC TLS with fingerprinting configured");
     info!("🔒 OpenSSL version: {}", pqc_status.openssl_version);
@@ -4637,6 +4637,9 @@ pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 
     // Fires when the process begins to shut down.
     shutdown: watch::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // On the address every other listener binds (`server.bind_address`, as
+    // `enable_ipv6` leaves it); this was `[::]` whatever the setting said
+    let bind = config.borrow().server.effective_bind_address();
     let https_port_clone = https_port;
 
     let has_acme = acme_challenges.is_some();
@@ -4737,15 +4740,15 @@ pub async fn run_http_redirect_server<S: std::hash::BuildHasher + Send + Sync + 
         }
     });
 
-    let addr: SocketAddr = format!("[::]:{}", port)
+    let addr: SocketAddr = format!("{bind}:{port}")
         .parse()
-        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], port)));
+        .map_err(|e| format!("http_redirect on {bind}:{port}: {e}"))?;
     info!(
         "🔀 Starting HTTP→HTTPS redirect server on {} (ACME challenge support: {})",
         addr, has_acme
     );
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = crate::inherited::tcp_listener(addr).await?;
     serve_plain(listener, app, idle, shutdown).await;
     Ok(())
 }

@@ -815,7 +815,7 @@ impl QuicListener {
         // version-specific Initial keys (via rustls), retry integrity key, and
         // long-header packet-type renumbering. noq still adds its reserved/GREASE
         // version automatically.
-        let socket = std::net::UdpSocket::bind(addr)?;
+        let socket = crate::inherited::udp_socket(addr)?;
 
         // Explicitly size the kernel UDP socket buffers. quinn-udp enables GSO/GRO
         // automatically but does NOT set SO_RCVBUF/SO_SNDBUF — it inherits the host's

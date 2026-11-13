@@ -97,9 +97,13 @@ pub async fn spawn(config: &DohConfig) -> anyhow::Result<SocketAddr> {
         .upstream
         .parse()
         .map_err(|e| anyhow::anyhow!("doh.upstream {:?}: {}", config.upstream, e))?;
-    let listener = TcpListener::bind(&config.listen)
-        .await
-        .map_err(|e| anyhow::anyhow!("doh.listen {}: {}", config.listen, e))?;
+    // The socket the service manager passed for it, where `listen` is an
+    // address (crate::inherited); a name is resolved and bound here
+    let listener = match config.listen.parse::<std::net::SocketAddr>() {
+        Ok(addr) => crate::inherited::tcp_listener(addr).await,
+        Err(_) => TcpListener::bind(&config.listen).await,
+    }
+    .map_err(|e| anyhow::anyhow!("doh.listen {}: {}", config.listen, e))?;
     let local = listener.local_addr()?;
     let gateway = Arc::new(Gateway {
         path: config.path.clone(),

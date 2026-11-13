@@ -150,6 +150,7 @@ pub(crate) mod fuzz_support;
 pub mod host_names;
 pub mod http3_features;
 pub mod http_listener;
+pub mod inherited;
 pub mod load_balancer;
 pub mod log_file;
 pub mod memory_pressure;

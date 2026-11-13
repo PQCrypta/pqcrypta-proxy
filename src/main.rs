@@ -112,6 +112,13 @@ struct Args {
     #[arg(long)]
     validate: bool,
 
+    /// Write the systemd socket unit for this configuration's listeners
+    /// (pqcrypta-proxy.socket) to FILE and exit: with it, the service manager
+    /// holds the listening sockets across a restart. A file, not standard
+    /// output, which the proxy's own log may share
+    #[arg(long, value_name = "FILE")]
+    socket_unit: Option<PathBuf>,
+
     /// Merge fingerprint corpora into one and write it here: observed.json of
     /// either version, or a published directory's full.json (`--from`)
     #[arg(long, value_name = "OUT")]
@@ -426,6 +433,23 @@ async fn run() -> anyhow::Result<()> {
     }
 
     info!("Configuration validated successfully");
+
+    if let Some(out) = &args.socket_unit {
+        let unit = config.socket_unit(&args.config.to_string_lossy());
+        // Whole or not at all: a unit read half-written would hold half the
+        // sockets
+        let staged = out.with_extension("socket.new");
+        std::fs::write(&staged, unit)?;
+        std::fs::rename(&staged, out)?;
+        info!("Socket unit written to {}", out.display());
+        return Ok(());
+    }
+    // The sockets the service manager holds for this process, taken before any
+    // listener asks for one (crate::inherited)
+    let passed = pqcrypta_proxy::inherited::init();
+    if passed > 0 {
+        info!("{} listening socket(s) held by the service manager", passed);
+    }
 
     // Deprecation warning: trusted_internal_cidrs will be removed in a future release.
     if !config.security.trusted_internal_cidrs.is_empty() {
@@ -1541,7 +1565,8 @@ async fn run() -> anyhow::Result<()> {
             pqcrypta_proxy::conformance::listener::spawn_all(
                 &conf,
                 &tls_provider,
-                &config.server.bind_address,
+                // As every other listener binds (`enable_ipv6` applied)
+                &config.server.effective_bind_address(),
                 // Its maps are shared: the blocklist the other listeners hold
                 &std::sync::Arc::new(security_state.clone()),
             );
@@ -1780,6 +1805,14 @@ async fn run() -> anyhow::Result<()> {
             );
         }
     }
+
+    // A passed socket no listener took is a unit and a configuration that
+    // disagree. Some listeners bind from tasks of their own, so it is looked
+    // for once they have had time to start
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        pqcrypta_proxy::inherited::report_unclaimed();
+    });
 
     // Serving, and probed: the service manager is told, and its watchdog
     // pinged from here on

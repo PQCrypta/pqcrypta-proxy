@@ -263,7 +263,8 @@
 - **Audit Logging**: Async structured JSON audit log for security-relevant events — admin actions, auth failures, WAF blocks/detects, IP blocks, rate limit hits, PQC downgrade events, config and TLS reloads, JA3 replay/drift detections
 - **Log Rotation via SIGHUP**: Sending `SIGHUP` to the proxy reopens all log file handles without dropping connections or restarting — compatible with standard logrotate `postrotate` hooks (`systemctl kill -s HUP pqcrypta-proxy`)
 - **Admin API**: Health checks, Prometheus metrics, config reload, graceful shutdown, QUIC health, WebTransport health, canary status and live weight/suspend/resume control, live blocklist inspection (`GET /blocklist`), manual block (`POST /blocklist/block/:ip?duration_secs=N`) and immediate unblock (`POST /blocklist/unblock/:ip`); `GET /security/status`, `/security/geoip/:ip`, `/security/fingerprints` and `/security/threats`; rate-limit statistics (`GET /ratelimit`) and per-client reset (`POST /ratelimit/reset/:key`) against the one advanced rate limiter every listener, port and protocol shares; loopback enforcement prevents plain-HTTP token exposure on non-loopback interfaces; ephemeral session tokens use `OsRng` for cryptographic security; per-IP and global lockout of failing callers with exponential back-off; the token is checked first, so a correct token is never refused by it (a client left on a stale token cannot lock out the rest)
-- **Graceful Shutdown Drain**: Configurable drain timeout polls active connections at 100 ms intervals and exits as soon as they reach zero — no unnecessary delay on idle restarts
+- **Graceful Shutdown Drain**: Configurable drain timeout polls active connections at 100 ms intervals and exits as soon as they reach zero — no unnecessary delay on idle restarts; while it waits it says, every 2 s, what it is waiting for
+- **Restarts that refuse nothing (systemd socket activation)**: with the socket unit `pqcrypta-proxy --socket-unit FILE` writes from the configuration, the service manager holds every listening socket across a restart, so a connection that arrives while one process drains and the next starts waits in the kernel and is served, rather than refused; each listener takes the socket bound to its address and binds itself what was not passed
 - **Certificate Transparency**: New ACME-issued certs submitted via `POST /ct/v1/add-chain` for public auditability, to the configured logs or, by default, to one log per operator from the live CT log list whose temporal shard holds the certificate's expiry
 - **Per-Backend Retry**: Configurable retry count and exponential backoff per backend; retry on 5xx responses, connect failures, or timeouts
 - **Cross-Platform**: Linux, macOS, and Windows support
@@ -2367,6 +2368,28 @@ sudo systemctl start pqcrypta-proxy
 # View logs
 journalctl -u pqcrypta-proxy -f
 ```
+
+**Restarts without refusing connections.** The proxy takes its listening sockets
+from the service manager when it passes them (systemd socket activation). Write
+the socket unit from the configuration, the same addresses the listeners bind,
+and enable it; the service needs no change, since systemd hands a service the
+sockets of the unit with its name:
+
+```bash
+sudo pqcrypta-proxy --config /etc/pqcrypta/proxy-config.toml \
+  --socket-unit /etc/systemd/system/pqcrypta-proxy.socket
+sudo systemctl daemon-reload
+sudo systemctl enable --now pqcrypta-proxy.socket
+sudo systemctl restart pqcrypta-proxy   # takes the sockets from here on
+```
+
+The sockets then outlive the process: while one drains and the next starts,
+the kernel completes TCP handshakes into the listen backlog and queues
+datagrams, and the next process serves them. Write the unit again when the
+listeners change (ports, `bind_address`, the conformance range): a passed
+socket no listener takes is reported at startup, and a listener with no passed
+socket binds its own as before. QUIC connections still end at a restart (their
+state lives in the process); clients open new ones on the same socket.
 
 ### macOS (launchd)
 

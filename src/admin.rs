@@ -22,7 +22,6 @@ use axum::routing::{get, post};
 use axum::Router;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, warn};
@@ -359,7 +358,7 @@ impl AdminServer {
 
         // Start server
         info!("Admin API listening on {}", addr);
-        let listener = TcpListener::bind(addr).await?;
+        let listener = crate::inherited::tcp_listener(addr).await?;
 
         // Unconditionally: the admin API returns small JSON documents, so Nagle
         // has nothing to coalesce here and can only add a delayed-ACK wait.

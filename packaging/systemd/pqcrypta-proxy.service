@@ -1,5 +1,8 @@
 [Unit]
 Description=PQCrypta Proxy - QUIC/HTTP3/WebTransport Proxy with PQC TLS
+# With pqcrypta-proxy.socket (`pqcrypta-proxy --socket-unit`), enabled, the
+# service manager holds the listening sockets across a restart; this unit
+# needs no change for it (README, Systemd).
 Documentation=https://github.com/PQCrypta/pqcrypta-proxy
 After=network-online.target
 Wants=network-online.target
