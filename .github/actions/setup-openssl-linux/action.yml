@@ -1,15 +1,19 @@
-name: Setup OpenSSL 3.5 (Linux)
+name: Setup OpenSSL (Linux)
 description: >
-  Build and cache OpenSSL 3.5.x on a Linux runner and export the env the openssl
-  crate reads. ubuntu-latest ships OpenSSL 3.0, but the `pqc` feature links
-  symbols added in 3.2+ (e.g. SSL_get0_group_name) and needs 3.5 for native
-  ML-KEM — the same OpenSSL production runs. macOS/Windows CI already install a
-  recent OpenSSL via brew/vcpkg; this is the Linux equivalent.
+  Build and cache OpenSSL on a Linux runner and export the env the openssl
+  crate reads: 4.0.3, the version the production nodes link, with zlib, brotli
+  and zstd for RFC 8879 certificate compression, as theirs has. ubuntu-latest
+  ships OpenSSL 3.0, which lacks symbols the proxy links (SSL_get0_group_name,
+  SSL_CTX_compress_certs) and native ML-KEM. macOS/Windows CI install a recent
+  OpenSSL via brew/vcpkg; this is the Linux equivalent.
 
 inputs:
   version:
     description: OpenSSL version to build
-    default: "3.5.5"
+    default: "4.0.3"
+  sha256:
+    description: SHA-256 of openssl-<version>.tar.gz, as the OpenSSL project publishes it
+    default: "325b5c806167c13b40b1ffeadfe0248197c00eccc4cf123ec1e28d2d2fd216d9"
 
 runs:
   using: composite
@@ -19,7 +23,22 @@ runs:
       uses: actions/cache@v4
       with:
         path: ~/openssl-${{ inputs.version }}
-        key: openssl-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}-v1
+        key: openssl-${{ inputs.version }}-${{ inputs.sha256 }}-${{ runner.os }}-${{ runner.arch }}-v2
+
+    # libssl links the compression libraries; on a cache hit nothing else
+    # installs their runtimes
+    - name: Compression libraries
+      shell: bash
+      run: |
+        set -euo pipefail
+        missing=()
+        for lib in libz.so.1:zlib1g libbrotlienc.so.1:libbrotli1 libzstd.so.1:libzstd1; do
+          ldconfig -p | grep -q "${lib%%:*} " || missing+=("${lib##*:}")
+        done
+        if [ ${#missing[@]} -gt 0 ]; then
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends "${missing[@]}"
+        fi
 
     - name: Build OpenSSL ${{ inputs.version }} (cache miss)
       if: steps.cache.outputs.cache-hit != 'true'
@@ -27,13 +46,23 @@ runs:
       run: |
         set -euxo pipefail
         V="${{ inputs.version }}"
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends zlib1g-dev libbrotli-dev libzstd-dev
         cd "$(mktemp -d)"
         curl -fsSL "https://github.com/openssl/openssl/releases/download/openssl-${V}/openssl-${V}.tar.gz" -o openssl.tar.gz
+        # Checked before it is built: what it holds is linked into the release binary
+        echo "${{ inputs.sha256 }}  openssl.tar.gz" | sha256sum -c -
         tar xf openssl.tar.gz
         cd "openssl-${V}"
-        ./Configure --prefix="$HOME/openssl-${V}" --libdir=lib linux-x86_64 no-docs shared
+        # The configuration directory is the distribution's, where a downloaded
+        # binary finds the host's CA certificates, not this runner's prefix
+        ./Configure --prefix="$HOME/openssl-${V}" --openssldir=/usr/lib/ssl --libdir=lib \
+          linux-x86_64 no-docs no-tests shared zlib enable-brotli enable-zstd
         make -j"$(nproc)"
         make install_sw
+        # A static link of libcrypto needs the compression libraries' archives as
+        # well: beside it, where openssl-sys looks for what OPENSSL_LIBS names
+        cp /usr/lib/x86_64-linux-gnu/{libz,libbrotlienc,libbrotlidec,libbrotlicommon,libzstd}.a "$HOME/openssl-${V}/lib/"
 
     - name: Export OpenSSL environment
       shell: bash

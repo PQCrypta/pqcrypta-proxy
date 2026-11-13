@@ -917,10 +917,6 @@ pub mod openssl_pqc {
         }
     }
 
-    /// Create an OpenSSL SSL acceptor with PQC hybrid key exchange
-    ///
-    /// This configures OpenSSL 3.5+ with ML-KEM hybrid groups for post-quantum
-    /// key exchange while maintaining backward compatibility with classical TLS.
     /// Enable RFC 8879 certificate compression on the TCP listener.
     ///
     /// OpenSSL will *receive* a compressed chain by default but never *sends* one
@@ -929,19 +925,21 @@ pub mod openssl_pqc {
     /// doing. The rustls side (QUIC/HTTP-3) needs no equivalent: there the crate
     /// features alone populate `ServerConfig::cert_compressors`.
     ///
-    /// Raw FFI because neither the `openssl` nor the `openssl-sys` crate binds this
-    /// call, though libssl exports it.
+    /// Raw FFI because neither the `openssl` nor the `openssl-sys` crate binds these
+    /// calls, though libssl exports them.
     ///
-    /// Only zlib is offered. The three OpenSSL builds here report `-DZLIB` and
-    /// nothing else, so naming brotli or zstd would advertise algorithms the
-    /// library cannot produce. Clients overwhelmingly offer zlib anyway — OpenSSL's
-    /// own s_client offers zlib alone, and Facebook, the one of four large external
-    /// origins sampled that compresses at all, answers with it.
+    /// Every algorithm RFC 8879 defines is named, in OpenSSL's own default order
+    /// (brotli, zlib, zstd), and the library keeps those it was built with:
+    /// "unknown algorithms in algs are ignored"
+    /// (`SSL_CTX_set1_cert_comp_preference(3)`), so one list fits every build. The
+    /// client's order then picks among the algorithms both sides have. The stack
+    /// under `/usr/local/openssl-4.0.3` has all three
+    /// (`pqcrypta-configs/openssl/build-openssl-stack.sh`). Built with zlib alone,
+    /// it sent a plain Certificate to a client offering only brotli, as BoringSSL's
+    /// clients do.
     ///
-    /// Worth exactly 1,051 bytes per full handshake here, measured over seven
-    /// connections each way with `-no_rx_cert_comp`: the Certificate message is
-    /// 3,435 bytes and the CompressedCertificate that replaces it is 2,384. The
-    /// chain itself is 3,411 bytes over four certs, which zlib takes to 2,356.
+    /// What each algorithm makes of the context's chain is logged once, read from
+    /// the library itself, so the log names the algorithms the loaded build has.
     fn enable_cert_compression(ctx: *mut openssl_sys::SSL_CTX) {
         // `tls.certificate_compression = "off"` leaves the context alone, which is
         // all that is needed here: OpenSSL sends an uncompressed chain unless
@@ -962,21 +960,40 @@ pub mod openssl_pqc {
                 ctx: *mut openssl_sys::SSL_CTX,
                 alg: std::os::raw::c_int,
             ) -> std::os::raw::c_int;
+            // size_t SSL_CTX_get1_compressed_cert(SSL_CTX *ctx, int alg,
+            //                                     unsigned char **data, size_t *orig_len);
+            fn SSL_CTX_get1_compressed_cert(
+                ctx: *mut openssl_sys::SSL_CTX,
+                alg: std::os::raw::c_int,
+                data: *mut *mut u8,
+                orig_len: *mut usize,
+            ) -> usize;
         }
 
-        const TLSEXT_COMP_CERT_ZLIB: std::os::raw::c_int = 1;
-        let mut algs = [TLSEXT_COMP_CERT_ZLIB];
+        // RFC 8879 section 7.3's code points, in OpenSSL's default order
+        const ALGORITHMS: [(std::os::raw::c_int, &str); 3] =
+            [(2, "brotli"), (1, "zlib"), (3, "zstd")];
+        let mut algs = ALGORITHMS.map(|(code, _)| code);
 
         // Safety: `ctx` is the live SSL_CTX owned by the builder, and `algs` is a
         // stack array that OpenSSL copies out of (set1_ semantics) before returning.
         let rc = unsafe { SSL_CTX_set1_cert_comp_preference(ctx, algs.as_mut_ptr(), algs.len()) };
+        if rc != 1 {
+            // Not fatal: an uncompressed chain is correct, just larger.
+            tracing::warn!(
+                "TLS certificate compression unavailable (SSL_CTX_set1_cert_comp_preference \
+                 returned {rc}); chains will be sent uncompressed"
+            );
+            return;
+        }
 
         // Setting the preference alone is not enough on OpenSSL 3.5: the chain
         // must also be compressed into the context. Verified the hard way — with
         // only the preference set, and the call reporting success, pqcrypta.com
         // went on answering a zlib-offering client with a plain 3,435-byte
         // Certificate. Safe to call here: the certificate is loaded before this
-        // point at every call site.
+        // point at every call site. Algorithm 0 compresses with each one the
+        // preference kept.
         //
         // It returns 0 for two different reasons: the compression failed (an
         // error on OpenSSL's queue), or no chain came out smaller, in which
@@ -984,28 +1001,53 @@ pub mod openssl_pqc {
         // signatures are close to random and do not shrink. The queue is
         // emptied first, so what is on it afterwards is this call's.
         drop(openssl::error::ErrorStack::get());
-        let compressed = unsafe { SSL_CTX_compress_certs(ctx, TLSEXT_COMP_CERT_ZLIB) };
+        // Safety: `ctx` is the live SSL_CTX, its certificate already loaded.
+        let compressed = unsafe { SSL_CTX_compress_certs(ctx, 0) };
+        let errors = openssl::error::ErrorStack::get();
 
-        if rc == 1 && compressed == 1 {
-            tracing::info!("TLS certificate compression enabled (RFC 8879, zlib)");
-        } else if rc == 1 {
-            let errors = openssl::error::ErrorStack::get();
-            if errors.errors().is_empty() {
-                tracing::info!(
-                    "TLS certificate compression offered (RFC 8879, zlib); this chain is sent \
-                     uncompressed, as zlib does not make it smaller"
-                );
-            } else {
-                tracing::warn!(
-                    "TLS certificate compression offered but the chain could not be compressed \
-                     ({errors}); it is sent uncompressed"
-                );
-            }
-        } else {
-            // Not fatal: an uncompressed chain is correct, just larger.
+        // Each algorithm's result for the context's chain, compressed afresh:
+        // a length of 0 is an algorithm the library was built without
+        let sizes: Vec<String> = ALGORITHMS
+            .iter()
+            .filter_map(|&(code, name)| {
+                let mut data: *mut u8 = std::ptr::null_mut();
+                let mut orig_len = 0usize;
+                // Safety: `ctx` is the live SSL_CTX; the out-pointers are locals,
+                // and a buffer OpenSSL allocates into `data` is freed below.
+                let len = unsafe {
+                    SSL_CTX_get1_compressed_cert(ctx, code, &raw mut data, &raw mut orig_len)
+                };
+                if !data.is_null() {
+                    // Safety: allocated by OpenSSL for this call, used nowhere else
+                    unsafe { openssl_sys::OPENSSL_free(data.cast()) };
+                }
+                (len > 0).then(|| format!("{name} {orig_len} to {len} bytes"))
+            })
+            .collect();
+        // What the compression call queued, if it queued anything; the size
+        // calls above put nothing on the queue that matters here
+        drop(openssl::error::ErrorStack::get());
+
+        if sizes.is_empty() {
             tracing::warn!(
-                "TLS certificate compression unavailable (SSL_CTX_set1_cert_comp_preference \
-             returned {rc}); chains will be sent uncompressed"
+                "TLS certificate compression offered, but this OpenSSL build has none of \
+                 brotli, zlib and zstd; chains are sent uncompressed"
+            );
+        } else if compressed == 1 {
+            tracing::info!(
+                "TLS certificate compression enabled (RFC 8879): {}",
+                sizes.join(", ")
+            );
+        } else if errors.errors().is_empty() {
+            tracing::info!(
+                "TLS certificate compression offered (RFC 8879), but no algorithm makes this \
+                 chain smaller ({}); it is sent uncompressed",
+                sizes.join(", ")
+            );
+        } else {
+            tracing::warn!(
+                "TLS certificate compression offered but the chain could not be compressed \
+                 ({errors}); it is sent uncompressed"
             );
         }
     }

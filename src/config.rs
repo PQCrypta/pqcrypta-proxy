@@ -1764,7 +1764,8 @@ pub struct TlsConfig {
     /// RFC 8879 certificate compression: `"auto"` (default) or `"off"`.
     ///
     /// `auto` offers whatever the compiled TLS stack can actually produce —
-    /// zlib on the OpenSSL side, brotli or zlib on rustls for QUIC and HTTP/3 —
+    /// brotli, zlib and zstd on the OpenSSL side, as many as its build has, and
+    /// brotli or zlib on rustls for QUIC and HTTP/3 —
     /// and `off` sends an uncompressed chain on both. The semantics match
     /// HAProxy's `tune.ssl.certificate-compression`, which is the closest thing
     /// to a convention here; nginx spells the same idea
@@ -3197,8 +3198,14 @@ pub struct HeadersConfig {
     #[serde(default = "default_server_timing_desc")]
     pub server_timing_desc: String,
 
-    /// Accept-CH header for Client Hints (responsive content delivery)
-    /// Example: "DPR, Viewport-Width, Width, ECT, RTT, Downlink, Sec-CH-UA-Platform"
+    /// Accept-CH (RFC 8942): the client hints the origin reads, asked of the
+    /// browser for its later requests. Empty sends no header. Name only hints
+    /// something consumes: each one costs bytes on every request and hands the
+    /// origin a little more about the visitor. The low-entropy `Sec-CH-UA`,
+    /// `Sec-CH-UA-Mobile` and `Sec-CH-UA-Platform` arrive without asking, and
+    /// Chromium no longer sends the unprefixed `DPR`, `Width` and
+    /// `Viewport-Width`, so asking for those gets nothing.
+    /// Example: "Sec-CH-DPR, Sec-CH-Viewport-Width, ECT, RTT, Downlink"
     #[serde(default)]
     pub accept_ch: String,
 

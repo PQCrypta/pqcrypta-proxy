@@ -33,11 +33,12 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
-  # The binary, built the way CI builds it: against OpenSSL 3.5, because the
-  # runner's OpenSSL 3.0 lacks the 3.2+ symbols the proxy links
-  # (SSL_get0_group_name, SSL_CTX_compress_certs) and the release build failed
-  # to link against it. Linked statically, so that a downloaded binary runs
-  # without OpenSSL 3.5 installed. release-please creates the release as a
+  # The binary, built the way CI builds it: against OpenSSL 4.0.3, the version
+  # production links, because the runner's OpenSSL 3.0 lacks the 3.2+ symbols
+  # the proxy links (SSL_get0_group_name, SSL_CTX_compress_certs) and the
+  # release build failed to link against it. Linked statically, with the
+  # compression libraries certificate compression uses, so that a downloaded
+  # binary runs without either installed. release-please creates the release as a
   # draft (release-please-config.json): the asset goes up, then the release is
   # published, as immutable releases require.
   binary:
@@ -56,12 +57,16 @@ jobs:
         with:
           toolchain: "1.99.0"
 
-      - name: Setup OpenSSL 3.5 (Linux)
+      - name: Setup OpenSSL (Linux)
         uses: ./.github/actions/setup-openssl-linux
 
       - name: Build release binary
         env:
           OPENSSL_STATIC: "1"
+          # libcrypto's own dependencies, linked statically after it in this
+          # order: certificate compression (brotli, zstd, zlib) needs nothing
+          # on the host
+          OPENSSL_LIBS: "ssl:crypto:brotlienc:brotlidec:brotlicommon:zstd:z"
         run: cargo build --release --locked
 
       - name: Upload binary to the draft release
