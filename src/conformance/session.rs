@@ -1473,15 +1473,32 @@ pub struct Registry {
     /// is a real limitation and the reason SNI is still preferred when it
     /// carries a usable id: this is the fallback, not the design.
     by_source: DashMap<std::net::IpAddr, (String, Instant)>,
+    /// `by_source`'s ceiling: one address a request, from anyone who knows a
+    /// session's id, so without one the table grew by every address a
+    /// sender had until the sweep
+    sources: crate::bounded::Ceiling,
+    /// When a full `by_source` was last reported, in s since `Registry::new`
+    full_said: std::sync::atomic::AtomicU64,
+    created: Instant,
     ttl: Duration,
     max: usize,
 }
 
+/// Source addresses associated with sessions at once.
+const MAX_SOURCES: usize = 65_536;
+
 impl Registry {
     pub fn new(ttl_secs: u64, max: usize) -> Arc<Self> {
+        Self::with_sources(ttl_secs, max, MAX_SOURCES)
+    }
+
+    fn with_sources(ttl_secs: u64, max: usize, sources: usize) -> Arc<Self> {
         Arc::new(Self {
             sessions: DashMap::new(),
             by_source: DashMap::new(),
+            sources: crate::bounded::Ceiling::new(sources, Duration::from_secs(5)),
+            full_said: std::sync::atomic::AtomicU64::new(0),
+            created: Instant::now(),
             ttl: Duration::from_secs(ttl_secs),
             max,
         })
@@ -1568,6 +1585,36 @@ impl Registry {
     /// at the moment it happens, rather than inferred from a strange row a week
     /// later.
     pub fn associate(&self, ip: std::net::IpAddr, id: &str) {
+        let ttl = self.ttl;
+        if !self.by_source.contains_key(&ip)
+            && !self.sources.admits(self.by_source.len(), || {
+                self.by_source
+                    .retain(|_, (_, started)| started.elapsed() < ttl);
+                self.by_source.len()
+            })
+        {
+            // Once a minute at most
+            let now = self.created.elapsed().as_secs() + 60;
+            let said = self.full_said.load(std::sync::atomic::Ordering::Relaxed);
+            if now.saturating_sub(said) >= 60
+                && self
+                    .full_said
+                    .compare_exchange(
+                        said,
+                        now,
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                tracing::warn!(
+                    "conformance: {} source addresses are associated with sessions; new ones \
+                     are not (their connections are found by the session's server name alone)",
+                    self.by_source.len()
+                );
+            }
+            return;
+        }
         if let Some((prev_id, recorded)) = self.displaced_by(ip, id) {
             tracing::warn!(
                 "conformance: session {id} claimed {ip}, which session {prev_id} was already \
@@ -2668,6 +2715,22 @@ mod tests {
             .find(|r| r.test_id == t.id)
             .unwrap();
         assert_eq!(r.verdict, Verdict::Pass, "the later run wins");
+    }
+
+    /// Source addresses are bounded too: a full table associates no new
+    /// address, and one already associated can move to another session.
+    #[test]
+    fn source_addresses_stay_bounded() {
+        let reg = Registry::with_sources(3600, 8, 2);
+        let id = reg.create();
+        let ip = |n: u8| std::net::IpAddr::from([203, 0, 113, n]);
+        reg.associate(ip(1), &id);
+        reg.associate(ip(2), &id);
+        reg.associate(ip(3), &id);
+        assert_eq!(reg.for_source(ip(3)), None, "the table is full");
+        let other = reg.create();
+        reg.associate(ip(1), &other);
+        assert_eq!(reg.for_source(ip(1)).as_deref(), Some(other.as_str()));
     }
 
     #[test]

@@ -128,6 +128,7 @@ pub mod audit_logger;
 pub mod backend_client;
 pub mod backend_limits;
 pub mod body_budget;
+pub mod bounded;
 pub mod cache;
 pub mod cert_compression;
 pub mod compression;

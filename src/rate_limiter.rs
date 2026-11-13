@@ -916,6 +916,19 @@ struct Charge {
     network_bound: bool,
 }
 
+/// How long a bucket goes unused before the cleanup lets it go.
+const BUCKET_IDLE: Duration = Duration::from_mins(5);
+
+/// The overflow bucket a network key is counted in when the map is full: its
+/// route's, the key without its network.
+fn overflow_key(key_string: &str) -> String {
+    let scope = key_string.rsplit_once('#').map_or_else(
+        || key_string.split(':').next().unwrap_or(key_string),
+        |(route, _)| route,
+    );
+    format!("overflow:{scope}")
+}
+
 /// A fixed-length stand-in for a value the client wrote, for use in a bucket's
 /// key: the first 128 bits of its SHA-256, in hex.
 fn value_digest(value: &str) -> String {
@@ -1567,6 +1580,16 @@ pub struct AdvancedRateLimiter {
     /// Per-route rate limit buckets
     route_buckets: Arc<DashMap<String, Arc<DashMap<String, Arc<RateLimitBucket>>>>>,
 
+    /// Where `buckets` is full of live ones: a client network that did not
+    /// fit is counted in its route's overflow bucket, one per route, so it is
+    /// still limited ([`Self::get_or_create_bucket`])
+    overflow_buckets: Arc<DashMap<String, Arc<RateLimitBucket>>>,
+
+    /// `buckets`' ceiling for network keys: a full map is swept of idle
+    /// buckets at most once a gap where a new network arrives, as well as once
+    /// a minute
+    network_ceiling: Arc<crate::bounded::Ceiling>,
+
     /// Parsed trusted proxy CIDRs
     trusted_cidrs: Arc<RwLock<Vec<ipnet::IpNet>>>,
 
@@ -1675,6 +1698,11 @@ impl AdvancedRateLimiter {
             global_limiter: arc_swap::ArcSwap::from_pointee(global_limiter),
             buckets: Arc::new(DashMap::new()),
             route_buckets: Arc::new(DashMap::new()),
+            overflow_buckets: Arc::new(DashMap::new()),
+            network_ceiling: Arc::new(crate::bounded::Ceiling::new(
+                Self::MAX_TRACKED_KEYS,
+                Duration::from_secs(5),
+            )),
             trusted_cidrs: Arc::new(RwLock::new(trusted_cidrs)),
             global_baseline: arc_swap::ArcSwap::from_pointee(global_baseline),
             stats: Arc::new(RateLimiterStats::default()),
@@ -2002,12 +2030,15 @@ impl AdvancedRateLimiter {
 
     /// The bucket `charge` is counted in, made on first use.
     ///
-    /// The map holds at most [`Self::MAX_TRACKED_KEYS`] buckets. An address's
-    /// own bucket is always kept: there is one per network a client really
-    /// connected from. Past the limit, a key the client chose is counted in a
-    /// bucket of its own that is not kept, so the map's size does not follow
-    /// the number of values clients send; the address's bucket is the one
-    /// that holds such a client.
+    /// The map holds at most [`Self::MAX_TRACKED_KEYS`] buckets. Past the
+    /// limit, a key the client chose is counted in a bucket of its own that is
+    /// not kept, so the map's size does not follow the number of values
+    /// clients send; the address's bucket is the one that holds such a
+    /// client. A network's own bucket is kept while there is room: a full map
+    /// is swept of buckets idle five minutes at most once a gap, and a network
+    /// that still finds it full is counted in its route's overflow bucket, so
+    /// the map does not follow the number of networks either (an IPv6 /48
+    /// holds 65,536 /64s) and none of them goes unlimited.
     fn get_or_create_bucket(
         &self,
         charge: &Charge,
@@ -2016,8 +2047,24 @@ impl AdvancedRateLimiter {
         if let Some(bucket) = self.buckets.get(&charge.key_string) {
             return Arc::clone(bucket.value());
         }
-        if !charge.network_bound && self.buckets.len() >= Self::MAX_TRACKED_KEYS {
-            return Arc::new(RateLimitBucket::new(&charge.limits, Some(adaptive_cfg)));
+        if self.buckets.len() >= Self::MAX_TRACKED_KEYS {
+            if !charge.network_bound {
+                return Arc::new(RateLimitBucket::new(&charge.limits, Some(adaptive_cfg)));
+            }
+            let admitted = self.network_ceiling.admits(self.buckets.len(), || {
+                self.buckets
+                    .retain(|_, bucket| bucket.last_request.read().elapsed() < BUCKET_IDLE);
+                self.buckets.len()
+            });
+            if !admitted {
+                return self
+                    .overflow_buckets
+                    .entry(overflow_key(&charge.key_string))
+                    .or_insert_with(|| {
+                        Arc::new(RateLimitBucket::new(&charge.limits, Some(adaptive_cfg)))
+                    })
+                    .clone();
+            }
         }
         self.buckets
             .entry(charge.key_string.clone())
@@ -2539,7 +2586,7 @@ impl AdvancedRateLimiter {
             loop {
                 interval.tick().await;
 
-                let idle_threshold = Duration::from_mins(5); // 5 minutes
+                let idle_threshold = BUCKET_IDLE;
 
                 // Clean up idle buckets
                 // Buckets are added while this runs: the count is approximate
@@ -2714,6 +2761,7 @@ impl AdvancedRateLimiter {
         if rebuilt {
             self.buckets.clear();
             self.route_buckets.clear();
+            self.overflow_buckets.clear();
             info!(
                 "Rate limiter configuration updated: every key starts again under the new limits"
             );
@@ -2801,6 +2849,25 @@ pub fn build_context_from_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A network that does not fit a full map is counted in its route's
+    /// overflow bucket, one per route whatever the network.
+    #[test]
+    fn overflow_buckets_are_one_per_route() {
+        assert_eq!(
+            overflow_key("SourceIp:2001:db8:1::/64"),
+            "overflow:SourceIp"
+        );
+        assert_eq!(
+            overflow_key("SourceIp:2001:db8:2::/64"),
+            "overflow:SourceIp"
+        );
+        assert_eq!(
+            overflow_key("SourceIp:api#2001:db8:1::/64"),
+            "overflow:SourceIp:api"
+        );
+        assert_eq!(overflow_key("SourceIp:203.0.113.7"), "overflow:SourceIp");
+    }
     use std::net::Ipv4Addr;
 
     #[test]

@@ -1716,10 +1716,14 @@ pub struct TlsConfig {
     pub zero_rtt_safe_methods: Vec<String>,
 
     /// 0-RTT replay protection mode: "strict" | "session" | "none" — default "strict".
-    /// Applied to every TCP ClientHello that offers early data; a repeat
-    /// within `zero_rtt_nonce_window_secs` is refused before the handshake.
+    /// Applied, where `enable_0rtt` is on, to every TCP ClientHello that offers
+    /// early data: a repeat within `zero_rtt_nonce_window_secs` has its early
+    /// data declined and completes a full handshake (RFC 8446 §8), as does a
+    /// ClientHello the store, full, cannot vouch for. The store holds a bounded
+    /// number of digests and costs the same per ClientHello however many it
+    /// holds.
     /// - "strict": the ClientHello itself (its random is among the bytes
-    ///   hashed), so an exact replay is refused.
+    ///   hashed), so an exact replay's early data is declined.
     /// - "session": the session ticket it resumes, so each ticket carries early
     ///   data once (RFC 8446 §8.1, single-use tickets). A ClientHello whose
     ///   ticket was not in the bytes read falls back to "strict".
@@ -2971,7 +2975,9 @@ pub struct FingerprintConfig {
     pub suspicious_rate_threshold: u64,
     /// Time window for suspicious rate detection (seconds)
     pub suspicious_rate_window_secs: u64,
-    /// Fingerprint cache max age before cleanup (seconds)
+    /// How long a fingerprint the classification cache has not seen again is
+    /// kept, in seconds: what a full cache (65,536 fingerprints) sweeps out to
+    /// make room
     pub cache_max_age_secs: u64,
     /// Block scanner fingerprints (Nmap, Nikto, Burp Suite, etc.)
     pub block_scanners: bool,

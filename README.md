@@ -73,7 +73,7 @@
 | **Per-Backend Connection Pool** | ✅ | Per-host idle timeout, max idle connections, max total connections, and acquire timeout for the HTTP/1.1 backend pool. A reused connection the backend closes just as a request is written (its keep-alive timeout racing the reuse) no longer turns into a 502: an idempotent request (RFC 9110 §9.2.2) with a replayable body is sent again on another connection; a POST is not, since its first copy may have been acted on |
 | **Per-Backend Retry** | ✅ | `retries`, `retry_backoff_ms` (doubling) and `retry_on` per backend, on TCP and HTTP/3: a connection that could not be made is retried for any method; a 5xx or a timeout only for a method that may be repeated with a body that can be resent |
 | **Per-Backend Circuit Breaker** | ✅ | Per pool server: `cb_failure_threshold` failures open it; after `cb_half_open_delay_secs` one trial request at a time goes through, and `cb_success_threshold` successes close it (a trial that fails opens it for another delay); the server then ramps back up in slow start |
-| **0-RTT Replay Protection** | ✅ | Nonce store (strict/session/none); rejects replayed early-data nonces |
+| **0-RTT Replay Protection** | ✅ | Bounded nonce store (strict/session/none); a replayed or unverifiable ClientHello's early data is declined and the handshake completes without it |
 | **QUIC Retry** | ✅ | Optional RFC 9000 source-address validation (`enable_quic_retry`); Retry token echoed before handshake, anti-spoofing at +1 RTT |
 | **Certificate Transparency** | ✅ | Submits new certs via `POST /ct/v1/add-chain` after ACME issuance, to logs chosen from the live CT log list: one per operator whose shard holds the expiry |
 | **QUIC Connection Migration** | ✅ | Configurable enable/disable of QUIC connection migration (`enable_quic_migration`) |
@@ -176,7 +176,7 @@
 - **Certificate Compression**: RFC 8879, on by default (`certificate_compression = "auto"` in `[tls]`; `"off"` disables it on both stacks). The two stacks enable it in completely different ways — OpenSSL sends an uncompressed chain unless the application calls **both** `SSL_CTX_set1_cert_comp_preference` *and* `SSL_CTX_compress_certs`, neither of which the `openssl` or `openssl-sys` crates bind, while rustls needs no call at all and populates `cert_compressors` from the `brotli` and `zlib` crate features. Only zlib is offered over TCP, because these OpenSSL builds report `-DZLIB` and nothing else and advertising an algorithm the library cannot produce is worse than offering one fewer. Measured on this deployment: the Certificate message is 3,435 bytes and the `CompressedCertificate` replacing it is 2,384, a saving of exactly 1,051 bytes per full handshake — most of what the X25519MLKEM768 key share adds. The setting is read once at startup because both stacks bake it into the TLS context, so changing it needs a restart rather than a config reload
 - **TLS 1.3 Default**: TLS 1.3 minimum on all listeners by default (`min_version = "1.3"` in `[tls]`), which is what this deployment runs. TLS 1.2 can be permitted via config for compatibility, but that is a departure from the default posture rather than an equivalent choice — OpenSSL 3.5+ for TCP/TLS, rustls for QUIC/HTTP3
 - **TLS Key Permission Checks**: Private key file permissions validated at startup; `strict_key_permissions = true` aborts if permissions are too permissive
-- **0-RTT Replay Protection**: Nonce store (strict/session/none modes) — rejects replayed TLS 1.3 early-data nonces within configurable window
+- **0-RTT Replay Protection**: Bounded two-generation nonce store (strict/session/none modes) — a TLS 1.3 ClientHello (or ticket) seen within the window, or one a full store cannot vouch for, has its early data declined (RFC 8446 §8) and completes a full handshake
 - **QUIC Retry (source-address validation)**: Optional RFC 9000 §8.1.2 Retry — a new, unvalidated connection is answered with a Retry token the client must echo before the handshake proceeds, hardening against spoofed-source amplification/DDoS at the cost of one extra round trip per new connection. Configurable via `enable_quic_retry` in `[server]` (default off, in which case RFC 9000's implicit 3× anti-amplification validation is used instead — no per-connection latency).
 - **Circuit Breaker**: Per-backend protection from cascading failures; per-backend threshold/delay overrides
 - **Advanced Rate Limiting**: Multi-dimensional limiting (IP, JA3/JA4, JWT-verified subject, headers, composite keys) applied on both TCP (HTTP/1.1, HTTP/2) and QUIC/HTTP3 paths; optional Redis backend distributes counters across all proxy instances
@@ -2467,9 +2467,9 @@ describes the rig and the traps it guards against.
 - [x] Backend certificates always verified (`tls_skip_verify` refused; pin with `tls_cert`)
 - [x] `unsafe_code = deny` globally (OpenSSL FFI retains targeted allow)
 - [x] Panic prevention (no production-path unwrap(); ok_or/? throughout)
-- [x] Memory exhaustion prevention (DashMap collections bounded with eviction)
+- [x] Memory exhaustion prevention: every table a client can add to (addresses, fingerprints, cookies, paths, replay nonces) has a ceiling enforced where entries are made, swept for room at most once every few seconds when full, so neither memory nor the work per request follows the number of distinct values clients send
 - [x] ReDoS prevention (regex patterns size-limited)
-- [x] SECURITY.md vulnerability disclosure policy
+- [x] [SECURITY.md](SECURITY.md): private vulnerability reporting, and an advisory with each fix
 
 ### mTLS Configuration
 

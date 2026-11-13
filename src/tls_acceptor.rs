@@ -26,7 +26,6 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use axum::extract::connect_info::Connected;
-use dashmap::DashMap;
 use pin_project_lite::pin_project;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -41,57 +40,115 @@ use crate::security::SecurityState;
 /// Maximum size to peek for ClientHello (typically < 1KB but can be up to 16KB with extensions)
 const MAX_CLIENT_HELLO_SIZE: usize = 4096;
 
-/// 0-RTT replay protection nonce store.
-///
-/// Stores SHA-256 digests of the first 64 bytes of observed ClientHello messages
-/// to detect replayed early-data attempts.  Entries older than `window_secs` are
-/// evicted lazily on each `check_and_insert` call.
-pub struct ZeroRttNonceStore {
-    /// nonce → insertion time
-    nonces: DashMap<[u8; 32], Instant>,
-    /// Retention window in seconds
-    window_secs: u64,
+/// Digests seen within a window, in two generations: the current one takes
+/// new digests and the previous one is kept until the current one is a window
+/// old, so a digest is remembered for at least a window and at most two. A
+/// lookup and an insert cost the same however many digests are held, and
+/// nothing scans the table: it was swept in full before every lookup, a pass
+/// over everything a window had recorded for each new ClientHello. Each
+/// generation holds at most `cap` digests; a full store cannot tell a new
+/// digest from one it had no room to remember, and says so.
+#[derive(Debug)]
+struct Generations {
+    inner: parking_lot::Mutex<GenerationState>,
+    window: std::time::Duration,
+    cap: usize,
 }
 
-impl ZeroRttNonceStore {
-    /// Create a new nonce store with the given replay window.
-    pub fn new(window_secs: u64) -> Self {
+#[derive(Debug)]
+struct GenerationState {
+    current: std::collections::HashSet<[u8; 32]>,
+    previous: std::collections::HashSet<[u8; 32]>,
+    started: Instant,
+}
+
+/// What a store knows of a digest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Seen {
+    /// Not seen within the window: recorded now
+    New,
+    /// Seen within the window
+    Again,
+    /// Not recorded, the store being full: it may have been seen
+    Unknown,
+}
+
+impl Generations {
+    fn new(window: std::time::Duration, cap: usize) -> Self {
         Self {
-            nonces: DashMap::new(),
-            window_secs,
+            inner: parking_lot::Mutex::new(GenerationState {
+                current: std::collections::HashSet::new(),
+                previous: std::collections::HashSet::new(),
+                started: Instant::now(),
+            }),
+            window,
+            cap: cap.max(1),
         }
     }
 
-    /// Compute a 32-byte nonce from the raw ClientHello bytes (first 64 bytes).
+    fn check(&self, digest: [u8; 32]) -> Seen {
+        let mut g = self.inner.lock();
+        let age = g.started.elapsed();
+        if age >= self.window {
+            if age >= self.window * 2 {
+                g.previous.clear();
+                g.current.clear();
+            } else {
+                g.previous = std::mem::take(&mut g.current);
+            }
+            g.started = Instant::now();
+        }
+        if g.current.contains(&digest) || g.previous.contains(&digest) {
+            return Seen::Again;
+        }
+        if g.current.len() >= self.cap {
+            return Seen::Unknown;
+        }
+        g.current.insert(digest);
+        Seen::New
+    }
+}
+
+/// Digests a 0-RTT store holds per generation: at a 60 s window, 4,000
+/// ClientHellos offering early data a second, every second.
+const ZERO_RTT_DIGESTS: usize = 1 << 18;
+
+/// Request nonces an HMAC store holds per generation.
+const HMAC_NONCES: usize = 1 << 18;
+
+/// 0-RTT replay protection: the ClientHellos (or tickets) that offered early
+/// data within the window, as SHA-256 digests.
+#[derive(Debug)]
+pub struct ZeroRttNonceStore {
+    seen: Generations,
+}
+
+impl ZeroRttNonceStore {
+    /// A store remembering each digest for at least `window_secs`.
+    pub fn new(window_secs: u64) -> Self {
+        Self::with_capacity(window_secs, ZERO_RTT_DIGESTS)
+    }
+
+    fn with_capacity(window_secs: u64, cap: usize) -> Self {
+        Self {
+            seen: Generations::new(std::time::Duration::from_secs(window_secs), cap),
+        }
+    }
+
+    /// The digest of a ClientHello's first 64 bytes, which take in its random.
     fn nonce_from_client_hello(data: &[u8]) -> [u8; 32] {
         // The digest is the nonce: no zeroed buffer stands in for it first
         Sha256::digest(&data[..data.len().min(64)]).into()
     }
 
-    /// Returns `true` if this ClientHello is a replay (nonce seen before);
-    /// `false` if it is new (nonce recorded for future comparison).
-    ///
-    /// Expired entries are evicted before the lookup.
-    pub fn check_and_insert(&self, client_hello: &[u8]) -> bool {
-        self.check_and_insert_digest(Self::nonce_from_client_hello(client_hello))
+    /// Whether `client_hello` was seen within the window, recording it if not.
+    pub fn check(&self, client_hello: &[u8]) -> Seen {
+        self.check_digest(Self::nonce_from_client_hello(client_hello))
     }
 
-    /// As [`check_and_insert`](Self::check_and_insert), for a key already
-    /// reduced to a digest.
-    pub fn check_and_insert_digest(&self, nonce: [u8; 32]) -> bool {
-        let now = Instant::now();
-        let window = self.window_secs;
-        self.nonces
-            .retain(|_, inserted_at| now.duration_since(*inserted_at).as_secs() < window);
-        // One atomic step: two connections carrying the same ClientHello must
-        // not both find it absent.
-        match self.nonces.entry(nonce) {
-            dashmap::mapref::entry::Entry::Occupied(_) => true, // replay
-            dashmap::mapref::entry::Entry::Vacant(v) => {
-                v.insert(now);
-                false
-            }
-        }
+    /// As [`check`](Self::check), for a key already reduced to a digest.
+    pub fn check_digest(&self, nonce: [u8; 32]) -> Seen {
+        self.seen.check(nonce)
     }
 }
 
@@ -138,12 +195,14 @@ pub fn client_hello_psk_identity(data: &[u8]) -> Option<&[u8]> {
 }
 
 /// SEC-002: `tls.zero_rtt_replay_protection`, applied to a ClientHello that
-/// offers early data before its handshake starts. One guard for both TCP
-/// stacks; the OpenSSL listener applied none.
+/// offers early data before its handshake starts, on every TCP listener that
+/// accepts early data.
 #[derive(Clone)]
 pub struct ZeroRttReplayGuard {
     mode: ZeroRttReplayMode,
     store: Option<Arc<ZeroRttNonceStore>>,
+    /// Last time a full store was reported, in s since the Unix epoch
+    full_said: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,26 +224,61 @@ impl ZeroRttReplayGuard {
             mode,
             store: (mode != ZeroRttReplayMode::Off)
                 .then(|| Arc::new(ZeroRttNonceStore::new(window_secs))),
+            full_said: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
-    /// True when `client_hello` offers early data and repeats one seen within
-    /// the window: under "strict" the ClientHello itself, under "session" the
-    /// ticket it resumes, so each ticket carries early data once.
-    pub fn is_replay(&self, client_hello: &[u8]) -> bool {
-        let Some(store) = &self.store else {
-            return false;
-        };
+    /// What the store knows of `client_hello`, when it offers early data:
+    /// under "strict" the ClientHello itself, under "session" the ticket it
+    /// resumes, so each ticket carries early data once. `None` when it offers
+    /// none, or the guard is off.
+    fn seen(&self, client_hello: &[u8]) -> Option<Seen> {
+        let store = self.store.as_ref()?;
         if !FingerprintingTlsAcceptor::client_hello_has_early_data_extension(client_hello) {
-            return false;
+            return None;
         }
-        match (self.mode, client_hello_psk_identity(client_hello)) {
+        Some(match (self.mode, client_hello_psk_identity(client_hello)) {
             (ZeroRttReplayMode::Session, Some(ticket)) => {
                 let mut key = [0u8; 32];
                 key.copy_from_slice(&Sha256::digest(ticket));
-                store.check_and_insert_digest(key)
+                store.check_digest(key)
             }
-            _ => store.check_and_insert(client_hello),
+            _ => store.check(client_hello),
+        })
+    }
+
+    /// Whether this connection may have its early data accepted. Not when the
+    /// ClientHello (or ticket) offered early data within the window, nor when
+    /// the store is too full to tell: the server then declines the early data
+    /// and the handshake goes on without it (RFC 8446 section 8), so a replay
+    /// gains nothing and a client is never refused for a full store.
+    pub fn accepts_early_data(&self, client_hello: &[u8]) -> bool {
+        match self.seen(client_hello) {
+            None | Some(Seen::New) => true,
+            Some(Seen::Again) => {
+                debug!("0-RTT: a ClientHello offering early data seen within the window; early data declined");
+                false
+            }
+            Some(Seen::Unknown) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                let said = self.full_said.load(std::sync::atomic::Ordering::Relaxed);
+                if now.saturating_sub(said) >= 60
+                    && self
+                        .full_said
+                        .compare_exchange(
+                            said,
+                            now,
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                        )
+                        .is_ok()
+                {
+                    warn!("0-RTT: the replay store is full; early data declined until it has room");
+                }
+                false
+            }
         }
     }
 }
@@ -193,51 +287,37 @@ impl ZeroRttReplayGuard {
 ///
 /// Clients include a unique `X-Request-Nonce` (or `X-Admin-Nonce`) whose value
 /// is incorporated into the HMAC signature. The server records SHA-256 digests
-/// of seen nonces and rejects duplicates within the retention window.
-///
-/// Nonces are stored as SHA-256 digests to bound memory regardless of input length.
-/// Entries are lazily evicted on each `check_and_insert` call.
+/// of seen nonces and rejects duplicates within the retention window; a store
+/// too full to tell rejects the request too.
+#[derive(Debug)]
 pub struct HmacNonceStore {
-    /// nonce-digest → insertion time
-    nonces: DashMap<[u8; 32], Instant>,
-    /// Retention window in seconds (should equal the HMAC timestamp window)
-    window_secs: u64,
+    seen: Generations,
 }
 
 impl HmacNonceStore {
     pub fn new(window_secs: u64) -> Self {
         Self {
-            nonces: DashMap::new(),
-            window_secs,
+            seen: Generations::new(std::time::Duration::from_secs(window_secs), HMAC_NONCES),
         }
     }
 
-    /// Returns `true` if this nonce has been seen before within the window
-    /// (replay detected); `false` if it is new (nonce recorded).
-    ///
-    /// Expired entries are lazily evicted on each call.
+    /// Returns `true` if this nonce was seen within the window, or cannot be
+    /// told from one (the store is full); `false` if it is new and recorded.
     pub fn check_and_insert(&self, nonce: &str) -> bool {
-        let now = Instant::now();
-        let window = self.window_secs;
-        self.nonces
-            .retain(|_, inserted_at| now.duration_since(*inserted_at).as_secs() < window);
-        // One atomic step: two requests carrying the same nonce must not both
-        // find it absent.
-        match self.nonces.entry(Self::digest(nonce)) {
-            dashmap::mapref::entry::Entry::Occupied(_) => true, // replay
-            dashmap::mapref::entry::Entry::Vacant(v) => {
-                v.insert(now);
-                false
-            }
-        }
+        self.seen.check(Self::digest(nonce)) != Seen::New
     }
 
     fn digest(nonce: &str) -> [u8; 32] {
-        let d = Sha256::digest(nonce.as_bytes());
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&d);
-        out
+        Sha256::digest(nonce.as_bytes()).into()
     }
+}
+
+/// `config` with early data declined: the configuration a connection whose
+/// early data the replay guard will not vouch for completes its handshake on.
+pub fn without_early_data(config: &Arc<rustls::ServerConfig>) -> Arc<rustls::ServerConfig> {
+    let mut declined = rustls::ServerConfig::clone(config);
+    declined.max_early_data_size = 0;
+    Arc::new(declined)
 }
 
 /// Connection info with fingerprint data
@@ -864,21 +944,16 @@ impl FingerprintingTlsAcceptor {
         }
 
         // SEC-002 / STEP 10: 0-RTT replay protection, before any handshake
-        // work: a repeated ClientHello (or, under "session", ticket) that
-        // offers early data is refused outright.
-        if offered_early_data
-            && peek_len > 0
-            && self.zero_rtt_replay.is_replay(&peek_buf[..peek_len])
-        {
-            warn!(
-                "0-RTT replay detected from {} — rejecting early data",
-                remote_addr
-            );
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                "0-RTT replay protection: duplicate early data rejected",
-            ));
-        }
+        // work, where early data can be accepted at all: a ClientHello (or,
+        // under "session", ticket) seen within the window, or one the store is
+        // too full to vouch for, has its early data declined and the handshake
+        // goes on without it.
+        let early_data_accepted = !self.zero_rtt_enabled
+            || !offered_early_data
+            || peek_len == 0
+            || self
+                .zero_rtt_replay
+                .accepts_early_data(&peek_buf[..peek_len]);
 
         // Log fingerprint info
         if let Some(ref ja3) = fingerprint_result.ja3_hash {
@@ -920,7 +995,11 @@ impl FingerprintingTlsAcceptor {
         };
         let tls_stream = if self.zero_rtt_enabled {
             crate::early_data::EarlyRustls::accept(
-                Arc::clone(acceptor.config()),
+                if early_data_accepted {
+                    Arc::clone(acceptor.config())
+                } else {
+                    without_early_data(acceptor.config())
+                },
                 stream,
                 self.handshake_timeout,
             )
@@ -1018,9 +1097,9 @@ mod tests {
             let _ = client_hello_psk_identity(m);
             let _ = FingerprintingTlsAcceptor::extract_sni(m);
             let _ = FingerprintingTlsAcceptor::client_hello_has_early_data_extension(m);
-            let _ = store.check_and_insert(m);
-            let _ = strict.is_replay(m);
-            let _ = session.is_replay(m);
+            let _ = store.check(m);
+            let _ = !strict.accepts_early_data(m);
+            let _ = !session.accepts_early_data(m);
         });
     }
 
@@ -1279,40 +1358,94 @@ mod tests {
     #[test]
     fn strict_refuses_a_repeated_client_hello() {
         let guard = ZeroRttReplayGuard::from_config("strict", 60);
-        assert!(!guard.is_replay(&early_hello(1, b"t")));
+        assert!(guard.accepts_early_data(&early_hello(1, b"t")));
         assert!(
-            guard.is_replay(&early_hello(1, b"t")),
+            !guard.accepts_early_data(&early_hello(1, b"t")),
             "the same ClientHello again"
         );
         assert!(
-            !guard.is_replay(&early_hello(2, b"t")),
+            guard.accepts_early_data(&early_hello(2, b"t")),
             "a new random is a new ClientHello"
         );
     }
 
     #[test]
-    fn session_refuses_a_ticket_used_twice_for_early_data() {
+    fn session_declines_early_data_on_a_ticket_used_twice() {
         let guard = ZeroRttReplayGuard::from_config("session", 60);
-        assert!(!guard.is_replay(&early_hello(1, b"ticket-a")));
+        assert!(guard.accepts_early_data(&early_hello(1, b"ticket-a")));
         assert!(
-            guard.is_replay(&early_hello(2, b"ticket-a")),
+            !guard.accepts_early_data(&early_hello(2, b"ticket-a")),
             "a different ClientHello resuming the same ticket"
         );
-        assert!(!guard.is_replay(&early_hello(3, b"ticket-b")));
+        assert!(guard.accepts_early_data(&early_hello(3, b"ticket-b")));
     }
 
     #[test]
     fn only_client_hellos_offering_early_data_are_tracked() {
         let guard = ZeroRttReplayGuard::from_config("strict", 60);
         let plain = client_hello(9, &[(0x0029, psk(b"t"))]);
-        assert!(!guard.is_replay(&plain));
+        assert!(guard.accepts_early_data(&plain));
         assert!(
-            !guard.is_replay(&plain),
+            guard.accepts_early_data(&plain),
             "a resumption without early data can repeat"
         );
         let off = ZeroRttReplayGuard::from_config("none", 60);
-        assert!(!off.is_replay(&early_hello(1, b"t")));
-        assert!(!off.is_replay(&early_hello(1, b"t")));
+        assert!(off.accepts_early_data(&early_hello(1, b"t")));
+        assert!(off.accepts_early_data(&early_hello(1, b"t")));
+    }
+
+    /// A store remembers a digest for at least a window, across a rotation.
+    #[test]
+    fn a_digest_is_remembered_across_a_rotation() {
+        let g = Generations::new(std::time::Duration::from_millis(40), 8);
+        assert_eq!(g.check([1; 32]), Seen::New);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(g.check([1; 32]), Seen::Again, "in the previous generation");
+        assert_eq!(g.check([2; 32]), Seen::New);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(g.check([1; 32]), Seen::New, "two windows on, forgotten");
+    }
+
+    /// A full store records nothing more and says it cannot tell.
+    #[test]
+    fn a_full_store_cannot_tell() {
+        let g = Generations::new(std::time::Duration::from_secs(60), 2);
+        assert_eq!(g.check([1; 32]), Seen::New);
+        assert_eq!(g.check([2; 32]), Seen::New);
+        assert_eq!(g.check([3; 32]), Seen::Unknown);
+        assert_eq!(
+            g.check([1; 32]),
+            Seen::Again,
+            "what it holds it still knows"
+        );
+    }
+
+    /// Early data a full store cannot vouch for is declined, as a replay's is.
+    #[test]
+    fn a_full_store_declines_early_data() {
+        let guard = ZeroRttReplayGuard {
+            mode: ZeroRttReplayMode::Strict,
+            store: Some(Arc::new(ZeroRttNonceStore::with_capacity(60, 1))),
+            full_said: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        assert!(guard.accepts_early_data(&early_hello(1, b"t")));
+        assert!(!guard.accepts_early_data(&early_hello(2, b"t")));
+    }
+
+    /// A configuration with early data declined is the same one otherwise.
+    #[test]
+    fn declining_early_data_changes_only_that() {
+        let mut config =
+            rustls::ServerConfig::builder_with_provider(Arc::new(crate::tls::build_pqc_provider()))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .expect("TLS 1.3")
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
+        config.max_early_data_size = 16384;
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let declined = without_early_data(&Arc::new(config));
+        assert_eq!(declined.max_early_data_size, 0);
+        assert_eq!(declined.alpn_protocols, vec![b"h2".to_vec()]);
     }
 
     #[test]
