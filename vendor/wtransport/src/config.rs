@@ -554,9 +554,18 @@ impl ServerConfigBuilder<states::WantsTransportConfigServer> {
     /// See the documentation of [`Self::with_custom_tls`] for the TLS 1.3 requirement.
     #[must_use]
     pub fn build(self) -> ServerConfig {
+        let tls = Arc::new(self.0.tls_config);
+        // A configuration whose own suites leave AES-128-GCM out takes it on its
+        // own for Initial packets ([`initial_suite`])
         let crypto: Arc<quinn::crypto::rustls::QuicServerConfig> = Arc::new(
-            quinn::crypto::rustls::QuicServerConfig::try_from(self.0.tls_config)
+            match quinn::crypto::rustls::QuicServerConfig::try_from(Arc::clone(&tls)) {
+                Ok(crypto) => crypto,
+                Err(_) => quinn::crypto::rustls::QuicServerConfig::with_initial(
+                    tls,
+                    initial_suite().expect("CipherSuite::TLS13_AES_128_GCM_SHA256 missing"),
+                )
                 .expect("CipherSuite::TLS13_AES_128_GCM_SHA256 missing"),
+            },
         );
 
         let mut quic_config = quinn::ServerConfig::with_crypto(crypto);
@@ -1081,8 +1090,15 @@ impl ClientConfigBuilder<states::WantsTransportConfigClient> {
     /// See the documentation of [`Self::with_custom_tls`] for the TLS 1.3 requirement.
     #[must_use]
     pub fn build(self) -> ClientConfig {
-        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(self.0.tls_config)
-            .expect("CipherSuite::TLS13_AES_128_GCM_SHA256 missing");
+        let tls = Arc::new(self.0.tls_config);
+        let crypto = match quinn::crypto::rustls::QuicClientConfig::try_from(Arc::clone(&tls)) {
+            Ok(crypto) => crypto,
+            Err(_) => quinn::crypto::rustls::QuicClientConfig::with_initial(
+                tls,
+                initial_suite().expect("CipherSuite::TLS13_AES_128_GCM_SHA256 missing"),
+            )
+            .expect("CipherSuite::TLS13_AES_128_GCM_SHA256 missing"),
+        };
 
         let mut quic_config = quinn::ClientConfig::new(Arc::new(crypto));
         quic_config.transport_config(Arc::new(self.0.transport_config));
@@ -1283,5 +1299,37 @@ impl Debug for InvalidIdleTimeout {
 impl Display for InvalidIdleTimeout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Debug::fmt(self, f)
+    }
+}
+
+/// TLS_AES_128_GCM_SHA256 as QUIC's Initial packets take it (RFC 9001 section
+/// 5.2).
+///
+/// For a TLS configuration whose own suites leave it out: one that lets a
+/// handshake agree only AES-256-GCM or ChaCha20 still protects its Initial
+/// packets as QUIC requires.
+fn initial_suite() -> Option<rustls::quic::Suite> {
+    #[cfg(feature = "aws-lc-rs")]
+    {
+        rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256
+            .tls13()
+            .and_then(|suite| suite.quic_suite())
+    }
+    #[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
+    {
+        rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
+            .tls13()
+            .and_then(|suite| suite.quic_suite())
+    }
+    #[cfg(not(any(feature = "ring", feature = "aws-lc-rs")))]
+    {
+        rustls::crypto::CryptoProvider::get_default().and_then(|provider| {
+            provider
+                .cipher_suites
+                .iter()
+                .filter(|cs| cs.suite() == rustls::CipherSuite::TLS13_AES_128_GCM_SHA256)
+                .find_map(|cs| cs.tls13())
+                .and_then(|suite| suite.quic_suite())
+        })
     }
 }

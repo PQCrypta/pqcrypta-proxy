@@ -74,10 +74,8 @@ pub(super) fn server_config(throwaway: &Throwaway) -> quinn::ServerConfig {
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(OneCert(throwaway.key.clone())));
     config.alpn_protocols = vec![b"h3".to_vec()];
-    let crypto = Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(config)
-            .expect("building the QUIC config"),
-    );
+    let crypto =
+        Arc::new(crate::tls::quic_server_config(config).expect("building the QUIC config"));
     let mut server_config = quinn::ServerConfig::with_crypto(crypto);
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(
@@ -99,7 +97,7 @@ pub(super) fn client_endpoint(throwaway: &Throwaway) -> quinn::Endpoint {
         .with_no_client_auth();
     client_crypto.alpn_protocols = vec![b"h3".to_vec()];
     let client_config = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
+        crate::tls::quic_client_config(client_crypto)
             .expect("building the QUIC client configuration"),
     ));
     let client = quinn::Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
