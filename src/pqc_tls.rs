@@ -234,6 +234,20 @@ pub fn experimental_group_is_hybrid(name: &str) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
+/// The `experimental_groups` entries a listener offers, in the order listed.
+///
+/// All of them, or under `require_hybrid` only their hybrids. One selection
+/// for the OpenSSL listeners and the rustls (QUIC) ones, so TCP and QUIC
+/// offer the same groups.
+pub fn offered_experimental_groups(config: &PqcConfig) -> Vec<&str> {
+    config
+        .experimental_groups
+        .iter()
+        .map(String::as_str)
+        .filter(|g| !config.require_hybrid || experimental_group_is_hybrid(g))
+        .collect()
+}
+
 /// An `experimental_groups` entry: a provider's group name, and neither a
 /// standard ML-KEM group nor a classical one, which have their own settings
 /// and their own place in the offer.
@@ -633,12 +647,7 @@ impl PqcTlsProvider {
         // after standard ML-KEM, so a client that offers ML-KEM gets it, and
         // before the classical fallback, so a client that offers one of these
         // and a classical group gets post-quantum.
-        let experimental: Vec<&str> = config
-            .experimental_groups
-            .iter()
-            .map(String::as_str)
-            .filter(|g| !config.require_hybrid || experimental_group_is_hybrid(g))
-            .collect();
+        let experimental = offered_experimental_groups(config);
         if !experimental.is_empty() {
             tuples.push(experimental.join(":"));
         }
@@ -1570,6 +1579,39 @@ mod tests {
         assert_eq!(
             PqcTlsProvider::build_groups_string(&hybrid_only, &all, x25519),
             "SecP384r1MLKEM1024/X25519MLKEM768:SecP256r1MLKEM768/p384_frodo976shake"
+        );
+    }
+
+    /// The one selection both transports offer from: every entry in the order
+    /// listed, and under require_hybrid only the hybrids. The QUIC listener
+    /// used to take every entry whatever require_hybrid said.
+    #[test]
+    fn offered_experimental_groups_follow_require_hybrid() {
+        let config = PqcConfig {
+            experimental_groups: vec![
+                "frodo1344shake".into(),
+                "p384_frodo976shake".into(),
+                "hqc5".into(),
+                "x25519_frodo640shake".into(),
+            ],
+            ..PqcConfig::default()
+        };
+        assert_eq!(
+            offered_experimental_groups(&config),
+            [
+                "frodo1344shake",
+                "p384_frodo976shake",
+                "hqc5",
+                "x25519_frodo640shake"
+            ]
+        );
+        let hybrid_only = PqcConfig {
+            require_hybrid: true,
+            ..config
+        };
+        assert_eq!(
+            offered_experimental_groups(&hybrid_only),
+            ["p384_frodo976shake", "x25519_frodo640shake"]
         );
     }
 

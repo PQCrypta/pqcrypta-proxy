@@ -2652,12 +2652,15 @@ pub fn server_provider(post_quantum: bool, pqc: &PqcConfig) -> CryptoProvider {
                     && (is_hybrid_group(name) || (named_at(name).is_some() && !pqc.require_hybrid))
             })
             .collect();
-    // The experimental KEMs the OpenSSL listener offers, from the same
+    // The experimental KEMs the OpenSSL listener offers -- the same selection,
+    // so require_hybrid keeps only their hybrids here too -- from the same
     // provider, after the standard groups and ahead of the classical ones,
     // where that listener puts them
     #[cfg(feature = "pqc")]
     if post_quantum {
-        groups.extend(crate::provider_kx::groups(&pqc.experimental_groups));
+        groups.extend(crate::provider_kx::groups(
+            crate::pqc_tls::offered_experimental_groups(pqc),
+        ));
     }
     groups.sort_by_key(|g| {
         let name = g.name();

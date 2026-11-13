@@ -1886,9 +1886,9 @@ pub struct PqcConfig {
     pub provider: String,
     /// Preferred KEM algorithm for key exchange
     pub preferred_kem: String,
-    /// Offer the classical key-exchange groups (P-384, then P-256) after the hybrid PQC
-    /// groups, so a client with no ML-KEM support can still complete a
-    /// handshake. This is a CLIENT COMPATIBILITY switch, not a statement about
+    /// Offer the classical key-exchange groups (P-384, P-256 and X25519, one
+    /// tuple, on every listener) after the hybrid PQC groups, so a client with
+    /// no ML-KEM support can still complete a handshake. This is a CLIENT COMPATIBILITY switch, not a statement about
     /// our own posture: with it off, such clients cannot connect at all.
     ///
     /// Measured on this deployment before the split: system curl built against
@@ -1917,14 +1917,16 @@ pub struct PqcConfig {
     pub additional_kems: Vec<String>,
     /// Key-exchange groups a loaded OpenSSL provider adds that have no IANA
     /// codepoint -- the OQS provider's FrodoKEM, HQC and the like -- by their
-    /// OpenSSL group names, in preference order. Offered by the OpenSSL
-    /// listeners in a tuple of their own, after the standard ML-KEM tuples
-    /// and before the classical fallback: a client that offers ML-KEM gets
-    /// ML-KEM, one that offers only these and a classical group gets one of
-    /// these. No browser offers them. Each is kept only if the linked libssl
-    /// accepts it; under `require_hybrid` only the hybrids (named for their
-    /// classical half: p384_frodo976shake); `min_security_level` does not
-    /// apply. The rustls listeners (HTTP/3) cannot offer them. Default: none.
+    /// OpenSSL group names, in preference order. Offered by every listener in
+    /// a tuple of their own, after the standard ML-KEM tuples and before the
+    /// classical fallback: a client that offers ML-KEM gets ML-KEM, one that
+    /// offers only these and a classical group gets one of these. No browser
+    /// offers them. OpenSSL negotiates them on TCP; over QUIC rustls runs the
+    /// same provider's KEM through OpenSSL's encapsulation API
+    /// (`provider_kx`). Each is kept only if a loaded provider carries it;
+    /// under `require_hybrid` only the hybrids (named for their classical
+    /// half: p384_frodo976shake), on both transports; `min_security_level`
+    /// does not apply. Default: none.
     #[serde(default)]
     pub experimental_groups: Vec<String>,
     /// What is done with a connection whose key exchange is classical, where
@@ -1952,7 +1954,7 @@ pub struct PqcConfig {
 
     /// Require every offered key-exchange group to be hybrid (classical + PQC).
     ///
-    /// Suppresses the pure-PQC preferred KEM and the classical P-384 fallback in
+    /// Suppresses the pure-PQC preferred KEM and the classical fallback in
     /// the offered group list, so a peer that supports neither a hybrid group
     /// nor nothing at all fails the handshake outright. Default false: on a
     /// public listener this turns away every client without PQC support.
