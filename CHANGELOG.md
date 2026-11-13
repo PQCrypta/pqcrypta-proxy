@@ -6,19 +6,30 @@
 ### Features
 
 * TLS over TCP compresses certificates with brotli, zlib or zstd, whichever the client asks for and the OpenSSL build has, and logs what each makes of the chain ([93d7bc8](https://github.com/PQCrypta/pqcrypta-proxy/commit/93d7bc8addd29affe9f0d32ff37d2ef0395077a9))
-* TLS over TCP compresses certificates with brotli, zlib or zstd, whichever the client asks for and the OpenSSL build has, and logs what each makes of the chain ([adcdef0](https://github.com/PQCrypta/pqcrypta-proxy/commit/adcdef01f2eac52e42b60ccc6f4be44469809974))
 
 
 ### Bug Fixes
 
 * a post-quantum group counts as available only under its own name ([9b82fac](https://github.com/PQCrypta/pqcrypta-proxy/commit/9b82fac3ab743eccd12904f35d9ea9e02f17aae7))
-* a post-quantum group counts as available only under its own name ([f972311](https://github.com/PQCrypta/pqcrypta-proxy/commit/f9723112bb6f3c29f8f9b3349dc84678ec0cedd0))
 * an opened ECH ClientHelloInner must carry encrypted_client_hello of type inner and offer TLS 1.3 alone, and one that breaks a rule ends the handshake (RFC 9849 section 7.1) ([2d25565](https://github.com/PQCrypta/pqcrypta-proxy/commit/2d255651a9d18d3bc75d89704be4c3eb91797ad7))
-* an opened ECH ClientHelloInner must carry encrypted_client_hello of type inner and offer TLS 1.3 alone, and one that breaks a rule ends the handshake (RFC 9849 section 7.1) ([3b0634d](https://github.com/PQCrypta/pqcrypta-proxy/commit/3b0634d6b510a258a115513002960bb8a6954bd2))
 * ECH ech_outer_extensions are expanded in one ordered pass over the outer hello, each named once, never encrypted_client_hello (RFC 9849 section 5.1) ([2d25565](https://github.com/PQCrypta/pqcrypta-proxy/commit/2d255651a9d18d3bc75d89704be4c3eb91797ad7))
-* ECH ech_outer_extensions are expanded in one ordered pass over the outer hello, each named once, never encrypted_client_hello (RFC 9849 section 5.1) ([3b0634d](https://github.com/PQCrypta/pqcrypta-proxy/commit/3b0634d6b510a258a115513002960bb8a6954bd2))
 * PQC support, the post-quantum groups offered and ML-DSA availability are read from the linked OpenSSL, not from an openssl binary at a configured path ([9b82fac](https://github.com/PQCrypta/pqcrypta-proxy/commit/9b82fac3ab743eccd12904f35d9ea9e02f17aae7))
-* PQC support, the post-quantum groups offered and ML-DSA availability are read from the linked OpenSSL, not from an openssl binary at a configured path ([f972311](https://github.com/PQCrypta/pqcrypta-proxy/commit/f9723112bb6f3c29f8f9b3349dc84678ec0cedd0))
+
+
+### Build System
+
+* CI, the release binary and the container build OpenSSL 4.0.3, checked against its SHA-256, with zlib, brotli and zstd; the binary and image link it all statically ([93d7bc8](https://github.com/PQCrypta/pqcrypta-proxy/commit/93d7bc8))
+
+
+### Code Refactoring
+
+* pqc.openssl_path and pqc.openssl_lib_path are removed, as nothing runs an OpenSSL binary (a configuration that sets them is told they are ignored); PqcCapabilities::detect and verify_openssl_provider take no configuration ([9b82fac](https://github.com/PQCrypta/pqcrypta-proxy/commit/9b82fac))
+
+
+### Documentation
+
+* accept_ch names current client hints and asks only for hints something reads ([93d7bc8](https://github.com/PQCrypta/pqcrypta-proxy/commit/93d7bc8))
+
 
 ## [0.10.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.9.0...v0.10.0) (2026-11-12)
 
