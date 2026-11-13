@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.1](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.11.0...v0.11.1) (2026-11-13)
+
+
+### Bug Fixes
+
+* bound every table a client can add to; decline early data the replay guard cannot vouch for ([d3bbf13](https://github.com/PQCrypta/pqcrypta-proxy/commit/d3bbf13068b482da8c2c8cdeaf4b0511b0c2f128)), closes [#184](https://github.com/PQCrypta/pqcrypta-proxy/issues/184)
+
 ## [0.11.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.10.0...v0.11.0) (2026-11-13)
 
 
