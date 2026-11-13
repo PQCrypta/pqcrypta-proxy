@@ -795,6 +795,9 @@ impl ExpectClientHello {
                     cx.data.ech_retry = Some(context);
                     (inner, wire)
                 }
+                super::ech::EchResolution::Invalid(alert, why) => {
+                    return Err(cx.common.send_fatal_alert(alert, why));
+                }
             }
         };
         cx.data.ech_status = super::ech::EchStatus::Accepted {

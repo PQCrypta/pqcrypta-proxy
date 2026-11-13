@@ -258,6 +258,14 @@ pub enum PeerMisbehaved {
     /// The second ClientHello's ECH payload did not open with the first's
     /// HPKE context (RFC 9849 section 7.1.1).
     EchUndecryptableInSecondClientHello,
+    /// An opened ECH payload is not an `EncodedClientHelloInner`, or its
+    /// `ech_outer_extensions` name an extension the ClientHelloOuter lacks,
+    /// name one twice or out of the outer's order, or name
+    /// `encrypted_client_hello` (RFC 9849 section 5.1).
+    EchInnerHelloUndecodable,
+    /// An opened ClientHelloInner has no `encrypted_client_hello` of type
+    /// inner, or offers TLS 1.2 or below (RFC 9849 section 7.1).
+    EchInnerHelloInvalid,
     HandshakeHashVariedAfterRetry,
     IllegalHelloRetryRequestWithEmptyCookie,
     IllegalHelloRetryRequestWithNoChanges,
