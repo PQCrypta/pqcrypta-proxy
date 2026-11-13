@@ -252,13 +252,10 @@ timeout_ms = 30000
     /// Test PQC capabilities detection
     #[tokio::test]
     async fn test_pqc_capabilities() {
-        use pqcrypta_proxy::pqc_extended::{ExtendedPqcConfig, PqcCapabilities};
-
-        // Create default config for detection
-        let config = ExtendedPqcConfig::default();
+        use pqcrypta_proxy::pqc_extended::PqcCapabilities;
 
         // Detect available PQC capabilities
-        let caps = PqcCapabilities::detect(&config);
+        let caps = PqcCapabilities::detect();
 
         // Should have at least one backend available (rustls or OpenSSL)
         assert!(caps.rustls_available || caps.openssl_available);

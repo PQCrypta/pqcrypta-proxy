@@ -31,7 +31,7 @@ use std::fmt;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// NIST Security Levels for PQC algorithms
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -267,14 +267,6 @@ pub struct ExtendedPqcConfig {
     /// Require hybrid mode (reject pure PQC or pure classical)
     #[serde(default)]
     pub require_hybrid: bool,
-
-    /// OpenSSL-specific: path to openssl binary
-    #[serde(default)]
-    pub openssl_path: Option<std::path::PathBuf>,
-
-    /// OpenSSL-specific: library path for 3.5+
-    #[serde(default)]
-    pub openssl_lib_path: Option<std::path::PathBuf>,
 }
 
 fn default_preferred_kem() -> PqcKem {
@@ -301,8 +293,6 @@ impl Default for ExtendedPqcConfig {
             preferred_signature: None,
             fallback_to_classical: true,
             require_hybrid: false,
-            openssl_path: None,
-            openssl_lib_path: None,
         }
     }
 }
@@ -328,7 +318,7 @@ pub struct PqcCapabilities {
 
 impl PqcCapabilities {
     /// Detect PQC capabilities on this system
-    pub fn detect(config: &ExtendedPqcConfig) -> Self {
+    pub fn detect() -> Self {
         let mut caps = Self {
             available_kems: HashSet::new(),
             available_signatures: HashSet::new(),
@@ -343,7 +333,7 @@ impl PqcCapabilities {
         caps.detect_rustls_capabilities();
 
         // Check OpenSSL capabilities
-        caps.detect_openssl_capabilities(config);
+        caps.detect_openssl_capabilities();
 
         // Check FIPS mode
         caps.detect_fips_mode();
@@ -375,81 +365,69 @@ impl PqcCapabilities {
         }
     }
 
-    fn detect_openssl_capabilities(&mut self, config: &ExtendedPqcConfig) {
+    /// The OpenSSL half, asked of the library this process links
+    /// ([`crate::pqc_tls::linked`]): each KEM counted where the libssl accepts
+    /// its TLS group, each ML-DSA where the libcrypto fetches it. It was an
+    /// `openssl` binary's version string, after which seven KEMs and three
+    /// signatures were assumed for anything 3.5 or later.
+    fn detect_openssl_capabilities(&mut self) {
         #[cfg(feature = "pqc")]
         {
-            use std::process::Command;
+            use crate::pqc_tls::{linked, PqcKemAlgorithm};
 
-            let openssl_bin = config
-                .openssl_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| "openssl".to_string());
-
-            let lib_path = config
-                .openssl_lib_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            // Check OpenSSL version (SEC-10: a cleared environment, as
-            // pqc_tls runs it, so nothing inherited can preload a library)
-            let mut version_cmd = Command::new(&openssl_bin);
-            version_cmd.env_clear().env("PATH", "/usr/bin:/bin");
-            if !lib_path.is_empty() {
-                version_cmd.env("LD_LIBRARY_PATH", &lib_path);
+            let version = linked::version().to_string();
+            if !crate::pqc_tls::openssl_has_native_mlkem(&version) {
+                self.warnings.push(format!(
+                    "OpenSSL {} linked, but 3.5 or later is required for native ML-KEM",
+                    version
+                ));
+                return;
             }
-            let version_output = version_cmd.arg("version").output();
-
-            match version_output {
-                Ok(output) if output.status.success() => {
-                    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-                    if crate::pqc_tls::openssl_has_native_mlkem(&version) {
-                        self.openssl_available = true;
-                        self.openssl_version = Some(version.clone());
-
-                        // OpenSSL 3.5+ has native ML-KEM support
-                        self.available_kems.insert(PqcKem::X25519MlKem768);
-                        self.available_kems.insert(PqcKem::SecP256r1MlKem768);
-                        self.available_kems.insert(PqcKem::SecP384r1MlKem1024);
-                        self.available_kems.insert(PqcKem::X448MlKem1024);
-                        self.available_kems.insert(PqcKem::MlKem512);
-                        self.available_kems.insert(PqcKem::MlKem768);
-                        self.available_kems.insert(PqcKem::MlKem1024);
-
-                        // ML-DSA signatures
-                        self.available_signatures.insert(PqcSignature::MlDsa44);
-                        self.available_signatures.insert(PqcSignature::MlDsa65);
-                        self.available_signatures.insert(PqcSignature::MlDsa87);
-
-                        info!(
-                            "OpenSSL 3.5+ detected: {} - full ML-KEM/ML-DSA support",
-                            version
-                        );
-                    } else {
-                        self.warnings.push(format!(
-                            "OpenSSL {} detected but 3.5 or later required for native ML-KEM",
-                            version
-                        ));
-                    }
-                }
-                Ok(output) => {
-                    self.warnings.push(format!(
-                        "OpenSSL version check failed: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    ));
-                }
-                Err(e) => {
-                    self.warnings
-                        .push(format!("OpenSSL not found at {}: {}", openssl_bin, e));
+            let kems = [
+                PqcKem::X25519MlKem768,
+                PqcKem::SecP256r1MlKem768,
+                PqcKem::SecP384r1MlKem1024,
+                PqcKem::X448MlKem1024,
+                PqcKem::MlKem512,
+                PqcKem::MlKem768,
+                PqcKem::MlKem1024,
+            ];
+            // This enum names pure ML-KEM as algorithms ("ML-KEM-768"); TLS
+            // names the groups ("MLKEM768")
+            let group = |kem: PqcKem| {
+                PqcKemAlgorithm::from_str(kem.openssl_name()).map(|k| k.openssl_name())
+            };
+            let offered = linked::tls_groups(kems.iter().filter_map(|&kem| group(kem)));
+            for kem in kems {
+                if group(kem).is_some_and(|g| offered.contains(&g)) {
+                    self.available_kems.insert(kem);
                 }
             }
+            for signature in [
+                PqcSignature::MlDsa44,
+                PqcSignature::MlDsa65,
+                PqcSignature::MlDsa87,
+            ] {
+                if linked::has_signature(signature.openssl_name()) {
+                    self.available_signatures.insert(signature);
+                }
+            }
+            self.openssl_available = !offered.is_empty();
+            self.openssl_version = Some(version.clone());
+            info!(
+                "OpenSSL linked: {} - {} ML-KEM TLS groups, ML-DSA {}",
+                version,
+                offered.len(),
+                if self.available_signatures.contains(&PqcSignature::MlDsa87) {
+                    "available"
+                } else {
+                    "unavailable"
+                }
+            );
         }
 
         #[cfg(not(feature = "pqc"))]
         {
-            let _ = config;
             self.warnings
                 .push("OpenSSL PQC feature not compiled".to_string());
         }
@@ -593,74 +571,35 @@ impl KeySecurityCheck {
     }
 }
 
-/// Verify OpenSSL provider integrity
+/// Verify that the linked OpenSSL can carry a post-quantum handshake.
+///
+/// That is 3.5 or later, and the IETF hybrid X25519MLKEM768 accepted as a TLS
+/// group with the providers this process loaded. It ran an `openssl` binary's
+/// `version` and `list -providers`, which spoke for that binary's build, not
+/// this process's.
 #[cfg(feature = "pqc")]
-pub fn verify_openssl_provider(config: &ExtendedPqcConfig) -> Result<(), String> {
-    use std::process::Command;
+pub fn verify_openssl_provider() -> Result<(), String> {
+    use crate::pqc_tls::linked;
 
-    let openssl_bin = config
-        .openssl_path
-        .as_ref()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "openssl".to_string());
-
-    let lib_path = config
-        .openssl_lib_path
-        .as_ref()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    // Verify version (SEC-10: a cleared environment)
-    let mut version_cmd = Command::new(&openssl_bin);
-    version_cmd.env_clear().env("PATH", "/usr/bin:/bin");
-    if !lib_path.is_empty() {
-        version_cmd.env("LD_LIBRARY_PATH", &lib_path);
-    }
-    let output = version_cmd
-        .arg("version")
-        .output()
-        .map_err(|e| format!("Failed to execute OpenSSL: {}", e))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "OpenSSL version check failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-    if !crate::pqc_tls::openssl_has_native_mlkem(&version) {
+    let version = linked::version();
+    if !crate::pqc_tls::openssl_has_native_mlkem(version) {
         return Err(format!(
             "OpenSSL version {} is not supported. Requires 3.5 or later for native ML-KEM.",
             version
         ));
     }
-
-    // Verify provider self-tests
-    let mut selftest_cmd = Command::new(&openssl_bin);
-    selftest_cmd.env_clear().env("PATH", "/usr/bin:/bin");
-    if !lib_path.is_empty() {
-        selftest_cmd.env("LD_LIBRARY_PATH", &lib_path);
+    if linked::tls_groups(["X25519MLKEM768"]).is_empty() {
+        return Err(format!(
+            "{} does not accept the X25519MLKEM768 group",
+            version
+        ));
     }
-    let selftest = selftest_cmd
-        .args(["list", "-providers"])
-        .output()
-        .map_err(|e| format!("Failed to list providers: {}", e))?;
-
-    if !selftest.status.success() {
-        warn!(
-            "OpenSSL provider self-test warning: {}",
-            String::from_utf8_lossy(&selftest.stderr)
-        );
-    }
-
     info!("OpenSSL provider verified: {}", version);
     Ok(())
 }
 
 #[cfg(not(feature = "pqc"))]
-pub fn verify_openssl_provider(_config: &ExtendedPqcConfig) -> Result<(), String> {
+pub fn verify_openssl_provider() -> Result<(), String> {
     Err("OpenSSL PQC feature not enabled".to_string())
 }
 

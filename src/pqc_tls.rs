@@ -10,9 +10,6 @@
 //!
 //! All paths are configurable via PqcConfig - no hardcoded paths.
 
-use std::path::Path;
-use std::process::Command;
-
 use parking_lot::RwLock;
 use tracing::{error, info, warn};
 
@@ -144,6 +141,16 @@ impl PqcKemAlgorithm {
             Self::CurveSm2MlKem768,   // SM2 deployments (OpenSSL 4.0+, rustls fork)
         ]
     }
+
+    /// Every algorithm this build knows: the hybrids in recommended order, then
+    /// pure ML-KEM
+    pub fn all() -> Vec<Self> {
+        let mut all = Self::recommended_hybrids();
+        all.extend([Self::MlKem512, Self::MlKem768, Self::MlKem1024]);
+        #[cfg(feature = "legacy-pqc")]
+        all.extend([Self::Kyber768, Self::X25519Kyber768]);
+        all
+    }
 }
 
 /// PQC TLS provider status
@@ -153,7 +160,7 @@ pub struct PqcStatus {
     pub available: bool,
     /// OpenSSL version string
     pub openssl_version: String,
-    /// List of available KEM algorithms
+    /// The post-quantum TLS groups the linked libssl accepts, by OpenSSL name
     pub available_kems: Vec<String>,
     /// Currently configured KEM
     pub configured_kem: Option<PqcKemAlgorithm>,
@@ -161,6 +168,62 @@ pub struct PqcStatus {
     pub hybrid_mode: bool,
     /// Error message if PQC is not available
     pub error: Option<String>,
+}
+
+/// What the OpenSSL this process links can do, asked of the library itself.
+///
+/// The startup checks used to run an `openssl` binary (`openssl_path`, or
+/// `/usr/local/openssl-3.5/bin/openssl` by default) and read its `version` and
+/// `list -kem-algorithms`. That answered for whichever build sat at the path,
+/// not for the libssl the listeners use: a host whose binary was another
+/// release reported that release, and one without the default path logged
+/// "PQC not available" while its listeners negotiated ML-KEM.
+#[cfg(feature = "pqc")]
+pub mod linked {
+    use openssl::ssl::{SslContext, SslMethod};
+
+    /// The linked library's version line ("OpenSSL 4.0.3 29 Sep 2026")
+    pub fn version() -> &'static str {
+        openssl::version::version()
+    }
+
+    /// Of `groups`, the TLS groups the linked libssl offers, in the order given.
+    ///
+    /// Each is set alone on a scratch context with `SSL_CTX_set1_groups_list`,
+    /// the call the listeners make, with the providers this process loaded, so
+    /// a group is counted exactly when a listener could offer it.
+    pub fn tls_groups<'a>(groups: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+        let Ok(mut ctx) = SslContext::builder(SslMethod::tls_server()) else {
+            return Vec::new();
+        };
+        groups
+            .into_iter()
+            .filter(|group| ctx.set_groups_list(group).is_ok())
+            .collect()
+    }
+
+    /// Whether the linked libcrypto implements a signature algorithm, by its
+    /// OpenSSL name ("ML-DSA-87"): `EVP_SIGNATURE_fetch` from the default
+    /// library context, which is where the listeners' keys are used
+    pub fn has_signature(name: &str) -> bool {
+        let Ok(name) = std::ffi::CString::new(name) else {
+            return false;
+        };
+        openssl::init();
+        // Safety: a null library context and property query are the defaults;
+        // `name` outlives the call, and a fetched algorithm is freed at once.
+        let signature = unsafe {
+            openssl_sys::EVP_SIGNATURE_fetch(std::ptr::null_mut(), name.as_ptr(), std::ptr::null())
+        };
+        if signature.is_null() {
+            // A failed fetch queues an error nothing else should read
+            drop(openssl::error::ErrorStack::get());
+            return false;
+        }
+        // Safety: fetched above, not used again
+        unsafe { openssl_sys::EVP_SIGNATURE_free(signature) };
+        true
+    }
 }
 
 /// Whether an `experimental_groups` entry is a hybrid: the OQS provider
@@ -374,7 +437,7 @@ impl PqcTlsProvider {
         }
 
         // Check OpenSSL 3.5 availability
-        match self.check_openssl35() {
+        match Self::check_linked_openssl() {
             Ok((version, kems)) => {
                 let mut status = self.status.write();
                 status.available = true;
@@ -430,138 +493,33 @@ impl PqcTlsProvider {
         }
     }
 
-    /// Check OpenSSL 3.5 availability and get supported KEMs
-    fn check_openssl35(&self) -> Result<(String, Vec<String>), String> {
-        let config = self.config.read();
-
-        // Get paths from config
-        let openssl_bin = config
-            .openssl_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "openssl".to_string());
-
-        let openssl_lib = config
-            .openssl_lib_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        // SEC-10: Validate that openssl_lib_path is absolute and is a directory owned by
-        // a trusted location to prevent library preload attacks via LD_LIBRARY_PATH.
-        if !openssl_lib.is_empty() {
-            let lib_path_obj = std::path::Path::new(&openssl_lib);
-            if !lib_path_obj.is_absolute() {
-                return Err(format!(
-                    "openssl_lib_path '{}' must be an absolute path (SEC-10).",
-                    openssl_lib
-                ));
-            }
-            if !lib_path_obj.is_dir() {
-                return Err(format!(
-                    "openssl_lib_path '{}' is not a directory (SEC-10).",
-                    openssl_lib
-                ));
-            }
-        }
-
-        // F-09: Validate the OpenSSL binary path before executing it.
-        // Require an absolute path so PATH-based hijacking is impossible, and
-        // verify the target is a regular file (not a directory, device, or
-        // dangling symlink) before passing it to Command::new().
-        let openssl_path_obj = Path::new(&openssl_bin);
-        if openssl_bin != "openssl" {
-            // Only enforce absolute-path and regular-file checks when a custom
-            // path was explicitly configured; the bare "openssl" default relies
-            // on the system PATH which is controlled by the operator.
-            if !openssl_path_obj.is_absolute() {
-                return Err(format!(
-                    "openssl_path '{}' must be an absolute path to prevent PATH-hijacking (F-09). \
-                     Example: /usr/local/ssl35/bin/openssl",
-                    openssl_bin
-                ));
-            }
-            match openssl_path_obj.metadata() {
-                Ok(meta) if !meta.is_file() => {
-                    return Err(format!(
-                        "openssl_path '{}' exists but is not a regular file (F-09). \
-                         Ensure the path points directly to the OpenSSL binary.",
-                        openssl_bin
-                    ));
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    return Err(format!(
-                        "OpenSSL not accessible at '{}': {} (F-09)",
-                        openssl_bin, e
-                    ));
-                }
-            }
-        } else if !openssl_path_obj.exists() {
-            return Err(format!("OpenSSL not found at {}", openssl_bin));
-        }
-
-        // Get version
-        // SEC-10: Clear the subprocess environment and set only the minimum variables
-        // needed. This prevents LD_LIBRARY_PATH (and other inherited env vars) from
-        // being used to preload attacker-controlled shared libraries.
-        let mut version_cmd = Command::new(&openssl_bin);
-        version_cmd.env_clear().env("PATH", "/usr/bin:/bin");
-        if !openssl_lib.is_empty() {
-            version_cmd.env("LD_LIBRARY_PATH", &openssl_lib);
-        }
-        let version_output = version_cmd
-            .arg("version")
-            .output()
-            .map_err(|e| format!("Failed to run OpenSSL: {}", e))?;
-
-        if !version_output.status.success() {
-            return Err(format!(
-                "OpenSSL version check failed: {}",
-                String::from_utf8_lossy(&version_output.stderr)
-            ));
-        }
-
-        let version = String::from_utf8_lossy(&version_output.stdout)
-            .trim()
-            .to_string();
-
+    /// The linked OpenSSL's version, and the post-quantum TLS groups it offers
+    /// (see [`linked`]): the PQC listeners' own library, asked directly.
+    #[cfg(feature = "pqc")]
+    fn check_linked_openssl() -> Result<(String, Vec<String>), String> {
+        let version = linked::version().to_string();
         if !openssl_has_native_mlkem(&version) {
             return Err(format!(
-                "OpenSSL version {} does not support native ML-KEM (requires 3.5 or later)",
-                version
+                "OpenSSL version {version} does not support native ML-KEM (requires 3.5 or later)"
             ));
         }
-
-        // Get available KEM algorithms (SEC-10: use env_clear)
-        let mut kem_cmd = Command::new(&openssl_bin);
-        kem_cmd.env_clear().env("PATH", "/usr/bin:/bin");
-        if !openssl_lib.is_empty() {
-            kem_cmd.env("LD_LIBRARY_PATH", &openssl_lib);
+        let known = PqcKemAlgorithm::all();
+        let groups: Vec<String> =
+            linked::tls_groups(known.iter().map(PqcKemAlgorithm::openssl_name))
+                .into_iter()
+                .map(String::from)
+                .collect();
+        if groups.is_empty() {
+            return Err(format!(
+                "{version} offers none of the post-quantum TLS groups this build knows"
+            ));
         }
-        let kem_output = kem_cmd
-            .args(["list", "-kem-algorithms"])
-            .output()
-            .map_err(|e| format!("Failed to list KEMs: {}", e))?;
+        Ok((version, groups))
+    }
 
-        let kem_list = String::from_utf8_lossy(&kem_output.stdout);
-        let kems: Vec<String> = kem_list
-            .lines()
-            .filter(|line| {
-                let lower = line.to_lowercase();
-                lower.contains("mlkem")
-                    || lower.contains("kyber")
-                    || lower.contains("x25519")
-                    || lower.contains("x448")
-            })
-            .map(|s| s.trim().to_string())
-            .collect();
-
-        if kems.is_empty() {
-            return Err("No PQC KEM algorithms found in OpenSSL".to_string());
-        }
-
-        Ok((version, kems))
+    #[cfg(not(feature = "pqc"))]
+    fn check_linked_openssl() -> Result<(String, Vec<String>), String> {
+        Err("built without the `pqc` feature: no OpenSSL is linked".to_string())
     }
 
     /// Build OpenSSL groups string for TLS configuration
@@ -617,7 +575,7 @@ impl PqcTlsProvider {
                 }
                 continue;
             }
-            if available_kems.iter().any(|k| k.contains(name)) {
+            if available_kems.iter().any(|k| k == name) {
                 groups.push((name, kem.security_level(), kem.is_hybrid()));
             }
         }
@@ -727,17 +685,6 @@ impl PqcTlsProvider {
     pub fn update_config(&self, config: &PqcConfig) {
         *self.config.write() = config.clone();
         self.initialize();
-    }
-
-    /// Get OpenSSL library path for subprocess calls
-    /// Returns the LD_LIBRARY_PATH value for OpenSSL 3.5+
-    pub fn openssl_lib_path(&self) -> String {
-        let config = self.config.read();
-        config
-            .openssl_lib_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default()
     }
 }
 
@@ -1447,15 +1394,15 @@ pub mod openssl_pqc {
     }
 }
 
-/// Verify that the operator's configured OpenSSL supports PQC TLS.
+/// Verify that the linked OpenSSL supports PQC TLS.
 ///
-/// Takes the live `[pqc]` config rather than `PqcConfig::default()`.  With the
-/// default it probed the compiled-in `/usr/local/openssl-3.5/lib64` no matter
-/// what `openssl_lib_path` said, so any host that installed OpenSSL 3.5
-/// somewhere else logged "PQC not available, falling back to classical TLS" at
-/// every startup while the listeners — which do read the config — negotiated
-/// ML-KEM perfectly well.  A startup check that reports on a path the server
-/// never uses is worse than no check: it trains operators to ignore it.
+/// Asks the OpenSSL the listeners link (see [`linked`]), with the live `[pqc]`
+/// config for the groups it builds. It used to run an `openssl` binary at a
+/// configured path, `/usr/local/openssl-3.5` by default, so a host whose
+/// binary sat elsewhere, or was another release, was reported on instead of
+/// the library that served its handshakes. A startup check that reports on
+/// something the server never uses is worse than no check: it trains
+/// operators to ignore it.
 ///
 /// # Example
 /// ```ignore
@@ -1624,6 +1571,44 @@ mod tests {
             PqcTlsProvider::build_groups_string(&hybrid_only, &all, x25519),
             "SecP384r1MLKEM1024/X25519MLKEM768:SecP256r1MLKEM768/p384_frodo976shake"
         );
+    }
+
+    /// A group is offered where the linked library has it by its own name:
+    /// pure ML-KEM-768 was counted wherever the X25519 hybrid was, since
+    /// "X25519MLKEM768" contains "MLKEM768"
+    #[test]
+    fn a_group_is_available_by_its_own_name() {
+        let hybrid_only = vec!["X25519MLKEM768".to_string()];
+        let config = PqcConfig {
+            additional_kems: vec!["MLKEM768".into()],
+            ..PqcConfig::default()
+        };
+        let groups = PqcTlsProvider::build_groups_string(
+            &config,
+            &hybrid_only,
+            PqcKemAlgorithm::from_str("X25519MLKEM768"),
+        );
+        let offered: Vec<&str> = groups.split([':', '/']).collect();
+        assert!(!offered.contains(&"MLKEM768"), "{groups}");
+        assert!(offered.contains(&"X25519MLKEM768"), "{groups}");
+    }
+
+    /// The linked library answers for itself: groups and a signature it has,
+    /// and names it does not
+    #[cfg(feature = "pqc")]
+    #[test]
+    fn the_linked_library_is_asked_directly() {
+        assert!(
+            openssl_has_native_mlkem(linked::version()),
+            "{}",
+            linked::version()
+        );
+        assert_eq!(
+            linked::tls_groups(["X25519MLKEM768", "NotAGroup", "MLKEM1024"]),
+            ["X25519MLKEM768", "MLKEM1024"]
+        );
+        assert!(linked::has_signature("ML-DSA-87"));
+        assert!(!linked::has_signature("ML-DSA-0"));
     }
 
     #[test]

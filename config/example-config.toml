@@ -328,12 +328,6 @@ enabled = true
 # - "openssl3.5": OpenSSL 3.5+ with native ML-KEM (broader algorithms)
 provider = "auto"
 
-# Path to OpenSSL 3.5+ binary (for OpenSSL backend)
-openssl_path = "/usr/local/openssl-3.5/bin/openssl"
-
-# OpenSSL library path
-openssl_lib_path = "/usr/local/openssl-3.5/lib64"
-
 # Preferred KEM algorithm for key exchange (IETF standard)
 # Recommended: X25519MLKEM768 (NIST Level 3, best compatibility)
 # Options:
