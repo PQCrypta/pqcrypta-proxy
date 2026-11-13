@@ -276,16 +276,18 @@ All responses automatically include these security headers. The `Server` header 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enabled` | bool | `true` | Enable PQC hybrid key exchange |
+| `required` | bool | `false` | Refuse to start unless an in-memory TLS 1.3 handshake against the proxy's own provider negotiates a post-quantum hybrid at startup; a handshake that cannot be completed counts as a failure |
 | `provider` | string | `"auto"` | PQC provider. Options: `"auto"`, `"rustls"`, `"openssl3.5"` |
 | `preferred_kem` | string | `"X25519MLKEM768"` | Preferred KEM algorithm |
-| `fallback_to_classical` | bool | `true` | Fallback to classical TLS if PQC unavailable |
+| `fallback_to_classical` | bool | `true` | Offer the classical groups (P-384, P-256, X25519, one tuple, on every listener) alongside the hybrid PQC groups, so a client without ML-KEM can connect; never under `require_hybrid`. What happens when PQC itself is unavailable is `require_pqc_provider` |
+| `require_pqc_provider` | bool | `true` | Refuse to start when `enabled` is true but the PQC provider cannot be used, instead of degrading to a classical-only listener |
 | `min_security_level` | u8 | `3` | Minimum NIST security level (1-5) |
 | `additional_kems` | array[string] | `[]` | Additional KEMs to enable |
-| `experimental_groups` | array[string] | `[]` | Provider groups with no IANA codepoint (OQS: `frodo976shake`, `p384_frodo976shake`, ...), offered over TCP after standard ML-KEM and before the classical fallback; hybrids only under `require_hybrid` |
-| `enable_signatures` | bool | `false` | Enable PQC signature algorithms (ML-DSA) |
+| `experimental_groups` | array[string] | `[]` | Provider groups with no IANA codepoint (OQS: `frodo976shake`, `p384_frodo976shake`, ...), offered over TCP and QUIC after standard ML-KEM and before the classical fallback; hybrids only under `require_hybrid`, on both |
+| `enable_signatures` | bool | `true` | Serve ML-DSA-87 (FIPS 204) certificate keys with the PQDSA signer (scheme 0x0906); false refuses such keys, so a host configured with one stops serving rather than falling back. Needs the `pqc-signatures` build feature |
 | `downgrade_action` | string | `"log"` | What a connection whose key exchange is classical gets while `enabled` is true: `"allow"` (served), `"log"` (served, recorded in the audit log), `"block"` (every request on it answered 421). Any other value is refused at load |
 | `log_downgrades` | bool | `true` | Record classical handshakes in the audit log under `"log"` and `"block"`, once per address in 10 minutes |
-| `require_hybrid` | bool | `true` | Require hybrid mode (classical + PQC) |
+| `require_hybrid` | bool | `false` | Offer hybrid groups only (classical + PQC): no pure ML-KEM, no non-hybrid experimental group and no classical fallback, on every listener. A client with neither a hybrid nor PQC support fails the handshake |
 | `verify_provider` | bool | `true` | Verify PQC provider at startup |
 | `check_key_permissions` | bool | `true` | Check TLS key file permissions |
 | `strict_key_permissions` | bool | `false` | Fail if key permissions are too permissive |

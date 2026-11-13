@@ -343,13 +343,15 @@ provider = "auto"
 preferred_kem = "X25519MLKEM768"
 
 # Fallback to classical TLS if PQC is unavailable
-# Offer a classical key-exchange group (P-384) alongside the hybrid PQC groups.
+# Offer the classical key-exchange groups (P-384, P-256, X25519, one tuple, on
+# every listener) alongside the hybrid PQC groups.
 #
 # This is a CLIENT COMPATIBILITY switch, not a statement about our posture. With
 # it off, a client with no ML-KEM support cannot handshake at all — measured on
 # this deployment, that includes curl built against quictls, third-party uptime
-# monitoring and several crawlers, all of which reach the site today over P-384.
-# X25519 and P-256 are already refused; P-384 is 192-bit.
+# monitoring and several crawlers. RFC 8446 §9.1 has every TLS 1.3
+# implementation support P-256 (MUST) and X25519 (SHOULD), and QUIC stacks such
+# as picotls offer nothing classical but P-256.
 #
 # It no longer governs what happens when our OWN crypto is broken. See
 # require_pqc_provider below.
@@ -374,9 +376,10 @@ min_security_level = 3
 additional_kems = ["SecP256r1MLKEM768", "SecP384r1MLKEM1024"]
 
 # Groups a loaded OpenSSL provider adds without an IANA codepoint (the OQS
-# provider's FrodoKEM, HQC, ...), by OpenSSL name. Offered by the TCP listener
-# after standard ML-KEM and before the classical fallback; browsers do not
-# offer them. Each is checked against the linked libssl.
+# provider's FrodoKEM, HQC, ...), by OpenSSL name. Offered by every listener,
+# TCP and QUIC, after standard ML-KEM and before the classical fallback;
+# browsers do not offer them. Each is checked against the loaded providers;
+# under require_hybrid only their hybrids (p384_frodo976shake) are offered.
 # experimental_groups = ["frodo1344shake", "frodo976shake"]
 
 # Enable PQC signatures (ML-DSA) - requires pqc-signatures feature

@@ -124,13 +124,14 @@ unsafe extern "C" fn each_group(params: *const OSSL_PARAM, data: *mut c_void) ->
     1
 }
 
-/// The groups for `names` (`pqc.experimental_groups`), in the order given.
+/// The groups for `names` (`crate::pqc_tls::offered_experimental_groups`), in
+/// the order given.
 ///
 /// Each is a key-encapsulation group a loaded provider carries and rustls
 /// does not. A name no provider carries is left out, as the OpenSSL listener
 /// leaves it out of its offer.
-pub fn groups(names: &[String]) -> Vec<&'static dyn SupportedKxGroup> {
-    names.iter().filter_map(|name| group(name)).collect()
+pub fn groups<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<&'static dyn SupportedKxGroup> {
+    names.into_iter().filter_map(group).collect()
 }
 
 /// The group named `name`, made once per process: rustls holds groups for
