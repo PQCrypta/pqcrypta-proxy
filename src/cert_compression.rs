@@ -15,7 +15,7 @@ static ENABLED: OnceLock<bool> = OnceLock::new();
 /// Resolve `tls.certificate_compression` into the process-wide policy.
 ///
 /// `auto` (the default) offers whatever the compiled stack can actually
-/// produce: zlib on OpenSSL, which reports `-DZLIB` and nothing else here, and
+/// produce: brotli, zlib and zstd on OpenSSL, as many as its build has, and
 /// brotli or zlib on rustls. `off` sends an uncompressed chain on both.
 ///
 /// An unrecognised value is a configuration mistake, not a reason to refuse

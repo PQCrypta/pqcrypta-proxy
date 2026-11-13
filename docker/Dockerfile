@@ -23,10 +23,13 @@
 #         defaultMode: 0400
 
 # Stage 1: Build
-# Trixie (Debian 13) ships OpenSSL 3.5.x; the `pqc` feature links 3.2+ symbols
-# (SSL_get0_group_name) and needs 3.5 for native ML-KEM, so bookworm's 3.0 will
-# not link. CI builds against the same 3.5; production nodes link OpenSSL
-# 4.0.3 with liboqs, built from source, which this image does not carry.
+# OpenSSL 4.0.3, the version production links, built here as CI builds it
+# (.github/actions/setup-openssl-linux): the archive checked against its
+# published SHA-256, zlib, brotli and zstd for RFC 8879 certificate
+# compression, and all of it linked statically into the binary. Trixie's own
+# OpenSSL 3.5 has zlib and zstd but not brotli, so a client offering only
+# brotli, as BoringSSL's do, was sent a plain Certificate. Production also
+# loads liboqs through oqs-provider, which this image does not carry.
 #
 # Both images are pinned by digest as well as by name: a tag is moved by
 # whoever publishes it, and the toolchain is the 1.99.0 every other build
@@ -37,11 +40,37 @@ FROM rust:1.99.0-trixie@sha256:81015672d6939b0265f09adf96d5de125482bb13301060769
 WORKDIR /build
 
 # Install build dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
-    libssl-dev \
     cmake \
+    zlib1g-dev \
+    libbrotli-dev \
+    libzstd-dev \
     && rm -rf /var/lib/apt/lists/*
+
+ARG OPENSSL_VERSION=4.0.3
+ARG OPENSSL_SHA256=325b5c806167c13b40b1ffeadfe0248197c00eccc4cf123ec1e28d2d2fd216d9
+# The configuration directory is Debian's, where ca-certificates puts the CA
+# store. libcrypto's archive needs the compression libraries' archives at
+# link time: beside it, where openssl-sys looks for what OPENSSL_LIBS names.
+RUN curl -fsSL "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" -o /tmp/openssl.tar.gz \
+    && echo "${OPENSSL_SHA256}  /tmp/openssl.tar.gz" | sha256sum -c - \
+    && tar -C /tmp -xzf /tmp/openssl.tar.gz \
+    && cd "/tmp/openssl-${OPENSSL_VERSION}" \
+    && ./Configure --prefix=/opt/openssl --openssldir=/usr/lib/ssl --libdir=lib \
+       no-docs no-tests shared zlib enable-brotli enable-zstd \
+    && make -j"$(nproc)" \
+    && make install_sw \
+    && multiarch="$(gcc -dumpmachine)" \
+    && cp "/usr/lib/${multiarch}"/libz.a "/usr/lib/${multiarch}"/libbrotlienc.a \
+       "/usr/lib/${multiarch}"/libbrotlidec.a "/usr/lib/${multiarch}"/libbrotlicommon.a \
+       "/usr/lib/${multiarch}"/libzstd.a /opt/openssl/lib/ \
+    && cd / && rm -rf /tmp/openssl.tar.gz "/tmp/openssl-${OPENSSL_VERSION}"
+ENV OPENSSL_DIR=/opt/openssl \
+    OPENSSL_LIB_DIR=/opt/openssl/lib \
+    OPENSSL_INCLUDE_DIR=/opt/openssl/include \
+    OPENSSL_STATIC=1 \
+    OPENSSL_LIBS=ssl:crypto:brotlienc:brotlidec:brotlicommon:zstd:z
 
 # Copy manifests and vendored dependencies (needed for path dependencies)
 COPY Cargo.toml Cargo.lock ./
@@ -72,10 +101,10 @@ FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f0
 # Install runtime dependencies
 # AUD-08: curl is required by the HEALTHCHECK instruction below.
 # Without it the container is immediately marked unhealthy.
-RUN apt-get update && apt-get install -y \
+# OpenSSL and the compression libraries are linked into the binary.
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
-    libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user with explicit UID for predictable ownership

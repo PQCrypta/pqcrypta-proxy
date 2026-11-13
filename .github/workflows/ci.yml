@@ -75,7 +75,7 @@ jobs:
         with:
           key: ${{ matrix.os }}
 
-      - name: Setup OpenSSL 3.5 (Linux)
+      - name: Setup OpenSSL (Linux)
         if: matrix.os == 'ubuntu-latest'
         uses: ./.github/actions/setup-openssl-linux
 
@@ -138,7 +138,7 @@ jobs:
           echo "OPENSSL_LIB_DIR=$OPENSSL_PREFIX/lib" >> $GITHUB_ENV
           echo "OPENSSL_INCLUDE_DIR=$OPENSSL_PREFIX/include" >> $GITHUB_ENV
 
-      - name: Setup OpenSSL 3.5 (Linux)
+      - name: Setup OpenSSL (Linux)
         if: matrix.os == 'ubuntu-latest'
         uses: ./.github/actions/setup-openssl-linux
 
@@ -304,10 +304,10 @@ jobs:
           backend = "echo"
           EOF
 
-      # Build/link needs OpenSSL 3.5 (native ML-KEM + SSL_get0_group_name); placed
+      # Build/link needs OpenSSL 3.2+ (native ML-KEM + SSL_get0_group_name); placed
       # AFTER cert generation so the system openssl CLI above is not perturbed by
       # LD_LIBRARY_PATH pointing at the freshly-built libs.
-      - name: Setup OpenSSL 3.5 (Linux)
+      - name: Setup OpenSSL (Linux)
         uses: ./.github/actions/setup-openssl-linux
 
       # Run integration tests

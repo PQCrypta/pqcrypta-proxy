@@ -275,10 +275,12 @@ server_timing_desc = "Proxy"
 # of them empty and server_timing_enabled = false, the TCP listener leaves this
 # layer out of its middleware chain entirely.
 
-# Accept-CH header for Client Hints (responsive content delivery)
-# Tells browsers which client hints to send on subsequent requests
-# Enables adaptive content delivery based on device capabilities
-accept_ch = "DPR, Viewport-Width, Width, ECT, RTT, Downlink, Sec-CH-UA-Platform, Sec-CH-UA-Mobile"
+# Accept-CH (RFC 8942): the client hints the origin reads, asked of the
+# browser for its later requests; leave it out to send no header. Name only
+# hints something consumes. Sec-CH-UA, Sec-CH-UA-Mobile and Sec-CH-UA-Platform
+# arrive without asking, and Chromium no longer sends the unprefixed DPR,
+# Width and Viewport-Width.
+accept_ch = "Sec-CH-DPR, Sec-CH-Viewport-Width, ECT, RTT, Downlink"
 
 # NEL (Network Error Logging) for client-side error reporting
 # JSON configuration for NEL policy - helps diagnose connection failures
