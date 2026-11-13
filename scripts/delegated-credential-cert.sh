@@ -41,22 +41,29 @@ CA_DAYS=${CA_DAYS:-1825}
 
 log() { echo "$(date -u +%FT%TZ) delegated-credential-cert: $*"; }
 
-# The directory the SNI resolver reads (that of [tls] cert_path), and the
-# OpenSSL the proxy runs ([pqc] openssl_path and openssl_lib_path), run as the
-# proxy runs it: not whichever `openssl` PATH finds, which need not match the
-# library the system loads for it.
-read -r CERTS_DIR CFG_OPENSSL CFG_OPENSSL_LIB < <(python3 -I - "$PROXY_CONFIG" <<'EOF'
+# The directory the SNI resolver reads (that of [tls] cert_path).
+CERTS_DIR=$(python3 -I - "$PROXY_CONFIG" <<'EOF'
 import os, sys, tomllib
-c = tomllib.load(open(sys.argv[1], 'rb'))
-pqc = c.get('pqc', {})
-print(os.path.dirname(c['tls']['cert_path']), pqc.get('openssl_path') or 'openssl',
-      pqc.get('openssl_lib_path') or '-')
+print(os.path.dirname(tomllib.load(open(sys.argv[1], 'rb'))['tls']['cert_path']))
 EOF
 )
-OPENSSL=${OPENSSL:-$CFG_OPENSSL}
-OPENSSL_LIB=${OPENSSL_LIB:-$CFG_OPENSSL_LIB}
-[ "$OPENSSL_LIB" = - ] && OPENSSL_LIB=
+
+# The OpenSSL the proxy runs: the libssl its binary loads (by its DT_RPATH,
+# the loader's configuration, or the system's), and the openssl of that build
+# beside it, run against that library -- not whichever `openssl` PATH finds,
+# which need not match. A libssl with no openssl beside it (the system's own)
+# leaves PATH's. OPENSSL and OPENSSL_LIB override both.
+PROXY_BIN=${PROXY_BIN:-/usr/local/bin/pqcrypta-proxy}
+libssl=$(ldd "$PROXY_BIN" 2>/dev/null | awk '$1 ~ /^libssl\.so/ && $3 ~ /^\// { print $3; exit }')
+build=$(dirname "$(dirname "${libssl:-/nonexistent/lib/libssl}")")
+if [[ -z ${OPENSSL:-} && -x $build/bin/openssl ]]; then
+    OPENSSL=$build/bin/openssl
+    OPENSSL_LIB=${OPENSSL_LIB:-$(dirname "$libssl")}
+fi
+OPENSSL=${OPENSSL:-openssl}
+OPENSSL_LIB=${OPENSSL_LIB:-}
 ossl() { LD_LIBRARY_PATH=$OPENSSL_LIB "$OPENSSL" "$@"; }
+log "$(ossl version) ($OPENSSL), for $PROXY_BIN, which loads ${libssl:-no libssl ldd could name}"
 CERT="$CERTS_DIR/$DC_NAME.crt"
 KEY="$CERTS_DIR/$DC_NAME.key"
 

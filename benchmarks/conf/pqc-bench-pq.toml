@@ -59,12 +59,11 @@ enable_0rtt = false
 pqc_session_tickets = false
 
 [pqc]
-# On, with the OpenSSL provider, so TCP handshakes run on the same OpenSSL 3.5
-# HAProxy uses and the comparison is of the two proxies, not two libraries.
+# On, with the OpenSSL provider, so TCP handshakes run on OpenSSL as HAProxy's
+# do. The proxy uses the OpenSSL it links: build it against the one HAProxy
+# uses, and the comparison is of the two proxies, not two libraries.
 enabled = true
 provider = "openssl3.5"
-openssl_path = "/usr/local/openssl-pq/bin/openssl"
-openssl_lib_path = "/usr/local/openssl-pq/lib64"
 preferred_kem = "X25519MLKEM768"
 fallback_to_classical = true
 
