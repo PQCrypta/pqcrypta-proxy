@@ -45,8 +45,8 @@ Complete reference for all configuration options in PQCrypta Proxy.
 | `additional_ports` | array[u16] | `[4433, 4434]` | Additional ports for WebTransport |
 | `max_connections` | u32 | `10000` | Maximum concurrent client connections across every listener (TCP, QUIC, WebTransport); a connection past it is refused. `0` = no limit |
 | `max_streams_per_connection` | u32 | `1000` | Maximum concurrent streams per connection |
-| `keepalive_interval_secs` | u64 | `15` | Keep-alive interval in seconds |
-| `max_idle_timeout_secs` | u64 | `120` | How long a connection may be idle, in seconds: the QUIC idle timeout, and the time a TCP connection may have no exchange in flight before it is closed |
+| `keepalive_interval_secs` | u64 | `15` | How often the QUIC listener sends a keep-alive PING, in seconds, so a NAT keeps the path of a connection with a session or tunnel open; an idle connection is still closed after `max_idle_timeout_secs` |
+| `max_idle_timeout_secs` | u64 | `120` | How long a connection may be idle, in seconds: the QUIC idle timeout; the time a TCP or HTTP/3 connection may have no exchange, session or tunnel in flight before it is closed (HTTP/3 with GOAWAY first); and how long a request's header block may take to arrive, on both |
 | `enable_ipv6` | bool | `true` | Enable IPv6 dual-stack binding |
 | `worker_threads` | usize | `0` | Worker threads (0 = auto-detect based on CPU cores) |
 | `enable_quic_migration` | bool | `true` | Enable QUIC connection migration (RFC 9000 §9) |

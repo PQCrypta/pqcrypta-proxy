@@ -137,7 +137,7 @@
 | **Least Response Time Routing** | ✅ | Routes requests to the backend with the lowest moving-average response time |
 | **IP Hash Load Balancing** | ✅ | Deterministic backend selection by client IP hash for implicit session stickiness |
 | **Per-Server Priority** | ✅ | Failover priority levels; lower-priority backends only receive traffic when higher-priority ones are unhealthy |
-| **Per-Server Keep-Alive** | ✅ | Configurable QUIC keep-alive interval per server to prevent idle connection timeouts |
+| **Per-Server Keep-Alive** | ✅ | QUIC keep-alive PINGs every `keepalive_interval_secs`, so a NAT keeps the path of a connection with a session or tunnel open; a connection with nothing in flight is still closed after `max_idle_timeout_secs` (HTTP/3 with GOAWAY first), as a TCP connection is |
 | **DNS Prefetch / Preconnect / Prerender Hints** | ✅ | Early Hints Link headers for dns-prefetch, preconnect, modulepreload, and speculative prerender |
 | **Report-To Header** | ✅ | Reporting endpoint configuration injected into responses for NEL and CSP violation delivery |
 | **Fingerprint Cache TTL** | ✅ | JA3/JA4 fingerprint classification cache with configurable max-age and background cleanup |
@@ -218,7 +218,7 @@
 - **Connection Draining**: a pool server removed by a reload (or drained through the admin API) takes no new sessions and keeps its own until the drain timeout
 - **Request Queuing**: a request that finds every pool server full waits for a place, up to the queue's size and time
 - **Connection Pool**: Per-backend connection pool with configurable max idle connections, max total connections, acquire timeout, and idle timeout; idempotent requests that meet a pooled connection the backend closed as they were written are sent again on another connection instead of failing with a 502
-- **Per-Server Keep-Alive**: Configurable QUIC keep-alive interval per server to prevent idle connection timeouts
+- **Per-Server Keep-Alive**: QUIC keep-alive PINGs keep a NAT's path open under a session or tunnel; a connection with nothing in flight is closed after `max_idle_timeout_secs` on every transport
 - **Priority Failover**: Primary servers first, then failover to lower priority
 
 ### HTTP/3 Advanced Features
@@ -263,7 +263,8 @@
 - **Audit Logging**: Async structured JSON audit log for security-relevant events — admin actions, auth failures, WAF blocks/detects, IP blocks, rate limit hits, PQC downgrade events, config and TLS reloads, JA3 replay/drift detections
 - **Log Rotation via SIGHUP**: Sending `SIGHUP` to the proxy reopens all log file handles without dropping connections or restarting — compatible with standard logrotate `postrotate` hooks (`systemctl kill -s HUP pqcrypta-proxy`)
 - **Admin API**: Health checks, Prometheus metrics, config reload, graceful shutdown, QUIC health, WebTransport health, canary status and live weight/suspend/resume control, live blocklist inspection (`GET /blocklist`), manual block (`POST /blocklist/block/:ip?duration_secs=N`) and immediate unblock (`POST /blocklist/unblock/:ip`); `GET /security/status`, `/security/geoip/:ip`, `/security/fingerprints` and `/security/threats`; rate-limit statistics (`GET /ratelimit`) and per-client reset (`POST /ratelimit/reset/:key`) against the one advanced rate limiter every listener, port and protocol shares; loopback enforcement prevents plain-HTTP token exposure on non-loopback interfaces; ephemeral session tokens use `OsRng` for cryptographic security; per-IP and global lockout of failing callers with exponential back-off; the token is checked first, so a correct token is never refused by it (a client left on a stale token cannot lock out the rest)
-- **Graceful Shutdown Drain**: Configurable drain timeout polls active connections at 100 ms intervals and exits as soon as they reach zero — no unnecessary delay on idle restarts
+- **Graceful Shutdown Drain**: Configurable drain timeout polls active connections at 100 ms intervals and exits as soon as they reach zero — no unnecessary delay on idle restarts; while it waits it says, every 2 s, what it is waiting for
+- **Restarts that refuse nothing (systemd socket activation)**: with the socket unit `pqcrypta-proxy --socket-unit FILE` writes from the configuration, the service manager holds every listening socket across a restart, so a connection that arrives while one process drains and the next starts waits in the kernel and is served, rather than refused; each listener takes the socket bound to its address and binds itself what was not passed
 - **Certificate Transparency**: New ACME-issued certs submitted via `POST /ct/v1/add-chain` for public auditability, to the configured logs or, by default, to one log per operator from the live CT log list whose temporal shard holds the certificate's expiry
 - **Per-Backend Retry**: Configurable retry count and exponential backoff per backend; retry on 5xx responses, connect failures, or timeouts
 - **Cross-Platform**: Linux, macOS, and Windows support
@@ -2340,18 +2341,23 @@ Spans are batched and exported asynchronously via OTLP HTTP/JSON (no protobuf de
 
 ## Deployment
 
-### Fleet deploy (build-verified)
+### Fleet deploy
 
-`scripts/deploy.sh` builds the release binary, records its sha256, deploys to
-every proxy node, and verifies each node is running that exact hash with the
-service active. It always builds first: `cargo test` and `cargo clippy` do not
-produce the release binary, so copying `target/release/pqcrypta-proxy` after
-only those can ship a stale build — this script closes that gap.
+`scripts/deploy.sh BINARY NODE...` installs a release binary on each node in
+turn (`local`, or an ssh destination). On each it copies the binary beside the
+live one and runs it with `--validate` as the service account against that
+node's configuration, which loads it and runs the startup security checks as a
+real start would. It keeps the live binary as `.prev-<UTC time>`, installs and
+restarts, and waits for the node to be active and running this binary's
+version, putting the previous binary back if it is not; the first node that
+fails stops the run. It builds nothing: build once, on a build host, and give
+it the binary. A measurement build (`[measurement build: …]` in `--version`) is
+refused.
 
 ```bash
-scripts/deploy.sh              # build + deploy all nodes + verify hashes
-scripts/deploy.sh --local-only # this node only
-scripts/deploy.sh --gate       # also run the post-deploy WAF regression gate
+cargo build --release --bin pqcrypta-proxy   # on the build host
+scripts/deploy.sh target/release/pqcrypta-proxy local node2 node3
+scripts/deploy.sh --gate target/release/pqcrypta-proxy local   # then the post-deploy WAF gate
 ```
 
 ### Systemd (Linux)
@@ -2367,6 +2373,28 @@ sudo systemctl start pqcrypta-proxy
 # View logs
 journalctl -u pqcrypta-proxy -f
 ```
+
+**Restarts without refusing connections.** The proxy takes its listening sockets
+from the service manager when it passes them (systemd socket activation). Write
+the socket unit from the configuration, the same addresses the listeners bind,
+and enable it; the service needs no change, since systemd hands a service the
+sockets of the unit with its name:
+
+```bash
+sudo pqcrypta-proxy --config /etc/pqcrypta/proxy-config.toml \
+  --socket-unit /etc/systemd/system/pqcrypta-proxy.socket
+sudo systemctl daemon-reload
+sudo systemctl enable --now pqcrypta-proxy.socket
+sudo systemctl restart pqcrypta-proxy   # takes the sockets from here on
+```
+
+The sockets then outlive the process: while one drains and the next starts,
+the kernel completes TCP handshakes into the listen backlog and queues
+datagrams, and the next process serves them. Write the unit again when the
+listeners change (ports, `bind_address`, the conformance range): a passed
+socket no listener takes is reported at startup, and a listener with no passed
+socket binds its own as before. QUIC connections still end at a restart (their
+state lives in the process); clients open new ones on the same socket.
 
 ### macOS (launchd)
 

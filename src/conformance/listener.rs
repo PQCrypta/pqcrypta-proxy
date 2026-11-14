@@ -390,7 +390,7 @@ impl TestListener {
 
         server_config.transport = Arc::new(transport);
 
-        let socket = std::net::UdpSocket::bind(addr)
+        let socket = crate::inherited::udp_socket(addr)
             .with_context(|| format!("binding conformance port {addr} for {}", test.id))?;
         let runtime = quinn::default_runtime()
             .ok_or_else(|| anyhow::anyhow!("no async runtime for conformance endpoint"))?;

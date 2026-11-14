@@ -166,7 +166,7 @@ impl WebTransportServer {
         // measured throughput, so request a fixed 16 MB; the kernel clamps to
         // net.core.{r,w}mem_max. with_bind_socket() takes the socket as-is, and
         // the address path sets no extra socket options, so this is equivalent.
-        let socket = std::net::UdpSocket::bind(addr)?;
+        let socket = crate::inherited::udp_socket(addr)?;
         {
             const UDP_BUFFER_BYTES: usize = 16 * 1024 * 1024;
             let sock_ref = socket2::SockRef::from(&socket);

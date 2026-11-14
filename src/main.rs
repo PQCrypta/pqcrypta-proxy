@@ -57,7 +57,13 @@ use pqcrypta_proxy::{run_http_listener_pqc, run_http_listener_pqc_with_fingerpri
 #[derive(Parser, Debug)]
 #[command(name = "pqcrypta-proxy")]
 #[command(
-    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("PQCRYPTA_GIT_COMMIT"), ")"),
+    version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (",
+        env!("PQCRYPTA_GIT_COMMIT"),
+        ")",
+        env!("PQCRYPTA_BUILD_NOTE")
+    ),
     about,
     long_about = None
 )]
@@ -111,6 +117,13 @@ struct Args {
     /// Run configuration validation only (don't start server)
     #[arg(long)]
     validate: bool,
+
+    /// Write the systemd socket unit for this configuration's listeners
+    /// (pqcrypta-proxy.socket) to FILE and exit: with it, the service manager
+    /// holds the listening sockets across a restart. A file, not standard
+    /// output, which the proxy's own log may share
+    #[arg(long, value_name = "FILE")]
+    socket_unit: Option<PathBuf>,
 
     /// Merge fingerprint corpora into one and write it here: observed.json of
     /// either version, or a published directory's full.json (`--from`)
@@ -426,6 +439,23 @@ async fn run() -> anyhow::Result<()> {
     }
 
     info!("Configuration validated successfully");
+
+    if let Some(out) = &args.socket_unit {
+        let unit = config.socket_unit(&args.config.to_string_lossy());
+        // Whole or not at all: a unit read half-written would hold half the
+        // sockets
+        let staged = out.with_extension("socket.new");
+        std::fs::write(&staged, unit)?;
+        std::fs::rename(&staged, out)?;
+        info!("Socket unit written to {}", out.display());
+        return Ok(());
+    }
+    // The sockets the service manager holds for this process, taken before any
+    // listener asks for one (crate::inherited)
+    let passed = pqcrypta_proxy::inherited::init();
+    if passed > 0 {
+        info!("{} listening socket(s) held by the service manager", passed);
+    }
 
     // Deprecation warning: trusted_internal_cidrs will be removed in a future release.
     if !config.security.trusted_internal_cidrs.is_empty() {
@@ -1541,7 +1571,8 @@ async fn run() -> anyhow::Result<()> {
             pqcrypta_proxy::conformance::listener::spawn_all(
                 &conf,
                 &tls_provider,
-                &config.server.bind_address,
+                // As every other listener binds (`enable_ipv6` applied)
+                &config.server.effective_bind_address(),
                 // Its maps are shared: the blocklist the other listeners hold
                 &std::sync::Arc::new(security_state.clone()),
             );
@@ -1781,6 +1812,14 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
+    // A passed socket no listener took is a unit and a configuration that
+    // disagree. Some listeners bind from tasks of their own, so it is looked
+    // for once they have had time to start
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        pqcrypta_proxy::inherited::report_unclaimed();
+    });
+
     // Serving, and probed: the service manager is told, and its watchdog
     // pinged from here on
     pqcrypta_proxy::service_notify::ready(&format!(
@@ -1837,30 +1876,50 @@ async fn run() -> anyhow::Result<()> {
         "Waiting up to {}s for in-flight connections to drain...",
         drain_secs
     );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(drain_secs);
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(drain_secs);
+    // What the drain is waiting for, said every 2 s while it waits: a
+    // drain that took 14 s on web1 (2026-11-13) left no word of what held it
+    let drain_report = std::time::Duration::from_secs(2);
+    let mut next_report = started + drain_report;
+    let held_by_protocol = |held: u64| {
+        let c = metrics_registry.snapshot().connections;
+        format!(
+            "{} client connection(s) held; open: http1 {}, http2 {}, http3 {}, \
+             webtransport {}, connect-udp {}, passthrough {}",
+            held,
+            c.open_http1,
+            c.open_http2,
+            c.open_http3,
+            c.open_webtransport,
+            c.open_connect_udp,
+            c.open_passthrough
+        )
+    };
     loop {
         // Exchanges in flight (by protocol), and client connections any
         // listener still holds, a handshake not yet finished among them
         let active = metrics_registry.active_connections();
         let held = pqcrypta_proxy::conn_limits::open_connections();
+        let now = std::time::Instant::now();
         if active == 0 && held == 0 {
-            info!("All connections drained — proceeding with shutdown");
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            let c = metrics_registry.snapshot().connections;
             info!(
-                "Drain timeout reached: {} client connection(s) held; open: \
-                 http1 {}, http2 {}, http3 {}, webtransport {}, connect-udp {}, passthrough {}",
-                held,
-                c.open_http1,
-                c.open_http2,
-                c.open_http3,
-                c.open_webtransport,
-                c.open_connect_udp,
-                c.open_passthrough
+                "All connections drained in {:.1}s — proceeding with shutdown",
+                now.duration_since(started).as_secs_f64()
             );
             break;
+        }
+        if now >= deadline {
+            info!("Drain timeout reached: {}", held_by_protocol(held));
+            break;
+        }
+        if now >= next_report {
+            info!(
+                "Draining for {:.0}s: {}",
+                now.duration_since(started).as_secs_f64(),
+                held_by_protocol(held)
+            );
+            next_report = now + drain_report;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }

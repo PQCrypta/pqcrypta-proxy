@@ -539,11 +539,15 @@ pub fn parse_client_qpack_limits(control: &[u8]) -> Option<ClientQpackLimits> {
                 blocked_streams: 0,
                 max_field_section_size: None,
             };
+            // Each identifier and value is read from within the frame: a pair
+            // cut off by the frame's end was completed from the next frame's
+            // bytes. read_varint consumes at most what it is given, so `p`
+            // never passes `end`.
             let mut p = off;
             while p < end {
-                let (id, a) = read_varint(&control[p..])?;
+                let (id, a) = read_varint(&control[p..end])?;
                 p += a;
-                let (value, c) = read_varint(&control[p..])?;
+                let (value, c) = read_varint(&control[p..end])?;
                 p += c;
                 match id {
                     setting::QPACK_MAX_TABLE_CAPACITY => limits.capacity = value,
@@ -912,6 +916,24 @@ mod tests {
         stream.extend_from_slice(&uni_stream_header(stream_type::CONTROL));
         let full = settings(&[(setting::QPACK_MAX_TABLE_CAPACITY, 4096)]);
         stream.extend_from_slice(&full[..full.len() - 1]);
+        assert_eq!(parse_client_qpack_limits(&stream), None);
+    }
+
+    /// A SETTINGS frame whose last identifier has no value inside the frame is
+    /// malformed: the value is not taken from the frame that follows
+    #[test]
+    fn a_setting_cut_by_its_frame_end_is_not_completed_from_the_next_frame() {
+        let mut stream = BytesMut::new();
+        stream.extend_from_slice(&uni_stream_header(stream_type::CONTROL));
+        // SETTINGS of length 1 holding only QPACK_MAX_TABLE_CAPACITY's id (0x01)
+        stream.extend_from_slice(&varint(frame_type::SETTINGS));
+        stream.extend_from_slice(&varint(1));
+        stream.extend_from_slice(&varint(setting::QPACK_MAX_TABLE_CAPACITY));
+        // An unknown frame (reserved type 0x21) whose first byte would have
+        // read as a capacity of 0x21
+        stream.extend_from_slice(&varint(0x21));
+        stream.extend_from_slice(&varint(1));
+        stream.extend_from_slice(&[0]);
         assert_eq!(parse_client_qpack_limits(&stream), None);
     }
 

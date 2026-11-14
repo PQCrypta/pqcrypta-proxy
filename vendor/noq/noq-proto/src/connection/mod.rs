@@ -4514,8 +4514,9 @@ impl Connection {
                     {
                         // Clients must send the same retry token in every Initial. Initial
                         // packets can be spoofed, so we discard rather than killing the
-                        // connection.
-                        warn!("discarding Initial with invalid retry token");
+                        // connection. Logged at debug: anyone can send these, one line per
+                        // packet, and a warning per packet is a flood a peer controls.
+                        debug!("discarding Initial with invalid retry token");
                         self.qlog.emit_packet_received(qlog, now);
                         return;
                     }

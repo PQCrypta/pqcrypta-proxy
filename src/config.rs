@@ -1051,9 +1051,13 @@ pub struct ServerConfig {
     /// WebTransport headroom while dropping the advertised ceiling tenfold.
     #[serde(default = "default_max_uni_streams")]
     pub max_uni_streams_per_connection: u32,
-    /// Keep-alive interval in seconds
+    /// How often the QUIC listener sends a keep-alive PING, in seconds: a NAT
+    /// keeps the path of a connection with a session or tunnel open. An idle
+    /// connection is still closed after `max_idle_timeout_secs`.
     pub keepalive_interval_secs: u64,
-    /// Maximum idle timeout in seconds
+    /// How long a connection may be idle, in seconds: the QUIC idle timeout,
+    /// the time a TCP or HTTP/3 connection may have nothing in flight before
+    /// it is closed, and how long a request's header block may take to arrive
     pub max_idle_timeout_secs: u64,
     /// Enable IPv6 dual-stack binding
     pub enable_ipv6: bool,
@@ -1654,6 +1658,15 @@ fn default_webtransport_port() -> u16 {
 
 fn default_wt_max_datagrams() -> u32 {
     500
+}
+
+/// One socket a listener of the configuration binds ([`ProxyConfig::listen_sockets`])
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenSocket {
+    pub kind: crate::inherited::Kind,
+    pub addr: SocketAddr,
+    /// What listens on it, as the socket unit's comment says
+    pub role: String,
 }
 
 impl ServerConfig {
@@ -5002,6 +5015,132 @@ impl ProxyConfig {
             .min_by_key(|r| r.priority)
     }
 
+    /// Every socket the listeners of this configuration bind.
+    ///
+    /// As the proxy starts them: TCP for HTTPS and UDP for HTTP/3 on `udp_port` and each of
+    /// `additional_ports` (no HTTP/3 on `webtransport_port`, which is the
+    /// WebTransport server's), the plain-HTTP redirect, one UDP port per
+    /// conformance test, the DNS over HTTPS gateway and the admin API.
+    ///
+    /// `pqcrypta-proxy --socket-unit` writes the systemd socket unit from this
+    /// list, so the sockets the service manager holds (crate::inherited) are
+    /// the ones the listeners ask for.
+    pub fn listen_sockets(&self) -> Vec<ListenSocket> {
+        use crate::inherited::Kind;
+        let bind = self.server.effective_bind_address();
+        let at = |port: u16| format!("{bind}:{port}").parse::<SocketAddr>().ok();
+        let mut out = Vec::new();
+        let mut push = |kind, addr: Option<SocketAddr>, role: String| {
+            if let Some(addr) = addr {
+                if !out
+                    .iter()
+                    .any(|s: &ListenSocket| s.kind == kind && s.addr == addr)
+                {
+                    out.push(ListenSocket { kind, addr, role });
+                }
+            }
+        };
+        let https = std::iter::once(self.server.udp_port)
+            .chain(self.server.additional_ports.iter().copied());
+        for port in https {
+            push(Kind::Tcp, at(port), format!("https {port}"));
+            if port != self.server.webtransport_port {
+                push(Kind::Udp, at(port), format!("http3 {port}"));
+            }
+        }
+        push(
+            Kind::Udp,
+            at(self.server.webtransport_port),
+            "webtransport".into(),
+        );
+        if self.http_redirect.enabled {
+            push(
+                Kind::Tcp,
+                at(self.http_redirect.port),
+                "http redirect".into(),
+            );
+        }
+        if self.conformance.enabled
+            && crate::conformance::check_port_conflicts(
+                &self.conformance,
+                self.server.udp_port,
+                &self.server.additional_ports,
+            )
+            .is_ok()
+        {
+            let start = self.conformance.port_range.0;
+            for test in crate::conformance::catalog::CATALOG {
+                if let Some(offset) = test.port_offset {
+                    push(
+                        Kind::Udp,
+                        start.checked_add(offset).and_then(at),
+                        format!("conformance {}", test.id),
+                    );
+                }
+            }
+        }
+        if self.doh.enabled {
+            push(
+                Kind::Tcp,
+                self.doh.listen.parse().ok(),
+                "dns over https".into(),
+            );
+        }
+        if self.admin.enabled {
+            push(Kind::Tcp, self.admin.socket_addr().ok(), "admin".into());
+        }
+        out
+    }
+
+    /// The systemd socket unit for [`Self::listen_sockets`].
+    ///
+    /// For `pqcrypta-proxy --socket-unit`: the service manager holds the
+    /// sockets across a restart, so what arrives while one process drains and
+    /// the next starts waits instead of being refused.
+    pub fn socket_unit(&self, config_path: &str) -> String {
+        use std::fmt::Write as _;
+        let mut unit = format!(
+            "# Written by `pqcrypta-proxy --config {config_path} --socket-unit FILE`: write it\n\
+             # again when the listeners change. The proxy takes each socket by its\n\
+             # address and binds what is not here itself; one passed that no listener\n\
+             # takes is reported at startup.\n\
+             [Unit]\n\
+             Description=PQCrypta Proxy listening sockets\n\
+             PartOf=pqcrypta-proxy.service\n\
+             \n\
+             [Socket]\n"
+        );
+        for s in self.listen_sockets() {
+            let directive = match s.kind {
+                crate::inherited::Kind::Tcp => "ListenStream",
+                crate::inherited::Kind::Udp => "ListenDatagram",
+            };
+            let _ = writeln!(unit, "# {}\n{directive}={}", s.role, s.addr);
+        }
+        // `[::]` takes IPv4 too, as the proxy's own dual-stack sockets do
+        unit.push_str(
+            "BindIPv6Only=both\n\
+             Backlog=4096\n\
+             Service=pqcrypta-proxy.service\n\
+             \n\
+             [Install]\n\
+             WantedBy=sockets.target\n",
+        );
+        unit
+    }
+
+    /// Whether any route names `host` (its own pattern, or a wildcard that
+    /// covers it). A path no route takes on a host this proxy serves is a gap
+    /// in the configuration; on a host it never served (an address, a name
+    /// pointed here by someone else) it is a scanner's guess.
+    pub fn serves_host(&self, host: &str) -> bool {
+        let host = host_without_port(host);
+        self.routes
+            .iter()
+            .filter_map(|r| r.host.as_deref())
+            .any(|pattern| self.host_matches(pattern, host))
+    }
+
     /// Check if a route matches the request
     /// All path and host comparisons are case-insensitive (lowercased)
     fn route_matches(
@@ -5568,5 +5707,85 @@ stream_to_method = "POST"
         assert!(config.pqc.enabled);
         assert_eq!(config.backends.len(), 1);
         assert_eq!(config.routes.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod listen_socket_tests {
+    use super::*;
+    use crate::inherited::Kind;
+
+    fn has(sockets: &[ListenSocket], kind: Kind, addr: &str) -> bool {
+        let addr: SocketAddr = addr.parse().unwrap();
+        sockets.iter().any(|s| s.kind == kind && s.addr == addr)
+    }
+
+    /// The sockets the listeners bind, and only those: HTTP/3 is not on the
+    /// WebTransport port, the redirect and the admin API follow their
+    /// switches, and each conformance test has its port
+    #[test]
+    fn the_listen_sockets_are_the_listeners() {
+        let mut c = ProxyConfig::default();
+        c.server.bind_address = "[::]".into();
+        c.server.enable_ipv6 = true;
+        c.server.udp_port = 443;
+        c.server.additional_ports = vec![4434, 4433];
+        c.server.webtransport_port = 4433;
+        c.http_redirect.enabled = true;
+        c.http_redirect.port = 80;
+        c.admin.enabled = true;
+        c.admin.bind_address = "127.0.0.1".into();
+        c.admin.port = 8082;
+        let s = c.listen_sockets();
+        for port in [443, 4434, 4433] {
+            assert!(has(&s, Kind::Tcp, &format!("[::]:{port}")), "https {port}");
+        }
+        assert!(has(&s, Kind::Udp, "[::]:443") && has(&s, Kind::Udp, "[::]:4434"));
+        assert_eq!(
+            s.iter()
+                .filter(|x| x.kind == Kind::Udp && x.addr.port() == 4433)
+                .count(),
+            1,
+            "the WebTransport port once, for the WebTransport server"
+        );
+        assert!(has(&s, Kind::Tcp, "[::]:80"));
+        assert!(has(&s, Kind::Tcp, "127.0.0.1:8082"));
+
+        c.conformance.enabled = true;
+        c.conformance.port_range = (4460, 4600);
+        let tests = crate::conformance::catalog::CATALOG
+            .iter()
+            .filter(|t| t.port_offset.is_some())
+            .count();
+        let with = c.listen_sockets();
+        assert_eq!(
+            with.iter()
+                .filter(|x| x.role.starts_with("conformance "))
+                .count(),
+            tests
+        );
+
+        c.server.enable_ipv6 = false;
+        assert!(
+            has(&c.listen_sockets(), Kind::Tcp, "0.0.0.0:443"),
+            "enable_ipv6 applied"
+        );
+    }
+
+    #[test]
+    fn the_socket_unit_lists_every_socket() {
+        let mut c = ProxyConfig::default();
+        c.server.bind_address = "[::]".into();
+        c.server.enable_ipv6 = true;
+        let unit = c.socket_unit("/etc/pqcrypta/proxy-config.toml");
+        for s in c.listen_sockets() {
+            let directive = match s.kind {
+                Kind::Tcp => "ListenStream",
+                Kind::Udp => "ListenDatagram",
+            };
+            assert!(unit.contains(&format!("{directive}={}\n", s.addr)), "{s:?}");
+        }
+        assert!(unit.contains("Service=pqcrypta-proxy.service"));
+        assert!(unit.contains("BindIPv6Only=both"));
     }
 }

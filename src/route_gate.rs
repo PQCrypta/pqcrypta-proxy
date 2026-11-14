@@ -107,21 +107,73 @@ pub struct GateContext<'a> {
 /// CORS preflight, matching the order the TCP path has always used.
 pub fn redirect_target(route: &RouteConfig, path: &str, query: &str) -> Option<(String, bool)> {
     let redirect_to = route.redirect.as_ref()?;
-    let new_path = if let Some(ref prefix) = route.path_prefix {
-        // Replace the prefix with the redirect target, keeping the rest. The
-        // route matched case-insensitively, so the prefix is compared the same
-        // way. A lowercase-only comparison assumed `normalize_paths` had already
-        // lowercased the path; with it off, `/THREAT_BOT/x` went to `/threat-bot`.
-        let suffix = if crate::config::starts_with_ignore_ascii_case(path, prefix) {
-            &path[prefix.len()..]
-        } else {
-            ""
-        };
-        format!("{}{}{}", redirect_to, suffix, query)
+    // Replace the prefix with the redirect target, keeping the rest. The route
+    // matched case-insensitively, so the prefix is compared the same way. A
+    // lowercase-only comparison assumed `normalize_paths` had already
+    // lowercased the path; with it off, `/THREAT_BOT/x` went to `/threat-bot`.
+    let rest = route.path_prefix.as_deref().and_then(|prefix| {
+        crate::config::starts_with_ignore_ascii_case(path, prefix)
+            .then(|| rest_after_prefix(prefix, &path[prefix.len()..]))
+            .flatten()
+    });
+    Some((
+        join_redirect(redirect_to, rest, query),
+        route.redirect_permanent,
+    ))
+}
+
+/// What of a path follows its route's prefix at a segment boundary: `None`
+/// for an exact match or one that ends inside a segment (`/oldx` under
+/// `/old`), `Some(rest)` after a `/` (`/old/deep` → `deep`, `/old/` → ``).
+///
+/// The rest is carried over only from a boundary, and [`join_redirect`] puts
+/// it under exactly one `/`: what follows the prefix is always a path below
+/// the target, whatever form the target and the request's path take.
+fn rest_after_prefix<'a>(prefix: &str, suffix: &'a str) -> Option<&'a str> {
+    if prefix.ends_with('/') {
+        Some(suffix)
     } else {
-        format!("{}{}", redirect_to, query)
+        suffix.strip_prefix('/')
+    }
+}
+
+/// `target` with the rest of the path joined on under exactly one `/`, then
+/// the request's query. A target that carries a query of its own keeps it and
+/// takes the request's after it; the rest of the path then has no place in it
+/// and is left off.
+fn join_redirect(target: &str, rest: Option<&str>, query: &str) -> String {
+    let (base, own_query) = match target.split_once('?') {
+        Some((base, q)) => (base, Some(q)),
+        None => (target, None),
     };
-    Some((new_path, route.redirect_permanent))
+    let mut out = String::with_capacity(target.len() + query.len() + 16);
+    match rest {
+        Some(rest) if own_query.is_none() => {
+            out.push_str(base.trim_end_matches('/'));
+            out.push('/');
+            out.push_str(rest.trim_start_matches('/'));
+        }
+        _ => out.push_str(base),
+    }
+    let incoming = query.strip_prefix('?').unwrap_or(query);
+    match (own_query, incoming.is_empty()) {
+        (Some(q), true) => {
+            out.push('?');
+            out.push_str(q);
+        }
+        (Some(q), false) => {
+            out.push('?');
+            out.push_str(q);
+            out.push('&');
+            out.push_str(incoming);
+        }
+        (None, false) => {
+            out.push('?');
+            out.push_str(incoming);
+        }
+        (None, true) => {}
+    }
+    out
 }
 
 /// Run every per-route gate, in the order the TCP path established.
@@ -425,6 +477,36 @@ mod tests {
         let (target, _) =
             redirect_target(&r, "/encryption/fun/fractaltree/", "").expect("a redirect");
         assert_eq!(target, "/fun/fractaltree/");
+    }
+
+    /// The rest of the path is carried over only from a segment boundary and
+    /// under exactly one `/`: it is always a path below the target.
+    #[test]
+    fn a_redirect_never_leaves_its_target() {
+        let mut r = route();
+        r.path_prefix = Some("/old".to_string());
+        r.redirect = Some("https://example.com".to_string());
+        let to =
+            |r: &RouteConfig, path: &str, query: &str| redirect_target(r, path, query).unwrap().0;
+        assert_eq!(to(&r, "/old.other.example/x", ""), "https://example.com");
+        assert_eq!(to(&r, "/oldx", "?q=1"), "https://example.com?q=1");
+        assert_eq!(to(&r, "/old/x", ""), "https://example.com/x");
+        assert_eq!(to(&r, "/old", ""), "https://example.com");
+
+        r.redirect = Some("/".to_string());
+        assert_eq!(to(&r, "/old//other.example/x", ""), "/other.example/x");
+        assert_eq!(to(&r, "/old///", ""), "/");
+
+        // A prefix ending in `/` is itself the boundary
+        r.path_prefix = Some("/old/".to_string());
+        r.redirect = Some("/new".to_string());
+        assert_eq!(to(&r, "/old/deep", ""), "/new/deep");
+        assert_eq!(to(&r, "/old/", ""), "/new/");
+
+        // A target with a query keeps it, and the request's follows it
+        r.redirect = Some("/new?from=old".to_string());
+        assert_eq!(to(&r, "/old/deep", "?a=1"), "/new?from=old&a=1");
+        assert_eq!(to(&r, "/old/deep", ""), "/new?from=old");
     }
 
     #[test]

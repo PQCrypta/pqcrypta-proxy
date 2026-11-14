@@ -150,6 +150,7 @@ pub(crate) mod fuzz_support;
 pub mod host_names;
 pub mod http3_features;
 pub mod http_listener;
+pub mod inherited;
 pub mod load_balancer;
 pub mod log_file;
 pub mod memory_pressure;
@@ -169,6 +170,8 @@ pub mod provider_kx;
 pub mod proxy;
 pub mod quic_listener;
 pub mod rate_limiter; // Must be before config (config imports from it)
+#[cfg(unix)]
+pub mod recv_low_water;
 pub mod request_encoding;
 pub mod request_id;
 pub mod request_target;

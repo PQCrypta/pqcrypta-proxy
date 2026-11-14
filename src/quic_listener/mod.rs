@@ -32,7 +32,7 @@ use crate::metrics::{ConnectionProtocol, MetricsRegistry};
 use crate::fingerprint::FingerprintExtractor;
 use crate::proxy::BackendPool;
 use crate::rate_limiter::AdvancedRateLimiter;
-use crate::security::{BlockReason, SecurityState};
+use crate::security::SecurityState;
 use crate::tls::TlsProvider;
 
 mod cors;
@@ -135,6 +135,70 @@ fn is_peer_violation<E: std::fmt::Display>(err: &E) -> bool {
         || (msg.contains("error with protocol compliance") && !msg.contains("closed by peer"))
 }
 
+/// Resolves once `activity` has had nothing in flight for `idle` (as
+/// `crate::memory_pressure::idle_limit` shortens it), or at the next moment it
+/// might have: while something is in flight there is nothing to count from,
+/// so the caller looks again after a whole `idle`.
+async fn idle_past(activity: &crate::conn_limits::Activity, idle: Duration) {
+    let idle = crate::memory_pressure::idle_limit(idle);
+    match activity.idle_for() {
+        Some(quiet) if quiet >= idle => {}
+        Some(quiet) => tokio::time::sleep(idle.saturating_sub(quiet)).await,
+        None => tokio::time::sleep(idle).await,
+    }
+}
+
+/// What the HTTP/3 accept loop woke for: a stream accepted, or a request
+/// stream's header block resolved (or not, by its deadline).
+enum Step<A, R> {
+    Accepted(A),
+    Resolved(Result<R, tokio::time::error::Elapsed>),
+}
+
+/// Whether a request that could not be resolved (`resolve_any`) failed on the
+/// peer's account, by the error's type rather than its text: a stream error h3
+/// raised on what the peer sent (a malformed or incomplete header block, a
+/// frame out of place: every code but H3_INTERNAL_ERROR, which is h3's own
+/// failure), a stream the peer reset or a connection it closed, or a header
+/// block over the limit. The hourly conformance battery sends malformed
+/// requests on purpose, and each was an error line.
+fn request_error_is_peers(err: &h3::error::StreamError) -> bool {
+    use h3::error::{Code, ConnectionError, LocalError, StreamError};
+    match err {
+        StreamError::StreamError { code, .. } => *code != Code::H3_INTERNAL_ERROR,
+        StreamError::RemoteTerminate { .. }
+        | StreamError::RemoteClosing { .. }
+        | StreamError::HeaderTooBig { .. } => true,
+        StreamError::ConnectionError { 0: connection, .. } => match connection {
+            ConnectionError::Local {
+                error: LocalError::Application { code, .. },
+                ..
+            } => *code != Code::H3_INTERNAL_ERROR,
+            ConnectionError::Local {
+                error: LocalError::Closing { .. },
+                ..
+            }
+            | ConnectionError::Remote { .. }
+            | ConnectionError::Timeout { .. } => true,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether this side closed the connection itself (`LocallyClosed`): a
+/// handshake past its deadline, a refused fingerprint, HTTP/3 that could not
+/// be set up, an idle connection let go. Each is decided, and said, where it
+/// is made; the connection ending for it is no error.
+fn closed_here(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| {
+        matches!(
+            e.downcast_ref::<quinn::ConnectionError>(),
+            Some(quinn::ConnectionError::LocallyClosed)
+        )
+    })
+}
+
 /// How loudly to report a QUIC connection that ended in an error.
 ///
 /// Most of what ends a connection is the client's doing and says nothing about
@@ -145,6 +209,10 @@ fn is_peer_violation<E: std::fmt::Display>(err: &E) -> bool {
 /// a warning, because it is usually a client asking for a name we never served
 /// but is also what a missing certificate looks like.
 fn log_connection_end(remote_addr: SocketAddr, err: &anyhow::Error) {
+    if closed_here(err) {
+        debug!("QUIC connection from {} closed by this side", remote_addr);
+        return;
+    }
     log_quic_end(remote_addr, &format!("{err:#}"));
 }
 
@@ -747,7 +815,7 @@ impl QuicListener {
         // version-specific Initial keys (via rustls), retry integrity key, and
         // long-header packet-type renumbering. noq still adds its reserved/GREASE
         // version automatically.
-        let socket = std::net::UdpSocket::bind(addr)?;
+        let socket = crate::inherited::udp_socket(addr)?;
 
         // Explicitly size the kernel UDP socket buffers. quinn-udp enables GSO/GRO
         // automatically but does NOT set SO_RCVBUF/SO_SNDBUF — it inherits the host's
@@ -886,16 +954,18 @@ impl QuicListener {
                     // Connection-level security checks: IP blocklist and GeoIP country blocking.
                     // Evaluated before completing the QUIC/TLS handshake so blocked IPs never
                     // consume cryptographic handshake resources.
+                    // The block was said once, when it was made: a refusal is
+                    // at debug, since every Initial from (or spoofed as) a
+                    // blocked address would otherwise be a warning.
                     let should_refuse = if !self.security.is_trusted(&ip) {
                         if let Some(block_info) = self.security.is_blocked(&ip) {
-                            warn!(
+                            debug!(
                                 "[QUIC] Refusing connection from blocked IP {} (reason: {:?})",
                                 ip, block_info.reason
                             );
                             true
-                        } else if self.security.is_geo_blocked(&ip) {
-                            warn!("[QUIC] Refusing connection from GeoIP-blocked IP {}", ip);
-                            self.security.block_ip(ip, BlockReason::GeoBlocked, None);
+                        } else if let Some(reason) = self.security.geo_block_reason(&ip) {
+                            self.security.geo_block(ip, &reason);
                             true
                         } else {
                             false
@@ -1108,6 +1178,10 @@ impl QuicListener {
                 tokio::select! {
                     accepted = &mut established => accepted,
                     () = tokio::time::sleep_until(handshake_deadline) => {
+                        debug!(
+                            "QUIC handshake from {} not finished by its deadline: closed",
+                            remote_addr
+                        );
                         connection.close(0u32.into(), b"handshake timeout");
                         established.await
                     }
@@ -1498,9 +1572,20 @@ impl QuicListener {
         let mut wt_sessions: std::collections::HashMap<u64, crate::wt_session::H3SessionFeed> =
             std::collections::HashMap::new();
 
+        // Request streams whose header block is still arriving, resolved beside
+        // the accept loop rather than in it: one stream's slow or stalled
+        // header block held up every other stream of the connection, and the
+        // loop's own GOAWAY and close with them. Each has as long as the TCP
+        // listeners give a request's header (`server.max_idle_timeout_secs`).
+        let mut resolving = futures_util::stream::FuturesUnordered::new();
+        let header_wait = Duration::from_secs(config.server.max_idle_timeout_secs.max(1));
+
         loop {
-            let accepted = tokio::select! {
-                accepted = h3.accept_any() => accepted,
+            let step = tokio::select! {
+                Some(resolved) = resolving.next(), if !resolving.is_empty() => {
+                    Step::Resolved(resolved)
+                }
+                accepted = h3.accept_any() => Step::Accepted(accepted),
                 () = crate::memory_pressure::idle_at_relief(&mut relief, &activity),
                     if closing.is_none() =>
                 {
@@ -1512,6 +1597,27 @@ impl QuicListener {
                         break;
                     }
                     closing = Some(tokio::time::Instant::now() + SHED_GRACE);
+                    continue;
+                }
+                // Nothing in flight for `server.max_idle_timeout_secs`
+                // (shorter while memory is short): GOAWAY, then closed as
+                // above, as the TCP listeners close an idle connection. The
+                // server's keep-alive PINGs kept an idle client's connection
+                // open for as long as the client acknowledged them.
+                () = idle_past(&activity, header_wait),
+                    if closing.is_none() && resolving.is_empty() =>
+                {
+                    if activity
+                        .idle_for()
+                        .is_some_and(|quiet| quiet >= crate::memory_pressure::idle_limit(header_wait))
+                    {
+                        debug!("HTTP/3 connection from {} idle: GOAWAY", remote_addr);
+                        if let Err(e) = h3.shutdown(0).await {
+                            debug!("HTTP/3 GOAWAY to {} failed: {}", remote_addr, e);
+                            break;
+                        }
+                        closing = Some(tokio::time::Instant::now() + SHED_GRACE);
+                    }
                     continue;
                 }
                 () = async {
@@ -1529,31 +1635,45 @@ impl QuicListener {
                     continue;
                 }
             };
-            match accepted {
-                Ok(Some(h3::server::Accepted::WebTransportUni {
+            match step {
+                Step::Accepted(Ok(Some(h3::server::Accepted::WebTransportUni {
                     session,
                     prefix,
                     stream,
-                })) => {
+                }))) => {
                     deliver_wt_uni(&mut wt_sessions, session, prefix, stream);
                 }
-                Ok(Some(h3::server::Accepted::Request(resolver))) => {
-                    // Resolve the request, or the WebTransport stream
-                    let (request, stream) = match resolver.resolve_any().await {
-                        Ok(h3::server::Resolved::Request(request, stream)) => (request, stream),
-                        Ok(h3::server::Resolved::WebTransportBi {
+                Step::Accepted(Ok(Some(h3::server::Accepted::Request(resolver)))) => {
+                    resolving.push(tokio::time::timeout(header_wait, resolver.resolve_any()));
+                }
+                Step::Resolved(resolved) => {
+                    // The request, or the WebTransport stream
+                    let (request, stream) = match resolved {
+                        Ok(Ok(h3::server::Resolved::Request(request, stream))) => (request, stream),
+                        Ok(Ok(h3::server::Resolved::WebTransportBi {
                             session,
                             prefix,
                             stream,
-                        }) => {
+                        })) => {
                             deliver_wt_bi(&mut wt_sessions, session, prefix, stream);
                             continue;
                         }
-                        Err(e) => {
-                            if is_benign_h3_close(&e) || is_peer_violation(&e) {
-                                debug!("HTTP/3 request abandoned before its headers: {}", e);
+                        Err(_) => {
+                            // Dropping the stream resets it
+                            debug!(
+                                "HTTP/3 request from {} sent no whole header block within {:?}",
+                                remote_addr, header_wait
+                            );
+                            continue;
+                        }
+                        Ok(Err(e)) => {
+                            if request_error_is_peers(&e)
+                                || is_benign_h3_close(&e)
+                                || is_peer_violation(&e)
+                            {
+                                debug!("HTTP/3 request from {} not taken: {}", remote_addr, e);
                             } else {
-                                error!("Failed to resolve request: {}", e);
+                                error!("Failed to resolve request from {}: {}", remote_addr, e);
                             }
                             continue;
                         }
@@ -2053,11 +2173,11 @@ impl QuicListener {
                         spawn_request(stream, request);
                     }
                 }
-                Ok(None) => {
+                Step::Accepted(Ok(None)) => {
                     debug!("HTTP/3 connection closed by peer: {}", remote_addr);
                     break;
                 }
-                Err(e) => {
+                Step::Accepted(Err(e)) => {
                     // A browser navigating away closes the connection mid-accept.
                     // That is the overwhelming majority of what lands here, and
                     // logging it at error level made the collector's log-analysis

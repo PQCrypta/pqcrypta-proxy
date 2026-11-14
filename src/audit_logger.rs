@@ -361,7 +361,10 @@ impl Sink {
 
     fn write(&mut self, event: &AuditEvent) {
         let record = AuditRecord {
-            timestamp: Utc::now().to_rfc3339(),
+            // As the proxy's own log writes it (`…T23:03:04.302806Z`), so the
+            // two streams sort and join on one format; this was `+00:00` with
+            // nanoseconds beside it
+            timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
             level: event.level(),
             category: event.category(),
             startup_probe: event
