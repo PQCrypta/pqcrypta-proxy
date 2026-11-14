@@ -5106,7 +5106,6 @@ impl ProxyConfig {
              # takes is reported at startup.\n\
              [Unit]\n\
              Description=PQCrypta Proxy listening sockets\n\
-             PartOf=pqcrypta-proxy.service\n\
              \n\
              [Socket]\n"
         );
@@ -5787,5 +5786,8 @@ mod listen_socket_tests {
         }
         assert!(unit.contains("Service=pqcrypta-proxy.service"));
         assert!(unit.contains("BindIPv6Only=both"));
+        // The sockets outlive a restart of the service: PartOf= would stop the
+        // socket unit with it and close them
+        assert!(!unit.contains("PartOf="), "{unit}");
     }
 }
