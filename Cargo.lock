@@ -2612,7 +2612,7 @@ dependencies = [
 
 [[package]]
 name = "pqcrypta-proxy"
-version = "0.13.2"
+version = "0.13.3"
 dependencies = [
  "anyhow",
  "arc-swap",
