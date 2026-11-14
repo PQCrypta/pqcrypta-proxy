@@ -249,7 +249,7 @@
 - **Telemetry Wall** (`/telemetry`): Native WebTransport handler that pushes 6 independent QUIC uni-streams at 20 Hz each (~5 Mbps virtual throughput per channel), demonstrating true QUIC stream isolation. A stats channel pushes RTT, CWND, CPU, and memory at 10 Hz. A control bidi-stream accepts impairment commands (delay, loss, bandwidth cap, jitter, disconnect) scoped to individual channels, leaving others unaffected — the opposite of TCP head-of-line blocking.
 - **QUIC vs TCP Speed Test** (`/speedtest`): Side-by-side throughput comparison over QUIC and TCP. WebTransport path measures download/upload throughput, datagram RTT, and packet loss. The `tcp_only_hosts` + `http11_only_hosts` config options force a parallel HTTP/1.1 connection so the browser opens one TCP stream per fetch rather than coalescing onto HTTP/2 — enabling a true protocol-level comparison. TCP-speedtest responses echo the request `Origin` when it is in `webtransport_allowed_origins`, so the test works from any allowed front-end regardless of allowlist order.
 - **Pentest Suite** (`pentests/`): 32 automated black-box attack scripts across 12 phases covering WAF bypass, HTTP smuggling (HTTP/1.1 CL.TE, HTTP/2 Rapid Reset, HTTP/3, WebTransport), SSRF, timing oracles, race conditions, and AI/LLM attack surface. Use `pentest_bypass_ips` in `[security]` to skip rate-limiting and auto-block for test runner IPs while keeping the WAF active.
-- **Unified UDP Listener**: Single QuicListener handles both HTTP/3 and WebTransport
+- **WebTransport in two places**: every HTTP/3 listener (`udp_port` and `additional_ports`) serves WebTransport sessions on the same connections as its requests, and the dedicated WebTransport server serves them on `webtransport_port` (default 4433), a port the HTTP/3 listeners skip; one implementation serves both
 - **Shared Security State**: Every listener — QUIC and all three TCP paths — shares one security context, so blocked IPs, rate limiter counters, the fingerprint corpus and DB-synced blocklists are consistent across every port and transport, and the admin API's unblock route reaches all of them
 - **Configurable WebTransport Port**: `webtransport_port` in `[server]` controls the dedicated WebTransport server bind port (default 4433)
 - **X-Forwarded Headers**: X-Real-IP, X-Forwarded-For, X-Forwarded-Proto
@@ -395,17 +395,21 @@ and the speed test's readers do the same on their next lookup. The unit needs
 `ExecReload=/bin/kill -HUP $MAINPID` for `systemctl reload`. The script restarted the proxy, on
 every node, every week; each restart refused connections while the old process drained.
 
-### Trusted Internal CIDRs
+### Trusted Internal CIDRs (deprecated)
 
-Only loopback (`127.0.0.0/8` / `::1`) is trusted by default (SEC-A05). RFC1918 private ranges
-are treated as untrusted external traffic — this prevents XFF/Real-IP spoofing attacks from
-RFC1918 sources (e.g., on multi-tenant or shared networks). If you operate a genuinely isolated
-private network where RFC1918 sources are legitimate, add them explicitly:
+Only loopback (`127.0.0.0/8` / `::1`) is trusted by default (SEC-A05); RFC1918 ranges are
+untrusted like any other source, so a forwarded-for header from them is not believed. For
+internal clients that need trust, authenticate them: mTLS client certificates
+(`tls.require_client_cert = true`, or per route under `[routes.security]`) bind trust to an
+identity instead of an address.
+
+`trusted_internal_cidrs` remains for compatibility and is **deprecated**: a configuration that
+sets it is warned at every start to replace it with mTLS, and `zero_trust_mode` requires it to
+be empty. Addresses it lists bypass the security checks:
 
 ```toml
 [security]
-# Explicit opt-in for CIDRs that should bypass security checks.
-# Default: empty (only loopback 127.x/::1 is trusted; RFC1918 is NOT trusted by default).
+# Deprecated: prefer mTLS. Default: empty (only loopback 127.x/::1 is trusted).
 trusted_internal_cidrs = ["10.200.0.0/16"]
 ```
 
@@ -588,20 +592,23 @@ Leave `allowed_domains = []` (empty, the default) to disable the check and allow
 
 ### Admin API Authentication
 
-The admin API should always have an authentication token set:
+Every admin route but `/health` takes a credential: the configured `auth_token`,
+a token the proxy generates at each start when none is configured (printed to
+standard error, and different after every restart), or the client certificate
+under `require_mtls`; `hmac_secret` adds a signature to every request.
+`allowed_ips` filters addresses before any of that and is not authentication.
+The details are under [Admin API Authentication](#admin-api-authentication-1).
 
 ```toml
 [admin]
+enabled = true                 # off by default
 bind_address = "127.0.0.1"
-port = 8082
+port = 8081                    # the default
 allowed_ips = ["127.0.0.1", "::1"]
-# Generate with: openssl rand -base64 32
+# At least 32 characters: openssl rand -base64 48
 auth_token = "your-random-token-here"
 # require_loopback = true  ← default: aborts startup when bind_address is non-loopback
 ```
-
-Without an `auth_token` any process on the host can call destructive endpoints
-(`/shutdown`, `/reload`) without credentials.
 
 **Loopback enforcement (`require_loopback`):** By default the proxy refuses to start when the
 admin `bind_address` resolves to a non-loopback interface, because all admin traffic — including
@@ -631,7 +638,8 @@ cp config/example-config.toml config/proxy-config.toml
 
 ### Prerequisites
 
-- Rust 1.75+ (install via [rustup](https://rustup.rs/))
+- Rust: the toolchain pinned in [`rust-toolchain.toml`](rust-toolchain.toml), which
+  [rustup](https://rustup.rs/) installs on the first `cargo` command in the repository
 - TLS certificates (Let's Encrypt recommended)
 
 ### Build
@@ -663,8 +671,9 @@ docker build -f docker/Dockerfile \
   --build-arg PQCRYPTA_GIT_COMMIT="$(git rev-parse HEAD)" -t pqcrypta-proxy .
 
 # Run it: the proxy runs unprivileged in the container, on 4433 (TCP and
-# UDP) with the admin API on 8081, which the health check asks; the
-# configuration's listeners must say so
+# UDP). The image's health check asks the admin API on 8081, which is off
+# unless the mounted configuration says `[admin] enabled = true` (port 8081 is
+# its default); its listeners must use these ports
 docker run -d -p 443:4433/tcp -p 443:4433/udp \
   -v /path/to/certs:/etc/pqcrypta/certs:ro \
   -v /path/to/config.toml:/etc/pqcrypta/config.toml:ro \
@@ -1380,7 +1389,7 @@ POST /canary/weight/:server_id   — adjust weight at runtime
 
 Example:
 ```bash
-curl -s http://127.0.0.1:8082/canary \
+curl -s http://127.0.0.1:8081/canary \
      -H "Authorization: Bearer <token>"
 # {"pools":[{"pool":"api-pool","servers":[{"id":"127.0.0.1:3005","is_canary":true,
 #   "canary_weight_percent":5,"suspended":false,"error_rate":0.0,...}]}]}
@@ -1418,7 +1427,7 @@ log_responses       = true             # Log shadow status + latency at INFO (de
 
 1. Add a `[backends.api-canary]` entry pointing at the canary instance (e.g. `127.0.0.1:3004`).
 2. Add the `[routes.shadow]` block to the desired route in `/etc/pqcrypta/proxy-config.toml`.
-3. Reload config: `curl -s -X POST http://127.0.0.1:8082/reload -H "Authorization: Bearer $TOKEN"`.
+3. Reload config: `curl -s -X POST http://127.0.0.1:8081/reload -H "Authorization: Bearer $TOKEN"`.
 
 ### Response Cache Configuration
 
@@ -1628,22 +1637,28 @@ See [config/example-config.toml](config/example-config.toml) for full documentat
 ## CLI Arguments
 
 ```
-pqcrypta-proxy [OPTIONS]
+QUIC/HTTP/3/WebTransport reverse proxy with hybrid post-quantum TLS
+
+Usage: pqcrypta-proxy [OPTIONS]
 
 Options:
-  -c, --config <PATH>       Configuration file [default: /etc/pqcrypta/config.toml]
-      --udp-port <PORT>     Override UDP port for QUIC
-      --admin-port <PORT>   Override admin API port
-      --log-level <LEVEL>   Log level [default: info]
-      --json-logs           Enable JSON log format
-      --no-pqc              Disable PQC hybrid key exchange
-      --watch-config        Watch config file for changes [default: true]
-      --validate            Validate configuration only
-  -h, --help                Print help
-  -V, --version             Print version
+  -c, --config <CONFIG>                Configuration file path [env: PQCRYPTA_CONFIG=] [default: /etc/pqcrypta/config.toml]
+      --udp-port <UDP_PORT>            Override UDP port for QUIC listener [env: PQCRYPTA_UDP_PORT=]
+      --admin-port <ADMIN_PORT>        Override admin API port [env: PQCRYPTA_ADMIN_PORT=]
+      --log-level <LOG_LEVEL>          Log level (trace, debug, info, warn, error). Unset falls back to `[logging] level` in the config file, then "info" [env: PQCRYPTA_LOG_LEVEL=]
+      --json-logs [<JSON_LOGS>]        Enable JSON log format (`--json-logs`, or `--json-logs=false` to force text). Unset falls back to `[logging] format` in the config file, then text [env: PQCRYPTA_JSON_LOGS=] [possible values: true, false]
+      --no-pqc                         Disable PQC hybrid key exchange
+      --watch-config [<WATCH_CONFIG>]  Watch the configuration file and reload it when it changes (on unless `--watch-config=false`) [env: PQCRYPTA_WATCH_CONFIG=] [default: true] [possible values: true, false]
+      --env <ENV>                      Environment name for per-env config overlay. When set, loads <config-dir>/<config-stem>.<env>.toml and merges it over the base config. Example: --env prod loads /etc/pqcrypta/config.prod.toml [env: PQCRYPTA_ENV=]
+      --validate                       Run configuration validation only (don't start server)
+      --socket-unit <FILE>             Write the systemd socket unit for this configuration's listeners (pqcrypta-proxy.socket) to FILE and exit: with it, the service manager holds the listening sockets across a restart. A file, not standard output, which the proxy's own log may share
+      --merge-fingerprints <OUT>       Merge fingerprint corpora into one and write it here: observed.json of either version, or a published directory's full.json (`--from`)
+      --from <FILE>                    A corpus or directory to merge (`--merge-fingerprints`); repeatable
+  -h, --help                           Print help
+  -V, --version                        Print version
 ```
 
-Environment variables: `PQCRYPTA_CONFIG`, `PQCRYPTA_UDP_PORT`, `PQCRYPTA_ADMIN_PORT`, `PQCRYPTA_LOG_LEVEL`, `PQCRYPTA_JSON_LOGS`, `PQCRYPTA_ENV`
+The block is `pqcrypta-proxy --help` (a test holds it to that). An option on the command line wins over its environment variable, which wins over the configuration file's setting where there is one (`[logging] level` and `format` for `--log-level` and `--json-logs`), which wins over the built-in default.
 
 `PQCRYPTA_ENV` (or `--env`) names the environment overlay merged over the configuration (see Environment Config Overlay). No setting is relaxed by it: backend certificates are verified in every environment.
 
@@ -1651,7 +1666,7 @@ Environment variables: `PQCRYPTA_CONFIG`, `PQCRYPTA_UDP_PORT`, `PQCRYPTA_ADMIN_P
 
 ```
                     ┌──────────────────────────────────────────────────────────┐
-                    │                         PQCProxy v0.2.2                   │
+                    │                      PQCrypta Proxy                      │
                     │                                                          │
   Client ──────────►│  Port 80  ─► HTTP Redirect Server ─► HTTPS (301/308)    │
   (Browser/App)     │                                                          │
@@ -1706,7 +1721,7 @@ Environment variables: `PQCRYPTA_CONFIG`, `PQCRYPTA_UDP_PORT`, `PQCRYPTA_ADMIN_P
                     │   │ S1 │ S2 │ S3 │ │ S1 │ S2 │ S3 │  │ S1 │ S2 │       │
                     │   └────┴────┴────┘ └────┴────┴────┘  └────┴────┘       │
                     │                                                          │
-                    │  Admin API (HTTP 8082)                                   │
+                    │  Admin API (optional; loopback HTTP, 8081 by default)    │
                     │    /health, /metrics, /reload, /shutdown                 │
                     └──────────────────────────────────────────────────────────┘
 ```
@@ -1715,35 +1730,74 @@ Environment variables: `PQCRYPTA_CONFIG`, `PQCRYPTA_UDP_PORT`, `PQCRYPTA_ADMIN_P
 
 ```
 src/
-├── main.rs              # Entry point; --env overlay; startup validation
-├── lib.rs               # Library exports
-├── config.rs            # Configuration parsing, schema versioning, conflict validation, env overlay
-├── load_balancer.rs     # Load balancing algorithms, pools, session affinity, per-backend CB overrides
-├── proxy.rs             # Backend pool, request routing, per-backend retry with exponential backoff
-├── http_listener/       # HTTP/1.1 + HTTP/2 listener with PQC TLS; layers (security
-│                       # headers, Alt-Svc, rate limit), TLS config, PROXY v2, passthrough
-├── quic_listener/       # QUIC/HTTP/3 listener; configurable connection migration;
-│                       # request.rs holds the h3 request pipeline and response policy headers
-├── security.rs          # Rate limiting, DoS, GeoIP, circuit breaker, WAF hook, body size limit
-├── fingerprint.rs       # JA3/JA4 TLS fingerprint extraction, replay cache, drift detector
-├── tls_acceptor.rs      # Custom TLS acceptor with fingerprint capture; 0-RTT nonce store
-├── compression.rs       # Brotli/Zstd/Gzip compression
-├── http3_features.rs    # Early Hints, Priority, Request Coalescing
-├── admin.rs             # Admin API endpoints; audit logging; /health/quic; /health/webtransport
-├── tls.rs               # TLS configuration; PQC session tickets
-├── pqc_tls.rs           # Post-Quantum TLS provider; downgrade detection
-├── pqc_extended.rs      # Extended PQC configuration and capabilities
-├── acme.rs              # ACME certificate automation (DNS and IP identifiers, ARI renewal); Certificate Transparency log submission; domain path validation
-├── acme_dns.rs          # ACME dns-01 / dns-account-01: TXT records by TSIG-signed DNS UPDATE, waited for at every name server
-├── dns_wire.rs          # DNS message reading and writing shared by the DoH gateway and acme_dns
-├── ocsp.rs              # OCSP stapling automation
-├── metrics.rs           # Prometheus metrics registry
-├── rate_limiter.rs      # Advanced multi-dimensional rate limiting; JWT HMAC verification
-├── proxy_protocol.rs    # PROXY protocol v2 support
-├── access_logger.rs     # Structured access log with log-injection sanitization
-├── waf.rs               # WAF engine — 256-rule RegexSet, PQW-* IDs, anomaly scoring, multi-pass decoding, per-rule metrics; enforced on TCP, HTTP/3 and WebTransport (A01/A03/A06/A08/A10)
-├── audit_logger.rs      # Async structured JSON audit logger for security events
-└── webtransport_server.rs  # WebTransport session handling; per-origin session rate limiting
+├── main.rs                 # PQCrypta Proxy - QUIC/HTTP3/WebTransport Proxy with Hybrid PQC TLS
+├── lib.rs                  # PQCrypta Proxy - QUIC/HTTP3/WebTransport Proxy with Hybrid PQC TLS
+├── access_logger.rs        # Access Logger for PQCrypta Proxy
+├── acme.rs                 # ACME (Automated Certificate Management Environment) Client
+├── acme_dns.rs             # DNS-based ACME challenges
+├── admin.rs                # Admin HTTP API for health, metrics, config reload, and graceful shutdown
+├── audit_logger.rs         # Structured audit logging for security-relevant events
+├── backend_client.rs       # Connections to backends
+├── backend_limits.rs       # How many requests each backend has in flight at once, for the whole process
+├── bin/                    # The tools built beside the proxy: ech-check, ech-keygen, h3-conformance, h3-get
+├── body_budget.rs          # The memory request bodies may occupy while the proxy holds them
+├── bounded.rs              # Ceilings for the tables a request can add to
+├── cache.rs                # HTTP response cache (RFC 9111)
+├── cert_compression.rs     # RFC 8879 certificate compression policy
+├── compression.rs          # Response compression middleware
+├── config.rs               # Configuration module with TOML parsing and hot-reload support
+├── conformance/            # HTTP/3 and QUIC **client** conformance suite
+├── conn_limits.rs          # What every listener holds a client connection to
+├── connect_udp.rs          # MASQUE CONNECT-UDP proxying (RFC 9298)
+├── crawler_verify.rs       # Verified search-engine crawler detection
+├── data_file.rs            # Data files the proxy reads at run time (the GeoLite2 databases, the JA3/JA4 fingerprint …
+├── dns_wire.rs             # The DNS message format (RFC 1035 §4), as far as the proxy reads and writes it
+├── doh.rs                  # DNS over HTTPS (RFC 8484) for the authoritative name server on this host
+├── doq.rs                  # DNS over QUIC (RFC 9250) on the QUIC listener, beside HTTP/3
+├── early_data.rs           # TLS 1.3 early data (0-RTT) on the TCP listeners
+├── ech_config.rs           # Loads Encrypted Client Hello (ECH, draft-ietf-tls-esni-25) server configurations from disk
+├── fingerprint.rs          # TLS Fingerprinting Module
+├── fingerprint_corpus.rs   # The observed TLS fingerprint corpus
+├── fuzz_support.rs         # Mutation fuzzing for the parsers that read raw client bytes
+├── host_names.rs           # Host names in security.pentest_bypass_ips and the [masque] client lists
+├── http3_features.rs       # HTTP/3 Advanced Features Module
+├── http_listener/          # HTTP/1.1 and HTTP/2 reverse proxy with TLS termination, re-encryption, and passthrough
+├── inherited.rs            # Listening sockets the service manager opened for this process
+├── load_balancer.rs        # Load balancer module for backend pool management
+├── log_file.rs             # Size-based rotating file writer for the tracing subscriber
+├── memory_pressure.rs      # The proxy's own memory, as its cgroup accounts it, and what the proxy gives up when that runs …
+├── metrics.rs              # Prometheus metrics for the proxy
+├── ocsp.rs                 # OCSP stapling (RFC 6960, RFC 6066 section 8, RFC 8446 section 4.4.2.1)
+├── openssl_alloc.rs        # OpenSSL's memory, from the proxy's own allocator
+├── otel.rs                 # OpenTelemetry distributed tracing integration
+├── path_canon.rs           # The request path every listener routes and forwards on
+├── path_loss.rs            # Real packet loss on one peer's path, at the socket
+├── pqc_extended.rs         # Extended Post-Quantum Cryptography Support
+├── pqc_policy.rs           # What a classical key exchange means to this server (pqc.downgrade_action)
+├── pqc_tickets.rs          # ML-KEM-1024 protected TLS session tickets (tls.pqc_session_tickets)
+├── pqc_tls.rs              # Post-Quantum Cryptography TLS Provider
+├── provider_kx.rs          # Key-exchange groups the linked OpenSSL's providers carry and rustls does not
+├── proxy.rs                # Backend proxy module
+├── quic_listener/          # QUIC/HTTP3/WebTransport listener
+├── rate_limiter.rs         # Advanced Multi-Dimensional Rate Limiting Module
+├── recv_low_water.rs       # A socket's receive low-water mark (SO_RCVLOWAT)
+├── request_encoding.rs     # A request body's content coding (RFC 9110 section 8.4), decoded here
+├── request_id.rs           # Request IDs
+├── request_target.rs       # The host a request names, resolved one way for every layer and transport
+├── route_gate.rs           # Per-route request gates, applied identically on every transport
+├── security.rs             # Security middleware module
+├── service_notify.rs       # The service manager's notification protocol (sd_notify(3))
+├── speedtest.rs            # Native speed test session handler for WebTransport connections on /speedtest
+├── speedtest_budget.rs     # What one client may take of the speed test
+├── speedtest_meter.rs      # Server-side meter for speed-test uploads, shared by every transport
+├── startup_verify.rs       # Startup verification of the cryptographic runtime
+├── telemetry.rs            # WebTransport Telemetry Wall — native handler for the /telemetry path
+├── tls.rs                  # TLS configuration with Post-Quantum Cryptography (PQC) support
+├── tls_acceptor.rs         # Custom TLS Acceptor with ClientHello Capture
+├── waf.rs                  # Web Application Firewall (WAF) module
+├── webtransport_server.rs  # The dedicated WebTransport server, on webtransport_port, with ALPN negotiation
+├── ws_tunnel.rs            # WebSocket tunnels to a backend, for every transport a client may use
+└── wt_session.rs           # One WebTransport session, whichever listener accepted it
 ```
 
 ## Post-Quantum Cryptography
@@ -1950,10 +2004,10 @@ max_retries = 3
 
 ```bash
 # Check OCSP status
-curl http://127.0.0.1:8082/ocsp
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/ocsp
 
 # Force refresh
-curl -X POST http://127.0.0.1:8082/ocsp/refresh
+curl -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/ocsp/refresh
 ```
 
 ## Admin API
@@ -1966,7 +2020,9 @@ curl -X POST http://127.0.0.1:8082/ocsp/refresh
 |----------|--------|-------------|
 | `/health` | GET | Minimal health check — safe for load-balancer probes (F-03) |
 
-**Protected (Bearer token required):**
+**Protected** (by the configured admin authentication: the bearer token or, under `require_mtls`,
+the client certificate; with `hmac_secret`, a signed request — see
+[Admin API Authentication](#admin-api-authentication-1)):
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -1983,23 +2039,40 @@ curl -X POST http://127.0.0.1:8082/ocsp/refresh
 | `/acme` | GET | ACME certificate status |
 | `/acme/renew` | POST | Force certificate renewal *(1-hour cooldown)* |
 | `/ratelimit` | GET | Rate limiter status and statistics |
+| `/ratelimit/reset/{key}` | POST | Clear a client's rate-limit buckets; `key` is a whole key (`SourceIp:203.0.113.7`) or its value |
+| `/blocklist` | GET | Blocked addresses, with reason and expiry |
+| `/blocklist/block/{ip}` | POST | Block an address on every listener — audit logged |
+| `/blocklist/unblock/{ip}` | POST | Lift a block on every listener — audit logged |
+| `/security/status` | GET | Which protections are on and what they have loaded |
+| `/security/geoip/{ip}` | GET | What the GeoIP and ASN databases say about an address, and whether a location rule blocks it |
+| `/security/fingerprints` | GET | Observed fingerprints, one per JA4, most recently seen first (`?limit=N`) |
+| `/security/threats` | GET | What is being refused, and why |
+| `/waf/explain` | POST | Every WAF rule a request matches and what enforcement would do, without counting it |
 | `/health/quic` | GET | QUIC listener health — port, migration status, active connections |
 | `/health/webtransport` | GET | WebTransport health — active sessions, allowed origins, limits |
+| `/canary` | GET | Canary servers, their weights and state |
+| `/canary/suspend/{server_id}` | POST | Take a canary out of rotation |
+| `/canary/resume/{server_id}` | POST | Put a suspended canary back |
+| `/canary/weight/{server_id}` | POST | Set a canary's share of traffic |
+| `/pools` | GET | Load-balancer pools: servers, load, circuit breakers, draining |
+| `/pools/{pool}/servers/{server_id}/{action}` | POST | `drain`, `undrain`, `healthy` or `unhealthy` for one server |
+| `/cache` | GET | Response cache statistics |
+| `/cache/purge` | POST | Purge the response cache: everything, one host and path prefix (`?host=&prefix=`), or one URL (`?host=&path=`) |
 
 ### Example
 
 ```bash
-# Health check
-curl http://127.0.0.1:8082/health
+# Health check (the one route that needs no credential)
+curl http://127.0.0.1:8081/health
 
 # Prometheus metrics
-curl http://127.0.0.1:8082/metrics
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/metrics
 
 # Reload configuration
-curl -X POST http://127.0.0.1:8082/reload
+curl -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/reload
 
 # Reload TLS certificates only
-curl -X POST http://127.0.0.1:8082/reload -d '{"tls_only":true}'
+curl -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/reload -d '{"tls_only":true}'
 ```
 
 ## Telemetry Wall
@@ -2550,7 +2623,7 @@ proof-of-possession requirement as `hmac_secret` does.
 [admin]
 enabled = true
 bind_address = "10.0.0.5"           # reachable from the management network
-port = 8082
+port = 8081
 require_mtls = true
 client_ca_path = "/etc/pqcrypta/admin-ca.pem"
 # tls_cert_path / tls_key_path default to [tls] cert_path / key_path
@@ -2558,18 +2631,41 @@ client_ca_path = "/etc/pqcrypta/admin-ca.pem"
 
 ## Admin API Authentication
 
-The admin API requires **at least one** of the following to be configured, or the proxy refuses to start:
+The admin API is off unless `[admin] enabled = true`. It listens on `127.0.0.1:8081` by
+default and speaks plain HTTP, so it refuses to start on a non-loopback `bind_address` unless
+`require_loopback = false` or `require_mtls` makes it TLS with client certificates. Every route
+but `/health` passes, in order:
 
-- `auth_token` set in `[admin]` — Bearer token required on every admin request, or
-- `allowed_ips` restricted to loopback addresses (`127.x.x.x`, `::1`)
+1. **The address filter** (`allowed_ips`): a request from an address not listed is refused 403.
+   It decides who may try; it authenticates no one.
+2. **A credential**, one of:
+   - **The bearer token** (`auth_token`, at least 32 characters), compared in constant time. A
+     correct token is never throttled.
+   - **With no `auth_token` configured**, a 48-character token the proxy generates at each start
+     and prints to standard error (not to the log, so a log pipeline does not carry it), with the
+     `auth_token = "…"` line that would keep it. It changes at every restart, so anything that
+     calls the API unattended needs `auth_token` set. There is no unauthenticated mode.
+   - **Under mTLS** (`require_mtls = true` with `client_ca_path`; `tls_cert_path` and
+     `tls_key_path` default to `[tls]`'s), the client certificate: a token is still checked when
+     one is configured, and none is generated.
+3. **Proof of possession** (optional, `hmac_secret`; in `zero_trust_mode`, this or mTLS is
+   required): each request also carries
+   `X-Admin-Signature`, the HMAC-SHA256 of `METHOD\nPATH_AND_QUERY\nTIMESTAMP\nNONCE`, with
+   `X-Admin-Timestamp` (within ±300 s) and `X-Admin-Nonce` (each accepted once), so a token taken
+   from one request cannot be replayed.
+
+Startup refuses an `allowed_ips` that is not loopback-only when no `auth_token` is configured: a
+token generated per start is not one a remote caller can hold across restarts.
 
 ```toml
 [admin]
 enabled = true
 bind_address = "127.0.0.1"
-port = 8082
-auth_token = "your-strong-secret-token-at-least-32-chars"   # required unless allowed_ips is loopback-only
+port = 8081
+auth_token = "your-strong-secret-token-at-least-32-chars"
 allowed_ips = ["127.0.0.1", "::1"]
+# hmac_secret = "…"            # optional: per-request signatures
+# require_mtls = true          # optional: client certificates (tls_cert_path, tls_key_path, client_ca_path)
 ```
 
 **Token requirements:**

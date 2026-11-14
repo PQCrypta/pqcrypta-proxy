@@ -322,31 +322,21 @@ All responses automatically include these security headers. The `Server` header 
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `enabled` | bool | `true` | Enable admin HTTP API |
-| `bind_address` | string | `"127.0.0.1"` | Admin API bind address (use localhost for security) |
+| `enabled` | bool | `false` | Run the admin API |
+| `bind_address` | string | `"127.0.0.1"` | Admin API bind address; a non-loopback one is refused unless `require_loopback = false` or `require_mtls` |
 | `port` | u16 | `8081` | Admin API port |
-| `require_mtls` | bool | `false` | Require mTLS for admin API access |
-| `auth_token` | string? | `null` | Bearer token for API authentication |
-| `allowed_ips` | array[string] | `["127.0.0.1", "::1"]` | IP addresses allowed to access admin API |
+| `require_loopback` | bool | `true` | Refuse to start when `bind_address` is not loopback (the API is plain HTTP without `require_mtls`) |
+| `require_mtls` | bool | `false` | TLS with client certificates: the certificate is the credential (a configured `auth_token` is still checked) |
+| `client_ca_path` | path? | `null` | CA that admin client certificates must chain to (`require_mtls`) |
+| `tls_cert_path` / `tls_key_path` | path? | `null` | The admin listener's certificate and key under `require_mtls`; default to `[tls]`'s |
+| `auth_token` | string? | `null` | Bearer token, at least 32 characters. Unset (and no mTLS): a 48-character token is generated at each start and printed to standard error |
+| `allowed_ips` | array[string] | `["127.0.0.1", "::1"]` | Addresses that may reach the API at all (a filter, not authentication); one that is not loopback-only needs `auth_token` |
+| `hmac_secret` | string? | `null` | Per-request proof of possession: `X-Admin-Signature` (HMAC-SHA256 of method, path and query, timestamp, nonce) with `X-Admin-Timestamp` (±300 s) and `X-Admin-Nonce` (each accepted once) |
 
 ### Admin API Endpoints
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check with backend status |
-| `/metrics` | GET | Prometheus metrics |
-| `/metrics/json` | GET | JSON metrics snapshot |
-| `/metrics/errors` | GET | Per-endpoint error counts and recent failure log |
-| `/reload` | POST | Reload configuration |
-| `/shutdown` | POST | Graceful shutdown |
-| `/config` | GET | Read-only config view |
-| `/backends` | GET | Backend health status |
-| `/tls` | GET | TLS certificate info |
-| `/ocsp` | GET | OCSP stapling status |
-| `/ocsp/refresh` | POST | Force OCSP response refresh |
-| `/acme` | GET | ACME certificate status |
-| `/acme/renew` | POST | Force certificate renewal |
-| `/ratelimit` | GET | Rate limiter status and statistics |
+The README's [Admin API](../README.md#admin-api) tables list every route with its method; a test
+(`tests/docs.rs`) holds them to the router, so they are the one list kept.
 
 ---
 
