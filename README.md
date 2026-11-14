@@ -2572,7 +2572,7 @@ describes the rig and the traps it guards against.
 - [x] OpenSSL binary path validation (must be absolute, pointing to a regular file)
 - [x] Log injection prevention (newlines and control characters stripped from all user-controlled log fields)
 - [x] Backend certificates always verified (`tls_skip_verify` refused; pin with `tls_cert`)
-- [x] `unsafe_code = deny` globally (OpenSSL FFI retains targeted allow)
+- [x] `unsafe_code = deny` crate-wide; only the modules at a C or kernel boundary (OpenSSL, mimalloc, inherited sockets, socket options) allow it, and `clippy::undocumented_unsafe_blocks = deny` makes every unsafe block and impl state why it is sound in a `SAFETY` comment
 - [x] Panic prevention (no production-path unwrap(); ok_or/? throughout)
 - [x] Memory exhaustion prevention: every table a client can add to (addresses, fingerprints, cookies, paths, replay nonces) has a ceiling enforced where entries are made, swept for room at most once every few seconds when full, so neither memory nor the work per request follows the number of distinct values clients send
 - [x] ReDoS prevention (regex patterns size-limited)
@@ -2669,7 +2669,7 @@ allowed_ips = ["127.0.0.1", "::1"]
 ```
 
 **Token requirements:**
-- Minimum **32 characters** — the proxy rejects shorter tokens at startup. Generate a strong token with `openssl rand -base64 48`.
+- Minimum **32 characters** — the proxy rejects a shorter `auth_token`, `admin.hmac_secret` or route `security.hmac_secret` at startup. Generate one with `openssl rand -base64 48`.
 - Token comparison uses constant-time equality to prevent timing side-channel attacks.
 
 **Brute-force protection:**

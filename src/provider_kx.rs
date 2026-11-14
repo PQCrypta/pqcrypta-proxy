@@ -62,7 +62,7 @@ pub fn provider_groups() -> &'static [ProviderGroup] {
     static GROUPS: LazyLock<Vec<ProviderGroup>> = LazyLock::new(|| {
         openssl::init();
         let mut groups: Vec<ProviderGroup> = Vec::new();
-        // Safety: the callback receives `groups` back as its argument and
+        // SAFETY: the callback receives `groups` back as its argument and
         // nothing else holds it during the call.
         unsafe {
             OSSL_PROVIDER_do_all(
@@ -78,17 +78,17 @@ pub fn provider_groups() -> &'static [ProviderGroup] {
 }
 
 unsafe extern "C" fn each_provider(provider: *mut OSSL_PROVIDER, data: *mut c_void) -> c_int {
-    // Safety: `provider` is live for the call; `data` is passed on unchanged.
+    // SAFETY: `provider` is live for the call; `data` is passed on unchanged.
     unsafe { OSSL_PROVIDER_get_capabilities(provider, c"TLS-GROUP".as_ptr(), each_group, data) };
     1
 }
 
 unsafe extern "C" fn each_group(params: *const OSSL_PARAM, data: *mut c_void) -> c_int {
-    // Safety: `data` is the `Vec` `provider_groups` passed, borrowed by no one
+    // SAFETY: `data` is the `Vec` `provider_groups` passed, borrowed by no one
     // else for the duration of the walk.
     let groups = unsafe { &mut *data.cast::<Vec<ProviderGroup>>() };
     let text = |key: &CStr| -> Option<String> {
-        // Safety: `params` is the provider's array, live for the callback.
+        // SAFETY: `params` is the provider's array, live for the callback.
         unsafe {
             let p = openssl_sys::OSSL_PARAM_locate_const(params, key.as_ptr());
             let mut value: *const c_char = ptr::null();
@@ -99,7 +99,7 @@ unsafe extern "C" fn each_group(params: *const OSSL_PARAM, data: *mut c_void) ->
         }
     };
     let number = |key: &CStr| -> Option<u32> {
-        // Safety: as for `text`.
+        // SAFETY: as for `text`.
         unsafe {
             let p = openssl_sys::OSSL_PARAM_locate_const(params, key.as_ptr());
             let mut value: c_uint = 0;
@@ -243,15 +243,15 @@ fn failed(what: &str) -> Error {
 /// An `EVP_PKEY`, freed on drop.
 struct Pkey(*mut EVP_PKEY);
 
-// Safety: an EVP_PKEY is used here by one thread at a time (a key exchange
+// SAFETY: an EVP_PKEY is used here by one thread at a time (a key exchange
 // is completed once), and OpenSSL's key objects may be moved between threads.
 unsafe impl Send for Pkey {}
-// Safety: shared references only read the key (its public half).
+// SAFETY: shared references only read the key (its public half).
 unsafe impl Sync for Pkey {}
 
 impl Drop for Pkey {
     fn drop(&mut self) {
-        // Safety: owned, freed once.
+        // SAFETY: owned, freed once.
         unsafe { openssl_sys::EVP_PKEY_free(self.0) };
     }
 }
@@ -261,14 +261,14 @@ struct Ctx(*mut EVP_PKEY_CTX);
 
 impl Drop for Ctx {
     fn drop(&mut self) {
-        // Safety: owned, freed once.
+        // SAFETY: owned, freed once.
         unsafe { openssl_sys::EVP_PKEY_CTX_free(self.0) };
     }
 }
 
 impl Ctx {
     fn by_name(algorithm: &CStr) -> Result<Self, Error> {
-        // Safety: default library context and properties; `algorithm` outlives the call.
+        // SAFETY: default library context and properties; `algorithm` outlives the call.
         let ctx = unsafe {
             openssl_sys::EVP_PKEY_CTX_new_from_name(
                 ptr::null_mut(),
@@ -283,7 +283,7 @@ impl Ctx {
     }
 
     fn for_key(key: &Pkey) -> Result<Self, Error> {
-        // Safety: `key` is live; the context takes its own reference.
+        // SAFETY: `key` is live; the context takes its own reference.
         let ctx = unsafe { EVP_PKEY_CTX_new_from_pkey(ptr::null_mut(), key.0, ptr::null()) };
         if ctx.is_null() {
             return Err(failed("a context for the key"));
@@ -296,7 +296,7 @@ impl Pkey {
     fn generate(algorithm: &CStr) -> Result<Self, Error> {
         let ctx = Ctx::by_name(algorithm)?;
         let mut key: *mut EVP_PKEY = ptr::null_mut();
-        // Safety: `ctx` is live; `key` receives a new key or stays null.
+        // SAFETY: `ctx` is live; `key` receives a new key or stays null.
         let ok = unsafe {
             openssl_sys::EVP_PKEY_keygen_init(ctx.0) == 1
                 && openssl_sys::EVP_PKEY_generate(ctx.0, &raw mut key) == 1
@@ -311,7 +311,7 @@ impl Pkey {
         let ctx = Ctx::by_name(algorithm)?;
         let mut copy = public.to_vec();
         let mut key: *mut EVP_PKEY = ptr::null_mut();
-        // Safety: the parameter array points at `copy`, live for the call;
+        // SAFETY: the parameter array points at `copy`, live for the call;
         // `key` receives a new key or stays null.
         let ok = unsafe {
             let mut params = [
@@ -339,7 +339,7 @@ impl Pkey {
     /// The public key's encoding: the key share.
     fn public(&self) -> Result<Vec<u8>, Error> {
         let mut len = 0usize;
-        // Safety: a null buffer asks for the length.
+        // SAFETY: a null buffer asks for the length.
         let sized = unsafe {
             openssl_sys::EVP_PKEY_get_octet_string_param(
                 self.0,
@@ -353,7 +353,7 @@ impl Pkey {
             return Err(failed("sizing the public key"));
         }
         let mut out = vec![0u8; len];
-        // Safety: `out` holds `len` bytes.
+        // SAFETY: `out` holds `len` bytes.
         let ok = unsafe {
             openssl_sys::EVP_PKEY_get_octet_string_param(
                 self.0,
@@ -374,7 +374,7 @@ impl Pkey {
     fn encapsulate(&self) -> Result<(Vec<u8>, Vec<u8>), Error> {
         let ctx = Ctx::for_key(self)?;
         let (mut ct_len, mut ss_len) = (0usize, 0usize);
-        // Safety: `ctx` is live; null buffers ask for the lengths.
+        // SAFETY: `ctx` is live; null buffers ask for the lengths.
         let sized = unsafe {
             openssl_sys::EVP_PKEY_encapsulate_init(ctx.0, ptr::null()) == 1
                 && openssl_sys::EVP_PKEY_encapsulate(
@@ -389,7 +389,7 @@ impl Pkey {
             return Err(failed("sizing the encapsulation"));
         }
         let (mut ct, mut ss) = (vec![0u8; ct_len], vec![0u8; ss_len]);
-        // Safety: the buffers hold the lengths OpenSSL gave.
+        // SAFETY: the buffers hold the lengths OpenSSL gave.
         let ok = unsafe {
             openssl_sys::EVP_PKEY_encapsulate(
                 ctx.0,
@@ -411,7 +411,7 @@ impl Pkey {
     fn decapsulate(&self, ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
         let ctx = Ctx::for_key(self)?;
         let mut ss_len = 0usize;
-        // Safety: `ctx` is live; a null buffer asks for the length.
+        // SAFETY: `ctx` is live; a null buffer asks for the length.
         let sized = unsafe {
             openssl_sys::EVP_PKEY_decapsulate_init(ctx.0, ptr::null()) == 1
                 && openssl_sys::EVP_PKEY_decapsulate(
@@ -426,7 +426,7 @@ impl Pkey {
             return Err(failed("sizing the decapsulation"));
         }
         let mut ss = vec![0u8; ss_len];
-        // Safety: `ss` holds the length OpenSSL gave; `ciphertext` is live.
+        // SAFETY: `ss` holds the length OpenSSL gave; `ciphertext` is live.
         let ok = unsafe {
             openssl_sys::EVP_PKEY_decapsulate(
                 ctx.0,

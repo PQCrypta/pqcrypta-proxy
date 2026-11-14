@@ -218,7 +218,7 @@ impl Default for AdvancedRateLimitConfig {
 }
 
 /// Key resolution strategy - waterfall order
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyResolutionStrategy {
     /// Priority order for key resolution (first match wins)
     #[serde(default = "default_key_order")]
@@ -245,6 +245,18 @@ fn default_key_order() -> Vec<RateLimitKeyType> {
 
 fn default_fallback() -> RateLimitKeyType {
     RateLimitKeyType::SourceIp
+}
+
+// The documented waterfall, whether `[advanced_rate_limiting.key_strategy]`
+// is written or not.
+impl Default for KeyResolutionStrategy {
+    fn default() -> Self {
+        Self {
+            order: default_key_order(),
+            fallback: default_fallback(),
+            use_composite: false,
+        }
+    }
 }
 
 /// Types of rate limit keys

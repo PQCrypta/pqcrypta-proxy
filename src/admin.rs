@@ -225,7 +225,9 @@ impl AdminServer {
             allowed_ips: self.config.allowed_ips.clone(),
             auth_token: effective_token,
             hmac_secret: self.config.hmac_secret.clone(),
-            hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(300)),
+            hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(
+                ADMIN_HMAC_WINDOW_SECS,
+            )),
             failed_attempts: Arc::new(DashMap::new()),
             global_failure_count: Arc::new(AtomicU32::new(0)),
             global_cooldown_until: Arc::new(RwLock::new(None)),
@@ -483,6 +485,9 @@ struct EndpointCooldowns {
 
 /// Maximum failed authentication attempts per IP per minute before lockout.
 const ADMIN_AUTH_MAX_FAILURES: u32 = 10;
+/// How far a signed admin request's X-Admin-Timestamp may be from this
+/// server's clock, either way, and how long its nonce is remembered.
+const ADMIN_HMAC_WINDOW_SECS: u64 = 300;
 /// Length of the sliding rate-limit window.
 const ADMIN_AUTH_WINDOW: Duration = Duration::from_mins(1);
 /// AUD-10: Total failures across all IPs before a global cooldown is triggered.
@@ -662,9 +667,9 @@ async fn auth_middleware(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if now_ts.abs_diff(ts_u) > 300 {
+        if now_ts.abs_diff(ts_u) > ADMIN_HMAC_WINDOW_SECS {
             warn!(
-                "Admin API HMAC timestamp out of 300s window from {}",
+                "Admin API HMAC timestamp out of {ADMIN_HMAC_WINDOW_SECS}s window from {}",
                 client_ip
             );
             auth.refused(&client_ip, "request signature timestamp outside its window");
@@ -2281,7 +2286,9 @@ mod auth_tests {
             allowed_ips: Vec::new(),
             auth_token: Some(TOKEN.to_string()),
             hmac_secret: None,
-            hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(300)),
+            hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(
+                ADMIN_HMAC_WINDOW_SECS,
+            )),
             failed_attempts: Arc::new(DashMap::new()),
             global_failure_count: Arc::new(AtomicU32::new(0)),
             global_cooldown_until: Arc::new(RwLock::new(None)),

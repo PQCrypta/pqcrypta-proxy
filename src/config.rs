@@ -133,6 +133,10 @@ pub enum ConfigReloadEvent {
     ReloadFailed(String),
 }
 
+/// The shortest admin token or HMAC signing secret the configuration accepts,
+/// in characters: what `openssl rand -base64 24` prints, 192 bits.
+pub const MIN_SECRET_CHARS: usize = 32;
+
 /// Main proxy configuration structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -577,6 +581,7 @@ pub struct RouteSecurityPolicy {
     /// When set, requests must carry X-Request-Signature and X-Request-Timestamp headers.
     /// Signature = HMAC-SHA256(METHOD + "\n" + PATH + "\n" + TIMESTAMP, secret).
     /// Timestamp must be within 300 seconds of server time (replay protection).
+    /// At least [`MIN_SECRET_CHARS`] characters.
     pub hmac_secret: Option<String>,
 }
 
@@ -650,10 +655,9 @@ impl Default for Http3Config {
             early_hints_enabled: true,
             priority_hints_enabled: true,
             coalescing_enabled: true,
-            preconnect_origins: vec![
-                "https://fonts.googleapis.com".to_string(),
-                "https://fonts.gstatic.com".to_string(),
-            ],
+            // Only the origins an operator names: a site's third-party
+            // origins are its own to list.
+            preconnect_origins: vec![],
             preload_resources: vec![],
             coalescing_max_wait_ms: 100,
             coalescing_max_subscribers: 100,
@@ -1504,11 +1508,22 @@ impl Default for ServerConfig {
 /// or older binary does not know — so a misspelt or invented key used to be
 /// dropped without a word, and the setting the operator thought they had made
 /// silently did not exist. The paths are reported instead.
+///
+/// The file is read over the whole default configuration: a key it leaves out
+/// takes its value from `ProxyConfig::default()` whether or not its table is
+/// written, so every setting has one default, the one
+/// `docs/config-defaults.json` and `docs/CONFIG.md` state.
 pub fn parse_config_str(content: &str) -> Result<(ProxyConfig, Vec<String>), toml::de::Error> {
+    use serde::de::Error as _;
+    // The keys no setting reads are those of the file as written.
     let mut ignored = Vec::new();
-    let config = serde_ignored::deserialize(toml::Deserializer::parse(content)?, |path| {
+    let _: ProxyConfig = serde_ignored::deserialize(toml::Deserializer::parse(content)?, |path| {
         ignored.push(path.to_string());
     })?;
+    let file: toml::Value = toml::from_str(content)?;
+    let defaults = toml::Value::try_from(ProxyConfig::default())
+        .map_err(|e| toml::de::Error::custom(format!("the default configuration: {e}")))?;
+    let config = merge_toml_values(defaults, file).try_into()?;
     Ok((config, ignored))
 }
 
@@ -4702,6 +4717,17 @@ impl ProxyConfig {
 
         // Validate routes reference existing backends or backend_pools (unless they're redirect routes)
         for route in &self.routes {
+            // A route's request-signing key, held to the admin token's floor.
+            if let Some(secret) = route.security.as_ref().and_then(|p| p.hmac_secret.as_ref()) {
+                if secret.len() < MIN_SECRET_CHARS {
+                    return Err(anyhow::anyhow!(
+                        "route {:?}: security.hmac_secret is too short ({} characters): it must be \
+                         at least {MIN_SECRET_CHARS}. Generate one with: openssl rand -base64 48",
+                        route.name.as_deref().unwrap_or(""),
+                        secret.len()
+                    ));
+                }
+            }
             // SEC-09: Validate redirect target to prevent open redirect.
             // Only relative paths (starting with '/') are allowed by default.
             // Absolute URLs pointing to unknown origins are rejected.
@@ -4925,15 +4951,26 @@ impl ProxyConfig {
                 .map_err(|e| anyhow::anyhow!("Invalid admin bind address: {}", e))?;
 
             // SEC-005: Enforce a minimum token length to reject trivially weak tokens.
-            // A token shorter than 32 characters offers insufficient entropy against
+            // A token shorter than MIN_SECRET_CHARS offers insufficient entropy against
             // offline dictionary or brute-force attacks.
             if let Some(ref token) = self.admin.auth_token {
-                if token.len() < 32 {
+                if token.len() < MIN_SECRET_CHARS {
                     return Err(anyhow::anyhow!(
                         "Admin API auth_token is too short ({} characters). \
-                         The token must be at least 32 characters to ensure sufficient entropy. \
+                         The token must be at least {MIN_SECRET_CHARS} characters to ensure sufficient entropy. \
                          Generate a strong token with: openssl rand -base64 48",
                         token.len()
+                    ));
+                }
+            }
+            // The key that signs admin requests, held to the same floor: a short
+            // one is guessed offline from a single signed request.
+            if let Some(ref secret) = self.admin.hmac_secret {
+                if secret.len() < MIN_SECRET_CHARS {
+                    return Err(anyhow::anyhow!(
+                        "admin.hmac_secret is too short ({} characters): it must be at least \
+                         {MIN_SECRET_CHARS}. Generate one with: openssl rand -base64 48",
+                        secret.len()
                     ));
                 }
             }
@@ -5518,6 +5555,31 @@ mod tests {
         );
         let (_, clean) = parse_config_str("[headers]\nhsts = \"x\"\n").unwrap();
         assert!(clean.is_empty(), "{clean:?}");
+    }
+
+    /// Signing secrets are held to the admin token's floor: a secret one
+    /// character short is refused, at the admin API and on a route, and one
+    /// of the full length is not refused for its length.
+    #[test]
+    fn short_signing_secrets_are_refused() {
+        let mut c = ProxyConfig::default();
+        c.admin.enabled = true;
+        c.admin.hmac_secret = Some("s".repeat(MIN_SECRET_CHARS - 1));
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("admin.hmac_secret is too short"), "{err}");
+        c.admin.hmac_secret = Some("s".repeat(MIN_SECRET_CHARS));
+        if let Err(e) = c.validate() {
+            assert!(!e.to_string().contains("hmac_secret"), "{e}");
+        }
+
+        let mut r = route(None, Some("/signed"), None, None, 1);
+        r.security = Some(RouteSecurityPolicy {
+            hmac_secret: Some("s".repeat(MIN_SECRET_CHARS - 1)),
+            ..RouteSecurityPolicy::default()
+        });
+        c.routes.push(r);
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("security.hmac_secret is too short"), "{err}");
     }
 
     #[test]

@@ -210,7 +210,7 @@ pub mod linked {
             return false;
         };
         openssl::init();
-        // Safety: a null library context and property query are the defaults;
+        // SAFETY: a null library context and property query are the defaults;
         // `name` outlives the call, and a fetched algorithm is freed at once.
         let signature = unsafe {
             openssl_sys::EVP_SIGNATURE_fetch(std::ptr::null_mut(), name.as_ptr(), std::ptr::null())
@@ -220,7 +220,7 @@ pub mod linked {
             drop(openssl::error::ErrorStack::get());
             return false;
         }
-        // Safety: fetched above, not used again
+        // SAFETY: fetched above, not used again
         unsafe { openssl_sys::EVP_SIGNATURE_free(signature) };
         true
     }
@@ -931,7 +931,7 @@ pub mod openssl_pqc {
             [(2, "brotli"), (1, "zlib"), (3, "zstd")];
         let mut algs = ALGORITHMS.map(|(code, _)| code);
 
-        // Safety: `ctx` is the live SSL_CTX owned by the builder, and `algs` is a
+        // SAFETY: `ctx` is the live SSL_CTX owned by the builder, and `algs` is a
         // stack array that OpenSSL copies out of (set1_ semantics) before returning.
         let rc = unsafe { SSL_CTX_set1_cert_comp_preference(ctx, algs.as_mut_ptr(), algs.len()) };
         if rc != 1 {
@@ -957,7 +957,7 @@ pub mod openssl_pqc {
         // signatures are close to random and do not shrink. The queue is
         // emptied first, so what is on it afterwards is this call's.
         drop(openssl::error::ErrorStack::get());
-        // Safety: `ctx` is the live SSL_CTX, its certificate already loaded.
+        // SAFETY: `ctx` is the live SSL_CTX, its certificate already loaded.
         let compressed = unsafe { SSL_CTX_compress_certs(ctx, 0) };
         let errors = openssl::error::ErrorStack::get();
 
@@ -968,13 +968,13 @@ pub mod openssl_pqc {
             .filter_map(|&(code, name)| {
                 let mut data: *mut u8 = std::ptr::null_mut();
                 let mut orig_len = 0usize;
-                // Safety: `ctx` is the live SSL_CTX; the out-pointers are locals,
+                // SAFETY: `ctx` is the live SSL_CTX; the out-pointers are locals,
                 // and a buffer OpenSSL allocates into `data` is freed below.
                 let len = unsafe {
                     SSL_CTX_get1_compressed_cert(ctx, code, &raw mut data, &raw mut orig_len)
                 };
                 if !data.is_null() {
-                    // Safety: allocated by OpenSSL for this call, used nowhere else
+                    // SAFETY: allocated by OpenSSL for this call, used nowhere else
                     unsafe { openssl_sys::OPENSSL_free(data.cast()) };
                 }
                 (len > 0).then(|| format!("{name} {orig_len} to {len} bytes"))
@@ -1061,7 +1061,7 @@ pub mod openssl_pqc {
                     recv_max_early_data: u32,
                 ) -> std::os::raw::c_int;
             }
-            // Safety: `builder` owns the live SSL_CTX; the call copies a u32.
+            // SAFETY: `builder` owns the live SSL_CTX; the call copies a u32.
             let ok = unsafe {
                 SSL_CTX_set_recv_max_early_data(builder.as_ptr(), settings.max_early_data)
             };

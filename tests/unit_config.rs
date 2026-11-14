@@ -318,3 +318,122 @@ fn test_masque_empty_allowlist_denies_all() {
     assert!(!masque.is_target_allowed("127.0.0.53", 53));
     assert!(!masque.is_target_allowed("anything", 443));
 }
+
+/// `docs/config-defaults.json` is `ProxyConfig::default()` as the
+/// configuration file spells it: the value every key takes when the file
+/// leaves it out. Documents and pages that quote a default read it there
+/// rather than restating it, so a default changed here changes them too. The
+/// keys are sorted, so the file only moves when a default does.
+///
+/// After changing a default: `PQCRYPTA_WRITE_DEFAULTS=1 cargo test --test
+/// unit_config config_defaults`.
+#[test]
+fn config_defaults_file_is_the_code() {
+    let defaults = serde_json::to_value(ProxyConfig::default()).expect("the defaults serialise");
+    let mut rendered = serde_json::to_string_pretty(&sort_keys(defaults)).expect("JSON");
+    rendered.push('\n');
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/config-defaults.json");
+    if std::env::var_os("PQCRYPTA_WRITE_DEFAULTS").is_some() {
+        std::fs::write(&path, &rendered).expect("write docs/config-defaults.json");
+        return;
+    }
+    // As committed, whatever line endings a checkout gave it.
+    let committed = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
+    if committed != rendered {
+        // The file it should be, where a build that cannot pass the variable
+        // through (a container, CI) can copy it from.
+        let expected =
+            std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("config-defaults.json");
+        std::fs::write(&expected, &rendered).expect("write the expected defaults");
+        panic!(
+            "docs/config-defaults.json is not ProxyConfig::default(): regenerate it with \
+             PQCRYPTA_WRITE_DEFAULTS=1 cargo test --test unit_config config_defaults, \
+             or copy {}",
+            expected.display()
+        );
+    }
+}
+
+fn sort_keys(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let sorted: std::collections::BTreeMap<_, _> =
+                map.into_iter().map(|(k, v)| (k, sort_keys(v))).collect();
+            serde_json::Value::Object(sorted.into_iter().collect())
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(sort_keys).collect())
+        }
+        other => other,
+    }
+}
+
+/// A table present in the file with nothing in it reads as the table left
+/// out: one default per setting, `ProxyConfig::default()`'s.
+#[test]
+fn an_empty_table_reads_as_an_absent_one() {
+    let absent = sort_keys(serde_json::to_value(ProxyConfig::default()).expect("serialise"));
+    let mut headers = Vec::new();
+    collect_tables(&absent, "", &mut headers);
+    let text = headers
+        .iter()
+        .map(|h| format!("[{h}]"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (present, _) = parse_config_str(&text).expect("every table, empty, parses");
+    let present = sort_keys(serde_json::to_value(present).expect("serialise"));
+    let mut differences = Vec::new();
+    diff(&absent, &present, "", &mut differences);
+    assert!(
+        differences.is_empty(),
+        "settings whose default depends on whether their table is written:\n{}",
+        differences.join("\n")
+    );
+}
+
+/// Every table the defaults hold, as `a.b` paths: the objects among them,
+/// except the maps of named entries, which are empty and have no fields.
+fn collect_tables(value: &serde_json::Value, path: &str, out: &mut Vec<String>) {
+    let Some(map) = value.as_object() else { return };
+    for (key, child) in map {
+        let Some(fields) = child.as_object() else {
+            continue;
+        };
+        if fields.is_empty() {
+            continue;
+        }
+        let child_path = if path.is_empty() {
+            key.clone()
+        } else {
+            format!("{path}.{key}")
+        };
+        out.push(child_path.clone());
+        collect_tables(child, &child_path, out);
+    }
+}
+
+fn diff(a: &serde_json::Value, b: &serde_json::Value, path: &str, out: &mut Vec<String>) {
+    match (a.as_object(), b.as_object()) {
+        (Some(x), Some(y)) => {
+            for (key, value) in x {
+                let child = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                diff(
+                    value,
+                    y.get(key).unwrap_or(&serde_json::Value::Null),
+                    &child,
+                    out,
+                );
+            }
+        }
+        _ if a != b => out.push(format!(
+            "{path}: {a} when its table is left out, {b} when it is empty"
+        )),
+        _ => {}
+    }
+}
