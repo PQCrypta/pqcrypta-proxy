@@ -41,6 +41,11 @@ const MAX_TRACKED_IPS: usize = 100_000;
 /// IPv6 network, a new address a request.
 const FULL_SWEEP_GAP: Duration = Duration::from_secs(5);
 
+/// How long after the process starts the connection-rate limit waits before
+/// it counts ([`SecurityState::with_startup_grace`]): long enough for the
+/// listeners to take what queued while it started.
+pub const STARTUP_GRACE: Duration = Duration::from_secs(10);
+
 /// The ceilings of the tables a new address or fingerprint adds to, enforced
 /// where entries are made ([`crate::bounded::Ceiling`]).
 struct Ceilings {
@@ -280,6 +285,9 @@ pub struct SecurityState {
     /// Separate from `ip_connections`, which caps how many connections an IP may
     /// hold at once: this caps how fast it may open them.
     pub connection_rates: Arc<DashMap<IpAddr, ConnectionRateWindow>>,
+    /// Until when the connection-rate limit does not count
+    /// ([`Self::with_startup_grace`]); unset, it always counts
+    pub connection_rate_grace: Arc<std::sync::OnceLock<Instant>>,
     /// JA3 fingerprint cache (fingerprint -> classification), for the
     /// request path; bounded, as a cache is (`max_tracked_fingerprints`)
     pub ja3_cache: Arc<DashMap<String, TlsFingerprint>>,
@@ -857,6 +865,7 @@ impl SecurityState {
                 fingerprints: crate::bounded::Ceiling::new(max_fingerprints, FULL_SWEEP_GAP),
             }),
             connection_rates: Arc::new(DashMap::new()),
+            connection_rate_grace: Arc::new(std::sync::OnceLock::new()),
             blocked_ips: Arc::new(DashMap::new()),
             request_counts: Arc::new(DashMap::new()),
             ja3_cache: Arc::new(DashMap::new()),
@@ -2182,13 +2191,32 @@ impl SecurityState {
     /// connection loading a page with 50 subresources crossed it, and real
     /// visitors were locked out of /encryption/ mid-load. `peer_port: None`
     /// counts every call, as before.
+    /// Hold the connection-rate limit off for `grace` from now.
+    ///
+    /// For the process's start: the connections that queued while it started
+    /// (the service manager holds the listening sockets across a restart,
+    /// crate::inherited) reach it together, so one client's are many in its
+    /// first second. They say nothing about the client, and the limit bans on
+    /// its first offence. The request-rate limits and the per-address
+    /// connection limits apply throughout.
+    #[must_use]
+    pub fn with_startup_grace(self, grace: Duration) -> Self {
+        let _ = self.connection_rate_grace.set(Instant::now() + grace);
+        self
+    }
+
     pub fn connection_rate_exceeded(
         &self,
         ip: IpAddr,
         peer_port: Option<u16>,
         per_second: u32,
     ) -> bool {
-        if per_second == 0 {
+        if per_second == 0
+            || self
+                .connection_rate_grace
+                .get()
+                .is_some_and(|until| Instant::now() < *until)
+        {
             return false;
         }
         let now = Instant::now();
@@ -4058,6 +4086,19 @@ mod tests {
         let (security, ip) = production_rate_limits();
         assert!((0..50).all(|_| !security.connection_rate_exceeded(ip, None, 50)));
         assert!(security.connection_rate_exceeded(ip, None, 50));
+    }
+
+    /// Within the startup grace the connection-rate limit does not count: the
+    /// connections that queued while the process started arrive together
+    #[tokio::test]
+    async fn the_connection_rate_limit_waits_out_the_startup_grace() {
+        let (security, ip) = production_rate_limits();
+        let security = security.with_startup_grace(Duration::from_secs(60));
+        assert!((0..500).all(|_| !security.connection_rate_exceeded(ip, None, 50)));
+        let (counting, ip) = production_rate_limits();
+        let counting = counting.with_startup_grace(Duration::ZERO);
+        assert!((0..50).all(|_| !counting.connection_rate_exceeded(ip, None, 50)));
+        assert!(counting.connection_rate_exceeded(ip, None, 50));
     }
 
     /// Against the real GeoLite2 databases when present (every node has them,
