@@ -5106,6 +5106,9 @@ impl ProxyConfig {
              # takes is reported at startup.\n\
              [Unit]\n\
              Description=PQCrypta Proxy listening sockets\n\
+             # Opened once the host firewall has its rules: firewalls (nftables,\n\
+             # ufw, firewalld) start before network-pre.target\n\
+             After=network-pre.target\n\
              \n\
              [Socket]\n"
         );
@@ -5789,5 +5792,6 @@ mod listen_socket_tests {
         // The sockets outlive a restart of the service: PartOf= would stop the
         // socket unit with it and close them
         assert!(!unit.contains("PartOf="), "{unit}");
+        assert!(unit.contains("After=network-pre.target\n"), "{unit}");
     }
 }
