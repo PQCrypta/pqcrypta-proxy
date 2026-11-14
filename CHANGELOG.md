@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.13.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.12.1...v0.13.0) (2026-11-14)
+
+
+### Features
+
+* listening sockets from the service manager (systemd socket activation), so a restart refuses no connection ([ab86104](https://github.com/PQCrypta/pqcrypta-proxy/commit/ab8610462aee2c8514d8e6ab37ecb6d3332eacb2))
+
+
+### Bug Fixes
+
+* a redirect route joins the rest of the path to its target at a segment boundary ([70a67c6](https://github.com/PQCrypta/pqcrypta-proxy/commit/70a67c63afa9a02addc98c3288122cda2a7645e2))
+* HTTP/3 idle close and header resolution beside the accept loop; ClientHello peek paced by the kernel; peer-driven log lines below warning ([09b33ab](https://github.com/PQCrypta/pqcrypta-proxy/commit/09b33ab32ebe5fc041b11ec12147fcf7ce6050f9))
+* scripts/deploy.sh installs a given binary on each node, validated, with the previous kept and put back on failure ([b691732](https://github.com/PQCrypta/pqcrypta-proxy/commit/b691732afc8e0689dc1b684deed5160bddfd8d5e))
+
 ## [0.12.1](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.12.0...v0.12.1) (2026-11-13)
 
 
