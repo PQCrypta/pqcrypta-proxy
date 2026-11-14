@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.13.1](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.13.0...v0.13.1) (2026-11-14)
+
+
+### Bug Fixes
+
+* the connection-rate limit waits ten seconds after the process starts before it counts ([37bd766](https://github.com/PQCrypta/pqcrypta-proxy/commit/37bd76603f0c1d8acf5dd2761ac55b168b259f1b))
+* the socket unit stands apart from the service, so its sockets outlive a restart ([b28675c](https://github.com/PQCrypta/pqcrypta-proxy/commit/b28675c42ff351bb508e09d7183eb1e426428ff7))
+
 ## [0.13.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.12.1...v0.13.0) (2026-11-14)
 
 
