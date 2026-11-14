@@ -170,6 +170,10 @@ mod libc_codes {
 pub struct Activity {
     in_flight: AtomicUsize,
     idle_since: Mutex<Instant>,
+    /// Whether any exchange has begun on the connection, and the wake-up for
+    /// a wait on the first ([`Activity::first_exchange`])
+    begun: std::sync::atomic::AtomicBool,
+    first: tokio::sync::Notify,
 }
 
 impl Activity {
@@ -177,13 +181,35 @@ impl Activity {
         Arc::new(Self {
             in_flight: AtomicUsize::new(0),
             idle_since: Mutex::new(Instant::now()),
+            begun: std::sync::atomic::AtomicBool::new(false),
+            first: tokio::sync::Notify::new(),
         })
     }
 
     /// One exchange begins; it ends when the returned guard drops.
     pub fn begin(self: &Arc<Self>) -> InFlight {
         self.in_flight.fetch_add(1, Ordering::AcqRel);
+        if !self.begun.swap(true, Ordering::AcqRel) {
+            self.first.notify_waiters();
+        }
         InFlight(Arc::clone(self))
+    }
+
+    /// Whether any exchange has begun on the connection.
+    pub fn has_begun(&self) -> bool {
+        self.begun.load(Ordering::Acquire)
+    }
+
+    /// Resolves once the connection's first exchange has begun.
+    pub async fn first_exchange(&self) {
+        let notified = self.first.notified();
+        tokio::pin!(notified);
+        // Registered before the check, so a begin() between them still wakes it
+        notified.as_mut().enable();
+        if self.has_begun() {
+            return;
+        }
+        notified.await;
     }
 
     /// How long the connection has had nothing in flight; `None` while

@@ -3025,7 +3025,20 @@ where
         };
         tokio::select! {
             result = conn.as_mut() => return result,
-            _ = shutdown.changed() => break,
+            _ = shutdown.changed() => {
+                // A connection that has begun no exchange was opened to send
+                // one: one accepted just before the shutdown, or still in its
+                // handshake, had no chance to. It is given CLOSE_GRACE for its
+                // first request, which is then answered before the close.
+                if !activity.has_begun() {
+                    tokio::select! {
+                        result = conn.as_mut() => return result,
+                        () = activity.first_exchange() => {}
+                        () = tokio::time::sleep(CLOSE_GRACE) => {}
+                    }
+                }
+                break;
+            }
             () = tokio::time::sleep(wait) => {}
             () = crate::memory_pressure::idle_at_relief(&mut relief, activity) => {
                 crate::memory_pressure::connection_shed();
@@ -5264,6 +5277,54 @@ mod connection_lifetime_tests {
         tokio::time::timeout(Duration::from_secs(5), server)
             .await
             .expect("the accept loop stops at shutdown")
+            .unwrap();
+    }
+
+    /// A connection whose first request comes after the shutdown began, within
+    /// the close grace, is answered before it is closed
+    #[tokio::test]
+    async fn the_first_request_of_a_connection_opened_before_shutdown_is_answered() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let (stop, shutdown) = watch::channel(());
+        let activity = crate::conn_limits::Activity::new();
+        let serving = {
+            let activity = activity.clone();
+            tokio::spawn(async move {
+                let marks = activity.clone();
+                let service =
+                    hyper::service::service_fn(move |_req: Request<hyper::body::Incoming>| {
+                        let flight = marks.begin();
+                        async move {
+                            drop(flight);
+                            Ok::<_, Infallible>(Response::new(Body::from("served")))
+                        }
+                    });
+                let idle = Duration::from_secs(600);
+                let _ = serve_until_shutdown(
+                    connection_builder(idle)
+                        .serve_connection_with_upgrades(TokioIo::new(server), service),
+                    shutdown,
+                    &activity,
+                    idle,
+                )
+                .await;
+            })
+        };
+        stop.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        let mut answer = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut answer)).await;
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(answer.ends_with("served"), "{answer}");
+        tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("closed after the answer")
             .unwrap();
     }
 
