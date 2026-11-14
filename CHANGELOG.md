@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.3](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.13.2...v0.13.3) (2026-11-14)
+
+
+### Bug Fixes
+
+* --watch-config can be turned off; the help and module docs describe the proxy plainly ([2d98f8b](https://github.com/PQCrypta/pqcrypta-proxy/commit/2d98f8b29b729494643ea6ae6a1f3aee2752995c))
+
 ## [0.13.2](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.13.1...v0.13.2) (2026-11-14)
 
 
