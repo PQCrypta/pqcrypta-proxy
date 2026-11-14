@@ -744,6 +744,13 @@ struct BackendHealth {
     #[serde(rename = "type")]
     backend_type: String,
     address: String,
+    /// Whether a health check is configured and has been asked; without one
+    /// the backend is reported up, as requests are sent to it.
+    checked: bool,
+    /// The last probe's answer (`HTTP 200`, `connected`) or why it failed.
+    last_check: Option<String>,
+    /// When the last probe ran, in seconds since the Unix epoch.
+    last_check_at: Option<u64>,
 }
 
 /// Health check endpoint (public — no auth required)
@@ -753,8 +760,8 @@ async fn health_handler(State(state): State<Arc<AdminState>>) -> Json<HealthResp
 
     // SR-01: Collect only name + healthy status; omit addresses and types.
     let mut backends = Vec::new();
-    for (name, backend) in &config.backends {
-        let healthy = state.backend_pool.check_health(backend).await;
+    for name in config.backends.keys() {
+        let healthy = state.backend_pool.health().healthy(name);
         backends.push(PublicBackendHealth {
             name: name.clone(),
             healthy,
@@ -787,8 +794,10 @@ async fn metrics_handler(State(state): State<Arc<AdminState>>) -> String {
     output.push_str("\n# HELP pqcrypta_backend_up Backend availability (1=up, 0=down)\n");
     output.push_str("# TYPE pqcrypta_backend_up gauge\n");
 
+    // What the background probes recorded (crate::health): a scrape asks no
+    // backend anything.
     for (name, backend) in &config.backends {
-        let healthy = state.backend_pool.check_health(backend).await;
+        let healthy = state.backend_pool.health().healthy(name);
         let health_val = i32::from(healthy);
         let _ = writeln!(
             output,
@@ -1149,12 +1158,20 @@ async fn backends_handler(State(state): State<Arc<AdminState>>) -> Json<Vec<Back
     let mut backends = Vec::new();
 
     for (name, backend) in &config.backends {
-        let healthy = state.backend_pool.check_health(backend).await;
+        let last = state.backend_pool.health().state(name);
         backends.push(BackendHealth {
             name: name.clone(),
-            healthy,
+            healthy: last.as_ref().is_none_or(|s| s.outcome.is_up()),
             backend_type: format!("{:?}", backend.backend_type),
             address: backend.address.clone(),
+            checked: last.is_some(),
+            last_check: last.as_ref().map(|s| s.outcome.describe()),
+            last_check_at: last.as_ref().and_then(|s| {
+                s.checked_at
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_secs())
+            }),
         });
     }
 

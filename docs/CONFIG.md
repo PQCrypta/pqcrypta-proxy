@@ -756,8 +756,8 @@ Backend pools group multiple servers for load balancing.
 | `affinity_header` | string? | `null` | Header name when `affinity = "header"` |
 | `queue_max_size` | usize? | `null` | Pool-specific queue size (overrides global) |
 | `queue_timeout_ms` | u64? | `null` | Pool-specific queue timeout (overrides global) |
-| `health_check_path` | string? | `null` | Health check endpoint path |
-| `health_check_interval_secs` | u64 | `10` | Health check interval |
+| `health_check_path` | string? | `null` | Path each server is asked, a GET over its own transport, healthy on a 2xx; without one, a server is healthy when it accepts a TCP connection |
+| `health_check_interval_secs` | u64 | `10` | How often each server is asked; a probe has half of it to answer, from 1 to 10 s. A server that fails is out of rotation until it answers again, then ramps up |
 
 ### Pool Servers
 
@@ -801,8 +801,8 @@ Single backend definitions (use backend pools for load balancing).
 | `tls_sni` | string? | `null` | Custom SNI hostname |
 | `timeout_ms` | u64 | `30000` | Connection timeout (30 seconds) |
 | `max_connections` | u32 | `100` | Requests in flight to this backend at once, for the whole process and every transport; a request holds its place until its response body has been sent on, and one that cannot have a place within `connection_pool.acquire_timeout_ms` is refused |
-| `health_check` | string? | `null` | Health check endpoint path |
-| `health_check_interval_secs` | u64 | `30` | Health check interval |
+| `health_check` | string? | `null` | Path this backend is asked in the background, a GET over the transport its requests take, healthy on a 2xx (a `tcp` backend is connected to); the admin API's `/health`, `/backends` and `pqcrypta_backend_up` report the last answer. Without one the backend is reported up |
+| `health_check_interval_secs` | u64 | `30` | How often `health_check` is asked, under whatever configuration is current; a probe has half of it to answer, from 1 to 10 s |
 
 ### TLS Modes Explained
 
