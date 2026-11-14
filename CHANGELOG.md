@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.13.2](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.13.1...v0.13.2) (2026-11-14)
+
+
+### Bug Fixes
+
+* a connection opened just before shutdown has its first request answered ([e6906d9](https://github.com/PQCrypta/pqcrypta-proxy/commit/e6906d97b15400792928c7191b274ff3d84c06fc))
+* the socket unit opens its sockets once the host firewall has its rules ([4d2a746](https://github.com/PQCrypta/pqcrypta-proxy/commit/4d2a74667ec62ca76730877e403a84bd9f19be13))
+
 ## [0.13.1](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.13.0...v0.13.1) (2026-11-14)
 
 
