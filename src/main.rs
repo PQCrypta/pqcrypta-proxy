@@ -536,8 +536,11 @@ async fn run() -> anyhow::Result<()> {
         config.security.geoip_db_path.clone(),
         config.security.geoip_asn_db_path.clone(),
     );
+    // The connection-rate limit waits STARTUP_GRACE before it counts: what
+    // queued while this process started arrives at once (crate::inherited)
     let security_state = pqcrypta_proxy::security::SecurityState::new(&config)
-        .with_audit_logger(audit_logger.clone());
+        .with_audit_logger(audit_logger.clone())
+        .with_startup_grace(pqcrypta_proxy::security::STARTUP_GRACE);
 
     // The connection limits every listener applies (see conn_limits.rs).
     pqcrypta_proxy::conn_limits::configure(

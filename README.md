@@ -2396,6 +2396,12 @@ socket no listener takes is reported at startup, and a listener with no passed
 socket binds its own as before. QUIC connections still end at a restart (their
 state lives in the process); clients open new ones on the same socket.
 
+The connections that queued during a restart reach the new process together,
+so the connection-rate limit (`rate_limiting.connection_rate_limit`) waits ten
+seconds after the process starts before it counts: one client's queued
+connections say nothing about it, and the limit bans on its first offence. The
+request-rate limits and the per-address connection limits apply throughout.
+
 ### macOS (launchd)
 
 ```bash
