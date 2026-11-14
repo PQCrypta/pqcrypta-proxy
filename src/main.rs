@@ -13,9 +13,10 @@
 
 //! `PQCrypta` Proxy - QUIC/HTTP3/WebTransport Proxy with Hybrid PQC TLS
 //!
-//! A production-ready proxy that:
+//! A proxy that:
 //! - Listens for QUIC connections with HTTP/3 and WebTransport support
-//! - Supports hybrid Post-Quantum Cryptography (PQC) key exchange via OpenSSL 3.5 + OQS
+//! - Supports hybrid Post-Quantum Cryptography (PQC) key exchange via the OpenSSL it links
+//!   (3.5 or later), with the OQS provider's groups where it is loaded
 //! - Routes WebTransport streams and datagrams to HTTP/1.1, HTTP/2, HTTP/3, or Unix socket backends
 //! - Provides hot-reload of configuration and TLS certificates
 //! - Exposes admin API for health, metrics, and management
@@ -104,8 +105,16 @@ struct Args {
     #[arg(long)]
     no_pqc: bool,
 
-    /// Enable configuration file watching for hot-reload
-    #[arg(long, default_value = "true")]
+    /// Watch the configuration file and reload it when it changes (on unless
+    /// `--watch-config=false`)
+    #[arg(
+        long,
+        env = "PQCRYPTA_WATCH_CONFIG",
+        num_args = 0..=1,
+        default_value_t = true,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set
+    )]
     watch_config: bool,
 
     /// Environment name for per-env config overlay.

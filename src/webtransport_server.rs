@@ -1,4 +1,4 @@
-//! Production WebTransport Server with proper ALPN negotiation
+//! The dedicated WebTransport server, on `webtransport_port`, with ALPN negotiation
 //!
 //! Uses the wtransport crate for full WebTransport protocol support including:
 //! - Automatic ALPN "h3" configuration

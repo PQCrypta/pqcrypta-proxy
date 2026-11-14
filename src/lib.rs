@@ -113,7 +113,7 @@
 
 //! `PQCrypta` Proxy - QUIC/HTTP3/WebTransport Proxy with Hybrid PQC TLS
 //!
-//! A production-ready proxy that:
+//! A proxy that:
 //! - Listens for QUIC connections with HTTP/3 and WebTransport support
 //! - Supports hybrid Post-Quantum Cryptography (PQC) key exchange
 //! - Routes WebTransport streams and datagrams to various backend types
