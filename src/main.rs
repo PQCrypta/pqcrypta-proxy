@@ -225,23 +225,34 @@ mod alloc_counter {
 
     pub struct Counting(pub mimalloc::MiMalloc);
 
+    // SAFETY: every method hands its arguments, unchanged, to MiMalloc's own
+    // GlobalAlloc implementation and returns what it returns, so the
+    // contract GlobalAlloc requires is MiMalloc's; the counters are atomics
+    // that allocate nothing, so no method re-enters the allocator.
     unsafe impl GlobalAlloc for Counting {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
             BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            // SAFETY: the caller upholds GlobalAlloc::alloc's contract for
+            // `layout`, which is the one MiMalloc::alloc has.
             unsafe { self.0.alloc(layout) }
         }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: `ptr` came from this allocator with `layout`, so from
+            // MiMalloc, which every method here delegates to.
             unsafe { self.0.dealloc(ptr, layout) }
         }
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
             BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
+            // SAFETY: as for `dealloc`; `new_size` meets realloc's contract
+            // because the caller's does.
             unsafe { self.0.realloc(ptr, layout, new_size) }
         }
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
             BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            // SAFETY: as for `alloc`.
             unsafe { self.0.alloc_zeroed(layout) }
         }
     }

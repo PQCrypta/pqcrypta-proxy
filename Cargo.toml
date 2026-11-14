@@ -323,12 +323,15 @@ h3 = { path = "vendor/h3" }
 # crates.io `quinn` any more.
 
 [lints.rust]
-# F-12: Enforce unsafe_code = deny globally. The pqc_tls.rs module carries
-# a targeted #![allow(unsafe_code)] for its OpenSSL FFI bindings; all other
-# modules must not introduce unsafe blocks without explicit justification.
+# unsafe is denied crate-wide. The modules at a C or kernel boundary allow it
+# for themselves (#![allow(unsafe_code)], or #[allow] on the one item), and
+# clippy's undocumented_unsafe_blocks below makes every unsafe block and impl
+# state why it is sound in a SAFETY comment.
 unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
 
 [lints.clippy]
-all = "warn"
-pedantic = "warn"
-nursery = "warn"
+undocumented_unsafe_blocks = "deny"
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }

@@ -2,8 +2,10 @@
 
 Complete reference for all configuration options in PQCrypta Proxy.
 
-**Version**: 0.1.0
-**Last Updated**: 2026-01-24
+Every default stated here is the code's: `tests/docs.rs` holds each one to
+[`config-defaults.json`](config-defaults.json), which a test holds equal to
+`ProxyConfig::default()`, so a default that changes in the code fails the
+build until this reference says so too.
 
 ---
 
@@ -215,7 +217,6 @@ as_type = "style"
 | `key_path` | path | `"/etc/pqcrypta/key.pem"` | Path to TLS private key (PEM format) |
 | `ca_cert_path` | path? | `null` | The CA that issues client certificates (mTLS). Required whenever a listener asks for one (`require_client_cert`, a route with `mtls_required` or `internal`): client certificates are verified against it and nothing else |
 | `require_client_cert` | bool | `false` | Require client certificates (mTLS mode) |
-| `alpn_protocols` | array[string] | `["h3", "webtransport"]` | ALPN protocols to advertise |
 | `min_version` | string | `"1.3"` | Minimum TLS version. Options: `"1.2"`, `"1.3"` |
 | `ocsp_stapling` | bool | `true` | Staple verified OCSP responses (with `[ocsp].enabled`); see the README's OCSP section |
 | `cert_reload_interval_secs` | u64 | `3600` | How often the certificates and ECH configs on disk are checked for a change (0 = disabled). A change is a file created, replaced, removed or written in place. A pair is served once its key is the certificate's key; a domain whose files do not load keeps the certificate it is serving |
@@ -282,7 +283,7 @@ All responses automatically include these security headers. The `Server` header 
 | `fallback_to_classical` | bool | `true` | Offer the classical groups (P-384, P-256, X25519, one tuple, on every listener) alongside the hybrid PQC groups, so a client without ML-KEM can connect; never under `require_hybrid`. What happens when PQC itself is unavailable is `require_pqc_provider` |
 | `require_pqc_provider` | bool | `true` | Refuse to start when `enabled` is true but the PQC provider cannot be used, instead of degrading to a classical-only listener |
 | `min_security_level` | u8 | `3` | Minimum NIST security level (1-5) |
-| `additional_kems` | array[string] | `[]` | Additional KEMs to enable |
+| `additional_kems` | array[string] | `["SecP256r1MLKEM768", "SecP384r1MLKEM1024"]` | Additional KEMs to enable |
 | `experimental_groups` | array[string] | `[]` | Provider groups with no IANA codepoint (OQS: `frodo976shake`, `p384_frodo976shake`, ...), offered over TCP and QUIC after standard ML-KEM and before the classical fallback; hybrids only under `require_hybrid`, on both |
 | `enable_signatures` | bool | `true` | Serve ML-DSA-87 (FIPS 204) certificate keys with the PQDSA signer (scheme 0x0906); false refuses such keys, so a host configured with one stops serving rather than falling back. Needs the `pqc-signatures` build feature |
 | `downgrade_action` | string | `"log"` | What a connection whose key exchange is classical gets while `enabled` is true: `"allow"` (served), `"log"` (served, recorded in the audit log), `"block"` (every request on it answered 421). Any other value is refused at load |
@@ -328,7 +329,8 @@ All responses automatically include these security headers. The `Server` header 
 | `require_loopback` | bool | `true` | Refuse to start when `bind_address` is not loopback (the API is plain HTTP without `require_mtls`) |
 | `require_mtls` | bool | `false` | TLS with client certificates: the certificate is the credential (a configured `auth_token` is still checked) |
 | `client_ca_path` | path? | `null` | CA that admin client certificates must chain to (`require_mtls`) |
-| `tls_cert_path` / `tls_key_path` | path? | `null` | The admin listener's certificate and key under `require_mtls`; default to `[tls]`'s |
+| `tls_cert_path` | path? | `null` | The admin listener's certificate under `require_mtls`; defaults to `[tls]`'s |
+| `tls_key_path` | path? | `null` | The admin listener's key under `require_mtls`; defaults to `[tls]`'s |
 | `auth_token` | string? | `null` | Bearer token, at least 32 characters. Unset (and no mTLS): a 48-character token is generated at each start and printed to standard error |
 | `allowed_ips` | array[string] | `["127.0.0.1", "::1"]` | Addresses that may reach the API at all (a filter, not authentication); one that is not loopback-only needs `auth_token` |
 | `hmac_secret` | string? | `null` | Per-request proof of possession: `X-Admin-Signature` (HMAC-SHA256 of method, path and query, timestamp, nonce) with `X-Admin-Timestamp` (±300 s) and `X-Admin-Nonce` (each accepted once) |
@@ -372,7 +374,7 @@ Simple per-IP rate limiting. For advanced features, use `[advanced_rate_limiting
 | `requests_per_second` | u32 | `100` | Requests per second per IP |
 | `burst_size` | u32 | `50` | Burst size for token bucket |
 | `connection_rate_limit` | bool | `true` | Enable connection rate limiting |
-| `connections_per_second` | u32 | `10` | New connections per second per IP |
+| `connections_per_second` | u32 | `50` | New connections per second per IP |
 
 ---
 
@@ -586,7 +588,7 @@ ML-inspired anomaly detection that learns normal traffic patterns.
 | `error_rate_threshold` | f64 | `0.7` | Error rate threshold (70%) to trigger suspicious |
 | `error_window_secs` | u64 | `60` | Error tracking sliding window (1 minute) |
 | `pentest_bypass_ips` | array[string] | `[]` | Authorised test sources: inspected by the WAF but never rate-limited or auto-banned. An entry is an address or a host name standing for the addresses it resolves to |
-| `host_resolver` | socket address? | none | A validating resolver, reached over TCP, for the host names in `pentest_bypass_ips`. Only an answer it authenticates (AD bit) counts, refreshed every minute; without one, a name matches nothing |
+| `host_resolver` | socket address? | `null` | A validating resolver, reached over TCP, for the host names in `pentest_bypass_ips`. Only an answer it authenticates (AD bit) counts, refreshed every minute; without one, a name matches nothing |
 
 ---
 

@@ -153,3 +153,192 @@ fn the_module_tree_names_every_module() {
         "modules the README's tree leaves out: {missing:?}; in the tree but not in src/: {gone:?}"
     );
 }
+
+/// One entry of each list and map the configuration holds, with only the
+/// fields that have no default: what a file that names nothing else gets.
+const ENTRIES: &str = r#"
+[backends.doh]
+name = "doh"
+type = "http1"
+address = "127.0.0.1:1"
+
+[backend_pools.pool]
+name = "pool"
+[[backend_pools.pool.servers]]
+address = "127.0.0.1:1"
+
+[[routes]]
+[routes.security]
+[routes.cors]
+
+[[passthrough_routes]]
+sni = "passthrough.example"
+backend = "127.0.0.1:1"
+
+[advanced_rate_limiting.route_limits.route]
+pattern = "/"
+
+[[advanced_rate_limiting.composite_keys]]
+name = "composite"
+keys = ["source_ip"]
+[advanced_rate_limiting.composite_keys.limits]
+"#;
+
+/// The table a TOML header line names: `[a.b]` or `[[a.b]]`.
+fn toml_header(line: &str) -> Option<String> {
+    let inner = line.strip_prefix('[')?.strip_suffix(']')?;
+    let inner = inner
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(inner);
+    inner
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        .then(|| inner.to_string())
+}
+
+/// The serialised table a documented section names. A list's entry is its
+/// first; a name in capitals (`POOL_NAME`) stands for any entry of a map.
+fn resolve<'a>(config: &'a serde_json::Value, section: &str) -> Option<&'a serde_json::Value> {
+    let mut node = config;
+    for part in section.split('.') {
+        if let Some(first) = node.as_array().and_then(|a| a.first()) {
+            node = first;
+        }
+        let map = node.as_object()?;
+        node = if part.chars().all(|c| c.is_ascii_uppercase() || c == '_') {
+            map.values().next()?
+        } else {
+            map.get(part)?
+        };
+    }
+    if let Some(first) = node.as_array().and_then(|a| a.first()) {
+        node = first;
+    }
+    node.is_object().then_some(node)
+}
+
+/// A documented default as a value: a TOML literal, or `null` for none.
+fn stated_value(text: &str) -> Option<serde_json::Value> {
+    let literal = text.strip_prefix('`')?.strip_suffix('`')?;
+    if literal == "null" {
+        return Some(serde_json::Value::Null);
+    }
+    let table: toml::Table = toml::from_str(&format!("v = {literal}")).ok()?;
+    serde_json::to_value(table.get("v")?).ok()
+}
+
+/// Equal as configuration values: numbers by value, so `3` documents `3.0`.
+fn same(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    match (a, b) {
+        (serde_json::Value::Number(x), serde_json::Value::Number(y)) => x.as_f64() == y.as_f64(),
+        (serde_json::Value::Array(x), serde_json::Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| same(p, q))
+        }
+        _ => a == b,
+    }
+}
+
+/// Every default docs/CONFIG.md states is the code's. A row of a table with
+/// a Default column belongs to the TOML table its section's example names;
+/// its key must be a setting of that table, and its default the value the
+/// code gives a file that leaves the key out, for the top-level tables and
+/// for an entry of each list and map alike.
+#[test]
+fn the_config_reference_states_the_code_defaults() {
+    let (config, _) =
+        pqcrypta_proxy::config::parse_config_str(ENTRIES).expect("one entry of each kind parses");
+    let code = serde_json::to_value(&config).expect("the configuration serialises");
+    let doc = read("docs/CONFIG.md");
+    // The table a `##` section's example names, which its `###` subsections
+    // share unless their own example names another.
+    let mut section_table: Option<String> = None;
+    let mut in_subsection = false;
+    let mut table: Option<String> = None;
+    let mut fence: Option<bool> = None; // inside a fenced block; true for TOML
+    let mut default_column = false;
+    let mut checked = 0;
+    let mut wrong = Vec::new();
+    for line in doc.lines() {
+        let line = line.trim();
+        if let Some(info) = line.strip_prefix("```") {
+            fence = if fence.is_some() {
+                None
+            } else {
+                Some(info == "toml")
+            };
+            continue;
+        }
+        match fence {
+            Some(true) => {
+                if let Some(name) = toml_header(line) {
+                    if !in_subsection {
+                        section_table = Some(name.clone());
+                    }
+                    table = Some(name);
+                }
+                continue;
+            }
+            Some(false) => continue,
+            None => {}
+        }
+        if line.starts_with("## ") {
+            section_table = None;
+            in_subsection = false;
+            table = None;
+            default_column = false;
+            continue;
+        }
+        if line.starts_with("### ") {
+            in_subsection = true;
+            table.clone_from(&section_table);
+            default_column = false;
+            continue;
+        }
+        let Some(row) = line.strip_prefix('|').and_then(|r| r.strip_suffix('|')) else {
+            continue;
+        };
+        let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+        if cells.first() == Some(&"Option") {
+            default_column = cells.get(2) == Some(&"Default");
+            continue;
+        }
+        let Some(key) = cells
+            .first()
+            .and_then(|c| c.strip_prefix('`'))
+            .and_then(|c| c.strip_suffix('`'))
+        else {
+            continue;
+        };
+        if !default_column {
+            continue;
+        }
+        let Some(section) = &table else {
+            wrong.push(format!("`{key}`: no TOML example above it names its table"));
+            continue;
+        };
+        let Some(actual) = resolve(&code, section).and_then(|t| t.get(key)) else {
+            wrong.push(format!("[{section}] {key}: not a setting of that table"));
+            continue;
+        };
+        checked += 1;
+        let stated = cells.get(2).copied().unwrap_or_default();
+        if stated == "required" {
+            continue;
+        }
+        match stated_value(stated) {
+            Some(value) if same(&value, actual) => {}
+            Some(_) => wrong.push(format!(
+                "[{section}] {key}: documented {stated}, the code's default is {actual}"
+            )),
+            None => wrong.push(format!(
+                "[{section}] {key}: the default {stated} is not a TOML value or `null`"
+            )),
+        }
+    }
+    assert!(
+        checked > 150,
+        "only {checked} documented defaults were found to check"
+    );
+    assert!(wrong.is_empty(), "docs/CONFIG.md:\n{}", wrong.join("\n"));
+}

@@ -923,7 +923,7 @@ mod tests {
             assert!(done.is_done(), "what follows the handshake is not early");
         });
         let mut ssl = connector.configure().unwrap().into_ssl(NAME).unwrap();
-        // Safety: the session came from a connection on the same context.
+        // SAFETY: the session came from a connection on the same context.
         unsafe { ssl.set_session(&session).unwrap() };
         let mut cli = SslStream::new(ssl, client_io).unwrap();
         let n = Pin::new(&mut cli)
@@ -938,7 +938,7 @@ mod tests {
             fn SSL_get_early_data_status(ssl: *const openssl_sys::SSL) -> std::os::raw::c_int;
         }
         use foreign_types::ForeignTypeRef;
-        // Safety: a live SSL owned by `cli`.
+        // SAFETY: a live SSL owned by `cli`.
         let status = unsafe { SSL_get_early_data_status(cli.ssl().as_ptr()) };
         assert!(cli.ssl().session_reused(), "the ticket was not resumed");
         assert_eq!(status, 2, "early data status {status} (1 = rejected)");

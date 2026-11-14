@@ -1,0 +1,578 @@
+{
+  "acme": {
+    "accept_tos": true,
+    "account_path": "/etc/pqcrypta/acme/account.json",
+    "certificate_transparency": true,
+    "certs_path": "/etc/pqcrypta/certs",
+    "challenge_type": "http-01",
+    "check_interval_hours": 12,
+    "ct_log_list": "https://www.gstatic.com/ct/log_list/v3/log_list.json",
+    "ct_logs": [],
+    "directory_url": "https://acme-v02.api.letsencrypt.org/directory",
+    "dns_update": null,
+    "domains": [],
+    "eab_hmac_key": null,
+    "eab_kid": null,
+    "ecdsa_curve": "P-384",
+    "email": null,
+    "enabled": false,
+    "http_port": 80,
+    "ip_addresses": {},
+    "ip_profile": "shortlived",
+    "key_size": 2048,
+    "renewal_days": 30,
+    "staging": false,
+    "use_ecdsa": false
+  },
+  "admin": {
+    "allowed_ips": [
+      "127.0.0.1",
+      "::1"
+    ],
+    "auth_token": null,
+    "bind_address": "127.0.0.1",
+    "client_ca_path": null,
+    "enabled": false,
+    "hmac_secret": null,
+    "port": 8081,
+    "require_loopback": true,
+    "require_mtls": false,
+    "tls_cert_path": null,
+    "tls_key_path": null
+  },
+  "advanced_rate_limiting": {
+    "adaptive": {
+      "auto_adjust": false,
+      "baseline_window_secs": 3600,
+      "enabled": false,
+      "min_samples": 1000,
+      "sensitivity": 0.7,
+      "std_dev_multiplier": 3.0
+    },
+    "composite_keys": [],
+    "enabled": true,
+    "fingerprint_limiting": {
+      "blocked_fingerprints": [],
+      "enabled": true,
+      "prefer_over_ip": false,
+      "trusted_fingerprints": {},
+      "unknown_limits": {
+        "burst_size": 25,
+        "requests_per_hour": 25000,
+        "requests_per_minute": 1500,
+        "requests_per_second": 50
+      }
+    },
+    "global_limits": {
+      "burst_size": 50000,
+      "per_api_key": {
+        "burst_size": 250,
+        "requests_per_hour": 250000,
+        "requests_per_minute": 15000,
+        "requests_per_second": 500
+      },
+      "per_composite": {
+        "burst_size": 100,
+        "requests_per_hour": 100000,
+        "requests_per_minute": 6000,
+        "requests_per_second": 200
+      },
+      "per_fingerprint": {
+        "burst_size": 50,
+        "requests_per_hour": 50000,
+        "requests_per_minute": 3000,
+        "requests_per_second": 100
+      },
+      "per_ip": {
+        "burst_size": 500,
+        "requests_per_hour": 500000,
+        "requests_per_minute": 30000,
+        "requests_per_second": 1000
+      },
+      "per_jwt_subject": {
+        "burst_size": 500,
+        "requests_per_hour": 500000,
+        "requests_per_minute": 30000,
+        "requests_per_second": 1000
+      },
+      "requests_per_second": 100000
+    },
+    "headers": {
+      "api_key": "X-API-Key",
+      "real_ip": "X-Real-IP",
+      "tenant_id": "X-Tenant-ID",
+      "user_id": "X-User-ID"
+    },
+    "ipv6_subnet_bits": 64,
+    "jwt_algorithms": [
+      "HS256"
+    ],
+    "jwt_secret": null,
+    "key_strategy": {
+      "fallback": "source_ip",
+      "order": [
+        "api_key",
+        "jwt_subject",
+        "ja3_fingerprint",
+        "real_ip",
+        "source_ip"
+      ],
+      "use_composite": false
+    },
+    "redis": null,
+    "route_limits": {},
+    "trusted_proxies": [
+      "10.0.0.0/8",
+      "172.16.0.0/12",
+      "192.168.0.0/16",
+      "127.0.0.1"
+    ]
+  },
+  "backend_pools": {},
+  "backends": {},
+  "cache": {
+    "default_ttl_secs": 60,
+    "enabled": false,
+    "excluded_hosts": [],
+    "excluded_paths": [
+      "/api/",
+      "/ws",
+      "/stream",
+      "/auth",
+      "/admin"
+    ],
+    "max_body_size_bytes": 2097152,
+    "max_size_mb": 128,
+    "no_cache_set_cookie": true
+  },
+  "circuit_breaker": {
+    "enabled": true,
+    "failure_threshold": 5,
+    "half_open_delay_secs": 30,
+    "half_open_max_requests": 3,
+    "stale_counter_cleanup_secs": 300,
+    "success_threshold": 2
+  },
+  "compression": {
+    "brotli_quality": 4,
+    "compress_types": [
+      "text/html",
+      "text/css",
+      "text/javascript",
+      "text/plain",
+      "text/xml",
+      "application/javascript",
+      "application/json",
+      "application/xml",
+      "application/xhtml+xml",
+      "application/rss+xml",
+      "application/atom+xml",
+      "image/svg+xml",
+      "font/ttf",
+      "font/otf",
+      "application/wasm"
+    ],
+    "enabled": true,
+    "gzip_level": 6,
+    "min_size": 1024,
+    "zstd_level": 3
+  },
+  "conformance": {
+    "enabled": false,
+    "host": "conformance.pqcrypta.com",
+    "liveness_timeout_ms": 5000,
+    "max_sessions": 512,
+    "port_range": [
+      4460,
+      4600
+    ],
+    "pq_chain_cert": "/etc/pqcrypta/pqc-certs/conformance/fullchain.pem",
+    "pq_chain_key": "/etc/pqcrypta/pqc-certs/conformance/server.key",
+    "session_ttl_secs": 3600
+  },
+  "connection_pool": {
+    "acquire_timeout_ms": 5000,
+    "idle_timeout_secs": 90,
+    "max_connections_per_host": 100,
+    "max_idle_per_host": 10
+  },
+  "doh": {
+    "enabled": false,
+    "listen": "127.0.0.1:8053",
+    "path": "/dns-query",
+    "timeout_ms": 3000,
+    "upstream": "127.0.0.1:53"
+  },
+  "doq": {
+    "enabled": false,
+    "timeout_ms": 3000,
+    "upstream": "127.0.0.1:53"
+  },
+  "fingerprint": {
+    "add_response_headers": false,
+    "block_malicious": true,
+    "block_scanners": false,
+    "cache_max_age_secs": 3600,
+    "drift_action": "log",
+    "drift_detection": true,
+    "drift_min_connections": 12,
+    "drift_threshold": 0.7,
+    "drift_window_secs": 300,
+    "enabled": true,
+    "fingerprint_db_path": "/var/lib/pqcrypta-proxy/fingerprints/ja3.json",
+    "malicious_block_duration_secs": 3600,
+    "observed_path": "/var/lib/pqcrypta-proxy/state/observed.json",
+    "replay_action": "log",
+    "replay_detection": true,
+    "replay_min_networks": 50,
+    "replay_window_secs": 60,
+    "suspicious_block_duration_secs": 300,
+    "suspicious_rate_threshold": 100,
+    "suspicious_rate_window_secs": 60,
+    "tls_layer_capture": false
+  },
+  "headers": {
+    "accept_ch": "",
+    "addin_csp": "",
+    "addin_hosts": [],
+    "addin_path_prefix": "",
+    "content_security_policy": "default-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+    "cross_origin_embedder_policy": "require-corp",
+    "cross_origin_opener_policy": "same-origin",
+    "cross_origin_resource_policy": "same-origin",
+    "hsts": "max-age=63072000; includeSubDomains; preload",
+    "nel": "",
+    "permissions_policy": "camera=(), microphone=(), geolocation=(), fullscreen=(self), payment=()",
+    "priority": "",
+    "referrer_policy": "strict-origin-when-cross-origin",
+    "report_to": "",
+    "server_timing_desc": "PQ Crypta Processing",
+    "server_timing_enabled": true,
+    "x_content_type_options": "nosniff",
+    "x_dns_prefetch_control": "off",
+    "x_download_options": "noopen",
+    "x_frame_options": "DENY",
+    "x_permitted_cross_domain_policies": "none",
+    "x_quantum_resistant": "ML-KEM-1024, ML-DSA-87, X25519MLKEM768",
+    "x_security_level": "Post-Quantum Ready"
+  },
+  "http3": {
+    "coalescing_enabled": true,
+    "coalescing_exclude_paths": [
+      "/api/",
+      "/ws",
+      "/stream"
+    ],
+    "coalescing_max_subscribers": 100,
+    "coalescing_max_wait_ms": 100,
+    "coalescing_methods": [
+      "GET",
+      "HEAD"
+    ],
+    "early_hints_enabled": true,
+    "preconnect_origins": [],
+    "preload_resources": [],
+    "priority_hints_enabled": true
+  },
+  "http_redirect": {
+    "allowed_domains": [],
+    "enabled": true,
+    "port": 80,
+    "redirect_status": 308,
+    "redirect_to_https": true
+  },
+  "load_balancer": {
+    "connection_draining": {
+      "enabled": true,
+      "timeout_secs": 30
+    },
+    "default_algorithm": "least_connections",
+    "enabled": true,
+    "queue": {
+      "enabled": true,
+      "max_size": 1000,
+      "timeout_ms": 5000
+    },
+    "session_affinity": {
+      "cookie_httponly": true,
+      "cookie_name": "PQCPROXY_BACKEND",
+      "cookie_samesite": "lax",
+      "cookie_secure": true,
+      "cookie_ttl_secs": 3600,
+      "enabled": false
+    },
+    "slow_start": {
+      "duration_secs": 30,
+      "enabled": true,
+      "initial_weight_percent": 10
+    }
+  },
+  "logging": {
+    "access_log": true,
+    "access_log_file": null,
+    "access_log_format": "combined",
+    "audit_log_enabled": true,
+    "audit_log_path": null,
+    "file": null,
+    "format": "json",
+    "level": "info",
+    "max_age_days": 7,
+    "max_backups": 3,
+    "max_size_mb": 50
+  },
+  "masque": {
+    "allowed_clients": [],
+    "allowed_targets": [],
+    "enabled": false,
+    "max_sessions_per_connection": 8,
+    "private_target_clients": [],
+    "session_idle_timeout_secs": 60
+  },
+  "ocsp": {
+    "cache_duration_secs": 3600,
+    "enabled": false,
+    "max_retries": 3,
+    "refresh_before_expiry_secs": 300,
+    "retry_delay_ms": 1000,
+    "timeout_secs": 10
+  },
+  "otel": {
+    "enabled": false,
+    "otlp_endpoint": "http://localhost:4318",
+    "resource_attributes": {},
+    "sample_ratio": 1.0,
+    "service_name": "pqcrypta-proxy",
+    "trusted_parents": []
+  },
+  "passthrough_routes": [],
+  "pqc": {
+    "additional_kems": [
+      "SecP256r1MLKEM768",
+      "SecP384r1MLKEM1024"
+    ],
+    "check_key_permissions": true,
+    "downgrade_action": "log",
+    "enable_signatures": true,
+    "enabled": true,
+    "experimental_groups": [],
+    "fallback_to_classical": true,
+    "log_downgrades": true,
+    "min_security_level": 3,
+    "preferred_kem": "X25519MLKEM768",
+    "provider": "auto",
+    "require_hybrid": false,
+    "require_pqc_provider": true,
+    "required": false,
+    "strict_key_permissions": false,
+    "verify_provider": true
+  },
+  "rate_limiting": {
+    "burst_size": 50,
+    "connection_rate_limit": true,
+    "connections_per_second": 50,
+    "enabled": true,
+    "requests_per_second": 100
+  },
+  "routes": [],
+  "security": {
+    "allow_internal_backends": false,
+    "allowed_countries": [],
+    "allowed_ips": [],
+    "auto_block_duration_secs": 300,
+    "auto_block_threshold": 10,
+    "block_tor_exit_nodes": false,
+    "blocked_asns": [],
+    "blocked_countries": [],
+    "blocked_ips": [],
+    "blocked_regions": [],
+    "blocklist_dir": "/var/lib/pqcrypta-proxy/blocklists",
+    "connection_timeout_secs": 30,
+    "crawler_published_ranges": true,
+    "dos_protection": true,
+    "error_4xx_threshold": 100,
+    "error_pages_path_prefix": "",
+    "error_rate_threshold": 0.7,
+    "error_window_secs": 60,
+    "geo_block_redirect_url": "",
+    "geoip_asn_db_path": "/var/lib/pqcrypta-proxy/geoip/GeoLite2-ASN.mmdb",
+    "geoip_block_duration_secs": 86400,
+    "geoip_db_path": "/var/lib/pqcrypta-proxy/geoip/GeoLite2-City.mmdb",
+    "host_resolver": null,
+    "max_buffered_body_bytes": 0,
+    "max_connections_per_ip": 100,
+    "max_header_size": 65536,
+    "max_request_size": 10485760,
+    "max_tracked_fingerprints": 250000,
+    "min_requests_for_error_check": 200,
+    "pentest_bypass_ips": [],
+    "refusal_cors_origins": [],
+    "tor_exit_list_url": "https://check.torproject.org/torbulkexitlist",
+    "tor_exit_refresh_secs": 3600,
+    "trusted_internal_cidrs": [],
+    "validation": {
+      "allowed_methods": [],
+      "enabled": true,
+      "max_header_name_length": 256,
+      "max_header_value_length": 16384,
+      "max_headers_count": 200,
+      "max_uri_length": 16384,
+      "reject_null_bytes": true
+    },
+    "zero_trust_mode": false
+  },
+  "server": {
+    "ack_eliciting_threshold": 1,
+    "ack_piggyback": true,
+    "additional_ports": [
+      4433,
+      4434
+    ],
+    "alt_svc_clear_cidrs": [
+      "173.245.48.0/20",
+      "103.21.244.0/22",
+      "103.22.200.0/22",
+      "103.31.4.0/22",
+      "141.101.64.0/18",
+      "108.162.192.0/18",
+      "190.93.240.0/20",
+      "188.114.96.0/20",
+      "197.234.240.0/22",
+      "198.41.128.0/17",
+      "162.158.0.0/15",
+      "104.16.0.0/13",
+      "104.24.0.0/14",
+      "172.64.0.0/13",
+      "131.0.72.0/22",
+      "2400:cb00::/32",
+      "2606:4700::/32",
+      "2803:f800::/32",
+      "2405:b500::/32",
+      "2405:8100::/32",
+      "2a06:98c0::/29",
+      "2c0f:f248::/32"
+    ],
+    "alt_svc_clear_user_agents": [
+      "googlebot",
+      "adsbot-google",
+      "google-inspectiontool",
+      "googleother",
+      "bingbot",
+      "msnbot",
+      "yandexbot",
+      "baiduspider",
+      "duckduckbot",
+      "slurp",
+      "applebot",
+      "semrushbot",
+      "ahrefsbot",
+      "dotbot",
+      "sogou",
+      "exabot",
+      "facebot",
+      "ia_archiver",
+      "ssllabs",
+      "qualys",
+      "ssl-pulse"
+    ],
+    "alt_svc_max_age_secs": 86400,
+    "alt_svc_ports": null,
+    "bind_address": "0.0.0.0",
+    "enable_ack_frequency": true,
+    "enable_ipv6": true,
+    "enable_quic_migration": true,
+    "enable_quic_retry": false,
+    "graceful_shutdown_timeout_secs": 30,
+    "http11_only_hosts": [],
+    "keepalive_interval_secs": 15,
+    "max_concurrent_multipath_paths": 4,
+    "max_connections": 10000,
+    "max_idle_timeout_secs": 120,
+    "max_request_body_bytes": null,
+    "max_streams_per_connection": 1000,
+    "max_uni_streams_per_connection": 100,
+    "merge_slashes": true,
+    "normalize_paths": true,
+    "proxy_protocol_timeout_ms": 3000,
+    "proxy_protocol_trusted": [],
+    "quic_congestion_control": "bbr3",
+    "quic_send_coalescing": true,
+    "request_id_header": "",
+    "resolve_dot_segments": true,
+    "server_header": "pqcrypta",
+    "tcp_nodelay": true,
+    "tcp_only_hosts": [],
+    "udp_gro": false,
+    "udp_port": 443,
+    "webtransport_allowed_origins": [],
+    "webtransport_cert_path": null,
+    "webtransport_key_path": null,
+    "webtransport_max_datagrams_per_sec": 500,
+    "webtransport_max_sessions_per_client": 64,
+    "webtransport_max_sessions_per_origin": 4096,
+    "webtransport_max_streams_per_session": 1000,
+    "webtransport_port": 4433,
+    "worker_threads": 0
+  },
+  "tls": {
+    "ca_cert_path": null,
+    "cert_path": "/etc/pqcrypta/cert.pem",
+    "cert_reload_interval_secs": 3600,
+    "certificate_compression": "auto",
+    "enable_0rtt": false,
+    "handshake_timeout_secs": 10,
+    "key_path": "/etc/pqcrypta/key.pem",
+    "min_version": "1.3",
+    "ocsp_stapling": true,
+    "pqc_session_tickets": false,
+    "require_client_cert": false,
+    "session_cache_entries": 16384,
+    "session_ticket_lifetime_secs": 43200,
+    "zero_rtt_max_early_data": 16384,
+    "zero_rtt_nonce_window_secs": 60,
+    "zero_rtt_replay_protection": "strict",
+    "zero_rtt_safe_methods": [
+      "GET",
+      "HEAD"
+    ]
+  },
+  "version": 1,
+  "waf": {
+    "anomaly_threshold": 5,
+    "block_scanner_uas": true,
+    "cmd_injection": true,
+    "crlf_injection": true,
+    "custom_patterns": [],
+    "decode_compressed_body": true,
+    "deserialization": true,
+    "enabled": false,
+    "exclusions": [],
+    "file_inclusion": true,
+    "graphql": false,
+    "jndi": true,
+    "max_body_scan_bytes": 0,
+    "max_decode_passes": 3,
+    "max_decompressed_body_bytes": 1048576,
+    "max_header_count": 80,
+    "max_header_scan_bytes": 8192,
+    "mode": "block",
+    "nosqli": true,
+    "path_traversal": true,
+    "programmatic_client_paths": [],
+    "proto_pollution": true,
+    "request_anomaly": true,
+    "scan_all_headers": true,
+    "scan_json_body": true,
+    "scanner_probe": true,
+    "scanner_ua_exempt_paths": [
+      "^/robots\\.txt$",
+      "^/sitemap\\.xml$",
+      "^/llms\\.txt$",
+      "^/\\.well-known/"
+    ],
+    "sqli": true,
+    "ssrf": false,
+    "ssti": true,
+    "xss": true,
+    "xxe": true
+  }
+}
