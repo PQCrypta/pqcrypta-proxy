@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::backend_client::BackendClient;
@@ -15,10 +16,10 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::header::HeaderMap;
 use hyper::{Method, Request, StatusCode};
-use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
-use crate::config::{BackendConfig, BackendType, ProxyConfig};
+use crate::config::{BackendConfig, ProxyConfig};
+use crate::health::HealthMonitor;
 use crate::otel;
 
 /// Response from backend proxy
@@ -78,6 +79,9 @@ pub type BackendLease = crate::backend_client::Lease<Full<Bytes>>;
 pub struct BackendPool {
     /// Pooled HTTP/1.1 connections to the backends; see [`crate::backend_client`].
     client: BackendClient<Full<Bytes>>,
+    /// Each backend's health, probed on its own interval once
+    /// [`HealthMonitor::spawn`] has started it.
+    health: Arc<HealthMonitor>,
 }
 
 impl BackendPool {
@@ -94,7 +98,10 @@ impl BackendPool {
             Duration::from_secs(config.security.connection_timeout_secs),
         );
 
-        Self { client }
+        Self {
+            client,
+            health: Arc::new(HealthMonitor::default()),
+        }
     }
 
     /// Proxy request to HTTP/1.1 or HTTP/2 backend
@@ -284,49 +291,11 @@ impl BackendPool {
         Ok((status, response_headers, body_part, lease))
     }
 
-    /// Check backend health
-    pub async fn check_health(&self, backend: &BackendConfig) -> bool {
-        let Some(ref health_endpoint) = backend.health_check else {
-            // No health check configured, assume healthy
-            return true;
-        };
-        match backend.backend_type {
-            // Every HTTP backend is asked its health endpoint over the
-            // transport its requests take
-            BackendType::Http1 | BackendType::Http2 | BackendType::Http3 | BackendType::Unix => {
-                let request = match Request::builder()
-                    .method(Method::GET)
-                    .uri(health_endpoint.as_str())
-                    .body(Full::new(Bytes::new()))
-                {
-                    Ok(r) => r,
-                    Err(_) => return false,
-                };
-
-                let timeout = Duration::from_secs(5);
-                match tokio::time::timeout(timeout, self.client.send(backend, request)).await {
-                    Ok(Ok((response, lease))) => {
-                        let healthy = response.status().is_success();
-                        // Read to the end so the connection can be reused.
-                        if response.into_body().collect().await.is_ok() {
-                            lease.release();
-                        }
-                        healthy
-                    }
-                    Ok(Err(_)) => false,
-                    Err(_) => {
-                        self.client.timed_out(backend);
-                        false
-                    }
-                }
-            }
-            // A raw TCP backend answers no HTTP: it is up when it accepts
-            BackendType::Tcp => {
-                tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&backend.address))
-                    .await
-                    .is_ok_and(|r| r.is_ok())
-            }
-        }
+    /// What the background probes last recorded for each backend; see
+    /// [`crate::health`].
+    #[must_use]
+    pub const fn health(&self) -> &Arc<HealthMonitor> {
+        &self.health
     }
 }
 

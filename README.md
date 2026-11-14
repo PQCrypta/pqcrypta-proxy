@@ -84,7 +84,7 @@
 | **Environment Config Overlay** | ✅ | `--env <name>` flag loads `config.<name>.toml` overlay merged on top of base config |
 | **CIDR Blocklist Support** | ✅ | Blocklist files now match full subnet ranges (e.g. `192.0.2.0/24`); previously only host addresses were matched |
 | **Session Affinity TTL** | ✅ | Sticky session maps evict stale entries after configurable TTL; header affinity uses its own dedicated map |
-| **Proactive Backend Health Checks** | ✅ | Background TCP-connect health task marks backends unreachable before traffic hits them; configurable interval |
+| **Proactive Backend Health Checks** | ✅ | Background probes on each backend's own interval: a GET for the pool's `health_check_path` (or a backend's `health_check`) over its own transport, healthy on a 2xx, or a TCP connect without a path. Failing pool servers leave rotation until they answer; the admin API and metrics report the last answer without asking again |
 | **Enforced Backend Request Timeout** | ✅ | Per-backend/pool-server `timeout_ms` bounds the forwarded request itself (not just connection setup) — a hung backend returns 504 Gateway Timeout instead of holding the client connection open indefinitely |
 | **Configurable GeoIP Block Duration** | ✅ | `geoip_block_duration_secs` in `[security]` (default 24 h); previously blocks were permanent with no expiry |
 | **Configurable WebTransport Port** | ✅ | `webtransport_port` in `[server]` replaces the hardcoded port 4433 for the dedicated WebTransport server |
@@ -1759,6 +1759,7 @@ src/
 ├── fingerprint.rs          # TLS Fingerprinting Module
 ├── fingerprint_corpus.rs   # The observed TLS fingerprint corpus
 ├── fuzz_support.rs         # Mutation fuzzing for the parsers that read raw client bytes
+├── health.rs               # Backend health probes on each backend's interval; what the admin API reports
 ├── host_names.rs           # Host names in security.pentest_bypass_ips and the [masque] client lists
 ├── http3_features.rs       # HTTP/3 Advanced Features Module
 ├── http_listener/          # HTTP/1.1 and HTTP/2 reverse proxy with TLS termination, re-encryption, and passthrough
@@ -2032,7 +2033,7 @@ the client certificate; with `hmac_secret`, a signed request — see
 | `/reload` | POST | Reload configuration — audit logged |
 | `/shutdown` | POST | Graceful shutdown — audit logged |
 | `/config` | GET | Read-only config view |
-| `/backends` | GET | Backend health status |
+| `/backends` | GET | Each backend's health as the background probes last found it: up or down, the answer (`HTTP 200`, or why it failed) and when it was asked |
 | `/tls` | GET | TLS certificate info |
 | `/ocsp` | GET | OCSP stapling status |
 | `/ocsp/refresh` | POST | Force OCSP response refresh *(5-min cooldown)* |

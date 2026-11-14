@@ -867,6 +867,12 @@ async fn run() -> anyhow::Result<()> {
         "Backend pool initialized with {} backends",
         config.backends.len()
     );
+    // Each backend with a health check is asked it on its own interval, under
+    // whatever configuration is current; the admin API reads the answers.
+    {
+        let config_manager = Arc::clone(&config_manager);
+        backend_pool.health().spawn(move || config_manager.get());
+    }
 
     // Create shutdown channels.
     //

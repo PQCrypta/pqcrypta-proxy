@@ -1362,9 +1362,11 @@ impl BackendPool {
     /// P2-fix: previously the pool only reacted to failures seen during real
     /// requests (`record_result`).  A backend could be completely unreachable
     /// yet still receive requests until one happened to land on it.  This task
-    /// proactively checks each server on the configured interval via a TCP
-    /// connect (sufficient to detect port-closed / firewall-dropped backends)
-    /// and updates `BackendHealth::healthy` accordingly.
+    /// asks each server on the configured interval, with the probe the
+    /// single backends use ([`crate::health::probe`]): a GET for the pool's
+    /// `health_check_path` over the server's own transport, healthy on a 2xx,
+    /// or, where the pool names no path, a TCP connect. It updates
+    /// `BackendHealth::healthy` accordingly.
     ///
     /// # Arguments
     /// `pool` — the pool wrapped in `Arc` so the spawned task can hold a reference.
@@ -1383,6 +1385,8 @@ impl BackendPool {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
+        // A reload that changes the path rebuilds the pool, so it is fixed here.
+        let path = pool.health_check_path.clone();
         let pool = Arc::downgrade(pool);
 
         runtime.spawn(async move {
@@ -1403,15 +1407,13 @@ impl BackendPool {
 
                 for server in servers {
                     let addr = server.address;
-                    // Use half the interval as the connect timeout so a slow
-                    // backend doesn't stall the entire health-check round.
-                    let timeout_dur = interval / 2;
-
-                    let reachable =
-                        tokio::time::timeout(timeout_dur, tokio::net::TcpStream::connect(addr))
-                            .await
-                            .map(|r| r.is_ok())
-                            .unwrap_or(false);
+                    let outcome = crate::health::probe(
+                        &server.backend_config(),
+                        path.as_deref(),
+                        crate::health::probe_timeout(interval),
+                    )
+                    .await;
+                    let reachable = outcome.is_up();
 
                     let mut health = server.health.write();
                     let was_healthy = health.healthy;
@@ -1431,8 +1433,9 @@ impl BackendPool {
                     } else {
                         if was_healthy {
                             warn!(
-                                "Health check: backend {} is unreachable — marking unhealthy",
-                                addr
+                                "Health check: backend {} is down ({}) — marking unhealthy",
+                                addr,
+                                outcome.describe()
                             );
                         }
                         health.healthy = false;
@@ -2568,6 +2571,60 @@ mod tests {
     }
 
     /// Build a pool of `n` servers, all healthy, for the hash tests.
+    /// A server that answers every request with `status`.
+    async fn server_answering(status: &'static str) -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut head = [0u8; 2048];
+                    let _ = stream.read(&mut head).await;
+                    let answer = format!(
+                        "HTTP/1.1 {status}\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok"
+                    );
+                    let _ = stream.write_all(answer.as_bytes()).await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// A health-aware pool asks each server its `health_check_path`: the one
+    /// answering 503 is taken out of rotation, the one answering 200 stays,
+    /// though both accept connections.
+    #[tokio::test]
+    async fn pool_health_checks_ask_the_path() {
+        let ok = server_answering("200 OK").await;
+        let failing = server_answering("503 Service Unavailable").await;
+        let config: BackendPoolConfig = toml::from_str(&format!(
+            r#"
+            name = "h"
+            health_aware = true
+            health_check_path = "/health"
+            health_check_interval_secs = 1
+            [[servers]]
+            address = "{ok}"
+            [[servers]]
+            address = "{failing}"
+            "#
+        ))
+        .unwrap();
+        let pool = Arc::new(BackendPool::from_config(
+            &config,
+            &LoadBalancerConfig::default(),
+        ));
+        BackendPool::start_health_check_task(&pool);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pool.get_healthy_servers().len() != 1 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let healthy = pool.get_healthy_servers();
+        assert_eq!(healthy.len(), 1, "the 503 server is out, the 200 one stays");
+        assert_eq!(healthy[0].address, ok);
+    }
+
     fn hash_pool(algorithm: &str, n: usize) -> BackendPool {
         let servers: Vec<PoolServerConfig> = (0..n)
             .map(|i| PoolServerConfig {
