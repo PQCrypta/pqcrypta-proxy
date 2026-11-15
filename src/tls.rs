@@ -1522,9 +1522,11 @@ mod server_policy_tests {
     use rustls::{ClientConfig, ClientConnection, NamedGroup, ProtocolVersion, RootCertStore};
 
     use super::{
-        build_pqc_provider, group_tuples, is_experimental_group, is_post_quantum_group,
-        quic_server_config, server_provider, RustlsServerConfig, ServerTlsPolicy,
+        build_pqc_provider, is_post_quantum_group, quic_server_config, server_provider,
+        RustlsServerConfig, ServerTlsPolicy,
     };
+    #[cfg(feature = "pqc")]
+    use super::{group_tuples, is_experimental_group};
     use crate::config::{ClientAuth, PqcConfig, TlsConfig};
     use crate::startup_verify::{pump_handshake, self_signed_pair, VERIFY_SNI};
 
@@ -3365,7 +3367,7 @@ impl TlsProvider {
             cert_path: tls_config.cert_path.to_string_lossy().to_string(),
             key_path: tls_config.key_path.to_string_lossy().to_string(),
             pqc_enabled: *self.pqc_available.read(),
-            pqc_provider: self.pqc_config.read().provider.clone(),
+            pqc_provider: self.pqc_config.read().provider,
             alpn_protocols: self
                 .applications
                 .iter()
@@ -3383,7 +3385,7 @@ pub struct CertificateInfo {
     pub cert_path: String,
     pub key_path: String,
     pub pqc_enabled: bool,
-    pub pqc_provider: String,
+    pub pqc_provider: crate::config::PqcProvider,
     pub alpn_protocols: Vec<String>,
     pub last_reloaded: Option<String>,
 }

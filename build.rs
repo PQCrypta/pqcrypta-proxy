@@ -31,8 +31,29 @@ fn measurement_note() -> String {
     }
 }
 
+/// The version of the vendored rustls the build links, from its own manifest:
+/// what `x-tls-library` names for a rustls handshake.
+fn rustls_version() -> String {
+    let manifest = "vendor/rustls-fixed/rustls/Cargo.toml";
+    println!("cargo:rerun-if-changed={manifest}");
+    std::fs::read_to_string(manifest)
+        .ok()
+        .and_then(|toml| {
+            toml.lines().find_map(|l| {
+                l.strip_prefix("version = \"")
+                    .and_then(|v| v.strip_suffix('"'))
+                    .map(str::to_string)
+            })
+        })
+        .unwrap_or_default()
+}
+
 fn main() {
     println!("cargo:rustc-env=PQCRYPTA_BUILD_NOTE={}", measurement_note());
+    println!(
+        "cargo:rustc-env=PQCRYPTA_RUSTLS_VERSION={}",
+        rustls_version()
+    );
     // A build with no git checkout -- the Docker image, whose context has no
     // .git -- is given the commit instead (a build argument in CI).
     println!("cargo:rerun-if-env-changed=PQCRYPTA_GIT_COMMIT");

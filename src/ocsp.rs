@@ -30,6 +30,7 @@ use x509_parser::prelude::*;
 /// The most of a responder's answer that is read
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 /// Clock skew allowed on `thisUpdate` / `nextUpdate`, in seconds
+#[cfg(feature = "pqc")]
 const CLOCK_SKEW_SECS: u32 = 300;
 /// How often the served chains are looked at again when nothing is due and
 /// no reload said they changed

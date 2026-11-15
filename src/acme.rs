@@ -17,7 +17,9 @@
 //! - Certificate storage with configurable paths
 //! - Integration with TLS provider hot-reload
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(feature = "acme")]
+use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -25,10 +27,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use parking_lot::RwLock;
-use reqwest;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+#[cfg(feature = "acme")]
+use tracing::debug;
+use tracing::{error, info, warn};
 
 #[cfg(feature = "acme")]
 use instant_acme::{
@@ -346,13 +349,14 @@ pub struct AcmeService {
     /// Certificate status cache
     cert_status: Arc<RwLock<HashMap<String, CertificateStatus>>>,
     /// The CA's suggested renewal windows, by certificate
+    #[cfg(feature = "acme")]
     renewal_windows: RenewalWindows,
 }
 
 /// A CA's suggested renewal window for one certificate (RFC 9773 §4.2), kept
 /// until the CA's Retry-After says to ask again.
+#[cfg(feature = "acme")]
 #[derive(Debug, Clone)]
-#[cfg_attr(not(feature = "acme"), allow(dead_code))]
 struct RenewalWindow {
     /// Unix time the window opens
     start: i64,
@@ -363,6 +367,7 @@ struct RenewalWindow {
 }
 
 /// Suggested renewal windows by ARI certificate identifier (`aki.serial`)
+#[cfg(feature = "acme")]
 type RenewalWindows = Arc<RwLock<HashMap<String, RenewalWindow>>>;
 
 /// When a certificate renews.
@@ -402,6 +407,7 @@ fn lifetime_renewal_at(not_before: i64, not_after: i64, renewal_days: u32) -> i6
 /// RFC 9773 §4.2 has the client choose a uniformly random time in the window;
 /// a hash of the certificate's serial chooses it, so certificates spread over
 /// the window and each keeps its point across checks and restarts.
+#[cfg(feature = "acme")]
 fn point_in_window(start: i64, end: i64, serial: &[u8]) -> i64 {
     use sha2::{Digest, Sha256};
     let Ok(span) = u64::try_from(end.saturating_sub(start)) else {
@@ -452,10 +458,13 @@ struct IssuedCertificate {
     /// The IP addresses it covers
     ip_addresses: Vec<IpAddr>,
     /// The leaf, DER: its ARI identifier comes from its AKI and serial
+    #[cfg(feature = "acme")]
     der: Vec<u8>,
     /// The serial number's octets
+    #[cfg(feature = "acme")]
     serial: Vec<u8>,
     /// Its SubjectPublicKeyInfo, DER: what its key must have
+    #[cfg(feature = "acme")]
     spki: Vec<u8>,
 }
 
@@ -485,8 +494,11 @@ impl IssuedCertificate {
             not_after: cert.validity().not_after.timestamp(),
             dns_names,
             ip_addresses: crate::tls::certificate_ip_addresses(&pem.contents),
+            #[cfg(feature = "acme")]
             serial: cert.raw_serial().to_vec(),
+            #[cfg(feature = "acme")]
             spki: cert.public_key().raw.to_vec(),
+            #[cfg(feature = "acme")]
             der: pem.contents.clone(),
         })
     }
@@ -500,6 +512,7 @@ impl IssuedCertificate {
     /// the certificate itself looks current: such a pair is reissued at once.
     /// A key that cannot be read is not a reason to reissue, or a key type
     /// this cannot parse would be reissued on every check.
+    #[cfg(feature = "acme")]
     fn matches_key(&self, key_path: &Path) -> Option<bool> {
         use rcgen::PublicKeyData as _;
         let pem = fs::read_to_string(key_path).ok()?;
@@ -622,6 +635,7 @@ impl AcmeService {
             last_check: Arc::new(RwLock::new(None)),
             next_check: Arc::new(RwLock::new(None)),
             cert_status: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(feature = "acme")]
             renewal_windows: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -665,6 +679,7 @@ impl AcmeService {
         let last_check = self.last_check.clone();
         let next_check = self.next_check.clone();
         let cert_status = self.cert_status.clone();
+        #[cfg(feature = "acme")]
         let renewal_windows = self.renewal_windows.clone();
 
         tokio::spawn(async move {
@@ -679,6 +694,7 @@ impl AcmeService {
                     &pending_challenges,
                     &cert_update_tx,
                     &cert_status,
+                    #[cfg(feature = "acme")]
                     &renewal_windows,
                 )
                 .await
@@ -807,6 +823,7 @@ impl AcmeService {
         let pending_challenges = self.pending_challenges.clone();
         let cert_update_tx = self.cert_update_tx.clone();
         let cert_status = self.cert_status.clone();
+        #[cfg(feature = "acme")]
         let renewal_windows = self.renewal_windows.clone();
         async move {
             if !config.enabled {
@@ -817,6 +834,7 @@ impl AcmeService {
                 &pending_challenges,
                 &cert_update_tx,
                 &cert_status,
+                #[cfg(feature = "acme")]
                 &renewal_windows,
             )
             .await
@@ -1249,6 +1267,7 @@ async fn invalid_order_reasons(order: &mut instant_acme::Order) -> String {
 /// rather than HTTP-01: always for a wildcard, which only a DNS challenge can
 /// validate, and for every name when the node's challenge type is dns-01.
 /// Addresses are HTTP-01 throughout.
+#[cfg(feature = "acme")]
 const fn wants_dns_challenge(wildcard: bool, prefer_dns: bool) -> bool {
     wildcard || prefer_dns
 }
@@ -1682,7 +1701,6 @@ async fn check_and_renew_certificates(
     _pending_challenges: &Arc<RwLock<HashMap<String, PendingChallenge>>>,
     _cert_update_tx: &Option<mpsc::Sender<CertificateUpdate>>,
     cert_status: &Arc<RwLock<HashMap<String, CertificateStatus>>>,
-    _renewal_windows: &RenewalWindows,
 ) -> anyhow::Result<Option<SystemTime>> {
     warn!("ACME feature not enabled at compile time. Enable with --features acme");
 
@@ -1742,6 +1760,7 @@ async fn check_and_renew_certificates(
 ///
 /// The logs are `config.ct_logs`, or when that is empty the ones the CT log
 /// list has for the certificate's expiry, `not_after` ([`ct_logs_for_expiry`]).
+#[cfg(feature = "acme")]
 async fn submit_to_ct_logs(
     cert_pem: &str,
     chain_pem: &str,
@@ -1825,11 +1844,13 @@ async fn submit_to_ct_logs(
 
 /// The CT log list (the v3 schema Google and Apple publish), as far as
 /// choosing a log needs.
+#[cfg(feature = "acme")]
 #[derive(Debug, Deserialize)]
 struct CtLogList {
     operators: Vec<CtOperator>,
 }
 
+#[cfg(feature = "acme")]
 #[derive(Debug, Deserialize)]
 struct CtOperator {
     /// RFC 6962 logs. The list's `tiled_logs` (the static CT API) take no
@@ -1838,6 +1859,7 @@ struct CtOperator {
     logs: Vec<CtLog>,
 }
 
+#[cfg(feature = "acme")]
 #[derive(Debug, Deserialize)]
 struct CtLog {
     url: String,
@@ -1847,6 +1869,7 @@ struct CtLog {
     temporal_interval: Option<CtTemporalInterval>,
 }
 
+#[cfg(feature = "acme")]
 #[derive(Debug, Deserialize)]
 struct CtTemporalInterval {
     start_inclusive: chrono::DateTime<chrono::Utc>,
@@ -1856,6 +1879,7 @@ struct CtTemporalInterval {
 /// The logs in `list` that take a certificate expiring at `not_after`: per
 /// operator, the first that accepts submissions (usable, or qualified and
 /// on its way to usable) and whose temporal interval holds the expiry.
+#[cfg(feature = "acme")]
 fn ct_logs_for_expiry(list: &CtLogList, not_after: i64) -> Vec<String> {
     list.operators
         .iter()
@@ -1878,6 +1902,7 @@ fn ct_logs_for_expiry(list: &CtLogList, not_after: i64) -> Vec<String> {
 ///
 /// PEM stores DER data as base64 with whitespace; we strip the whitespace so
 /// the resulting strings are valid base64 for the CT JSON body.
+#[cfg(feature = "acme")]
 fn extract_pem_base64_blocks(cert_pem: &str, chain_pem: &str) -> Vec<String> {
     let combined = format!("{}\n{}", cert_pem, chain_pem);
     combined
@@ -1902,6 +1927,7 @@ mod tests {
 
     /// A wildcard is validated by DNS whatever the challenge type; every
     /// other name by DNS only when the node asks for it.
+    #[cfg(feature = "acme")]
     #[test]
     fn wildcards_take_a_dns_challenge() {
         assert!(wants_dns_challenge(true, false));
@@ -2049,6 +2075,7 @@ mod tests {
 
     /// The point is inside the window, the same for the same serial, and
     /// different serials spread over it.
+    #[cfg(feature = "acme")]
     #[test]
     fn the_renewal_point_falls_in_the_window() {
         let (start, end) = (1_000_000, 1_086_400);
@@ -2101,6 +2128,7 @@ mod tests {
         let v6: IpAddr = "2606:4700:4700::1111".parse().unwrap();
         assert_eq!(issued.ip_addresses, vec![v4, v6]);
         assert!(issued.not_after > issued.not_before);
+        #[cfg(feature = "acme")]
         assert_ne!(issued.serial, Vec::<u8>::new());
 
         assert!(issued.covers("ns1.example.com", &[v6, v4]));
@@ -2130,6 +2158,7 @@ mod tests {
 
     /// A certificate knows its own key from another's, and a key that cannot
     /// be read is not taken for another's.
+    #[cfg(feature = "acme")]
     #[test]
     fn a_certificate_knows_its_own_key() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -2191,6 +2220,7 @@ mod tests {
     /// From the log list: per operator, the first log that accepts
     /// submissions and whose shard holds the expiry; read-only, retired and
     /// other shards are passed over, and tiled logs are not read.
+    #[cfg(feature = "acme")]
     #[test]
     fn ct_logs_are_chosen_for_the_certificate_expiry() {
         let list: CtLogList = serde_json::from_value(serde_json::json!({

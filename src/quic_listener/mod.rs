@@ -294,6 +294,7 @@ fn quic_handshake_facts_empty() -> crate::tls_acceptor::HandshakeFacts {
         kex_group: None,
         alpn: None,
         ech: "unknown",
+        library: crate::tls_acceptor::TlsLibrary::Rustls,
         prepared: std::sync::OnceLock::default(),
     }
 }
@@ -1914,7 +1915,7 @@ impl QuicListener {
                             Arc::clone(&session),
                             remote_addr,
                             path.clone(),
-                            wt_route.map(|r| r.backend.clone()),
+                            wt_route.map(crate::webtransport_server::WtTarget::of),
                             config.clone(),
                             backend_pool.clone(),
                             Some((*security).clone()),

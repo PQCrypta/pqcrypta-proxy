@@ -507,14 +507,14 @@ pub fn dynamic_runtime_section(runtime: &VerifiedRuntime, openssl_terminates_tcp
 /// that had nothing to do with the handshake. It used to be scanned out of the mapped
 /// file's bytes for "OpenSSL 3", which an OpenSSL 4 never matched.
 #[cfg(feature = "pqc")]
-fn openssl_version_string() -> Option<String> {
+pub(crate) fn openssl_version_string() -> Option<String> {
     let text = openssl::version::version();
     let named: Vec<&str> = text.split_whitespace().take(2).collect();
     (named.len() == 2).then(|| named.join(" "))
 }
 
 #[cfg(not(feature = "pqc"))]
-fn openssl_version_string() -> Option<String> {
+pub(crate) fn openssl_version_string() -> Option<String> {
     None
 }
 

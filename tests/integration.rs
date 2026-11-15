@@ -69,7 +69,7 @@ key_path = "/tmp/test.key"
 
 [pqc]
 enabled = true
-provider = "openssl3.5"
+provider = "openssl"
 preferred_kem = "X25519MLKEM768"
 fallback_to_classical = true
 min_security_level = 3
@@ -84,7 +84,10 @@ strict_key_permissions = false
             toml::from_str(config_content).expect("Failed to parse config");
 
         assert!(config.pqc.enabled);
-        assert_eq!(config.pqc.provider, "openssl3.5");
+        assert_eq!(
+            config.pqc.provider,
+            pqcrypta_proxy::config::PqcProvider::OpenSsl
+        );
         assert_eq!(config.pqc.preferred_kem, "X25519MLKEM768");
         assert!(config.pqc.fallback_to_classical);
         assert_eq!(config.pqc.min_security_level, 3);
@@ -99,7 +102,10 @@ strict_key_permissions = false
 
         // Verify PQC defaults
         assert!(config.pqc.enabled);
-        assert_eq!(config.pqc.provider, "auto");
+        assert_eq!(
+            config.pqc.provider,
+            pqcrypta_proxy::config::PqcProvider::Auto
+        );
         assert_eq!(config.pqc.min_security_level, 3);
         assert!(config.pqc.fallback_to_classical);
     }

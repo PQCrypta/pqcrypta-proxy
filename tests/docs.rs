@@ -342,3 +342,71 @@ fn the_config_reference_states_the_code_defaults() {
     );
     assert!(wrong.is_empty(), "docs/CONFIG.md:\n{}", wrong.join("\n"));
 }
+
+/// The non-test code of every `.rs` file under `dir`.
+fn source_under(dir: &Path, out: &mut String) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            source_under(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            let text = std::fs::read_to_string(&path).unwrap();
+            out.push_str(&without_test_module(&text));
+            out.push('\n');
+        }
+    }
+}
+
+/// A source file without its test modules. Each is cut from its
+/// `#[cfg(test)]` to the `}` that closes it at the start of a line (rustfmt
+/// indents everything inside a top-level module): tls.rs and security.rs keep
+/// test modules between their items, so cutting at the first would hide the
+/// code after it.
+fn without_test_module(text: &str) -> String {
+    let module =
+        regex::Regex::new(r"(?ms)^#\[cfg\(test\)\]\n(?:#\[[^\n]*\]\n)*mod \w+ \{\n.*?^\}\n")
+            .unwrap();
+    module.replace_all(text, "").into_owned()
+}
+
+/// Every setting the configuration file accepts is read by the code: each
+/// field of a deserialised struct in src/config.rs appears somewhere as
+/// `.field`. A setting nothing reads is a feature the documents describe and
+/// the proxy does not have; `routes.stream_to_method` was one, documented in
+/// docs/CONFIG.md and read by nothing until it was built.
+#[test]
+fn every_setting_is_read() {
+    let mut code = String::new();
+    source_under(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut code,
+    );
+    let config = read("src/config.rs");
+    let config = without_test_module(&config);
+    let config = config.as_str();
+    let structs = regex::Regex::new(
+        r"(?s)#\[derive\(([^\]]*)\)\]\s*(?:#\[[^\]]*\]\s*)*pub struct (\w+)\s*\{(.*?)\n\}",
+    )
+    .unwrap();
+    let field = regex::Regex::new(r"(?m)^\s+pub (\w+)\s*:").unwrap();
+    let mut unread = Vec::new();
+    let mut settings = 0;
+    for s in structs.captures_iter(config) {
+        if !s[1].contains("Deserialize") {
+            continue;
+        }
+        for f in field.captures_iter(&s[3]) {
+            settings += 1;
+            let name = &f[1];
+            let used = code.match_indices(&format!(".{name}")).any(|(at, _)| {
+                !code[at + 1 + name.len()..]
+                    .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            });
+            if !used {
+                unread.push(format!("{}.{name}", &s[2]));
+            }
+        }
+    }
+    assert!(settings > 400, "only {settings} settings found");
+    assert!(unread.is_empty(), "settings no code reads: {unread:?}");
+}

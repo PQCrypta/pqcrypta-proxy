@@ -434,6 +434,41 @@ impl FingerprintedConnection {
     }
 }
 
+/// The TLS library a handshake ran in: OpenSSL on the TCP listeners that
+/// offer its post-quantum groups, rustls everywhere else, QUIC included.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TlsLibrary {
+    /// The vendored rustls
+    #[default]
+    Rustls,
+    /// The OpenSSL the process loaded
+    OpenSsl,
+}
+
+impl TlsLibrary {
+    /// Its name and version, as `x-tls-library` reports it:
+    /// `OpenSSL 4.0.3`, `rustls 0.23.46`.
+    pub fn named(self) -> Option<&'static str> {
+        match self {
+            Self::OpenSsl => openssl_named(),
+            Self::Rustls => {
+                static RUSTLS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+                    format!("rustls {}", env!("PQCRYPTA_RUSTLS_VERSION"))
+                });
+                (!env!("PQCRYPTA_RUSTLS_VERSION").is_empty()).then(|| RUSTLS.as_str())
+            }
+        }
+    }
+}
+
+/// The OpenSSL this process loaded, by its name and version alone, asked of
+/// the library once; none in a build without OpenSSL.
+pub fn openssl_named() -> Option<&'static str> {
+    static OPENSSL: std::sync::LazyLock<Option<String>> =
+        std::sync::LazyLock::new(crate::startup_verify::openssl_version_string);
+    OPENSSL.as_deref()
+}
+
 /// The negotiated properties of one completed TLS handshake.
 ///
 /// Deliberately `String`/`&'static str` rather than the rustls types: this is
@@ -453,13 +488,15 @@ pub struct HandshakeFacts {
     pub alpn: Option<String>,
     /// Encrypted Client Hello outcome: `not-offered`, `rejected`, or `accepted`.
     pub ech: &'static str,
+    /// The library the handshake ran in.
+    pub library: TlsLibrary,
     /// The five header values, built on first use. A connection's handshake
     /// does not change, so validating and copying these strings on every
     /// request — five `HeaderValue::from_str` allocations and five
     /// name parses each time — was work done once per request for an answer
     /// fixed per connection. Filled after the fields above are final: every
     /// constructor finishes them before the facts are shared.
-    pub(crate) prepared: std::sync::OnceLock<[Option<http::HeaderValue>; 5]>,
+    pub(crate) prepared: std::sync::OnceLock<[Option<http::HeaderValue>; 7]>,
 }
 
 impl HandshakeFacts {
@@ -477,13 +514,18 @@ impl HandshakeFacts {
     /// The headers [`inject_headers`](Self::inject_headers) owns.
     ///
     /// Named in one place because they have to be stripped and set as a set:
-    /// removing four of five would leave the fifth forgeable.
-    pub const HEADER_NAMES: [&'static str; 5] = [
+    /// removing six of seven would leave the seventh forgeable.
+    /// `x-tls-library` is the library this handshake ran in; `x-openssl-version`
+    /// the OpenSSL the process loaded, whichever listener answered, so a
+    /// backend can describe the TCP stack from a request that came over QUIC.
+    pub const HEADER_NAMES: [&'static str; 7] = [
         "x-tls-version",
         "x-tls-cipher",
         "x-tls-group",
         "x-tls-alpn",
         "x-tls-ech",
+        "x-tls-library",
+        "x-openssl-version",
     ];
 
     /// Replace any client-supplied handshake headers with what this connection
@@ -498,12 +540,14 @@ impl HandshakeFacts {
     /// filled with a placeholder — "unknown" and "we didn't look" are different
     /// answers and the mirror renders them differently.
     pub fn inject_headers(&self, headers: &mut http::HeaderMap) {
-        const NAMES: [http::HeaderName; 5] = [
+        const NAMES: [http::HeaderName; 7] = [
             http::HeaderName::from_static(HandshakeFacts::HEADER_NAMES[0]),
             http::HeaderName::from_static(HandshakeFacts::HEADER_NAMES[1]),
             http::HeaderName::from_static(HandshakeFacts::HEADER_NAMES[2]),
             http::HeaderName::from_static(HandshakeFacts::HEADER_NAMES[3]),
             http::HeaderName::from_static(HandshakeFacts::HEADER_NAMES[4]),
+            http::HeaderName::from_static(HandshakeFacts::HEADER_NAMES[5]),
+            http::HeaderName::from_static(HandshakeFacts::HEADER_NAMES[6]),
         ];
         let values = self.prepared.get_or_init(|| {
             let v = |s: Option<&str>| s.and_then(|s| http::HeaderValue::from_str(s).ok());
@@ -513,6 +557,8 @@ impl HandshakeFacts {
                 v(self.kex_group.as_deref()),
                 v(self.alpn.as_deref()),
                 v(Some(self.ech)),
+                v(self.library.named()),
+                v(openssl_named()),
             ]
         });
         // `insert` replaces every value the client sent under the name, so
@@ -549,6 +595,7 @@ impl HandshakeFacts {
                 rustls::server::EchAcceptance::UnknownConfig => "unknown-config",
                 rustls::server::EchAcceptance::Accepted => "accepted",
             },
+            library: TlsLibrary::Rustls,
             prepared: std::sync::OnceLock::default(),
         }
     }
@@ -1079,6 +1126,43 @@ impl FingerprintExt for FingerprintedConnection {
 mod tests {
     use super::*;
 
+    /// `x-tls-library` names the library the handshake ran in and
+    /// `x-openssl-version` the OpenSSL the process loaded; a client's own
+    /// copies of either are replaced, never passed on.
+    #[test]
+    fn the_tls_library_headers_are_set_and_not_forgeable() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-tls-library", "OpenSSL 9.9.9".parse().unwrap());
+        headers.insert("x-openssl-version", "forged".parse().unwrap());
+        let facts = HandshakeFacts {
+            library: TlsLibrary::Rustls,
+            ech: "not-offered",
+            ..HandshakeFacts::default()
+        };
+        facts.inject_headers(&mut headers);
+        let library = headers.get("x-tls-library").unwrap().to_str().unwrap();
+        assert!(library.starts_with("rustls 0."), "{library}");
+        assert_eq!(headers.get_all("x-tls-library").iter().count(), 1);
+        match openssl_named() {
+            Some(v) => {
+                assert!(v.starts_with("OpenSSL "), "{v}");
+                assert_eq!(headers.get("x-openssl-version").unwrap(), v);
+                let openssl = HandshakeFacts {
+                    library: TlsLibrary::OpenSsl,
+                    ech: "not-supported",
+                    ..HandshakeFacts::default()
+                };
+                let mut h = http::HeaderMap::new();
+                openssl.inject_headers(&mut h);
+                assert_eq!(h.get("x-tls-library").unwrap(), v);
+            }
+            None => assert!(
+                headers.get("x-openssl-version").is_none(),
+                "no OpenSSL, no header"
+            ),
+        }
+    }
+
     /// Every reader of raw ClientHello bytes here runs before the handshake,
     /// on bytes any client chooses; with panic = "abort" a panic in one ends
     /// the process. See crate::fuzz_support.
@@ -1222,7 +1306,7 @@ mod tests {
 
         // The handshake set is stripped wholesale by inject_headers; the rest
         // are stripped explicitly at each listener's injection site.
-        assert_eq!(HandshakeFacts::HEADER_NAMES.len(), 5);
+        assert_eq!(HandshakeFacts::HEADER_NAMES.len(), 7);
     }
 
     /// A client's `x-webtransport-proxy` never reaches a backend: the API
@@ -1243,6 +1327,7 @@ mod tests {
                 kex_group: None,
                 alpn: Some("h2".to_string()),
                 ech: "not-offered",
+                library: TlsLibrary::Rustls,
                 prepared: std::sync::OnceLock::default(),
             },
         };
@@ -1266,6 +1351,7 @@ mod tests {
             kex_group: Some("secp384r1".to_string()),
             alpn: Some("h2".to_string()),
             ech: "not-offered",
+            library: TlsLibrary::Rustls,
             prepared: std::sync::OnceLock::default(),
         };
 
@@ -1294,6 +1380,7 @@ mod tests {
             kex_group: None,
             alpn: Some("h3".to_string()),
             ech: "unknown",
+            library: TlsLibrary::Rustls,
             prepared: std::sync::OnceLock::default(),
         };
 

@@ -322,10 +322,11 @@ priority = "u=3"
 # Enable PQC hybrid key exchange
 enabled = true
 
-# PQC provider selection:
-# - "auto" (recommended): Use rustls for QUIC, OpenSSL for broader algorithms
-# - "rustls": Pure Rust via aws-lc-rs (memory-safe, QUIC support)
-# - "openssl3.5": OpenSSL 3.5+ with native ML-KEM (broader algorithms)
+# The TLS library that terminates TCP (QUIC is always rustls):
+# - "auto" (default): OpenSSL, with ClientHellos offering ECH handed to rustls
+# - "rustls": rustls (aws-lc-rs) on every transport, no C TLS library on any connection
+# - "openssl": OpenSSL for every TCP ClientHello; ECH is then served over QUIC only
+# Any other value is refused when the configuration loads.
 provider = "auto"
 
 # Preferred KEM algorithm for key exchange (IETF standard)

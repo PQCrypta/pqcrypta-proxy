@@ -472,10 +472,10 @@ async fn handle_incoming_session(
     // and path it was opened for. None for the paths served here (the speed
     // test, the telemetry wall) and for a session no route covers, which is
     // answered only what the proxy answers itself.
-    let session_backend: Option<String> = config
+    let session_target: Option<WtTarget> = config
         .find_route(Some(&host), &route_path, true)
         .filter(|route| route.webtransport)
-        .map(|route| route.backend.clone());
+        .map(WtTarget::of);
 
     // SR-02: Origin validation.
     //
@@ -579,7 +579,7 @@ async fn handle_incoming_session(
             Arc::new(connection),
             remote_addr,
             path,
-            session_backend,
+            session_target,
             config,
             backend_pool,
             security,
@@ -671,7 +671,39 @@ impl Drop for ClientSlot {
 /// The path a session was opened for and the backend its route names.
 struct SessionRoute {
     path: String,
-    backend: Option<String>,
+    /// The route's backend and method; none for a session no route covers
+    target: Option<WtTarget>,
+}
+
+impl SessionRoute {
+    /// The method each payload is forwarded with: the route's
+    /// `stream_to_method`, POST by default and for a session with no route.
+    fn method(&self) -> &http::Method {
+        self.target
+            .as_ref()
+            .map_or(&http::Method::POST, |t| &t.method)
+    }
+}
+
+/// Where a WebTransport session's streams and datagrams go: its route's
+/// backend, and the HTTP method their payloads are forwarded with.
+#[derive(Clone, Debug)]
+pub struct WtTarget {
+    /// The route's backend or pool
+    pub backend: String,
+    /// `stream_to_method`, or POST
+    pub method: http::Method,
+}
+
+impl WtTarget {
+    /// The target a WebTransport route names.
+    #[must_use]
+    pub fn of(route: &crate::config::RouteConfig) -> Self {
+        Self {
+            backend: route.backend.clone(),
+            method: route.stream_method(),
+        }
+    }
 }
 
 /// How long a stream's request may take to arrive.
@@ -712,7 +744,7 @@ pub async fn serve_session<S: WtSession>(
     connection: Arc<S>,
     remote_addr: SocketAddr,
     path: String,
-    session_backend: Option<String>,
+    session_target: Option<WtTarget>,
     config: Arc<ProxyConfig>,
     backend_pool: Arc<BackendPool>,
     security: Option<crate::security::SecurityState>,
@@ -735,7 +767,7 @@ pub async fn serve_session<S: WtSession>(
     // What every stream and datagram of this session is routed by.
     let session = Arc::new(SessionRoute {
         path,
-        backend: session_backend,
+        target: session_target,
     });
 
     // Per-session datagram budget window (see webtransport_max_datagrams_per_sec).
@@ -908,9 +940,9 @@ async fn handle_bi_stream<S: WtSession>(
     // A raw TCP backend: the stream's bytes are relayed both ways as they
     // come, to a connection of its own
     if let Some(backend) = session
-        .backend
-        .as_deref()
-        .and_then(|name| config.backends.get(name))
+        .target
+        .as_ref()
+        .and_then(|t| config.backends.get(&t.backend))
         .filter(|b| b.backend_type == crate::config::BackendType::Tcp)
     {
         return relay_to_tcp(send_stream, recv_stream, backend, remote_addr).await;
@@ -1135,7 +1167,7 @@ async fn proxy_request(
             let view = crate::security::SecurityRequestView {
                 ip,
                 peer_port: Some(remote_addr.port()),
-                method: "POST",
+                method: session.method().as_str(),
                 path,
                 query: "",
                 headers: &headers,
@@ -1189,7 +1221,7 @@ async fn proxy_request(
                 return forward_to_backend(
                     data,
                     backend_path,
-                    session.backend.as_deref(),
+                    session.target.as_ref(),
                     request_credential(&request).as_deref(),
                     remote_addr,
                     config,
@@ -1204,7 +1236,7 @@ async fn proxy_request(
     forward_to_backend(
         data,
         path,
-        session.backend.as_deref(),
+        session.target.as_ref(),
         None,
         remote_addr,
         config,
@@ -1234,13 +1266,17 @@ fn request_credential(request: &serde_json::Value) -> Option<String> {
 async fn forward_to_backend(
     data: &[u8],
     path: &str,
-    backend_name: Option<&str>,
+    target: Option<&WtTarget>,
     api_key: Option<&str>,
     remote_addr: SocketAddr,
     config: &Arc<ProxyConfig>,
     backend_pool: &Arc<BackendPool>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let Some(backend_name) = backend_name else {
+    let Some(WtTarget {
+        backend: backend_name,
+        method,
+    }) = target
+    else {
         debug!(
             "WebTransport request from {} for {}: the session has no route",
             remote_addr, path
@@ -1280,7 +1316,7 @@ async fn forward_to_backend(
 
     // Use the BackendPool's proxy_http method
     let response = backend_pool
-        .proxy_http(backend, "POST", path, headers, data)
+        .proxy_http(backend, method.as_str(), path, headers, data)
         .await
         .map_err(|e| format!("Backend proxy error: {}", e))?;
 

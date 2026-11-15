@@ -32,6 +32,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 
 // Use the library crate instead of re-declaring modules
 use pqcrypta_proxy::acme;
+#[cfg(feature = "admin-api")]
 use pqcrypta_proxy::admin::AdminServer;
 use pqcrypta_proxy::audit_logger::AuditLogger;
 use pqcrypta_proxy::config::{ConfigManager, ConfigReloadEvent, ProxyConfig, TlsMode};
@@ -741,7 +742,9 @@ async fn run() -> anyhow::Result<()> {
         },
         startup_verify::dynamic_runtime_section(
             &runtime,
-            cfg!(feature = "pqc") && config.pqc.enabled,
+            cfg!(feature = "pqc")
+                && config.pqc.enabled
+                && config.pqc.provider.openssl_serves_tcp(true),
         ),
         startup_verify::Section {
             title: "POLICY",
@@ -838,6 +841,16 @@ async fn run() -> anyhow::Result<()> {
         PqcTlsProvider::new(&config.pqc).with_tls_settings(&config.tls, config.client_auth()),
     );
     let pqc_status = pqc_provider.status();
+    // OpenSSL named for TCP and not usable: serving rustls in its place is not
+    // what the operator asked for
+    if config.pqc.enabled
+        && config.pqc.provider == pqcrypta_proxy::config::PqcProvider::OpenSsl
+        && !pqc_status.available
+    {
+        anyhow::bail!(
+            "pqc.provider is \"openssl\" and OpenSSL's post-quantum key exchange is not usable"
+        );
+    }
 
     // Initialize TLS provider (rustls for QUIC)
     info!("Initializing TLS provider...");
@@ -880,10 +893,10 @@ async fn run() -> anyhow::Result<()> {
     // select! below receives.  The receiver used to be bound as `_shutdown_rx`
     // and never polled, so the documented admin shutdown endpoint returned 200
     // and shut nothing down.
-    let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     // `admin_shutdown_tx` runs the other way, main → admin, so the admin
     // listener stops accepting and drains when the process is going down.
-    let (admin_shutdown_tx, mut admin_shutdown_rx) = mpsc::channel::<()>(1);
+    let (admin_shutdown_tx, admin_shutdown_rx) = mpsc::channel::<()>(1);
 
     // Start configuration file watching
     if args.watch_config {
@@ -1223,31 +1236,50 @@ async fn run() -> anyhow::Result<()> {
         None
     };
 
-    let admin_server = AdminServer::new(
-        config.admin_resolved(),
-        config_manager.clone(),
-        tls_provider.clone(),
-        backend_pool.clone(),
-        ocsp_service,
-        acme_service,
-        Some(shared_rate_limiter.clone()),
-        shutdown_tx.clone(),
-        Some(metrics_registry.clone()),
-        Some(audit_logger),
-        Some(shared_lb.clone()),
-        Some(security_state.clone()),
-    );
-
-    let admin_handle = tokio::spawn(async move {
-        if let Err(e) = admin_server
-            .run(async move {
-                let _ = admin_shutdown_rx.recv().await;
-            })
-            .await
-        {
-            error!("Admin server error: {}", e);
+    #[cfg(feature = "admin-api")]
+    let admin_handle = {
+        let admin_server = AdminServer::new(
+            config.admin_resolved(),
+            config_manager.clone(),
+            tls_provider.clone(),
+            backend_pool.clone(),
+            ocsp_service,
+            acme_service,
+            Some(shared_rate_limiter.clone()),
+            shutdown_tx.clone(),
+            Some(metrics_registry.clone()),
+            Some(audit_logger),
+            Some(shared_lb.clone()),
+            Some(security_state.clone()),
+        );
+        tokio::spawn(async move {
+            if let Err(e) = admin_server
+                .run(async move {
+                    let mut admin_shutdown_rx = admin_shutdown_rx;
+                    let _ = admin_shutdown_rx.recv().await;
+                })
+                .await
+            {
+                error!("Admin server error: {}", e);
+            }
+        })
+    };
+    // A build without the admin API: nothing listens, and what the admin
+    // server would have held lives as long as the process, as it does with
+    // one. That includes `shutdown_tx`: with its only sender dropped, the
+    // select! below would see the channel close and shut the proxy down at
+    // once. The shutdown waits on a task that has already ended.
+    #[cfg(not(feature = "admin-api"))]
+    let (admin_handle, _held_for_the_process) = {
+        if config.admin.enabled {
+            warn!("admin.enabled is true and this build has no admin API (the admin-api feature)");
         }
-    });
+        drop(admin_shutdown_rx);
+        (
+            tokio::spawn(async {}),
+            (ocsp_service, acme_service, audit_logger, shutdown_tx),
+        )
+    };
 
     // Start HTTP/HTTPS/WebTransport listeners on all configured ports
     let cert_path = config.tls.cert_path.to_string_lossy().to_string();
@@ -1311,7 +1343,9 @@ async fn run() -> anyhow::Result<()> {
 
     // Start HTTPS reverse proxy listeners (TCP) on all ports
     // Priority: PQC+fingerprinting > fingerprinting-only > PQC-only > standard rustls
-    let use_pqc_listener = pqc_status.available && config.pqc.enabled;
+    // OpenSSL terminates TCP unless `pqc.provider` is "rustls"
+    let use_pqc_listener =
+        config.pqc.enabled && config.pqc.provider.openssl_serves_tcp(pqc_status.available);
     let use_fingerprint_listener =
         config.fingerprint.enabled && config.fingerprint.tls_layer_capture;
     // ECH over TCP needs the PQC listener that reads the ClientHello before
@@ -1322,8 +1356,9 @@ async fn run() -> anyhow::Result<()> {
     // keys yet: the route is built on every TLS reload (ech_route_for) and
     // stays empty until configs exist, so a node's first keys, from
     // ech-rotate, are served at the reload rather than at the next restart.
+    // Under `pqc.provider = "openssl"` OpenSSL keeps every ClientHello.
     #[cfg(feature = "pqc")]
-    let use_ech_over_tcp = use_pqc_listener;
+    let use_ech_over_tcp = use_pqc_listener && config.pqc.provider.ech_to_rustls();
 
     // Create shutdown channels for fingerprinting listeners (supports graceful shutdown)
     let mut http_shutdown_senders: Vec<tokio::sync::watch::Sender<()>> = Vec::new();
