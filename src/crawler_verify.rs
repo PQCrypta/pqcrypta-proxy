@@ -53,6 +53,11 @@ pub const RANGES_CACHE: &str = "/var/lib/pqcrypta-proxy/state/crawler-ranges.jso
 /// How often the published ranges are fetched again.
 const RANGES_REFRESH: Duration = Duration::from_hours(6);
 
+/// How soon a family whose feed failed is fetched again, doubling on each
+/// failure up to [`RANGES_REFRESH`]: a feed's server failing for a moment
+/// should not leave its family a whole refresh period behind.
+const RANGES_RETRY: Duration = Duration::from_mins(5);
+
 /// A feed larger than this is not an address list.
 const MAX_FEED_BYTES: usize = 4 << 20;
 
@@ -519,9 +524,59 @@ fn write_ranges_cache(path: &Path, ranges: &PublishedRanges) -> std::io::Result<
     std::fs::rename(&tmp, path)
 }
 
-/// Fetch every family's feeds now and every [`RANGES_REFRESH`] after. A family
-/// is replaced only when all of its feeds were fetched and parsed: one failed
-/// feed must not drop the ranges the others cover.
+/// When the range refresh runs, and which families each pass fetches: every
+/// family every [`RANGES_REFRESH`], and between those only the families whose
+/// feeds failed, from [`RANGES_RETRY`] after the failure, doubling each time.
+/// A retry never moves the full refresh.
+struct RefreshSchedule {
+    next_full: Instant,
+    retry: Duration,
+    failed: Vec<&'static str>,
+}
+
+impl RefreshSchedule {
+    fn new(now: Instant) -> Self {
+        Self {
+            next_full: now,
+            retry: RANGES_RETRY,
+            failed: Vec::new(),
+        }
+    }
+
+    /// Start a pass: whether it is the full one (and if so, when the next is).
+    fn begin(&mut self, now: Instant) -> bool {
+        let full = now >= self.next_full;
+        if full {
+            self.next_full = now + RANGES_REFRESH;
+        }
+        full
+    }
+
+    /// Whether a pass fetches `family`.
+    fn due(&self, full: bool, family: &str) -> bool {
+        full || self.failed.contains(&family)
+    }
+
+    /// End a pass with the families whose feeds failed; how long to wait.
+    fn end(&mut self, failed: Vec<&'static str>, now: Instant) -> Duration {
+        let until_full = self.next_full.saturating_duration_since(now);
+        self.failed = failed;
+        if self.failed.is_empty() {
+            self.retry = RANGES_RETRY;
+            until_full
+        } else {
+            let wait = self.retry.min(until_full);
+            self.retry = (self.retry * 2).min(RANGES_REFRESH);
+            wait
+        }
+    }
+}
+
+/// Fetch every family's feeds now and every [`RANGES_REFRESH`] after, and a
+/// failed family sooner ([`RefreshSchedule`]). A family is replaced only when
+/// all of its feeds were fetched and parsed: one failed feed must not drop the
+/// ranges the others cover, and until it is fetched the family keeps the
+/// ranges it had.
 fn spawn_range_refresh(ranges: Arc<ArcSwap<PublishedRanges>>, cache: PathBuf) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
@@ -532,10 +587,16 @@ fn spawn_range_refresh(ranges: Arc<ArcSwap<PublishedRanges>>, cache: PathBuf) {
             .user_agent("pqcrypta-proxy crawler-range refresh (+https://pqcrypta.com/pqcproxy/)")
             .build()
             .unwrap_or_default();
+        let mut schedule = RefreshSchedule::new(Instant::now());
         loop {
+            let full = schedule.begin(Instant::now());
             let mut next = (**ranges.load()).clone();
             let mut refreshed = Vec::new();
-            for spec in CRAWLERS.iter().filter(|s| !s.feeds.is_empty()) {
+            let mut failed = Vec::new();
+            for spec in CRAWLERS
+                .iter()
+                .filter(|s| !s.feeds.is_empty() && schedule.due(full, s.family))
+            {
                 let mut nets = Vec::new();
                 let mut complete = true;
                 for url in spec.feeds {
@@ -556,6 +617,8 @@ fn spawn_range_refresh(ranges: Arc<ArcSwap<PublishedRanges>>, cache: PathBuf) {
                     nets.dedup();
                     refreshed.push(format!("{} {}", spec.family, nets.len()));
                     next.insert(spec.family, nets.into());
+                } else {
+                    failed.push(spec.family);
                 }
             }
             if !refreshed.is_empty() {
@@ -565,7 +628,15 @@ fn spawn_range_refresh(ranges: Arc<ArcSwap<PublishedRanges>>, cache: PathBuf) {
                 }
                 ranges.store(Arc::new(next));
             }
-            tokio::time::sleep(RANGES_REFRESH).await;
+            let wait = schedule.end(failed, Instant::now());
+            if !schedule.failed.is_empty() {
+                info!(
+                    "Crawler ranges: {} kept as they were; fetched again in {} s",
+                    schedule.failed.join(", "),
+                    wait.as_secs()
+                );
+            }
+            tokio::time::sleep(wait).await;
         }
     });
 }
@@ -847,5 +918,62 @@ mod tests {
         assert!(verifier.cache.get(&ip).is_some());
         // Second call is served from cache and must agree.
         assert_eq!(verifier.classify(ip, ua), CrawlerVerdict::Rejected);
+    }
+
+    #[test]
+    fn a_failed_family_is_fetched_again_sooner_and_the_full_refresh_stays_put() {
+        let start = Instant::now();
+        let mut schedule = RefreshSchedule::new(start);
+
+        // The first pass is the full one; every family is due
+        assert!(schedule.begin(start));
+        assert!(schedule.due(true, "bing"));
+        assert!(schedule.due(true, "duckduckbot"));
+        // One feed failed: retried in RANGES_RETRY, then twice that, and so on
+        assert_eq!(schedule.end(vec!["duckduckbot"], start), RANGES_RETRY);
+        let t1 = start + RANGES_RETRY;
+        assert!(!schedule.begin(t1));
+        assert!(schedule.due(false, "duckduckbot"));
+        assert!(!schedule.due(false, "bing"));
+        assert_eq!(schedule.end(vec!["duckduckbot"], t1), RANGES_RETRY * 2);
+        let t2 = t1 + RANGES_RETRY * 2;
+        assert!(!schedule.begin(t2));
+        assert_eq!(schedule.end(vec!["duckduckbot"], t2), RANGES_RETRY * 4);
+
+        // Once it answers, the wait is to the full refresh, which did not move
+        let t3 = t2 + RANGES_RETRY * 4;
+        assert!(!schedule.begin(t3));
+        assert_eq!(
+            schedule.end(Vec::new(), t3),
+            (start + RANGES_REFRESH).saturating_duration_since(t3)
+        );
+        let full = start + RANGES_REFRESH;
+        assert!(schedule.begin(full));
+        assert!(schedule.due(true, "bing"));
+        // and a later failure starts again from RANGES_RETRY
+        assert_eq!(schedule.end(vec!["bing"], full), RANGES_RETRY);
+    }
+
+    #[test]
+    fn a_retry_never_waits_past_the_full_refresh() {
+        let start = Instant::now();
+        let mut schedule = RefreshSchedule::new(start);
+        assert!(schedule.begin(start));
+        let mut now = start;
+        let mut waits = Vec::new();
+        // A feed that keeps failing: the waits double, but each ends by the
+        // full refresh, and the full refresh comes on time
+        while now < start + RANGES_REFRESH {
+            let wait = schedule.end(vec!["duckduckbot"], now);
+            assert!(now + wait <= start + RANGES_REFRESH);
+            waits.push(wait);
+            now += wait;
+            if now < start + RANGES_REFRESH {
+                assert!(!schedule.begin(now));
+            }
+        }
+        assert!(waits.windows(2).take(3).all(|w| w[1] == w[0] * 2));
+        assert!(schedule.begin(now));
+        assert_eq!(now, start + RANGES_REFRESH);
     }
 }
