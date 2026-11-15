@@ -42,6 +42,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+use crate::error_chain::Chain;
+
 /// Where the published ranges are cached between refreshes and restarts.
 ///
 /// The edge honeypot feed (scripts/detect_bots_from_logs.sh) reads it to spare
@@ -647,14 +649,14 @@ async fn fetch_feed(client: &reqwest::Client, url: &str) -> Result<Vec<IpNet>, S
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| Chain(&e).to_string())?;
     if resp
         .content_length()
         .is_some_and(|n| n > MAX_FEED_BYTES as u64)
     {
         return Err("larger than an address list".into());
     }
-    let body = resp.bytes().await.map_err(|e| e.to_string())?;
+    let body = resp.bytes().await.map_err(|e| Chain(&e).to_string())?;
     if body.len() > MAX_FEED_BYTES {
         return Err("larger than an address list".into());
     }

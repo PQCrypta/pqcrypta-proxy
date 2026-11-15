@@ -1790,10 +1790,22 @@ async fn submit_to_ct_logs(
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
-            .map_err(|e| anyhow::anyhow!("CT: log list {} not fetched: {}", config.ct_log_list, e))?
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "CT: log list {} not fetched: {}",
+                    config.ct_log_list,
+                    crate::error_chain::Chain(&e)
+                )
+            })?
             .json()
             .await
-            .map_err(|e| anyhow::anyhow!("CT: log list {} not read: {}", config.ct_log_list, e))?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "CT: log list {} not read: {}",
+                    config.ct_log_list,
+                    crate::error_chain::Chain(&e)
+                )
+            })?;
         let logs = ct_logs_for_expiry(&list, not_after);
         if logs.is_empty() {
             warn!(
@@ -1834,7 +1846,11 @@ async fn submit_to_ct_logs(
                 );
             }
             Err(e) => {
-                warn!("CT log {}: HTTP request failed: {}", log_url, e);
+                warn!(
+                    "CT log {}: HTTP request failed: {}",
+                    log_url,
+                    crate::error_chain::Chain(&e)
+                );
             }
         }
     }

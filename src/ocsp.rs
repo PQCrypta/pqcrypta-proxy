@@ -457,8 +457,9 @@ impl OcspService {
                 Ok(answer) => answer,
                 Err(e) => {
                     shared.failures.fetch_add(1, Ordering::Relaxed);
-                    debug!("OCSP {} attempt {}: {}", url, attempt + 1, e);
-                    last = e.to_string();
+                    // {:#}: the error and its causes, so a failed fetch says why
+                    debug!("OCSP {} attempt {}: {:#}", url, attempt + 1, e);
+                    last = format!("{e:#}");
                     continue;
                 }
             };

@@ -3669,9 +3669,17 @@ fn spawn_tor_exit_refresh(
                             set.store(Arc::new(exits));
                         }
                     }
-                    Err(e) => warn!("Tor exit list body from {} unreadable: {}", url, e),
+                    Err(e) => warn!(
+                        "Tor exit list body from {} unreadable: {}",
+                        url,
+                        crate::error_chain::Chain(&e)
+                    ),
                 },
-                Err(e) => warn!("Tor exit list fetch from {} failed: {}", url, e),
+                Err(e) => warn!(
+                    "Tor exit list fetch from {} failed: {}",
+                    url,
+                    crate::error_chain::Chain(&e)
+                ),
             }
             tokio::time::sleep(every).await;
         }
