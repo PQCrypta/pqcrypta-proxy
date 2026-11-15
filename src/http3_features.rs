@@ -679,8 +679,67 @@ pub async fn http3_features_middleware(
     {
         return next.run(request).await;
     }
+    // Early Hints over TCP, as the QUIC listener sends them: for a page load
+    // of a path with preloads, a 103 on HTTP/2 ahead of the backend's answer
+    // (hyper::ext::InformationalSender, from the vendored hyper's patch); on
+    // HTTP/1.1, which browsers do not read a 103 on, the same Link headers on
+    // the final response.
+    let hints = if state.early_hints.is_enabled()
+        && (request.method() == axum::http::Method::GET
+            || request.method() == axum::http::Method::HEAD)
+        && is_page_load(request.headers())
+    {
+        let host = request
+            .headers()
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| request.uri().host())
+            .unwrap_or("");
+        let host = host.rsplit_once(':').map_or(host, |(name, port)| {
+            if port.chars().all(|c| c.is_ascii_digit()) {
+                name
+            } else {
+                host
+            }
+        });
+        state
+            .early_hints
+            .get_hints_for_request(host, request.uri().path())
+    } else {
+        Vec::new()
+    };
+    let mut sent_early = false;
+    if !hints.is_empty() {
+        if let Some(sender) = request
+            .extensions()
+            .get::<hyper::ext::InformationalSender>()
+        {
+            let mut early = Response::builder().status(axum::http::StatusCode::EARLY_HINTS);
+            for hint in &hints {
+                early = early.header(header::LINK, hint.as_str());
+            }
+            if let Ok(early) = early.body(()) {
+                sent_early = sender.send(early).is_ok();
+                if sent_early {
+                    debug!(
+                        "Sent 103 Early Hints over HTTP/2 with {} link hints",
+                        hints.len()
+                    );
+                }
+            }
+        }
+    }
+
     // Process the request
     let mut response = next.run(request).await;
+
+    if !hints.is_empty() && !sent_early && response.status().is_success() {
+        for hint in &hints {
+            if let Ok(value) = HeaderValue::from_str(hint) {
+                response.headers_mut().append(header::LINK, value);
+            }
+        }
+    }
 
     // Add Priority header based on content type (only if not already set)
     // The security_headers_middleware may have already set a priority from config

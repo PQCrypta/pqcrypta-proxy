@@ -269,6 +269,8 @@ signal-hook-tokio = { version = "0.4", features = ["futures-v0_3"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
+# HTTP/2 interim responses read by a client (tests/early_hints_h2.rs)
+h2 = "0.4"
 assert_matches = "1.5"
 rcgen = "0.14"
 
@@ -320,6 +322,13 @@ rustls = { path = "vendor/rustls-fixed/rustls" }
 # profile at 4.88% -- more than the entire QUIC stack. Patched here rather than
 # in the dependency graph so `h3-noq` gets the same fork.
 h3 = { path = "vendor/h3" }
+# hyper: forked so an HTTP/2 service can send interim responses. Upstream
+# hyper's server holds each stream's h2 `SendResponse` and gives the service no
+# way to reach it, so a 103 Early Hints was impossible over HTTP/2 (h2 itself
+# has `send_informational`). The fork puts `hyper::ext::InformationalSender` in
+# each HTTP/2 request's extensions and sends what the service queues on it
+# ahead of the final response (vendor/hyper/src/ext/h2_informational.rs).
+hyper = { path = "vendor/hyper" }
 # NOTE: the QUIC stack moved from the narrow-probe quinn fork to noq (see the
 # quinn/quinn-proto aliases in [dependencies]); the old quinn/quinn-proto
 # [patch.crates-io] entries were removed since nothing depends on the

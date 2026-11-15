@@ -219,6 +219,27 @@ jobs:
       - name: Run the fork's tests
         run: cargo test --manifest-path vendor/h3/Cargo.toml --lib --all-features
 
+  # The vendored hyper fork's tests: upstream's library tests and the fork's
+  # own, for the sender that lets an HTTP/2 service send a 103 Early Hints
+  # (vendor/hyper/src/ext/h2_informational.rs) ahead of its response.
+  hyper-fork:
+    name: hyper fork tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # the toolchain rust-toolchain.toml names
+        with:
+          toolchain: "1.99.0"
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: hyper-fork
+          workspaces: vendor/hyper
+
+      - name: Run the fork's tests
+        run: cargo test --manifest-path vendor/hyper/Cargo.toml --lib --features full
+
   # The vendored noq fork's tests: noq-proto's protocol and noq's connections
   # over it, the QUIC stack the proxy serves with. noq is a workspace of its
   # own, and its manifest repeats the proxy's rustls patch so noq-proto sees
