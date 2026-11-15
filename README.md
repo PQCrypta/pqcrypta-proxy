@@ -1756,6 +1756,7 @@ src/
 ├── doq.rs                  # DNS over QUIC (RFC 9250) on the QUIC listener, beside HTTP/3
 ├── early_data.rs           # TLS 1.3 early data (0-RTT) on the TCP listeners
 ├── ech_config.rs           # Loads Encrypted Client Hello (ECH, draft-ietf-tls-esni-25) server configurations from disk
+├── error_chain.rs          # An error with every cause under it, for log lines (a failed fetch says why)
 ├── fingerprint.rs          # TLS Fingerprinting Module
 ├── fingerprint_corpus.rs   # The observed TLS fingerprint corpus
 ├── fuzz_support.rs         # Mutation fuzzing for the parsers that read raw client bytes

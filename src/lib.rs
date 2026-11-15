@@ -144,6 +144,7 @@ pub mod doh;
 pub mod doq;
 pub mod early_data;
 pub mod ech_config;
+pub mod error_chain;
 pub mod fingerprint;
 pub mod fingerprint_corpus;
 #[cfg(test)]
