@@ -371,6 +371,7 @@ impl OpensslTlsSettings {
 /// The application protocols the TCP listeners serve, by ALPN, in the
 /// server's order of preference.
 pub const TCP_APPLICATIONS: [&str; 2] = ["h2", "http/1.1"];
+#[cfg(feature = "pqc")]
 const TCP_APPLICATIONS_WIRE: [&[u8]; 2] = [b"h2", b"http/1.1"];
 
 /// The first of `ours`, in our order, that the client's ALPN list offers.
@@ -380,6 +381,7 @@ const TCP_APPLICATIONS_WIRE: [&[u8]; 2] = [b"h2", b"http/1.1"];
 /// The callback runs only when the ClientHello carries ALPN at all, so a
 /// client that names no protocol still connects. A malformed list (a length
 /// past its end) offers nothing.
+#[cfg(feature = "pqc")]
 pub(crate) fn select_application<'a>(
     client_protos: &[u8],
     ours: &[&'a [u8]],
@@ -1435,6 +1437,7 @@ pub fn verify_pqc_support(config: &PqcConfig) -> Result<PqcStatus, String> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "pqc")]
     #[test]
     fn tcp_takes_h2_then_http11_and_refuses_anything_else() {
         let list = |names: &[&str]| -> Vec<u8> {

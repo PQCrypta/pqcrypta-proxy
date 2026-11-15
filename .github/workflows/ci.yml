@@ -45,6 +45,26 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
+  # Each Cargo feature builds on its own, and the crate builds with none: a
+  # feature is a promise that the build works without the others.
+  features:
+    name: Features (${{ matrix.features || 'none' }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", pqc, pqc-signatures, metrics, admin-api, acme, geoip, legacy-pqc]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # the toolchain rust-toolchain.toml names
+        with:
+          toolchain: "1.99.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: features-${{ matrix.features }}
+      - run: cargo clippy --all-targets --no-default-features --features "${{ matrix.features }}" -- -D warnings
+
   # =============================================================================
   # Build and Test Matrix
   # =============================================================================

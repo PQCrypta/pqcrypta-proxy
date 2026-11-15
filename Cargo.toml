@@ -12,39 +12,44 @@ categories = ["network-programming", "cryptography", "web-programming"]
 
 [features]
 default = ["pqc", "pqc-signatures", "metrics", "admin-api", "geoip", "acme"]
-# Enable PQC hybrid key exchange via OpenSSL 3.5+ (native ML-KEM)
-# Also enables extended algorithm detection and configuration
-pqc = ["openssl", "openssl-sys", "openssl-probe", "foreign-types"]
+# OpenSSL on TCP: its native ML-KEM groups and a loaded provider's (OQS),
+# the PQC TCP listener and its handshake verification. Without it rustls
+# serves TCP as well as QUIC.
+pqc = ["openssl", "openssl-sys", "openssl-probe", "foreign-types", "tokio-openssl"]
 # ML-DSA-87 certificate signatures (aws-lc-rs's stable signature module, FIPS builds included)
 pqc-signatures = []
-# Prometheus metrics endpoint
-metrics = ["prometheus"]
-# Count allocations, for answering "how many per request" rather than inferring
-# it from a profile's allocator share. Diagnostic only; never in a release build.
+# Prometheus metrics endpoint on the admin API (/metrics), exposition
+# written by src/metrics.rs.
+metrics = []
+# Counting allocator, for allocations per request; diagnostic only.
+# Answers "how many per request" rather than inferring it from a profile's
+# allocator share. Never in a release build.
 count-allocs = []
-# MEASUREMENT ONLY: collapse the middleware chain to nothing, to price the
-# layering. Produces a binary with no security evaluator and no rate limiting.
-# Never ship it.
+# Measurement build without the middleware chain; never shipped.
+# Collapses the chain to nothing, to price the layering: the binary has no
+# security evaluator and no rate limiting.
 bench-no-middleware = []
-# MEASUREMENT ONLY: keep all eight layers in the chain, paying the boxed future,
-# the per-request clone and the `Next` indirection, but make each do no work.
-# Isolates the plumbing from the work. Produces a binary with no security
-# evaluator and no rate limiting. Never ship it.
+# Measurement build whose layers do no work; never shipped.
+# Keeps all eight layers in the chain, paying the boxed future, the
+# per-request clone and the `Next` indirection, so the plumbing is priced
+# apart from the work: the binary has no security evaluator and no rate
+# limiting.
 bench-null-middleware = []
-# Admin HTTP API for health, reload, shutdown
+# Admin HTTP API: health, reload, shutdown, certificates, bans and metrics.
+# Without it nothing listens on the admin port.
 admin-api = ["tower-http"]
-# ACME certificate automation (works with any ACME CA: Let's Encrypt, ZeroSSL, Buypass, etc.)
+# ACME certificate automation, with any ACME CA (Let's Encrypt, ZeroSSL,
+# Buypass, ...).
 acme = ["instant-acme"]
-# Windows service support
-# SEC-006: Legacy pre-NIST Kyber768 support (disabled by default).
-# Enables Kyber768 and X25519Kyber768 for backward compatibility with deployments
-# that have not yet migrated to the finalised ML-KEM (FIPS 203) standard.
-# These algorithms are NOT FIPS 203 compliant and NOT interoperable with
-# standard ML-KEM peers.  DO NOT enable in new deployments.
+# Pre-standard Kyber drafts (Kyber768, X25519Kyber768), for migration only.
+# For deployments that have not yet moved to the final ML-KEM (FIPS 203):
+# these are not FIPS 203 and do not interoperate with ML-KEM peers. Never
+# in a new deployment.
 legacy-pqc = []
-# GeoIP blocking support
+# GeoIP lookups from MaxMind databases: country and ASN blocking, and the
+# speed test's location.
 geoip = ["maxminddb"]
-# FIPS mode for aws-lc-rs (requires FIPS-validated build)
+# FIPS 140-3 mode for aws-lc-rs, from its FIPS-validated build.
 #
 # `rustls/fips` is part of it, not an extra: without it the vendored rustls
 # is built non-FIPS against a FIPS backend. `cargo {clippy,test,doc}
@@ -145,11 +150,9 @@ axum = { version = "0.8", features = ["macros"] }
 axum-server = { version = "0.8", features = ["tls-rustls", "tls-openssl"] }
 tower = "0.5"
 # Async OpenSSL for TLS connections with PQC
-tokio-openssl = "0.6"
+tokio-openssl = { version = "0.6", optional = true }
 tower-http = { version = "0.7", features = ["cors", "trace", "timeout", "limit"], optional = true }
 
-# Metrics (optional feature)
-prometheus = { version = "0.14", optional = true }
 
 # Utilities
 anyhow = "1.0"

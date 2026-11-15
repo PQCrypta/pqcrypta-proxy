@@ -158,7 +158,7 @@ x_security_level = "Post-Quantum Ready"
 ```toml
 [pqc]
 enabled = true
-provider = "openssl3.5"
+provider = "auto"
 preferred_kem = "X25519MLKEM768"
 fallback_to_classical = true
 ```

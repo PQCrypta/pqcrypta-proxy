@@ -1072,7 +1072,7 @@ struct TlsConfigView {
 #[derive(Serialize)]
 struct PqcConfigView {
     enabled: bool,
-    provider: String,
+    provider: crate::config::PqcProvider,
     preferred_kem: String,
 }
 
@@ -1144,7 +1144,7 @@ async fn config_handler(State(state): State<Arc<AdminState>>) -> Json<ConfigResp
         },
         pqc: PqcConfigView {
             enabled: config.pqc.enabled,
-            provider: config.pqc.provider.clone(),
+            provider: config.pqc.provider,
             preferred_kem: config.pqc.preferred_kem.clone(),
         },
         backends,

@@ -123,6 +123,7 @@
 pub mod access_logger;
 pub mod acme;
 pub mod acme_dns;
+#[cfg(feature = "admin-api")]
 pub mod admin;
 pub mod audit_logger;
 pub mod backend_client;

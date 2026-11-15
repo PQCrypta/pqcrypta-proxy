@@ -1873,23 +1873,73 @@ fn default_zero_rtt_safe_methods() -> Vec<String> {
     vec!["GET".to_string(), "HEAD".to_string()]
 }
 
+/// Which TLS library terminates TLS over TCP (`pqc.provider`). QUIC is
+/// always rustls: it is the only QUIC TLS stack the proxy has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PqcProvider {
+    /// OpenSSL serves TCP, and a ClientHello offering ECH is handed to
+    /// rustls, which opens it: each connection gets the library that can
+    /// serve what it offers.
+    #[default]
+    Auto,
+    /// rustls serves TCP too: one memory-safe TLS stack on every transport,
+    /// with no C TLS library on any connection.
+    Rustls,
+    /// OpenSSL serves every TCP ClientHello; ECH is then served over QUIC
+    /// only.
+    OpenSsl,
+}
+
+impl PqcProvider {
+    /// The setting's value, as the configuration file spells it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Rustls => "rustls",
+            Self::OpenSsl => "openssl",
+        }
+    }
+
+    /// Whether OpenSSL terminates TCP, given whether its post-quantum key
+    /// exchange is usable in this process.
+    #[must_use]
+    pub fn openssl_serves_tcp(self, openssl_usable: bool) -> bool {
+        self != Self::Rustls && openssl_usable
+    }
+
+    /// Whether the OpenSSL listener hands a ClientHello offering ECH to
+    /// rustls rather than serving it itself.
+    #[must_use]
+    pub fn ech_to_rustls(self) -> bool {
+        self == Self::Auto
+    }
+}
+
+impl std::fmt::Display for PqcProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// Post-quantum cryptography configuration
 ///
-/// Supports both TLS backends:
-/// - **rustls** (default): Pure Rust, memory-safe, QUIC support, uses aws-lc-rs
-/// - **OpenSSL 3.5+**: Broader algorithm support, hardware acceleration
+/// Both TLS libraries serve: rustls (aws-lc-rs) on QUIC, and on TCP the one
+/// `provider` names.
 ///
 /// ## Algorithm Support
 ///
-/// | Algorithm | rustls | OpenSSL 3.5+ |
-/// |-----------|--------|--------------|
+/// | Algorithm | rustls | OpenSSL |
+/// |-----------|--------|---------|
 /// | X25519MLKEM768 | ✅ | ✅ |
-/// | SecP256r1MLKEM768 | ⏳ | ✅ |
-/// | SecP384r1MLKEM1024 | ⏳ | ✅ |
+/// | SecP256r1MLKEM768 | ✅ | ✅ |
+/// | SecP384r1MLKEM1024 | ✅ | ✅ |
 /// | ML-KEM-512/768/1024 | ✅ | ✅ |
-/// | ML-DSA-44/65/87 | 🔧 | ✅ |
+/// | `experimental_groups` (a loaded OpenSSL provider's) | ✅ (`provider_kx`) | ✅ |
+/// | ML-DSA-87 certificates | 🔧 | ✅ |
 ///
-/// ✅ = Available, ⏳ = Planned, 🔧 = Requires `pqc-signatures` feature
+/// ✅ = Available, 🔧 = Requires the `pqc-signatures` feature
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PqcConfig {
@@ -1907,11 +1957,11 @@ pub struct PqcConfig {
     /// upgrade. An operator who is selling PQC as the security property wants it true.
     #[serde(default)]
     pub required: bool,
-    /// PQC provider: "auto", "rustls", or "openssl3.5"
-    /// - "auto" (default): Use rustls for QUIC, OpenSSL when broader algorithms needed
-    /// - "rustls": Pure Rust via aws-lc-rs (memory-safe, QUIC support)
-    /// - "openssl3.5": OpenSSL 3.5+ with native ML-KEM (broader algorithms)
-    pub provider: String,
+    /// The TLS library that terminates TCP: `"auto"` (the default: OpenSSL,
+    /// with ClientHellos offering ECH handed to rustls), `"rustls"` (rustls
+    /// on every transport) or `"openssl"` (OpenSSL for every TCP ClientHello;
+    /// ECH over QUIC only). QUIC is rustls under each.
+    pub provider: PqcProvider,
     /// Preferred KEM algorithm for key exchange
     pub preferred_kem: String,
     /// Offer the classical key-exchange groups (P-384, P-256 and X25519, one
@@ -2012,7 +2062,7 @@ impl Default for PqcConfig {
         Self {
             enabled: true,
             required: false,
-            provider: "auto".to_string(), // Auto-select best available
+            provider: PqcProvider::Auto,
             // X25519MLKEM768 is the IETF standard hybrid (classical + PQC)
             // Provides NIST Level 3 security with classical fallback
             preferred_kem: "X25519MLKEM768".to_string(),
@@ -2217,7 +2267,9 @@ pub struct RouteConfig {
     /// Backend name to route to (not required if redirect is set)
     #[serde(default)]
     pub backend: String,
-    /// Transform WebTransport stream to HTTP method
+    /// The HTTP method a WebTransport stream's or datagram's payload is
+    /// forwarded to the backend with: POST (the default), PUT or PATCH
+    /// ([`RouteConfig::STREAM_METHODS`])
     pub stream_to_method: Option<String>,
     /// Headers to add to backend request
     #[serde(default)]
@@ -2328,6 +2380,20 @@ pub struct RouteConfig {
 }
 
 impl RouteConfig {
+    /// The methods a WebTransport payload may be forwarded with: those whose
+    /// request content has defined semantics (RFC 9110 sections 9.3.3,
+    /// 9.3.4; RFC 5789).
+    pub const STREAM_METHODS: [&'static str; 3] = ["POST", "PUT", "PATCH"];
+
+    /// The method this route's WebTransport payloads are forwarded with.
+    #[must_use]
+    pub fn stream_method(&self) -> http::Method {
+        self.stream_to_method
+            .as_deref()
+            .and_then(|m| http::Method::from_bytes(m.as_bytes()).ok())
+            .unwrap_or(http::Method::POST)
+    }
+
     /// Whether requests to this route must come with a client certificate:
     /// `security.mtls_required`, defaulting to `internal`.
     pub fn requires_client_cert(&self) -> bool {
@@ -4715,8 +4781,24 @@ impl ProxyConfig {
             warn!("TLS private key not found: {:?}", self.tls.key_path);
         }
 
+        #[cfg(not(feature = "pqc"))]
+        if self.pqc.enabled && self.pqc.provider == PqcProvider::OpenSsl {
+            return Err(anyhow::anyhow!(
+                "pqc.provider \"openssl\": this build has no OpenSSL (the pqc feature)"
+            ));
+        }
+
         // Validate routes reference existing backends or backend_pools (unless they're redirect routes)
         for route in &self.routes {
+            if let Some(method) = route.stream_to_method.as_deref() {
+                if !RouteConfig::STREAM_METHODS.contains(&method) {
+                    return Err(anyhow::anyhow!(
+                        "route {:?}: stream_to_method {method:?} must be one of {:?}",
+                        route.name.as_deref().unwrap_or(""),
+                        RouteConfig::STREAM_METHODS
+                    ));
+                }
+            }
             // A route's request-signing key, held to the admin token's floor.
             if let Some(secret) = route.security.as_ref().and_then(|p| p.hmac_secret.as_ref()) {
                 if secret.len() < MIN_SECRET_CHARS {
@@ -5582,6 +5664,45 @@ mod tests {
         assert!(err.contains("security.hmac_secret is too short"), "{err}");
     }
 
+    /// A WebTransport route forwards with its `stream_to_method`, POST when it
+    /// names none, and a method without defined request content is refused.
+    #[test]
+    fn stream_to_method_is_used_and_validated() {
+        let mut r = route(None, Some("/wt"), None, None, 1);
+        assert_eq!(r.stream_method(), http::Method::POST);
+        r.stream_to_method = Some("PUT".into());
+        assert_eq!(r.stream_method(), http::Method::PUT);
+
+        let mut c = ProxyConfig::default();
+        r.stream_to_method = Some("GET".into());
+        c.routes.push(r);
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("stream_to_method"), "{err}");
+    }
+
+    /// `pqc.provider` chooses the TCP library: rustls takes OpenSSL off TCP,
+    /// OpenSSL keeps ECH offers for itself, and a value outside the three
+    /// fails the load rather than meaning "auto".
+    #[test]
+    fn pqc_provider_chooses_the_tcp_library() {
+        let parse = |v: &str| toml::from_str::<PqcConfig>(&format!("provider = {v:?}"));
+        assert_eq!(parse("auto").unwrap().provider, PqcProvider::Auto);
+        assert_eq!(parse("rustls").unwrap().provider, PqcProvider::Rustls);
+        assert_eq!(parse("openssl").unwrap().provider, PqcProvider::OpenSsl);
+        assert!(parse("openssl3.5").is_err());
+        assert_eq!(PqcConfig::default().provider, PqcProvider::Auto);
+
+        assert!(PqcProvider::Auto.openssl_serves_tcp(true));
+        assert!(PqcProvider::OpenSsl.openssl_serves_tcp(true));
+        assert!(!PqcProvider::Rustls.openssl_serves_tcp(true));
+        assert!(!PqcProvider::Auto.openssl_serves_tcp(false));
+        assert!(PqcProvider::Auto.ech_to_rustls());
+        assert!(!PqcProvider::OpenSsl.ech_to_rustls());
+        for p in [PqcProvider::Auto, PqcProvider::Rustls, PqcProvider::OpenSsl] {
+            assert_eq!(parse(p.name()).unwrap().provider, p);
+        }
+    }
+
     #[test]
     fn redirect_status_is_validated() {
         let mut c = ProxyConfig::default();
@@ -5748,7 +5869,7 @@ key_path = "/etc/pqcrypta/key.pem"
 
 [pqc]
 enabled = true
-provider = "openssl3.5"
+provider = "openssl"
 
 [admin]
 enabled = true

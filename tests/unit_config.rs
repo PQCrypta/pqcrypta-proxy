@@ -13,7 +13,7 @@ fn test_default_config() {
     assert!(config.server.udp_port > 0);
     assert!(config.admin.port > 0);
     assert!(config.pqc.enabled);
-    assert_ne!(config.pqc.provider, "");
+    assert_eq!(config.pqc.provider, PqcProvider::Auto);
 }
 
 #[test]
@@ -108,7 +108,7 @@ fn test_tls_mode_defaults() {
 fn test_pqc_config_defaults() {
     let config = PqcConfig::default();
     assert!(config.enabled);
-    assert_eq!(config.provider, "auto");
+    assert_eq!(config.provider, PqcProvider::Auto);
     assert_ne!(config.preferred_kem, "");
     assert!(config.fallback_to_classical);
     assert!(config.min_security_level >= 1 && config.min_security_level <= 5);
@@ -130,7 +130,7 @@ enabled = true
 provider = "auto"
 "#;
     let config: ProxyConfig = toml::from_str(toml_auto).unwrap();
-    assert_eq!(config.pqc.provider, "auto");
+    assert_eq!(config.pqc.provider, PqcProvider::Auto);
 
     let toml_rustls = r#"
 [server]
@@ -145,7 +145,7 @@ enabled = true
 provider = "rustls"
 "#;
     let config: ProxyConfig = toml::from_str(toml_rustls).unwrap();
-    assert_eq!(config.pqc.provider, "rustls");
+    assert_eq!(config.pqc.provider, PqcProvider::Rustls);
 
     let toml_openssl = r#"
 [server]
@@ -157,10 +157,10 @@ key_path = "/tmp/test.key"
 
 [pqc]
 enabled = true
-provider = "openssl3.5"
+provider = "openssl"
 "#;
     let config: ProxyConfig = toml::from_str(toml_openssl).unwrap();
-    assert_eq!(config.pqc.provider, "openssl3.5");
+    assert_eq!(config.pqc.provider, PqcProvider::OpenSsl);
 }
 
 #[test]

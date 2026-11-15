@@ -331,6 +331,7 @@ impl<T> HandshakeSource for tokio_rustls::server::TlsStream<T> {
     }
 }
 
+#[cfg(feature = "pqc")]
 impl<T> HandshakeSource for tokio_openssl::SslStream<T> {
     fn handshake_facts(&self) -> crate::tls_acceptor::HandshakeFacts {
         pqc_handshake_facts(self.ssl())
@@ -2410,6 +2411,7 @@ fn pqc_handshake_facts(ssl: &openssl::ssl::SslRef) -> crate::tls_acceptor::Hands
             .selected_alpn_protocol()
             .map(|p| String::from_utf8_lossy(p).into_owned()),
         ech: "not-supported",
+        library: crate::tls_acceptor::TlsLibrary::OpenSsl,
         prepared: std::sync::OnceLock::default(),
     }
 }
@@ -2432,6 +2434,7 @@ fn openssl_ech_status(ech_held: bool) -> &'static str {
 
 /// The rustls acceptor the OpenSSL listener hands ECH connections to, and
 /// the config ids it holds keys for.
+#[cfg(feature = "pqc")]
 #[derive(Clone)]
 struct EchRoute {
     acceptor: Arc<FingerprintingTlsAcceptor>,
@@ -2449,6 +2452,10 @@ fn current_ech_route(
     fingerprint_extractor: &Arc<FingerprintExtractor>,
     security_state: &SecurityState,
 ) -> Result<Option<EchRoute>, Box<dyn std::error::Error + Send + Sync>> {
+    // `pqc.provider = "openssl"`: OpenSSL serves every ClientHello
+    if !config.pqc.provider.ech_to_rustls() {
+        return Ok(None);
+    }
     let config_ids: Arc<[u8]> = crate::ech_config::config_ids().into();
     if config_ids.is_empty() || crate::ech_config::load().is_none() {
         if previous.is_some() {
@@ -2583,6 +2590,7 @@ async fn wait_for_record(
 // Every argument is a distinct per-connection dependency with no natural
 // grouping; bundling them into a struct purely to satisfy the lint would add an
 // indirection this accept path does not otherwise need.
+#[cfg(feature = "pqc")]
 #[expect(clippy::too_many_arguments)]
 async fn handle_pqc_fingerprinted_connection<S>(
     stream: TcpStream,

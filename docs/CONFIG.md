@@ -278,7 +278,7 @@ All responses automatically include these security headers. The `Server` header 
 |--------|------|---------|-------------|
 | `enabled` | bool | `true` | Enable PQC hybrid key exchange |
 | `required` | bool | `false` | Refuse to start unless an in-memory TLS 1.3 handshake against the proxy's own provider negotiates a post-quantum hybrid at startup; a handshake that cannot be completed counts as a failure |
-| `provider` | string | `"auto"` | PQC provider. Options: `"auto"`, `"rustls"`, `"openssl3.5"` |
+| `provider` | string | `"auto"` | The TLS library that terminates TCP: `"auto"`, `"rustls"` or `"openssl"` (see [PQC Providers](#pqc-providers)); any other value is refused at load |
 | `preferred_kem` | string | `"X25519MLKEM768"` | Preferred KEM algorithm |
 | `fallback_to_classical` | bool | `true` | Offer the classical groups (P-384, P-256, X25519, one tuple, on every listener) alongside the hybrid PQC groups, so a client without ML-KEM can connect; never under `require_hybrid`. What happens when PQC itself is unavailable is `require_pqc_provider` |
 | `require_pqc_provider` | bool | `true` | Refuse to start when `enabled` is true but the PQC provider cannot be used, instead of degrading to a classical-only listener |
@@ -307,11 +307,17 @@ All responses automatically include these security headers. The `Server` header 
 
 ### PQC Providers
 
-| Provider | Backend | QUIC Support | Algorithms |
-|----------|---------|--------------|------------|
-| `auto` | Auto-detect | Yes | Best available |
-| `rustls` | aws-lc-rs | Yes | X25519MLKEM768 |
-| `openssl3.5` | OpenSSL 3.5+ | No | All ML-KEM variants |
+QUIC is served by rustls under every value: it is the proxy's only QUIC TLS stack.
+Both libraries offer every ML-KEM group above and `experimental_groups` (rustls
+runs a loaded OpenSSL provider's KEM through `provider_kx`).
+
+| Provider | TCP served by | ECH over TCP | When to choose it |
+|----------|---------------|--------------|-------------------|
+| `auto` | OpenSSL; a ClientHello offering ECH is handed to rustls | Yes | The default: each connection gets the library that can serve what it offers |
+| `rustls` | rustls (aws-lc-rs) | Yes | One memory-safe TLS stack on every transport, no C TLS library on any connection |
+| `openssl` | OpenSSL, every ClientHello | No (QUIC only) | OpenSSL's own handshake for every TCP client; refused at startup when its post-quantum key exchange is not usable |
+
+Each request's `x-tls-library` header names the library that completed its handshake.
 
 ---
 
@@ -883,7 +889,7 @@ Route configuration for request matching and forwarding.
 | `webtransport` | bool | `false` | Enable WebTransport for this route |
 | `supports_websocket` | bool | `false` | Tunnel WebSockets on this route: an HTTP/1.1 upgrade (RFC 6455), an HTTP/2 extended CONNECT (RFC 8441) or an HTTP/3 one (RFC 9220), each opened to the backend as an HTTP/1.1 upgrade with the backend's TLS settings and the request's fields, within its `timeout_ms`; the backend's `Sec-WebSocket-Accept` is verified and the subprotocol and extensions it agreed to are passed to the client |
 | `ws_idle_timeout_secs` | u64 | `300` | Close a WebSocket tunnel when nothing has moved either way for this long (0: never) |
-| `stream_to_method` | string? | `null` | Transform WebTransport stream to HTTP method |
+| `stream_to_method` | string? | `null` | The HTTP method a WebTransport stream's or datagram's payload is forwarded to the backend with: `POST` (when unset), `PUT` or `PATCH`; any other value is refused when the configuration loads |
 
 ### Redirects
 

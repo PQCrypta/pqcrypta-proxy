@@ -180,10 +180,16 @@ struct GeoInfo {
     org: Option<String>,
 }
 
+/// Without the geoip feature there is no database to ask.
+#[cfg(not(feature = "geoip"))]
+fn lookup_geoip(_ip: IpAddr) -> GeoInfo {
+    GeoInfo::default()
+}
+
+#[cfg(feature = "geoip")]
 fn lookup_geoip(ip: IpAddr) -> GeoInfo {
     let mut info = GeoInfo::default();
 
-    #[cfg(feature = "geoip")]
     {
         // ── City ─────────────────────────────────────────────────────────
         let city_slot = CITY_READER.get(GEOIP_PATHS.get().and_then(|p| p.0.as_deref()), |path| {
