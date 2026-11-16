@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.14.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.13.3...v0.14.0) (2026-11-16)
+
+
+### Features
+
+* backend health probed in the background, by HTTP where a path is set ([84913a3](https://github.com/PQCrypta/pqcrypta-proxy/commit/84913a3c305c4ef450e646b2440d245c1bc9fa1a))
+* settings and features do what their documents say ([543dffc](https://github.com/PQCrypta/pqcrypta-proxy/commit/543dffc7815aa082b5e42c79424d826ba8912e59))
+
+
+### Bug Fixes
+
+* a build without the pqc feature links no OpenSSL ([048ba90](https://github.com/PQCrypta/pqcrypta-proxy/commit/048ba90c906b8228b0a31e526605ab9a81b5575f))
+* every setting has one default, and the documents state it from the code ([ff8923d](https://github.com/PQCrypta/pqcrypta-proxy/commit/ff8923df0948334aba06005ee0d40b06a2f7eeb6))
+* WebTransport stream reads count against the session's share and the body budget ([cb2eb6a](https://github.com/PQCrypta/pqcrypta-proxy/commit/cb2eb6abdc9c2a6d7e32af69a8d6d03dbb5ed145))
+
 ## [0.13.3](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.13.2...v0.13.3) (2026-11-14)
 
 
