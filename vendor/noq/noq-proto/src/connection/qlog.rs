@@ -607,10 +607,10 @@ impl ToQlog for frame::AddAddress {
             sequence_number: self.seq_no.into_inner(),
             ip_v4: match self.ip {
                 IpAddr::V4(ipv4_addr) => Some(ipv4_addr.to_string()),
-                IpAddr::V6(ipv6_addr) => None,
+                IpAddr::V6(_) => None,
             },
             ip_v6: match self.ip {
-                IpAddr::V4(ipv4_addr) => None,
+                IpAddr::V4(_) => None,
                 IpAddr::V6(ipv6_addr) => Some(ipv6_addr.to_string()),
             },
             port: self.port,
@@ -797,10 +797,10 @@ impl ToQlog for frame::ObservedAddr {
             sequence_number: self.seq_no.into_inner(),
             ip_v4: match self.ip {
                 IpAddr::V4(ipv4_addr) => Some(ipv4_addr.to_string()),
-                IpAddr::V6(ipv6_addr) => None,
+                IpAddr::V6(_) => None,
             },
             ip_v6: match self.ip {
-                IpAddr::V4(ipv4_addr) => None,
+                IpAddr::V4(_) => None,
                 IpAddr::V6(ipv6_addr) => Some(ipv6_addr.to_string()),
             },
             port: self.port,
@@ -879,10 +879,10 @@ impl ToQlog for frame::ReachOut {
             round: self.round.into_inner(),
             ip_v4: match self.ip {
                 IpAddr::V4(ipv4_addr) => Some(ipv4_addr.to_string()),
-                IpAddr::V6(ipv6_addr) => None,
+                IpAddr::V6(_) => None,
             },
             ip_v6: match self.ip {
-                IpAddr::V4(ipv4_addr) => None,
+                IpAddr::V4(_) => None,
                 IpAddr::V6(ipv6_addr) => Some(ipv6_addr.to_string()),
             },
             port: self.port,
