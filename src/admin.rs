@@ -195,10 +195,11 @@ impl AdminServer {
             None => {
                 // P3-fix: use OsRng (cryptographically secure) instead of thread_rng
                 // (designed for simulation, not secret generation).
-                use rand::rngs::OsRng;
-                use rand::Rng;
-                let token: String = OsRng
-                    .sample_iter(&rand::distributions::Alphanumeric)
+                use rand::RngExt;
+                // The operating system's generator; rand's UnwrapErr makes its
+                // (fallible) source the infallible one sample_iter draws from
+                let token: String = rand::rand_core::UnwrapErr(rand::rngs::SysRng)
+                    .sample_iter(&rand::distr::Alphanumeric)
                     .take(48)
                     .map(char::from)
                     .collect();

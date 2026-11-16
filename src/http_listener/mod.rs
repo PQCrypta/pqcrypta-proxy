@@ -3932,7 +3932,7 @@ async fn proxy_handler(
         // Shadow mirroring: spawn fire-and-forget task concurrently with primary forward.
         // The client only receives the primary response; shadow response is logged + discarded.
         if let (Some(shadow_cfg), Some(shadow_bytes)) = (&route.shadow, &shadow_body_bytes) {
-            let roll: u8 = rand::Rng::gen_range(&mut rand::thread_rng(), 0..100);
+            let roll: u8 = rand::random_range(0..100);
             if roll < shadow_cfg.percent.min(100) {
                 if let Some(shadow_backend) = state.config.get_backend(&shadow_cfg.backend) {
                     spawn_shadow_request(

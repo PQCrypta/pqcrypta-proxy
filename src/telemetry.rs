@@ -84,7 +84,6 @@ use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use rand::Rng;
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::RwLock;
@@ -128,7 +127,7 @@ const SESSION_MAX_DURATION: Duration = Duration::from_hours(1); // 60 minutes
 /// make them smaller than they are.
 static PAYLOAD: LazyLock<Vec<u8>> = LazyLock::new(|| {
     let mut bytes = vec![0u8; CHUNK_BYTES];
-    rand::thread_rng().fill(bytes.as_mut_slice());
+    rand::fill(bytes.as_mut_slice());
     bytes
 });
 
@@ -243,8 +242,7 @@ fn compute_intensity(cfg: &ImpairmentConfig, elapsed_s: f64) -> f64 {
         ImpairmentPattern::Fixed => cfg.intensity,
 
         ImpairmentPattern::Random => {
-            let mut rng = rand::thread_rng();
-            cfg.rand_min + rng.gen::<f64>() * (cfg.rand_max - cfg.rand_min)
+            cfg.rand_min + rand::random::<f64>() * (cfg.rand_max - cfg.rand_min)
         }
 
         ImpairmentPattern::Sine => {
@@ -634,7 +632,7 @@ fn hold_back(imp: &ImpairmentConfig, elapsed_s: f64) -> Duration {
     let intensity = compute_intensity(imp, elapsed_s).max(0.0);
     let ms = match imp.imp_type {
         ImpairmentType::DelayMs => intensity,
-        ImpairmentType::JitterMs => rand::thread_rng().gen::<f64>() * intensity * 2.0,
+        ImpairmentType::JitterMs => rand::random::<f64>() * intensity * 2.0,
         _ => 0.0,
     };
     Duration::from_secs_f64(ms.min(10_000.0) / 1000.0)

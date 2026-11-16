@@ -24,7 +24,6 @@ use std::path::PathBuf;
 use base64::engine::general_purpose::STANDARD as base64_engine;
 use base64::Engine;
 use clap::Parser;
-use rand::RngCore;
 use rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES;
 use rustls::crypto::hpke::{Hpke, HpkeSuite};
 use rustls::internal::msgs::base::PayloadU16;
@@ -229,9 +228,8 @@ fn pick_unused_config_id(out_dir: &std::path::Path) -> u8 {
         })
         .collect();
 
-    let mut rng = rand::thread_rng();
     loop {
-        let candidate = (rng.next_u32() & 0xff) as u8;
+        let candidate: u8 = rand::random();
         if !used.contains(&candidate) {
             return candidate;
         }

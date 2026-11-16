@@ -48,7 +48,6 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use rand::Rng;
 use tracing::{info, warn};
 
 use crate::config::{
@@ -1055,7 +1054,7 @@ impl BackendPool {
             return None;
         }
 
-        let roll: u8 = rand::thread_rng().gen_range(0..100);
+        let roll: u8 = rand::random_range(0..100);
         if roll >= max_pct {
             return None;
         }
@@ -1690,7 +1689,7 @@ impl LoadBalancingAlgorithm for RandomAlgorithm {
             return None;
         }
 
-        let idx = rand::thread_rng().gen_range(0..healthy_servers.len());
+        let idx = rand::random_range(0..healthy_servers.len());
         Some(healthy_servers[idx].clone())
     }
 
@@ -1939,11 +1938,10 @@ impl LoadBalancingAlgorithm for PowerOfTwoChoicesAlgorithm {
             _ => {}
         }
 
-        let mut rng = rand::thread_rng();
-        let a = rng.gen_range(0..healthy.len());
+        let a = rand::random_range(0..healthy.len());
         // Draw the second from the remaining n-1 and shift, so the two are always
         // distinct without looping until they differ.
-        let mut b = rng.gen_range(0..healthy.len() - 1);
+        let mut b = rand::random_range(0..healthy.len() - 1);
         if b >= a {
             b += 1;
         }

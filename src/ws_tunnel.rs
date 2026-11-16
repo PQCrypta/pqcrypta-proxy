@@ -154,7 +154,7 @@ where
     let made_key = client_key.is_none();
     let key = client_key.unwrap_or_else(|| {
         let mut nonce = [0u8; 16];
-        rand::Rng::fill(&mut rand::thread_rng(), &mut nonce);
+        rand::fill(&mut nonce);
         HeaderValue::from_str(&base64::engine::general_purpose::STANDARD.encode(nonce))
             .unwrap_or(HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="))
     });

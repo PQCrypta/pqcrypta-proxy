@@ -7,7 +7,6 @@
 //! Off by default: an empty setting costs nothing per request.
 
 use http::{HeaderMap, HeaderName, HeaderValue};
-use rand::RngCore;
 
 /// Longest client-supplied ID the proxy will pass on.
 const MAX_LEN: usize = 128;
@@ -30,7 +29,7 @@ pub fn resolve(request_headers: &HeaderMap, name: &HeaderName) -> HeaderValue {
         }
     }
     let mut id = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut id);
+    rand::fill(&mut id);
     // Hex is always a valid header value.
     HeaderValue::from_str(&hex::encode(id)).unwrap_or_else(|_| HeaderValue::from_static("0"))
 }
