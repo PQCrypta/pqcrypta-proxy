@@ -221,7 +221,7 @@ pin-project-lite = "0.2"
 url = "2.5"
 
 # IP address handling
-ipnetwork = "0.20"
+ipnetwork = "0.21"
 ipnet = { version = "2.12", features = ["serde"] }
 
 # Regex for route matching
