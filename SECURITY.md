@@ -26,4 +26,7 @@ against hosts you do not operate.
 Fixes are made on `main` and released as the next version; the latest release
 is the supported one. Releases are tagged `v<version>` and listed under
 [Releases](https://github.com/PQCrypta/pqcrypta-proxy/releases), with the
-binary and container image they publish.
+binary and container image (`ghcr.io/pqcrypta/pqcrypta-proxy`) they publish,
+each with signed build provenance; the README's
+[Release binary](README.md#release-binary) and [Docker](README.md#docker)
+sections show how to verify them.

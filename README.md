@@ -662,7 +662,47 @@ cp config/example-config.toml /etc/pqcrypta/proxy-config.toml
 ./target/release/pqcrypta-proxy --config /etc/pqcrypta/proxy-config.toml
 ```
 
+### Release binary
+
+Each release attaches a Linux x86-64 binary, built by the release workflow
+with OpenSSL linked in, and its signed SLSA build provenance:
+`pqcrypta-proxy.sigstore.json` (the Sigstore bundle) and
+`pqcrypta-proxy.intoto.jsonl` (its DSSE envelope with the signing
+certificate). The signature is keyless: the certificate names the release
+workflow and the commit it built, and the signature is entered in Sigstore's
+public transparency log. Releases up to v0.14.1 carry the binary alone.
+
+```bash
+gh release download --repo PQCrypta/pqcrypta-proxy --pattern 'pqcrypta-proxy*'
+
+# Against GitHub's attestation store
+gh attestation verify pqcrypta-proxy --repo PQCrypta/pqcrypta-proxy
+
+# Or against the bundle that came with it
+gh attestation verify pqcrypta-proxy --repo PQCrypta/pqcrypta-proxy \
+  --bundle pqcrypta-proxy.sigstore.json
+
+# Or with cosign
+cosign verify-blob-attestation --new-bundle-format \
+  --bundle pqcrypta-proxy.sigstore.json --type slsaprovenance1 \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/PQCrypta/pqcrypta-proxy/\.github/workflows/release-please\.yml@refs/heads/main$' \
+  pqcrypta-proxy
+```
+
 ### Docker
+
+Each release pushes its image to the GitHub Container Registry, tagged with
+the release (`v<version>`) and `latest`, with signed build provenance attached
+in the registry (images up to v0.14.1 were built and tested, not published):
+
+```bash
+docker pull ghcr.io/pqcrypta/pqcrypta-proxy:latest
+gh attestation verify oci://ghcr.io/pqcrypta/pqcrypta-proxy:latest \
+  --repo PQCrypta/pqcrypta-proxy
+```
+
+Or build it yourself:
 
 ```bash
 # Build the image from the repository root (the Dockerfile is docker/'s; the
