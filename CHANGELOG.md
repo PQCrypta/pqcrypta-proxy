@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.1](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.14.0...v0.14.1) (2026-11-16)
+
+
+### Bug Fixes
+
+* JWT rate-limit settings checked at load, and jsonwebtoken 12 ([7424508](https://github.com/PQCrypta/pqcrypta-proxy/commit/7424508d53992fe5c2b7d891742499ed908aae71))
+
 ## [0.14.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.13.3...v0.14.0) (2026-11-16)
 
 
