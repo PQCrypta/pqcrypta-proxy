@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.14.1...v0.15.0) (2026-11-16)
+
+
+### Features
+
+* **release:** signed build provenance for the binary, and the image published to GHCR ([2721ad2](https://github.com/PQCrypta/pqcrypta-proxy/commit/2721ad23360cb5709672a018e26c608738d1809e))
+
 ## [0.14.1](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.14.0...v0.14.1) (2026-11-16)
 
 
