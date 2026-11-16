@@ -1551,8 +1551,9 @@ mod tests {
             .unwrap()
     }
 
-    /// A WebTransport server on a free IPv6 loopback port, with a self-signed
-    /// `localhost` certificate its clients trust.
+    /// A WebTransport server on a free loopback port of the address `localhost`
+    /// resolves to first, with a self-signed `localhost` certificate its
+    /// clients trust.
     async fn server(
         dir: &std::path::Path,
         per_origin: u32,
@@ -1563,8 +1564,16 @@ mod tests {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         std::fs::write(dir.join("localhost.crt"), cert.cert.pem()).unwrap();
         std::fs::write(dir.join("localhost.key"), cert.signing_key.serialize_pem()).unwrap();
-        // `localhost` resolves to ::1 first, so that is where the server listens.
-        let port = std::net::UdpSocket::bind("[::1]:0")
+        // Where the clients will connect: `localhost` as this host resolves it.
+        // That is ::1 first on most hosts, and 127.0.0.1 where /etc/hosts names
+        // only that (api3 does): a server on ::1 alone was never reached there,
+        // and both tests that open sessions timed out.
+        let ip = std::net::ToSocketAddrs::to_socket_addrs(&("localhost", 0))
+            .unwrap()
+            .next()
+            .expect("localhost resolves")
+            .ip();
+        let port = std::net::UdpSocket::bind((ip, 0))
             .unwrap()
             .local_addr()
             .unwrap()
@@ -1576,7 +1585,7 @@ mod tests {
         let crt = dir.join("localhost.crt");
         let key = dir.join("localhost.key");
         let server = WebTransportServer::new(
-            SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port)),
+            SocketAddr::from((ip, port)),
             crt.to_str().unwrap(),
             key.to_str().unwrap(),
             config.clone(),
