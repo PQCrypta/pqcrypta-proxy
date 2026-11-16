@@ -77,7 +77,7 @@ mod request_host;
 // Shared with the HTTP/3 path: the security headers (layers::ResponseHeaderSet)
 pub(crate) mod layers;
 pub mod passthrough;
-mod proxy_protocol;
+pub(crate) mod proxy_protocol;
 mod speedtest_tcp;
 mod tls_config;
 mod websocket;
@@ -2491,7 +2491,7 @@ fn current_ech_route(
 /// How many bytes of `buf` (a peek of `n`) make the first TLS record whole:
 /// the 5-byte header, then the length it gives, at most the buffer. `n` itself
 /// for something that is not a handshake record.
-fn client_hello_needs(buf: &[u8], n: usize) -> usize {
+pub(crate) fn client_hello_needs(buf: &[u8], n: usize) -> usize {
     if n == 0 || buf[0] != 22 {
         return n;
     }

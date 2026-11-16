@@ -136,6 +136,27 @@ error!(error = %e, "Failed to process request");
 - Add integration tests for end-to-end scenarios
 - Use property-based testing for complex logic
 
+### Fuzzing
+
+Release builds abort on a panic, so a parser that panics on a client's bytes
+ends the process. `fuzz/` holds coverage-guided targets (cargo-fuzz) for each
+family of parsers a client or a peer reaches: ClientHello records (where the
+acceptor's and the passthrough router's SNI must agree), DNS messages,
+request bodies (never decoded past their limit), PROXY protocol headers,
+fetched documents, CONNECT-UDP targets and session tickets. Their entry
+points are `src/fuzzing.rs`, compiled only under `cfg(fuzzing)`; seeds are in
+`fuzz/seeds/<target>/`. With a nightly toolchain and `cargo install cargo-fuzz`:
+
+```bash
+cd fuzz
+# new cases go to the first directory (corpus/, ignored); seeds/ is read only
+cargo +nightly fuzz run client_hello corpus/client_hello seeds/client_hello -- -max_total_time=60
+```
+
+ClusterFuzzLite runs every target on pull requests that touch the code they
+reach, and for an hour each day. A parser added where client bytes arrive
+gets an entry in `src/fuzzing.rs` and a target.
+
 ```rust
 #[test]
 fn test_route_matching() {

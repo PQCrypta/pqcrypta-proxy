@@ -452,7 +452,7 @@ pub(crate) fn inspect(msg: &[u8]) -> Option<QueryInfo> {
 /// REFUSED, answered here, for a query the gateway does not forward: the
 /// query's ID, opcode, RD and question, and for an EDNS query an OPT record
 /// with an Extended DNS Error saying why (RFC 8914 §4.22), padded on request.
-fn refusal(query: &[u8], info: &QueryInfo) -> Vec<u8> {
+pub(crate) fn refusal(query: &[u8], info: &QueryInfo) -> Vec<u8> {
     answered_here(query, info, RCODE_REFUSED, EDE_NOT_SUPPORTED, EDE_TEXT)
 }
 
@@ -544,7 +544,7 @@ pub(crate) fn padded(msg: &[u8]) -> Option<Vec<u8>> {
 /// MINIMUM (RFC 2308 §5). A referral, with no answer and no SOA, is bounded by
 /// its authority records. `None` for a response nothing should cache: an error
 /// RCODE, or one with no records to take a lifetime from.
-fn freshness(msg: &[u8]) -> Option<u32> {
+pub(crate) fn freshness(msg: &[u8]) -> Option<u32> {
     let rcode = msg.get(3)? & 0x0F;
     if rcode != RCODE_NOERROR && rcode != RCODE_NXDOMAIN {
         return None;

@@ -1,0 +1,77 @@
+[package]
+name = "pqcrypta-proxy-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+# The parsers fuzzed need none of the default features (OpenSSL on TCP among
+# them): the build stays the size of the parsers
+pqcrypta-proxy = { path = "..", default-features = false }
+
+# The proxy's own forks, as its manifest patches them (a dependency's
+# [patch] applies only in its own workspace)
+[patch.crates-io]
+rustls = { path = "../vendor/rustls-fixed/rustls" }
+h3 = { path = "../vendor/h3" }
+hyper = { path = "../vendor/hyper" }
+
+[[bin]]
+name = "client_hello"
+path = "fuzz_targets/client_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_message"
+path = "fuzz_targets/dns_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "request_body"
+path = "fuzz_targets/request_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_header"
+path = "fuzz_targets/proxy_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fetched_documents"
+path = "fuzz_targets/fetched_documents.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "connect_udp_target"
+path = "fuzz_targets/connect_udp_target.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_ticket"
+path = "fuzz_targets/session_ticket.rs"
+test = false
+doc = false
+bench = false
+
+# Its own workspace: not built with the proxy
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
