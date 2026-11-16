@@ -4752,6 +4752,7 @@ impl ProxyConfig {
         if self.doq.enabled {
             self.doq.validate()?;
         }
+        self.advanced_rate_limiting.validate()?;
 
         // PQC passthrough conflict
         for route in &self.routes {
