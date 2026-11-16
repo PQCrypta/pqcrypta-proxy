@@ -2662,7 +2662,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "pqcrypta-hpke-pq",
- "rand 0.8.8",
+ "rand 0.10.3",
  "rcgen",
  "redis",
  "regex",
