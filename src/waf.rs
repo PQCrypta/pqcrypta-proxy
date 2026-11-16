@@ -2610,7 +2610,7 @@ mod tests {
     #[test]
     fn no_rule_matches_random_base64() {
         use base64::Engine as _;
-        use rand::{RngCore, SeedableRng};
+        use rand::{Rng, SeedableRng};
 
         let engine = WafEngine::new(&WafConfig {
             enabled: true,

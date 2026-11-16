@@ -1697,10 +1697,9 @@ impl Registry {
 /// only what the requester's own client did — but they are unguessable so that
 /// one developer's in-progress run is not trivially enumerable by another.
 fn new_session_id() -> String {
-    use rand::RngCore;
     use std::fmt::Write as _;
     let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::fill(&mut bytes);
     bytes.iter().fold(String::with_capacity(32), |mut acc, b| {
         // Cannot fail: writing to a String is infallible.
         let _ = write!(acc, "{b:02x}");

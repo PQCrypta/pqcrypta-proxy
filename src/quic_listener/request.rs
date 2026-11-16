@@ -1850,7 +1850,7 @@ impl QuicListener {
         // Traffic shadowing: fire-and-forget async copy to shadow backend (if configured)
         if let Some(ref shadow_cfg) = route.shadow {
             if !shadow_cfg.backend.is_empty() && shadow_cfg.percent > 0 {
-                let roll: u8 = rand::Rng::gen_range(&mut rand::thread_rng(), 0..100);
+                let roll: u8 = rand::random_range(0..100);
                 if roll < shadow_cfg.percent.min(100) {
                     if let Some(shadow_backend) = config.get_backend(&shadow_cfg.backend).cloned() {
                         // The shadow path still takes the older
