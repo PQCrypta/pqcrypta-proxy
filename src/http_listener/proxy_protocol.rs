@@ -210,7 +210,7 @@ where
     }
 }
 
-fn parse_v1(line: &[u8]) -> std::io::Result<ProxyHeader> {
+pub(crate) fn parse_v1(line: &[u8]) -> std::io::Result<ProxyHeader> {
     let line = std::str::from_utf8(line).map_err(|_| invalid("v1 line is not ASCII"))?;
     let parts: Vec<&str> = line.split(' ').collect();
     if parts.first() != Some(&"PROXY") {
@@ -239,7 +239,7 @@ fn parse_v1(line: &[u8]) -> std::io::Result<ProxyHeader> {
     }
 }
 
-fn parse_v2(head: &[u8; 16], body: &[u8]) -> std::io::Result<ProxyHeader> {
+pub(crate) fn parse_v2(head: &[u8; 16], body: &[u8]) -> std::io::Result<ProxyHeader> {
     if head[12] >> 4 != 2 {
         return Err(invalid("unsupported v2 version"));
     }

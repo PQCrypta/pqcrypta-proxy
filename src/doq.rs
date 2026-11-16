@@ -81,7 +81,7 @@ impl Service {
 
 /// What a client's message on a stream is.
 #[derive(Debug, PartialEq, Eq)]
-enum Framed<'a> {
+pub(crate) enum Framed<'a> {
     /// One length-prefixed DNS message whose Message ID is 0
     Query(&'a [u8]),
     /// Anything else: a connection error of type DOQ_PROTOCOL_ERROR
@@ -90,7 +90,7 @@ enum Framed<'a> {
 
 /// A stream's bytes, as section 4.2 has a client send them: the two-octet
 /// length, exactly that many octets of DNS message, and its ID 0.
-fn framed(bytes: &[u8]) -> Framed<'_> {
+pub(crate) fn framed(bytes: &[u8]) -> Framed<'_> {
     let Some((prefix, message)) = bytes.split_first_chunk::<2>() else {
         return Framed::ProtocolError("the stream ended before the length prefix");
     };

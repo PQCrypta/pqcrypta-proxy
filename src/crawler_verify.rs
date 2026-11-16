@@ -462,7 +462,7 @@ impl CrawlerVerifier {
 /// The prefixes of one published feed: `{"prefixes": [{"ipv4Prefix": "a/n"},
 /// {"ipv6Prefix": "b/m"}]}`, the shape every operator here uses. Unparseable
 /// entries are skipped; an unparseable document is None.
-fn parse_feed(body: &[u8]) -> Option<Vec<IpNet>> {
+pub(crate) fn parse_feed(body: &[u8]) -> Option<Vec<IpNet>> {
     let doc: serde_json::Value = serde_json::from_slice(body).ok()?;
     let prefixes = doc.get("prefixes")?.as_array()?;
     Some(

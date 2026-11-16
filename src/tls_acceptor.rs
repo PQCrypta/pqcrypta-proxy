@@ -858,7 +858,7 @@ impl FingerprintingTlsAcceptor {
     /// Parses the SNI extension (type 0x0000) and returns the first `host_name`
     /// entry as a UTF-8 string.  Returns `None` if SNI is absent, malformed, or
     /// the data is too short to parse.
-    fn extract_sni(data: &[u8]) -> Option<String> {
+    pub(crate) fn extract_sni(data: &[u8]) -> Option<String> {
         // TLS record header: 5 bytes.  Handshake header: 4 bytes.
         if data.len() < 9 {
             return None;

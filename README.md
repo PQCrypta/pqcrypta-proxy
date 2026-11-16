@@ -1760,6 +1760,7 @@ src/
 ├── fingerprint.rs          # TLS Fingerprinting Module
 ├── fingerprint_corpus.rs   # The observed TLS fingerprint corpus
 ├── fuzz_support.rs         # Mutation fuzzing for the parsers that read raw client bytes
+├── fuzzing.rs              # Entry points for the coverage-guided fuzz targets in fuzz/ (built under cfg(fuzzing))
 ├── health.rs               # Backend health probes on each backend's interval; what the admin API reports
 ├── host_names.rs           # Host names in security.pentest_bypass_ips and the [masque] client lists
 ├── http3_features.rs       # HTTP/3 Advanced Features Module

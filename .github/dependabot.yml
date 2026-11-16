@@ -29,3 +29,15 @@ updates:
       # two versions (#116). It follows openssl's, not its own releases.
       - dependency-name: "foreign-types"
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+  # The fuzz targets' crate (its own workspace) and the ClusterFuzzLite
+  # builder image, pinned by digest
+  - package-ecosystem: "cargo"
+    directory: "/fuzz"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "docker"
+    directory: "/.clusterfuzzlite"
+    schedule:
+      interval: "weekly"

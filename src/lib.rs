@@ -149,6 +149,10 @@ pub mod fingerprint;
 pub mod fingerprint_corpus;
 #[cfg(test)]
 pub(crate) mod fuzz_support;
+/// Entry points for the fuzz targets in fuzz/ (cargo-fuzz sets `cfg(fuzzing)`)
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzzing;
 pub mod health;
 pub mod host_names;
 pub mod http3_features;
