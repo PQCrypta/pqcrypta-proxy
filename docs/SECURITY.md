@@ -22,7 +22,7 @@ To report a vulnerability, see the repository's [security policy](../SECURITY.md
 | Request Size Limits | ✅ Complete | `security.rs` |
 | Security Headers | ✅ Complete | `http_listener.rs` |
 | Background Cleanup | ✅ Complete | `security.rs` |
-| Memory Exhaustion Prevention | ✅ Complete | `bounded.rs` (ceilings enforced where entries are made), `security.rs`, `rate_limiter.rs`, `fingerprint.rs`, `fingerprint_corpus.rs`, `load_balancer.rs`, `metrics.rs`, `tls_acceptor.rs`, `conformance/session.rs` |
+| Memory Exhaustion Prevention | ✅ Complete | `bounded.rs` (ceilings enforced where entries are made), `security.rs`, `rate_limiter.rs`, `fingerprint.rs`, `fingerprint_corpus.rs`, `load_balancer.rs`, `metrics.rs`, `tls_acceptor.rs`, `conformance/session.rs`, `body_budget.rs`, `webtransport_server.rs` |
 | ReDoS Prevention | ✅ Complete | `config.rs` |
 | Command Injection Prevention | ✅ Complete | `acme.rs` |
 | Safe Panic Handling | ✅ Complete | All modules |
@@ -548,6 +548,15 @@ finds it full is not admitted. What that means is each table's own decision:
 The replay stores keep two generations, so a lookup costs the same however
 many digests they hold; the periodic cleanup (once a minute) still sweeps
 every per-address table and enforces `max_tracked_fingerprints`.
+
+Request data held while it is read counts against the process's body budget
+(`src/body_budget.rs`, `security.max_buffered_body_bytes`) on every transport,
+piece by piece before it is kept: HTTP/1.1, HTTP/2 and HTTP/3 bodies, and
+WebTransport streams. A WebTransport session's streams together hold at most
+four requests of `security.max_request_size` (`SESSION_BUFFERED_REQUESTS` in
+`src/webtransport_server.rs`), however many streams it opens. A stream that
+would take its session or the process past either is refused as its bytes
+arrive, so a stream that withholds its end holds no more than was counted.
 
 ### ReDoS Prevention
 

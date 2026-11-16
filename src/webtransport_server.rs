@@ -10,7 +10,7 @@ use dashmap::DashMap;
 use serde_json::json;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -673,6 +673,9 @@ struct SessionRoute {
     path: String,
     /// The route's backend and method; none for a session no route covers
     target: Option<WtTarget>,
+    /// The bytes this session's streams hold while their requests are read
+    /// (see [`SESSION_BUFFERED_REQUESTS`])
+    buffered: Arc<AtomicUsize>,
 }
 
 impl SessionRoute {
@@ -709,32 +712,109 @@ impl WtTarget {
 /// How long a stream's request may take to arrive.
 const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// What one session's streams may hold together while their requests are
+/// read, in requests of `security.max_request_size`: however many streams a
+/// session opens, and however long each withholds its end. The process as a
+/// whole holds no more than its body budget (body_budget.rs), which every
+/// transport's request bodies count against.
+const SESSION_BUFFERED_REQUESTS: usize = 4;
+
+/// How much of a stream is read at a time: each piece is counted before it
+/// is kept.
+const STREAM_READ_CHUNK: usize = 16 * 1024;
+
 /// Why a stream's request was not read.
 enum StreamRead {
     TooLarge,
+    /// The session's share or the process's body budget would be exceeded
+    NoMemory,
     Failed(std::io::Error),
     TimedOut,
 }
 
-/// A stream's whole request, read no further than `max` bytes: what would not
-/// be accepted is not held either.
+/// The bytes one stream's request holds of its session's share, given back
+/// when it drops.
+struct SessionHold {
+    held: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl SessionHold {
+    /// Count `more` bytes against the session's share of `limit`; `false`
+    /// (nothing counted) when they would take it past.
+    fn grow(&mut self, more: usize, limit: usize) -> bool {
+        self.held
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |now| {
+                now.checked_add(more).filter(|total| *total <= limit)
+            })
+            .is_ok()
+            && {
+                self.bytes += more;
+                true
+            }
+    }
+}
+
+impl Drop for SessionHold {
+    fn drop(&mut self) {
+        self.held.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+/// A stream's request as read, with the memory it holds counted against the
+/// process's body budget and its session's share until it drops.
+struct StreamRequest {
+    bytes: Vec<u8>,
+    _process: crate::body_budget::Reservation,
+    _session: SessionHold,
+}
+
+impl std::ops::Deref for StreamRequest {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// A stream's whole request, no more than `max` bytes. Every piece is counted
+/// against the session's share (`session_limit` bytes in all) and the
+/// process's body budget before it is kept, so a stream that would take
+/// either past is refused as it arrives, not once it ends: a stream that
+/// withholds its end holds no more than was counted.
 async fn read_request<R: tokio::io::AsyncRead + Unpin>(
     recv_stream: &mut R,
     max: usize,
-) -> Result<Vec<u8>, StreamRead> {
-    let mut buffer = Vec::new();
-    let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
-    let read = tokio::time::timeout(
-        STREAM_READ_TIMEOUT,
-        (&mut *recv_stream).take(limit).read_to_end(&mut buffer),
-    )
-    .await;
-    match read {
-        Ok(Ok(_)) if buffer.len() > max => Err(StreamRead::TooLarge),
-        Ok(Ok(_)) => Ok(buffer),
-        Ok(Err(e)) => Err(StreamRead::Failed(e)),
-        Err(_) => Err(StreamRead::TimedOut),
+    session_held: &Arc<AtomicUsize>,
+    session_limit: usize,
+) -> Result<StreamRequest, StreamRead> {
+    let deadline = tokio::time::Instant::now() + STREAM_READ_TIMEOUT;
+    let mut bytes = Vec::new();
+    let mut process = crate::body_budget::Reservation::new();
+    let mut session = SessionHold {
+        held: Arc::clone(session_held),
+        bytes: 0,
+    };
+    let mut chunk = vec![0u8; STREAM_READ_CHUNK];
+    loop {
+        let n = match tokio::time::timeout_at(deadline, recv_stream.read(&mut chunk)).await {
+            Err(_) => return Err(StreamRead::TimedOut),
+            Ok(Err(e)) => return Err(StreamRead::Failed(e)),
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => n,
+        };
+        if bytes.len() + n > max {
+            return Err(StreamRead::TooLarge);
+        }
+        if !session.grow(n, session_limit) || !process.grow(n) {
+            return Err(StreamRead::NoMemory);
+        }
+        bytes.extend_from_slice(&chunk[..n]);
     }
+    Ok(StreamRequest {
+        bytes,
+        _process: process,
+        _session: session,
+    })
 }
 
 /// Serve an established WebTransport session, on either listener: the speed
@@ -768,6 +848,7 @@ pub async fn serve_session<S: WtSession>(
     let session = Arc::new(SessionRoute {
         path,
         target: session_target,
+        buffered: Arc::new(AtomicUsize::new(0)),
     });
 
     // Per-session datagram budget window (see webtransport_max_datagrams_per_sec).
@@ -877,8 +958,18 @@ async fn handle_uni_stream<S: WtSession>(
     security: Option<crate::security::SecurityState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let max_size = config.security.max_request_size;
-    let buffer = match read_request(&mut recv_stream, max_size).await {
+    let session_limit = max_size.saturating_mul(SESSION_BUFFERED_REQUESTS);
+    let buffer = match read_request(&mut recv_stream, max_size, &session.buffered, session_limit)
+        .await
+    {
         Ok(buffer) => buffer,
+        Err(StreamRead::NoMemory) => {
+            debug!(
+                "Stream from {} refused: its session or the process holds as much request data as it may",
+                remote_addr
+            );
+            return Err("Request memory exhausted".into());
+        }
         Err(StreamRead::TooLarge) => {
             debug!(
                 "Request from {} exceeds max size ({} bytes)",
@@ -948,7 +1039,10 @@ async fn handle_bi_stream<S: WtSession>(
         return relay_to_tcp(send_stream, recv_stream, backend, remote_addr).await;
     }
     let max_size = config.security.max_request_size;
-    let buffer = match read_request(&mut recv_stream, max_size).await {
+    let session_limit = max_size.saturating_mul(SESSION_BUFFERED_REQUESTS);
+    let buffer = match read_request(&mut recv_stream, max_size, &session.buffered, session_limit)
+        .await
+    {
         Ok(buffer) => buffer,
         Err(why) => {
             // SEC-02: the detail is logged here; the client gets a generic
@@ -957,6 +1051,10 @@ async fn handle_bi_stream<S: WtSession>(
                 StreamRead::TooLarge => (
                     format!("Request exceeds max size of {} bytes", max_size),
                     "Request too large".into(),
+                ),
+                StreamRead::NoMemory => (
+                    "Server busy, try again".to_string(),
+                    "Request memory exhausted".into(),
                 ),
                 StreamRead::Failed(e) => {
                     debug!("Stream read error for {}: {}", remote_addr, e);
@@ -1327,6 +1425,100 @@ async fn forward_to_backend(
 
 #[cfg(test)]
 mod tests {
+    /// A stream that sends `left` bytes and then neither ends nor sends more:
+    /// a peer withholding its FIN.
+    struct Withholding {
+        left: usize,
+    }
+
+    impl tokio::io::AsyncRead for Withholding {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.left == 0 {
+                return std::task::Poll::Pending;
+            }
+            let n = self.left.min(buf.remaining()).min(4096);
+            buf.put_slice(&vec![b'a'; n]);
+            self.left -= n;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    fn outcome(r: &Result<super::StreamRequest, super::StreamRead>) -> &'static str {
+        match r {
+            Ok(_) => "read",
+            Err(super::StreamRead::TooLarge) => "too large",
+            Err(super::StreamRead::NoMemory) => "no memory",
+            Err(super::StreamRead::Failed(_)) => "failed",
+            Err(super::StreamRead::TimedOut) => "timed out",
+        }
+    }
+
+    /// A stream past its session's share is refused as the bytes arrive,
+    /// though it never ends, and gives back what it held.
+    #[tokio::test]
+    async fn a_stream_is_refused_at_its_session_s_share_without_waiting_for_its_end() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let held = Arc::new(AtomicUsize::new(0));
+        let mut stream = Withholding { left: 100 * 1024 };
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::read_request(&mut stream, 1024 * 1024, &held, 64 * 1024),
+        )
+        .await
+        .expect("refused as it arrives, not after the 30 s read timeout");
+        assert_eq!(outcome(&r), "no memory");
+        drop(r);
+        assert_eq!(
+            held.load(Ordering::Acquire),
+            0,
+            "the refused stream holds nothing"
+        );
+    }
+
+    /// A stream past the request limit is refused as the bytes arrive, too.
+    #[tokio::test]
+    async fn a_stream_is_refused_at_the_request_limit_without_waiting_for_its_end() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+        let held = Arc::new(AtomicUsize::new(0));
+        let mut stream = Withholding { left: 100 * 1024 };
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::read_request(&mut stream, 32 * 1024, &held, 1024 * 1024),
+        )
+        .await
+        .expect("refused as it arrives");
+        assert_eq!(outcome(&r), "too large");
+    }
+
+    /// The streams of one session share it: what one holds the next cannot
+    /// take, and it is given back when the first is done.
+    #[tokio::test]
+    async fn the_streams_of_a_session_share_its_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let held = Arc::new(AtomicUsize::new(0));
+        let body = vec![b'b'; 40 * 1024];
+        let limit = 64 * 1024;
+        let first = super::read_request(&mut body.as_slice(), 1024 * 1024, &held, limit).await;
+        assert_eq!(outcome(&first), "read");
+        assert_eq!(held.load(Ordering::Acquire), 40 * 1024);
+        let second = super::read_request(&mut body.as_slice(), 1024 * 1024, &held, limit).await;
+        assert_eq!(outcome(&second), "no memory");
+        drop(second);
+        assert_eq!(held.load(Ordering::Acquire), 40 * 1024);
+        drop(first);
+        assert_eq!(held.load(Ordering::Acquire), 0);
+        let third = super::read_request(&mut body.as_slice(), 1024 * 1024, &held, limit).await;
+        assert_eq!(outcome(&third), "read");
+        assert_eq!(third.map(|r| r.len()).ok(), Some(40 * 1024));
+    }
+
     #[test]
     fn the_request_s_api_key_is_its_credential() {
         use super::request_credential;
