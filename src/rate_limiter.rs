@@ -192,6 +192,47 @@ fn default_jwt_algorithms() -> Vec<String> {
     vec!["HS256".to_string()]
 }
 
+/// The least key an HMAC algorithm may be verified with: the size of its hash
+/// output (RFC 7518 section 3.2), in bytes; none for an algorithm that is not
+/// HMAC.
+fn hmac_min_key_bytes(algorithm: &str) -> Option<usize> {
+    match algorithm {
+        "HS256" => Some(32),
+        "HS384" => Some(48),
+        "HS512" => Some(64),
+        _ => None,
+    }
+}
+
+impl AdvancedRateLimitConfig {
+    /// The JWT settings, as a start or a reload loads them: only HMAC
+    /// algorithms, and a secret (when one is set) at least as long as each
+    /// allowed algorithm's hash output (RFC 7518 section 3.2). A short key is
+    /// a guessable one, and an empty key verifies tokens anyone can sign.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let mut longest = 0;
+        for algorithm in &self.jwt_algorithms {
+            let Some(min) = hmac_min_key_bytes(algorithm) else {
+                return Err(anyhow::anyhow!(
+                    "advanced_rate_limiting.jwt_algorithms: {algorithm:?} is not HS256, HS384 \
+                     or HS512; a shared secret verifies HMAC signatures only"
+                ));
+            };
+            longest = longest.max(min);
+        }
+        if let Some(secret) = &self.jwt_secret {
+            if secret.len() < longest {
+                return Err(anyhow::anyhow!(
+                    "advanced_rate_limiting.jwt_secret is {} bytes; the algorithms allowed need \
+                     at least {longest} (RFC 7518 section 3.2)",
+                    secret.len()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Default for AdvancedRateLimitConfig {
     fn default() -> Self {
         Self {
@@ -2521,7 +2562,14 @@ impl AdvancedRateLimiter {
             return None;
         }
 
-        let key = DecodingKey::from_secret(secret.as_bytes());
+        // Refused here too (an empty secret), not only at load
+        let key = match DecodingKey::from_secret(secret.as_bytes()) {
+            Ok(key) => key,
+            Err(e) => {
+                debug!("JWT rate-limit key unusable: {}", e);
+                return None;
+            }
+        };
         // Use the first algorithm as the primary for Validation::new, then
         // override the full list to accept exactly what was configured.
         let mut validation = Validation::new(parsed[0]);
@@ -2861,6 +2909,37 @@ pub fn build_context_from_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC 7518 section 3.2: an HMAC key at least as long as the hash
+    /// output, and only HMAC algorithms, or the configuration is refused.
+    #[test]
+    fn jwt_settings_are_checked_at_load() {
+        let with = |secret: Option<&str>, algorithms: &[&str]| AdvancedRateLimitConfig {
+            jwt_secret: secret.map(str::to_string),
+            jwt_algorithms: algorithms.iter().map(|a| (*a).to_string()).collect(),
+            ..AdvancedRateLimitConfig::default()
+        };
+        assert!(
+            AdvancedRateLimitConfig::default().validate().is_ok(),
+            "unset is valid"
+        );
+        assert!(with(Some(&"k".repeat(32)), &["HS256"]).validate().is_ok());
+        assert!(
+            with(Some(&"k".repeat(31)), &["HS256"]).validate().is_err(),
+            "short for HS256"
+        );
+        assert!(with(Some(""), &["HS256"]).validate().is_err(), "empty");
+        assert!(
+            with(Some(&"k".repeat(48)), &["HS256", "HS512"])
+                .validate()
+                .is_err(),
+            "short for HS512"
+        );
+        assert!(with(Some(&"k".repeat(64)), &["HS256", "HS512"])
+            .validate()
+            .is_ok());
+        assert!(with(None, &["RS256"]).validate().is_err(), "not HMAC");
+    }
 
     /// A network that does not fit a full map is counted in its route's
     /// overflow bucket, one per route whatever the network.
@@ -3512,7 +3591,7 @@ mod tests {
         let jwt = jsonwebtoken::encode(
             &Header::new(Algorithm::HS256),
             &claims,
-            &EncodingKey::from_secret(TEST_SECRET),
+            &EncodingKey::from_secret(TEST_SECRET).expect("a non-empty secret"),
         )
         .expect("test JWT encoding must not fail");
 
