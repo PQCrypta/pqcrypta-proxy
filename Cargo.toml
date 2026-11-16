@@ -159,7 +159,7 @@ anyhow = "1.0"
 thiserror = "2.0"
 uuid = { version = "1.11", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-base64 = "0.22"
+base64 = "0.23"
 hex = "0.4"
 hmac = "0.13"
 rand = "0.8"
