@@ -8,6 +8,10 @@ on:
   release:
     types: [created]
 
+# Read only unless a job asks for more
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -387,17 +391,26 @@ jobs:
   # =============================================================================
   # Security Audit
   # =============================================================================
+  # Every lockfile, the vendored forks' too (their standalone tests build from
+  # them; cargo-deny reads the proxy's alone), and warnings (unsound,
+  # unmaintained, yanked) as failures
   security:
     name: Security Audit
     runs-on: ubuntu-latest
-    permissions:
-      checks: write
-      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      - name: cargo audit, each lockfile
+        run: |
+          status=0
+          while IFS= read -r lock; do
+            echo "::group::$lock"
+            cargo audit --deny warnings --file "$lock" || status=1
+            echo "::endgroup::"
+          done < <(find . -name Cargo.lock -not -path './target/*' | sort)
+          exit $status
 
   # =============================================================================
   # Docker Build
