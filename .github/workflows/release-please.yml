@@ -50,9 +50,14 @@ jobs:
     needs: release-please
     if: always() && (needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
-    # Attaches the binary to the draft release and publishes it
+    # Attaches the binary and its signed build provenance to the draft
+    # release and publishes it. The provenance is signed keylessly: Sigstore's
+    # Fulcio issues a short-lived certificate for this workflow's OIDC
+    # identity, and the signature goes into its public transparency log.
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     env:
       TAG: ${{ needs.release-please.outputs.tag_name || inputs.tag }}
     steps:
@@ -76,28 +81,59 @@ jobs:
           OPENSSL_LIBS: "ssl:crypto:brotlienc:brotlidec:brotlicommon:zstd:z"
         run: cargo build --release --locked
 
+      # SLSA build provenance for the binary (its SHA-256, this workflow, the
+      # commit and the run), signed and recorded in GitHub's attestation store,
+      # where `gh attestation verify` finds it
+      - name: Sign the binary's build provenance
+        id: provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: target/release/pqcrypta-proxy
+
+      # The same signed provenance beside the binary on the release, so a copy
+      # can be checked without the attestation store: the Sigstore bundle
+      # (signature, certificate, log proof), and its DSSE envelope with the
+      # signing certificate as one in-toto JSON line, the form SLSA tools read
+      - name: Write the provenance files
+        env:
+          BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+        run: |
+          cp "$BUNDLE" target/release/pqcrypta-proxy.sigstore.json
+          jq -c -f .github/dsse-envelope.jq "$BUNDLE" > target/release/pqcrypta-proxy.intoto.jsonl
+          test "$(wc -l < target/release/pqcrypta-proxy.intoto.jsonl)" -eq 1
+
       - name: Upload binary to the draft release
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
           tag_name: ${{ env.TAG }}
           draft: true
-          files: target/release/pqcrypta-proxy
+          files: |
+            target/release/pqcrypta-proxy
+            target/release/pqcrypta-proxy.sigstore.json
+            target/release/pqcrypta-proxy.intoto.jsonl
 
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release edit "$TAG" --draft=false
 
-  # The container image of the release builds and runs: nothing else builds
-  # docker/Dockerfile, so a base image pin or a build step that stopped
-  # working would otherwise be found by whoever builds the image next.
+  # The release's container image: built, run (its binary must name the
+  # release's commit), then pushed to the GitHub Container Registry under the
+  # release's tag and `latest`, with its signed build provenance attached in
+  # the registry beside it.
   image:
     name: Container image
     needs: release-please
     if: always() && (needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
     env:
       TAG: ${{ needs.release-please.outputs.tag_name || inputs.tag }}
+      IMAGE: ghcr.io/pqcrypta/pqcrypta-proxy
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -107,11 +143,34 @@ jobs:
         run: >-
           docker build -f docker/Dockerfile
           --build-arg PQCRYPTA_GIT_COMMIT="$(git rev-parse HEAD)"
-          -t "pqcrypta-proxy:$TAG" .
+          --label org.opencontainers.image.source=https://github.com/PQCrypta/pqcrypta-proxy
+          --label org.opencontainers.image.revision="$(git rev-parse HEAD)"
+          --label org.opencontainers.image.version="${TAG#v}"
+          --label org.opencontainers.image.licenses="MIT OR Apache-2.0"
+          -t "$IMAGE:$TAG" -t "$IMAGE:latest" .
 
       - name: The image's binary runs and names its commit
         run: |
-          version=$(docker run --rm "pqcrypta-proxy:$TAG" --version)
+          version=$(docker run --rm "$IMAGE:$TAG" --version)
           echo "$version"
           # build.rs keeps the first 7 characters of the commit it is given
           case "$version" in *"($(git rev-parse HEAD | cut -c1-7))"*) ;; *) exit 1 ;; esac
+
+      - name: Push the image
+        id: push
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          docker push "$IMAGE:$TAG"
+          docker push "$IMAGE:latest"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$TAG")
+          echo "digest=${digest#*@}" >> "$GITHUB_OUTPUT"
+
+      - name: Sign the image's build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
