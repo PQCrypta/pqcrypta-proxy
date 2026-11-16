@@ -13,15 +13,19 @@ on:
         description: Tag of the draft release to build, attach the binary to and publish
         required: true
 
+# Read only unless a job asks for more
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   release-please:
     name: Release Please
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    # The release pull request, and the tag and draft release it makes
+    permissions:
+      contents: write
+      pull-requests: write
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
@@ -46,6 +50,9 @@ jobs:
     needs: release-please
     if: always() && (needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    # Attaches the binary to the draft release and publishes it
+    permissions:
+      contents: write
     env:
       TAG: ${{ needs.release-please.outputs.tag_name || inputs.tag }}
     steps:

@@ -244,9 +244,7 @@ impl ZeroRttReplayGuard {
         }
         Some(match (self.mode, client_hello_psk_identity(client_hello)) {
             (ZeroRttReplayMode::Session, Some(ticket)) => {
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&Sha256::digest(ticket));
-                store.check_digest(key)
+                store.check_digest(Sha256::digest(ticket).into())
             }
             _ => store.check(client_hello),
         })

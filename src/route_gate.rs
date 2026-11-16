@@ -399,6 +399,12 @@ mod tests {
         toml::from_str(toml_src).expect("valid route TOML")
     }
 
+    /// A secret of this run's own: the gate verifies against the route's
+    /// configured secret, whatever it is, not one written into its tests.
+    fn test_secret() -> String {
+        hex::encode(rand::random::<[u8; 32]>())
+    }
+
     fn route() -> RouteConfig {
         route_from("name = \"t\"\nbackend = \"b\"\n")
     }
@@ -671,7 +677,7 @@ mod tests {
     fn hmac_route_refuses_an_unsigned_request() {
         let mut r = route();
         r.security = Some(crate::config::RouteSecurityPolicy {
-            hmac_secret: Some("s3cret".to_string()),
+            hmac_secret: Some(test_secret()),
             ..Default::default()
         });
         let h = HeaderMap::new();
@@ -689,9 +695,10 @@ mod tests {
         use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
 
+        let secret = test_secret();
         let mut r = route();
         r.security = Some(crate::config::RouteSecurityPolicy {
-            hmac_secret: Some("s3cret".to_string()),
+            hmac_secret: Some(secret.clone()),
             ..Default::default()
         });
 
@@ -703,7 +710,7 @@ mod tests {
         let nonce = "n-once-1";
         let message = format!("GET\n/x\n{}\n{}", ts, nonce);
         type HmacSha256 = Hmac<Sha256>;
-        let mut mac = HmacSha256::new_from_slice(b"s3cret").unwrap();
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(message.as_bytes());
         let sig = hex::encode(mac.finalize().into_bytes());
 
@@ -763,7 +770,7 @@ mod tests {
     fn hmac_stale_timestamp_is_refused() {
         let mut r = route();
         r.security = Some(crate::config::RouteSecurityPolicy {
-            hmac_secret: Some("s3cret".to_string()),
+            hmac_secret: Some(test_secret()),
             ..Default::default()
         });
         let mut h = HeaderMap::new();

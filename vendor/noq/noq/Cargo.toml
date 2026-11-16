@@ -81,7 +81,6 @@ async-fs = { workspace = true, optional = true }
 async-executor = { workspace = true, optional = true }
 aws-lc-fips-sys = { workspace = true, optional = true }
 aws-lc-sys = { workspace = true, optional = true }
-gcc = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 lazy_static = { workspace = true, optional = true }
 sharded-slab = { workspace = true, optional = true }

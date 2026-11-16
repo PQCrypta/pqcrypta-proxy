@@ -31,6 +31,10 @@ on:
         default: "https://pqcrypta.com"
         required: false
 
+# Read only unless a job asks for more
+permissions:
+  contents: read
+
 concurrency:
   group: post-deploy-regression
   cancel-in-progress: false
