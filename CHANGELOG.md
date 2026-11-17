@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.16.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.15.0...v0.16.0) (2026-11-17)
+
+
+### Features
+
+* **cache:** read HTTP dates in all three forms RFC 9110 lists ([e421953](https://github.com/PQCrypta/pqcrypta-proxy/commit/e4219539d5be0b91739adf9f3f461c756df01987))
+
+
+### Bug Fixes
+
+* **deps:** replace chrono, now unmaintained (RUSTSEC-2026-0543), with jiff ([b954df6](https://github.com/PQCrypta/pqcrypta-proxy/commit/b954df6f3c2990a79ff18616abf0140d8640833d))
+
 ## [0.15.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.14.1...v0.15.0) (2026-11-16)
 
 
