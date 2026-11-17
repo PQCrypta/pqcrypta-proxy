@@ -20,7 +20,6 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
 use parking_lot::Mutex;
 use serde::Serialize;
 use tracing::{error, warn};
@@ -364,7 +363,9 @@ impl Sink {
             // As the proxy's own log writes it (`…T23:03:04.302806Z`), so the
             // two streams sort and join on one format; this was `+00:00` with
             // nanoseconds beside it
-            timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            timestamp: jiff::fmt::temporal::DateTimePrinter::new()
+                .precision(Some(6))
+                .timestamp_to_string(&jiff::Timestamp::now()),
             level: event.level(),
             category: event.category(),
             startup_probe: event

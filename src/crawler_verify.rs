@@ -514,7 +514,7 @@ fn write_ranges_cache(path: &Path, ranges: &PublishedRanges) -> std::io::Result<
         })
         .collect();
     let doc = serde_json::json!({
-        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "generated_at": jiff::Timestamp::now().display_with_offset(jiff::tz::Offset::UTC).to_string(),
         "families": families,
     });
     if let Some(dir) = path.parent() {

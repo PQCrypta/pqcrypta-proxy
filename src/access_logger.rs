@@ -3,7 +3,7 @@
 //! Writes access logs in nginx-compatible combined log format:
 //! $remote_addr - - [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent"
 
-use chrono::Local;
+use jiff::ZonedDateTime;
 use std::fs::File;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -13,6 +13,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tracing::{debug, error, info};
 
 use crate::otel;
+
+/// A local time in RFC 3339, with its offset (`2026-11-17T06:34:56.123456789-06:00`)
+fn local_rfc3339(at: &ZonedDateTime) -> String {
+    at.timestamp().display_with_offset(at.offset()).to_string()
+}
 
 /// Sanitize a user-controlled log field by stripping newlines and control characters.
 ///
@@ -213,7 +218,7 @@ impl AccessLogger {
                 format!(
                     "{} - - [{}] \"{} {} {}\" {} {} \"{}\" \"{}\" host=\"{}\" time={}ms{}\n",
                     entry.remote_addr.ip(),
-                    Local::now().format("%d/%b/%Y:%H:%M:%S %z"),
+                    ZonedDateTime::now().strftime("%d/%b/%Y:%H:%M:%S %z"),
                     sanitize_log_field(entry.method),
                     sanitize_log_field(entry.path),
                     sanitize_log_field(entry.protocol),
@@ -228,7 +233,7 @@ impl AccessLogger {
             }
             LogFormat::Json => {
                 let mut line = serde_json::json!({
-                    "time": Local::now().to_rfc3339(),
+                    "time": local_rfc3339(&ZonedDateTime::now()),
                     "remote_addr": entry.remote_addr.ip().to_string(),
                     "method": entry.method,
                     "path": entry.path,
@@ -257,8 +262,10 @@ impl AccessLogger {
                         Token::Literal(l) => line.push_str(l),
                         Token::Var(v) => line.push_str(&match *v {
                             "remote_addr" => entry.remote_addr.ip().to_string(),
-                            "time_local" => Local::now().format("%d/%b/%Y:%H:%M:%S %z").to_string(),
-                            "time_iso8601" => Local::now().to_rfc3339(),
+                            "time_local" => ZonedDateTime::now()
+                                .strftime("%d/%b/%Y:%H:%M:%S %z")
+                                .to_string(),
+                            "time_iso8601" => local_rfc3339(&ZonedDateTime::now()),
                             "request" => format!(
                                 "{} {} {}",
                                 sanitize_log_field(entry.method),

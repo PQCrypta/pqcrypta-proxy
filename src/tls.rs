@@ -312,9 +312,9 @@ fn delegating(
                 .delegated_credentials
                 .first()
                 .and_then(|dc| {
-                    chrono::DateTime::from_timestamp(i64::try_from(dc.expires().as_secs()).ok()?, 0)
+                    jiff::Timestamp::from_second(i64::try_from(dc.expires().as_secs()).ok()?).ok()
                 })
-                .map(|t| t.to_rfc3339())
+                .map(|t| t.display_with_offset(jiff::tz::Offset::UTC).to_string())
                 .unwrap_or_default();
             info!(
                 "SNI resolver: '{}' delegates its certificate (RFC 9345): {} until {}",
@@ -3374,7 +3374,8 @@ impl TlsProvider {
                 .map(|p| String::from_utf8_lossy(p).into_owned())
                 .collect(),
             last_reloaded: last_modified
-                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()),
+                .and_then(|t| jiff::Timestamp::try_from(t).ok())
+                .map(|t| t.display_with_offset(jiff::tz::Offset::UTC).to_string()),
         }
     }
 }

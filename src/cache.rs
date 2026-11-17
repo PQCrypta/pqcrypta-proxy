@@ -96,7 +96,7 @@ struct CacheEntry {
     /// Last-Modified header value from backend (sent back on a 304)
     last_modified: Option<String>,
     /// That value as a time, for If-Modified-Since
-    modified_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+    modified_at: Option<jiff::Timestamp>,
     /// Raw Cache-Control header from backend (forwarded on 304 responses)
     cache_control: Option<String>,
     /// When this entry was created (used to compute Age header)
@@ -242,8 +242,10 @@ impl CacheControlDirectives {
 }
 
 /// An HTTP-date (RFC 9110 section 5.6.7) as a time.
-fn http_date(value: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
-    chrono::DateTime::parse_from_rfc2822(value.trim()).ok()
+fn http_date(value: &str) -> Option<jiff::Timestamp> {
+    jiff::fmt::rfc2822::DateTimeParser::new()
+        .parse_timestamp(value.trim())
+        .ok()
 }
 
 /// A request the cache may answer and keep the answer to
@@ -791,7 +793,7 @@ impl ResponseCache {
             None => match expires.as_deref() {
                 Some(expires) => {
                     let left = http_date(expires)
-                        .map(|at| at.signed_duration_since(chrono::Utc::now()).num_seconds())
+                        .map(|at| at.duration_since(jiff::Timestamp::now()).as_secs())
                         .unwrap_or(0);
                     match u64::try_from(left) {
                         Ok(secs) if secs > 0 => Some(Duration::from_secs(secs)),
@@ -1548,7 +1550,11 @@ mod bound_tests {
     fn expired_entries_are_swept_with_their_queue_slots() {
         let c = cache(1);
         // Expires a second from now: the shortest stated lifetime there is
-        let soon = (chrono::Utc::now() + chrono::Duration::seconds(2)).to_rfc2822();
+        let soon = jiff::fmt::rfc2822::DateTimePrinter::new()
+            .timestamp_to_rfc9110_string(
+                &(jiff::Timestamp::now() + jiff::SignedDuration::from_secs(2)),
+            )
+            .unwrap();
         for n in 0..50 {
             c.put(
                 &key(n),
@@ -1613,7 +1619,11 @@ mod freshness_tests {
     #[test]
     fn expires_is_read_when_cache_control_states_no_lifetime() {
         let past = "Thu, 19 Nov 1981 08:52:00 GMT";
-        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc2822();
+        let future = jiff::fmt::rfc2822::DateTimePrinter::new()
+            .timestamp_to_rfc9110_string(
+                &(jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1)),
+            )
+            .unwrap();
         assert!(!stored(&[("expires", past)], 200, false));
         assert!(!stored(&[("expires", "0")], 200, false));
         assert!(stored(&[("expires", &future)], 200, false));

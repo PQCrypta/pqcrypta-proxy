@@ -441,9 +441,9 @@ fn next_check_wait(
 
 /// A Unix time as the status and the log show it
 fn utc(timestamp: i64) -> String {
-    chrono::DateTime::from_timestamp(timestamp, 0)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+    jiff::Timestamp::from_second(timestamp)
+        .map(|t| t.strftime("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
 }
 
 /// What renewal reads from an issued certificate.
@@ -755,7 +755,7 @@ impl AcmeService {
                     let safe_domain = validate_domain_for_path(domain)
                         .unwrap_or_else(|_| "invalid-domain".to_string());
                     let cert_path = self.config.certs_path.join(format!("{}.crt", safe_domain));
-                    let now = chrono::Utc::now().timestamp();
+                    let now = jiff::Timestamp::now().as_second();
                     match IssuedCertificate::read(&cert_path) {
                         // Before the first check: by lifetime, as the check
                         // decides where the CA publishes no window
@@ -969,7 +969,7 @@ async fn check_and_renew_certificates(
         let cert_path = config.certs_path.join(format!("{}.crt", domain));
         let key_path = config.certs_path.join(format!("{}.key", domain));
         let addresses = config.ip_addresses_for(domain);
-        let now = chrono::Utc::now().timestamp();
+        let now = jiff::Timestamp::now().as_second();
 
         let existing = if cert_path.exists() {
             match IssuedCertificate::read(&cert_path) {
@@ -1091,7 +1091,7 @@ async fn check_and_renew_certificates(
                     window: None,
                 };
                 next_renewal = Some(next_renewal.map_or(plan.at, |n| n.min(plan.at)));
-                let now = chrono::Utc::now().timestamp();
+                let now = jiff::Timestamp::now().as_second();
                 cert_status.write().insert(
                     domain.clone(),
                     CertificateStatus::of(domain, &issued, plan, now, Some(utc(now))),
@@ -1113,7 +1113,7 @@ async fn check_and_renew_certificates(
             }
             Err(e) => {
                 error!("[{}] Failed to obtain certificate: {}", domain, e);
-                let now = chrono::Utc::now().timestamp();
+                let now = jiff::Timestamp::now().as_second();
                 cert_status.write().insert(
                     domain.clone(),
                     CertificateStatus {
@@ -1664,8 +1664,8 @@ async fn get_or_create_account(config: &AcmeConfig) -> anyhow::Result<Account> {
     let stored = StoredAccountWrapper {
         directory_url: config.directory_url.clone(),
         email: config.email.clone(),
-        created: chrono::Utc::now()
-            .format("%Y-%m-%d %H:%M:%S UTC")
+        created: jiff::Timestamp::now()
+            .strftime("%Y-%m-%d %H:%M:%S UTC")
             .to_string(),
         credentials: credentials_json,
     };
@@ -1718,7 +1718,7 @@ async fn check_and_renew_certificates(
             }
         };
         let cert_path = config.certs_path.join(format!("{}.crt", safe_domain));
-        let now = chrono::Utc::now().timestamp();
+        let now = jiff::Timestamp::now().as_second();
         let status = match IssuedCertificate::read(&cert_path) {
             Ok(cert) => {
                 let plan = RenewalPlan {
@@ -1888,8 +1888,8 @@ struct CtLog {
 #[cfg(feature = "acme")]
 #[derive(Debug, Deserialize)]
 struct CtTemporalInterval {
-    start_inclusive: chrono::DateTime<chrono::Utc>,
-    end_exclusive: chrono::DateTime<chrono::Utc>,
+    start_inclusive: jiff::Timestamp,
+    end_exclusive: jiff::Timestamp,
 }
 
 /// The logs in `list` that take a certificate expiring at `not_after`: per
@@ -1904,8 +1904,8 @@ fn ct_logs_for_expiry(list: &CtLogList, not_after: i64) -> Vec<String> {
                 let accepting =
                     log.state.contains_key("usable") || log.state.contains_key("qualified");
                 let holds_expiry = log.temporal_interval.as_ref().is_none_or(|interval| {
-                    interval.start_inclusive.timestamp() <= not_after
-                        && not_after < interval.end_exclusive.timestamp()
+                    interval.start_inclusive.as_second() <= not_after
+                        && not_after < interval.end_exclusive.as_second()
                 });
                 accepting && holds_expiry
             })
@@ -2268,9 +2268,10 @@ mod tests {
             ]
         }))
         .expect("log list");
-        let nov_2026 = chrono::DateTime::parse_from_rfc3339("2026-11-01T00:00:00Z")
+        let nov_2026 = "2026-11-01T00:00:00Z"
+            .parse::<jiff::Timestamp>()
             .unwrap()
-            .timestamp();
+            .as_second();
         assert_eq!(
             ct_logs_for_expiry(&list, nov_2026),
             vec![
@@ -2279,9 +2280,10 @@ mod tests {
                 "https://c/any/"
             ]
         );
-        let jan_2027 = chrono::DateTime::parse_from_rfc3339("2027-01-01T00:00:00Z")
+        let jan_2027 = "2027-01-01T00:00:00Z"
+            .parse::<jiff::Timestamp>()
             .unwrap()
-            .timestamp();
+            .as_second();
         assert_eq!(
             ct_logs_for_expiry(&list, jan_2027),
             vec!["https://a/2027h1/", "https://c/any/"],

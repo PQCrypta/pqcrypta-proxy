@@ -507,8 +507,8 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<CorpusEntry>, String> {
         let spec = value
             .get("generated_at")
             .and_then(|g| g.as_str())
-            .and_then(|g| chrono::DateTime::parse_from_rfc3339(g).ok())
-            .is_some_and(|g| g.timestamp() >= JA4_SPEC_DIRECTORY_EPOCH);
+            .and_then(|g| g.parse::<jiff::Timestamp>().ok())
+            .is_some_and(|g| g.as_second() >= JA4_SPEC_DIRECTORY_EPOCH);
         return Ok(list
             .iter()
             .filter_map(|e| from_directory(e, spec))

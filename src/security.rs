@@ -1642,20 +1642,16 @@ impl SecurityState {
                     for entry in entries {
                         // Calculate expiration from the expires_at field (shared logic)
                         let expires_at = entry.expires_at.as_ref().and_then(|exp| {
-                            chrono::DateTime::parse_from_rfc3339(exp)
-                                .ok()
-                                .and_then(|dt| {
-                                    let now = chrono::Utc::now();
-                                    let exp_utc = dt.with_timezone(&chrono::Utc);
-                                    if exp_utc > now {
-                                        let duration = (exp_utc - now)
-                                            .to_std()
-                                            .unwrap_or(Duration::from_hours(1));
-                                        Some(Instant::now() + duration)
-                                    } else {
-                                        None // Already expired
-                                    }
-                                })
+                            exp.parse::<jiff::Timestamp>().ok().and_then(|exp| {
+                                let left = exp.duration_since(jiff::Timestamp::now());
+                                if left.is_positive() {
+                                    let duration =
+                                        Duration::try_from(left).unwrap_or(Duration::from_hours(1));
+                                    Some(Instant::now() + duration)
+                                } else {
+                                    None // Already expired
+                                }
+                            })
                         });
 
                         // Skip entries that are already expired
