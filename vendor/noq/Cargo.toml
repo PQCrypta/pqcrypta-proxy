@@ -21,6 +21,8 @@ resolver = "2"
 # path dependency of the proxy, so it changes nothing about the proxy's build.
 [patch.crates-io]
 rustls = { path = "../rustls-fixed/rustls" }
+# humantime (unmaintained, RUSTSEC-2026-0542) replaced with jiff
+n0-qlog = { path = "../n0-qlog" }
 
 [workspace.package]
 version = "1.5.0"

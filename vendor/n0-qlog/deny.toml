@@ -1,0 +1,13 @@
+[advisories]
+
+[bans]
+multiple-versions = "allow"
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+]

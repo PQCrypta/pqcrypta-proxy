@@ -1703,7 +1703,7 @@ mod tests {
     #[cfg(feature = "server")]
     #[test]
     fn test_parse_request() {
-        let _ = pretty_env_logger::try_init();
+        let _ = env_logger::try_init();
         let mut raw = BytesMut::from("GET /echo HTTP/1.1\r\nHost: hyper.rs\r\n\r\n");
         let mut method = None;
         let msg = Server::parse(
@@ -1735,7 +1735,7 @@ mod tests {
 
     #[test]
     fn test_parse_response() {
-        let _ = pretty_env_logger::try_init();
+        let _ = env_logger::try_init();
         let mut raw = BytesMut::from("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
         let ctx = ParseContext {
             cached_headers: &mut None,
@@ -1782,7 +1782,7 @@ mod tests {
 
     #[test]
     fn test_parse_response_h09_allowed() {
-        let _ = pretty_env_logger::try_init();
+        let _ = env_logger::try_init();
         let mut raw = BytesMut::from(H09_RESPONSE);
         let ctx = ParseContext {
             cached_headers: &mut None,
@@ -1806,7 +1806,7 @@ mod tests {
 
     #[test]
     fn test_parse_response_h09_rejected() {
-        let _ = pretty_env_logger::try_init();
+        let _ = env_logger::try_init();
         let mut raw = BytesMut::from(H09_RESPONSE);
         let ctx = ParseContext {
             cached_headers: &mut None,
@@ -1832,7 +1832,7 @@ mod tests {
     fn test_parse_allow_response_with_spaces_before_colons() {
         use httparse::ParserConfig;
 
-        let _ = pretty_env_logger::try_init();
+        let _ = env_logger::try_init();
         let mut raw = BytesMut::from(RESPONSE_WITH_WHITESPACE_BETWEEN_HEADER_NAME_AND_COLON);
         let mut h1_parser_config = ParserConfig::default();
         h1_parser_config.allow_spaces_after_header_name_in_responses(true);
@@ -1859,7 +1859,7 @@ mod tests {
 
     #[test]
     fn test_parse_reject_response_with_spaces_before_colons() {
-        let _ = pretty_env_logger::try_init();
+        let _ = env_logger::try_init();
         let mut raw = BytesMut::from(RESPONSE_WITH_WHITESPACE_BETWEEN_HEADER_NAME_AND_COLON);
         let ctx = ParseContext {
             cached_headers: &mut None,
@@ -1885,7 +1885,7 @@ mod tests {
     fn test_parse_allow_request_with_multiple_spaces_in_request_line() {
         use httparse::ParserConfig;
 
-        let _ = pretty_env_logger::try_init();
+        let _ = env_logger::try_init();
         let mut raw = BytesMut::from(REQUEST_WITH_MULTIPLE_SPACES_IN_REQUEST_LINE);
         let mut h1_parser_config = ParserConfig::default();
         h1_parser_config.allow_multiple_spaces_in_request_line_delimiters(true);
@@ -1916,7 +1916,7 @@ mod tests {
     #[cfg(feature = "server")]
     #[test]
     fn test_parse_reject_request_with_multiple_spaces_in_request_line() {
-        let _ = pretty_env_logger::try_init();
+        let _ = env_logger::try_init();
         let mut raw = BytesMut::from(REQUEST_WITH_MULTIPLE_SPACES_IN_REQUEST_LINE);
         let ctx = ParseContext {
             cached_headers: &mut None,
@@ -3284,7 +3284,7 @@ mod tests {
     #[test]
     #[cfg(feature = "server")]
     fn test_h1_server_max_header_size() {
-        let _ = pretty_env_logger::try_init();
+        let _ = env_logger::try_init();
 
         let req_str = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
         assert_eq!(req_str.len(), 37);
@@ -3320,7 +3320,7 @@ mod tests {
     #[test]
     #[cfg(feature = "client")]
     fn test_h1_client_max_header_size() {
-        let _ = pretty_env_logger::try_init();
+        let _ = env_logger::try_init();
 
         let resp_str = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
         assert_eq!(resp_str.len(), 38);
