@@ -21,6 +21,7 @@ use std::sync::{LazyLock, Mutex};
 use openssl_sys::{EVP_PKEY, EVP_PKEY_CTX, OSSL_LIB_CTX, OSSL_PARAM, OSSL_PROVIDER};
 use rustls::crypto::{ActiveKeyExchange, CompletedKeyExchange, SharedSecret, SupportedKxGroup};
 use rustls::{Error, NamedGroup, PeerMisbehaved, ProtocolVersion};
+use zeroize::Zeroizing;
 
 unsafe extern "C" {
     fn OSSL_PROVIDER_do_all(
@@ -196,7 +197,7 @@ impl SupportedKxGroup for ProviderKem {
         Ok(CompletedKeyExchange {
             group: self.group,
             pub_key: ciphertext,
-            secret: SharedSecret::from(secret.as_slice()),
+            secret: shared_secret(secret),
         })
     }
 
@@ -207,6 +208,14 @@ impl SupportedKxGroup for ProviderKem {
     fn usable_for_version(&self, version: ProtocolVersion) -> bool {
         version == ProtocolVersion::TLSv1_3
     }
+}
+
+/// A KEM shared secret as rustls holds one. The bytes move into it without a
+/// copy, and rustls erases them when the secret is dropped; until then they
+/// are held in `Zeroizing`, so a secret is erased on every path, a failed
+/// handshake's included.
+fn shared_secret(mut secret: Zeroizing<Vec<u8>>) -> SharedSecret {
+    SharedSecret::from(std::mem::take(&mut *secret))
 }
 
 /// A client's key pair, waiting for the server's ciphertext.
@@ -222,7 +231,7 @@ impl ActiveKeyExchange for ActiveProviderKem {
             .key
             .decapsulate(ciphertext)
             .map_err(|_| Error::PeerMisbehaved(PeerMisbehaved::InvalidKeyShare))?;
-        Ok(SharedSecret::from(secret.as_slice()))
+        Ok(shared_secret(secret))
     }
 
     fn pub_key(&self) -> &[u8] {
@@ -371,7 +380,7 @@ impl Pkey {
     }
 
     /// A ciphertext to this public key, and the secret it carries.
-    fn encapsulate(&self) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    fn encapsulate(&self) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>), Error> {
         let ctx = Ctx::for_key(self)?;
         let (mut ct_len, mut ss_len) = (0usize, 0usize);
         // SAFETY: `ctx` is live; null buffers ask for the lengths.
@@ -388,7 +397,7 @@ impl Pkey {
         if !sized {
             return Err(failed("sizing the encapsulation"));
         }
-        let (mut ct, mut ss) = (vec![0u8; ct_len], vec![0u8; ss_len]);
+        let (mut ct, mut ss) = (vec![0u8; ct_len], Zeroizing::new(vec![0u8; ss_len]));
         // SAFETY: the buffers hold the lengths OpenSSL gave.
         let ok = unsafe {
             openssl_sys::EVP_PKEY_encapsulate(
@@ -408,7 +417,7 @@ impl Pkey {
     }
 
     /// The secret `ciphertext` carries to this private key.
-    fn decapsulate(&self, ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
+    fn decapsulate(&self, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
         let ctx = Ctx::for_key(self)?;
         let mut ss_len = 0usize;
         // SAFETY: `ctx` is live; a null buffer asks for the length.
@@ -425,7 +434,7 @@ impl Pkey {
         if !sized {
             return Err(failed("sizing the decapsulation"));
         }
-        let mut ss = vec![0u8; ss_len];
+        let mut ss = Zeroizing::new(vec![0u8; ss_len]);
         // SAFETY: `ss` holds the length OpenSSL gave; `ciphertext` is live.
         let ok = unsafe {
             openssl_sys::EVP_PKEY_decapsulate(

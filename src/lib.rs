@@ -188,6 +188,7 @@ pub mod service_notify;
 pub mod speedtest;
 pub mod speedtest_budget;
 pub mod speedtest_meter;
+pub mod staged_file;
 pub mod startup_verify;
 pub mod telemetry;
 pub mod tls;

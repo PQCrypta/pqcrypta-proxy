@@ -2575,10 +2575,20 @@ pub struct AdminConfig {
     /// with client authentication, and a non-loopback bind is what it is for.
     #[serde(default = "default_require_loopback")]
     pub require_loopback: bool,
+    /// Where a token generated at startup is written when neither
+    /// `auth_token` nor mTLS is configured: created readable by the proxy's
+    /// own user alone, and never logged. Default
+    /// `/var/lib/pqcrypta-proxy/state/admin-token`.
+    #[serde(default = "default_generated_token_path")]
+    pub generated_token_path: PathBuf,
 }
 
 fn default_require_loopback() -> bool {
     true
+}
+
+fn default_generated_token_path() -> PathBuf {
+    PathBuf::from("/var/lib/pqcrypta-proxy/state/admin-token")
 }
 
 impl Default for AdminConfig {
@@ -2598,6 +2608,7 @@ impl Default for AdminConfig {
             allowed_ips: vec!["127.0.0.1".to_string(), "::1".to_string()],
             hmac_secret: None,
             require_loopback: default_require_loopback(),
+            generated_token_path: default_generated_token_path(),
         }
     }
 }
@@ -4705,6 +4716,19 @@ impl ProxyConfig {
             ));
         }
 
+        // RFC 8446 section 4.6.1: a ticket lifetime is at most seven days, and a
+        // ticket whose lifetime is zero is discarded at once. The ticket key
+        // rolls on this lifetime, so it is held to the same range.
+        if self.tls.pqc_session_tickets
+            && !(1..=604_800).contains(&self.tls.session_ticket_lifetime_secs)
+        {
+            anyhow::bail!(
+                "tls.session_ticket_lifetime_secs is {}: a ticket lifetime is 1 to 604800 \
+                 seconds (RFC 8446 section 4.6.1)",
+                self.tls.session_ticket_lifetime_secs
+            );
+        }
+
         // Config conflict: 0-RTT enabled with non-safe methods and no replay protection
         if self.tls.enable_0rtt && self.tls.zero_rtt_replay_protection == "none" {
             for route in &self.routes {
@@ -5679,6 +5703,28 @@ mod tests {
         c.routes.push(r);
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("stream_to_method"), "{err}");
+    }
+
+    /// A ticket lifetime is 1 to 604800 seconds (RFC 8446 section 4.6.1); the
+    /// ticket key rolls on it, so a value outside that is refused at load.
+    #[test]
+    fn session_ticket_lifetimes_are_held_to_rfc_8446() {
+        let mut c = ProxyConfig::default();
+        c.tls.pqc_session_tickets = true;
+        for refused in [0, 604_801] {
+            c.tls.session_ticket_lifetime_secs = refused;
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains("session_ticket_lifetime_secs"), "{err}");
+        }
+        for accepted in [1, 43_200, 604_800] {
+            c.tls.session_ticket_lifetime_secs = accepted;
+            if let Err(e) = c.validate() {
+                assert!(
+                    !e.to_string().contains("session_ticket_lifetime_secs"),
+                    "{e}"
+                );
+            }
+        }
     }
 
     /// `pqc.provider` chooses the TCP library: rustls takes OpenSSL off TCP,

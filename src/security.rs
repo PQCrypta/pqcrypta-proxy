@@ -569,14 +569,34 @@ pub fn request_policy(
     path: &str,
     method: &hyper::Method,
 ) -> RequestPolicy {
+    route_request_policy(
+        routes,
+        host,
+        path,
+        method,
+        routes.find_route(host, path, false),
+    )
+}
+
+/// The policy of a request served by `route`, which its caller has resolved.
+///
+/// An extended CONNECT is matched among the routes that serve its protocol (a
+/// WebTransport route, say), and is judged by that route's policy, as an
+/// ordinary request is by the route it matches.
+pub fn route_request_policy(
+    routes: &ProxyConfig,
+    host: Option<&str>,
+    path: &str,
+    method: &hyper::Method,
+    route: Option<&crate::config::RouteConfig>,
+) -> RequestPolicy {
     // The conformance vhost has no route entry: its flag is OR'd in.
     let on_conformance_host = is_conformance_host(routes, host);
     let prefix = &routes.security.error_pages_path_prefix;
     let error_page = !prefix.is_empty()
         && path.starts_with(prefix.as_str())
         && matches!(*method, hyper::Method::GET | hyper::Method::HEAD);
-    let mut policy = routes
-        .find_route(host, path, false)
+    let mut policy = route
         .map(|r| RequestPolicy {
             skip_bot_blocking: r.skip_bot_blocking,
             credentialed_clients: r.allow_credentialed_clients,
@@ -3429,12 +3449,16 @@ fn forwardable_body(
         .headers
         .get(hyper::header::CONTENT_ENCODING)
         .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
-    match crate::request_encoding::decode(coding.as_deref(), &body, limit) {
+    // Decoded within the body budget (request_encoding.rs); the encoded
+    // body's share is given back once it is replaced.
+    match crate::request_encoding::decode(coding.as_deref(), &body, limit, reservation) {
         Ok(None) => Ok(body),
+        Err(crate::request_encoding::Refusal::NoMemory) => {
+            Err(Box::new(body_memory_exhausted_response(alt_svc)))
+        }
         Ok(Some(decoded)) => {
-            if !reservation.grow(decoded.len()) {
-                return Err(Box::new(body_memory_exhausted_response(alt_svc)));
-            }
+            reservation.shrink(body.len());
+            drop(body);
             let h = &mut parts.headers;
             h.remove(hyper::header::CONTENT_ENCODING);
             h.remove(hyper::header::TRANSFER_ENCODING);

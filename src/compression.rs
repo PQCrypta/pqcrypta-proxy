@@ -569,10 +569,14 @@ mod tests {
             let body = encode_stream(std::io::Cursor::new(data.clone()), encoding, &config);
             let encoded = axum::body::to_bytes(body, usize::MAX).await.unwrap();
             assert!(encoded.len() < data.len(), "{encoding:?} compresses");
-            let decoded =
-                crate::request_encoding::decode(Some(encoding.as_str()), &encoded, data.len() * 2)
-                    .unwrap()
-                    .unwrap();
+            let decoded = crate::request_encoding::decode(
+                Some(encoding.as_str()),
+                &encoded,
+                data.len() * 2,
+                &mut crate::body_budget::Reservation::new(),
+            )
+            .unwrap()
+            .unwrap();
             assert_eq!(decoded, data, "{encoding:?} round trip");
         }
     }

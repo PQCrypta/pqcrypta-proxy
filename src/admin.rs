@@ -180,10 +180,11 @@ impl AdminServer {
             ));
         }
 
-        // SR-03: If no auth_token is configured, generate a random 32-byte
-        // session token and log it so the operator can copy it into the config
-        // for persistence.  This ensures every startup always has token auth
-        // active (the token changes each restart until the operator pins one).
+        // SR-03: If no auth_token is configured, generate a random session
+        // token, so every startup has token auth active (it changes each
+        // restart until the operator pins one). It is written to
+        // `generated_token_path`, readable by the proxy's user alone; only
+        // that path is logged.
         let effective_token: Option<String> = match &self.config.auth_token {
             Some(t) => Some(t.clone()),
             // Under mTLS the client certificate is the credential; a token is
@@ -203,19 +204,24 @@ impl AdminServer {
                     .take(48)
                     .map(char::from)
                     .collect();
-                // SEC-06: Print the token to stderr (bypasses structured log pipeline) so
-                // it is not captured by log aggregators/SIEMs in plaintext. The warn!
-                // entry records the event without exposing the secret value.
-                eprintln!(
-                    "[ADMIN] No auth_token configured. Copy the following line into your \
-                     [admin] config section to persist it between restarts:\n  \
-                     auth_token = \"{}\"",
-                    token
-                );
-                warn!(
-                    "Admin API: no auth_token configured — generated ephemeral session token. \
-                     Token printed to stderr. Set auth_token in [admin] config to persist it."
-                );
+                // SEC-06: the token goes to a file only its owner reads, never
+                // to a log or a console: a service's stderr is its journal.
+                let path = &self.config.generated_token_path;
+                match crate::staged_file::write_atomic(path, &format!("{token}\n"), true) {
+                    Ok(()) => warn!(
+                        "Admin API: no auth_token configured; generated a session token, \
+                         written to {} (mode 0600). Set auth_token in [admin] to keep one \
+                         across restarts.",
+                        path.display()
+                    ),
+                    Err(e) => error!(
+                        "Admin API: no auth_token configured, and the generated token could \
+                         not be written to {}: {:#}. Token authentication cannot succeed \
+                         until auth_token is set in [admin].",
+                        path.display(),
+                        e
+                    ),
+                }
                 Some(token)
             }
         };
@@ -226,7 +232,7 @@ impl AdminServer {
             allowed_ips: self.config.allowed_ips.clone(),
             auth_token: effective_token,
             hmac_secret: self.config.hmac_secret.clone(),
-            hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(
+            hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::for_timestamp_skew(
                 ADMIN_HMAC_WINDOW_SECS,
             )),
             failed_attempts: Arc::new(DashMap::new()),
@@ -2304,7 +2310,7 @@ mod auth_tests {
             allowed_ips: Vec::new(),
             auth_token: Some(TOKEN.to_string()),
             hmac_secret: None,
-            hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::new(
+            hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::for_timestamp_skew(
                 ADMIN_HMAC_WINDOW_SECS,
             )),
             failed_attempts: Arc::new(DashMap::new()),

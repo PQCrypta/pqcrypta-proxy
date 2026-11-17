@@ -224,6 +224,8 @@ as_type = "style"
 | `zero_rtt_max_early_data` | u32 | `16384` | Early data a TCP session ticket allows when `enable_0rtt` is on (QUIC tickets always carry 0xffffffff) |
 | `zero_rtt_replay_protection` | string | `"strict"` | `strict`: refuse a repeated ClientHello; `session`: each ticket carries early data once (RFC 8446 §8.1); `none` |
 | `zero_rtt_nonce_window_secs` | u64 | `60` | How long a ClientHello or ticket is remembered for replay protection |
+| `pqc_session_tickets` | bool | `false` | Issue TLS 1.3 session tickets sealed under ML-KEM-1024 (each ticket its own encapsulation, AES-256-GCM); off, the proxy issues no stateless tickets |
+| `session_ticket_lifetime_secs` | u32 | `43200` | Ticket key lifetime, and the lifetime hint sent to clients: 1 to 604800 (RFC 8446 §4.6.1). A key seals tickets only within it (none while a rotation fails) and opens them only while they are valid |
 | `handshake_timeout_secs` | u64 | `10` | Seconds a TCP client has to complete its TLS handshake, ClientHello included |
 
 ---
@@ -337,7 +339,8 @@ Each request's `x-tls-library` header names the library that completed its hands
 | `client_ca_path` | path? | `null` | CA that admin client certificates must chain to (`require_mtls`) |
 | `tls_cert_path` | path? | `null` | The admin listener's certificate under `require_mtls`; defaults to `[tls]`'s |
 | `tls_key_path` | path? | `null` | The admin listener's key under `require_mtls`; defaults to `[tls]`'s |
-| `auth_token` | string? | `null` | Bearer token, at least 32 characters. Unset (and no mTLS): a 48-character token is generated at each start and printed to standard error |
+| `auth_token` | string? | `null` | Bearer token, at least 32 characters. Unset (and no mTLS): a 48-character token is generated at each start and written to `generated_token_path`, readable by the proxy's user alone; it is never logged |
+| `generated_token_path` | path | `"/var/lib/pqcrypta-proxy/state/admin-token"` | Where a generated token is written (mode 0600) |
 | `allowed_ips` | array[string] | `["127.0.0.1", "::1"]` | Addresses that may reach the API at all (a filter, not authentication); one that is not loopback-only needs `auth_token` |
 | `hmac_secret` | string? | `null` | Per-request proof of possession: `X-Admin-Signature` (HMAC-SHA256 of method, path and query, timestamp, nonce) with `X-Admin-Timestamp` (±300 s) and `X-Admin-Nonce` (each accepted once) |
 

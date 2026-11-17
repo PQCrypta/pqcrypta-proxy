@@ -418,8 +418,11 @@ port = 8081
 # Require mTLS for admin API
 require_mtls = false
 
-# Optional: Bearer token for admin API authentication
+# Optional: Bearer token for admin API authentication. Unset (and no mTLS), a
+# token is generated at each start and written to generated_token_path,
+# readable by the proxy's user alone; it is never logged.
 # auth_token = "your-secret-token-here"
+# generated_token_path = "/var/lib/pqcrypta-proxy/state/admin-token"
 
 # Allowed IP addresses for admin API access
 allowed_ips = ["127.0.0.1", "::1"]

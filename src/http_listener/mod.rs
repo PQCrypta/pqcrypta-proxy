@@ -3553,9 +3553,7 @@ async fn proxy_handler(
                 is_http11,
                 is_websocket_upgrade: is_ws_upgrade,
                 zero_rtt_safe_methods: &state.config.tls.zero_rtt_safe_methods,
-                hmac_nonce_store: crate::route_gate::shared_nonce_store(
-                    state.config.tls.zero_rtt_nonce_window_secs,
-                ),
+                hmac_nonce_store: crate::route_gate::shared_nonce_store(),
             };
             if let crate::route_gate::GateOutcome::Refuse {
                 status,
