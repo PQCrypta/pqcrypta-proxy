@@ -48,20 +48,12 @@ skip = [
     { name = "getrandom", reason = "multiple versions due to rand/crypto crate ecosystem transition" },
     { name = "r-efi", reason = "version-mirrors getrandom: 5.x via getrandom 0.3 (rand 0.9, opentelemetry_sdk), 6.x via getrandom 0.4 (rand 0.10, tempfile, uuid)" },
     { name = "synstructure", reason = "build-time proc-macro helper: 0.13 via asn1-rs-derive 0.6 (x509-parser 0.18, its newest), 0.14 via yoke-derive 0.8 (icu, through url)" },
-    # bitflags — 1.x → 2.x migration ongoing; many crates still on 1.x
     # hashbrown — std uses 0.14 internally; external crates use 0.15
     { name = "hashbrown", reason = "0.14 used by std/indexmap internals; 0.15 used by direct crates" },
-    # thiserror — 1.x → 2.x migration; older transitive crates not yet updated
-    { name = "thiserror", reason = "1.x retained by older transitive crates; 2.x used by direct deps" },
-    { name = "thiserror-impl", reason = "proc-macro companion of thiserror; mirrors thiserror version split" },
-    # socket2 — 0.4 used by tokio 1.x internals; 0.5 used by newer crates
-    # ipnetwork — pulled at different versions by database and network crates
-    { name = "ipnetwork", reason = "multiple transitive versions from sqlx and network crate sub-trees" },
-    # openssl-probe — version split between openssl-related crate trees
-    { name = "openssl-probe", reason = "multiple transitive versions from openssl/rustls bridging crates" },
-    # syn — wasm-bindgen 0.2.129 (wasm32 only, via chrono/js-sys) moved its macro
-    # crate to syn 3; every other proc macro in the graph is still on syn 2.
-    { name = "syn", reason = "3.x via wasm-bindgen-macro-support (wasm32 only); 2.x via every other proc macro" },
+    # syn — proc macros mid-move to syn 3: serde_derive, clap_derive,
+    # async-trait, futures-macro and others are on 3; tracing-attributes,
+    # pin-project-internal, zeroize_derive, axum-macros and others still on 2.
+    { name = "syn", reason = "3.x via serde_derive/clap_derive/async-trait and others; 2.x via tracing-attributes/pin-project/zeroize_derive/axum-macros and others" },
     # untrusted — 0.7 retained by webpki 0.22; 0.9 used by newer ring-based crates
     { name = "untrusted", reason = "0.7 retained by webpki 0.22 sub-tree; 0.9 used by newer ring crates" },
     # base64 — reqwest 0.13 moved to 0.23; jsonwebtoken, pem, hyper-util,

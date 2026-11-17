@@ -1068,7 +1068,7 @@ async fn handle_bi_stream<S: WtSession>(
             let error_response = json!({
                 "success": false,
                 "error": message,
-                "timestamp": chrono::Utc::now().to_rfc3339()
+                "timestamp": jiff::Timestamp::now().display_with_offset(jiff::tz::Offset::UTC).to_string()
             });
             let error_bytes = serde_json::to_vec(&error_response)?;
             send_stream.write_all(&error_bytes).await?;
@@ -1112,7 +1112,7 @@ async fn handle_bi_stream<S: WtSession>(
             let error_response = json!({
                 "success": false,
                 "error": "Request processing failed",
-                "timestamp": chrono::Utc::now().to_rfc3339()
+                "timestamp": jiff::Timestamp::now().display_with_offset(jiff::tz::Offset::UTC).to_string()
             });
 
             let error_bytes = serde_json::to_vec(&error_response)?;
@@ -1176,7 +1176,7 @@ async fn handle_datagram<S: WtSession>(
         let error_response = json!({
             "success": false,
             "error": "Datagram too large",
-            "timestamp": chrono::Utc::now().to_rfc3339()
+            "timestamp": jiff::Timestamp::now().display_with_offset(jiff::tz::Offset::UTC).to_string()
         });
         let error_bytes = serde_json::to_vec(&error_response)?;
         connection.send_datagram(&error_bytes)?;
@@ -1220,7 +1220,7 @@ async fn handle_datagram<S: WtSession>(
             let error_response = json!({
                 "success": false,
                 "error": "Datagram processing failed",
-                "timestamp": chrono::Utc::now().to_rfc3339()
+                "timestamp": jiff::Timestamp::now().display_with_offset(jiff::tz::Offset::UTC).to_string()
             });
             let error_bytes = serde_json::to_vec(&error_response)?;
             connection.send_datagram(&error_bytes)?;
@@ -1230,7 +1230,7 @@ async fn handle_datagram<S: WtSession>(
             let error_response = json!({
                 "success": false,
                 "error": "Backend timeout",
-                "timestamp": chrono::Utc::now().to_rfc3339()
+                "timestamp": jiff::Timestamp::now().display_with_offset(jiff::tz::Offset::UTC).to_string()
             });
             let error_bytes = serde_json::to_vec(&error_response)?;
             connection.send_datagram(&error_bytes)?;
@@ -1308,7 +1308,7 @@ async fn proxy_request(
                             "operation": "pong",
                             "server": "pqcrypta-proxy",
                             "webtransport": true,
-                            "timestamp": chrono::Utc::now().to_rfc3339()
+                            "timestamp": jiff::Timestamp::now().display_with_offset(jiff::tz::Offset::UTC).to_string()
                         });
                         return Ok(serde_json::to_vec(&response)?);
                     }

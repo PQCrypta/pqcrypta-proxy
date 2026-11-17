@@ -741,8 +741,11 @@ fn system_time(t: &openssl::asn1::Asn1GeneralizedTimeRef) -> Option<SystemTime> 
         return None;
     };
     let normal = format!("{month} {day} {clock} {year}");
-    let at = chrono::NaiveDateTime::parse_from_str(&normal, "%b %d %H:%M:%S%.f %Y").ok()?;
-    let secs = u64::try_from(at.and_utc().timestamp()).ok()?;
+    let at = jiff::civil::DateTime::strptime("%b %d %H:%M:%S%.f %Y", &normal)
+        .ok()?
+        .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+        .ok()?;
+    let secs = u64::try_from(at.timestamp().as_second()).ok()?;
     SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs))
 }
 
@@ -906,8 +909,8 @@ mod tests {
         }
 
         fn time(offset_secs: i64) -> Vec<u8> {
-            let at = chrono::Utc::now() + chrono::Duration::seconds(offset_secs);
-            tlv(0x18, at.format("%Y%m%d%H%M%SZ").to_string().as_bytes())
+            let at = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(offset_secs);
+            tlv(0x18, at.strftime("%Y%m%d%H%M%SZ").to_string().as_bytes())
         }
 
         /// A BasicOCSPResponse about `ee` (issued by `issuer`), `good` or

@@ -433,7 +433,7 @@ mod tests {
     #[cfg(not(miri))]
     #[tokio::test]
     async fn drop_receiver_sends_cancel_errors() {
-        let _ = pretty_env_logger::try_init();
+        let _ = env_logger::try_init();
 
         let (mut tx, mut rx) = channel::<Custom, ()>();
 

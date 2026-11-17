@@ -685,7 +685,7 @@ mod tests {
     async fn parse_reads_until_blocked() {
         use crate::proto::h1::ClientTransaction;
 
-        let _ = pretty_env_logger::try_init();
+        let _ = env_logger::try_init();
         let mock = Mock::new()
             // Split over multiple reads will read all of it
             .read(b"HTTP/1.1 200 OK\r\n")
@@ -846,7 +846,7 @@ mod tests {
     TODO: needs tokio_test::io to allow configure write_buf calls
     #[test]
     fn write_buf_queue() {
-        let _ = pretty_env_logger::try_init();
+        let _ = env_logger::try_init();
 
         let mock = AsyncIo::new_buf(vec![], 1024);
         let mut buffered = Buffered::<_, Cursor<Vec<u8>>>::new(mock);
@@ -868,7 +868,7 @@ mod tests {
     #[cfg(not(miri))]
     #[tokio::test]
     async fn write_buf_flatten() {
-        let _ = pretty_env_logger::try_init();
+        let _ = env_logger::try_init();
 
         let mock = Mock::new().write(b"hello world, it's hyper!").build();
 
@@ -886,7 +886,7 @@ mod tests {
 
     #[test]
     fn write_buf_flatten_partially_flushed() {
-        let _ = pretty_env_logger::try_init();
+        let _ = env_logger::try_init();
 
         let b = |s: &str| Cursor::new(s.as_bytes().to_vec());
 
@@ -922,7 +922,7 @@ mod tests {
     #[cfg(not(miri))]
     #[tokio::test]
     async fn write_buf_queue_disable_auto() {
-        let _ = pretty_env_logger::try_init();
+        let _ = env_logger::try_init();
 
         let mock = Mock::new()
             .write(b"hello ")

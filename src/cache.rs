@@ -96,7 +96,7 @@ struct CacheEntry {
     /// Last-Modified header value from backend (sent back on a 304)
     last_modified: Option<String>,
     /// That value as a time, for If-Modified-Since
-    modified_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+    modified_at: Option<jiff::Timestamp>,
     /// Raw Cache-Control header from backend (forwarded on 304 responses)
     cache_control: Option<String>,
     /// When this entry was created (used to compute Age header)
@@ -241,9 +241,52 @@ impl CacheControlDirectives {
     }
 }
 
-/// An HTTP-date (RFC 9110 section 5.6.7) as a time.
-fn http_date(value: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
-    chrono::DateTime::parse_from_rfc2822(value.trim()).ok()
+/// An HTTP-date (RFC 9110 section 5.6.7) as a time. Senders write the
+/// IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`); a recipient must also accept
+/// the two obsolete forms, RFC 850's (`Sunday, 06-Nov-94 08:49:37 GMT`) and
+/// asctime's (`Sun Nov  6 08:49:37 1994`). A weekday that is not its date's
+/// makes it not a date.
+fn http_date(value: &str) -> Option<jiff::Timestamp> {
+    let value = value.trim();
+    if let Ok(at) = jiff::fmt::rfc2822::DateTimeParser::new().parse_timestamp(value) {
+        return Some(at);
+    }
+    let utc = |at: jiff::civil::DateTime| {
+        at.to_zoned_datetime(jiff::tz::TimeZone::UTC)
+            .ok()
+            .map(|at| at.timestamp())
+    };
+    if let Ok(at) = jiff::civil::DateTime::strptime("%a %b %e %H:%M:%S %Y", value) {
+        return utc(at);
+    }
+    rfc850_date(value).and_then(utc)
+}
+
+/// RFC 850's form of an HTTP-date, its two-digit year read as RFC 9110 section
+/// 5.6.7 says: a year more than 50 years ahead is the most recent past year
+/// with those two digits.
+fn rfc850_date(value: &str) -> Option<jiff::civil::DateTime> {
+    let (weekday, rest) = value.split_once(", ")?;
+    let (date, time) = rest.split_once(' ')?;
+    let (day_month, yy) = date.rsplit_once('-')?;
+    if yy.len() != 2 || !yy.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let yy: i32 = yy.parse().ok()?;
+    let now = i32::from(
+        jiff::Timestamp::now()
+            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+            .year(),
+    );
+    let mut year = now - now.rem_euclid(100) + yy;
+    if year > now + 50 {
+        year -= 100;
+    }
+    jiff::civil::DateTime::strptime(
+        "%A, %d-%b-%Y %H:%M:%S GMT",
+        format!("{weekday}, {day_month}-{year} {time}"),
+    )
+    .ok()
 }
 
 /// A request the cache may answer and keep the answer to
@@ -791,7 +834,7 @@ impl ResponseCache {
             None => match expires.as_deref() {
                 Some(expires) => {
                     let left = http_date(expires)
-                        .map(|at| at.signed_duration_since(chrono::Utc::now()).num_seconds())
+                        .map(|at| at.duration_since(jiff::Timestamp::now()).as_secs())
                         .unwrap_or(0);
                     match u64::try_from(left) {
                         Ok(secs) if secs > 0 => Some(Duration::from_secs(secs)),
@@ -1548,7 +1591,11 @@ mod bound_tests {
     fn expired_entries_are_swept_with_their_queue_slots() {
         let c = cache(1);
         // Expires a second from now: the shortest stated lifetime there is
-        let soon = (chrono::Utc::now() + chrono::Duration::seconds(2)).to_rfc2822();
+        let soon = jiff::fmt::rfc2822::DateTimePrinter::new()
+            .timestamp_to_rfc9110_string(
+                &(jiff::Timestamp::now() + jiff::SignedDuration::from_secs(2)),
+            )
+            .unwrap();
         for n in 0..50 {
             c.put(
                 &key(n),
@@ -1570,6 +1617,44 @@ mod bound_tests {
 #[cfg(test)]
 mod freshness_tests {
     use super::*;
+
+    #[test]
+    fn http_dates_are_read_in_all_three_forms() {
+        // RFC 9110 section 5.6.7's example, in each form a recipient accepts
+        let at = "1994-11-06T08:49:37Z".parse::<jiff::Timestamp>().unwrap();
+        assert_eq!(http_date("Sun, 06 Nov 1994 08:49:37 GMT"), Some(at));
+        assert_eq!(http_date("Sunday, 06-Nov-94 08:49:37 GMT"), Some(at));
+        assert_eq!(http_date("Sun Nov  6 08:49:37 1994"), Some(at));
+        assert_eq!(http_date("  Sun, 06 Nov 1994 08:49:37 GMT "), Some(at));
+        // A weekday that is not the date's, and values that are not dates
+        assert_eq!(http_date("Mon, 06 Nov 1994 08:49:37 GMT"), None);
+        assert_eq!(http_date("Monday, 06-Nov-94 08:49:37 GMT"), None);
+        assert_eq!(http_date("Mon Nov  6 08:49:37 1994"), None);
+        assert_eq!(http_date("Sunday, 06-Nov-1994 08:49:37 GMT"), None);
+        assert_eq!(http_date("0"), None);
+        assert_eq!(http_date(""), None);
+    }
+
+    #[test]
+    fn rfc850_years_are_never_more_than_50_years_ahead() {
+        let now = jiff::Timestamp::now()
+            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+            .year();
+        // 50 years ahead is still ahead; 51 is the century before
+        for (ahead, year) in [(50, now + 50), (51, now + 51 - 100), (0, now)] {
+            let first = jiff::civil::date(now + ahead, 1, 1);
+            let printed = format!(
+                "{}, 01-Jan-{:02} 00:00:00 GMT",
+                jiff::civil::date(year, 1, 1).strftime("%A"),
+                first.year().rem_euclid(100)
+            );
+            let read = http_date(&printed)
+                .unwrap_or_else(|| panic!("{printed} is a date"))
+                .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+                .year();
+            assert_eq!(read, year, "{printed}");
+        }
+    }
 
     fn cache() -> ResponseCache {
         ResponseCache::new(ResponseCacheConfig {
@@ -1613,7 +1698,11 @@ mod freshness_tests {
     #[test]
     fn expires_is_read_when_cache_control_states_no_lifetime() {
         let past = "Thu, 19 Nov 1981 08:52:00 GMT";
-        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc2822();
+        let future = jiff::fmt::rfc2822::DateTimePrinter::new()
+            .timestamp_to_rfc9110_string(
+                &(jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1)),
+            )
+            .unwrap();
         assert!(!stored(&[("expires", past)], 200, false));
         assert!(!stored(&[("expires", "0")], 200, false));
         assert!(stored(&[("expires", &future)], 200, false));

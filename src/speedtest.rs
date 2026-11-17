@@ -461,7 +461,7 @@ async fn handle_op_info<W: AsyncWrite + Unpin + Send>(
             "max_upload_bytes":   MAX_UPLOAD_BYTES,
             "max_traceroute_hops": TRACEROUTE_MAX_HOPS,
         },
-        "server_ts_ms": chrono::Utc::now().timestamp_millis()
+        "server_ts_ms": jiff::Timestamp::now().as_millisecond()
     });
     write_framed_json(send, &info).await?;
     send.shutdown().await?;
@@ -776,7 +776,7 @@ async fn handle_op_upload<W: AsyncWrite + Unpin + Send, R: AsyncRead + Unpin + S
             "duration_ms":     duration_ms,
             "throughput_mbps": throughput_mbps,
             "steady_mbps":     steady_mbps,
-            "server_ts_ms":    chrono::Utc::now().timestamp_millis()
+            "server_ts_ms":    jiff::Timestamp::now().as_millisecond()
         }),
     )
     .await?;
