@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.17.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.16.0...v0.17.0) (2026-11-18)
+
+
+### Features
+
+* `--admin METHOD PATH`, a signed request to this node's admin API ([772ae8c](https://github.com/PQCrypta/pqcrypta-proxy/commit/772ae8c39b85a8b9a8462ffbe3cea8188e97d563))
+* **admin:** `metrics_token`, a token that reads the metrics alone, unsigned ([34e5d4e](https://github.com/PQCrypta/pqcrypta-proxy/commit/34e5d4e5becf68fdf348f2c5e70ad8395834530e))
+* per-route JA4 allowlist; an mTLS route answers 421 over HTTP/3 without a certificate ([4b9b66e](https://github.com/PQCrypta/pqcrypta-proxy/commit/4b9b66e1f1b4bba5de906934746c97fd18aab664))
+* secret settings named by systemd credential or file, so the configuration holds no secret ([fcb6cce](https://github.com/PQCrypta/pqcrypta-proxy/commit/fcb6ccee70b58390f57cecd176b896622b21a78c))
+
+
+### Bug Fixes
+
+* every request path meets its route's gates and policy; decoding within the body budget; secrets erased and kept off logs ([df82f79](https://github.com/PQCrypta/pqcrypta-proxy/commit/df82f790961077395b26acda1bd0fb1543f73740))
+
 ## [0.16.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.15.0...v0.16.0) (2026-11-17)
 
 
