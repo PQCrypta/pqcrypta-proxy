@@ -35,14 +35,13 @@ cargo run -- --config config/example-config.toml --validate
 
 ### Branching Strategy
 
-- `main` - Stable release branch
-- `develop` - Development branch (target for PRs)
+- `main` - The development branch (target for PRs); releases are tagged from it
 - `feature/*` - Feature branches
 - `fix/*` - Bug fix branches
 
 ### Pull Request Process
 
-1. **Fork the repository** and create your branch from `develop`
+1. **Fork the repository** and create your branch from `main`
 
 2. **Make your changes**:
    - Write clear, concise commit messages

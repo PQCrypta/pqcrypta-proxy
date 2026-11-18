@@ -6,7 +6,8 @@
 [![Cargo Deny](https://github.com/PQCrypta/pqcrypta-proxy/actions/workflows/cargo-deny.yml/badge.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions/workflows/cargo-deny.yml)
 [![OSSF Scorecard](https://github.com/PQCrypta/pqcrypta-proxy/actions/workflows/ossf-scorecard.yml/badge.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions/workflows/ossf-scorecard.yml)
 [![CodeQL](https://github.com/PQCrypta/pqcrypta-proxy/actions/workflows/codeql.yml/badge.svg)](https://github.com/PQCrypta/pqcrypta-proxy/actions/workflows/codeql.yml)
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/16902/badge)](https://www.bestpractices.dev/projects/16902)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
 
 ## Highlights
 
@@ -2834,3 +2835,5 @@ at your option.
 ## Contributing
 
 Contributions welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) first.
+
+Report a bug or ask for a feature in [GitHub Issues](https://github.com/PQCrypta/pqcrypta-proxy/issues), and ask questions in [Discussions](https://github.com/PQCrypta/pqcrypta-proxy/discussions). Report a vulnerability privately, as [SECURITY.md](SECURITY.md) describes.
