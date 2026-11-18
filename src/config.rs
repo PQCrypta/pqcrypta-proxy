@@ -567,8 +567,16 @@ pub enum ClientAuth {
 pub struct RouteSecurityPolicy {
     /// Require mTLS for this route
     pub mtls_required: Option<bool>,
-    /// Allowlisted JA3 fingerprint hashes for this route
+    /// Allowlisted JA3 fingerprint hashes for this route (32 hexadecimal
+    /// digits each). A client must match this list and `allowed_ja4` where
+    /// both are set; a connection whose fingerprint was not captured matches
+    /// neither.
     pub allowed_ja3: Option<Vec<String>>,
+    /// Allowlisted JA4 fingerprints for this route (FoxIO's form, such as
+    /// `t13d1516h2_8daaf6152771_02713d6af862`). JA4 sorts the cipher suites
+    /// and extensions before hashing, so it holds for a client that reorders
+    /// its extensions on every connection, as Chrome does, where JA3 does not.
+    pub allowed_ja4: Option<Vec<String>>,
     /// Rate limit override for this route
     pub rate_limit_override: Option<RateLimitConfig>,
     /// Allow 0-RTT for this route (overrides global tls.enable_0rtt)
@@ -578,9 +586,12 @@ pub struct RouteSecurityPolicy {
     /// WAF mode for this route: "detect" | "block"
     pub waf_mode: Option<String>,
     /// HMAC-SHA256 secret for per-request signing on this route.
-    /// When set, requests must carry X-Request-Signature and X-Request-Timestamp headers.
-    /// Signature = HMAC-SHA256(METHOD + "\n" + PATH + "\n" + TIMESTAMP, secret).
-    /// Timestamp must be within 300 seconds of server time (replay protection).
+    /// When set, requests must carry `X-Request-Signature`,
+    /// `X-Request-Timestamp` and `X-Request-Nonce` (8 to 128 characters).
+    /// Signature = hex HMAC-SHA256(METHOD + "\n" + PATH_AND_QUERY + "\n" +
+    /// TIMESTAMP + "\n" + NONCE, secret), over the request target as sent.
+    /// The timestamp must be within 300 seconds of server time, either way,
+    /// and a nonce is accepted once for as long as a signature can be.
     /// At least [`MIN_SECRET_CHARS`] characters.
     pub hmac_secret: Option<String>,
 }
@@ -2581,6 +2592,37 @@ pub struct AdminConfig {
     /// `/var/lib/pqcrypta-proxy/state/admin-token`.
     #[serde(default = "default_generated_token_path")]
     pub generated_token_path: PathBuf,
+}
+
+/// A JA3 hash: 32 lowercase hexadecimal digits (an MD5 digest).
+fn is_ja3(entry: &str) -> bool {
+    entry.len() == 32
+        && entry
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// A JA4 fingerprint, `a_b_c`: the 10-character prefix (protocol `t`, `q` or
+/// `d`; version; `d` or `i` for SNI; two two-digit counts; the ALPN's first
+/// and last characters), then two 12-digit lowercase hexadecimal hashes.
+fn is_ja4(entry: &str) -> bool {
+    let mut parts = entry.split('_');
+    let (Some(a), Some(b), Some(c), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let hex12 =
+        |s: &str| s.len() == 12 && s.bytes().all(|x| matches!(x, b'0'..=b'9' | b'a'..=b'f'));
+    let a = a.as_bytes();
+    a.len() == 10
+        && matches!(a[0], b't' | b'q' | b'd')
+        && a[1..3].iter().all(u8::is_ascii_alphanumeric)
+        && matches!(a[3], b'd' | b'i')
+        && a[4..8].iter().all(u8::is_ascii_digit)
+        && a[8..10].iter().all(u8::is_ascii_alphanumeric)
+        && hex12(b)
+        && hex12(c)
 }
 
 fn default_require_loopback() -> bool {
@@ -4824,6 +4866,28 @@ impl ProxyConfig {
                     ));
                 }
             }
+            // A fingerprint allowlist entry that cannot be a fingerprint could
+            // never match: the route would refuse every client without saying
+            // why.
+            if let Some(policy) = route.security.as_ref() {
+                let lists = [
+                    (
+                        "allowed_ja3",
+                        policy.allowed_ja3.as_deref(),
+                        is_ja3 as fn(&str) -> bool,
+                    ),
+                    ("allowed_ja4", policy.allowed_ja4.as_deref(), is_ja4),
+                ];
+                for (field, list, valid) in lists {
+                    if let Some(bad) = list.into_iter().flatten().find(|entry| !valid(entry)) {
+                        return Err(anyhow::anyhow!(
+                            "route {:?}: security.{field} entry {bad:?} is not a {} fingerprint",
+                            route.name.as_deref().unwrap_or(""),
+                            if field == "allowed_ja3" { "JA3" } else { "JA4" }
+                        ));
+                    }
+                }
+            }
             // A route's request-signing key, held to the admin token's floor.
             if let Some(secret) = route.security.as_ref().and_then(|p| p.hmac_secret.as_ref()) {
                 if secret.len() < MIN_SECRET_CHARS {
@@ -5703,6 +5767,30 @@ mod tests {
         c.routes.push(r);
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("stream_to_method"), "{err}");
+    }
+
+    /// Fingerprint allowlists hold fingerprints: an entry that is not one is
+    /// refused at load, where it would otherwise lock every client out.
+    #[test]
+    fn fingerprint_allowlist_entries_are_checked() {
+        assert!(is_ja3("0123456789abcdef0123456789abcdef"));
+        assert!(!is_ja3("0123456789ABCDEF0123456789ABCDEF"));
+        assert!(!is_ja3("abc123..."));
+        assert!(is_ja4("t13d1516h2_8daaf6152771_02713d6af862"));
+        assert!(is_ja4("q13d0310h3_55b375c5d22e_cd85d2d88918"));
+        assert!(!is_ja4("t13d1516h2_8daaf6152771"));
+        assert!(!is_ja4("x13d1516h2_8daaf6152771_02713d6af862"));
+        assert!(!is_ja4("t13d1516h2_8DAAF6152771_02713d6af862"));
+
+        let mut c = ProxyConfig::default();
+        let mut r = route(None, Some("/fp"), None, None, 1);
+        r.security = Some(RouteSecurityPolicy {
+            allowed_ja4: Some(vec!["t13d1516h2_8daaf6152771".into()]),
+            ..RouteSecurityPolicy::default()
+        });
+        c.routes.push(r);
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("security.allowed_ja4"), "{err}");
     }
 
     /// A ticket lifetime is 1 to 604800 seconds (RFC 8446 section 4.6.1); the

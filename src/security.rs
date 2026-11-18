@@ -448,8 +448,8 @@ pub enum SecurityDecision {
         retry_after_secs: u64,
         kind: RateLimitKind,
     },
-    /// Route names a JA3 allowlist this client is not on.
-    Ja3Rejected,
+    /// Route names a JA3 or JA4 allowlist this client is not on.
+    FingerprintRejected,
     /// Header block exceeds `security.max_header_size`.
     HeadersTooLarge { max: usize },
     /// Refused by `[security.validation]`: status and the reason for the log.
@@ -547,6 +547,8 @@ pub struct RequestPolicy {
     pub programmatic_clients: bool,
     /// Only these JA3 hashes may reach this route
     pub allowed_ja3: Option<Vec<String>>,
+    /// Only these JA4 fingerprints may reach this route
+    pub allowed_ja4: Option<Vec<String>>,
     /// Per-route WAF on/off, overriding waf.enabled
     pub waf_enabled: Option<bool>,
     /// Per-route WAF mode ("block" | "detect"), overriding waf.mode
@@ -602,6 +604,7 @@ pub fn route_request_policy(
             credentialed_clients: r.allow_credentialed_clients,
             programmatic_clients: r.allow_programmatic_clients,
             allowed_ja3: r.security.as_ref().and_then(|s| s.allowed_ja3.clone()),
+            allowed_ja4: r.security.as_ref().and_then(|s| s.allowed_ja4.clone()),
             waf_enabled: r.security.as_ref().and_then(|s| s.waf_enabled),
             waf_mode: r.security.as_ref().and_then(|s| s.waf_mode.clone()),
             rate_limit_override: r
@@ -2084,7 +2087,19 @@ impl SecurityState {
                     view.path,
                     presented.unwrap_or("none captured")
                 );
-                return Err(SecurityDecision::Ja3Rejected);
+                return Err(SecurityDecision::FingerprintRejected);
+            }
+        }
+        if let Some(ref allowed) = policy.allowed_ja4 {
+            let presented = view.headers.get("x-ja4-hash").and_then(|v| v.to_str().ok());
+            if !presented.is_some_and(|h| allowed.iter().any(|a| a == h)) {
+                warn!(
+                    "JA4 allowlist rejected {} on {} (fingerprint: {})",
+                    ip,
+                    view.path,
+                    presented.unwrap_or("none captured")
+                );
+                return Err(SecurityDecision::FingerprintRejected);
             }
         }
 
@@ -3316,7 +3331,7 @@ pub fn decision_rendering(
         // Plain 403 rather than the redirect used for GeoIP blocks: the caller
         // here is an automated client that named itself by TLS fingerprint, so a
         // human-readable error page serves no one.
-        SecurityDecision::Ja3Rejected => Some(DecisionRendering {
+        SecurityDecision::FingerprintRejected => Some(DecisionRendering {
             status: StatusCode::FORBIDDEN,
             headers: Vec::new(),
             body: "Forbidden".to_string(),
@@ -4608,7 +4623,7 @@ mod decision_rendering_tests {
                 retry_after_secs: 1,
                 kind: RateLimitKind::Request,
             },
-            SecurityDecision::Ja3Rejected,
+            SecurityDecision::FingerprintRejected,
             SecurityDecision::HeadersTooLarge { max: 8192 },
             SecurityDecision::InvalidRequest {
                 status: 414,
@@ -5193,5 +5208,57 @@ mod hot_reload_tests {
             .scanner_ua_exempt
             .load()
             .is_match("/downloads/agent.tar.gz"));
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_allowlist_tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    /// A route's JA4 allowlist admits the connections whose fingerprint it
+    /// lists and no other, one with no fingerprint captured included.
+    #[tokio::test]
+    async fn a_ja4_allowlist_admits_only_the_listed_fingerprints() {
+        let mut config = ProxyConfig::default();
+        config.security.geoip_db_path = None;
+        config.security.geoip_asn_db_path = None;
+        config.fingerprint.fingerprint_db_path = None;
+        let security = SecurityState::new(&config);
+        let allowed = "t13d1516h2_8daaf6152771_02713d6af862";
+        let policy = RequestPolicy {
+            allowed_ja4: Some(vec![allowed.into()]),
+            skip_bot_blocking: true,
+            ..RequestPolicy::default()
+        };
+        let verdict = |ja4: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "user-agent",
+                HeaderValue::from_static("fingerprint-test/1.0"),
+            );
+            if let Some(value) = ja4 {
+                headers.insert("x-ja4-hash", HeaderValue::from_str(value).unwrap());
+            }
+            let view = SecurityRequestView {
+                ip: "203.0.113.20".parse().unwrap(),
+                peer_port: Some(50000),
+                method: "GET",
+                path: "/",
+                query: "",
+                headers: &headers,
+                body: None,
+            };
+            security.evaluate(&view, &policy)
+        };
+        assert!(matches!(verdict(Some(allowed)), SecurityDecision::Allow));
+        assert!(matches!(
+            verdict(Some("t13d1516h2_000000000000_000000000000")),
+            SecurityDecision::FingerprintRejected
+        ));
+        assert!(matches!(
+            verdict(None),
+            SecurityDecision::FingerprintRejected
+        ));
     }
 }

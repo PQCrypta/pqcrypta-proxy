@@ -99,6 +99,10 @@ pub struct GateContext<'a> {
     /// A WebSocket upgrade is always HTTP/1.1, so it bypasses the HTTP/1.1 gate
     /// when the route opts into WebSocket passthrough.
     pub is_websocket_upgrade: bool,
+    /// Whether this request arrived over HTTP/3. A client that sends no
+    /// certificate over QUIC is answered 421 rather than 401 on an mTLS route
+    /// (see `mtls_gate`), so it repeats the request on a new connection.
+    pub is_http3: bool,
     /// `tls.zero_rtt_safe_methods` — which methods may ride on early data.
     pub zero_rtt_safe_methods: &'a [String],
     pub hmac_nonce_store: &'a HmacNonceStore,
@@ -283,6 +287,14 @@ fn http11_gate(cx: &GateContext<'_>) -> Option<GateOutcome> {
 /// client-supplied copy, so it cannot be forged. A transport that cannot present
 /// a client certificate therefore fails this closed, which is the intent: an
 /// mTLS route is not reachable from a transport that cannot authenticate.
+///
+/// Every listener asks for a certificate wherever a route needs one, QUIC
+/// included, but not every client answers over QUIC: a browser may present its
+/// certificate over TLS on TCP alone. An HTTP/3 request without one is
+/// therefore answered 421 Misdirected Request (RFC 9110 section 15.5.20),
+/// which a client may repeat on a new connection -- Chromium repeats it
+/// without the HTTP/3 alternative, over TCP, where its certificate is sent.
+/// Over TCP the answer is 401.
 fn mtls_gate(cx: &GateContext<'_>) -> Option<GateOutcome> {
     if !cx.route.requires_client_cert() {
         return None;
@@ -299,7 +311,11 @@ fn mtls_gate(cx: &GateContext<'_>) -> Option<GateOutcome> {
             "mTLS route {:?} rejected request from {}: no client certificate",
             cx.route.name, cx.client_ip
         );
-        return refuse(StatusCode::UNAUTHORIZED);
+        return refuse(if cx.is_http3 {
+            StatusCode::MISDIRECTED_REQUEST
+        } else {
+            StatusCode::UNAUTHORIZED
+        });
     }
     None
 }
@@ -445,6 +461,7 @@ mod tests {
             client_ip: "203.0.113.9".parse().unwrap(),
             is_http11,
             is_websocket_upgrade: false,
+            is_http3: false,
             zero_rtt_safe_methods: safe,
             hmac_nonce_store: store,
         }
@@ -543,6 +560,28 @@ mod tests {
             status_of(&evaluate(&ctx(&r, &h, &store, "GET", &safe))),
             Some(StatusCode::UNAUTHORIZED)
         );
+    }
+
+    /// Over HTTP/3 the same refusal is 421, which a client repeats on a new
+    /// connection, where TLS on TCP carries its certificate.
+    #[test]
+    fn an_mtls_route_answers_421_over_http3_without_a_certificate() {
+        let mut r = route();
+        r.internal = true;
+        let store = HmacNonceStore::for_timestamp_skew(HMAC_WINDOW_SECS);
+        let safe: Vec<String> = vec![];
+        let none = HeaderMap::new();
+        let mut cx = ctx(&r, &none, &store, "GET", &safe);
+        cx.is_http3 = true;
+        assert_eq!(
+            status_of(&evaluate(&cx)),
+            Some(StatusCode::MISDIRECTED_REQUEST)
+        );
+        let mut with = HeaderMap::new();
+        with.insert("x-client-cert", HeaderValue::from_static("1"));
+        let mut cx = ctx(&r, &with, &store, "GET", &safe);
+        cx.is_http3 = true;
+        assert!(status_of(&evaluate(&cx)).is_none());
     }
 
     #[test]

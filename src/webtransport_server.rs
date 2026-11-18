@@ -513,6 +513,7 @@ async fn handle_incoming_session(
             client_ip: remote_addr.ip(),
             is_http11: false,
             is_websocket_upgrade: false,
+            is_http3: true,
             zero_rtt_safe_methods: &config.tls.zero_rtt_safe_methods,
             hmac_nonce_store: crate::route_gate::shared_nonce_store(),
         };

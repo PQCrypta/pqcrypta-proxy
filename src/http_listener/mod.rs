@@ -3552,6 +3552,7 @@ async fn proxy_handler(
                 client_ip: client_addr.ip(),
                 is_http11,
                 is_websocket_upgrade: is_ws_upgrade,
+                is_http3: false,
                 zero_rtt_safe_methods: &state.config.tls.zero_rtt_safe_methods,
                 hmac_nonce_store: crate::route_gate::shared_nonce_store(),
             };

@@ -663,6 +663,7 @@ async fn connect_refusal(
         client_ip: ip,
         is_http11: false,
         is_websocket_upgrade: false,
+        is_http3: true,
         zero_rtt_safe_methods: &config.tls.zero_rtt_safe_methods,
         hmac_nonce_store: crate::route_gate::shared_nonce_store(),
     };
@@ -2933,11 +2934,12 @@ mod connect_parity_tests {
              [security]\nmtls_required = true\n",
         );
         let config = proxy_config(vec![wt.clone()]);
-        // A client's own claim to a certificate is not one
+        // A client's own claim to a certificate is not one; over HTTP/3 the
+        // refusal is 421 (route_gate::mtls_gate)
         let request = connect("/wt", &[("x-client-cert", "1")]);
         assert_eq!(
             refusal(&config, request, Some(&wt), None).await,
-            Some(http::StatusCode::UNAUTHORIZED)
+            Some(http::StatusCode::MISDIRECTED_REQUEST)
         );
     }
 
