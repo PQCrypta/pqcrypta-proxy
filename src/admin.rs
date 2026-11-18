@@ -232,6 +232,7 @@ impl AdminServer {
             allowed_ips: self.config.allowed_ips.clone(),
             auth_token: effective_token,
             hmac_secret: self.config.hmac_secret.clone(),
+            metrics_token: self.config.metrics_token.clone(),
             hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::for_timestamp_skew(
                 ADMIN_HMAC_WINDOW_SECS,
             )),
@@ -413,6 +414,8 @@ struct AdminAuthState {
     /// must carry X-Admin-Signature and X-Admin-Timestamp headers in addition
     /// to the bearer token.
     hmac_secret: Option<String>,
+    /// The token that reads the metrics alone, unsigned (`[admin] metrics_token`).
+    metrics_token: Option<String>,
     /// Nonce store for admin API HMAC replay protection.
     hmac_nonce_store: Arc<crate::tls_acceptor::HmacNonceStore>,
     /// Map from client IP string → (failure_count, window_start).
@@ -437,6 +440,20 @@ struct AdminCredentials {
     allowed_ips: Vec<String>,
     auth_token: Option<String>,
     hmac_secret: Option<String>,
+    metrics_token: Option<String>,
+}
+
+/// The routes `[admin] metrics_token` reads: the metrics, and nothing that
+/// changes anything.
+const METRICS_PATHS: [&str; 3] = ["/metrics", "/metrics/json", "/metrics/errors"];
+
+/// Whether `request` reads the metrics alone (`GET` or `HEAD` of one of
+/// [`METRICS_PATHS`]), the one thing the metrics token authorises.
+fn reads_metrics_only(request: &axum::extract::Request) -> bool {
+    matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD
+    ) && METRICS_PATHS.contains(&request.uri().path())
 }
 
 impl AdminAuthState {
@@ -468,12 +485,14 @@ impl AdminAuthState {
                     allowed_ips: admin.allowed_ips.clone(),
                     auth_token: admin.auth_token.clone().or_else(|| self.auth_token.clone()),
                     hmac_secret: admin.hmac_secret.clone(),
+                    metrics_token: admin.metrics_token.clone(),
                 }
             }
             None => AdminCredentials {
                 allowed_ips: self.allowed_ips.clone(),
                 auth_token: self.auth_token.clone(),
                 hmac_secret: self.hmac_secret.clone(),
+                metrics_token: self.metrics_token.clone(),
             },
         }
     }
@@ -532,6 +551,22 @@ async fn auth_middleware(
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    let provided_token = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.strip_prefix("Bearer ").unwrap_or(v));
+
+    // The metrics token reads the metrics, unsigned, and does nothing else:
+    // on any other route it is a token not accepted, below.
+    if let Some(ref metrics_token) = credentials.metrics_token {
+        let provided_bytes = provided_token.unwrap_or("").as_bytes();
+        let matches: bool = provided_bytes.ct_eq(metrics_token.as_bytes()).into();
+        if matches && reads_metrics_only(&request) {
+            auth.failed_attempts.remove(&client_ip);
+            return next.run(request).await.into_response();
+        }
+    }
+
     // Check auth token if configured.
     //
     // The token is evaluated FIRST, and a correct token is never refused.
@@ -546,11 +581,6 @@ async fn auth_middleware(
     // enumerates — so what they bound is failure noise, and they now bound
     // only failures.
     if let Some(ref expected_token) = credentials.auth_token {
-        let provided_token = headers
-            .get("Authorization")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.strip_prefix("Bearer ").unwrap_or(v));
-
         // H-3: Constant-time comparison to prevent timing side-channel attacks
         let provided_bytes = provided_token.unwrap_or("").as_bytes();
         let authorized: bool = provided_bytes.ct_eq(expected_token.as_bytes()).into();
@@ -2307,6 +2337,7 @@ mod auth_tests {
             allowed_ips: Vec::new(),
             auth_token: Some(TOKEN.to_string()),
             hmac_secret: None,
+            metrics_token: None,
             hmac_nonce_store: Arc::new(crate::tls_acceptor::HmacNonceStore::for_timestamp_skew(
                 ADMIN_HMAC_WINDOW_SECS,
             )),
@@ -2357,6 +2388,71 @@ mod auth_tests {
             "success disarms the cooldown"
         );
         assert_eq!(call(&auth, "stale-token").await, StatusCode::UNAUTHORIZED);
+    }
+
+    /// `method path` with `token`, unsigned, against a router with a metrics
+    /// route, a configuration route and a reload.
+    async fn call_route(
+        auth: &Arc<AdminAuthState>,
+        method: &str,
+        path: &str,
+        token: &str,
+    ) -> StatusCode {
+        let app = axum::Router::new()
+            .route("/metrics", get(|| async { "ok" }))
+            .route("/metrics/json", get(|| async { "{}" }))
+            .route("/config", get(|| async { "config" }))
+            .route("/reload", axum::routing::post(|| async { "reloaded" }))
+            .layer(axum::middleware::from_fn_with_state(
+                auth.clone(),
+                auth_middleware,
+            ));
+        let mut req = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    /// With requests signed, a scraper that cannot sign reads the metrics with
+    /// a token of its own, which reads them and nothing else.
+    #[tokio::test]
+    async fn the_metrics_token_reads_the_metrics_unsigned_and_nothing_else() {
+        // This run's own key and token, never values written into the tests
+        let metrics_token = hex::encode(rand::random::<[u8; 24]>());
+        let mut state = Arc::try_unwrap(state()).ok().expect("one owner");
+        state.hmac_secret = Some(hex::encode(rand::random::<[u8; 32]>()));
+        state.metrics_token = Some(metrics_token.clone());
+        let auth = Arc::new(state);
+
+        assert_eq!(
+            call_route(&auth, "GET", "/metrics", &metrics_token).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call_route(&auth, "GET", "/metrics/json", &metrics_token).await,
+            StatusCode::OK
+        );
+        for (method, path) in [
+            ("GET", "/config"),
+            ("POST", "/reload"),
+            ("POST", "/metrics"),
+        ] {
+            assert_eq!(
+                call_route(&auth, method, path, &metrics_token).await,
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}"
+            );
+        }
+        // The admin token still has to sign, the metrics included
+        assert_eq!(
+            call_route(&auth, "GET", "/metrics", TOKEN).await,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]

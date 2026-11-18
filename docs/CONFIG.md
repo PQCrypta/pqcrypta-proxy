@@ -325,7 +325,7 @@ Each request's `x-tls-library` header names the library that completed its hands
 
 ## Secrets
 
-Every secret setting -- `[admin] auth_token` and `hmac_secret`, `[routes.security] hmac_secret`, `[advanced_rate_limiting] jwt_secret`, `[acme] eab_hmac_key` -- takes a string, or a table that says where the value is, so the configuration itself holds none and can be kept or tracked as it is:
+Every secret setting -- `[admin] auth_token`, `hmac_secret` and `metrics_token`, `[routes.security] hmac_secret`, `[advanced_rate_limiting] jwt_secret`, `[acme] eab_hmac_key` -- takes a string, or a table that says where the value is, so the configuration itself holds none and can be kept or tracked as it is:
 
 ```toml
 [admin]
@@ -368,6 +368,7 @@ LoadCredentialEncrypted=admin-hmac
 | `generated_token_path` | path | `"/var/lib/pqcrypta-proxy/state/admin-token"` | Where a generated token is written (mode 0600) |
 | `allowed_ips` | array[string] | `["127.0.0.1", "::1"]` | Addresses that may reach the API at all (a filter, not authentication); one that is not loopback-only needs `auth_token` |
 | `hmac_secret` | string? | `null` | Per-request proof of possession: `X-Admin-Signature` (HMAC-SHA256 of method, path and query, timestamp, nonce) with `X-Admin-Timestamp` (±300 s) and `X-Admin-Nonce` (each accepted once) |
+| `metrics_token` | string? | `null` | A bearer token that reads the metrics alone (`GET`/`HEAD` of `/metrics`, `/metrics/json`, `/metrics/errors`), unsigned, for a scraper that cannot sign (Prometheus's `authorization.credentials_file`); it authorises nothing else. At least 32 characters, and not `auth_token` |
 
 ### Admin API Endpoints
 

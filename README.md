@@ -460,7 +460,7 @@ What a reload applies:
   custom patterns, `enabled` — with its counters carried over; the scanner-UA
   exemptions; the GeoIP and JA3 databases when their paths change; the crawler
   verifier; and the Tor exit refresher, which reads its settings each round.
-- **Admin API credentials** — `auth_token`, `hmac_secret`, `allowed_ips` — on
+- **Admin API credentials** — `auth_token`, `hmac_secret`, `metrics_token`, `allowed_ips` — on
   the next request, so a rotated token takes effect without a restart. A reload
   that removes `auth_token` keeps the previous one rather than switching
   authentication off.
@@ -594,9 +594,12 @@ Leave `allowed_domains = []` (empty, the default) to disable the check and allow
 ### Admin API Authentication
 
 Every admin route but `/health` takes a credential: the configured `auth_token`,
-a token the proxy generates at each start when none is configured (printed to
-standard error, and different after every restart), or the client certificate
-under `require_mtls`; `hmac_secret` adds a signature to every request.
+a token the proxy generates at each start when none is configured (written to
+`generated_token_path`, readable by the proxy's user alone, never logged, and
+different after every restart), or the client certificate under
+`require_mtls`; `hmac_secret` adds a signature to every request. The metrics
+routes also take `metrics_token`, unsigned, which authorises nothing else: for
+a scraper that cannot sign.
 `allowed_ips` filters addresses before any of that and is not authentication.
 The details are under [Admin API Authentication](#admin-api-authentication-1).
 
@@ -2071,7 +2074,8 @@ curl -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/ocsp/refres
 | `/health` | GET | Minimal health check — safe for load-balancer probes (F-03) |
 
 **Protected** (by the configured admin authentication: the bearer token or, under `require_mtls`,
-the client certificate; with `hmac_secret`, a signed request — see
+the client certificate; with `hmac_secret`, a signed request; `GET` of the three
+`/metrics` routes also with `metrics_token`, unsigned — see
 [Admin API Authentication](#admin-api-authentication-1)):
 
 | Endpoint | Method | Description |
@@ -2715,11 +2719,12 @@ port = 8081
 auth_token = "your-strong-secret-token-at-least-32-chars"
 allowed_ips = ["127.0.0.1", "::1"]
 # hmac_secret = "…"            # optional: per-request signatures
+# metrics_token = "…"          # optional: reads /metrics, /metrics/json, /metrics/errors alone, unsigned
 # require_mtls = true          # optional: client certificates (tls_cert_path, tls_key_path, client_ca_path)
 ```
 
 **Token requirements:**
-- Minimum **32 characters** — the proxy rejects a shorter `auth_token`, `admin.hmac_secret` or route `security.hmac_secret` at startup. Generate one with `openssl rand -base64 48`.
+- Minimum **32 characters** — the proxy rejects a shorter `auth_token`, `admin.hmac_secret`, `admin.metrics_token` or route `security.hmac_secret` at startup, and a `metrics_token` that is the `auth_token`. Generate one with `openssl rand -base64 48`.
 - Token comparison uses constant-time equality to prevent timing side-channel attacks.
 
 **Brute-force protection:**

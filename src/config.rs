@@ -2587,6 +2587,14 @@ pub struct AdminConfig {
     /// (`{ credential = "name" }`, `{ file = "/path" }`, see `secret_source`).
     #[serde(default, deserialize_with = "crate::secret_source::optional")]
     pub hmac_secret: Option<String>,
+    /// A second bearer token that reads the metrics alone: `GET` (or `HEAD`)
+    /// of `/metrics`, `/metrics/json` and `/metrics/errors`, with no request
+    /// signature, so a scraper that cannot sign (Prometheus) needs neither the
+    /// admin token nor `hmac_secret`. It authorises nothing else. At least
+    /// [`MIN_SECRET_CHARS`] characters, and not `auth_token`. A string, or
+    /// where it is (`{ credential = "name" }`, `{ file = "/path" }`).
+    #[serde(default, deserialize_with = "crate::secret_source::optional")]
+    pub metrics_token: Option<String>,
     /// Refuse to start if the admin bind address is not loopback (default: true).
     /// Applies to the plain-HTTP listener, where a non-loopback bind transmits
     /// Bearer tokens in cleartext; set it to `false` only behind a TLS tunnel
@@ -2657,6 +2665,7 @@ impl Default for AdminConfig {
             auth_token: None,
             allowed_ips: vec!["127.0.0.1".to_string(), "::1".to_string()],
             hmac_secret: None,
+            metrics_token: None,
             require_loopback: default_require_loopback(),
             generated_token_path: default_generated_token_path(),
         }
@@ -5142,6 +5151,23 @@ impl ProxyConfig {
                     ));
                 }
             }
+            // The metrics token is a bearer token too, held to the same floor,
+            // and a token of its own: were it the admin token, the admin token
+            // would read the metrics unsigned.
+            if let Some(ref token) = self.admin.metrics_token {
+                if token.len() < MIN_SECRET_CHARS {
+                    return Err(anyhow::anyhow!(
+                        "admin.metrics_token is too short ({} characters): it must be at least \
+                         {MIN_SECRET_CHARS}. Generate one with: openssl rand -base64 48",
+                        token.len()
+                    ));
+                }
+                if self.admin.auth_token.as_deref() == Some(token.as_str()) {
+                    return Err(anyhow::anyhow!(
+                        "admin.metrics_token is admin.auth_token: give the metrics a token of their own"
+                    ));
+                }
+            }
             // The key that signs admin requests, held to the same floor: a short
             // one is guessed offline from a single signed request.
             if let Some(ref secret) = self.admin.hmac_secret {
@@ -5759,6 +5785,28 @@ mod tests {
         c.routes.push(r);
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("security.hmac_secret is too short"), "{err}");
+    }
+
+    /// The metrics token is held to the token floor and must not be the admin
+    /// token, which would then read the metrics unsigned.
+    #[test]
+    fn the_metrics_token_is_long_and_its_own() {
+        let mut c = ProxyConfig::default();
+        c.admin.enabled = true;
+        c.admin.auth_token = Some("a".repeat(MIN_SECRET_CHARS));
+        c.admin.metrics_token = Some("m".repeat(MIN_SECRET_CHARS - 1));
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("admin.metrics_token is too short"), "{err}");
+        c.admin.metrics_token = c.admin.auth_token.clone();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("admin.metrics_token is admin.auth_token"),
+            "{err}"
+        );
+        c.admin.metrics_token = Some("m".repeat(MIN_SECRET_CHARS));
+        if let Err(e) = c.validate() {
+            assert!(!e.to_string().contains("metrics_token"), "{e}");
+        }
     }
 
     /// A WebTransport route forwards with its `stream_to_method`, POST when it
