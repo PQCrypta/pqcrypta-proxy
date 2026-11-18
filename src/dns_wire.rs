@@ -113,15 +113,22 @@ pub(crate) fn layout(msg: &[u8]) -> Option<Layout> {
 /// The name that starts at `at`, lowercase and without the trailing dot
 /// (the root is the empty string), following compression pointers. Each
 /// pointer must point before itself and before the last one followed, so the
-/// walk only goes backwards: a loop cannot spin.
+/// walk only goes backwards: a loop cannot spin. `None` for a name over the
+/// 255 octets RFC 1035 §3.1 allows, however it was compressed.
 pub(crate) fn read_name(msg: &[u8], mut at: usize) -> Option<String> {
     let mut labels: Vec<String> = Vec::new();
     let mut limit = usize::MAX;
+    // The root label's one octet
+    let mut wire_length = 1;
     loop {
         let length = *msg.get(at)?;
         match length & 0xC0 {
             0x00 if length == 0 => break,
             0x00 => {
+                wire_length += 1 + usize::from(length);
+                if wire_length > 255 {
+                    return None;
+                }
                 let label = msg.get(at + 1..at + 1 + usize::from(length))?;
                 labels.push(String::from_utf8_lossy(label).to_ascii_lowercase());
                 at += 1 + usize::from(length);
@@ -135,9 +142,6 @@ pub(crate) fn read_name(msg: &[u8], mut at: usize) -> Option<String> {
                 at = target;
             }
             _ => return None,
-        }
-        if labels.len() > 127 {
-            return None;
         }
     }
     Some(labels.join("."))
@@ -178,6 +182,32 @@ mod tests {
         assert_eq!(read_name(b"\x00", 0).as_deref(), Some(""));
         assert!(encode_name("a..b").is_none(), "empty label");
         assert!(encode_name(&"x".repeat(64)).is_none(), "label over 63");
+    }
+
+    #[test]
+    fn a_name_over_255_octets_is_refused() {
+        let label = |length: usize| {
+            let mut wire = vec![u8::try_from(length).unwrap()];
+            wire.extend(std::iter::repeat_n(b'a', length));
+            wire
+        };
+        // 3 labels of 64 octets, one of 62 and the root: 255 exactly
+        let mut longest = [label(63), label(63), label(63), label(61)].concat();
+        longest.push(0);
+        assert_eq!(longest.len(), 255);
+        assert!(read_name(&longest, 0).is_some());
+
+        let mut over = [label(63), label(63), label(63), label(62)].concat();
+        over.push(0);
+        assert_eq!(read_name(&over, 0), None);
+
+        // The same length reached through a compression pointer
+        let mut tail = [label(63), label(63), label(63)].concat();
+        tail.push(0);
+        let start = tail.len();
+        tail.extend(label(62));
+        tail.extend_from_slice(b"\xC0\x00");
+        assert_eq!(read_name(&tail, start), None);
     }
 
     #[test]

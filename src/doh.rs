@@ -417,9 +417,13 @@ impl QueryInfo {
         (self.flags >> 11) & 0x0F
     }
 
-    /// A standard query for anything but a zone transfer.
+    /// A standard query with one question, for anything but a zone transfer.
+    /// A message with several has no one type to judge it by, and no server
+    /// in general use answers one.
     pub(crate) fn forwardable(&self) -> bool {
-        self.opcode() == 0 && !matches!(self.qtype, Some(TYPE_AXFR | TYPE_IXFR))
+        self.opcode() == 0
+            && self.questions == 1
+            && !matches!(self.qtype, Some(TYPE_AXFR | TYPE_IXFR))
     }
 }
 
@@ -638,6 +642,26 @@ mod tests {
         assert_eq!(name_end(b"\x03www", 0), None, "runs past the end");
         assert_eq!(name_end(b"\x41abc\x00", 0), None, "retired label type");
         assert_eq!(name_end(b"\xC0", 0), None, "half a pointer");
+    }
+
+    #[test]
+    fn a_message_with_more_than_one_question_is_refused() {
+        for second in [1, TYPE_AXFR, TYPE_IXFR] {
+            let mut q = query(1, 0, false, false);
+            q[4..6].copy_from_slice(&2u16.to_be_bytes());
+            q.push(0);
+            q.extend_from_slice(&second.to_be_bytes());
+            q.extend_from_slice(&1u16.to_be_bytes());
+            assert!(!inspect(&q).unwrap().forwardable(), "second type {second}");
+        }
+    }
+
+    #[test]
+    fn a_message_with_no_question_is_refused() {
+        let mut q = query(1, 0, false, false);
+        q[4..6].copy_from_slice(&0u16.to_be_bytes());
+        q.truncate(12);
+        assert!(!inspect(&q).unwrap().forwardable());
     }
 
     #[test]

@@ -1154,6 +1154,9 @@ impl QuicListener {
         // Borrowed from the config unless a pool built one for this request:
         // cloning the configured backend copied its name, address and every
         // other owned field on each request, to read them once.
+        // The place the pool gave this request: held to the end of a response
+        // body, and given back at the head of an event stream, as on TCP.
+        let mut pool_slot: Option<crate::load_balancer::ConnectionSlot> = None;
         let (backend, canary_cookie_to_set, pool_server): (
             Cow<'_, BackendConfig>,
             Option<String>,
@@ -1228,6 +1231,7 @@ impl QuicListener {
                 match pool.select_queued(&ctx).await {
                     Some(result) => {
                         let cfg = result.server.backend_config();
+                        pool_slot = Some(result.slot);
                         (
                             Cow::Owned(cfg),
                             result.set_canary_cookie,
@@ -1963,9 +1967,6 @@ impl QuicListener {
         let request_body = Bytes::from(body);
         let request_body_len = request_body.len() as u64;
 
-        // Counted in the pool server's active connections until this request
-        // finishes; see `BackendServer::acquire_slot`.
-        let _pool_slot = pool_server.as_ref().map(|s| s.acquire_slot());
         let backend_start = std::time::Instant::now();
         let proxied = backend_pool
             .proxy_stream(
@@ -1979,15 +1980,29 @@ impl QuicListener {
         // The outcome goes to the pool and the circuit breaker, as it does on TCP.
         let backend_ok = proxied.is_ok();
         if let Some(server) = &pool_server {
-            load_balancer.record_completion(
-                &route.backend,
-                server,
-                backend_start.elapsed(),
-                backend_ok,
-            );
+            match &proxied {
+                Ok((status, ..)) => load_balancer.record_response(
+                    &route.backend,
+                    server,
+                    backend_start.elapsed(),
+                    status.as_u16(),
+                ),
+                Err(_) => load_balancer.record_completion(
+                    &route.backend,
+                    server,
+                    backend_start.elapsed(),
+                    false,
+                ),
+            }
         } else {
             security.record_backend_result(&route.backend, backend_ok);
         }
+        // A response whose body fails after its head counts against the server.
+        let body_failed = || {
+            if let Some(server) = &pool_server {
+                load_balancer.record_body_failure(&route.backend, server);
+            }
+        };
         let (stream_status, mut stream_headers, stream_body, backend_lease) = match proxied {
             Ok(r) => r,
             Err(e) => {
@@ -2058,6 +2073,7 @@ impl QuicListener {
 
         // SSE fast path: send headers immediately, then pump body frames as they arrive.
         if is_sse {
+            drop(pool_slot.take());
             let mut sse_builder = http::Response::builder().status(stream_status);
             for (name, value) in &stream_headers {
                 // Skip content-length (SSE has no fixed length) and hop-by-hop
@@ -2107,7 +2123,10 @@ impl QuicListener {
                             }
                         }
                     }
-                    Some(Err(_)) => break,
+                    Some(Err(_)) => {
+                        body_failed();
+                        break;
+                    }
                     None => {
                         sse_complete = true;
                         break;
@@ -2176,7 +2195,10 @@ impl QuicListener {
             let body = stream_body
                 .collect()
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to read response body: {}", e))?
+                .map_err(|e| {
+                    body_failed();
+                    anyhow::anyhow!("Failed to read response body: {}", e)
+                })?
                 .to_bytes();
             if let Some(lease) = backend_lease.take() {
                 lease.release();
@@ -2200,6 +2222,7 @@ impl QuicListener {
                         }
                     }
                     Some(Err(e)) => {
+                        body_failed();
                         return Err(anyhow::anyhow!("Failed to read response body: {}", e));
                     }
                 }
@@ -2398,8 +2421,10 @@ impl QuicListener {
                     }
                 }
                 while let Some(frame_result) = body.frame().await {
-                    let frame = frame_result
-                        .map_err(|e| anyhow::anyhow!("Backend body stream failed: {}", e))?;
+                    let frame = frame_result.map_err(|e| {
+                        body_failed();
+                        anyhow::anyhow!("Backend body stream failed: {}", e)
+                    })?;
                     if let Some(data) = frame.data_ref() {
                         if !data.is_empty() {
                             sent += data.len();

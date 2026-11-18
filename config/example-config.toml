@@ -487,8 +487,10 @@ enabled = true
 # IPv6 subnet grouping (64 = /64 subnets treated as single client)
 ipv6_subnet_bits = 64
 
-# Trusted proxies for X-Forwarded-For parsing (CIDR or IP)
-trusted_proxies = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.1"]
+# The proxies in front of this one, whose X-Forwarded-For is believed (CIDR or
+# IP). None by default: any address listed can say where a request came from.
+# trusted_proxies = ["10.0.0.10"]
+trusted_proxies = []
 
 # Key resolution strategy
 [advanced_rate_limiting.key_strategy]
@@ -569,7 +571,7 @@ std_dev_multiplier = 3.0  # Requests > mean + 3*std_dev = anomaly
 # [advanced_rate_limiting.route_limits.api_heavy]
 # pattern = "/api/heavy"                    # Route pattern (path prefix or regex)
 # key_override = "api_key"                  # Override key resolution for this route
-# exempt_keys = ["internal-service-key"]    # Keys exempt from rate limiting
+# exempt_keys = ["192.0.2.10"]    # Addresses or verified JWT subjects exempt from rate limiting
 # [advanced_rate_limiting.route_limits.api_heavy.limits]
 # requests_per_second = 10
 # burst_size = 5
@@ -950,6 +952,9 @@ tls_mode = "terminate"
 # rollback_error_rate    = 0.05             # Suspend when error rate exceeds this (default: 5 %)
 # rollback_window_secs   = 60              # Sliding window length for error tracking (seconds)
 # rollback_min_requests  = 10              # Minimum requests before rollback can trigger
+# rollback_min_errors    = 3               # Minimum errors before rollback can trigger
+# rollback_compare_stable = true           # Roll back only when the canary fails more than the stable servers
+# rollback_ignored_statuses = []           # 5xx statuses that are not the canary's errors, e.g. [501]
 #
 # Canary server entry (place before stable servers in the pool):
 # [[backend_pools.api-pool.servers]]

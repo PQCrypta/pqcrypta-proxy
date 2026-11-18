@@ -50,7 +50,7 @@ use tracing::{debug, info, warn};
 /// bucket always remains in-process to provide fast local DDoS protection.
 /// If Redis becomes unreachable any command that times out or errors falls
 /// back transparently to the in-memory DashMap bucket for that request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RedisConfig {
     /// Redis connection URL.
     /// Examples:
@@ -128,7 +128,8 @@ pub struct AdvancedRateLimitConfig {
     #[serde(default)]
     pub route_limits: HashMap<String, RouteLimits>,
 
-    /// Trusted proxies for X-Forwarded-For parsing
+    /// The proxies in front of this one, whose X-Forwarded-For is believed
+    /// (default: none)
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
 
@@ -211,6 +212,21 @@ impl AdvancedRateLimitConfig {
     /// allowed algorithm's hash output (RFC 7518 section 3.2). A short key is
     /// a guessable one, and an empty key verifies tokens anyone can sign.
     pub fn validate(&self) -> anyhow::Result<()> {
+        for (route, limits) in &self.route_limits {
+            if let Some(key) = limits
+                .key_override
+                .as_ref()
+                .filter(|k| !k.is_network_bound())
+            {
+                if !limits.exempt_keys.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "advanced_rate_limiting.route_limits.{route}: exempt_keys cannot apply \
+                         to key_override {key:?}, a value a client can present as it likes; \
+                         exempt an address or a verified JWT subject"
+                    ));
+                }
+            }
+        }
         let mut longest = 0;
         for algorithm in &self.jwt_algorithms {
             let Some(min) = hmac_min_key_bytes(algorithm) else {
@@ -241,12 +257,9 @@ impl Default for AdvancedRateLimitConfig {
             key_strategy: KeyResolutionStrategy::default(),
             global_limits: GlobalLimits::default(),
             route_limits: HashMap::new(),
-            trusted_proxies: vec![
-                "10.0.0.0/8".to_string(),
-                "172.16.0.0/12".to_string(),
-                "192.168.0.0/16".to_string(),
-                "127.0.0.1".to_string(),
-            ],
+            // None until the operator names its own proxies: a client on a
+            // listed network could otherwise say which address it came from.
+            trusted_proxies: Vec::new(),
             headers: RateLimitHeaders::default(),
             fingerprint_limiting: FingerprintLimitConfig::default(),
             adaptive: AdaptiveConfig::default(),
@@ -341,6 +354,12 @@ impl Default for RateLimitKeyType {
 }
 
 impl RateLimitKeyType {
+    /// Whether this key's value is one the client cannot choose: the address
+    /// it connected from, or a subject whose token verified.
+    pub fn is_network_bound(&self) -> bool {
+        matches!(self, Self::SourceIp | Self::RealIp | Self::JwtSubject)
+    }
+
     /// Whether the client writes this key's value into each request as it
     /// likes: a header (the API key among them), a cookie, a query parameter
     /// or the path. Nothing here verifies such a value, so it names a
@@ -499,7 +518,9 @@ pub struct RouteLimits {
     /// Override key resolution for this route
     pub key_override: Option<RateLimitKeyType>,
 
-    /// Exempt certain keys from rate limiting
+    /// Exempt certain keys from rate limiting: addresses and verified JWT
+    /// subjects. A value a client writes or can imitate (an API key, a header,
+    /// a cookie, a TLS fingerprint) earns no exemption.
     #[serde(default)]
     pub exempt_keys: Vec<String>,
 }
@@ -1187,17 +1208,9 @@ impl RateLimitKey {
     /// other key is counted beside the address's own bucket, never instead of
     /// it (see `AdvancedRateLimiter::charges`).
     pub fn is_network_bound(&self) -> bool {
-        let bound = |t: &RateLimitKeyType| {
-            matches!(
-                t,
-                RateLimitKeyType::SourceIp
-                    | RateLimitKeyType::RealIp
-                    | RateLimitKeyType::JwtSubject
-            )
-        };
         match &self.components {
-            Some(components) => components.iter().all(|(t, _)| bound(t)),
-            None => bound(&self.key_type),
+            Some(components) => components.iter().all(|(t, _)| t.is_network_bound()),
+            None => self.key_type.is_network_bound(),
         }
     }
 
@@ -1907,6 +1920,10 @@ pub struct AdvancedRateLimiter {
     /// configured).  Falls back to `buckets` (in-memory) on every `None`.
     redis_backend: Arc<AsyncRwLock<Option<Arc<RedisBackend>>>>,
 
+    /// The task that connects `redis_backend`, replaced when a reload changes
+    /// the Redis settings
+    redis_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+
     /// Where a refused request is recorded, once the audit log exists
     audit: std::sync::OnceLock<Arc<crate::audit_logger::AuditLogger>>,
 
@@ -2003,6 +2020,7 @@ impl AdvancedRateLimiter {
             global_baseline: arc_swap::ArcSwap::from_pointee(global_baseline),
             stats: Arc::new(RateLimiterStats::default()),
             redis_backend,
+            redis_task: Mutex::new(None),
             audit: std::sync::OnceLock::new(),
             asn_of: std::sync::OnceLock::new(),
             global_second: AtomicU64::new(0),
@@ -2014,35 +2032,53 @@ impl AdvancedRateLimiter {
         limiter.spawn_cleanup_task();
 
         // Spawn Redis connection task (if configured)
-        if let Some(rcfg) = redis_cfg {
-            let slot = limiter.redis_backend.clone();
-            tokio::spawn(async move {
-                let url = redis_url_for_log(&rcfg.url);
-                let mut delay = Duration::from_secs(1);
-                let mut warned = false;
-                loop {
-                    match RedisBackend::connect(&rcfg).await {
-                        Ok(backend) => {
-                            *slot.write().await = Some(Arc::new(backend));
-                            info!("Distributed rate limiting: Redis connected at {url}");
-                            break;
-                        }
-                        Err(e) if !warned => {
-                            warned = true;
-                            warn!(
-                                "Distributed rate limiting: could not connect to Redis at {url}, \
-                                 counting on this node until it can. Error: {e}"
-                            );
-                        }
-                        Err(e) => debug!("Redis at {url} still refuses: {e}"),
-                    }
-                    tokio::time::sleep(delay).await;
-                    delay = (delay * 2).min(Duration::from_secs(30));
-                }
-            });
+        if redis_cfg.is_some() {
+            limiter.supervise_redis(redis_cfg);
         }
 
         limiter
+    }
+
+    /// Connect to the Redis `config` names, in place of any before it, and go
+    /// on trying until it answers. Until then requests are counted on this node.
+    fn supervise_redis(&self, config: Option<RedisConfig>) {
+        let previous = self.redis_task.lock().take();
+        if let Some(task) = previous {
+            task.abort();
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let slot = self.redis_backend.clone();
+        let task = runtime.spawn(async move {
+            *slot.write().await = None;
+            let Some(rcfg) = config else {
+                return;
+            };
+            let url = redis_url_for_log(&rcfg.url);
+            let mut delay = Duration::from_secs(1);
+            let mut warned = false;
+            loop {
+                match RedisBackend::connect(&rcfg).await {
+                    Ok(backend) => {
+                        *slot.write().await = Some(Arc::new(backend));
+                        info!("Distributed rate limiting: Redis connected at {url}");
+                        return;
+                    }
+                    Err(e) if !warned => {
+                        warned = true;
+                        warn!(
+                            "Distributed rate limiting: could not connect to Redis at {url}, \
+                             counting on this node until it can. Error: {e}"
+                        );
+                    }
+                    Err(e) => debug!("Redis at {url} still refuses: {e}"),
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(30));
+            }
+        });
+        *self.redis_task.lock() = Some(task);
     }
 
     /// Check if the request is allowed.
@@ -2139,13 +2175,14 @@ impl AdvancedRateLimiter {
             let (key, limits) = self.resolve_key_and_limits(ctx, &config);
 
             // `route_limits.<route>.exempt_keys` names the key values that this
-            // route does not rate-limit — a health-check API key, a monitoring
-            // agent's fingerprint, an internal caller's IP.  The field was
+            // route does not rate-limit — an internal caller's IP, a verified
+            // service account.  The field was
             // parsed and stored and read by nothing, so every listed key was
             // limited exactly like an anonymous one.  Compare against the
             // resolved key's value, which is what the operator writes in the
-            // list, rather than the internal `type:value` string.
-            if let Some(route_name) = &ctx.route_name {
+            // list, rather than the internal `type:value` string. Only a key
+            // the client cannot choose is compared: anyone can send a header.
+            if let Some(route_name) = ctx.route_name.as_ref().filter(|_| key.is_network_bound()) {
                 if let Some(route_limits) = config.route_limits.get(route_name) {
                     let bare = key
                         .value
@@ -2923,6 +2960,7 @@ impl AdvancedRateLimiter {
             .try_read()
             .map(|g| g.as_ref().is_some_and(|backend| backend.health.is_up()))
             .unwrap_or(false); // lock held → assume state unknown, report false
+        let redis_configured = self.config.read().redis.is_some();
 
         RateLimiterSnapshot {
             total_requests: self.stats.total_requests.load(Ordering::Relaxed),
@@ -2932,7 +2970,9 @@ impl AdvancedRateLimiter {
             keys_tracked: self.buckets.len(),
             global_baseline_mean: self.global_baseline.load().get_mean(),
             global_baseline_std_dev: self.global_baseline.load().get_std_dev(),
+            redis_configured,
             redis_connected,
+            redis_degraded: redis_configured && !redis_connected,
         }
     }
 
@@ -3041,6 +3081,9 @@ impl AdvancedRateLimiter {
             serde_json::to_value(&previous),
             serde_json::to_value(&config),
         );
+        if previous.redis != config.redis {
+            self.supervise_redis(config.redis.clone());
+        }
         *self.config.write() = config;
         if rebuilt {
             self.buckets.clear();
@@ -3065,8 +3108,12 @@ pub struct RateLimiterSnapshot {
     pub keys_tracked: usize,
     pub global_baseline_mean: f64,
     pub global_baseline_std_dev: f64,
-    /// Whether the Redis distributed backend is currently connected.
+    /// Whether the configuration names a Redis backend.
+    pub redis_configured: bool,
+    /// Whether the Redis distributed backend is connected and answering.
     pub redis_connected: bool,
+    /// Configured but not answering: requests are counted on this node.
+    pub redis_degraded: bool,
 }
 
 // ============================================================================
@@ -3159,11 +3206,9 @@ mod tests {
                 .is_err(),
             "short for HS512"
         );
-        assert!(
-            with(Some(&"k".repeat(64)), &["HS256", "HS512"])
-                .validate()
-                .is_ok()
-        );
+        assert!(with(Some(&"k".repeat(64)), &["HS256", "HS512"])
+            .validate()
+            .is_ok());
         assert!(with(None, &["RS256"]).validate().is_err(), "not HMAC");
     }
 
@@ -4484,12 +4529,10 @@ mod redis_limit_tests {
         let backend = RedisBackend::connect(&redis.config()).await.unwrap();
         redis.stop();
 
-        assert!(
-            backend
-                .check_limits("k", &limits(Some(9), None), 0)
-                .await
-                .is_none()
-        );
+        assert!(backend
+            .check_limits("k", &limits(Some(9), None), 0)
+            .await
+            .is_none());
         assert!(!backend.health.is_up());
         assert!(!backend.health.may_ask());
     }
@@ -4532,6 +4575,25 @@ mod redis_limit_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn requests_redis_admits_reach_the_nodes_adaptive_baseline() {
+        let Some(redis) = TestRedis::start().await else {
+            return;
+        };
+        let backend = RedisBackend::connect(&redis.config()).await.unwrap();
+        let limiter = AdvancedRateLimiter::new(AdvancedRateLimitConfig::default());
+        let charge = charge(limits(Some(1_000), Some(1_000)));
+        let adaptive = adaptive_off();
+        for _ in 0..7 {
+            limiter
+                .check_distributed(&backend, &charge, &adaptive)
+                .await;
+        }
+        let bucket = limiter.get_or_create_bucket(&charge, &adaptive);
+        assert_eq!(bucket.minute_counter.as_ref().unwrap().get_count(), 7);
+        assert_eq!(redis.counted("1m", &charge.key_string).await, 7);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_proxy_started_before_redis_connects_once_redis_is_up() {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -4562,5 +4624,130 @@ mod redis_limit_tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         panic!("the limiter never connected to Redis");
+    }
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+
+    fn route(key_override: Option<RateLimitKeyType>, exempt: &str) -> RouteLimits {
+        RouteLimits {
+            pattern: "/login".to_string(),
+            limits: PerKeyLimits {
+                requests_per_second: 1,
+                burst_size: 1,
+                requests_per_minute: None,
+                requests_per_hour: None,
+            },
+            key_override,
+            exempt_keys: vec![exempt.to_string()],
+        }
+    }
+
+    fn request(headers: &[(&str, &str)], source: &str) -> RateLimitContext {
+        RateLimitContext {
+            source_ip: source.parse().unwrap(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            path: "/login".to_string(),
+            method: "POST".to_string(),
+            query_params: HashMap::new(),
+            cookies: HashMap::new(),
+            ja3_hash: None,
+            ja4_hash: None,
+            route_name: Some("login".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_header_a_client_writes_earns_no_exemption() {
+        let mut config = AdvancedRateLimitConfig::default();
+        config
+            .route_limits
+            .insert("login".to_string(), route(None, "monitoring-key"));
+        let limiter = AdvancedRateLimiter::new(config);
+        let ctx = request(&[("x-api-key", "monitoring-key")], "203.0.113.9");
+        let mut refused = false;
+        for _ in 0..20 {
+            refused |= matches!(limiter.check(&ctx).await, RateLimitResult::Limited { .. });
+        }
+        assert!(
+            refused,
+            "the listed value was honoured from an unverified header"
+        );
+    }
+
+    #[test]
+    fn an_exemption_for_a_key_a_client_writes_is_refused_at_load() {
+        let mut config = AdvancedRateLimitConfig::default();
+        config.route_limits.insert(
+            "login".to_string(),
+            route(Some(RateLimitKeyType::ApiKey), "monitoring-key"),
+        );
+        let refusal = config.validate().unwrap_err().to_string();
+        assert!(refusal.contains("exempt_keys"), "{refusal}");
+    }
+
+    #[test]
+    fn an_exemption_for_an_address_is_accepted_at_load() {
+        let mut config = AdvancedRateLimitConfig::default();
+        config.route_limits.insert(
+            "login".to_string(),
+            route(Some(RateLimitKeyType::SourceIp), "192.0.2.1"),
+        );
+        config.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn by_default_no_address_may_say_where_a_request_came_from() {
+        assert_eq!(AdvancedRateLimitConfig::default().trusted_proxies.len(), 0);
+        let limiter = AdvancedRateLimiter::new(AdvancedRateLimitConfig::default());
+        let config = AdvancedRateLimitConfig::default();
+        let ctx = request(&[("x-forwarded-for", "198.51.100.7")], "10.0.0.5");
+        assert_eq!(limiter.extract_real_ip(&ctx, &config), None);
+    }
+
+    #[tokio::test]
+    async fn a_named_proxy_may_say_where_a_request_came_from() {
+        let config = AdvancedRateLimitConfig {
+            trusted_proxies: vec!["10.0.0.5".to_string()],
+            ..AdvancedRateLimitConfig::default()
+        };
+        let limiter = AdvancedRateLimiter::new(config.clone());
+        let ctx = request(&[("x-forwarded-for", "198.51.100.7")], "10.0.0.5");
+        assert_eq!(
+            limiter.extract_real_ip(&ctx, &config),
+            Some("198.51.100.7".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reload_replaces_the_redis_backend_and_reports_its_state() {
+        let limiter = AdvancedRateLimiter::new(AdvancedRateLimitConfig::default());
+        let stats = limiter.get_stats();
+        assert!(!stats.redis_configured && !stats.redis_degraded);
+
+        let config = AdvancedRateLimitConfig {
+            redis: Some(RedisConfig {
+                // Nothing listens on this port.
+                url: "redis://127.0.0.1:1".to_string(),
+                key_prefix: "test".to_string(),
+                connect_timeout_ms: 100,
+                command_timeout_ms: 100,
+                distribute_per_second: true,
+            }),
+            ..AdvancedRateLimitConfig::default()
+        };
+        limiter.update_config(config);
+        let stats = limiter.get_stats();
+        assert!(stats.redis_configured && !stats.redis_connected && stats.redis_degraded);
+        assert!(limiter.redis_task.lock().is_some(), "a task is connecting");
+
+        limiter.update_config(AdvancedRateLimitConfig::default());
+        let stats = limiter.get_stats();
+        assert!(!stats.redis_configured && !stats.redis_degraded);
     }
 }
