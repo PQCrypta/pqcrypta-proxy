@@ -1107,6 +1107,12 @@ pub mod openssl_pqc {
                 SslVerifyMode::PEER
             });
         }
+        builder
+            .set_session_id_context(&session_id_context(
+                settings.client_auth,
+                settings.client_ca.as_deref(),
+            )?)
+            .map_err(|e| format!("Failed to set the session ID context: {}", e))?;
         Ok(())
     }
 
@@ -1401,6 +1407,156 @@ pub mod openssl_pqc {
                 .to_str()
                 .ok()
                 .map(|s| s.to_string())
+        }
+    }
+
+    /// The session ID context every OpenSSL server context names (at most 32
+    /// bytes, `SSL_MAX_SID_CTX_LENGTH`): a digest of the client-certificate
+    /// settings, the mode and the CA's own bytes.
+    ///
+    /// A server that verifies clients (`SSL_VERIFY_PEER`, which requesting a
+    /// certificate for one route sets on every listener) must name the context
+    /// its sessions belong to, or OpenSSL refuses each resumption with
+    /// `internal_error` (`SSL_R_SESSION_ID_CONTEXT_UNINITIALIZED`). None was named,
+    /// so with an mTLS route every resumed TLS session over TCP failed. A session
+    /// made under other client-certificate settings, another CA or none asked
+    /// for, is not resumed into these: it is a full handshake instead.
+    fn session_id_context(
+        client_auth: ClientAuth,
+        client_ca: Option<&Path>,
+    ) -> Result<[u8; 32], String> {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(b"pqcrypta-proxy tls session context v1\0");
+        digest.update([match client_auth {
+            ClientAuth::None => 0u8,
+            ClientAuth::Requested => 1,
+            ClientAuth::Required => 2,
+        }]);
+        if let (ClientAuth::Requested | ClientAuth::Required, Some(path)) = (client_auth, client_ca)
+        {
+            let ca = std::fs::read(path)
+                .map_err(|e| format!("Failed to read client CA {:?}: {}", path, e))?;
+            digest.update(&ca);
+        }
+        Ok(digest.finalize().into())
+    }
+
+    #[cfg(test)]
+    mod resumption_tests {
+        use super::*;
+        use openssl::pkey::PKey;
+        use openssl::ssl::{Ssl, SslConnector, SslSessionCacheMode};
+        use openssl::x509::X509;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_openssl::SslStream;
+
+        /// The listeners' own settings with a client certificate requested (an
+        /// mTLS route anywhere in the config): a TLS 1.3 session resumes. It
+        /// did not, with `internal_error`, until the context had a session ID
+        /// context.
+        #[tokio::test]
+        async fn a_session_resumes_while_client_certificates_are_requested() {
+            let dir = tempfile::tempdir().unwrap();
+            let ca = rcgen::generate_simple_self_signed(vec!["operator ca".to_string()]).unwrap();
+            let ca_path = dir.path().join("client-ca.pem");
+            std::fs::write(&ca_path, ca.cert.pem()).unwrap();
+            let server = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+
+            let tls = crate::config::TlsConfig {
+                ca_cert_path: Some(ca_path.clone()),
+                min_version: "1.3".to_string(),
+                ..crate::config::TlsConfig::default()
+            };
+            let provider = PqcTlsProvider::new(&crate::config::PqcConfig::default())
+                .with_tls_settings(&tls, ClientAuth::Requested);
+            let mut builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls_server()).unwrap();
+            apply_tls_settings(&mut builder, &provider).unwrap();
+            builder
+                .set_certificate(&X509::from_pem(server.cert.pem().as_bytes()).unwrap())
+                .unwrap();
+            builder
+                .set_private_key(
+                    &PKey::private_key_from_pem(server.signing_key.serialize_pem().as_bytes())
+                        .unwrap(),
+                )
+                .unwrap();
+            builder.set_session_cache_mode(SslSessionCacheMode::SERVER);
+            // OpenSSL resumes only a session whose server name matches, and
+            // records the name only when SNI is acknowledged, which the
+            // listeners' servername callback (the SNI map) does
+            builder.set_servername_callback(|_, _| Ok(()));
+            let acceptor = Arc::new(builder.build());
+
+            let mut connector = SslConnector::builder(SslMethod::tls_client()).unwrap();
+            connector.set_verify(SslVerifyMode::NONE);
+            let connector = connector.build();
+
+            let mut session: Option<openssl::ssl::SslSession> = None;
+            for round in 0..2 {
+                let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                let srv = tokio::spawn({
+                    let acceptor = Arc::clone(&acceptor);
+                    async move {
+                        let ssl = Ssl::new(acceptor.context()).unwrap();
+                        let mut tls = SslStream::new(ssl, server_io).unwrap();
+                        std::pin::Pin::new(&mut tls).accept().await.unwrap();
+                        let mut ping = [0u8; 4];
+                        tls.read_exact(&mut ping).await.unwrap();
+                        tls.write_all(b"pong").await.unwrap();
+                        tls.shutdown().await.unwrap();
+                    }
+                });
+                let mut ssl = connector
+                    .configure()
+                    .unwrap()
+                    .into_ssl("localhost")
+                    .unwrap();
+                if let Some(previous) = &session {
+                    // SAFETY: the session came from a connection to this acceptor.
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        ssl.set_session(previous).unwrap();
+                    };
+                }
+                let mut cli = SslStream::new(ssl, client_io).unwrap();
+                std::pin::Pin::new(&mut cli)
+                    .connect()
+                    .await
+                    .expect("the handshake completes");
+                cli.write_all(b"ping").await.unwrap();
+                let mut pong = [0u8; 4];
+                cli.read_exact(&mut pong).await.unwrap();
+                assert_eq!(&pong, b"pong");
+                if round == 1 {
+                    assert!(cli.ssl().session_reused(), "the session was not resumed");
+                }
+                session = cli.ssl().session().map(|s| s.to_owned());
+                // A clean close, as a browser's: OpenSSL marks the session of a
+                // connection freed without one not resumable (ssl_clear_bad_session)
+                cli.shutdown().await.ok();
+                srv.await.unwrap();
+            }
+        }
+
+        #[test]
+        fn the_context_names_the_client_certificate_settings() {
+            let dir = tempfile::tempdir().unwrap();
+            let (a, b) = (dir.path().join("a.pem"), dir.path().join("b.pem"));
+            std::fs::write(&a, "one CA").unwrap();
+            std::fs::write(&b, "another CA").unwrap();
+            let none = session_id_context(ClientAuth::None, Some(&a)).unwrap();
+            assert_eq!(none, session_id_context(ClientAuth::None, None).unwrap());
+            let requested_a = session_id_context(ClientAuth::Requested, Some(&a)).unwrap();
+            assert_ne!(requested_a, none);
+            assert_ne!(
+                requested_a,
+                session_id_context(ClientAuth::Requested, Some(&b)).unwrap()
+            );
+            assert_ne!(
+                requested_a,
+                session_id_context(ClientAuth::Required, Some(&a)).unwrap()
+            );
         }
     }
 }
