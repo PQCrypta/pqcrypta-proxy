@@ -60,6 +60,7 @@ CHECK_ADDR="${ECH_CHECK_ADDR:-127.0.0.1:443}"
 # records name that port
 CHECK_QUIC_PORT="${ECH_CHECK_QUIC_PORT:-}"
 PROXY_CONFIG="${PROXY_CONFIG:-/etc/pqcrypta/proxy-config.toml}"
+PROXY_BIN="${PROXY_BIN:-/usr/local/bin/pqcrypta-proxy}"
 # "no" on a node the signer's host rotates: stop once the configs are checked
 PUBLISH_HERE="${ECH_PUBLISH:-yes}"
 # The nodes rotated from here, NODE=NAME[@QUICPORT]: an ssh host, a name it
@@ -99,20 +100,19 @@ for kem in x-wing x25519; do
     "$BIN" --out-dir "$OUT_DIR" --public-name "$PUBLIC_NAME" --max-name-length 32 --retain 3 --kem "$kem" >>"$LOG_FILE" 2>&1
 done
 
-# [admin] enabled / bind_address / port / auth_token, and the poller interval.
-read -r admin_enabled admin_url poll_secs < <(python3 -I - "$PROXY_CONFIG" <<'EOF'
+# [admin] enabled, and the poller interval.
+read -r admin_enabled poll_secs < <(python3 -I - "$PROXY_CONFIG" <<'EOF'
 import sys, tomllib
 c = tomllib.load(open(sys.argv[1], 'rb'))
-a = c.get('admin', {})
-print('yes' if a.get('enabled') and a.get('auth_token') else 'no',
-      'http://%s:%s/reload' % (a.get('bind_address', '127.0.0.1'), a.get('port', 8082)),
+print('yes' if c.get('admin', {}).get('enabled') else 'no',
       c.get('tls', {}).get('cert_reload_interval_secs', 300))
 EOF
 )
 if [[ "$admin_enabled" == "yes" ]]; then
-    # The token goes to curl on stdin (-K -), never on a command line.
-    reply=$(python3 -I -c 'import sys, tomllib; print("header = \"Authorization: Bearer %s\"" % tomllib.load(open(sys.argv[1], "rb"))["admin"]["auth_token"])' "$PROXY_CONFIG" \
-        | curl -sS --max-time 30 -K - -H 'Content-Type: application/json' -d '{"tls_only": true}' "$admin_url")
+    # Sent by the proxy itself with the node's admin credentials (the token,
+    # and the signature where [admin] hmac_secret is set), which never reach
+    # a command line.
+    reply=$("$PROXY_BIN" --config "$PROXY_CONFIG" --admin POST /reload --admin-body '{"tls_only": true}' 2>&1)
     if ! grep -q '"success":true' <<<"$reply"; then
         log "ERROR: the proxy did not reload its TLS material: $reply"
         exit 1

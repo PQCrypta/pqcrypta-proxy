@@ -33,6 +33,7 @@ set -euo pipefail
 
 DC_NAME=${DC_NAME:-delegated-credential.conformance.pqcrypta.com}
 PROXY_CONFIG=${PROXY_CONFIG:-/etc/pqcrypta/proxy-config.toml}
+PROXY_BIN="${PROXY_BIN:-/usr/local/bin/pqcrypta-proxy}"
 # The unit's state directory (StateDirectory=pqcrypta-delegation-ca), or CA_DIR
 CA_DIR=${CA_DIR:-${STATE_DIRECTORY:-/var/lib/pqcrypta-delegation-ca}}
 DC_LEAF_DAYS=${DC_LEAF_DAYS:-90}
@@ -135,20 +136,19 @@ put 600 "$work/leaf.key" "$KEY"
 put 644 "$work/chain.crt" "$CERT"
 log "Wrote $CERT and $KEY"
 
-# [admin] enabled / bind_address / port / auth_token, and the poller interval.
-read -r admin_enabled admin_url poll_secs < <(python3 -I - "$PROXY_CONFIG" <<'EOF'
+# [admin] enabled, and the poller interval.
+read -r admin_enabled poll_secs < <(python3 -I - "$PROXY_CONFIG" <<'EOF'
 import sys, tomllib
 c = tomllib.load(open(sys.argv[1], 'rb'))
-a = c.get('admin', {})
-print('yes' if a.get('enabled') and a.get('auth_token') else 'no',
-      'http://%s:%s/reload' % (a.get('bind_address', '127.0.0.1'), a.get('port', 8082)),
+print('yes' if c.get('admin', {}).get('enabled') else 'no',
       c.get('tls', {}).get('cert_reload_interval_secs', 300))
 EOF
 )
 if [[ "$admin_enabled" == "yes" ]]; then
-    # The token goes to curl on stdin (-K -), never on a command line.
-    reply=$(python3 -I -c 'import sys, tomllib; print("header = \"Authorization: Bearer %s\"" % tomllib.load(open(sys.argv[1], "rb"))["admin"]["auth_token"])' "$PROXY_CONFIG" \
-        | curl -sS --max-time 30 -K - -H 'Content-Type: application/json' -d '{"tls_only": true}' "$admin_url")
+    # Sent by the proxy itself with the node's admin credentials (the token,
+    # and the signature where [admin] hmac_secret is set), which never reach
+    # a command line.
+    reply=$("$PROXY_BIN" --config "$PROXY_CONFIG" --admin POST /reload --admin-body '{"tls_only": true}' 2>&1)
     if ! grep -q '"success":true' <<<"$reply"; then
         log "ERROR: the proxy did not reload its TLS material: $reply"
         exit 1
