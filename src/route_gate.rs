@@ -38,8 +38,10 @@ use tracing::{debug, warn};
 use crate::config::RouteConfig;
 use crate::tls_acceptor::HmacNonceStore;
 
-/// The HMAC timestamp window, in seconds. Also the nonce retention window: a
-/// nonce may be forgotten once no signature bearing it can still be accepted.
+/// How far, in seconds, an HMAC timestamp may be from this server's clock,
+/// either way. The nonce store is built from the same figure
+/// ([`HmacNonceStore::for_timestamp_skew`]): it holds a nonce for as long as a
+/// signature bearing it can still be accepted.
 const HMAC_WINDOW_SECS: u64 = 300;
 
 static NONCE_STORE: OnceLock<HmacNonceStore> = OnceLock::new();
@@ -53,10 +55,11 @@ static NONCE_STORE: OnceLock<HmacNonceStore> = OnceLock::new();
 /// caller happened to use first. HTTP/3 had no store at all. Every transport
 /// now consults this one.
 ///
-/// `window_secs` is honoured on the first call and ignored afterwards. Every
-/// listener is built from the same config, so whichever starts first sets it.
-pub fn shared_nonce_store(window_secs: u64) -> &'static HmacNonceStore {
-    NONCE_STORE.get_or_init(|| HmacNonceStore::new(window_secs))
+/// Its retention follows [`HMAC_WINDOW_SECS`], the window the gate accepts
+/// timestamps in, and nothing else: replay protection for these signatures is
+/// a property of how long they are valid.
+pub fn shared_nonce_store() -> &'static HmacNonceStore {
+    NONCE_STORE.get_or_init(|| HmacNonceStore::for_timestamp_skew(HMAC_WINDOW_SECS))
 }
 
 /// What the gates decided.
@@ -96,6 +99,10 @@ pub struct GateContext<'a> {
     /// A WebSocket upgrade is always HTTP/1.1, so it bypasses the HTTP/1.1 gate
     /// when the route opts into WebSocket passthrough.
     pub is_websocket_upgrade: bool,
+    /// Whether this request arrived over HTTP/3. A client that sends no
+    /// certificate over QUIC is answered 421 rather than 401 on an mTLS route
+    /// (see `mtls_gate`), so it repeats the request on a new connection.
+    pub is_http3: bool,
     /// `tls.zero_rtt_safe_methods` — which methods may ride on early data.
     pub zero_rtt_safe_methods: &'a [String],
     pub hmac_nonce_store: &'a HmacNonceStore,
@@ -280,6 +287,14 @@ fn http11_gate(cx: &GateContext<'_>) -> Option<GateOutcome> {
 /// client-supplied copy, so it cannot be forged. A transport that cannot present
 /// a client certificate therefore fails this closed, which is the intent: an
 /// mTLS route is not reachable from a transport that cannot authenticate.
+///
+/// Every listener asks for a certificate wherever a route needs one, QUIC
+/// included, but not every client answers over QUIC: a browser may present its
+/// certificate over TLS on TCP alone. An HTTP/3 request without one is
+/// therefore answered 421 Misdirected Request (RFC 9110 section 15.5.20),
+/// which a client may repeat on a new connection -- Chromium repeats it
+/// without the HTTP/3 alternative, over TCP, where its certificate is sent.
+/// Over TCP the answer is 401.
 fn mtls_gate(cx: &GateContext<'_>) -> Option<GateOutcome> {
     if !cx.route.requires_client_cert() {
         return None;
@@ -296,9 +311,32 @@ fn mtls_gate(cx: &GateContext<'_>) -> Option<GateOutcome> {
             "mTLS route {:?} rejected request from {}: no client certificate",
             cx.route.name, cx.client_ip
         );
-        return refuse(StatusCode::UNAUTHORIZED);
+        return refuse(if cx.is_http3 {
+            StatusCode::MISDIRECTED_REQUEST
+        } else {
+            StatusCode::UNAUTHORIZED
+        });
     }
     None
+}
+
+/// The HMAC proof of possession over a request.
+///
+/// Hex HMAC-SHA256, under `secret`, of
+/// `METHOD\nPATH_AND_QUERY\nTIMESTAMP\nNONCE`. The route gate and the admin
+/// API verify it; `pqcrypta-proxy --admin` signs with it.
+pub fn request_signature(
+    secret: &str,
+    method: &str,
+    path_and_query: &str,
+    timestamp: &str,
+    nonce: &str,
+) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac =
+        Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key size");
+    mac.update(format!("{method}\n{path_and_query}\n{timestamp}\n{nonce}").as_bytes());
+    hex::encode(mac.finalize().into_bytes())
 }
 
 /// Per-route HMAC proof-of-possession.
@@ -309,8 +347,6 @@ fn mtls_gate(cx: &GateContext<'_>) -> Option<GateOutcome> {
 /// sent again, which freshness alone (the timestamp) would allow for the
 /// whole window.
 fn hmac_gate(cx: &GateContext<'_>) -> Option<GateOutcome> {
-    use hmac::{Hmac, KeyInit, Mac};
-    use sha2::Sha256;
     use subtle::ConstantTimeEq;
 
     let secret = cx
@@ -355,16 +391,8 @@ fn hmac_gate(cx: &GateContext<'_>) -> Option<GateOutcome> {
         return refuse(StatusCode::UNAUTHORIZED);
     }
 
-    // Sign the full path and query to prevent query-parameter mutation attacks.
-    let message = format!(
-        "{}\n{}\n{}\n{}",
-        cx.method, cx.path_and_query, ts, nonce_val
-    );
-
-    type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key size");
-    mac.update(message.as_bytes());
-    let expected = hex::encode(mac.finalize().into_bytes());
+    // The full path and query are signed, so no parameter can be changed.
+    let expected = request_signature(secret, cx.method, cx.path_and_query, ts, nonce_val);
 
     let valid: bool = sig.as_bytes().ct_eq(expected.as_bytes()).into();
     if !valid {
@@ -405,6 +433,12 @@ mod tests {
         hex::encode(rand::random::<[u8; 32]>())
     }
 
+    /// A nonce of this run's own, as a client makes one: never a value
+    /// written into the tests.
+    fn test_nonce() -> String {
+        hex::encode(rand::random::<[u8; 16]>())
+    }
+
     fn route() -> RouteConfig {
         route_from("name = \"t\"\nbackend = \"b\"\n")
     }
@@ -436,6 +470,7 @@ mod tests {
             client_ip: "203.0.113.9".parse().unwrap(),
             is_http11,
             is_websocket_upgrade: false,
+            is_http3: false,
             zero_rtt_safe_methods: safe,
             hmac_nonce_store: store,
         }
@@ -528,12 +563,34 @@ mod tests {
         let mut r = route();
         r.internal = true;
         let h = HeaderMap::new();
-        let store = HmacNonceStore::new(300);
+        let store = HmacNonceStore::for_timestamp_skew(HMAC_WINDOW_SECS);
         let safe: Vec<String> = vec![];
         assert_eq!(
             status_of(&evaluate(&ctx(&r, &h, &store, "GET", &safe))),
             Some(StatusCode::UNAUTHORIZED)
         );
+    }
+
+    /// Over HTTP/3 the same refusal is 421, which a client repeats on a new
+    /// connection, where TLS on TCP carries its certificate.
+    #[test]
+    fn an_mtls_route_answers_421_over_http3_without_a_certificate() {
+        let mut r = route();
+        r.internal = true;
+        let store = HmacNonceStore::for_timestamp_skew(HMAC_WINDOW_SECS);
+        let safe: Vec<String> = vec![];
+        let none = HeaderMap::new();
+        let mut cx = ctx(&r, &none, &store, "GET", &safe);
+        cx.is_http3 = true;
+        assert_eq!(
+            status_of(&evaluate(&cx)),
+            Some(StatusCode::MISDIRECTED_REQUEST)
+        );
+        let mut with = HeaderMap::new();
+        with.insert("x-client-cert", HeaderValue::from_static("1"));
+        let mut cx = ctx(&r, &with, &store, "GET", &safe);
+        cx.is_http3 = true;
+        assert!(status_of(&evaluate(&cx)).is_none());
     }
 
     #[test]
@@ -542,7 +599,7 @@ mod tests {
         r.internal = true;
         let mut h = HeaderMap::new();
         h.insert("x-client-cert", HeaderValue::from_static("1"));
-        let store = HmacNonceStore::new(300);
+        let store = HmacNonceStore::for_timestamp_skew(HMAC_WINDOW_SECS);
         let safe: Vec<String> = vec![];
         assert!(status_of(&evaluate(&ctx(&r, &h, &store, "GET", &safe))).is_none());
     }
@@ -557,7 +614,7 @@ mod tests {
             ..Default::default()
         });
         assert!(r.requires_client_cert());
-        let store = HmacNonceStore::new(300);
+        let store = HmacNonceStore::for_timestamp_skew(HMAC_WINDOW_SECS);
         let safe: Vec<String> = vec![];
         let none = HeaderMap::new();
         assert_eq!(
@@ -579,7 +636,7 @@ mod tests {
             ..Default::default()
         });
         assert!(!r.requires_client_cert());
-        let store = HmacNonceStore::new(300);
+        let store = HmacNonceStore::for_timestamp_skew(HMAC_WINDOW_SECS);
         let safe: Vec<String> = vec![];
         assert!(status_of(&evaluate(&ctx(&r, &HeaderMap::new(), &store, "GET", &safe))).is_none());
     }
@@ -590,7 +647,7 @@ mod tests {
         let r = route(); // allow_0rtt defaults false
         let mut h = HeaderMap::new();
         h.insert("x-tls-early-data", HeaderValue::from_static("1"));
-        let store = HmacNonceStore::new(300);
+        let store = HmacNonceStore::for_timestamp_skew(HMAC_WINDOW_SECS);
         let safe: Vec<String> = vec!["GET".to_string()];
         assert_eq!(
             status_of(&evaluate(&ctx(&r, &h, &store, "GET", &safe))),
@@ -606,7 +663,7 @@ mod tests {
         r.allow_0rtt = true;
         let mut h = HeaderMap::new();
         h.insert("x-tls-early-data", HeaderValue::from_static("1"));
-        let store = HmacNonceStore::new(300);
+        let store = HmacNonceStore::for_timestamp_skew(HMAC_WINDOW_SECS);
         let safe: Vec<String> = vec!["GET".to_string(), "HEAD".to_string()];
         assert_eq!(
             status_of(&evaluate(&ctx(&r, &h, &store, "POST", &safe))),
@@ -621,7 +678,7 @@ mod tests {
     fn the_http11_gate_fires_only_on_http11() {
         let r = route(); // allow_http11 defaults false
         let h = HeaderMap::new();
-        let store = HmacNonceStore::new(300);
+        let store = HmacNonceStore::for_timestamp_skew(HMAC_WINDOW_SECS);
         let safe: Vec<String> = vec![];
 
         assert!(
@@ -646,7 +703,7 @@ mod tests {
     #[test]
     fn the_http11_gate_ignores_the_connection_protocol_header() {
         let r = route(); // allow_http11 defaults false
-        let store = HmacNonceStore::new(300);
+        let store = HmacNonceStore::for_timestamp_skew(HMAC_WINDOW_SECS);
         let safe: Vec<String> = vec![];
 
         // A real HTTP/1.1 request is refused even with no header to say so —
@@ -681,7 +738,7 @@ mod tests {
             ..Default::default()
         });
         let h = HeaderMap::new();
-        let store = HmacNonceStore::new(300);
+        let store = HmacNonceStore::for_timestamp_skew(HMAC_WINDOW_SECS);
         let safe: Vec<String> = vec![];
         assert_eq!(
             status_of(&evaluate(&ctx(&r, &h, &store, "GET", &safe))),
@@ -719,7 +776,7 @@ mod tests {
         h.insert("x-request-timestamp", HeaderValue::from_str(&ts).unwrap());
         h.insert("x-request-nonce", HeaderValue::from_static("n-once-1"));
 
-        let store = HmacNonceStore::new(300);
+        let store = HmacNonceStore::for_timestamp_skew(HMAC_WINDOW_SECS);
         let safe: Vec<String> = vec![];
         assert!(
             status_of(&evaluate(&ctx(&r, &h, &store, "GET", &safe))).is_none(),
@@ -757,7 +814,7 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-request-signature", HeaderValue::from_str(&sig).unwrap());
         h.insert("x-request-timestamp", HeaderValue::from_str(&ts).unwrap());
-        let store = HmacNonceStore::new(300);
+        let store = HmacNonceStore::for_timestamp_skew(HMAC_WINDOW_SECS);
         let safe: Vec<String> = vec![];
         assert_eq!(
             status_of(&evaluate(&ctx(&r, &h, &store, "GET", &safe))),
@@ -776,11 +833,46 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-request-timestamp", HeaderValue::from_static("1"));
         h.insert("x-request-signature", HeaderValue::from_static("deadbeef"));
-        let store = HmacNonceStore::new(300);
+        let store = HmacNonceStore::for_timestamp_skew(HMAC_WINDOW_SECS);
         let safe: Vec<String> = vec![];
         assert_eq!(
             status_of(&evaluate(&ctx(&r, &h, &store, "GET", &safe))),
             Some(StatusCode::UNAUTHORIZED)
         );
+    }
+
+    /// A signature's timestamp passes for `HMAC_WINDOW_SECS` either side of
+    /// this clock, so a signature can be presented over twice that span. Its
+    /// nonce is held for all of it, across a generation rotation too: a
+    /// replay at any point a signature could still be accepted is refused.
+    #[test]
+    fn a_nonce_is_held_for_as_long_as_its_signature_is_accepted() {
+        let secs = std::time::Duration::from_secs;
+        let span = 2 * HMAC_WINDOW_SECS;
+        let store = HmacNonceStore::for_timestamp_skew(HMAC_WINDOW_SECS);
+        let t0 = std::time::Instant::now();
+        let first = test_nonce();
+        assert!(!store.check_and_insert_at(&first, t0));
+        for later in [1, span / 2, span - 1] {
+            assert!(store.check_and_insert_at(&first, t0 + secs(later)));
+        }
+        // Spent just before the store rotates, and replayed as late as a
+        // signature carrying it could still be accepted
+        let late = t0 + secs(span - 1);
+        let late_nonce = test_nonce();
+        assert!(!store.check_and_insert_at(&late_nonce, late));
+        assert!(store.check_and_insert_at(&late_nonce, late + secs(span - 1)));
+    }
+
+    /// The store every listener shares is built from the gate's own window,
+    /// not from an unrelated setting.
+    #[test]
+    fn the_shared_store_follows_the_hmac_window() {
+        let store = shared_nonce_store();
+        let t0 = std::time::Instant::now();
+        let nonce = test_nonce();
+        assert!(!store.check_and_insert_at(&nonce, t0));
+        let still_valid = t0 + std::time::Duration::from_secs(2 * HMAC_WINDOW_SECS - 1);
+        assert!(store.check_and_insert_at(&nonce, still_valid));
     }
 }

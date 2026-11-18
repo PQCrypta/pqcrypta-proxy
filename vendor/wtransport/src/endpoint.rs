@@ -781,6 +781,17 @@ impl SessionRequest {
         self.reject(SessionResponseProto::misdirected_request()).await;
     }
 
+    /// Rejects the client request by replying with `status`, a 4xx or 5xx
+    /// code: anything else is answered `403`, so a session is never accepted
+    /// this way.
+    pub async fn reject_with(self, status: u16) {
+        let code = wtransport_proto::ids::StatusCode::try_from_u32(u32::from(status))
+            .ok()
+            .filter(|code| code.into_inner() >= 400)
+            .unwrap_or(wtransport_proto::ids::StatusCode::FORBIDDEN);
+        self.reject(SessionResponseProto::with_status_code(code)).await;
+    }
+
     /// Returns a reference to the QUIC connection the request came on, whose
     /// handshake is complete by the time the request is read.
     #[cfg(feature = "quinn")]

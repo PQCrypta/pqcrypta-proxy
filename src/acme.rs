@@ -867,55 +867,8 @@ impl AcmeService {
     }
 }
 
-/// A file written beside its destination and not yet in place.
 #[cfg(feature = "acme")]
-struct Staged {
-    tmp: PathBuf,
-    path: PathBuf,
-}
-
-#[cfg(feature = "acme")]
-impl Staged {
-    /// Write `content` to a sibling of `path` and sync it to disk. A
-    /// `private` file is created readable by its owner alone, so a key is
-    /// never on disk under another mode.
-    fn write(path: &Path, content: &str, private: bool) -> anyhow::Result<Self> {
-        use std::io::Write as _;
-        let mut name = path.as_os_str().to_os_string();
-        name.push(".tmp");
-        let tmp = PathBuf::from(name);
-        // What an interrupted write left behind has a mode of its own.
-        let _ = fs::remove_file(&tmp);
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        if private {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        #[cfg(not(unix))]
-        let _ = private;
-        let mut file = options.open(&tmp)?;
-        file.write_all(content.as_bytes())?;
-        file.sync_all()?;
-        Ok(Self {
-            tmp,
-            path: path.to_path_buf(),
-        })
-    }
-
-    /// Put the file in place: a reader sees the old file or the new, whole.
-    fn commit(self) -> anyhow::Result<()> {
-        fs::rename(&self.tmp, &self.path)?;
-        Ok(())
-    }
-}
-
-/// Write one file atomically (see [`Staged`]).
-#[cfg(feature = "acme")]
-fn write_atomic(path: &Path, content: &str, private: bool) -> anyhow::Result<()> {
-    Staged::write(path, content, private)?.commit()
-}
+use crate::staged_file::{write_atomic, Staged};
 
 /// Write a certificate chain and its key. Both are on disk before either
 /// is put in place, the key first, so the two names hold halves of

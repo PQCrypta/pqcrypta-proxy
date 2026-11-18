@@ -63,6 +63,20 @@ impl Reservation {
         }
     }
 
+    /// The bytes this reservation holds.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Give back `less` of what this reservation holds (at most all of it):
+    /// bytes the request no longer keeps, such as a body replaced by its
+    /// decoded form.
+    pub fn shrink(&mut self, less: usize) {
+        let less = less.min(self.bytes);
+        self.bytes -= less;
+        HELD.fetch_sub(less, Ordering::AcqRel);
+    }
+
     fn take(held: &AtomicUsize, limit: usize, more: usize) -> bool {
         held.try_update(Ordering::AcqRel, Ordering::Acquire, |now| {
             now.checked_add(more).filter(|total| *total <= limit)
@@ -99,6 +113,17 @@ mod tests {
         assert!(Reservation::take(&held, 100, 40));
         assert!(!Reservation::take(&held, 100, 1));
         assert!(!Reservation::take(&held, usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn a_reservation_gives_back_part_of_what_it_took() {
+        let mut reservation = Reservation::new();
+        assert!(reservation.grow(4096));
+        reservation.shrink(1024);
+        assert_eq!(reservation.bytes, 3072);
+        // Never more than it holds
+        reservation.shrink(usize::MAX);
+        assert_eq!(reservation.bytes, 0);
     }
 
     #[test]

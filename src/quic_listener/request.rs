@@ -63,6 +63,105 @@ where
     Ok(())
 }
 
+/// The headers this proxy derives from the connection rather than taking
+/// from the client -- the fingerprint, the client certificate, early data, the
+/// protocol and the key exchange -- set on `h` once any copy the client sent
+/// is removed, along with every header only the proxy may set.
+///
+/// It runs before anything reads a request's headers: `security.evaluate`
+/// checks a route's JA3 allowlist against `x-ja3-hash`, and the route gate
+/// reads the client-certificate, early-data and protocol fields, so each is
+/// the connection's own. Every HTTP/3 request goes through it, an ordinary one
+/// and an extended CONNECT alike, as the TCP listeners set the same fields
+/// before their router runs.
+///
+/// Strip first, then set: a field this connection cannot supply is absent,
+/// never the client's value.
+pub(super) fn derive_connection_headers(
+    h: &mut http::HeaderMap,
+    handshake: &crate::tls_acceptor::HandshakeFacts,
+    conn_headers: &super::H3ConnHeaders,
+    fingerprint: &crate::fingerprint::FingerprintResult,
+    early_data: bool,
+) {
+    // Every name this path derives from the connection rather than
+    // taking from the client. Constants, so neither the check nor the
+    // removals parse a name.
+    const DERIVED: [HeaderName; 8] = [
+        HeaderName::from_static("x-ja3-hash"),
+        HeaderName::from_static("x-ja4-hash"),
+        HeaderName::from_static("x-client-name"),
+        HeaderName::from_static("x-client-type"),
+        HeaderName::from_static("x-client-cert"),
+        HeaderName::from_static("x-tls-early-data"),
+        HeaderName::from_static("x-connection-protocol"),
+        HeaderName::from_static("x-pqc-enabled"),
+    ];
+    // Room for what is inserted below — up to five handshake values,
+    // the protocol, three fingerprint values, the client type, the
+    // client-certificate flag and the PQC flag — so the map h3 built to
+    // the request's exact size is not regrown.
+    h.reserve(12);
+    // A request carries a handful of headers and almost never one of
+    // these, so look at its own names first: that is a few short
+    // comparisons, where removing unconditionally was eight hashed
+    // lookups on every request. The handshake names are handled by
+    // `inject_headers`, which replaces or removes each of them itself.
+    if h.keys().any(|n| DERIVED.contains(n)) {
+        for name in &DERIVED {
+            h.remove(name);
+        }
+    }
+    // Headers only the proxy may set (see `PROXY_ONLY_HEADERS`).
+    for name in crate::tls_acceptor::PROXY_ONLY_HEADERS {
+        h.remove(name);
+    }
+
+    handshake.inject_headers(h);
+    h.insert(
+        HeaderName::from_static("x-connection-protocol"),
+        HeaderValue::from_static("h3"),
+    );
+    // Built once per connection; see `H3ConnHeaders`.
+    if let Some(v) = &conn_headers.ja3 {
+        h.insert(HeaderName::from_static("x-ja3-hash"), v.clone());
+    }
+    if let Some(v) = &conn_headers.ja4 {
+        h.insert(HeaderName::from_static("x-ja4-hash"), v.clone());
+    }
+    if let Some(v) = &conn_headers.client_name {
+        h.insert(HeaderName::from_static("x-client-name"), v.clone());
+    }
+    if matches!(
+        fingerprint.classification,
+        Some(crate::security::FingerprintClass::Browser)
+    ) {
+        h.insert(
+            HeaderName::from_static("x-client-type"),
+            HeaderValue::from_static("browser"),
+        );
+    }
+    // A request accepted before the handshake completed rode on 0-RTT:
+    // marked for the route gate, which answers 425 wherever a replay is
+    // not acceptable (RFC 8470), and never credited with a client
+    // certificate the handshake has not yet verified.
+    if early_data {
+        h.insert(
+            HeaderName::from_static("x-tls-early-data"),
+            HeaderValue::from_static("1"),
+        );
+    } else if conn_headers.client_cert.get() == Some(&true) {
+        h.insert(
+            HeaderName::from_static("x-client-cert"),
+            HeaderValue::from_static("1"),
+        );
+    }
+    h.insert(
+        HeaderName::from_static("x-pqc-enabled"),
+        conn_headers.pqc_enabled.clone(),
+    );
+}
+
 impl QuicListener {
     /// Handle a single HTTP/3 request
     #[expect(clippy::too_many_arguments)]
@@ -103,97 +202,15 @@ impl QuicListener {
             stream.set_priority(urgency, incremental);
         }
 
-        // Establish the connection-derived headers before anything reads them.
-        //
-        // This has to happen here, not at forwarding time. `security.evaluate`
-        // enforces the per-route JA3 allowlist by reading `x-ja3-hash` off this
-        // request, and on this path nothing ever set it — so the allowlist was
-        // matching whatever the *client* chose to send, which a client wanting
-        // past it would simply set to an allowed value. The TCP listeners avoid
-        // that by overwriting these headers before the router runs; this does
-        // the same.
-        //
-        // Strip first, then set: a field this path cannot observe must come out
-        // absent rather than keep the client's value.
-        {
-            // Every name this path derives from the connection rather than
-            // taking from the client. Constants, so neither the check nor the
-            // removals parse a name.
-            const DERIVED: [HeaderName; 8] = [
-                HeaderName::from_static("x-ja3-hash"),
-                HeaderName::from_static("x-ja4-hash"),
-                HeaderName::from_static("x-client-name"),
-                HeaderName::from_static("x-client-type"),
-                HeaderName::from_static("x-client-cert"),
-                HeaderName::from_static("x-tls-early-data"),
-                HeaderName::from_static("x-connection-protocol"),
-                HeaderName::from_static("x-pqc-enabled"),
-            ];
-            let h = request.headers_mut();
-            // Room for what is inserted below — up to five handshake values,
-            // the protocol, three fingerprint values, the client type, the
-            // client-certificate flag and the PQC flag — so the map h3 built to
-            // the request's exact size is not regrown.
-            h.reserve(12);
-            // A request carries a handful of headers and almost never one of
-            // these, so look at its own names first: that is a few short
-            // comparisons, where removing unconditionally was eight hashed
-            // lookups on every request. The handshake names are handled by
-            // `inject_headers`, which replaces or removes each of them itself.
-            if h.keys().any(|n| DERIVED.contains(n)) {
-                for name in &DERIVED {
-                    h.remove(name);
-                }
-            }
-            // Headers only the proxy may set (see `PROXY_ONLY_HEADERS`).
-            for name in crate::tls_acceptor::PROXY_ONLY_HEADERS {
-                h.remove(name);
-            }
-
-            handshake.inject_headers(h);
-            h.insert(
-                HeaderName::from_static("x-connection-protocol"),
-                HeaderValue::from_static("h3"),
-            );
-            // Built once per connection; see `H3ConnHeaders`.
-            if let Some(v) = &conn_headers.ja3 {
-                h.insert(HeaderName::from_static("x-ja3-hash"), v.clone());
-            }
-            if let Some(v) = &conn_headers.ja4 {
-                h.insert(HeaderName::from_static("x-ja4-hash"), v.clone());
-            }
-            if let Some(v) = &conn_headers.client_name {
-                h.insert(HeaderName::from_static("x-client-name"), v.clone());
-            }
-            if matches!(
-                fingerprint.classification,
-                Some(crate::security::FingerprintClass::Browser)
-            ) {
-                h.insert(
-                    HeaderName::from_static("x-client-type"),
-                    HeaderValue::from_static("browser"),
-                );
-            }
-            // A request accepted before the handshake completed rode on 0-RTT:
-            // marked for the route gate, which answers 425 wherever a replay is
-            // not acceptable (RFC 8470), and never credited with a client
-            // certificate the handshake has not yet verified.
-            if stream.is_0rtt() {
-                h.insert(
-                    HeaderName::from_static("x-tls-early-data"),
-                    HeaderValue::from_static("1"),
-                );
-            } else if conn_headers.client_cert.get() == Some(&true) {
-                h.insert(
-                    HeaderName::from_static("x-client-cert"),
-                    HeaderValue::from_static("1"),
-                );
-            }
-            h.insert(
-                HeaderName::from_static("x-pqc-enabled"),
-                conn_headers.pqc_enabled.clone(),
-            );
-        }
+        // Establish the connection-derived headers before anything reads them
+        // (see `derive_connection_headers`).
+        derive_connection_headers(
+            request.headers_mut(),
+            &handshake,
+            &conn_headers,
+            &fingerprint,
+            stream.is_0rtt(),
+        );
 
         let uri = request.uri();
         // `Cow`: the common request has no query and no path normalisation, and
@@ -1083,20 +1100,27 @@ impl QuicListener {
         // `mtls_required` or an `hmac_secret` was enforced over HTTP/1.1 and
         // HTTP/2 and wide open over HTTP/3.
         {
+            // The request target as the client sent it, which is what an HMAC
+            // signs (`GateContext::path_and_query`); the canonical path is
+            // what routes the request.
+            let received = request.uri();
+            let path_and_query = received
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or_else(|| received.path());
             let gate_cx = crate::route_gate::GateContext {
                 route,
                 method,
-                path_and_query: &path_with_query,
+                path_and_query,
                 path: &path,
                 headers: request.headers(),
                 client_ip: ip,
                 // HTTP/3 by construction, so the HTTP/1.1 gate never fires here.
                 is_http11: false,
                 is_websocket_upgrade: false,
+                is_http3: true,
                 zero_rtt_safe_methods: &config.tls.zero_rtt_safe_methods,
-                hmac_nonce_store: crate::route_gate::shared_nonce_store(
-                    config.tls.zero_rtt_nonce_window_secs,
-                ),
+                hmac_nonce_store: crate::route_gate::shared_nonce_store(),
             };
             if let crate::route_gate::GateOutcome::Refuse {
                 status,
@@ -1410,18 +1434,21 @@ impl QuicListener {
                 .headers()
                 .get(http::header::CONTENT_ENCODING)
                 .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+            // Decoded within the body budget (request_encoding.rs); the
+            // encoded body's share is given back once it is replaced.
             let refused = match crate::request_encoding::decode(
                 coding.as_deref(),
                 &body,
                 config.security.max_request_size,
+                &mut body_memory,
             ) {
                 Ok(None) => None,
-                Ok(Some(decoded)) if body_memory.grow(decoded.len()) => {
-                    body = decoded;
+                Ok(Some(decoded)) => {
+                    let encoded = std::mem::replace(&mut body, decoded);
+                    body_memory.shrink(encoded.len());
                     body_decoded = true;
                     None
                 }
-                Ok(Some(_)) => Some((http::StatusCode::SERVICE_UNAVAILABLE, false)),
                 Err(refusal) => Some((
                     refusal.status(),
                     matches!(refusal, crate::request_encoding::Refusal::Unsupported(_)),

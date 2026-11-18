@@ -82,7 +82,10 @@ pub fn request_body(data: &[u8]) {
         format!("{first}, {}", CODINGS[usize::from((select >> 2) & 3)])
     };
     let limit = 256usize << ((select >> 4) & 7);
-    if let Ok(Some(decoded)) = crate::request_encoding::decode(Some(&encoding), body, limit) {
+    let mut budget = crate::body_budget::Reservation::new();
+    if let Ok(Some(decoded)) =
+        crate::request_encoding::decode(Some(&encoding), body, limit, &mut budget)
+    {
         assert!(
             decoded.len() <= limit,
             "{encoding} decoded to {} bytes past the limit of {limit}",

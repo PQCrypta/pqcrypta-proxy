@@ -420,21 +420,54 @@ async fn handle_incoming_session(
         crate::path_canon::PathCanon::from(&config.server),
     )
     .into_owned();
-    if let Some(sec) = &security {
-        let mut headers = axum::http::HeaderMap::new();
-        for (name, value) in session_request.headers() {
-            if let (Ok(name), Ok(value)) = (
-                axum::http::HeaderName::from_bytes(name.as_bytes()),
-                axum::http::HeaderValue::from_str(value),
-            ) {
-                headers.append(name, value);
-            }
+    // The request's headers as every check reads them: what the proxy derives
+    // from the connection, and what only it may set, never the client's copy.
+    // This server records no ClientHello and asks for no client certificate,
+    // so the fingerprint and certificate fields are absent and a route that
+    // requires either refuses the session.
+    let mut headers = axum::http::HeaderMap::new();
+    for (name, value) in session_request.headers() {
+        let derived = crate::tls_acceptor::FingerprintedConnection::DERIVED_HEADERS
+            .iter()
+            .chain(crate::tls_acceptor::HandshakeFacts::HEADER_NAMES.iter())
+            .chain(crate::tls_acceptor::PROXY_ONLY_HEADERS.iter())
+            .any(|own| own.eq_ignore_ascii_case(name));
+        if derived {
+            continue;
         }
-        let mut policy = crate::security::request_policy(
+        if let (Ok(name), Ok(value)) = (
+            axum::http::HeaderName::from_bytes(name.as_bytes()),
+            axum::http::HeaderValue::from_str(value),
+        ) {
+            headers.append(name, value);
+        }
+    }
+    headers.insert(
+        axum::http::HeaderName::from_static("x-connection-protocol"),
+        axum::http::HeaderValue::from_static("h3"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("x-pqc-enabled"),
+        axum::http::HeaderValue::from_static(if post_quantum { "true" } else { "false" }),
+    );
+
+    // The route this session is opened on, by its host and path. None for
+    // the paths served here (the speed test, the telemetry wall) and for a
+    // session no route covers, which is answered only what the proxy answers
+    // itself.
+    let route = config
+        .find_route(Some(&host), &route_path, true)
+        .filter(|route| route.webtransport);
+
+    if let Some(sec) = &security {
+        // That route's policy: a WebTransport route is matched only for a
+        // WebTransport request
+        let mut policy = crate::security::route_request_policy(
             &config,
             Some(&host),
             &route_path,
             &hyper::Method::CONNECT,
+            route,
         );
         policy.skip_bot_blocking = true;
         let lowered = raw_path.to_ascii_lowercase();
@@ -468,14 +501,36 @@ async fn handle_incoming_session(
         }
     }
 
-    // The backend this session's requests go to: its own route's, by the host
-    // and path it was opened for. None for the paths served here (the speed
-    // test, the telemetry wall) and for a session no route covers, which is
-    // answered only what the proxy answers itself.
-    let session_target: Option<WtTarget> = config
-        .find_route(Some(&host), &route_path, true)
-        .filter(|route| route.webtransport)
-        .map(WtTarget::of);
+    // The route's gates -- mTLS, HMAC proof-of-possession and the rest -- as
+    // any other request on it meets them, over the request target as sent.
+    if let Some(route) = route {
+        let gate = crate::route_gate::GateContext {
+            route,
+            method: "CONNECT",
+            path_and_query: &path,
+            path: &route_path,
+            headers: &headers,
+            client_ip: remote_addr.ip(),
+            is_http11: false,
+            is_websocket_upgrade: false,
+            is_http3: true,
+            zero_rtt_safe_methods: &config.tls.zero_rtt_safe_methods,
+            hmac_nonce_store: crate::route_gate::shared_nonce_store(),
+        };
+        if let crate::route_gate::GateOutcome::Refuse { status, .. } =
+            crate::route_gate::evaluate(&gate)
+        {
+            warn!(
+                "WebTransport session from {} refused by route {:?}: {}",
+                remote_addr, route.name, status
+            );
+            session_request.reject_with(status.as_u16()).await;
+            return Ok(());
+        }
+    }
+
+    // The backend this session's requests go to: its own route's.
+    let session_target: Option<WtTarget> = route.map(WtTarget::of);
 
     // SR-02: Origin validation.
     //
@@ -578,6 +633,7 @@ async fn handle_incoming_session(
         serve_session(
             Arc::new(connection),
             remote_addr,
+            Some(host),
             path,
             session_target,
             config,
@@ -670,6 +726,8 @@ impl Drop for ClientSlot {
 
 /// The path a session was opened for and the backend its route names.
 struct SessionRoute {
+    /// The host the session was opened for (lowercase, no port)
+    host: Option<String>,
     path: String,
     /// The route's backend and method; none for a session no route covers
     target: Option<WtTarget>,
@@ -820,9 +878,11 @@ async fn read_request<R: tokio::io::AsyncRead + Unpin>(
 /// Serve an established WebTransport session, on either listener: the speed
 /// test and the telemetry wall at their paths, and otherwise each stream and
 /// datagram forwarded to the session route's backend.
+#[expect(clippy::too_many_arguments)]
 pub async fn serve_session<S: WtSession>(
     connection: Arc<S>,
     remote_addr: SocketAddr,
+    host: Option<String>,
     path: String,
     session_target: Option<WtTarget>,
     config: Arc<ProxyConfig>,
@@ -846,6 +906,7 @@ pub async fn serve_session<S: WtSession>(
 
     // What every stream and datagram of this session is routed by.
     let session = Arc::new(SessionRoute {
+        host,
         path,
         target: session_target,
         buffered: Arc::new(AtomicUsize::new(0)),
@@ -1249,13 +1310,41 @@ async fn proxy_request(
     backend_pool: &Arc<BackendPool>,
     security: &Option<crate::security::SecurityState>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    // Where the payload goes: a JSON request names an operation, each the
+    // backend path it is forwarded to; anything else goes to the session's
+    // own path. A ping is answered here.
+    let request: Option<serde_json::Value> = std::str::from_utf8(data)
+        .ok()
+        .and_then(|text| serde_json::from_str(text).ok());
+    let operation = request
+        .as_ref()
+        .and_then(|r| r.get("operation"))
+        .and_then(|v| v.as_str());
+    if operation == Some("ping") {
+        let response = json!({
+            "success": true,
+            "operation": "pong",
+            "server": "pqcrypta-proxy",
+            "webtransport": true,
+            "timestamp": jiff::Timestamp::now().display_with_offset(jiff::tz::Offset::UTC).to_string()
+        });
+        return Ok(serde_json::to_vec(&response)?);
+    }
+    let forward_path = match operation {
+        Some("encrypt") => "/encrypt",
+        Some("decrypt") => "/decrypt",
+        Some("generate_keys" | "keygen") => "/keys/generate",
+        Some("health") => "/health",
+        _ => session.path.as_str(),
+    };
+
     // WAF inspection. A WebTransport stream/datagram payload is proxied to the
     // same backends (/encrypt, /decrypt, …) as an HTTP request, so it is an
     // attack surface on those backends and must clear the same WAF the HTTP and
-    // HTTP/3 paths run. The payload is treated as the request body; there are no
-    // HTTP headers on a WT frame, so a minimal header map is synthesised. When
-    // no security state is attached (WAF disabled) this is a no-op.
-    let path = session.path.as_str();
+    // HTTP/3 paths run, under the policy of the route its path is on (that
+    // route's WAF switch and mode). The payload is treated as the request
+    // body; there are no HTTP headers on a WT frame, so the header map is
+    // empty. When no security state is attached (WAF disabled) this is a no-op.
     if let Some(sec) = security {
         if sec.waf().is_some() {
             let ip = crate::security::canonical_addr(remote_addr).ip();
@@ -1266,18 +1355,23 @@ async fn proxy_request(
                 ip,
                 peer_port: Some(remote_addr.port()),
                 method: session.method().as_str(),
-                path,
+                path: forward_path,
                 query: "",
                 headers: &headers,
                 body: Some(data),
             };
-            let policy = crate::security::RequestPolicy::default();
+            let policy = crate::security::request_policy(
+                config,
+                session.host.as_deref(),
+                forward_path,
+                session.method(),
+            );
             if let crate::security::SecurityDecision::WafBlock { rule } =
                 sec.inspect_body(&view, &policy, is_pentest)
             {
                 warn!(
                     "[WebTransport] WAF block: rule={} ip={} path={}",
-                    rule, ip, path
+                    rule, ip, forward_path
                 );
                 let body = json!({
                     "success": false,
@@ -1289,53 +1383,16 @@ async fn proxy_request(
         }
     }
 
-    // Try to parse as JSON
-    if let Ok(request_str) = std::str::from_utf8(data) {
-        if let Ok(request) = serde_json::from_str::<serde_json::Value>(request_str) {
-            debug!("📋 Processing JSON request from {}", remote_addr);
-
-            // Determine the operation to route to backend
-            if let Some(operation) = request.get("operation").and_then(|v| v.as_str()) {
-                let backend_path = match operation {
-                    "encrypt" => "/encrypt",
-                    "decrypt" => "/decrypt",
-                    "generate_keys" | "keygen" => "/keys/generate",
-                    "health" => "/health",
-                    "ping" => {
-                        // Handle ping locally
-                        let response = json!({
-                            "success": true,
-                            "operation": "pong",
-                            "server": "pqcrypta-proxy",
-                            "webtransport": true,
-                            "timestamp": jiff::Timestamp::now().display_with_offset(jiff::tz::Offset::UTC).to_string()
-                        });
-                        return Ok(serde_json::to_vec(&response)?);
-                    }
-                    _ => path,
-                };
-
-                // Forward to backend, with the request's own credential
-                return forward_to_backend(
-                    data,
-                    backend_path,
-                    session.target.as_ref(),
-                    request_credential(&request).as_deref(),
-                    remote_addr,
-                    config,
-                    backend_pool,
-                )
-                .await;
-            }
-        }
-    }
-
-    // For non-JSON data, forward to the path directly
+    // Forward to backend, with a JSON request's own credential
+    let credential = request
+        .as_ref()
+        .filter(|_| operation.is_some())
+        .and_then(request_credential);
     forward_to_backend(
         data,
-        path,
+        forward_path,
         session.target.as_ref(),
-        None,
+        credential.as_deref(),
         remote_addr,
         config,
         backend_pool,

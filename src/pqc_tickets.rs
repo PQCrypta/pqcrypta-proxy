@@ -38,7 +38,17 @@
 //! so tickets issued moments before the roll still open; anything older fails
 //! to decapsulate and the client falls back to a full handshake. Erasing the
 //! old key is what actually limits the damage a stolen ticket can do.
+//!
+//! Each generation is held to that lifetime by the clock as well as by the
+//! roll. A key seals tickets only within its lifetime: if a rotation fails, no
+//! ticket is issued under the expired key (resumption waits, full handshakes
+//! go on) until one succeeds, and the failure is logged as an error once. A
+//! key opens tickets only while those it sealed can still be valid: the
+//! current one until a lifetime after it stopped sealing, the previous one for
+//! a lifetime after it was replaced. The derived AEAD key and every buffer
+//! that held resumption state in the clear are erased when dropped.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -48,7 +58,8 @@ use aws_lc_rs::kem::{Ciphertext, DecapsulationKey, EncapsulationKey, ML_KEM_1024
 use aws_lc_rs::rand::SystemRandom;
 use parking_lot::RwLock;
 use rustls::server::ProducesTickets;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
+use zeroize::Zeroizing;
 
 /// Wire format version. A ticket that does not start with this is refused
 /// rather than parsed, so a future format change cannot be misread as this one.
@@ -87,6 +98,9 @@ pub struct PqcTicketer {
     rotated_at: RwLock<Instant>,
     /// How long a generation is used before rolling.
     lifetime: Duration,
+    /// Whether the last rotation failed (logged once per failure, and once
+    /// when a rotation succeeds again)
+    rotation_failing: AtomicBool,
     rng: SystemRandom,
 }
 
@@ -113,8 +127,14 @@ impl PqcTicketer {
             keys: RwLock::new((key, None)),
             rotated_at: RwLock::new(Instant::now()),
             lifetime: Duration::from_secs(u64::from(lifetime_secs)),
+            rotation_failing: AtomicBool::new(false),
             rng: SystemRandom::new(),
         })
+    }
+
+    /// How long ago, at `now`, the current generation began sealing tickets.
+    fn age_at(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(*self.rotated_at.read())
     }
 
     /// Roll the keypair if the current one has reached its lifetime.
@@ -122,28 +142,40 @@ impl PqcTicketer {
     /// The previous generation is kept for one further period so a ticket
     /// issued just before the roll still resumes; the generation before that is
     /// dropped, which is the erasure the trait asks for.
-    fn maybe_rotate(&self) {
-        if self.rotated_at.read().elapsed() < self.lifetime {
+    ///
+    /// At `now`, with `generate` making the new keypair.
+    fn maybe_rotate_at(&self, now: Instant, generate: impl FnOnce() -> Result<TicketKey, String>) {
+        if self.age_at(now) < self.lifetime {
             return;
         }
         let mut rotated = self.rotated_at.write();
         // Re-check under the write lock: several connections can reach this at
         // once and only one roll should happen.
-        if rotated.elapsed() < self.lifetime {
+        if now.saturating_duration_since(*rotated) < self.lifetime {
             return;
         }
-        match TicketKey::generate() {
+        match generate() {
             Ok(fresh) => {
                 let mut keys = self.keys.write();
                 let previous = std::mem::replace(&mut keys.0, Arc::new(fresh));
                 keys.1 = Some(previous);
-                *rotated = Instant::now();
-                debug!("Rotated PQC session ticket key");
+                *rotated = now;
+                if self.rotation_failing.swap(false, Ordering::Relaxed) {
+                    info!("PQC session ticket key rotated; tickets are issued again");
+                } else {
+                    debug!("Rotated PQC session ticket key");
+                }
             }
             Err(e) => {
-                // Keep serving with the current key rather than losing
-                // resumption entirely; try again on the next ticket.
-                warn!("PQC ticket key rotation failed, keeping current key: {}", e);
+                // The key has reached its lifetime and seals nothing more
+                // (`seal_at`); the next ticket tries the rotation again.
+                if !self.rotation_failing.swap(true, Ordering::Relaxed) {
+                    error!(
+                        "PQC session ticket key rotation failed ({}): no tickets are issued \
+                         until a new key is generated",
+                        e
+                    );
+                }
             }
         }
     }
@@ -152,36 +184,40 @@ impl PqcTicketer {
     fn aead_key(shared_secret: &[u8]) -> Option<LessSafeKey> {
         let prk = Salt::new(HKDF_SHA384, &[]).extract(shared_secret);
         let okm = prk.expand(&[HKDF_INFO], &AES_256_GCM).ok()?;
-        let mut key_bytes = [0u8; 32];
-        okm.fill(&mut key_bytes).ok()?;
-        let unbound = UnboundKey::new(&AES_256_GCM, &key_bytes).ok()?;
+        let mut key_bytes = Zeroizing::new([0u8; 32]);
+        okm.fill(&mut key_bytes[..]).ok()?;
+        let unbound = UnboundKey::new(&AES_256_GCM, &key_bytes[..]).ok()?;
         Some(LessSafeKey::new(unbound))
     }
 
-    /// Try to open a ticket with one specific generation.
+    /// Try to open a ticket with one specific generation. The buffer it is
+    /// opened in becomes the plaintext returned; on a failed open it is erased.
     fn open_with(key: &TicketKey, ct: &[u8], nonce: &[u8], sealed: &[u8]) -> Option<Vec<u8>> {
         let shared = key.decaps.decapsulate(Ciphertext::from(ct)).ok()?;
         let aead = Self::aead_key(shared.as_ref())?;
         let nonce = Nonce::try_assume_unique_for_key(nonce).ok()?;
-        let mut buf = sealed.to_vec();
-        let plain = aead.open_in_place(nonce, Aad::from(ct), &mut buf).ok()?;
-        Some(plain.to_vec())
-    }
-}
-
-impl ProducesTickets for PqcTicketer {
-    fn enabled(&self) -> bool {
-        true
-    }
-
-    fn lifetime(&self) -> u32 {
-        // Saturating: a lifetime beyond u32 seconds is a misconfiguration, and
-        // wrapping it would advertise a nonsensically short hint.
-        u32::try_from(self.lifetime.as_secs()).unwrap_or(u32::MAX)
+        let mut buf = Zeroizing::new(sealed.to_vec());
+        let plain_len = aead
+            .open_in_place(nonce, Aad::from(ct), &mut buf)
+            .ok()?
+            .len();
+        let mut plain = std::mem::take(&mut *buf);
+        plain.truncate(plain_len);
+        Some(plain)
     }
 
-    fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
-        self.maybe_rotate();
+    /// A ticket for `plain`, sealed at `now`: after any rotation due, and only
+    /// under a key within its lifetime.
+    fn seal_at(
+        &self,
+        plain: &[u8],
+        now: Instant,
+        generate: impl FnOnce() -> Result<TicketKey, String>,
+    ) -> Option<Vec<u8>> {
+        self.maybe_rotate_at(now, generate);
+        if self.age_at(now) >= self.lifetime {
+            return None;
+        }
 
         let key = Arc::clone(&self.keys.read().0);
         let (ct, shared) = key.encaps.encapsulate().ok()?;
@@ -197,8 +233,9 @@ impl ProducesTickets for PqcTicketer {
         let nonce_bytes: [u8; NONCE_LEN] = aws_lc_rs::rand::generate(&self.rng).ok()?.expose();
         let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 
-        let mut sealed = plain.to_vec();
-        aead.seal_in_place_append_tag(nonce, Aad::from(ct), &mut sealed)
+        // Plaintext until it is sealed in place: erased if sealing fails
+        let mut sealed = Zeroizing::new(plain.to_vec());
+        aead.seal_in_place_append_tag(nonce, Aad::from(ct), &mut *sealed)
             .ok()?;
 
         let ct_len = u16::try_from(ct.len()).ok()?;
@@ -211,7 +248,9 @@ impl ProducesTickets for PqcTicketer {
         Some(out)
     }
 
-    fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {
+    /// The resumption state `cipher` seals, opened at `now` by a generation
+    /// whose tickets can still be valid.
+    fn open_at(&self, cipher: &[u8], now: Instant) -> Option<Vec<u8>> {
         // `cipher` is fully attacker controlled. Every length is checked before
         // it is used to slice, and every failure returns None rather than
         // distinguishing why — a caller learns only "not a valid ticket".
@@ -237,12 +276,40 @@ impl ProducesTickets for PqcTicketer {
             let keys = self.keys.read();
             (Arc::clone(&keys.0), keys.1.as_ref().map(Arc::clone))
         };
-
-        if let Some(plain) = Self::open_with(&current, ct, nonce, sealed) {
-            return Some(plain);
+        // The current generation sealed tickets until a lifetime after it
+        // began, valid a lifetime each; the previous one stopped sealing when
+        // it was replaced, which is `age` ago.
+        let age = self.age_at(now);
+        if age < self.lifetime.saturating_mul(2) {
+            if let Some(plain) = Self::open_with(&current, ct, nonce, sealed) {
+                return Some(plain);
+            }
         }
         // Issued just before the last rotation.
-        previous.and_then(|prev| Self::open_with(&prev, ct, nonce, sealed))
+        if age < self.lifetime {
+            return previous.and_then(|prev| Self::open_with(&prev, ct, nonce, sealed));
+        }
+        None
+    }
+}
+
+impl ProducesTickets for PqcTicketer {
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    fn lifetime(&self) -> u32 {
+        // Saturating: a lifetime beyond u32 seconds is a misconfiguration, and
+        // wrapping it would advertise a nonsensically short hint.
+        u32::try_from(self.lifetime.as_secs()).unwrap_or(u32::MAX)
+    }
+
+    fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
+        self.seal_at(plain, Instant::now(), TicketKey::generate)
+    }
+
+    fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {
+        self.open_at(cipher, Instant::now())
     }
 }
 
@@ -317,14 +384,43 @@ mod tests {
 
     #[test]
     fn a_ticket_from_a_previous_key_still_opens_after_rotation() {
-        let t = PqcTicketer::new(0).expect("ticketer");
-        let ticket = t.encrypt(b"pre-rotation").unwrap();
-        // lifetime 0 means the next encrypt rolls the key.
-        let _ = t.encrypt(b"triggers rotation").unwrap();
+        let t = PqcTicketer::new(3600).expect("ticketer");
+        let hour = Duration::from_secs(3600);
+        let t0 = Instant::now();
+        let ticket = t.seal_at(b"pre-rotation", t0, TicketKey::generate).unwrap();
+        // A lifetime on, the next ticket rolls the key
+        let rolled = t0 + hour;
+        let _ = t
+            .seal_at(b"triggers rotation", rolled, TicketKey::generate)
+            .unwrap();
         assert_eq!(
-            t.decrypt(&ticket).as_deref(),
+            t.open_at(&ticket, rolled + Duration::from_secs(1))
+                .as_deref(),
             Some(&b"pre-rotation"[..]),
             "one generation of overlap must be honoured"
         );
+        // And not past the lifetime its tickets were issued for
+        assert!(t.open_at(&ticket, rolled + hour).is_none());
+    }
+
+    /// A key that could not be rotated seals nothing past its lifetime, and
+    /// tickets resume normally once a rotation succeeds.
+    #[test]
+    fn a_failed_rotation_issues_no_ticket_under_the_expired_key() {
+        let t = PqcTicketer::new(3600).expect("ticketer");
+        let hour = Duration::from_secs(3600);
+        let t0 = Instant::now();
+        let earlier = t.seal_at(b"state", t0, TicketKey::generate).unwrap();
+        let fail = || Err("no entropy".to_string());
+        assert!(t.seal_at(b"state", t0 + hour, fail).is_none());
+        assert!(t.seal_at(b"state", t0 + hour + hour / 2, fail).is_none());
+        // A ticket sealed within the key's lifetime still opens while it is valid
+        assert!(t.open_at(&earlier, t0 + hour + hour / 2).is_some());
+        assert!(t.open_at(&earlier, t0 + 2 * hour).is_none());
+        // The next successful rotation issues tickets again
+        let fresh = t
+            .seal_at(b"state", t0 + 2 * hour, TicketKey::generate)
+            .unwrap();
+        assert!(t.open_at(&fresh, t0 + 2 * hour).is_some());
     }
 }

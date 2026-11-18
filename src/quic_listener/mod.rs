@@ -556,56 +556,121 @@ fn deliver_wt_bi(
 }
 
 /// Whether an extended CONNECT this listener answers itself (WebTransport,
-/// WebSocket, CONNECT-UDP) is refused, and with which status: the advanced
-/// rate limiter and `SecurityState::evaluate`, as for any other request. A
+/// WebSocket, CONNECT-UDP) is refused, with the status and any headers the
+/// refusal carries. It meets what every other request does, in the same
+/// order: the advanced rate limiter and `SecurityState::evaluate`, then the
+/// per-route rate limit and the route gate (`route_gate::evaluate`) of
+/// `route`, the route it is served by. The request's headers are the
+/// connection-derived ones by now (`request::derive_connection_headers`). A
 /// client opening a session is a program, so the user-agent rules for unnamed
 /// clients are not applied to it.
+#[expect(clippy::too_many_arguments)]
 async fn connect_refusal(
     security: &SecurityState,
     advanced_rate_limiter: &AdvancedRateLimiter,
+    config: &ProxyConfig,
     request: &http::Request<()>,
     host: Option<&str>,
     path: &str,
+    route: Option<&crate::config::RouteConfig>,
     remote_addr: SocketAddr,
     fingerprint: &crate::fingerprint::FingerprintResult,
-) -> Option<http::StatusCode> {
+) -> Option<(http::StatusCode, Vec<(&'static str, String)>)> {
     let ip = remote_addr.ip();
-    if security.is_trusted(&ip) {
-        return None;
-    }
-    let context = crate::rate_limiter::build_context_from_request(
-        ip,
-        request.headers(),
-        path,
-        request.method().as_str(),
-        fingerprint.ja3_hash.clone(),
-        fingerprint.ja4_hash.clone(),
-        None,
-    );
-    match advanced_rate_limiter.check(&context).await {
-        crate::rate_limiter::RateLimitResult::Allowed { .. } => {}
-        crate::rate_limiter::RateLimitResult::Limited { .. } => {
-            return Some(http::StatusCode::TOO_MANY_REQUESTS);
+    let refuse = |status: http::StatusCode| Some((status, Vec::new()));
+    if !security.is_trusted(&ip) {
+        let context = crate::rate_limiter::build_context_from_request(
+            ip,
+            request.headers(),
+            path,
+            request.method().as_str(),
+            fingerprint.ja3_hash.clone(),
+            fingerprint.ja4_hash.clone(),
+            None,
+        );
+        match advanced_rate_limiter.check(&context).await {
+            crate::rate_limiter::RateLimitResult::Allowed { .. } => {}
+            crate::rate_limiter::RateLimitResult::Limited { .. } => {
+                return refuse(http::StatusCode::TOO_MANY_REQUESTS);
+            }
+            crate::rate_limiter::RateLimitResult::Blocked { .. } => {
+                return refuse(http::StatusCode::FORBIDDEN);
+            }
         }
-        crate::rate_limiter::RateLimitResult::Blocked { .. } => {
-            return Some(http::StatusCode::FORBIDDEN);
+        // The policy of the route it is served by: an extended CONNECT is not
+        // matched among ordinary routes, and a WebTransport route is matched
+        // only for one
+        let mut policy =
+            crate::security::route_request_policy(config, host, path, request.method(), route);
+        policy.skip_bot_blocking = true;
+        let raw_path = request.uri().path().to_ascii_lowercase();
+        let view = crate::security::SecurityRequestView {
+            ip,
+            peer_port: Some(remote_addr.port()),
+            method: request.method().as_str(),
+            path: &raw_path,
+            query: request.uri().query().unwrap_or(""),
+            headers: request.headers(),
+            body: None,
+        };
+        let decision = security.evaluate(&view, &policy);
+        let rendered = {
+            let security_config = security.config.read();
+            crate::security::decision_rendering(&decision, None, &security_config).map(|r| r.status)
+        };
+        if let Some(status) = rendered {
+            return refuse(status);
         }
     }
-    let mut policy = resolve_route_policy(security, request, host, path);
-    policy.skip_bot_blocking = true;
-    let raw_path = request.uri().path().to_ascii_lowercase();
-    let view = crate::security::SecurityRequestView {
-        ip,
-        peer_port: Some(remote_addr.port()),
+
+    let route = route?;
+    // The route's own rate limit, as an ordinary request on it is held to
+    if let Some(name) = &route.name {
+        if config
+            .advanced_rate_limiting
+            .route_limits
+            .contains_key(name.as_str())
+        {
+            let context = crate::rate_limiter::build_context_from_request(
+                ip,
+                request.headers(),
+                path,
+                request.method().as_str(),
+                fingerprint.ja3_hash.clone(),
+                fingerprint.ja4_hash.clone(),
+                Some(name.clone()),
+            );
+            if let crate::rate_limiter::RateLimitResult::Limited { .. } =
+                advanced_rate_limiter.check(&context).await
+            {
+                return refuse(http::StatusCode::TOO_MANY_REQUESTS);
+            }
+        }
+    }
+    // The route's gates: mTLS, HMAC proof-of-possession and the rest, over
+    // the request target as the client sent it
+    let received = request.uri();
+    let path_and_query = received
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or_else(|| received.path());
+    let gate = crate::route_gate::GateContext {
+        route,
         method: request.method().as_str(),
-        path: &raw_path,
-        query: request.uri().query().unwrap_or(""),
+        path_and_query,
+        path,
         headers: request.headers(),
-        body: None,
+        client_ip: ip,
+        is_http11: false,
+        is_websocket_upgrade: false,
+        is_http3: true,
+        zero_rtt_safe_methods: &config.tls.zero_rtt_safe_methods,
+        hmac_nonce_store: crate::route_gate::shared_nonce_store(),
     };
-    let decision = security.evaluate(&view, &policy);
-    let config = security.config.read();
-    crate::security::decision_rendering(&decision, None, &config).map(|r| r.status)
+    match crate::route_gate::evaluate(&gate) {
+        crate::route_gate::GateOutcome::Continue => None,
+        crate::route_gate::GateOutcome::Refuse { status, headers } => Some((status, headers)),
+    }
 }
 
 /// The access-log line of an extended CONNECT answered here.
@@ -635,6 +700,8 @@ fn log_connect(
     });
 }
 
+/// The policy an ordinary HTTP/3 request is judged by: its route's, where one
+/// matches (`security::request_policy`).
 fn resolve_route_policy(
     security: &SecurityState,
     request: &http::Request<()>,
@@ -1649,7 +1716,7 @@ impl QuicListener {
                 }
                 Step::Resolved(resolved) => {
                     // The request, or the WebTransport stream
-                    let (request, stream) = match resolved {
+                    let (mut request, stream) = match resolved {
                         Ok(Ok(h3::server::Resolved::Request(request, stream))) => (request, stream),
                         Ok(Ok(h3::server::Resolved::WebTransportBi {
                             session,
@@ -1719,6 +1786,17 @@ impl QuicListener {
                         continue;
                     }
 
+                    // The connection's own fingerprint, certificate and
+                    // protocol fields, set as on every other request before
+                    // anything reads its headers (no early data reaches here)
+                    request::derive_connection_headers(
+                        request.headers_mut(),
+                        &handshake,
+                        &conn_headers,
+                        &fingerprint,
+                        false,
+                    );
+
                     let method = request.method().clone();
                     let uri = request.uri().clone();
                     let path = crate::path_canon::canonical_path(
@@ -1767,25 +1845,42 @@ impl QuicListener {
                     // every other request meets before anything is opened, and
                     // written to the access log either way.
                     if is_webtransport || is_ws_h3 || is_connect_udp {
+                        // The route each is served by, whose gates it meets:
+                        // a WebTransport or WebSocket route, and for
+                        // CONNECT-UDP (governed by `[masque]`) any route that
+                        // covers its path.
+                        let gate_route = if is_webtransport {
+                            config
+                                .find_route(host.as_deref(), &path, true)
+                                .filter(|r| r.webtransport)
+                        } else if is_ws_h3 {
+                            config
+                                .find_route(host.as_deref(), &path, false)
+                                .filter(|r| r.supports_websocket)
+                        } else {
+                            config.find_route(host.as_deref(), &path, false)
+                        };
                         // A classical key exchange where the server refuses
                         // those is answered as any other request on the
                         // connection is (pqc_policy.rs).
                         let refusal =
                             if crate::pqc_policy::refuses(conn_headers.pqc_enabled == "true") {
-                                Some(http::StatusCode::MISDIRECTED_REQUEST)
+                                Some((http::StatusCode::MISDIRECTED_REQUEST, Vec::new()))
                             } else {
                                 connect_refusal(
                                     &security,
                                     &advanced_rate_limiter,
+                                    &config,
                                     &request,
                                     host.as_deref(),
                                     &path,
+                                    gate_route,
                                     remote_addr,
                                     &fingerprint,
                                 )
                                 .await
                             };
-                        if let Some(status) = refusal {
+                        if let Some((status, extra)) = refusal {
                             log_connect(
                                 &request,
                                 host.as_deref(),
@@ -1799,7 +1894,11 @@ impl QuicListener {
                                 protocol_ext, path, remote_addr, status
                             );
                             let mut stream = stream;
-                            let refused = http::Response::builder().status(status).body(())?;
+                            let mut refused = http::Response::builder().status(status);
+                            for (name, value) in extra {
+                                refused = refused.header(name, value);
+                            }
+                            let refused = refused.body(())?;
                             if stream.send_response(refused).await.is_ok() {
                                 let _ = stream.finish().await;
                             }
@@ -1914,6 +2013,7 @@ impl QuicListener {
                         let serve = crate::webtransport_server::serve_session(
                             Arc::clone(&session),
                             remote_addr,
+                            host.clone(),
                             path.clone(),
                             wt_route.map(crate::webtransport_server::WtTarget::of),
                             config.clone(),
@@ -2746,5 +2846,154 @@ mod tests {
                 "4bf92f3577b34da6a3ce929d0e0e4736"
             );
         });
+    }
+}
+
+/// An extended CONNECT meets what an ordinary request on its route meets: the
+/// connection's own headers, the route's policy and the route gate.
+#[cfg(test)]
+mod connect_parity_tests {
+    use super::*;
+
+    fn route(toml_src: &str) -> crate::config::RouteConfig {
+        toml::from_str(toml_src).expect("valid route TOML")
+    }
+
+    fn proxy_config(routes: Vec<crate::config::RouteConfig>) -> ProxyConfig {
+        let mut config = ProxyConfig::default();
+        config.security.geoip_db_path = None;
+        config.security.geoip_asn_db_path = None;
+        config.fingerprint.fingerprint_db_path = None;
+        config.routes = routes;
+        config
+    }
+
+    fn connect(path: &str, headers: &[(&str, &str)]) -> http::Request<()> {
+        let mut builder = http::Request::builder()
+            .method(http::Method::CONNECT)
+            .uri(format!("https://example.test{path}"));
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder.body(()).expect("request")
+    }
+
+    fn fingerprint(ja3: Option<&str>) -> crate::fingerprint::FingerprintResult {
+        crate::fingerprint::FingerprintResult {
+            allowed: true,
+            ja3_hash: ja3.map(str::to_string),
+            ja4_hash: None,
+            classification: None,
+            client_name: None,
+        }
+    }
+
+    const PEER: &str = "198.51.100.7:50000";
+
+    /// The request as the dispatch has it: the connection's own headers set,
+    /// then judged against `route`.
+    async fn refusal(
+        config: &ProxyConfig,
+        mut request: http::Request<()>,
+        route: Option<&crate::config::RouteConfig>,
+        connection_ja3: Option<&str>,
+    ) -> Option<http::StatusCode> {
+        let security = SecurityState::new(config);
+        let limiter = AdvancedRateLimiter::new(config.advanced_rate_limiting.clone());
+        let peer: SocketAddr = PEER.parse().unwrap();
+        let fp = fingerprint(connection_ja3);
+        let handshake = quic_handshake_facts_empty();
+        let conn_headers = H3ConnHeaders::new(config, peer, 443, &fp, &handshake);
+        request::derive_connection_headers(
+            request.headers_mut(),
+            &handshake,
+            &conn_headers,
+            &fp,
+            false,
+        );
+        let path = request.uri().path().to_string();
+        connect_refusal(
+            &security,
+            &limiter,
+            config,
+            &request,
+            Some("example.test"),
+            &path,
+            route,
+            peer,
+            &fp,
+        )
+        .await
+        .map(|(status, _)| status)
+    }
+
+    #[tokio::test]
+    async fn an_mtls_route_refuses_a_session_without_a_client_certificate() {
+        let wt = route(
+            "name = \"wt\"\nbackend = \"b\"\nwebtransport = true\npath_prefix = \"/wt\"\n\
+             [security]\nmtls_required = true\n",
+        );
+        let config = proxy_config(vec![wt.clone()]);
+        // A client's own claim to a certificate is not one; over HTTP/3 the
+        // refusal is 421 (route_gate::mtls_gate)
+        let request = connect("/wt", &[("x-client-cert", "1")]);
+        assert_eq!(
+            refusal(&config, request, Some(&wt), None).await,
+            Some(http::StatusCode::MISDIRECTED_REQUEST)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_hmac_route_refuses_an_unsigned_session() {
+        let ws = route(&format!(
+            "name = \"ws\"\nbackend = \"b\"\nsupports_websocket = true\npath_prefix = \"/ws\"\n\
+             [security]\nhmac_secret = \"{}\"\n",
+            hex::encode(rand::random::<[u8; 32]>())
+        ));
+        let config = proxy_config(vec![ws.clone()]);
+        assert_eq!(
+            refusal(&config, connect("/ws", &[]), Some(&ws), None).await,
+            Some(http::StatusCode::UNAUTHORIZED)
+        );
+    }
+
+    /// A JA3 allowlist reads the connection's fingerprint: a client naming an
+    /// allowed one itself is refused, the connection that has it is admitted,
+    /// on a WebTransport-only route as on any other.
+    #[tokio::test]
+    async fn a_ja3_allowlist_reads_the_connections_fingerprint() {
+        let allowed = "0123456789abcdef0123456789abcdef";
+        let wt = route(&format!(
+            "name = \"wt\"\nbackend = \"b\"\nwebtransport = true\npath_prefix = \"/wt\"\n\
+             [security]\nallowed_ja3 = [\"{allowed}\"]\n"
+        ));
+        let config = proxy_config(vec![wt.clone()]);
+        let forged = connect("/wt", &[("x-ja3-hash", allowed)]);
+        assert!(refusal(&config, forged, Some(&wt), None).await.is_some());
+        let other = connect("/wt", &[("x-ja3-hash", allowed)]);
+        assert!(refusal(
+            &config,
+            other,
+            Some(&wt),
+            Some("ffffffffffffffffffffffffffffffff")
+        )
+        .await
+        .is_some());
+        let genuine = connect("/wt", &[]);
+        assert_eq!(
+            refusal(&config, genuine, Some(&wt), Some(allowed)).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_route_with_no_gates_admits_the_session() {
+        let wt =
+            route("name = \"wt\"\nbackend = \"b\"\nwebtransport = true\npath_prefix = \"/wt\"\n");
+        let config = proxy_config(vec![wt.clone()]);
+        assert_eq!(
+            refusal(&config, connect("/wt", &[]), Some(&wt), None).await,
+            None
+        );
     }
 }

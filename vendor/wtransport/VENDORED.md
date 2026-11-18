@@ -17,6 +17,9 @@ manifest (no upstream workspace).
 - `SessionRequest::quic_connection()` (the handshake's outcome before a
   session is accepted) and `SessionRequest::misdirected_request()` (421),
   with `SessionResponseProto::misdirected_request()`.
+- `SessionRequest::reject_with(status)`: a refusal with any 4xx or 5xx
+  status (the proxy's route gate answers 401 and 425 as well as the
+  statuses the named methods send).
 - `[patch.crates-io] rustls = ../rustls-fixed/rustls` in its own manifest, so
   `cargo test --manifest-path vendor/wtransport/Cargo.toml` builds against the
   rustls the proxy uses; Cargo ignores it when the proxy builds wtransport.

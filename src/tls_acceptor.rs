@@ -298,9 +298,17 @@ pub struct HmacNonceStore {
 }
 
 impl HmacNonceStore {
-    pub fn new(window_secs: u64) -> Self {
+    /// The store for signatures whose timestamp is accepted up to `skew_secs`
+    /// either side of this server's clock. Such a signature can be presented
+    /// for twice that span -- from the moment its timestamp first falls inside
+    /// the window to the moment it leaves -- so each nonce is held at least
+    /// that long: one generation is the whole span.
+    pub fn for_timestamp_skew(skew_secs: u64) -> Self {
         Self {
-            seen: Generations::new(std::time::Duration::from_secs(window_secs), HMAC_NONCES),
+            seen: Generations::new(
+                std::time::Duration::from_secs(skew_secs.saturating_mul(2)),
+                HMAC_NONCES,
+            ),
         }
     }
 
@@ -308,6 +316,12 @@ impl HmacNonceStore {
     /// told from one (the store is full); `false` if it is new and recorded.
     pub fn check_and_insert(&self, nonce: &str) -> bool {
         self.seen.check(Self::digest(nonce)) != Seen::New
+    }
+
+    /// As [`check_and_insert`](Self::check_and_insert), at `now`.
+    #[cfg(test)]
+    pub fn check_and_insert_at(&self, nonce: &str, now: Instant) -> bool {
+        self.seen.check_at(Self::digest(nonce), now) != Seen::New
     }
 
     fn digest(nonce: &str) -> [u8; 32] {

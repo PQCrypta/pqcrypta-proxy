@@ -36,7 +36,7 @@
 | Circuit Breaker | ✅ | Backend health monitoring with auto-recovery |
 | **Advanced Rate Limiting** | ✅ | Multi-dimensional: IP, JA3/JA4, JWT, headers, composite keys on all paths (TCP + QUIC/HTTP3); optional Redis backend for distributed cross-instance coordination |
 | **Connection Rate Limiting** | ✅ | Per-IP cap on *new connections per second* (`connection_rate_limit`, `connections_per_second`), separate from `max_connections_per_ip` which caps concurrency — a client that opens and closes as fast as it can never trips a concurrency limit |
-| **Per-Route Security Policy** | ✅ | `[routes.security]` overrides applied before the global checks: WAF on/off and mode, rate limits, JA3 allowlist, mTLS, HMAC request signing, plus `skip_bot_blocking` for routes that serve automated clients |
+| **Per-Route Security Policy** | ✅ | `[routes.security]` overrides applied before the global checks: WAF on/off and mode, rate limits, JA3 and JA4 allowlists, mTLS, HMAC request signing, plus `skip_bot_blocking` for routes that serve automated clients |
 | DoS Protection | ✅ | Connection limits, request validation |
 | GeoIP Blocking | ✅ | Country-based blocking (MaxMind DB) |
 | JA3/JA4 Fingerprinting | ✅ | TLS client fingerprint detection and classification on **every transport** — HTTP/1.1, HTTP/2 and HTTP/3. Over QUIC the ClientHello arrives inside encrypted Initial CRYPTO frames, so the vendored rustls/noq forks surface it through `HandshakeData` and it is parsed by the same extractor the TCP paths use. The JA4 transport marker is `q` over QUIC and `t` over TCP |
@@ -77,7 +77,7 @@
 | **QUIC Retry** | ✅ | Optional RFC 9000 source-address validation (`enable_quic_retry`); Retry token echoed before handshake, anti-spoofing at +1 RTT |
 | **Certificate Transparency** | ✅ | Submits new certs via `POST /ct/v1/add-chain` after ACME issuance, to logs chosen from the live CT log list: one per operator whose shard holds the expiry |
 | **QUIC Connection Migration** | ✅ | Configurable enable/disable of QUIC connection migration (`enable_quic_migration`) |
-| **Per-Route Security Policy** | ✅ | Per-route mTLS requirement, JA3 allowlist, rate limit override, WAF mode, 0-RTT control |
+| **Per-Route Security Policy** | ✅ | Per-route mTLS requirement, JA3 and JA4 allowlists, rate limit override, WAF mode, 0-RTT control |
 | **Body Size Limit** | ✅ | Global `max_request_body_bytes` enforced (default 50 MB); 413 on excess |
 | **Config Schema Versioning** | ✅ | `version` field in config; warns if absent, errors if version > current |
 | **Config Conflict Validation** | ✅ | Startup validation catches conflicting settings (PQC+passthrough, 0-RTT non-safe, mTLS without CA) |
@@ -187,7 +187,7 @@
 - **DoS Protection**: Connection limits, body size enforcement, request validation, auto-blocking
 - **GeoIP Blocking**: Block by country/region using MaxMind GeoLite2 database; configurable block duration via `geoip_block_duration_secs` (default 24 h)
 - **SSRF Protection**: Link-local (169.254.x.x) and loopback backend addresses rejected at config load; RFC1918 backends log a warning; WAF SSRF pattern set active for path, query, and body inspection; `X-Forwarded-For` exempt from SSRF patterns since proxy hops legitimately insert loopback/RFC1918 IPs into the forwarded chain
-- **Per-Route Security Policy**: Per-route mTLS requirement, JA3 allowlist, rate limit override, WAF mode override, 0-RTT control
+- **Per-Route Security Policy**: Per-route mTLS requirement, JA3 and JA4 allowlists, rate limit override, WAF mode override, 0-RTT control
 - **Security Headers**: HSTS, X-Frame-Options, CSP, COEP, COOP, CORP, and more
 - **CORS Handling**: Full CORS support with preflight OPTIONS handling; all rate-limit 429 responses include `Access-Control-Allow-Origin` and `Access-Control-Allow-Credentials` headers when the request Origin matches an allowed origin — prevents browsers from reporting rate-limit errors as CORS failures
 - **Server Identity Concealment**: the backend's `Server` header is replaced by `server_header` in `[server]` (default `pqcrypta`, no version); an empty value passes the backend's own header through, as HAProxy and NGINX do by default
@@ -1285,8 +1285,9 @@ path_prefix = "/"
 backend = "api"
 
 [routes.security]
-mtls_required = true                          # require client certificate on this route
-allowed_ja3 = ["abc123...", "def456..."]      # allowlist of known-good JA3 fingerprints
+mtls_required = true                          # require client certificate on this route (401; 421 over HTTP/3, retried over TCP)
+allowed_ja4 = ["t13d1516h2_8daaf6152771_02713d6af862"]  # allowlist of known-good JA4 fingerprints
+allowed_ja3 = ["0123456789abcdef0123456789abcdef"]      # and of JA3 hashes (both must match where both are set)
 waf_enabled = true
 waf_mode = "block"
 enable_0rtt = false                           # deny 0-RTT early data on this route
@@ -1694,6 +1695,8 @@ Options:
       --socket-unit <FILE>             Write the systemd socket unit for this configuration's listeners (pqcrypta-proxy.socket) to FILE and exit: with it, the service manager holds the listening sockets across a restart. A file, not standard output, which the proxy's own log may share
       --merge-fingerprints <OUT>       Merge fingerprint corpora into one and write it here: observed.json of either version, or a published directory's full.json (`--from`)
       --from <FILE>                    A corpus or directory to merge (`--merge-fingerprints`); repeatable
+      --admin <METHOD> <PATH>          Send one request to this node's admin API with the credentials its configuration names (the token, and the HMAC proof of possession where `[admin] hmac_secret` is set), print the response body and exit, 1 unless it succeeded: `--admin POST /reload`
+      --admin-body <JSON>              The JSON body of an `--admin` request
   -h, --help                           Print help
   -V, --version                        Print version
 ```
@@ -1776,6 +1779,7 @@ src/
 ├── acme.rs                 # ACME (Automated Certificate Management Environment) Client
 ├── acme_dns.rs             # DNS-based ACME challenges
 ├── admin.rs                # Admin HTTP API for health, metrics, config reload, and graceful shutdown
+├── admin_client.rs         # `--admin METHOD PATH`: a request to this node's admin API with its token, signed where hmac_secret is set
 ├── audit_logger.rs         # Structured audit logging for security-relevant events
 ├── backend_client.rs       # Connections to backends
 ├── backend_limits.rs       # How many requests each backend has in flight at once, for the whole process
@@ -1833,6 +1837,7 @@ src/
 ├── speedtest.rs            # Native speed test session handler for WebTransport connections on /speedtest
 ├── speedtest_budget.rs     # What one client may take of the speed test
 ├── speedtest_meter.rs      # Server-side meter for speed-test uploads, shared by every transport
+├── staged_file.rs          # Files written beside their destination and renamed in place; private ones mode 0600 from creation
 ├── startup_verify.rs       # Startup verification of the cryptographic runtime
 ├── telemetry.rs            # WebTransport Telemetry Wall — native handler for the /telemetry path
 ├── tls.rs                  # TLS configuration with Post-Quantum Cryptography (PQC) support
@@ -2603,7 +2608,7 @@ describes the rig and the traps it guards against.
 - [x] ACME domain path sanitization — RFC 1035 validation before any certs_path join
 - [x] QUIC connection migration (configurable enable/disable via `enable_quic_migration`)
 - [x] WebTransport per-origin session rate limiting (max sessions, streams, datagrams/sec)
-- [x] Per-route security policy (mTLS, JA3 allowlist, rate limit override, WAF mode, 0-RTT control)
+- [x] Per-route security policy (mTLS, JA3 and JA4 allowlists, rate limit override, WAF mode, 0-RTT control)
 - [x] Config conflict validation at startup and hot-reload (PQC+passthrough, 0-RTT without replay protection, mTLS without CA cert)
 - [x] Environment config overlay (`--env <name>` merges `config.<name>.toml` over base)
 - [x] Config schema versioning (warns on absent version; errors on future version)

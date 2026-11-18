@@ -33,6 +33,7 @@
     "bind_address": "127.0.0.1",
     "client_ca_path": null,
     "enabled": false,
+    "generated_token_path": "/var/lib/pqcrypta-proxy/state/admin-token",
     "hmac_secret": null,
     "port": 8081,
     "require_loopback": true,
