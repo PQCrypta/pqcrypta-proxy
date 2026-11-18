@@ -30,8 +30,14 @@ mkdir -p "$(dirname "${STATE_FILE}")" "${TEMP_DIR}"
 TS=$(date '+%Y-%m-%d %H:%M:%S')
 log() { echo "[${TS}] $1"; }
 
-# The database password from the platform's .env (the web server's group reads it)
-PGPASSWORD=$(sed -n 's/^DB_PASS=//p' /var/www/html/.env 2>/dev/null | tail -n 1 | tr -d "\"'")
+# The unit's systemd credentials (LoadCredentialEncrypted=DB_PASS and
+# BOT_THREAT_INGEST_KEY): sealed at rest, decrypted by systemd for this run
+# into $CREDENTIALS_DIRECTORY, which only this run's account reads
+CREDENTIALS="${CREDENTIALS_DIRECTORY:-/nonexistent}"
+PGPASSWORD=""
+if [ -s "${CREDENTIALS}/DB_PASS" ]; then
+    PGPASSWORD=$(<"${CREDENTIALS}/DB_PASS")
+fi
 export PGPASSWORD
 
 # Verified crawlers: the address ranges their operators publish (Google, Bing,
@@ -362,13 +368,14 @@ ENDSQL
     # scoring server-side (crawler-safe: it only scores real attack patterns
     # and never auto-blocks). Capped per run so the cron stays quick.
     # -----------------------------------------------------------------------
-    INGEST_KEY=$(grep -E '^BOT_THREAT_INGEST_KEY=' /var/www/html/.env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'"' ')
-    if [ -n "${INGEST_KEY}" ]; then
-        INGEST_COUNT=$(BOT_INGEST_KEY="${INGEST_KEY}" python3 - <<'PYEOF' || echo 0
+    if [ -s "${CREDENTIALS}/BOT_THREAT_INGEST_KEY" ]; then
+        INGEST_COUNT=$(python3 - <<'PYEOF' || echo 0
 import os, re, json, urllib.request
 
 TSV = "/run/pqcrypta-bot-detect/probes.tsv"
-KEY = os.environ["BOT_INGEST_KEY"]
+# Read here, from the credential: never in an environment or on a command line
+with open(os.path.join(os.environ["CREDENTIALS_DIRECTORY"], "BOT_THREAT_INGEST_KEY"), encoding="utf-8") as f:
+    KEY = f.read().removesuffix("\n")
 URL = "http://127.0.0.1:3003/bot-threat/log-request"
 # Only replay requests that look like probing/attacks — keeps bot_ip_tracking
 # threat-focused instead of logging every benign 404.
