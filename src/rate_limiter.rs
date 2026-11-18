@@ -21,15 +21,15 @@ use dashmap::DashMap;
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, MutexGuard, RwLock};
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::net::{IpAddr, Ipv6Addr};
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock as AsyncRwLock;
 use tracing::{debug, info, warn};
@@ -724,67 +724,238 @@ pub struct CompositeKeyConfig {
 // REDIS BACKEND
 // ============================================================================
 
-/// Lua script: atomic token-bucket check-and-consume.
+/// How a rolling window is divided: `buckets` of `bucket_ms` each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowShape {
+    bucket_ms: u64,
+    buckets: u64,
+}
+
+impl WindowShape {
+    /// A counter on this node divided the way Redis divides the window.
+    fn counter(self) -> SlidingWindowCounter {
+        SlidingWindowCounter::new(
+            self.bucket_ms * self.buckets / 1000,
+            usize::try_from(self.buckets).unwrap_or(1),
+        )
+    }
+}
+
+/// The per-minute window: twelve buckets of five seconds.
+const MINUTE_WINDOW: WindowShape = WindowShape {
+    bucket_ms: 5_000,
+    buckets: 12,
+};
+
+/// The per-hour window: sixty buckets of a minute.
+const HOUR_WINDOW: WindowShape = WindowShape {
+    bucket_ms: 60_000,
+    buckets: 60,
+};
+
+/// Lua script: one atomic check of a key's per-second, per-minute and per-hour
+/// limits. A request is counted in all of them or in none, and one that is
+/// refused is counted in none.
 ///
-/// KEYS[1]  = hash key  (e.g. "pqcp:tb:SourceIp:1.2.3.4")
-/// ARGV[1]  = max_tokens  (burst capacity, integer)
-/// ARGV[2]  = tokens_per_ms  (rate as float string, e.g. "0.1" for 100 rps)
-/// ARGV[3]  = now_ms  (current Unix time in milliseconds)
+/// Every window is a rolling one: the buckets the window overlaps are summed
+/// whole, so no span the length of the window ever holds more than the limit,
+/// and a request gives its place back within one bucket of leaving the window.
+/// The time is the Redis server's, the one clock every node shares.
 ///
-/// Returns: {1, remaining}  if allowed
-///          {0, 0}          if denied
-const TOKEN_BUCKET_LUA: &str = r"
-local key        = KEYS[1]
-local max_tokens = tonumber(ARGV[1])
-local rate_ms    = tonumber(ARGV[2])
-local now        = tonumber(ARGV[3])
+/// KEYS[1]   = token bucket hash
+/// KEYS[2]   = per-minute window hash
+/// KEYS[3]   = per-hour window hash
+/// ARGV[1]   = 1 to count the per-second limit here, 0 when each node does
+/// ARGV[2]   = burst capacity
+/// ARGV[3]   = tokens per millisecond
+/// ARGV[4-6] = per-minute limit (-1 for none), bucket length in ms, buckets
+/// ARGV[7-9] = per-hour limit (-1 for none), bucket length in ms, buckets
+/// ARGV[10]  = requests this node admitted while Redis did not answer
+///
+/// Returns: {1, 0, 0}                    if allowed
+///          {0, reason, retry_after_ms}  if refused (1 second, 2 minute, 3 hour)
+const RATE_CHECK_LUA: &str = r"
+local time  = redis.call('TIME')
+local now   = tonumber(time[1]) * 1000 + math.floor(tonumber(time[2]) / 1000)
+local carry = tonumber(ARGV[10])
 
-local data       = redis.call('HMGET', key, 't', 'ts')
-local tokens     = tonumber(data[1]) or max_tokens
-local last_ts    = tonumber(data[2]) or now
-
-local elapsed    = math.max(0, now - last_ts)
-tokens           = math.min(max_tokens, tokens + elapsed * rate_ms)
-
--- TTL: time to refill from 0 to max_tokens plus a generous buffer
-local ttl_ms = math.ceil(max_tokens / math.max(rate_ms, 0.000001)) + 5000
-
-if tokens >= 1.0 then
-    tokens = tokens - 1.0
-    redis.call('HMSET', key, 't', tostring(tokens), 'ts', tostring(now))
-    redis.call('PEXPIRE', key, ttl_ms)
-    return {1, math.floor(tokens)}
-else
-    redis.call('HMSET', key, 't', tostring(tokens), 'ts', tostring(now))
-    redis.call('PEXPIRE', key, ttl_ms)
-    return {0, 0}
+local function read_window(key, limit, bucket_ms, buckets)
+    if limit < 0 then
+        return nil
+    end
+    local index = math.floor(now / bucket_ms)
+    local counts, used = {}, 0
+    local fields = redis.call('HGETALL', key)
+    for i = 1, #fields, 2 do
+        local at, count = tonumber(fields[i]), tonumber(fields[i + 1])
+        if at < index - buckets then
+            redis.call('HDEL', key, fields[i])
+        else
+            counts[at] = count
+            used = used + count
+        end
+    end
+    local window = {key = key, limit = limit, bucket_ms = bucket_ms, buckets = buckets,
+                    index = index, counts = counts, used = used}
+    if carry > 0 then
+        counts[index] = (counts[index] or 0) + carry
+        window.used = used + carry
+        redis.call('HINCRBY', key, string.format('%.0f', index), carry)
+        redis.call('PEXPIRE', key, bucket_ms * (buckets + 2))
+    end
+    return window
 end
+
+local function refuses(window)
+    return window ~= nil and window.used + 1 > window.limit
+end
+
+-- Milliseconds until enough of the oldest buckets have left the window.
+local function retry_after(window)
+    local need = window.used + 1 - window.limit
+    for at = window.index - window.buckets, window.index do
+        need = need - (window.counts[at] or 0)
+        if need <= 0 then
+            return (at + window.buckets + 1) * window.bucket_ms - now
+        end
+    end
+    return (window.buckets + 1) * window.bucket_ms
+end
+
+local function count_in(window)
+    if window ~= nil then
+        redis.call('HINCRBY', window.key, string.format('%.0f', window.index), 1)
+        redis.call('PEXPIRE', window.key, window.bucket_ms * (window.buckets + 2))
+    end
+end
+
+local minute = read_window(KEYS[2], tonumber(ARGV[4]), tonumber(ARGV[5]), tonumber(ARGV[6]))
+local hour   = read_window(KEYS[3], tonumber(ARGV[7]), tonumber(ARGV[8]), tonumber(ARGV[9]))
+
+local tokens
+local burst = tonumber(ARGV[2])
+local rate  = math.max(tonumber(ARGV[3]), 0.000001)
+if ARGV[1] == '1' then
+    local held = redis.call('HMGET', KEYS[1], 't', 'ts')
+    local last = tonumber(held[2]) or now
+    tokens = math.min(burst, (tonumber(held[1]) or burst) + math.max(0, now - last) * rate)
+    if tokens < 1 then
+        return {0, 1, math.ceil((1 - tokens) / rate)}
+    end
+end
+if refuses(minute) then
+    return {0, 2, retry_after(minute)}
+end
+if refuses(hour) then
+    return {0, 3, retry_after(hour)}
+end
+
+if tokens ~= nil then
+    redis.call('HSET', KEYS[1], 't', string.format('%.17g', tokens - 1),
+               'ts', string.format('%.0f', now))
+    redis.call('PEXPIRE', KEYS[1], math.ceil(burst / rate) + 5000)
+end
+count_in(minute)
+count_in(hour)
+return {1, 0, 0}
 ";
 
-/// Lua script: atomic fixed-window counter.
-///
-/// KEYS[1]  = counter key  (e.g. "pqcp:sw:1m:SourceIp:1.2.3.4:28123456")
-/// ARGV[1]  = limit  (integer)
-/// ARGV[2]  = window_ttl  (seconds, integer)
-///
-/// Returns: {1, remaining}  if allowed
-///          {0, 0}          if denied
-const SLIDING_WINDOW_LUA: &str = r"
-local key   = KEYS[1]
-local limit = tonumber(ARGV[1])
-local ttl   = tonumber(ARGV[2])
+static RATE_CHECK_SCRIPT: LazyLock<redis::Script> =
+    LazyLock::new(|| redis::Script::new(RATE_CHECK_LUA));
 
-local count = redis.call('INCR', key)
-if count == 1 then
-    redis.call('EXPIRE', key, ttl)
-end
+/// A Redis URL with any password taken out, for the log.
+fn redis_url_for_log(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let host = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+            format!("{scheme}://{host}")
+        }
+        None => "redis".to_string(),
+    }
+}
 
-if count > limit then
-    return {0, 0}
-else
-    return {1, limit - count}
-end
-";
+/// The shortest and longest time Redis is left alone after it fails to answer.
+const REDIS_BACKOFF_MIN_MS: u64 = 250;
+const REDIS_BACKOFF_MAX_MS: u64 = 5_000;
+
+/// Whether Redis is worth asking.
+///
+/// A request that finds Redis failing would otherwise wait out the command
+/// timeout before being counted here. After a failure nothing asks Redis until
+/// the backoff has passed; then one request does, and its answer decides.
+#[derive(Debug)]
+struct RedisHealth {
+    started: Instant,
+    /// When Redis may be asked again, in ms since `started`; 0 when it is up
+    retry_at_ms: AtomicU64,
+    failures: AtomicU32,
+}
+
+impl RedisHealth {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            retry_at_ms: AtomicU64::new(0),
+            failures: AtomicU32::new(0),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1)
+    }
+
+    fn backoff_ms(failures: u32) -> u64 {
+        REDIS_BACKOFF_MIN_MS
+            .saturating_mul(1u64 << failures.saturating_sub(1).min(8))
+            .min(REDIS_BACKOFF_MAX_MS)
+    }
+
+    fn is_up(&self) -> bool {
+        self.retry_at_ms.load(Ordering::Acquire) == 0
+    }
+
+    /// Whether this request may ask Redis. Moving the deadline is what makes
+    /// one request the one that tries, and no request can leave it stuck.
+    fn may_ask(&self) -> bool {
+        let retry_at = self.retry_at_ms.load(Ordering::Acquire);
+        if retry_at == 0 {
+            return true;
+        }
+        let now = self.now_ms();
+        now >= retry_at
+            && self
+                .retry_at_ms
+                .compare_exchange(
+                    retry_at,
+                    now + Self::backoff_ms(self.failures.load(Ordering::Acquire)),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+    }
+
+    fn answered(&self) {
+        if self.retry_at_ms.swap(0, Ordering::AcqRel) != 0 {
+            self.failures.store(0, Ordering::Release);
+            info!("Distributed rate limiting: Redis is answering again");
+        }
+    }
+
+    fn failed(&self, why: &str) {
+        let failures = self
+            .failures
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        let retry_at = self.now_ms() + Self::backoff_ms(failures);
+        if self.retry_at_ms.swap(retry_at, Ordering::AcqRel) == 0 {
+            warn!(
+                "Distributed rate limiting: Redis did not answer ({why}), counting on this node until it does"
+            );
+        }
+    }
+}
 
 /// Redis-backed distributed rate-limit counters.
 ///
@@ -795,6 +966,9 @@ pub struct RedisBackend {
     prefix: String,
     cmd_timeout: Duration,
     distribute_per_second: bool,
+    health: RedisHealth,
+    minute_window: WindowShape,
+    hour_window: WindowShape,
 }
 
 impl RedisBackend {
@@ -818,144 +992,117 @@ impl RedisBackend {
             prefix: config.key_prefix.clone(),
             cmd_timeout: Duration::from_millis(config.command_timeout_ms),
             distribute_per_second: config.distribute_per_second,
+            health: RedisHealth::new(),
+            minute_window: MINUTE_WINDOW,
+            hour_window: HOUR_WINDOW,
         })
     }
 
-    // ── Key helpers ─────────────────────────────────────────────────────────
-
-    fn tb_key(&self, key_str: &str) -> String {
-        format!("{}:tb:{}", self.prefix, key_str)
+    /// One of a key's three hashes. The braces keep the three in one Redis
+    /// Cluster slot, as a script's keys must be.
+    fn limit_key(&self, kind: &str, key_str: &str) -> String {
+        format!("{}:{{{}}}:{}", self.prefix, key_str, kind)
     }
 
-    fn sw_key(&self, label: &str, key_str: &str, bucket: u64) -> String {
-        format!("{}:sw:{}:{}:{}", self.prefix, label, key_str, bucket)
-    }
-
-    // ── Token-bucket (per-second) ────────────────────────────────────────────
-
-    /// Distributed token-bucket check.  Returns `None` on Redis error
-    /// (caller should fall back to in-memory).
-    pub async fn check_token_bucket(
-        &self,
-        key_str: &str,
-        rps: u32,
-        burst: u32,
-    ) -> Option<RateLimitResult> {
-        if !self.distribute_per_second {
-            return None; // caller uses local governor
-        }
-
-        let redis_key = self.tb_key(key_str);
-        let max_tokens = burst as f64;
-        let tokens_per_ms = rps as f64 / 1000.0;
-        // Milliseconds, as the script's refill rate is per millisecond: taken
-        // in whole seconds, a bucket refilled in one lump a second.
-        let now_ms: u64 = u64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
-        )
-        .unwrap_or(u64::MAX);
-
-        let mut conn = self.conn.clone();
-        let result: Result<(i64, i64), _> = tokio::time::timeout(self.cmd_timeout, async {
-            redis::Script::new(TOKEN_BUCKET_LUA)
-                .key(&redis_key)
-                .arg(max_tokens)
-                .arg(tokens_per_ms)
-                .arg(now_ms)
-                .invoke_async(&mut conn)
-                .await
-        })
-        .await
-        .map_err(|_| ())
-        .and_then(|r| r.map_err(|_| ()));
-
-        match result {
-            Ok((1, remaining)) => Some(RateLimitResult::Allowed {
-                remaining: u32::try_from(remaining.max(0)).unwrap_or(0),
-                limit: rps,
-            }),
-            Ok(_) => Some(RateLimitResult::Limited {
-                reason: LimitReason::PerSecond,
-                retry_after_ms: 1_000,
-                limit: rps,
-            }),
-            Err(()) => {
-                warn!(
-                    "Redis token-bucket error for key '{}', falling back to local",
-                    key_str
-                );
-                None
-            }
-        }
-    }
-
-    // ── Sliding-window (per-minute / per-hour) ───────────────────────────────
-
-    /// Distributed sliding-window check.
+    /// Check a request against the key's limits in Redis and count it there
+    /// if they allow it, together with the `carry` requests this node admitted
+    /// while Redis did not answer.
     ///
-    /// `window_secs` must be 60 (per-minute) or 3600 (per-hour).
-    /// Returns `None` on Redis error.
-    pub async fn check_sliding_window(
+    /// Returns `None` when Redis does not answer, or was not asked because it
+    /// recently did not: the caller counts the request on this node.
+    pub async fn check_limits(
         &self,
         key_str: &str,
-        limit: u32,
-        window_secs: u64,
-        label: &str,
+        limits: &PerKeyLimits,
+        carry: u64,
     ) -> Option<RateLimitResult> {
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let bucket = now_secs / window_secs;
-        let redis_key = self.sw_key(label, key_str, bucket);
+        if !self.health.may_ask() {
+            return None;
+        }
 
-        // TTL = 2× window so the key expires cleanly even if there's clock skew.
-        let ttl = window_secs * 2;
-
+        let window_limit = |limit: Option<u32>| limit.map_or(-1, i64::from);
         let mut conn = self.conn.clone();
-        let result: Result<(i64, i64), _> = tokio::time::timeout(self.cmd_timeout, async {
-            redis::Script::new(SLIDING_WINDOW_LUA)
-                .key(&redis_key)
-                .arg(limit)
-                .arg(ttl)
-                .invoke_async(&mut conn)
-                .await
-        })
-        .await
-        .map_err(|_| ())
-        .and_then(|r| r.map_err(|_| ()));
+        let answer: Result<Result<(i64, i64, i64), redis::RedisError>, _> =
+            tokio::time::timeout(self.cmd_timeout, async {
+                RATE_CHECK_SCRIPT
+                    .key(self.limit_key("tb", key_str))
+                    .key(self.limit_key("1m", key_str))
+                    .key(self.limit_key("1h", key_str))
+                    .arg(i32::from(self.distribute_per_second))
+                    .arg(limits.burst_size)
+                    .arg(f64::from(limits.requests_per_second) / 1000.0)
+                    .arg(window_limit(limits.requests_per_minute))
+                    .arg(self.minute_window.bucket_ms)
+                    .arg(self.minute_window.buckets)
+                    .arg(window_limit(limits.requests_per_hour))
+                    .arg(self.hour_window.bucket_ms)
+                    .arg(self.hour_window.buckets)
+                    .arg(carry)
+                    .invoke_async(&mut conn)
+                    .await
+            })
+            .await;
 
-        let retry_after_ms: u64 = {
-            // Time remaining until the current window expires.
-            let window_start = bucket * window_secs;
-            let window_end = window_start + window_secs;
-            (window_end.saturating_sub(now_secs)) * 1_000
-        };
-
-        match result {
-            Ok((1, remaining)) => Some(RateLimitResult::Allowed {
-                remaining: u32::try_from(remaining.max(0)).unwrap_or(0),
-                limit,
-            }),
-            Ok(_) => Some(RateLimitResult::Limited {
-                reason: if window_secs <= 60 {
-                    LimitReason::PerMinute
-                } else {
-                    LimitReason::PerHour
-                },
-                retry_after_ms,
-                limit,
-            }),
-            Err(()) => {
-                warn!(
-                    "Redis sliding-window error for key '{}' ({}), falling back to local",
-                    key_str, label
-                );
-                None
+        let (allowed, reason, retry_after) = match answer {
+            Ok(Ok(verdict)) => verdict,
+            Ok(Err(error)) => {
+                self.health.failed(&error.to_string());
+                return None;
             }
+            Err(_) => {
+                self.health.failed("command timed out");
+                return None;
+            }
+        };
+        self.health.answered();
+
+        if allowed == 1 {
+            return Some(RateLimitResult::Allowed {
+                remaining: limits.requests_per_second.saturating_sub(1),
+                limit: limits.requests_per_second,
+            });
+        }
+        let (reason, limit) = match reason {
+            1 => (LimitReason::PerSecond, limits.requests_per_second),
+            2 => (
+                LimitReason::PerMinute,
+                limits.requests_per_minute.unwrap_or(0),
+            ),
+            _ => (LimitReason::PerHour, limits.requests_per_hour.unwrap_or(0)),
+        };
+        Some(RateLimitResult::Limited {
+            reason,
+            retry_after_ms: u64::try_from(retry_after).unwrap_or(0).max(1),
+            limit,
+        })
+    }
+}
+
+/// Requests admitted while Redis did not answer, taken to be sent with this
+/// request. They go back if they are not delivered, even if the request is
+/// dropped while it waits.
+struct TakenCarry<'a> {
+    unsynced: &'a AtomicU64,
+    count: u64,
+}
+
+impl<'a> TakenCarry<'a> {
+    fn take(unsynced: &'a AtomicU64) -> Self {
+        Self {
+            count: unsynced.swap(0, Ordering::AcqRel),
+            unsynced,
+        }
+    }
+
+    fn delivered(mut self) {
+        self.count = 0;
+    }
+}
+
+impl Drop for TakenCarry<'_> {
+    fn drop(&mut self) {
+        if self.count > 0 {
+            self.unsynced.fetch_add(self.count, Ordering::AcqRel);
         }
     }
 }
@@ -1155,82 +1302,160 @@ impl RateLimitContext {
 // SLIDING WINDOW COUNTER
 // ============================================================================
 
-/// Sliding window rate counter for minute/hour limits
+/// Why a window refused a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowRefusal {
+    reason: LimitReason,
+    retry_after_ms: u64,
+    limit: u32,
+}
+
+/// The counts of a window's buckets, in a ring.
+#[derive(Debug)]
+struct WindowState {
+    counts: Vec<u64>,
+    /// The bucket time has reached
+    newest: u64,
+}
+
+impl WindowState {
+    fn slot(&self, bucket: u64) -> usize {
+        usize::try_from(bucket % self.counts.len() as u64).unwrap_or(0)
+    }
+
+    /// Move to `bucket`, emptying the buckets that have left the window.
+    fn advance(&mut self, bucket: u64) {
+        if bucket <= self.newest {
+            return;
+        }
+        let steps = (bucket - self.newest).min(self.counts.len() as u64);
+        for step in 1..=steps {
+            let slot = self.slot(self.newest + step);
+            self.counts[slot] = 0;
+        }
+        self.newest = bucket;
+    }
+
+    fn used(&self) -> u64 {
+        self.counts.iter().sum()
+    }
+
+    fn count_one(&mut self) {
+        let slot = self.slot(self.newest);
+        self.counts[slot] += 1;
+    }
+}
+
+/// Rolling window rate counter for minute/hour limits
+///
+/// The buckets the window overlaps are summed whole, so no span the length of
+/// the window ever holds more than the limit, and a request gives its place
+/// back within one bucket of leaving the window. The Redis script counts the
+/// same way (`RATE_CHECK_LUA`).
 #[derive(Debug)]
 pub struct SlidingWindowCounter {
-    /// Number of buckets (granularity)
-    num_buckets: usize,
+    /// Bucket length in milliseconds
+    bucket_ms: u64,
 
-    /// Bucket counts
-    buckets: Vec<AtomicU64>,
+    /// The moment bucket 0 began
+    origin: Instant,
 
-    /// Current bucket index
-    current_bucket: AtomicU64,
-
-    /// Last update timestamp
-    last_update: RwLock<Instant>,
-
-    /// Bucket duration in seconds
-    bucket_duration_secs: u64,
+    /// One slot more than `num_buckets`: the bucket the window's far edge is in
+    state: Mutex<WindowState>,
 }
 
 impl SlidingWindowCounter {
     pub fn new(window_secs: u64, num_buckets: usize) -> Self {
-        let buckets = (0..num_buckets).map(|_| AtomicU64::new(0)).collect();
-        let bucket_duration_secs = window_secs / num_buckets as u64;
-
         Self {
-            num_buckets,
-            buckets,
-            current_bucket: AtomicU64::new(0),
-            last_update: RwLock::new(Instant::now()),
-            bucket_duration_secs,
+            bucket_ms: (window_secs * 1000 / num_buckets as u64).max(1),
+            origin: Instant::now(),
+            state: Mutex::new(WindowState {
+                counts: vec![0; num_buckets + 1],
+                newest: 0,
+            }),
         }
     }
 
-    /// Increment counter and return current count
+    /// The window's state as of `now`, held until the guard is dropped.
+    fn state_at(&self, now: Instant) -> MutexGuard<'_, WindowState> {
+        let elapsed = u64::try_from(now.saturating_duration_since(self.origin).as_millis())
+            .unwrap_or(u64::MAX);
+        let mut state = self.state.lock();
+        state.advance(elapsed / self.bucket_ms);
+        state
+    }
+
+    /// Count a request whatever the limit, and return the count
     pub fn increment(&self) -> u64 {
-        self.rotate_buckets();
-
-        let current = usize::try_from(self.current_bucket.load(Ordering::Relaxed))
-            .unwrap_or(usize::MAX)
-            % self.num_buckets;
-        self.buckets[current].fetch_add(1, Ordering::Relaxed);
-
-        self.get_count()
+        let mut state = self.state_at(Instant::now());
+        state.count_one();
+        state.used()
     }
 
     /// Get current count across all buckets
     pub fn get_count(&self) -> u64 {
-        self.rotate_buckets();
-        self.buckets.iter().map(|b| b.load(Ordering::Relaxed)).sum()
+        self.state_at(Instant::now()).used()
     }
 
-    /// Rotate buckets based on elapsed time
-    fn rotate_buckets(&self) {
-        let mut last_update = self.last_update.write();
-        let elapsed = last_update.elapsed();
-        let buckets_to_rotate =
-            usize::try_from(elapsed.as_secs() / self.bucket_duration_secs).unwrap_or(usize::MAX);
-
-        if buckets_to_rotate > 0 {
-            let current =
-                usize::try_from(self.current_bucket.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
-
-            // Clear old buckets
-            for i in 1..=buckets_to_rotate.min(self.num_buckets) {
-                let idx = (current + i) % self.num_buckets;
-                self.buckets[idx].store(0, Ordering::Relaxed);
+    /// Milliseconds from `now` until the window has room for one more request.
+    fn retry_after_ms(&self, state: &WindowState, limit: u32, now: Instant) -> u64 {
+        let elapsed = u64::try_from(now.saturating_duration_since(self.origin).as_millis())
+            .unwrap_or(u64::MAX);
+        let span = state.counts.len() as u64;
+        let mut need = (state.used() + 1).saturating_sub(u64::from(limit));
+        // Oldest first: the slot after the newest holds the oldest bucket.
+        for age in 0..span {
+            let bucket = state.newest + 1 + age;
+            let count = state.counts[state.slot(bucket)];
+            if count >= need {
+                // That bucket is empty again one whole window after it began.
+                return (bucket * self.bucket_ms)
+                    .saturating_sub(elapsed % self.bucket_ms + state.newest * self.bucket_ms)
+                    .max(1);
             }
-
-            // Update current bucket
-            self.current_bucket.store(
-                ((current + buckets_to_rotate) % self.num_buckets) as u64,
-                Ordering::Relaxed,
-            );
-
-            *last_update = Instant::now();
+            need -= count;
         }
+        span * self.bucket_ms
+    }
+
+    /// Count a request in both windows if both have room, and in neither if
+    /// one does not. A refused request is not counted: a client that keeps
+    /// retrying gets its place back as soon as one that waits would.
+    fn try_acquire(
+        minute: Option<(&Self, u32)>,
+        hour: Option<(&Self, u32)>,
+        now: Instant,
+    ) -> Result<(), WindowRefusal> {
+        // Always the minute's lock first.
+        let mut minute = minute.map(|(window, limit)| (window, limit, window.state_at(now)));
+        let mut hour = hour.map(|(window, limit)| (window, limit, window.state_at(now)));
+
+        if let Some((window, limit, state)) = &minute {
+            if state.used() + 1 > u64::from(*limit) {
+                return Err(WindowRefusal {
+                    reason: LimitReason::PerMinute,
+                    retry_after_ms: window.retry_after_ms(state, *limit, now),
+                    limit: *limit,
+                });
+            }
+        }
+        if let Some((window, limit, state)) = &hour {
+            if state.used() + 1 > u64::from(*limit) {
+                return Err(WindowRefusal {
+                    reason: LimitReason::PerHour,
+                    retry_after_ms: window.retry_after_ms(state, *limit, now),
+                    limit: *limit,
+                });
+            }
+        }
+
+        if let Some((_, _, state)) = &mut minute {
+            state.count_one();
+        }
+        if let Some((_, _, state)) = &mut hour {
+            state.count_one();
+        }
+        Ok(())
     }
 }
 
@@ -1408,6 +1633,10 @@ pub struct RateLimitBucket {
 
     /// Adaptive baseline (if enabled)
     pub baseline: Option<Arc<AdaptiveBaseline>>,
+
+    /// Requests admitted here while Redis did not answer, for it to count
+    /// once it does
+    unsynced: AtomicU64,
 }
 
 impl RateLimitBucket {
@@ -1420,11 +1649,11 @@ impl RateLimitBucket {
 
         let minute_counter = limits
             .requests_per_minute
-            .map(|_| Arc::new(SlidingWindowCounter::new(60, 12))); // 5-second buckets
+            .map(|_| Arc::new(MINUTE_WINDOW.counter()));
 
         let hour_counter = limits
             .requests_per_hour
-            .map(|_| Arc::new(SlidingWindowCounter::new(3600, 60))); // 1-minute buckets
+            .map(|_| Arc::new(HOUR_WINDOW.counter()));
 
         let baseline = adaptive_config.and_then(|config| {
             if config.enabled {
@@ -1448,6 +1677,7 @@ impl RateLimitBucket {
             total_requests: AtomicU64::new(0),
             total_blocked: AtomicU64::new(0),
             baseline,
+            unsynced: AtomicU64::new(0),
         }
     }
 
@@ -1501,47 +1731,59 @@ impl RateLimitBucket {
         let adjusted = self.effective_limits(limits, adaptive);
         let limits = &adjusted;
 
+        self.touch();
+        if let Some(refused) = self.check_second(limits) {
+            return refused;
+        }
+        self.check_windows(limits)
+    }
+
+    /// Note a request for the stats and the idle sweep.
+    fn touch(&self) {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         *self.last_request.write() = Instant::now();
+    }
 
-        // 1. Check token bucket (per-second)
-        if self.token_bucket.check().is_err() {
+    /// The per-second limit, on this node. `Some` when it refuses the request.
+    fn check_second(&self, limits: &PerKeyLimits) -> Option<RateLimitResult> {
+        if self.token_bucket.check().is_ok() {
+            return None;
+        }
+        self.total_blocked.fetch_add(1, Ordering::Relaxed);
+        Some(RateLimitResult::Limited {
+            reason: LimitReason::PerSecond,
+            retry_after_ms: 1000,
+            limit: limits.requests_per_second,
+        })
+    }
+
+    /// Count a request Redis admitted in this node's windows too, so that if
+    /// Redis stops answering they already hold what this client has used.
+    fn record_admitted(&self) {
+        if let Some(ref counter) = self.minute_counter {
+            counter.increment();
+        }
+        if let Some(ref counter) = self.hour_counter {
+            counter.increment();
+        }
+    }
+
+    /// The per-minute and per-hour limits and the adaptive baseline, on this
+    /// node.
+    fn check_windows(&self, limits: &PerKeyLimits) -> RateLimitResult {
+        // 2-3. Check the minute and hour limits (if configured)
+        let minute = self
+            .minute_counter
+            .as_deref()
+            .zip(limits.requests_per_minute);
+        let hour = self.hour_counter.as_deref().zip(limits.requests_per_hour);
+        if let Err(refusal) = SlidingWindowCounter::try_acquire(minute, hour, Instant::now()) {
             self.total_blocked.fetch_add(1, Ordering::Relaxed);
             return RateLimitResult::Limited {
-                reason: LimitReason::PerSecond,
-                retry_after_ms: 1000,
-                limit: limits.requests_per_second,
+                reason: refusal.reason,
+                retry_after_ms: refusal.retry_after_ms,
+                limit: refusal.limit,
             };
-        }
-
-        // 2. Check minute limit (if configured)
-        if let Some(ref counter) = self.minute_counter {
-            if let Some(limit) = limits.requests_per_minute {
-                let count = counter.increment();
-                if count > limit as u64 {
-                    self.total_blocked.fetch_add(1, Ordering::Relaxed);
-                    return RateLimitResult::Limited {
-                        reason: LimitReason::PerMinute,
-                        retry_after_ms: 60_000,
-                        limit,
-                    };
-                }
-            }
-        }
-
-        // 3. Check hour limit (if configured)
-        if let Some(ref counter) = self.hour_counter {
-            if let Some(limit) = limits.requests_per_hour {
-                let count = counter.increment();
-                if count > limit as u64 {
-                    self.total_blocked.fetch_add(1, Ordering::Relaxed);
-                    return RateLimitResult::Limited {
-                        reason: LimitReason::PerHour,
-                        retry_after_ms: 3_600_000,
-                        limit,
-                    };
-                }
-            }
         }
 
         // 4. Check adaptive baseline (if enabled)
@@ -1775,18 +2017,27 @@ impl AdvancedRateLimiter {
         if let Some(rcfg) = redis_cfg {
             let slot = limiter.redis_backend.clone();
             tokio::spawn(async move {
-                match RedisBackend::connect(&rcfg).await {
-                    Ok(backend) => {
-                        *slot.write().await = Some(Arc::new(backend));
-                        info!("Distributed rate limiting: Redis connected at {}", rcfg.url);
+                let url = redis_url_for_log(&rcfg.url);
+                let mut delay = Duration::from_secs(1);
+                let mut warned = false;
+                loop {
+                    match RedisBackend::connect(&rcfg).await {
+                        Ok(backend) => {
+                            *slot.write().await = Some(Arc::new(backend));
+                            info!("Distributed rate limiting: Redis connected at {url}");
+                            break;
+                        }
+                        Err(e) if !warned => {
+                            warned = true;
+                            warn!(
+                                "Distributed rate limiting: could not connect to Redis at {url}, \
+                                 counting on this node until it can. Error: {e}"
+                            );
+                        }
+                        Err(e) => debug!("Redis at {url} still refuses: {e}"),
                     }
-                    Err(e) => {
-                        warn!(
-                            "Distributed rate limiting: could not connect to Redis at {} — \
-                             falling back to in-memory rate limiting. Error: {}",
-                            rcfg.url, e
-                        );
-                    }
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(30));
                 }
             });
         }
@@ -2003,76 +2254,48 @@ impl AdvancedRateLimiter {
         charge: &Charge,
         adaptive_cfg: &AdaptiveConfig,
     ) -> RateLimitResult {
-        let (key_string, limits) = (charge.key_string.as_str(), &charge.limits);
-        // Per-second token bucket via Redis (or local governor fallback)
-        let tb_result = backend
-            .check_token_bucket(key_string, limits.requests_per_second, limits.burst_size)
-            .await;
+        let bucket = self.get_or_create_bucket(charge, adaptive_cfg);
+        let limits = bucket.effective_limits(&charge.limits, adaptive_cfg);
+        bucket.touch();
 
-        let token_result = match tb_result {
-            Some(r) => r,
-            // Redis failed → local governor
-            None => self.check_local(charge, adaptive_cfg),
-        };
-
-        if !matches!(token_result, RateLimitResult::Allowed { .. }) {
-            return token_result;
-        }
-
-        // Per-minute sliding window
-        if let Some(rpm) = limits.requests_per_minute {
-            let sw = backend
-                .check_sliding_window(key_string, rpm, 60, "1m")
-                .await;
-            match sw {
-                Some(r @ RateLimitResult::Limited { .. }) => return r,
-                Some(_) => {} // allowed
-                None => {
-                    // Redis failed — check local minute counter
-                    let local = self.get_or_create_bucket(charge, adaptive_cfg);
-                    if let Some(ref counter) = local.minute_counter {
-                        let count = counter.increment();
-                        if count > u64::from(rpm) {
-                            local.total_blocked.fetch_add(1, Ordering::Relaxed);
-                            return RateLimitResult::Limited {
-                                reason: LimitReason::PerMinute,
-                                retry_after_ms: 60_000,
-                                limit: rpm,
-                            };
-                        }
-                    }
-                }
+        if !backend.distribute_per_second {
+            if let Some(refused) = bucket.check_second(&limits) {
+                return refused;
             }
         }
 
-        // Per-hour sliding window
-        if let Some(rph) = limits.requests_per_hour {
-            let sw = backend
-                .check_sliding_window(key_string, rph, 3600, "1h")
-                .await;
-            match sw {
-                Some(r @ RateLimitResult::Limited { .. }) => return r,
-                Some(_) => {} // allowed
-                None => {
-                    // Redis failed — check local hour counter
-                    let local = self.get_or_create_bucket(charge, adaptive_cfg);
-                    if let Some(ref counter) = local.hour_counter {
-                        let count = counter.increment();
-                        if count > u64::from(rph) {
-                            local.total_blocked.fetch_add(1, Ordering::Relaxed);
-                            return RateLimitResult::Limited {
-                                reason: LimitReason::PerHour,
-                                retry_after_ms: 3_600_000,
-                                limit: rph,
-                            };
-                        }
+        let carry = TakenCarry::take(&bucket.unsynced);
+        match backend
+            .check_limits(&charge.key_string, &limits, carry.count)
+            .await
+        {
+            Some(RateLimitResult::Allowed { .. }) => {
+                carry.delivered();
+                bucket.record_admitted();
+                // Adaptive anomaly detection (always local — per-node baseline)
+                self.check_adaptive(charge, adaptive_cfg)
+            }
+            Some(refused) => {
+                carry.delivered();
+                bucket.total_blocked.fetch_add(1, Ordering::Relaxed);
+                refused
+            }
+            // Redis did not answer: this node counts the request, once, and
+            // Redis is told when it answers again.
+            None => {
+                drop(carry);
+                if backend.distribute_per_second {
+                    if let Some(refused) = bucket.check_second(&limits) {
+                        return refused;
                     }
                 }
+                let counted = bucket.check_windows(&limits);
+                if matches!(counted, RateLimitResult::Allowed { .. }) {
+                    bucket.unsynced.fetch_add(1, Ordering::AcqRel);
+                }
+                counted
             }
         }
-
-        // Adaptive anomaly detection (always local — per-node baseline)
-        self.check_adaptive(charge, adaptive_cfg)
     }
 
     // ── Internal: local in-memory path ──────────────────────────────────────
@@ -2698,7 +2921,7 @@ impl AdvancedRateLimiter {
         let redis_connected = self
             .redis_backend
             .try_read()
-            .map(|g| g.is_some())
+            .map(|g| g.as_ref().is_some_and(|backend| backend.health.is_up()))
             .unwrap_or(false); // lock held → assume state unknown, report false
 
         RateLimiterSnapshot {
@@ -2936,9 +3159,11 @@ mod tests {
                 .is_err(),
             "short for HS512"
         );
-        assert!(with(Some(&"k".repeat(64)), &["HS256", "HS512"])
-            .validate()
-            .is_ok());
+        assert!(
+            with(Some(&"k".repeat(64)), &["HS256", "HS512"])
+                .validate()
+                .is_ok()
+        );
         assert!(with(None, &["RS256"]).validate().is_err(), "not HMAC");
     }
 
@@ -3819,5 +4044,523 @@ mod tests {
         let ctx = ctx_from([198, 51, 100, 9], None, Some("abc"));
         let _ = limiter.check(&ctx).await;
         assert_eq!(limiter.reset_key("198.51.100.9"), 2);
+    }
+}
+
+#[cfg(test)]
+mod rolling_window_tests {
+    use super::*;
+
+    fn at(window: &SlidingWindowCounter, ms: u64) -> Instant {
+        window.origin + Duration::from_millis(ms)
+    }
+
+    fn take(window: &SlidingWindowCounter, limit: u32, ms: u64) -> Result<(), WindowRefusal> {
+        SlidingWindowCounter::try_acquire(Some((window, limit)), None, at(window, ms))
+    }
+
+    #[test]
+    fn a_burst_on_each_side_of_a_minute_boundary_is_one_window() {
+        let window = SlidingWindowCounter::new(60, 12);
+        for _ in 0..100 {
+            take(&window, 100, 59_900).unwrap();
+        }
+        assert_eq!(
+            take(&window, 100, 60_100).unwrap_err().reason,
+            LimitReason::PerMinute
+        );
+    }
+
+    #[test]
+    fn no_span_of_the_window_ever_holds_more_than_the_limit() {
+        let window = SlidingWindowCounter::new(60, 12);
+        let mut admitted = Vec::new();
+        for ms in (0..300_000).step_by(37) {
+            if take(&window, 50, ms).is_ok() {
+                admitted.push(ms);
+            }
+        }
+        assert!(admitted.len() > 200, "admitted {}", admitted.len());
+        for (first, start) in admitted.iter().enumerate() {
+            let inside = admitted[first..]
+                .iter()
+                .take_while(|ms| **ms < start + 60_000)
+                .count();
+            assert!(inside <= 50, "{inside} requests in the minute from {start}");
+        }
+    }
+
+    #[test]
+    fn a_request_leaves_within_one_bucket_of_the_window() {
+        let window = SlidingWindowCounter::new(60, 12);
+        for _ in 0..100 {
+            take(&window, 100, 0).unwrap();
+        }
+        assert!(take(&window, 100, 64_999).is_err());
+        assert!(take(&window, 100, 65_000).is_ok());
+    }
+
+    #[test]
+    fn a_refused_request_is_not_counted() {
+        let window = SlidingWindowCounter::new(60, 12);
+        for _ in 0..10 {
+            take(&window, 10, 0).unwrap();
+        }
+        for ms in (1..65_000).step_by(100) {
+            assert!(take(&window, 10, ms).is_err());
+        }
+        assert!(take(&window, 10, 65_000).is_ok());
+    }
+
+    #[test]
+    fn retry_after_is_the_moment_there_is_room() {
+        let window = SlidingWindowCounter::new(60, 12);
+        for _ in 0..10 {
+            take(&window, 10, 2_000).unwrap();
+        }
+        let wait = take(&window, 10, 30_500).unwrap_err().retry_after_ms;
+        assert_eq!(wait, 65_000 - 30_500);
+        assert!(take(&window, 10, 30_500 + wait - 1).is_err());
+        assert!(take(&window, 10, 30_500 + wait).is_ok());
+    }
+
+    #[test]
+    fn retry_after_frees_only_as_many_buckets_as_it_needs() {
+        let window = SlidingWindowCounter::new(60, 12);
+        for _ in 0..4 {
+            take(&window, 10, 0).unwrap();
+        }
+        for _ in 0..6 {
+            take(&window, 10, 20_000).unwrap();
+        }
+        assert_eq!(
+            take(&window, 10, 30_000).unwrap_err().retry_after_ms,
+            35_000
+        );
+    }
+
+    #[test]
+    fn a_long_quiet_spell_empties_the_window() {
+        let window = SlidingWindowCounter::new(60, 12);
+        for _ in 0..10 {
+            take(&window, 10, 0).unwrap();
+        }
+        take(&window, 10, 3_600_000).unwrap();
+        assert_eq!(window.state_at(at(&window, 3_600_000)).used(), 1);
+    }
+
+    #[test]
+    fn a_request_one_window_refuses_is_counted_in_neither() {
+        let minute = SlidingWindowCounter::new(60, 12);
+        let hour = SlidingWindowCounter::new(3600, 60);
+        let now = minute.origin.max(hour.origin) + Duration::from_secs(1);
+        for _ in 0..3 {
+            SlidingWindowCounter::try_acquire(Some((&minute, 100)), Some((&hour, 3)), now).unwrap();
+        }
+        let refused =
+            SlidingWindowCounter::try_acquire(Some((&minute, 100)), Some((&hour, 3)), now)
+                .unwrap_err();
+        assert_eq!(refused.reason, LimitReason::PerHour);
+        assert_eq!(minute.state_at(now).used(), 3);
+        assert_eq!(hour.state_at(now).used(), 3);
+    }
+
+    #[test]
+    fn a_password_in_a_redis_url_stays_out_of_the_log() {
+        assert_eq!(
+            redis_url_for_log("redis://:hunter2@cache.internal:6379/0"),
+            "redis://cache.internal:6379/0"
+        );
+        assert_eq!(
+            redis_url_for_log("redis://127.0.0.1:6379"),
+            "redis://127.0.0.1:6379"
+        );
+    }
+
+    #[test]
+    fn after_a_failure_redis_is_left_alone_until_the_backoff_passes() {
+        let health = RedisHealth::new();
+        assert!(health.may_ask());
+        health.failed("test");
+        assert!(!health.is_up());
+        assert!(!health.may_ask());
+
+        health.retry_at_ms.store(1, Ordering::Release);
+        assert!(
+            health.may_ask(),
+            "the first request after the backoff tries"
+        );
+        assert!(!health.may_ask(), "and only that one");
+
+        health.answered();
+        assert!(health.is_up());
+        assert!(health.may_ask());
+    }
+
+    #[test]
+    fn the_backoff_grows_to_its_ceiling() {
+        assert_eq!(RedisHealth::backoff_ms(1), REDIS_BACKOFF_MIN_MS);
+        assert_eq!(RedisHealth::backoff_ms(2), REDIS_BACKOFF_MIN_MS * 2);
+        assert_eq!(RedisHealth::backoff_ms(40), REDIS_BACKOFF_MAX_MS);
+    }
+}
+
+/// Against a real `redis-server`, started for each test. Without one these
+/// tests skip, unless `PQCRYPTA_REQUIRE_REDIS` is set, as it is in CI.
+#[cfg(test)]
+mod redis_limit_tests {
+    use super::*;
+    use std::process::{Child, Command, Stdio};
+
+    struct TestRedis {
+        child: Child,
+        port: u16,
+    }
+
+    impl TestRedis {
+        fn spawn(port: u16) -> Option<Self> {
+            let child = Command::new("redis-server")
+                .args(["--port", &port.to_string(), "--bind", "127.0.0.1"])
+                .args(["--save", "", "--appendonly", "no"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            match child {
+                Ok(child) => Some(Self { child, port }),
+                Err(error) => {
+                    assert!(
+                        std::env::var_os("PQCRYPTA_REQUIRE_REDIS").is_none(),
+                        "redis-server is required here: {error}"
+                    );
+                    eprintln!("skipped: no redis-server ({error})");
+                    None
+                }
+            }
+        }
+
+        async fn start_on(port: u16) -> Option<Self> {
+            let server = Self::spawn(port)?;
+            for _ in 0..200 {
+                if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .is_ok()
+                {
+                    return Some(server);
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("redis-server did not start on port {port}");
+        }
+
+        async fn start() -> Option<Self> {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            Self::start_on(port).await
+        }
+
+        fn config(&self) -> RedisConfig {
+            RedisConfig {
+                url: format!("redis://127.0.0.1:{}", self.port),
+                key_prefix: "test".to_string(),
+                connect_timeout_ms: 2_000,
+                command_timeout_ms: 500,
+                distribute_per_second: true,
+            }
+        }
+
+        fn stop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+
+        /// The requests held in one of a key's window hashes.
+        async fn counted(&self, kind: &str, key: &str) -> i64 {
+            let client = redis::Client::open(self.config().url).unwrap();
+            let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+            let counts: Vec<i64> = redis::cmd("HVALS")
+                .arg(format!("test:{{{key}}}:{kind}"))
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            counts.iter().sum()
+        }
+    }
+
+    impl Drop for TestRedis {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    fn limits(per_minute: Option<u32>, per_hour: Option<u32>) -> PerKeyLimits {
+        PerKeyLimits {
+            requests_per_second: 100_000,
+            burst_size: 100_000,
+            requests_per_minute: per_minute,
+            requests_per_hour: per_hour,
+        }
+    }
+
+    fn allowed(result: &Option<RateLimitResult>) -> bool {
+        matches!(result, Some(RateLimitResult::Allowed { .. }))
+    }
+
+    fn charge(limits: PerKeyLimits) -> Charge {
+        Charge {
+            key_string: "SourceIp:192.0.2.1".to_string(),
+            limits,
+            network_bound: true,
+        }
+    }
+
+    fn adaptive_off() -> AdaptiveConfig {
+        AdaptiveConfig {
+            enabled: false,
+            ..AdaptiveConfig::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_span_of_the_window_holds_more_than_the_limit() {
+        let Some(redis) = TestRedis::start().await else {
+            return;
+        };
+        let mut backend = RedisBackend::connect(&redis.config()).await.unwrap();
+        backend.minute_window = WindowShape {
+            bucket_ms: 50,
+            buckets: 6,
+        };
+        let limits = limits(Some(20), None);
+
+        let start = Instant::now();
+        let mut admitted = Vec::new();
+        while start.elapsed() < Duration::from_millis(1_500) {
+            if allowed(&backend.check_limits("k", &limits, 0).await) {
+                admitted.push(start.elapsed());
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        assert!(admitted.len() > 20, "admitted {}", admitted.len());
+        // A little under the window, for the time a reply takes to arrive.
+        let span = Duration::from_millis(270);
+        for (first, begin) in admitted.iter().enumerate() {
+            let inside = admitted[first..]
+                .iter()
+                .take_while(|at| **at < *begin + span)
+                .count();
+            assert!(inside <= 20, "{inside} requests in {span:?} from {begin:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_request_gives_a_wait_that_is_enough_and_is_not_counted() {
+        let Some(redis) = TestRedis::start().await else {
+            return;
+        };
+        let mut backend = RedisBackend::connect(&redis.config()).await.unwrap();
+        backend.minute_window = WindowShape {
+            bucket_ms: 100,
+            buckets: 3,
+        };
+        let limits = limits(Some(2), None);
+        assert!(allowed(&backend.check_limits("k", &limits, 0).await));
+        assert!(allowed(&backend.check_limits("k", &limits, 0).await));
+
+        let mut wait = 0;
+        for _ in 0..20 {
+            match backend.check_limits("k", &limits, 0).await {
+                Some(RateLimitResult::Limited {
+                    reason: LimitReason::PerMinute,
+                    retry_after_ms,
+                    limit: 2,
+                }) => wait = retry_after_ms,
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+        assert_eq!(redis.counted("1m", "k").await, 2);
+        assert!((1..=400).contains(&wait), "wait {wait}");
+
+        tokio::time::sleep(Duration::from_millis(wait + 5)).await;
+        assert!(allowed(&backend.check_limits("k", &limits, 0).await));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_the_hour_refuses_is_not_counted_in_the_minute() {
+        let Some(redis) = TestRedis::start().await else {
+            return;
+        };
+        let backend = RedisBackend::connect(&redis.config()).await.unwrap();
+        let limits = limits(Some(100), Some(3));
+        for _ in 0..3 {
+            assert!(allowed(&backend.check_limits("k", &limits, 0).await));
+        }
+        for _ in 0..5 {
+            assert!(!allowed(&backend.check_limits("k", &limits, 0).await));
+        }
+        assert_eq!(redis.counted("1m", "k").await, 3);
+        assert_eq!(redis.counted("1h", "k").await, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_nodes_share_one_count() {
+        let Some(redis) = TestRedis::start().await else {
+            return;
+        };
+        let first = RedisBackend::connect(&redis.config()).await.unwrap();
+        let second = RedisBackend::connect(&redis.config()).await.unwrap();
+        let limits = limits(Some(6), None);
+        let mut admitted = 0;
+        for _ in 0..10 {
+            admitted += i32::from(allowed(&first.check_limits("k", &limits, 0).await));
+            admitted += i32::from(allowed(&second.check_limits("k", &limits, 0).await));
+        }
+        assert_eq!(admitted, 6);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_per_second_limit_refills_by_the_servers_clock() {
+        let Some(redis) = TestRedis::start().await else {
+            return;
+        };
+        let backend = RedisBackend::connect(&redis.config()).await.unwrap();
+        let limits = PerKeyLimits {
+            requests_per_second: 10,
+            burst_size: 2,
+            requests_per_minute: None,
+            requests_per_hour: None,
+        };
+        assert!(allowed(&backend.check_limits("k", &limits, 0).await));
+        assert!(allowed(&backend.check_limits("k", &limits, 0).await));
+        match backend.check_limits("k", &limits, 0).await {
+            Some(RateLimitResult::Limited {
+                reason: LimitReason::PerSecond,
+                retry_after_ms,
+                ..
+            }) => assert!((1..=100).contains(&retry_after_ms), "{retry_after_ms}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(allowed(&backend.check_limits("k", &limits, 0).await));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn in_an_outage_each_request_is_counted_once() {
+        let Some(mut redis) = TestRedis::start().await else {
+            return;
+        };
+        let backend = RedisBackend::connect(&redis.config()).await.unwrap();
+        redis.stop();
+
+        let limiter = AdvancedRateLimiter::new(AdvancedRateLimitConfig::default());
+        let charge = charge(limits(Some(10), Some(10)));
+        let adaptive = adaptive_off();
+        for number in 1..=10 {
+            let result = limiter
+                .check_distributed(&backend, &charge, &adaptive)
+                .await;
+            assert!(
+                matches!(result, RateLimitResult::Allowed { .. }),
+                "request {number}: {result:?}"
+            );
+        }
+        let result = limiter
+            .check_distributed(&backend, &charge, &adaptive)
+            .await;
+        assert!(
+            matches!(result, RateLimitResult::Limited { .. }),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn in_an_outage_requests_do_not_wait_for_redis() {
+        let Some(mut redis) = TestRedis::start().await else {
+            return;
+        };
+        let backend = RedisBackend::connect(&redis.config()).await.unwrap();
+        redis.stop();
+
+        assert!(
+            backend
+                .check_limits("k", &limits(Some(9), None), 0)
+                .await
+                .is_none()
+        );
+        assert!(!backend.health.is_up());
+        assert!(!backend.health.may_ask());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn what_a_node_admitted_in_an_outage_reaches_redis_when_it_returns() {
+        let Some(mut redis) = TestRedis::start().await else {
+            return;
+        };
+        let port = redis.port;
+        let backend = RedisBackend::connect(&redis.config()).await.unwrap();
+        redis.stop();
+
+        let limiter = AdvancedRateLimiter::new(AdvancedRateLimitConfig::default());
+        let charge = charge(limits(Some(1_000), None));
+        let adaptive = adaptive_off();
+        let mut admitted = 0;
+        for _ in 0..5 {
+            limiter
+                .check_distributed(&backend, &charge, &adaptive)
+                .await;
+            admitted += 1;
+        }
+
+        let redis = TestRedis::start_on(port).await.unwrap();
+        for _ in 0..200 {
+            limiter
+                .check_distributed(&backend, &charge, &adaptive)
+                .await;
+            admitted += 1;
+            if backend.health.is_up() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(backend.health.is_up(), "Redis never answered again");
+        assert_eq!(redis.counted("1m", &charge.key_string).await, admitted);
+        let bucket = limiter.get_or_create_bucket(&charge, &adaptive);
+        assert_eq!(bucket.unsynced.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_proxy_started_before_redis_connects_once_redis_is_up() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let config = AdvancedRateLimitConfig {
+            redis: Some(RedisConfig {
+                url: format!("redis://127.0.0.1:{port}"),
+                key_prefix: "test".to_string(),
+                connect_timeout_ms: 300,
+                command_timeout_ms: 300,
+                distribute_per_second: true,
+            }),
+            ..AdvancedRateLimitConfig::default()
+        };
+        let limiter = AdvancedRateLimiter::new(config);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!limiter.get_stats().redis_connected);
+
+        let Some(_redis) = TestRedis::start_on(port).await else {
+            return;
+        };
+        for _ in 0..120 {
+            if limiter.get_stats().redis_connected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("the limiter never connected to Redis");
     }
 }

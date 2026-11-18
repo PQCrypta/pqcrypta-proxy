@@ -962,16 +962,19 @@ Request arrives on any path
   │     ├─ Resolve key (IP / API key / JA3 / JWT / composite)
   │     │
   │     ├─ Redis available?
-  │     │    YES → Lua token-bucket  (per-second, distributed, atomic EVAL)
-  │     │          Lua fixed-window  (per-minute, distributed, INCR+EXPIRE)
-  │     │          Lua fixed-window  (per-hour,   distributed, INCR+EXPIRE)
-  │     │          ── any command timeout → local DashMap fallback ──
+  │     │    YES → one atomic Lua check, on the Redis server's clock:
+  │     │          token bucket     (per-second)
+  │     │          rolling window   (per-minute, 12 buckets of 5 s)
+  │     │          rolling window   (per-hour,   60 buckets of 1 min)
+  │     │          ── no answer → counted on this node, sent to Redis when it returns ──
   │     │    NO  → local DashMap bucket (original behaviour)
   │     │
   │     └─ Adaptive anomaly detection (always local, per-node)
 ```
 
-**Graceful fallback**: if Redis is unreachable or a command exceeds `command_timeout_ms`, that single request silently falls back to the local in-memory bucket. No error is returned to the client and no exception is thrown. The proxy remains fully functional without Redis.
+**Rolling windows**: the per-minute and per-hour limits sum every bucket the window overlaps, here and in Redis, so no span the length of the window holds more than the limit, including across a minute or hour boundary. A request gives its place back within one bucket of leaving the window (5 s for the minute, 1 min for the hour). A refused request is not counted, and a request is counted in all of a key's limits or in none.
+
+**Graceful fallback**: if Redis is unreachable or a command exceeds `command_timeout_ms`, the request is counted once on this node, whose windows already hold what the client has used here. No error is returned to the client. After a failure Redis is left alone for 250 ms, growing to 5 s, so requests do not wait for it during an outage; then one request tries it. When Redis answers again, each key's next request adds what this node admitted in the meantime. A proxy that starts before Redis keeps trying to connect.
 
 **Admin API** reports `redis_connected: true/false` in the rate limiter stats snapshot so you can verify the connection is live.
 

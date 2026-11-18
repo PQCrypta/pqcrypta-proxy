@@ -617,8 +617,9 @@ std_dev_multiplier = 3.0  # Requests > mean + 3*std_dev = anomaly
 # The global token-bucket (DDoS guard) always runs in-process; only per-key
 # limits are distributed.
 #
-# On any Redis error (timeout, connection loss) the affected request falls back
-# transparently to the in-memory bucket — no dropped requests, no crashes.
+# On any Redis error (timeout, connection loss) the request is counted once on
+# this node, and Redis is told what it missed when it answers again: no dropped
+# requests, no crashes.
 #
 # Uncomment the section below to enable:
 #
