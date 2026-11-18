@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.2](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.17.1...v0.17.2) (2026-11-18)
+
+
+### Bug Fixes
+
+* **scripts:** the config drift check refuses a copy that holds a secret's value, not one without the token placeholder ([1d55fd6](https://github.com/PQCrypta/pqcrypta-proxy/commit/1d55fd620b3eac0eb723e05e9e711a3339a53750))
+
 ## [0.17.1](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.17.0...v0.17.1) (2026-11-18)
 
 
