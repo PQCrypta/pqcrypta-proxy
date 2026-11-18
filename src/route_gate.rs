@@ -320,6 +320,25 @@ fn mtls_gate(cx: &GateContext<'_>) -> Option<GateOutcome> {
     None
 }
 
+/// The HMAC proof of possession over a request.
+///
+/// Hex HMAC-SHA256, under `secret`, of
+/// `METHOD\nPATH_AND_QUERY\nTIMESTAMP\nNONCE`. The route gate and the admin
+/// API verify it; `pqcrypta-proxy --admin` signs with it.
+pub fn request_signature(
+    secret: &str,
+    method: &str,
+    path_and_query: &str,
+    timestamp: &str,
+    nonce: &str,
+) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac =
+        Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key size");
+    mac.update(format!("{method}\n{path_and_query}\n{timestamp}\n{nonce}").as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
 /// Per-route HMAC proof-of-possession.
 ///
 /// Signature = HMAC-SHA256(METHOD\nPATH_AND_QUERY\nTIMESTAMP\nNONCE, secret).
@@ -328,8 +347,6 @@ fn mtls_gate(cx: &GateContext<'_>) -> Option<GateOutcome> {
 /// sent again, which freshness alone (the timestamp) would allow for the
 /// whole window.
 fn hmac_gate(cx: &GateContext<'_>) -> Option<GateOutcome> {
-    use hmac::{Hmac, KeyInit, Mac};
-    use sha2::Sha256;
     use subtle::ConstantTimeEq;
 
     let secret = cx
@@ -374,16 +391,8 @@ fn hmac_gate(cx: &GateContext<'_>) -> Option<GateOutcome> {
         return refuse(StatusCode::UNAUTHORIZED);
     }
 
-    // Sign the full path and query to prevent query-parameter mutation attacks.
-    let message = format!(
-        "{}\n{}\n{}\n{}",
-        cx.method, cx.path_and_query, ts, nonce_val
-    );
-
-    type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key size");
-    mac.update(message.as_bytes());
-    let expected = hex::encode(mac.finalize().into_bytes());
+    // The full path and query are signed, so no parameter can be changed.
+    let expected = request_signature(secret, cx.method, cx.path_and_query, ts, nonce_val);
 
     let valid: bool = sig.as_bytes().ct_eq(expected.as_bytes()).into();
     if !valid {

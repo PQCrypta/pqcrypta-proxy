@@ -143,6 +143,17 @@ struct Args {
     /// A corpus or directory to merge (`--merge-fingerprints`); repeatable
     #[arg(long = "from", value_name = "FILE")]
     merge_from: Vec<PathBuf>,
+
+    /// Send one request to this node's admin API with the credentials its
+    /// configuration names (the token, and the HMAC proof of possession where
+    /// `[admin] hmac_secret` is set), print the response body and exit, 1
+    /// unless it succeeded: `--admin POST /reload`
+    #[arg(long, num_args = 2, value_names = ["METHOD", "PATH"])]
+    admin: Option<Vec<String>>,
+
+    /// The JSON body of an `--admin` request
+    #[arg(long, value_name = "JSON", requires = "admin")]
+    admin_body: Option<String>,
 }
 
 /// Raise `RLIMIT_NOFILE`'s soft limit to the hard limit.
@@ -361,6 +372,35 @@ async fn run() -> anyhow::Result<()> {
             }
             Err(e) => {
                 eprintln!("merge failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // A client of this node's admin API, not the proxy: one request with the
+    // configuration's credentials, its body on standard output
+    if let Some(admin) = args.admin.as_deref() {
+        let [method, path] = admin else {
+            unreachable!("clap takes exactly two values for --admin");
+        };
+        match pqcrypta_proxy::admin_client::send_from_config(
+            &args.config,
+            method,
+            path,
+            args.admin_body.as_deref(),
+        )
+        .await
+        {
+            Ok(response) => {
+                println!("{}", response.body);
+                if !(200..300).contains(&response.status) {
+                    eprintln!("admin API answered {}", response.status);
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("admin request failed: {e:#}");
                 std::process::exit(1);
             }
         }

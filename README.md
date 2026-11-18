@@ -1695,6 +1695,8 @@ Options:
       --socket-unit <FILE>             Write the systemd socket unit for this configuration's listeners (pqcrypta-proxy.socket) to FILE and exit: with it, the service manager holds the listening sockets across a restart. A file, not standard output, which the proxy's own log may share
       --merge-fingerprints <OUT>       Merge fingerprint corpora into one and write it here: observed.json of either version, or a published directory's full.json (`--from`)
       --from <FILE>                    A corpus or directory to merge (`--merge-fingerprints`); repeatable
+      --admin <METHOD> <PATH>          Send one request to this node's admin API with the credentials its configuration names (the token, and the HMAC proof of possession where `[admin] hmac_secret` is set), print the response body and exit, 1 unless it succeeded: `--admin POST /reload`
+      --admin-body <JSON>              The JSON body of an `--admin` request
   -h, --help                           Print help
   -V, --version                        Print version
 ```
@@ -1777,6 +1779,7 @@ src/
 ├── acme.rs                 # ACME (Automated Certificate Management Environment) Client
 ├── acme_dns.rs             # DNS-based ACME challenges
 ├── admin.rs                # Admin HTTP API for health, metrics, config reload, and graceful shutdown
+├── admin_client.rs         # `--admin METHOD PATH`: a request to this node's admin API with its token, signed where hmac_secret is set
 ├── audit_logger.rs         # Structured audit logging for security-relevant events
 ├── backend_client.rs       # Connections to backends
 ├── backend_limits.rs       # How many requests each backend has in flight at once, for the whole process

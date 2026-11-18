@@ -642,9 +642,6 @@ async fn auth_middleware(
     // This runs after bearer-token authorization succeeds so an attacker cannot
     // probe the HMAC path without first holding a valid token.
     if let Some(ref secret) = credentials.hmac_secret {
-        use hmac::{Hmac, KeyInit, Mac};
-        use sha2::Sha256;
-
         let sig = headers
             .get("x-admin-signature")
             .and_then(|v| v.to_str().ok())
@@ -692,13 +689,13 @@ async fn auth_middleware(
         };
         let req_method = request.method().as_str().to_owned();
 
-        let message = format!("{req_method}\n{req_path_and_query}\n{ts}\n{nonce_val}");
-
-        type HmacSha256 = Hmac<Sha256>;
-        let mut mac =
-            HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key size");
-        mac.update(message.as_bytes());
-        let expected = hex::encode(mac.finalize().into_bytes());
+        let expected = crate::route_gate::request_signature(
+            secret,
+            &req_method,
+            &req_path_and_query,
+            ts,
+            nonce_val,
+        );
 
         let sig_valid: bool = sig.as_bytes().ct_eq(expected.as_bytes()).into();
         if !sig_valid {

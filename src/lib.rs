@@ -125,6 +125,7 @@ pub mod acme;
 pub mod acme_dns;
 #[cfg(feature = "admin-api")]
 pub mod admin;
+pub mod admin_client;
 pub mod audit_logger;
 pub mod backend_client;
 pub mod backend_limits;
