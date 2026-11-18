@@ -66,11 +66,12 @@ for HOST_FILE in "${CONFIG_REPO}"/*/ssh-host; do
     FLEET_NODES+=("$(tr -d '[:space:]' < "${HOST_FILE}")|$(basename "$(dirname "${HOST_FILE}")")")
 done
 
-# The placeholder the repo commits in place of a real admin token. Deliberately
-# 24 characters — under the 32 the proxy demands — so a config copied from the
-# repo fails to start rather than running with a guessable token. The node's
-# endpoint writes it in (pqcrypta-config-redact); it is checked again here.
-TOKEN_PLACEHOLDER='auth_token = "REPLACE_WITH_ADMIN_TOKEN"  # live value lives only in /etc/pqcrypta/proxy-config.toml (0640) — never commit a real token'
+# A secret setting written as a value: a config copy that holds one is not
+# kept, whatever else differs. The configs name every secret instead
+# (`auth_token = { credential = "proxy-admin-token" }`, a systemd credential),
+# so a copy is the config as it is; the node's endpoint refuses to write one
+# that holds a secret (pqcrypta-config-redact), and it is checked again here.
+SECRET_VALUE='^[[:space:]]*(auth_token|hmac_secret|metrics_token|jwt_secret|eab_hmac_key|password|secret|private_key|api_secret|client_secret)[[:space:]]*=[[:space:]]*["'"'"']'
 DRIFT_DIR="${STATE}/drift"
 
 # Runtime data files replicated to every node, at the same paths everywhere
@@ -194,9 +195,10 @@ sync_fleet() {
 # Report proxy configs that have drifted from what is tracked in
 # pqcrypta-configs.
 #
-# Detection only: a node whose config moved has its copy (admin token replaced
-# by the placeholder) kept in DRIFT_DIR for review, and the run fails, which is
-# the alert. Nothing writes the repository's working tree, which is root's.
+# Detection only: a node whose config moved has its copy (which holds no
+# secret: each is a credential the config names) kept in DRIFT_DIR for review,
+# and the run fails, which is the alert. Nothing writes the repository's
+# working tree, which is root's.
 #
 # The reason this exists: the tracked copy was found 474 lines behind the
 # running node, still naming the obsolete x25519_kyber768 KEM. A rebuild from
@@ -222,11 +224,8 @@ check_config_drift() {
             log "config drift: could not read ${NAME}'s config — node unreachable?"
             rm -f "${COPY}"; continue
         fi
-        # "A token line exists AND it is not the placeholder". Both halves are
-        # needed: a node with no [admin] section (fortress) has no token line.
-        if grep -qE '^auth_token' "${COPY}" \
-           && ! grep -qxF "${TOKEN_PLACEHOLDER}" "${COPY}"; then
-            log "config drift: ABORT on ${NAME} — its copy does not carry the placeholder, discarded"
+        if command grep -qE "${SECRET_VALUE}" "${COPY}"; then
+            log "config drift: ABORT on ${NAME} — its copy holds a secret setting's value, discarded"
             rm -f "${COPY}"; DRIFTED=1; continue
         fi
         N=$(diff "${TRACKED}" "${COPY}" 2>/dev/null | grep -c '^[<>]')
