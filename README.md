@@ -91,6 +91,7 @@
 | **Dynamic Alt-Svc Header** | ✅ | Alt-Svc value built from `udp_port` + `additional_ports` instead of a hardcoded constant; `alt_svc_ports` overrides that list where a bound port does not actually serve HTTP/3 |
 | **TCP-Only Hosts** | ✅ | `tcp_only_hosts` in `[server]` — listed hostnames receive `Alt-Svc: clear`, evicting cached QUIC upgrades so browsers always connect via TCP/TLS; a request for one that arrives over HTTP/3 anyway (coalesced onto another name's connection) gets `421 Misdirected Request`, which browsers retry on a new connection — TCP |
 | **HTTP/1.1-Only Hosts** | ✅ | `http11_only_hosts` in `[server]` — listed hostnames negotiate HTTP/1.1 only (no `h2` ALPN); browsers open an independent TCP connection per `fetch()` stream instead of coalescing onto one HTTP/2 pipe, eliminating head-of-line blocking on parallel speed test streams |
+| **Secrets out of the configuration** | ✅ | Every secret setting takes `{ credential = "name" }` (a systemd credential, encrypted at rest under the TPM2 and/or host key with `LoadCredentialEncrypted=`) or `{ file = "/path" }`, read at start and on every reload; the configuration itself holds none |
 | **Admin Loopback Enforcement** | ✅ | `require_loopback = true` (default) aborts startup when admin API is bound to a non-loopback address |
 | **Shared Security State** | ✅ | **Every** listener — QUIC and all three TCP paths — shares one `SecurityState`. Blocked IPs, rate limiter counters, the fingerprint corpus and DB-synced blocklists are visible across all of them. The TCP listeners previously each constructed their own, so an IP blocked on one was not blocked on another and the admin API could not clear it |
 | **Audit Events at Their Source** | ✅ | Each event is recorded where it happens: the admin API (actions, refused requests), the security layer (WAF verdicts, address blocks), the rate limiter, the TLS provider (every reload, whatever asked for it), the configuration reload handler and the handshake policy |
@@ -1832,6 +1833,7 @@ src/
 ├── request_id.rs           # Request IDs
 ├── request_target.rs       # The host a request names, resolved one way for every layer and transport
 ├── route_gate.rs           # Per-route request gates, applied identically on every transport
+├── secret_source.rs        # Secret settings named by systemd credential or file rather than written in the configuration
 ├── security.rs             # Security middleware module
 ├── service_notify.rs       # The service manager's notification protocol (sd_notify(3))
 ├── speedtest.rs            # Native speed test session handler for WebTransport connections on /speedtest

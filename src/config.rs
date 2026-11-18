@@ -592,7 +592,9 @@ pub struct RouteSecurityPolicy {
     /// TIMESTAMP + "\n" + NONCE, secret), over the request target as sent.
     /// The timestamp must be within 300 seconds of server time, either way,
     /// and a nonce is accepted once for as long as a signature can be.
-    /// At least [`MIN_SECRET_CHARS`] characters.
+    /// At least [`MIN_SECRET_CHARS`] characters. A string, or where it is
+    /// (`{ credential = "name" }`, `{ file = "/path" }`, see `secret_source`).
+    #[serde(default, deserialize_with = "crate::secret_source::optional")]
     pub hmac_secret: Option<String>,
 }
 
@@ -2570,14 +2572,20 @@ pub struct AdminConfig {
     /// CA that issues admin client certificates. Default: `tls.ca_cert_path`;
     /// `require_mtls` refuses to start with neither.
     pub client_ca_path: Option<PathBuf>,
-    /// Admin API token for authentication (if not using mTLS)
+    /// Admin API token for authentication (if not using mTLS): a string, or
+    /// where it is (`{ credential = "name" }`, `{ file = "/path" }`, see
+    /// `secret_source`)
+    #[serde(default, deserialize_with = "crate::secret_source::optional")]
     pub auth_token: Option<String>,
     /// Allowed IP addresses for admin API
     pub allowed_ips: Vec<String>,
     /// Proof-of-possession HMAC secret for admin API.
-    /// When set, all admin requests must include X-Admin-Signature and X-Admin-Timestamp.
-    /// Signature = HMAC-SHA256(METHOD + "\n" + PATH + "\n" + TIMESTAMP, secret).
-    /// Provides per-request proof without replacing the bearer token.
+    /// When set, every admin request carries `X-Admin-Signature`,
+    /// `X-Admin-Timestamp` and `X-Admin-Nonce`: the signature is hex
+    /// HMAC-SHA256(METHOD + "\n" + PATH_AND_QUERY + "\n" + TIMESTAMP + "\n" +
+    /// NONCE, secret), beside the bearer token. A string, or where it is
+    /// (`{ credential = "name" }`, `{ file = "/path" }`, see `secret_source`).
+    #[serde(default, deserialize_with = "crate::secret_source::optional")]
     pub hmac_secret: Option<String>,
     /// Refuse to start if the admin bind address is not loopback (default: true).
     /// Applies to the plain-HTTP listener, where a non-loopback bind transmits

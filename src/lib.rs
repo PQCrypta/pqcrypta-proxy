@@ -184,6 +184,7 @@ pub mod request_encoding;
 pub mod request_id;
 pub mod request_target;
 pub mod route_gate;
+pub mod secret_source;
 pub mod security;
 pub mod service_notify;
 pub mod speedtest;

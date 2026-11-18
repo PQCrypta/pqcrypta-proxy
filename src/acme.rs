@@ -167,7 +167,7 @@ pub struct AcmeConfig {
     pub eab_kid: Option<String>,
 
     /// External Account Binding HMAC key
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::secret_source::optional")]
     pub eab_hmac_key: Option<String>,
 
     /// RSA key size for certificates (2048 or 4096)

@@ -323,6 +323,31 @@ Each request's `x-tls-library` header names the library that completed its hands
 
 ---
 
+## Secrets
+
+Every secret setting -- `[admin] auth_token` and `hmac_secret`, `[routes.security] hmac_secret`, `[advanced_rate_limiting] jwt_secret`, `[acme] eab_hmac_key` -- takes a string, or a table that says where the value is, so the configuration itself holds none and can be kept or tracked as it is:
+
+```toml
+[admin]
+auth_token  = { credential = "admin-token" }        # a systemd credential
+hmac_secret = { file = "/etc/pqcrypta/admin-hmac" }  # a file
+```
+
+`credential` names a file of the service's credentials directory (`$CREDENTIALS_DIRECTORY`). With systemd, encrypt each secret at rest and give it to the service alone:
+
+```sh
+systemd-creds encrypt --name=admin-token --with-key=auto - /etc/credstore.encrypted/admin-token < token
+```
+
+```ini
+# /etc/systemd/system/pqcrypta-proxy.service.d/credentials.conf
+[Service]
+LoadCredentialEncrypted=admin-token
+LoadCredentialEncrypted=admin-hmac
+```
+
+`--with-key=auto` seals to the TPM2 and the host key where the machine has a TPM2, and to the host key otherwise; systemd decrypts it into the service's private credentials directory when the service starts. A value is read at start and at every reload, less one trailing newline; a secret that cannot be read, or is empty, refuses the configuration. A command run outside the service (`--admin`, `--validate`) reads the same names from its own `$CREDENTIALS_DIRECTORY`, from `PQCRYPTA_CREDENTIALS_DIRECTORY`, or, run as root while the service runs, from the service's own `/run/credentials/pqcrypta-proxy.service`.
+
 ## Admin API
 
 ```toml
