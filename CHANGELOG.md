@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.3](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.17.2...v0.17.3) (2026-11-18)
+
+
+### Bug Fixes
+
+* **tls:** name a session ID context, so a session resumes while client certificates are requested ([0500a9d](https://github.com/PQCrypta/pqcrypta-proxy/commit/0500a9d2918b24c26bb6b57625e1e3df3bd0c6d0))
+
 ## [0.17.2](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.17.1...v0.17.2) (2026-11-18)
 
 
