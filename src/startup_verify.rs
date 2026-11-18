@@ -357,43 +357,69 @@ pub fn render_banner(sections: &[Section]) {
             continue;
         }
         info!("{}", section.title);
-        for row in &section.rows {
-            // Warn rather than info for anything that failed verification, so the one
-            // line that matters is not the same colour as the thirty that are fine.
-            let text = format!(
-                "  {:<name_w$} {:<value_w$} [{}]",
-                row.name,
-                row.value,
-                row.provenance.tag()
-            );
-            // The aligned text is the message; the same facts also go out as
-            // structured fields. Under the JSON log format the table is just a string
-            // per line and `[VERIFIED]` is buried inside it, so a SIEM cannot assert
-            // on any of it — which makes an artifact whose entire purpose is to attest
-            // a security boundary unqueryable exactly where it would be relied on.
-            // Emitting both costs nothing: the human reads the message, the collector
-            // reads the fields.
-            if row.provenance == Provenance::Verified && row.value.contains("FAILED") {
-                warn!(
-                    attestation = true,
-                    section = %section.title,
-                    capability = %row.name,
-                    value = %row.value,
-                    provenance = %row.provenance.tag(),
-                    "{text}"
-                );
-            } else {
-                info!(
-                    attestation = true,
-                    section = %section.title,
-                    capability = %row.name,
-                    value = %row.value,
-                    provenance = %row.provenance.tag(),
-                    "{text}"
-                );
-            }
-        }
+        emit_rows(section, name_w, value_w);
         info!("{rule}");
+    }
+}
+
+/// One section's rows on their own, after the banner: a probe that runs once
+/// the process has started (the connection-rate limit, after its grace).
+pub fn render_rows(section: &Section) {
+    let name_w = section
+        .rows
+        .iter()
+        .map(|r| r.name.chars().count())
+        .max()
+        .unwrap_or(20)
+        .max(20);
+    let value_w = section
+        .rows
+        .iter()
+        .map(|r| r.value.chars().count())
+        .max()
+        .unwrap_or(24)
+        .max(24);
+    info!("{}", section.title);
+    emit_rows(section, name_w, value_w);
+}
+
+/// A section's rows, aligned to the widths given, as text and as fields.
+fn emit_rows(section: &Section, name_w: usize, value_w: usize) {
+    for row in &section.rows {
+        // Warn rather than info for anything that failed verification, so the one
+        // line that matters is not the same colour as the thirty that are fine.
+        let text = format!(
+            "  {:<name_w$} {:<value_w$} [{}]",
+            row.name,
+            row.value,
+            row.provenance.tag()
+        );
+        // The aligned text is the message; the same facts also go out as
+        // structured fields. Under the JSON log format the table is just a string
+        // per line and `[VERIFIED]` is buried inside it, so a SIEM cannot assert
+        // on any of it — which makes an artifact whose entire purpose is to attest
+        // a security boundary unqueryable exactly where it would be relied on.
+        // Emitting both costs nothing: the human reads the message, the collector
+        // reads the fields.
+        if row.provenance == Provenance::Verified && row.value.contains("FAILED") {
+            warn!(
+                attestation = true,
+                section = %section.title,
+                capability = %row.name,
+                value = %row.value,
+                provenance = %row.provenance.tag(),
+                "{text}"
+            );
+        } else {
+            info!(
+                attestation = true,
+                section = %section.title,
+                capability = %row.name,
+                value = %row.value,
+                provenance = %row.provenance.tag(),
+                "{text}"
+            );
+        }
     }
 }
 
@@ -1007,6 +1033,7 @@ pub fn forget_probes(engine: &crate::security::SecurityState) {
 }
 
 /// The outcome of probing one enforcement control.
+#[derive(Debug)]
 pub enum ProbeOutcome {
     /// The control ran and did what it is configured to do.
     Enforced(String),
@@ -1016,6 +1043,9 @@ pub enum ProbeOutcome {
     NotConfigured,
     /// The probe itself could not run.
     Inconclusive(String),
+    /// The control is not in force yet, by design, and is probed once it is:
+    /// the result is its own line, later.
+    Deferred(String),
 }
 
 impl ProbeOutcome {
@@ -1029,6 +1059,7 @@ impl ProbeOutcome {
             },
             Self::NotConfigured => Row::configured(name, "not configured"),
             Self::Inconclusive(why) => Row::observed(name, format!("inconclusive — {why}")),
+            Self::Deferred(why) => Row::observed(name, format!("deferred — {why}")),
         }
     }
 }
@@ -1153,18 +1184,67 @@ pub async fn probe_rate_limits(
     config: &crate::config::ProxyConfig,
     engine: &crate::security::SecurityState,
 ) -> (ProbeOutcome, ProbeOutcome) {
-    use crate::security::{RequestPolicy, SecurityDecision, SecurityRequestView};
-
     if !config.rate_limiting.enabled {
         return (ProbeOutcome::NotConfigured, ProbeOutcome::NotConfigured);
     }
 
+    // ── Connection limiter, through the full decision path ───────────────────
+    //
+    // Not while the startup grace holds it off: every connection would pass, by
+    // design, and the probe would report the limit as not enforced. Until
+    // 0.17.1 it did, at every start. It is probed when the grace ends
+    // (`probe_connection_rate_after_grace`), against the same live engine.
+    let connection = match engine.connection_rate_grace_remaining() {
+        Some(left) => ProbeOutcome::Deferred(format!(
+            "the startup grace holds it off for {} s more; probed when it ends",
+            left.as_secs_f64().ceil()
+        )),
+        None => probe_connection_rate(&config.rate_limiting, engine),
+    };
+
+    // ── Request limiter, exercised directly ──────────────────────────────────
+    //
+    // Same per-IP governor bucket `evaluate()` checks, reached without going through
+    // the connection limiter that would otherwise answer first. Its own source, so the
+    // bucket is untouched.
+    let rps = config.rate_limiting.requests_per_second;
+    let req_ceiling = config
+        .rate_limiting
+        .burst_size
+        .saturating_add(rps)
+        .saturating_add(50)
+        .clamp(10, 5000);
+    let bucket = engine.get_ip_rate_limiter(PROBE_SOURCE_REQRATE);
+    let mut request = ProbeOutcome::NotEnforced(format!(
+        "{req_ceiling} consecutive checks against one bucket were all allowed"
+    ));
+    for attempt in 1..=req_ceiling {
+        if bucket.check().is_err() {
+            request = ProbeOutcome::Enforced(format!(
+                "request rate denied at {attempt} (limit {rps}/s, burst {})",
+                config.rate_limiting.burst_size
+            ));
+            break;
+        }
+    }
+
+    (connection, request)
+}
+
+/// The connection limiter, through the full decision path: a new source port
+/// on every attempt, each attempt a new connection, until it denies one.
+fn probe_connection_rate(
+    rate: &crate::config::RateLimitConfig,
+    engine: &crate::security::SecurityState,
+) -> ProbeOutcome {
+    use crate::security::{RequestPolicy, SecurityDecision, SecurityRequestView};
+
+    if !rate.connection_rate_limit {
+        return ProbeOutcome::NotConfigured;
+    }
     let headers = probe_headers();
     let policy = RequestPolicy::default();
-
-    // ── Connection limiter, through the full decision path ───────────────────
-    let conn_ceiling = config
-        .rate_limiting
+    let conn_ceiling = rate
         .connections_per_second
         .saturating_mul(3)
         .clamp(10, 2000);
@@ -1198,34 +1278,30 @@ pub async fn probe_rate_limits(
             }
         }
     }
+    connection
+}
 
-    // ── Request limiter, exercised directly ──────────────────────────────────
-    //
-    // Same per-IP governor bucket `evaluate()` checks, reached without going through
-    // the connection limiter that would otherwise answer first. Its own source, so the
-    // bucket is untouched.
-    let rps = config.rate_limiting.requests_per_second;
-    let req_ceiling = config
-        .rate_limiting
-        .burst_size
-        .saturating_add(rps)
-        .saturating_add(50)
-        .clamp(10, 5000);
-    let bucket = engine.get_ip_rate_limiter(PROBE_SOURCE_REQRATE);
-    let mut request = ProbeOutcome::NotEnforced(format!(
-        "{req_ceiling} consecutive checks against one bucket were all allowed"
-    ));
-    for attempt in 1..=req_ceiling {
-        if bucket.check().is_err() {
-            request = ProbeOutcome::Enforced(format!(
-                "request rate denied at {attempt} (limit {rps}/s, burst {})",
-                config.rate_limiting.burst_size
-            ));
-            break;
-        }
+/// The connection-rate limit's probe, once the startup grace has ended.
+///
+/// Against the live engine, from its own TEST-NET-1 source, whose traces it
+/// removes after, and reported as its own attestation line. Run in a task of
+/// its own, so nothing waits for it.
+pub async fn probe_connection_rate_after_grace(
+    rate: crate::config::RateLimitConfig,
+    engine: crate::security::SecurityState,
+) {
+    if !rate.enabled {
+        return;
     }
-
-    (connection, request)
+    if let Some(left) = engine.connection_rate_grace_remaining() {
+        tokio::time::sleep(left + std::time::Duration::from_millis(100)).await;
+    }
+    let outcome = probe_connection_rate(&rate, &engine);
+    engine.forget(PROBE_SOURCE_RATELIMIT);
+    render_rows(&Section {
+        title: "ENFORCEMENT, after the startup grace (TEST-NET-1 source, no network I/O)",
+        rows: vec![outcome.row("Connection rate limit")],
+    });
 }
 
 /// Is mutual TLS actually required, or only written down?
@@ -1272,5 +1348,60 @@ pub fn enforcement_section(
             req_rate.row("Request rate limit"),
             mtls.row("mTLS"),
         ],
+    }
+}
+
+#[cfg(test)]
+mod rate_probe_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn limited() -> crate::config::ProxyConfig {
+        let mut config = crate::config::ProxyConfig::default();
+        config.rate_limiting.enabled = true;
+        config.rate_limiting.connection_rate_limit = true;
+        config.rate_limiting.connections_per_second = 50;
+        config
+    }
+
+    /// Inside the startup grace the connection limiter passes everything, by
+    /// design: the probe defers rather than report it not enforced, as it did
+    /// at every start until 0.17.1.
+    #[tokio::test]
+    async fn the_connection_probe_waits_for_the_startup_grace() {
+        let config = limited();
+        let engine = crate::security::SecurityState::new(&config)
+            .with_startup_grace(Duration::from_secs(60));
+        let (connection, request) = probe_rate_limits(&config, &engine).await;
+        assert!(
+            matches!(connection, ProbeOutcome::Deferred(_)),
+            "{connection:?}"
+        );
+        assert!(matches!(request, ProbeOutcome::Enforced(_)), "{request:?}");
+    }
+
+    #[tokio::test]
+    async fn after_the_grace_the_connection_limit_is_probed_and_enforced() {
+        let config = limited();
+        let engine =
+            crate::security::SecurityState::new(&config).with_startup_grace(Duration::ZERO);
+        assert!(engine.connection_rate_grace_remaining().is_none());
+        let (connection, _) = probe_rate_limits(&config, &engine).await;
+        assert!(
+            matches!(connection, ProbeOutcome::Enforced(_)),
+            "{connection:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_limit_switched_off_is_not_configured() {
+        let mut config = limited();
+        config.rate_limiting.connection_rate_limit = false;
+        let engine = crate::security::SecurityState::new(&config);
+        let (connection, _) = probe_rate_limits(&config, &engine).await;
+        assert!(
+            matches!(connection, ProbeOutcome::NotConfigured),
+            "{connection:?}"
+        );
     }
 }

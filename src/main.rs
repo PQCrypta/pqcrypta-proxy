@@ -1905,6 +1905,14 @@ async fn run() -> anyhow::Result<()> {
             startup_verify::bound_listener_section(&probe, probe_addr),
             startup_verify::enforcement_section(waf, conn_rate, req_rate, mtls),
         ]);
+        // The connection-rate limit, held off by the startup grace above, is
+        // probed when the grace ends; its line follows the banner
+        if security_state.connection_rate_grace_remaining().is_some() {
+            tokio::spawn(startup_verify::probe_connection_rate_after_grace(
+                config.rate_limiting.clone(),
+                security_state.clone(),
+            ));
+        }
         // Only a surprise when post-quantum key exchange was asked for; with
         // pqc.enabled false a classical group is what the listener should pick.
         if config.pqc.enabled && probe.succeeded() && !probe.is_post_quantum {
