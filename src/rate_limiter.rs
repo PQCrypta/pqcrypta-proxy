@@ -160,6 +160,7 @@ pub struct AdvancedRateLimitConfig {
     /// could forge any `sub` claim to get elevated quotas.  Set this to a strong
     /// random secret (≥32 bytes, base64-encoded) that matches the secret used by
     /// the upstream token issuer.
+    #[serde(default, deserialize_with = "crate::secret_source::optional")]
     pub jwt_secret: Option<String>,
 
     /// F-10: Allowed JWT HMAC algorithms for rate-limit key extraction.

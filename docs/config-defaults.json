@@ -35,6 +35,7 @@
     "enabled": false,
     "generated_token_path": "/var/lib/pqcrypta-proxy/state/admin-token",
     "hmac_secret": null,
+    "metrics_token": null,
     "port": 8081,
     "require_loopback": true,
     "require_mtls": false,

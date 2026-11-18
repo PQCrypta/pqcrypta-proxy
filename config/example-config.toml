@@ -422,6 +422,13 @@ require_mtls = false
 # token is generated at each start and written to generated_token_path,
 # readable by the proxy's user alone; it is never logged.
 # auth_token = "your-secret-token-here"
+# Or named rather than written, so this file holds no secret (docs/CONFIG.md,
+# Secrets): a systemd credential (LoadCredentialEncrypted=) or a file.
+# auth_token = { credential = "admin-token" }
+# hmac_secret = { credential = "admin-hmac" }
+# A token that reads /metrics, /metrics/json and /metrics/errors alone,
+# unsigned, for a scraper that cannot sign (Prometheus); nothing else
+# metrics_token = { credential = "admin-metrics-token" }
 # generated_token_path = "/var/lib/pqcrypta-proxy/state/admin-token"
 
 # Allowed IP addresses for admin API access

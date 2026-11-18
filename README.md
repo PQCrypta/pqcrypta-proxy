@@ -91,6 +91,7 @@
 | **Dynamic Alt-Svc Header** | ✅ | Alt-Svc value built from `udp_port` + `additional_ports` instead of a hardcoded constant; `alt_svc_ports` overrides that list where a bound port does not actually serve HTTP/3 |
 | **TCP-Only Hosts** | ✅ | `tcp_only_hosts` in `[server]` — listed hostnames receive `Alt-Svc: clear`, evicting cached QUIC upgrades so browsers always connect via TCP/TLS; a request for one that arrives over HTTP/3 anyway (coalesced onto another name's connection) gets `421 Misdirected Request`, which browsers retry on a new connection — TCP |
 | **HTTP/1.1-Only Hosts** | ✅ | `http11_only_hosts` in `[server]` — listed hostnames negotiate HTTP/1.1 only (no `h2` ALPN); browsers open an independent TCP connection per `fetch()` stream instead of coalescing onto one HTTP/2 pipe, eliminating head-of-line blocking on parallel speed test streams |
+| **Secrets out of the configuration** | ✅ | Every secret setting takes `{ credential = "name" }` (a systemd credential, encrypted at rest under the TPM2 and/or host key with `LoadCredentialEncrypted=`) or `{ file = "/path" }`, read at start and on every reload; the configuration itself holds none |
 | **Admin Loopback Enforcement** | ✅ | `require_loopback = true` (default) aborts startup when admin API is bound to a non-loopback address |
 | **Shared Security State** | ✅ | **Every** listener — QUIC and all three TCP paths — shares one `SecurityState`. Blocked IPs, rate limiter counters, the fingerprint corpus and DB-synced blocklists are visible across all of them. The TCP listeners previously each constructed their own, so an IP blocked on one was not blocked on another and the admin API could not clear it |
 | **Audit Events at Their Source** | ✅ | Each event is recorded where it happens: the admin API (actions, refused requests), the security layer (WAF verdicts, address blocks), the rate limiter, the TLS provider (every reload, whatever asked for it), the configuration reload handler and the handshake policy |
@@ -459,7 +460,7 @@ What a reload applies:
   custom patterns, `enabled` — with its counters carried over; the scanner-UA
   exemptions; the GeoIP and JA3 databases when their paths change; the crawler
   verifier; and the Tor exit refresher, which reads its settings each round.
-- **Admin API credentials** — `auth_token`, `hmac_secret`, `allowed_ips` — on
+- **Admin API credentials** — `auth_token`, `hmac_secret`, `metrics_token`, `allowed_ips` — on
   the next request, so a rotated token takes effect without a restart. A reload
   that removes `auth_token` keeps the previous one rather than switching
   authentication off.
@@ -593,9 +594,12 @@ Leave `allowed_domains = []` (empty, the default) to disable the check and allow
 ### Admin API Authentication
 
 Every admin route but `/health` takes a credential: the configured `auth_token`,
-a token the proxy generates at each start when none is configured (printed to
-standard error, and different after every restart), or the client certificate
-under `require_mtls`; `hmac_secret` adds a signature to every request.
+a token the proxy generates at each start when none is configured (written to
+`generated_token_path`, readable by the proxy's user alone, never logged, and
+different after every restart), or the client certificate under
+`require_mtls`; `hmac_secret` adds a signature to every request. The metrics
+routes also take `metrics_token`, unsigned, which authorises nothing else: for
+a scraper that cannot sign.
 `allowed_ips` filters addresses before any of that and is not authentication.
 The details are under [Admin API Authentication](#admin-api-authentication-1).
 
@@ -1832,6 +1836,7 @@ src/
 ├── request_id.rs           # Request IDs
 ├── request_target.rs       # The host a request names, resolved one way for every layer and transport
 ├── route_gate.rs           # Per-route request gates, applied identically on every transport
+├── secret_source.rs        # Secret settings named by systemd credential or file rather than written in the configuration
 ├── security.rs             # Security middleware module
 ├── service_notify.rs       # The service manager's notification protocol (sd_notify(3))
 ├── speedtest.rs            # Native speed test session handler for WebTransport connections on /speedtest
@@ -2069,7 +2074,8 @@ curl -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/ocsp/refres
 | `/health` | GET | Minimal health check — safe for load-balancer probes (F-03) |
 
 **Protected** (by the configured admin authentication: the bearer token or, under `require_mtls`,
-the client certificate; with `hmac_secret`, a signed request — see
+the client certificate; with `hmac_secret`, a signed request; `GET` of the three
+`/metrics` routes also with `metrics_token`, unsigned — see
 [Admin API Authentication](#admin-api-authentication-1)):
 
 | Endpoint | Method | Description |
@@ -2713,11 +2719,12 @@ port = 8081
 auth_token = "your-strong-secret-token-at-least-32-chars"
 allowed_ips = ["127.0.0.1", "::1"]
 # hmac_secret = "…"            # optional: per-request signatures
+# metrics_token = "…"          # optional: reads /metrics, /metrics/json, /metrics/errors alone, unsigned
 # require_mtls = true          # optional: client certificates (tls_cert_path, tls_key_path, client_ca_path)
 ```
 
 **Token requirements:**
-- Minimum **32 characters** — the proxy rejects a shorter `auth_token`, `admin.hmac_secret` or route `security.hmac_secret` at startup. Generate one with `openssl rand -base64 48`.
+- Minimum **32 characters** — the proxy rejects a shorter `auth_token`, `admin.hmac_secret`, `admin.metrics_token` or route `security.hmac_secret` at startup, and a `metrics_token` that is the `auth_token`. Generate one with `openssl rand -base64 48`.
 - Token comparison uses constant-time equality to prevent timing side-channel attacks.
 
 **Brute-force protection:**
