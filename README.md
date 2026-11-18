@@ -35,7 +35,7 @@
 | **Load Balancing** | ✅ | 11 algorithms with session affinity and health-aware routing |
 | Circuit Breaker | ✅ | Backend health monitoring with auto-recovery |
 | **Advanced Rate Limiting** | ✅ | Multi-dimensional: IP, JA3/JA4, JWT, headers, composite keys on all paths (TCP + QUIC/HTTP3); optional Redis backend for distributed cross-instance coordination |
-| **Connection Rate Limiting** | ✅ | Per-IP cap on *new connections per second* (`connection_rate_limit`, `connections_per_second`), separate from `max_connections_per_ip` which caps concurrency — a client that opens and closes as fast as it can never trips a concurrency limit |
+| **Connection Rate Limiting** | ✅ | Per-IP cap on *new connections per second* (`connection_rate_limit`, `connections_per_second`), separate from `max_connections_per_ip` which caps concurrency — a client that opens and closes as fast as it can never trips a concurrency limit. It counts from 10 s after start (the connections queued across a restart arrive together and say nothing about a client); the startup attestation probes it against the live engine once that grace has ended, in a line of its own |
 | **Per-Route Security Policy** | ✅ | `[routes.security]` overrides applied before the global checks: WAF on/off and mode, rate limits, JA3 and JA4 allowlists, mTLS, HMAC request signing, plus `skip_bot_blocking` for routes that serve automated clients |
 | DoS Protection | ✅ | Connection limits, request validation |
 | GeoIP Blocking | ✅ | Country-based blocking (MaxMind DB) |

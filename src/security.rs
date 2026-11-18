@@ -2236,6 +2236,15 @@ impl SecurityState {
         self
     }
 
+    /// How much longer the startup grace holds the connection-rate limit
+    /// off; none once it counts.
+    pub fn connection_rate_grace_remaining(&self) -> Option<Duration> {
+        self.connection_rate_grace
+            .get()
+            .and_then(|until| until.checked_duration_since(Instant::now()))
+            .filter(|left| !left.is_zero())
+    }
+
     pub fn connection_rate_exceeded(
         &self,
         ip: IpAddr,
