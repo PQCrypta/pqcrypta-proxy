@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.1](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.17.0...v0.17.1) (2026-11-18)
+
+
+### Bug Fixes
+
+* **startup:** probe the connection-rate limit once the startup grace has ended ([4553029](https://github.com/PQCrypta/pqcrypta-proxy/commit/4553029755e23164563f56c157af1f039c9416c9))
+
 ## [0.17.0](https://github.com/PQCrypta/pqcrypta-proxy/compare/v0.16.0...v0.17.0) (2026-11-18)
 
 
