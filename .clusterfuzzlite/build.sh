@@ -6,7 +6,8 @@ cd "$SRC/pqcrypta-proxy/fuzz"
 # stable since 1.95): the nightly the proxy's build hosts run, here too
 TOOLCHAIN=nightly-2026-10-02
 rustup toolchain install "$TOOLCHAIN" --profile minimal
-cargo +"$TOOLCHAIN" fuzz build -O
+# -a: optimized, with debug assertions and overflow checks on
+cargo +"$TOOLCHAIN" fuzz build -O -a
 for target in fuzz_targets/*.rs; do
     name=$(basename "$target" .rs)
     cp "target/x86_64-unknown-linux-gnu/release/$name" "$OUT/"
