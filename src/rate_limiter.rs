@@ -884,6 +884,24 @@ return {1, 0, 0}
 static RATE_CHECK_SCRIPT: LazyLock<redis::Script> =
     LazyLock::new(|| redis::Script::new(RATE_CHECK_LUA));
 
+/// Every Redis command the limiter sends, its script's included.
+///
+/// Redis checks a script's commands against the caller's ACL, so this is what
+/// the proxy's Redis user needs, and all it needs, on its `key_prefix`:
+/// `user <name> on ... ~<key_prefix>:* +<each>` (README, "Least privilege").
+pub const REDIS_COMMANDS: &[&str] = &[
+    "evalsha",
+    "eval",
+    "script|load",
+    "hdel",
+    "hgetall",
+    "hincrby",
+    "hmget",
+    "hset",
+    "pexpire",
+    "time",
+];
+
 /// A Redis URL with any password taken out, for the log.
 fn redis_url_for_log(url: &str) -> String {
     match url.split_once("://") {
@@ -4260,6 +4278,9 @@ mod redis_limit_tests {
     struct TestRedis {
         child: Child,
         port: u16,
+        /// Served on this socket alone, its default user held to
+        /// REDIS_COMMANDS on the test prefix
+        socket: Option<std::path::PathBuf>,
     }
 
     impl TestRedis {
@@ -4271,7 +4292,11 @@ mod redis_limit_tests {
                 .stderr(Stdio::null())
                 .spawn();
             match child {
-                Ok(child) => Some(Self { child, port }),
+                Ok(child) => Some(Self {
+                    child,
+                    port,
+                    socket: None,
+                }),
                 Err(error) => {
                     assert!(
                         std::env::var_os("PQCRYPTA_REQUIRE_REDIS").is_none(),
@@ -4306,9 +4331,69 @@ mod redis_limit_tests {
             Self::start_on(port).await
         }
 
+        /// redis-server on a Unix socket alone (`port 0`), its default user
+        /// allowed REDIS_COMMANDS on the `test` prefix and nothing else: how
+        /// the nodes run it (pqcrypta-configs redis-pqcrypta.conf).
+        async fn start_on_socket() -> Option<Self> {
+            let dir = std::env::temp_dir().join(format!(
+                "pqcp-redis-{}-{}",
+                std::process::id(),
+                rand::random::<u32>()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let socket = dir.join("redis.sock");
+            let mut acl = vec!["default", "reset", "on", "nopass", "~test:*"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>();
+            acl.extend(REDIS_COMMANDS.iter().map(|c| format!("+{c}")));
+            let child = Command::new("redis-server")
+                .args(["--port", "0", "--unixsocket"])
+                .arg(&socket)
+                .args([
+                    "--unixsocketperm",
+                    "700",
+                    "--save",
+                    "",
+                    "--appendonly",
+                    "no",
+                ])
+                .arg("--user")
+                .args(&acl)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            let child = match child {
+                Ok(child) => child,
+                Err(error) => {
+                    assert!(
+                        std::env::var_os("PQCRYPTA_REQUIRE_REDIS").is_none(),
+                        "redis-server is required here: {error}"
+                    );
+                    eprintln!("skipped: no redis-server ({error})");
+                    return None;
+                }
+            };
+            let server = Self {
+                child,
+                port: 0,
+                socket: Some(socket.clone()),
+            };
+            for _ in 0..200 {
+                if tokio::net::UnixStream::connect(&socket).await.is_ok() {
+                    return Some(server);
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("redis-server did not start on {}", socket.display());
+        }
+
         fn config(&self) -> RedisConfig {
             RedisConfig {
-                url: format!("redis://127.0.0.1:{}", self.port),
+                url: match &self.socket {
+                    Some(socket) => format!("unix://{}", socket.display()),
+                    None => format!("redis://127.0.0.1:{}", self.port),
+                },
                 key_prefix: "test".to_string(),
                 connect_timeout_ms: 2_000,
                 command_timeout_ms: 500,
@@ -4319,6 +4404,22 @@ mod redis_limit_tests {
         fn stop(&mut self) {
             let _ = self.child.kill();
             let _ = self.child.wait();
+            if let Some(dir) = self.socket.as_ref().and_then(|s| s.parent()) {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+
+        /// The requests held in one of a key's window hashes, read with a
+        /// command the limiter's user has (HGETALL)
+        async fn counted_by_script(&self, kind: &str, key: &str) -> i64 {
+            let client = redis::Client::open(self.config().url).unwrap();
+            let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+            let fields: std::collections::HashMap<String, i64> = redis::cmd("HGETALL")
+                .arg(format!("test:{{{key}}}:{kind}"))
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            fields.values().sum()
         }
 
         /// The requests held in one of a key's window hashes.
@@ -4366,6 +4467,40 @@ mod redis_limit_tests {
             enabled: false,
             ..AdaptiveConfig::default()
         }
+    }
+
+    /// Over a Unix socket, with the user held to REDIS_COMMANDS on its
+    /// prefix as the nodes hold it, the limiter counts and refuses as it does
+    /// over TCP; a command outside the list, or a key outside the prefix, is
+    /// refused. A change to the script that sends another command fails here
+    /// rather than on the nodes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_limiter_needs_only_its_commands_over_the_socket() {
+        let Some(redis) = TestRedis::start_on_socket().await else {
+            return;
+        };
+        let backend = RedisBackend::connect(&redis.config()).await.unwrap();
+        let limits = limits(Some(3), Some(100));
+        for _ in 0..3 {
+            assert!(allowed(&backend.check_limits("acl", &limits, 0).await));
+        }
+        assert!(matches!(
+            backend.check_limits("acl", &limits, 0).await,
+            Some(RateLimitResult::Limited { .. })
+        ));
+        assert_eq!(redis.counted_by_script("1m", "acl").await, 3);
+
+        let client = redis::Client::open(redis.config().url).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let flush: redis::RedisResult<()> = redis::cmd("FLUSHALL").query_async(&mut conn).await;
+        assert!(flush.is_err(), "FLUSHALL is not the limiter's");
+        let other: redis::RedisResult<()> = redis::cmd("HSET")
+            .arg("other:k")
+            .arg("f")
+            .arg(1)
+            .query_async(&mut conn)
+            .await;
+        assert!(other.is_err(), "a key outside the prefix");
     }
 
     #[tokio::test(flavor = "multi_thread")]

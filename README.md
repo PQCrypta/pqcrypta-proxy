@@ -925,7 +925,7 @@ Enabling the Redis backend makes all per-key counters shared across every instan
 
 ```toml
 [advanced_rate_limiting.redis]
-url                  = "redis://127.0.0.1:6379"
+url                  = "unix:///run/redis/redis-server.sock"   # or redis://, rediss:// for a remote one
 key_prefix           = "pqcp"          # Namespace prefix for all Redis keys
 connect_timeout_ms   = 2000            # Abort connection attempt after 2 s
 command_timeout_ms   = 50             # Per-command timeout; on timeout → silent local fallback
@@ -979,6 +979,12 @@ Request arrives on any path
 **Graceful fallback**: if Redis is unreachable or a command exceeds `command_timeout_ms`, the request is counted once on this node, whose windows already hold what the client has used here. No error is returned to the client. After a failure Redis is left alone for 250 ms, growing to 5 s, so requests do not wait for it during an outage; then one request tries it. When Redis answers again, each key's next request adds what this node admitted in the meantime. A proxy that starts before Redis keeps trying to connect.
 
 **Admin API** reports `redis_connected: true/false` in the rate limiter stats snapshot so you can verify the connection is live.
+
+**Least privilege.** A Redis on the same host is best reached on its Unix socket alone (`port 0`, `unixsocket`, `unixsocketperm 770`), with the proxy's account in Redis's group: no other local process can then touch the counters. The proxy needs only these commands, its Lua script's included (Redis checks a script's commands against the caller's ACL), on its own `key_prefix` (`rate_limiter::REDIS_COMMANDS`; a test runs the limiter against a Redis held to exactly them):
+
+```
+user default reset on nopass ~pqcp:* +evalsha +eval +script|load +hdel +hgetall +hincrby +hmget +hset +pexpire +time
+```
 
 **No Redis = zero behaviour change.** The `[advanced_rate_limiting.redis]` section is optional. Omitting it leaves the proxy running exactly as before with in-memory limiting.
 
