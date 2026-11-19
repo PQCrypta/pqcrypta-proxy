@@ -26,7 +26,7 @@
 - **Structured Access Logging**: Per-request JSON or text logs with latency, bytes, upstream, and client IP
 - **Enterprise Load Balancing**: 11 algorithms, session affinity, health-aware routing, per-backend retry policies, per-backend circuit breaker overrides, canary / percentage traffic splitting with sticky assignment and auto-rollback, traffic shadowing / mirroring
 - **Multi-Dimensional Rate Limiting**: Composite keys, JA3/JA4-based, JWT-verified, adaptive ML anomaly detection; optional Redis backend distributes counters across all proxy instances
-- **Zero-Trust Primitives**: Per-route HMAC proof-of-possession (method, path+query, timestamp and a required nonce signed; each nonce accepted once), internal route mTLS auto-enforcement, zero-trust mode startup validation (includes admin HMAC requirement), admin proof-of-possession, `trusted_internal_cidrs` deprecation
+- **Zero-Trust Primitives**: Per-route HMAC proof-of-possession (method, path+query, timestamp, a required nonce and the body's `Content-Digest` signed, the body held to it; each nonce accepted once), internal route mTLS auto-enforcement, zero-trust mode startup validation (includes admin HMAC requirement), admin proof-of-possession, `trusted_internal_cidrs` deprecation
 - **OpenTelemetry Distributed Tracing**: W3C TraceContext + B3 propagation on all transports, OTLP HTTP/JSON export, configurable sampling, access-log trace-ID correlation
 
 ## All Features Implemented
@@ -98,9 +98,9 @@
 | **Audit Events at Their Source** | ✅ | Each event is recorded where it happens: the admin API (actions, refused requests), the security layer (WAF verdicts, address blocks), the rate limiter, the TLS provider (every reload, whatever asked for it), the configuration reload handler and the handshake policy |
 | **Cryptographically Secure Admin Token** | ✅ | Ephemeral admin tokens use `OsRng` instead of `thread_rng` |
 | **`zero_trust_mode`** | ✅ | Startup validation enforcing mTLS, no plaintext backends, no CIDR trust, and admin HMAC proof-of-possession |
-| **Per-Route HMAC Signing** | ✅ | HMAC-SHA256 proof-of-possession signing full path+query string; a required `X-Request-Nonce` (8–128 characters) is bound into the signature and accepted once within the window, so a signed request cannot be replayed |
+| **Per-Route HMAC Signing** | ✅ | `X-Request-Signature`, hex HMAC-SHA256 of `METHOD\nPATH_AND_QUERY\nTIMESTAMP\nNONCE\nCONTENT_DIGEST`, the last the request's `Content-Digest` field (RFC 9530, with a `sha-256` member) or empty; the body is held to that digest as it is forwarded (a request without the field has no body), so neither request nor body can be changed. A required `X-Request-Nonce` (8–128 characters) is bound into the signature and accepted once within the window, so a signed request cannot be replayed |
 | **Internal Route Auto-mTLS** | ✅ | `internal = true` routes default to requiring client certificate |
-| **Admin HMAC Proof-of-Possession** | ✅ | Optional per-request HMAC signature (path+query+timestamp+nonce signed) alongside the bearer token; the `X-Admin-Nonce` (8–128 characters) is required and accepted once within the window |
+| **Admin HMAC Proof-of-Possession** | ✅ | Optional per-request HMAC signature (method, path+query, timestamp, nonce and the body's SHA-256 signed) alongside the bearer token; the `X-Admin-Nonce` (8–128 characters) is required and accepted once within the window |
 | **`trusted_internal_cidrs` Deprecation** | ✅ | Startup warning directing operators to cert-based trust |
 | **OpenSSL Subprocess Env Sanitisation** | ✅ | All `openssl` subprocesses clear the environment before execution (`env_clear()`) to prevent PATH/LD_PRELOAD injection |
 | **Hot Reload** | ✅ | Configuration and TLS certificates reloaded at runtime without dropping connections or restarting: routes, security, the WAF, admin credentials, pools and every listener's per-request settings; a change to a setting bound at startup (ports, listener kinds, process-wide services) is named in a warning |
@@ -117,6 +117,8 @@
 | **SSRF Protection** | ✅ | Link-local and loopback backend addresses rejected; RFC1918 logged with warning; WAF SSRF pattern set active |
 | **Admin Brute-Force Lockout** | ✅ | Per-IP and global lockout with exponential back-off (5 min base, up to 30 min) on repeated auth failures |
 | **Connection Draining** | ✅ | A pool server a reload removes takes no new sessions, keeps the ones it has until `connection_draining.timeout_secs`, then leaves the pool; requests in flight on it finish. By hand: `POST /pools/{pool}/servers/{id}/drain` (and `undrain`, `healthy`, `unhealthy`) on the admin API |
+| **Passive Health and Failover** | ✅ | A pool member a request cannot reach leaves rotation at once (its health check, which first runs as the pool is built, puts it back) and the request goes to another member, on TCP and HTTP/3 alike: nothing was sent, so whatever its method |
+| **Canary Rollouts** | ✅ | A member made the canary through the admin API steps through `canary.ramp_percent` while its error rate holds and is promoted at the end (`auto_promote`), the members it replaces draining: blue/green deployments with automatic rollback |
 | **Request Queuing** | ✅ | Every algorithm honours each pool server's `max_connections`; a request that finds every server up but full waits for the first place given back, up to `queue.timeout_ms`, with at most `queue.max_size` waiting (per pool: `queue_max_size`, `queue_timeout_ms`) |
 | **Slow Start** | ✅ | A pool server that recovers (its health check, its breaker) or joins on a reload ramps from `initial_weight_percent` to its weight over `duration_secs`: through its weight for the weighted and hashing algorithms, and for the others by being passed over in proportion to its ramp |
 | **Connection Pool** | ✅ | Per-backend connection pool with configurable max idle, max total, acquire timeout, and idle timeout |
@@ -1402,6 +1404,11 @@ rollback_min_requests  = 10             # minimum requests before rollback can t
 rollback_min_errors    = 3              # minimum errors before rollback can trigger
 rollback_compare_stable = true          # roll back only when the canary fails more than the stable servers
 rollback_ignored_statuses = []          # 5xx statuses that are not the canary's errors, e.g. [501]
+ramp_percent           = [5, 25, 50]       # a rollout's steps (admin API `canary` without a weight)
+ramp_step_secs         = 120               # each step lasts at least this long
+ramp_min_requests      = 10                # and until the canary has answered this many in it
+auto_promote           = true              # promote when the last step holds; the replaced members drain
+cohort                 = "ip"              # each client keeps its side: "random" (default), "ip", "header:<name>"
 
 # Canary server — mark with canary = true, set canary_weight_percent
 [[backend_pools.api-pool.servers]]
@@ -1429,22 +1436,27 @@ tls_mode = "terminate"
 2. Otherwise, each canary with a free place takes its own `canary_weight_percent` of new requests (5 and 50 send 5 % to one, 50 % to the other and 45 % to the stable servers; shares over 100 % divide all the traffic). The request gets a `Set-Cookie` header for future stickiness.
 3. If `auto_rollback = true`, the canary is suspended and all traffic falls back to stable servers when, within the rolling window, it has served `rollback_min_requests`, had `rollback_min_errors` errors, and its error rate exceeds `rollback_error_rate` and the stable servers' rate by more than that. An error is a failed backend exchange, a 5xx response or a response body that fails part-way.
 
+**Rollouts.** A member becomes the canary at run time, a configured stable one included, through `POST /pools/{pool}/servers/{id}/canary`: with `{"weight": n}` it takes that share; with no body it steps through `ramp_percent`, each step held for `ramp_step_secs` and until it has answered `ramp_min_requests`. A rollback ends the rollout; at the last step the canary is promoted (`auto_promote`) or waits for `POST /pools/{pool}/servers/{id}/promote`. Promotion makes it a stable member and drains the members it was compared with, the version it replaces. So a blue/green deployment is two members, one running: start the new version on the other's address, make it the canary, and stop the old one when the rollout is promoted (or the new one when it is rolled back). A rollout outlives a config reload that keeps its canary.
+
 **Live admin control** (all endpoints require Bearer token auth):
 
 ```
-GET  /canary                     — current status of every canary server across all pools
+GET  /canary                     — every pool's canaries and its rollout
 POST /canary/suspend/:server_id  — suspend a canary immediately
 POST /canary/resume/:server_id   — re-enable a suspended canary (resets error window)
 POST /canary/weight/:server_id   — adjust weight at runtime
                                    body: {"percent": 10}
+POST /pools/:pool/servers/:id/canary   — make a member the canary: {"weight": n}, or no body for the ramp
+POST /pools/:pool/servers/:id/promote  — promote the canary; the members it replaces drain
 ```
 
 Example:
 ```bash
-curl -s http://127.0.0.1:8081/canary \
-     -H "Authorization: Bearer <token>"
-# {"pools":[{"pool":"api-pool","servers":[{"id":"127.0.0.1:3005","is_canary":true,
-#   "canary_weight_percent":5,"suspended":false,"error_rate":0.0,...}]}]}
+pqcrypta-proxy --config /etc/pqcrypta/proxy-config.toml --admin GET /canary
+# {"pools":[{"pool":"api-pool","canary_enabled":true,...,"ramp_percent":[5,25,50],
+#   "servers":[{"id":"127.0.0.1:3005","canary_weight_percent":25,"suspended":false,
+#   "error_rate":0.0,"window_requests":41,"window_errors":0,...}],
+#   "rollout":{"server":"127.0.0.1:3005","outcome":"ramping","step":2,"steps":[5,25,50],...}}]}
 ```
 
 ### Traffic Shadowing / Mirroring
@@ -2116,7 +2128,7 @@ the client certificate; with `hmac_secret`, a signed request; `GET` of the three
 | `/canary/resume/{server_id}` | POST | Put a suspended canary back |
 | `/canary/weight/{server_id}` | POST | Set a canary's share of traffic |
 | `/pools` | GET | Load-balancer pools: servers, load, circuit breakers, draining |
-| `/pools/{pool}/servers/{server_id}/{action}` | POST | `drain`, `undrain`, `healthy` or `unhealthy` for one server |
+| `/pools/{pool}/servers/{server_id}/{action}` | POST | `drain`, `undrain`, `healthy`, `unhealthy`, `canary` (`{"weight": n}`, or no body for the pool's ramp) or `promote` for one server |
 | `/cache` | GET | Response cache statistics |
 | `/cache/purge` | POST | Purge the response cache: everything, one host and path prefix (`?host=&prefix=`), or one URL (`?host=&path=`) |
 
@@ -2711,7 +2723,8 @@ but `/health` passes, in order:
      one is configured, and none is generated.
 3. **Proof of possession** (optional, `hmac_secret`; in `zero_trust_mode`, this or mTLS is
    required): each request also carries
-   `X-Admin-Signature`, the HMAC-SHA256 of `METHOD\nPATH_AND_QUERY\nTIMESTAMP\nNONCE`, with
+   `X-Admin-Signature`, the HMAC-SHA256 of `METHOD\nPATH_AND_QUERY\nTIMESTAMP\nNONCE\nBODY_SHA256`
+   (the body's SHA-256 in hex, of no bytes when there is none, so a body cannot be changed either), with
    `X-Admin-Timestamp` (within ±300 s) and `X-Admin-Nonce` (each accepted once), so a token taken
    from one request cannot be replayed.
 

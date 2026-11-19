@@ -592,6 +592,21 @@ where
         req: http::Request<B>,
         attempt_timeout: Duration,
     ) -> Result<(http::Response<BackendBody>, Lease<B>), SendError> {
+        self.send_or_hand_back(backend, req, attempt_timeout)
+            .await
+            .map_err(|(error, _)| error)
+    }
+
+    /// [`Self::send_with_retry`], handing back a request that never reached
+    /// the backend (its last connection could not be made, so nothing of it
+    /// was written), for the caller to send to another member of a pool.
+    pub async fn send_or_hand_back(
+        &self,
+        backend: &BackendConfig,
+        req: http::Request<B>,
+        attempt_timeout: Duration,
+    ) -> Result<(http::Response<BackendBody>, Lease<B>), (SendError, Option<Box<http::Request<B>>>)>
+    {
         let policy = RetryPolicy::of(backend);
         let mut req = req;
         let mut attempt: u8 = 0;
@@ -618,21 +633,19 @@ where
                         None => return Ok((resp, lease)),
                     }
                 }
-                Ok(Err(failed)) => {
-                    match failed.unsent.filter(|_| again && policy.on_connect_failure) {
-                        Some(unsent) => {
-                            debug!(
-                                "backend {}: {}; sending again ({} of {})",
-                                backend.name,
-                                failed.error,
-                                attempt + 1,
-                                policy.retries
-                            );
-                            *unsent
-                        }
-                        None => return Err(SendError::Failed(failed.error)),
+                Ok(Err(Failed { error, unsent })) => match unsent {
+                    Some(unsent) if again && policy.on_connect_failure => {
+                        debug!(
+                            "backend {}: {}; sending again ({} of {})",
+                            backend.name,
+                            error,
+                            attempt + 1,
+                            policy.retries
+                        );
+                        *unsent
                     }
-                }
+                    unsent => return Err((SendError::Failed(error), unsent)),
+                },
                 Err(_) => {
                     self.timed_out(backend);
                     match copy.filter(|_| again && policy.on_timeout) {
@@ -646,7 +659,7 @@ where
                             );
                             copy
                         }
-                        None => return Err(SendError::TimedOut(attempt_timeout)),
+                        None => return Err((SendError::TimedOut(attempt_timeout), None)),
                     }
                 }
             };

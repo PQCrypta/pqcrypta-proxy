@@ -15,6 +15,12 @@
 //! - Connection draining: a server a reload removes takes no new sessions and
 //!   keeps its own until `connection_draining.timeout_secs`; by hand through
 //!   the admin API (`/pools/{pool}/servers/{id}/drain`)
+//! - Canary rollouts: a member made a canary through the admin API
+//!   (`/pools/{pool}/servers/{id}/canary`) steps through `canary.ramp_percent`
+//!   while its error rate holds, and is promoted at the end
+//!   (`canary.auto_promote`, or `/promote`): the stable members it replaces drain
+//! - Passive health: a member a request could not reach leaves rotation at once,
+//!   and the request goes to another member
 
 /// Maximum age of a sticky session mapping before it is silently evicted.
 const SESSION_TTL: Duration = Duration::from_hours(1); // 1 hour
@@ -102,6 +108,8 @@ pub struct SelectionContext {
     pub canary_header: Option<String>,
     /// Raw query string without the leading `?`, for `url_param` hashing.
     pub query: Option<String>,
+    /// Value of the header a `header:<name>` canary cohort hashes.
+    pub cohort_header: Option<String>,
     /// Value of the header named by the pool's `header:<name>` algorithm.
     ///
     /// Extracted by the listener rather than handed the whole header map, the same
@@ -109,6 +117,56 @@ pub struct SelectionContext {
     /// algorithm needs (`BackendPool::hash_header_name`), so cloning the rest of
     /// them into every selection would be waste.
     pub hash_header: Option<String>,
+}
+
+impl SelectionContext {
+    /// What `pool` chooses a member for this request by: the session and
+    /// canary cookies, from every Cookie field (HTTP/2 and HTTP/3 may send
+    /// each cookie in a field of its own, RFC 9113 section 8.2.3 and RFC 9114
+    /// section 4.2.1), the affinity, canary and hash headers the pool names,
+    /// and the request's address, path, host and query.
+    ///
+    /// One definition for both transports. HTTP/3 built its own, which took
+    /// the first cookie of any name as the session cookie and never read the
+    /// affinity header.
+    pub fn for_request(
+        pool: &BackendPool,
+        session_cookie: &SessionCookieConfig,
+        headers: &http::HeaderMap,
+        client_ip: IpAddr,
+        path: &str,
+        host: &str,
+        query: Option<&str>,
+    ) -> Self {
+        let cookies = headers
+            .get_all(http::header::COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect::<Vec<_>>()
+            .join("; ");
+        let cookies = (!cookies.is_empty()).then_some(cookies.as_str());
+        let header = |name: Option<&str>| {
+            name.and_then(|n| headers.get(n))
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        };
+        let canary = pool.canary_config.as_ref();
+        Self {
+            client_ip,
+            session_cookie: extract_session_cookie(cookies, session_cookie),
+            affinity_header: header(pool.affinity_header.as_deref()),
+            path: path.to_string(),
+            host: host.to_string(),
+            canary_cookie: extract_cookie_by_name(
+                cookies,
+                canary.map_or("PQCPROXY_CANARY", |c| c.sticky_cookie_name.as_str()),
+            ),
+            canary_header: header(canary.and_then(|c| c.sticky_header.as_deref())),
+            cohort_header: header(canary.and_then(CanaryPoolConfig::cohort_header)),
+            query: query.map(String::from),
+            hash_header: header(pool.hash_header_name()),
+        }
+    }
 }
 
 /// Result of `BackendPool::select()`.
@@ -225,6 +283,35 @@ fn error_rate((requests, errors): (u64, u64)) -> f64 {
 /// The canary a roll in `0..span` lands on, of `(server, percent)` shares:
 /// each canary has its own share of new traffic, and the rest is the stable
 /// servers'. Shares that add up to more than 100 divide all of it.
+/// A client's place in `0..range` for its canary cohort (`canary.cohort`):
+/// a hash of its address or of the cohort header, salted with the canary's
+/// id so each rollout draws its own cohort. Where the place is below the
+/// canary's weight the client goes to it; a weight that rises keeps every
+/// client already there. `None` for chance (`random`, or a header absent).
+fn cohort_roll(
+    cfg: &CanaryPoolConfig,
+    ctx: &SelectionContext,
+    salt: &str,
+    range: u32,
+) -> Option<u32> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(salt.as_bytes());
+    h.update([0]);
+    match cfg.cohort.as_str() {
+        "ip" => match ctx.client_ip {
+            IpAddr::V4(ip) => h.update(ip.octets()),
+            IpAddr::V6(ip) => h.update(ip.octets()),
+        },
+        _ if cfg.cohort_header().is_some() => h.update(ctx.cohort_header.as_ref()?.as_bytes()),
+        _ => return None,
+    }
+    let digest = h.finalize();
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&digest[..8]);
+    u32::try_from(u64::from_be_bytes(first) % u64::from(range)).ok()
+}
+
 fn canary_for_roll<T>(shares: &[(T, u32)], mut roll: u32) -> Option<&T> {
     shares.iter().find_map(|(canary, percent)| {
         if roll < *percent {
@@ -281,6 +368,12 @@ pub struct BackendServer {
     pub tls_skip_verify: bool,
     /// Server name to present and verify, when it is not the address's host.
     pub tls_sni: Option<String>,
+    /// A connection per request (`disable_pooling`)
+    pub disable_pooling: bool,
+    /// Its retry policy (`retries`, `retry_backoff_ms`, `retry_on`)
+    pub retries: Option<u8>,
+    pub retry_backoff_ms: Option<u64>,
+    pub retry_on: Option<Vec<String>>,
 
     // === Circuit breaker thresholds (per-backend overrides) ===
     /// Consecutive failures before tripping the circuit breaker
@@ -315,8 +408,10 @@ pub struct BackendServer {
     ramp: RwLock<Option<(Duration, u32)>>,
 
     // === Canary state ===
-    /// Whether this server is designated as a canary deployment target
-    pub is_canary: bool,
+    /// Whether this server is a canary deployment target: set from its
+    /// config, and changed at run time by a rollout (`BackendPool::start_canary`,
+    /// `BackendPool::promote`)
+    canary: AtomicBool,
     /// Fraction of *new* traffic to route here when it is the active canary (0–100)
     pub canary_weight_percent: AtomicU8,
     /// True when the canary has been suspended (manually or by auto-rollback)
@@ -402,11 +497,11 @@ impl BackendServer {
             max_connections: self.max_connections,
             health_check: None,
             health_check_interval_secs: 30,
-            retries: None,
-            retry_backoff_ms: None,
-            retry_on: None,
+            retries: self.retries,
+            retry_backoff_ms: self.retry_backoff_ms,
+            retry_on: self.retry_on.clone(),
             circuit_breaker: None,
-            disable_pooling: false,
+            disable_pooling: self.disable_pooling,
         }
     }
 
@@ -445,7 +540,11 @@ impl BackendServer {
             draining: RwLock::new(None),
             freed: RwLock::new(None),
             ramp: RwLock::new(None),
-            is_canary: config.canary,
+            disable_pooling: config.disable_pooling,
+            retries: config.retries,
+            retry_backoff_ms: config.retry_backoff_ms,
+            retry_on: config.retry_on.clone(),
+            canary: AtomicBool::new(config.canary),
             canary_weight_percent: AtomicU8::new(config.canary_weight_percent),
             canary_suspended: AtomicBool::new(false),
             canary_window: Mutex::new(OutcomeWindow::new()),
@@ -464,7 +563,7 @@ impl BackendServer {
         health.healthy
             && (!health.circuit_open || self.is_half_open(&health))
             && draining.is_none()
-            && !(self.is_canary && self.canary_suspended.load(Ordering::Relaxed))
+            && !(self.is_canary() && self.canary_suspended.load(Ordering::Relaxed))
     }
 
     /// A tripped breaker past `cb_half_open_delay`: one trial request at a
@@ -512,9 +611,49 @@ impl BackendServer {
         *self.ramp.write() = ramp;
     }
 
+    /// Whether this server is a canary now.
+    pub fn is_canary(&self) -> bool {
+        self.canary.load(Ordering::Acquire)
+    }
+
     /// Check if this canary server is available for canary-specific routing.
     pub fn is_canary_available(&self) -> bool {
-        self.is_canary && self.is_available()
+        self.is_canary() && self.is_available()
+    }
+
+    /// A request could not reach this server (its connection was refused or
+    /// never made): it is out of rotation at once, rather than after its
+    /// breaker's run of failures or its next health check, which puts it back
+    /// when it answers again.
+    pub fn mark_unreachable(&self) {
+        let mut health = self.health.write();
+        if health.healthy {
+            health.healthy = false;
+            warn!(
+                "Backend {} could not be reached: out of rotation until its health check finds it",
+                self.id
+            );
+        }
+    }
+
+    /// Make this server a canary taking `weight`% of new requests: out of
+    /// draining and suspension, its error window started afresh.
+    fn make_canary(&self, weight: u8) {
+        self.canary_weight_percent.store(weight, Ordering::Relaxed);
+        *self.canary_window.lock() = OutcomeWindow::new();
+        self.canary_suspended.store(false, Ordering::Relaxed);
+        *self.draining.write() = None;
+        self.canary.store(true, Ordering::Release);
+        info!("Backend {} is a canary at {}%", self.id, weight);
+    }
+
+    /// Make this server a stable one: it takes its share of normal routing.
+    fn make_stable(&self) {
+        self.canary.store(false, Ordering::Release);
+        self.canary_weight_percent.store(0, Ordering::Relaxed);
+        self.canary_suspended.store(false, Ordering::Relaxed);
+        *self.canary_window.lock() = OutcomeWindow::new();
+        *self.draining.write() = None;
     }
 
     /// Whether this server keeps the sessions it has: it is draining, and up.
@@ -813,6 +952,60 @@ pub struct BackendPool {
     ramp: Option<(Duration, u32)>,
     /// How long a server removed by a reload drains (`load_balancer.connection_draining`)
     drain_for: Option<Duration>,
+    /// The canary rollout under way, or the last one, when one was started
+    /// through the admin API
+    rollout: Mutex<Option<Rollout>>,
+}
+
+/// How often a rollout is looked at to move it on.
+const ROLLOUT_TICK: Duration = Duration::from_secs(1);
+
+/// A canary's progressive rollout (`canary.ramp_percent`): its weight steps
+/// up while its error rate holds, and at the end it is promoted
+/// (`canary.auto_promote`) or waits to be.
+#[derive(Debug, Clone)]
+struct Rollout {
+    server: String,
+    step: usize,
+    started: Instant,
+    step_started: Instant,
+    /// The server's requests when the step began
+    requests_at_step: u64,
+    outcome: RolloutOutcome,
+}
+
+/// Where a rollout is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutOutcome {
+    /// Stepping through the ramp
+    Ramping,
+    /// At the last step, for `promote` through the admin API
+    AwaitingPromotion,
+    /// The canary became a stable server
+    Promoted,
+    /// Its error rate suspended the canary
+    RolledBack,
+    /// The server stopped being this rollout's canary otherwise: made stable
+    /// or given a fixed weight by hand, or removed by a reload
+    Ended,
+}
+
+/// A rollout as the admin API shows it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RolloutStatus {
+    pub server: String,
+    pub outcome: RolloutOutcome,
+    /// The step it is at, from 1
+    pub step: usize,
+    pub steps: Vec<u8>,
+    pub weight_percent: u8,
+    pub step_secs: u64,
+    pub step_elapsed_secs: u64,
+    /// The canary's requests in this step, and how many the step needs
+    pub step_requests: u64,
+    pub step_min_requests: u64,
+    pub elapsed_secs: u64,
 }
 
 /// State for weighted round-robin algorithm
@@ -906,6 +1099,7 @@ impl BackendPool {
             queue_refused: AtomicU64::new(0),
             ramp,
             drain_for,
+            rollout: Mutex::new(None),
         }
     }
 
@@ -1055,7 +1249,7 @@ impl BackendPool {
             .servers
             .read()
             .iter()
-            .any(|s| !s.is_canary && s.is_available());
+            .any(|s| !s.is_canary() && s.is_available());
         if !any_up {
             return None;
         }
@@ -1197,7 +1391,10 @@ impl BackendPool {
         if total == 0 {
             return None;
         }
-        let server = canary_for_roll(&shares, rand::random_range(0..total.max(100)))?.clone();
+        let range = total.max(100);
+        let roll = cohort_roll(canary_cfg, ctx, &shares[0].0.id, range)
+            .unwrap_or_else(|| rand::random_range(0..range));
+        let server = canary_for_roll(&shares, roll)?.clone();
 
         let set_canary_cookie = if canary_cfg.sticky {
             self.canary_sessions
@@ -1331,14 +1528,15 @@ impl BackendPool {
             // and servers being drained or at `max_connections`.
             return servers
                 .iter()
-                .filter(|s| !s.is_canary && s.draining.read().is_none() && s.has_capacity())
+                .filter(|s| !s.is_canary() && s.draining.read().is_none() && s.has_capacity())
                 .cloned()
                 .collect();
         }
 
         // A server at `max_connections` takes no more, whichever algorithm
         // chooses: only first_available read the limit before.
-        let takes = |s: &&Arc<BackendServer>| s.is_available() && !s.is_canary && s.has_capacity();
+        let takes =
+            |s: &&Arc<BackendServer>| s.is_available() && !s.is_canary() && s.has_capacity();
 
         // First, try priority 1 healthy non-canary servers
         let priority_1: Vec<_> = servers
@@ -1391,7 +1589,7 @@ impl BackendPool {
         let Some(canary_cfg) = self.rollback_config() else {
             return;
         };
-        if !server.is_canary {
+        if !server.is_canary() {
             self.stable_outcomes.lock().record(
                 !succeeded,
                 Duration::from_secs(canary_cfg.rollback_window_secs),
@@ -1410,7 +1608,7 @@ impl BackendPool {
         let Some(canary_cfg) = self.rollback_config() else {
             return;
         };
-        if !server.is_canary {
+        if !server.is_canary() {
             self.stable_outcomes.lock().record_late_error(
                 Duration::from_secs(canary_cfg.rollback_window_secs),
                 Instant::now(),
@@ -1458,7 +1656,7 @@ impl BackendPool {
     /// Suspend a canary server by its ID.  Returns true if found and suspended.
     pub fn suspend_canary_server(&self, server_id: &str) -> bool {
         let servers = self.servers.read();
-        if let Some(s) = servers.iter().find(|s| s.id == server_id && s.is_canary) {
+        if let Some(s) = servers.iter().find(|s| s.id == server_id && s.is_canary()) {
             s.suspend_canary();
             return true;
         }
@@ -1468,7 +1666,7 @@ impl BackendPool {
     /// Resume a suspended canary server by its ID.  Returns true if found and resumed.
     pub fn resume_canary_server(&self, server_id: &str) -> bool {
         let servers = self.servers.read();
-        if let Some(s) = servers.iter().find(|s| s.id == server_id && s.is_canary) {
+        if let Some(s) = servers.iter().find(|s| s.id == server_id && s.is_canary()) {
             s.resume_canary();
             return true;
         }
@@ -1483,7 +1681,7 @@ impl BackendPool {
         }
         let servers = self.servers.read();
         for s in servers.iter() {
-            if s.id == server_id && s.is_canary {
+            if s.id == server_id && s.is_canary() {
                 s.canary_weight_percent.store(percent, Ordering::Relaxed);
                 return true;
             }
@@ -1491,12 +1689,210 @@ impl BackendPool {
         false
     }
 
+    /// The member `server_id`, if the pool has it.
+    pub fn member(&self, server_id: &str) -> Option<Arc<BackendServer>> {
+        self.servers
+            .read()
+            .iter()
+            .find(|s| s.id == server_id)
+            .cloned()
+    }
+
+    /// How many members the pool has, those draining included.
+    pub fn member_count(&self) -> usize {
+        self.servers.read().len()
+    }
+
+    /// Make member `server_id` this pool's canary: at `weight`% of new
+    /// requests, or, without a weight, through the pool's ramp
+    /// (`canary.ramp_percent`) from its first step. Out of draining and
+    /// suspension, its error window afresh. Returns the weight it starts at.
+    pub fn start_canary(
+        self: &Arc<Self>,
+        server_id: &str,
+        weight: Option<u8>,
+    ) -> Result<u8, String> {
+        let cfg = self
+            .canary_config
+            .as_ref()
+            .filter(|c| c.enabled)
+            .ok_or_else(|| format!("pool '{}' has no canary enabled", self.name))?;
+        let server = self
+            .member(server_id)
+            .ok_or_else(|| format!("no server '{server_id}' in pool '{}'", self.name))?;
+        let start = match weight {
+            Some(w) if w > 100 => return Err(format!("weight {w} is more than 100")),
+            Some(w) => w,
+            None => *cfg.ramp_percent.first().ok_or_else(|| {
+                format!(
+                    "pool '{}' has no canary.ramp_percent: give a weight",
+                    self.name
+                )
+            })?,
+        };
+        server.make_canary(start);
+        let now = Instant::now();
+        *self.rollout.lock() = weight.is_none().then(|| Rollout {
+            server: server.id.clone(),
+            step: 0,
+            started: now,
+            step_started: now,
+            requests_at_step: server.total_requests.load(Ordering::Relaxed),
+            outcome: RolloutOutcome::Ramping,
+        });
+        if weight.is_none() {
+            Self::start_rollout_task(self);
+        }
+        Ok(start)
+    }
+
+    /// Promote canary `server_id`: it becomes a stable member, and the stable
+    /// members it was compared with drain, being the version it replaces.
+    /// False when it is not a canary of this pool.
+    pub fn promote(&self, server_id: &str) -> bool {
+        let Some(server) = self.member(server_id).filter(|s| s.is_canary()) else {
+            return false;
+        };
+        server.make_stable();
+        let drain_for = self.drain_for.unwrap_or_default();
+        for other in self.servers.read().iter() {
+            if !Arc::ptr_eq(other, &server) && !other.is_canary() {
+                other.start_draining(drain_for);
+            }
+        }
+        if let Some(rollout) = self.rollout.lock().as_mut() {
+            if rollout.server == server.id {
+                rollout.outcome = RolloutOutcome::Promoted;
+            }
+        }
+        info!(
+            "Canary {} in pool '{}' promoted: the members it replaces drain",
+            server.id, self.name
+        );
+        true
+    }
+
+    /// Look at the rollout at `now` and move it on: a suspended canary ends
+    /// it (rolled back); a step held for `ramp_step_secs` in which the canary
+    /// answered `ramp_min_requests` goes to the next weight; the last step
+    /// held promotes the canary (`auto_promote`) or waits for promotion.
+    /// Whether the rollout is still stepping.
+    fn advance_rollout(&self, now: Instant) -> bool {
+        let Some(cfg) = self.canary_config.as_ref() else {
+            return false;
+        };
+        let mut guard = self.rollout.lock();
+        let Some(rollout) = guard
+            .as_mut()
+            .filter(|r| r.outcome == RolloutOutcome::Ramping)
+        else {
+            return false;
+        };
+        let Some(server) = self.member(&rollout.server).filter(|s| s.is_canary()) else {
+            rollout.outcome = RolloutOutcome::Ended;
+            return false;
+        };
+        if server.canary_suspended.load(Ordering::Relaxed) {
+            rollout.outcome = RolloutOutcome::RolledBack;
+            warn!(
+                "Canary {} in pool '{}' rolled back at {}% after {:?}",
+                server.id,
+                self.name,
+                server.canary_weight_percent.load(Ordering::Relaxed),
+                now.saturating_duration_since(rollout.started)
+            );
+            return false;
+        }
+        let requests = server.total_requests.load(Ordering::Relaxed);
+        let held = now.saturating_duration_since(rollout.step_started)
+            >= Duration::from_secs(cfg.ramp_step_secs)
+            && requests.saturating_sub(rollout.requests_at_step) >= cfg.ramp_min_requests;
+        if !held {
+            return true;
+        }
+        if let Some(next) = cfg.ramp_percent.get(rollout.step + 1) {
+            rollout.step += 1;
+            rollout.step_started = now;
+            rollout.requests_at_step = requests;
+            server.canary_weight_percent.store(*next, Ordering::Relaxed);
+            info!(
+                "Canary {} in pool '{}': step {} of {}, {}%",
+                server.id,
+                self.name,
+                rollout.step + 1,
+                cfg.ramp_percent.len(),
+                next
+            );
+            return true;
+        }
+        if cfg.auto_promote {
+            drop(guard);
+            self.promote(&server.id);
+        } else {
+            rollout.outcome = RolloutOutcome::AwaitingPromotion;
+            info!(
+                "Canary {} in pool '{}' has held every step: promote it through the admin API",
+                server.id, self.name
+            );
+        }
+        false
+    }
+
+    /// Steps the rollout until it ends or the pool is replaced.
+    fn start_rollout_task(pool: &Arc<Self>) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let pool = Arc::downgrade(pool);
+        runtime.spawn(async move {
+            let mut ticker = tokio::time::interval(ROLLOUT_TICK);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let Some(pool) = pool.upgrade() else {
+                    return;
+                };
+                if !pool.advance_rollout(Instant::now()) {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// The rollout under way or last finished, for the admin API.
+    pub fn rollout_status(&self) -> Option<RolloutStatus> {
+        let cfg = self.canary_config.as_ref()?;
+        let rollout = self.rollout.lock().clone()?;
+        let server = self.member(&rollout.server);
+        let now = Instant::now();
+        Some(RolloutStatus {
+            weight_percent: server
+                .as_ref()
+                .map_or(0, |s| s.canary_weight_percent.load(Ordering::Relaxed)),
+            step_requests: server.as_ref().map_or(0, |s| {
+                s.total_requests
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(rollout.requests_at_step)
+            }),
+            server: rollout.server,
+            outcome: rollout.outcome,
+            step: rollout.step + 1,
+            steps: cfg.ramp_percent.clone(),
+            step_secs: cfg.ramp_step_secs,
+            step_elapsed_secs: now
+                .saturating_duration_since(rollout.step_started)
+                .as_secs(),
+            step_min_requests: cfg.ramp_min_requests,
+            elapsed_secs: now.saturating_duration_since(rollout.started).as_secs(),
+        })
+    }
+
     /// Return a snapshot of canary server status for the admin API.
     pub fn canary_status(&self) -> Vec<CanaryServerStatus> {
         let servers = self.servers.read();
         servers
             .iter()
-            .filter(|s| s.is_canary)
+            .filter(|s| s.is_canary())
             .map(|s| {
                 let (window_requests, window_errors) =
                     s.canary_window.lock().totals(Instant::now());
@@ -1543,7 +1939,7 @@ impl BackendPool {
                         healthy: health.healthy,
                         circuit_open: health.circuit_open,
                         draining: s.is_draining(),
-                        canary: s.is_canary,
+                        canary: s.is_canary(),
                         slow_start_percent: s.ramp_factor().map(|f| (f * 100.0).round()),
                         active_connections: s.active_connections.load(Ordering::Relaxed),
                         max_connections: s.max_connections,
@@ -1589,11 +1985,11 @@ impl BackendPool {
         let pool = Arc::downgrade(pool);
 
         runtime.spawn(async move {
+            // The first tick is at once: a member that is not running when
+            // the pool is built (one half of a pair whose other half serves)
+            // is known to be down before requests are sent to it, rather than
+            // after an interval of them.
             let mut ticker = tokio::time::interval(interval);
-            // Skip the first tick so we don't check immediately on startup
-            // (all servers start healthy by default and the first real request
-            // will quickly surface any that are unreachable).
-            ticker.tick().await;
 
             loop {
                 ticker.tick().await;
@@ -2321,6 +2717,20 @@ impl LoadBalancer {
                         }
                     }
                 }
+                // A rollout goes on in the rebuilt pool while its canary is
+                // still there, the live object kept.
+                let carried = old.rollout.lock().clone().filter(|r| {
+                    rebuilt
+                        .member(&r.server)
+                        .is_some_and(|s| old.member(&r.server).is_some_and(|o| Arc::ptr_eq(&s, &o)))
+                });
+                let ramping = carried
+                    .as_ref()
+                    .is_some_and(|r| r.outcome == RolloutOutcome::Ramping);
+                *rebuilt.rollout.lock() = carried;
+                if ramping {
+                    BackendPool::start_rollout_task(&rebuilt);
+                }
                 info!(
                     "Backend pool '{}' rebuilt from the reloaded config",
                     pool_config.name
@@ -2392,6 +2802,26 @@ impl LoadBalancer {
         let pool = self.pools.get(pool_name)?;
         let servers = pool.servers.read();
         servers.iter().find(|s| s.id == server_id).cloned()
+    }
+
+    /// Make `server_id` the canary of `pool_name` (see
+    /// [`BackendPool::start_canary`]).
+    pub fn start_canary(
+        &self,
+        pool_name: &str,
+        server_id: &str,
+        weight: Option<u8>,
+    ) -> Result<u8, String> {
+        let pool = self
+            .get_pool(pool_name)
+            .ok_or_else(|| format!("no pool '{pool_name}'"))?;
+        pool.start_canary(server_id, weight)
+    }
+
+    /// Promote canary `server_id` of `pool_name` (see [`BackendPool::promote`]).
+    pub fn promote(&self, pool_name: &str, server_id: &str) -> bool {
+        self.get_pool(pool_name)
+            .is_some_and(|pool| pool.promote(server_id))
     }
 
     /// Drain a server: no new sessions, the ones it has kept for
@@ -2679,6 +3109,10 @@ mod tests {
             cb_success_threshold: None,
             canary,
             canary_weight_percent: canary_pct,
+            disable_pooling: false,
+            retries: None,
+            retry_backoff_ms: None,
+            retry_on: None,
         };
         Arc::new(BackendServer::from_config(&config).expect("test address must be valid"))
     }
@@ -2784,6 +3218,7 @@ mod tests {
             canary_cookie: None,
             canary_header: None,
             query: None,
+            cohort_header: None,
             hash_header: None,
         }
     }
@@ -2860,6 +3295,10 @@ mod tests {
                 cb_success_threshold: None,
                 canary: false,
                 canary_weight_percent: 0,
+                disable_pooling: false,
+                retries: None,
+                retry_backoff_ms: None,
+                retry_on: None,
             })
             .collect();
         let cfg = make_pool_config(algorithm, servers, None);
@@ -3149,6 +3588,10 @@ mod tests {
             cb_success_threshold: None,
             canary: false,
             canary_weight_percent: 0,
+            disable_pooling: false,
+            retries: None,
+            retry_backoff_ms: None,
+            retry_on: None,
         };
         let canary_cfg = PoolServerConfig {
             address: "127.0.0.1:9002".to_string(),
@@ -3165,6 +3608,10 @@ mod tests {
             cb_success_threshold: None,
             canary: true,
             canary_weight_percent: 50,
+            disable_pooling: false,
+            retries: None,
+            retry_backoff_ms: None,
+            retry_on: None,
         };
 
         let pool_cfg = make_pool_config(
@@ -3192,7 +3639,7 @@ mod tests {
         let iterations = 1000;
         for _ in 0..iterations {
             if let Some(result) = pool.select(&ctx) {
-                if result.server.is_canary {
+                if result.server.is_canary() {
                     canary_hits += 1;
                 }
             }
@@ -3227,6 +3674,10 @@ mod tests {
                     cb_success_threshold: None,
                     canary: false,
                     canary_weight_percent: 0,
+                    disable_pooling: false,
+                    retries: None,
+                    retry_backoff_ms: None,
+                    retry_on: None,
                 },
                 PoolServerConfig {
                     address: "127.0.0.1:9002".to_string(),
@@ -3243,6 +3694,10 @@ mod tests {
                     cb_success_threshold: None,
                     canary: true,
                     canary_weight_percent: 100, // always canary for test
+                    disable_pooling: false,
+                    retries: None,
+                    retry_backoff_ms: None,
+                    retry_on: None,
                 },
             ],
             Some(CanaryPoolConfig {
@@ -3264,7 +3719,7 @@ mod tests {
 
         // First select — no cookie yet.
         let result1 = pool.select(&default_ctx()).expect("should select");
-        assert!(result1.server.is_canary);
+        assert!(result1.server.is_canary());
         let cookie_header = result1
             .set_canary_cookie
             .expect("should set canary cookie on first assignment");
@@ -3336,6 +3791,10 @@ mod tests {
                     cb_success_threshold: None,
                     canary: false,
                     canary_weight_percent: 0,
+                    disable_pooling: false,
+                    retries: None,
+                    retry_backoff_ms: None,
+                    retry_on: None,
                 },
                 PoolServerConfig {
                     address: "127.0.0.1:9002".to_string(),
@@ -3352,6 +3811,10 @@ mod tests {
                     cb_success_threshold: None,
                     canary: true,
                     canary_weight_percent: 0, // 0% → no probabilistic routing
+                    disable_pooling: false,
+                    retries: None,
+                    retry_backoff_ms: None,
+                    retry_on: None,
                 },
             ],
             None, // canary config disabled
@@ -3362,7 +3825,7 @@ mod tests {
 
         let healthy = pool.get_healthy_servers();
         assert_eq!(healthy.len(), 1);
-        assert!(!healthy[0].is_canary);
+        assert!(!healthy[0].is_canary());
     }
 
     #[test]
@@ -3422,6 +3885,7 @@ mod reservation_and_rollback_tests {
             canary_cookie: None,
             canary_header: None,
             query: None,
+            cohort_header: None,
             hash_header: None,
         }
     }
@@ -3456,7 +3920,7 @@ mod reservation_and_rollback_tests {
         pool.servers
             .read()
             .iter()
-            .find(|s| s.is_canary == canary)
+            .find(|s| s.is_canary() == canary)
             .cloned()
             .unwrap()
     }
@@ -3537,8 +4001,8 @@ mod reservation_and_rollback_tests {
             "#,
         );
         let first = pool.select(&ctx()).unwrap();
-        assert!(first.server.is_canary);
-        assert!(!pool.select(&ctx()).unwrap().server.is_canary);
+        assert!(first.server.is_canary());
+        assert!(!pool.select(&ctx()).unwrap().server.is_canary());
     }
 
     #[test]
@@ -3719,5 +4183,272 @@ mod reservation_and_rollback_tests {
         first.start_draining(Duration::from_secs(60));
         first.health.write().healthy = false;
         assert_ne!(pool.select(&session).unwrap().server.id, first.id);
+    }
+}
+
+#[cfg(test)]
+mod rollout_tests {
+    use super::*;
+
+    /// A blue/green pair: one stable member, one stopped, a canary with a
+    /// ramp of two steps.
+    const PAIR: &str = r#"
+        name = "api"
+        algorithm = "least_connections"
+        health_aware = true
+        [canary]
+        enabled = true
+        sticky = false
+        auto_rollback = true
+        rollback_min_requests = 3
+        rollback_min_errors = 2
+        rollback_compare_stable = false
+        ramp_percent = [10, 50]
+        ramp_step_secs = 60
+        ramp_min_requests = 2
+        auto_promote = true
+        [[servers]]
+        address = "127.0.0.1:3013"
+        [[servers]]
+        address = "127.0.0.1:3023"
+    "#;
+
+    fn pool(toml_src: &str) -> Arc<BackendPool> {
+        let config: BackendPoolConfig = toml::from_str(toml_src).expect("pool config");
+        Arc::new(BackendPool::from_config(
+            &config,
+            &LoadBalancerConfig::default(),
+        ))
+    }
+
+    fn ctx() -> SelectionContext {
+        SelectionContext {
+            client_ip: "192.0.2.1".parse().unwrap(),
+            session_cookie: None,
+            affinity_header: None,
+            path: "/".to_string(),
+            host: "example.test".to_string(),
+            canary_cookie: None,
+            canary_header: None,
+            query: None,
+            cohort_header: None,
+            hash_header: None,
+        }
+    }
+
+    /// `n` answered requests on `server`
+    fn answered(pool: &BackendPool, server: &BackendServer, n: usize, status: u16) {
+        for _ in 0..n {
+            pool.record_response(server, Duration::from_millis(1), status);
+        }
+    }
+
+    #[test]
+    fn a_rollout_steps_up_with_time_and_answers_then_promotes() {
+        let pool = pool(PAIR);
+        let blue = pool.member("127.0.0.1:3013").unwrap();
+        let green = pool.member("127.0.0.1:3023").unwrap();
+        assert!(!green.is_canary(), "configured stable");
+
+        assert_eq!(pool.start_canary(&green.id, None), Ok(10));
+        assert!(green.is_canary());
+        let t0 = Instant::now();
+        let step = Duration::from_secs(60);
+
+        // Time alone does not move it on: the canary has answered nothing
+        assert!(pool.advance_rollout(t0 + step));
+        assert_eq!(green.canary_weight_percent.load(Ordering::Relaxed), 10);
+
+        answered(&pool, &green, 2, 200);
+        // Answers alone do not either, before the step's time
+        assert!(pool.advance_rollout(t0 + Duration::from_secs(1)));
+        assert_eq!(green.canary_weight_percent.load(Ordering::Relaxed), 10);
+        assert!(pool.advance_rollout(t0 + step));
+        assert_eq!(green.canary_weight_percent.load(Ordering::Relaxed), 50);
+        let status = pool.rollout_status().unwrap();
+        assert_eq!((status.step, status.outcome), (2, RolloutOutcome::Ramping));
+
+        answered(&pool, &green, 2, 200);
+        assert!(
+            !pool.advance_rollout(t0 + 3 * step),
+            "the last step held: done"
+        );
+        assert!(!green.is_canary(), "promoted to stable");
+        assert!(green.is_available());
+        assert!(!blue.is_available(), "the member it replaces drains");
+        assert_eq!(
+            pool.rollout_status().unwrap().outcome,
+            RolloutOutcome::Promoted
+        );
+        // Everything new goes to the promoted member
+        for _ in 0..10 {
+            assert!(Arc::ptr_eq(&pool.select(&ctx()).unwrap().server, &green));
+        }
+    }
+
+    #[test]
+    fn a_failing_canary_rolls_the_rollout_back() {
+        let pool = pool(PAIR);
+        let green = pool.member("127.0.0.1:3023").unwrap();
+        pool.start_canary(&green.id, None).unwrap();
+        answered(&pool, &green, 3, 503);
+        assert!(green.canary_suspended.load(Ordering::Relaxed));
+        assert!(!pool.advance_rollout(Instant::now() + Duration::from_secs(600)));
+        assert_eq!(
+            pool.rollout_status().unwrap().outcome,
+            RolloutOutcome::RolledBack
+        );
+        // The stable member takes everything
+        let blue = pool.member("127.0.0.1:3013").unwrap();
+        for _ in 0..10 {
+            assert!(Arc::ptr_eq(&pool.select(&ctx()).unwrap().server, &blue));
+        }
+    }
+
+    #[test]
+    fn a_fixed_weight_is_no_rollout_and_bad_requests_are_refused() {
+        let pool = pool(PAIR);
+        assert_eq!(pool.start_canary("127.0.0.1:3023", Some(30)), Ok(30));
+        assert!(pool.rollout_status().is_none());
+        assert!(pool.start_canary("127.0.0.1:3023", Some(101)).is_err());
+        assert!(pool.start_canary("127.0.0.1:9", None).is_err());
+
+        let off = self::pool(&PAIR.replace("enabled = true", "enabled = false"));
+        assert!(off.start_canary("127.0.0.1:3023", Some(5)).is_err());
+        let no_ramp = self::pool(
+            &PAIR
+                .replace("ramp_percent = [10, 50]", "")
+                .replace("auto_promote = true", ""),
+        );
+        assert!(no_ramp.start_canary("127.0.0.1:3023", None).is_err());
+    }
+
+    #[test]
+    fn without_auto_promote_the_canary_waits_for_promotion() {
+        let pool = pool(&PAIR.replace("auto_promote = true", "auto_promote = false"));
+        let green = pool.member("127.0.0.1:3023").unwrap();
+        pool.start_canary(&green.id, None).unwrap();
+        let t0 = Instant::now();
+        answered(&pool, &green, 2, 200);
+        pool.advance_rollout(t0 + Duration::from_secs(60));
+        answered(&pool, &green, 2, 200);
+        assert!(!pool.advance_rollout(t0 + Duration::from_secs(180)));
+        assert!(green.is_canary());
+        assert_eq!(
+            pool.rollout_status().unwrap().outcome,
+            RolloutOutcome::AwaitingPromotion
+        );
+        assert!(pool.promote(&green.id));
+        assert!(!green.is_canary());
+        assert!(!pool.promote(&green.id), "no longer a canary");
+    }
+
+    #[test]
+    fn an_unreachable_member_leaves_rotation_until_it_answers() {
+        let pool = pool(PAIR);
+        let blue = pool.member("127.0.0.1:3013").unwrap();
+        let green = pool.member("127.0.0.1:3023").unwrap();
+        green.mark_unreachable();
+        for _ in 0..10 {
+            assert!(Arc::ptr_eq(&pool.select(&ctx()).unwrap().server, &blue));
+        }
+        // Made the canary while down: it takes nothing until it is up
+        pool.start_canary(&green.id, Some(100)).unwrap();
+        assert!(Arc::ptr_eq(&pool.select(&ctx()).unwrap().server, &blue));
+        green.health.write().healthy = true;
+        assert!(Arc::ptr_eq(&pool.select(&ctx()).unwrap().server, &green));
+    }
+
+    #[test]
+    fn a_reload_that_keeps_the_canary_keeps_its_rollout() {
+        let lb = LoadBalancer::new(Arc::new(LoadBalancerConfig::default()));
+        let config: BackendPoolConfig = toml::from_str(PAIR).unwrap();
+        let configured = std::collections::HashMap::from([("api".to_string(), config.clone())]);
+        lb.reconcile_pools(&configured);
+        assert_eq!(lb.start_canary("api", "127.0.0.1:3023", None), Ok(10));
+
+        // A change to the pool's settings rebuilds it; the members keep their objects
+        let mut changed = config;
+        changed.queue_timeout_ms = Some(1234);
+        lb.reconcile_pools(&std::collections::HashMap::from([(
+            "api".to_string(),
+            changed,
+        )]));
+        let status = lb.get_pool("api").unwrap().rollout_status().unwrap();
+        assert_eq!(status.server, "127.0.0.1:3023");
+        assert_eq!(status.outcome, RolloutOutcome::Ramping);
+        assert!(lb.promote("api", "127.0.0.1:3023"));
+    }
+
+    /// An `ip` cohort keeps each client on its side while the weight holds,
+    /// and a weight that rises moves clients only towards the canary.
+    #[test]
+    fn a_cohort_keeps_each_client_on_its_side_as_the_weight_rises() {
+        let pool = pool(&PAIR.replace("sticky = false", "sticky = false\ncohort = \"ip\""));
+        let green = pool.member("127.0.0.1:3023").unwrap();
+        pool.start_canary(&green.id, Some(10)).unwrap();
+        let from = |i: u32| SelectionContext {
+            client_ip: IpAddr::V4(std::net::Ipv4Addr::from(0xC000_0200 + i)),
+            ..ctx()
+        };
+        let side = |i: u32| {
+            let chosen = pool.select(&from(i)).unwrap();
+            chosen.server.is_canary()
+        };
+        let at_10: Vec<bool> = (0..400).map(side).collect();
+        // The same clients, the same sides
+        assert_eq!(at_10, (0..400).map(side).collect::<Vec<_>>());
+        let share = at_10.iter().filter(|c| **c).count();
+        assert!((15..=70).contains(&share), "about 10% of 400: {share}");
+
+        green.canary_weight_percent.store(50, Ordering::Relaxed);
+        let at_50: Vec<bool> = (0..400).map(side).collect();
+        for (before, after) in at_10.iter().zip(&at_50) {
+            assert!(!before || *after, "a client on the canary stays there");
+        }
+        assert!(at_50.iter().filter(|c| **c).count() > share);
+    }
+
+    #[test]
+    fn selection_reads_every_cookie_field_and_the_affinity_header() {
+        let pool = pool(
+            r#"
+            name = "s"
+            affinity = "header"
+            affinity_header = "x-tenant"
+            [canary]
+            enabled = true
+            sticky_cookie_name = "CANARY"
+            [[servers]]
+            address = "127.0.0.1:3013"
+            "#,
+        );
+        let mut headers = http::HeaderMap::new();
+        headers.append(http::header::COOKIE, "a=1".parse().unwrap());
+        headers.append(
+            http::header::COOKIE,
+            "SESSION=s1; CANARY=c1".parse().unwrap(),
+        );
+        headers.insert("x-tenant", "t9".parse().unwrap());
+        let cookie = SessionCookieConfig {
+            name: "SESSION".to_string(),
+            ttl: Duration::from_secs(60),
+            secure: true,
+            httponly: true,
+            samesite: SameSite::Lax,
+        };
+        let ctx = SelectionContext::for_request(
+            &pool,
+            &cookie,
+            &headers,
+            "192.0.2.7".parse().unwrap(),
+            "/p",
+            "h.test",
+            Some("q=1"),
+        );
+        assert_eq!(ctx.session_cookie.as_deref(), Some("s1"));
+        assert_eq!(ctx.canary_cookie.as_deref(), Some("c1"));
+        assert_eq!(ctx.affinity_header.as_deref(), Some("t9"));
+        assert_eq!(ctx.query.as_deref(), Some("q=1"));
     }
 }

@@ -510,6 +510,7 @@ async fn handle_incoming_session(
             path_and_query: &path,
             path: &route_path,
             headers: &headers,
+            verified_content_digest: None,
             client_ip: remote_addr.ip(),
             is_http11: false,
             is_websocket_upgrade: false,

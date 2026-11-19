@@ -514,6 +514,9 @@ const ADMIN_AUTH_MAX_FAILURES: u32 = 10;
 /// How far a signed admin request's X-Admin-Timestamp may be from this
 /// server's clock, either way, and how long its nonce is remembered.
 const ADMIN_HMAC_WINDOW_SECS: u64 = 300;
+/// The largest admin request body read (they are small JSON objects): the
+/// signature covers the body, so it is read before the request is handled.
+const ADMIN_MAX_BODY: usize = 64 * 1024;
 /// Length of the sliding rate-limit window.
 const ADMIN_AUTH_WINDOW: Duration = Duration::from_mins(1);
 /// AUD-10: Total failures across all IPs before a global cooldown is triggered.
@@ -538,7 +541,7 @@ async fn auth_middleware(
     State(auth): State<Arc<AdminAuthState>>,
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> impl IntoResponse {
     let client_ip = remote_addr.ip().to_string();
@@ -710,7 +713,9 @@ async fn auth_middleware(
             return StatusCode::UNAUTHORIZED.into_response();
         }
 
-        // Sign path + query string.
+        // Sign path + query string, and the body: a signature over the rest
+        // alone let a request's body (a canary's weight, which server to
+        // promote) be changed on the way.
         let req_path_and_query = {
             let uri = request.uri();
             uri.path_and_query()
@@ -718,14 +723,21 @@ async fn auth_middleware(
                 .unwrap_or_else(|| uri.path().to_owned())
         };
         let req_method = request.method().as_str().to_owned();
+        let (parts, body) = request.into_parts();
+        let Ok(body) = axum::body::to_bytes(body, ADMIN_MAX_BODY).await else {
+            auth.refused(&client_ip, "request body unreadable or too large");
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        };
 
-        let expected = crate::route_gate::request_signature(
+        let expected = crate::route_gate::admin_request_signature(
             secret,
             &req_method,
             &req_path_and_query,
             ts,
             nonce_val,
+            &body,
         );
+        request = axum::extract::Request::from_parts(parts, axum::body::Body::from(body));
 
         let sig_valid: bool = sig.as_bytes().ct_eq(expected.as_bytes()).into();
         if !sig_valid {
@@ -1527,7 +1539,11 @@ struct CanaryPoolStatus {
     sticky_cookie_name: String,
     auto_rollback: bool,
     rollback_error_rate: f64,
+    ramp_percent: Vec<u8>,
+    auto_promote: bool,
     servers: Vec<CanaryServerInfo>,
+    /// The rollout under way, or the last one
+    rollout: Option<crate::load_balancer::RolloutStatus>,
 }
 
 /// GET /canary — return canary status for all pools that have canary configuration
@@ -1553,6 +1569,9 @@ async fn canary_handler(State(state): State<Arc<AdminState>>) -> impl IntoRespon
                 sticky_cookie_name: cfg.sticky_cookie_name.clone(),
                 auto_rollback: cfg.auto_rollback,
                 rollback_error_rate: cfg.rollback_error_rate,
+                ramp_percent: cfg.ramp_percent.clone(),
+                auto_promote: cfg.auto_promote,
+                rollout: pool.rollout_status(),
                 servers: servers
                     .into_iter()
                     .map(|s| CanaryServerInfo {
@@ -1570,6 +1589,14 @@ async fn canary_handler(State(state): State<Arc<AdminState>>) -> impl IntoRespon
         .collect();
 
     Json(CanaryStatusResponse { pools }).into_response()
+}
+
+/// Body of `POST /pools/{pool}/servers/{id}/canary`: a fixed share, or none
+/// for the pool's ramp
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanaryStartRequest {
+    weight: Option<u8>,
 }
 
 /// Request body for POST /canary/suspend/:id and /resume/:id
@@ -1599,11 +1626,14 @@ async fn pools_handler(State(state): State<Arc<AdminState>>) -> impl IntoRespons
 /// sessions; the ones it has kept for `connection_draining.timeout_secs`),
 /// `undrain`, `unhealthy` (out of rotation until marked healthy or its health
 /// check finds it), `healthy` (back in, breaker closed, in slow start where
-/// the pool has it).
+/// the pool has it), `canary` (the pool's canary: `{"weight": n}` for a fixed
+/// share, no body for the pool's ramp, `canary.ramp_percent`), `promote` (a
+/// canary becomes a stable member and the members it replaces drain).
 async fn pool_server_handler(
     State(state): State<Arc<AdminState>>,
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     Path((pool, server_id, action)): Path<(String, String, String)>,
+    body: axum::body::Bytes,
 ) -> impl IntoResponse {
     let Some(ref lb) = state.load_balancer else {
         return (
@@ -1617,11 +1647,49 @@ async fn pool_server_handler(
         "undrain" => lb.undrain_server(&pool, &server_id),
         "healthy" => lb.mark_healthy(&pool, &server_id),
         "unhealthy" => lb.mark_unhealthy(&pool, &server_id),
+        "promote" => lb.promote(&pool, &server_id),
+        "canary" => {
+            let weight = if body.is_empty() {
+                None
+            } else {
+                match serde_json::from_slice::<CanaryStartRequest>(&body) {
+                    Ok(request) => request.weight,
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"error": format!("body: {e}")})),
+                        )
+                            .into_response();
+                    }
+                }
+            };
+            let started = lb.start_canary(&pool, &server_id, weight);
+            if let Some(ref logger) = state.audit_logger {
+                logger.log(AuditEvent::AdminAction {
+                    ip: remote_addr.ip().to_string(),
+                    action: "pool-server-canary".into(),
+                    success: started.is_ok(),
+                    detail: Some(format!("{pool}/{server_id}")),
+                });
+            }
+            return match started {
+                Ok(percent) => Json(serde_json::json!({
+                    "success": true, "pool": pool, "server": server_id, "action": action,
+                    "weight_percent": percent, "ramp": weight.is_none(),
+                }))
+                .into_response(),
+                Err(error) => (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": error})),
+                )
+                    .into_response(),
+            };
+        }
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
-                    "error": "action is one of drain, undrain, healthy, unhealthy"
+                    "error": "action is one of drain, undrain, healthy, unhealthy, canary, promote"
                 })),
             )
                 .into_response();

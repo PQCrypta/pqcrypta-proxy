@@ -3477,10 +3477,30 @@ fn forwardable_body(
     // body's share is given back once it is replaced.
     match crate::request_encoding::decode(coding.as_deref(), &body, limit, reservation) {
         Ok(None) => Ok(body),
+        // A digest of the encoded bytes is checked against them while they
+        // are here, and kept for a signature that covers it (route_gate)
+        Ok(Some(decoded))
+            if crate::route_gate::check_content_digest(&parts.headers, &body).is_err() =>
+        {
+            drop(decoded);
+            let mut response = (
+                StatusCode::BAD_REQUEST,
+                "The request body does not match its Content-Digest",
+            )
+                .into_response();
+            add_alt_svc(&mut response, alt_svc);
+            Err(Box::new(response))
+        }
         Err(crate::request_encoding::Refusal::NoMemory) => {
             Err(Box::new(body_memory_exhausted_response(alt_svc)))
         }
         Ok(Some(decoded)) => {
+            if let Ok(Some(field)) = crate::route_gate::check_content_digest(&parts.headers, &body)
+            {
+                parts
+                    .extensions
+                    .insert(crate::route_gate::VerifiedContentDigest(field));
+            }
             reservation.shrink(body.len());
             drop(body);
             let h = &mut parts.headers;

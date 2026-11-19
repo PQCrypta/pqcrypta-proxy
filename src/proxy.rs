@@ -71,6 +71,20 @@ impl std::fmt::Display for BackendTimeout {
 
 impl std::error::Error for BackendTimeout {}
 
+/// A request that never reached its backend: its connection could not be
+/// made, so nothing of it was written and another member of a pool may take
+/// it whatever its method.
+#[derive(Debug)]
+pub struct BackendUnreached(pub anyhow::Error);
+
+impl std::fmt::Display for BackendUnreached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "backend could not be reached: {:#}", self.0)
+    }
+}
+
+impl std::error::Error for BackendUnreached {}
+
 /// The connection a streamed backend response arrived on; release it once the
 /// body has been read to its end.
 pub type BackendLease = crate::backend_client::Lease<Full<Bytes>>;
@@ -272,11 +286,17 @@ impl BackendPool {
         *request.headers_mut() = headers;
 
         let timeout = Duration::from_millis(backend.timeout_ms);
-        let (response, lease) = self
+        let (response, lease) = match self
             .client
-            .send_with_retry(backend, request, timeout)
+            .send_or_hand_back(backend, request, timeout)
             .await
-            .map_err(|e| backend_error(e, "Backend stream request failed"))?;
+        {
+            Ok(sent) => sent,
+            Err((crate::backend_client::SendError::Failed(e), Some(_))) => {
+                return Err(anyhow::Error::new(BackendUnreached(e)));
+            }
+            Err((e, _)) => return Err(backend_error(e, "Backend stream request failed")),
+        };
 
         let status = response.status();
         let (parts, body_part) = response.into_parts();

@@ -4,7 +4,7 @@
 //! configuration's `[admin]` section and sends the request with the
 //! credentials it names: the bearer token (`auth_token`, else the token the
 //! proxy generated into `generated_token_path`) and, where `hmac_secret` is
-//! set, the proof of possession (`route_gate::request_signature`) with a
+//! set, the proof of possession (`route_gate::admin_request_signature`, which covers the body) with a
 //! fresh timestamp and nonce. Scripts on the node call it rather than
 //! building the signature themselves.
 
@@ -96,12 +96,13 @@ pub async fn send(
             .as_secs()
             .to_string();
         let nonce = hex::encode(rand::random::<[u8; 16]>());
-        let signature = crate::route_gate::request_signature(
+        let signature = crate::route_gate::admin_request_signature(
             secret,
             method.as_str(),
             path_and_query,
             &timestamp,
             &nonce,
+            body.unwrap_or_default().as_bytes(),
         );
         request = request
             .header("x-admin-signature", signature)

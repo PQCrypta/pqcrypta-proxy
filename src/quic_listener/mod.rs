@@ -660,6 +660,7 @@ async fn connect_refusal(
         path_and_query,
         path,
         headers: request.headers(),
+        verified_content_digest: None,
         client_ip: ip,
         is_http11: false,
         is_websocket_upgrade: false,

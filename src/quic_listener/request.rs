@@ -1114,6 +1114,8 @@ impl QuicListener {
                 path_and_query,
                 path: &path,
                 headers: request.headers(),
+                // Nothing is decoded before the gates over HTTP/3
+                verified_content_digest: None,
                 client_ip: ip,
                 // HTTP/3 by construction, so the HTTP/1.1 gate never fires here.
                 is_http11: false,
@@ -1157,78 +1159,28 @@ impl QuicListener {
         // The place the pool gave this request: held to the end of a response
         // body, and given back at the head of an event stream, as on TCP.
         let mut pool_slot: Option<crate::load_balancer::ConnectionSlot> = None;
-        let (backend, canary_cookie_to_set, pool_server): (
+        // The pool and what it chose by, for a member that cannot be reached:
+        // the request goes on to another.
+        let mut pool_choice: Option<(Arc<crate::load_balancer::BackendPool>, SelectionContext)> =
+            None;
+        let (backend, mut canary_cookie_to_set, mut pool_server): (
             Cow<'_, BackendConfig>,
             Option<String>,
             Option<Arc<crate::load_balancer::BackendServer>>,
         ) = {
-            // Extract cookies from request headers for sticky session / canary routing
-            let cookie_str = request
-                .headers()
-                .get("cookie")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-
             if let Some(pool) = load_balancer.get_pool(&route.backend) {
-                // Determine canary sticky cookie name from pool config (default "PQCPROXY_CANARY")
-                let canary_cookie_name = pool
-                    .canary_config
-                    .as_ref()
-                    .map(|c| c.sticky_cookie_name.clone())
-                    .unwrap_or_else(|| "PQCPROXY_CANARY".to_string());
-
-                // Extract canary cookie value from cookie header
-                let canary_cookie_val = cookie_str.split(';').find_map(|part| {
-                    let part = part.trim();
-                    part.strip_prefix(&format!("{}=", canary_cookie_name))
-                        .map(|v| v.to_string())
-                });
-
-                // Extract canary sticky header value if pool has one configured
-                let canary_header_val = pool
-                    .canary_config
-                    .as_ref()
-                    .and_then(|c| c.sticky_header.as_deref())
-                    .and_then(|hdr_name| {
-                        request
-                            .headers()
-                            .get(hdr_name)
-                            .and_then(|v| v.to_str().ok())
-                            .map(|s| s.to_string())
-                    });
-
-                // Extract session affinity cookie
-                let session_cookie_val = cookie_str.split(';').find_map(|part| {
-                    let part = part.trim();
-                    // Generic session cookie extraction – key=value
-                    if part.contains('=') {
-                        let (k, v) = part.split_once('=').unwrap_or(("", ""));
-                        if !k.starts_with("PQCPROXY_CANARY") {
-                            return Some(v.to_string());
-                        }
-                    }
-                    None
-                });
-
-                let ctx = SelectionContext {
-                    client_ip: remote_addr.ip(),
-                    session_cookie: session_cookie_val,
-                    affinity_header: None,
-                    path: path.clone().into_owned(),
-                    host: host.clone().map(Cow::into_owned).unwrap_or_default(),
-                    canary_cookie: canary_cookie_val,
-                    canary_header: canary_header_val,
-                    query: request.uri().query().map(String::from),
-                    hash_header: pool.hash_header_name().and_then(|h| {
-                        request
-                            .headers()
-                            .get(h)
-                            .and_then(|v| v.to_str().ok().map(String::from))
-                    }),
-                };
-
-                match pool.select_queued(&ctx).await {
+                let ctx = SelectionContext::for_request(
+                    &pool,
+                    &load_balancer.cookie_config,
+                    request.headers(),
+                    remote_addr.ip(),
+                    &path,
+                    host.as_deref().unwrap_or_default(),
+                    request.uri().query(),
+                );
+                let chosen = pool.select_queued(&ctx).await;
+                pool_choice = Some((Arc::clone(&pool), ctx));
+                match chosen {
                     Some(result) => {
                         let cfg = result.server.backend_config();
                         pool_slot = Some(result.slot);
@@ -1426,6 +1378,33 @@ impl QuicListener {
                     }
                     return Ok(());
                 }
+            }
+        }
+
+        // A signed route's body is held to the digest its signature covered
+        // (route_gate), as received, before any content coding is decoded.
+        if let Some(expected) =
+            crate::route_gate::expected_body_digest(route, request.headers(), false)
+        {
+            use sha2::Digest;
+            if <[u8; 32]>::from(sha2::Sha256::digest(&body)) != expected {
+                warn!(
+                    "HTTP/3 {} {}: the body does not match its signed Content-Digest",
+                    method, path
+                );
+                metrics.requests.request_end_full(
+                    400,
+                    start_time.elapsed(),
+                    body.len() as u64,
+                    0,
+                    Some(&path),
+                );
+                let response = http::Response::builder()
+                    .status(http::StatusCode::BAD_REQUEST)
+                    .server_header(&config)
+                    .body(())?;
+                respond_and_finish(&mut stream, response).await?;
+                return Ok(());
             }
         }
 
@@ -1950,14 +1929,20 @@ impl QuicListener {
         // A route may raise or lower its backend's timeout for its own traffic
         // (`timeout_override_ms`), on this transport as on TCP, pool members
         // included: the override belongs to the route.
-        let backend = match route.timeout_override_ms {
-            Some(ms) if ms != backend.timeout_ms => {
-                let mut overridden = backend.into_owned();
-                overridden.timeout_ms = ms;
-                Cow::Owned(overridden)
+        fn with_route_timeout(
+            backend: Cow<'_, BackendConfig>,
+            override_ms: Option<u64>,
+        ) -> Cow<'_, BackendConfig> {
+            match override_ms {
+                Some(ms) if ms != backend.timeout_ms => {
+                    let mut overridden = backend.into_owned();
+                    overridden.timeout_ms = ms;
+                    Cow::Owned(overridden)
+                }
+                _ => backend,
             }
-            _ => backend,
-        };
+        }
+        let mut backend = with_route_timeout(backend, route.timeout_override_ms);
 
         // Proxy to backend (include query string in path).
         // Use the streaming path for all requests: inspect content-type from response
@@ -1968,7 +1953,9 @@ impl QuicListener {
         let request_body_len = request_body.len() as u64;
 
         let backend_start = std::time::Instant::now();
-        let proxied = backend_pool
+        // Kept for another member of a pool, should the first be unreachable
+        let headers_again = pool_choice.as_ref().map(|_| headers.clone());
+        let mut proxied = backend_pool
             .proxy_stream(
                 &backend,
                 request.method(),
@@ -1977,6 +1964,64 @@ impl QuicListener {
                 request_body.clone(),
             )
             .await;
+        // A pool member that could not be reached was sent nothing of the
+        // request: it leaves rotation (its health check puts it back) and the
+        // request goes to another member, while the pool has one to offer.
+        if let (Some((pool, ctx)), Some(headers_again)) = (&pool_choice, &headers_again) {
+            for _ in 1..pool.member_count() {
+                let Err(error) = &proxied else { break };
+                if !error.is::<crate::proxy::BackendUnreached>() {
+                    break;
+                }
+                if let Some(server) = &pool_server {
+                    server.mark_unreachable();
+                    load_balancer.record_completion(
+                        &route.backend,
+                        server,
+                        backend_start.elapsed(),
+                        false,
+                    );
+                }
+                drop(pool_slot.take());
+                let Some(next) = pool.select(ctx).filter(|next| {
+                    pool_server
+                        .as_ref()
+                        .is_none_or(|failed| !Arc::ptr_eq(failed, &next.server))
+                }) else {
+                    break;
+                };
+                warn!(
+                    "Pool '{}': {} could not be reached ({:#}); sent to {}",
+                    route.backend,
+                    pool_server.as_ref().map_or("a member", |s| s.id.as_str()),
+                    error,
+                    next.server.id
+                );
+                backend = with_route_timeout(
+                    Cow::Owned(next.server.backend_config()),
+                    route.timeout_override_ms,
+                );
+                if next.set_canary_cookie.is_some() {
+                    canary_cookie_to_set = next.set_canary_cookie;
+                }
+                pool_slot = Some(next.slot);
+                pool_server = Some(next.server);
+                proxied = backend_pool
+                    .proxy_stream(
+                        &backend,
+                        request.method(),
+                        &path_with_query,
+                        headers_again.clone(),
+                        request_body.clone(),
+                    )
+                    .await;
+            }
+        }
+        if let (Err(error), Some(server)) = (&proxied, &pool_server) {
+            if error.is::<crate::proxy::BackendUnreached>() {
+                server.mark_unreachable();
+            }
+        }
         // The outcome goes to the pool and the circuit breaker, as it does on TCP.
         let backend_ok = proxied.is_ok();
         if let Some(server) = &pool_server {

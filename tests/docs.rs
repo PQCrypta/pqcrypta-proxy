@@ -164,6 +164,7 @@ address = "127.0.0.1:1"
 
 [backend_pools.pool]
 name = "pool"
+[backend_pools.pool.canary]
 [[backend_pools.pool.servers]]
 address = "127.0.0.1:1"
 
