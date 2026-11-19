@@ -825,7 +825,7 @@ connections_per_second = 50
 [advanced_rate_limiting]
 enabled = true
 ipv6_subnet_bits = 64               # group /64 subnets so a single host cannot rotate addresses
-trusted_proxies = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+trusted_proxies = ["10.0.0.10"]        # the proxies in front of this one; none by default
 
 # Key resolution: a table, not a string. The first entry that can be derived
 # from the request wins; `fallback` applies when none can.
@@ -880,7 +880,7 @@ requests_per_hour = 100
 - **Composite Keys**: Combine IP + JA3 fingerprint + path for fine-grained limiting
 - **JA3/JA4 Fingerprinting**: Identify clients behind NAT by TLS handshake signature, on TCP and QUIC alike
 - **JWT Subject Extraction**: Rate limit by authenticated user, not just IP
-- **X-Forwarded-For Trust Chain**: `trusted_proxies` lists the hops whose XFF header is honoured when deriving the client IP
+- **X-Forwarded-For Trust Chain**: `trusted_proxies` lists the hops whose XFF header is honoured when deriving the client IP. The list is empty by default: name only your own proxies, because any address on it can say where a request came from
 - **IPv6 Subnet Grouping**: `ipv6_subnet_bits` groups /64 subnets to prevent per-host evasion
 - **Adaptive Baseline**: each key's request rate, sampled once a second, as a mean and standard deviation that weigh older samples less (a sample `baseline_window_secs` old weighs 1/e), so the baseline follows traffic that changes; a rate beyond `std_dev_multiplier` standard deviations is anomalous. A reload that changes the limits applies to every key at once
 - **Layered Limits**: Global → Route → Client hierarchy for defense in depth
@@ -962,16 +962,19 @@ Request arrives on any path
   │     ├─ Resolve key (IP / API key / JA3 / JWT / composite)
   │     │
   │     ├─ Redis available?
-  │     │    YES → Lua token-bucket  (per-second, distributed, atomic EVAL)
-  │     │          Lua fixed-window  (per-minute, distributed, INCR+EXPIRE)
-  │     │          Lua fixed-window  (per-hour,   distributed, INCR+EXPIRE)
-  │     │          ── any command timeout → local DashMap fallback ──
+  │     │    YES → one atomic Lua check, on the Redis server's clock:
+  │     │          token bucket     (per-second)
+  │     │          rolling window   (per-minute, 12 buckets of 5 s)
+  │     │          rolling window   (per-hour,   60 buckets of 1 min)
+  │     │          ── no answer → counted on this node, sent to Redis when it returns ──
   │     │    NO  → local DashMap bucket (original behaviour)
   │     │
   │     └─ Adaptive anomaly detection (always local, per-node)
 ```
 
-**Graceful fallback**: if Redis is unreachable or a command exceeds `command_timeout_ms`, that single request silently falls back to the local in-memory bucket. No error is returned to the client and no exception is thrown. The proxy remains fully functional without Redis.
+**Rolling windows**: the per-minute and per-hour limits sum every bucket the window overlaps, here and in Redis, so no span the length of the window holds more than the limit, including across a minute or hour boundary. A request gives its place back within one bucket of leaving the window (5 s for the minute, 1 min for the hour). A refused request is not counted, and a request is counted in all of a key's limits or in none.
+
+**Graceful fallback**: if Redis is unreachable or a command exceeds `command_timeout_ms`, the request is counted once on this node, whose windows already hold what the client has used here. No error is returned to the client. After a failure Redis is left alone for 250 ms, growing to 5 s, so requests do not wait for it during an outage; then one request tries it. When Redis answers again, each key's next request adds what this node admitted in the meantime. A proxy that starts before Redis keeps trying to connect.
 
 **Admin API** reports `redis_connected: true/false` in the rate limiter stats snapshot so you can verify the connection is live.
 
@@ -1396,6 +1399,9 @@ auto_rollback          = true              # suspend canary on high error rate
 rollback_error_rate    = 0.05             # error rate threshold (5 %)
 rollback_window_secs   = 60              # sliding window length (seconds)
 rollback_min_requests  = 10             # minimum requests before rollback can trigger
+rollback_min_errors    = 3              # minimum errors before rollback can trigger
+rollback_compare_stable = true          # roll back only when the canary fails more than the stable servers
+rollback_ignored_statuses = []          # 5xx statuses that are not the canary's errors, e.g. [501]
 
 # Canary server — mark with canary = true, set canary_weight_percent
 [[backend_pools.api-pool.servers]]
@@ -1420,8 +1426,8 @@ tls_mode = "terminate"
 
 **How it works:**
 1. A request arrives. If it carries a `PQCPROXY_CANARY` cookie matching a live canary server, it is routed there (sticky assignment).
-2. Otherwise, a random roll (0–99) is compared against `canary_weight_percent`. If the roll is lower, the request goes to the canary and a `Set-Cookie` header is added to the response for future stickiness.
-3. If `auto_rollback = true` and the canary's error count within the sliding window exceeds `rollback_error_rate × requests`, the canary is suspended and all traffic falls back to stable servers.
+2. Otherwise, each canary with a free place takes its own `canary_weight_percent` of new requests (5 and 50 send 5 % to one, 50 % to the other and 45 % to the stable servers; shares over 100 % divide all the traffic). The request gets a `Set-Cookie` header for future stickiness.
+3. If `auto_rollback = true`, the canary is suspended and all traffic falls back to stable servers when, within the rolling window, it has served `rollback_min_requests`, had `rollback_min_errors` errors, and its error rate exceeds `rollback_error_rate` and the stable servers' rate by more than that. An error is a failed backend exchange, a 5xx response or a response body that fails part-way.
 
 **Live admin control** (all endpoints require Bearer token auth):
 

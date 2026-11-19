@@ -3702,6 +3702,22 @@ pub struct CanaryPoolConfig {
     pub rollback_window_secs: u64,
     /// Minimum requests in the window before rollback can trigger (default: 10)
     pub rollback_min_requests: u64,
+    /// Minimum errors in the window before rollback can trigger (default: 3),
+    /// so one failure among few requests does not suspend a deployment
+    pub rollback_min_errors: u64,
+    /// Roll back only when the canary's error rate exceeds the stable servers'
+    /// by more than `rollback_error_rate` (default: true), so a failure they
+    /// share, a database going down, does not suspend the canary
+    pub rollback_compare_stable: bool,
+    /// 5xx statuses that are not the canary's errors, e.g. 501 (default: none)
+    pub rollback_ignored_statuses: Vec<u16>,
+}
+
+impl CanaryPoolConfig {
+    /// Whether a response with this status counts against the canary.
+    pub fn is_error_status(&self, status: u16) -> bool {
+        (500..600).contains(&status) && !self.rollback_ignored_statuses.contains(&status)
+    }
 }
 
 impl Default for CanaryPoolConfig {
@@ -3716,6 +3732,9 @@ impl Default for CanaryPoolConfig {
             rollback_error_rate: 0.05,
             rollback_window_secs: 60,
             rollback_min_requests: 10,
+            rollback_min_errors: 3,
+            rollback_compare_stable: true,
+            rollback_ignored_statuses: Vec::new(),
         }
     }
 }
@@ -4538,7 +4557,10 @@ impl ProxyConfig {
         // Config schema version check
         match self.version {
             None => {
-                warn!("Config missing 'version' field — assuming v{}. Add `version = 1` to suppress this warning.", CURRENT_CONFIG_VERSION);
+                warn!(
+                    "Config missing 'version' field — assuming v{}. Add `version = 1` to suppress this warning.",
+                    CURRENT_CONFIG_VERSION
+                );
             }
             Some(v) if v > CURRENT_CONFIG_VERSION => {
                 return Err(anyhow::anyhow!(

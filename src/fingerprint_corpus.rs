@@ -479,12 +479,31 @@ impl Corpus {
     /// bad file must not stop the proxy starting.
     pub fn load(&self, path: &Path) -> Result<usize, String> {
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let entries = parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-        let n = entries.len();
+        let mut entries = parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+        // A file larger than the ceiling keeps what has proved itself and
+        // what was seen most: the memory it may take is the ceiling's.
+        entries.sort_by_key(|e| std::cmp::Reverse((proven(e), e.request_count)));
+        let mut read = 0;
+        let mut over = 0usize;
         for e in entries {
+            if !e.probation
+                && !self.entries.contains_key(&e.key)
+                && self.entries.len() >= self.ceiling
+            {
+                over += 1;
+                continue;
+            }
             self.absorb(e);
+            read += 1;
         }
-        Ok(n)
+        if over > 0 {
+            tracing::warn!(
+                "{}: {over} fingerprints past the ceiling of {} were not loaded",
+                path.display(),
+                self.ceiling
+            );
+        }
+        Ok(read)
     }
 }
 
@@ -1257,5 +1276,46 @@ mod tests {
         let newer = serde_json::json!({ "version": CORPUS_VERSION + 1, "fingerprints": [] });
         assert!(parse(newer.to_string().as_bytes()).is_err());
         std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod load_ceiling_tests {
+    use super::*;
+
+    fn entry(key: &str, request_count: u64) -> CorpusEntry {
+        CorpusEntry {
+            key: key.to_string(),
+            ja4_hash: None,
+            ja4_raw: None,
+            ja4_verified: false,
+            classification: "unknown".to_string(),
+            transport: Default::default(),
+            first_seen: 0,
+            last_seen: 0,
+            request_count,
+            user_agents: HashMap::new(),
+            ja3_variant_count: 0,
+            ja3_samples: Vec::new(),
+            probation: false,
+        }
+    }
+
+    #[test]
+    fn a_file_over_the_ceiling_keeps_the_most_seen_and_no_more() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("corpus.json");
+        let file = CorpusFile {
+            version: CORPUS_VERSION,
+            fingerprints: (1..=5).map(|n| entry(&format!("k{n}"), n)).collect(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+
+        let corpus = Corpus::with_ceiling(3);
+        assert_eq!(corpus.load(&path).unwrap(), 3);
+        assert_eq!(corpus.established(), 3);
+        for kept in ["k5", "k4", "k3"] {
+            assert!(corpus.entries.contains_key(kept), "{kept}");
+        }
     }
 }

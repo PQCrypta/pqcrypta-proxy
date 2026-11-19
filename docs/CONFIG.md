@@ -425,7 +425,7 @@ Multi-dimensional rate limiting with composite keys, JA3/JA4 fingerprinting, and
 |--------|------|---------|-------------|
 | `enabled` | bool | `true` | Enable advanced rate limiting (overrides basic) |
 | `ipv6_subnet_bits` | u8 | `64` | IPv6 subnet grouping (64 = /64 subnets as single client) |
-| `trusted_proxies` | array[string] | `["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.1"]` | Trusted proxies for X-Forwarded-For parsing |
+| `trusted_proxies` | array[string] | `[]` | The proxies in front of this one, whose X-Forwarded-For is believed. Any address listed can say where a request came from |
 | `jwt_secret` | string | `null` | HMAC secret that verifies a JWT's signature before its `sub` claim keys a `jwt_subject` limit; unset, no JWT is trusted. At least the hash size of every allowed algorithm (RFC 7518 §3.2): 32 bytes for HS256, 48 for HS384, 64 for HS512, or the configuration is refused at load |
 | `jwt_algorithms` | array[string] | `["HS256"]` | The JWT algorithms accepted: HMAC only (`HS256`, `HS384`, `HS512`); any other name is refused at load |
 
@@ -561,7 +561,7 @@ ML-inspired anomaly detection that learns normal traffic patterns.
 |--------|------|---------|-------------|
 | `pattern` | string | required | Route pattern (path prefix or regex) |
 | `key_override` | string? | `null` | Override key resolution for this route |
-| `exempt_keys` | array[string] | `[]` | Keys exempt from rate limiting |
+| `exempt_keys` | array[string] | `[]` | Addresses or verified JWT subjects exempt from rate limiting. A value a client writes or can imitate earns no exemption, and such a `key_override` with `exempt_keys` is refused at load |
 
 ```toml
 [advanced_rate_limiting.route_limits.ROUTE_NAME.limits]

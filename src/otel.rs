@@ -152,6 +152,11 @@ impl TextMapPropagator for B3Propagator {
     }
 
     fn extract_with_context(&self, cx: &Context, carrier: &dyn Extractor) -> Context {
+        // A context the W3C headers already named takes priority.
+        let named = cx.span().span_context().clone();
+        if named.is_valid() && named.is_remote() {
+            return cx.clone();
+        }
         // Try single-header first: {traceId}-{spanId}[-{flag}[-{parentSpanId}]]
         let (trace_str, span_str, sampled) = if let Some(b3) = carrier.get(B3_SINGLE) {
             let parts: Vec<&str> = b3.splitn(4, '-').collect();
@@ -261,13 +266,18 @@ pub fn init_otel(config: &OtelConfig) -> anyhow::Result<SdkTracerProvider> {
     Ok(provider)
 }
 
-/// Install the composite propagator: W3C TraceContext first, then B3.
-fn install_propagators() {
+/// The composite propagator: W3C TraceContext first, then B3.
+fn composite_propagator() -> TextMapCompositePropagator {
     let propagators: Vec<Box<dyn TextMapPropagator + Send + Sync>> = vec![
         Box::new(TraceContextPropagator::new()),
         Box::new(B3Propagator),
     ];
-    global::set_text_map_propagator(TextMapCompositePropagator::new(propagators));
+    TextMapCompositePropagator::new(propagators)
+}
+
+/// Install the composite propagator.
+fn install_propagators() {
+    global::set_text_map_propagator(composite_propagator());
 }
 
 /// Flush and shut down the OTLP exporter, blocking until the queue is drained.
@@ -455,6 +465,27 @@ pub(crate) mod tests {
             set_parent_from_headers(&span, &headers, "::ffff:192.0.2.5".parse().unwrap());
             assert_eq!(trace_id_of(&span), TRACE);
         });
+    }
+
+    #[test]
+    fn w3c_takes_priority_over_a_conflicting_b3_context() {
+        const B3_TRACE: &str = "a3ce929d0e0e47364bf92f3577b34da6";
+        let both = HashMap::from([
+            (
+                "traceparent".to_string(),
+                format!("00-{TRACE}-00f067aa0ba902b7-01"),
+            ),
+            ("b3".to_string(), format!("{B3_TRACE}-00f067aa0ba902b8-1")),
+        ]);
+        let context = composite_propagator().extract(&both);
+        assert_eq!(context.span().span_context().trace_id().to_string(), TRACE);
+
+        let b3_only = HashMap::from([("b3".to_string(), both["b3"].clone())]);
+        let context = composite_propagator().extract(&b3_only);
+        assert_eq!(
+            context.span().span_context().trace_id().to_string(),
+            B3_TRACE
+        );
     }
 
     #[test]

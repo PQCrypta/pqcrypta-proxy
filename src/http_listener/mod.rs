@@ -693,6 +693,50 @@ fn logged_stream(body: Body, log: crate::access_logger::DeferredAccessLog) -> Bo
     Body::from_stream(counted)
 }
 
+/// A backend's response body on its way to the client. The request keeps its
+/// place on the pool's server until the body has ended, as it does on HTTP/3,
+/// and a body that fails counts against that server.
+struct HeldBody {
+    body: Body,
+    slot: Option<crate::load_balancer::ConnectionSlot>,
+    on_failure: Option<(
+        Arc<LoadBalancer>,
+        String,
+        Arc<crate::load_balancer::BackendServer>,
+    )>,
+}
+
+impl hyper::body::Body for HeldBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<bytes::Bytes>, axum::Error>>> {
+        let polled = Pin::new(&mut self.body).poll_frame(cx);
+        match &polled {
+            Poll::Ready(None) => self.slot = None,
+            Poll::Ready(Some(Err(_))) => {
+                self.slot = None;
+                if let Some((balancer, pool, server)) = self.on_failure.take() {
+                    balancer.record_body_failure(&pool, &server);
+                }
+            }
+            _ => {}
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        hyper::body::Body::is_end_stream(&self.body)
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        hyper::body::Body::size_hint(&self.body)
+    }
+}
+
 /// Static dispatch for a layer the configuration may leave out.
 ///
 /// A disabled feature used to stay in the chain and return early: its layer
@@ -1925,7 +1969,9 @@ fn refresh_on_tls_reload<T: Send + 'static>(
             match rebuild(&config, &resolver) {
                 Ok(built) => {
                     install(built);
-                    info!("🔏 {what}: TLS configuration rebuilt with the current ECH configs and certificates");
+                    info!(
+                        "🔏 {what}: TLS configuration rebuilt with the current ECH configs and certificates"
+                    );
                 }
                 Err(e) => warn!(
                     "{what}: TLS configuration not rebuilt after a TLS reload, keeping the previous one: {e}"
@@ -2244,7 +2290,8 @@ pub async fn run_http_listener_pqc_with_fingerprint(
         tokio::spawn(async move {
             while reloads.changed().await.is_ok() {
                 let previous = routes.load_full();
-                match current_ech_route(previous.as_deref(), &config, &resolver, &extractor, &state) {
+                match current_ech_route(previous.as_deref(), &config, &resolver, &extractor, &state)
+                {
                     Ok(route) => routes.store(route.map(Arc::new)),
                     Err(e) => warn!(
                         "ECH over TCP: route not rebuilt after a TLS reload, keeping the previous one: {e}"
@@ -3700,6 +3747,10 @@ async fn proxy_handler(
 
         // Check if backend is a pool first, then fall back to single backend
         let mut canary_cookie_to_set: Option<String> = None;
+        // The place the pool gave this request: held to the end of a response
+        // body, and given back at the head of an event stream, which can stay
+        // open for as long as the client likes.
+        let mut pool_slot: Option<crate::load_balancer::ConnectionSlot> = None;
         let (backend_cfg, pool_server, pool_name, backend_timeout) =
             if let Some(pool) = state.load_balancer.get_pool(&route.backend) {
                 // Extract session cookie for sticky sessions
@@ -3752,6 +3803,7 @@ async fn proxy_handler(
                     Some(result) => {
                         let timeout = result.server.timeout;
                         canary_cookie_to_set = result.set_canary_cookie;
+                        pool_slot = Some(result.slot);
                         (
                             std::borrow::Cow::Owned(result.server.backend_config()),
                             Some(result.server),
@@ -3796,11 +3848,6 @@ async fn proxy_handler(
                 error!("Backend or pool not found: {}", route.backend);
                 return (StatusCode::BAD_GATEWAY, "Backend not configured").into_response();
             };
-
-        // Counted in the server's active connections until this handler
-        // returns — at the response head, which is where the pool records the
-        // request's outcome.
-        let _pool_slot = pool_server.as_ref().map(|s| s.acquire_slot());
 
         // A route may raise or lower the backend's timeout for its own traffic —
         // one slow endpoint (an LLM chat completion, a large PDF conversion)
@@ -4064,12 +4111,13 @@ async fn proxy_handler(
                 if content_type.contains("text/event-stream") {
                     // Release pool slot immediately — the streaming hyper connection keeps
                     // the underlying TCP socket open for as long as the body is live.
+                    drop(pool_slot.take());
                     if let (Some(server), Some(ref pn)) = (&pool_server, &pool_name) {
-                        state.load_balancer.record_completion(
+                        state.load_balancer.record_response(
                             pn,
                             server.as_ref(),
                             response_time,
-                            true,
+                            parts.status.as_u16(),
                         );
                     }
                     if let Some(ref cors) = route.cors {
@@ -4190,14 +4238,25 @@ async fn proxy_handler(
                         }
                     }
                 } else {
-                    BodySource::Streamed(Body::new(incoming_body))
+                    BodySource::Streamed(Body::new(HeldBody {
+                        body: Body::new(incoming_body),
+                        slot: pool_slot.take(),
+                        on_failure: pool_server
+                            .clone()
+                            .zip(pool_name.clone())
+                            .map(|(server, pool)| (Arc::clone(&state.load_balancer), pool, server)),
+                    }))
                 };
 
-                // Record success for the load balancer pool at headers, as the SSE path does
+                // The response's outcome for the load balancer pool, at its
+                // headers, as the SSE path does
                 if let (Some(server), Some(ref pn)) = (&pool_server, &pool_name) {
-                    state
-                        .load_balancer
-                        .record_completion(pn, server.as_ref(), response_time, true);
+                    state.load_balancer.record_response(
+                        pn,
+                        server.as_ref(),
+                        response_time,
+                        parts.status.as_u16(),
+                    );
                 }
 
                 // Add CORS headers if configured

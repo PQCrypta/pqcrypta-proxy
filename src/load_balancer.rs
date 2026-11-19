@@ -47,7 +47,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use tracing::{info, warn};
 
 use crate::config::{
@@ -113,13 +113,14 @@ pub struct SelectionContext {
 
 /// Result of `BackendPool::select()`.
 ///
-/// Carries the chosen server and an optional `Set-Cookie` header value that
-/// the HTTP listener must inject into the response to establish a sticky
-/// canary assignment for the client.
-#[derive(Clone)]
+/// Carries the chosen server, the place taken on it, and an optional
+/// `Set-Cookie` header value that the HTTP listener must inject into the
+/// response to establish a sticky canary assignment for the client.
 pub struct SelectionResult {
     /// The selected backend server.
     pub server: Arc<BackendServer>,
+    /// The place this request holds on the server until it is dropped.
+    pub slot: ConnectionSlot,
     /// If `Some(header_value)`, the listener should append this as a `Set-Cookie`
     /// response header (format: `PQCPROXY_CANARY=<id>; Path=/; …`).
     pub set_canary_cookie: Option<String>,
@@ -129,8 +130,114 @@ pub struct SelectionResult {
 // Backend Server
 // ═══════════════════════════════════════════════════════════════
 
+/// How many parts a rollback window is counted in.
+const OUTCOME_BUCKETS: usize = 12;
+
+/// Requests and errors over a rolling window, in buckets: the oldest leave one
+/// bucket at a time, so a count never starts again from nothing.
+#[derive(Debug)]
+struct OutcomeWindow {
+    origin: Instant,
+    bucket_ms: u64,
+    newest: u64,
+    /// (requests, errors), in a ring one longer than the window
+    buckets: [(u64, u64); OUTCOME_BUCKETS + 1],
+}
+
+impl OutcomeWindow {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            bucket_ms: 0,
+            newest: 0,
+            buckets: [(0, 0); OUTCOME_BUCKETS + 1],
+        }
+    }
+
+    fn slot(bucket: u64) -> usize {
+        usize::try_from(bucket % (OUTCOME_BUCKETS as u64 + 1)).unwrap_or(0)
+    }
+
+    /// Move to `now`, emptying the buckets that have left the window.
+    fn roll(&mut self, now: Instant) {
+        if self.bucket_ms == 0 {
+            return;
+        }
+        let elapsed = u64::try_from(now.saturating_duration_since(self.origin).as_millis())
+            .unwrap_or(u64::MAX);
+        let bucket = elapsed / self.bucket_ms;
+        if bucket > self.newest {
+            let steps = (bucket - self.newest).min(OUTCOME_BUCKETS as u64 + 1);
+            for step in 1..=steps {
+                self.buckets[Self::slot(self.newest + step)] = (0, 0);
+            }
+            self.newest = bucket;
+        }
+    }
+
+    /// Use a window of `window`, starting again if its length has changed.
+    fn shape(&mut self, window: Duration, now: Instant) {
+        let bucket_ms = u64::try_from(window.as_millis())
+            .unwrap_or(u64::MAX)
+            .div_ceil(OUTCOME_BUCKETS as u64)
+            .max(1);
+        if bucket_ms != self.bucket_ms {
+            *self = Self::new();
+            self.origin = now;
+            self.bucket_ms = bucket_ms;
+        }
+        self.roll(now);
+    }
+
+    fn record(&mut self, failed: bool, window: Duration, now: Instant) {
+        self.shape(window, now);
+        let bucket = &mut self.buckets[Self::slot(self.newest)];
+        bucket.0 += 1;
+        bucket.1 += u64::from(failed);
+    }
+
+    /// An error in a request already counted: its body failed after its head.
+    fn record_late_error(&mut self, window: Duration, now: Instant) {
+        self.shape(window, now);
+        self.buckets[Self::slot(self.newest)].1 += 1;
+    }
+
+    /// (requests, errors) in the window as of `now`.
+    fn totals(&mut self, now: Instant) -> (u64, u64) {
+        self.roll(now);
+        self.buckets
+            .iter()
+            .fold((0, 0), |(requests, errors), (r, e)| {
+                (requests + r, errors + e)
+            })
+    }
+}
+
+#[expect(clippy::cast_precision_loss)]
+fn error_rate((requests, errors): (u64, u64)) -> f64 {
+    if requests == 0 {
+        0.0
+    } else {
+        (errors.min(requests)) as f64 / requests as f64
+    }
+}
+
+/// The canary a roll in `0..span` lands on, of `(server, percent)` shares:
+/// each canary has its own share of new traffic, and the rest is the stable
+/// servers'. Shares that add up to more than 100 divide all of it.
+fn canary_for_roll<T>(shares: &[(T, u32)], mut roll: u32) -> Option<&T> {
+    shares.iter().find_map(|(canary, percent)| {
+        if roll < *percent {
+            Some(canary)
+        } else {
+            roll -= percent;
+            None
+        }
+    })
+}
+
 /// One request in flight on a [`BackendServer`]; see
-/// [`BackendServer::acquire_slot`].
+/// [`BackendServer::try_acquire_slot`].
 pub struct ConnectionSlot {
     server: Arc<BackendServer>,
 }
@@ -214,12 +321,8 @@ pub struct BackendServer {
     pub canary_weight_percent: AtomicU8,
     /// True when the canary has been suspended (manually or by auto-rollback)
     pub canary_suspended: AtomicBool,
-    /// Start of the current error-rate measurement window
-    canary_window_start: RwLock<Instant>,
-    /// Total requests seen in the current window
-    canary_window_requests: AtomicU64,
-    /// Error requests seen in the current window
-    canary_window_errors: AtomicU64,
+    /// Requests and errors over the rollback window
+    canary_window: Mutex<OutcomeWindow>,
 }
 
 /// Backend health status
@@ -345,9 +448,7 @@ impl BackendServer {
             is_canary: config.canary,
             canary_weight_percent: AtomicU8::new(config.canary_weight_percent),
             canary_suspended: AtomicBool::new(false),
-            canary_window_start: RwLock::new(Instant::now()),
-            canary_window_requests: AtomicU64::new(0),
-            canary_window_errors: AtomicU64::new(0),
+            canary_window: Mutex::new(OutcomeWindow::new()),
         })
     }
 
@@ -416,21 +517,36 @@ impl BackendServer {
         self.is_canary && self.is_available()
     }
 
-    /// Count a request in flight on this server until the returned slot drops.
+    /// Whether this server keeps the sessions it has: it is draining, and up.
+    fn keeps_sessions_while_draining(&self) -> bool {
+        self.is_draining() && {
+            let health = self.health.read();
+            health.healthy && !health.circuit_open
+        }
+    }
+
+    /// Take a place on this server, if it has one, until the returned slot
+    /// drops. The check and the count are one atomic step, so the last place
+    /// goes to one request however many arrive at once. `trial` is a request
+    /// to a server whose breaker is open: one at a time.
     ///
     /// `active_connections` is what least-connections, least-response-time and
     /// first-available read, and what `max_connections` is enforced against.
-    /// It used to be decremented by a `release_connection` the TCP listener
-    /// called after every pooled request, paired with an acquire nothing ever
-    /// called: the counter wrapped below zero to `u32::MAX` on the first
-    /// request and counted down from there, so least-connections chose
-    /// whichever server had served the *most* — and HTTP/3 never counted at
-    /// all. A slot cannot be released twice or not at all.
-    pub fn acquire_slot(self: &Arc<Self>) -> ConnectionSlot {
-        self.active_connections.fetch_add(1, Ordering::Relaxed);
-        ConnectionSlot {
+    /// A slot cannot be released twice or not at all.
+    pub fn try_acquire_slot(self: &Arc<Self>, trial: bool) -> Option<ConnectionSlot> {
+        let ceiling = match (trial, self.max_connections) {
+            (true, _) => 1,
+            (false, 0) => u32::MAX,
+            (false, most) => most,
+        };
+        self.active_connections
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < ceiling).then_some(active + 1)
+            })
+            .ok()?;
+        Some(ConnectionSlot {
             server: Arc::clone(self),
-        }
+        })
     }
 
     /// Get effective weight considering slow start
@@ -550,68 +666,80 @@ impl BackendServer {
     /// Resume a suspended canary server and reset its error-rate window.
     pub fn resume_canary(&self) {
         self.canary_suspended.store(false, Ordering::Relaxed);
-        *self.canary_window_start.write() = Instant::now();
-        self.canary_window_requests.store(0, Ordering::Relaxed);
-        self.canary_window_errors.store(0, Ordering::Relaxed);
+        *self.canary_window.lock() = OutcomeWindow::new();
         info!("Canary server {} resumed", self.id);
     }
 
     /// Return the current error rate in the sliding window (0.0–1.0).
-    #[expect(clippy::cast_precision_loss)]
     pub fn canary_error_rate(&self) -> f64 {
-        let requests = self.canary_window_requests.load(Ordering::Relaxed);
-        if requests == 0 {
-            return 0.0;
-        }
-        let errors = self.canary_window_errors.load(Ordering::Relaxed);
-        errors as f64 / requests as f64
+        error_rate(self.canary_window.lock().totals(Instant::now()))
     }
 
     /// Record a canary request outcome and potentially trigger auto-rollback.
     ///
-    /// Returns `true` if auto-rollback was just triggered (i.e. the canary was
-    /// suspended by this call).  The caller should log a warning in that case.
-    #[expect(clippy::cast_precision_loss)]
-    pub fn record_canary_result(&self, success: bool, config: &CanaryPoolConfig) -> bool {
+    /// `stable_rate` is the stable servers' error rate, when it is to be
+    /// compared. Returns `true` if auto-rollback was just triggered (i.e. the
+    /// canary was suspended by this call). The caller should log a warning in
+    /// that case.
+    pub fn record_canary_result(
+        &self,
+        success: bool,
+        config: &CanaryPoolConfig,
+        stable_rate: Option<f64>,
+    ) -> bool {
         if !config.auto_rollback {
             return false;
         }
+        let now = Instant::now();
+        let totals = {
+            let mut window = self.canary_window.lock();
+            window.record(
+                !success,
+                Duration::from_secs(config.rollback_window_secs),
+                now,
+            );
+            window.totals(now)
+        };
+        self.rollback_if_due(totals, config, stable_rate)
+    }
 
-        let window_dur = Duration::from_secs(config.rollback_window_secs);
-
-        // Reset window if it has expired.
-        {
-            let mut window_start = self.canary_window_start.write();
-            if window_start.elapsed() >= window_dur {
-                *window_start = Instant::now();
-                self.canary_window_requests.store(0, Ordering::Relaxed);
-                self.canary_window_errors.store(0, Ordering::Relaxed);
-            }
+    /// Count a failure in the body of a response already counted by its head.
+    fn record_canary_late_error(
+        &self,
+        config: &CanaryPoolConfig,
+        stable_rate: Option<f64>,
+    ) -> bool {
+        if !config.auto_rollback {
+            return false;
         }
+        let now = Instant::now();
+        let totals = {
+            let mut window = self.canary_window.lock();
+            window.record_late_error(Duration::from_secs(config.rollback_window_secs), now);
+            window.totals(now)
+        };
+        self.rollback_if_due(totals, config, stable_rate)
+    }
 
-        self.canary_window_requests.fetch_add(1, Ordering::Relaxed);
-        if !success {
-            self.canary_window_errors.fetch_add(1, Ordering::Relaxed);
-        }
-
-        let requests = self.canary_window_requests.load(Ordering::Relaxed);
-        let errors = self.canary_window_errors.load(Ordering::Relaxed);
-
-        if requests >= config.rollback_min_requests {
-            let error_rate = errors as f64 / requests as f64;
-            if error_rate > config.rollback_error_rate {
-                // Use compare-and-swap so we only return true once (first trigger).
-                if self
-                    .canary_suspended
-                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    return true;
-                }
-            }
-        }
-
-        false
+    fn rollback_if_due(
+        &self,
+        totals: (u64, u64),
+        config: &CanaryPoolConfig,
+        stable_rate: Option<f64>,
+    ) -> bool {
+        let (requests, errors) = totals;
+        let rate = error_rate(totals);
+        let worse_than_stable =
+            stable_rate.is_none_or(|stable| rate - stable > config.rollback_error_rate);
+        requests >= config.rollback_min_requests
+            && errors >= config.rollback_min_errors
+            && rate > config.rollback_error_rate
+            && worse_than_stable
+            // Compare-and-swap so only the first trigger reports it.
+            && self
+                .canary_suspended
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
     }
 }
 
@@ -664,6 +792,8 @@ pub struct BackendPool {
     pub canary_config: Option<CanaryPoolConfig>,
     /// Canary sticky-cookie → (server_id, last_access) with TTL eviction.
     canary_sessions: DashMap<String, (String, Instant)>,
+    /// The stable servers' requests and errors, to compare the canary with
+    stable_outcomes: Mutex<OutcomeWindow>,
 
     /// The configuration this pool was built from, so a reload can tell
     /// whether it changed.
@@ -768,6 +898,7 @@ impl BackendPool {
             wrr_state: RwLock::new(WeightedRoundRobinState::default()),
             canary_config: config.canary.clone(),
             canary_sessions: DashMap::new(),
+            stable_outcomes: Mutex::new(OutcomeWindow::new()),
             source: config.clone(),
             freed,
             queue,
@@ -844,28 +975,43 @@ impl BackendPool {
         }
     }
 
-    /// Select a backend server.
+    /// Select a backend server and take a place on it.
     ///
     /// Canary routing is attempted first (when configured and enabled), then
     /// falls back to normal sticky-session / algorithm selection among non-canary
-    /// servers.  Returns a `SelectionResult` that may carry a `Set-Cookie` header
-    /// value that the caller must inject into the HTTP response.
+    /// servers.  Returns a `SelectionResult` that holds the place and may carry a
+    /// `Set-Cookie` header value that the caller must inject into the HTTP
+    /// response. A place another request took first sends this one back to
+    /// choose again.
     pub fn select(&self, ctx: &SelectionContext) -> Option<SelectionResult> {
+        let attempts = self.servers.read().len() + 1;
+        for _ in 0..attempts {
+            let (server, set_canary_cookie) = self.choose(ctx)?;
+            let trial = self.health_aware && server.health.read().circuit_open;
+            if let Some(slot) = server.try_acquire_slot(trial) {
+                return Some(SelectionResult {
+                    server,
+                    slot,
+                    set_canary_cookie,
+                });
+            }
+        }
+        None
+    }
+
+    /// The server this request should go to, and the canary cookie to set.
+    fn choose(&self, ctx: &SelectionContext) -> Option<(Arc<BackendServer>, Option<String>)> {
         // Try canary routing first.
-        if let Some(result) = self.try_canary_select(ctx) {
-            return Some(result);
+        if let Some(chosen) = self.try_canary_select(ctx) {
+            return Some(chosen);
         }
 
         // Normal routing (canary servers are excluded from get_healthy_servers).
         // A session stays with its server while that server drains: draining
         // takes no new sessions and lets the ones it has finish.
         if let Some(server) = self.check_sticky_session(ctx) {
-            let draining_with_session = server.is_draining() && server.health.read().healthy;
-            if (server.is_available() || draining_with_session) && server.has_capacity() {
-                return Some(SelectionResult {
-                    server,
-                    set_canary_cookie: None,
-                });
+            if server.has_capacity() {
+                return Some((server, None));
             }
         }
 
@@ -873,10 +1019,7 @@ impl BackendPool {
         let server = self.pass_over_ramping(server);
         self.record_sticky_session(ctx, &server);
 
-        Some(SelectionResult {
-            server,
-            set_canary_cookie: None,
-        })
+        Some((server, None))
     }
 
     /// A server in slow start chosen by an algorithm that does not weigh
@@ -974,19 +1117,22 @@ impl BackendPool {
     }
 
     /// Canary-specific selection logic.  Returns `None` if canary is not
-    /// configured/enabled or no canary server is available.
-    fn try_canary_select(&self, ctx: &SelectionContext) -> Option<SelectionResult> {
+    /// configured/enabled or no canary server has a place.
+    fn try_canary_select(
+        &self,
+        ctx: &SelectionContext,
+    ) -> Option<(Arc<BackendServer>, Option<String>)> {
         let canary_cfg = self.canary_config.as_ref()?;
         if !canary_cfg.enabled {
             return None;
         }
 
-        // Collect available canary servers.
+        // Collect the canary servers that can take a request.
         let available_canaries: Vec<Arc<BackendServer>> = {
             let servers = self.servers.read();
             servers
                 .iter()
-                .filter(|s| s.is_canary_available())
+                .filter(|s| s.is_canary_available() && s.has_capacity())
                 .cloned()
                 .collect()
         };
@@ -1007,10 +1153,8 @@ impl BackendPool {
                         if let Some(server) =
                             available_canaries.iter().find(|s| s.id == id).cloned()
                         {
-                            return Some(SelectionResult {
-                                server,
-                                set_canary_cookie: None, // already set on a previous request
-                            });
+                            // The cookie was set on a previous request.
+                            return Some((server, None));
                         }
                     } else {
                         drop(entry);
@@ -1036,34 +1180,24 @@ impl BackendPool {
                 } else {
                     None
                 };
-                return Some(SelectionResult {
-                    server,
-                    set_canary_cookie: set_cookie,
-                });
+                return Some((server, set_cookie));
             }
         }
 
-        // 3. Probabilistic roll — route `canary_weight_percent`% of new requests.
-        let max_pct = available_canaries
-            .iter()
-            .map(|s| s.canary_weight_percent.load(Ordering::Relaxed))
-            .max()
-            .unwrap_or(0);
-
-        if max_pct == 0 {
+        // 3. Probabilistic roll: each canary takes its own
+        // `canary_weight_percent`% of new requests.
+        let shares: Vec<(Arc<BackendServer>, u32)> = available_canaries
+            .into_iter()
+            .map(|s| {
+                let percent = u32::from(s.canary_weight_percent.load(Ordering::Relaxed));
+                (s, percent)
+            })
+            .collect();
+        let total: u32 = shares.iter().map(|(_, percent)| percent).sum();
+        if total == 0 {
             return None;
         }
-
-        let roll: u8 = rand::random_range(0..100);
-        if roll >= max_pct {
-            return None;
-        }
-
-        // Select least-connections canary.
-        let server = available_canaries
-            .iter()
-            .min_by_key(|s| s.active_connections.load(Ordering::Relaxed))
-            .cloned()?;
+        let server = canary_for_roll(&shares, rand::random_range(0..total.max(100)))?.clone();
 
         let set_canary_cookie = if canary_cfg.sticky {
             self.canary_sessions
@@ -1073,10 +1207,7 @@ impl BackendPool {
             None
         };
 
-        Some(SelectionResult {
-            server,
-            set_canary_cookie,
-        })
+        Some((server, set_canary_cookie))
     }
 
     /// Build a `Set-Cookie` header value for the canary sticky cookie.
@@ -1178,12 +1309,12 @@ impl BackendPool {
         }
     }
 
-    /// Find server by ID
+    /// The server a session is with, while it can still serve that session.
     fn find_server_by_id(&self, id: &str) -> Option<Arc<BackendServer>> {
         let servers = self.servers.read();
         servers
             .iter()
-            .find(|s| s.id == id && s.is_available())
+            .find(|s| s.id == id && (s.is_available() || s.keeps_sessions_while_draining()))
             .cloned()
     }
 
@@ -1224,31 +1355,96 @@ impl BackendPool {
         servers.iter().filter(takes).cloned().collect()
     }
 
-    /// Record request completion and update canary auto-rollback counters.
+    /// Record a request that got no response from the server, or (`success`)
+    /// one whose outcome has no status to read.
     pub fn record_completion(
         &self,
         server: &BackendServer,
         response_time: Duration,
         success: bool,
     ) {
-        self.algorithm
-            .record_completion(server, response_time, success);
-        server.record_result(success, response_time);
+        self.record_outcome(server, response_time, success, success);
+    }
 
-        // Canary error-rate tracking and auto-rollback.
-        if server.is_canary {
-            if let Some(ref canary_cfg) = self.canary_config {
-                if server.record_canary_result(success, canary_cfg) {
-                    warn!(
-                        "Canary server {} in pool '{}' auto-suspended: error rate {:.1}% exceeded threshold {:.1}%",
-                        server.id,
-                        self.name,
-                        server.canary_error_rate() * 100.0,
-                        canary_cfg.rollback_error_rate * 100.0
-                    );
-                }
-            }
+    /// Record a response from the server. The server answered, which is what
+    /// its circuit breaker follows; whether the answer was an error is what a
+    /// canary is rolled back on.
+    pub fn record_response(&self, server: &BackendServer, response_time: Duration, status: u16) {
+        let succeeded = self
+            .canary_config
+            .as_ref()
+            .is_none_or(|canary| !canary.is_error_status(status));
+        self.record_outcome(server, response_time, true, succeeded);
+    }
+
+    fn record_outcome(
+        &self,
+        server: &BackendServer,
+        response_time: Duration,
+        reachable: bool,
+        succeeded: bool,
+    ) {
+        self.algorithm
+            .record_completion(server, response_time, reachable);
+        server.record_result(reachable, response_time);
+
+        let Some(canary_cfg) = self.rollback_config() else {
+            return;
+        };
+        if !server.is_canary {
+            self.stable_outcomes.lock().record(
+                !succeeded,
+                Duration::from_secs(canary_cfg.rollback_window_secs),
+                Instant::now(),
+            );
+            return;
         }
+        let stable_rate = self.stable_rate(canary_cfg);
+        if server.record_canary_result(succeeded, canary_cfg, stable_rate) {
+            self.warn_rolled_back(server, canary_cfg);
+        }
+    }
+
+    /// Record a response whose body failed after its head was counted.
+    pub fn record_body_failure(&self, server: &BackendServer) {
+        let Some(canary_cfg) = self.rollback_config() else {
+            return;
+        };
+        if !server.is_canary {
+            self.stable_outcomes.lock().record_late_error(
+                Duration::from_secs(canary_cfg.rollback_window_secs),
+                Instant::now(),
+            );
+            return;
+        }
+        let stable_rate = self.stable_rate(canary_cfg);
+        if server.record_canary_late_error(canary_cfg, stable_rate) {
+            self.warn_rolled_back(server, canary_cfg);
+        }
+    }
+
+    fn rollback_config(&self) -> Option<&CanaryPoolConfig> {
+        self.canary_config.as_ref().filter(|c| c.auto_rollback)
+    }
+
+    /// The stable servers' error rate, when it is to be compared and they have
+    /// served enough requests to say.
+    fn stable_rate(&self, canary_cfg: &CanaryPoolConfig) -> Option<f64> {
+        if !canary_cfg.rollback_compare_stable {
+            return None;
+        }
+        let totals = self.stable_outcomes.lock().totals(Instant::now());
+        (totals.0 >= canary_cfg.rollback_min_requests).then(|| error_rate(totals))
+    }
+
+    fn warn_rolled_back(&self, server: &BackendServer, canary_cfg: &CanaryPoolConfig) {
+        warn!(
+            "Canary server {} in pool '{}' auto-suspended: error rate {:.1}% exceeded threshold {:.1}%",
+            server.id,
+            self.name,
+            server.canary_error_rate() * 100.0,
+            canary_cfg.rollback_error_rate * 100.0
+        );
     }
 
     /// The single request header this pool's algorithm hashes on, if any.
@@ -1301,13 +1497,17 @@ impl BackendPool {
         servers
             .iter()
             .filter(|s| s.is_canary)
-            .map(|s| CanaryServerStatus {
-                id: s.id.clone(),
-                canary_weight_percent: s.canary_weight_percent.load(Ordering::Relaxed),
-                suspended: s.canary_suspended.load(Ordering::Relaxed),
-                error_rate: s.canary_error_rate(),
-                window_requests: s.canary_window_requests.load(Ordering::Relaxed),
-                window_errors: s.canary_window_errors.load(Ordering::Relaxed),
+            .map(|s| {
+                let (window_requests, window_errors) =
+                    s.canary_window.lock().totals(Instant::now());
+                CanaryServerStatus {
+                    id: s.id.clone(),
+                    canary_weight_percent: s.canary_weight_percent.load(Ordering::Relaxed),
+                    suspended: s.canary_suspended.load(Ordering::Relaxed),
+                    error_rate: s.canary_error_rate(),
+                    window_requests,
+                    window_errors,
+                }
             })
             .collect()
     }
@@ -2162,6 +2362,26 @@ impl LoadBalancer {
         }
     }
 
+    /// Record a response from a pool's server, by its status
+    pub fn record_response(
+        &self,
+        pool_name: &str,
+        server: &BackendServer,
+        response_time: Duration,
+        status: u16,
+    ) {
+        if let Some(pool) = self.pools.get(pool_name) {
+            pool.record_response(server, response_time, status);
+        }
+    }
+
+    /// Record a response whose body failed after its head was counted
+    pub fn record_body_failure(&self, pool_name: &str, server: &BackendServer) {
+        if let Some(pool) = self.pools.get(pool_name) {
+            pool.record_body_failure(server);
+        }
+    }
+
     /// Get all pool statistics
     pub fn all_stats(&self) -> Vec<PoolStats> {
         self.pools.iter().map(|p| p.stats()).collect()
@@ -2501,7 +2721,7 @@ mod tests {
         let mut lb_config = LoadBalancerConfig::default();
         lb_config.queue.enabled = true;
         let pool = Arc::new(BackendPool::from_config(&config, &lb_config));
-        let held = pool.select(&default_ctx()).unwrap().server.acquire_slot();
+        let held = pool.select(&default_ctx()).unwrap();
         assert!(
             pool.select(&default_ctx()).is_none(),
             "full: least_connections skips it"
@@ -2545,7 +2765,7 @@ mod tests {
         assert!(server.health.read().circuit_open);
         // Past the delay (0 s here): one trial at a time
         assert!(server.is_available());
-        let trial = server.acquire_slot();
+        let trial = server.try_acquire_slot(true).unwrap();
         assert!(!server.is_available(), "one trial at a time");
         drop(trial);
         server.record_result(true, Duration::from_millis(1));
@@ -2960,6 +3180,7 @@ mod tests {
                 rollback_error_rate: 0.05,
                 rollback_window_secs: 60,
                 rollback_min_requests: 10,
+                ..CanaryPoolConfig::default()
             }),
         );
 
@@ -3034,6 +3255,7 @@ mod tests {
                 rollback_error_rate: 0.05,
                 rollback_window_secs: 60,
                 rollback_min_requests: 10,
+                ..CanaryPoolConfig::default()
             }),
         );
 
@@ -3074,12 +3296,13 @@ mod tests {
             rollback_error_rate: 0.5, // 50% threshold for easy testing
             rollback_window_secs: 60,
             rollback_min_requests: 10,
+            ..CanaryPoolConfig::default()
         };
 
         // Feed 15 failures — should trigger rollback.
         let mut triggered = false;
         for _ in 0..15 {
-            if server.record_canary_result(false, &cfg) {
+            if server.record_canary_result(false, &cfg, None) {
                 triggered = true;
             }
         }
@@ -3165,14 +3388,336 @@ mod tests {
     fn connection_slots_count_and_never_wrap() {
         let server = create_test_server("127.0.0.1:1", 1);
         {
-            let _a = server.acquire_slot();
-            let _b = server.acquire_slot();
+            let _a = server.try_acquire_slot(false).unwrap();
+            let _b = server.try_acquire_slot(false).unwrap();
             assert_eq!(server.active_connections.load(Ordering::Relaxed), 2);
         }
         assert_eq!(server.active_connections.load(Ordering::Relaxed), 0);
-        let s = server.acquire_slot();
+        let s = server.try_acquire_slot(false).unwrap();
         server.active_connections.store(0, Ordering::Relaxed);
         drop(s);
         assert_eq!(server.active_connections.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+mod reservation_and_rollback_tests {
+    use super::*;
+
+    fn pool(toml_src: &str) -> Arc<BackendPool> {
+        let config: BackendPoolConfig = toml::from_str(toml_src).expect("pool config");
+        Arc::new(BackendPool::from_config(
+            &config,
+            &LoadBalancerConfig::default(),
+        ))
+    }
+
+    fn ctx() -> SelectionContext {
+        SelectionContext {
+            client_ip: "192.0.2.1".parse().unwrap(),
+            session_cookie: None,
+            affinity_header: None,
+            path: "/".to_string(),
+            host: "example.test".to_string(),
+            canary_cookie: None,
+            canary_header: None,
+            query: None,
+            hash_header: None,
+        }
+    }
+
+    fn rollback() -> CanaryPoolConfig {
+        CanaryPoolConfig {
+            enabled: true,
+            auto_rollback: true,
+            rollback_error_rate: 0.05,
+            rollback_min_requests: 10,
+            ..CanaryPoolConfig::default()
+        }
+    }
+
+    const CANARY_POOL: &str = r#"
+        name = "c"
+        algorithm = "round_robin"
+        [canary]
+        enabled = true
+        sticky = false
+        auto_rollback = true
+        rollback_min_requests = 10
+        [[servers]]
+        address = "127.0.0.1:9201"
+        canary = true
+        canary_weight_percent = 100
+        [[servers]]
+        address = "127.0.0.1:9202"
+    "#;
+
+    fn member(pool: &BackendPool, canary: bool) -> Arc<BackendServer> {
+        pool.servers
+            .read()
+            .iter()
+            .find(|s| s.is_canary == canary)
+            .cloned()
+            .unwrap()
+    }
+
+    #[test]
+    fn the_last_place_goes_to_one_request_however_many_arrive_at_once() {
+        let pool = pool(
+            r#"
+            name = "p"
+            [[servers]]
+            address = "127.0.0.1:9203"
+            max_connections = 5
+            "#,
+        );
+        let start = Arc::new(std::sync::Barrier::new(32));
+        let mut threads = Vec::new();
+        for _ in 0..32 {
+            let (pool, start) = (Arc::clone(&pool), Arc::clone(&start));
+            threads.push(std::thread::spawn(move || {
+                start.wait();
+                pool.select(&ctx())
+            }));
+        }
+        let held: Vec<_> = threads
+            .into_iter()
+            .filter_map(|t| t.join().unwrap())
+            .collect();
+        assert_eq!(held.len(), 5);
+        assert_eq!(
+            pool.servers.read()[0]
+                .active_connections
+                .load(Ordering::Acquire),
+            5
+        );
+        drop(held);
+        assert_eq!(
+            pool.servers.read()[0]
+                .active_connections
+                .load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[test]
+    fn a_server_with_an_open_breaker_takes_one_trial_at_a_time() {
+        let pool = pool(
+            r#"
+            name = "p"
+            [[servers]]
+            address = "127.0.0.1:9204"
+            cb_failure_threshold = 1
+            cb_half_open_delay_secs = 0
+            "#,
+        );
+        pool.servers.read()[0].record_result(false, Duration::from_millis(1));
+        let trial = pool.select(&ctx()).expect("the trial");
+        assert!(pool.select(&ctx()).is_none(), "one at a time");
+        drop(trial);
+        assert!(pool.select(&ctx()).is_some());
+    }
+
+    #[test]
+    fn a_full_canary_takes_no_more_and_the_stable_servers_do() {
+        let pool = pool(
+            r#"
+            name = "c"
+            algorithm = "round_robin"
+            [canary]
+            enabled = true
+            sticky = false
+            [[servers]]
+            address = "127.0.0.1:9205"
+            canary = true
+            canary_weight_percent = 100
+            max_connections = 1
+            [[servers]]
+            address = "127.0.0.1:9206"
+            "#,
+        );
+        let first = pool.select(&ctx()).unwrap();
+        assert!(first.server.is_canary);
+        assert!(!pool.select(&ctx()).unwrap().server.is_canary);
+    }
+
+    #[test]
+    fn each_canary_has_its_own_share_of_new_traffic() {
+        let shares = [("a", 5), ("b", 50)];
+        let landed: Vec<_> = (0..100)
+            .map(|roll| canary_for_roll(&shares, roll))
+            .collect();
+        assert_eq!(landed.iter().filter(|c| **c == Some(&"a")).count(), 5);
+        assert_eq!(landed.iter().filter(|c| **c == Some(&"b")).count(), 50);
+        assert_eq!(landed.iter().filter(|c| c.is_none()).count(), 45);
+    }
+
+    #[test]
+    fn shares_over_a_hundred_divide_all_of_the_traffic() {
+        let shares = [("a", 80), ("b", 80)];
+        let landed: Vec<_> = (0..160)
+            .map(|roll| canary_for_roll(&shares, roll))
+            .collect();
+        assert_eq!(landed.iter().filter(|c| **c == Some(&"a")).count(), 80);
+        assert_eq!(landed.iter().filter(|c| **c == Some(&"b")).count(), 80);
+    }
+
+    #[test]
+    fn a_canary_answering_500_is_rolled_back_and_its_breaker_stays_closed() {
+        let pool = pool(CANARY_POOL);
+        let canary = member(&pool, true);
+        for _ in 0..10 {
+            pool.record_response(&canary, Duration::from_millis(1), 500);
+        }
+        assert!(canary.canary_suspended.load(Ordering::Acquire));
+        assert!(!canary.health.read().circuit_open, "the server did answer");
+    }
+
+    #[test]
+    fn a_canary_answering_200_is_kept() {
+        let pool = pool(CANARY_POOL);
+        let canary = member(&pool, true);
+        for _ in 0..50 {
+            pool.record_response(&canary, Duration::from_millis(1), 200);
+        }
+        assert!(!canary.canary_suspended.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_status_the_operator_ignores_is_not_an_error() {
+        let config = CanaryPoolConfig {
+            rollback_ignored_statuses: vec![501],
+            ..rollback()
+        };
+        assert!(config.is_error_status(500));
+        assert!(!config.is_error_status(501));
+        assert!(!config.is_error_status(404));
+    }
+
+    #[test]
+    fn a_body_that_fails_counts_against_the_canary() {
+        let pool = pool(CANARY_POOL);
+        let canary = member(&pool, true);
+        for _ in 0..10 {
+            pool.record_response(&canary, Duration::from_millis(1), 200);
+        }
+        for _ in 0..3 {
+            pool.record_body_failure(&canary);
+        }
+        assert!(canary.canary_suspended.load(Ordering::Acquire));
+        assert_eq!(canary.canary_window.lock().totals(Instant::now()), (10, 3));
+    }
+
+    #[test]
+    fn one_error_among_few_requests_does_not_roll_back() {
+        let server = Arc::new(
+            BackendServer::from_config(
+                &toml::from_str(r#"address = "127.0.0.1:9207""#).expect("server config"),
+            )
+            .unwrap(),
+        );
+        let config = rollback();
+        assert!(!server.record_canary_result(false, &config, None));
+        for _ in 0..12 {
+            assert!(!server.record_canary_result(true, &config, None));
+        }
+        assert!(
+            !server.record_canary_result(false, &config, None),
+            "two errors"
+        );
+        assert!(
+            server.record_canary_result(false, &config, None),
+            "the third"
+        );
+    }
+
+    #[test]
+    fn a_failure_the_stable_servers_share_does_not_roll_back_the_canary() {
+        let pool = pool(CANARY_POOL);
+        let (canary, stable) = (member(&pool, true), member(&pool, false));
+        for _ in 0..20 {
+            pool.record_response(&stable, Duration::from_millis(1), 503);
+            pool.record_response(&canary, Duration::from_millis(1), 503);
+        }
+        assert!(!canary.canary_suspended.load(Ordering::Acquire));
+
+        for _ in 0..200 {
+            pool.record_response(&stable, Duration::from_millis(1), 200);
+        }
+        pool.record_response(&canary, Duration::from_millis(1), 503);
+        assert!(
+            canary.canary_suspended.load(Ordering::Acquire),
+            "now it is the canary's"
+        );
+    }
+
+    #[test]
+    fn errors_leave_the_rollback_window_a_bucket_at_a_time() {
+        let window_length = Duration::from_secs(60);
+        let start = Instant::now();
+        let mut window = OutcomeWindow::new();
+        window.record(true, window_length, start);
+        window.record(false, window_length, start + Duration::from_secs(30));
+        assert_eq!(window.totals(start + Duration::from_secs(59)), (2, 1));
+        // The first has gone; a window that reset as a whole would lose both.
+        assert_eq!(window.totals(start + Duration::from_secs(66)), (1, 0));
+        assert_eq!(window.totals(start + Duration::from_secs(96)), (0, 0));
+    }
+
+    #[test]
+    fn a_draining_server_keeps_its_sessions_and_takes_no_new_ones() {
+        let pool = pool(
+            r#"
+            name = "s"
+            algorithm = "round_robin"
+            affinity = "cookie"
+            [[servers]]
+            address = "127.0.0.1:9208"
+            [[servers]]
+            address = "127.0.0.1:9209"
+            "#,
+        );
+        let session = SelectionContext {
+            session_cookie: Some("kept".to_string()),
+            ..ctx()
+        };
+        let first = pool.select(&session).unwrap().server;
+        first.start_draining(Duration::from_secs(60));
+
+        assert_eq!(
+            pool.select(&session).unwrap().server.id,
+            first.id,
+            "it stays"
+        );
+        for number in 0..8 {
+            let new = SelectionContext {
+                session_cookie: Some(format!("new-{number}")),
+                ..ctx()
+            };
+            assert_ne!(pool.select(&new).unwrap().server.id, first.id);
+        }
+    }
+
+    #[test]
+    fn a_session_leaves_a_draining_server_that_goes_down() {
+        let pool = pool(
+            r#"
+            name = "s"
+            algorithm = "round_robin"
+            affinity = "cookie"
+            [[servers]]
+            address = "127.0.0.1:9210"
+            [[servers]]
+            address = "127.0.0.1:9211"
+            "#,
+        );
+        let session = SelectionContext {
+            session_cookie: Some("kept".to_string()),
+            ..ctx()
+        };
+        let first = pool.select(&session).unwrap().server;
+        first.start_draining(Duration::from_secs(60));
+        first.health.write().healthy = false;
+        assert_ne!(pool.select(&session).unwrap().server.id, first.id);
     }
 }
