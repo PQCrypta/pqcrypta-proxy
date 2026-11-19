@@ -3663,6 +3663,96 @@ pub struct BackendPoolConfig {
     pub canary: Option<CanaryPoolConfig>,
 }
 
+/// The conditions `retry_on` may name: an unknown one was ignored, so a
+/// typo left a backend with no retry where one was asked for.
+pub const RETRY_CONDITIONS: &[&str] = &["connect-failure", "timeout", "5xx"];
+
+fn validate_retry_on(conditions: Option<&[String]>) -> anyhow::Result<()> {
+    for condition in conditions.unwrap_or_default() {
+        if !RETRY_CONDITIONS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(condition))
+        {
+            return Err(anyhow::anyhow!(
+                "retry_on names {condition:?}: expected one of {}",
+                RETRY_CONDITIONS.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A pool's canary settings, each in its range, and no member marked a
+/// canary where the pool routes none (it would take no request at all).
+fn validate_canary(name: &str, pool: &BackendPoolConfig) -> anyhow::Result<()> {
+    let enabled = pool.canary.as_ref().is_some_and(|c| c.enabled);
+    if !enabled {
+        if let Some(server) = pool.servers.iter().find(|s| s.canary) {
+            return Err(anyhow::anyhow!(
+                "Server '{}' in pool '{name}' is a canary, but the pool's canary is not \
+                 enabled: it would take no requests",
+                server.address
+            ));
+        }
+    }
+    let Some(canary) = &pool.canary else {
+        return Ok(());
+    };
+    let field = |what: &str| format!("backend_pools[{name:?}].canary.{what}");
+    if !(canary.rollback_error_rate > 0.0 && canary.rollback_error_rate <= 1.0) {
+        return Err(anyhow::anyhow!(
+            "{} = {}: expected more than 0 and at most 1",
+            field("rollback_error_rate"),
+            canary.rollback_error_rate
+        ));
+    }
+    if canary.rollback_window_secs == 0 {
+        return Err(anyhow::anyhow!(
+            "{} = 0: the error rate needs a window",
+            field("rollback_window_secs")
+        ));
+    }
+    if let Some(status) = canary
+        .rollback_ignored_statuses
+        .iter()
+        .find(|s| !(500..600).contains(*s))
+    {
+        return Err(anyhow::anyhow!(
+            "{} names {status}: only a 5xx counts against a canary",
+            field("rollback_ignored_statuses")
+        ));
+    }
+    if canary.ramp_percent.iter().any(|p| *p == 0 || *p > 100)
+        || canary.ramp_percent.windows(2).any(|w| w[0] >= w[1])
+    {
+        return Err(anyhow::anyhow!(
+            "{} = {:?}: expected weights from 1 to 100, ascending",
+            field("ramp_percent"),
+            canary.ramp_percent
+        ));
+    }
+    if !canary.ramp_percent.is_empty() && canary.ramp_step_secs == 0 {
+        return Err(anyhow::anyhow!(
+            "{} = 0: each step of the ramp needs a time",
+            field("ramp_step_secs")
+        ));
+    }
+    if !matches!(canary.cohort.as_str(), "random" | "ip") && canary.cohort_header().is_none() {
+        return Err(anyhow::anyhow!(
+            "{} = {:?}: expected \"random\", \"ip\" or \"header:<name>\"",
+            field("cohort"),
+            canary.cohort
+        ));
+    }
+    if canary.auto_promote && canary.ramp_percent.is_empty() {
+        return Err(anyhow::anyhow!(
+            "{} needs ramp_percent: a canary is promoted when it has held the last step",
+            field("auto_promote")
+        ));
+    }
+    Ok(())
+}
+
 fn default_lb_algorithm() -> String {
     "least_connections".to_string()
 }
@@ -3711,6 +3801,35 @@ pub struct CanaryPoolConfig {
     pub rollback_compare_stable: bool,
     /// 5xx statuses that are not the canary's errors, e.g. 501 (default: none)
     pub rollback_ignored_statuses: Vec<u16>,
+    /// A progressive rollout: the canary weights a server made canary through
+    /// the admin API without a weight steps through, ascending, each held
+    /// for `ramp_step_secs` (default: none, the weight it is given applies)
+    pub ramp_percent: Vec<u8>,
+    /// How long each ramp step lasts at least, in seconds (default: 120)
+    pub ramp_step_secs: u64,
+    /// Requests the canary answers in a step before the rollout moves on, so
+    /// a quiet spell does not carry an untried version forward (default: 10)
+    pub ramp_min_requests: u64,
+    /// Promote the canary when it has held the last ramp step: it becomes a
+    /// stable server and the servers it was compared with drain (default:
+    /// false, it waits at the last step for `promote` through the admin API)
+    pub auto_promote: bool,
+    /// Who goes to the canary: `"random"`, each new request by chance
+    /// (default); `"ip"`, each client by a hash of its address; or
+    /// `"header:<name>"`, by a hash of that header (by chance without it). A
+    /// client of a cohort keeps its side while the weight holds, and moves to
+    /// the canary at most once as the weight rises, so per-process state
+    /// (a bound session's keys) changes hands once per rollout
+    pub cohort: String,
+}
+
+impl CanaryPoolConfig {
+    /// The header a `header:<name>` cohort hashes, if that is the cohort.
+    pub fn cohort_header(&self) -> Option<&str> {
+        self.cohort
+            .strip_prefix("header:")
+            .filter(|n| !n.is_empty())
+    }
 }
 
 impl CanaryPoolConfig {
@@ -3735,6 +3854,11 @@ impl Default for CanaryPoolConfig {
             rollback_min_errors: 3,
             rollback_compare_stable: true,
             rollback_ignored_statuses: Vec::new(),
+            ramp_percent: Vec::new(),
+            ramp_step_secs: 120,
+            ramp_min_requests: 10,
+            auto_promote: false,
+            cohort: "random".to_string(),
         }
     }
 }
@@ -3772,7 +3896,7 @@ pub struct PoolServerConfig {
     /// Circuit breaker: number of consecutive successes to close the circuit (overrides global default of 3)
     #[serde(default)]
     pub cb_success_threshold: Option<u32>,
-    /// Circuit breaker: half-open delay in seconds (overrides global default of 0)
+    /// Circuit breaker: seconds an open breaker waits before a trial request (default 30)
     #[serde(default)]
     pub cb_half_open_delay_secs: Option<u64>,
     /// Mark this server as a canary deployment target
@@ -3782,6 +3906,22 @@ pub struct PoolServerConfig {
     /// Only used when canary = true and pool.canary.enabled = true.
     #[serde(default)]
     pub canary_weight_percent: u8,
+    /// A connection per request rather than kept-alive ones, as
+    /// `BackendConfig::disable_pooling`
+    #[serde(default)]
+    pub disable_pooling: bool,
+    /// Attempts after the first, as `BackendConfig::retries` (default 2)
+    #[serde(default)]
+    pub retries: Option<u8>,
+    /// Before the first retry, doubled before each after it, as
+    /// `BackendConfig::retry_backoff_ms` (default 50)
+    #[serde(default)]
+    pub retry_backoff_ms: Option<u64>,
+    /// When a request goes to this server again, as `BackendConfig::retry_on`
+    /// (default: a connection that could not be made). A request that could
+    /// not reach the server at all goes on to another member of the pool.
+    #[serde(default)]
+    pub retry_on: Option<Vec<String>>,
 }
 
 fn default_weight() -> u32 {
@@ -5111,7 +5251,22 @@ impl ProxyConfig {
                     &server.address,
                     self.security.allow_internal_backends,
                 )?;
+                validate_retry_on(server.retry_on.as_deref()).map_err(|e| {
+                    anyhow::anyhow!("Server '{}' in pool '{name}': {e}", server.address)
+                })?;
+                if server.canary_weight_percent > 100 {
+                    return Err(anyhow::anyhow!(
+                        "Server '{}' in pool '{name}': canary_weight_percent = {} is more than 100",
+                        server.address,
+                        server.canary_weight_percent
+                    ));
+                }
             }
+            validate_canary(name, pool)?;
+        }
+        for (name, backend) in &self.backends {
+            validate_retry_on(backend.retry_on.as_deref())
+                .map_err(|e| anyhow::anyhow!("Backend '{name}': {e}"))?;
         }
 
         // SEC-009 / F-01: SSRF check on all named backend addresses
@@ -6189,5 +6344,71 @@ mod listen_socket_tests {
         // socket unit with it and close them
         assert!(!unit.contains("PartOf="), "{unit}");
         assert!(unit.contains("After=network-pre.target\n"), "{unit}");
+    }
+}
+
+#[cfg(test)]
+mod pool_validation_tests {
+    use super::*;
+
+    fn pool(toml_src: &str) -> BackendPoolConfig {
+        toml::from_str(toml_src).expect("pool config")
+    }
+
+    const POOL: &str = r#"
+        name = "api"
+        [canary]
+        enabled = true
+        ramp_percent = [10, 50]
+        auto_promote = true
+        [[servers]]
+        address = "127.0.0.1:3013"
+    "#;
+
+    #[test]
+    fn canary_settings_are_held_to_their_ranges() {
+        assert!(validate_canary("api", &pool(POOL)).is_ok());
+        for (from, to) in [
+            ("ramp_percent = [10, 50]", "ramp_percent = [50, 10]"),
+            ("ramp_percent = [10, 50]", "ramp_percent = [0, 50]"),
+            ("ramp_percent = [10, 50]", "ramp_percent = [10, 101]"),
+            ("ramp_percent = [10, 50]", "ramp_percent = []"),
+            (
+                "enabled = true",
+                "enabled = true\nrollback_error_rate = 0.0",
+            ),
+            ("enabled = true", "enabled = true\nrollback_window_secs = 0"),
+            (
+                "enabled = true",
+                "enabled = true\nrollback_ignored_statuses = [404]",
+            ),
+            ("enabled = true", "enabled = true\nramp_step_secs = 0"),
+            ("enabled = true", "enabled = true\ncohort = \"client\""),
+            ("enabled = true", "enabled = true\ncohort = \"header:\""),
+        ] {
+            let bad = POOL.replace(from, to);
+            assert!(
+                validate_canary("api", &pool(&bad)).is_err(),
+                "{to} accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_canary_member_needs_the_pool_canary_enabled() {
+        let marked = POOL.replace(
+            "address = \"127.0.0.1:3013\"",
+            "address = \"127.0.0.1:3013\"\ncanary = true",
+        );
+        assert!(validate_canary("api", &pool(&marked)).is_ok());
+        let off = marked.replace("enabled = true", "enabled = false");
+        assert!(validate_canary("api", &pool(&off)).is_err());
+    }
+
+    #[test]
+    fn retry_on_names_only_known_conditions() {
+        assert!(validate_retry_on(None).is_ok());
+        assert!(validate_retry_on(Some(&["connect-failure".into(), "5XX".into()])).is_ok());
+        assert!(validate_retry_on(Some(&["connect_failure".into()])).is_err());
     }
 }

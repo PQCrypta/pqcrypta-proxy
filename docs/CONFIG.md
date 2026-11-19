@@ -367,7 +367,7 @@ LoadCredentialEncrypted=admin-hmac
 | `auth_token` | string? | `null` | Bearer token, at least 32 characters. Unset (and no mTLS): a 48-character token is generated at each start and written to `generated_token_path`, readable by the proxy's user alone; it is never logged |
 | `generated_token_path` | path | `"/var/lib/pqcrypta-proxy/state/admin-token"` | Where a generated token is written (mode 0600) |
 | `allowed_ips` | array[string] | `["127.0.0.1", "::1"]` | Addresses that may reach the API at all (a filter, not authentication); one that is not loopback-only needs `auth_token` |
-| `hmac_secret` | string? | `null` | Per-request proof of possession: `X-Admin-Signature` (HMAC-SHA256 of method, path and query, timestamp, nonce) with `X-Admin-Timestamp` (±300 s) and `X-Admin-Nonce` (each accepted once) |
+| `hmac_secret` | string? | `null` | Per-request proof of possession: `X-Admin-Signature` (HMAC-SHA256 of method, path and query, timestamp, nonce and the SHA-256 of the body) with `X-Admin-Timestamp` (±300 s) and `X-Admin-Nonce` (each accepted once) |
 | `metrics_token` | string? | `null` | A bearer token that reads the metrics alone (`GET`/`HEAD` of `/metrics`, `/metrics/json`, `/metrics/errors`), unsigned, for a scraper that cannot sign (Prometheus's `authorization.credentials_file`); it authorises nothing else. At least 32 characters, and not `auth_token` |
 
 ### Admin API Endpoints
@@ -794,7 +794,39 @@ Backend pools group multiple servers for load balancing.
 | `queue_max_size` | usize? | `null` | Pool-specific queue size (overrides global) |
 | `queue_timeout_ms` | u64? | `null` | Pool-specific queue timeout (overrides global) |
 | `health_check_path` | string? | `null` | Path each server is asked, a GET over its own transport, healthy on a 2xx; without one, a server is healthy when it accepts a TCP connection |
-| `health_check_interval_secs` | u64 | `10` | How often each server is asked; a probe has half of it to answer, from 1 to 10 s. A server that fails is out of rotation until it answers again, then ramps up |
+| `health_check_interval_secs` | u64 | `10` | How often each server is asked, the first time as soon as the pool is built (so a member that is not running is known before requests go to it); a probe has half of it to answer, from 1 to 10 s. A server that fails is out of rotation until it answers again, then ramps up |
+
+A member a request cannot reach (its connection refused or never made, so nothing of the request was sent) leaves rotation at once, without waiting for its breaker or its next health check, and the request goes to another member of the pool, whatever its method. Its health check puts it back when it answers.
+
+### Pool Canary
+
+```toml
+[backend_pools.POOL_NAME.canary]
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `false` | Route a share of new requests to the members that are canaries |
+| `sticky` | bool | `true` | Keep a client on its canary with a cookie |
+| `sticky_cookie_name` | string | `"PQCPROXY_CANARY"` | That cookie's name |
+| `sticky_cookie_ttl_secs` | u64 | `3600` | Its Max-Age |
+| `sticky_header` | string? | `null` | A request carrying this header goes to a canary |
+| `auto_rollback` | bool | `false` | Suspend a canary whose error rate passes `rollback_error_rate` |
+| `rollback_error_rate` | f64 | `0.05` | The threshold, more than 0 and at most 1 |
+| `rollback_window_secs` | u64 | `60` | The rolling window the rate is measured over (more than 0) |
+| `rollback_min_requests` | u64 | `10` | Requests in the window before a rollback can happen |
+| `rollback_min_errors` | u64 | `3` | Errors in the window before a rollback can happen |
+| `rollback_compare_stable` | bool | `true` | Roll back only when the canary's rate is above the stable members' by more than `rollback_error_rate` |
+| `rollback_ignored_statuses` | [u16] | `[]` | 5xx statuses that are not the canary's errors |
+| `ramp_percent` | [u8] | `[]` | A rollout's weights, ascending from 1 to 100: a member made a canary through the admin API without a weight steps through them |
+| `ramp_step_secs` | u64 | `120` | How long each step lasts at least |
+| `ramp_min_requests` | u64 | `10` | Requests the canary answers in a step before the rollout moves on |
+| `auto_promote` | bool | `false` | Promote the canary when it has held the last step (needs `ramp_percent`): it becomes a stable member and the members it replaces drain. Otherwise it waits for `promote` |
+| `cohort` | string | `"random"` | Who goes to the canary: `"random"` (each new request by chance), `"ip"` (each client by a hash of its address) or `"header:<name>"` (by a hash of that header; by chance without it). A cohort keeps each client on its side while the weight holds and moves it to the canary at most once as the weight rises, so state an instance holds for a client (a bound session's keys) changes hands once per rollout. The hash is salted with the canary's address, so each rollout draws its own cohort |
+
+A member marked `canary = true` in a pool whose canary is not enabled is refused: it would take no requests.
+
+The admin API's `POST /pools/{pool}/servers/{id}/canary` makes a member the canary at run time (`{"weight": n}` for a fixed share, no body for the ramp) and `POST /pools/{pool}/servers/{id}/promote` promotes it; `GET /canary` shows each pool's canaries and its rollout (`ramping`, `awaiting_promotion`, `promoted`, `rolled_back` or `ended`). A rollout outlives a config reload that keeps its canary.
 
 ### Pool Servers
 
@@ -813,6 +845,15 @@ Backend pools group multiple servers for load balancing.
 | `tls_cert` | path? | `null` | CA certificate for backend verification |
 | `tls_skip_verify` | bool | `false` | Refused when true: the certificate is always verified; pin a self-signed backend or private CA with `tls_cert` |
 | `tls_sni` | string? | `null` | Custom SNI hostname for TLS handshake |
+| `cb_failure_threshold` | u32? | `null` | Consecutive failures that open this member's breaker (5 when unset) |
+| `cb_success_threshold` | u32? | `null` | Consecutive successes of half-open trials that close it (3 when unset) |
+| `cb_half_open_delay_secs` | u64? | `null` | How long an open breaker waits before a trial request (30 s when unset) |
+| `canary` | bool | `false` | This member is a canary from the start (the pool's canary must be enabled) |
+| `canary_weight_percent` | u8 | `0` | The share of new requests it takes as a canary, at most 100 |
+| `disable_pooling` | bool | `false` | A connection per request, as for single backends |
+| `retries` | u8? | `null` | Attempts after the first, as for single backends (2 when unset) |
+| `retry_backoff_ms` | u64? | `null` | Before the first retry, doubled before each after it (50 ms when unset) |
+| `retry_on` | [string]? | `null` | When a request goes to this member again (a connection that could not be made, when unset): `connect-failure`, `timeout`, `5xx`. One that still cannot reach it goes on to another member |
 
 ---
 
@@ -840,6 +881,11 @@ Single backend definitions (use backend pools for load balancing).
 | `max_connections` | u32 | `100` | Requests in flight to this backend at once, for the whole process and every transport; a request holds its place until its response body has been sent on, and one that cannot have a place within `connection_pool.acquire_timeout_ms` is refused |
 | `health_check` | string? | `null` | Path this backend is asked in the background, a GET over the transport its requests take, healthy on a 2xx (a `tcp` backend is connected to); the admin API's `/health`, `/backends` and `pqcrypta_backend_up` report the last answer. Without one the backend is reported up |
 | `health_check_interval_secs` | u64 | `30` | How often `health_check` is asked, under whatever configuration is current; a probe has half of it to answer, from 1 to 10 s |
+| `retries` | u8? | `null` | Attempts after the first (2 when unset) |
+| `retry_backoff_ms` | u64? | `null` | Before the first retry, doubled before each after it (50 ms when unset) |
+| `retry_on` | [string]? | `null` | When a request goes again (`connect-failure` when unset): `connect-failure` (nothing was sent, whatever the method), `timeout` and `5xx` (only a method that may be repeated, its body replayable); any other name is refused |
+| `circuit_breaker` | table? | `null` | `failure_threshold`, `half_open_delay_secs`, `success_threshold` in place of `[circuit_breaker]`'s |
+| `disable_pooling` | bool | `false` | A connection per request rather than kept-alive ones |
 
 ### TLS Modes Explained
 

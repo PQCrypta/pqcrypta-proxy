@@ -64,9 +64,7 @@ use crate::fingerprint::{
     fingerprint_middleware, FingerprintExtractor, FingerprintMiddlewareState,
 };
 use crate::http3_features::{http3_features_middleware, Http3FeaturesState};
-use crate::load_balancer::{
-    extract_cookie_by_name, extract_session_cookie, LoadBalancer, SelectionContext,
-};
+use crate::load_balancer::{LoadBalancer, SelectionContext};
 use crate::metrics::{ConnectionProtocol, MetricsRegistry};
 use crate::rate_limiter::{build_context_from_request, AdvancedRateLimiter, RateLimitResult};
 use crate::security::{security_middleware, SecurityState};
@@ -3596,6 +3594,10 @@ async fn proxy_handler(
                 path_and_query,
                 path: &path,
                 headers: &headers,
+                verified_content_digest: req
+                    .extensions()
+                    .get::<crate::route_gate::VerifiedContentDigest>()
+                    .map(|v| v.0.as_str()),
                 client_ip: client_addr.ip(),
                 is_http11,
                 is_websocket_upgrade: is_ws_upgrade,
@@ -3751,55 +3753,26 @@ async fn proxy_handler(
         // body, and given back at the head of an event stream, which can stay
         // open for as long as the client likes.
         let mut pool_slot: Option<crate::load_balancer::ConnectionSlot> = None;
-        let (backend_cfg, pool_server, pool_name, backend_timeout) =
+        // The pool and what it chose by, for a member that cannot be reached:
+        // the request goes on to another.
+        let mut pool_choice: Option<(Arc<crate::load_balancer::BackendPool>, SelectionContext)> =
+            None;
+        let (mut backend_cfg, mut pool_server, pool_name, backend_timeout) =
             if let Some(pool) = state.load_balancer.get_pool(&route.backend) {
-                // Extract session cookie for sticky sessions
-                let cookie_header = headers.get("cookie").and_then(|v| v.to_str().ok());
-                let session_cookie =
-                    extract_session_cookie(cookie_header, &state.load_balancer.cookie_config);
-
-                // Extract canary sticky cookie
-                let canary_name = pool
-                    .canary_config
-                    .as_ref()
-                    .map(|c| c.sticky_cookie_name.as_str())
-                    .unwrap_or("PQCPROXY_CANARY");
-                let canary_cookie = extract_cookie_by_name(cookie_header, canary_name);
-
-                // Extract canary sticky header (pre-assigned group)
-                let canary_header = pool
-                    .canary_config
-                    .as_ref()
-                    .and_then(|c| c.sticky_header.as_ref())
-                    .and_then(|h| {
-                        headers
-                            .get(h.as_str())
-                            .and_then(|v| v.to_str().ok().map(String::from))
-                    });
-
-                // Build selection context
-                let ctx = SelectionContext {
-                    client_ip: client_addr.ip(),
-                    session_cookie,
-                    affinity_header: pool.affinity_header.as_ref().and_then(|h| {
-                        headers
-                            .get(h)
-                            .and_then(|v| v.to_str().ok().map(String::from))
-                    }),
-                    path: path.clone(),
-                    host: host.clone(),
-                    canary_cookie,
-                    canary_header,
-                    query: uri.query().map(String::from),
-                    hash_header: pool.hash_header_name().and_then(|h| {
-                        headers
-                            .get(h)
-                            .and_then(|v| v.to_str().ok().map(String::from))
-                    }),
-                };
+                let ctx = SelectionContext::for_request(
+                    &pool,
+                    &state.load_balancer.cookie_config,
+                    &headers,
+                    client_addr.ip(),
+                    &path,
+                    &host,
+                    uri.query(),
+                );
 
                 // Select backend from pool
-                match pool.select_queued(&ctx).await {
+                let chosen = pool.select_queued(&ctx).await;
+                pool_choice = Some((Arc::clone(&pool), ctx));
+                match chosen {
                     Some(result) => {
                         let timeout = result.server.timeout;
                         canary_cookie_to_set = result.set_canary_cookie;
@@ -3854,10 +3827,11 @@ async fn proxy_handler(
         // should not force every other route on that backend to wait as long.
         // Applies to pool members too: the override is a property of the route,
         // not of whichever server the pool happened to pick.
-        let backend_timeout = match route.timeout_override_ms {
+        let timeout_for = |member_timeout: Duration| match route.timeout_override_ms {
             Some(ms) => Duration::from_millis(ms),
-            None => backend_timeout,
+            None => member_timeout,
         };
+        let mut backend_timeout = timeout_for(backend_timeout);
 
         // TLS to the backend by the one rule both transports use; see
         // `BackendConfig::wants_tls`.
@@ -3936,7 +3910,17 @@ async fn proxy_handler(
 
         // Consume the request body now — WebSocket upgrades were handled above and always
         // returned early, so `req` was not moved in that branch.
+        let verified_digest = req
+            .extensions()
+            .get::<crate::route_gate::VerifiedContentDigest>()
+            .is_some();
         let body = req.into_body();
+        // A signed route's body is held to the digest its signature covered,
+        // as it is forwarded: one that differs never reaches the backend whole.
+        let body = match crate::route_gate::expected_body_digest(route, &headers, verified_digest) {
+            Some(digest) => Body::new(crate::route_gate::DigestChecked::new(body, digest)),
+            None => body,
+        };
 
         // Buffer request body when shadow mirroring is configured on this route.
         // Only incurs allocation cost when a shadow backend is configured with percent > 0.
@@ -4009,14 +3993,72 @@ async fn proxy_handler(
         // connection open indefinitely.
         // Sent again where the backend's retry policy and the request allow
         // (BackendClient::send_with_retry); a timeout is the last attempt's.
-        let result = match state
+        let mut sent = state
             .backend_client
-            .send_with_retry(&backend_cfg, proxy_request, backend_timeout)
-            .await
+            .send_or_hand_back(&backend_cfg, proxy_request, backend_timeout)
+            .await;
+        // A pool member that could not be reached was sent nothing of the
+        // request: it leaves rotation (its health check puts it back) and the
+        // request goes to another member, while the pool has one to offer.
+        if let (Some((pool, ctx)), Some(pn)) = (&pool_choice, &pool_name) {
+            for _ in 1..pool.member_count() {
+                let (error, request) = match sent {
+                    Err((crate::backend_client::SendError::Failed(error), Some(request))) => {
+                        (error, request)
+                    }
+                    other => {
+                        sent = other;
+                        break;
+                    }
+                };
+                if let Some(server) = &pool_server {
+                    server.mark_unreachable();
+                    state.load_balancer.record_completion(
+                        pn,
+                        server.as_ref(),
+                        request_start.elapsed(),
+                        false,
+                    );
+                }
+                drop(pool_slot.take());
+                let Some(next) = pool.select(ctx).filter(|next| {
+                    pool_server
+                        .as_ref()
+                        .is_none_or(|failed| !Arc::ptr_eq(failed, &next.server))
+                }) else {
+                    sent = Err((crate::backend_client::SendError::Failed(error), None));
+                    break;
+                };
+                warn!(
+                    "Pool '{}': {} could not be reached ({:#}); sent to {}",
+                    pn,
+                    pool_server.as_ref().map_or("a member", |s| s.id.as_str()),
+                    error,
+                    next.server.id
+                );
+                backend_cfg = std::borrow::Cow::Owned(next.server.backend_config());
+                backend_timeout = timeout_for(next.server.timeout);
+                if next.set_canary_cookie.is_some() {
+                    canary_cookie_to_set = next.set_canary_cookie;
+                }
+                pool_slot = Some(next.slot);
+                pool_server = Some(next.server);
+                sent = state
+                    .backend_client
+                    .send_or_hand_back(&backend_cfg, *request, backend_timeout)
+                    .await;
+            }
+        }
+        // A member that could not be reached and had no other to go to
+        if let (Err((crate::backend_client::SendError::Failed(_), Some(_))), Some(server)) =
+            (&sent, &pool_server)
         {
+            server.mark_unreachable();
+        }
+        let result = match sent {
             Ok(sent) => Ok(Ok(sent)),
-            Err(crate::backend_client::SendError::TimedOut(_)) => Err(()),
-            Err(crate::backend_client::SendError::Failed(e)) => Ok(Err(e)),
+            Err((crate::backend_client::SendError::TimedOut(_), _)) => Err(()),
+            Err((crate::backend_client::SendError::Failed(e), _)) => Ok(Err(e)),
         };
 
         match result {

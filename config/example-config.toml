@@ -955,6 +955,11 @@ tls_mode = "terminate"
 # rollback_min_errors    = 3               # Minimum errors before rollback can trigger
 # rollback_compare_stable = true           # Roll back only when the canary fails more than the stable servers
 # rollback_ignored_statuses = []           # 5xx statuses that are not the canary's errors, e.g. [501]
+# ramp_percent           = [5, 25, 50]       # A rollout's steps, for a canary made without a weight
+# ramp_step_secs         = 120               # Each step lasts at least this long
+# ramp_min_requests      = 10                # and until the canary has answered this many in it
+# auto_promote           = true              # Promote at the end; the members it replaces drain
+# cohort                 = "ip"              # Each client keeps its side: "random", "ip", "header:<name>"
 #
 # Canary server entry (place before stable servers in the pool):
 # [[backend_pools.api-pool.servers]]
@@ -973,6 +978,9 @@ tls_mode = "terminate"
 #   POST /canary/resume/:server_id   — re-enable a suspended canary
 #   POST /canary/weight/:server_id   — adjust canary_weight_percent at runtime
 #                                      body: {"percent": 10}
+#   POST /pools/:pool/servers/:id/canary   — make a member the canary: {"weight": n},
+#                                            or no body to step through ramp_percent
+#   POST /pools/:pool/servers/:id/promote  — promote it; the members it replaces drain
 
 # Example: Apache pool with IP hash for session stickiness
 [backend_pools.apache-pool]
