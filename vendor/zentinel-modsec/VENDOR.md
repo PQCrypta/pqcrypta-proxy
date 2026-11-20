@@ -21,10 +21,12 @@ The changes from that commit:
   and the rules do not. The proxy lifts CRS's scanner detection (913) where it
   lifts its own user-agent rules: its own monitoring's addresses, crawler
   paths, routes that serve tools.
+- **md-5, sha1, sha2 0.11**, the RustCrypto release the proxy builds with,
+  in place of 0.10: one copy of each in the build.
 - **`benches/`** removed, with the bench target, its feature and `criterion`:
   they compared against libmodsecurity through FFI and were this crate's only
   `unsafe` code.
 
 To move to a newer upstream commit: copy it over this directory (`git archive
-<commit> | tar -x`), keep `src/libinjection/`, `remove_rules_by_id` and this file, drop `benches/`
+<commit> | tar -x`), keep `src/libinjection/`, `remove_rules_by_id`, the hash crates' versions and this file, drop `benches/`
 again, and rerun `tests/crs_regression.rs` in the proxy.

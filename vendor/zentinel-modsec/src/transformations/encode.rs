@@ -59,7 +59,7 @@ impl Transformation for Md5 {
         let mut hasher = Md5Hasher::new();
         hasher.update(input.as_bytes());
         let result = hasher.finalize();
-        Cow::Owned(format!("{:x}", result))
+        Cow::Owned(hex::encode(result))
     }
 
     fn name(&self) -> &'static str {
@@ -76,7 +76,7 @@ impl Transformation for Sha1 {
         let mut hasher = Sha1Hasher::new();
         hasher.update(input.as_bytes());
         let result = hasher.finalize();
-        Cow::Owned(format!("{:x}", result))
+        Cow::Owned(hex::encode(result))
     }
 
     fn name(&self) -> &'static str {

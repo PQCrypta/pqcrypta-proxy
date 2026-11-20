@@ -36,9 +36,9 @@ aho-corasick = "1.1"
 ipnetwork = "0.21"
 
 # Hashing (for md5/sha1/sha2 transformations)
-md-5 = "0.10"
-sha1 = "0.10"
-sha2 = "0.10"
+md-5 = "0.11"
+sha1 = "0.11"
+sha2 = "0.11"
 hex = "0.4"
 
 # HTML entity decoding
