@@ -5833,25 +5833,28 @@ mod tests {
         on.waf.crs.entry = crs.join("main.conf").to_string_lossy().into_owned();
         manager.store_config(Arc::new(on));
 
-        std::fs::write(
-            crs.join("REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf"),
-            "# 1\n",
-        )
-        .unwrap();
+        // Renamed into place, as an install or an editor replaces a file: the
+        // event every platform reports (macOS reports no close after write)
+        let replace = |text: &str| {
+            let tmp = crs.join(".exclusions.tmp");
+            std::fs::write(&tmp, text).unwrap();
+            std::fs::rename(
+                &tmp,
+                crs.join("REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf"),
+            )
+            .unwrap();
+        };
+        replace("# 1\n");
         let event = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
             .await
-            .expect("a CRS file written after the reload turned CRS on reloads");
+            .expect("a CRS file replaced after the reload turned CRS on reloads");
         assert!(matches!(event, Some(ConfigReloadEvent::ConfigReloaded(_))));
 
         let mut off = (*manager.get()).clone();
         off.waf.crs.enabled = false;
         manager.store_config(Arc::new(off));
         while events.try_recv().is_ok() {}
-        std::fs::write(
-            crs.join("REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf"),
-            "# 2\n",
-        )
-        .unwrap();
+        replace("# 2\n");
         let quiet = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await;
         assert!(
             quiet.is_err(),
