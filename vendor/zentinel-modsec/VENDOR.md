@@ -25,6 +25,20 @@ The changes from that commit:
   from its XSS rules (tag `xss-perf-disable`) when the path holds only
   characters no XSS needs; the directive was reported as unsupported on
   nearly every request and the path inspected anyway.
+- **Request bodies as ModSecurity reads them**: an XML body fills the XML
+  collection (what `XML:/*` and `XML://@*` read), not ARGS; `REQUEST_BODY`
+  holds the raw body after the URLENCODED or JSON processor or when
+  `ctl:forceRequestBodyVariable=On` (implemented here; CRS's 901340 sets it
+  for a body no processor parses), not an XML or multipart one;
+  `REQBODY_PROCESSOR` is known from the request's head, so phase 1 reads it
+  (901340 decides there), and is present, empty, when no processor applies.
+  XML element names in ARGS_NAMES and raw XML in REQUEST_BODY were what CRS's
+  944 tests (a payload in an element's name) failed on: 30 false positives.
+- **`ctl:ruleRemoveByTag`** (CRS's 905100 and 905110), and **`UNIQUE_ID`**,
+  the embedding application's request ID when it sets one
+  (`Transaction::set_unique_id`). A multipart body whose Content-Type names
+  no boundary is a body error (REQBODY_ERROR), as in ModSecurity, rather
+  than a warning per request.
 - **md-5, sha1, sha2 0.11**, the RustCrypto release the proxy builds with,
   in place of 0.10: one copy of each in the build.
 - **`benches/`** removed, with the bench target, its feature and `criterion`:
@@ -32,10 +46,10 @@ The changes from that commit:
   `unsafe` code.
 
 `tests/crs_conformance.rs` gates the engine on CRS's own regression corpus
-(CRS 30cb436): 4953 of 5184 cases pass here, 4947 upstream, and no case
+(CRS 30cb436): 4984 of 5184 cases pass here, 4947 upstream, and no case
 upstream passes fails here. The proxy's CI runs this crate's tests and that
 gate (`zentinel-modsec fork tests`).
 
 To move to a newer upstream commit: copy it over this directory (`git archive
-<commit> | tar -x`), keep `src/libinjection/`, `remove_rules_by_id`, `ruleRemoveTargetByTag`, the hash crates' versions and this file, drop `benches/`
+<commit> | tar -x`), keep `src/libinjection/` and every change listed above, and this file, drop `benches/`
 again, and rerun `tests/crs_regression.rs` in the proxy.

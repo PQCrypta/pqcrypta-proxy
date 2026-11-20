@@ -54,6 +54,14 @@ pub enum CtlDirective {
     RuleEngine(RuleEngineMode),
     /// `ctl:ruleRemoveById=ID` or `=START-END`, or several separated by commas.
     RuleRemoveById(Vec<RuleIdRange>),
+    /// `ctl:ruleRemoveByTag=TAG`: every rule carrying the tag, for the rest of
+    /// the transaction. CRS's 905100 and 905110 lift the whole rule set
+    /// (`OWASP_CRS`) for the web server's own internal requests.
+    RuleRemoveByTag(String),
+    /// `ctl:forceRequestBodyVariable=On|Off`: populate `REQUEST_BODY` whatever
+    /// the body processor. CRS's 901340 turns it on for a body no processor
+    /// parses, so its rules read that body raw.
+    ForceRequestBodyVariable(bool),
     /// `ctl:ruleRemoveTargetById=ID;TARGET`
     RuleRemoveTargetById {
         /// ID of the rule the exclusion applies to.
@@ -118,6 +126,25 @@ impl CtlDirective {
                     directive,
                     value,
                     "ruleRemoveById expects a rule ID or an ID range such as 942100-942999",
+                ),
+            },
+
+            "ruleremovebytag" => match value.trim() {
+                "" => CtlDirective::unsupported(
+                    directive,
+                    value,
+                    "ruleRemoveByTag expects a tag, for example OWASP_CRS",
+                ),
+                tag => CtlDirective::RuleRemoveByTag(tag.to_string()),
+            },
+
+            "forcerequestbodyvariable" => match value.to_ascii_lowercase().as_str() {
+                "on" => CtlDirective::ForceRequestBodyVariable(true),
+                "off" => CtlDirective::ForceRequestBodyVariable(false),
+                _ => CtlDirective::unsupported(
+                    directive,
+                    value,
+                    "forceRequestBodyVariable accepts only On or Off",
                 ),
             },
 
@@ -229,6 +256,8 @@ pub(crate) fn parse_id_ranges(value: &str) -> Option<Vec<RuleIdRange>> {
 pub struct TransactionControls {
     engine_mode: Option<RuleEngineMode>,
     removed_rules: Vec<RuleIdRange>,
+    /// Tags from `ctl:ruleRemoveByTag`: a rule carrying any is skipped.
+    removed_tags: Vec<String>,
     /// `(rule id, parsed target)` pairs from `ctl:ruleRemoveTargetById`.
     ///
     /// The target is parsed once when the directive fires rather than once per
@@ -255,6 +284,14 @@ impl TransactionControls {
         match directive {
             CtlDirective::RuleEngine(mode) => self.engine_mode = Some(mode),
             CtlDirective::RuleRemoveById(mut ranges) => self.removed_rules.append(&mut ranges),
+            CtlDirective::RuleRemoveByTag(tag) => {
+                if !self.removed_tags.contains(&tag) {
+                    self.removed_tags.push(tag);
+                }
+            }
+            // The request data holds this: REQUEST_BODY reads it there
+            // (`Transaction` copies it over as the directive runs).
+            CtlDirective::ForceRequestBodyVariable(_) => {}
             CtlDirective::RuleRemoveTargetById { rule_id, target } => {
                 // Parse with the same parser used for rule variables so
                 // collection names round-trip: SecLang writes REQUEST_HEADERS
@@ -317,6 +354,12 @@ impl TransactionControls {
         self.engine_mode.unwrap_or(ruleset_mode)
     }
 
+    /// Whether `ctl:ruleRemoveByTag` has excluded a rule, given whether it
+    /// carries a tag (compared exactly, as `SecRuleRemoveByTag` compares).
+    pub fn is_rule_removed_by_tag(&self, has_tag: impl Fn(&str) -> bool) -> bool {
+        self.removed_tags.iter().any(|t| has_tag(t))
+    }
+
     /// Whether `ctl:ruleRemoveById` has excluded this rule.
     pub fn is_rule_removed(&self, rule_id: Option<&str>) -> bool {
         let Some(id) = rule_id else {
@@ -357,7 +400,11 @@ impl TransactionControls {
     /// Whether one resolved value is among `removals`, the targets
     /// [`Self::target_removals`] gave for its rule. Values are filtered, not
     /// specifications: see [`Self::is_target_removed`].
-    pub fn is_removed_by(removals: &[&VariableSpec], var: &VariableSpec, resolved_name: &str) -> bool {
+    pub fn is_removed_by(
+        removals: &[&VariableSpec],
+        var: &VariableSpec,
+        resolved_name: &str,
+    ) -> bool {
         removals
             .iter()
             .any(|target| target_matches_resolved(var, target, resolved_name))
@@ -741,7 +788,8 @@ mod tests {
             ("requestBodyProcessor", "YAML"),
             ("auditEngine", "Off"),
             ("auditLogParts", "+E"),
-            ("forceRequestBodyVariable", "On"),
+            ("forceRequestBodyVariable", "Maybe"),
+            ("ruleRemoveByTag", ""),
         ] {
             assert!(
                 matches!(

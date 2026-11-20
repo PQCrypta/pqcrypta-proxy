@@ -37,6 +37,43 @@ fn is_xml_content_type(ct_lower: &str) -> bool {
     media_type == "application/xml" || media_type == "text/xml" || media_type.ends_with("+xml")
 }
 
+/// The processor [`Transaction::process_request_body`] will run for a body of
+/// this (lowercased) Content-Type, empty for none. ModSecurity knows its body
+/// processor from the request's head, so phase 1 rules read it
+/// (`REQBODY_PROCESSOR`): CRS's 901340 forces `REQUEST_BODY` for a body no
+/// processor will parse, and decides that in phase 1.
+fn processor_for(ct_lower: &str) -> &'static str {
+    if ct_lower.starts_with("multipart/form-data") {
+        "MULTIPART"
+    } else if is_xml_content_type(ct_lower) {
+        "XML"
+    } else if is_json_content_type(ct_lower) {
+        "JSON"
+    } else if ct_lower.starts_with("application/x-www-form-urlencoded") {
+        "URLENCODED"
+    } else {
+        ""
+    }
+}
+
+/// A transaction identifier for `UNIQUE_ID` when the caller gives none: 32
+/// hex digits, from the time, a process-wide counter and the standard
+/// library's randomly keyed hasher. Unique, not secret.
+fn generate_unique_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let keyed = std::collections::hash_map::RandomState::new();
+    let mut h = keyed.build_hasher();
+    h.write_u64(n);
+    h.write_u64(nanos);
+    format!("{:016x}{:016x}", nanos ^ n.rotate_left(32), h.finish())
+}
+
 /// A ModSecurity transaction for processing a single request.
 pub struct Transaction {
     /// Compiled ruleset reference.
@@ -167,9 +204,11 @@ pub struct SetVarEffect {
 impl Transaction {
     /// Create a new transaction.
     pub fn new(ruleset: Arc<CompiledRuleset>, default_status: u16) -> Self {
+        let mut request = RequestData::new();
+        request.unique_id = generate_unique_id();
         Self {
             ruleset,
-            request: RequestData::new(),
+            request,
             response: ResponseData::new(),
             tx: TxCollection::new(),
             phase: Phase::RequestHeaders,
@@ -194,6 +233,13 @@ impl Transaction {
     pub fn set_client_addr(&mut self, ip: &str, port: u16) {
         self.request.client_ip = ip.to_string();
         self.request.client_port = port;
+    }
+
+    /// Set `UNIQUE_ID`, the transaction's identifier: the embedding
+    /// application's request ID, so a rule's log line and the application's
+    /// name the same request. Without it a generated one stands.
+    pub fn set_unique_id(&mut self, id: &str) {
+        self.request.unique_id = id.to_string();
     }
 
     /// Set the local address, backing `SERVER_ADDR` and `SERVER_PORT`.
@@ -261,6 +307,16 @@ impl Transaction {
     /// Process request headers (Phase 1).
     pub fn process_request_headers(&mut self) -> Result<()> {
         self.phase = Phase::RequestHeaders;
+        // The body processor is known from the head, as in ModSecurity, for
+        // the phase 1 rules that read REQBODY_PROCESSOR; ctl:requestBodyProcessor
+        // replaces it, and phase 2 sets what actually ran.
+        let ct_lower = self
+            .request
+            .headers
+            .get("content-type")
+            .and_then(|v| v.first().map(|s| s.trim_start().to_ascii_lowercase()))
+            .unwrap_or_default();
+        self.request.body_processor = processor_for(&ct_lower).to_string();
         self.run_phase(Phase::RequestHeaders)?;
         Ok(())
     }
@@ -302,10 +358,7 @@ impl Transaction {
                         .request
                         .parse_multipart_body(content_type.as_deref().unwrap_or_default())
                     {
-                        tracing::warn!(
-                            "ctl:requestBodyProcessor=MULTIPART, but the body has no parseable \
-                             boundary; body arguments were not extracted"
-                        );
+                        self.multipart_without_boundary();
                     }
                 }
                 "URLENCODED" => {
@@ -329,10 +382,7 @@ impl Transaction {
                 .request
                 .parse_multipart_body(content_type.as_deref().unwrap_or_default())
             {
-                tracing::warn!(
-                    "multipart/form-data request without a parseable boundary; \
-                     body arguments were not extracted"
-                );
+                self.multipart_without_boundary();
             }
         } else if is_xml_content_type(&ct_lower) {
             self.process_xml_body();
@@ -352,6 +402,16 @@ impl Transaction {
 
         self.run_phase(Phase::RequestBody)?;
         Ok(())
+    }
+
+    /// A multipart body whose Content-Type names no boundary cannot be parsed:
+    /// a body error, as in ModSecurity, so `REQBODY_ERROR` reports it (CRS's
+    /// 200002 denies it) rather than the body passing with nothing extracted.
+    /// Not a log line: the client chose it, and would choose it per request.
+    fn multipart_without_boundary(&mut self) {
+        tracing::debug!("multipart body without a boundary in its Content-Type");
+        self.request.body_processor = "MULTIPART".to_string();
+        self.request.body_error = Some("Multipart: boundary not found in Content-Type".into());
     }
 
     /// Run the XML body processor, recording any failure.
@@ -542,7 +602,11 @@ impl Transaction {
             // ctl:ruleRemoveById excluded this rule for this transaction. Skip
             // it as though it were not in the ruleset -- including its chain
             // links, which cannot fire without their starter.
-            if self.controls.is_rule_removed(rule.id.as_deref()) {
+            if self.controls.is_rule_removed(rule.id.as_deref())
+                || self
+                    .controls
+                    .is_rule_removed_by_tag(|tag| rule.has_tag(tag))
+            {
                 if rule.is_chain {
                     chain_state.reset();
                     pending_chain_actions = None;
@@ -685,7 +749,19 @@ impl Transaction {
                 // that ctl:ruleEngine=DetectionOnly on the same rule governs
                 // whether that rule blocks.
                 for ctl in &action_result.control_ops {
-                    self.controls.apply(CtlDirective::parse(ctl));
+                    let directive = CtlDirective::parse(ctl);
+                    match &directive {
+                        CtlDirective::ForceRequestBodyVariable(on) => {
+                            self.request.force_body_variable = *on;
+                        }
+                        // REQBODY_PROCESSOR names the forced processor from
+                        // here on, before phase 2 runs it
+                        CtlDirective::RequestBodyProcessor(p) => {
+                            self.request.body_processor = p.clone();
+                        }
+                        _ => {}
+                    }
+                    self.controls.apply(directive);
                 }
 
                 // Handle flow control
@@ -821,7 +897,8 @@ impl Transaction {
             let mut resolved = resolver.resolve(spec);
             if filter_targets {
                 let before = resolved.len();
-                resolved.retain(|(name, _)| !TransactionControls::is_removed_by(&removals, spec, name));
+                resolved
+                    .retain(|(name, _)| !TransactionControls::is_removed_by(&removals, spec, name));
                 any_excluded |= resolved.len() != before;
             }
             if spec.count_mode {

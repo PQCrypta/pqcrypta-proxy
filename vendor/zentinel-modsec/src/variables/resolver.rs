@@ -147,8 +147,18 @@ impl<'a> VariableResolver<'a> {
                     .sum();
                 vec![("ARGS_COMBINED_SIZE".to_string(), size.to_string())]
             }
+            // REQUEST_BODY: the raw body after the URLENCODED or JSON processor,
+            // or when ctl:forceRequestBodyVariable=On (CRS 901340, for a body
+            // no processor parses); see RequestData::request_body_variable.
             VariableName::RequestBody => {
-                vec![("REQUEST_BODY".to_string(), self.request.body_str())]
+                if self.request.request_body_variable() {
+                    vec![("REQUEST_BODY".to_string(), self.request.body_str())]
+                } else {
+                    vec![]
+                }
+            }
+            VariableName::UniqueId => {
+                vec![("UNIQUE_ID".to_string(), self.request.unique_id.clone())]
             }
             VariableName::RequestBodyLength => {
                 vec![(
@@ -207,16 +217,14 @@ impl<'a> VariableResolver<'a> {
             VariableName::FilesNames => {
                 self.resolve_collection_names(&[&self.request.files], "FILES_NAMES", selection)
             }
-            VariableName::ReqBodyProcessor => {
-                if self.request.body_processor.is_empty() {
-                    vec![]
-                } else {
-                    vec![(
-                        "REQBODY_PROCESSOR".to_string(),
-                        self.request.body_processor.clone(),
-                    )]
-                }
-            }
+            // Present, empty, when no processor applies, as in ModSecurity:
+            // CRS's 901340 (`!@rx (?:URLENCODED|MULTIPART|XML|JSON)`) forces
+            // REQUEST_BODY for exactly that body, and a negated operator does
+            // not match an absent variable.
+            VariableName::ReqBodyProcessor => vec![(
+                "REQBODY_PROCESSOR".to_string(),
+                self.request.body_processor.clone(),
+            )],
 
             // A body the processor could not handle. These resolved to nothing
             // before, so CRS rule 200002 (`SecRule REQBODY_ERROR "!@eq 0"`)
@@ -386,7 +394,8 @@ impl<'a> VariableResolver<'a> {
     /// Resolve an `XML:` target against the flattened XML body.
     ///
     /// The XML body processor flattens element text to `xml.<path>` and
-    /// attributes to `xml.<path>.@<name>` in `ARGS`. `XML:/*` and `XML://@*`
+    /// attributes to `xml.<path>.@<name>` in the XML collection (not ARGS,
+    /// as in ModSecurity). `XML:/*` and `XML://@*`
     /// are exactly those two sets, so they are answered from the flattening
     /// rather than by evaluating XPath.
     ///
@@ -403,7 +412,7 @@ impl<'a> VariableResolver<'a> {
         };
 
         self.request
-            .args_post
+            .xml
             .all()
             .into_iter()
             .filter_map(|(name, value)| {

@@ -31,6 +31,12 @@ pub struct RequestData {
     /// populated by the multipart body processor. Mirrors ModSecurity's
     /// `MULTIPART_PART_HEADERS` collection.
     pub multipart_part_headers: HashMapCollection,
+    /// An XML body's element text and attributes, flattened by element path
+    /// (`xml.order.item`, `xml.order.item.@id`): what `XML:/*` and `XML://@*`
+    /// read. Not arguments: in ModSecurity an XML body fills the XML
+    /// collection alone, so ARGS and ARGS_NAMES never hold its markup, which
+    /// CRS's rules read through their `XML:` targets.
+    pub xml: HashMapCollection,
     /// Uploaded files (key = part name, value = client-supplied filename),
     /// populated by the multipart body processor. Backs `FILES`/`FILES_NAMES`.
     pub files: HashMapCollection,
@@ -46,6 +52,14 @@ pub struct RequestData {
     /// that the origin application happily accepts is a bypass when it
     /// happens quietly.
     pub body_error: Option<String>,
+    /// `ctl:forceRequestBodyVariable=On` ran: `REQUEST_BODY` holds the body
+    /// whatever the processor. Otherwise it does only after the URLENCODED
+    /// processor, as in ModSecurity: an XML, JSON or multipart body is read
+    /// through what its processor extracted (ARGS, XML, FILES), not raw.
+    pub force_body_variable: bool,
+    /// `UNIQUE_ID`: this transaction's identifier, the embedding
+    /// application's request ID when it gives one.
+    pub unique_id: String,
     /// Request body.
     pub body: Vec<u8>,
     /// Client IP address.
@@ -227,6 +241,17 @@ impl RequestData {
         true
     }
 
+    /// Whether `REQUEST_BODY` holds the body: after the URLENCODED or JSON
+    /// processor, or when `ctl:forceRequestBodyVariable=On` ran. Not after
+    /// XML or MULTIPART, whose bodies are read through what the processor
+    /// extracted. Measured against CRS's regression corpus, which expects
+    /// a JSON body raw (934210: a key followed by `":`, which no argument
+    /// name carries) and an XML body not (944120: a payload in an element's
+    /// name, which `XML:` targets exclude).
+    pub fn request_body_variable(&self) -> bool {
+        self.force_body_variable || matches!(self.body_processor.as_str(), "URLENCODED" | "JSON")
+    }
+
     /// Parse form body into args_post.
     pub fn parse_form_body(&mut self) {
         let body_str = self.body_str();
@@ -305,7 +330,7 @@ impl RequestData {
     }
 
     /// Parse an XML body, flattening element text and attributes into
-    /// `args_post`.
+    /// `xml`, the collection `XML:` targets read.
     ///
     /// ModSecurity exposes XML through an XPath-selected `XML:` variable. That
     /// needs an XPath engine, which this does not have — so instead each text
@@ -318,13 +343,11 @@ impl RequestData {
     ///      xml.order.item.@id  = 7
     /// ```
     ///
-    /// That is not ModSecurity-compatible naming, and rules written against
-    /// `XML:/order/item` will not match it. It is chosen because the
-    /// alternative was leaving XML bodies uninspected entirely: with this,
-    /// `SecRule ARGS "@detectSQLi"` covers XML payloads the same way it covers
-    /// form and JSON ones, which is what the common rulesets actually do.
-    ///
-    /// The whole document's text is also available as `REQUEST_BODY`.
+    /// Rules written against an XPath such as `XML:/order/item` will not
+    /// match it; the two selectors CRS writes, `XML:/*` (element text) and
+    /// `XML://@*` (attributes), map onto it exactly. As in ModSecurity, the
+    /// values are not arguments, and `REQUEST_BODY` holds the document only
+    /// when `ctl:forceRequestBodyVariable=On` asks for it.
     pub fn parse_xml_body(&mut self) -> Result<(), String> {
         use quick_xml::events::Event;
 
@@ -349,7 +372,7 @@ impl RequestData {
 
         macro_rules! cap {
             ($name:expr, $value:expr) => {
-                if push_xml_arg(&$name, $value, &mut self.args_post, &mut count) {
+                if push_xml_arg(&$name, $value, &mut self.xml, &mut count) {
                     let msg = xml_limit_message();
                     self.body_error = Some(msg.clone());
                     return Err(msg);

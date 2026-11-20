@@ -332,7 +332,8 @@ impl VariableName {
             | VariableName::ReqBodyError
             | VariableName::ReqBodyErrorMsg
             | VariableName::ReqBodyProcessorError
-            | VariableName::ReqBodyProcessorErrorMsg => true,
+            | VariableName::ReqBodyProcessorErrorMsg
+            | VariableName::UniqueId => true,
 
             VariableName::ResponseProtocol
             | VariableName::ResponseHeadersNames
@@ -358,7 +359,6 @@ impl VariableName {
             | VariableName::FilesSizes
             | VariableName::FilesTmpnames
             | VariableName::FilesCombinedSize
-            | VariableName::UniqueId
             | VariableName::InboundAnomalyScore
             | VariableName::OutboundAnomalyScore
             | VariableName::Duration
