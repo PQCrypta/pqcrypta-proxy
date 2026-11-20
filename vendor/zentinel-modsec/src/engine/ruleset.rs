@@ -38,6 +38,15 @@ pub struct CompiledRule {
     pub chain_next: Option<usize>,
 }
 
+impl CompiledRule {
+    /// Whether the rule carries this tag (`tag:'...'`), compared exactly.
+    pub fn has_tag(&self, tag: &str) -> bool {
+        self.actions
+            .iter()
+            .any(|a| matches!(a, Action::Metadata(MetadataAction::Tag(t)) if t == tag))
+    }
+}
+
 impl std::fmt::Debug for CompiledRule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CompiledRule")

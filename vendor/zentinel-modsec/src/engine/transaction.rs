@@ -806,11 +806,14 @@ impl Transaction {
         // and is what CRS's `SecRule &TX:x "@eq 0"` initialization relies on.
         // Emitting a value even for an absent count also keeps the spec out of
         // the "resolved to nothing" early-return below, so `&x "@eq 0"` matches.
-        // ctl:ruleRemoveTargetById drops individual targets from this rule for
-        // this transaction. The check is hoisted so rules with no exclusion --
-        // effectively all of them -- pay one comparison rather than a scan per
-        // variable.
-        let filter_targets = self.controls.has_target_removals(rule.id.as_deref());
+        // ctl:ruleRemoveTargetById and ctl:ruleRemoveTargetByTag drop
+        // individual targets from this rule for this transaction. They are
+        // gathered once per rule, so rules with no exclusion -- effectively
+        // all of them -- pay no scan per variable.
+        let removals = self
+            .controls
+            .target_removals(rule.id.as_deref(), |tag| rule.has_tag(tag));
+        let filter_targets = !removals.is_empty();
 
         let mut all_values = Vec::new();
         let mut any_excluded = false;
@@ -818,11 +821,7 @@ impl Transaction {
             let mut resolved = resolver.resolve(spec);
             if filter_targets {
                 let before = resolved.len();
-                resolved.retain(|(name, _)| {
-                    !self
-                        .controls
-                        .is_target_removed(rule.id.as_deref(), spec, name)
-                });
+                resolved.retain(|(name, _)| !TransactionControls::is_removed_by(&removals, spec, name));
                 any_excluded |= resolved.len() != before;
             }
             if spec.count_mode {

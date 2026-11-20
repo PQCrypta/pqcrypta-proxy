@@ -352,6 +352,30 @@ SecRule TX:BLOCKING_INBOUND_ANOMALY_SCORE "@ge 5" "id:949111,phase:2,deny,status
         assert_eq!(t.outcome().rules, ["942100"], "SQL injection is not");
     }
 
+    /// CRS's 941010: a path of only characters no XSS needs is dropped from
+    /// the XSS rules (`ctl:ruleRemoveTargetByTag`); any other path, and the
+    /// arguments, are still inspected
+    #[test]
+    fn a_safe_path_is_removed_from_the_tagged_rules_by_tag() {
+        const XSS: &str = r#"
+SecRuleEngine On
+SecAction "id:1,phase:1,pass,nolog,setvar:tx.blocking_inbound_anomaly_score=0"
+SecRule REQUEST_FILENAME "!@validateByteRange 20,45-47,48-57,65-90,95,97-122" "id:941010,phase:1,pass,nolog,ctl:ruleRemoveTargetByTag=xss-perf-disable;REQUEST_FILENAME"
+SecRule REQUEST_FILENAME|ARGS "@contains alert" "id:941999,phase:2,pass,tag:'xss-perf-disable',setvar:tx.inbound_anomaly_score_pl1=+5,setvar:tx.blocking_inbound_anomaly_score=+5"
+SecRule TX:BLOCKING_INBOUND_ANOMALY_SCORE "@ge 5" "id:949110,phase:2,deny,status:403"
+"#;
+        let crs = CrsLayer::from_rules(XSS);
+        let headers = HeaderMap::new();
+        let run = |path, query| {
+            let mut t = crs.head(&head(path, query, &headers));
+            crs.body(&mut t, None);
+            t.outcome().denied
+        };
+        assert!(!run("/alert", ""), "a safe path is not an XSS target");
+        assert!(run("/alert(1)", ""), "a path with ( still is");
+        assert!(run("/search", "q=alert"), "the arguments still are");
+    }
+
     /// A reload keeps the loaded rules until a file behind the entry changes,
     /// a linked rules directory (one install per version) included
     #[test]
