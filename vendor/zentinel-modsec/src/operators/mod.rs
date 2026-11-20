@@ -138,7 +138,9 @@ impl ValidateByteRangeOperator {
 impl Operator for ValidateByteRangeOperator {
     fn execute(&self, value: &str) -> OperatorResult {
         // Check if all bytes are within the allowed ranges
-        for byte in value.bytes() {
+        // The request's bytes: a byte that was not UTF-8 is read back from
+        // its stand-in (crate::bytes)
+        for byte in crate::bytes::bytes(value) {
             let valid = self
                 .ranges
                 .iter()

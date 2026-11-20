@@ -152,7 +152,7 @@ impl RequestData {
 
     /// Get body as string.
     pub fn body_str(&self) -> String {
-        String::from_utf8_lossy(&self.body).to_string()
+        crate::bytes::text(&self.body)
     }
 
     /// Get body length.
@@ -198,7 +198,7 @@ impl RequestData {
                 }
                 None => self
                     .args_post
-                    .add(part.name, String::from_utf8_lossy(&part.value).into_owned()),
+                    .add(part.name, crate::bytes::text(&part.value)),
             }
         }
         self.body_processor = "MULTIPART".to_string();
@@ -404,7 +404,7 @@ impl RequestData {
                     // CDATA is text that is deliberately not markup, and a
                     // classic place to hide a payload.
                     if let Some(current) = text.last_mut() {
-                        current.push_str(&String::from_utf8_lossy(e.as_ref()));
+                        current.push_str(&crate::bytes::text(e.as_ref()));
                     }
                 }
                 Ok(Event::GeneralRef(e)) => {
@@ -537,14 +537,14 @@ fn form_decode(component: &str) -> String {
     } else {
         Cow::Borrowed(component)
     };
-    percent_encoding::percent_decode_str(&plus_decoded)
-        .decode_utf8_lossy()
-        .into_owned()
+    // Bytes that are not UTF-8 kept, each as itself (crate::bytes)
+    let decoded: Vec<u8> = percent_encoding::percent_decode_str(&plus_decoded).collect();
+    crate::bytes::text(&decoded)
 }
 
 /// libmodsecurity v3's `utils::uri_decode`: `%XX` decoded, anything else (a
 /// `+`, an invalid or truncated escape) kept. Bytes that do not form UTF-8 are
-/// kept one character per byte, as the URL transformations keep them.
+/// kept, each as itself (crate::bytes).
 fn uri_decode(s: &str) -> String {
     fn hex(c: u8) -> Option<u8> {
         (c as char).to_digit(16).map(|d| d as u8)
@@ -569,8 +569,7 @@ fn uri_decode(s: &str) -> String {
         out.push(b[i]);
         i += 1;
     }
-    String::from_utf8(out)
-        .unwrap_or_else(|e| e.into_bytes().iter().map(|&c| char::from(c)).collect())
+    crate::bytes::text(&out)
 }
 
 /// Record one extracted XML value. Returns `true` once the cap is hit.

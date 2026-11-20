@@ -24,8 +24,6 @@ pub struct ValidateUtf8EncodingOperator;
 
 impl Operator for ValidateUtf8EncodingOperator {
     fn execute(&self, value: &str) -> OperatorResult {
-        // In Rust, &str is always valid UTF-8, so we check for overlong encodings
-        // and other invalid sequences that might have been decoded
         if is_valid_utf8_sequence(value) {
             OperatorResult::no_match()
         } else {
@@ -64,29 +62,11 @@ fn is_valid_url_encoding(s: &str) -> bool {
 
 /// Check for valid UTF-8 sequences (no overlong encodings, etc.).
 fn is_valid_utf8_sequence(s: &str) -> bool {
-    // Since Rust strings are always valid UTF-8, we mainly check for
-    // suspicious patterns that might indicate encoding attacks
-
-    // Check for null bytes
-    if s.contains('\0') {
-        return false;
-    }
-
-    // Check for overlong encoded sequences by looking for specific patterns
-    // that would have been decoded incorrectly
-    for &byte in s.as_bytes() {
-        // Check for sequences that look like they were overlong encoded
-        if byte == 0xC0 || byte == 0xC1 {
-            // These lead bytes are always overlong
-            return false;
-        }
-        if byte >= 0xF5 {
-            // Invalid lead bytes
-            return false;
-        }
-    }
-
-    true
+    // A value is a String, so its invalid UTF-8 is what the decoders kept as
+    // stand-ins (crate::bytes): truncated sequences, stray continuation
+    // bytes, overlong forms (`%c0%af`), surrogates, code points past
+    // U+10FFFF. A NUL is valid UTF-8, as in ModSecurity.
+    !crate::bytes::has_invalid_utf8(s)
 }
 
 #[cfg(test)]

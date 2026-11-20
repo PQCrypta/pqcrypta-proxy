@@ -400,9 +400,7 @@ impl<'a> Parser<'a> {
         let plain = c.filename.filter(|f| !f.is_empty());
         self.mp.parts.push(Part {
             name: c.name,
-            filename: star
-                .or(plain)
-                .map(|f| String::from_utf8_lossy(&f).into_owned()),
+            filename: star.or(plain).map(|f| crate::bytes::text(&f)),
             value: c.value,
         });
     }
@@ -433,7 +431,7 @@ impl<'a> Parser<'a> {
                     .fail("Multipart: Invalid part header (folding error).");
                 return;
             };
-            let more = String::from_utf8_lossy(trim_start(content));
+            let more = crate::bytes::text(trim_start(content));
             last.1.push(' ');
             last.1.push_str(&more);
             last.2.push(' ');
@@ -459,8 +457,8 @@ impl<'a> Parser<'a> {
                 .fail("Multipart: Invalid part header (contains invalid character).");
             return;
         }
-        let name = String::from_utf8_lossy(name).into_owned();
-        let value = String::from_utf8_lossy(trim_start(&content[colon + 1..]))
+        let name = crate::bytes::text(name);
+        let value = crate::bytes::text(trim_start(&content[colon + 1..]))
             .trim_end_matches(['\r', '\n'])
             .to_string();
         let current = self.current.as_mut().expect("in a part");
@@ -472,7 +470,7 @@ impl<'a> Parser<'a> {
             self.mp.flags.duplicate_part_header = true;
             return;
         }
-        let line = String::from_utf8_lossy(content).into_owned();
+        let line = crate::bytes::text(content);
         current.headers.push((name, value, line));
     }
 
@@ -631,7 +629,7 @@ fn content_disposition(
                     flags.duplicate_part_header = true;
                     return Err(-14);
                 }
-                part.name = String::from_utf8_lossy(&value).into_owned();
+                part.name = crate::bytes::text(&value);
             }
             b"filename" => {
                 if part.filename.as_ref().is_some_and(|f| !f.is_empty()) {

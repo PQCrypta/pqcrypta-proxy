@@ -67,6 +67,11 @@ The changes from that commit:
   (`uri_decode`: `+` and invalid escapes kept), `REQUEST_URI_RAW`,
   `REQUEST_LINE` and `QUERY_STRING` are not. CRS's path rules apply no URL
   decoding of their own, so a path read raw hid `/%24%28id%29` from them.
+- **Bytes that are not UTF-8 kept as themselves** (`src/bytes.rs`): each
+  becomes one private-use character (U+F780..U+F7FF) instead of U+FFFD, in
+  every decoder, so `@validateUtf8Encoding` finds an overlong `%c0%af` or a
+  truncated sequence (and no longer calls a NUL invalid), and
+  `@validateByteRange` judges the byte itself.
 - **md-5, sha1, sha2 0.11**, the RustCrypto release the proxy builds with,
   in place of 0.10: one copy of each in the build.
 - **`benches/`** removed, with the bench target, its feature and `criterion`:
@@ -74,7 +79,7 @@ The changes from that commit:
   `unsafe` code.
 
 `tests/crs_conformance.rs` gates the engine on CRS's own regression corpus
-(CRS 30cb436): 5062 of 5184 cases pass here, 4947 upstream. Three cases
+(CRS 30cb436): 5066 of 5184 cases pass here, 4947 upstream. Three cases
 upstream passes fail here, by ModSecurity's own URL decoding (below); no
 other. The proxy's CI runs this crate's tests and that
 gate (`zentinel-modsec fork tests`).

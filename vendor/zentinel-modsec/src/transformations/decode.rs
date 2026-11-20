@@ -75,12 +75,9 @@ fn url_decode(input: &str, unicode: bool) -> Option<String> {
     if !changed {
         return None;
     }
-    // Rules match text: decoded bytes that are not UTF-8 are kept one
-    // character per byte, so none is lost to a replacement character
-    Some(
-        String::from_utf8(out)
-            .unwrap_or_else(|e| e.into_bytes().iter().map(|&c| char::from(c)).collect()),
-    )
+    // Decoded bytes that are not UTF-8 are kept, each as itself
+    // (crate::bytes), for @validateUtf8Encoding and @validateByteRange
+    Some(crate::bytes::text(&out))
 }
 
 /// URL decode transformation (`t:urlDecode`).
@@ -116,7 +113,7 @@ impl Transformation for Base64Decode {
     fn transform<'a>(&self, input: &'a str) -> Cow<'a, str> {
         use base64::Engine;
         match base64::engine::general_purpose::STANDARD.decode(input) {
-            Ok(bytes) => Cow::Owned(String::from_utf8_lossy(&bytes).into_owned()),
+            Ok(bytes) => Cow::Owned(crate::bytes::text(&bytes)),
             Err(_) => Cow::Borrowed(input),
         }
     }
@@ -138,7 +135,7 @@ impl Transformation for Base64DecodeExt {
             .or_else(|_| base64::engine::general_purpose::STANDARD.decode(input));
 
         match result {
-            Ok(bytes) => Cow::Owned(String::from_utf8_lossy(&bytes).into_owned()),
+            Ok(bytes) => Cow::Owned(crate::bytes::text(&bytes)),
             Err(_) => Cow::Borrowed(input),
         }
     }
@@ -171,7 +168,7 @@ impl Transformation for HexDecode {
             }
         }
 
-        Cow::Owned(String::from_utf8_lossy(&result).into_owned())
+        Cow::Owned(crate::bytes::text(&result))
     }
 
     fn name(&self) -> &'static str {
@@ -350,7 +347,8 @@ mod tests {
             assert_eq!(t.transform("cat+/etc/passwd"), "cat /etc/passwd");
             assert_eq!(t.transform("100%"), "100%");
             assert_eq!(t.transform("a%zzb%4"), "a%zzb%4");
-            assert_eq!(t.transform("%3Cscript%3E%ff"), "<script>\u{ff}");
+            // %ff is not UTF-8: kept as itself, its stand-in (crate::bytes)
+            assert_eq!(t.transform("%3Cscript%3E%ff"), "<script>\u{f7ff}");
             assert_eq!(t.transform("%E2%82%AC"), "\u{20ac}");
             assert!(matches!(t.transform("plain"), Cow::Borrowed(_)));
         }

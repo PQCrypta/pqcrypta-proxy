@@ -46,6 +46,7 @@
 #![deny(unsafe_code)]
 
 pub mod actions;
+pub mod bytes;
 pub mod engine;
 pub mod error;
 pub mod libinjection;
