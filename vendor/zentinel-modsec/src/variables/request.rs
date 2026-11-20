@@ -31,9 +31,22 @@ pub struct RequestData {
     /// populated by the multipart body processor. Mirrors ModSecurity's
     /// `MULTIPART_PART_HEADERS` collection.
     pub multipart_part_headers: HashMapCollection,
+    /// An XML body's element text and attributes, flattened by element path
+    /// (`xml.order.item`, `xml.order.item.@id`): what `XML:/*` and `XML://@*`
+    /// read. Not arguments: in ModSecurity an XML body fills the XML
+    /// collection alone, so ARGS and ARGS_NAMES never hold its markup, which
+    /// CRS's rules read through their `XML:` targets.
+    pub xml: HashMapCollection,
     /// Uploaded files (key = part name, value = client-supplied filename),
     /// populated by the multipart body processor. Backs `FILES`/`FILES_NAMES`.
     pub files: HashMapCollection,
+    /// `FILES_SIZES`: each file part's size in bytes, by part name.
+    pub files_sizes: HashMapCollection,
+    /// `FILES_COMBINED_SIZE`: the file parts' sizes added up.
+    pub files_combined_size: usize,
+    /// What the multipart processor's strict checks found, for the
+    /// `MULTIPART_*` variables; `None` when it did not run.
+    pub multipart: Option<super::multipart::MultipartFlags>,
     /// Name of the body processor that handled the request body
     /// (`MULTIPART`, `URLENCODED`, `JSON`, or empty when none ran). Backs
     /// `REQBODY_PROCESSOR`.
@@ -46,6 +59,14 @@ pub struct RequestData {
     /// that the origin application happily accepts is a bypass when it
     /// happens quietly.
     pub body_error: Option<String>,
+    /// `ctl:forceRequestBodyVariable=On` ran: `REQUEST_BODY` holds the body
+    /// whatever the processor. Otherwise it does only after the URLENCODED
+    /// processor, as in ModSecurity: an XML, JSON or multipart body is read
+    /// through what its processor extracted (ARGS, XML, FILES), not raw.
+    pub force_body_variable: bool,
+    /// `UNIQUE_ID`: this transaction's identifier, the embedding
+    /// application's request ID when it gives one.
+    pub unique_id: String,
     /// Request body.
     pub body: Vec<u8>,
     /// Client IP address.
@@ -67,16 +88,26 @@ impl RequestData {
     }
 
     /// Set the URI and parse path/query string.
+    ///
+    /// As libmodsecurity v3's `processURI`: `REQUEST_URI_RAW` (and
+    /// `REQUEST_LINE`) keep the URI as it arrived; `REQUEST_URI`,
+    /// `REQUEST_FILENAME` and `REQUEST_BASENAME` are `%XX`-decoded
+    /// (`uri_decode`: `+` kept, an invalid escape kept), without any
+    /// fragment; `QUERY_STRING` stays raw, its arguments form-decoded. CRS's
+    /// path rules apply no URL decoding of their own (932130's
+    /// `REQUEST_FILENAME`, `t:cmdLine` alone), so a path read raw hid
+    /// `%24%28...%29` from them.
     pub fn set_uri(&mut self, uri: &str) {
-        self.uri = uri.to_string();
         self.uri_raw = uri.to_string();
+        let uri = uri.split('#').next().unwrap_or_default();
+        self.uri = uri_decode(uri);
 
         if let Some(pos) = uri.find('?') {
-            self.path = uri[..pos].to_string();
+            self.path = uri_decode(&uri[..pos]);
             self.query_string = uri[pos + 1..].to_string();
             self.parse_query_string(&self.query_string.clone());
         } else {
-            self.path = uri.to_string();
+            self.path = uri_decode(uri);
             self.query_string.clear();
         }
     }
@@ -121,7 +152,7 @@ impl RequestData {
 
     /// Get body as string.
     pub fn body_str(&self) -> String {
-        String::from_utf8_lossy(&self.body).to_string()
+        crate::bytes::text(&self.body)
     }
 
     /// Get body length.
@@ -146,85 +177,48 @@ impl RequestData {
         }
     }
 
-    /// Parse a `multipart/form-data` body.
-    ///
-    /// Populates `args_post` from form fields, `files` from file parts, and
-    /// `multipart_part_headers` with every part header line keyed by the part
-    /// name (ModSecurity `MULTIPART_PART_HEADERS` semantics). Returns `false`
-    /// when no boundary parameter can be extracted from the Content-Type.
+    /// Parse a `multipart/form-data` body (`super::multipart`, libmodsecurity
+    /// v3's processor): form fields into `args_post`, file parts into `files`
+    /// (name to file name) and `files_sizes`, every part header line into
+    /// `multipart_part_headers` under its part's name, and the strict checks'
+    /// findings into `multipart` and, for an error, `body_error`. Returns
+    /// false when parsing stopped on an error.
     pub fn parse_multipart_body(&mut self, content_type: &str) -> bool {
-        let Some(boundary) = extract_multipart_boundary(content_type) else {
-            return false;
-        };
-        let body = self.body_str();
-        let delimiter = format!("--{boundary}");
-
-        let mut sections = body.split(delimiter.as_str());
-        // Everything before the first boundary is preamble; discard it.
-        let _preamble = sections.next();
-
-        for section in sections {
-            if section.starts_with("--") {
-                // Closing delimiter (`--boundary--`); anything after is epilogue.
-                break;
-            }
-            // The boundary line ends with CRLF before the part headers.
-            let section = section
-                .strip_prefix("\r\n")
-                .or_else(|| section.strip_prefix("\n"))
-                .unwrap_or(section);
-
-            // Headers are separated from the part content by a blank line.
-            let (head, content) = match section.split_once("\r\n\r\n") {
-                Some(split) => split,
-                None => match section.split_once("\n\n") {
-                    Some(split) => split,
-                    None => (section, ""),
-                },
-            };
-            // The CRLF before the next boundary belongs to the framing, not
-            // the content.
-            let content = content
-                .strip_suffix("\r\n")
-                .or_else(|| content.strip_suffix("\n"))
-                .unwrap_or(content);
-
-            let mut part_name: Option<String> = None;
-            let mut filename: Option<String> = None;
-            let mut header_lines: Vec<String> = Vec::new();
-
-            for line in head.lines() {
-                let line = line.trim_end_matches('\r');
-                if line.is_empty() {
-                    continue;
+        let mp = super::multipart::parse(content_type, &self.body);
+        for (name, line) in mp.part_headers {
+            self.multipart_part_headers.add(name, line);
+        }
+        for part in mp.parts {
+            match part.filename {
+                Some(filename) => {
+                    self.files_combined_size += part.value.len();
+                    self.files_sizes
+                        .add(part.name.clone(), part.value.len().to_string());
+                    self.files.add(part.name, filename);
                 }
-                header_lines.push(line.to_string());
-                if let Some((hname, hval)) = line.split_once(':') {
-                    if hname.trim().eq_ignore_ascii_case("content-disposition") {
-                        part_name = extract_disposition_param(hval, "name");
-                        filename = extract_disposition_param(hval, "filename");
-                    }
-                }
-            }
-
-            let Some(name) = part_name else {
-                // A part without a Content-Disposition name cannot be
-                // addressed by any collection key; skip it.
-                continue;
-            };
-
-            for line in header_lines {
-                self.multipart_part_headers.add(name.clone(), line);
-            }
-            if let Some(fname) = filename {
-                self.files.add(name, fname);
-            } else {
-                self.args_post.add(name, content.to_string());
+                None => self
+                    .args_post
+                    .add(part.name, crate::bytes::text(&part.value)),
             }
         }
-
         self.body_processor = "MULTIPART".to_string();
-        true
+        if let Some(e) = mp.error {
+            self.body_error.get_or_insert(e);
+        }
+        let parsed = !mp.flags.fatal;
+        self.multipart = Some(mp.flags);
+        parsed
+    }
+
+    /// Whether `REQUEST_BODY` holds the body: after the URLENCODED or JSON
+    /// processor, or when `ctl:forceRequestBodyVariable=On` ran. Not after
+    /// XML or MULTIPART, whose bodies are read through what the processor
+    /// extracted. Measured against CRS's regression corpus, which expects
+    /// a JSON body raw (934210: a key followed by `":`, which no argument
+    /// name carries) and an XML body not (944120: a payload in an element's
+    /// name, which `XML:` targets exclude).
+    pub fn request_body_variable(&self) -> bool {
+        self.force_body_variable || matches!(self.body_processor.as_str(), "URLENCODED" | "JSON")
     }
 
     /// Parse form body into args_post.
@@ -305,7 +299,7 @@ impl RequestData {
     }
 
     /// Parse an XML body, flattening element text and attributes into
-    /// `args_post`.
+    /// `xml`, the collection `XML:` targets read.
     ///
     /// ModSecurity exposes XML through an XPath-selected `XML:` variable. That
     /// needs an XPath engine, which this does not have — so instead each text
@@ -318,13 +312,11 @@ impl RequestData {
     ///      xml.order.item.@id  = 7
     /// ```
     ///
-    /// That is not ModSecurity-compatible naming, and rules written against
-    /// `XML:/order/item` will not match it. It is chosen because the
-    /// alternative was leaving XML bodies uninspected entirely: with this,
-    /// `SecRule ARGS "@detectSQLi"` covers XML payloads the same way it covers
-    /// form and JSON ones, which is what the common rulesets actually do.
-    ///
-    /// The whole document's text is also available as `REQUEST_BODY`.
+    /// Rules written against an XPath such as `XML:/order/item` will not
+    /// match it; the two selectors CRS writes, `XML:/*` (element text) and
+    /// `XML://@*` (attributes), map onto it exactly. As in ModSecurity, the
+    /// values are not arguments, and `REQUEST_BODY` holds the document only
+    /// when `ctl:forceRequestBodyVariable=On` asks for it.
     pub fn parse_xml_body(&mut self) -> Result<(), String> {
         use quick_xml::events::Event;
 
@@ -349,7 +341,7 @@ impl RequestData {
 
         macro_rules! cap {
             ($name:expr, $value:expr) => {
-                if push_xml_arg(&$name, $value, &mut self.args_post, &mut count) {
+                if push_xml_arg(&$name, $value, &mut self.xml, &mut count) {
                     let msg = xml_limit_message();
                     self.body_error = Some(msg.clone());
                     return Err(msg);
@@ -412,7 +404,7 @@ impl RequestData {
                     // CDATA is text that is deliberately not markup, and a
                     // classic place to hide a payload.
                     if let Some(current) = text.last_mut() {
-                        current.push_str(&String::from_utf8_lossy(e.as_ref()));
+                        current.push_str(&crate::bytes::text(e.as_ref()));
                     }
                 }
                 Ok(Event::GeneralRef(e)) => {
@@ -545,9 +537,39 @@ fn form_decode(component: &str) -> String {
     } else {
         Cow::Borrowed(component)
     };
-    percent_encoding::percent_decode_str(&plus_decoded)
-        .decode_utf8_lossy()
-        .into_owned()
+    // Bytes that are not UTF-8 kept, each as itself (crate::bytes)
+    let decoded: Vec<u8> = percent_encoding::percent_decode_str(&plus_decoded).collect();
+    crate::bytes::text(&decoded)
+}
+
+/// libmodsecurity v3's `utils::uri_decode`: `%XX` decoded, anything else (a
+/// `+`, an invalid or truncated escape) kept. Bytes that do not form UTF-8 are
+/// kept, each as itself (crate::bytes).
+fn uri_decode(s: &str) -> String {
+    fn hex(c: u8) -> Option<u8> {
+        (c as char).to_digit(16).map(|d| d as u8)
+    }
+    if !s.contains('%') {
+        return s.to_string();
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            if let (Some(h), Some(l)) = (
+                b.get(i + 1).and_then(|&c| hex(c)),
+                b.get(i + 2).and_then(|&c| hex(c)),
+            ) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    crate::bytes::text(&out)
 }
 
 /// Record one extracted XML value. Returns `true` once the cap is hit.
@@ -650,37 +672,6 @@ fn push_json_arg(
     args.add(path.to_string(), value);
     false
 }
-
-/// Extract the `boundary` parameter from a multipart Content-Type value.
-fn extract_multipart_boundary(content_type: &str) -> Option<String> {
-    for param in content_type.split(';').skip(1) {
-        let param = param.trim();
-        if let Some((key, value)) = param.split_once('=') {
-            if key.trim().eq_ignore_ascii_case("boundary") {
-                let value = value.trim().trim_matches('"');
-                if !value.is_empty() {
-                    return Some(value.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Extract a parameter value (e.g. `name`, `filename`) from a
-/// Content-Disposition header value.
-fn extract_disposition_param(header_value: &str, param: &str) -> Option<String> {
-    for part in header_value.split(';') {
-        let part = part.trim();
-        if let Some((key, value)) = part.split_once('=') {
-            if key.trim().eq_ignore_ascii_case(param) {
-                return Some(value.trim().trim_matches('"').to_string());
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -741,6 +732,11 @@ mod tests {
         let mut req = RequestData::new();
         req.append_body(b"irrelevant");
         assert!(!req.parse_multipart_body("multipart/form-data"));
-        assert!(req.body_processor.is_empty());
+        assert_eq!(req.body_processor, "MULTIPART");
+        assert_eq!(
+            req.body_error.as_deref(),
+            Some("Multipart: Boundary not found in C-T.")
+        );
+        assert!(req.multipart.as_ref().is_some_and(|f| f.strict_error()));
     }
 }

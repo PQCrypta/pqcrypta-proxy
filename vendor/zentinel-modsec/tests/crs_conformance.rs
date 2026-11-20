@@ -65,7 +65,25 @@ use zentinel_modsec::ModSecurity;
 /// 30cb436, the commit CI fetches). The corpus upstream keeps moving, so a
 /// change after bumping that commit is worth reading as new tests before
 /// reading it as a regression.
-const MIN_PASSING: u32 = 4947;
+///
+/// 4947 upstream at 8ba8099; 5066 in pqcrypta-proxy's copy (VENDOR.md):
+/// libinjection itself and `ctl:ruleRemoveTargetByTag` pass six more cases
+/// (941100 two, 941180 one, 942100 two, 942101 one), request bodies read as
+/// ModSecurity reads them 31 (944100 four, 944110 four, 944120 sixteen,
+/// 944210 six, 920400 one), case-insensitive regex selections 17 (922110),
+/// libmodsecurity v3's multipart processor 18 (920120 sixteen, 920121 one,
+/// 920410 one), and ModSecurity's URL decoding (`+` to a space) 18 (932200
+/// seven, 932205 three, 932206 one, 932207 two, 942101 two, 942210 two,
+/// 942240 one), and the path variables URI-decoded as v3 sets them 28 (one
+/// each in 932125 to 932380 and 933151 to 933153, three in 933160), and bytes
+/// that are not UTF-8 kept as themselves 4 (920250). That
+/// decoding fails three cases upstream passed, each a
+/// `%2B` the test expects to survive `t:urlDecodeUni` as `+` (934160 test 4,
+/// 942500 tests 3 and 4): ModSecurity v2 and v3 turn it into a space too
+/// (msc_util.c `urldecode_uni_nonstrict_inplace_ex`, v3 url_decode_uni.cc),
+/// so the engine keeps their semantics. No other case upstream passes fails
+/// here, compared case file by case file.
+const MIN_PASSING: u32 = 5066;
 
 /// Corpus stages that cannot be driven from here: an `encoded_request` payload,
 /// or an expectation that is not about rule IDs (`status`, `match_regex`).
@@ -80,6 +98,8 @@ struct TestFile {
 }
 #[derive(Deserialize)]
 struct Test {
+    #[serde(default)]
+    test_id: Option<u32>,
     #[serde(default)]
     stages: Vec<Stage>,
 }
@@ -235,6 +255,9 @@ fn crs_regression_corpus() {
     let m = load(&dir, FTW_SETUP);
 
     let (mut pass, mut fail, mut skipped) = (0u32, 0u32, 0u32);
+    // CRS_CONFORMANCE_FAILURES=1 lists every failing stage, to look at one
+    // case rather than a file's count
+    let list_failures = std::env::var_os("CRS_CONFORMANCE_FAILURES").is_some();
     let mut by_file: BTreeMap<String, u32> = BTreeMap::new();
     let mut missing: BTreeMap<String, u32> = BTreeMap::new();
     let mut spurious: BTreeMap<String, u32> = BTreeMap::new();
@@ -294,6 +317,24 @@ fn crs_regression_corpus() {
                 if ok {
                     pass += 1;
                 } else {
+                    if list_failures {
+                        println!(
+                            "FAILING {fname} test {} (expected {:?}, not {:?}; got {:?})",
+                            t.test_id.unwrap_or_default(),
+                            log.expect_ids.iter().map(scalar).collect::<Vec<_>>(),
+                            log.no_expect_ids.iter().map(scalar).collect::<Vec<_>>(),
+                            got.iter()
+                                .filter(|id| !id.ends_with("011")
+                                    && !id.ends_with("012")
+                                    && !id.ends_with("013")
+                                    && !id.ends_with("014")
+                                    && !id.ends_with("015")
+                                    && !id.ends_with("016")
+                                    && !id.ends_with("017")
+                                    && !id.ends_with("018"))
+                                .collect::<Vec<_>>(),
+                        );
+                    }
                     fail += 1;
                     *by_file.entry(fname.clone()).or_default() += 1;
                 }

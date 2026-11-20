@@ -63,6 +63,25 @@ pub struct CrsOutcome {
     /// The rules that raised the score, in the order they did, and any rule
     /// that denied outright other than 949110.
     pub rules: Vec<String>,
+    /// What those rules matched in: variable names (`ARGS:json.q`,
+    /// `REQUEST_HEADERS:Referer`), never values, which may be a user's data.
+    /// What an exclusion names. At most [`MAX_VARIABLES`], each printable
+    /// and at most [`MAX_VARIABLE_LEN`] bytes: a name can be the client's.
+    pub variables: Vec<String>,
+}
+
+/// Variable names a verdict carries.
+const MAX_VARIABLES: usize = 3;
+/// Longest variable name a verdict carries, in bytes.
+const MAX_VARIABLE_LEN: usize = 80;
+
+/// A variable name fit for a log line: printable ASCII, the rest `?`, cut to
+/// [`MAX_VARIABLE_LEN`].
+fn loggable(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_graphic() { c } else { '?' })
+        .take(MAX_VARIABLE_LEN)
+        .collect()
 }
 
 impl CrsLayer {
@@ -182,10 +201,23 @@ impl CrsTransaction {
             .get("blocking_inbound_anomaly_score")
             .and_then(|v| v.first().and_then(|s| s.parse::<u32>().ok()))
             .unwrap_or(0);
+        let mut variables: Vec<String> = Vec::new();
+        for m in self.tx.matched_data() {
+            if variables.len() == MAX_VARIABLES {
+                break;
+            }
+            if m.rule_id.as_ref().is_some_and(|id| rules.contains(id)) {
+                let name = loggable(&m.variable);
+                if !variables.contains(&name) {
+                    variables.push(name);
+                }
+            }
+        }
         CrsOutcome {
             denied: intervention.is_some(),
             score,
             rules,
+            variables,
         }
     }
 
@@ -274,6 +306,15 @@ SecRule TX:BLOCKING_INBOUND_ANOMALY_SCORE "@ge 5" "id:949111,phase:2,deny,status
         assert!(o.denied);
         assert_eq!(o.rules, ["942100"]);
         assert_eq!(o.score, 5);
+        assert_eq!(o.variables, ["ARGS:q"], "where it matched, not what");
+    }
+
+    /// A variable name is the client's: what a verdict carries of it is
+    /// printable and bounded
+    #[test]
+    fn matched_variable_names_are_bounded_and_printable() {
+        assert_eq!(loggable("ARGS:json.a\nb\u{7f}"), "ARGS:json.a?b?");
+        assert_eq!(loggable(&"x".repeat(500)).len(), MAX_VARIABLE_LEN);
     }
 
     #[test]
@@ -350,6 +391,30 @@ SecRule TX:BLOCKING_INBOUND_ANOMALY_SCORE "@ge 5" "id:949111,phase:2,deny,status
         let mut t = crs.head(&exempt("q=1%27%20OR%20%271%27=%271"));
         crs.body(&mut t, None);
         assert_eq!(t.outcome().rules, ["942100"], "SQL injection is not");
+    }
+
+    /// CRS's 941010: a path of only characters no XSS needs is dropped from
+    /// the XSS rules (`ctl:ruleRemoveTargetByTag`); any other path, and the
+    /// arguments, are still inspected
+    #[test]
+    fn a_safe_path_is_removed_from_the_tagged_rules_by_tag() {
+        const XSS: &str = r#"
+SecRuleEngine On
+SecAction "id:1,phase:1,pass,nolog,setvar:tx.blocking_inbound_anomaly_score=0"
+SecRule REQUEST_FILENAME "!@validateByteRange 20,45-47,48-57,65-90,95,97-122" "id:941010,phase:1,pass,nolog,ctl:ruleRemoveTargetByTag=xss-perf-disable;REQUEST_FILENAME"
+SecRule REQUEST_FILENAME|ARGS "@contains alert" "id:941999,phase:2,pass,tag:'xss-perf-disable',setvar:tx.inbound_anomaly_score_pl1=+5,setvar:tx.blocking_inbound_anomaly_score=+5"
+SecRule TX:BLOCKING_INBOUND_ANOMALY_SCORE "@ge 5" "id:949110,phase:2,deny,status:403"
+"#;
+        let crs = CrsLayer::from_rules(XSS);
+        let headers = HeaderMap::new();
+        let run = |path, query| {
+            let mut t = crs.head(&head(path, query, &headers));
+            crs.body(&mut t, None);
+            t.outcome().denied
+        };
+        assert!(!run("/alert", ""), "a safe path is not an XSS target");
+        assert!(run("/alert(1)", ""), "a path with ( still is");
+        assert!(run("/search", "q=alert"), "the arguments still are");
     }
 
     /// A reload keeps the loaded rules until a file behind the entry changes,

@@ -1,9 +1,11 @@
 //! Tests for the XML request body processor.
 //!
 //! XML bodies were not inspected at all: they fell through to the urlencoded
-//! parser, which finds nothing in them, so `ARGS` was empty and rules like
-//! CRS 942100 had nothing to look at — the same gap the JSON processor
-//! closed, and the last one from zentinelproxy/zentinel#340.
+//! parser, which finds nothing in them, so rules like CRS 942100 had nothing
+//! to look at — the same gap the JSON processor closed, and the last one from
+//! zentinelproxy/zentinel#340. As in ModSecurity, an XML body fills the XML
+//! collection, which CRS's rules read through `XML:/*` (element text) and
+//! `XML://@*` (attributes); it is not arguments.
 //!
 //! XML brings hazards JSON does not, and most of this file is about them.
 //! Expanding attacker-supplied entity definitions is the mechanism behind
@@ -28,12 +30,12 @@ fn run(rules: &str, content_type: &str, body: &[u8]) -> bool {
 
 fn contains(body: &[u8], needle: &str) -> bool {
     let rules =
-        format!("SecRuleEngine On\nSecRule ARGS \"@contains {needle}\" \"id:1,phase:2,deny\"");
+        format!("SecRuleEngine On\nSecRule XML:/* \"@contains {needle}\" \"id:1,phase:2,deny\"");
     run(&rules, "application/xml", body)
 }
 
 const SQLI_RULE: &str = "SecRuleEngine On\n\
-     SecRule ARGS \"@detectSQLi\" \"id:942100,phase:2,deny,status:403\"";
+     SecRule XML:/*|XML://@* \"@detectSQLi\" \"id:942100,phase:2,deny,status:403\"";
 
 const BODY_ERROR_RULE: &str = "SecRuleEngine On\n\
      SecRule REQBODY_ERROR \"!@eq 0\" \"id:200002,phase:2,deny,status:400\"";
@@ -109,7 +111,7 @@ fn xml_content_types_are_recognised() {
 fn ctl_can_force_the_xml_processor() {
     let rules = "SecRuleEngine On\n\
          SecAction \"id:1,phase:1,pass,nolog,ctl:requestBodyProcessor=XML\"\n\
-         SecRule ARGS \"@detectSQLi\" \"id:942100,phase:2,deny\"";
+         SecRule XML:/* \"@detectSQLi\" \"id:942100,phase:2,deny\"";
     assert!(run(
         rules,
         "",
@@ -125,13 +127,26 @@ fn reqbody_processor_reports_xml() {
 }
 
 // ---------------------------------------------------------------------------
-// Argument naming
+// Naming: what MATCHED_VAR_NAME reports for a value
 // ---------------------------------------------------------------------------
+
+/// An XML body is not arguments: ARGS never holds its markup or text
+#[test]
+fn an_xml_body_is_not_arguments() {
+    let rules = "SecRuleEngine On\n\
+         SecRule ARGS|ARGS_NAMES \"@rx .\" \"id:1,phase:2,deny\"";
+    assert!(!run(
+        rules,
+        "application/xml",
+        br#"<order><item id="7">widget</item></order>"#
+    ));
+}
 
 #[test]
 fn elements_are_named_by_their_path() {
     let rules = "SecRuleEngine On\n\
-         SecRule ARGS:xml.order.item \"@streq widget\" \"id:1,phase:2,deny\"";
+         SecRule XML:/* \"@streq widget\" \"id:1,phase:2,chain,deny\"\n\
+             SecRule MATCHED_VAR_NAME \"@streq XML:/order/item\" \"t:none\"";
     assert!(run(
         rules,
         "application/xml",
@@ -142,7 +157,8 @@ fn elements_are_named_by_their_path() {
 #[test]
 fn attributes_are_named_with_an_at_sign() {
     let rules = "SecRuleEngine On\n\
-         SecRule ARGS:xml.order.item.@id \"@streq 7\" \"id:1,phase:2,deny\"";
+         SecRule XML://@* \"@streq 7\" \"id:1,phase:2,chain,deny\"\n\
+             SecRule MATCHED_VAR_NAME \"@streq XML:/order/item/@id\" \"t:none\"";
     assert!(run(
         rules,
         "application/xml",
@@ -190,7 +206,7 @@ fn an_external_entity_is_not_resolved() {
 
     assert!(
         !contains(xxe, "root:"),
-        "external entity content must never reach ARGS"
+        "external entity content must never reach the XML collection"
     );
 }
 
@@ -301,6 +317,6 @@ fn a_malformed_body_does_not_abort_the_transaction() {
 #[test]
 fn a_non_xml_content_type_is_not_parsed_as_xml() {
     let rules = "SecRuleEngine On\n\
-         SecRule ARGS:xml.a \"@rx .\" \"id:1,phase:2,deny\"";
+         SecRule XML:/* \"@rx .\" \"id:1,phase:2,deny\"";
     assert!(!run(rules, "text/plain", b"<a>value</a>"));
 }

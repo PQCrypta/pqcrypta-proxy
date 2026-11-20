@@ -2,6 +2,8 @@
 //! surface as arguments (zentinelproxy/zentinel-modsec#60). Flattened, the
 //! name `xml.o:order.@xmlns:o` put `xmlns` into ARGS_NAMES, which CRS 941130
 //! reads as an XSS attribute vector -- so every namespaced body was blocked.
+//! An XML body is not arguments at all now (the XML collection, as in
+//! ModSecurity), and a declaration is not one of its attribute values either.
 
 use zentinel_modsec::ModSecurity;
 
@@ -53,27 +55,42 @@ fn a_nested_declaration_is_not_an_argument() {
 }
 
 #[test]
-fn element_text_and_other_attributes_are_still_arguments() {
+fn a_declaration_is_not_an_attribute_value() {
+    let body = r#"<o:order xmlns:o="urn:example:orders"><o:item>w</o:item></o:order>"#;
+    let rules = "SecRuleEngine On\n\
+        SecRule XML://@* \"@contains urn:example:orders\" \"id:1,phase:2,deny\"";
+    assert!(!blocked(rules, body));
+}
+
+#[test]
+fn element_text_and_other_attributes_are_still_read() {
     let body = r#"<o:order xmlns:o="urn:x" o:id="7"><o:item>widget</o:item></o:order>"#;
     let item = "SecRuleEngine On\n\
-        SecRule ARGS:xml.o:order.o:item \"@streq widget\" \"id:1,phase:2,deny\"";
+        SecRule XML:/* \"@streq widget\" \"id:1,phase:2,deny\"";
     assert!(blocked(item, body));
     let attr = "SecRuleEngine On\n\
-        SecRule ARGS:xml.o:order.@o:id \"@streq 7\" \"id:2,phase:2,deny\"";
+        SecRule XML://@* \"@streq 7\" \"id:2,phase:2,deny\"";
     assert!(blocked(attr, body));
 }
 
 #[test]
-fn an_attribute_that_merely_starts_with_xmlns_is_still_an_argument() {
+fn an_attribute_that_merely_starts_with_xmlns_is_still_an_attribute() {
     // `xmlnsfoo` is an ordinary attribute, not a declaration.
     let body = r#"<order xmlnsfoo="bar"><item>widget</item></order>"#;
-    assert!(blocked(RULE_941130_SHAPE, body));
+    let rules = "SecRuleEngine On\n\
+        SecRule XML://@* \"@streq bar\" \"id:1,phase:2,deny\"";
+    assert!(blocked(rules, body));
 }
 
+/// Dropped from ARGS, a declaration is not hidden from the rules: a rule
+/// reading the body raw sees it. REQUEST_BODY holds an XML body only when
+/// `ctl:forceRequestBodyVariable=On` asks for it, as in ModSecurity (it is
+/// read through the XML processor otherwise).
 #[test]
 fn a_declaration_is_still_visible_in_request_body() {
     let rules = "SecRuleEngine On\n\
         SecRequestBodyAccess On\n\
+        SecAction \"id:1,phase:1,pass,nolog,ctl:forceRequestBodyVariable=On\"\n\
         SecRule REQUEST_BODY \"@contains urn:example:orders\" \"id:3,phase:2,deny\"";
     let body = r#"<o:order xmlns:o="urn:example:orders"><o:item>w</o:item></o:order>"#;
     assert!(blocked(rules, body));

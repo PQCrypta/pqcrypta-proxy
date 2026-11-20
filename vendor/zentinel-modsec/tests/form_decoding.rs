@@ -146,7 +146,7 @@ fn a_json_body_keeps_its_pluses() {
 
 #[test]
 fn an_xml_body_keeps_its_pluses() {
-    let rules = "SecRuleEngine On\nSecRule ARGS \"@rx ^a\\+b$\" \"id:1,phase:2,deny,t:none\"";
+    let rules = "SecRuleEngine On\nSecRule XML:/* \"@rx ^a\\+b$\" \"id:1,phase:2,deny,t:none\"";
     let m = ModSecurity::from_string(rules).unwrap();
     let mut tx = m.new_transaction();
     tx.process_uri("/g", "POST", "HTTP/1.1").unwrap();

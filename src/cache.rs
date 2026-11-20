@@ -1590,11 +1590,15 @@ mod bound_tests {
     #[test]
     fn expired_entries_are_swept_with_their_queue_slots() {
         let c = cache(1);
-        // Expires a second from now: the shortest stated lifetime there is
+        // An HTTP date holds whole seconds, and a stated lifetime under one is
+        // not cached. "Now plus two seconds" came out anywhere from one to two
+        // seconds away, so on a slow runner the last puts arrived with less
+        // than a second left and were not stored. An expiry three whole
+        // seconds past the current second leaves every put at least one
+        // however slowly they run, and the wait below is to that exact second.
+        let expiry = jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() + 3).unwrap();
         let soon = jiff::fmt::rfc2822::DateTimePrinter::new()
-            .timestamp_to_rfc9110_string(
-                &(jiff::Timestamp::now() + jiff::SignedDuration::from_secs(2)),
-            )
+            .timestamp_to_rfc9110_string(&expiry)
             .unwrap();
         for n in 0..50 {
             c.put(
@@ -1606,7 +1610,9 @@ mod bound_tests {
         }
         c.put(&key(999), 200, &fresh(), Bytes::from_static(b"x"));
         assert_eq!(c.stats().0, 51);
-        std::thread::sleep(Duration::from_millis(2100));
+        let until_expired =
+            expiry.duration_since(jiff::Timestamp::now()) + jiff::SignedDuration::from_millis(150);
+        std::thread::sleep(Duration::try_from(until_expired).unwrap_or_default());
         c.evict_expired();
         assert_eq!(c.stats().0, 1);
         let queues = c.queues.lock();

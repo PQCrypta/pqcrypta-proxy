@@ -199,6 +199,8 @@ pub enum VariableName {
     MultipartMissingSemicolon,
     /// `MULTIPART_STRICT_ERROR` — any of the strict multipart checks failed.
     MultipartStrictError,
+    /// `MULTIPART_CRLF_LF_LINES` — both CRLF and LF line endings were used.
+    MultipartCrlfLfLines,
     /// `MULTIPART_UNMATCHED_BOUNDARY` — a boundary did not match the declared one.
     MultipartUnmatchedBoundary,
     /// `MULTIPART_PART_HEADERS`
@@ -235,10 +237,6 @@ pub enum VariableName {
     ReqBodyProcessorError,
     /// `REQBODY_PROCESSOR_ERROR_MSG`
     ReqBodyProcessorErrorMsg,
-
-    // Multipart strict
-    /// `MULTIPART_STRICT_ERROR`
-    MultipartStrictCheck,
 }
 
 /// Which part of a flattened XML body an `XML:` selector refers to.
@@ -332,7 +330,24 @@ impl VariableName {
             | VariableName::ReqBodyError
             | VariableName::ReqBodyErrorMsg
             | VariableName::ReqBodyProcessorError
-            | VariableName::ReqBodyProcessorErrorMsg => true,
+            | VariableName::ReqBodyProcessorErrorMsg
+            | VariableName::UniqueId
+            | VariableName::FilesSizes
+            | VariableName::FilesCombinedSize
+            | VariableName::MultipartBoundaryQuoted
+            | VariableName::MultipartBoundaryWhitespace
+            | VariableName::MultipartDataAfter
+            | VariableName::MultipartDataBefore
+            | VariableName::MultipartFileLimitExceeded
+            | VariableName::MultipartHeaderFolding
+            | VariableName::MultipartInvalidHeaderFolding
+            | VariableName::MultipartInvalidPart
+            | VariableName::MultipartInvalidQuoting
+            | VariableName::MultipartLfLine
+            | VariableName::MultipartMissingSemicolon
+            | VariableName::MultipartStrictError
+            | VariableName::MultipartUnmatchedBoundary
+            | VariableName::MultipartCrlfLfLines => true,
 
             VariableName::ResponseProtocol
             | VariableName::ResponseHeadersNames
@@ -355,33 +370,16 @@ impl VariableName {
             | VariableName::TimeWday
             | VariableName::TimeMon
             | VariableName::TimeYear
-            | VariableName::FilesSizes
             | VariableName::FilesTmpnames
-            | VariableName::FilesCombinedSize
-            | VariableName::UniqueId
             | VariableName::InboundAnomalyScore
             | VariableName::OutboundAnomalyScore
             | VariableName::Duration
-            | VariableName::MultipartBoundaryQuoted
-            | VariableName::MultipartBoundaryWhitespace
-            | VariableName::MultipartDataAfter
-            | VariableName::MultipartDataBefore
-            | VariableName::MultipartFileLimitExceeded
-            | VariableName::MultipartHeaderFolding
-            | VariableName::MultipartInvalidHeaderFolding
-            | VariableName::MultipartInvalidPart
-            | VariableName::MultipartInvalidQuoting
-            | VariableName::MultipartLfLine
-            | VariableName::MultipartMissingSemicolon
-            | VariableName::MultipartStrictError
-            | VariableName::MultipartUnmatchedBoundary
             | VariableName::WebserverErrorLog
             | VariableName::HighestSeverity
             | VariableName::StatusLine
             | VariableName::FullRequest
             | VariableName::FullRequestLength
-            | VariableName::AuthType
-            | VariableName::MultipartStrictCheck => false,
+            | VariableName::AuthType => false,
         }
     }
 }
@@ -462,7 +460,20 @@ static VARIABLE_MAP: phf::Map<&'static str, VariableName> = phf_map! {
     "REQBODY_ERROR_MSG" => VariableName::ReqBodyErrorMsg,
     "REQBODY_PROCESSOR_ERROR" => VariableName::ReqBodyProcessorError,
     "REQBODY_PROCESSOR_ERROR_MSG" => VariableName::ReqBodyProcessorErrorMsg,
-    "MULTIPART_STRICT_ERROR" => VariableName::MultipartStrictCheck,
+    "MULTIPART_STRICT_ERROR" => VariableName::MultipartStrictError,
+    "MULTIPART_BOUNDARY_QUOTED" => VariableName::MultipartBoundaryQuoted,
+    "MULTIPART_BOUNDARY_WHITESPACE" => VariableName::MultipartBoundaryWhitespace,
+    "MULTIPART_DATA_AFTER" => VariableName::MultipartDataAfter,
+    "MULTIPART_DATA_BEFORE" => VariableName::MultipartDataBefore,
+    "MULTIPART_FILE_LIMIT_EXCEEDED" => VariableName::MultipartFileLimitExceeded,
+    "MULTIPART_HEADER_FOLDING" => VariableName::MultipartHeaderFolding,
+    "MULTIPART_INVALID_HEADER_FOLDING" => VariableName::MultipartInvalidHeaderFolding,
+    "MULTIPART_INVALID_PART" => VariableName::MultipartInvalidPart,
+    "MULTIPART_INVALID_QUOTING" => VariableName::MultipartInvalidQuoting,
+    "MULTIPART_LF_LINE" => VariableName::MultipartLfLine,
+    "MULTIPART_CRLF_LF_LINES" => VariableName::MultipartCrlfLfLines,
+    "MULTIPART_MISSING_SEMICOLON" => VariableName::MultipartMissingSemicolon,
+    "MULTIPART_UNMATCHED_BOUNDARY" => VariableName::MultipartUnmatchedBoundary,
     "MULTIPART_PART_HEADERS" => VariableName::MultipartPartHeaders,
 };
 

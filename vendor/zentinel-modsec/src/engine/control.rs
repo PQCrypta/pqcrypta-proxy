@@ -54,11 +54,29 @@ pub enum CtlDirective {
     RuleEngine(RuleEngineMode),
     /// `ctl:ruleRemoveById=ID` or `=START-END`, or several separated by commas.
     RuleRemoveById(Vec<RuleIdRange>),
+    /// `ctl:ruleRemoveByTag=TAG`: every rule carrying the tag, for the rest of
+    /// the transaction. CRS's 905100 and 905110 lift the whole rule set
+    /// (`OWASP_CRS`) for the web server's own internal requests.
+    RuleRemoveByTag(String),
+    /// `ctl:forceRequestBodyVariable=On|Off`: populate `REQUEST_BODY` whatever
+    /// the body processor. CRS's 901340 turns it on for a body no processor
+    /// parses, so its rules read that body raw.
+    ForceRequestBodyVariable(bool),
     /// `ctl:ruleRemoveTargetById=ID;TARGET`
     RuleRemoveTargetById {
         /// ID of the rule the exclusion applies to.
         rule_id: String,
         /// Target to drop from that rule, e.g. `ARGS:token`.
+        target: String,
+    },
+    /// `ctl:ruleRemoveTargetByTag=TAG;TARGET`: the target dropped from every
+    /// rule carrying the tag. CRS's 941010 removes REQUEST_FILENAME from its
+    /// XSS rules (tag `xss-perf-disable`) when the path holds only characters
+    /// no XSS needs.
+    RuleRemoveTargetByTag {
+        /// Tag the exclusion applies to, matched exactly.
+        tag: String,
+        /// Target to drop from those rules, e.g. `REQUEST_FILENAME`.
         target: String,
     },
     /// `ctl:requestBodyAccess=On|Off`
@@ -111,6 +129,25 @@ impl CtlDirective {
                 ),
             },
 
+            "ruleremovebytag" => match value.trim() {
+                "" => CtlDirective::unsupported(
+                    directive,
+                    value,
+                    "ruleRemoveByTag expects a tag, for example OWASP_CRS",
+                ),
+                tag => CtlDirective::RuleRemoveByTag(tag.to_string()),
+            },
+
+            "forcerequestbodyvariable" => match value.to_ascii_lowercase().as_str() {
+                "on" => CtlDirective::ForceRequestBodyVariable(true),
+                "off" => CtlDirective::ForceRequestBodyVariable(false),
+                _ => CtlDirective::unsupported(
+                    directive,
+                    value,
+                    "forceRequestBodyVariable accepts only On or Off",
+                ),
+            },
+
             "ruleremovetargetbyid" => match value.split_once(';') {
                 Some((rule_id, target))
                     if !rule_id.trim().is_empty() && !target.trim().is_empty() =>
@@ -124,6 +161,20 @@ impl CtlDirective {
                     directive,
                     value,
                     "ruleRemoveTargetById expects ID;TARGET, for example 942100;ARGS:token",
+                ),
+            },
+
+            "ruleremovetargetbytag" => match value.split_once(';') {
+                Some((tag, target)) if !tag.trim().is_empty() && !target.trim().is_empty() => {
+                    CtlDirective::RuleRemoveTargetByTag {
+                        tag: tag.trim().to_string(),
+                        target: target.trim().to_string(),
+                    }
+                }
+                _ => CtlDirective::unsupported(
+                    directive,
+                    value,
+                    "ruleRemoveTargetByTag expects TAG;TARGET, for example xss-perf-disable;REQUEST_FILENAME",
                 ),
             },
 
@@ -205,12 +256,17 @@ pub(crate) fn parse_id_ranges(value: &str) -> Option<Vec<RuleIdRange>> {
 pub struct TransactionControls {
     engine_mode: Option<RuleEngineMode>,
     removed_rules: Vec<RuleIdRange>,
+    /// Tags from `ctl:ruleRemoveByTag`: a rule carrying any is skipped.
+    removed_tags: Vec<String>,
     /// `(rule id, parsed target)` pairs from `ctl:ruleRemoveTargetById`.
     ///
     /// The target is parsed once when the directive fires rather than once per
     /// resolved value: a rule over a large collection would otherwise re-parse
     /// the same string thousands of times.
     removed_targets: Vec<(String, VariableSpec)>,
+    /// `(tag, parsed target)` pairs from `ctl:ruleRemoveTargetByTag`, parsed
+    /// once for the same reason.
+    removed_targets_by_tag: Vec<(String, VariableSpec)>,
     request_body_access: Option<bool>,
     request_body_processor: Option<String>,
     /// Unsupported directives already reported, so a rule that fires on every
@@ -228,6 +284,14 @@ impl TransactionControls {
         match directive {
             CtlDirective::RuleEngine(mode) => self.engine_mode = Some(mode),
             CtlDirective::RuleRemoveById(mut ranges) => self.removed_rules.append(&mut ranges),
+            CtlDirective::RuleRemoveByTag(tag) => {
+                if !self.removed_tags.contains(&tag) {
+                    self.removed_tags.push(tag);
+                }
+            }
+            // The request data holds this: REQUEST_BODY reads it there
+            // (`Transaction` copies it over as the directive runs).
+            CtlDirective::ForceRequestBodyVariable(_) => {}
             CtlDirective::RuleRemoveTargetById { rule_id, target } => {
                 // Parse with the same parser used for rule variables so
                 // collection names round-trip: SecLang writes REQUEST_HEADERS
@@ -241,6 +305,21 @@ impl TransactionControls {
                                 rule_id = %rule_id,
                                 target = %target,
                                 "ignoring ctl:ruleRemoveTargetById with an unparseable target"
+                            );
+                        }
+                    }
+                }
+            }
+            CtlDirective::RuleRemoveTargetByTag { tag, target } => {
+                match crate::parser::parse_single_variable(&target) {
+                    Ok(spec) => self.removed_targets_by_tag.push((tag, spec)),
+                    Err(_) => {
+                        let key = format!("ruleRemoveTargetByTag={tag};{target}");
+                        if self.reported.insert(key) {
+                            tracing::warn!(
+                                tag = %tag,
+                                target = %target,
+                                "ignoring ctl:ruleRemoveTargetByTag with an unparseable target"
                             );
                         }
                     }
@@ -275,6 +354,12 @@ impl TransactionControls {
         self.engine_mode.unwrap_or(ruleset_mode)
     }
 
+    /// Whether `ctl:ruleRemoveByTag` has excluded a rule, given whether it
+    /// carries a tag (compared exactly, as `SecRuleRemoveByTag` compares).
+    pub fn is_rule_removed_by_tag(&self, has_tag: impl Fn(&str) -> bool) -> bool {
+        self.removed_tags.iter().any(|t| has_tag(t))
+    }
+
     /// Whether `ctl:ruleRemoveById` has excluded this rule.
     pub fn is_rule_removed(&self, rule_id: Option<&str>) -> bool {
         let Some(id) = rule_id else {
@@ -282,6 +367,47 @@ impl TransactionControls {
             return false;
         };
         self.removed_rules.iter().any(|r| r.contains(id))
+    }
+
+    /// The targets excluded from one rule for this transaction: by its ID
+    /// (`ctl:ruleRemoveTargetById`) and by any tag it carries
+    /// (`ctl:ruleRemoveTargetByTag`, the tag matched exactly, as
+    /// `SecRuleRemoveByTag` matches). Empty, and nothing allocated, when no
+    /// exclusion names the rule, which is nearly every rule.
+    pub fn target_removals(
+        &self,
+        rule_id: Option<&str>,
+        has_tag: impl Fn(&str) -> bool,
+    ) -> Vec<&VariableSpec> {
+        let mut out = Vec::new();
+        if let Some(id) = rule_id {
+            out.extend(
+                self.removed_targets
+                    .iter()
+                    .filter(|(r, _)| r == id)
+                    .map(|(_, t)| t),
+            );
+        }
+        out.extend(
+            self.removed_targets_by_tag
+                .iter()
+                .filter(|(tag, _)| has_tag(tag))
+                .map(|(_, t)| t),
+        );
+        out
+    }
+
+    /// Whether one resolved value is among `removals`, the targets
+    /// [`Self::target_removals`] gave for its rule. Values are filtered, not
+    /// specifications: see [`Self::is_target_removed`].
+    pub fn is_removed_by(
+        removals: &[&VariableSpec],
+        var: &VariableSpec,
+        resolved_name: &str,
+    ) -> bool {
+        removals
+            .iter()
+            .any(|target| target_matches_resolved(var, target, resolved_name))
     }
 
     /// Whether any target exclusion applies to this rule.
@@ -366,10 +492,40 @@ fn target_matches_resolved(var: &VariableSpec, target: &VariableSpec, resolved_n
                 key == wanted.as_str()
             }
         }
-        // A regex selection in a ctl: target is not something ModSecurity
-        // accepts here; refuse rather than guess.
-        Some(Selection::Regex(_)) => false,
+        // `ARGS:/protocol$/`: the members whose key the expression finds,
+        // compared as a regular-expression selection compares keys
+        // (case-insensitively), as Coraza and ModSecurity v3 accept it. One
+        // expression excludes a field wherever an array puts it
+        // (`json.resources.3.next_hop_protocol`).
+        Some(Selection::Regex(pattern)) => {
+            let Some((_, key)) = resolved_name.split_once(':') else {
+                return false;
+            };
+            selection_regex(pattern).is_some_and(|re| re.is_match(key))
+        }
     }
+}
+
+/// A regular expression from an exclusion's target, compiled once.
+/// Case-insensitive, as a variable's regular-expression selection is.
+fn selection_regex(pattern: &str) -> Option<regex::Regex> {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, RwLock};
+    static CACHE: LazyLock<RwLock<HashMap<String, Option<regex::Regex>>>> =
+        LazyLock::new(Default::default);
+    if let Some(hit) = CACHE.read().unwrap_or_else(|e| e.into_inner()).get(pattern) {
+        return hit.clone();
+    }
+    let compiled = regex::RegexBuilder::new(pattern)
+        .case_insensitive(true)
+        .build()
+        .ok();
+    CACHE
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(pattern.to_string())
+        .or_insert(compiled)
+        .clone()
 }
 
 /// Whether member keys of this variable's collection compare case-insensitively.
@@ -435,6 +591,32 @@ mod tests {
                 "ruleEngine={value}"
             );
         }
+    }
+
+    #[test]
+    fn rule_remove_target_by_tag_parses_and_applies_to_tagged_rules_only() {
+        let parsed = CtlDirective::parse(&ctl(
+            "ruleRemoveTargetByTag",
+            "xss-perf-disable;REQUEST_FILENAME",
+        ));
+        assert_eq!(
+            parsed,
+            CtlDirective::RuleRemoveTargetByTag {
+                tag: "xss-perf-disable".into(),
+                target: "REQUEST_FILENAME".into(),
+            }
+        );
+        assert!(matches!(
+            CtlDirective::parse(&ctl("ruleRemoveTargetByTag", "no-target")),
+            CtlDirective::Unsupported { .. }
+        ));
+        let mut controls = TransactionControls::default();
+        controls.apply(parsed);
+        let tagged = controls.target_removals(Some("941100"), |t| t == "xss-perf-disable");
+        assert_eq!(tagged.len(), 1);
+        assert!(controls
+            .target_removals(Some("942100"), |t| t == "attack-sqli")
+            .is_empty());
     }
 
     #[test]
@@ -636,7 +818,8 @@ mod tests {
             ("requestBodyProcessor", "YAML"),
             ("auditEngine", "Off"),
             ("auditLogParts", "+E"),
-            ("forceRequestBodyVariable", "On"),
+            ("forceRequestBodyVariable", "Maybe"),
+            ("ruleRemoveByTag", ""),
         ] {
             assert!(
                 matches!(

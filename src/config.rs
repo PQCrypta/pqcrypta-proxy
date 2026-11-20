@@ -101,6 +101,13 @@ pub struct ConfigManager {
     config_path: PathBuf,
     /// Applied to the file on every load, see [`ConfigOverrides`].
     overrides: Arc<RwLock<ConfigOverrides>>,
+    /// The CRS entry's directory the watcher follows (`[waf.crs]`), shared
+    /// with its callback: a reload that turns the rule set on, or moves its
+    /// entry, moves the watch with it ([`Self::store_config`]).
+    crs_watch: Arc<RwLock<Option<PathBuf>>>,
+    /// The directories the watcher was started on (the config's, the
+    /// certificate's), which a CRS directory never takes off it.
+    base_watch: RwLock<Vec<PathBuf>>,
 }
 
 /// What turns the config file into the configuration in force.
@@ -4034,6 +4041,8 @@ impl ConfigManager {
             reload_tx,
             config_path,
             overrides: Arc::new(RwLock::new(ConfigOverrides::default())),
+            crs_watch: Arc::new(RwLock::new(None)),
+            base_watch: RwLock::new(Vec::new()),
         };
 
         Ok((manager, reload_rx))
@@ -4100,7 +4109,39 @@ impl ConfigManager {
     /// event but does not update this `ArcSwap` itself; the reload handler calls
     /// this to keep the central snapshot consistent with what listeners apply.
     pub fn store_config(&self, config: Arc<ProxyConfig>) {
+        self.refresh_crs_watch(&config);
         self.config.store(config);
+    }
+
+    /// Point the watcher at the CRS entry's directory `config` names, or at
+    /// none: every reload passes through here ([`Self::store_config`]), so a
+    /// rule set turned on after the proxy started is watched from that
+    /// reload on, and one turned off stops being watched. A directory the
+    /// watcher was started on stays watched.
+    pub fn refresh_crs_watch(&self, config: &ProxyConfig) {
+        let next = crs_watch_dir(config);
+        let mut current = self.crs_watch.write();
+        if *current == next {
+            return;
+        }
+        if let Some(watcher) = self.watcher.write().as_mut() {
+            let base = self.base_watch.read();
+            if let Some(old) = current.as_ref().filter(|d| !base.contains(d)) {
+                if let Err(e) = watcher.unwatch(old) {
+                    warn!("Could not stop watching {:?}: {}", old, e);
+                }
+            }
+            if let Some(new) = next.as_ref().filter(|d| !base.contains(d)) {
+                match watcher.watch(new, RecursiveMode::NonRecursive) {
+                    Ok(()) => info!("Watching directory {:?} (the CRS rule set)", new),
+                    Err(e) => warn!(
+                        "Could not watch {:?}: {}; CRS changes need a reload",
+                        new, e
+                    ),
+                }
+            }
+        }
+        *current = next;
     }
 } // impl ConfigManager
 
@@ -4266,6 +4307,20 @@ fn is_finished_write(kind: &notify::EventKind) -> bool {
     )
 }
 
+/// The directory of the CRS entry `config` runs, canonical, when the WAF and
+/// its CRS layer are on and it exists.
+fn crs_watch_dir(config: &ProxyConfig) -> Option<PathBuf> {
+    (config.waf.enabled && config.waf.crs.enabled)
+        .then(|| {
+            Path::new(&config.waf.crs.entry)
+                .parent()
+                .map(Path::to_path_buf)
+        })
+        .flatten()
+        .filter(|d| !d.as_os_str().is_empty() && d.is_dir())
+        .map(|d| d.canonicalize().unwrap_or(d))
+}
+
 /// A file of the CRS layer in its entry's directory: a `.conf` file (the
 /// entry, its setup, the exclusions) or the `rules` link. Editors' swap and
 /// backup files beside them are not.
@@ -4348,20 +4403,22 @@ impl ConfigManager {
         add_dir(&config_file, &mut dirs);
         add_dir(&cert_file, &mut dirs);
         add_dir(&key_file, &mut dirs);
+        let base = dirs.clone();
         // The CRS entry's directory: its setup, the site's exclusions, and
         // the link to the installed rules, which an install renames into
         // place. A change there reloads like a change to the file, and the
         // reload rebuilds the WAF because the rules changed
-        // (`WafEngine::crs_current`).
-        let crs_dir = (config.waf.enabled && config.waf.crs.enabled)
-            .then(|| Path::new(&config.waf.crs.entry).parent().map(canon))
-            .flatten()
-            .filter(|d| d.is_dir());
+        // (`WafEngine::crs_current`). Followed across reloads
+        // (`refresh_crs_watch`), so it is read from shared state per event.
+        let crs_dir = crs_watch_dir(&config);
         if let Some(d) = &crs_dir {
             if !dirs.contains(d) {
                 dirs.push(d.clone());
             }
         }
+        *self.crs_watch.write() = crs_dir;
+        *self.base_watch.write() = base;
+        let crs_watch = Arc::clone(&self.crs_watch);
         if dirs.is_empty() {
             anyhow::bail!("no watchable directory for config {:?}", config_file);
         }
@@ -4379,6 +4436,7 @@ impl ConfigManager {
                     // A directory watch also reports siblings — editor swap files,
                     // .bak copies, certbot's staging files — so dispatch strictly
                     // on which watched path the event names.
+                    let crs_dir = crs_watch.read().clone();
                     let hit_config = event.paths.iter().any(|p| {
                         p == &ev_config || crs_dir.as_deref().is_some_and(|d| is_crs_file(d, p))
                     });
@@ -5753,6 +5811,58 @@ pub fn ip_list_contains(list: &[String], ip: &std::net::IpAddr) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// A rule set turned on after the watcher started is watched from the
+    /// reload that turned it on, and one turned off is no longer watched
+    #[tokio::test]
+    async fn the_watcher_follows_the_crs_directory_across_reloads() {
+        let base = std::env::temp_dir().join(format!("crs-watch-{}", std::process::id()));
+        let etc = base.join("etc");
+        let crs = base.join("crs");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::create_dir_all(&crs).unwrap();
+        let file = etc.join("proxy.toml");
+        std::fs::write(&file, "[waf]\nenabled = false\n").unwrap();
+        std::fs::write(crs.join("main.conf"), "SecRuleEngine On\n").unwrap();
+
+        let (manager, mut events) = ConfigManager::new(&file).await.expect("config loads");
+        manager.start_watching().expect("watching");
+        let mut on = (*manager.get()).clone();
+        on.waf.enabled = true;
+        on.waf.crs.enabled = true;
+        on.waf.crs.entry = crs.join("main.conf").to_string_lossy().into_owned();
+        manager.store_config(Arc::new(on));
+
+        // Renamed into place, as an install or an editor replaces a file: the
+        // event every platform reports (macOS reports no close after write)
+        let replace = |text: &str| {
+            let tmp = crs.join(".exclusions.tmp");
+            std::fs::write(&tmp, text).unwrap();
+            std::fs::rename(
+                &tmp,
+                crs.join("REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf"),
+            )
+            .unwrap();
+        };
+        replace("# 1\n");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+            .await
+            .expect("a CRS file replaced after the reload turned CRS on reloads");
+        assert!(matches!(event, Some(ConfigReloadEvent::ConfigReloaded(_))));
+
+        let mut off = (*manager.get()).clone();
+        off.waf.crs.enabled = false;
+        manager.store_config(Arc::new(off));
+        while events.try_recv().is_ok() {}
+        replace("# 2\n");
+        let quiet = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await;
+        assert!(
+            quiet.is_err(),
+            "CRS turned off: its directory is no longer watched"
+        );
+        manager.stop_watching();
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
     /// The watcher reloads for the CRS layer's files and its rules link,
     /// never for an editor's swap file beside them

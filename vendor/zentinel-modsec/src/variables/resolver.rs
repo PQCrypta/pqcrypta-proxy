@@ -23,7 +23,14 @@ fn cached_regex(pattern: &str) -> Option<Regex> {
     if let Some(hit) = CACHE.read().unwrap_or_else(|e| e.into_inner()).get(pattern) {
         return hit.clone();
     }
-    let compiled = Regex::new(pattern).ok();
+    // Case-insensitive, as a key selection is: collection keys are, in
+    // ModSecurity, and TX keys are stored lowercased, so CRS's 922110 reading
+    // `TX:/MULTIPART_HEADERS_CONTENT_TYPES_*/` found none of the keys its
+    // 922150 sets
+    let compiled = regex::RegexBuilder::new(pattern)
+        .case_insensitive(true)
+        .build()
+        .ok();
     CACHE
         .write()
         .unwrap_or_else(|e| e.into_inner())
@@ -127,16 +134,12 @@ impl<'a> VariableResolver<'a> {
                 )]
             }
             VariableName::RequestBasename => {
-                // Final path segment. ModSecurity splits on both separators, so
-                // a Windows-style path does not hide the basename.
-                let basename = self
-                    .request
-                    .path
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                vec![("REQUEST_BASENAME".to_string(), basename)]
+                // Final segment of the decoded path. ModSecurity splits on both
+                // separators, so a Windows-style path does not hide the
+                // basename. Empty, and present, for a path ending in one: CRS's
+                // 920200 tests `!@endsWith .pdf` on it for `/`.
+                let basename = self.request.path.rsplit(['/', '\\']).next().unwrap_or("");
+                vec![("REQUEST_BASENAME".to_string(), basename.to_string())]
             }
             VariableName::ArgsCombinedSize => {
                 use super::collection::Collection;
@@ -147,8 +150,18 @@ impl<'a> VariableResolver<'a> {
                     .sum();
                 vec![("ARGS_COMBINED_SIZE".to_string(), size.to_string())]
             }
+            // REQUEST_BODY: the raw body after the URLENCODED or JSON processor,
+            // or when ctl:forceRequestBodyVariable=On (CRS 901340, for a body
+            // no processor parses); see RequestData::request_body_variable.
             VariableName::RequestBody => {
-                vec![("REQUEST_BODY".to_string(), self.request.body_str())]
+                if self.request.request_body_variable() {
+                    vec![("REQUEST_BODY".to_string(), self.request.body_str())]
+                } else {
+                    vec![]
+                }
+            }
+            VariableName::UniqueId => {
+                vec![("UNIQUE_ID".to_string(), self.request.unique_id.clone())]
             }
             VariableName::RequestBodyLength => {
                 vec![(
@@ -207,16 +220,71 @@ impl<'a> VariableResolver<'a> {
             VariableName::FilesNames => {
                 self.resolve_collection_names(&[&self.request.files], "FILES_NAMES", selection)
             }
-            VariableName::ReqBodyProcessor => {
-                if self.request.body_processor.is_empty() {
-                    vec![]
-                } else {
-                    vec![(
-                        "REQBODY_PROCESSOR".to_string(),
-                        self.request.body_processor.clone(),
-                    )]
-                }
+            VariableName::FilesSizes => {
+                self.resolve_collection(&self.request.files_sizes, "FILES_SIZES", selection)
             }
+            VariableName::FilesCombinedSize => vec![(
+                "FILES_COMBINED_SIZE".to_string(),
+                self.request.files_combined_size.to_string(),
+            )],
+
+            // The multipart processor's findings (variables::multipart):
+            // absent when it did not run, 0 or 1 when it did
+            VariableName::MultipartStrictError => {
+                self.multipart_flag("MULTIPART_STRICT_ERROR", |f| f.strict_error().into())
+            }
+            VariableName::MultipartBoundaryQuoted => {
+                self.multipart_flag("MULTIPART_BOUNDARY_QUOTED", |f| f.boundary_quoted.into())
+            }
+            VariableName::MultipartBoundaryWhitespace => self
+                .multipart_flag("MULTIPART_BOUNDARY_WHITESPACE", |f| {
+                    f.boundary_whitespace.into()
+                }),
+            VariableName::MultipartDataBefore => {
+                self.multipart_flag("MULTIPART_DATA_BEFORE", |f| f.data_before.into())
+            }
+            VariableName::MultipartDataAfter => {
+                self.multipart_flag("MULTIPART_DATA_AFTER", |f| f.data_after.into())
+            }
+            VariableName::MultipartHeaderFolding => {
+                self.multipart_flag("MULTIPART_HEADER_FOLDING", |f| f.header_folding.into())
+            }
+            VariableName::MultipartInvalidHeaderFolding => self
+                .multipart_flag("MULTIPART_INVALID_HEADER_FOLDING", |f| {
+                    f.invalid_header_folding.into()
+                }),
+            VariableName::MultipartLfLine => {
+                self.multipart_flag("MULTIPART_LF_LINE", |f| f.lf_line.into())
+            }
+            VariableName::MultipartCrlfLfLines => self
+                .multipart_flag("MULTIPART_CRLF_LF_LINES", |f| {
+                    (f.crlf_line && f.lf_line).into()
+                }),
+            VariableName::MultipartMissingSemicolon => self
+                .multipart_flag("MULTIPART_MISSING_SEMICOLON", |f| {
+                    f.missing_semicolon.into()
+                }),
+            VariableName::MultipartInvalidQuoting => {
+                self.multipart_flag("MULTIPART_INVALID_QUOTING", |f| f.invalid_quoting.into())
+            }
+            VariableName::MultipartInvalidPart => {
+                self.multipart_flag("MULTIPART_INVALID_PART", |f| f.invalid_part.into())
+            }
+            VariableName::MultipartFileLimitExceeded => self
+                .multipart_flag("MULTIPART_FILE_LIMIT_EXCEEDED", |f| {
+                    f.file_limit_exceeded.into()
+                }),
+            VariableName::MultipartUnmatchedBoundary => {
+                self.multipart_flag("MULTIPART_UNMATCHED_BOUNDARY", |f| f.unmatched_boundary)
+            }
+            // Present, empty, when no processor applies, as in ModSecurity:
+            // CRS's 901340 (`!@rx (?:URLENCODED|MULTIPART|XML|JSON)`) forces
+            // REQUEST_BODY for exactly that body, and a negated operator does
+            // not match an absent variable.
+            VariableName::ReqBodyProcessor => vec![(
+                "REQBODY_PROCESSOR".to_string(),
+                self.request.body_processor.clone(),
+            )],
 
             // A body the processor could not handle. These resolved to nothing
             // before, so CRS rule 200002 (`SecRule REQBODY_ERROR "!@eq 0"`)
@@ -386,13 +454,28 @@ impl<'a> VariableResolver<'a> {
     /// Resolve an `XML:` target against the flattened XML body.
     ///
     /// The XML body processor flattens element text to `xml.<path>` and
-    /// attributes to `xml.<path>.@<name>` in `ARGS`. `XML:/*` and `XML://@*`
+    /// attributes to `xml.<path>.@<name>` in the XML collection (not ARGS,
+    /// as in ModSecurity). `XML:/*` and `XML://@*`
     /// are exactly those two sets, so they are answered from the flattening
     /// rather than by evaluating XPath.
     ///
     /// Values are reported under their XPath-style name -- `xml.order.item.@id`
     /// is reported as `XML:/order/item/@id` -- so `%{MATCHED_VAR_NAME}` in a
     /// rule's `logdata` names the node the way the rule addressed it.
+    /// One `MULTIPART_*` variable: absent when the multipart processor did
+    /// not run.
+    fn multipart_flag(
+        &self,
+        name: &str,
+        get: impl Fn(&super::multipart::MultipartFlags) -> u8,
+    ) -> Vec<(String, String)> {
+        self.request
+            .multipart
+            .as_ref()
+            .map(|f| vec![(name.to_string(), get(f).to_string())])
+            .unwrap_or_default()
+    }
+
     fn resolve_xml(&self, selection: &Option<Selection>) -> Vec<(String, String)> {
         use super::collection::Collection;
 
@@ -403,7 +486,7 @@ impl<'a> VariableResolver<'a> {
         };
 
         self.request
-            .args_post
+            .xml
             .all()
             .into_iter()
             .filter_map(|(name, value)| {
