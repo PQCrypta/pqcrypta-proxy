@@ -62,6 +62,11 @@ The changes from that commit:
   cases (934160 test 4, 942500 tests 3 and 4) that expect a `%2B` to survive
   `t:urlDecodeUni`; under ModSecurity's decoding it cannot, and they fail
   here as they would there.
+- **The path variables as libmodsecurity v3's `processURI` sets them**:
+  `REQUEST_URI`, `REQUEST_FILENAME` and `REQUEST_BASENAME` are `%XX`-decoded
+  (`uri_decode`: `+` and invalid escapes kept), `REQUEST_URI_RAW`,
+  `REQUEST_LINE` and `QUERY_STRING` are not. CRS's path rules apply no URL
+  decoding of their own, so a path read raw hid `/%24%28id%29` from them.
 - **md-5, sha1, sha2 0.11**, the RustCrypto release the proxy builds with,
   in place of 0.10: one copy of each in the build.
 - **`benches/`** removed, with the bench target, its feature and `criterion`:
@@ -69,7 +74,7 @@ The changes from that commit:
   `unsafe` code.
 
 `tests/crs_conformance.rs` gates the engine on CRS's own regression corpus
-(CRS 30cb436): 5034 of 5184 cases pass here, 4947 upstream. Three cases
+(CRS 30cb436): 5062 of 5184 cases pass here, 4947 upstream. Three cases
 upstream passes fail here, by ModSecurity's own URL decoding (below); no
 other. The proxy's CI runs this crate's tests and that
 gate (`zentinel-modsec fork tests`).

@@ -88,16 +88,26 @@ impl RequestData {
     }
 
     /// Set the URI and parse path/query string.
+    ///
+    /// As libmodsecurity v3's `processURI`: `REQUEST_URI_RAW` (and
+    /// `REQUEST_LINE`) keep the URI as it arrived; `REQUEST_URI`,
+    /// `REQUEST_FILENAME` and `REQUEST_BASENAME` are `%XX`-decoded
+    /// (`uri_decode`: `+` kept, an invalid escape kept), without any
+    /// fragment; `QUERY_STRING` stays raw, its arguments form-decoded. CRS's
+    /// path rules apply no URL decoding of their own (932130's
+    /// `REQUEST_FILENAME`, `t:cmdLine` alone), so a path read raw hid
+    /// `%24%28...%29` from them.
     pub fn set_uri(&mut self, uri: &str) {
-        self.uri = uri.to_string();
         self.uri_raw = uri.to_string();
+        let uri = uri.split('#').next().unwrap_or_default();
+        self.uri = uri_decode(uri);
 
         if let Some(pos) = uri.find('?') {
-            self.path = uri[..pos].to_string();
+            self.path = uri_decode(&uri[..pos]);
             self.query_string = uri[pos + 1..].to_string();
             self.parse_query_string(&self.query_string.clone());
         } else {
-            self.path = uri.to_string();
+            self.path = uri_decode(uri);
             self.query_string.clear();
         }
     }
@@ -530,6 +540,37 @@ fn form_decode(component: &str) -> String {
     percent_encoding::percent_decode_str(&plus_decoded)
         .decode_utf8_lossy()
         .into_owned()
+}
+
+/// libmodsecurity v3's `utils::uri_decode`: `%XX` decoded, anything else (a
+/// `+`, an invalid or truncated escape) kept. Bytes that do not form UTF-8 are
+/// kept one character per byte, as the URL transformations keep them.
+fn uri_decode(s: &str) -> String {
+    fn hex(c: u8) -> Option<u8> {
+        (c as char).to_digit(16).map(|d| d as u8)
+    }
+    if !s.contains('%') {
+        return s.to_string();
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            if let (Some(h), Some(l)) = (
+                b.get(i + 1).and_then(|&c| hex(c)),
+                b.get(i + 2).and_then(|&c| hex(c)),
+            ) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8(out)
+        .unwrap_or_else(|e| e.into_bytes().iter().map(|&c| char::from(c)).collect())
 }
 
 /// Record one extracted XML value. Returns `true` once the cap is hit.

@@ -200,3 +200,32 @@ fn unique_id_names_each_transaction() {
         "the caller's request ID stands in"
     );
 }
+
+/// The path variables as libmodsecurity v3's `processURI` sets them
+#[test]
+fn path_variables_are_uri_decoded_and_the_raw_ones_are_not() {
+    let msc = engine(
+        "SecRuleEngine On\n\
+         SecRule REQUEST_FILENAME \"@streq /path/with/$(id)+x\" \"id:1,phase:1,pass\"\n\
+         SecRule REQUEST_BASENAME \"@streq $(id)+x\" \"id:2,phase:1,pass\"\n\
+         SecRule REQUEST_URI \"@streq /path/with/$(id)+x?q=%zz\" \"id:3,phase:1,pass\"\n\
+         SecRule REQUEST_URI_RAW \"@contains %24%28id%29\" \"id:4,phase:1,pass\"\n\
+         SecRule QUERY_STRING \"@streq q=%zz\" \"id:5,phase:1,pass\"\n\
+         SecRule REQUEST_LINE \"@contains %24%28id%29\" \"id:6,phase:1,pass\"\n",
+    );
+    let mut tx = msc.new_transaction();
+    tx.process_uri("/path/with/%24%28id%29+x?q=%zz", "GET", "HTTP/1.1")
+        .unwrap();
+    tx.process_request_headers().unwrap();
+    assert_eq!(tx.matched_rules(), ["1", "2", "3", "4", "5", "6"]);
+
+    // Present and empty for a path ending in a separator: CRS's 920200
+    // tests `!@endsWith .pdf` on it for `/`
+    let msc = engine(
+        "SecRuleEngine On\nSecRule REQUEST_BASENAME \"!@endsWith .pdf\" \"id:7,phase:1,pass\"\n",
+    );
+    let mut tx = msc.new_transaction();
+    tx.process_uri("/dir/", "GET", "HTTP/1.1").unwrap();
+    tx.process_request_headers().unwrap();
+    assert_eq!(tx.matched_rules(), ["7"]);
+}

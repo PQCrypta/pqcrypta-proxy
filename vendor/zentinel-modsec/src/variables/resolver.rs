@@ -134,16 +134,12 @@ impl<'a> VariableResolver<'a> {
                 )]
             }
             VariableName::RequestBasename => {
-                // Final path segment. ModSecurity splits on both separators, so
-                // a Windows-style path does not hide the basename.
-                let basename = self
-                    .request
-                    .path
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                vec![("REQUEST_BASENAME".to_string(), basename)]
+                // Final segment of the decoded path. ModSecurity splits on both
+                // separators, so a Windows-style path does not hide the
+                // basename. Empty, and present, for a path ending in one: CRS's
+                // 920200 tests `!@endsWith .pdf` on it for `/`.
+                let basename = self.request.path.rsplit(['/', '\\']).next().unwrap_or("");
+                vec![("REQUEST_BASENAME".to_string(), basename.to_string())]
             }
             VariableName::ArgsCombinedSize => {
                 use super::collection::Collection;
