@@ -3,21 +3,92 @@
 use super::Transformation;
 use std::borrow::Cow;
 
-/// URL decode transformation.
+/// ModSecurity's non-strict URL decoding, on bytes: `%XX` decoded, an
+/// invalid or truncated escape kept as it is, `+` to a space, and with
+/// `unicode`, `%uXXXX` too (full-width ASCII folded to ASCII). `None` when
+/// nothing changed.
+///
+/// The decoders this replaces decoded through UTF-8 and gave the input back
+/// unchanged when the result was not UTF-8: one `%ff` anywhere in a value
+/// turned decoding off for all of it. And neither turned `+` into a space,
+/// which CRS's rules expect of both (932200 reads a command's arguments
+/// after `t:urlDecodeUni`).
+fn url_decode(input: &str, unicode: bool) -> Option<String> {
+    fn hex(c: u8) -> Option<u8> {
+        (c as char).to_digit(16).map(|d| d as u8)
+    }
+    let b = input.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut changed = false;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if unicode
+                && i + 5 < b.len()
+                && (b[i + 1] | 0x20) == b'u'
+                && b[i + 2..i + 6].iter().all(|&c| hex(c).is_some()) =>
+            {
+                let code = b[i + 2..i + 6]
+                    .iter()
+                    .fold(0u32, |acc, &c| acc * 16 + u32::from(hex(c).unwrap_or(0)));
+                // Full-width ASCII (U+FF01..U+FF5E) is the ASCII it imitates
+                let code = if (0xff01..=0xff5e).contains(&code) {
+                    code - 0xfee0
+                } else {
+                    code
+                };
+                match char::from_u32(code) {
+                    Some(c) => {
+                        let mut buf = [0u8; 4];
+                        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                    }
+                    None => out.extend_from_slice(&b[i..i + 6]),
+                }
+                i += 6;
+                changed = true;
+            }
+            b'%' => match (
+                b.get(i + 1).and_then(|&c| hex(c)),
+                b.get(i + 2).and_then(|&c| hex(c)),
+            ) {
+                (Some(h), Some(l)) => {
+                    out.push(h * 16 + l);
+                    i += 3;
+                    changed = true;
+                }
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+                changed = true;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    if !changed {
+        return None;
+    }
+    // Rules match text: decoded bytes that are not UTF-8 are kept one
+    // character per byte, so none is lost to a replacement character
+    Some(
+        String::from_utf8(out)
+            .unwrap_or_else(|e| e.into_bytes().iter().map(|&c| char::from(c)).collect()),
+    )
+}
+
+/// URL decode transformation (`t:urlDecode`).
 pub struct UrlDecode;
 
 impl Transformation for UrlDecode {
     fn transform<'a>(&self, input: &'a str) -> Cow<'a, str> {
-        match percent_encoding::percent_decode_str(input).decode_utf8() {
-            Ok(decoded) => {
-                if decoded == input {
-                    Cow::Borrowed(input)
-                } else {
-                    Cow::Owned(decoded.into_owned())
-                }
-            }
-            Err(_) => Cow::Borrowed(input),
-        }
+        url_decode(input, false).map_or(Cow::Borrowed(input), Cow::Owned)
     }
 
     fn name(&self) -> &'static str {
@@ -25,68 +96,12 @@ impl Transformation for UrlDecode {
     }
 }
 
-/// URL decode with Unicode support.
+/// URL decode with `%uXXXX` escapes (`t:urlDecodeUni`).
 pub struct UrlDecodeUni;
 
 impl Transformation for UrlDecodeUni {
     fn transform<'a>(&self, input: &'a str) -> Cow<'a, str> {
-        // Handle %uXXXX unicode escapes in addition to standard URL encoding
-        let mut result = String::new();
-        let mut chars = input.chars().peekable();
-        let mut modified = false;
-
-        while let Some(c) = chars.next() {
-            if c == '%' {
-                if chars.peek() == Some(&'u') || chars.peek() == Some(&'U') {
-                    chars.next(); // consume 'u'
-                                  // Read 4 hex digits
-                    let mut hex = String::new();
-                    for _ in 0..4 {
-                        if let Some(h) = chars.next() {
-                            hex.push(h);
-                        }
-                    }
-                    if let Ok(code) = u32::from_str_radix(&hex, 16) {
-                        let code = if (0xff01..=0xff5e).contains(&code) {
-                            code - 0xfee0
-                        } else {
-                            code
-                        };
-                        if let Some(decoded) = char::from_u32(code) {
-                            result.push(decoded);
-                            modified = true;
-                            continue;
-                        }
-                    }
-                    result.push('%');
-                    result.push('u');
-                    result.push_str(&hex);
-                } else {
-                    // Standard URL encoding
-                    let mut hex = String::new();
-                    for _ in 0..2 {
-                        if let Some(h) = chars.next() {
-                            hex.push(h);
-                        }
-                    }
-                    if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                        result.push(byte as char);
-                        modified = true;
-                    } else {
-                        result.push('%');
-                        result.push_str(&hex);
-                    }
-                }
-            } else {
-                result.push(c);
-            }
-        }
-
-        if modified {
-            Cow::Owned(result)
-        } else {
-            Cow::Borrowed(input)
-        }
+        url_decode(input, true).map_or(Cow::Borrowed(input), Cow::Owned)
     }
 
     fn name(&self) -> &'static str {
@@ -325,6 +340,22 @@ mod tests {
         let t = UrlDecode;
         assert_eq!(t.transform("hello%20world"), "hello world");
         assert_eq!(t.transform("test%2Fpath"), "test/path");
+    }
+
+    /// ModSecurity's decoding: `+` is a space, an invalid escape stays, and
+    /// a byte that is not UTF-8 does not stop the rest from being decoded
+    #[test]
+    fn url_decoding_is_modsecuritys() {
+        for t in [&UrlDecode as &dyn Transformation, &UrlDecodeUni] {
+            assert_eq!(t.transform("cat+/etc/passwd"), "cat /etc/passwd");
+            assert_eq!(t.transform("100%"), "100%");
+            assert_eq!(t.transform("a%zzb%4"), "a%zzb%4");
+            assert_eq!(t.transform("%3Cscript%3E%ff"), "<script>\u{ff}");
+            assert_eq!(t.transform("%E2%82%AC"), "\u{20ac}");
+            assert!(matches!(t.transform("plain"), Cow::Borrowed(_)));
+        }
+        assert_eq!(UrlDecode.transform("%u0041"), "%u0041");
+        assert_eq!(UrlDecodeUni.transform("%u0041%u00"), "A%u00");
     }
 
     #[test]

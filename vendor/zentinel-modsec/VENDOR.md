@@ -53,6 +53,15 @@ The changes from that commit:
   boundary is an error, where v3 stops silently and leaves the body
   uninspected; and the file limit is never reached, since v3 checks it only
   when writing uploads to disk, which this engine never does.
+- **URL decoding as ModSecurity's** (`t:urlDecode`, `t:urlDecodeUni`): on
+  bytes, non-strict (an invalid escape kept), and `+` to a space, as v2's
+  `urldecode_nonstrict_inplace_ex` / `urldecode_uni_nonstrict_inplace_ex`
+  and v3's `url_decode_uni.cc` do. The decoder before went through UTF-8 and
+  gave the input back unchanged when the result was not UTF-8, so a single
+  `%ff` turned `t:urlDecode` off for a whole value. CRS's corpus has three
+  cases (934160 test 4, 942500 tests 3 and 4) that expect a `%2B` to survive
+  `t:urlDecodeUni`; under ModSecurity's decoding it cannot, and they fail
+  here as they would there.
 - **md-5, sha1, sha2 0.11**, the RustCrypto release the proxy builds with,
   in place of 0.10: one copy of each in the build.
 - **`benches/`** removed, with the bench target, its feature and `criterion`:
@@ -60,8 +69,9 @@ The changes from that commit:
   `unsafe` code.
 
 `tests/crs_conformance.rs` gates the engine on CRS's own regression corpus
-(CRS 30cb436): 5019 of 5184 cases pass here, 4947 upstream, and no case
-upstream passes fails here. The proxy's CI runs this crate's tests and that
+(CRS 30cb436): 5034 of 5184 cases pass here, 4947 upstream. Three cases
+upstream passes fail here, by ModSecurity's own URL decoding (below); no
+other. The proxy's CI runs this crate's tests and that
 gate (`zentinel-modsec fork tests`).
 
 To move to a newer upstream commit: copy it over this directory (`git archive

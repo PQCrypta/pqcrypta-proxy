@@ -66,15 +66,21 @@ use zentinel_modsec::ModSecurity;
 /// change after bumping that commit is worth reading as new tests before
 /// reading it as a regression.
 ///
-/// 4947 upstream at 8ba8099; 5019 in pqcrypta-proxy's copy (VENDOR.md):
+/// 4947 upstream at 8ba8099; 5034 in pqcrypta-proxy's copy (VENDOR.md):
 /// libinjection itself and `ctl:ruleRemoveTargetByTag` pass six more cases
 /// (941100 two, 941180 one, 942100 two, 942101 one), request bodies read as
 /// ModSecurity reads them 31 (944100 four, 944110 four, 944120 sixteen,
 /// 944210 six, 920400 one), case-insensitive regex selections 17 (922110),
 /// libmodsecurity v3's multipart processor 18 (920120 sixteen, 920121 one,
-/// 920410 one), and none that upstream passes fails here, compared case file
-/// by case file.
-const MIN_PASSING: u32 = 5019;
+/// 920410 one), and ModSecurity's URL decoding (`+` to a space) 18 (932200
+/// seven, 932205 three, 932206 one, 932207 two, 942101 two, 942210 two,
+/// 942240 one). That decoding fails three cases upstream passed, each a
+/// `%2B` the test expects to survive `t:urlDecodeUni` as `+` (934160 test 4,
+/// 942500 tests 3 and 4): ModSecurity v2 and v3 turn it into a space too
+/// (msc_util.c `urldecode_uni_nonstrict_inplace_ex`, v3 url_decode_uni.cc),
+/// so the engine keeps their semantics. No other case upstream passes fails
+/// here, compared case file by case file.
+const MIN_PASSING: u32 = 5034;
 
 /// Corpus stages that cannot be driven from here: an `encoded_request` payload,
 /// or an expectation that is not about rule IDs (`status`, `match_regex`).
