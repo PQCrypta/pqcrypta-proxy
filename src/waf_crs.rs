@@ -63,6 +63,25 @@ pub struct CrsOutcome {
     /// The rules that raised the score, in the order they did, and any rule
     /// that denied outright other than 949110.
     pub rules: Vec<String>,
+    /// What those rules matched in: variable names (`ARGS:json.q`,
+    /// `REQUEST_HEADERS:Referer`), never values, which may be a user's data.
+    /// What an exclusion names. At most [`MAX_VARIABLES`], each printable
+    /// and at most [`MAX_VARIABLE_LEN`] bytes: a name can be the client's.
+    pub variables: Vec<String>,
+}
+
+/// Variable names a verdict carries.
+const MAX_VARIABLES: usize = 3;
+/// Longest variable name a verdict carries, in bytes.
+const MAX_VARIABLE_LEN: usize = 80;
+
+/// A variable name fit for a log line: printable ASCII, the rest `?`, cut to
+/// [`MAX_VARIABLE_LEN`].
+fn loggable(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_graphic() { c } else { '?' })
+        .take(MAX_VARIABLE_LEN)
+        .collect()
 }
 
 impl CrsLayer {
@@ -182,10 +201,23 @@ impl CrsTransaction {
             .get("blocking_inbound_anomaly_score")
             .and_then(|v| v.first().and_then(|s| s.parse::<u32>().ok()))
             .unwrap_or(0);
+        let mut variables: Vec<String> = Vec::new();
+        for m in self.tx.matched_data() {
+            if variables.len() == MAX_VARIABLES {
+                break;
+            }
+            if m.rule_id.as_ref().is_some_and(|id| rules.contains(id)) {
+                let name = loggable(&m.variable);
+                if !variables.contains(&name) {
+                    variables.push(name);
+                }
+            }
+        }
         CrsOutcome {
             denied: intervention.is_some(),
             score,
             rules,
+            variables,
         }
     }
 
@@ -274,6 +306,15 @@ SecRule TX:BLOCKING_INBOUND_ANOMALY_SCORE "@ge 5" "id:949111,phase:2,deny,status
         assert!(o.denied);
         assert_eq!(o.rules, ["942100"]);
         assert_eq!(o.score, 5);
+        assert_eq!(o.variables, ["ARGS:q"], "where it matched, not what");
+    }
+
+    /// A variable name is the client's: what a verdict carries of it is
+    /// printable and bounded
+    #[test]
+    fn matched_variable_names_are_bounded_and_printable() {
+        assert_eq!(loggable("ARGS:json.a\nb\u{7f}"), "ARGS:json.a?b?");
+        assert_eq!(loggable(&"x".repeat(500)).len(), MAX_VARIABLE_LEN);
     }
 
     #[test]

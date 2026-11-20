@@ -492,10 +492,40 @@ fn target_matches_resolved(var: &VariableSpec, target: &VariableSpec, resolved_n
                 key == wanted.as_str()
             }
         }
-        // A regex selection in a ctl: target is not something ModSecurity
-        // accepts here; refuse rather than guess.
-        Some(Selection::Regex(_)) => false,
+        // `ARGS:/protocol$/`: the members whose key the expression finds,
+        // compared as a regular-expression selection compares keys
+        // (case-insensitively), as Coraza and ModSecurity v3 accept it. One
+        // expression excludes a field wherever an array puts it
+        // (`json.resources.3.next_hop_protocol`).
+        Some(Selection::Regex(pattern)) => {
+            let Some((_, key)) = resolved_name.split_once(':') else {
+                return false;
+            };
+            selection_regex(pattern).is_some_and(|re| re.is_match(key))
+        }
     }
+}
+
+/// A regular expression from an exclusion's target, compiled once.
+/// Case-insensitive, as a variable's regular-expression selection is.
+fn selection_regex(pattern: &str) -> Option<regex::Regex> {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, RwLock};
+    static CACHE: LazyLock<RwLock<HashMap<String, Option<regex::Regex>>>> =
+        LazyLock::new(Default::default);
+    if let Some(hit) = CACHE.read().unwrap_or_else(|e| e.into_inner()).get(pattern) {
+        return hit.clone();
+    }
+    let compiled = regex::RegexBuilder::new(pattern)
+        .case_insensitive(true)
+        .build()
+        .ok();
+    CACHE
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(pattern.to_string())
+        .or_insert(compiled)
+        .clone()
 }
 
 /// Whether member keys of this variable's collection compare case-insensitively.

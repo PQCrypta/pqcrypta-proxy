@@ -2092,6 +2092,12 @@ impl WafEngine {
             Severity::High
         };
         let matched = u32::try_from(o.rules.len()).unwrap_or(u32::MAX);
+        // Where it matched, for the log and the audit: what an exclusion names
+        let location = if o.variables.is_empty() {
+            "crs".to_string()
+        } else {
+            format!("crs {}", o.variables.join(","))
+        };
         if self.crs_blocks(block_mode) {
             self.stats.blocked.fetch_add(1, Ordering::Relaxed);
             WafVerdict::Block {
@@ -2099,7 +2105,7 @@ impl WafEngine {
                 severity,
                 score: o.score,
                 matched,
-                location: "crs".to_string(),
+                location,
             }
         } else {
             debug!(
@@ -2112,7 +2118,7 @@ impl WafEngine {
                 severity,
                 score: o.score,
                 matched,
-                location: "crs".to_string(),
+                location,
             }
         }
     }

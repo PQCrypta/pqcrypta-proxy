@@ -433,3 +433,31 @@ fn an_unsupported_ctl_does_not_disable_the_engine() {
 
     assert!(blocked(rules, "/attack"));
 }
+
+/// `ctl:ruleRemoveTargetById=ID;ARGS:/regex/` lifts the members whose key the
+/// expression finds, wherever an array puts them, and nothing else
+#[test]
+fn rule_remove_target_by_id_takes_a_regular_expression() {
+    let rules = "SecRuleEngine On\n\
+        SecRequestBodyAccess On\n\
+        SecAction \"id:1,phase:1,pass,nolog,ctl:ruleRemoveTargetById=921130;ARGS:/next_hop_protocol$/\"\n\
+        SecRule ARGS \"@rx \\bhttp/\\d\" \"id:921130,phase:2,deny\"";
+    let msc = ModSecurity::from_string(rules).unwrap();
+    let run = |body: &str| {
+        let mut tx = msc.new_transaction();
+        tx.process_uri("/analytics/web/resources", "POST", "HTTP/1.1")
+            .unwrap();
+        tx.add_request_header("Content-Type", "application/json")
+            .unwrap();
+        tx.process_request_headers().unwrap();
+        tx.append_request_body(body.as_bytes()).unwrap();
+        tx.process_request_body().unwrap();
+        tx.has_intervention()
+    };
+    assert!(!run(
+        r#"{"resources":[{"next_hop_protocol":"http/1.1"},{"next_hop_protocol":"h3"}]}"#
+    ));
+    assert!(run(
+        r#"{"resources":[{"name":"x","note":"http/1.1 200 ok"}]}"#
+    ));
+}
