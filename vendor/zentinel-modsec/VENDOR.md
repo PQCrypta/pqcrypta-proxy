@@ -31,6 +31,11 @@ The changes from that commit:
   they compared against libmodsecurity through FFI and were this crate's only
   `unsafe` code.
 
+`tests/crs_conformance.rs` gates the engine on CRS's own regression corpus
+(CRS 30cb436): 4953 of 5184 cases pass here, 4947 upstream, and no case
+upstream passes fails here. The proxy's CI runs this crate's tests and that
+gate (`zentinel-modsec fork tests`).
+
 To move to a newer upstream commit: copy it over this directory (`git archive
 <commit> | tar -x`), keep `src/libinjection/`, `remove_rules_by_id`, `ruleRemoveTargetByTag`, the hash crates' versions and this file, drop `benches/`
 again, and rerun `tests/crs_regression.rs` in the proxy.

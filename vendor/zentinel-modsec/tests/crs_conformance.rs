@@ -65,7 +65,12 @@ use zentinel_modsec::ModSecurity;
 /// 30cb436, the commit CI fetches). The corpus upstream keeps moving, so a
 /// change after bumping that commit is worth reading as new tests before
 /// reading it as a regression.
-const MIN_PASSING: u32 = 4947;
+///
+/// 4947 upstream at 8ba8099; 4953 in pqcrypta-proxy's copy, whose
+/// libinjection and `ctl:ruleRemoveTargetByTag` (VENDOR.md) pass six more
+/// cases (941100 two, 941180 one, 942100 two, 942101 one) and fail none that
+/// upstream passes, compared case file by case file.
+const MIN_PASSING: u32 = 4953;
 
 /// Corpus stages that cannot be driven from here: an `encoded_request` payload,
 /// or an expectation that is not about rule IDs (`status`, `match_regex`).

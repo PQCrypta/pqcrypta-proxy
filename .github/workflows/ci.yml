@@ -233,6 +233,49 @@ jobs:
       - name: Run the fork's tests
         run: cargo test --manifest-path vendor/h3/Cargo.toml --lib --all-features
 
+  # The vendored zentinel-modsec (the SecLang engine behind [waf.crs]): its
+  # own tests, and its gate on CRS's regression corpus, which compares the
+  # pass count exactly against a pinned CRS commit. vendor/zentinel-modsec/
+  # VENDOR.md says what differs from upstream and what the gate measures.
+  zentinel-modsec-fork:
+    name: zentinel-modsec fork tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # the toolchain rust-toolchain.toml names
+        with:
+          toolchain: "1.99.0"
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: zentinel-modsec-fork
+          workspaces: vendor/zentinel-modsec
+
+      - name: Run the fork's tests
+        env:
+          SKIP_CRS_CONFORMANCE: "1"
+        run: cargo test --release --manifest-path vendor/zentinel-modsec/Cargo.toml
+
+      # Pinned: the gate compares the pass count for an exact match, so the
+      # corpus must not move under it. Bump the commit and MIN_PASSING in
+      # tests/crs_conformance.rs together.
+      - name: Fetch OWASP CRS
+        working-directory: vendor/zentinel-modsec
+        env:
+          CRS_COMMIT: 30cb436b261a9f5ec32a5a0677e17f3cfa1a8739
+        run: |
+          mkdir -p test-rules/crs
+          git -C test-rules/crs init -q
+          git -C test-rules/crs fetch -q --depth 1 https://github.com/coreruleset/coreruleset.git "$CRS_COMMIT"
+          git -C test-rules/crs checkout -q FETCH_HEAD
+          cp test-rules/crs/crs-setup.conf.example test-rules/crs/crs-setup.conf
+
+      # Never with SKIP_CRS_CONFORMANCE: that is what makes the gate real.
+      - name: CRS conformance gate
+        working-directory: vendor/zentinel-modsec
+        run: cargo test --release --test crs_conformance -- --nocapture
+
   # The vendored hyper fork's tests: upstream's library tests and the fork's
   # own, for the sender that lets an HTTP/2 service send a 103 Early Hints
   # (vendor/hyper/src/ext/h2_informational.rs) ahead of its response.
