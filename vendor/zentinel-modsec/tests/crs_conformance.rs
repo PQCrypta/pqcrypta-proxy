@@ -99,6 +99,8 @@ struct TestFile {
 #[derive(Deserialize)]
 struct Test {
     #[serde(default)]
+    test_id: Option<u32>,
+    #[serde(default)]
     stages: Vec<Stage>,
 }
 #[derive(Deserialize)]
@@ -253,6 +255,9 @@ fn crs_regression_corpus() {
     let m = load(&dir, FTW_SETUP);
 
     let (mut pass, mut fail, mut skipped) = (0u32, 0u32, 0u32);
+    // CRS_CONFORMANCE_FAILURES=1 lists every failing stage, to look at one
+    // case rather than a file's count
+    let list_failures = std::env::var_os("CRS_CONFORMANCE_FAILURES").is_some();
     let mut by_file: BTreeMap<String, u32> = BTreeMap::new();
     let mut missing: BTreeMap<String, u32> = BTreeMap::new();
     let mut spurious: BTreeMap<String, u32> = BTreeMap::new();
@@ -312,6 +317,24 @@ fn crs_regression_corpus() {
                 if ok {
                     pass += 1;
                 } else {
+                    if list_failures {
+                        println!(
+                            "FAILING {fname} test {} (expected {:?}, not {:?}; got {:?})",
+                            t.test_id.unwrap_or_default(),
+                            log.expect_ids.iter().map(scalar).collect::<Vec<_>>(),
+                            log.no_expect_ids.iter().map(scalar).collect::<Vec<_>>(),
+                            got.iter()
+                                .filter(|id| !id.ends_with("011")
+                                    && !id.ends_with("012")
+                                    && !id.ends_with("013")
+                                    && !id.ends_with("014")
+                                    && !id.ends_with("015")
+                                    && !id.ends_with("016")
+                                    && !id.ends_with("017")
+                                    && !id.ends_with("018"))
+                                .collect::<Vec<_>>(),
+                        );
+                    }
                     fail += 1;
                     *by_file.entry(fname.clone()).or_default() += 1;
                 }
