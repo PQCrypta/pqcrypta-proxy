@@ -479,6 +479,8 @@ async fn handle_incoming_session(
             query,
             headers: &headers,
             body: None,
+            version: Some(http::Version::HTTP_3),
+            authority: Some(&host),
         };
         match sec.evaluate(&view, &policy) {
             crate::security::SecurityDecision::Allow => {}
@@ -1360,6 +1362,8 @@ async fn proxy_request(
                 query: "",
                 headers: &headers,
                 body: Some(data),
+                version: Some(http::Version::HTTP_3),
+                authority: session.host.as_deref(),
             };
             let policy = crate::security::request_policy(
                 config,

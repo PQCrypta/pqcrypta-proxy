@@ -612,6 +612,8 @@ async fn connect_refusal(
             query: request.uri().query().unwrap_or(""),
             headers: request.headers(),
             body: None,
+            version: Some(http::Version::HTTP_3),
+            authority: host,
         };
         let decision = security.evaluate(&view, &policy);
         let rendered = {

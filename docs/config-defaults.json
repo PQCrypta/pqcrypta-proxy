@@ -538,6 +538,11 @@
     "block_scanner_uas": true,
     "cmd_injection": true,
     "crlf_injection": true,
+    "crs": {
+      "enabled": false,
+      "entry": "/etc/pqcrypta/crs/main.conf",
+      "mode": "detect"
+    },
     "custom_patterns": [],
     "decode_compressed_body": true,
     "deserialization": true,

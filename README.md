@@ -1038,6 +1038,40 @@ lower it to act on single weak signals. A match below the threshold is still
 counted in the per-rule metrics, so a rule can be evaluated before it is trusted
 to block.
 
+**The OWASP Core Rule Set (`[waf.crs]`).** Beside the native rules, the proxy
+can run CRS itself: the rule set ModSecurity and Coraza run, executed by a
+pure-Rust SecLang engine (`vendor/zentinel-modsec`, with libinjection behind
+`@detectSQLi` and `@detectXSS`; `vendor/zentinel-modsec/VENDOR.md`). No C, no
+module, no sidecar. A request's head runs CRS's phase 1 as it is read; phase 2,
+where most of CRS's attack rules are, runs with the body, decoded as the native
+rules decode it, or without one. A body the proxy holds only in part
+(`max_body_scan_bytes`) is not given to CRS, which would refuse it as
+unparsable; the native rules scan the part there is. CRS decides by its own
+anomaly score, and its verdict joins the native one: a request the native rules
+block stays blocked, and one CRS denies is blocked when `mode = "block"` and
+the route's WAF mode blocks, and reported in `"detect"`. Either way it is named
+`crs:<rule>+<rule>` by the CRS rules that scored it, counted per rule in the
+WAF metrics, and shown by the admin explain endpoint.
+
+```toml
+[waf.crs]
+enabled = true
+mode = "detect"                         # "block" once the site's exclusions are written
+entry = "/etc/pqcrypta/crs/main.conf"   # SecRuleEngine On, then Include crs-setup.conf, rules/*.conf, exclusions
+```
+
+The entry file is SecLang: paranoia level, anomaly thresholds, allowed methods
+and the site's exclusions are CRS's own settings, made there. A configuration
+whose rule set does not load is refused at `--validate` and at reload; a
+reload keeps the loaded rule set when none of its files changed, and loads it
+again when one did. With `--watch-config`, a change in the entry's directory
+(an exclusion edited, the `rules` link renamed to a new release) is itself a
+reload.
+`tests/crs_regression.rs` measures both engines against CRS's own regression
+suite (`scripts/crs-cases.py` turns its go-ftw tests into cases): on CRS
+4.30, blocking at paranoia level 1, the native rules block 18.7% of the
+level-1 attack cases and CRS 96.1%.
+
 **Rule identifiers.** Every rule has a stable identifier of the form
 `PQW-<CATEGORY>-<NNN>`, and verdicts are reported as `category:identifier` —
 `bad-bot-ua:PQW-BOT-001`, `sqli:PQW-SQLI-011`. Identifiers are stable across
@@ -1873,6 +1907,7 @@ src/
 ├── tls.rs                  # TLS configuration with Post-Quantum Cryptography (PQC) support
 ├── tls_acceptor.rs         # Custom TLS Acceptor with ClientHello Capture
 ├── waf.rs                  # Web Application Firewall (WAF) module
+├── waf_crs.rs              # The OWASP Core Rule Set beside the native WAF rules ([waf.crs])
 ├── webtransport_server.rs  # The dedicated WebTransport server, on webtransport_port, with ALPN negotiation
 ├── ws_tunnel.rs            # WebSocket tunnels to a backend, for every transport a client may use
 └── wt_session.rs           # One WebTransport session, whichever listener accepted it

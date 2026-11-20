@@ -110,6 +110,10 @@ rustls-pki-types = { version = "1.9", features = ["alloc"] }
 # ECH config can seal the inner ClientHello to a key a quantum computer cannot
 # open. Canonical source in pqcrypta-platform (public/ent/hpke-pq).
 pqcrypta-hpke-pq = { path = "vendor/pqcrypta-hpke-pq" }
+# The OWASP Core Rule Set beside the native WAF ([waf.crs], src/waf_crs.rs):
+# a pure-Rust SecLang engine, vendored with libinjection itself behind
+# @detectSQLi and @detectXSS (vendor/zentinel-modsec/VENDOR.md)
+zentinel-modsec = { path = "vendor/zentinel-modsec" }
 rustls-native-certs = "0.8"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 webpki-roots = "1.0"

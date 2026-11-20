@@ -496,6 +496,10 @@ pub struct SecurityRequestView<'a> {
     /// Body bytes when already buffered, for WAF body inspection. None means
     /// the caller has not buffered a body — not that the body is empty.
     pub body: Option<&'a [u8]>,
+    /// The protocol the request arrived over (CRS reads it)
+    pub version: Option<http::Version>,
+    /// The request's authority: its Host over HTTP/2 and HTTP/3, for CRS
+    pub authority: Option<&'a str>,
 }
 
 /// Whether `host` is the conformance suite's own vhost.
@@ -1098,7 +1102,9 @@ impl SecurityState {
         let current = self.waf();
         let waf_unchanged = match current.as_deref() {
             Some(engine) => {
-                config.waf.enabled && crate::config::same_settings(engine.config(), &config.waf)
+                config.waf.enabled
+                    && crate::config::same_settings(engine.config(), &config.waf)
+                    && engine.crs_current()
             }
             None => !config.waf.enabled,
         };
@@ -1854,6 +1860,8 @@ impl SecurityState {
             generic_client_allowed: generic_client_allowed(policy, view.headers)
                 || self.programmatic_client_paths.load().is_match(view.path),
             mode_override: policy.waf_mode.as_deref(),
+            version: view.version,
+            authority: view.authority,
         }
     }
 
@@ -2637,7 +2645,7 @@ pub struct PendingWaf {
 impl Drop for PendingWaf {
     fn drop(&mut self) {
         if let Some(head) = self.head.take() {
-            let verdict = self.engine.conclude(&head, &self.path);
+            let verdict = self.engine.conclude(head, &self.path);
             report_waf_verdict(&verdict, self.ip, &self.path, self.audit.as_ref());
         }
     }
@@ -2980,6 +2988,8 @@ pub async fn security_middleware(
             query: request.uri().query().unwrap_or(""),
             headers: request.headers(),
             body: None,
+            version: Some(request.version()),
+            authority: request.uri().authority().map(|a| a.as_str()),
         };
         let (decision, pending) = security.evaluate_head(&view, &route_policy);
 
@@ -3022,6 +3032,8 @@ pub async fn security_middleware(
                 query: request.uri().query().unwrap_or(""),
                 headers: request.headers(),
                 body: None,
+                version: Some(request.version()),
+                authority: request.uri().authority().map(|a| a.as_str()),
             };
             let decision = security.finish_waf(pending, &view, &route_policy);
             if !matches!(decision, SecurityDecision::Allow) {
@@ -3111,6 +3123,8 @@ pub async fn security_middleware(
                     query: parts.uri.query().unwrap_or(""),
                     headers: &parts.headers,
                     body: Some(&collected_bytes),
+                    version: Some(parts.version),
+                    authority: parts.uri.authority().map(|a| a.as_str()),
                 };
                 let decision = security.inspect_rest(pending, &body_view, &route_policy);
                 if !matches!(decision, SecurityDecision::Allow) {
@@ -3174,6 +3188,8 @@ pub async fn security_middleware(
                 query: parts.uri.query().unwrap_or(""),
                 headers: &parts.headers,
                 body: Some(&collected_bytes),
+                version: Some(parts.version),
+                authority: parts.uri.authority().map(|a| a.as_str()),
             };
             let decision = security.inspect_rest(pending, &body_view, &route_policy);
             if !matches!(decision, SecurityDecision::Allow) {
@@ -4103,6 +4119,8 @@ mod tests {
                 query: "",
                 headers: &headers,
                 body: None,
+                version: None,
+                authority: None,
             };
             assert!(matches!(
                 security.evaluate(&view, &RequestPolicy::default()),
@@ -4127,6 +4145,8 @@ mod tests {
                     query: "",
                     headers: &headers,
                     body: None,
+                    version: None,
+                    authority: None,
                 };
                 let first = security.evaluate(&view, &RequestPolicy::default());
                 if matches!(first, SecurityDecision::Allow) {
@@ -4261,6 +4281,8 @@ mod tests {
                         query,
                         headers: h,
                         body: None,
+                        version: None,
+                        authority: None,
                     },
                     &policy,
                 ) {
@@ -4297,7 +4319,9 @@ mod tests {
                     path: "/x",
                     query: "",
                     headers: &headers,
-                    body: None
+                    body: None,
+                    version: None,
+                    authority: None,
                 },
                 &policy
             ),
@@ -4321,6 +4345,8 @@ mod tests {
             query: "",
             headers: &headers,
             body: None,
+            version: None,
+            authority: None,
         };
         let mut config = ProxyConfig::default();
         config.waf.enabled = true;
@@ -4367,6 +4393,8 @@ mod tests {
             query: "",
             headers: &headers,
             body: None,
+            version: None,
+            authority: None,
         };
 
         let mut config = ProxyConfig::default();
@@ -4756,6 +4784,8 @@ mod decision_rendering_tests {
             query: "",
             headers: &headers,
             body: None,
+            version: None,
+            authority: None,
         };
         let (decision, pending) = security.evaluate_head(&view, &RequestPolicy::default());
         assert!(matches!(decision, SecurityDecision::Allow));
@@ -4891,6 +4921,8 @@ mod decision_rendering_tests {
                 query,
                 headers: &headers,
                 body: None,
+                version: None,
+                authority: None,
             };
             security.evaluate(&view, &policy)
         };
@@ -5047,6 +5079,8 @@ mod hot_reload_tests {
                 query: "",
                 headers: &headers,
                 body: Some(br#"{"crl":"ldap:///CN=Root,CN=CDP?certificateRevocationList"}"#),
+                version: None,
+                authority: None,
             },
             &RequestPolicy::default(),
             false,
@@ -5190,6 +5224,8 @@ mod hot_reload_tests {
                 query: "",
                 headers: &headers,
                 body: None,
+                version: None,
+                authority: None,
             };
             matches!(security.evaluate(&view, &policy), SecurityDecision::Allow)
         };
@@ -5277,6 +5313,8 @@ mod fingerprint_allowlist_tests {
                 query: "",
                 headers: &headers,
                 body: None,
+                version: None,
+                authority: None,
             };
             security.evaluate(&view, &policy)
         };

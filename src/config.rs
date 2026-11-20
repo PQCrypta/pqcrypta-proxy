@@ -472,6 +472,39 @@ pub struct WafConfig {
     /// compression bomb cannot exhaust memory during inspection.
     #[serde(default = "default_max_decompressed_body_bytes")]
     pub max_decompressed_body_bytes: usize,
+    /// The OWASP Core Rule Set, run beside the native rules
+    #[serde(default)]
+    pub crs: WafCrsConfig,
+}
+
+/// `[waf.crs]`: the OWASP Core Rule Set, run by a pure-Rust SecLang engine
+/// beside the native rules (`src/waf_crs.rs`).
+///
+/// `entry` is a SecLang file that turns the engine on (`SecRuleEngine On`,
+/// `SecRequestBodyAccess On`) and `Include`s `crs-setup.conf`, CRS's
+/// `rules/*.conf` and the site's exclusions. Paranoia level and anomaly
+/// thresholds are CRS's own, set there. A request CRS denies is blocked when
+/// `mode` is `"block"` and the route's WAF mode blocks, and only reported in
+/// `"detect"`; either way it is named by the CRS rules that scored it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WafCrsConfig {
+    /// Run CRS (default false)
+    pub enabled: bool,
+    /// "detect" (report only, the default) | "block"
+    pub mode: String,
+    /// The entry SecLang file (default `/etc/pqcrypta/crs/main.conf`)
+    pub entry: String,
+}
+
+impl Default for WafCrsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: "detect".to_string(),
+            entry: "/etc/pqcrypta/crs/main.conf".to_string(),
+        }
+    }
 }
 
 /// Suppress specific WAF rules or categories on paths matching a regex.
@@ -545,6 +578,7 @@ impl Default for WafConfig {
             exclusions: Vec::new(),
             decode_compressed_body: true,
             max_decompressed_body_bytes: default_max_decompressed_body_bytes(),
+            crs: WafCrsConfig::default(),
         }
     }
 }
@@ -4232,6 +4266,15 @@ fn is_finished_write(kind: &notify::EventKind) -> bool {
     )
 }
 
+/// A file of the CRS layer in its entry's directory: a `.conf` file (the
+/// entry, its setup, the exclusions) or the `rules` link. Editors' swap and
+/// backup files beside them are not.
+fn is_crs_file(dir: &Path, path: &Path) -> bool {
+    path.parent() == Some(dir)
+        && (path.extension().is_some_and(|e| e == "conf")
+            || path.file_name().is_some_and(|n| n == "rules"))
+}
+
 impl ConfigManager {
     // re-open for remaining methods
 
@@ -4305,6 +4348,20 @@ impl ConfigManager {
         add_dir(&config_file, &mut dirs);
         add_dir(&cert_file, &mut dirs);
         add_dir(&key_file, &mut dirs);
+        // The CRS entry's directory: its setup, the site's exclusions, and
+        // the link to the installed rules, which an install renames into
+        // place. A change there reloads like a change to the file, and the
+        // reload rebuilds the WAF because the rules changed
+        // (`WafEngine::crs_current`).
+        let crs_dir = (config.waf.enabled && config.waf.crs.enabled)
+            .then(|| Path::new(&config.waf.crs.entry).parent().map(canon))
+            .flatten()
+            .filter(|d| d.is_dir());
+        if let Some(d) = &crs_dir {
+            if !dirs.contains(d) {
+                dirs.push(d.clone());
+            }
+        }
         if dirs.is_empty() {
             anyhow::bail!("no watchable directory for config {:?}", config_file);
         }
@@ -4322,7 +4379,9 @@ impl ConfigManager {
                     // A directory watch also reports siblings — editor swap files,
                     // .bak copies, certbot's staging files — so dispatch strictly
                     // on which watched path the event names.
-                    let hit_config = event.paths.iter().any(|p| p == &ev_config);
+                    let hit_config = event.paths.iter().any(|p| {
+                        p == &ev_config || crs_dir.as_deref().is_some_and(|d| is_crs_file(d, p))
+                    });
                     let hit_tls = event.paths.iter().any(|p| p == &ev_cert || p == &ev_key);
 
                     if hit_config {
@@ -4781,6 +4840,25 @@ impl ProxyConfig {
         }
         if let Err(e) = regex::RegexSet::new(&self.waf.programmatic_client_paths) {
             return Err(anyhow::anyhow!("waf.programmatic_client_paths: {e}"));
+        }
+        if !matches!(self.waf.crs.mode.as_str(), "detect" | "block") {
+            return Err(anyhow::anyhow!(
+                "waf.crs.mode {:?}: \"detect\" or \"block\"",
+                self.waf.crs.mode
+            ));
+        }
+        // The rule set loads here too, so `--validate` (and a reload) refuses
+        // a configuration whose CRS would not load, rather than the running
+        // proxy finding out
+        if self.waf.enabled && self.waf.crs.enabled {
+            let crs = crate::waf_crs::CrsLayer::load(&self.waf.crs.entry)
+                .map_err(|e| anyhow::anyhow!("waf.crs.entry: {e}"))?;
+            if crs.rule_count() == 0 {
+                return Err(anyhow::anyhow!(
+                    "waf.crs.entry {}: no rules loaded",
+                    self.waf.crs.entry
+                ));
+            }
         }
 
         // `headers_override` takes literal header names, while `[headers]` spells
@@ -5675,6 +5753,24 @@ pub fn ip_list_contains(list: &[String], ip: &std::net::IpAddr) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// The watcher reloads for the CRS layer's files and its rules link,
+    /// never for an editor's swap file beside them
+    #[test]
+    fn crs_files_are_the_conf_files_and_the_rules_link() {
+        let dir = Path::new("/etc/pqcrypta/crs");
+        assert!(is_crs_file(
+            dir,
+            &dir.join("REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf")
+        ));
+        assert!(is_crs_file(dir, &dir.join("rules")));
+        assert!(!is_crs_file(dir, &dir.join(".main.conf.swp")));
+        assert!(!is_crs_file(dir, &dir.join("main.conf~")));
+        assert!(!is_crs_file(
+            dir,
+            Path::new("/etc/pqcrypta/proxy-config.conf")
+        ));
+    }
     use super::*;
 
     /// Every listed setting names a real key: a typo would be a setting that
