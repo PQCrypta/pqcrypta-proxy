@@ -1,0 +1,98 @@
+[package]
+name = "zentinel-modsec"
+version = "0.6.0"
+edition = "2021"
+rust-version = "1.94.1"
+authors = ["Zentinel Contributors"]
+license = "Apache-2.0"
+repository = "https://github.com/zentinelproxy/zentinel-modsec"
+homepage = "https://zentinelproxy.io"
+documentation = "https://zentinelproxy.io/docs/zentinel-modsec"
+description = "Pure Rust ModSecurity rule engine, measured against the OWASP CRS regression suite"
+keywords = ["modsecurity", "waf", "security", "owasp", "crs"]
+categories = ["network-programming", "web-programming"]
+readme = "README.md"
+
+[lib]
+name = "zentinel_modsec"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zentinel-modsec"
+path = "src/main.rs"
+
+[dependencies]
+# libinjection itself (a memory-safe port, measured against the C library), in
+# place of the simplified detector this crate shipped; see VENDOR.md
+barbacane-libinjection = "=0.1.3"
+# Pattern matching
+regex = "1.10"
+# Syntax validation without building the automaton, so an invalid pattern is a
+# load error while compilation itself stays lazy.
+regex-syntax = "0.8"
+aho-corasick = "1.1"
+
+# IP address matching
+ipnetwork = "0.21"
+
+# Hashing (for md5/sha1/sha2 transformations)
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+hex = "0.4"
+
+# HTML entity decoding
+html-escape = "0.2"
+
+# Base64 encoding/decoding
+base64 = "0.22"
+
+# JSON request body processor
+serde = "1.0"
+serde_json = "1.0"
+
+# XML request body processor. Pull-based, and it does not resolve or expand
+# entities on its own — external entity references arrive as raw tokens, so
+# XXE and entity-expansion attacks are not reachable through it.
+quick-xml = "0.41"
+
+# URL encoding/decoding
+percent-encoding = "2.3"
+
+# File globbing
+glob = "0.3"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+thiserror = "2.0"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Insertion-ordered collections: rule evaluation order over a collection is
+# part of the result (MATCHED_VAR, captures), so it must not depend on a hash
+# seed (#53).
+indexmap = "2"
+
+# Lazy initialization
+once_cell = "1.19"
+
+# Perfect hash function for fast lookups
+phf = { version = "0.13", features = ["macros"] }
+
+# Optional: geolocation
+maxminddb = { version = "0.27", optional = true }
+
+[features]
+default = []
+geo = ["maxminddb"]
+
+[dev-dependencies]
+tempfile = "3"
+# Reading the OWASP CRS regression corpus in tests/crs_conformance.rs
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+walkdir = "2"
