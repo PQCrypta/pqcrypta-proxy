@@ -52,6 +52,21 @@ pub fn bytes(s: &str) -> impl Iterator<Item = u8> + '_ {
     })
 }
 
+/// The request's bytes for a value: the value's own UTF-8 when it holds no
+/// stand-in (nearly always, and then nothing is copied), otherwise each
+/// stand-in read back as its byte.
+pub fn request_bytes(s: &str) -> std::borrow::Cow<'_, [u8]> {
+    // A stand-in (U+F780..U+F7FF) is EF 9E xx or EF 9F xx in UTF-8
+    let b = s.as_bytes();
+    if b.windows(2)
+        .any(|w| w[0] == 0xef && (w[1] == 0x9e || w[1] == 0x9f))
+    {
+        std::borrow::Cow::Owned(bytes(s).collect())
+    } else {
+        std::borrow::Cow::Borrowed(b)
+    }
+}
+
 /// Whether the text holds a byte that was not UTF-8.
 pub fn has_invalid_utf8(s: &str) -> bool {
     s.chars().any(|c| raw_byte(c).is_some())

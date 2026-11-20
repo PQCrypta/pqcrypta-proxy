@@ -6,9 +6,16 @@ use super::traits::{Operator, OperatorResult};
 use crate::error::{Error, Result};
 use aho_corasick::AhoCorasick;
 use once_cell::sync::OnceCell;
-use regex::Regex;
+use regex::bytes::{Regex, RegexBuilder};
 
 /// Regex operator (@rx) with lazy compilation.
+///
+/// Matched as ModSecurity matches: PCRE without UTF mode, with DOTALL. The
+/// pattern runs over the value's bytes, so `\xe2\x80\x99` in a CRS pattern
+/// is the three bytes of `’` (not U+00E2 and two controls), `\w`, `\s`,
+/// `\d` and `(?i)` are ASCII, and `.` is any byte, a newline included. A
+/// pattern that only Unicode mode can express (`\x{2019}`, `\p{L}`) is
+/// compiled in it, over the same bytes.
 ///
 /// The pattern's *syntax* is validated when the rule is loaded, but the
 /// automaton is only built on first use — CRS defines hundreds of regex rules
@@ -41,11 +48,19 @@ impl RxOperator {
             });
         }
 
-        if let Err(e) = regex_syntax::Parser::new().parse(pattern) {
-            return Err(Error::RegexCompile {
-                pattern: pattern.to_string(),
-                source: regex::Error::Syntax(e.to_string()),
-            });
+        // Valid as PCRE reads it (bytes), or failing that in Unicode mode
+        let as_bytes = regex_syntax::ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .build()
+            .parse(pattern);
+        if as_bytes.is_err() {
+            if let Err(e) = regex_syntax::Parser::new().parse(pattern) {
+                return Err(Error::RegexCompile {
+                    pattern: pattern.to_string(),
+                    source: regex::Error::Syntax(e.to_string()),
+                });
+            }
         }
 
         Ok(Self {
@@ -63,7 +78,7 @@ impl RxOperator {
     #[inline]
     fn get_regex(&self) -> Option<&Regex> {
         self.compiled
-            .get_or_init(|| match Regex::new(&self.pattern_str) {
+            .get_or_init(|| match compile(&self.pattern_str) {
                 Ok(regex) => Some(regex),
                 Err(e) => {
                     tracing::error!(
@@ -78,20 +93,35 @@ impl RxOperator {
     }
 }
 
+/// A pattern as PCRE compiles it for ModSecurity: bytes, DOTALL; Unicode mode
+/// only for a pattern that cannot be written without it.
+fn compile(pattern: &str) -> std::result::Result<Regex, regex::Error> {
+    let build = |unicode: bool| {
+        RegexBuilder::new(pattern)
+            .unicode(unicode)
+            .dot_matches_new_line(true)
+            .size_limit(64 << 20)
+            .build()
+    };
+    build(false).or_else(|_| build(true))
+}
+
 impl Operator for RxOperator {
     fn execute(&self, value: &str) -> OperatorResult {
         let Some(regex) = self.get_regex() else {
             return OperatorResult::no_match();
         };
+        let haystack = crate::bytes::request_bytes(value);
 
-        if let Some(captures) = regex.captures(value) {
-            let matched_value = captures.get(0).map(|m| m.as_str().to_string());
+        if let Some(captures) = regex.captures(&haystack) {
+            let text = |m: regex::bytes::Match<'_>| crate::bytes::text(m.as_bytes());
+            let matched_value = captures.get(0).map(text);
             let capture_groups: Vec<String> = captures
                 .iter()
                 .skip(1) // Skip the full match
                 // A group that did not take part stays in its slot (empty), so
                 // TX:2 is always the second group.
-                .map(|c| c.map(|m| m.as_str().to_string()).unwrap_or_default())
+                .map(|c| c.map(text).unwrap_or_default())
                 .collect();
 
             OperatorResult {
@@ -220,6 +250,38 @@ impl Operator for PmOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rx(pattern: &str, value: &str) -> bool {
+        RxOperator::new(pattern).unwrap().execute(value).matched
+    }
+
+    /// PCRE without UTF mode, as ModSecurity runs CRS: bytes, ASCII classes,
+    /// DOTALL
+    #[test]
+    fn patterns_match_bytes_as_pcre_does() {
+        // CRS 942430's class holds the bytes of ’ and ´
+        assert!(rx(r"[\xc2\xb4\xe2\x80\x99]{3}", "\u{2019}"));
+        assert!(rx(r"^\xe2\x80\x99$", "\u{2019}"));
+        assert!(!rx(r"^\xe2$", "\u{e2}"), "\\xe2 is a byte, not U+00E2");
+        assert!(rx(r"a.b", "a\nb"), "DOTALL");
+        assert!(!rx(r"^\w+$", "caf\u{e9}"), "\\w is ASCII");
+        assert!(!rx(r"(?i)^k$", "\u{212a}"), "case folding is ASCII");
+        assert!(rx(r"(?i)^select$", "SeLeCt"));
+        // A byte that was not UTF-8, kept as its stand-in, is matched as itself
+        assert!(rx(r"\xc0\xaf", &crate::bytes::text(b"..\xc0\xaf..")));
+        // A pattern only Unicode mode can write still works
+        assert!(rx(r"\x{2019}", "it\u{2019}s"));
+        assert!(rx(r"\p{Greek}", "\u{3b1}"));
+    }
+
+    #[test]
+    fn captures_come_back_as_text() {
+        let r = RxOperator::new(r"(\xe2\x80\x99)(x)?")
+            .unwrap()
+            .execute("a\u{2019}");
+        assert_eq!(r.captures, ["\u{2019}", ""]);
+        assert_eq!(r.matched_value.as_deref(), Some("\u{2019}"));
+    }
 
     #[test]
     fn test_rx_simple() {
