@@ -66,13 +66,13 @@ use zentinel_modsec::ModSecurity;
 /// change after bumping that commit is worth reading as new tests before
 /// reading it as a regression.
 ///
-/// 4947 upstream at 8ba8099; 4984 in pqcrypta-proxy's copy (VENDOR.md):
+/// 4947 upstream at 8ba8099; 5001 in pqcrypta-proxy's copy (VENDOR.md):
 /// libinjection itself and `ctl:ruleRemoveTargetByTag` pass six more cases
 /// (941100 two, 941180 one, 942100 two, 942101 one), request bodies read as
 /// ModSecurity reads them 31 (944100 four, 944110 four, 944120 sixteen,
-/// 944210 six, 920400 one), and none that upstream passes fails here,
-/// compared case file by case file.
-const MIN_PASSING: u32 = 4984;
+/// 944210 six, 920400 one), case-insensitive regex selections 17 (922110),
+/// and none that upstream passes fails here, compared case file by case file.
+const MIN_PASSING: u32 = 5001;
 
 /// Corpus stages that cannot be driven from here: an `encoded_request` payload,
 /// or an expectation that is not about rule IDs (`status`, `match_regex`).

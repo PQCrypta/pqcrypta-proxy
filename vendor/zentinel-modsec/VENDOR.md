@@ -39,6 +39,10 @@ The changes from that commit:
   (`Transaction::set_unique_id`). A multipart body whose Content-Type names
   no boundary is a body error (REQBODY_ERROR), as in ModSecurity, rather
   than a warning per request.
+- **Regular-expression selections compare keys case-insensitively**
+  (`TX:/.../`, `ARGS:/.../`, and in exclusions), as a key selection does and
+  as ModSecurity does: TX keys are stored lowercased, so CRS's 922110 never
+  found the multipart content types its 922150 recorded.
 - **md-5, sha1, sha2 0.11**, the RustCrypto release the proxy builds with,
   in place of 0.10: one copy of each in the build.
 - **`benches/`** removed, with the bench target, its feature and `criterion`:
@@ -46,7 +50,7 @@ The changes from that commit:
   `unsafe` code.
 
 `tests/crs_conformance.rs` gates the engine on CRS's own regression corpus
-(CRS 30cb436): 4984 of 5184 cases pass here, 4947 upstream, and no case
+(CRS 30cb436): 5001 of 5184 cases pass here, 4947 upstream, and no case
 upstream passes fails here. The proxy's CI runs this crate's tests and that
 gate (`zentinel-modsec fork tests`).
 
